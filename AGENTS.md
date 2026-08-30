@@ -550,6 +550,23 @@ under review every round. Do not "fix" this by withholding `--auto`.
   `test (windows-latest)`. Name only variables you set yourself, and always pair
   them with `| default(...)`.
 
+### `kata status` will keep reporting AGENTS.md drift. Do not "fix" it.
+
+`pj-rust/AGENTS.md.rust` is stored with **CRLF on all 130 of its lines** in the
+template repository (`pj-base/AGENTS.md.base` is LF). kata copies those bytes
+faithfully, so a local `kata apply` rewrites the `kata:agents:rust:*` block with
+CRLF and leaves a 260-line whitespace-only diff plus a permanent
+`update AGENTS.md` in `kata status`.
+
+The fleet stays LF anyway because `kata-apply.yml` commits on ubuntu **through
+git**, where `.gitattributes` (`* text=auto eol=lf`) normalises on commit. The
+trap is local: **jj does not implement git's eol normalisation**, so a
+`kata apply` followed by a jj commit lands CRLF that CI would have stripped.
+
+So: this file stays LF. If `kata status` nags about `AGENTS.md`, that is the
+upstream CRLF, not drift worth committing — normalise back to LF and
+`jj restore .kata/applied.toml`. Tracked by yukimemi/pj-rust.
+
 ### Facts duplicated with no compiler in between
 
 - **Prompt phrasing is load-bearing for the tests.** `tests/common/mod.rs`
