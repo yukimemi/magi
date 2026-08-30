@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
+use jiff::Timestamp;
 use tokio::sync::Semaphore;
 
 use crate::agent::{self, AgentOutput, Invocation, SeatState};
@@ -31,8 +32,8 @@ use crate::git;
 use crate::prompt::{self, CandidateView, Turn};
 use crate::run::{
     Candidate, CommandOutcome, DeliberationRound, DeliberationTurn, FixRecord, Judgement,
-    MergeOutcome, ReviewRecord, ReviewRound, RunState, RunStatus, Tally, VoteRecord, tail,
-    write_artifact,
+    MergeOutcome, QuotaLoss, ReviewRecord, ReviewRound, RunState, RunStatus, Tally, VoteRecord,
+    tail, write_artifact,
 };
 use crate::verdict::{self, FinalVote, FixReport, Position, Ranking, Review, Severity};
 
@@ -50,6 +51,20 @@ struct SeatJob {
     sessions: bool,
     artifacts: PathBuf,
     stem: String,
+}
+
+/// How the graph reads one agent invocation.
+///
+/// Quota is split out from an ordinary failure on purpose: a rate-limited call
+/// is known to fail again if retried now, so the retry loop must not spend an
+/// attempt on it.
+enum AgentOutcome {
+    /// A usable output.
+    Ok(AgentOutput),
+    /// The CLI ran out of quota / rate limit. Retrying now is pointless.
+    Quota(AgentOutput),
+    /// Any other failure: a timeout, a bad exit code, an empty reply.
+    Failed(String),
 }
 
 /// Drives one run.
@@ -246,12 +261,32 @@ impl Runner {
 
     /// Walk the graph to a terminal state, skipping nodes already recorded.
     pub async fn execute(&mut self) -> Result<()> {
+        // A run that already lost its quorum never resumes into the verdict
+        // machinery: `deliberate` and `vote` would otherwise clobber the
+        // stalled marker back to Voting and the run would keep going past a
+        // verdict that is no longer trustworthy. Everything already recorded is
+        // kept, so the run stays resumable (or foldable) for a human to pick up.
+        if self.state.status == RunStatus::Stalled {
+            self.state.save()?;
+            return Ok(());
+        }
         self.prep().await?;
         self.implement().await?;
         self.judge().await?;
         self.deliberate().await?;
         self.vote().await?;
         self.tally()?;
+        // A verdict that lost its quorum is not trustworthy: do not review,
+        // gate, or merge on it. Everything already done is kept, so the run
+        // stays resumable (or foldable); the human can replace the agent that
+        // ran out of quota and pick it up.
+        if self.state.status == RunStatus::Stalled {
+            // Persist the stalled marker now — the normal end-of-execute save
+            // below is below this early return, and without it a resumed run
+            // would reload a pre-tally status and keep going.
+            self.state.save()?;
+            return Ok(());
+        }
         self.fold_losers().await?;
         self.review_loop().await?;
         self.gate().await?;
@@ -419,14 +454,15 @@ impl Runner {
         );
         let results = wave(jobs, Arc::clone(&self.sem)).await;
 
-        for (&i, (seat, out)) in todo.iter().zip(results) {
+        for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
+            let seat_key = seat.key.clone();
             self.state.seats.insert(seat.key.clone(), seat);
             let label = self.state.candidates[i].label;
             let worktree = self.state.candidates[i].worktree.clone();
             let base = self.state.base_commit.clone();
 
             let (summary, duration, failed) = match out {
-                Ok(o) => {
+                AgentOutcome::Ok(o) => {
                     let text = verdict::section(&o.text, "summary").unwrap_or(o.text.clone());
                     let failed = (!o.usable()).then(|| {
                         if o.timed_out {
@@ -437,7 +473,20 @@ impl Runner {
                     });
                     (text, o.duration_ms, failed)
                 }
-                Err(e) => (String::new(), 0, Some(e.to_string())),
+                AgentOutcome::Quota(o) => {
+                    self.state.quota.push(QuotaLoss {
+                        seat: seat_key,
+                        node: "implement".to_owned(),
+                        at: Timestamp::now(),
+                        reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
+                    });
+                    (
+                        String::new(),
+                        o.duration_ms,
+                        Some("rate limited (quota); produced no change".to_owned()),
+                    )
+                }
+                AgentOutcome::Failed(e) => (String::new(), 0, Some(e)),
             };
 
             // Rescue anything the agent edited but never committed: an
@@ -617,13 +666,17 @@ impl Runner {
             ),
         );
         let labels_for_check = labels.clone();
+        let mut quota_losses = Vec::new();
         let results = ask_json_wave::<Ranking>(
             jobs,
             Arc::clone(&self.sem),
             self.state.config.graph.retries,
+            "judge",
+            &mut quota_losses,
             &move |r: &Ranking| r.validate(&labels_for_check),
         )
         .await;
+        self.state.quota.extend(quota_losses);
 
         for (j, (seat, res)) in results.into_iter().enumerate() {
             let agent_id = seat.agent.clone();
@@ -747,10 +800,24 @@ impl Runner {
                 let (updated, out) = run_one(job, Arc::clone(&self.sem)).await;
                 seat = updated;
                 let agent_id = seat.agent.clone();
+                let seat_key = seat.key.clone();
                 self.state.seats.insert(seat.key.clone(), seat);
                 let body = match out {
-                    Ok(o) => verdict::section(&o.text, "position").unwrap_or(o.text),
-                    Err(e) => {
+                    AgentOutcome::Ok(o) => verdict::section(&o.text, "position").unwrap_or(o.text),
+                    AgentOutcome::Quota(o) => {
+                        self.state.quota.push(QuotaLoss {
+                            seat: seat_key,
+                            node: "deliberate".to_owned(),
+                            at: Timestamp::now(),
+                            reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
+                        });
+                        self.state.event(
+                            "deliberate",
+                            format!("judge {} skipped: rate limited (quota)", j + 1),
+                        );
+                        continue;
+                    }
+                    AgentOutcome::Failed(e) => {
                         self.state
                             .event("deliberate", format!("judge {} skipped: {e}", j + 1));
                         continue;
@@ -850,16 +917,20 @@ impl Runner {
             ),
         );
         let allowed = viable.clone();
+        let mut quota_losses = Vec::new();
         let results = ask_json_wave::<FinalVote>(
             jobs,
             Arc::clone(&self.sem),
             self.state.config.graph.retries,
+            "vote",
+            &mut quota_losses,
             &move |v: &FinalVote| match v.label() {
                 Some(c) if allowed.contains(&c) => Ok(()),
                 other => bail!("vote {other:?} is not one of {allowed:?}"),
             },
         )
         .await;
+        self.state.quota.extend(quota_losses);
 
         for (&j, (seat, res)) in seats_at.iter().zip(results) {
             let agent_id = seat.agent.clone();
@@ -980,10 +1051,42 @@ impl Runner {
         let unanimous_final = !cast.is_empty() && cast.iter().all(|c| *c == cast[0]);
         let deliberated = !self.state.deliberation.is_empty();
 
+        // Whose verdict is this? A rate-limited seat is absent even if it
+        // ranked before the limit hit, so presence is measured against the
+        // recorded losses, not just "did a ranking ever appear".
+        let quota_seats: std::collections::BTreeSet<&str> =
+            self.state.quota.iter().map(|q| q.seat.as_str()).collect();
+        let mut present = 0usize;
+        for (i, j) in self.state.judgements.iter().enumerate() {
+            if quota_seats.contains(j.seat.as_str()) {
+                continue;
+            }
+            let ranked = !j.ranking.is_empty() && j.failed.is_none();
+            let voted = self
+                .state
+                .votes
+                .iter()
+                .any(|v| v.judge == i + 1 && v.vote.is_some());
+            if ranked || voted {
+                present += 1;
+            }
+        }
+        // Strict majority of the configured panel. A bare majority is real
+        // signal we can act on, while a minority verdict must never stand in
+        // for a healthy one. A one-candidate run needs no panel at all.
+        let judges_total = self.roles.judges.len();
+        let needs_quorum = viable.len() > 1;
+        let quorum = if needs_quorum {
+            judges_total / 2 + 1
+        } else {
+            0
+        };
+        let met_quorum = !needs_quorum || present >= quorum;
+
         self.state.event(
             "tally",
             format!(
-                "winner {winner} — votes {} | initial {} | {} changed{}",
+                "winner {winner} — votes {} | initial {} | {} changed | {present}/{judges_total} judges{}",
                 first_choice
                     .iter()
                     .map(|(k, v)| format!("{k}:{v}"))
@@ -995,11 +1098,22 @@ impl Runner {
                     "split"
                 },
                 changed_votes,
-                tie_break
-                    .as_deref()
-                    .map_or(String::new(), |t| format!(" | {t}"))
+                if met_quorum {
+                    String::new()
+                } else {
+                    format!(" — below quorum ({quorum} required)")
+                },
             ),
         );
+        if !met_quorum {
+            self.state.event(
+                "stall",
+                format!(
+                    "verdict rests on {present} of {judges_total} judges (quorum {quorum}); \
+                     the run stops here, resumable"
+                ),
+            );
+        }
         self.state.tally = Some(Tally {
             first_choice,
             borda,
@@ -1010,8 +1124,16 @@ impl Runner {
             changed_votes,
             unanimous_final,
             tie_break,
+            judges: judges_total,
+            present,
+            quorum,
+            met_quorum,
         });
-        self.state.status = RunStatus::Reviewing;
+        self.state.status = if met_quorum {
+            RunStatus::Reviewing
+        } else {
+            RunStatus::Stalled
+        };
         self.state.save()?;
         Ok(())
     }
@@ -1129,13 +1251,17 @@ impl Runner {
                     short(&head)
                 ),
             );
+            let mut quota_losses = Vec::new();
             let results = ask_json_wave::<Review>(
                 jobs,
                 Arc::clone(&self.sem),
                 self.state.config.graph.retries,
+                "review",
+                &mut quota_losses,
                 &|_: &Review| Ok(()),
             )
             .await;
+            self.state.quota.extend(quota_losses);
 
             let mut records = Vec::new();
             let mut all_findings = Vec::new();
@@ -1283,6 +1409,7 @@ impl Runner {
             let before = git::rev_parse(&winner.worktree, "HEAD").await?;
             let (seat, out) = run_one(job, Arc::clone(&self.sem)).await;
             let agent_id = seat.agent.clone();
+            let seat_key = seat.key.clone();
             self.state.seats.insert(seat.key.clone(), seat);
 
             let mut fix = FixRecord {
@@ -1295,7 +1422,7 @@ impl Runner {
                 duration_ms: 0,
             };
             match out {
-                Ok(o) => {
+                AgentOutcome::Ok(o) => {
                     fix.duration_ms = o.duration_ms;
                     match verdict::extract_json::<FixReport>(&o.text) {
                         Ok(report) => {
@@ -1307,7 +1434,16 @@ impl Runner {
                         Err(e) => fix.failed = Some(format!("unparsable fix report: {e}")),
                     }
                 }
-                Err(e) => fix.failed = Some(e.to_string()),
+                AgentOutcome::Quota(o) => {
+                    self.state.quota.push(QuotaLoss {
+                        seat: seat_key,
+                        node: "fix".to_owned(),
+                        at: Timestamp::now(),
+                        reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
+                    });
+                    fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
+                }
+                AgentOutcome::Failed(e) => fix.failed = Some(e),
             }
             git::commit_all(
                 &winner.worktree,
@@ -1609,13 +1745,16 @@ fn make_executable(path: &Path) -> Result<()> {
 }
 
 /// Run one job, honouring the parallelism budget.
-async fn run_one(job: SeatJob, sem: Arc<Semaphore>) -> (SeatState, Result<AgentOutput>) {
-    let mut results = wave(vec![job], sem).await;
-    results.pop().expect("one job in, one result out")
+async fn run_one(job: SeatJob, sem: Arc<Semaphore>) -> (SeatState, AgentOutcome) {
+    let (_, seat, out) = wave(vec![job], sem)
+        .await
+        .pop()
+        .expect("one job in, one result out");
+    (seat, out)
 }
 
 /// Run every job concurrently, capped by the semaphore, preserving order.
-async fn wave(jobs: Vec<SeatJob>, sem: Arc<Semaphore>) -> Vec<(SeatState, Result<AgentOutput>)> {
+async fn wave(jobs: Vec<SeatJob>, sem: Arc<Semaphore>) -> Vec<(usize, SeatState, AgentOutcome)> {
     let mut set = tokio::task::JoinSet::new();
     for (i, job) in jobs.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
@@ -1637,18 +1776,19 @@ async fn wave(jobs: Vec<SeatJob>, sem: Arc<Semaphore>) -> Vec<(SeatState, Result
             )
             .await;
             let out = match out {
-                Ok(o) if o.usable() => Ok(o),
-                Ok(o) if o.timed_out => Err(anyhow::anyhow!("timed out")),
-                Ok(o) => Err(anyhow::anyhow!(
+                Ok(o) if o.usable() => AgentOutcome::Ok(o),
+                Ok(o) if o.quota_exhausted() => AgentOutcome::Quota(o),
+                Ok(o) if o.timed_out => AgentOutcome::Failed("timed out".to_owned()),
+                Ok(o) => AgentOutcome::Failed(format!(
                     "exited with {:?} and no usable output",
                     o.exit_code
                 )),
-                Err(e) => Err(e),
+                Err(e) => AgentOutcome::Failed(e.to_string()),
             };
             (i, seat, out)
         });
     }
-    let mut collected: Vec<Option<(SeatState, Result<AgentOutput>)>> = Vec::new();
+    let mut collected: Vec<Option<(usize, SeatState, AgentOutcome)>> = Vec::new();
     while let Some(joined) = set.join_next().await {
         let (i, seat, out) = match joined {
             Ok(v) => v,
@@ -1660,7 +1800,7 @@ async fn wave(jobs: Vec<SeatJob>, sem: Arc<Semaphore>) -> Vec<(SeatState, Result
         if collected.len() <= i {
             collected.resize_with(i + 1, || None);
         }
-        collected[i] = Some((seat, out));
+        collected[i] = Some((i, seat, out));
     }
     collected.into_iter().flatten().collect()
 }
@@ -1671,10 +1811,19 @@ async fn wave(jobs: Vec<SeatJob>, sem: Arc<Semaphore>) -> Vec<(SeatState, Result
 /// The re-ask is a nudge rather than the whole prompt again when the seat still
 /// holds its conversation, which is the difference between a cheap retry and
 /// paying for the entire candidate set twice.
+///
+/// A seat that hits a rate limit is **not** re-asked: the same call will fail
+/// the same way until the limit resets, so spending a retry attempt on it is
+/// pure waste. Its loss is recorded in `losses` and it is returned as a failure
+/// like any other absent seat — the caller decides whether the panel still has
+/// a quorum.
+#[allow(clippy::too_many_arguments)]
 async fn ask_json_wave<T>(
     jobs: Vec<SeatJob>,
     sem: Arc<Semaphore>,
     retries: usize,
+    node: &str,
+    losses: &mut Vec<QuotaLoss>,
     validate: &(dyn Fn(&T) -> Result<()> + Send + Sync),
 ) -> Vec<(SeatState, Result<(T, AgentOutput)>)>
 where
@@ -1726,21 +1875,38 @@ where
 
         let results = wave(batch, Arc::clone(&sem)).await;
         let mut still = Vec::new();
-        for (&i, (seat, out)) in pending.iter().zip(results) {
+        for (&i, (_wi, seat, out)) in pending.iter().zip(results) {
             seats[i] = seat;
-            let parsed = match out {
-                Ok(o) => match verdict::extract_json::<T>(&o.text) {
-                    Ok(v) => match validate(&v) {
-                        Ok(()) => Ok((v, o)),
+            let (parsed, quota) = match out {
+                AgentOutcome::Ok(o) => (
+                    match verdict::extract_json::<T>(&o.text) {
+                        Ok(v) => match validate(&v) {
+                            Ok(()) => Ok((v, o)),
+                            Err(e) => Err(e),
+                        },
                         Err(e) => Err(e),
                     },
-                    Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
+                    false,
+                ),
+                AgentOutcome::Quota(o) => {
+                    losses.push(QuotaLoss {
+                        seat: originals[i].seat.key.clone(),
+                        node: node.to_owned(),
+                        at: Timestamp::now(),
+                        reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
+                    });
+                    (
+                        Err(anyhow::anyhow!("rate limited (quota); not retrying now")),
+                        true,
+                    )
+                }
+                AgentOutcome::Failed(e) => (Err(anyhow::anyhow!(e)), false),
             };
             let failed = parsed.is_err();
             done[i] = Some(parsed);
-            if failed {
+            // Do not re-ask a rate-limited seat (quota) — a retry is known to
+            // fail the same way; and never re-ask a seat that already parsed.
+            if failed && !quota {
                 still.push(i);
             }
         }

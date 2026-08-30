@@ -593,6 +593,25 @@ upstream CRLF, not drift worth committing — normalise back to LF and
 - `blind::redact` must never rescan its own replacement. It once did, and
   `[REDACTED]` contains the letters of `codex` and `cursor` — an infinite loop.
 
+### Rate limits, and what a collapsed panel means
+
+- **Quota is detected, not guessed.** `agent::claude_quota` keys on the *only*
+  observed shape (a JSON object with `is_error: true` and a `result` mentioning
+  `session limit`) and treats everything else — other CLIs, unknown output — as
+  an ordinary failure. `AgentOutcome::Quota` is distinct from `Failed`, and a
+  quota'd seat is **not** re-asked, because a retry now fails the same way.
+- **A verdict needs a quorum.** `tally()` counts a judge as present unless a
+  `QuotaLoss` names that seat; a strict majority (`judges/2 + 1`) is required,
+  or the run becomes `Stalled`. `Stalled` is a terminal-but-suspect status: it
+  must never look like `Ready` in the report or the TUI (which is why
+  `Filter::Attention` and `status_style` carry it), and the graph's
+  fold/review/gate/merge stop at the tally so the run stays resumable.
+- **A stalled run must stay stalled across `--resume`.** `execute()` short-
+  circuits at the top when the loaded status is already `Stalled` — otherwise
+  `deliberate()`/`vote()` clobber it back to `Voting` and the run resumes into
+  a tidy `Ready`. The early return also persists the marker, because the normal
+  end-of-execute save sits below the `Stalled` return.
+
 ### Running magi on magi
 
 `magi.toml` in this repo sets `e2e = cargo test` and `gate = cargo make check`.
