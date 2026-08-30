@@ -26,18 +26,35 @@ model = "sonnet"
 id = "oc"
 kind = "opencode"
 
+[[agents]]
+id = "agy"
+kind = "antigravity"
+
+# Seat assignment is a cost decision, and the numbers are measured, not guessed.
+# One implement seat on this repo cost $12.09 on opus against $6.95 on sonnet
+# for the same task — 1.7x — while `oc` reported $0.00. The driver is internal
+# tool-loop iterations (111 and 134 turns respectively): every turn re-reads the
+# cached context, so cache_read ends up ~= turns * context size, and the
+# implement node is where the turns are.
+#
+# Hence: the expensive model never implements. opus judges instead, which is a
+# handful of turns, and the free CLIs carry the implementation load.
 [roles]
-implementers = ["opus", "sonnet", "oc"]
-# Rotated by one so no judge sits on its own candidate.
-judges = ["sonnet", "oc", "opus"]
-reviewers = ["opus", "oc"]
+implementers = ["oc", "agy", "sonnet"]
+# Rotated so no judge sits on its own candidate: opus/oc/agy against oc/agy/sonnet.
+judges = ["opus", "oc", "agy"]
+reviewers = ["sonnet", "oc"]
+# Not the winner's own author by default: the fixer would inherit the
+# implementer's 100-turn session, and with it the whole accumulated cache-read
+# bill.
+fixer = "sonnet"
 
 [graph]
 candidates = 3
 judges = 3
 deliberate_rounds = 1
 reviewers = 2
-review_rounds = 4
+review_rounds = 3
 max_parallel = 3
 language = "ja"
 sessions = true
