@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="magi — blind multi-agent implementation competition">
+  <title>Three independent candidates converge on a single verdict</title>
+  <!--
+    三賢者 (sankenja) — the standing Japanese rendering of "magi" (東方の三博士).
+    Three wise ones deliberate and hand down one answer, which is exactly the
+    graph here: three bodies solve the same task without seeing each other,
+    and the judging collapses them to one.
+
+    Three discs, one colour each, sit apart at the top: independent candidates.
+    Their paths run down into a single gold diamond — the blind verdict — and
+    one result leaves it. Colour carries the independence; the diamond is the
+    fleet's shared accent for a tie/decision point.
+  -->
+  <g fill="none" stroke-width="18" stroke-linecap="round">
+    <!-- candidate A — rust -->
+    <path d="M 50 80 C 50 124, 78 136, 128 166" stroke="#c5582d" />
+    <!-- candidate B — teal -->
+    <path d="M 128 80 L 128 166" stroke="#0a7e8c" />
+    <!-- candidate C — violet -->
+    <path d="M 206 80 C 206 124, 178 136, 128 166" stroke="#7d4b9e" />
+    <!-- the one that survives the verdict -->
+    <path d="M 128 172 L 128 216" stroke="#c9a227" />
+  </g>
+  <!-- verdict diamond at the convergence point -->
+  <rect x="111" y="149" width="34" height="34"
+        transform="rotate(45 128 166)"
+        fill="#c9a227" />
+  <circle cx="50"  cy="54" r="21" fill="#c5582d" />
+  <circle cx="128" cy="54" r="21" fill="#0a7e8c" />
+  <circle cx="206" cy="54" r="21" fill="#7d4b9e" />
+</svg>
