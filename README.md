@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/yukimemi/magi/main/assets/logo-dark.svg">
+    <img src="https://raw.githubusercontent.com/yukimemi/magi/main/assets/logo.svg" alt="magi — blind multi-agent implementation competition" width="540">
+  </picture>
+</p>
+
 # magi
 
 **A blind multi-agent implementation competition, as a CLI.**
