@@ -45,7 +45,7 @@ tokio = { version = "1.53.1", features = [
 ] }
 jiff = { version = "0.2.35", features = ["serde"] }
 dirs = "6"
-kaishin = "0.7.0"
+kaishin = "0.7.1"
 teravars = { version = "0.2.1", features = ["merge"] }
 
 [dev-dependencies]
