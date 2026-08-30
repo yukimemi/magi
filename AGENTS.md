@@ -641,3 +641,54 @@ enter the alternate screen and block on input forever.
 `<data_local>/magi`. `report::set_color` exists so rendering is assertable —
 that is also why there is no colour crate: the ones available decide for you
 whether the stream supports colour, which makes the output untestable.
+
+### Changes to this repo go through the graph
+
+A feature or a fix here is written as a task file and put through the graph —
+`magi run --file <path>` — not typed into `src/` by whichever agent happens to
+be open. In rough order of why:
+
+- **It is the only honest test.** Whether blind competition yields a mergeable
+  result on a real Rust repository is not knowable from the outside; the suite
+  can prove that the graph moves bytes correctly and nothing more.
+- **It surfaces operational defects nothing else reaches.** The first attempt to
+  run magi on magi found that jj keeps git's HEAD detached at the working-copy
+  commit, so magi refuses to start on most repositories in this fleet.
+  `base = "main"` in this repo's `magi.toml` is the workaround, and no test saw
+  any part of it.
+- **It accumulates a record.** The win rates and reviewer precision behind
+  `magi stats` only mean something over a workload whose distribution of tasks
+  we choose ourselves — which is this repository.
+
+### What stays with the human
+
+The graph implements intent; it does not decide what magi is for. These do not
+go into a task file:
+
+- **The rules and conventions themselves**, this section included. A candidate
+  that could rewrite the standard it is judged against is not competing.
+- **The task statement.** A vague task buys three vague candidates and a
+  coin-toss tally. Write the mechanical constraints exactly and leave the design
+  open — that gap is where blind judging does its work.
+- **Visual and UX judgement.** No judge sees a rendered SVG or a running TUI.
+  Someone has to look at the real thing on a real terminal.
+- **Destructive or irreversible operations.** Three candidates run unattended
+  and in parallel, and no node stops to ask. Anything that outlives deleting a
+  worktree is not something to hand to three of them at once.
+
+### Every friction with magi becomes a task
+
+- If using magi is annoying, write the task file and run it, however small the
+  fix looks. Left alone, the tool stays as inconvenient as the day it was
+  written, because the one person who notices has memorised the workaround.
+- **One change per competition.** Bundling unrelated fixes into one task makes
+  the diff unjudgeable and the statistics meaningless.
+- The examples already collected, which are the queue to work from:
+  - Per-node durations are absent from the report, so the numbers had to be
+    computed by hand out of `run.json`'s `events` with `jq`.
+  - For the ten minutes the implementation nodes ran, `magi show` printed
+    `0 files, 0 commits, 0s` for all three candidates. Telling a live agent from
+    a dead one meant a human checking file mtimes in the worktrees and the
+    absence of `artifacts/*.out`.
+  - An opencode judge dropped out on a permission refusal, and the report showed
+    it only as one ranking fewer.
