@@ -163,7 +163,16 @@ pub fn fixture(judges: Judges, require_fix: bool) -> Fixture {
             retries: 1,
             worktree_root: Some(tmp.path().join("wt")),
         },
-        blind: Blind::default(),
+        // Pinned so the label assignment and the per-judge presentation orders
+        // are the same on every run. Without it the run id supplies the seed,
+        // and any assertion about *which* order a judge got is a dice roll —
+        // three judges shuffling three candidates land on the same permutation
+        // about once in 36 runs, which is exactly how `test (windows-latest)`
+        // went red on an unrelated Renovate PR.
+        blind: Blind {
+            seed: Some(20_260_830),
+            ..Blind::default()
+        },
         verify: Verify {
             e2e: vec!["test -f note.txt".to_owned()],
             gate: vec!["test -f note.txt".to_owned()],
