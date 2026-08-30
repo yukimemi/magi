@@ -1,0 +1,23 @@
+# Shared Rust clippy policy. Centralised in
+# `yukimemi/pj-rust`; every Rust project picks this up via
+# `kata apply` (overwrite always). Local edits don't survive
+# `kata apply` — push the change here.
+
+# MSRV is deliberately NOT set here.
+#
+# Clippy reads `package.rust-version` (or `workspace.package.
+# rust-version`) from Cargo.toml on its own, so pinning it a second
+# time in this file just creates a value that can disagree with the
+# manifest — and clippy warns when it does:
+#
+#   warning: the MSRV in `clippy.toml` and `Cargo.toml` differ
+#
+# That is not hypothetical: a project that raises its floor for a
+# dependency (yukimemi/yaiba went to 1.91 for iroh 1.0) starts warning
+# on every `cargo clippy` run, and can't fix it locally because this
+# file is overwritten on the next `kata apply`. Pinning a single
+# shared MSRV across every consumer is also wrong in principle —
+# projects have different dependency floors.
+#
+# Leaving it unset makes Cargo.toml the one place an MSRV is
+# declared, which is where `cargo` already enforces it.

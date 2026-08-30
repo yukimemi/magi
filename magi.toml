@@ -1,0 +1,61 @@
+# magi competing on its own repository.
+#
+# Rendered by teravars. Note that Tera braces are live everywhere in this file,
+# comments included.
+#
+# Gemini CLI is absent on purpose: Google retired the standalone client for
+# individual accounts, so the roster is claude (two models) plus opencode. Add
+# an `agy` entry once Antigravity's plan is worth a seat here.
+
+[vars]
+# Shared build cache for the verification commands. Override per machine with
+# MAGI_CACHE.
+cache = "{{ env.MAGI_CACHE | default(value='/tmp') }}"
+
+[[agents]]
+id = "opus"
+kind = "claude"
+model = "opus"
+
+[[agents]]
+id = "sonnet"
+kind = "claude"
+model = "sonnet"
+
+[[agents]]
+id = "oc"
+kind = "opencode"
+
+[roles]
+implementers = ["opus", "sonnet", "oc"]
+# Rotated by one so no judge sits on its own candidate.
+judges = ["sonnet", "oc", "opus"]
+reviewers = ["opus", "oc"]
+
+[graph]
+candidates = 3
+judges = 3
+deliberate_rounds = 1
+reviewers = 2
+review_rounds = 4
+max_parallel = 3
+language = "ja"
+sessions = true
+
+[verify]
+# The real-machine leg, run in the winner's worktree once per review round.
+#
+# CARGO_TARGET_DIR is shared on purpose: each candidate worktree would otherwise
+# compile this crate from scratch, which is by far the slowest thing in a run on
+# a Rust repo (minutes, against ~90 s of agent latency per node). Only the
+# winner's worktree runs these commands, and only one at a time, so nothing
+# contends on cargo's lock.
+e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo test --locked --all-targets"]
+# Same gate as CI and the pre-push hook.
+gate = ["CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo make check"]
+
+[merge]
+mode = "none"
+
+[update]
+mode = "notify"

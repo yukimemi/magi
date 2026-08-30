@@ -1,0 +1,53 @@
+[package]
+# `magi` on crates.io is an 882-byte placeholder with no repository, and
+# crates.io does not reclaim names. Same workaround as yukimemi/yui, which
+# publishes as `yui-cli`: the repo, the binary and the library all stay `magi`,
+# only the published package name carries the suffix.
+name = "magi-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["yukimemi <yukimemi@gmail.com>"]
+license = "MIT"
+description = "Blind multi-agent implementation competition: N agents implement, M judges rank blind, deliberate, vote privately, winner survives double review + E2E gate"
+repository = "https://github.com/yukimemi/magi"
+readme = "README.md"
+categories = ["command-line-utilities", "development-tools"]
+keywords = ["ai", "agent", "code-review", "git", "worktree"]
+
+[lib]
+name = "magi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "magi"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+clap_complete = "4.6.9"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.4"
+anyhow = "1.0.104"
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tokio = { version = "1.53.1", features = [
+  "rt",
+  "rt-multi-thread",
+  "macros",
+  "process",
+  "time",
+  "fs",
+  "io-util",
+  "sync",
+] }
+jiff = { version = "0.2.35", features = ["serde"] }
+dirs = "6"
+kaishin = "0.7.0"
+teravars = { version = "0.2.1", features = ["merge"] }
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"
+tempfile = "3.27.0"
