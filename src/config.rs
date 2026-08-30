@@ -768,16 +768,21 @@ mod tests {
         let path = dir.path().join("magi.toml");
         // teravars ships no `env`; magi adds it, and the `default` filter has
         // to cover the unset case or every machine would need the variable.
+        //
+        // Deliberately no named variable: `env` is keyed by the exact spelling
+        // the OS reports, and Windows says `Path` where POSIX says `PATH`, so a
+        // test asserting `env.PATH` passes on one runner and fails on another.
+        // The map's non-emptiness is the platform-neutral claim.
         std::fs::write(
             &path,
             "[verify]\n\
              gate = [\"cache={{ env.MAGI_TEST_UNSET_XYZ | default(value='fallback') }}\", \
-             \"path={{ env.PATH | length > 0 }}\"]\n",
+             \"populated={{ env | length > 0 }}\"]\n",
         )
         .unwrap();
         let cfg = Config::load(&path).expect("env lookup must render");
         assert_eq!(cfg.verify.gate[0], "cache=fallback");
-        assert_eq!(cfg.verify.gate[1], "path=true");
+        assert_eq!(cfg.verify.gate[1], "populated=true");
     }
 
     #[test]

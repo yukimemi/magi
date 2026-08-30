@@ -753,7 +753,7 @@ impl Runner {
                         format!(
                             "judge {} voted {}{}",
                             j + 1,
-                            record.vote.map_or('?', |c| c),
+                            record.vote.unwrap_or('?'),
                             if record.changed { " (changed)" } else { "" }
                         ),
                     );
