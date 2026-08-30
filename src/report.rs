@@ -187,7 +187,7 @@ pub fn run(state: &RunState) -> String {
                     "  judge {}  {:<12} {}{}",
                     v.judge,
                     v.agent,
-                    bold(&v.vote.map_or('?', |c| c).to_string()),
+                    bold(&v.vote.unwrap_or('?').to_string()),
                     if v.changed {
                         yellow("  (changed after deliberation)")
                     } else {

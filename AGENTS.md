@@ -542,6 +542,13 @@ under review every round. Do not "fix" this by withholding `--auto`.
   `repo_name` to the context in `load_layers`; there is no `env` upstream.
 - **`[vars]` stays in the merged table**, so `load_layers` removes it before
   deserializing — `Config` has `deny_unknown_fields`.
+- **`env` is keyed by the OS's exact spelling.** Windows reports `Path`, POSIX
+  reports `PATH`, and `std::env::vars()` passes that through verbatim into a
+  case-sensitive map, so a config or test written against `{{ env.PATH }}`
+  passes on one runner and fails on another —
+  `env_is_available_to_templates_with_a_default` learned this from a red
+  `test (windows-latest)`. Name only variables you set yourself, and always pair
+  them with `| default(...)`.
 
 ### Facts duplicated with no compiler in between
 
