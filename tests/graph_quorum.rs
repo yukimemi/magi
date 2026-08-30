@@ -58,7 +58,9 @@ async fn below_quorum_run_is_stalled_not_ready_and_resumable() {
     let full = report::run(state);
     assert!(full.contains("BELOW QUORUM"), "{full}");
 
-    // `--resume` reopens it unchanged: nothing is re-run, nothing lost.
+    // `--resume` reopens it: the collapsed seats are re-asked but their quota
+    // is still exhausted in this fixture, so they fall away again and the run
+    // stays stale — no verdict is clobbered back into a healthy-looking one.
     let mut again = Runner::resume(&state.id).expect("resume");
     again.execute().await.expect("re-execute");
     assert_eq!(again.state.status, RunStatus::Stalled);
@@ -87,6 +89,80 @@ async fn a_rate_limited_seat_is_not_retried() {
     // With only one judge lost, the remaining two still form a quorum.
     let tally = state.tally.as_ref().expect("tally");
     assert!(tally.met_quorum, "2 of 3 still meets the majority quorum");
+}
+
+#[tokio::test]
+async fn a_stalled_run_recovers_to_ready_once_the_quota_resets() {
+    let _home = common::home_lock().await;
+    // Phase 1: two of three judges are rate-limited out — below quorum,
+    // the run collapses to `Stalled` and stops before review/gate/merge.
+    let fx = fixture_with_quota(&["judge-1", "judge-2"]);
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    assert_eq!(runner.state.status, RunStatus::Stalled);
+    assert_eq!(runner.state.tally.as_ref().unwrap().present, 1);
+    let id = runner.state.id.clone();
+    drop(runner);
+
+    // The quota resets between attempts: clear the simulated limit so the
+    // collapsed seats can answer on `--resume`.
+    {
+        let mut state = magi::run::RunState::load(&id).expect("load");
+        for a in &mut state.config.agents {
+            a.env.remove("MOCK_QUOTA_SEAT");
+        }
+        state.save().expect("save");
+    }
+
+    // Resuming re-asks the lost judges; with their quota back the quorum is
+    // restored and the run finishes the graph to a healthy `Ready`.
+    let mut again = Runner::resume(&id).expect("resume");
+    again.execute().await.expect("re-execute");
+    assert_eq!(
+        again.state.status,
+        RunStatus::Ready,
+        "{}",
+        report::run(&again.state)
+    );
+    let tally = again.state.tally.as_ref().expect("tally");
+    assert!(tally.met_quorum, "quorum restored on resume");
+    assert_eq!(tally.present, 3);
+    assert!(
+        again.state.quota.is_empty(),
+        "recovered seats drop their loss"
+    );
+    assert!(
+        !report::line(&again.state).contains("quorum"),
+        "{}",
+        report::line(&again.state)
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_run_stays_stalled_when_the_quota_has_not_reset() {
+    let _home = common::home_lock().await;
+    // judge-1 and judge-2 are still rate-limited on resume, so the run cannot
+    // reach a quorum no matter how often it is retried: it must stay `Stalled`
+    // and resumable rather than finish on the back of one surviving judge.
+    let fx = fixture_with_quota(&["judge-1", "judge-2"]);
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    assert_eq!(runner.state.status, RunStatus::Stalled);
+    let id = runner.state.id.clone();
+    drop(runner);
+
+    let mut again = Runner::resume(&id).expect("resume");
+    again.execute().await.expect("re-execute");
+    assert_eq!(again.state.status, RunStatus::Stalled);
+    assert_eq!(again.state.tally.as_ref().unwrap().present, 1);
+    // Still below quorum: nothing was folded, reviewed, gated or merged.
+    assert!(again.state.reviews.is_empty());
+    assert!(again.state.gate.is_empty());
+    assert!(again.state.merge.is_none());
 }
 
 #[tokio::test]

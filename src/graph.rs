@@ -16,7 +16,7 @@
 //! There is no moderator agent: magi assigns the labels, decides the
 //! presentation order, relays the transcript, and collects the final votes
 //! one-to-one. A moderator that never learns an author cannot leak one.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -266,8 +266,20 @@ impl Runner {
         // stalled marker back to Voting and the run would keep going past a
         // verdict that is no longer trustworthy. Everything already recorded is
         // kept, so the run stays resumable (or foldable) for a human to pick up.
+        //
+        // On --resume the run gets one chance to repair itself: the seats a
+        // rate limit took out are re-asked. If their quota has since reset and
+        // the quorum is restored, the run picks up and finishes; otherwise it
+        // stays stale and still-resumable for a later retry. If it does not
+        // recover, the returned status stays `Stalled` and nothing was
+        // clobbered (the recovery only mutates entries for the lost seats).
         if self.state.status == RunStatus::Stalled {
-            self.state.save()?;
+            if self.recover_stall().await? {
+                self.finish_after_tally().await?;
+            } else {
+                // Still below quorum: persist the marker and stay resumable.
+                self.state.save()?;
+            }
             return Ok(());
         }
         self.prep().await?;
@@ -287,6 +299,13 @@ impl Runner {
             self.state.save()?;
             return Ok(());
         }
+        self.finish_after_tally().await?;
+        Ok(())
+    }
+
+    /// The tail of the graph after a trustworthy tally: fold losers, review,
+    /// gate, merge, and persist.
+    async fn finish_after_tally(&mut self) -> Result<()> {
         self.fold_losers().await?;
         self.review_loop().await?;
         self.gate().await?;
@@ -1136,6 +1155,216 @@ impl Runner {
         };
         self.state.save()?;
         Ok(())
+    }
+
+    // ------------------------------------------------------------- recover
+
+    /// Re-ask the judge/vote seats a rate limit took out, so a `Stalled` run can
+    /// be resumed toward completion once the quota resets.
+    ///
+    /// Only seats recorded in [`RunState::quota`] for the judge or vote nodes
+    /// are re-invoked; a healthy seat is never disturbed. A seat that now
+    /// answers with a usable ranking is "recovered": its `Judgement` is
+    /// refreshed, its `QuotaLoss` dropped (so `tally` counts it present again),
+    /// and its vote re-collected. A seat that still fails keeps its loss and
+    /// stays absent.
+    ///
+    /// Returns `true` when the re-tally restores the quorum (the run may
+    /// proceed to review/gate/merge), `false` when it is still below quorum
+    /// (the run stays `Stalled`, still resumable for a later retry).
+    #[allow(clippy::too_many_lines)]
+    async fn recover_stall(&mut self) -> Result<bool> {
+        let lost: Vec<String> = self
+            .state
+            .quota
+            .iter()
+            .filter(|q| q.node == "judge" || q.node == "vote")
+            .map(|q| q.seat.clone())
+            .collect();
+        if lost.is_empty() {
+            return Ok(false);
+        }
+        let viable: Vec<Candidate> = self.state.viable().into_iter().cloned().collect();
+        if viable.len() <= 1 {
+            return Ok(false);
+        }
+        let labels: Vec<char> = viable.iter().map(|c| c.label).collect();
+        let language = self.state.config.graph.language.clone();
+        let timeout = Duration::from_secs(self.state.config.graph.timeout_judge);
+        let sessions = self.state.config.graph.sessions;
+        let artifacts = agent::artifacts_dir(&self.state.dir());
+        let root = self.state.worktree_root();
+        let base_short = short(&self.state.base_commit);
+        let candidates: Vec<Candidate> = viable.clone();
+
+        // Map each lost seat key to its 0-based position in `roles.judges`.
+        let mut positions: Vec<usize> = lost
+            .iter()
+            .filter_map(|k| self.state.judgements.iter().position(|r| &r.seat == k))
+            .collect();
+        if positions.is_empty() {
+            return Ok(false);
+        }
+        positions.sort_unstable();
+        positions.dedup();
+
+        // Re-rank the lost seats, one blind prompt each.
+        let mut judge_jobs = Vec::new();
+        for &j in &positions {
+            let order = blind::presentation_order(viable.len(), j, self.state.seed);
+            let views: Vec<CandidateView> = order.iter().map(|&k| self.view(&viable[k])).collect();
+            let seat_key = format!("judge-{}", j + 1);
+            let spec = self.roles.judges[j].clone();
+            let seat = self.seat(&seat_key, &spec.id);
+            judge_jobs.push(SeatJob {
+                spec,
+                seat,
+                prompt: prompt::judge(
+                    &self.state.instruction,
+                    &views,
+                    self.roles.judges.len(),
+                    &base_short,
+                    &language,
+                ),
+                cwd: root.join(seat_key),
+                timeout,
+                allow_write: false,
+                sessions,
+                artifacts: artifacts.clone(),
+                stem: format!("judge-{}-recover", j + 1),
+            });
+        }
+
+        let labels_for_check = labels.clone();
+        let mut judge_losses = Vec::new();
+        let results = ask_json_wave::<Ranking>(
+            judge_jobs,
+            Arc::clone(&self.sem),
+            self.state.config.graph.retries,
+            "judge",
+            &mut judge_losses,
+            &move |r: &Ranking| r.validate(&labels_for_check),
+        )
+        .await;
+
+        // Refresh the judgement of every seat that ranked again.
+        let mut recovered: BTreeSet<usize> = BTreeSet::new();
+        for (&j, (seat, res)) in positions.iter().zip(results) {
+            self.state.seats.insert(seat.key.clone(), seat);
+            let record = &mut self.state.judgements[j];
+            match res {
+                Ok((ranking, out)) => {
+                    record.ranking = ranking.normalized();
+                    record.reasons = ranking.reasons;
+                    record.confidence = ranking.confidence;
+                    record.failed = None;
+                    record.duration_ms = out.duration_ms;
+                    recovered.insert(j);
+                    self.state.event(
+                        "recover",
+                        format!("judge {} ranked again after the limit", j + 1),
+                    );
+                }
+                Err(e) => {
+                    self.state
+                        .event("recover", format!("judge {} still cannot rank: {e}", j + 1));
+                }
+            }
+        }
+
+        // Re-ask the votes of the seats that recovered a ranking.
+        let mut vote_jobs = Vec::new();
+        let mut vote_pos: Vec<usize> = Vec::new();
+        for &j in &recovered {
+            let seat_key = format!("judge-{}", j + 1);
+            let spec = self.roles.judges[j].clone();
+            let seat = self.seat(&seat_key, &spec.id);
+            let mut text = prompt::final_vote(&labels, &language);
+            if !has_context(&spec, &seat, sessions) {
+                text = format!(
+                    "{}\n\n# Candidates\n\n{}",
+                    text,
+                    self.candidate_block(&candidates, &base_short)
+                );
+            }
+            vote_jobs.push(SeatJob {
+                spec,
+                seat,
+                prompt: text,
+                cwd: root.join(seat_key),
+                timeout,
+                allow_write: false,
+                sessions,
+                artifacts: artifacts.clone(),
+                stem: format!("vote-judge-{}-recover", j + 1),
+            });
+            vote_pos.push(j);
+        }
+        let allowed = labels.clone();
+        let mut vote_losses = Vec::new();
+        let votes = ask_json_wave::<FinalVote>(
+            vote_jobs,
+            Arc::clone(&self.sem),
+            self.state.config.graph.retries,
+            "vote",
+            &mut vote_losses,
+            &move |v: &FinalVote| match v.label() {
+                Some(c) if allowed.contains(&c) => Ok(()),
+                other => bail!("vote {other:?} is not one of {allowed:?}"),
+            },
+        )
+        .await;
+        for (&j, (seat, res)) in vote_pos.iter().zip(votes) {
+            let agent_id = seat.agent.clone();
+            self.state.seats.insert(seat.key.clone(), seat);
+            match res {
+                Ok((v, _)) => {
+                    if let Some(rec) = self.state.votes.iter_mut().find(|r| r.judge == j + 1) {
+                        rec.vote = v.label();
+                        rec.reason = blind::sanitize_prose(&v.reason, &self.state.config.blind);
+                    } else {
+                        self.state.votes.push(VoteRecord {
+                            judge: j + 1,
+                            agent: agent_id,
+                            vote: v.label(),
+                            reason: blind::sanitize_prose(&v.reason, &self.state.config.blind),
+                            changed: false,
+                        });
+                    }
+                    self.state.event(
+                        "recover",
+                        format!("judge {} voted again after the limit", j + 1),
+                    );
+                }
+                Err(e) => {
+                    self.state
+                        .event("recover", format!("judge {} still cannot vote: {e}", j + 1));
+                }
+            }
+        }
+
+        // A seat that ranked again is present even if its re-vote failed —
+        // `tally` falls back to the initial ranking's first choice — so clear
+        // its quota loss. Seats that still fail keep theirs and stay absent.
+        if !recovered.is_empty() {
+            let recovered_keys: BTreeSet<String> = recovered
+                .iter()
+                .map(|&j| format!("judge-{}", j + 1))
+                .collect();
+            self.state
+                .quota
+                .retain(|q| !recovered_keys.contains(&q.seat));
+        }
+
+        // Recompute the verdict from the refreshed panel.
+        self.state.tally = None;
+        self.tally()?;
+        Ok(self
+            .state
+            .tally
+            .as_ref()
+            .map(|t| t.met_quorum)
+            .unwrap_or(false))
     }
 
     // ----------------------------------------------------------------- fold

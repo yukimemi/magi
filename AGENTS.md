@@ -606,11 +606,17 @@ upstream CRLF, not drift worth committing — normalise back to LF and
   must never look like `Ready` in the report or the TUI (which is why
   `Filter::Attention` and `status_style` carry it), and the graph's
   fold/review/gate/merge stop at the tally so the run stays resumable.
-- **A stalled run must stay stalled across `--resume`.** `execute()` short-
-  circuits at the top when the loaded status is already `Stalled` — otherwise
-  `deliberate()`/`vote()` clobber it back to `Voting` and the run resumes into
-  a tidy `Ready`. The early return also persists the marker, because the normal
-  end-of-execute save sits below the `Stalled` return.
+- **A stalled run must stay stalled across `--resume` until its quota comes
+  back.** `execute()` short-circuits at the top when the loaded status is
+  already `Stalled` — otherwise `deliberate()`/`vote()` clobber it back to
+  `Voting` and the run resumes into a tidy `Ready`. But the early return first
+  gives the run one chance to repair itself: `recover_stall()` re-asks exactly
+  the seats recorded in `RunState::quota` for the judge/vote nodes (never a
+  healthy seat), and if the re-tally restores the quorum the run picks up and
+  finishes; for a seat that ranks again its `QuotaLoss` is dropped so `tally`
+  counts it present. If the quota is still out, the seat fails again, the run
+  stays `Stalled` and the marker is persisted (the normal end-of-execute save
+  sits below the `Stalled` return), so it stays resumable for a later retry.
 
 ### Running magi on magi
 
