@@ -600,6 +600,41 @@ Every candidate worktree compiles from scratch — no shared `target/` — so a
 self-run is slow and disk-hungry (`candidates + judges + reviewers` worktrees at
 peak). `magi fold --all` afterwards.
 
+### The TUI: pure state, one render function, one terminal function
+
+`src/tui.rs` keeps `App` as pure state with pure transitions, `draw` as the only
+function that knows ratatui, and `run` as the only one that touches the real
+terminal. That is what makes selection clamping, filter cycling and modal-help
+behaviour unit-testable, and it is why the frame tests can use
+`ratatui::backend::TestBackend` instead of a PTY.
+
+Three things that are load-bearing:
+
+- **`disable_raw_mode` runs LAST in `TerminalGuard::drop`.** On Windows the
+  console-mode restore performed while leaving the alternate screen replays a
+  snapshot taken *after* raw mode was enabled, so disabling raw mode first lets
+  that restore put the cooked bits back to their raw values and strands the
+  whole console after magi exits. Learned in yukimemi/shoka; do not "tidy" the
+  order.
+- **Quit is checked before anything modal.** A help overlay that swallows
+  `Ctrl-C` is how a TUI earns a reputation for trapping people;
+  `help_is_modal_but_never_swallows_a_quit` pins it, and it was a real bug in the
+  first draft.
+- **The report pane renders `report::run`'s own ANSI** through `ansi-to-tui`
+  rather than reimplementing the report against ratatui spans. One
+  implementation of the report, one place to change it. Colour therefore has to
+  be *on* for the TUI, which is why `main` only disables it for non-terminals
+  and explicit `--no-color`.
+
+The deck is read-only. Adding a key that mutates a run means adding a
+confirmation flow and an undo story; `magi fold` already exists for cleanup.
+
+### Bare `magi` must not raise a screen in a pipe
+
+`main` resolves an absent subcommand to `Tui` only when `stdout` is a terminal,
+and to `Show` otherwise. Without that, `magi | head` and any CI invocation would
+enter the alternate screen and block on input forever.
+
 ### Tests must not touch the operator's history
 
 `run::set_home` (and `MAGI_HOME`) exist so tests never write into

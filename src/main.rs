@@ -8,7 +8,7 @@ use clap_complete::Shell;
 use magi::config::{Config, MergeMode};
 use magi::graph::{Runner, fold_run};
 use magi::run::{RunState, latest_id, list_ids, resolve_id};
-use magi::{agent, report, stats, updater};
+use magi::{agent, report, stats, tui, updater};
 
 /// Blind multi-agent implementation competition.
 #[derive(Debug, Parser)]
@@ -20,8 +20,9 @@ struct Cli {
     /// Disable colour (also respected via NO_COLOR).
     #[arg(long, global = true)]
     no_color: bool,
+    /// Omitted: open the TUI on a terminal, print the latest run otherwise.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 /// Merge mode, on the command line.
@@ -99,6 +100,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Open the observation deck: every run, live, in one screen. This is what
+    /// bare `magi` does on a terminal.
+    Tui,
     /// Aggregate win rates, reviewer precision, and verification yield.
     Stats,
     /// Remove a run's worktrees and branches.
@@ -147,25 +151,38 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
-    if cli.no_color || std::env::var_os("NO_COLOR").is_some() || !std::io::stdout().is_terminal() {
+    let interactive = std::io::stdout().is_terminal();
+    if cli.no_color || std::env::var_os("NO_COLOR").is_some() || !interactive {
         report::set_color(false);
     }
+
+    // Bare `magi` opens the observation deck — but only on a terminal. Piped or
+    // in CI it must not raise an alternate screen and block on input, so it
+    // degrades to the report the pipe was almost certainly after.
+    let command = cli.command.unwrap_or(if interactive {
+        Command::Tui
+    } else {
+        Command::Show {
+            id: None,
+            json: false,
+        }
+    });
 
     // Overlap the release check with the command: a run spends minutes waiting
     // on agent latency, so this is free, and it is drained with a bounded wait
     // so a slow network cannot delay the exit.
-    let pending = spawn_update_check(&cli.command);
-    let result = dispatch(cli.command).await;
+    let pending = spawn_update_check(&command);
+    let result = dispatch(command).await;
     updater::finalize(pending, std::time::Duration::from_millis(1500)).await;
     result
 }
 
-/// Start the background release check, unless this command is about updating
-/// or printing static text.
+/// Start the background release check, unless this command is about updating,
+/// printing static text, or holding the whole screen.
 fn spawn_update_check(command: &Command) -> Option<updater::Pending> {
     if matches!(
         command,
-        Command::SelfUpdate { .. } | Command::Completion { .. }
+        Command::SelfUpdate { .. } | Command::Completion { .. } | Command::Tui
     ) {
         return None;
     }
@@ -265,6 +282,11 @@ async fn dispatch(command: Command) -> Result<()> {
             }
             Ok(())
         }
+
+        // Colour is already decided in `main`: bare `magi` only reaches here on
+        // a terminal, and `--no-color` / NO_COLOR turned it off there. The
+        // report pane parses those same ANSI codes back into ratatui spans.
+        Command::Tui => tui::run(),
 
         Command::Stats => {
             let states = stats::load_all();

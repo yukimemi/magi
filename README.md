@@ -90,6 +90,7 @@ any command you point it at. It spends your existing plan and nothing else.
 ## Use
 
 ```sh
+magi                          # the observation deck (see below)
 magi init                     # write a starter magi.toml
 magi doctor                   # check CLIs, repo, roster, seat assignment
 magi run "add retries to the uploader"
@@ -105,6 +106,40 @@ magi self-update              # or let the background check tell you
 
 A run refuses to start on a dirty tree: candidates branch off `HEAD`, and
 uncommitted work would be silently excluded from the competition.
+
+## The observation deck
+
+Bare `magi` (or `magi tui`) opens every run in one screen, refreshed from disk
+once a second, so a competition can be watched instead of polled:
+
+```text
+ magi   2 runs  1 active  1 done  0 attention  |  filter: all
+┌ runs ─────────────────────────┐┌ report ────────────────────────────────┐
+│> reviewing   a1b2  add retries ││magi run 20260830-153012-a1b2  reviewing│
+│  ready       50f1  fix the …   ││  candidates                            │
+│                               ││  A  opus    3 files, 2 commits  <- winner
+└───────────────────────────────┘└────────────────────────────────────────┘
+ j/k move  Tab pane  J/K scroll  a filter  r refresh  o open dir  ? help  q quit
+```
+
+| key | |
+|---|---|
+| `j` `k` `↓` `↑` | move in the focused pane |
+| `Tab` | switch pane (runs / report) |
+| `J` `K`, `PageDown` `PageUp` | scroll the report |
+| `g` `G` | newest / oldest run |
+| `a` | cycle filter: all → active → attention → done |
+| `r` | refresh now |
+| `o` | open the run's directory in the OS file manager |
+| `?` | help |
+| `q` `Esc` `Ctrl-C` | quit |
+
+It is **read-only on purpose**: the runs are the record of what the agents did,
+and a keystroke that could rewrite one has no business being a `j` away from
+browsing. Cleanup stays in `magi fold`.
+
+Piped or in CI, bare `magi` does not raise an alternate screen — it prints the
+latest run's report instead, so `magi | head` behaves.
 
 ## Configuration
 
