@@ -58,6 +58,15 @@ if [ -n "$MOCK_QUOTA_SEAT" ] && { case ",$MOCK_QUOTA_SEAT," in *",$seat,"*) true
   exit 1
 fi
 
+# Ordinary-failure simulation: a matching judge seat produces no usable output
+# and exits non-zero — distinctly NOT the rate-limit shape above, so the graph
+# must treat it as a plain failure (retried the configured number of times),
+# meanwhile still collapsing the quorum if enough seats drop.
+if [ -n "$MOCK_FAILED_SEAT" ] && { case ",$MOCK_FAILED_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && grep -q "independent judges" "$p"; then
+  echo 'not a ranking at all'
+  exit 1
+fi
+
 if grep -q "Final vote" "$p"; then
   printf '```json\n{"vote":"%s","reason":"mock final vote"}\n```\n' "$MOCK_VOTE"
   exit 0
@@ -222,6 +231,19 @@ pub fn fixture_with_quota(quota_seats: &[&str]) -> Fixture {
     let value = quota_seats.join(",");
     for a in &mut fx.config.agents {
         a.env.insert("MOCK_QUOTA_SEAT".to_owned(), value.clone());
+    }
+    fx
+}
+
+/// Like [`fixture`], but the given judge seats fail with a *plain* error (no
+/// usable output) at their initial ranking — the non-quota counterpart to
+/// [`fixture_with_quota`]. Enough of these collapse the quorum the same way a
+/// rate limit does.
+pub fn fixture_with_failure(failed_seats: &[&str]) -> Fixture {
+    let mut fx = fixture(Judges::Unanimous, false);
+    let value = failed_seats.join(",");
+    for a in &mut fx.config.agents {
+        a.env.insert("MOCK_FAILED_SEAT".to_owned(), value.clone());
     }
     fx
 }

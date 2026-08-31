@@ -1159,29 +1159,44 @@ impl Runner {
 
     // ------------------------------------------------------------- recover
 
-    /// Re-ask the judge/vote seats a rate limit took out, so a `Stalled` run can
-    /// be resumed toward completion once the quota resets.
+    /// Re-ask the judge seats `tally` counts as absent, so a `Stalled` run can be
+    /// resumed toward completion once the transient cause clears.
     ///
-    /// Only seats recorded in [`RunState::quota`] for the judge or vote nodes
-    /// are re-invoked; a healthy seat is never disturbed. A seat that now
-    /// answers with a usable ranking is "recovered": its `Judgement` is
-    /// refreshed, its `QuotaLoss` dropped (so `tally` counts it present again),
-    /// and its vote re-collected. A seat that still fails keeps its loss and
-    /// stays absent.
+    /// A seat is absent — and therefore re-asked — when `tally` refuses to count
+    /// it toward the quorum, which is exactly the set of seats whose absence
+    /// collapsed the panel: struck by a rate limit at *any* node (the quorum must
+    /// not depend on which node happened to hit the limit), or an ordinary
+    /// failure (`failed = Some`) that never produced a usable ranking. A healthy
+    /// seat is never disturbed.
     ///
-    /// Returns `true` when the re-tally restores the quorum (the run may
-    /// proceed to review/gate/merge), `false` when it is still below quorum
-    /// (the run stays `Stalled`, still resumable for a later retry).
+    /// A seat that now answers with a usable ranking is "recovered": its
+    /// `Judgement` is refreshed, its `QuotaLoss`/`failed` state cleared (so
+    /// `tally` counts it present again), and its vote re-collected. A seat that
+    /// still fails keeps its loss and stays absent.
+    ///
+    /// Returns `true` when the re-tally restores the quorum (the run may proceed
+    /// to review/gate/merge), `false` when it is still below quorum (the run
+    /// stays `Stalled`, still resumable for a later retry).
     #[allow(clippy::too_many_lines)]
     async fn recover_stall(&mut self) -> Result<bool> {
-        let lost: Vec<String> = self
+        // Absent seats = quota-lost at any node, or failed outright. Mirroring
+        // `tally`'s presence test (rather than the old quota-judge/vote filter)
+        // is what keeps a non-quota collapse — or a quota loss recorded at the
+        // deliberate node — from being a permanent dead-end on `--resume`.
+        let quota_seats: BTreeSet<&str> = self
             .state
             .quota
             .iter()
-            .filter(|q| q.node == "judge" || q.node == "vote")
-            .map(|q| q.seat.clone())
+            .map(|q| q.seat.as_str())
             .collect();
-        if lost.is_empty() {
+        let absent: Vec<String> = self
+            .state
+            .judgements
+            .iter()
+            .filter(|j| quota_seats.contains(j.seat.as_str()) || j.failed.is_some())
+            .map(|j| j.seat.clone())
+            .collect();
+        if absent.is_empty() {
             return Ok(false);
         }
         let viable: Vec<Candidate> = self.state.viable().into_iter().cloned().collect();
@@ -1197,8 +1212,8 @@ impl Runner {
         let base_short = short(&self.state.base_commit);
         let candidates: Vec<Candidate> = viable.clone();
 
-        // Map each lost seat key to its 0-based position in `roles.judges`.
-        let mut positions: Vec<usize> = lost
+        // Map each absent seat key to its 0-based position in `roles.judges`.
+        let mut positions: Vec<usize> = absent
             .iter()
             .filter_map(|k| self.state.judgements.iter().position(|r| &r.seat == k))
             .collect();

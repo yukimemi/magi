@@ -3,7 +3,7 @@
 //! logic — a verdict backed by a minority of the panel is not trustworthy.
 mod common;
 
-use common::fixture_with_quota;
+use common::{fixture_with_failure, fixture_with_quota};
 use magi::graph::Runner;
 use magi::report;
 use magi::run::RunStatus;
@@ -160,6 +160,82 @@ async fn a_stalled_run_stays_stalled_when_the_quota_has_not_reset() {
     assert_eq!(again.state.status, RunStatus::Stalled);
     assert_eq!(again.state.tally.as_ref().unwrap().present, 1);
     // Still below quorum: nothing was folded, reviewed, gated or merged.
+    assert!(again.state.reviews.is_empty());
+    assert!(again.state.gate.is_empty());
+    assert!(again.state.merge.is_none());
+}
+
+#[tokio::test]
+async fn a_plain_failure_collapse_stalls_and_recovers_on_resume() {
+    let _home = common::home_lock().await;
+    // Two of the three judges fail with an *ordinary* error — no usable output,
+    // no rate-limit shape. That collapses the quorum exactly like quota, and the
+    // run must not pretend to be healthy.
+    let fx = fixture_with_failure(&["judge-1", "judge-2"]);
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    // A plain failure is retried (records a retry artifact) but not mistaken for
+    // quota.
+    let art = state.dir().join("artifacts");
+    assert!(
+        art.join("judge-1-retry1.out").exists(),
+        "a plain failure is retried like any other unusable reply"
+    );
+    assert!(state.quota.is_empty(), "a plain failure is not a quota loss");
+    let failed_j = |seat: &str| {
+        state
+            .judgements
+            .iter()
+            .find(|j| j.seat == seat)
+            .map(|j| j.failed.is_some())
+            .unwrap_or(false)
+    };
+    assert!(failed_j("judge-1"), "judge-1 failed outright");
+    assert!(failed_j("judge-2"), "judge-2 failed outright");
+    assert!(!failed_j("judge-3"), "judge-3 ranked and voted");
+    assert_eq!(state.status, RunStatus::Stalled);
+    let tally = state.tally.as_ref().expect("tally");
+    assert_eq!(tally.present, 1);
+    assert!(!tally.met_quorum);
+    let id = state.id.clone();
+    drop(runner);
+
+    // The transient failure clears: with the mock no longer failing, resume
+    // re-asks the two absent judges, restores the quorum, and reaches `Ready`.
+    {
+        let mut s = magi::run::RunState::load(&id).expect("load");
+        for a in &mut s.config.agents {
+            a.env.remove("MOCK_FAILED_SEAT");
+        }
+        s.save().expect("save");
+    }
+    let mut again = Runner::resume(&id).expect("resume");
+    again.execute().await.expect("re-execute");
+    assert_eq!(again.state.status, RunStatus::Ready, "{}", report::run(&again.state));
+    assert!(again.state.tally.as_ref().unwrap().met_quorum);
+    assert_eq!(again.state.tally.as_ref().unwrap().present, 3);
+}
+
+#[tokio::test]
+async fn a_plain_failure_collapse_stays_stalled_while_the_failure_persists() {
+    let _home = common::home_lock().await;
+    let fx = fixture_with_failure(&["judge-1", "judge-2"]);
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    assert_eq!(runner.state.status, RunStatus::Stalled);
+    let id = runner.state.id.clone();
+    drop(runner);
+
+    let mut again = Runner::resume(&id).expect("resume");
+    again.execute().await.expect("re-execute");
+    assert_eq!(again.state.status, RunStatus::Stalled);
+    assert_eq!(again.state.tally.as_ref().unwrap().present, 1);
     assert!(again.state.reviews.is_empty());
     assert!(again.state.gate.is_empty());
     assert!(again.state.merge.is_none());
