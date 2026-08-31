@@ -1183,12 +1183,8 @@ impl Runner {
         // `tally`'s presence test (rather than the old quota-judge/vote filter)
         // is what keeps a non-quota collapse — or a quota loss recorded at the
         // deliberate node — from being a permanent dead-end on `--resume`.
-        let quota_seats: BTreeSet<&str> = self
-            .state
-            .quota
-            .iter()
-            .map(|q| q.seat.as_str())
-            .collect();
+        let quota_seats: BTreeSet<&str> =
+            self.state.quota.iter().map(|q| q.seat.as_str()).collect();
         let absent: Vec<String> = self
             .state
             .judgements

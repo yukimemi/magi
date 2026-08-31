@@ -185,7 +185,10 @@ async fn a_plain_failure_collapse_stalls_and_recovers_on_resume() {
         art.join("judge-1-retry1.out").exists(),
         "a plain failure is retried like any other unusable reply"
     );
-    assert!(state.quota.is_empty(), "a plain failure is not a quota loss");
+    assert!(
+        state.quota.is_empty(),
+        "a plain failure is not a quota loss"
+    );
     let failed_j = |seat: &str| {
         state
             .judgements
@@ -215,7 +218,12 @@ async fn a_plain_failure_collapse_stalls_and_recovers_on_resume() {
     }
     let mut again = Runner::resume(&id).expect("resume");
     again.execute().await.expect("re-execute");
-    assert_eq!(again.state.status, RunStatus::Ready, "{}", report::run(&again.state));
+    assert_eq!(
+        again.state.status,
+        RunStatus::Ready,
+        "{}",
+        report::run(&again.state)
+    );
     assert!(again.state.tally.as_ref().unwrap().met_quorum);
     assert_eq!(again.state.tally.as_ref().unwrap().present, 3);
 }
