@@ -99,6 +99,139 @@ impl Runner {
         })
     }
 
+    /// Open a review-only run against work that already exists on `branch`.
+    ///
+    /// The expensive half of the graph is the implement wave — measured at
+    /// 111 and 134 internal tool-loop turns on this repository, against a
+    /// handful for a judge or a reviewer. The cheap half is worth running on
+    /// hand-written work too, and there was no way to reach it.
+    ///
+    /// No new state and no schema change are needed: a run with **one** viable
+    /// candidate and a tally already decided degrades `execute` to exactly
+    /// review → gate → merge, because `judge` skips a single-candidate field,
+    /// `deliberate` has fewer than two first choices to reconcile, `vote`
+    /// returns early, `tally` is already present and `fold_losers` has no
+    /// losers. Resuming such a run therefore does the right thing as well.
+    pub async fn review(repo: &Path, branch: &str, config: Config) -> Result<Self> {
+        let repo = git::toplevel(repo).await?;
+        let missing = agent::missing_programs(&config.agents);
+        if !missing.is_empty() {
+            bail!(
+                "these agent programs are not on PATH: {}. Fix the roster in \
+                 magi.toml or install them.",
+                missing.join(", ")
+            );
+        }
+        if !git::branch_exists(&repo, branch).await? {
+            bail!("no branch `{branch}` in {}", repo.display());
+        }
+        let base_branch = match config.merge.base.clone() {
+            Some(b) => b,
+            None => git::current_branch(&repo)
+                .await?
+                .context("HEAD is detached; set [merge] base in magi.toml")?,
+        };
+        if base_branch == branch {
+            bail!("`{branch}` is the base branch; there is nothing to review against");
+        }
+        let base_commit = git::rev_parse(&repo, &base_branch).await?;
+
+        let roles = config.resolve_roles()?;
+        let max_parallel = config.graph.max_parallel.max(1);
+        // The commit subjects are the closest thing to a task statement that
+        // existing work carries, and the reviewers are told as much.
+        let log = git::log_oneline(&repo, &base_commit, branch)
+            .await
+            .unwrap_or_default();
+        let instruction = format!(
+            "Review the work already on branch `{branch}`. There is no task \
+             statement: what the change claims to do is whatever its commits \
+             say.\n\n{}",
+            if log.trim().is_empty() {
+                "(no commit messages)"
+            } else {
+                log.trim()
+            }
+        );
+        let mut state = RunState::new(
+            repo.clone(),
+            base_branch,
+            base_commit.clone(),
+            instruction,
+            config,
+        );
+
+        // An attached worktree, so the fixer's commits land on the branch under
+        // review rather than on a detached head nobody will look at again.
+        let worktree = state.worktree_root().join("under-review");
+        if let Some(parent) = worktree.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        let path = worktree.to_string_lossy().to_string();
+        git::git(&repo, &["worktree", "add", &path, branch])
+            .await
+            .with_context(|| {
+                format!("checking out `{branch}` at {path} (is it checked out elsewhere?)")
+            })?;
+
+        let commits = git::commits_ahead(&worktree, &base_commit, "HEAD")
+            .await
+            .unwrap_or(0);
+        if commits == 0 {
+            bail!("`{branch}` has no commits beyond {}", short(&base_commit));
+        }
+        let files = git::changed_files(&worktree, &base_commit, "HEAD")
+            .await
+            .map(|f| f.len())
+            .unwrap_or(0);
+        let stat = git::diff_stat(&worktree, &base_commit, "HEAD")
+            .await
+            .unwrap_or_default();
+
+        state.candidates.push(Candidate {
+            index: 0,
+            label: 'A',
+            // Not an agent id on purpose: nothing in the roster wrote this, and
+            // the stats tables must not credit anyone with a win for it.
+            agent: "(existing branch)".to_owned(),
+            branch: branch.to_owned(),
+            worktree,
+            summary: String::new(),
+            stat,
+            files,
+            commits,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        state.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 0)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 0,
+            unanimous_initial: false,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: false,
+            tie_break: Some("review-only run: nothing competed".to_owned()),
+        });
+        state.status = RunStatus::Reviewing;
+        state.event(
+            "start",
+            format!(
+                "review-only run {} on `{branch}` ({files} files, {commits} commits)",
+                state.id
+            ),
+        );
+        state.save()?;
+        Ok(Self {
+            state,
+            roles,
+            sem: Arc::new(Semaphore::new(max_parallel)),
+        })
+    }
+
     /// Reopen an existing run.
     pub fn resume(id: &str) -> Result<Self> {
         let state = RunState::load(id)?;
@@ -972,6 +1105,9 @@ impl Runner {
                         reviewers: reviewers.len(),
                         round,
                         rounds: max_rounds,
+                        // A review-only run has no rankings, so nothing
+                        // competed for this patch and the reviewer is told so.
+                        competed: self.state.tally.as_ref().is_some_and(|t| t.rankings > 0),
                         language: &language,
                     }),
                     spec,

@@ -86,6 +86,28 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Run only the review + verification + gate loop, on work that already
+    /// exists on a branch. Nothing competes: no implementation, no judging, no
+    /// vote. This is the cheap half of the graph, for hand-written changes.
+    Review {
+        /// Branch holding the work to review.
+        branch: String,
+        /// Repository to work on.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Config file; defaults to <repo>/magi.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Reviewers per round.
+        #[arg(long)]
+        reviewers: Option<usize>,
+        /// Review + fix rounds before giving up.
+        #[arg(long)]
+        review_rounds: Option<usize>,
+        /// What to do with the branch once it is clean.
+        #[arg(long, value_enum)]
+        merge: Option<MergeArg>,
+    },
     /// List recorded runs.
     List {
         /// How many to show.
@@ -245,6 +267,31 @@ async fn dispatch(command: Command) -> Result<()> {
                 return Ok(());
             }
 
+            let result = runner.execute().await;
+            print!("{}", report::run(&runner.state));
+            result
+        }
+
+        Command::Review {
+            branch,
+            repo,
+            config,
+            reviewers,
+            review_rounds,
+            merge,
+        } => {
+            let (mut cfg, from) = Config::discover(&repo, config.as_deref())?;
+            if let Some(n) = reviewers {
+                cfg.graph.reviewers = n;
+            }
+            if let Some(n) = review_rounds {
+                cfg.graph.review_rounds = n;
+            }
+            if let Some(m) = merge {
+                cfg.merge.mode = m.into();
+            }
+            println!("config: {}", describe_layers(&from));
+            let mut runner = Runner::review(&repo, &branch, cfg).await?;
             let result = runner.execute().await;
             print!("{}", report::run(&runner.state));
             result
