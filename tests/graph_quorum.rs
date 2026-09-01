@@ -92,11 +92,32 @@ async fn a_rate_limited_seat_is_not_retried() {
         names.sort();
         names.join(" ")
     };
+    let head = |name: &str| {
+        std::fs::read_to_string(art.join(name))
+            .unwrap_or_default()
+            .lines()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" / ")
+    };
     assert!(
         !art.join("judge-1-retry1.out").exists(),
-        "the rate-limited judge must not be retried.\nartifacts: {}\njudge-1 stdout: {:?}\nquota losses: {:?}",
+        "the rate-limited judge must not be retried.\n\
+         artifacts: {}\n\
+         attempt 0 stdout: {:?}\n\
+         retry prompt head: {:?}\n\
+         retry stdout: {:?}\n\
+         candidates: {:?}\n\
+         quota losses: {:?}",
         listing(),
         std::fs::read_to_string(art.join("judge-1.out")).unwrap_or_default(),
+        head("judge-1-retry1.prompt.md"),
+        std::fs::read_to_string(art.join("judge-1-retry1.out")).unwrap_or_default(),
+        state
+            .candidates
+            .iter()
+            .map(|c| (c.label, c.viable(), c.commits, c.failed.clone()))
+            .collect::<Vec<_>>(),
         state.quota,
     );
     // With only one judge lost, the remaining two still form a quorum.
