@@ -274,6 +274,10 @@ pub struct ReviewCtx<'a> {
     pub round: usize,
     /// Round budget.
     pub rounds: usize,
+    /// Did this patch win a competition? False for a review-only run, where
+    /// telling the reviewer it beat two rivals would be a lie — and a lie that
+    /// flatters the patch it is supposed to be sceptical about.
+    pub competed: bool,
     /// Language for prose.
     pub language: &'a str,
 }
@@ -290,14 +294,25 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
         reviewers,
         round,
         rounds,
+        competed,
         language,
     } = *ctx;
     let mut s = format!(
-        "You are one of {reviewers} reviewers of a patch that won a blind \
-         implementation competition. Review round {round} of {rounds}.\n\n\
+        "You are one of {reviewers} reviewers of {}. Review round {round} of \
+         {rounds}.\n\n\
          You do not know who wrote the patch or who the other reviewers are. \
-         Do not speculate about either.\n\n\
-         # The task\n\n{instruction}\n\n\
+         Do not speculate about either.\n\n",
+        if competed {
+            "a patch that won a blind implementation competition"
+        } else {
+            "a change that already exists on a branch. Nothing competed for \
+             this: it was written directly, so it has had no rival to be \
+             measured against and no judge has looked at it yet"
+        }
+    );
+    let _ = write!(
+        s,
+        "# The task\n\n{instruction}\n\n\
          # Patch under review\n\n\
          Branch `{branch}`, base {base_short}. Your working directory is a \
          checkout of exactly this state: read it, run it, but do not modify \
@@ -497,9 +512,8 @@ mod tests {
         assert!(p.contains("\"vote\""));
     }
 
-    #[test]
-    fn review_prompt_allows_an_empty_review() {
-        let p = review(&ReviewCtx {
+    fn review_ctx(competed: bool) -> ReviewCtx<'static> {
+        ReviewCtx {
             instruction: "task",
             branch: "magi/run/B",
             base_short: "abc1234",
@@ -509,10 +523,32 @@ mod tests {
             reviewers: 2,
             round: 1,
             rounds: 6,
+            competed,
             language: "en",
-        });
+        }
+    }
+
+    #[test]
+    fn review_prompt_allows_an_empty_review() {
+        let p = review(&review_ctx(true));
         assert!(p.contains("An empty review is a valid review"));
         assert!(p.contains("do not modify"));
+    }
+
+    #[test]
+    fn a_review_only_run_does_not_claim_the_patch_won_anything() {
+        let competed = review(&review_ctx(true));
+        assert!(competed.contains("won a blind implementation competition"));
+
+        let alone = review(&review_ctx(false));
+        assert!(
+            !alone.contains("won"),
+            "a change that never competed must not be introduced as a winner"
+        );
+        assert!(alone.contains("Nothing competed for this"));
+        // The rest of the brief is identical either way.
+        assert!(alone.contains("An empty review is a valid review"));
+        assert!(alone.contains("do not modify"));
     }
 
     #[test]

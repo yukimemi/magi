@@ -63,7 +63,7 @@ if grep -q "independent judges" "$p"; then
   exit 0
 fi
 
-if grep -q "reviewers of a patch" "$p"; then
+if grep -q "reviewers of" "$p"; then
   if [ -n "$MOCK_FINDING" ] && [ ! -f fixed.txt ]; then
     printf '{"summary":"mock review","findings":[{"severity":"blocker","file":"note.txt","line":1,"title":"needs a fixed marker","detail":"create fixed.txt"}]}\n'
   else
