@@ -82,9 +82,22 @@ async fn a_rate_limited_seat_is_not_retried() {
     // `judge-N-retry1` artifact; a rate-limited seat must not be re-asked at
     // all, because a retry now is known to fail the same way.
     let art = state.dir().join("artifacts");
+    let listing = || {
+        let mut names: Vec<String> = std::fs::read_dir(&art)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names.join(" ")
+    };
     assert!(
         !art.join("judge-1-retry1.out").exists(),
-        "the rate-limited judge must not be retried"
+        "the rate-limited judge must not be retried.\nartifacts: {}\njudge-1 stdout: {:?}\nquota losses: {:?}",
+        listing(),
+        std::fs::read_to_string(art.join("judge-1.out")).unwrap_or_default(),
+        state.quota,
     );
     // With only one judge lost, the remaining two still form a quorum.
     let tally = state.tally.as_ref().expect("tally");
