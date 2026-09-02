@@ -34,7 +34,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt as _;
+use std::sync::{Arc, Mutex};
+
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::Command;
 
 use crate::config::{AgentKind, AgentSpec, Delivery};
@@ -156,6 +158,67 @@ impl AgentOutput {
     }
 }
 
+/// How long to keep reading a pipe after the child is gone.
+///
+/// Bounded on purpose: a surviving grandchild can hold the write end open
+/// forever, and the graph must not hang on a process it has already killed.
+const PIPE_GRACE: Duration = Duration::from_secs(3);
+
+/// Bytes a pipe reader has accumulated so far, shared with whoever spawned it.
+type Captured = Arc<Mutex<Vec<u8>>>;
+
+/// Read `pipe` to end in its own task, appending into a buffer the caller can
+/// inspect at any time.
+///
+/// The buffer is shared rather than returned because the interesting moment is
+/// exactly the one where the reader has *not* finished: a killed agent's pipe
+/// may still be held open by a surviving grandchild, and the bytes that did
+/// arrive are the only evidence of what it was doing. An earlier version
+/// returned the buffer from the task and dropped it on timeout, which is how
+/// `<stem>.out` came to be empty on every timeout.
+fn drain<R>(pipe: Option<R>) -> (Captured, Option<tokio::task::JoinHandle<()>>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let buf: Captured = Arc::new(Mutex::new(Vec::new()));
+    let Some(mut pipe) = pipe else {
+        return (buf, None);
+    };
+    let sink = Arc::clone(&buf);
+    let handle = tokio::spawn(async move {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut guard) = sink.lock() {
+                        guard.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            }
+        }
+    });
+    (buf, Some(handle))
+}
+
+/// Take whatever a reader has captured, giving it at most `grace` to finish.
+///
+/// A reader still blocked after that is abandoned, not awaited — but its bytes
+/// come back either way, which is the whole point.
+async fn collect(
+    buf: &Captured,
+    handle: Option<tokio::task::JoinHandle<()>>,
+    grace: Duration,
+) -> String {
+    if let Some(handle) = handle {
+        if tokio::time::timeout(grace, handle).await.is_err() {
+            tracing::debug!("a pipe is still held open after the child exited");
+        }
+    }
+    let bytes = buf.lock().map(|g| g.clone()).unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Invoke `spec` for `seat`, updating the seat's conversation state.
 pub async fn invoke(
     spec: &AgentSpec,
@@ -207,22 +270,44 @@ pub async fn invoke(
         });
     }
 
-    let (stdout, stderr, code, timed_out) =
-        match tokio::time::timeout(inv.timeout, child.wait_with_output()).await {
-            Ok(res) => {
-                let out = res.with_context(|| format!("wait for seat {}", seat.key))?;
-                (
-                    String::from_utf8_lossy(&out.stdout).into_owned(),
-                    String::from_utf8_lossy(&out.stderr).into_owned(),
-                    out.status.code(),
-                    false,
-                )
-            }
-            Err(_) => {
-                tracing::warn!(seat = %seat.key, secs = inv.timeout.as_secs(), "agent timed out");
-                (String::new(), String::new(), None, true)
-            }
-        };
+    // Drain the pipes in their own tasks, and wait on the *process*, not on
+    // end-of-file. Two failures come out of conflating those:
+    //
+    // 1. `wait_with_output` returns when both pipes reach EOF, which is not
+    //    when the child exits. A CLI that leaves a helper process holding the
+    //    inherited stdout handle - normal on Windows, where a `.cmd` shim and
+    //    its grandchildren share handles - never closes the pipe, so a seat
+    //    that answered in five minutes was billed the full hour and then
+    //    recorded as a timeout. The answer was thrown away with it.
+    // 2. Cancelling `wait_with_output` at the timeout drops the buffers it
+    //    owned, so `<stem>.out` and `<stem>.err` were written empty exactly
+    //    when an operator needs them most. "It printed nothing" and "we
+    //    discarded what it printed" looked identical on disk.
+    //
+    // Now the readers own the bytes, so a timeout keeps whatever arrived, and
+    // the wait ends at exit even if a stray handle stays open.
+    let (out_buf, out_reader) = drain(child.stdout.take());
+    let (err_buf, err_reader) = drain(child.stderr.take());
+
+    let (code, timed_out) = match tokio::time::timeout(inv.timeout, child.wait()).await {
+        Ok(res) => {
+            let status = res.with_context(|| format!("wait for seat {}", seat.key))?;
+            (status.code(), false)
+        }
+        Err(_) => {
+            tracing::warn!(seat = %seat.key, secs = inv.timeout.as_secs(), "agent timed out");
+            // Kill the tree so the readers see EOF instead of hanging with it.
+            child.start_kill().ok();
+            (None, true)
+        }
+    };
+
+    // The child is gone either way, so the readers are bounded now. A grace
+    // window rather than an unbounded await: a surviving grandchild can still
+    // hold the write end open, and losing a few trailing bytes beats hanging
+    // the graph on a process we no longer control.
+    let stdout = collect(&out_buf, out_reader, PIPE_GRACE).await;
+    let stderr = collect(&err_buf, err_reader, PIPE_GRACE).await;
 
     let out_path = inv.artifacts.join(format!("{}.out", inv.stem));
     let err_path = inv.artifacts.join(format!("{}.err", inv.stem));
@@ -282,8 +367,20 @@ struct Plan {
     stdin: Option<String>,
 }
 
-/// Text handed to an agent when the prompt is delivered as a file.
-fn pointer(prompt_path: &Path) -> String {
+/// How a file-delivered prompt is pointed at, per CLI.
+///
+/// `agy` has a native file-context syntax, `@<path>`, and it is measurably the
+/// better contract: on the same trivial task it finished in 17s against 73s for
+/// the prose form, because prose makes the model spend a tool round-trip
+/// deciding to read the file. It is also the form yukimemi/rvpm proved out.
+///
+/// opencode has no equivalent, so it gets the prose. That is not a fallback
+/// worth apologising for — it works, and it is what the winning opencode
+/// candidates on this repository have been driven by all along.
+fn pointer(kind: AgentKind, prompt_path: &Path) -> String {
+    if matches!(kind, AgentKind::Antigravity) {
+        return format!("@{}", prompt_path.display());
+    }
     format!(
         "Read the file at {} and follow every instruction in it exactly. That \
          file is your complete task description; this message contains nothing \
@@ -428,11 +525,11 @@ fn build_command(
     match delivery {
         Delivery::Stdin if spec.kind == AgentKind::Antigravity => {
             // agy has no text stdin path; fall back to the pointer file.
-            argv.push(pointer(prompt_path));
+            argv.push(pointer(spec.kind, prompt_path));
         }
         Delivery::Stdin => stdin = Some(inv.prompt.to_owned()),
         Delivery::Argv => argv.push(inv.prompt.to_owned()),
-        Delivery::File => argv.push(pointer(prompt_path)),
+        Delivery::File => argv.push(pointer(spec.kind, prompt_path)),
     }
 
     Ok(Plan { argv, stdin })
@@ -689,6 +786,24 @@ mod tests {
                 .argv
                 .iter()
                 .any(|a| a == "--dangerously-skip-permissions")
+        );
+        // agy is pointed at its prompt with its own `@<path>` syntax, not with
+        // prose asking it to read a file. Measured on one trivial task: 17s
+        // against 73s, because prose costs a tool round-trip before the model
+        // has even seen its instructions. It is also the form rvpm proved.
+        let agy_prompt = agy_rw
+            .argv
+            .iter()
+            .position(|a| a == "-p")
+            .map(|i| agy_rw.argv[i + 1].clone())
+            .expect("agy takes its prompt with -p");
+        assert!(
+            agy_prompt.starts_with('@'),
+            "agy must get a file reference, got {agy_prompt:?}"
+        );
+        assert!(
+            !agy_prompt.contains("Read the file at"),
+            "the prose pointer is for CLIs with no file syntax"
         );
 
         // opencode is the exception: `--auto` also gates reads, so withholding
@@ -987,6 +1102,58 @@ mod tests {
         .unwrap();
         assert!(out.timed_out);
         assert!(!out.usable());
+    }
+
+    #[tokio::test]
+    async fn a_timeout_keeps_what_the_agent_had_already_printed() {
+        // The old implementation cancelled `wait_with_output`, which dropped
+        // the buffers it owned, so `<stem>.out` was written empty on every
+        // timeout. "It printed nothing" and "we discarded what it printed"
+        // looked identical on disk — and one real hour-long stall was
+        // diagnosed wrongly twice because of it.
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = dir.path().join("artifacts");
+        let mut seat = SeatState::new("impl-A", "a", 7);
+        let mut s = spec(AgentKind::Command, None);
+        s.command = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "echo i-said-something; sleep 30".to_owned(),
+        ];
+        let out = invoke(
+            &s,
+            &mut seat,
+            &Invocation {
+                cwd: dir.path(),
+                prompt: "unused",
+                // Wide enough to cover process-spawn latency inside a loaded
+                // parallel test run, not merely the echo. At two seconds this
+                // passed alone and failed in the full suite, which is a dice
+                // roll rather than a test.
+                timeout: Duration::from_secs(10),
+                allow_write: true,
+                sessions: true,
+                artifacts: &artifacts,
+                stem: "chatty",
+                run: "test-run",
+                node: "test",
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(out.timed_out, "{out:?}");
+        assert!(!out.usable(), "a cut-off answer is still not an answer");
+        let recorded = std::fs::read_to_string(artifacts.join("chatty.out")).unwrap();
+        assert!(
+            recorded.contains("i-said-something"),
+            "the artifact must keep what arrived before the kill, got {recorded:?}"
+        );
+        assert!(
+            out.text.contains("i-said-something"),
+            "and the graph must be able to see it too, got {:?}",
+            out.text
+        );
     }
 
     #[test]
