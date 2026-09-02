@@ -433,6 +433,9 @@ impl Runner {
     // ----------------------------------------------------------- implement
 
     async fn implement(&mut self) -> Result<()> {
+        // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
+        // agent files with `magi task add` name the run that paid for it.
+        let run_id = self.state.id.clone();
         let todo: Vec<usize> = self
             .state
             .candidates
@@ -478,7 +481,7 @@ impl Runner {
             "implement",
             format!("{} candidates in parallel", jobs.len()),
         );
-        let results = wave(jobs, Arc::clone(&self.sem)).await;
+        let results = wave(jobs, Arc::clone(&self.sem), &run_id, "implement").await;
 
         for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
             let seat_key = seat.key.clone();
@@ -631,6 +634,9 @@ impl Runner {
     // --------------------------------------------------------------- judge
 
     async fn judge(&mut self) -> Result<()> {
+        // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
+        // agent files with `magi task add` name the run that paid for it.
+        let run_id = self.state.id.clone();
         if !self.state.judgements.is_empty() {
             return Ok(());
         }
@@ -697,6 +703,7 @@ impl Runner {
             jobs,
             Arc::clone(&self.sem),
             self.state.config.graph.retries,
+            &run_id,
             "judge",
             &mut quota_losses,
             &move |r: &Ranking| r.validate(&labels_for_check),
@@ -748,6 +755,9 @@ impl Runner {
     // ---------------------------------------------------------- deliberate
 
     async fn deliberate(&mut self) -> Result<()> {
+        // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
+        // agent files with `magi task add` name the run that paid for it.
+        let run_id = self.state.id.clone();
         if !self.state.deliberation.is_empty() {
             return Ok(());
         }
@@ -823,7 +833,8 @@ impl Runner {
                     artifacts: artifacts.clone(),
                     stem: format!("delib-{round}-judge-{}", j + 1),
                 };
-                let (updated, out) = run_one(job, Arc::clone(&self.sem)).await;
+                let (updated, out) =
+                    run_one(job, Arc::clone(&self.sem), &run_id, "deliberate").await;
                 seat = updated;
                 let agent_id = seat.agent.clone();
                 let seat_key = seat.key.clone();
@@ -883,6 +894,9 @@ impl Runner {
     // ---------------------------------------------------------------- vote
 
     async fn vote(&mut self) -> Result<()> {
+        // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
+        // agent files with `magi task add` name the run that paid for it.
+        let run_id = self.state.id.clone();
         if !self.state.votes.is_empty() {
             return Ok(());
         }
@@ -948,6 +962,7 @@ impl Runner {
             jobs,
             Arc::clone(&self.sem),
             self.state.config.graph.retries,
+            &run_id,
             "vote",
             &mut quota_losses,
             &move |v: &FinalVote| match v.label() {
@@ -1186,6 +1201,9 @@ impl Runner {
     /// stays `Stalled`, still resumable for a later retry).
     #[allow(clippy::too_many_lines)]
     async fn recover_stall(&mut self) -> Result<bool> {
+        // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
+        // agent files with `magi task add` name the run that paid for it.
+        let run_id = self.state.id.clone();
         // Absent seats = quota-lost at any node, or failed outright. Mirroring
         // `tally`'s presence test (rather than the old quota-judge/vote filter)
         // is what keeps a non-quota collapse — or a quota loss recorded at the
@@ -1259,6 +1277,7 @@ impl Runner {
             judge_jobs,
             Arc::clone(&self.sem),
             self.state.config.graph.retries,
+            &run_id,
             "judge",
             &mut judge_losses,
             &move |r: &Ranking| r.validate(&labels_for_check),
@@ -1324,6 +1343,7 @@ impl Runner {
             vote_jobs,
             Arc::clone(&self.sem),
             self.state.config.graph.retries,
+            &run_id,
             "vote",
             &mut vote_losses,
             &move |v: &FinalVote| match v.label() {
@@ -1423,6 +1443,9 @@ impl Runner {
     // --------------------------------------------------------------- review
 
     async fn review_loop(&mut self) -> Result<()> {
+        // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
+        // agent files with `magi task add` name the run that paid for it.
+        let run_id = self.state.id.clone();
         let Some(winner) = self.state.winner().cloned() else {
             return Ok(());
         };
@@ -1503,6 +1526,7 @@ impl Runner {
                 jobs,
                 Arc::clone(&self.sem),
                 self.state.config.graph.retries,
+                &run_id,
                 "review",
                 &mut quota_losses,
                 &|_: &Review| Ok(()),
@@ -1654,7 +1678,7 @@ impl Runner {
                 stem: format!("fix-{round}"),
             };
             let before = git::rev_parse(&winner.worktree, "HEAD").await?;
-            let (seat, out) = run_one(job, Arc::clone(&self.sem)).await;
+            let (seat, out) = run_one(job, Arc::clone(&self.sem), &run_id, "fix").await;
             let agent_id = seat.agent.clone();
             let seat_key = seat.key.clone();
             self.state.seats.insert(seat.key.clone(), seat);
@@ -1992,8 +2016,13 @@ fn make_executable(path: &Path) -> Result<()> {
 }
 
 /// Run one job, honouring the parallelism budget.
-async fn run_one(job: SeatJob, sem: Arc<Semaphore>) -> (SeatState, AgentOutcome) {
-    let (_, seat, out) = wave(vec![job], sem)
+async fn run_one(
+    job: SeatJob,
+    sem: Arc<Semaphore>,
+    run: &str,
+    node: &str,
+) -> (SeatState, AgentOutcome) {
+    let (_, seat, out) = wave(vec![job], sem, run, node)
         .await
         .pop()
         .expect("one job in, one result out");
@@ -2001,10 +2030,22 @@ async fn run_one(job: SeatJob, sem: Arc<Semaphore>) -> (SeatState, AgentOutcome)
 }
 
 /// Run every job concurrently, capped by the semaphore, preserving order.
-async fn wave(jobs: Vec<SeatJob>, sem: Arc<Semaphore>) -> Vec<(usize, SeatState, AgentOutcome)> {
+///
+/// `run` and `node` are attribution, not behaviour: they reach the agent as
+/// `MAGI_RUN` / `MAGI_NODE` so a task the agent files with `magi task add` can
+/// name the seat that asked for it. They are cloned per job because each job is
+/// spawned onto its own task and cannot borrow from this frame.
+async fn wave(
+    jobs: Vec<SeatJob>,
+    sem: Arc<Semaphore>,
+    run: &str,
+    node: &str,
+) -> Vec<(usize, SeatState, AgentOutcome)> {
     let mut set = tokio::task::JoinSet::new();
     for (i, job) in jobs.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
+        let run = run.to_owned();
+        let node = node.to_owned();
         set.spawn(async move {
             let _permit = sem.acquire().await;
             let mut seat = job.seat;
@@ -2019,6 +2060,8 @@ async fn wave(jobs: Vec<SeatJob>, sem: Arc<Semaphore>) -> Vec<(usize, SeatState,
                     sessions: job.sessions,
                     artifacts: &job.artifacts,
                     stem: &job.stem,
+                    run: &run,
+                    node: &node,
                 },
             )
             .await;
@@ -2069,6 +2112,7 @@ async fn ask_json_wave<T>(
     jobs: Vec<SeatJob>,
     sem: Arc<Semaphore>,
     retries: usize,
+    run: &str,
     node: &str,
     losses: &mut Vec<QuotaLoss>,
     validate: &(dyn Fn(&T) -> Result<()> + Send + Sync),
@@ -2120,7 +2164,7 @@ where
             });
         }
 
-        let results = wave(batch, Arc::clone(&sem)).await;
+        let results = wave(batch, Arc::clone(&sem), run, node).await;
         let mut still = Vec::new();
         for (&i, (_wi, seat, out)) in pending.iter().zip(results) {
             seats[i] = seat;

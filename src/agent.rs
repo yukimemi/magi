@@ -101,6 +101,14 @@ pub struct Invocation<'a> {
     pub artifacts: &'a Path,
     /// Artifact filename stem.
     pub stem: &'a str,
+    /// Run this invocation belongs to. Exported as `MAGI_RUN` so an agent that
+    /// files a task with `magi task add` is attributed to the run that was
+    /// paying for it, rather than looking like a human wandered by.
+    pub run: &'a str,
+    /// Graph node being executed, e.g. `implement` or `review`. Exported as
+    /// `MAGI_NODE` for the same reason: "who asked for this" is the first
+    /// question about an autonomously created task.
+    pub node: &'a str,
 }
 
 /// Evidence that a CLI ran out of its rate limit / quota, distinct from an
@@ -172,6 +180,8 @@ pub async fn invoke(
         .envs(&spec.env)
         .env("MAGI_SEAT", &seat.key)
         .env("MAGI_TURN", seat.turns.to_string())
+        .env("MAGI_RUN", inv.run)
+        .env("MAGI_NODE", inv.node)
         .env("MAGI_PROMPT_FILE", &prompt_path)
         .env("MAGI_ALLOW_WRITE", if inv.allow_write { "1" } else { "0" })
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -619,6 +629,8 @@ mod tests {
             sessions: true,
             artifacts: art,
             stem: "t",
+            run: "test-run",
+            node: "test",
         }
     }
 
@@ -766,6 +778,8 @@ mod tests {
                 sessions: true,
                 artifacts: Path::new("/art"),
                 stem: "t",
+                run: "test-run",
+                node: "test",
             },
             Path::new("/art/p.md"),
         )
@@ -905,6 +919,8 @@ mod tests {
                 sessions: true,
                 artifacts: &art,
                 stem: "impl-A",
+                run: "test-run",
+                node: "test",
             },
         )
         .await
@@ -936,6 +952,8 @@ mod tests {
                 sessions: true,
                 artifacts: &dir.path().join("artifacts"),
                 stem: "big",
+                run: "test-run",
+                node: "test",
             },
         )
         .await
@@ -961,6 +979,8 @@ mod tests {
                 sessions: true,
                 artifacts: &dir.path().join("artifacts"),
                 stem: "slow",
+                run: "test-run",
+                node: "test",
             },
         )
         .await
