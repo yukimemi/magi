@@ -50,6 +50,13 @@ set -e
 p="$MAGI_PROMPT_FILE"
 seat="$MAGI_SEAT"
 
+# Attribution trail. `magi task add` turns MAGI_RUN / MAGI_NODE into a task's
+# source, so a run whose agents never receive them would silently attribute
+# agent-filed work to a passing human. Recording them here is what lets a test
+# assert the plumbing from inside a real graph run.
+printf '%s %s %s\n' "$MAGI_RUN" "$MAGI_NODE" "$seat" \
+  >> "$(dirname "$p")/attribution.log"
+
 # Rate-limit simulation: a matching seat reports the same error shape a real
 # claude prints on quota exhaustion, and exits non-zero. The graph must read
 # this as "rate limited" — not a normal failure, not retried.

@@ -98,6 +98,38 @@ async fn a_unanimous_run_reaches_the_gate_without_deliberating() {
         );
     }
 
+    // Attribution: every agent the graph spawned received this run's id and the
+    // node it was working in. `magi task add` reads exactly these two variables
+    // to record a task's source, so if they ever stopped reaching the agents,
+    // agent-filed work would quietly attribute itself to a human and the claim
+    // that agents file their own tasks would become unfalsifiable.
+    let trail = std::fs::read_to_string(state.dir().join("artifacts/attribution.log"))
+        .expect("the mock agents recorded their attribution");
+    let rows: Vec<(&str, &str, &str)> = trail
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let mut f = l.split_whitespace();
+            (
+                f.next().unwrap_or(""),
+                f.next().unwrap_or(""),
+                f.next().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert!(!rows.is_empty(), "no agent was invoked: {trail}");
+    assert!(
+        rows.iter().all(|(run, _, _)| *run == state.id),
+        "every seat must see this run's id, got {rows:?} for run {}",
+        state.id
+    );
+    let nodes: std::collections::BTreeSet<&str> = rows.iter().map(|(_, node, _)| *node).collect();
+    assert!(
+        nodes.contains("implement") && nodes.contains("judge") && nodes.contains("review"),
+        "a full run must attribute at least the implement, judge and review \
+         nodes, got {nodes:?}"
+    );
+
     // The run is resumable and idempotent: re-executing changes nothing.
     let mut again = Runner::resume(&state.id).expect("resume");
     again.execute().await.expect("re-execute");
