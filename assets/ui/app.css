@@ -59,6 +59,9 @@
   --focus: #2d5391;
   --shadow: 0 1px 2px rgba(26, 22, 14, .06), 0 4px 14px rgba(26, 22, 14, .05);
   --hatch: rgba(143, 58, 26, .13);
+  /* The same hatching in the verdict colour, for the one card whose answer
+     cannot be taken back. */
+  --hatch-gold: rgba(107, 84, 16, .22);
 
   --radius: 12px;
   --radius-sm: 8px;
@@ -121,6 +124,7 @@
     --focus: #93b8f2;
     --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 4px 14px rgba(0, 0, 0, .35);
     --hatch: rgba(240, 154, 114, .14);
+    --hatch-gold: rgba(237, 200, 92, .2);
   }
 }
 
@@ -163,6 +167,7 @@
   --focus: #93b8f2;
   --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 4px 14px rgba(0, 0, 0, .35);
   --hatch: rgba(240, 154, 114, .14);
+  --hatch-gold: rgba(237, 200, 92, .2);
 }
 
 :root[data-theme="dark"] { color-scheme: dark; }
@@ -944,6 +949,264 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
   border-radius: var(--radius-sm); font-size: var(--t3); font-weight: 600;
 }
 
+/* ---- agent-authored panels --------------------------------------------- *
+ * A question may hand over a whole HTML page — a diff, a table of changed
+ * files, an image — because one line of prose is not enough to judge by. It
+ * is rendered inside <iframe sandbox> with NO tokens, so nothing in it runs
+ * and it can reach neither this document nor its storage, and the endpoint
+ * that serves it sends a CSP denying every network request from inside the
+ * frame. That sandbox is the entire reason this is allowed, so nothing below
+ * may ask for a token back.
+ *
+ * A tokenless frame is opaque to this page in both directions: its height
+ * cannot be measured and there is no channel to ask it. So the inline frame
+ * is bounded and the full-screen dialog carries the rest, and the bounded
+ * state is drawn as a deliberate window — its own edge, a fade at the sill,
+ * and a sentence saying where the rest is — rather than as a clipped card.
+ */
+.ask-panel { display: flex; flex-direction: column; gap: var(--s2); }
+.ask-panel-bar { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.ask-panel-label {
+  font-size: var(--t1); font-weight: 700;
+  text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3);
+}
+.ask-panel-label::before { content: "\25a4"; margin-right: 6px; font-size: 1.1em; }
+.ask-panel-bar .btn { margin-left: auto; }
+
+.frame-wrap {
+  position: relative;
+  border: 1px solid var(--line-2); border-radius: var(--radius-sm);
+  /* Paper, in both themes, and not var(--surface): a panel that sets no
+     background of its own would otherwise render the agent's default black
+     text onto the dark surface and be unreadable exactly when it matters. */
+  background: #fffdfa;
+  overflow: hidden;
+}
+.frame-wrap iframe {
+  display: block; width: 100%; height: 320px; border: 0;
+  /* The frame scrolls itself; momentum must not escape into the page and
+     carry the operator away from the choices underneath. */
+  overscroll-behavior: contain;
+}
+/* The sill: the panel visibly continues past the bottom edge. Fixed paper
+   tint because the frame backdrop is fixed paper too. Not the only signal —
+   the sentence below the frame says it in words. */
+.frame-more {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 44px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, rgba(255, 253, 250, 0) 0%, rgba(255, 253, 250, .96) 82%);
+  border-bottom: 1px solid var(--line-2);
+}
+.frame-note { font-size: var(--t2); color: var(--ink-3); }
+/* The panel was promised and did not arrive. Stated, not left as a blank
+   hole, and the choices below stay live: the owner still has to answer. */
+.frame-fail {
+  display: flex; flex-direction: column; gap: var(--s2);
+  padding: var(--s3);
+  background: var(--tint-rust); color: var(--on-rust);
+  border: 1px dashed currentColor; border-radius: var(--radius-sm);
+  font-size: var(--t3); font-weight: 600;
+}
+.frame-fail .hint { color: inherit; font-weight: 400; }
+
+/* Full screen: on a phone this is the only place a unified diff is legible.
+   The dialog is the viewport, and the iframe fills it. */
+.full {
+  width: 100%; max-width: none; height: 100dvh; max-height: 100dvh;
+  padding: 0; margin: 0; border: 0;
+  background: var(--bg); color: var(--ink);
+}
+.full[open] { display: flex; flex-direction: column; }
+.full::backdrop { background: rgba(20, 18, 14, .8); }
+.full-head {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
+  padding: var(--s2) var(--s4);
+  padding-top: calc(var(--s2) + env(safe-area-inset-top));
+  padding-left: calc(var(--s4) + env(safe-area-inset-left));
+  padding-right: calc(var(--s4) + env(safe-area-inset-right));
+  border-bottom: 1px solid var(--line);
+}
+.full-head h2 { font-size: var(--t5); text-transform: none; letter-spacing: -.01em; color: var(--ink); }
+.full-body { flex: 1; min-height: 0; background: #fffdfa; }
+.full-body iframe { display: block; width: 100%; height: 100%; border: 0; }
+
+/* ---- merge approval ---------------------------------------------------- *
+ * The land loop asks before it merges, and that is the one question in this
+ * product whose answer cannot be taken back. "Which cache backend?" and
+ * "shall I merge this into main?" therefore must not be the same card: this
+ * one is bordered on all four sides in the verdict gold, capped with a
+ * hatched rule, and titled by a band that names the consequence.
+ *
+ * The guard against a thumb that was only scrolling is two taps, not a
+ * timer: the first arms, and the confirm row it reveals puts Cancel where
+ * the arm button just was, so the pixel under the finger is never the
+ * irreversible one. Nothing is disabled and nothing counts down, so an
+ * operator who means it is two taps away rather than annoyed.
+ */
+.ask[data-stakes="merge"] {
+  border: 1px solid var(--gold-line);
+  border-left: 6px double var(--gold-line);
+  box-shadow: var(--shadow), 0 0 0 3px var(--tint-gold);
+}
+/* Once it is decided, the card stops shouting: the record of a merge
+   decision keeps the double edge that identifies it and loses the ring and
+   the hatching, which were there to slow a thumb down. */
+.ask[data-stakes="merge"]:not([data-state="open"]) { box-shadow: none; }
+.ask:not([data-state="open"]) .stakes-band { background-image: none; }
+.stakes-band {
+  display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap;
+  margin: calc(-1 * var(--s4)) calc(-1 * var(--s4)) 0;
+  padding: var(--s2) var(--s4);
+  background: var(--tint-gold); color: var(--on-gold);
+  border-bottom: 1px solid var(--gold-line);
+  border-radius: 0 var(--radius) 0 0;
+  background-image: repeating-linear-gradient(-45deg,
+    var(--hatch-gold) 0 4px, transparent 4px 11px);
+  font-size: var(--t2); font-weight: 700;
+  text-transform: uppercase; letter-spacing: .06em;
+}
+.stakes-band::before { content: "\25c6"; letter-spacing: 0; }
+
+.stakes {
+  display: flex; flex-direction: column; gap: var(--s3);
+  padding: var(--s3);
+  background: var(--tint-gold);
+  border: 1px solid var(--gold-line); border-radius: var(--radius-sm);
+}
+.stakes-what { font-size: var(--t3); font-weight: 600; color: var(--on-gold); }
+.stakes-what .ask-seat { color: var(--on-gold); }
+.stakes-arm { align-self: stretch; }
+.stakes-confirm { display: flex; flex-direction: column; gap: var(--s3); }
+.stakes-warn { font-size: var(--t4); font-weight: 700; color: var(--on-rust); }
+.stakes-row { display: flex; gap: var(--s2); }
+.stakes-row .btn { flex: 1; }
+/* Hold is not a lesser option, it is the safe one, so it keeps a full target
+   and a real edge rather than being demoted to a text link. */
+.stakes-hold { align-self: stretch; }
+
+/* ---- planning conversation --------------------------------------------- *
+ * `magi plan` gives the terminal to an agent CLI. A phone has no terminal, so
+ * the same interview runs here one turn at a time. A turn takes tens of
+ * seconds because a real model is thinking: everything below is built so that
+ * wait reads as work rather than as a hang. */
+.turns { display: flex; flex-direction: column; gap: var(--s3); }
+.turn {
+  max-width: 92%; min-width: 0;
+  padding: var(--s3) var(--s4);
+  border-radius: var(--radius);
+  font-size: var(--t4);
+}
+.turn-who {
+  display: block; margin-bottom: var(--s1);
+  font-size: var(--t1); font-weight: 700;
+  text-transform: uppercase; letter-spacing: .06em;
+}
+.turn-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.turn[data-who="operator"] {
+  align-self: flex-end;
+  background: var(--tint-blue); color: var(--on-blue);
+  border-bottom-right-radius: var(--radius-sm);
+}
+.turn[data-who="agent"] {
+  align-self: flex-start;
+  background: var(--surface); color: var(--ink);
+  border: 1px solid var(--line); box-shadow: var(--shadow);
+  border-bottom-left-radius: var(--radius-sm);
+}
+.turn[data-who="agent"] .turn-who { color: var(--ink-3); }
+.turn[data-who="agent"] .md { color: var(--ink); font-size: var(--t4); }
+/* magi itself speaking: the interviewing agent timed out, failed or ran out
+   of quota. It is not the model talking and must not be read as an answer. */
+.turn[data-who="system"] {
+  align-self: stretch; max-width: none;
+  background: var(--tint-rust); color: var(--on-rust);
+  border: 1px dashed currentColor;
+  font-weight: 600;
+}
+.turn-at { display: block; margin-top: var(--s1); font-size: var(--t1); opacity: .75; }
+
+/* The honest wait. Three dots breathing at 1.6s is slow enough to read as
+   thinking rather than as a stuck spinner, and the elapsed seconds beside it
+   are the proof that something is still counting. */
+.waiting {
+  align-self: flex-start;
+  display: flex; align-items: center; gap: var(--s3);
+  padding: var(--s3) var(--s4);
+  border: 1px dashed var(--line-2); border-radius: var(--radius);
+  font-size: var(--t3); color: var(--ink-2);
+}
+.waiting-dots { display: inline-flex; gap: 5px; flex: none; }
+.waiting-dots i {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--ink-3);
+  animation: breathe 1.6s var(--ease) infinite;
+}
+.waiting-dots i:nth-child(2) { animation-delay: .2s; }
+.waiting-dots i:nth-child(3) { animation-delay: .4s; }
+.waiting-text { flex: 1; min-width: 0; }
+/* Tabular, so the number does not shuffle the sentence beside it every
+   second while the operator is reading it. */
+.waiting-secs {
+  flex: none; font-family: var(--mono); font-size: var(--t2);
+  font-variant-numeric: tabular-nums; color: var(--ink-3);
+}
+@keyframes breathe {
+  0%, 100% { opacity: .25; transform: translateY(0); }
+  50%      { opacity: 1;   transform: translateY(-2px); }
+}
+
+/* The composer sits above the dock and stays there, because a conversation
+   grows downwards and hunting for the reply box at the bottom of a long
+   transcript is the one thing that would make this unusable on a phone. */
+.say {
+  position: sticky; z-index: 10;
+  /* Parked one dock above the bottom edge. The dock is its 44px tap target
+     plus the label row under the glyph, which is what --s3 stands in for
+     here; at 44px alone the composer's own edge crossed the dock's top rule. */
+  bottom: calc(var(--tap) + var(--s3) + env(safe-area-inset-bottom));
+  display: flex; gap: var(--s2); align-items: flex-end;
+  padding: var(--s2) 0;
+  background: var(--bg);
+}
+.say textarea { margin-top: 0; flex: 1; min-width: 0; }
+.say .btn { flex: none; }
+
+/* The task file, as the file it is: monospace, wrapped rather than scrolled
+   sideways, and readable at 390px. */
+.draft {
+  margin: 0; padding: var(--s3);
+  background: var(--sunk); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  font-family: var(--mono); font-size: var(--t2); line-height: 1.55;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 52vh; overflow-y: auto;
+  tab-size: 2;
+}
+/* Every problem at once, because the operator wants to fix them in one pass
+   and the draft stays on screen above them. */
+.problems {
+  display: flex; flex-direction: column; gap: var(--s2);
+  padding: var(--s3);
+  background: var(--tint-rust); color: var(--on-rust);
+  border: 1px solid currentColor; border-radius: var(--radius-sm);
+  font-size: var(--t3);
+}
+.problems h3 { font-size: var(--t3); font-weight: 700; }
+.problems ul { display: flex; flex-direction: column; gap: var(--s2); }
+.problems li { position: relative; padding-left: var(--s4); font-weight: 600; overflow-wrap: anywhere; }
+.problems li::before { content: "\2715"; position: absolute; left: 2px; }
+/* On the rust tint a sunk grey code chip disappears, so the span is outlined
+   in the ink it already sits in. */
+.problems code {
+  font-family: var(--mono); font-size: .92em;
+  border: 1px solid currentColor; border-radius: 4px; padding: 0 3px;
+  overflow-wrap: anywhere;
+}
+
+.filed-note { font-size: var(--t3); color: var(--ink-2); }
+.filed-note .ask-seat { font-size: var(--t2); }
+.chat-ready { color: var(--on-gold); font-weight: 700; }
+
 /* ---- wide screens ------------------------------------------------------ *
  * Not a stretched phone: the dock becomes a header rail, the run list becomes
  * a grid, and the report pane sits beside the analysis instead of below it. */
@@ -981,6 +1244,21 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
      option still wraps onto its own line. */
   .choices { flex-direction: row; flex-wrap: wrap; }
   .choices .btn { flex: 0 1 auto; }
+  /* More room means a taller window before the operator has to go full
+     screen, but the bound stays: the choices must remain on the same screen
+     as the panel that argues for them. */
+  .frame-wrap iframe { height: 460px; }
+  /* The stakes row stops stretching to 780px; the irreversible button being
+     the width of the card is not emphasis, it is just a big target. */
+  .stakes-row { justify-content: flex-start; }
+  .stakes-row .btn { flex: 0 1 auto; min-width: 180px; }
+  .stakes-arm, .stakes-hold { align-self: flex-start; }
+  /* A transcript is read, so it is measured; and with the dock gone the
+     composer sticks to the bottom of the viewport instead of above it. */
+  #view-chat { max-width: 780px; }
+  #view-chats .cards { max-width: 780px; }
+  .say { bottom: 0; padding-bottom: var(--s4); }
+  .turn { max-width: 80%; }
 }
 
 /* The two run-detail wrappers are inert on a phone: their children flow into
@@ -1014,7 +1292,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 
 /* ---- print ------------------------------------------------------------- */
 @media print {
-  .top, .daemon, .ask-bar, .dock, .back, .sheet { display: none; }
+  .top, .daemon, .ask-bar, .dock, .back, .sheet, .full, .say { display: none; }
+  .frame-wrap iframe { height: 520px; }
+  .draft { max-height: none; }
   .card, .panel { box-shadow: none; break-inside: avoid; }
   .report { max-height: none; white-space: pre-wrap; }
 }

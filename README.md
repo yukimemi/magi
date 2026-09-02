@@ -230,6 +230,81 @@ criteria is refused, with every problem listed at once, and **the draft is kept
 on disk and named in the error** — a twenty-minute interview is never lost to a
 validation failure.
 
+## Panels: the agent formats its own confirmation screen
+
+One line of prose is not enough to decide anything. So an agent can hand over
+a page it wrote itself:
+
+```sh
+magi ask --summary "Which cache key shape?" \
+         --choice "u64 hash" --choice "string key" \
+         --panel panel.html --asset before.png
+```
+
+The panel is the agent's own HTML and CSS — a diffstat table, a coloured diff,
+a screenshot — rendered on your phone under the question. Attachments are
+copied into the question, so a panel still renders after `magi fold` has
+deleted the worktree it was written in.
+
+### Why this is safe
+
+Rendering someone else's HTML in your browser is the thing this UI otherwise
+refuses to do: nothing from the API is ever put into `innerHTML`, and even an
+href out of a run record goes through a scheme check. A panel is the exception,
+and it is only acceptable because of three things together:
+
+- The frame is `<iframe sandbox>` **with no tokens at all**. No JavaScript
+  runs. It cannot reach the page around it, your cookies, or `localStorage`.
+  There is one function in the client that builds it and a comment forbidding
+  anyone from adding `allow-scripts`.
+- The panel is served under a **strict CSP**:
+  `default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; …`.
+  Inline CSS is allowed, because formatting is the point. **Everything that
+  reaches the network is denied**, so a panel cannot phone home through a
+  remote image or a beacon — verified with the browser's own violation log.
+- Assets come from magi, by bare filename, from that question's own directory.
+  The name must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, is validated on the
+  way in and again on the way out, and an `.svg` is served
+  `Content-Disposition: attachment` so it can only ever be an `<img>`.
+
+A panel that will not load says so and leaves the choices usable: you still
+have to be able to answer.
+
+## Approving a merge
+
+With `land_approval` on — the default whenever `land` is on — magi asks before
+it merges, and the question carries a panel with the whole case: the diffstat
+as a table, the diff itself with a `+`/`-` gutter so it reads without colour,
+the checks, the review comments that were addressed, the commits being squashed
+and **the subject the merge will use**, because you are approving that too.
+
+The diffstat comes from `git diff --numstat`, not `--stat`: the `+++---` bar in
+`--stat` is scaled to terminal width, and fabricated numbers have no business
+in an irreversible decision.
+
+**Silence is a hold.** An unanswered approval never merges, and neither does
+anything other than the word `merge`.
+
+## Planning from a phone
+
+`magi plan` hands your terminal to an agent CLI, which a browser cannot do. So
+the web UI runs the same interview as a **turn-based conversation**: your
+message, one headless agent turn, repeat. It is not a second implementation of
+the interview — it is the same briefing, the same `TASK_FILE_SPEC`, and the
+same validator, reached a different way, and it ends the same way: a task file
+in the queue.
+
+Each turn resumes the CLI's own conversation (`claude -p --resume`,
+`opencode run -s`, `agy --conversation`), so a turn sends only your new
+sentence rather than replaying the transcript and paying for it again. Your
+message is written to disk **before** the agent is invoked, so a quota window
+or a crash cannot lose something you typed. The interviewer runs with writes
+disabled: a planner that had already edited the repository would make the
+candidates' diffs unjudgeable.
+
+When the agent has written a draft you get it as the task file it is, with the
+problems listed if it is not usable yet, and one button to file it.
+
 ## When an agent needs you
 
 ```sh

@@ -407,7 +407,7 @@ fn new_id() -> String {
 }
 
 /// Can this agent's CLI actually be run on this machine?
-fn installed(spec: &AgentSpec) -> bool {
+pub(crate) fn installed(spec: &AgentSpec) -> bool {
     // A `command` agent has no program of its own to look for - its argv is the
     // operator's, and they are the authority on whether it runs.
     spec.kind.program().is_none_or(which)
@@ -435,7 +435,7 @@ fn installed(spec: &AgentSpec) -> bool {
 /// 3. Otherwise the first runnable agent in roster order, because the roster
 ///    order is the operator's own stated preference and magi has nothing better
 ///    to go on.
-fn pick(
+pub(crate) fn pick(
     agents: &[AgentSpec],
     want: Option<&str>,
     available: &dyn Fn(&AgentSpec) -> bool,

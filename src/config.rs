@@ -176,6 +176,16 @@ pub struct Graph {
     pub land: bool,
     /// Land rounds - watch, fix, push - before the run is left for a human.
     pub land_rounds: usize,
+    /// Ask the owner before merging, showing what is about to land.
+    ///
+    /// On by default, so turning `land` on does not silently hand magi the
+    /// merge button. The question carries a rendered panel - diffstat, the
+    /// diff itself, the checks, the review comments that were addressed - so
+    /// the decision is made on evidence rather than on trust, and it is made
+    /// from wherever the operator happens to be.
+    ///
+    /// Silence is a hold. An unanswered approval never merges.
+    pub land_approval: bool,
     /// How long to wait for an owner to answer a question before the run is
     /// abandoned, seconds. A parked run costs nothing, so this is generous;
     /// it exists so a forgotten question cannot pin a worktree forever.
@@ -201,6 +211,7 @@ impl Default for Graph {
             worktree_root: None,
             land: false,
             land_rounds: 4,
+            land_approval: true,
             answer_timeout: 86_400,
         }
     }
