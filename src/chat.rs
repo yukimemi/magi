@@ -340,7 +340,11 @@ pub async fn start(
     // own working directory and a relative path would mean the wrong
     // repository.
     let repo = repo.canonicalize().unwrap_or(repo);
-    let spec = plan::pick(&cfg.agents, agent, &plan::installed)?;
+    // The API's `agent` beats the config, the config beats the built-in order.
+    // On a phone there is no flag to pass, so `[roles] planner` is the only
+    // way an operator states who they want to be interviewed by.
+    let want = agent.or(cfg.roles.planner.as_deref());
+    let spec = plan::pick(&cfg.agents, want, &plan::installed)?;
 
     let now = Timestamp::now();
     let id = new_id();

@@ -294,6 +294,36 @@ pub async fn push(repo: &Path, remote: &str, branch: &str) -> Result<GitOut> {
     git_raw(repo, &["push", "-u", remote, branch]).await
 }
 
+/// Fetch one branch from `remote`, updating its remote-tracking ref.
+///
+/// The refspec is spelled out rather than left to `git fetch <remote>
+/// <branch>`, which writes `FETCH_HEAD` and updates
+/// `refs/remotes/<remote>/<branch>` only as a side effect of the remote's
+/// configured refspec. Naming the destination makes the thing this function
+/// exists for - a tracking ref that moved - the operation rather than a
+/// consequence of configuration magi does not own.
+///
+/// Honest note: a CI failure was first read as proof that some git versions do
+/// not update the tracking ref here. That was wrong - the fetch had nothing to
+/// update because the test had pushed to the wrong branch - so this is
+/// determinism, not a fix for a demonstrated portability bug.
+///
+/// Refs, not the working copy: nothing is checked out and no local branch
+/// moves, so this is safe to run while the operator has uncommitted work.
+/// Returned as a [`GitOut`] rather than an error so the caller can decide - a
+/// machine with no network must still be able to start a run.
+pub async fn fetch(repo: &Path, remote: &str, branch: &str) -> Result<GitOut> {
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+    git_raw(repo, &["fetch", "--quiet", remote, &refspec]).await
+}
+
+/// Does this ref resolve?
+pub async fn rev_exists(repo: &Path, rev: &str) -> bool {
+    git_raw(repo, &["rev-parse", "--verify", "--quiet", rev])
+        .await
+        .is_ok_and(|o| o.ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

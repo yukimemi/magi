@@ -126,6 +126,15 @@ pub struct Roles {
     pub reviewers: Vec<String>,
     /// Agent that applies review findings. Defaults to the winner's author.
     pub fixer: Option<String>,
+    /// Agent that runs the `magi plan` interview and the browser conversation.
+    ///
+    /// Unset picks a `claude` seat, else the first runnable agent in roster
+    /// order - which is roster *order*, not a judgement about who interviews
+    /// well. Naming one here is worth it because the interview is the one node
+    /// a human sits through: the model that asks good questions is not
+    /// necessarily the one that writes the best patch, and on a phone there is
+    /// no `--agent` to type.
+    pub planner: Option<String>,
 }
 
 /// Graph shape and limits.
@@ -167,24 +176,30 @@ pub struct Graph {
     /// Root for candidate / judge worktrees. Defaults to `~/wt/magi`.
     pub worktree_root: Option<PathBuf>,
     /// After the pull request is open, keep going: watch its checks and
-    /// reviews, run a fix round when they are unhappy, and merge when they are
-    /// not.
+    /// reviews, run a fix round when they are unhappy, and ask to merge.
     ///
-    /// Off by default, and deliberately so. Merging is the one irreversible
-    /// thing magi can do to a repository, and it must be something the
-    /// operator turned on rather than something they discovered.
+    /// On, because stopping at an open pull request left the operator doing
+    /// the watching by hand - six times in the session this was built in - and
+    /// that is the work the loop exists to take. It only engages for
+    /// `merge = "pr"`; every other merge mode ends the run as before.
+    ///
+    /// Turning this on does **not** hand magi the merge button:
+    /// [`Graph::land_approval`] is on too, and nothing merges without an
+    /// explicit answer. Setting both to their non-defaults is the only way to
+    /// get an unattended merge, and it has to be chosen twice.
     pub land: bool,
     /// Land rounds - watch, fix, push - before the run is left for a human.
     pub land_rounds: usize,
     /// Ask the owner before merging, showing what is about to land.
     ///
-    /// On by default, so turning `land` on does not silently hand magi the
-    /// merge button. The question carries a rendered panel - diffstat, the
-    /// diff itself, the checks, the review comments that were addressed - so
-    /// the decision is made on evidence rather than on trust, and it is made
-    /// from wherever the operator happens to be.
+    /// On, and it is what makes `land` safe to have on: the question carries a
+    /// rendered panel - the diffstat, the patch, the checks, the review
+    /// comments that were addressed, and the subject the squash will use - so
+    /// the decision is made on evidence rather than on trust, from wherever
+    /// the operator happens to be.
     ///
-    /// Silence is a hold. An unanswered approval never merges.
+    /// Silence is a hold. An unanswered approval never merges, and neither
+    /// does any answer other than the word `merge`.
     pub land_approval: bool,
     /// How long to wait for an owner to answer a question before the run is
     /// abandoned, seconds. A parked run costs nothing, so this is generous;
@@ -209,7 +224,7 @@ impl Default for Graph {
             timeout_fix: 1800,
             retries: 1,
             worktree_root: None,
-            land: false,
+            land: true,
             land_rounds: 4,
             land_approval: true,
             answer_timeout: 86_400,
@@ -481,6 +496,32 @@ pub struct ResolvedRoles {
     pub fixer: Option<AgentSpec>,
 }
 
+/// Every array-valued key in a config table, as a dotted path.
+///
+/// Dotted so the error names `roles.implementers` rather than `implementers`:
+/// an operator with three config files needs to know which key, not just that
+/// there was one. `vars` is skipped because it is teravars' own input, merged
+/// on purpose and never deserialised into `Config`.
+fn array_keys(table: &toml::value::Table, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (k, v) in table {
+        if prefix.is_empty() && k == "vars" {
+            continue;
+        }
+        let path = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        match v {
+            toml::Value::Array(_) => out.push(path),
+            toml::Value::Table(t) => out.extend(array_keys(t, &path)),
+            _ => {}
+        }
+    }
+    out
+}
+
 impl Config {
     /// Load one file through teravars: Tera rendering, `[vars]` resolution,
     /// and the `include = [...]` directive.
@@ -513,6 +554,9 @@ impl Config {
                 &dir.file_name().unwrap_or_default().to_string_lossy(),
             );
         }
+        if paths.len() > 1 {
+            Self::refuse_split_arrays(paths, &mut engine, &ctx)?;
+        }
         let merged = teravars::load_merged(paths, &mut engine, &ctx).with_context(|| {
             format!(
                 "rendering config via teravars: {}",
@@ -530,6 +574,50 @@ impl Config {
         toml::Value::Table(table)
             .try_into()
             .context("deserializing magi config")
+    }
+
+    /// Refuse an array that two layers both declare.
+    ///
+    /// teravars **appends** arrays when it merges layers, and that is wrong for
+    /// every array magi has: `implementers` is an ordered list of seats,
+    /// `verify.gate` is the commands to run, `notify.command` is an argv.
+    /// Concatenating two of them yields something nobody wrote - three
+    /// implementers out of a machine's two and a repository's one, or an argv
+    /// of `["ntfy", "publish", "curl", "-X"]`.
+    ///
+    /// Replacing instead would be the right merge rule, but the rule lives in
+    /// teravars, which several other projects depend on; changing it there is
+    /// a decision for that crate, not something to fake here by re-reading the
+    /// files with different semantics and hoping the two paths agree.
+    ///
+    /// So magi refuses the ambiguity rather than resolving it silently. The
+    /// cost of guessing is a roster the operator did not ask for and is paying
+    /// for by the token.
+    fn refuse_split_arrays(
+        paths: &[PathBuf],
+        engine: &mut teravars::Engine,
+        ctx: &teravars::Context,
+    ) -> Result<()> {
+        let mut seen: std::collections::BTreeMap<String, PathBuf> = Default::default();
+        for path in paths {
+            let one = teravars::load_merged([path], engine, ctx)
+                .with_context(|| format!("rendering {}", path.display()))?;
+            for key in array_keys(&one.config, "") {
+                if let Some(first) = seen.get(&key) {
+                    bail!(
+                        "`{key}` is an array declared in two config layers:\n  \
+                         {}\n  {}\nteravars appends arrays when it merges, so \
+                         magi would run the concatenation of both - which is \
+                         not what either file says. Declare `{key}` in exactly \
+                         one of them.",
+                        first.display(),
+                        path.display()
+                    );
+                }
+                seen.insert(key, path.clone());
+            }
+        }
+        Ok(())
     }
 
     /// Every config layer that applies to `repo`, in increasing precedence.
@@ -793,6 +881,7 @@ mod tests {
                 judges: vec!["a".to_owned()],
                 reviewers: Vec::new(),
                 fixer: Some("a".to_owned()),
+                ..Roles::default()
             },
             ..Config::default()
         };
@@ -903,5 +992,63 @@ mod tests {
         assert_eq!(s.delivery(), Delivery::File);
         s.prompt_delivery = Some(Delivery::Argv);
         assert_eq!(s.delivery(), Delivery::Argv);
+    }
+    #[test]
+    fn the_land_loop_is_on_but_it_cannot_merge_without_being_asked() {
+        // Both default on, and that pair is the safety property: `land` takes
+        // over the watching an operator was doing by hand, `land_approval`
+        // keeps the irreversible step a human decision. An unattended merge
+        // needs BOTH flipped, which has to be chosen deliberately twice.
+        let g = Graph::default();
+        assert!(
+            g.land,
+            "stopping at an open PR left the watching to a human"
+        );
+        assert!(
+            g.land_approval,
+            "on-by-default land is only defensible while this is also on"
+        );
+        assert!(g.land_rounds > 0, "a loop with no budget never terminates");
+    }
+    #[test]
+    fn an_array_declared_in_two_layers_is_refused_instead_of_concatenated() {
+        // teravars appends arrays. For an ordered list of seats, or an argv,
+        // the concatenation is something neither file says - and the operator
+        // pays for the extra seats by the token.
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.toml");
+        let repo = dir.path().join("magi.toml");
+        std::fs::write(&machine, "[roles]\nimplementers = [\"a\", \"b\"]\n").unwrap();
+        std::fs::write(&repo, "[roles]\nimplementers = [\"oc\"]\n").unwrap();
+
+        let err = Config::load_layers(&[machine.clone(), repo.clone()])
+            .expect_err("two layers naming one array must not merge silently")
+            .to_string();
+        assert!(err.contains("roles.implementers"), "{err}");
+        // Both files are named: the fix is to delete one of them, and the
+        // operator has to know which two to choose between.
+        assert!(err.contains("machine.toml"), "{err}");
+        assert!(err.contains("magi.toml"), "{err}");
+    }
+
+    #[test]
+    fn a_scalar_in_one_layer_and_an_array_in_another_still_merges() {
+        // The split the layering exists for: state a preference machine-wide,
+        // let the repository own its own lists.
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.toml");
+        let repo = dir.path().join("magi.toml");
+        std::fs::write(&machine, "[roles]\nplanner = \"opus\"\n").unwrap();
+        std::fs::write(
+            &repo,
+            "[[agents]]\nid = \"oc\"\nkind = \"opencode\"\n\n\
+             [roles]\nimplementers = [\"oc\"]\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load_layers(&[machine, repo]).expect("layers merge");
+        assert_eq!(cfg.roles.planner.as_deref(), Some("opus"));
+        assert_eq!(cfg.roles.implementers, ["oc"]);
+        assert_eq!(cfg.agents.len(), 1, "the roster is not doubled");
     }
 }

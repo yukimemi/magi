@@ -198,7 +198,9 @@ pub async fn plan(opts: Opts) -> Result<Task> {
         .canonicalize()
         .unwrap_or_else(|_| opts.repo.clone());
     let (config, _sources) = Config::discover(&repo, opts.config.as_deref())?;
-    let leader = pick(&config.agents, opts.agent.as_deref(), &installed)?;
+    // `--agent` beats the config, the config beats the built-in order.
+    let want = opts.agent.as_deref().or(config.roles.planner.as_deref());
+    let leader = pick(&config.agents, want, &installed)?;
 
     let dir = drafts_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -407,7 +409,7 @@ fn new_id() -> String {
 }
 
 /// Can this agent's CLI actually be run on this machine?
-pub(crate) fn installed(spec: &AgentSpec) -> bool {
+pub fn installed(spec: &AgentSpec) -> bool {
     // A `command` agent has no program of its own to look for - its argv is the
     // operator's, and they are the authority on whether it runs.
     spec.kind.program().is_none_or(which)
@@ -435,7 +437,7 @@ pub(crate) fn installed(spec: &AgentSpec) -> bool {
 /// 3. Otherwise the first runnable agent in roster order, because the roster
 ///    order is the operator's own stated preference and magi has nothing better
 ///    to go on.
-pub(crate) fn pick(
+pub fn pick(
     agents: &[AgentSpec],
     want: Option<&str>,
     available: &dyn Fn(&AgentSpec) -> bool,
@@ -1025,5 +1027,30 @@ mod tests {
             .expect_err("a command agent with no command cannot be spawned")
             .to_string();
         assert!(msg.contains("broken"), "{msg}");
+    }
+    #[test]
+    fn the_configured_planner_is_used_and_an_explicit_agent_still_beats_it() {
+        // The interview is the one node a human sits through, and on a phone
+        // there is no `--agent` to type - so it has to be settable in config.
+        let agents = [
+            spec("opus", AgentKind::Claude),
+            spec("oc", AgentKind::Opencode),
+            spec("agy", AgentKind::Antigravity),
+        ];
+
+        // Config names the seat: roster order does not get a say.
+        let by_config = pick(&agents, Some("oc"), &without(&[])).expect("configured");
+        assert_eq!(by_config.id, "oc");
+
+        // Nothing named anywhere falls back to the built-in order, which
+        // prefers a claude seat.
+        let by_default = pick(&agents, None, &without(&[])).expect("default");
+        assert_eq!(by_default.kind, AgentKind::Claude);
+
+        // A configured seat that is not installed is an error rather than a
+        // silent substitution: an operator who named an interviewer had a
+        // reason, and quietly using a different model wastes the conversation.
+        let err = pick(&agents, Some("oc"), &without(&["oc"])).expect_err("not runnable");
+        assert!(err.to_string().contains("oc"), "{err}");
     }
 }

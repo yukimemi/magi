@@ -666,6 +666,21 @@ limit is a property of the machine, not of the task, and a quota window closing
 overnight must not leave a backlog of `held` tasks that were never actually
 judged. Do not "simplify" this into `fail`.
 
+### Two gates guard the merge, and both are on
+
+`graph.land` and `graph.land_approval` both default to `true`, and neither is
+redundant:
+
+- `land` decides whether magi keeps watching the pull request after opening it.
+  It only engages for `merge = "pr"`.
+- `land_approval` decides whether a human sees the panel before the merge.
+  Silence is a hold, and nothing but the word `merge` merges.
+
+An unattended merge requires flipping both, which is two deliberate choices.
+Do not "simplify" them into one flag: the useful middle state - magi does the
+watching and the fixing, a human owns the irreversible step - is exactly the
+default, and one flag cannot express it.
+
 ### Autonomy is bounded, and the bound is the point
 
 `src/daemon.rs` runs one competition at a time — no `--jobs`. The graph is
