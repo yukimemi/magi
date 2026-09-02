@@ -199,6 +199,14 @@ enum Command {
         /// Repository used by tasks filed without one.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// What the loop this server runs should do with each winning branch.
+        ///
+        /// `magi web` runs the loop itself now, so the override `magi serve`
+        /// accepts has to be expressible here too - otherwise starting the
+        /// loop from a phone would mean accepting whatever the repository's
+        /// config says, and the terminal would still be required to change it.
+        #[arg(long, value_enum)]
+        merge: Option<MergeArg>,
     },
     /// Talk over an idea with a leader agent, then file the task it writes.
     ///
@@ -566,12 +574,18 @@ async fn dispatch(command: Command) -> Result<()> {
             .await
         }
 
-        Command::Web { bind, port, repo } => {
+        Command::Web {
+            bind,
+            port,
+            repo,
+            merge,
+        } => {
             web::serve(web::Opts {
                 bind,
                 port,
                 repo,
                 open: false,
+                merge: merge.map(|m| m.as_str().to_owned()),
             })
             .await
         }

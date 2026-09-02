@@ -61,12 +61,25 @@
   </button>
 </header>
 
-<!-- The daemon strip is the difference between "nothing is queued" and
+<!-- The loop strip is the difference between "nothing is queued" and
      "nothing is going to happen", so it sits above the content on every view
-     instead of inside one of them. -->
-<div class="daemon" id="daemon" role="status" aria-label="Daemon status">
+     instead of inside one of them. The loop runs inside this server, so the
+     strip also carries the control that starts and stops it: a task filed
+     from a phone that sat in the queue until somebody reached a keyboard was
+     the last thing in this product that needed a terminal.
+
+     The button is deliberately not guarded by a confirmation the way the
+     merge approval is. Starting is cheap and stopping is not destructive —
+     the loop finishes the run it is on either way — so a second tap would
+     only be ceremony. What starting *does* spend is stated next to it
+     instead, in .daemon-why, which is also the button's description. -->
+<div class="daemon" id="daemon" role="status" aria-label="Loop status">
   <span class="daemon-dot" aria-hidden="true"></span>
-  <span class="daemon-text">Connecting…</span>
+  <span class="daemon-body">
+    <span class="daemon-text">Connecting…</span>
+    <span class="daemon-why" id="loop-why" hidden></span>
+  </span>
+  <button class="btn daemon-btn" type="button" id="loop-toggle" aria-describedby="loop-why" hidden></button>
 </div>
 
 <!-- An unanswered question is the only state in this product where nothing at

@@ -66,12 +66,36 @@
 //! waits tens of seconds for a sentence. It is a plain `await` holding no lock
 //! and no executor thread, and concurrent turns on one chat are refused rather
 //! than queued - see [`Ui::begin_turn`].
+//!
+//! # The loop runs here
+//!
+//! `magi web` runs the queue loop in this process, started and stopped from
+//! `/api/loop`. That is the point of the whole surface: a task filed from a
+//! phone with nobody around to type `magi serve` is a task that sits in the
+//! queue until someone walks back to the machine.
+//!
+//! It is a tokio task holding a [`daemon::Stop`], not a child process. There
+//! is no pid file of this module's own and nothing to supervise - a child
+//! would need reaping, a second copy of the daemon's retry policy, and a
+//! story for what happens when `magi web` dies with the loop still running.
+//! `<home>/daemon.json`, which the loop itself writes, stays the only
+//! cross-process signal, and it is how this process notices that the
+//! operator's own `magi serve` already owns the loop and refuses to start a
+//! second one that would fight it for claims.
+//!
+//! Stopping is cooperative and therefore not instant. A run in flight is
+//! finished first, for the reason [`daemon::serve`] gives: killing the graph
+//! mid-node leaves worktrees, branches and agent sessions behind and throws
+//! away every agent call already paid for. `POST /api/loop` sets the flag and
+//! answers immediately rather than waiting, because the wait is measured in
+//! tens of minutes and the operator is holding a phone.
 
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -192,6 +216,14 @@ pub struct Opts {
     /// Print the URL on its own line for a caller that wants to hand it to a
     /// browser. magi never launches one itself.
     pub open: bool,
+    /// Merge mode override for the loop this process runs (`none`, `local`,
+    /// `pr`); `None` leaves it to each repository's own config.
+    ///
+    /// The same override `magi serve --merge` takes, and here for the same
+    /// reason: `magi web` is now the thing that runs the loop, so an operator
+    /// who wants this session's runs to open pull requests has to be able to
+    /// say so without going back to the command they no longer type.
+    pub merge: Option<String>,
 }
 
 impl Default for Opts {
@@ -201,6 +233,7 @@ impl Default for Opts {
             port: DEFAULT_PORT,
             repo: PathBuf::from("."),
             open: false,
+            merge: None,
         }
     }
 }
@@ -226,6 +259,22 @@ pub struct Ui {
     /// see it, and a second `magi web` on the same home is already a
     /// misconfiguration the queue's claims would catch first.
     turns: Arc<Mutex<HashSet<String>>>,
+    /// Merge mode override handed to the loop this process starts.
+    merge: Option<String>,
+    /// The loop this process is running, if it is running one.
+    looping: Arc<Mutex<LoopState>>,
+    /// How a loop is actually started.
+    ///
+    /// A field rather than a direct call to [`daemon::serve_until`], because
+    /// the real loop resolves its queue and its status file through the
+    /// process-global magi home and claims whatever it finds there. A test
+    /// that started it would reach straight past its own temp directory into
+    /// the operator's live queue, overwrite the status file of the `magi
+    /// serve` that owns it, and spend real agent quota on a real competition.
+    /// What the routes have to get right is the bookkeeping, so the tests
+    /// drive the routes against a loop that only starts and stops; production
+    /// is [`launch_daemon`] and nothing reassigns it.
+    launch: Launch,
 }
 
 impl Ui {
@@ -246,6 +295,9 @@ impl Ui {
             home,
             repo,
             turns: Arc::default(),
+            merge: None,
+            looping: Arc::default(),
+            launch: launch_daemon,
         }
     }
 
@@ -260,6 +312,162 @@ impl Ui {
             run::home(),
             repo,
         )
+    }
+
+    /// The merge mode the loop should use, as the command line gave it.
+    ///
+    /// A builder step rather than a seventh parameter on [`Ui::new`], because
+    /// the override is a property of how this process was invoked and not of
+    /// where its state lives - which is all the tests that build a `Ui` by
+    /// hand are saying.
+    #[must_use]
+    pub fn with_merge(mut self, merge: Option<String>) -> Self {
+        self.merge = merge;
+        self
+    }
+
+    /// Point the loop at something other than [`launch_daemon`].
+    ///
+    /// Test-only, and deliberately: see [`Ui::launch`] for why no test in
+    /// this crate may start the real loop.
+    #[cfg(test)]
+    #[must_use]
+    fn with_launch(mut self, launch: Launch) -> Self {
+        self.launch = launch;
+        self
+    }
+
+    /// The loop's state, for [`serve`]'s own way out.
+    fn looping(&self) -> Arc<Mutex<LoopState>> {
+        Arc::clone(&self.looping)
+    }
+
+    /// Start the loop in this process, or say who already has one.
+    ///
+    /// `foreign` is passed in rather than read here so that one request makes
+    /// one judgement about who owns the loop: reading the status file again
+    /// inside this function could refuse a start for a daemon the same
+    /// response then reports as gone.
+    fn start_loop(&self, foreign: Option<Foreign>) -> ApiResult<()> {
+        if let Some(other) = foreign {
+            return Err(ApiError::conflict(format!(
+                "{} is already running the loop, so this one will not start a \
+                 second: two loops on one queue race for the same claims and \
+                 burn the agent quota twice over. Stop it where it was \
+                 started.",
+                other.who()
+            )));
+        }
+        let mut state = self.lock_loop();
+        if state.live.as_ref().is_some_and(Live::alive) {
+            return Err(ApiError::conflict(format!(
+                "this magi web process (pid {}) is already running the loop",
+                std::process::id()
+            )));
+        }
+
+        let stop = daemon::Stop::new();
+        // The CLI's own defaults for everything the UI has no opinion about:
+        // one poll interval and one retry budget, so a loop started from a
+        // phone behaves exactly like the `magi serve` it replaces.
+        let opts = daemon::Opts {
+            repo: self.repo.clone(),
+            merge: self.merge.clone(),
+            ..daemon::Opts::default()
+        };
+        let launch = self.launch;
+        let looping = Arc::clone(&self.looping);
+        let handle = tokio::spawn({
+            let opts = opts.clone();
+            let stop = stop.clone();
+            async move {
+                let failure = match launch(opts, stop).await {
+                    Ok(()) => None,
+                    Err(e) => Some(format!("{e:#}")),
+                };
+                match &failure {
+                    Some(why) => tracing::error!("the loop stopped: {why}"),
+                    None => tracing::info!("the loop stopped"),
+                }
+                // Recorded by the task itself rather than reaped by whichever
+                // request happens next, so `loop_rev` moves the moment the
+                // loop ends and a phone with the change stream open learns
+                // that it did. Clearing `live` drops this task's own handle,
+                // which only detaches it, and is the last thing it does.
+                let mut state = lock_or_recover(&looping);
+                state.live = None;
+                state.last_error = failure;
+                state.rev += 1;
+            }
+        });
+        tracing::info!(
+            "the loop is now running in this process: repo {}, merge {}",
+            opts.repo.display(),
+            opts.merge.as_deref().unwrap_or("as the config says")
+        );
+        state.live = Some(Live { stop, handle, opts });
+        // A fresh start is not the place to keep showing why the last one
+        // died; the operator has read it and pressed the button anyway.
+        state.last_error = None;
+        state.rev += 1;
+        Ok(())
+    }
+
+    /// Ask the loop to stop, without waiting for it to get there.
+    ///
+    /// Idempotent: a second tap on stop is not an error, because the first one
+    /// leaves the loop running for as long as the run in flight takes and the
+    /// operator has no way to tell a slow stop from a lost one.
+    fn stop_loop(&self, foreign: Option<Foreign>) -> ApiResult<()> {
+        if let Some(other) = foreign {
+            return Err(ApiError::conflict(format!(
+                "the loop belongs to {}, and this process cannot stop it - \
+                 stop it where it was started. A button that silently did \
+                 nothing would be worse than this refusal.",
+                other.who()
+            )));
+        }
+        let mut state = self.lock_loop();
+        let Some(live) = state.live.as_ref() else {
+            return Ok(());
+        };
+        if live.stop.stopped() {
+            return Ok(());
+        }
+        live.stop.stop();
+        state.rev += 1;
+        tracing::info!("the loop was asked to stop; a run in flight is finished first");
+        Ok(())
+    }
+
+    /// The loop as both `/api/loop` and `/api/health` report it.
+    ///
+    /// `reading` is the caller's single read of `<home>/daemon.json`, because
+    /// health answers with this view *and* the daemon object beside it: one
+    /// read per response is what stops a single answer naming a foreign owner
+    /// in one field and calling the loop free in the other.
+    fn loop_view(&self, reading: Option<daemon::Reading>) -> LoopView {
+        let state = self.lock_loop();
+        // A loop that panicked never recorded its own end, so the handle -
+        // not the presence of the record - is what "running" means.
+        let live = state.live.as_ref().filter(|live| live.alive());
+        LoopView {
+            running: live.is_some(),
+            stopping: live.is_some_and(|live| live.stop.finishing()),
+            owned: live.is_some(),
+            repo: live
+                .map_or(&self.repo, |live| &live.opts.repo)
+                .display()
+                .to_string(),
+            merge: live.map_or_else(|| self.merge.clone(), |live| live.opts.merge.clone()),
+            last_error: state.last_error.clone(),
+            daemon: DaemonView::of(reading),
+        }
+    }
+
+    /// Take the loop lock. See [`lock_or_recover`] for why it cannot fail.
+    fn lock_loop(&self) -> MutexGuard<'_, LoopState> {
+        lock_or_recover(&self.looping)
     }
 
     /// Claim the right to run one turn in a chat, or refuse.
@@ -313,6 +521,7 @@ impl Ui {
             .route("/app.css", get(app_css))
             .route("/app.js", get(app_js))
             .route("/api/health", get(health))
+            .route("/api/loop", get(loop_get).post(loop_post))
             .route("/api/runs", get(runs_list))
             .route("/api/runs/{id}", get(run_detail))
             .route("/api/runs/{id}/report", get(run_report))
@@ -360,11 +569,23 @@ impl Drop for TurnGuard {
     }
 }
 
-/// Serve the UI until the process is stopped.
+/// Serve the UI until Ctrl-C, finishing a run the loop has in flight.
 ///
-/// There is no graceful-shutdown hook: the server owns no state of its own, so
-/// killing it loses nothing a restart cannot rebuild from the queue and the
-/// runs directory.
+/// The server itself owns no state, so nothing here is graceful for the HTTP
+/// side's sake: the connections go with the dropped listener, which costs a
+/// phone one change-stream reconnection it was going to make anyway.
+///
+/// The signal branch is not optional now that the loop lives in this process.
+/// [`daemon::serve_until`] listens for Ctrl-C itself, and a registered
+/// handler is what stops the signal terminating the process - so without a
+/// branch of our own, the first Ctrl-C after the operator started the loop
+/// would stop the loop and leave `magi web` listening forever, unkillable
+/// from the terminal it was started in.
+///
+/// What it waits for is the loop, not the sockets. A run in flight is
+/// finished first, for the reason [`daemon::serve`] gives: killing the graph
+/// mid-node leaves worktrees, branches and agent sessions behind and throws
+/// away every agent call already paid for.
 pub async fn serve(opts: Opts) -> Result<()> {
     let (addr, warning) = resolve_bind(&opts.bind);
     if let Some(warning) = warning {
@@ -378,7 +599,8 @@ pub async fn serve(opts: Opts) -> Result<()> {
     // change. Nothing in the server turns colour back on.
     report::set_color(false);
 
-    let ui = Ui::open(opts.repo);
+    let ui = Ui::open(opts.repo).with_merge(opts.merge);
+    let looping = ui.looping();
     let socket = SocketAddr::new(addr, opts.port);
     let listener = tokio::net::TcpListener::bind(socket)
         .await
@@ -389,15 +611,53 @@ pub async fn serve(opts: Opts) -> Result<()> {
          reach this address can file and hold tasks: the tailnet is the \
          security boundary"
     );
+    tracing::info!(
+        "the queue loop is not running yet - start it from the UI, which is \
+         the whole reason this process can: nothing in the queue moves until \
+         something is running the loop"
+    );
     if opts.open {
         // The URL alone on stdout, for a caller that wants to open it. magi
         // does not spawn a browser: on the machine this usually runs on there
         // is no display, and a failed launch would be the only output.
         println!("{url}");
     }
-    axum::serve(listener, ui.router())
-        .await
-        .context("serve the web UI")
+
+    let served = axum::serve(listener, ui.router()).into_future();
+    let interrupted = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            // No handler on this platform, so there is no signal to act on.
+            // Never resolving is the safe answer: a failed registration must
+            // not masquerade as the operator asking for a shutdown and take
+            // the UI down on startup.
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        outcome = served => outcome.context("serve the web UI"),
+        () = interrupted => {
+            tracing::info!("shutting down the web UI");
+            finish_loop(&looping).await;
+            Ok(())
+        }
+    }
+}
+
+/// Ask the loop to stop and wait for it, on the way out of [`serve`].
+///
+/// The wait is the whole function. Returning from `serve` while a graph is
+/// mid-node ends the process with worktrees, branches and agent sessions left
+/// behind and every agent call in that run paid for and thrown away, which is
+/// exactly what the daemon's own shutdown refuses to do.
+async fn finish_loop(state: &Mutex<LoopState>) {
+    let live = lock_or_recover(state).live.take();
+    let Some(live) = live else { return };
+    live.stop.stop();
+    lock_or_recover(state).rev += 1;
+    tracing::info!("waiting for the loop to finish the run in flight");
+    // The task records its own outcome and logs it, so there is nothing to do
+    // with a join error here but stop waiting.
+    let _ = live.handle.await;
 }
 
 /// Resolve `--bind` to an address, plus a warning when the answer is not what
@@ -621,6 +881,11 @@ struct HealthView {
     questions_rev: u64,
     /// See [`HealthView::questions_rev`].
     chats_rev: u64,
+    /// See [`HealthView::questions_rev`]. The loop's counter is the one that
+    /// is not on disk anywhere, so a phone with no change stream has no other
+    /// way to notice that the loop it is waiting on was started from another
+    /// device.
+    loop_rev: u64,
     /// Runs on disk whose state this build cannot parse - almost always a
     /// schema bump, occasionally a run killed mid-write.
     ///
@@ -643,6 +908,13 @@ struct HealthView {
     /// has no way to say "you left one open".
     chats_open: usize,
     daemon: DaemonView,
+    /// The loop in this process, exactly what `/api/loop` answers with.
+    ///
+    /// Here so a phone that has just woken needs one request to know whether
+    /// anything is going to happen at all: `daemon` says a loop is alive
+    /// somewhere, and this says whether it is one this UI can stop.
+    #[serde(rename = "loop")]
+    looping: LoopView,
 }
 
 /// The daemon's state as the UI presents it.
@@ -686,6 +958,14 @@ impl DaemonView {
 
 async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
     blocking(move || {
+        // One read of the status file for the two fields that describe it, so
+        // `daemon` and `loop` in the same answer cannot disagree about who is
+        // running the loop.
+        let reading = daemon::read_status(&ui.home);
+        // Read on its own line, not inside the literal below: the loop's lock
+        // is not reentrant, and a guard taken as a temporary there would still
+        // be held when `loop_view` took it again.
+        let loop_rev = ui.lock_loop().rev;
         Ok(Json(HealthView {
             version: env!("CARGO_PKG_VERSION"),
             home: ui.home.display().to_string(),
@@ -693,11 +973,206 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             runs_rev: runs_revision(&ui.runs),
             questions_rev: ui.questions.revision(),
             chats_rev: ui.chats.revision(),
+            loop_rev,
             runs_unreadable: runs_unreadable(&ui.runs),
             questions_open: ui.questions.count_open(),
             chats_open: ui.chats.count_open(),
-            daemon: DaemonView::of(daemon::read_status(&ui.home)),
+            daemon: DaemonView::of(reading.clone()),
+            looping: ui.loop_view(reading),
         }))
+    })
+    .await
+}
+
+/// What `/api/loop` answers, and what `/api/health` carries as `loop`.
+#[derive(Debug, Serialize)]
+struct LoopView {
+    /// A loop is running in *this* process.
+    running: bool,
+    /// It has been asked to stop and is still finishing a run.
+    ///
+    /// [`daemon::Stop::finishing`]'s answer rather than "the flag is set",
+    /// because the two differ exactly where it matters: a loop asked to stop
+    /// while idle is gone within one poll interval, and one asked to stop
+    /// mid-run keeps going for as long as the graph takes. The operator needs
+    /// to be told which of those they are waiting for.
+    stopping: bool,
+    /// The loop is this process's own.
+    ///
+    /// Spelled separately from `running` for the front end's sake, even
+    /// though inside this process the two move together: `running: false`
+    /// with `daemon.running: true` is the case where the operator's own `magi
+    /// serve` owns the loop, and `owned` is the field that tells the UI its
+    /// buttons have to explain that rather than pretend.
+    owned: bool,
+    /// Repository the loop uses for tasks that name none - what it was
+    /// started with while it runs, and what a start would use before that.
+    repo: String,
+    /// Merge mode override in force, or `null` when each repository's own
+    /// config decides.
+    merge: Option<String>,
+    /// Why the last loop in this process ended, when it ended badly.
+    ///
+    /// The only place a crashed loop is visible to someone holding a phone.
+    /// It is logged at error level as well, but a terminal nobody kept open
+    /// is not a report, and a loop that died at 3am must not read as merely
+    /// stopped in the morning. Named as [`Task::last_error`] is, because it
+    /// answers the same question about the same kind of failure.
+    last_error: Option<String>,
+    /// The status file, judged the same way `/api/health` judges it: this is
+    /// what says whether a loop is alive in some *other* process.
+    daemon: DaemonView,
+}
+
+/// A loop another process already owns.
+///
+/// `<home>/daemon.json` is the only cross-process signal there is, so this is
+/// the whole of the test: a heartbeat no older than [`daemon::STALE_SECS`],
+/// published by a pid that is not ours. Excluding our own pid is what makes
+/// stopping work at all - the loop this process runs writes that file too, so
+/// a check that ignored the pid would decide the operator's own UI was a
+/// stranger and refuse to stop the loop it had just started.
+#[derive(Debug, Clone, Copy)]
+struct Foreign {
+    /// The pid the other process published, when it published one.
+    pid: Option<u32>,
+}
+
+impl Foreign {
+    /// Another process's live loop, or `None` when this process is free to
+    /// run one.
+    fn of(reading: Option<&daemon::Reading>) -> Option<Self> {
+        let reading = reading?;
+        if !reading.running(Timestamp::now()) {
+            return None;
+        }
+        match reading.pid {
+            Some(pid) if pid == std::process::id() => None,
+            // A fresh heartbeat with no pid in it is still evidence of a live
+            // daemon. "Some other process" is the honest answer, and refusing
+            // to start beside it is the safe one.
+            pid => Some(Self { pid }),
+        }
+    }
+
+    /// How a conflict names it. The pid is the whole point of the message: it
+    /// is what the operator needs to find the terminal that owns the loop.
+    fn who(&self) -> String {
+        match self.pid {
+            Some(pid) => format!("another magi process (pid {pid})"),
+            None => "another magi process".to_owned(),
+        }
+    }
+}
+
+/// How a loop is started, as a future this module can hold onto.
+///
+/// A plain function pointer, so [`Ui`] stays `Debug` and `Clone` without a
+/// trait object or a hand-written `Debug` impl for the sake of one seam.
+type Launch = fn(daemon::Opts, daemon::Stop) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+/// The real loop: [`daemon::serve_until`], boxed to fit [`Launch`].
+fn launch_daemon(
+    opts: daemon::Opts,
+    stop: daemon::Stop,
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    Box::pin(daemon::serve_until(opts, stop))
+}
+
+/// The loop this process runs, behind one lock.
+#[derive(Debug, Default)]
+struct LoopState {
+    /// The loop, while there is one.
+    live: Option<Live>,
+    /// Bumped on every change to this struct, and streamed as `loop_rev`.
+    ///
+    /// The loop is in-process state rather than a file, so nothing on disk
+    /// would tell a second phone that the first one started it. Without this
+    /// counter the only way to learn about a start, a stop request or a crash
+    /// would be to poll `/api/loop`, which is the thing the change stream
+    /// exists to avoid on a mobile link.
+    rev: u64,
+    /// Why the last loop ended, when it ended badly. See
+    /// [`LoopView::last_error`].
+    last_error: Option<String>,
+}
+
+/// A loop in flight.
+#[derive(Debug)]
+struct Live {
+    /// The cooperative stop, shared with the loop task.
+    stop: daemon::Stop,
+    /// The task itself, kept only to answer whether it is still there: a loop
+    /// that panicked never records its own end, and without this the view
+    /// would go on reporting a loop that no longer exists - the one lie that
+    /// would leave the operator with no button to press.
+    handle: tokio::task::JoinHandle<()>,
+    /// What the loop was started with, so the view reports the repository and
+    /// merge mode its runs will actually use rather than what an edit to the
+    /// config since would give.
+    opts: daemon::Opts,
+}
+
+impl Live {
+    /// Is the task still there? See [`Live::handle`].
+    fn alive(&self) -> bool {
+        !self.handle.is_finished()
+    }
+}
+
+/// Take the loop lock, recovering from a poisoned one.
+///
+/// What this mutex holds is a stop flag, a task handle and two counters, none
+/// of which a panic elsewhere can leave in a state worth refusing to read.
+/// Propagating the poison instead would mean an operator who can see the loop
+/// running and can no longer stop it from the only surface they have.
+fn lock_or_recover(state: &Mutex<LoopState>) -> MutexGuard<'_, LoopState> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `GET /api/loop`.
+async fn loop_get(State(ui): State<Arc<Ui>>) -> ApiResult<Json<LoopView>> {
+    blocking(move || {
+        let reading = daemon::read_status(&ui.home);
+        Ok(Json(ui.loop_view(reading)))
+    })
+    .await
+}
+
+/// The body of `POST /api/loop`.
+///
+/// One required field and nothing else: no `default` and no unknown fields,
+/// so a body that fails to say which way the switch was flipped is a 400
+/// rather than a tap that quietly does the opposite of what was pressed.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoopCommand {
+    running: bool,
+}
+
+/// `POST /api/loop` - start the loop in this process, or ask it to stop.
+///
+/// Answers with the view rather than waiting for the loop to reach the state
+/// that was asked for. Starting is immediate anyway; stopping is not, and the
+/// wait is a run's worth of minutes, which is not a thing to hold a phone's
+/// request open for. `stopping` in the answer is what the operator watches
+/// instead.
+async fn loop_post(
+    State(ui): State<Arc<Ui>>,
+    body: std::result::Result<Json<LoopCommand>, JsonRejection>,
+) -> ApiResult<Json<LoopView>> {
+    // Taken as a `Result` so a malformed body is a 400 like every other route
+    // here, rather than axum's default 422 that the UI has no branch for.
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    blocking(move || {
+        let reading = daemon::read_status(&ui.home);
+        let foreign = Foreign::of(reading.as_ref());
+        if body.running {
+            ui.start_loop(foreign)?;
+        } else {
+            ui.stop_loop(foreign)?;
+        }
+        Ok(Json(ui.loop_view(reading)))
     })
     .await
 }
@@ -955,7 +1430,7 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(4);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(POLL);
-        let mut last: Option<(u64, u64, u64, u64)> = None;
+        let mut last: Option<(u64, u64, u64, u64, u64)> = None;
         loop {
             // The first tick completes immediately, which is what makes the
             // stream announce the current revisions on connect.
@@ -967,6 +1442,10 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
                     runs_revision(&state.runs),
                     state.questions.revision(),
                     state.chats.revision(),
+                    // The loop's counter is in-process state rather than a
+                    // file, so nothing the three stats above look at would
+                    // tell this phone that another one started the loop.
+                    state.lock_loop().rev,
                 )
             })
             .await;
@@ -980,8 +1459,9 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
                 "runs_rev": revisions.1,
                 "questions_rev": revisions.2,
                 "chats_rev": revisions.3,
+                "loop_rev": revisions.4,
             });
-            // Serializing four integers cannot fail; giving up beats looping.
+            // Serializing five integers cannot fail; giving up beats looping.
             let Ok(event) = Event::default().event("change").json_data(payload) else {
                 break;
             };
@@ -1415,7 +1895,7 @@ async fn chat_say(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
     body: std::result::Result<Json<NewTurn>, JsonRejection>,
-) -> ApiResult<Json<Chat>> {
+) -> ApiResult<(StatusCode, Json<Chat>)> {
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
     if body.text.trim().is_empty() {
         return Err(ApiError::bad_request("say something"));
@@ -1431,7 +1911,7 @@ async fn chat_say(
     // replaced.
     let _turn = ui.begin_turn(&id)?;
 
-    let (mut chat, cfg) = {
+    let (chat, cfg) = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
         blocking(move || {
@@ -1442,24 +1922,48 @@ async fn chat_say(
         .await?
     };
 
-    let before = chat.turns.len();
-    if let Err(e) = chat::say(&mut chat, &ui.chats, &cfg, &body.text).await {
-        // The detail goes to the operator's terminal; the phone gets the
-        // transcript, which `say` has already made self-explaining.
-        tracing::warn!("chat {id} turn failed: {e:#}");
-        let reloaded = {
-            let ui = Arc::clone(&ui);
-            let id = id.clone();
-            blocking(move || Ok(ui.chats.get(&id)?)).await?
-        };
-        if reloaded.turns.len() <= before {
-            // Nothing was recorded, so the request achieved nothing and must
-            // not look like it did.
-            return Err(ApiError::internal(format!("{e:#}")));
+    // The operator's turn is recorded, the agent's turn runs in the background,
+    // and the response goes back now.
+    //
+    // This used to hold the HTTP connection for the whole turn - 23 to 90
+    // seconds against a real model. On a phone that is a coin flip: a screen
+    // lock or a network handoff drops the request and the browser reports
+    // "Failed to fetch", while the server finishes the turn and writes it to
+    // disk. The operator is then told their message failed when it did not,
+    // which is the worst of both answers. Every other moving part in magi is
+    // state on disk plus the change stream; this was the one place that
+    // depended on a connection staying up, and it did not need to.
+    //
+    // The turn guard moves into the spawned task, so a second `say` on the
+    // same chat still gets a 409 while this one is in flight.
+    let chats = ui.chats.clone();
+    let text = {
+        let mut chat = chat.clone();
+        let chats = chats.clone();
+        let said = body.text.clone();
+        blocking(move || Ok(chat::record(&mut chat, &chats, &said)?)).await?
+    };
+    // Re-read so the spawned task appends to the record that now holds the
+    // operator's turn, rather than to the snapshot taken before it.
+    let mut chat = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || Ok(ui.chats.get(&id)?)).await?
+    };
+    let queued = chat.clone();
+    tokio::spawn(async move {
+        let _turn = _turn;
+        if let Err(e) = chat::respond(&mut chat, &chats, &cfg, &text).await {
+            // `respond` records the failure in the transcript itself, which is
+            // what the phone reads; this line is for the operator's terminal.
+            tracing::warn!("chat {id} turn failed: {e:#}");
         }
-        return Ok(Json(reloaded));
-    }
-    Ok(Json(chat))
+    });
+
+    // 202: the operator's message is recorded and a turn is running. The front
+    // end learns the reply from the change stream, the same way it learns
+    // everything else.
+    Ok((StatusCode::ACCEPTED, Json(queued)))
 }
 
 /// The body of `POST /api/chats/{id}/file`, which the phone sends empty.
@@ -1571,12 +2075,17 @@ mod tests {
 
     impl Fixture {
         async fn start() -> Self {
+            Self::with_loop(launch_idle).await
+        }
+
+        /// A fixture whose loop is `launch`.
+        async fn with_loop(launch: Launch) -> Self {
             let home = TempDir::new().expect("temp home");
-            let addr = Self::serve(home.path()).await;
+            let addr = Self::serve(home.path(), launch).await;
             Self { home, addr }
         }
 
-        async fn serve(home: &FsPath) -> SocketAddr {
+        async fn serve(home: &FsPath, launch: Launch) -> SocketAddr {
             let queue = Queue::at(home.join("queue"));
             let runs = home.join("runs");
             std::fs::create_dir_all(&runs).expect("runs dir");
@@ -1587,7 +2096,8 @@ mod tests {
                 runs,
                 home.to_path_buf(),
                 PathBuf::from("/repo/magi"),
-            );
+            )
+            .with_launch(launch);
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
                 .expect("bind loopback");
@@ -1739,6 +2249,61 @@ mod tests {
             "polls": 143,
         });
         std::fs::write(home.join("daemon.json"), body.to_string()).expect("write daemon.json");
+    }
+
+    /// A loop that starts, finds nothing to do, and waits to be told to stop.
+    ///
+    /// No test in this file may start the real loop - see [`Ui::launch`] for
+    /// why - so this stands in for the only thing the routes need a loop to
+    /// do: keep running until `Stop` is set, then return. A real
+    /// `serve_until` here would resolve its queue and its status file through
+    /// the process-global magi home, claim whatever it found in the
+    /// operator's live backlog, overwrite the status file of the `magi serve`
+    /// that owns it, and spend real agent quota on a real competition.
+    fn launch_idle(
+        _opts: daemon::Opts,
+        stop: daemon::Stop,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+        Box::pin(async move {
+            while !stop.stopped() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            Ok(())
+        })
+    }
+
+    /// A loop that fails on the way up, the way one whose home has gone
+    /// read-only does.
+    fn launch_broken(
+        _opts: daemon::Opts,
+        _stop: daemon::Stop,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+        Box::pin(async {
+            Err(anyhow::anyhow!(
+                "publish the daemon status file: read-only file system"
+            ))
+        })
+    }
+
+    /// The loop view once `want` accepts it.
+    ///
+    /// Polled rather than asserted straight after the POST because stopping
+    /// is deliberately not instant - that is the contract - and rather than
+    /// slept through because a fixed wait is either flaky or slow. Two
+    /// seconds is far longer than a stand-in loop needs and still finite, so
+    /// a genuine hang fails the test instead of hanging the suite.
+    async fn settled(fx: &Fixture, want: fn(&Value) -> bool) -> Value {
+        for _ in 0..200 {
+            let view = fx.get("/api/loop").await.json();
+            if want(&view) {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the loop never settled: {}",
+            fx.get("/api/loop").await.json()
+        );
     }
 
     /// File an open question directly in the store the server reads.
@@ -2578,6 +3143,228 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_loop_is_not_running_until_something_starts_it() {
+        let f = Fixture::start().await;
+
+        let view = f.get("/api/loop").await.json();
+        assert_eq!(view["running"], false);
+        assert_eq!(
+            view["owned"], false,
+            "nobody owns a loop that does not exist: {view}"
+        );
+        assert_eq!(view["stopping"], false);
+        assert_eq!(view["last_error"], Value::Null);
+        assert_eq!(view["daemon"]["running"], false);
+        assert_eq!(
+            view["repo"], "/repo/magi",
+            "the repository a start would use, named before it is started"
+        );
+    }
+
+    #[tokio::test]
+    async fn starting_the_loop_runs_it_in_this_process_and_health_says_the_same() {
+        let f = Fixture::start().await;
+
+        let res = f.post("/api/loop", Some(r#"{"running":true}"#)).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let view = res.json();
+        assert_eq!(view["running"], true);
+        assert_eq!(
+            view["owned"], true,
+            "the loop the UI started is the UI's own to stop: {view}"
+        );
+        assert_eq!(
+            view["merge"],
+            Value::Null,
+            "no override was given, so each repository's own config decides"
+        );
+
+        // The same object from the route a waking phone polls first. Two
+        // surfaces disagreeing about whether anything is running is exactly
+        // the confusion this UI exists to remove.
+        let health = f.get("/api/health").await.json();
+        assert_eq!(health["loop"]["running"], true, "{health}");
+        assert_eq!(health["loop"]["owned"], true, "{health}");
+
+        f.post("/api/loop", Some(r#"{"running":false}"#)).await;
+    }
+
+    #[tokio::test]
+    async fn a_second_start_is_refused_rather_than_racing_the_first_for_claims() {
+        let f = Fixture::start().await;
+        let first = f.post("/api/loop", Some(r#"{"running":true}"#)).await;
+        assert_eq!(first.status, 200, "{}", first.body);
+
+        let again = f.post("/api/loop", Some(r#"{"running":true}"#)).await;
+        assert_eq!(
+            again.status, 409,
+            "two loops on one queue race for the same claims: {}",
+            again.body
+        );
+        assert!(
+            again.json()["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("already running the loop")),
+            "the refusal has to say why: {}",
+            again.body
+        );
+        assert_eq!(
+            f.get("/api/loop").await.json()["running"],
+            true,
+            "and the loop that was already running is untouched by it"
+        );
+
+        f.post("/api/loop", Some(r#"{"running":false}"#)).await;
+    }
+
+    #[tokio::test]
+    async fn stopping_answers_at_once_and_the_loop_settles_stopped() {
+        let f = Fixture::start().await;
+        f.post("/api/loop", Some(r#"{"running":true}"#)).await;
+
+        let res = f.post("/api/loop", Some(r#"{"running":false}"#)).await;
+        assert_eq!(
+            res.status, 200,
+            "the answer must not wait for the loop: a run in flight is tens of \
+             minutes and the operator is holding a phone: {}",
+            res.body
+        );
+
+        let view = settled(&f, |v| v["running"] == false).await;
+        assert_eq!(view["owned"], false);
+        assert_eq!(
+            view["stopping"], false,
+            "a loop that has stopped is not still stopping: {view}"
+        );
+        assert_eq!(
+            view["last_error"],
+            Value::Null,
+            "a loop that was asked to stop did not fail: {view}"
+        );
+
+        // Idempotent, because the operator cannot tell a slow stop from a lost
+        // one and will press it again.
+        let twice = f.post("/api/loop", Some(r#"{"running":false}"#)).await;
+        assert_eq!(twice.status, 200, "{}", twice.body);
+    }
+
+    #[tokio::test]
+    async fn a_loop_another_process_owns_can_be_neither_started_nor_stopped_here() {
+        let f = Fixture::start().await;
+        // How the operator has been doing it: a `magi serve` of their own,
+        // heartbeat fresh, in the same home this UI reads.
+        write_daemon(f.home.path(), Timestamp::now());
+
+        let view = f.get("/api/loop").await.json();
+        assert_eq!(view["running"], false, "not in this process: {view}");
+        assert_eq!(view["owned"], false, "and not this process's to control");
+        assert_eq!(
+            view["daemon"]["running"], true,
+            "but a loop is alive somewhere, which is what the UI must say"
+        );
+        assert_eq!(view["daemon"]["pid"], 4242);
+
+        for body in [r#"{"running":true}"#, r#"{"running":false}"#] {
+            let res = f.post("/api/loop", Some(body)).await;
+            assert_eq!(
+                res.status, 409,
+                "neither button may pretend to work on someone else's loop: {}",
+                res.body
+            );
+            assert!(
+                res.json()["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("4242")),
+                "the refusal has to name the process the operator must go to: {}",
+                res.body
+            );
+        }
+        assert_eq!(
+            f.get("/api/loop").await.json()["running"],
+            false,
+            "and the refusal started nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_status_file_is_not_a_foreign_owner() {
+        let f = Fixture::start().await;
+        write_daemon(
+            f.home.path(),
+            Timestamp::now() - jiff::SignedDuration::from_secs(60),
+        );
+
+        let res = f.post("/api/loop", Some(r#"{"running":true}"#)).await;
+        assert_eq!(
+            res.status, 200,
+            "a daemon killed a minute ago must not lock the loop out of its \
+             own home for good: {}",
+            res.body
+        );
+        assert_eq!(res.json()["running"], true);
+
+        f.post("/api/loop", Some(r#"{"running":false}"#)).await;
+    }
+
+    #[tokio::test]
+    async fn loop_rev_moves_on_a_start_so_a_phone_learns_without_polling() {
+        let f = Fixture::start().await;
+        let before = f.get("/api/health").await.json()["loop_rev"]
+            .as_u64()
+            .expect("a loop revision");
+
+        f.post("/api/loop", Some(r#"{"running":true}"#)).await;
+
+        let after = f.get("/api/health").await.json()["loop_rev"]
+            .as_u64()
+            .expect("a loop revision");
+        assert!(
+            after > before,
+            "the loop is in-process state, so this counter is the only thing \
+             that tells a second device the first one started it: {before} -> \
+             {after}"
+        );
+
+        f.post("/api/loop", Some(r#"{"running":false}"#)).await;
+    }
+
+    #[tokio::test]
+    async fn a_loop_that_failed_says_why_and_does_not_read_as_running() {
+        let f = Fixture::with_loop(launch_broken).await;
+
+        let res = f.post("/api/loop", Some(r#"{"running":true}"#)).await;
+        assert_eq!(
+            res.status, 200,
+            "starting it is not the failure: {}",
+            res.body
+        );
+
+        let view = settled(&f, |v| v["last_error"].is_string()).await;
+        assert_eq!(
+            view["running"], false,
+            "a loop that died must not read as running, or the operator has \
+             nothing to press: {view}"
+        );
+        assert_eq!(view["owned"], false);
+        assert!(
+            view["last_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("read-only file system")),
+            "the phone is where a loop that died at 3am is visible: {view}"
+        );
+
+        // And it can be started again: the corpse was reaped, not left to
+        // occupy the slot.
+        let again = f.post("/api/loop", Some(r#"{"running":true}"#)).await;
+        assert_eq!(again.status, 200, "{}", again.body);
+        assert_eq!(
+            again.json()["last_error"],
+            Value::Null,
+            "a fresh start does not keep showing why the last one died"
+        );
+    }
+
+    #[tokio::test]
     async fn a_newer_daemon_status_file_still_renders() {
         let f = Fixture::start().await;
         // A field this build has never heard of must not turn the status line
@@ -2766,10 +3553,12 @@ mod tests {
             payload["queue_rev"].is_u64()
                 && payload["runs_rev"].is_u64()
                 && payload["questions_rev"].is_u64()
-                && payload["chats_rev"].is_u64(),
+                && payload["chats_rev"].is_u64()
+                && payload["loop_rev"].is_u64(),
             "the client needs one revision per store to know what to refetch, \
              and `chats_rev` is the only notification a slow interview gets - \
-             a phone whose radio slept through a turn learns about it here: \
+             a phone whose radio slept through a turn learns about it here, as \
+             does one whose operator started the loop from another device: \
              {payload}"
         );
 
@@ -2780,7 +3569,13 @@ mod tests {
         // notice a question, and a missing key there is not a 500 but a UI
         // that quietly stops updating.
         let health = f.get("/api/health").await.json();
-        for key in ["queue_rev", "runs_rev", "questions_rev", "chats_rev"] {
+        for key in [
+            "queue_rev",
+            "runs_rev",
+            "questions_rev",
+            "chats_rev",
+            "loop_rev",
+        ] {
             assert!(
                 health[key].is_u64(),
                 "health is the change stream's fallback and is missing `{key}`: {health}"

@@ -399,12 +399,47 @@ pub async fn say(chat: &mut Chat, store: &Chats, cfg: &Config, text: &str) -> Re
     if text.is_empty() {
         bail!("nothing to say");
     }
+    let text = record(chat, store, text)?;
+    turn(chat, store, cfg, &text).await
+}
+
+/// Append the operator's turn and flush it, without invoking anything.
+///
+/// Split out of [`say`] so a caller that answers the operator before the agent
+/// has replied can still promise the message is on disk. `POST /api/chats/{id}/say`
+/// does exactly that: holding an HTTP connection for the 23-to-90 seconds a
+/// real turn takes is a coin flip on a phone, and the browser reporting
+/// "Failed to fetch" while the server quietly finished the turn is the worst
+/// of both answers.
+///
+/// Returns the trimmed text, so the caller and the agent see the same string.
+pub fn record(chat: &mut Chat, store: &Chats, text: &str) -> Result<String> {
+    if !chat.status.open() {
+        bail!(
+            "chat {} is {} and takes no more turns",
+            chat.short(),
+            chat.status.as_str()
+        );
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        bail!("nothing to say");
+    }
     chat.turns.push(Turn {
         who: Who::Operator,
         body: text.to_owned(),
         at: Timestamp::now(),
     });
     store.put(chat)?;
+    Ok(text.to_owned())
+}
+
+/// The agent's half of a turn: invoke, append, flush.
+///
+/// Pairs with [`record`]. `text` is the operator's message that this reply
+/// answers - the same string `record` returned, so the transcript and the
+/// prompt cannot disagree.
+pub async fn respond(chat: &mut Chat, store: &Chats, cfg: &Config, text: &str) -> Result<()> {
     turn(chat, store, cfg, text).await
 }
 

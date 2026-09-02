@@ -38,6 +38,9 @@ const API = {
   chat: (id) => `/api/chats/${encodeURIComponent(id)}`,
   say: (id) => `/api/chats/${encodeURIComponent(id)}/say`,
   file: (id) => `/api/chats/${encodeURIComponent(id)}/file`,
+  /* The loop itself: GET reports it, POST {running} starts or stops the one
+     inside this server. */
+  loop: "/api/loop",
   events: "/api/events",
 };
 
@@ -46,6 +49,17 @@ const RUN_LIMIT = 50;
    so asking twice per staleness window is enough to never show a false
    "running" for long. */
 const HEALTH_MS = 10000;
+/* How long this page keeps saying "stopping" on the strength of its own
+   request alone. A stop asked of an idle loop lands within one 5s poll and
+   the next view reports it, so this only has to outlast that \u2014 and it
+   must not be forever, or a request the server dropped would leave a strip
+   promising a stop that is never coming and no control to retry with. */
+const STOP_ASK_MS = 20000;
+/* How long a specific announcement holds the live region against the generic
+   "Updated." that follows a refresh. Long enough to cover the refresh a
+   change of state triggers, short enough that the next real refresh is still
+   announced. */
+const QUIET_HOLD_MS = 4000;
 
 /* ---- status vocabulary ------------------------------------------------- *
  * Every status carries a glyph as well as a colour. `stalled` additionally
@@ -365,6 +379,15 @@ function roundRail(pr) {
 const state = {
   route: { name: "runs", id: null },
   health: null,
+  /* The last LoopView seen. Health carries one too; this is what a POST to
+     /api/loop leaves behind, so the strip reflects a start or a stop before
+     the next health tick. */
+  loop: null,
+  /* When this page's own stop request was accepted, in epoch millis, or 0.
+     The server only reports `stopping` while a run is actually in flight: a
+     loop asked to stop while idle answers "still running" and goes quiet a
+     poll later, which without this looked like the tap had done nothing. */
+  stopAskedAt: 0,
   runs: null,
   queue: null,
   detail: { id: null, run: null, report: null },
@@ -388,7 +411,7 @@ const state = {
      is opaque, so a 404 inside it is indistinguishable from a rendered
      panel; this is the answer to that, asked once per question. */
   panelOk: new Map(),
-  rev: { queue: null, runs: null, questions: null, chats: null },
+  rev: { queue: null, runs: null, questions: null, chats: null, loop: null },
   streamOpen: false,
   wrap: false,
 };
@@ -440,47 +463,193 @@ function ok() {
   show($("alert"), false);
 }
 
+/* When something specific was last announced. A refresh finishing says only
+   "Updated.", and it was landing in the live region a fraction of a second
+   after a sentence that mattered \u2014 "Loop stopped." \u2014 which for a
+   screen reader means the sentence was never read at all. */
+let saidAt = 0;
+
 function announce(message) {
+  saidAt = Date.now();
   setText($("live"), message);
 }
 
-/* ---- daemon strip ------------------------------------------------------ */
-function renderDaemon() {
+/* A courtesy announcement: it is skipped rather than allowed to overwrite a
+   specific one that is still being read. */
+function announceQuietly(message) {
+  if (Date.now() - saidAt < QUIET_HOLD_MS) return;
+  setText($("live"), message);
+}
+
+/* ---- loop strip -------------------------------------------------------- *
+ * The loop runs inside this server, so this strip is both the report and the
+ * control. Before it was, a task filed from a phone sat in the queue until
+ * somebody reached a keyboard and typed `magi serve`, and the strip's own
+ * wording said so — which is the one place this product still sent its
+ * operator to a terminal.
+ *
+ * Every branch below ends in a sentence about whether anything is going to
+ * happen, because that is the question being asked, and the states differ in
+ * what the answer costs: `waiting` needs a tap, `stopping` needs patience,
+ * and a loop this page does not own needs neither. */
+
+/* Tasks the loop could claim right now, or null while the queue has not
+   answered yet. Counted from the queue this page already holds rather than
+   from health, because "off, with two tasks waiting" is the state that has to
+   be right the moment it becomes true. */
+function runnableTasks() {
+  if (state.queue === null) return null;
+  return state.queue.filter((task) => (task.status_str || task.status) === "queued").length;
+}
+
+/* The run the loop is on, as a link when there is one to point at. */
+function currentRunLink(daemon) {
+  const id = daemon.current && daemon.current.run;
+  if (!id) return null;
+  return el("a", {
+    class: "daemon-run",
+    href: `#/runs/${id}`,
+    text: shortId(id),
+    title: `run ${id}`,
+  });
+}
+
+/* What starting the loop is about to do. Said in full next to the button
+   rather than hidden behind a confirmation: starting is safe to repeat, but
+   it opens an implementation competition, and an operator who did not know
+   that would be surprised by the bill and not by the interface. */
+function startCost(loop) {
+  const mode = typeof loop.merge === "string" && loop.merge
+    ? ` Merges as \u2018${loop.merge}\u2019.`
+    : "";
+  return `It claims the highest-priority task and runs an implementation competition, which spends agent calls.${mode}`;
+}
+
+function renderLoop() {
   const box = $("daemon");
   const text = box.querySelector(".daemon-text");
+  const why = $("loop-why");
+  const button = $("loop-toggle");
+
+  const quiet = (note) => {
+    setText(why, note || "");
+    show(why, Boolean(note));
+    show(button, false);
+    button.onclick = null;
+  };
+
+  const control = (kind, label, note) => {
+    setText(why, note);
+    show(why, true);
+    setAttr(button, "data-kind", kind);
+    setText(button, label);
+    show(button, true);
+    button.disabled = false;
+    button.onclick = () => setLoop(kind === "start");
+  };
 
   if (!state.health) {
     setAttr(box, "data-state", null);
+    setAttr(box, "data-owned", null);
     setText(text, "Connecting\u2026");
+    quiet(null);
     return;
   }
 
-  const daemon = state.health.daemon || {};
+  const loop = state.health.loop || state.loop || {};
+  const daemon = loop.daemon || state.health.daemon || {};
   clear(text);
 
-  if (!daemon.running) {
-    setAttr(box, "data-state", "down");
+  /* `completed` is null until the loop has written a heartbeat, and "0 tasks
+     done" is a different claim from "not reporting yet", so the count is
+     omitted rather than guessed. */
+  const done = Number(daemon.completed);
+  const tail = Number.isFinite(done) ? ` \u00b7 ${plural(done, "task done", "tasks done")}` : "";
+  /* Running at all, from either side: `loop.running` is this process's own
+     flag and flips the instant a start is accepted, while `daemon.running`
+     comes from the heartbeat file and lags it by up to a poll. Trusting only
+     the file showed "Loop is off", with a Start button, for seconds after the
+     operator had already started it. */
+  const running = Boolean(loop.running) || Boolean(daemon.running);
+  /* A loop somebody else's process owns. It is reported by the heartbeat
+     (`daemon.running`) while this process's own flag stays false, which is
+     also why `running` above is not enough to tell the two apart. */
+  const foreign = Boolean(daemon.running) && loop.owned === false && !loop.running;
+  setAttr(box, "data-owned", foreign ? "no" : null);
+
+  /* Asked to stop. Two shapes reach here, and both are checked before
+     `running`, because the loop is still running while it winds down:
+
+     `loop.stopping` is the server saying a run is in flight, which it will
+     finish \u2014 killing the graph mid-node would leave worktrees, branches
+     and agent sessions behind and throw away calls already paid for, so magi
+     does not do it, and this can last tens of minutes.
+
+     A stop asked of an idle loop never reports `stopping` at all: it answers
+     "still running" and goes quiet within a poll. Without `stopAskedAt` that
+     read as a button that did nothing, so this page remembers its own
+     request \u2014 bounded, so a request that somehow did not take gives the
+     control back instead of claiming forever that a stop is coming. */
+  const asked = !foreign && state.stopAskedAt > 0 && Date.now() - state.stopAskedAt < STOP_ASK_MS;
+  if (running && (loop.stopping || asked)) {
+    setAttr(box, "data-state", "stopping");
+    const link = loop.stopping ? currentRunLink(daemon) : null;
     text.append(
-      el("b", { text: "Loop not running." }),
-      " Queued tasks wait until \u2018magi serve\u2019 is started.",
+      el("b", { text: "Stopping." }),
+      loop.stopping
+        ? [link ? " It is finishing run " : " It is finishing the run it is on", link, " first, and will not abandon it."]
+        : " It stops as soon as it finishes the poll it is on.",
     );
+    quiet(loop.stopping
+      ? `Nothing new will be claimed after it${tail}. You can start it again once it has stopped.`
+      : `Nothing new will be claimed${tail}. This takes a few seconds when no run is in flight.`);
     return;
   }
 
-  const done = Number(daemon.completed) || 0;
-  const tail = ` \u00b7 ${plural(done, "task done", "tasks done")}`;
+  if (!running) {
+    const waiting = runnableTasks();
+    const error = typeof loop.last_error === "string" && loop.last_error.trim() ? loop.last_error : null;
+
+    /* The loop died rather than being stopped. Kept until the next start
+       clears it, and it is the only way somebody holding a phone learns the
+       difference \u2014 so it is rendered as its own state, in the fault
+       colour the two ordinary "off" states deliberately avoid. */
+    if (error) {
+      setAttr(box, "data-state", "failed");
+      text.append(el("b", { text: "The loop stopped on an error." }), " ", error);
+      control("start", "Start the loop again", `${waiting ? `${plural(waiting, "task", "tasks")} still waiting. ` : ""}Starting it clears this error. ${startCost(loop)}`);
+      return;
+    }
+
+    if (waiting) {
+      /* The state this strip exists for. Gold, not rust: the loop being off
+         is not a fault, it is a tap away \u2014 and a fault colour here taught
+         the operator to ignore the one band that needed them. */
+      setAttr(box, "data-state", "waiting");
+      text.append(
+        el("b", { text: `${plural(waiting, "task", "tasks")} waiting.` }),
+        " The loop is off, so nothing will be claimed until you start it.",
+      );
+      control("start", "Start the loop", startCost(loop));
+      return;
+    }
+    setAttr(box, "data-state", "off");
+    text.append(
+      el("b", { text: "Loop is off." }),
+      waiting === null
+        ? " Nothing has been claimed."
+        : " Nothing is queued, so nothing is waiting.",
+    );
+    control("start", "Start the loop", `${startCost(loop)} Until one is filed it just watches the queue.`);
+    return;
+  }
 
   if (daemon.current && daemon.current.run) {
     setAttr(box, "data-state", "working");
     text.append(
       el("b", { text: "Working" }),
       " on ",
-      el("a", {
-        class: "daemon-run",
-        href: `#/runs/${daemon.current.run}`,
-        text: shortId(daemon.current.run),
-        title: `run ${daemon.current.run}`,
-      }),
+      currentRunLink(daemon),
       daemon.current.task
         ? el("span", { class: "daemon-run", text: ` \u2190 task ${shortId(daemon.current.task)}` })
         : null,
@@ -488,10 +657,95 @@ function renderDaemon() {
     );
   } else if (daemon.idle) {
     setAttr(box, "data-state", "idle");
-    text.append(el("b", { text: "Loop idle." }), " Nothing runnable in the queue.", tail);
-  } else {
+    text.append(el("b", { text: "Loop idle." }), ` Nothing runnable in the queue${tail}.`);
+  } else if (daemon.running) {
     setAttr(box, "data-state", "working");
-    text.append(el("b", { text: "Working." }), " Claiming a task.", tail);
+    text.append(el("b", { text: "Working." }), ` Claiming a task${tail}.`);
+  } else {
+    /* Started here, no heartbeat on disk yet. Said as its own sentence rather
+       than borrowed from `idle`, because "nothing runnable in the queue" would
+       be a claim about the queue that nothing has checked. */
+    setAttr(box, "data-state", "working");
+    text.append(el("b", { text: "Started." }), " Waiting for the loop\u2019s first heartbeat.");
+  }
+
+  /* Someone started the loop in another process. Both endpoints answer 409
+     for a loop this one does not own, so no button is offered: a control that
+     silently fails is worse than none. The queue is being drained either way,
+     which is the part the operator actually needs to know. */
+  if (foreign) {
+    const pid = Number(daemon.pid);
+    quiet(`${Number.isFinite(pid) && pid ? `Process ${pid} owns` : "Another process owns"} this loop, so this page can watch it but not stop it. The queue is being drained regardless \u2014 nothing is waiting on you.`);
+    return;
+  }
+
+  /* Two different promises, because they are two different facts: with a run
+     in flight the operator is being told they will wait for it, and with none
+     they are being told there is nothing to wait for. */
+  control("stop", "Stop the loop", daemon.current && daemon.current.run
+    ? "It finishes the run it is on first, then stops claiming. Nothing in flight is abandoned."
+    : "It stops claiming new tasks. Nothing is in flight, so nothing is interrupted.");
+}
+
+/* Start or stop the loop in this server. Neither direction is guarded by a
+   second tap: starting is repeatable and stopping is not destructive.
+
+   Neither direction is believed on request, either. A stop is accepted while
+   the loop is still running \u2014 reported as `stopping` when a run is in
+   flight, and as plain "running" when there is none and it will go quiet a
+   poll later \u2014 so "stopped" is announced from a view where `running` has
+   actually gone false, not from the tap. A 409 is followed by a refetch,
+   which is what replaces a button this page cannot honour with the sentence
+   explaining why. */
+async function setLoop(running) {
+  const button = $("loop-toggle");
+  button.disabled = true;
+  setText(button, running ? "Starting\u2026" : "Stopping\u2026");
+  try {
+    const view = await postJson(API.loop, { running });
+    /* Set before applyLoop, so the render that follows already knows this
+       page asked \u2014 that is what puts an idle loop into `stopping`. */
+    state.stopAskedAt = running ? 0 : Date.now();
+    applyLoop(view);
+    ok();
+    announce(running
+      ? "Loop started. It claims the highest-priority task next."
+      : view.stopping
+        ? "Loop asked to stop. It finishes the run it is on first."
+        : "Loop asked to stop. It goes quiet within a few seconds.");
+  } catch (error) {
+    /* 409 is not a failure of this page: the loop is already running, or it
+       belongs to another process. The server's own message names which, and
+       the pid when there is one, so it is shown verbatim. */
+    fail(error.status === 409
+      ? `The loop did not change: ${error.message}`
+      : `Could not ${running ? "start" : "stop"} the loop: ${error.message}`);
+    await loadLoop();
+  } finally {
+    renderLoop();   /* restores the label, whichever way it went */
+  }
+}
+
+/* One place where a LoopView lands, so /api/loop and the `loop` block inside
+   /api/health cannot disagree about what is on screen. Also where a stop this
+   page asked for is finally confirmed: the loop going quiet is the event, and
+   it arrives on a later view rather than in the answer to the request. */
+function applyLoop(view) {
+  const stopped = state.stopAskedAt > 0 && view && !view.running && !view.stopping;
+  state.loop = view;
+  if (state.health) state.health.loop = view;
+  if (stopped) {
+    state.stopAskedAt = 0;
+    announce("Loop stopped.");
+  }
+  renderLoop();
+}
+
+async function loadLoop() {
+  try {
+    applyLoop(await getJson(API.loop));
+  } catch (error) {
+    fail(`Could not read the loop: ${error.message}`);
   }
 }
 
@@ -828,6 +1082,10 @@ function renderQueue() {
 
   show($("queue-empty"), tasks.length === 0);
   syncList(list, tasks, (t) => t.id, createTaskCard, updateTaskCard);
+  /* The strip's wording depends on how many tasks are runnable, so it is
+     re-rendered from the queue rather than only from health: "off, with two
+     tasks waiting" has to appear the moment the second one is filed. */
+  renderLoop();
 }
 
 /* ---- questions --------------------------------------------------------- *
@@ -1492,14 +1750,25 @@ function turnWho(turn) {
   return turn.who === "operator" ? "operator" : "agent";
 }
 
-/* Open first, newest first inside each group: the same rule as the question
-   list, for the same reason — the ones still needing the operator come
-   first, and the filed ones are the record. */
+/* Order by when a conversation STARTED, not when it was last touched.
+
+   Sorting on `updated_at` meant every agent reply lifted its conversation to
+   the top, so a list the operator was reading rearranged itself under their
+   finger — on a phone that reads as the screen switching on its own. Every
+   other list in this client is ordered by creation (runs and tasks both sort
+   on their ids, which begin with a timestamp) and none of them move; this was
+   the only one that did.
+
+   Recency still shows: the card carries its own timestamp and its unread
+   marker. Position is identity, and identity should not move because a model
+   answered. Open-before-filed stays, because a conversation only changes
+   status when the operator files it — a card moving then is a consequence of
+   something they just did. */
 function sortChats(list) {
   return list.slice().sort((a, b) => {
     const rank = (a.status === "open" ? 0 : 1) - (b.status === "open" ? 0 : 1);
-    const when_ = (chat) => Date.parse(chat.updated_at || chat.created_at) || 0;
-    return rank || when_(b) - when_(a);
+    const started = (chat) => Date.parse(chat.created_at) || 0;
+    return rank || started(b) - started(a);
   });
 }
 
@@ -1860,18 +2129,19 @@ async function sendTurn(event) {
   $("chat-wait").scrollIntoView({ block: "nearest" });
 
   try {
-    const fresh = await postJson(API.say(id), { text });
-    endTurn(id);
+    /* 202: the server has recorded the message and is running the turn. It
+       does NOT wait for the agent, because holding a connection open for the
+       23-to-90 seconds a real turn takes is a coin flip on a phone — a screen
+       lock or a network handoff dropped it, the browser said "Failed to fetch",
+       and the server finished the turn anyway. So the wait stays up and the
+       reply arrives the way everything else in this client arrives: the change
+       stream, or the ten-second re-read in `tickWait`. `loadChat` ends the turn
+       once the transcript has grown past `busyTurns`. */
+    const queued = await postJson(API.say(id), { text });
     if (state.chatDetail.id === id) {
-      state.chatDetail.chat = fresh;
+      state.chatDetail.chat = queued;
       renderChat();
-      const tail = chatTurns(fresh);
-      const last = tail.length ? tail[tail.length - 1] : null;
-      announce(last && turnWho(last) === "system"
-        ? "The interviewing agent could not answer. Its message is in the conversation."
-        : "The agent replied.");
-      const rows = $("chat-turns").children;
-      if (rows.length) rows[rows.length - 1].scrollIntoView({ block: "nearest" });
+      announce("Sent. The agent is answering.");
     }
     loadChats();
     ok();
@@ -1885,9 +2155,11 @@ async function sendTurn(event) {
       return;
     }
     endTurn(id);
-    chatError(`The turn could not be run: ${error.message}`);
-    /* Whatever the server did or did not record is the truth, not the
-       optimistic bubble above. */
+    /* The request itself failed, which now means it failed before the server
+       recorded anything — the response no longer waits for the agent. Reload
+       anyway and say so carefully: the transcript on disk is the truth, not
+       the optimistic bubble above. */
+    chatError(`The message may not have been sent: ${error.message}`);
     await loadChat(id);
   }
 }
@@ -2442,7 +2714,11 @@ async function loadQuestions() {
 async function loadHealth({ applyRevisions = false } = {}) {
   try {
     state.health = await getJson(API.health);
-    renderDaemon();
+    /* Through applyLoop rather than a bare render, so a loop that went quiet
+       between ticks is confirmed here too: with the stream up, this interval
+       is the only thing that asks. */
+    if (state.health.loop) applyLoop(state.health.loop);
+    else renderLoop();
     /* health.questions_open is the count until /api/questions has answered,
        so the indicator is right on the very first paint. */
     renderAskBar();
@@ -2504,9 +2780,20 @@ async function applyRevisions_(source) {
     jobs.push(loadChats());
     if (state.route.name === "chat" && state.chatDetail.id) jobs.push(loadChat(state.chatDetail.id));
   }
+  /* Bumped by this process whenever the loop it owns starts, stops, claims or
+     finishes, so a phone learns about a tap it did not make. Guarded on the
+     field existing: a payload without it must not refetch every tick. */
+  if (source.loop_rev !== undefined && source.loop_rev !== state.rev.loop) {
+    state.rev.loop = source.loop_rev;
+    jobs.push(loadLoop());
+  }
   if (jobs.length) {
+    const saidBefore = saidCount;
     await Promise.allSettled(jobs);
-    announce("Updated.");
+    /* Only the generic word, and only when nothing better was said: a job in
+       this batch may have announced the loop stopping, and overwriting that
+       with "Updated." would be the one sentence the operator needed lost. */
+    if (saidCount === saidBefore) announce("Updated.");
   }
 }
 
@@ -2762,6 +3049,8 @@ async function boot() {
     state.rev.runs = state.health.runs_rev;
     state.rev.questions = state.health.questions_rev;
     state.rev.chats = state.health.chats_rev;
+    state.rev.loop = state.health.loop_rev;
+    if (state.health.loop) state.loop = state.health.loop;
   }
   await Promise.allSettled([loadRuns(), loadQueue(), loadQuestions(), loadChats()]);
 
