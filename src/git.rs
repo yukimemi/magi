@@ -296,13 +296,17 @@ pub async fn push(repo: &Path, remote: &str, branch: &str) -> Result<GitOut> {
 
 /// Fetch one branch from `remote`, updating its remote-tracking ref.
 ///
-/// The refspec is spelled out on purpose. `git fetch <remote> <branch>` writes
-/// `FETCH_HEAD` and only *opportunistically* updates
-/// `refs/remotes/<remote>/<branch>` - some git versions do, some write nothing
-/// but `FETCH_HEAD`. On the version this was written against it worked; on the
-/// CI runners' version it did not, so a run silently fell back to the stale
-/// local tip, which is the exact bug the fetch exists to prevent. Naming the
-/// destination makes the update the point rather than a side effect.
+/// The refspec is spelled out rather than left to `git fetch <remote>
+/// <branch>`, which writes `FETCH_HEAD` and updates
+/// `refs/remotes/<remote>/<branch>` only as a side effect of the remote's
+/// configured refspec. Naming the destination makes the thing this function
+/// exists for - a tracking ref that moved - the operation rather than a
+/// consequence of configuration magi does not own.
+///
+/// Honest note: a CI failure was first read as proof that some git versions do
+/// not update the tracking ref here. That was wrong - the fetch had nothing to
+/// update because the test had pushed to the wrong branch - so this is
+/// determinism, not a fix for a demonstrated portability bug.
 ///
 /// Refs, not the working copy: nothing is checked out and no local branch
 /// moves, so this is safe to run while the operator has uncommitted work.

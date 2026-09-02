@@ -143,7 +143,21 @@ async fn a_run_branches_off_what_the_remote_has_not_a_stale_local_ref() {
         ],
         &clone,
     );
-    git(&["push", "--quiet", "origin", "HEAD"], &clone);
+    // Push to the base branch by name. `git push origin HEAD` pushes to the
+    // *clone's* branch, and a bare repo created by `git init --bare` has its
+    // HEAD on whatever `init.defaultBranch` says - `master` on the CI runners,
+    // `main` here. The clone therefore landed its commit on `master` while the
+    // test went on asserting about `main`, which looked like the product
+    // failing to fetch.
+    git(
+        &[
+            "push",
+            "--quiet",
+            "origin",
+            &format!("HEAD:refs/heads/{base}"),
+        ],
+        &clone,
+    );
     let remote_tip = git(&["rev-parse", "HEAD"], &clone);
 
     let local_tip = git(&["rev-parse", &base], &fx.repo);
