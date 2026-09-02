@@ -58,9 +58,19 @@ use crate::run::{RunState, RunStatus};
 pub const SCHEMA: u32 = 1;
 
 /// How often the status file is refreshed. A reader treats a status file older
-/// than 30 seconds as "no daemon", so the heartbeat has to be brisk enough
+/// than [`STALE_SECS`] as "no daemon", so the heartbeat has to be brisk enough
 /// that a busy daemon is never mistaken for a dead one.
 pub const HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// How old a heartbeat may be before a reader calls the daemon dead. Six
+/// missed beats: long enough to survive a slow filesystem, short enough that
+/// a crashed daemon is not still reported as running a task.
+///
+/// The single threshold every reader shares — the web UI's `/api/health` and
+/// `magi doctor` both call [`Reading::running`] rather than each comparing
+/// against their own copy of this number, so a crashed daemon cannot look
+/// alive on one screen and dead on another.
+pub const STALE_SECS: i64 = 30;
 
 /// Default queue poll interval.
 pub const POLL: Duration = Duration::from_secs(5);
@@ -71,7 +81,8 @@ pub const POLL: Duration = Duration::from_secs(5);
 pub const STALE_CLAIM: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// What the loop is working on, for the status file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Current {
     /// Task id being run.
     pub task: String,
@@ -189,6 +200,63 @@ pub fn write_status_to(path: &Path, status: &Status) -> Result<()> {
 /// "no daemon" rather than as a daemon whose heartbeat merely stopped.
 pub fn clear_status() {
     let _ = std::fs::remove_file(status_path());
+}
+
+/// The daemon's published state, read permissively.
+///
+/// This mirrors [`Status`], but is a separate declaration on purpose: every
+/// field defaults, so a status file from an older or newer magi still yields
+/// a usable reading — one this build has never heard of — instead of a parse
+/// error that hides the daemon entirely.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Reading {
+    /// Format version the daemon claims.
+    pub schema: u32,
+    /// Daemon process id, for an operator who wants to stop it.
+    pub pid: Option<u32>,
+    /// When that process started.
+    pub started_at: Option<Timestamp>,
+    /// Last heartbeat. Absent means the file is unusable, hence not running.
+    pub updated_at: Option<Timestamp>,
+    /// True when the queue had nothing runnable at the last poll.
+    pub idle: bool,
+    /// What the daemon is working on.
+    pub current: Option<Current>,
+    /// Tasks this daemon process has finished.
+    pub completed: u64,
+    /// Queue polls this daemon process has made.
+    pub polls: u64,
+}
+
+impl Reading {
+    /// Seconds since the last heartbeat, or `None` when there has never been
+    /// one.
+    #[must_use]
+    pub fn age_secs(&self, now: Timestamp) -> Option<i64> {
+        self.updated_at
+            .map(|at| (now.as_second() - at.as_second()).max(0))
+    }
+
+    /// Whether the loop counts as running: a heartbeat no older than
+    /// [`STALE_SECS`]. The alternative is a reader that claims a task is in
+    /// progress hours after the daemon that owned it was killed.
+    #[must_use]
+    pub fn running(&self, now: Timestamp) -> bool {
+        self.age_secs(now).is_some_and(|secs| secs <= STALE_SECS)
+    }
+}
+
+/// Read `<home>/daemon.json` permissively, or `None` when there is nothing
+/// usable there.
+///
+/// Missing, half-written and unparseable all collapse to `None`, because the
+/// only question a reader asks is whether a daemon is alive, and a file it
+/// cannot read is not evidence that one is.
+#[must_use]
+pub fn read_status(home: &Path) -> Option<Reading> {
+    let body = std::fs::read_to_string(home.join("daemon.json")).ok()?;
+    serde_json::from_str(&body).ok()
 }
 
 /// Remove claim files older than `older_than` and return the task ids swept.
@@ -779,6 +847,51 @@ mod tests {
             "the start time is not a heartbeat"
         );
         assert_eq!(second.polls, 3);
+    }
+
+    #[test]
+    fn reading_counts_as_running_only_while_its_heartbeat_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(read_status(dir.path()).is_none(), "no file, no daemon");
+
+        let mut status = Status::new();
+        status.updated_at = Timestamp::now() - jiff::SignedDuration::from_secs(60);
+        write_status_to(&dir.path().join("daemon.json"), &status).unwrap();
+        let stale = read_status(dir.path()).unwrap();
+        assert!(
+            !stale.running(Timestamp::now()),
+            "a minute without a heartbeat is a dead daemon, not a busy one"
+        );
+        assert!(stale.age_secs(Timestamp::now()).is_some_and(|s| s >= 55));
+
+        status.updated_at = Timestamp::now();
+        write_status_to(&dir.path().join("daemon.json"), &status).unwrap();
+        let fresh = read_status(dir.path()).unwrap();
+        assert!(fresh.running(Timestamp::now()));
+    }
+
+    #[test]
+    fn a_newer_status_file_still_yields_a_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        // A field this build has never heard of must not turn the reading into
+        // nothing at all; that is the whole reason the reader is permissive.
+        std::fs::write(
+            dir.path().join("daemon.json"),
+            serde_json::json!({
+                "schema": 2,
+                "updated_at": Timestamp::now().to_string(),
+                "idle": true,
+                "surprise": { "nested": [1, 2, 3] },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let reading = read_status(dir.path()).expect("a forward-compatible read");
+        assert!(reading.running(Timestamp::now()));
+        assert!(reading.idle);
+        assert_eq!(reading.current, None);
     }
 
     #[test]
