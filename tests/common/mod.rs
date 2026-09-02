@@ -50,10 +50,17 @@ set -e
 p="$MAGI_PROMPT_FILE"
 seat="$MAGI_SEAT"
 
-# Rate-limit simulation: a matching judge seat reports the same error shape a
-# real claude prints on quota exhaustion, and exits non-zero. The graph must
-# read this as "rate limited" — not a normal failure, not retried.
-if [ -n "$MOCK_QUOTA_SEAT" ] && { case ",$MOCK_QUOTA_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && grep -q "independent judges" "$p"; then
+# Rate-limit simulation: a matching seat reports the same error shape a real
+# claude prints on quota exhaustion, and exits non-zero. The graph must read
+# this as "rate limited" — not a normal failure, not retried.
+#
+# Deliberately NOT gated on which prompt arrived. A quota is a property of the
+# account, not of the question: an exhausted seat answers every prompt the same
+# way, including a retry nudge. Gating it on the judging prompt let the nudge
+# fall through to the implementation branch below, so a seat that had just been
+# rate limited answered a retry with a SUMMARY block claiming it created
+# note.txt — which looks like success, and hid the very retry this forbids.
+if [ -n "$MOCK_QUOTA_SEAT" ] && { case ",$MOCK_QUOTA_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
   printf '{"is_error":true,"terminal_reason":"api_error","result":"You'\''ve hit your session limit","session_id":"quota-test"}\n'
   exit 1
 fi
