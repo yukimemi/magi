@@ -81,3 +81,21 @@ base = "main"
 
 [update]
 mode = "notify"
+
+# Project conventions appended to the node prompts, never merged into them.
+# Repository-wide context lives in AGENTS.md, which every agent already reads
+# from the checkout; these are the things a magi *node* needs to know.
+[prompts]
+all = """
+This repository uses jj (Jujutsu) with a colocated git repo. `git commit` works \
+in a candidate worktree and is what magi expects, but never run `jj` commands \
+and never touch the main working copy.
+Verify with `RUSTUP_TOOLCHAIN=stable cargo make check`: the environment here \
+pins an older toolchain than CI uses, so a lint that fails CI is invisible \
+without it.
+"""
+review = """
+Formatting is not a finding: `cargo fmt` runs in the gate. Spend the round on \
+correctness, on invariants the code claims and does not keep, and on tests that \
+assert plumbing rather than behaviour.
+"""
