@@ -8,10 +8,23 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use magi::config::{
     AgentKind, AgentSpec, Blind, Config, Graph, Merge, MergeMode, Roles, Update, UpdateMode, Verify,
 };
+
+/// `set_home` is a process-wide global, so scenes that share one test binary
+/// (multiple runs, includes a `--resume`) must not run concurrently or they
+/// will clobber each other's run directory. Take one of these for the life of
+/// the test to serialize them. Async-aware because the guard is held across
+/// the `execute` awaits.
+static HOME_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Hold for the duration of a test that touches a magi run.
+pub async fn home_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    HOME_LOCK.lock().await
+}
 
 /// Judge behaviour for a scenario.
 pub enum Judges {
@@ -36,6 +49,30 @@ const MOCK: &str = r#"#!/bin/sh
 set -e
 p="$MAGI_PROMPT_FILE"
 seat="$MAGI_SEAT"
+
+# Rate-limit simulation: a matching seat reports the same error shape a real
+# claude prints on quota exhaustion, and exits non-zero. The graph must read
+# this as "rate limited" — not a normal failure, not retried.
+#
+# Deliberately NOT gated on which prompt arrived. A quota is a property of the
+# account, not of the question: an exhausted seat answers every prompt the same
+# way, including a retry nudge. Gating it on the judging prompt let the nudge
+# fall through to the implementation branch below, so a seat that had just been
+# rate limited answered a retry with a SUMMARY block claiming it created
+# note.txt — which looks like success, and hid the very retry this forbids.
+if [ -n "$MOCK_QUOTA_SEAT" ] && { case ",$MOCK_QUOTA_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+  printf '{"is_error":true,"terminal_reason":"api_error","result":"You'\''ve hit your session limit","session_id":"quota-test"}\n'
+  exit 1
+fi
+
+# Ordinary-failure simulation: a matching judge seat produces no usable output
+# and exits non-zero — distinctly NOT the rate-limit shape above, so the graph
+# must treat it as a plain failure (retried the configured number of times),
+# meanwhile still collapsing the quorum if enough seats drop.
+if [ -n "$MOCK_FAILED_SEAT" ] && { case ",$MOCK_FAILED_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && grep -q "independent judges" "$p"; then
+  echo 'not a ranking at all'
+  exit 1
+fi
 
 if grep -q "Final vote" "$p"; then
   printf '```json\n{"vote":"%s","reason":"mock final vote"}\n```\n' "$MOCK_VOTE"
@@ -191,4 +228,29 @@ pub fn fixture(judges: Judges, require_fix: bool) -> Fixture {
     };
 
     Fixture { tmp, repo, config }
+}
+
+/// Like [`fixture`], but the given judge seats hit a simulated rate limit at
+/// their initial ranking. `Judges::Unanimous` keeps the surviving judges
+/// agreeing, so the only variable left is how many seats remain.
+pub fn fixture_with_quota(quota_seats: &[&str]) -> Fixture {
+    let mut fx = fixture(Judges::Unanimous, false);
+    let value = quota_seats.join(",");
+    for a in &mut fx.config.agents {
+        a.env.insert("MOCK_QUOTA_SEAT".to_owned(), value.clone());
+    }
+    fx
+}
+
+/// Like [`fixture`], but the given judge seats fail with a *plain* error (no
+/// usable output) at their initial ranking — the non-quota counterpart to
+/// [`fixture_with_quota`]. Enough of these collapse the quorum the same way a
+/// rate limit does.
+pub fn fixture_with_failure(failed_seats: &[&str]) -> Fixture {
+    let mut fx = fixture(Judges::Unanimous, false);
+    let value = failed_seats.join(",");
+    for a in &mut fx.config.agents {
+        a.env.insert("MOCK_FAILED_SEAT".to_owned(), value.clone());
+    }
+    fx
 }

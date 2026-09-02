@@ -22,7 +22,12 @@ use crate::verdict::{Finding, Rejection};
 
 /// On-disk format version. Bumped when a field changes meaning, so a resumed
 /// run never half-reads a state file written by a different magi.
-pub const SCHEMA: u32 = 1;
+///
+/// 2: added `RunStatus::Stalled`, `RunState::quota` (rate-limit losses), and
+/// the quorum fields on `Tally`. `RunState::load` already fails loudly and
+/// clearly on a schema mismatch; an old `run.json` from schema 1 now says so
+/// instead of silently half-reading.
+pub const SCHEMA: u32 = 2;
 
 /// Where a run got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +51,11 @@ pub enum RunStatus {
     Merged,
     /// Winner passed the gate; merge was not requested.
     Ready,
+    /// The judgement did not gather enough judges (e.g. rate limiting took out
+    /// seats), so the verdict is not trustworthy. The run stopped and kept its
+    /// work so it can be resumed or folded — it must never be confused with a
+    /// healthy `Ready`.
+    Stalled,
     /// Review rounds exhausted with findings still open, or the gate failed.
     Blocked,
     /// The graph could not complete.
@@ -57,7 +67,7 @@ impl RunStatus {
     pub fn done(self) -> bool {
         matches!(
             self,
-            Self::Merged | Self::Ready | Self::Blocked | Self::Failed
+            Self::Merged | Self::Ready | Self::Stalled | Self::Blocked | Self::Failed
         )
     }
 }
@@ -180,6 +190,21 @@ pub struct VoteRecord {
     pub changed: bool,
 }
 
+/// A seat that was taken out by a CLI rate limit / quota, recorded so a run
+/// whose panel collapsed does not masquerade as a healthy one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaLoss {
+    /// Seat key, e.g. `judge-1` or `review-2`.
+    pub seat: String,
+    /// Node that was running, e.g. `judge`, `vote`, `review`.
+    pub node: String,
+    /// When the CLI reported the limit.
+    pub at: Timestamp,
+    /// Reset hint if the CLI printed one, free text.
+    #[serde(default)]
+    pub reset: Option<String>,
+}
+
 /// The mechanical count.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tally {
@@ -204,6 +229,22 @@ pub struct Tally {
     /// How the tie was broken, when it had to be.
     #[serde(default)]
     pub tie_break: Option<String>,
+    /// Configured judge count — the size of the full panel.
+    #[serde(default)]
+    pub judges: usize,
+    /// Judges who actually contributed to the decision (not taken out by a
+    /// rate limit and producing a usable rank or vote).
+    #[serde(default)]
+    pub present: usize,
+    /// How many judges are required for a trustworthy verdict. Chosen as a
+    /// strict majority (`judges / 2 + 1`): a verdict backed by a minority must
+    /// never be presented as a healthy one, while a bare majority is still
+    /// real signal. A one-candidate run needs no quorum.
+    #[serde(default)]
+    pub quorum: usize,
+    /// `present >= quorum`, or no quorum was required.
+    #[serde(default)]
+    pub met_quorum: bool,
 }
 
 /// One reviewer's report in a round.
@@ -375,6 +416,9 @@ pub struct RunState {
     /// Vendor tokens seen in judged material.
     #[serde(default)]
     pub leaks: Vec<Leak>,
+    /// Seats lost to a CLI rate limit / quota, in the order they hit.
+    #[serde(default)]
+    pub quota: Vec<QuotaLoss>,
     /// Per-seat conversation state.
     #[serde(default)]
     pub seats: BTreeMap<String, SeatState>,
@@ -416,6 +460,7 @@ impl RunState {
             gate: Vec::new(),
             merge: None,
             leaks: Vec::new(),
+            quota: Vec::new(),
             seats: BTreeMap::new(),
             events: Vec::new(),
         }

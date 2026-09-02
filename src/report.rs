@@ -50,11 +50,15 @@ fn cyan(t: &str) -> String {
 }
 
 /// Colour for a status word.
+///
+/// `Stalled` is deliberately not green: a run whose judges were taken out by a
+/// rate limit must not look like a healthy `Ready` in a one-line listing.
 fn status_word(status: RunStatus) -> String {
     let text = format!("{status:?}").to_lowercase();
     match status {
         RunStatus::Merged => bold(&green(&text)),
         RunStatus::Ready => green(&text),
+        RunStatus::Stalled => bold(&yellow(&text)),
         RunStatus::Blocked => yellow(&text),
         RunStatus::Failed => red(&text),
         _ => cyan(&text),
@@ -68,8 +72,21 @@ pub fn line(state: &RunState) -> String {
         .as_ref()
         .map_or("-".to_owned(), |t| t.winner.to_string());
     let agent = state.winner().map_or("-", |c| c.agent.as_str());
+    // A below-quorum verdict carries an explicit stamp so a row in a listing
+    // reads "stalled" and "2/3 judges" without opening the report.
+    let quorum = match state.tally.as_ref() {
+        Some(t) if !t.met_quorum => format!(
+            "  {}",
+            bold(&red(&format!("quorum {}/{}", t.present, t.judges)))
+        ),
+        Some(t) if t.present > 0 && t.present < t.judges => format!(
+            "  {}",
+            yellow(&format!("judges {}/{}", t.present, t.judges))
+        ),
+        _ => String::new(),
+    };
     format!(
-        "{}  {:<20}  {:>2}c {:>2}j  win {} ({})  {}",
+        "{}  {:<20}  {:>2}c {:>2}j  win {} ({}){quorum}  {}",
         dim(&state.id),
         status_word(state.status),
         state.candidates.len(),
@@ -198,6 +215,41 @@ pub fn run(state: &RunState) -> String {
         }
 
         let _ = writeln!(s, "\n{}", bold("tally"));
+        if t.judges > 0 {
+            let _ = writeln!(
+                s,
+                "  judges        {} present{}",
+                if t.met_quorum {
+                    green(&format!("{}/{}", t.present, t.judges))
+                } else {
+                    red(&format!("{}/{}", t.present, t.judges))
+                },
+                if t.quorum > 0 {
+                    format!(" ({quorum} required)", quorum = t.quorum)
+                } else {
+                    String::new()
+                }
+            );
+        }
+        if !t.met_quorum {
+            let _ = writeln!(
+                s,
+                "  {}",
+                bold(&red("BELOW QUORUM — verdict is not trustworthy"))
+            );
+        }
+        if !state.quota.is_empty() {
+            let _ = writeln!(
+                s,
+                "  rate limited  {}",
+                state
+                    .quota
+                    .iter()
+                    .map(|q| q.seat.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         let _ = writeln!(
             s,
             "  first choice  {}",
@@ -477,6 +529,10 @@ mod tests {
             changed_votes: 0,
             unanimous_final: true,
             tie_break: None,
+            judges: 3,
+            present: 3,
+            quorum: 2,
+            met_quorum: true,
         });
         s
     }

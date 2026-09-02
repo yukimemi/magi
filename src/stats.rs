@@ -371,6 +371,10 @@ mod tests {
             changed_votes: 1,
             unanimous_final: true,
             tie_break: None,
+            judges: 3,
+            present: 3,
+            quorum: 2,
+            met_quorum: true,
         });
         s.reviews = reviews;
         s.status = status;

@@ -93,7 +93,14 @@ impl Filter {
             Self::All => true,
             Self::Active => !status.done(),
             Self::Done => matches!(status, RunStatus::Merged | RunStatus::Ready),
-            Self::Attention => matches!(status, RunStatus::Blocked | RunStatus::Failed),
+            // A stalled run wants a human even though it is terminal, so it
+            // surfaces under "attention", not "done".
+            Self::Attention => {
+                matches!(
+                    status,
+                    RunStatus::Stalled | RunStatus::Blocked | RunStatus::Failed
+                )
+            }
         }
     }
 }
@@ -242,7 +249,7 @@ impl App {
         for l in &self.runs {
             match l.state.status {
                 RunStatus::Merged | RunStatus::Ready => c.done += 1,
-                RunStatus::Blocked | RunStatus::Failed => c.attention += 1,
+                RunStatus::Stalled | RunStatus::Blocked | RunStatus::Failed => c.attention += 1,
                 _ => c.active += 1,
             }
         }
@@ -445,6 +452,9 @@ fn status_style(status: RunStatus) -> Style {
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
         RunStatus::Ready => Style::default().fg(Color::Green),
+        RunStatus::Stalled => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
         RunStatus::Blocked => Style::default().fg(Color::Yellow),
         RunStatus::Failed => Style::default().fg(Color::Red),
         _ => Style::default().fg(Color::Cyan),
@@ -893,6 +903,10 @@ mod tests {
             changed_votes: 0,
             unanimous_final: true,
             tie_break: None,
+            judges: 3,
+            present: 3,
+            quorum: 2,
+            met_quorum: true,
         });
         let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
         terminal.draw(|f| draw(f, &mut a)).unwrap();

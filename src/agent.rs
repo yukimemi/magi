@@ -103,6 +103,19 @@ pub struct Invocation<'a> {
     pub stem: &'a str,
 }
 
+/// Evidence that a CLI ran out of its rate limit / quota, distinct from an
+/// ordinary failure.
+///
+/// `reset` is free text: CLIs render the reset time in their own locale, and
+/// parsing it exactly would be a bug factory. When it is not readable we say
+/// nothing rather than invent a format.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Quota {
+    /// Human-readable reset time, when the CLI printed one.
+    #[serde(default)]
+    pub reset: Option<String>,
+}
+
 /// Result of an agent invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentOutput {
@@ -116,12 +129,22 @@ pub struct AgentOutput {
     pub duration_ms: u64,
     /// Artifact file names, relative to the run's `artifacts/` directory.
     pub artifacts: Vec<String>,
+    /// Rate-limit / quota exhaustion, when it can be told apart from a normal
+    /// failure. `None` for a normal failure, a timeout, or a CLI we cannot
+    /// read — the conservative default.
+    #[serde(default)]
+    pub quota: Option<Quota>,
 }
 
 impl AgentOutput {
     /// Did the CLI exit cleanly with something to say?
     pub fn usable(&self) -> bool {
         !self.timed_out && self.exit_code == Some(0) && !self.text.trim().is_empty()
+    }
+
+    /// Did this invocation run out of the CLI's rate limit / quota?
+    pub fn quota_exhausted(&self) -> bool {
+        self.quota.is_some()
     }
 }
 
@@ -231,6 +254,7 @@ pub async fn invoke(
             file_name(&out_path),
             file_name(&err_path),
         ],
+        quota: extracted.quota,
     })
 }
 
@@ -410,6 +434,7 @@ struct Extracted {
     text: String,
     session: Option<String>,
     status: Option<String>,
+    quota: Option<Quota>,
 }
 
 /// Pull the agent's message (and any session id) out of a CLI's stdout.
@@ -439,6 +464,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                         "success".to_owned()
                     }
                 }),
+                quota: claude_quota(&v),
             }
         }
         AgentKind::Opencode => {
@@ -469,6 +495,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 text,
                 session,
                 status: None,
+                quota: None,
             }
         }
         AgentKind::Antigravity => {
@@ -496,13 +523,51 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                     .and_then(|s| s.as_str())
                     .map(str::to_owned),
                 status: v.get("status").and_then(|s| s.as_str()).map(str::to_owned),
+                quota: None,
             }
         }
-        AgentKind::Command => Extracted {
-            text: stdout.trim().to_owned(),
-            ..Extracted::default()
-        },
+        AgentKind::Command => {
+            // A `command` agent may wrap a subscription CLI (a fixture, or a
+            // thin shim around `claude`). If its output is the claude error
+            // shape we recognise the quota the same way, so tests and wrappers
+            // do not need their own detection; anything else is just text.
+            let quota = serde_json::from_str::<serde_json::Value>(stdout.trim())
+                .ok()
+                .and_then(|v| claude_quota(&v));
+            Extracted {
+                text: stdout.trim().to_owned(),
+                session: None,
+                status: None,
+                quota,
+            }
+        }
     }
+}
+
+/// Recognise claude's rate-limit error shape, when it is present.
+///
+/// The only output we have observed is the JSON object carrying `is_error:
+/// true` and a `result` mentioning the session limit. We key on exactly that;
+/// every other CLI (and any future shape) returns `None` and is treated as an
+/// ordinary failure — the conservative side.
+fn claude_quota(v: &serde_json::Value) -> Option<Quota> {
+    let is_err = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+    if !is_err {
+        return None;
+    }
+    let result = v.get("result").and_then(|r| r.as_str()).unwrap_or("");
+    if !result.to_lowercase().contains("session limit") {
+        return None;
+    }
+    // "…session limit · resets 4:50am (Asia/Tokyo)". The timezone read is not
+    // worth parsing exactly; keep the whole phrase after "resets" as free text.
+    let reset = result
+        .split("resets ")
+        .nth(1)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    Some(Quota { reset })
 }
 
 /// Preflight: which configured agents are not runnable here?
@@ -715,6 +780,64 @@ mod tests {
         assert_eq!(p.argv[0], "echo");
         assert_eq!(p.argv[1], "impl-A");
         assert_eq!(p.stdin.as_deref(), Some("do the thing"));
+    }
+
+    #[test]
+    fn claude_rate_limit_is_detected_and_reset_read_when_present() {
+        // The exact shape observed in the wild (run 20260831-031005-ae94).
+        let stdout = r#"{"is_error": true, "terminal_reason": "api_error",
+                        "result": "You've hit your session limit · resets 4:50am (Asia/Tokyo)",
+                        "session_id": "b8e928f1-754e-4bd3-86c5-0567763654e3"}"#;
+        let out = extract(AgentKind::Claude, stdout);
+        let quota = out.quota.as_ref().expect("rate limit must be detected");
+        assert_eq!(
+            quota.reset.as_deref(),
+            Some("4:50am (Asia/Tokyo)"),
+            "reset time read from the body"
+        );
+    }
+
+    #[test]
+    fn claude_rate_limit_without_a_readable_reset_is_still_detected() {
+        let out = extract(
+            AgentKind::Claude,
+            r#"{"is_error":true,"result":"session limit reached"}"#,
+        );
+        let quota = out.quota.expect("rate limit detected without a reset");
+        assert!(quota.reset.is_none(), "unknown reset is kept as unknown");
+    }
+
+    #[test]
+    fn ordinary_failures_are_never_quota() {
+        // A normal failed claude call (is_error with a different message).
+        let claude_fail = extract(
+            AgentKind::Claude,
+            r#"{"is_error":true,"result":"account does not exist"}"#,
+        );
+        assert!(claude_fail.quota.is_none());
+
+        // A command agent that exits 1 with plain text.
+        let cmd_fail = extract(AgentKind::Command, "boom");
+        assert!(cmd_fail.quota.is_none());
+
+        // A successful call is not quota even if it mentions the phrase.
+        let success = extract(
+            AgentKind::Command,
+            r#"{"is_error":false,"result":"session limit is fine"}"#,
+        );
+        assert!(success.quota.is_none());
+    }
+
+    #[test]
+    fn command_agent_can_carry_the_claude_quota_shape() {
+        let out = extract(
+            AgentKind::Command,
+            r#"{"is_error":true,"result":"You've hit your session limit · resets 1:00am (UTC)"}"#,
+        );
+        assert!(
+            out.quota.is_some(),
+            "a wrapper emitting the claude shape counts as quota"
+        );
     }
 
     #[test]
