@@ -51,6 +51,7 @@
   <nav class="rail" aria-label="Sections">
     <a class="rail-link" href="#/runs" data-nav="runs">Runs</a>
     <a class="rail-link" href="#/queue" data-nav="queue">Queue</a>
+    <a class="rail-link" href="#/questions" data-nav="questions">Questions<span class="badge" id="ask-badge-rail" hidden></span></a>
     <button class="btn btn-gold rail-new" type="button" data-compose>New task</button>
   </nav>
 
@@ -65,6 +66,20 @@
 <div class="daemon" id="daemon" role="status" aria-label="Daemon status">
   <span class="daemon-dot" aria-hidden="true"></span>
   <span class="daemon-text">Connecting…</span>
+</div>
+
+<!-- An unanswered question is the only state in this product where nothing at
+     all is happening and only a human can restart it, so it is announced on
+     every view rather than left for the operator to find. role="status" makes
+     the appearance itself the announcement; there is no separate live-region
+     message to double it up. -->
+<div class="ask-bar" id="ask-bar" role="status" hidden>
+  <span class="ask-mark" aria-hidden="true">?</span>
+  <span class="ask-bar-text">
+    <b class="ask-bar-count"></b>
+    <span class="ask-bar-summary"></span>
+  </span>
+  <a class="btn btn-gold ask-bar-go" href="#/questions">Answer</a>
 </div>
 
 <div class="alert" id="alert" role="alert" hidden>
@@ -105,6 +120,19 @@
          one column in source order. On a wide screen they become the analysis
          column and the sticky report column. -->
     <div class="run-main">
+      <!-- First in the column: while a question is open nothing below it is
+           going to change, so the operator should not have to scroll past a
+           verdict that will not arrive to find the thing blocking it. -->
+      <div class="panel panel-ask" id="run-ask-panel" hidden>
+        <h2><span id="run-ask-title">Waiting on you</span> <span class="count" id="run-ask-count"></span></h2>
+        <ol class="asks" id="run-asks"></ol>
+      </div>
+
+      <div class="panel" id="run-land-panel" hidden>
+        <h2>Landing</h2>
+        <div class="land" id="run-land"></div>
+      </div>
+
       <div class="panel" id="run-verdict" hidden>
         <h2>Verdict</h2>
         <div class="converge" id="converge"></div>
@@ -161,6 +189,20 @@
       <button class="btn btn-gold" type="button" data-compose>File a task</button>
     </p>
   </section>
+
+  <!-- QUESTIONS --------------------------------------------------------- -->
+  <section class="view" id="view-questions" aria-labelledby="questions-h" hidden>
+    <div class="view-head">
+      <h1 id="questions-h">Questions</h1>
+      <p class="view-sub" id="questions-count">Loading…</p>
+    </div>
+    <ol class="asks" id="questions-list"></ol>
+    <p class="empty" id="questions-empty" hidden>
+      No agent is waiting on a decision. When one asks, its run parks here
+      until you answer — and answered questions stay, as the record of what
+      you decided and when.
+    </p>
+  </section>
 </main>
 
 <!-- Bottom dock: the only navigation on a phone, because the top of a 390x844
@@ -183,6 +225,17 @@
       </svg>
     </span>
     <span>Queue</span>
+  </a>
+  <a class="dock-item" href="#/questions" data-nav="questions">
+    <span class="dock-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20.5 12c0 3.9-3.8 7-8.5 7-1 0-2-.15-2.9-.42L4.2 20.5l1.5-3.7C4.4 15.5 3.5 13.9 3.5 12c0-3.9 3.8-7 8.5-7s8.5 3.1 8.5 7z"/>
+        <path d="M9.9 9.7a2.2 2.2 0 1 1 3.3 2.1c-.75.44-1.2 1-1.2 1.8"/>
+        <path d="M12 15.8h.01"/>
+      </svg>
+      <span class="badge" id="ask-badge-dock" hidden></span>
+    </span>
+    <span>Questions</span>
   </a>
   <button class="dock-item dock-new" type="button" data-compose>
     <span class="dock-glyph" aria-hidden="true">

@@ -10,7 +10,7 @@ use magi::config::{Config, MergeMode};
 use magi::graph::{Runner, fold_run};
 use magi::queue::{self, Queue, Source, Task, TaskStatus};
 use magi::run::{RunState, latest_id, list_ids, resolve_id};
-use magi::{agent, daemon, report, stats, tui, updater, web};
+use magi::{agent, ask, daemon, plan, report, stats, tui, updater, web};
 
 /// Blind multi-agent implementation competition.
 #[derive(Debug, Parser)]
@@ -199,6 +199,60 @@ enum Command {
         /// Repository used by tasks filed without one.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+    },
+    /// Talk over an idea with a leader agent, then file the task it writes.
+    ///
+    /// magi hands your terminal to the agent's own interface for the interview
+    /// and takes it back to validate and queue the result. It does not
+    /// reimplement a chat window.
+    Plan {
+        /// A rough starting idea. Omit to start from nothing.
+        #[arg(value_name = "IDEA", trailing_var_arg = true)]
+        idea: Vec<String>,
+        /// Repository the task will be competed in.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Config file; defaults to <repo>/magi.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Roster agent id to interview with.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Higher runs first.
+        #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+        priority: i32,
+        /// File the draft without the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Ask the owner something and wait. Meant for agents inside a run.
+    Ask {
+        /// One-line question.
+        #[arg(long)]
+        summary: String,
+        /// Longer explanation, markdown. Reads stdin when omitted.
+        #[arg(long)]
+        detail: Option<String>,
+        /// An answer to offer; repeat for more. Omit for a free-text reply.
+        #[arg(long = "choice")]
+        choices: Vec<String>,
+        /// Seconds to wait. Defaults to the config's answer_timeout.
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Repository, for the config that supplies the notify command.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Answer a question an agent is waiting on.
+    Answer {
+        /// Question id or unambiguous prefix/suffix. Omit for the oldest open one.
+        id: Option<String>,
+        /// The answer: one of the offered choices, or free text.
+        #[arg(long, conflicts_with = "list")]
+        reply: Option<String>,
+        /// Show the open questions and stop.
+        #[arg(long)]
+        list: bool,
     },
     /// Check the environment and the resolved roster.
     Doctor {
@@ -513,6 +567,38 @@ async fn dispatch(command: Command) -> Result<()> {
             .await
         }
 
+        Command::Plan {
+            idea,
+            repo,
+            config,
+            agent,
+            priority,
+            yes,
+        } => {
+            let idea = idea.join(" ");
+            let task = plan::plan(plan::Opts {
+                idea: (!idea.trim().is_empty()).then_some(idea),
+                repo,
+                config,
+                agent,
+                priority,
+                yes,
+            })
+            .await?;
+            println!("filed {} {}", task.short(), task.title);
+            Ok(())
+        }
+
+        Command::Ask {
+            summary,
+            detail,
+            choices,
+            timeout,
+            repo,
+        } => ask_cmd(summary, detail, choices, timeout, &repo).await,
+
+        Command::Answer { id, reply, list } => answer_cmd(id, reply, list),
+
         Command::Task { command } => task_cmd(command).await,
 
         Command::Doctor { repo, config } => doctor(&repo, config.as_deref()).await,
@@ -627,6 +713,108 @@ async fn task_text(words: &[String], file: Option<&Path>, issue: Option<u64>) ->
         }
     }
     bail!("give a task: as arguments, --file, --issue, or on stdin");
+}
+
+/// `magi ask`: file a question and block until the owner answers.
+///
+/// This is the command an agent runs, so its exit status carries the outcome:
+/// zero with the answer on stdout, non-zero when nobody answered in time. An
+/// agent that cannot tell "the owner said Redis" from "the owner never came
+/// back" would happily implement a guess.
+async fn ask_cmd(
+    summary: String,
+    detail: Option<String>,
+    choices: Vec<String>,
+    timeout: Option<u64>,
+    repo: &Path,
+) -> Result<()> {
+    let detail = match detail {
+        Some(d) => d,
+        // Long explanations arrive on stdin for the same reason task bodies do:
+        // quoting markdown through a shell is how it gets mangled.
+        None if !std::io::stdin().is_terminal() => {
+            use std::io::Read as _;
+            let mut body = String::new();
+            std::io::stdin()
+                .read_to_string(&mut body)
+                .context("read the question detail from stdin")?;
+            body
+        }
+        None => String::new(),
+    };
+
+    // The run and seat come from the environment the graph set, so a question
+    // is attributed to the seat that asked it rather than to whoever is at the
+    // terminal. Outside a run those are empty and the question still works.
+    let run = std::env::var("MAGI_RUN").unwrap_or_default();
+    let node = std::env::var("MAGI_NODE").unwrap_or_else(|_| "ask".to_owned());
+    let seat = std::env::var("MAGI_SEAT").unwrap_or_else(|_| "operator".to_owned());
+
+    let (cfg, _) = Config::discover(repo, None).unwrap_or_default();
+    let wait = std::time::Duration::from_secs(timeout.unwrap_or(cfg.graph.answer_timeout));
+
+    let store = ask::Questions::open();
+    let mut q = ask::Question::new(run, node, seat, summary, detail, choices);
+    store.put(&mut q)?;
+    eprintln!("asked {} — waiting for the owner", q.short());
+
+    match ask::ask_and_wait(&mut q, &store, &cfg.notify, wait).await? {
+        Some(answer) => {
+            println!("{answer}");
+            Ok(())
+        }
+        None => bail!(
+            "question {} went unanswered for {}s; it is recorded as abandoned",
+            q.short(),
+            wait.as_secs()
+        ),
+    }
+}
+
+/// `magi answer`: reply from the terminal, so the phone is a convenience and
+/// never the only way to unblock a run.
+fn answer_cmd(id: Option<String>, reply: Option<String>, list: bool) -> Result<()> {
+    let store = ask::Questions::open();
+    let open: Vec<ask::Question> = store
+        .list()
+        .into_iter()
+        .filter(|q| q.status.open())
+        .collect();
+
+    if list || (id.is_none() && reply.is_none()) {
+        if open.is_empty() {
+            println!("nothing is waiting on you");
+            return Ok(());
+        }
+        for q in &open {
+            println!("{}  {}", q.short(), q.summary);
+            if q.free_text() {
+                println!("      free text");
+            } else {
+                println!("      {}", q.choices.join(" | "));
+            }
+        }
+        return Ok(());
+    }
+
+    let mut q = match id {
+        Some(id) => store.get(&id)?,
+        // Oldest first: the question that has been blocking longest.
+        None => open
+            .into_iter()
+            .next_back()
+            .context("nothing is waiting on you")?,
+    };
+    let reply = reply.context("give the answer with --reply")?;
+    let answer = if q.free_text() {
+        ask::Answer::Text(reply)
+    } else {
+        ask::Answer::Choice(reply)
+    };
+    q.answer(answer)?;
+    store.put(&mut q)?;
+    println!("answered {} {}", q.short(), q.summary);
+    Ok(())
 }
 
 /// The `magi task` verbs.

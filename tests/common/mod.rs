@@ -206,6 +206,10 @@ pub fn fixture(judges: Judges, require_fix: bool) -> Fixture {
             timeout_fix: 120,
             retries: 1,
             worktree_root: Some(tmp.path().join("wt")),
+            // Everything else at its default. Naming every field here means a
+            // new config option breaks four integration tests that do not care
+            // about it, which is a cost with no matching benefit.
+            ..Graph::default()
         },
         // Pinned so the label assignment and the per-judge presentation orders
         // are the same on every run. Without it the run id supplies the seed,
@@ -232,6 +236,7 @@ pub fn fixture(judges: Judges, require_fix: bool) -> Fixture {
             mode: UpdateMode::Off,
             interval: None,
         },
+        ..Config::default()
     };
 
     Fixture { tmp, repo, config }

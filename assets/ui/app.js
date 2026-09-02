@@ -25,6 +25,8 @@ const API = {
   queue: "/api/queue",
   hold: (id) => `/api/queue/${encodeURIComponent(id)}/hold`,
   release: (id) => `/api/queue/${encodeURIComponent(id)}/release`,
+  questions: "/api/questions",
+  answer: (id) => `/api/questions/${encodeURIComponent(id)}/answer`,
   events: "/api/events",
 };
 
@@ -53,6 +55,9 @@ const RUN_STATUS = {
   stalled:      { glyph: "\u26a0", tone: "rust", note: "The panel collapsed on agent quota, so no verdict was recorded. The work is kept \u2014 resume it once the limits reset." },
   blocked:      { glyph: "\u2298", tone: "rust", note: "Review rounds ran out with findings still open, or the gate failed." },
   failed:       { glyph: "\u2715", tone: "ink",  note: "The graph could not complete." },
+  /* Derived from RunSummary.waiting rather than trusted from the status
+     string: the run parked in some node and the summary still names it. */
+  waiting:      { glyph: "?", tone: "wait", note: "An agent stopped to ask you something. Nothing in this run moves until it is answered." },
 };
 
 const TASK_STATUS = {
@@ -62,6 +67,37 @@ const TASK_STATUS = {
   failed:  { glyph: "\u2715", tone: "rust" },
   held:    { glyph: "\u2016", tone: "rust", note: "Held. This task will not be claimed until it is released." },
 };
+
+/* An unanswered question is the only state in the product that a human, and
+   only a human, can clear. `open` therefore borrows the same ringed gold as a
+   waiting run, and `answered` reads as settled rather than successful \u2014 a
+   decision is not a win. */
+const QUESTION_STATUS = {
+  open:      { glyph: "?", tone: "wait" },
+  answered:  { glyph: "\u2713", tone: "teal" },
+  abandoned: { glyph: "\u2296", tone: "ink" },
+};
+
+/* Check state on the pull request the land loop is watching. `red` is
+   deliberately not called a failure: the loop answers it with another fixer
+   round, and the word for that is in landNote() below. Pending carries no
+   glyph because CSS spins its ring \u2014 it is the one state that resolves
+   without anybody doing anything. */
+const CHECKS = {
+  pending: { glyph: "",        word: "checks running" },
+  green:   { glyph: "\u2713",  word: "checks green" },
+  red:     { glyph: "\u2715",  word: "checks red" },
+  unknown: { glyph: "\u2013",  word: "checks unknown" },
+};
+
+/* A pull request closed without merging is a problem; merged is the verdict
+   colour; open is simply where it is. */
+const PR_TONE = { open: "ink", merged: "gold", closed: "rust" };
+
+/* Open first, then settled, newest first inside each group. The server sends
+   this order already; it is applied again locally so an answer reflected
+   before the next revision lands in the right place. */
+const ASK_ORDER = { open: 0, answered: 1, abandoned: 2 };
 
 const SEV_RANK = { blocker: 3, major: 2, minor: 1, nit: 0 };
 
@@ -198,6 +234,21 @@ const shortId = (id) => (typeof id === "string" && id.includes("-") ? id.split("
 
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
+/* The one URL in this client that comes from the API rather than from this
+   file. Everything else from a run record is rendered as text, which cannot
+   execute; an href can, so a `javascript:` value in a run record would be a
+   click away from running in the operator's session. Only the two schemes a
+   forge actually serves are let through. */
+function forgeUrl(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value, location.origin);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.href : null;
+  } catch {
+    return null;   /* not a URL at all */
+  }
+}
+
 const candTone = (index) => `var(--cand-${"abcde"[index % 5]})`;
 
 function seconds(ms) {
@@ -221,21 +272,63 @@ function toneOf(status, table) {
   return (table[status] || { tone: "ink" }).tone;
 }
 
+/* A question names the graph node it came from — `implement`, `review`,
+   `gate` — while the rail is indexed by run status: `implementing`,
+   `reviewing`, `gating`. The node name being the stem of its status is the
+   only relationship the two vocabularies have, so it is matched as one. A
+   table mapping them by hand would go stale the first time a node is added,
+   and the failure would be silent: a parked run with no rail at all. */
+function phaseOf(node) {
+  if (!node) return null;
+  return PHASES.find((phase) => phase === node || phase.startsWith(node)) || null;
+}
+
 /* Where an in-flight run has reached. The summary carries no progress field,
-   so the position is derived from the status against the fixed node order. */
-function phaseRail(status) {
-  const at = PHASES.indexOf(status);
+   so the position is derived from the status against the fixed node order.
+   A parked run passes the node its question came from, so the rail still says
+   how far the run got while marking that segment stopped instead of pulsing:
+   the same rail cannot mean "working" and "halted" on colour alone. */
+function phaseRail(status, node) {
+  const parked = phaseOf(node);
+  const at = PHASES.indexOf(parked || status);
   if (at < 0) return null;
   const rail = el("div", {
     class: "phases",
     role: "img",
-    "aria-label": `Phase ${at + 1} of ${PHASES.length}: ${status}`,
+    "aria-label": parked
+      ? `Stopped at phase ${at + 1} of ${PHASES.length}, ${parked}, waiting for your answer`
+      : `Phase ${at + 1} of ${PHASES.length}: ${status}`,
   });
   for (let i = 0; i < PHASES.length; i += 1) {
+    const here = i === at;
     rail.append(el("span", {
       class: "phase",
-      "data-on": i <= at ? "1" : null,
-      "data-now": i === at ? "1" : null,
+      "data-on": parked ? (i < at ? "1" : null) : (i <= at ? "1" : null),
+      "data-now": here && !parked ? "1" : null,
+      "data-parked": here && parked ? "1" : null,
+    }));
+  }
+  return rail;
+}
+
+/* How many land rounds the loop has spent of its budget. Same vocabulary as
+   the phase rail, because it is the same idea: a fixed number of steps and
+   the one it is on. */
+function roundRail(pr) {
+  const rounds = Number(pr.rounds) || 0;
+  const round = Number(pr.round) || 0;
+  if (rounds <= 0) return null;
+  const settled = pr.state !== "open";
+  const rail = el("div", {
+    class: "phases",
+    role: "img",
+    "aria-label": `Land round ${round} of ${rounds}`,
+  });
+  for (let i = 1; i <= rounds; i += 1) {
+    rail.append(el("span", {
+      class: "phase",
+      "data-round": i < round || (i === round && settled) ? "1" : null,
+      "data-now": i === round && !settled ? "1" : null,
     }));
   }
   return rail;
@@ -248,7 +341,8 @@ const state = {
   runs: null,
   queue: null,
   detail: { id: null, run: null, report: null },
-  rev: { queue: null, runs: null },
+  questions: null,
+  rev: { queue: null, runs: null, questions: null },
   streamOpen: false,
   wrap: false,
 };
@@ -367,18 +461,37 @@ function createRunCard() {
     el("div", { class: "card-top" }, chipSlot, whenSlot),
     title, meta, note, event, rail,
   );
-  const row = el("li", {}, card);
-  row.refs = { card, chipSlot, whenSlot, title, repo, counts, winner, reviews, note, event, rail };
+
+  /* The card is one big anchor, which is the affordance the whole phone
+     layout leans on, and an anchor may contain neither another anchor nor a
+     button. The pull-request link and the Answer action therefore live in a
+     sibling strip that CSS draws as the bottom of the same card. */
+  const prLink = el("a", { class: "pr-link", target: "_blank", rel: "noopener noreferrer" });
+  const checks = el("span");
+  const prRound = el("span", { class: "pr-round" });
+  const tailGo = el("a", { class: "btn btn-gold tail-go" });
+  const tailNote = el("p", { class: "tail-note" });
+  const tail = el("div", { class: "card-tail" }, prLink, checks, prRound, tailGo, tailNote);
+
+  const row = el("li", {}, card, tail);
+  row.refs = { card, chipSlot, whenSlot, title, repo, counts, winner, reviews, note, event, rail,
+               tail, prLink, checks, prRound, tailGo, tailNote };
   return row;
 }
 
 function updateRunCard(row, run) {
   const r = row.refs;
-  const status = String(run.status || "");
+  /* `waiting` is a field of its own on the summary precisely because the
+     status string still names the node the run parked in. It wins: a run
+     nobody is working on must not read as one that is being worked on. */
+  const status = run.waiting ? "waiting" : String(run.status || "");
   const meta = RUN_STATUS[status] || {};
+  const parked = isWaiting(run);
+  const tone = toneOf(status, RUN_STATUS);
 
   r.card.setAttribute("href", `#/runs/${run.id}`);
-  setAttr(r.card, "data-tone", toneOf(status, RUN_STATUS));
+  setAttr(r.card, "data-tone", tone);
+  setAttr(row, "data-tone", tone);
 
   /* The chip is replaced rather than mutated: it is one element and its
      pseudo-element glyph is attribute-driven, so this cannot reflow siblings. */
@@ -416,17 +529,70 @@ function updateRunCard(row, run) {
   show(r.reviews, extra.length > 0);
   separate(r.reviews.parentNode);
 
-  /* Spell out the two endings that look like results but are not. */
-  setText(r.note, meta.note && status !== "merged" && status !== "ready" ? meta.note : "");
-  show(r.note, Boolean(meta.note) && status !== "merged" && status !== "ready");
+  /* Spell out the endings that look like results but are not. `waiting` is
+     excluded because the strip below says it better, and with a button. */
+  const spell = Boolean(meta.note) && status !== "merged" && status !== "ready" && status !== "waiting";
+  setText(r.note, spell ? meta.note : "");
+  show(r.note, spell);
 
   const moving = !run.done;
   setText(r.event, moving && run.event ? run.event : "");
   show(r.event, Boolean(moving && run.event));
 
-  const rail = moving ? phaseRail(status) : null;
+  /* A parked run keeps its rail so the operator can see how far it got, with
+     the node it stopped in drawn halted rather than pulsing. */
+  const ask = parked ? openFor(run.id)[0] : null;
+  const rail = moving ? phaseRail(status, ask ? ask.node : null) : null;
   clear(r.rail);
   if (rail) r.rail.append(rail);
+
+  updateRunTail(row, run, { parked, ask });
+}
+
+/* The strip under the card: where the pull request lives, and where the one
+   action the operator can take on a run appears when there is one. */
+function updateRunTail(row, run, { parked, ask }) {
+  const r = row.refs;
+  const pr = run.pr && typeof run.pr === "object" ? run.pr : null;
+
+  // The href goes through `forgeUrl`: a run record is data magi wrote, but a
+  // `javascript:` value in it would be one tap from running in the operator's
+  // session, and a link that cannot be trusted is not shown at all.
+  const prHref = pr ? forgeUrl(pr.url) : null;
+  if (prHref) {
+    setAttr(r.prLink, "href", prHref);
+    setAttr(r.prLink, "title", prHref);
+    setText(r.prLink, `PR #${pr.number}`);
+  }
+  show(r.prLink, Boolean(prHref));
+
+  if (pr) r.checks.replaceChildren(checksChip(pr));
+  show(r.checks, Boolean(pr));
+
+  const rounds = pr ? Number(pr.rounds) || 0 : 0;
+  setText(r.prRound, rounds ? `land round ${Number(pr.round) || 0} of ${rounds}` : "");
+  show(r.prRound, rounds > 0);
+
+  if (ask) {
+    setAttr(r.tailGo, "href", "#/questions");
+    setText(r.tailGo, "Answer");
+    setAttr(r.tailGo, "aria-label", `Answer: ${ask.summary || "the open question"}`);
+  }
+  show(r.tailGo, Boolean(ask));
+
+  const note = parked
+    ? `Waiting on you: ${(ask && ask.summary) || "an agent asked for a decision."}`
+    : run.waiting
+      ? "Answered. The loop picks this up on its next tick."
+      : pr
+        ? landNote(pr)
+        : "";
+  setText(r.tailNote, note);
+  show(r.tailNote, note !== "");
+
+  const tailed = Boolean(pr) || Boolean(run.waiting);
+  show(r.tail, tailed);
+  setAttr(row, "data-tail", tailed ? "1" : null);
 }
 
 function renderRuns() {
@@ -596,6 +762,428 @@ function renderQueue() {
   syncList(list, tasks, (t) => t.id, createTaskCard, updateTaskCard);
 }
 
+/* ---- questions --------------------------------------------------------- *
+ * An agent inside a run can stop and ask the owner something, and the run
+ * parks until it is answered. That makes an open question the only state in
+ * this product where nothing anywhere is making progress and no timeout will
+ * rescue it: the machine is burning nothing and going nowhere until a human
+ * taps. So the question is put in front of the operator from wherever they
+ * are — a band above every view, a count on the nav item and in the document
+ * title — and the controls to answer it are rendered in place, because a
+ * question you have to navigate somewhere else to answer is a question that
+ * waits until morning.
+ */
+const openQuestions = () => (state.questions || []).filter((q) => q.status === "open");
+const openFor = (runId) => openQuestions().filter((q) => q.run === runId);
+
+/* Until /api/questions has answered, health's own count is what is known. */
+function openCount() {
+  return state.questions === null
+    ? Number(state.health && state.health.questions_open) || 0
+    : openQuestions().length;
+}
+
+function sortQuestions(list) {
+  return list.slice().sort((a, b) => {
+    const rank = (ASK_ORDER[a.status] ?? 3) - (ASK_ORDER[b.status] ?? 3);
+    return rank || (Date.parse(b.asked_at) || 0) - (Date.parse(a.asked_at) || 0);
+  });
+}
+
+/* RunSummary.waiting is one revision behind an answer the operator has just
+   given. Once the questions are loaded they are the sharper truth: a run with
+   no open question is not parked, whatever the summary still says. This is
+   what makes answering read as immediate instead of as a round trip. */
+function isWaiting(run) {
+  if (!run.waiting) return false;
+  return state.questions === null || openFor(run.id).length > 0;
+}
+
+/* ---- markdown-ish ------------------------------------------------------ *
+ * A question's detail is agent-authored markdown and can be long. There is no
+ * library here and there will not be one, so this handles the four things a
+ * decision brief actually contains — fenced blocks, headings, dash lists and
+ * paragraphs — plus inline code spans, and treats everything else as text.
+ *
+ * It returns nodes. Nothing from the API is ever assigned as markup anywhere
+ * in this client, and least of all here: this string was written by a process
+ * the operator did not author, and a fence containing a script tag has to
+ * render as the characters of a script tag. */
+function markdownish(text) {
+  const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let paragraph = [];
+  let bullets = null;
+
+  const flush = () => {
+    if (paragraph.length) {
+      out.push(el("p", {}, inline(paragraph.join(" "))));
+      paragraph = [];
+    }
+    if (bullets) {
+      out.push(el("ul", {}, bullets.map((item) => el("li", {}, inline(item)))));
+      bullets = null;
+    }
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const fence = /^\s{0,3}(`{3,}|~{3,})/.exec(lines[i]);
+    if (fence) {
+      flush();
+      const closer = fence[1][0].repeat(3);
+      const body = [];
+      i += 1;
+      while (i < lines.length && !lines[i].trimStart().startsWith(closer)) {
+        body.push(lines[i]);
+        i += 1;
+      }
+      out.push(el("pre", {}, el("code", { text: body.join("\n") })));
+      continue;
+    }
+
+    const heading = /^ {0,3}#{1,6}\s+(.*)$/.exec(lines[i]);
+    if (heading) {
+      flush();
+      out.push(el("h4", {}, inline(heading[1].trim())));
+      continue;
+    }
+
+    const bullet = /^ {0,3}[-*+]\s+(.*)$/.exec(lines[i]);
+    if (bullet) {
+      if (paragraph.length) flush();
+      if (!bullets) bullets = [];
+      bullets.push(bullet[1]);
+      continue;
+    }
+
+    if (!lines[i].trim()) {
+      flush();
+      continue;
+    }
+    /* A wrapped continuation line belongs to whatever is already open. */
+    if (bullets) bullets[bullets.length - 1] += ` ${lines[i].trim()}`;
+    else paragraph.push(lines[i].trim());
+  }
+
+  flush();
+  return out;
+}
+
+/* Code spans only. Emphasis is left alone on purpose: a parser cheap enough
+   to belong in this file would read the asterisks in a glob as italics and
+   silently eat them out of a path the operator was meant to see. */
+function inline(text) {
+  const nodes = [];
+  String(text).split(/`([^`]+)`/g).forEach((part, i) => {
+    if (part === "") return;
+    nodes.push(i % 2 === 1 ? el("code", { text: part }) : document.createTextNode(part));
+  });
+  return nodes;
+}
+
+/* ---- question card ----------------------------------------------------- *
+ * Reconciled rather than rebuilt, because the free-text box may hold a
+ * half-typed answer: an SSE tick arriving mid-sentence must not throw it
+ * away. */
+function createAskCard() {
+  const chipSlot = el("span");
+  const whenSlot = el("time", { class: "ask-when" });
+  /* tabindex -1 so the ask bar can put the caret on the question it sent the
+     operator here to answer, instead of on the top of the document. */
+  const summary = el("h2", { class: "ask-summary", tabindex: "-1" });
+  const runLink = el("a", { class: "ask-seat" });
+  const node = el("span");
+  const seat = el("span", { class: "ask-seat" });
+  const where = el("div", { class: "ask-where" }, runLink, node, seat);
+  const detail = el("div");
+  const hint = el("p", { class: "hint" });
+  const choices = el("div", { class: "choices" });
+  const text = el("textarea", { rows: "4", "aria-label": "Your answer" });
+  const send = el("button", { class: "btn btn-gold", type: "button", text: "Send answer" });
+  const free = el("div", { class: "ask-free" }, text, send);
+  const error = el("p", { class: "form-error", role: "alert" });
+  const answerLabel = el("span", { class: "answer-label" });
+  const answerText = el("p", { class: "answer-text" });
+  const answer = el("div", { class: "answer" }, answerLabel, answerText);
+  const note = el("p", { class: "panel-note" });
+
+  const row = el("li", { class: "ask" },
+    el("div", { class: "ask-top" }, chipSlot, whenSlot),
+    summary, where, detail, hint, choices, free, error, answer, note,
+  );
+  row.refs = { chipSlot, whenSlot, summary, runLink, node, seat, where, detail,
+               hint, choices, text, send, free, error, answerLabel, answerText, answer, note };
+  return row;
+}
+
+function updateAskCard(row, question, { compact = false } = {}) {
+  const r = row.refs;
+  const status = String(question.status || "open");
+  const open = status === "open";
+  const choices = Array.isArray(question.choices) ? question.choices : [];
+
+  setAttr(row, "data-state", status);
+
+  const next = chip(status, QUESTION_STATUS);
+  if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
+  else r.chipSlot.append(next);
+
+  const settledAt = !open && question.answered_at ? question.answered_at : question.asked_at;
+  const at = when(settledAt);
+  setText(r.whenSlot, `${!open && question.answered_at ? "answered" : "asked"} ${at.text}`);
+  setAttr(r.whenSlot, "datetime", settledAt || null);
+  setAttr(r.whenSlot, "title", at.title);
+
+  setText(r.summary, question.summary || firstLine(question.detail) || `question ${shortId(question.id)}`);
+
+  setAttr(r.runLink, "href", `#/runs/${question.run}`);
+  setText(r.runLink, `run ${shortId(question.run)}`);
+  show(r.runLink, Boolean(question.run) && !compact);
+  setText(r.node, question.node ? `node ${question.node}` : "");
+  show(r.node, Boolean(question.node));
+  setText(r.seat, question.seat ? `seat ${question.seat}` : "");
+  show(r.seat, Boolean(question.seat));
+  separate(r.where);
+
+  /* The detail is immutable for a given question, so it is parsed once. An
+     open question shows it outright — it is the case for the decision. A
+     settled one folds it away, so the record does not push the next open
+     question off a 390px screen. */
+  const detail = typeof question.detail === "string" ? question.detail.trim() : "";
+  const key = `${open ? "open" : "settled"}:${detail.length}`;
+  if (row.dataset.detailKey !== key) {
+    row.dataset.detailKey = key;
+    clear(r.detail);
+    if (detail) {
+      const body = el("div", { class: "md" }, markdownish(detail));
+      r.detail.append(open
+        ? body
+        : el("details", { class: "advanced" }, el("summary", { text: "Context" }), body));
+    }
+  }
+  show(r.detail, detail !== "");
+
+  const choiceKey = choices.join("\u0000");
+  if (row.dataset.choiceKey !== choiceKey) {
+    row.dataset.choiceKey = choiceKey;
+    clear(r.choices);
+    for (const choice of choices) {
+      r.choices.append(el("button", {
+        class: "btn", type: "button", text: choice,
+        onclick: () => answerQuestion(question.id, { choice }, row),
+      }));
+    }
+  }
+  r.send.onclick = () => answerQuestion(question.id, { text: r.text.value }, row);
+
+  setText(r.hint, !open
+    ? ""
+    : choices.length
+      ? "Pick one. The run resumes as soon as you do."
+      : "No options were offered \u2014 answer in your own words.");
+  show(r.hint, open);
+  show(r.choices, open && choices.length > 0);
+  show(r.free, open && choices.length === 0);
+  show(r.error, open && !r.error.hidden && r.error.textContent !== "");
+
+  const given = question.answer && typeof question.answer === "object" ? question.answer : null;
+  const value = given
+    ? typeof given.choice === "string" ? given.choice : typeof given.text === "string" ? given.text : ""
+    : "";
+  if (value) {
+    const decided = when(question.answered_at);
+    setText(r.answerLabel, `Decided ${decided.text}`);
+    setAttr(r.answerLabel, "title", decided.title);
+    setText(r.answerText, value);
+  }
+  show(r.answer, Boolean(value));
+
+  setText(r.note, status === "abandoned"
+    ? "The run ended before this was answered, so nothing acted on it."
+    : row.dataset.raced === "1"
+      ? "This was answered elsewhere while you had it open. The recorded answer is above."
+      : "");
+  show(r.note, r.note.textContent !== "");
+}
+
+/* A 409 is not a failure worth a dialog: it means the operator answered from
+   the terminal, or a second phone got there first. What matters is the answer
+   that was actually recorded, so the list is refetched and the question is
+   shown as settled with a line saying why it changed under them. */
+async function answerQuestion(id, body, row) {
+  const r = row.refs;
+  const buttons = [...row.querySelectorAll("button")];
+  const value = typeof body.choice === "string" ? body.choice : String(body.text || "");
+
+  if (!value.trim()) {
+    setText(r.error, "An answer cannot be empty.");
+    show(r.error, true);
+    r.text.focus();
+    return;
+  }
+
+  show(r.error, false);
+  for (const button of buttons) button.disabled = true;
+
+  try {
+    reflectQuestion(await postJson(API.answer(id), body));
+    announce(`Answered: ${value.trim()}`);
+    ok();
+  } catch (error) {
+    if (error.status === 409) {
+      row.dataset.raced = "1";
+      announce("That question had already been answered.");
+      await loadQuestions();
+      return;
+    }
+    setText(r.error, error.message);
+    show(r.error, true);
+  }
+  for (const button of buttons) button.disabled = false;
+}
+
+/* Show the answer without waiting for the stream to confirm it, including in
+   the runs list: the run stops reading as blocked-on-you the moment it stops
+   being blocked on you. */
+function reflectQuestion(question) {
+  if (!question || typeof question !== "object" || !question.id) return;
+  state.questions = sortQuestions([
+    question,
+    ...(state.questions || []).filter((q) => q.id !== question.id),
+  ]);
+  renderQuestions();
+  renderAskBar();
+  renderRuns();
+  if (state.route.name === "run" && state.detail.run) renderRunDetail();
+}
+
+/* ---- ask bar and indicators -------------------------------------------- */
+
+/* The band never renders when there is nothing to answer. A permanent "no
+   questions" strip would train the operator to look straight past the place a
+   real one appears, which is the one failure this feature cannot survive. */
+function renderAskBar() {
+  const bar = $("ask-bar");
+  const count = openCount();
+  const open = openQuestions();
+
+  show(bar, count > 0);
+  renderIndicators(count);
+  if (count === 0) return;
+
+  setText(bar.querySelector(".ask-bar-count"), count === 1
+    ? "An agent is waiting on your decision"
+    : `${count} agents are waiting on your decision`);
+
+  /* The oldest one is quoted, because it is the one that has been blocking
+     longest; the list is newest-first, so that is the last of them. */
+  const oldest = open.length ? open[open.length - 1] : null;
+  const line = bar.querySelector(".ask-bar-summary");
+  setText(line, oldest ? oldest.summary || "" : "");
+  show(line, Boolean(oldest && oldest.summary));
+}
+
+function renderIndicators(count) {
+  for (const id of ["ask-badge-rail", "ask-badge-dock"]) {
+    const badge = $(id);
+    setText(badge, count > 99 ? "99+" : String(count));
+    show(badge, count > 0);
+  }
+  for (const link of document.querySelectorAll('[data-nav="questions"]')) {
+    setAttr(link, "aria-label", count > 0 ? `Questions, ${count} unanswered` : "Questions");
+  }
+  renderTitle();
+}
+
+/* The count rides on the document title as well, because a phone with the
+   deck open in a background tab shows the title in the tab strip and in the
+   app switcher — which is the only notification channel this UI has. */
+function renderTitle() {
+  const count = openCount();
+  const base = state.route.name === "queue"
+    ? "Backlog \u2014 magi"
+    : state.route.name === "questions"
+      ? "Questions \u2014 magi"
+      : state.route.name === "run"
+        ? `Run ${shortId(state.route.id)} \u2014 magi`
+        : "magi \u2014 observation deck";
+  document.title = count > 0 ? `(${count}) ${base}` : base;
+}
+
+function renderQuestions() {
+  const list = $("questions-list");
+  const questions = state.questions;
+
+  if (questions === null) {
+    setText($("questions-count"), "Loading\u2026");
+    return;
+  }
+
+  const open = openQuestions().length;
+  const settled = questions.length - open;
+  setText($("questions-count"), questions.length === 0
+    ? "Nothing asked yet"
+    : open === 0
+      ? `nothing open \u00b7 ${plural(settled, "decision on record", "decisions on record")}`
+      : [`${plural(open, "question is blocking a run", "questions are blocking runs")}`,
+         settled ? `${settled} on record` : null].filter(Boolean).join(" \u00b7 "));
+
+  show($("questions-empty"), questions.length === 0);
+  syncList(list, questions, (q) => q.id, createAskCard, (row, q) => updateAskCard(row, q));
+}
+
+/* The operator followed the band here to answer one specific thing; leaving
+   the caret at the top of the document would make them find it again. */
+function focusFirstAsk() {
+  requestAnimationFrame(() => {
+    const first = $("questions-list").querySelector('.ask[data-state="open"] .ask-summary');
+    if (first) first.focus({ preventScroll: true });
+  });
+}
+
+/* ---- landing ----------------------------------------------------------- *
+ * After a run wins, the land loop opens a pull request and watches it. The
+ * only thing the operator needs from this panel is whether it is their turn,
+ * so every state below ends in a sentence that says so in words. */
+
+/* `pr` is frozen on RunSummary; the detail payload is whatever the server
+   chose to include, so the run is asked first and the list second. */
+function landOf(run) {
+  if (run.pr && typeof run.pr === "object") return run.pr;
+  const summary = (state.runs || []).find((r) => r.id === run.id);
+  return summary && summary.pr && typeof summary.pr === "object" ? summary.pr : null;
+}
+
+/* Red checks are not a verdict on the run: the loop answers them with another
+   fixer round, and only becomes the operator's problem once the round budget
+   is spent. Saying which of those it is, in words, is the part that does not
+   depend on colour or on a glyph. */
+function landNote(pr) {
+  const rounds = Number(pr.rounds) || 0;
+  const left = Math.max(rounds - (Number(pr.round) || 0), 0);
+  if (pr.state === "merged") return "Merged. The land loop is finished with this run.";
+  if (pr.state === "closed") return "The pull request was closed without merging. This one needs you.";
+  if (pr.checks === "red") {
+    return left > 0
+      ? `Checks failed, so a fixer round is coming \u2014 ${plural(left, "round", "rounds")} of ${rounds} left. Nothing is needed from you.`
+      : `Checks failed and all ${rounds} fix rounds are spent. This one needs you.`;
+  }
+  if (pr.checks === "pending") return "Waiting on the checks. Nothing is needed from you.";
+  if (pr.checks === "green") return "Checks are green; the loop is taking it to merge.";
+  return "The check state could not be read from the forge.";
+}
+
+function checksChip(pr) {
+  const level = String(pr.checks || "unknown");
+  const check = CHECKS[level] || CHECKS.unknown;
+  return el("span", {
+    class: "checks",
+    "data-checks": level,
+    "data-glyph": check.glyph,
+    text: check.word,
+  });
+}
+
 /* ---- run detail -------------------------------------------------------- */
 function viable(candidate) {
   /* Candidate::viable is a method, so it is not on the wire; the rule it
@@ -613,17 +1201,27 @@ function renderRunDetail() {
     setText($("run-h"), "Loading run\u2026");
     setText($("run-meta"), "");
     clear($("run-status"));
+    /* Both of these are about a specific run, and a question belonging to a
+       different one is not merely stale, it is wrong. */
+    show($("run-ask-panel"), false);
+    show($("run-land-panel"), false);
     setText($("run-report"), report === null ? "Loading\u2026" : report);
     return;
   }
 
-  const status = String(run.status || "");
+  /* The detail payload carries the run's own status; the list carries the
+     derived `waiting`. Prefer whichever says the run is parked, because that
+     is the state the operator has to act on. */
+  const summary = (state.runs || []).find((r) => r.id === run.id);
+  const parkedNow = Boolean(summary && isWaiting(summary)) || openFor(run.id).length > 0;
+  const status = parkedNow ? "waiting" : String(run.status || "");
   const meta = RUN_STATUS[status] || {};
 
   const head = $("run-status");
   clear(head);
   head.append(chip(status, RUN_STATUS));
-  const rail = PHASES.includes(status) ? phaseRail(status) : null;
+  const parkedAt = parkedNow ? (openFor(run.id)[0] || {}).node || null : null;
+  const rail = PHASES.includes(status) || parkedAt ? phaseRail(status, parkedAt) : null;
   if (rail) head.append(rail);
   if (meta.note) head.append(el("p", { class: "card-note", text: meta.note }));
 
@@ -638,6 +1236,8 @@ function renderRunDetail() {
 
   setText($("run-instruction"), run.instruction || "");
 
+  renderAsks(run);
+  renderLand(run);
   renderVerdict(run);
   renderCandidates(run);
   renderReviews(run);
@@ -645,6 +1245,49 @@ function renderRunDetail() {
   renderTimeline(run);
 
   setText($("run-report"), report === null ? "Loading\u2026" : report);
+}
+
+/* Every question this run has ever asked, open ones first: the answered ones
+   are the record of the decisions that shaped the work below. They are
+   answerable right here, so arriving from the runs list is not a detour. */
+function renderAsks(run) {
+  const mine = (state.questions || []).filter((q) => q.run === run.id);
+  show($("run-ask-panel"), mine.length > 0);
+  if (mine.length === 0) return;
+
+  const open = mine.filter((q) => q.status === "open").length;
+  setText($("run-ask-title"), open > 0 ? "Waiting on you" : "Decisions");
+  setText($("run-ask-count"), open > 0 ? `${open} open` : plural(mine.length, "on record", "on record"));
+  syncList($("run-asks"), sortQuestions(mine), (q) => q.id, createAskCard,
+    (row, q) => updateAskCard(row, q, { compact: true }));
+}
+
+function renderLand(run) {
+  const pr = landOf(run);
+  show($("run-land-panel"), Boolean(pr));
+  if (!pr) return;
+
+  const box = $("run-land");
+  clear(box);
+  // Same reasoning as the card link: an untrusted scheme is rendered as plain
+  // text rather than as something tappable.
+  const prHref = forgeUrl(pr.url);
+  box.append(
+    el("div", { class: "land-top" },
+      prHref
+        ? el("a", {
+            class: "pr-link", href: prHref, title: prHref,
+            target: "_blank", rel: "noopener noreferrer",
+            text: `PR #${pr.number}`,
+          })
+        : el("span", { class: "ask-seat", text: `PR #${pr.number}` }),
+      el("span", { class: "tag", "data-tone": PR_TONE[pr.state] || "ink", text: pr.state || "unknown" }),
+      checksChip(pr),
+    ),
+    Number(pr.rounds) ? el("p", { class: "land-note", text: `Land round ${Number(pr.round) || 0} of ${pr.rounds}.` }) : null,
+    roundRail(pr),
+    el("p", { class: "land-note", text: landNote(pr) }),
+  );
 }
 
 function firstLine(text) {
@@ -994,10 +1637,33 @@ async function loadQueue() {
   }
 }
 
+/* Questions are loaded whole rather than by id: the list is short by nature —
+   a backlog of them would mean the loop had been stalled for days — and one
+   fetch keeps the runs list, the ask bar and the open run in agreement about
+   which runs are parked. */
+async function loadQuestions() {
+  try {
+    const list = await getJson(API.questions);
+    state.questions = sortQuestions(Array.isArray(list) ? list : []);
+    renderQuestions();
+    renderAskBar();
+    /* A run's `waiting` only means something next to the questions, so both
+       views are re-rendered from the answer, not from the run revision. */
+    renderRuns();
+    if (state.route.name === "run" && state.detail.run) renderRunDetail();
+    ok();
+  } catch (error) {
+    fail(`Could not load questions: ${error.message}`);
+  }
+}
+
 async function loadHealth({ applyRevisions = false } = {}) {
   try {
     state.health = await getJson(API.health);
     renderDaemon();
+    /* health.questions_open is the count until /api/questions has answered,
+       so the indicator is right on the very first paint. */
+    renderAskBar();
     if (applyRevisions) await applyRevisions_(state.health);
     ok();
   } catch (error) {
@@ -1032,6 +1698,7 @@ async function loadRun(id) {
 async function applyRevisions_(source) {
   const queueRev = source.queue_rev;
   const runsRev = source.runs_rev;
+  const questionsRev = source.questions_rev;
   const jobs = [];
 
   if (queueRev !== state.rev.queue) {
@@ -1042,6 +1709,10 @@ async function applyRevisions_(source) {
     state.rev.runs = runsRev;
     jobs.push(loadRuns());
     if (state.route.name === "run" && state.detail.id) jobs.push(loadRun(state.detail.id));
+  }
+  if (questionsRev !== state.rev.questions) {
+    state.rev.questions = questionsRev;
+    jobs.push(loadQuestions());
   }
   if (jobs.length) {
     await Promise.allSettled(jobs);
@@ -1091,6 +1762,7 @@ function subscribe() {
 function parseRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (parts[0] === "queue") return { name: "queue", id: null };
+  if (parts[0] === "questions") return { name: "questions", id: null };
   if (parts[0] === "runs" && parts[1]) return { name: "run", id: decodeURIComponent(parts[1]) };
   return { name: "runs", id: null };
 }
@@ -1103,8 +1775,9 @@ function applyRoute() {
   show($("view-runs"), route.name === "runs");
   show($("view-run"), route.name === "run");
   show($("view-queue"), route.name === "queue");
+  show($("view-questions"), route.name === "questions");
 
-  const section = route.name === "queue" ? "queue" : "runs";
+  const section = route.name === "run" ? "runs" : route.name;
   for (const link of document.querySelectorAll("[data-nav]")) {
     setAttr(link, "aria-current", link.dataset.nav === section ? "page" : null);
   }
@@ -1116,11 +1789,10 @@ function applyRoute() {
   }
 
   if (changed) window.scrollTo({ top: 0 });
-  document.title = route.name === "queue"
-    ? "Backlog — magi"
-    : route.name === "run"
-      ? `Run ${shortId(route.id)} — magi`
-      : "magi — observation deck";
+  /* The operator arrived to answer one specific thing, so the caret goes on
+     it rather than on the top of the document. */
+  if (changed && route.name === "questions") focusFirstAsk();
+  renderTitle();
 }
 
 /* ---- compose ----------------------------------------------------------- */
@@ -1233,6 +1905,7 @@ function wire() {
   $("alert-retry").addEventListener("click", () => {
     ok();
     loadHealth({ applyRevisions: true });
+    loadQuestions();
     if (state.route.name === "run" && state.detail.id) loadRun(state.detail.id);
   });
 
@@ -1254,8 +1927,9 @@ async function boot() {
   if (state.health) {
     state.rev.queue = state.health.queue_rev;
     state.rev.runs = state.health.runs_rev;
+    state.rev.questions = state.health.questions_rev;
   }
-  await Promise.allSettled([loadRuns(), loadQueue()]);
+  await Promise.allSettled([loadRuns(), loadQueue(), loadQuestions()]);
 
   subscribe();
   setInterval(() => {

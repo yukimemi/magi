@@ -113,6 +113,8 @@ magi task add "port the retry logic to the uploader"
 magi task list                # the backlog `magi serve` drains
 magi serve                    # run the queue unattended
 magi web                      # the phone UI, over Tailscale
+magi plan "rework the config loader"   # interview, then file the task it writes
+magi answer                   # what an agent is waiting to hear from you
 ```
 
 A run refuses to start on a dirty tree: candidates branch off `HEAD`, and
@@ -207,6 +209,91 @@ A **quota stall is refunded**. When the agent CLIs hit their rate limit the
 judging panel collapses, the run stops as `stalled`, and the task goes back in
 line *without* spending an attempt — a quota window closing at 4am must not
 leave a backlog of tasks that were never actually judged.
+
+## Working out what to build, with someone
+
+A task file without completion criteria produces a competition whose candidates
+cannot be compared, and you find out forty minutes and several dollars later.
+So the first step is a conversation:
+
+```sh
+magi plan "rework the config loader"
+```
+
+magi hands your terminal to a leader agent's own interface — its UI, its
+history, its keybindings — and takes it back when the interview is over to
+check the draft and queue it. It does **not** reimplement a chat window; the
+agent CLIs are better at that than magi will ever be.
+
+What magi does own is the shape of the result. A draft with no completion
+criteria is refused, with every problem listed at once, and **the draft is kept
+on disk and named in the error** — a twenty-minute interview is never lost to a
+validation failure.
+
+## When an agent needs you
+
+```sh
+magi ask --summary "Which storage backend?" --choice SQLite --choice Redis
+```
+
+That is the command an *agent* runs, mid-task, instead of guessing. It blocks;
+the question appears on your phone with the choices as buttons; the answer goes
+back on the agent's stdout. From a terminal, `magi answer` does the same job.
+
+A question is attributed to the seat that asked it — `run 9fb7 · node implement
+· seat impl-A` — because "who wants to know" is the first thing you need in
+order to answer. Runs blocked on an unanswered question are marked as such in
+the runs list: a parked run consumes nothing and progresses never, so being
+noticed is the only thing that moves it.
+
+Set `[notify] command` to be told out of band:
+
+```toml
+[notify]
+command = ["ntfy", "publish", "magi", "{summary} — {url}"]
+```
+
+`{summary}`, `{run}` and `{url}` are substituted into the argv, never into a
+shell string, so a question containing `; rm -rf` stays one argument. `{url}`
+comes from `MAGI_WEB_URL`, which `magi web` prints at startup — a run cannot
+discover the address another process bound. A notification that fails is logged
+and ignored: a broken webhook is not a reason to throw away an implementation.
+
+## Landing it
+
+```toml
+[graph]
+land = true
+land_rounds = 4
+```
+
+With `merge = "pr"` magi opens the pull request and stops. With `land = true`
+it keeps going: watches the checks, reads the review comments — human and bot —
+runs a fix round when either is unhappy, pushes, and merges when they are not.
+
+Off by default, because merging is the only irreversible thing magi can do to a
+repository and it should be something you turned on rather than something you
+discovered. It **never force-merges**: out of rounds means the pull request is
+left open with a comment saying what is still failing.
+
+## Project conventions in the prompts
+
+```toml
+[prompts]
+all = "This repo uses jj, not git. Never run `git commit`."
+review = "Ignore formatting; a hook owns it."
+```
+
+Appended to the node prompts, under a heading of their own — **never merged
+into them**. The built-in prompts carry the invariants the competition rests
+on: a judging prompt names no authors, structured answers arrive as one fenced
+`json` block, judges are told not to speculate about authorship. A config that
+could *replace* a prompt would let a typo un-blind the panel, and the symptom
+would be "the judges got worse" rather than an error.
+
+Repository-wide context belongs in `AGENTS.md`, which every agent already reads
+from the checkout. These fields are for what a *magi node* needs to know and a
+repository file cannot say.
 
 ## The phone UI
 

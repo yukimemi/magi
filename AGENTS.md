@@ -716,6 +716,28 @@ fetched.
   records a winner label, so the verdict marker is gated on `tally.met_quorum`
   and shows "provisional" when it is false.
 
+### Never take a port you did not check
+
+A UI verification fixture was started on **8791** in a temp directory, and that
+is the port `nagi`'s market maker listens on. The fixture won the bind, the
+agent that started it then died without cleaning up, and the trading service
+sat unable to reclaim its port until someone noticed. Worse, the first
+diagnosis was wrong: `Get-NetTCPConnection` showed `8791 python` and that was
+read as "nagi is fine" — the fixture *was* the python process.
+
+So, for anything that listens on this machine:
+
+- **Bind port 0** and let the OS choose, or check the port is free first.
+- The operator's occupied set today is `8080` kanade-backend, `8188` yaiba,
+  `8788` / `8789` / `8791` nagi, `4222` / `8222` nats, `6123` glazewm,
+  `6124` zebar, `7878` magi. Treat it as a floor, not a list: check.
+- **Identify a listener by its command line, never by its process name.**
+  `Get-CimInstance Win32_Process -Filter "ProcessId=<pid>"` and read
+  `CommandLine`. Two unrelated services are both "python".
+- A brief that tells a subagent to stand up a server MUST give it the port
+  policy. This one only said "in a temp directory outside the repo", and the
+  agent had no way to know 8791 mattered.
+
 ### Landing a run's winner by hand
 
 A candidate branch holds one commit, subject `magi: candidate A (uncommitted
