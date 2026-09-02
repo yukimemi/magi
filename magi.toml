@@ -40,9 +40,25 @@ kind = "antigravity"
 # Hence: the expensive model never implements. opus judges instead, which is a
 # handful of turns, and the free CLIs carry the implementation load.
 [roles]
-implementers = ["oc", "agy", "sonnet"]
-# Rotated so no judge sits on its own candidate: opus/oc/agy against oc/agy/sonnet.
-judges = ["opus", "oc", "agy"]
+# `agy` is deliberately absent from the implement seats. Measured twice on this
+# repository: it took the whole 3600s implement budget, burned 16s and 42s of
+# CPU respectively, produced no output and changed no files - so the wave was as
+# slow as the timeout rather than as slow as its slowest working seat, and every
+# run lost ~20 minutes after the other two had finished. It judges fine (five
+# minutes, a usable ranking), which is where it stays. Try it here again only
+# with evidence that the headless implement path works.
+implementers = ["oc", "sonnet"]
+# Two candidates, not three, and that is the consequence of the line above
+# rather than a separate preference. With `agy` out of the implement seats the
+# only remaining implementers are `oc` and `sonnet`: `opus` is kept out
+# deliberately - one implement seat here cost $12.09 on opus against $6.95 on
+# sonnet - so a third candidate would have to be a repeat of one of the two, or
+# the expensive model, or the one that does not work. Two implementations still
+# compete, and the panel still ranks them blind.
+#
+# Judges: only `oc` sits on a candidate it wrote, one seat of three, which is
+# better blindness than this roster has had.
+judges = ["opus", "agy", "oc"]
 reviewers = ["sonnet", "oc"]
 # Not the winner's own author by default: the fixer would inherit the
 # implementer's 100-turn session, and with it the whole accumulated cache-read
@@ -50,7 +66,7 @@ reviewers = ["sonnet", "oc"]
 fixer = "sonnet"
 
 [graph]
-candidates = 3
+candidates = 2
 judges = 3
 deliberate_rounds = 1
 reviewers = 2
