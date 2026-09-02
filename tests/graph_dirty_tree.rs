@@ -119,14 +119,28 @@ async fn a_run_branches_off_what_the_remote_has_not_a_stale_local_ref() {
     // Land the equivalent of a merged pull request straight onto the remote,
     // through a scratch clone, leaving the fixture's local ref behind.
     let clone = fx.tmp.path().join("elsewhere");
+    // `--branch` is load-bearing. A bare repo made by `git init --bare` puts
+    // HEAD on whatever `init.defaultBranch` says - `master` on the CI runners,
+    // `main` here - so a plain clone checks out a branch unrelated to the one
+    // the fixture pushed, and the commit below lands with no shared ancestry.
+    // That surfaced three CI rounds later as a non-fast-forward push and read
+    // like the product failing to fetch.
     git(
         &[
             "clone",
             "--quiet",
+            "--branch",
+            &base,
             remote_dir.to_str().unwrap(),
             clone.to_str().unwrap(),
         ],
         fx.tmp.path(),
+    );
+    // Fail at the cause, not three steps downstream.
+    assert_eq!(
+        git(&["rev-parse", "--abbrev-ref", "HEAD"], &clone),
+        base,
+        "the clone must be on the branch the run will resolve"
     );
     std::fs::write(clone.join("landed.txt"), "from a merged pr\n").expect("write");
     git(&["add", "landed.txt"], &clone);
