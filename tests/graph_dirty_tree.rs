@@ -157,12 +157,21 @@ async fn a_run_branches_off_what_the_remote_has_not_a_stale_local_ref() {
     // passed locally and failed on all three CI runners, and "left != right"
     // says nothing about which of fetch, the refspec or the ref name gave way.
     let fetched = std::process::Command::new("git")
-        .args(["fetch", "origin", &base])
+        .args([
+            "fetch",
+            "origin",
+            &format!("+refs/heads/{base}:refs/remotes/origin/{base}"),
+        ])
         .current_dir(&fx.repo)
         .output()
         .expect("git fetch");
     let tracking = std::process::Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", &format!("origin/{base}")])
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("origin/{base}"),
+        ])
         .current_dir(&fx.repo)
         .output()
         .expect("git rev-parse tracking");

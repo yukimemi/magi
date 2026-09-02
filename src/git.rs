@@ -294,14 +294,23 @@ pub async fn push(repo: &Path, remote: &str, branch: &str) -> Result<GitOut> {
     git_raw(repo, &["push", "-u", remote, branch]).await
 }
 
-/// Fetch one branch from `remote`, updating only its remote-tracking ref.
+/// Fetch one branch from `remote`, updating its remote-tracking ref.
+///
+/// The refspec is spelled out on purpose. `git fetch <remote> <branch>` writes
+/// `FETCH_HEAD` and only *opportunistically* updates
+/// `refs/remotes/<remote>/<branch>` - some git versions do, some write nothing
+/// but `FETCH_HEAD`. On the version this was written against it worked; on the
+/// CI runners' version it did not, so a run silently fell back to the stale
+/// local tip, which is the exact bug the fetch exists to prevent. Naming the
+/// destination makes the update the point rather than a side effect.
 ///
 /// Refs, not the working copy: nothing is checked out and no local branch
 /// moves, so this is safe to run while the operator has uncommitted work.
 /// Returned as a [`GitOut`] rather than an error so the caller can decide - a
 /// machine with no network must still be able to start a run.
 pub async fn fetch(repo: &Path, remote: &str, branch: &str) -> Result<GitOut> {
-    git_raw(repo, &["fetch", "--quiet", remote, branch]).await
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+    git_raw(repo, &["fetch", "--quiet", remote, &refspec]).await
 }
 
 /// Does this ref resolve?
