@@ -1,4 +1,5 @@
 //! `magi` command line entry point.
+use std::fmt::Write as _;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
@@ -853,7 +854,86 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
         cfg.merge.mode
     );
     println!("runs         {}", magi::run::runs_root().display());
+    print!("{}", doctor_queue_and_loop(&magi::run::home()));
     Ok(())
+}
+
+/// The queue and loop section of `magi doctor`: how much work is backed up,
+/// whether `magi serve` is the one moving it, and how far this build's view
+/// of the runs directory can be trusted.
+///
+/// Separate from the async probes above and driven from an explicit `home`
+/// rather than the process-global [`magi::run::home`], so a test can point it
+/// at a temp directory instead of fighting the `OnceLock` every other caller
+/// of that function shares. A fresh install has no queue directory and no
+/// daemon file; both collapse to empty results rather than an error, so
+/// `doctor` stays the first thing worth running on one.
+fn doctor_queue_and_loop(home: &Path) -> String {
+    let mut s = String::new();
+
+    let tasks = Queue::at(home.join("queue")).list();
+    let (mut queued, mut running, mut failed, mut held, mut done) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+    for t in &tasks {
+        match t.status {
+            TaskStatus::Queued => queued += 1,
+            TaskStatus::Running => running += 1,
+            TaskStatus::Failed => failed += 1,
+            TaskStatus::Held => held += 1,
+            TaskStatus::Done => done += 1,
+        }
+    }
+    let _ = writeln!(
+        s,
+        "\nqueue      {}",
+        if tasks.is_empty() {
+            "empty".to_owned()
+        } else {
+            format!("queued {queued}, running {running}, failed {failed}, held {held}, done {done}")
+        }
+    );
+    if held > 0 {
+        // The one queue state nothing will move without a human, so it gets
+        // its own line and the command that fixes it, rather than being
+        // just one more number in the summary above.
+        let _ = writeln!(
+            s,
+            "held       {held} task{} waiting on a human — release with `magi task release`",
+            if held == 1 { "" } else { "s" }
+        );
+    }
+
+    // Reuse daemon.rs's own staleness rule rather than re-deriving it: a
+    // heartbeat this build calls fresh must never disagree with what the web
+    // UI or the daemon's own log already said about the same file.
+    let now = jiff::Timestamp::now();
+    match daemon::read_status(home) {
+        Some(status) if status.running(now) => {
+            match status.pid {
+                Some(pid) => {
+                    let _ = writeln!(s, "loop       running (pid {pid})");
+                }
+                None => {
+                    let _ = writeln!(s, "loop       running");
+                }
+            }
+            if let Some(current) = &status.current {
+                let _ = writeln!(s, "  working  task {} (run {})", current.task, current.run);
+            }
+        }
+        Some(_) => {
+            let _ = writeln!(s, "loop       not running (last heartbeat is stale)");
+        }
+        None => {
+            let _ = writeln!(s, "loop       not running");
+        }
+    }
+
+    // Label kept inside the 11-column gutter the rest of `doctor` uses; at
+    // "runs unreadable" the value hung four characters past every other row.
+    let _ = writeln!(s, "unreadable {}", web::runs_unreadable(&home.join("runs")));
+
+    s
 }
 
 async fn probe(program: &str, args: &[&str]) -> String {
@@ -903,5 +983,105 @@ mod tests {
         let empty = dir.path().join("empty.md");
         std::fs::write(&empty, "  \n").unwrap();
         assert!(task_text(&[], Some(&empty), None).await.is_err());
+    }
+
+    #[test]
+    fn doctor_reports_an_empty_queue_and_no_loop_on_a_fresh_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = doctor_queue_and_loop(dir.path());
+        assert!(text.contains("queue      empty"), "{text}");
+        assert!(!text.contains("held"), "nothing to release: {text}");
+        assert!(text.contains("loop       not running"), "{text}");
+        assert!(text.contains("unreadable 0"), "{text}");
+    }
+
+    fn task(status: TaskStatus) -> Task {
+        let mut t = Task::new(
+            "add retries".to_owned(),
+            "add retries".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        t.status = status;
+        t
+    }
+
+    #[test]
+    fn doctor_counts_queued_tasks_and_calls_out_a_held_one_with_no_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        for status in [TaskStatus::Queued, TaskStatus::Queued, TaskStatus::Held] {
+            queue.put(&mut task(status)).unwrap();
+        }
+
+        let text = doctor_queue_and_loop(dir.path());
+
+        assert!(
+            text.contains("queue      queued 2, running 0, failed 0, held 1, done 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "held       1 task waiting on a human — release with `magi task release`"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("loop       not running"), "{text}");
+    }
+
+    #[test]
+    fn doctor_reports_the_loop_running_a_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut status = magi::daemon::Status::new();
+        status.pid = 4242;
+        status.current = Some(magi::daemon::Current {
+            task: "20260902-140501-t111".to_owned(),
+            run: "20260902-140502-r111".to_owned(),
+        });
+        magi::daemon::write_status_to(&dir.path().join("daemon.json"), &status).unwrap();
+
+        let text = doctor_queue_and_loop(dir.path());
+
+        assert!(text.contains("loop       running (pid 4242)"), "{text}");
+        assert!(
+            text.contains("working  task 20260902-140501-t111 (run 20260902-140502-r111)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_stale_daemon_file_reports_not_running_rather_than_work_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut status = magi::daemon::Status::new();
+        status.updated_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(60);
+        status.current = Some(magi::daemon::Current {
+            task: "20260902-140501-t111".to_owned(),
+            run: "20260902-140502-r111".to_owned(),
+        });
+        magi::daemon::write_status_to(&dir.path().join("daemon.json"), &status).unwrap();
+
+        let text = doctor_queue_and_loop(dir.path());
+
+        assert!(
+            text.contains("loop       not running"),
+            "a stale heartbeat must not claim work is in flight: {text}"
+        );
+        assert!(!text.contains("20260902-140501-t111"), "{text}");
+    }
+
+    #[test]
+    fn doctor_counts_runs_this_build_cannot_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        std::fs::create_dir_all(runs.join("20260902-140502-bad")).unwrap();
+        std::fs::write(
+            runs.join("20260902-140502-bad").join("run.json"),
+            "{ truncated",
+        )
+        .unwrap();
+
+        let text = doctor_queue_and_loop(dir.path());
+
+        assert!(text.contains("unreadable 1"), "{text}");
     }
 }

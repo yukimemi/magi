@@ -60,16 +60,10 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::queue::{Queue, Source, Task, title_from};
 use crate::run::{RunState, RunStatus};
-use crate::{report, run};
+use crate::{daemon, report, run};
 
 /// Default port. Chosen high and memorable; nothing else in the fleet uses it.
 pub const DEFAULT_PORT: u16 = 7878;
-
-/// How long a daemon status file may go unrefreshed before the UI calls the
-/// daemon dead. The writer heartbeats every five seconds, so thirty is six
-/// missed beats: long enough to survive a slow filesystem, short enough that
-/// a crashed daemon is not still reported as running a task.
-const DAEMON_STALE_SECS: i64 = 30;
 
 /// How often the change stream restats the queue and the runs directory.
 const POLL: Duration = Duration::from_secs(1);
@@ -303,52 +297,6 @@ fn is_tailnet(ip: &Ipv4Addr) -> bool {
     o[0] == 100 && (64..=127).contains(&o[1])
 }
 
-/// The daemon's published state, read permissively.
-///
-/// This mirrors what the daemon writes, but it is a separate declaration on
-/// purpose: every field defaults, so a status file from an older or newer magi
-/// still renders a status line instead of turning the whole UI into a 500.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct DaemonStatus {
-    /// Format version the daemon claims.
-    pub schema: u32,
-    /// Daemon process id, for an operator who wants to stop it.
-    pub pid: Option<u32>,
-    /// When that process started.
-    pub started_at: Option<Timestamp>,
-    /// Last heartbeat. Absent means the file is unusable, hence not running.
-    pub updated_at: Option<Timestamp>,
-    /// True when the queue had nothing runnable at the last poll.
-    pub idle: bool,
-    /// What the daemon is working on.
-    pub current: Option<DaemonCurrent>,
-    /// Tasks this daemon process has finished.
-    pub completed: u64,
-    /// Queue polls this daemon process has made.
-    pub polls: u64,
-}
-
-/// The task and run a daemon is working on.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct DaemonCurrent {
-    /// Task id.
-    pub task: String,
-    /// Run id the task produced.
-    pub run: String,
-}
-
-/// Read `<home>/daemon.json`, or `None` when there is nothing usable there.
-///
-/// Missing, half-written and unparseable all collapse to `None`, because the
-/// only question the UI asks is whether a daemon is alive, and a file it
-/// cannot read is not evidence that one is.
-pub fn daemon_status(home: &FsPath) -> Option<DaemonStatus> {
-    let body = std::fs::read_to_string(home.join("daemon.json")).ok()?;
-    serde_json::from_str(&body).ok()
-}
-
 /// What every handler returns. Spelled out because `Result` in this crate is
 /// `anyhow::Result`, and a handler's error is a status code as much as a
 /// message.
@@ -472,16 +420,16 @@ struct DaemonView {
     running: bool,
     idle: Option<bool>,
     pid: Option<u32>,
-    current: Option<DaemonCurrent>,
+    current: Option<daemon::Current>,
     completed: Option<u64>,
     stale_for_secs: Option<i64>,
 }
 
 impl DaemonView {
-    /// Judge a status file. A heartbeat older than [`DAEMON_STALE_SECS`] is
-    /// not running: the alternative is a UI that claims a task is in progress
-    /// hours after the daemon was killed.
-    fn of(status: Option<DaemonStatus>) -> Self {
+    /// Judge a status file. Staleness is [`daemon::Reading::running`]'s call,
+    /// not this UI's — a crashed daemon must not look alive here while
+    /// `doctor` calls it dead.
+    fn of(status: Option<daemon::Reading>) -> Self {
         let Some(status) = status else {
             return Self {
                 running: false,
@@ -492,11 +440,10 @@ impl DaemonView {
                 stale_for_secs: None,
             };
         };
-        let age = status
-            .updated_at
-            .map(|at| (Timestamp::now().as_second() - at.as_second()).max(0));
+        let now = Timestamp::now();
+        let age = status.age_secs(now);
         Self {
-            running: age.is_some_and(|secs| secs <= DAEMON_STALE_SECS),
+            running: status.running(now),
             idle: Some(status.idle),
             pid: status.pid,
             current: status.current,
@@ -513,11 +460,8 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             home: ui.home.display().to_string(),
             queue_rev: ui.queue.revision(),
             runs_rev: runs_revision(&ui.runs),
-            runs_unreadable: run_ids(&ui.runs)
-                .into_iter()
-                .filter(|id| read_run(&ui.runs, id).is_err())
-                .count(),
-            daemon: DaemonView::of(daemon_status(&ui.home)),
+            runs_unreadable: runs_unreadable(&ui.runs),
+            daemon: DaemonView::of(daemon::read_status(&ui.home)),
         }))
     })
     .await
@@ -846,6 +790,21 @@ fn read_run(runs: &FsPath, id: &str) -> Result<RunState> {
         );
     }
     Ok(state)
+}
+
+/// Runs on disk under `runs` whose state this build cannot parse - almost
+/// always a schema bump, occasionally a run killed mid-write.
+///
+/// Exposed so every surface that reports on runs shares one count instead of
+/// each re-deriving it: `/api/health` reports it as `runs_unreadable`, and
+/// `magi doctor` calls this directly rather than guessing at the same number
+/// a second way.
+#[must_use]
+pub fn runs_unreadable(runs: &FsPath) -> usize {
+    run_ids(runs)
+        .into_iter()
+        .filter(|id| read_run(runs, id).is_err())
+        .count()
 }
 
 /// Expand an id or short id to exactly one run id.
