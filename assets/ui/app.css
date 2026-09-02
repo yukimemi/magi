@@ -1,0 +1,740 @@
+/* magi observation deck.
+ *
+ * Phone-first: every layout decision below is made for a 390x844 screen held
+ * one-handed, then widened. The desktop rules are additive and near the bottom.
+ *
+ * The palette is taken from assets/logo.svg and assets/logo-dark.svg so the UI
+ * and the mark cannot drift apart. Both themes are written out in full rather
+ * than derived with color-mix(), because a tint that silently falls back to a
+ * flat colour on an older phone browser is a contrast bug the operator would
+ * only find in sunlight.
+ */
+
+/* ---- tokens: light ------------------------------------------------------ */
+:root {
+  --bg: #f7f5f1;          /* warm paper; pure white is never used */
+  --surface: #fffdfa;
+  --sunk: #efeae1;
+  --ink: #1a1a1a;         /* logo wordmark ink */
+  --ink-2: #55504a;
+  --ink-3: #6b655c;
+  --line: #ddd6c9;
+  --line-2: #c9c0af;
+  /* Boundary colour for anything interactive. Distinct from --line because a
+     divider may be faint, while the edge of a control has to clear 3:1. */
+  --edge: #9d8c6d;
+
+  --gold: #c9a227;
+  /* #c9a227 is only 2.4:1 on paper, so the gold that carries meaning as a
+     line or indicator is darkened; the fill of the gold button keeps the
+     logo value, where the ink on top is what needs the ratio. */
+  --gold-line: #ac8a21;
+  --teal: #0a7e8c;
+  --rust: #c5582d;
+  --violet: #7d4b9e;
+  --blue: #4a72b8;
+
+  /* The mark, exactly as assets/logo.svg draws it. A logotype is exempt from
+     the contrast minimum and must not be tampered with to satisfy it. */
+  --mark-a: #c5582d;
+  --mark-b: #0a7e8c;
+  --mark-c: #7d4b9e;
+  --mark-gold: #c9a227;
+
+  /* Candidate colours as they appear on data — labels, rails, diagram
+     strokes — darkened until each one reads as body text on every surface. */
+  --cand-a: #ad4d28;
+  --cand-b: #097582;
+  --cand-c: #7d4b9e;
+  --cand-d: #806719;
+  --cand-e: #4369ac;
+
+  /* chip fills and the ink that sits on them */
+  --tint-gold: #f6eccd;  --on-gold: #6b5410;
+  --tint-teal: #d7edef;  --on-teal: #05616b;
+  --tint-blue: #dce6f6;  --on-blue: #2d5391;
+  --tint-rust: #f8e1d6;  --on-rust: #8f3a1a;
+  --tint-ink:  #e9e5de;  --on-ink:  #494440;
+
+  --focus: #2d5391;
+  --shadow: 0 1px 2px rgba(26, 22, 14, .06), 0 4px 14px rgba(26, 22, 14, .05);
+  --hatch: rgba(143, 58, 26, .13);
+
+  --radius: 12px;
+  --radius-sm: 8px;
+
+  /* 4px spacing scale */
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px; --s7: 48px;
+
+  /* type scale */
+  --t1: .75rem; --t2: .8125rem; --t3: .875rem; --t4: .9375rem;
+  --t5: 1.0625rem; --t6: 1.3125rem; --t7: 1.625rem;
+
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  --tap: 44px;            /* minimum touch target */
+  --ease: cubic-bezier(.22, 1, .36, 1);   /* out-expo; never elastic */
+}
+
+/* ---- tokens: dark ------------------------------------------------------ *
+ * Duplicated for the media query and the explicit override, deliberately:
+ * an operator who pins a theme must beat their OS setting, and there is no
+ * single-selector way to say that without nesting. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #191817;
+    --surface: #211f1d;
+    --sunk: #131211;
+    --ink: #f5f5f5;
+    --ink-2: #b8b8b8;
+    --ink-3: #9b948a;
+    --line: #37342e;
+    --line-2: #4c473e;
+    --edge: #70695b;
+
+    --gold: #e9c14a;
+    --gold-line: #e9c14a;
+    --teal: #3aa9b8;
+    --rust: #e58050;
+    --violet: #b78fe0;
+    --blue: #7ea6e8;
+
+    /* assets/logo-dark.svg, verbatim. */
+    --mark-a: #e58050;
+    --mark-b: #3aa9b8;
+    --mark-c: #b78fe0;
+    --mark-gold: #e9c14a;
+
+    --cand-a: #e58050;
+    --cand-b: #3aa9b8;
+    --cand-c: #b78fe0;
+    --cand-d: #e9c14a;
+    --cand-e: #7ea6e8;
+
+    --tint-gold: #38301a;  --on-gold: #edc85c;
+    --tint-teal: #14313a;  --on-teal: #55c3d1;
+    --tint-blue: #1c2839;  --on-blue: #93b8f2;
+    --tint-rust: #382318;  --on-rust: #f09a72;
+    --tint-ink:  #2a2724;  --on-ink:  #c4bdb3;
+
+    --focus: #93b8f2;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 4px 14px rgba(0, 0, 0, .35);
+    --hatch: rgba(240, 154, 114, .14);
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #191817;
+  --surface: #211f1d;
+  --sunk: #131211;
+  --ink: #f5f5f5;
+  --ink-2: #b8b8b8;
+  --ink-3: #9b948a;
+  --line: #37342e;
+  --line-2: #4c473e;
+  --edge: #70695b;
+
+  --gold: #e9c14a;
+  --gold-line: #e9c14a;
+  --teal: #3aa9b8;
+  --rust: #e58050;
+  --violet: #b78fe0;
+  --blue: #7ea6e8;
+
+  /* assets/logo-dark.svg, verbatim. */
+  --mark-a: #e58050;
+  --mark-b: #3aa9b8;
+  --mark-c: #b78fe0;
+  --mark-gold: #e9c14a;
+
+  --cand-a: #e58050;
+  --cand-b: #3aa9b8;
+  --cand-c: #b78fe0;
+  --cand-d: #e9c14a;
+  --cand-e: #7ea6e8;
+
+  --tint-gold: #38301a;  --on-gold: #edc85c;
+  --tint-teal: #14313a;  --on-teal: #55c3d1;
+  --tint-blue: #1c2839;  --on-blue: #93b8f2;
+  --tint-rust: #382318;  --on-rust: #f09a72;
+  --tint-ink:  #2a2724;  --on-ink:  #c4bdb3;
+
+  --focus: #93b8f2;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 4px 14px rgba(0, 0, 0, .35);
+  --hatch: rgba(240, 154, 114, .14);
+}
+
+:root[data-theme="dark"] { color-scheme: dark; }
+:root[data-theme="light"] { color-scheme: light; }
+
+/* ---- base -------------------------------------------------------------- */
+*, *::before, *::after { box-sizing: border-box; }
+
+/* The client toggles visibility with the `hidden` attribute, and almost every
+   element it toggles also carries a `display` rule here, which would otherwise
+   win over the user-agent default and leave empty cards and blank alert boxes
+   on screen. */
+[hidden] { display: none !important; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 var(--t4)/1.55 var(--sans);
+  /* The dock is fixed; this keeps the last card clear of it and of the home
+     indicator. */
+  padding-bottom: calc(var(--tap) + var(--s6) + env(safe-area-inset-bottom));
+  overflow-x: hidden;      /* a horizontal scrollbar on a phone is a bug */
+  -webkit-tap-highlight-color: transparent;
+}
+
+h1, h2, h3 { margin: 0; font-weight: 650; letter-spacing: -.01em; line-height: 1.25; }
+h1 { font-size: var(--t6); letter-spacing: -.02em; }
+h2 { font-size: var(--t4); }
+h3 { font-size: var(--t4); }
+
+/* The small-caps treatment belongs to section labels inside a panel, not to
+   every h2: a card's title is the operator's own task text and must read as
+   the sentence they wrote. */
+.panel h2 {
+  font-size: var(--t3); text-transform: uppercase;
+  letter-spacing: .07em; color: var(--ink-3);
+}
+p { margin: 0; }
+ol, ul { margin: 0; padding: 0; list-style: none; }
+
+a { color: inherit; text-decoration: none; }
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+
+.skip {
+  position: absolute; left: var(--s3); top: -100px; z-index: 40;
+  background: var(--surface); color: var(--ink);
+  padding: var(--s3) var(--s4); border: 1px solid var(--edge);
+  border-radius: var(--radius-sm); font-weight: 600;
+}
+.skip:focus { top: var(--s3); }
+
+/* ---- header ------------------------------------------------------------ */
+.top {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: var(--s3);
+  padding: var(--s2) var(--s4);
+  padding-top: calc(var(--s2) + env(safe-area-inset-top));
+  padding-left: calc(var(--s4) + env(safe-area-inset-left));
+  padding-right: calc(var(--s4) + env(safe-area-inset-right));
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand { display: flex; align-items: center; gap: var(--s2); min-height: var(--tap); margin-right: auto; }
+.brand-mark { width: 30px; height: 30px; flex: none; }
+.brand-text { display: flex; flex-direction: column; line-height: 1.1; }
+.brand-name { font-size: var(--t5); font-weight: 700; letter-spacing: -.03em; }
+.brand-sub { font-size: var(--t1); color: var(--ink-3); font-style: italic; }
+
+.rail { display: none; }
+
+.icon-btn {
+  width: var(--tap); height: var(--tap); flex: none;
+  display: grid; place-items: center;
+  background: none; border: 1px solid transparent; border-radius: var(--radius-sm);
+  color: var(--ink-2); cursor: pointer; font: inherit;
+}
+.icon-btn:active { background: var(--sunk); }
+.icon-btn svg { width: 20px; height: 20px; }
+
+/* Sun / moon / auto, drawn in CSS so the toggle costs no markup and no fetch. */
+.theme-glyph {
+  width: 18px; height: 18px; border-radius: 50%;
+  border: 2px solid currentColor;
+  background: linear-gradient(90deg, currentColor 50%, transparent 50%);
+}
+[data-theme="light"] .theme-glyph { background: currentColor; }
+[data-theme="dark"] .theme-glyph { background: none; box-shadow: inset -5px 0 0 currentColor; }
+
+/* ---- daemon strip ------------------------------------------------------ */
+.daemon {
+  display: flex; align-items: center; gap: var(--s2);
+  padding: var(--s2) var(--s4);
+  padding-left: calc(var(--s4) + env(safe-area-inset-left));
+  padding-right: calc(var(--s4) + env(safe-area-inset-right));
+  background: var(--sunk);
+  border-bottom: 1px solid var(--line);
+  font-size: var(--t2); color: var(--ink-2);
+  min-height: 34px;
+}
+.daemon-dot {
+  width: 8px; height: 8px; flex: none; border-radius: 50%;
+  background: var(--ink-3);
+}
+.daemon-text { min-width: 0; }
+.daemon-text b { color: var(--ink); font-weight: 650; }
+.daemon-run { font-family: var(--mono); font-size: var(--t1); }
+
+.daemon[data-state="working"] { background: var(--tint-blue); color: var(--on-blue); border-bottom-color: var(--tint-blue); }
+.daemon[data-state="working"] .daemon-dot { background: var(--on-blue); animation: pulse 1.8s var(--ease) infinite; }
+.daemon[data-state="working"] .daemon-text b { color: var(--on-blue); }
+.daemon[data-state="idle"] .daemon-dot { background: var(--teal); }
+/* Down is stated, not implied: this is the difference between an empty queue
+   and a queue nothing will ever read. */
+.daemon[data-state="down"] { background: var(--tint-rust); color: var(--on-rust); border-bottom-color: var(--tint-rust); }
+.daemon[data-state="down"] .daemon-dot { background: var(--on-rust); box-shadow: 0 0 0 2px var(--tint-rust), 0 0 0 3px var(--on-rust); }
+.daemon[data-state="down"] .daemon-text b { color: var(--on-rust); }
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+/* ---- alert ------------------------------------------------------------- */
+.alert {
+  display: flex; align-items: center; gap: var(--s3);
+  margin: var(--s3) var(--s4) 0;
+  padding: var(--s3);
+  background: var(--tint-rust); color: var(--on-rust);
+  border: 1px solid currentColor; border-radius: var(--radius-sm);
+  font-size: var(--t3);
+}
+.alert-text { flex: 1; min-width: 0; }
+
+/* ---- views ------------------------------------------------------------- */
+main {
+  padding: var(--s4);
+  padding-left: calc(var(--s4) + env(safe-area-inset-left));
+  padding-right: calc(var(--s4) + env(safe-area-inset-right));
+  max-width: 1200px; margin: 0 auto;
+}
+.view { display: flex; flex-direction: column; gap: var(--s4); }
+
+.view-head { display: flex; flex-direction: column; gap: var(--s1); }
+.view-sub { font-size: var(--t2); color: var(--ink-3); }
+
+.back {
+  display: inline-flex; align-items: center; gap: var(--s1);
+  align-self: flex-start; min-height: var(--tap); padding-right: var(--s2);
+  font-size: var(--t3); color: var(--ink-2); font-weight: 600;
+}
+.back::before { content: "\2190"; font-size: var(--t5); }
+
+.empty {
+  display: flex; flex-direction: column; align-items: flex-start; gap: var(--s4);
+  padding: var(--s5) var(--s4);
+  border: 1px dashed var(--line-2); border-radius: var(--radius);
+  color: var(--ink-2); font-size: var(--t3); max-width: 46ch;
+}
+
+/* ---- buttons ----------------------------------------------------------- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: var(--tap); padding: 0 var(--s4);
+  border-radius: var(--radius-sm); border: 1px solid var(--edge);
+  background: var(--surface); color: var(--ink);
+  font: 600 var(--t3)/1 var(--sans); cursor: pointer;
+  transition: transform .18s var(--ease);
+}
+.btn:active { transform: scale(.97); }
+.btn:disabled { opacity: .5; cursor: default; }
+
+/* Gold is the verdict colour in the mark, so it is the commit action here and
+   nowhere else. */
+.btn-gold { background: var(--gold); border-color: var(--gold); color: #241d05; }
+:root[data-theme="dark"] .btn-gold { color: #241d05; }
+.btn-quiet { background: transparent; border-color: var(--edge); color: var(--ink-2); }
+
+/* ---- status chips ------------------------------------------------------ *
+ * Colour is never the only channel. Every status carries a glyph, and the
+ * three unhappy endings additionally differ in border and fill treatment, so
+ * `stalled` cannot be mistaken for `ready` in greyscale or by a red-green
+ * colour-blind operator. */
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 9px 3px 7px;
+  border-radius: 999px; border: 1.5px solid currentColor;
+  background: var(--tint-ink); color: var(--on-ink);
+  font-size: var(--t1); font-weight: 700;
+  text-transform: uppercase; letter-spacing: .06em;
+  white-space: nowrap;
+}
+.chip::before { content: attr(data-glyph); font-size: 1.05em; letter-spacing: 0; }
+
+.chip[data-status="merged"]  { background: var(--tint-gold); color: var(--on-gold); }
+.chip[data-status="ready"]   { background: var(--tint-teal); color: var(--on-teal); }
+.chip[data-status="prep"]    { background: var(--tint-ink);  color: var(--on-ink); }
+.chip[data-flight="1"]       { background: var(--tint-blue); color: var(--on-blue); border-style: dashed; }
+.chip[data-status="blocked"] { background: var(--tint-rust); color: var(--on-rust); }
+.chip[data-status="failed"]  { background: var(--tint-ink);  color: var(--on-ink); }
+
+/* stalled: hatched fill and a double border. The panel collapsed on quota —
+   the run holds work but reached no verdict, and it must not read as success. */
+.chip[data-status="stalled"] {
+  color: var(--on-rust);
+  border-style: double; border-width: 3px;
+  background-color: var(--tint-rust);
+  background-image: repeating-linear-gradient(-45deg,
+    var(--hatch) 0 3px, transparent 3px 7px);
+}
+
+/* ---- cards (runs + queue) ---------------------------------------------- */
+.cards { display: flex; flex-direction: column; gap: var(--s3); }
+
+.card {
+  display: block;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-2);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: var(--s3) var(--s4);
+}
+.card[data-tone="gold"]   { border-left-color: var(--gold-line); }
+.card[data-tone="teal"]   { border-left-color: var(--teal); }
+.card[data-tone="blue"]   { border-left-color: var(--blue); }
+.card[data-tone="rust"]   { border-left-color: var(--rust); }
+.card[data-tone="ink"]    { border-left-color: var(--line-2); }
+a.card:active { background: var(--sunk); }
+
+.card-top { display: flex; align-items: center; gap: var(--s2); }
+.card-when { margin-left: auto; font-size: var(--t1); color: var(--ink-3); white-space: nowrap; }
+.card-title {
+  margin-top: var(--s2);
+  font-size: var(--t5); font-weight: 600; line-height: 1.32; color: var(--ink);
+  /* Two lines is the honest budget at 390px; the full text is on the detail
+     view and in the instruction disclosure. */
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.card-meta {
+  margin-top: var(--s2);
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--s2);
+  font-size: var(--t2); color: var(--ink-2);
+}
+/* The separator trails its own item rather than leading the next one. When a
+   meta line wraps, the dot stays at the end of the previous line instead of
+   appearing as a stray bullet under the title. `data-sep` is set by the
+   client, which is the only thing that knows which item is last once some of
+   them are hidden. */
+.card-meta > [data-sep]::after,
+.cand-nums > [data-sep]::after {
+  content: "\00b7"; margin-left: var(--s2); color: var(--line-2);
+}
+.repo { font-family: var(--mono); font-size: var(--t1); }
+.win { font-weight: 700; color: var(--on-gold); }
+
+.card-event {
+  margin-top: var(--s2); padding-left: var(--s3);
+  border-left: 2px solid var(--line);
+  font-size: var(--t2); color: var(--ink-2); font-style: italic;
+  overflow-wrap: anywhere;
+}
+.card-note { margin-top: var(--s2); font-size: var(--t2); color: var(--on-rust); font-weight: 600; }
+
+.err {
+  margin-top: var(--s2); padding: var(--s2) var(--s3);
+  background: var(--tint-rust); color: var(--on-rust);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono); font-size: var(--t1); line-height: 1.45;
+  /* A <pre> defaults to white-space: pre, which let a one-line agent error
+     push the whole document sideways on a 390px screen. */
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+/* phase rail: where an in-flight run has got to, since the summary carries no
+   progress of its own. */
+.phases { display: flex; align-items: center; gap: 5px; margin-top: var(--s3); }
+.phase { width: 100%; height: 3px; border-radius: 2px; background: var(--line); }
+.phase[data-on="1"] { background: var(--blue); }
+.phase[data-now="1"] { background: var(--blue); animation: pulse 1.8s var(--ease) infinite; }
+
+.card-actions { display: flex; gap: var(--s2); margin-top: var(--s3); flex-wrap: wrap; }
+.card-actions .btn { flex: 1 1 auto; min-width: 120px; }
+
+/* ---- panels (run detail) ----------------------------------------------- */
+.panel {
+  display: flex; flex-direction: column; gap: var(--s3);
+  background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: var(--s4);
+}
+.panel-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); }
+.panel-note { font-size: var(--t2); color: var(--ink-3); }
+.count { color: var(--ink-3); font-weight: 500; letter-spacing: 0; text-transform: none; }
+
+.run-status { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.instruction { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--t4); color: var(--ink); }
+
+.facts { display: grid; grid-template-columns: auto 1fr; gap: var(--s2) var(--s4); margin: 0; font-size: var(--t3); }
+.facts dt { color: var(--ink-3); }
+.facts dd { margin: 0; color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+.facts dd.mono { font-family: var(--mono); font-size: var(--t2); font-weight: 500; }
+
+/* convergence diagram: the mark's three monoliths, drawn from the real
+   candidate list. The winner's stroke survives; the others fade. */
+.converge { width: 100%; }
+.converge svg { width: 100%; height: auto; display: block; }
+.converge text { font: 700 13px var(--sans); }
+
+/* ---- candidates -------------------------------------------------------- */
+.cands { display: flex; flex-direction: column; gap: var(--s3); }
+.cand {
+  display: flex; flex-direction: column; gap: var(--s2);
+  padding: var(--s3);
+  background: var(--sunk); border-radius: var(--radius-sm);
+  border-left: 3px solid var(--cand-tone, var(--line-2));
+}
+.cand[data-winner="1"] { background: var(--tint-gold); }
+.cand-head { display: flex; align-items: center; gap: var(--s2); }
+.cand-label {
+  width: 28px; height: 28px; flex: none;
+  display: grid; place-items: center;
+  border-radius: 50%; border: 2px solid var(--cand-tone, var(--ink-3));
+  color: var(--cand-tone, var(--ink)); background: var(--surface);
+  font-weight: 700; font-size: var(--t3);
+}
+.cand-agent { font-family: var(--mono); font-size: var(--t2); color: var(--ink-2); }
+.crown { margin-left: auto; font-size: var(--t1); font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--on-gold); }
+.crown::before { content: "\25c6"; margin-right: 4px; }
+/* A provisional lead is not a verdict: hollow diamond, neutral ink, no gold. */
+.crown[data-provisional] { color: var(--ink-3); }
+.crown[data-provisional]::before { content: "\25c7"; }
+.cand-nums { display: flex; flex-wrap: wrap; gap: 0 var(--s2); font-size: var(--t2); color: var(--ink-2); }
+.cand-summary { font-size: var(--t3); color: var(--ink-2); overflow-wrap: anywhere; }
+
+.stat, .report {
+  margin: 0;
+  font-family: var(--mono); font-size: var(--t1); line-height: 1.5;
+  color: var(--ink-2);
+  overflow-x: auto; overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* A diffstat is a handful of short lines, so it wraps rather than clipping a
+   word off at the card edge. The run report does not: it is column-aligned
+   terminal output and reflowing it would scramble the tables. */
+.stat { white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: visible; }
+
+/* ---- review rounds ----------------------------------------------------- */
+.rounds { display: flex; flex-direction: column; gap: var(--s3); }
+.round { background: var(--sunk); border-radius: var(--radius-sm); padding: var(--s3); }
+.round-head { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.round-n { font-weight: 700; font-size: var(--t4); }
+.tag {
+  font-size: var(--t1); font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+  padding: 2px 7px; border-radius: 999px; border: 1px solid currentColor;
+}
+.tag[data-tone="teal"] { background: var(--tint-teal); color: var(--on-teal); }
+.tag[data-tone="rust"] { background: var(--tint-rust); color: var(--on-rust); }
+.tag[data-tone="ink"]  { background: var(--tint-ink);  color: var(--on-ink); }
+.round-head .head-sha { margin-left: auto; font-family: var(--mono); font-size: var(--t1); color: var(--ink-3); }
+
+.findings { display: flex; flex-direction: column; gap: var(--s2); margin-top: var(--s3); }
+.finding {
+  padding-left: var(--s3);
+  border-left: 3px solid var(--line-2);
+  font-size: var(--t3);
+}
+.finding[data-sev="blocker"] { border-left-color: var(--rust); }
+.finding[data-sev="major"]   { border-left-color: var(--gold-line); }
+.finding-top { display: flex; align-items: baseline; gap: var(--s2); flex-wrap: wrap; }
+.finding-id { font-family: var(--mono); font-size: var(--t1); color: var(--ink-3); }
+.finding-sev { font-size: var(--t1); font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--ink-2); }
+.finding-title { font-weight: 600; color: var(--ink); }
+.finding-where { font-family: var(--mono); font-size: var(--t1); color: var(--ink-3); }
+.finding-detail { color: var(--ink-2); margin-top: 2px; overflow-wrap: anywhere; }
+.reviewer { margin-top: var(--s3); font-size: var(--t3); }
+.reviewer-name { font-family: var(--mono); font-size: var(--t2); color: var(--ink-3); }
+
+.plain { display: flex; flex-direction: column; gap: var(--s2); font-size: var(--t3); color: var(--ink-2); }
+.plain li { display: flex; gap: var(--s2); flex-wrap: wrap; }
+.plain .seat { font-family: var(--mono); color: var(--ink); font-weight: 600; }
+
+.report {
+  max-height: 60vh; overflow-y: auto;
+  padding: var(--s3);
+  background: var(--sunk); border-radius: var(--radius-sm);
+  color: var(--ink);
+  white-space: pre;
+  tab-size: 4;
+}
+.report[data-wrap="1"] { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* ---- timeline ---------------------------------------------------------- */
+.timeline { display: flex; flex-direction: column; }
+.timeline li {
+  display: grid; grid-template-columns: 62px 1fr; gap: var(--s3);
+  padding: var(--s2) 0 var(--s2) var(--s3);
+  border-left: 2px solid var(--line);
+  font-size: var(--t3);
+  position: relative;
+}
+.timeline li::before {
+  content: ""; position: absolute; left: -5px; top: 15px;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--line-2);
+}
+.timeline li:last-child::before { background: var(--gold-line); }
+.event-at { font-family: var(--mono); font-size: var(--t1); color: var(--ink-3); }
+.event-body { min-width: 0; }
+.event-node { font-weight: 700; font-size: var(--t2); text-transform: uppercase; letter-spacing: .05em; color: var(--ink-3); }
+.event-msg { color: var(--ink); overflow-wrap: anywhere; }
+
+/* ---- skeletons --------------------------------------------------------- */
+.skeleton { pointer-events: none; }
+.skeleton .bar { height: 12px; border-radius: 6px; background: var(--sunk); }
+.skeleton .bar + .bar { margin-top: var(--s2); }
+.skeleton { animation: fade 1.4s var(--ease) infinite; }
+@keyframes fade { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+
+/* ---- dock -------------------------------------------------------------- */
+.dock {
+  position: fixed; z-index: 20; left: 0; right: 0; bottom: 0;
+  display: flex;
+  background: var(--surface);
+  border-top: 1px solid var(--line);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.dock-item {
+  flex: 1;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  min-height: var(--tap); padding: var(--s2) var(--s1);
+  background: none; border: 0; border-top: 2px solid transparent;
+  color: var(--ink-3); font: 600 var(--t1)/1 var(--sans); cursor: pointer;
+}
+.dock-glyph svg { width: 22px; height: 22px; display: block; }
+.dock-item[aria-current="page"] { color: var(--ink); border-top-color: var(--gold-line); }
+.dock-new { color: var(--on-gold); }
+.dock-new .dock-glyph svg { stroke-width: 2.4; }
+
+/* ---- compose sheet ----------------------------------------------------- */
+.sheet {
+  width: 100%; max-width: 560px; padding: 0; margin: auto auto 0;
+  border: 0; border-radius: var(--radius) var(--radius) 0 0;
+  background: var(--surface); color: var(--ink);
+  box-shadow: 0 -8px 40px rgba(0, 0, 0, .28);
+  max-height: 92dvh;
+}
+.sheet::backdrop { background: rgba(20, 18, 14, .55); }
+.sheet form {
+  display: flex; flex-direction: column; gap: var(--s4);
+  padding: var(--s4);
+  padding-bottom: calc(var(--s4) + env(safe-area-inset-bottom));
+  max-height: 92dvh; overflow-y: auto;
+}
+.sheet-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); }
+.sheet-head h2 { font-size: var(--t5); text-transform: none; letter-spacing: -.01em; color: var(--ink); }
+
+.field { display: flex; flex-direction: column; gap: var(--s1); }
+.field label { font-size: var(--t3); font-weight: 650; }
+.opt { font-weight: 400; color: var(--ink-3); }
+.hint { font-size: var(--t2); color: var(--ink-3); }
+
+textarea, input[type="text"], select {
+  width: 100%; min-height: var(--tap);
+  padding: var(--s2) var(--s3);
+  margin-top: var(--s1);
+  background: var(--bg); color: var(--ink);
+  border: 1px solid var(--edge); border-radius: var(--radius-sm);
+  /* 16px minimum: anything smaller makes iOS zoom the viewport on focus, which
+     is the horizontal-scroll bug the layout is otherwise free of. */
+  font: 400 1rem/1.5 var(--sans);
+}
+textarea { resize: vertical; }
+input:focus-visible, textarea:focus-visible, select:focus-visible { border-color: var(--focus); }
+
+/* display:flex removes the native marker, so the chevron is drawn back in;
+   a disclosure with no affordance reads as dead text. */
+.advanced summary {
+  min-height: var(--tap); display: flex; align-items: center; gap: var(--s2);
+  font-size: var(--t3); font-weight: 650; color: var(--ink-2); cursor: pointer;
+}
+.advanced summary::marker, .advanced summary::-webkit-details-marker { display: none; content: ""; }
+.advanced summary::before {
+  content: "";
+  width: 7px; height: 7px; flex: none;
+  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  transform: rotate(-45deg); margin-left: 2px;
+  transition: transform .18s var(--ease);
+}
+.advanced[open] > summary::before { transform: rotate(45deg); }
+.sheet-actions { display: flex; gap: var(--s2); }
+.sheet-actions .btn { flex: 1; }
+.form-error {
+  padding: var(--s2) var(--s3);
+  background: var(--tint-rust); color: var(--on-rust);
+  border-radius: var(--radius-sm); font-size: var(--t3); font-weight: 600;
+}
+
+/* ---- wide screens ------------------------------------------------------ *
+ * Not a stretched phone: the dock becomes a header rail, the run list becomes
+ * a grid, and the report pane sits beside the analysis instead of below it. */
+@media (min-width: 720px) {
+  body { padding-bottom: var(--s6); }
+  .dock { display: none; }
+  .rail { display: flex; align-items: center; gap: var(--s1); }
+  .rail-link {
+    display: inline-flex; align-items: center;
+    min-height: var(--tap); padding: 0 var(--s3);
+    border-radius: var(--radius-sm);
+    font-size: var(--t3); font-weight: 650; color: var(--ink-3);
+  }
+  .rail-link[aria-current="page"] { color: var(--ink); background: var(--sunk); }
+  .rail-new { margin-left: var(--s3); }
+  main { padding: var(--s5); }
+  h1 { font-size: var(--t7); }
+  .view { gap: var(--s5); }
+  .sheet {
+    margin: auto; border-radius: var(--radius);
+    max-height: min(86dvh, 760px);
+  }
+  .sheet form { max-height: min(86dvh, 760px); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: var(--s4); }
+  .card { display: flex; flex-direction: column; }
+  .card-event { margin-top: auto; padding-top: var(--s2); }
+}
+
+/* The two run-detail wrappers are inert on a phone: their children flow into
+   the section's single column in source order. */
+.run-main, .run-side { display: contents; }
+
+@media (min-width: 1080px) {
+  #view-run {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+    align-items: start;
+    column-gap: var(--s5);
+  }
+  #view-run > .back, #view-run > .view-head { grid-column: 1 / -1; }
+  /* Real columns here, so the report sits level with the verdict instead of
+     being pushed to whatever grid row auto-placement gives it. */
+  .run-main, .run-side {
+    display: flex; flex-direction: column; gap: var(--s5);
+    min-width: 0;
+  }
+  .run-main { grid-column: 1; }
+  .run-side { grid-column: 2; position: sticky; top: 96px; }
+  .report { max-height: calc(100dvh - 260px); }
+  .facts { grid-template-columns: 10rem 1fr; }
+}
+
+/* ---- motion ------------------------------------------------------------ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+}
+
+/* ---- print ------------------------------------------------------------- */
+@media print {
+  .top, .daemon, .dock, .back, .sheet { display: none; }
+  .card, .panel { box-shadow: none; break-inside: avoid; }
+  .report { max-height: none; white-space: pre-wrap; }
+}

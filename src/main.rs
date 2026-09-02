@@ -7,8 +7,9 @@ use clap::{ArgAction, CommandFactory as _, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use magi::config::{Config, MergeMode};
 use magi::graph::{Runner, fold_run};
+use magi::queue::{self, Queue, Source, Task, TaskStatus};
 use magi::run::{RunState, latest_id, list_ids, resolve_id};
-use magi::{agent, report, stats, tui, updater};
+use magi::{agent, daemon, report, stats, tui, updater, web};
 
 /// Blind multi-agent implementation competition.
 #[derive(Debug, Parser)]
@@ -42,6 +43,18 @@ impl From<MergeArg> for MergeMode {
             MergeArg::None => Self::None,
             MergeArg::Local => Self::Local,
             MergeArg::Pr => Self::Pr,
+        }
+    }
+}
+
+impl MergeArg {
+    /// Name as the config parser spells it. Written out rather than derived
+    /// from `Debug`, which would change silently if a variant were renamed.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Local => "local",
+            Self::Pr => "pr",
         }
     }
 }
@@ -135,6 +148,57 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Read, file, and hold work in the queue that `magi serve` drains.
+    ///
+    /// This is the surface an agent uses too: an implementer that spots
+    /// something worth doing but out of scope runs `magi task add`, and the
+    /// task is attributed to its run rather than to a passing human.
+    Task {
+        /// What to do with the queue.
+        #[command(subcommand)]
+        command: TaskCmd,
+    },
+    /// Drain the queue unattended: take the next task, run the graph, repeat.
+    ///
+    /// One competition at a time on purpose. The graph is already parallel
+    /// inside (candidates times judges), and two at once doubles the burn on
+    /// the agent-CLI quota that is the real constraint.
+    Serve {
+        /// Repository used by tasks that name none.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Config file; defaults to <repo>/magi.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Seconds between queue polls.
+        #[arg(long, default_value_t = 5)]
+        poll: u64,
+        /// Attempts a task gets before it is held for a human.
+        #[arg(long, default_value_t = 2)]
+        max_attempts: usize,
+        /// Drain what is runnable now, then stop.
+        #[arg(long)]
+        once: bool,
+        /// What to do with each winning branch.
+        #[arg(long, value_enum)]
+        merge: Option<MergeArg>,
+    },
+    /// Serve the phone UI: the same runs and queue, from a browser.
+    ///
+    /// There is no authentication. The default bind is the machine's Tailscale
+    /// address precisely so the tailnet is the boundary; it is not a mistake
+    /// that this does not listen on 0.0.0.0.
+    Web {
+        /// `auto` for the Tailscale address, or an explicit IP.
+        #[arg(long, default_value_t = web::Bind::Auto)]
+        bind: web::Bind,
+        /// Port to listen on.
+        #[arg(long, default_value_t = web::DEFAULT_PORT)]
+        port: u16,
+        /// Repository used by tasks filed without one.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
     /// Check the environment and the resolved roster.
     Doctor {
         /// Repository to inspect.
@@ -166,6 +230,67 @@ enum Command {
         /// Install without asking.
         #[arg(long)]
         yes: bool,
+    },
+}
+
+/// Operations on the queue.
+#[derive(Debug, Subcommand)]
+enum TaskCmd {
+    /// File a task. Text as arguments, or --file, or --issue, or on stdin.
+    Add {
+        /// The task text.
+        #[arg(value_name = "TASK", trailing_var_arg = true)]
+        instruction: Vec<String>,
+        /// Read the task from a file.
+        #[arg(long, conflicts_with_all = ["instruction", "issue"])]
+        file: Option<PathBuf>,
+        /// Read the task from a GitHub issue via `gh`.
+        #[arg(long, conflicts_with_all = ["instruction", "file"])]
+        issue: Option<u64>,
+        /// One-line summary. Defaults to the first meaningful line.
+        #[arg(long)]
+        title: Option<String>,
+        /// Higher runs first.
+        #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+        priority: i32,
+        /// Repository the task applies to.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Print the filed task as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the queue.
+    List {
+        /// Include finished and held tasks.
+        #[arg(long)]
+        all: bool,
+        /// Print JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one task in full.
+    Show {
+        /// Task id or unambiguous prefix/suffix.
+        id: String,
+        /// Print the raw task file instead.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Take a task out of the loop's reach, keeping it on disk.
+    Hold {
+        /// Task id or unambiguous prefix/suffix.
+        id: String,
+    },
+    /// Put a held or finished task back in line, attempts reset.
+    Release {
+        /// Task id or unambiguous prefix/suffix.
+        id: String,
+    },
+    /// Delete a task.
+    Rm {
+        /// Task id or unambiguous prefix/suffix.
+        id: String,
     },
 }
 
@@ -358,6 +483,37 @@ async fn dispatch(command: Command) -> Result<()> {
             Ok(())
         }
 
+        Command::Serve {
+            repo,
+            config,
+            poll,
+            max_attempts,
+            once,
+            merge,
+        } => {
+            daemon::serve(daemon::Opts {
+                repo,
+                config,
+                poll: std::time::Duration::from_secs(poll),
+                max_attempts,
+                once,
+                merge: merge.map(|m| m.as_str().to_owned()),
+            })
+            .await
+        }
+
+        Command::Web { bind, port, repo } => {
+            web::serve(web::Opts {
+                bind,
+                port,
+                repo,
+                open: false,
+            })
+            .await
+        }
+
+        Command::Task { command } => task_cmd(command).await,
+
         Command::Doctor { repo, config } => doctor(&repo, config.as_deref()).await,
 
         Command::Init { repo, force } => {
@@ -452,10 +608,172 @@ async fn task_text(words: &[String], file: Option<&Path>, issue: Option<u64>) ->
         return Ok(format!("Resolve GitHub issue #{number}.\n\n{body}"));
     }
     let joined = words.join(" ");
-    if joined.trim().is_empty() {
-        bail!("give a task: `magi run \"<task>\"`, --file, --issue, or --resume");
+    if !joined.trim().is_empty() {
+        return Ok(joined);
     }
-    Ok(joined)
+    // Stdin, when it is not a terminal. An agent filing a task has a body, not
+    // a tidy argv, and quoting a multi-paragraph markdown task through a shell
+    // is how task text gets mangled. On a terminal we must not do this: it
+    // would hang waiting for input the operator has no reason to expect.
+    if !std::io::stdin().is_terminal() {
+        use std::io::Read as _;
+        let mut body = String::new();
+        std::io::stdin()
+            .read_to_string(&mut body)
+            .context("read the task from stdin")?;
+        if !body.trim().is_empty() {
+            return Ok(body);
+        }
+    }
+    bail!("give a task: as arguments, --file, --issue, or on stdin");
+}
+
+/// The `magi task` verbs.
+async fn task_cmd(command: TaskCmd) -> Result<()> {
+    let q = Queue::open();
+    match command {
+        TaskCmd::Add {
+            instruction,
+            file,
+            issue,
+            title,
+            priority,
+            repo,
+            json,
+        } => {
+            let text = task_text(&instruction, file.as_deref(), issue).await?;
+            let title = title.unwrap_or_else(|| queue::title_from(&text, 72));
+            let source = task_source(issue).await;
+            // Store an absolute path: the daemon that runs this task has its
+            // own working directory, and `.` would mean the wrong repository.
+            let repo = repo.canonicalize().unwrap_or(repo);
+            let mut task = Task::new(title, text, repo, source);
+            task.priority = priority;
+            q.put(&mut task)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&task)?);
+            } else {
+                println!(
+                    "filed {} [{}] {}",
+                    task.short(),
+                    task.source.label(),
+                    task.title
+                );
+            }
+            Ok(())
+        }
+
+        TaskCmd::List { all, json } => {
+            let tasks: Vec<Task> = q
+                .list()
+                .into_iter()
+                .filter(|t| all || t.status != TaskStatus::Done)
+                .collect();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tasks)?);
+                return Ok(());
+            }
+            if tasks.is_empty() {
+                println!("queue empty");
+                return Ok(());
+            }
+            for t in &tasks {
+                let attempts = if t.attempts > 0 {
+                    format!(" x{}", t.attempts)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{}  {:<9}{:<4} {:<14} {}",
+                    t.short(),
+                    t.status.as_str(),
+                    attempts,
+                    t.source.label(),
+                    t.title
+                );
+            }
+            Ok(())
+        }
+
+        TaskCmd::Show { id, json } => {
+            let t = q.get(&id)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&t)?);
+                return Ok(());
+            }
+            println!("{}  {}", t.id, t.title);
+            println!("status    {}", t.status.as_str());
+            println!("source    {}", t.source.label());
+            println!("repo      {}", t.repo.display());
+            println!("priority  {}", t.priority);
+            println!("attempts  {}", t.attempts);
+            if !t.runs.is_empty() {
+                println!("runs      {}", t.runs.join(", "));
+            }
+            if let Some(e) = &t.last_error {
+                println!("last      {e}");
+            }
+            println!("\n{}", t.instruction.trim_end());
+            Ok(())
+        }
+
+        TaskCmd::Hold { id } => {
+            let mut t = q.get(&id)?;
+            t.hold();
+            q.put(&mut t)?;
+            println!("held {} {}", t.short(), t.title);
+            Ok(())
+        }
+
+        TaskCmd::Release { id } => {
+            let mut t = q.get(&id)?;
+            t.release();
+            q.put(&mut t)?;
+            println!("queued {} {}", t.short(), t.title);
+            Ok(())
+        }
+
+        TaskCmd::Rm { id } => {
+            let removed = q.remove(&id)?;
+            println!("removed {removed}");
+            Ok(())
+        }
+    }
+}
+
+/// Who is filing this task.
+///
+/// An agent inside a run is identified by the environment the graph gave it, so
+/// no flag can be forgotten or forged by accident: `MAGI_RUN` is set only by
+/// `agent::invoke`. That is what makes "86% of tasks were filed by agents" a
+/// measurement rather than a claim.
+async fn task_source(issue: Option<u64>) -> Source {
+    if let Some(number) = issue {
+        let repo = tokio::process::Command::new("gh")
+            .args([
+                "repo",
+                "view",
+                "--json",
+                "nameWithOwner",
+                "-q",
+                ".nameWithOwner",
+            ])
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned());
+        return Source::Issue { number, repo };
+    }
+    match std::env::var("MAGI_RUN") {
+        Ok(run) if !run.trim().is_empty() => Source::Agent {
+            run,
+            node: std::env::var("MAGI_NODE").unwrap_or_else(|_| "agent".to_owned()),
+        },
+        _ => Source::Human,
+    }
 }
 
 async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {

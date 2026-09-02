@@ -109,6 +109,10 @@ magi list
 magi stats                    # win rates, reviewer precision, E2E yield
 magi fold --all               # remove a run's worktrees and branches
 magi self-update              # or let the background check tell you
+magi task add "port the retry logic to the uploader"
+magi task list                # the backlog `magi serve` drains
+magi serve                    # run the queue unattended
+magi web                      # the phone UI, over Tailscale
 ```
 
 A run refuses to start on a dirty tree: candidates branch off `HEAD`, and
@@ -147,6 +151,85 @@ browsing. Cleanup stays in `magi fold`.
 
 Piped or in CI, bare `magi` does not raise an alternate screen — it prints the
 latest run's report instead, so `magi | head` behaves.
+
+## Running unattended
+
+A competition takes tens of minutes, almost all of it agent latency. Sitting in
+front of that is the wrong job for a human, so magi has a queue and a loop that
+drains it:
+
+```sh
+magi task add "port the retry logic to the uploader"
+magi task add --file tasks/rework-config.md --priority 5
+magi task add --issue 42
+magi serve                    # take the next task, run the graph, repeat
+```
+
+One task is one JSON file under `<data_local>/magi/queue`, so the backlog is
+readable, editable, and greppable with the tools already on the machine, and a
+daemon killed mid-run leaves a queue the next one picks up.
+
+`magi serve` runs **one competition at a time** on purpose. The graph is already
+parallel inside — candidates times judges — and two graphs at once doubles the
+burn on the agent-CLI quota that is the real constraint.
+
+| verb | |
+|---|---|
+| `magi task add` | file work; text, `--file`, `--issue`, or stdin |
+| `magi task list` | the backlog, newest first |
+| `magi task show <id>` | one task in full |
+| `magi task hold` / `release` | park work, or give it a real second chance |
+| `magi task rm` | delete it |
+
+### Agents file their own work
+
+`magi task add` is not a human-only command. Every agent the graph spawns gets
+`MAGI_RUN` and `MAGI_NODE` in its environment, so an implementer that notices
+something worth doing but out of scope can file it:
+
+```sh
+magi task add "the config loader re-reads the file on every lookup"
+```
+
+The task records `implement@a1b2` as its source rather than `human`. That
+attribution comes from the environment `agent::invoke` sets, which no flag can
+forge by accident — which is what makes "most of the backlog was filed by
+agents" a measurement rather than a claim. It is also the whole point: the CLI
+is the operating surface, and the agents are its users as much as you are.
+
+### Bounded on purpose
+
+An autonomous loop that retries forever is a way to spend money on a task that
+cannot succeed. Every attempt is counted; a task that burns its attempts becomes
+`held` and waits for a person, not for another agent.
+
+A **quota stall is refunded**. When the agent CLIs hit their rate limit the
+judging panel collapses, the run stops as `stalled`, and the task goes back in
+line *without* spending an attempt — a quota window closing at 4am must not
+leave a backlog of tasks that were never actually judged.
+
+## The phone UI
+
+```sh
+magi web                      # http://100.x.y.z:7878
+```
+
+The same runs, the same queue, from a phone. `--bind auto` (the default) finds
+the machine's Tailscale address and serves there; with no Tailscale it falls
+back to loopback and says so.
+
+**There is no authentication. The tailnet is the security boundary.** That is a
+deliberate choice for a single-operator tool on a private network, and it is the
+reason the default bind is not `0.0.0.0`.
+
+It is still one binary. The interface is three files compiled in with
+`include_str!` — no JavaScript toolchain, no CDN, no remote font, nothing
+fetched at runtime. `cargo install magi-cli` gives you the phone UI too.
+
+You can watch runs, read the full report, browse the queue, hold and release
+tasks, and file new work from the compose form. You cannot delete a run or fold
+a worktree: same reasoning as the terminal deck, one tap from browsing is the
+wrong place for a destructive key.
 
 ## Configuration
 

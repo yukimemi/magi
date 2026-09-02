@@ -24,9 +24,11 @@
 pub mod agent;
 pub mod blind;
 pub mod config;
+pub mod daemon;
 pub mod git;
 pub mod graph;
 pub mod prompt;
+pub mod queue;
 pub mod report;
 pub mod rng;
 pub mod run;
@@ -34,3 +36,4 @@ pub mod stats;
 pub mod tui;
 pub mod updater;
 pub mod verdict;
+pub mod web;

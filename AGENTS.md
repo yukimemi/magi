@@ -647,6 +647,75 @@ Three things that are load-bearing:
 The deck is read-only. Adding a key that mutates a run means adding a
 confirmation flow and an undo story; `magi fold` already exists for cleanup.
 
+### The queue: data with pure transitions, I/O in one place
+
+`src/queue.rs` splits `Task` (data plus *pure* state changes) from `Queue`
+(every filesystem call, constructed with its root). That is not decoration:
+
+- `Queue::at(root)` is why the queue tests run in parallel against temp
+  directories with no process-global state. The first version used
+  `run::set_home`, whose `OnceLock` means **the first call in the process
+  wins** — three tests silently shared one home and clobbered each other. If
+  you find yourself reaching for `set_home` in a unit test, parameterise the
+  root instead.
+- `Task::fail` decides whether an attempt was the last one, with no disk in
+  the way, so the retry policy is asserted directly.
+
+**A quota stall is refunded.** `Task::stall` decrements `attempts`. A rate
+limit is a property of the machine, not of the task, and a quota window closing
+overnight must not leave a backlog of `held` tasks that were never actually
+judged. Do not "simplify" this into `fail`.
+
+### Autonomy is bounded, and the bound is the point
+
+`src/daemon.rs` runs one competition at a time — no `--jobs`. The graph is
+already parallel inside (candidates times judges), and the scarce resource is
+the agent CLIs' quota, not local CPU.
+
+- Every attempt is counted, and a task that burns its attempts is `held` for a
+  human rather than retried until the money runs out.
+- A setup error that never minted a run still spends an attempt. Otherwise a
+  task naming a nonexistent repository is retried at every poll, forever.
+- A crash mid-run leaves the task `Running` with its run id recorded. That is
+  deliberate legibility: the operator can see what was in flight. Do not add a
+  startup sweep that "cleans" those into `Queued` without also proving the run
+  is dead.
+- Ctrl-C does not abandon a run in flight. Killing the graph mid-node leaves
+  worktrees, branches and agent sessions behind, and throws away agent calls
+  already paid for.
+
+### Agents are users of this CLI
+
+`agent::invoke` exports `MAGI_RUN` and `MAGI_NODE`, and `magi task add` reads
+them to attribute a filed task to the seat that filed it. Nothing else may set
+those variables, which is what makes "most of the backlog was filed by agents" a
+measurement rather than a claim. `Invocation` carries `run`/`node` purely for
+this; they must not influence behaviour.
+
+### The web UI: one binary, no authentication, and no lying empty states
+
+`src/web.rs` serves `assets/ui/{index.html,app.css,app.js}` through
+`include_str!`. **There is no `--assets-dir` and no filesystem fallback**, and
+the front end has no build step, no CDN and no remote font, because
+`cargo install magi-cli` has to yield a working phone UI with nothing else
+fetched.
+
+- The default bind is the Tailscale address, not `0.0.0.0`. There is no
+  authentication: the tailnet is the security boundary, and that trade is only
+  honest while the default cannot accidentally face the internet.
+- `report::set_color(false)` is called once in `serve`, never per request — the
+  flag is a process-global `AtomicBool` and a request-time toggle would race a
+  concurrent render and leak escape codes into a browser.
+- **An unreadable run must be counted, not hidden.** `/api/health` reports
+  `runs_unreadable`, and the UI says so. The first live run of the server
+  printed "Nothing has run yet" with six runs on disk: they were schema 1
+  against a build speaking schema 2, and the list quietly dropped every one.
+  The terminal deck was fixed for the same failure the same day. Any new view
+  over runs owes the operator this number.
+- **A stalled run must never render as a decided one.** A collapsed panel still
+  records a winner label, so the verdict marker is gated on `tally.met_quorum`
+  and shows "provisional" when it is false.
+
 ### Running magi on magi
 
 `magi.toml` in this repo sets `e2e = cargo test` and `gate = cargo make check`,

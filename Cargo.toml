@@ -42,6 +42,9 @@ tokio = { version = "1.53.1", features = [
   "fs",
   "io-util",
   "sync",
+  # `signal`: the daemon's loop shuts down on Ctrl-C, which needs a portable
+  # signal handler. Without it an unattended run has no clean stop.
+  "signal",
 ] }
 # TUI. Versions match the rest of the fleet (shoka, rvpm), including
 # `ansi-to-tui`, which lets the detail pane render `report::run`'s own coloured
@@ -53,6 +56,12 @@ jiff = { version = "0.2.35", features = ["serde"] }
 dirs = "6"
 kaishin = "0.7.1"
 teravars = { version = "0.2.1", features = ["merge"] }
+# Web UI. `axum` for the API and its built-in SSE, `tokio-stream` to turn the
+# change-notification channel into the stream SSE wants. No `tower-http` and no
+# JS toolchain: the front end is three files embedded with `include_str!`, so
+# `cargo install magi-cli` yields a working phone UI with nothing else to fetch.
+axum = "0.8.9"
+tokio-stream = "0.1.19"
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
