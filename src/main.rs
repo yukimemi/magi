@@ -1034,7 +1034,9 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
             "clean      {}",
             match magi::git::is_clean(p).await {
                 Ok(true) => "yes".to_owned(),
-                Ok(false) => "no — magi refuses to start on a dirty tree".to_owned(),
+                // Not a blocker: a run branches off the base branch, so the
+                // working copy's state cannot reach it either way.
+                Ok(false) => "no — uncommitted work is not part of a run".to_owned(),
                 Err(e) => format!("unknown: {e}"),
             }
         );
@@ -1068,6 +1070,20 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
                     .fixer
                     .as_ref()
                     .map_or("the winner's own author".to_owned(), |f| f.display())
+            );
+            // The interview seat, resolved the same way `plan` and the browser
+            // conversation resolve it. Shown because a setting an operator
+            // cannot confirm is a setting they have to take on faith.
+            println!(
+                "  plan         {}",
+                match magi::plan::pick(
+                    &cfg.agents,
+                    cfg.roles.planner.as_deref(),
+                    &magi::plan::installed,
+                ) {
+                    Ok(s) => s.display(),
+                    Err(e) => format!("unusable: {e}"),
+                }
             );
         }
         Err(e) => println!("\nroster     unusable: {e}"),

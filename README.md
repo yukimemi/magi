@@ -117,8 +117,12 @@ magi plan "rework the config loader"   # interview, then file the task it writes
 magi answer                   # what an agent is waiting to hear from you
 ```
 
-A run refuses to start on a dirty tree: candidates branch off `HEAD`, and
-uncommitted work would be silently excluded from the competition.
+A run branches off the **base branch's tip**, not off your working copy, so it
+starts whether or not you have uncommitted work — and that work is not part of
+the competition. `magi serve` would otherwise decline every task for as long as
+you had something in progress, which is most of the time. magi says so in the
+log when the tree is dirty, because someone watching a candidate fail to use a
+change they just made deserves to know why.
 
 ## The observation deck
 
@@ -336,20 +340,25 @@ and ignored: a broken webhook is not a reason to throw away an implementation.
 
 ## Landing it
 
+With `merge = "pr"`, magi opens the pull request and then keeps going: watches
+the checks, reads the review comments — human and bot — runs a fix round when
+either is unhappy, pushes, and asks you to merge when they are happy.
+
 ```toml
 [graph]
-land = true
+land = true            # default: take over the watching
+land_approval = true   # default: never merge without being asked
 land_rounds = 4
 ```
 
-With `merge = "pr"` magi opens the pull request and stops. With `land = true`
-it keeps going: watches the checks, reads the review comments — human and bot —
-runs a fix round when either is unhappy, pushes, and merges when they are not.
+**Both are on by default, and that pair is the point.** `land` takes over the
+watching an operator would otherwise do by hand; `land_approval` keeps the
+irreversible step a human decision. An unattended merge needs both flipped, and
+that has to be chosen deliberately twice.
 
-Off by default, because merging is the only irreversible thing magi can do to a
-repository and it should be something you turned on rather than something you
-discovered. It **never force-merges**: out of rounds means the pull request is
-left open with a comment saying what is still failing.
+It **never force-merges**: out of rounds leaves the pull request open with a
+comment saying what is still failing, and `checks: unknown` — no signal at all —
+never merges either.
 
 ## Project conventions in the prompts
 
@@ -423,6 +432,19 @@ gate = ["CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo make check"]
 Two traps: the whole file is a template, **comments included**, and teravars
 renders the raw text before TOML unescaping — so use single quotes inside the
 braces (`value='/tmp'`, never `value=\"/tmp\"`).
+
+**Tables merge; arrays do not.** teravars appends arrays when it merges layers,
+which is wrong for every array magi has: `implementers` is an ordered list of
+seats, `verify.gate` is the commands to run, `notify.command` is an argv.
+Concatenating two of those produces something nobody wrote — three
+implementers from a machine's two and a repository's one, or an argv of
+`["ntfy", "publish", "curl", "-X"]`.
+
+So magi refuses it. Declare any given array in **exactly one layer**: either
+the machine states the roster and repositories override only scalars, or a
+repository states its own. Naming the same array in two layers is an error that
+names both files, rather than a roster you did not ask for and are paying for.
+`magi doctor` prints what actually resolved.
 
 The full surface:
 

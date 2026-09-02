@@ -76,6 +76,51 @@ pub struct Runner {
     sem: Arc<Semaphore>,
 }
 
+/// The commit a run branches from: the base branch as the remote has it.
+///
+/// Two failures this replaces. A run used to branch off `HEAD` and so refused
+/// to start on a dirty tree, which made `magi serve` decline every task for as
+/// long as the operator had work in progress - most of the time. Branching off
+/// the *local* base branch fixed that and introduced a worse one: `land` merges
+/// the winner on GitHub, nothing updates the local ref, and the next run
+/// branches off a base missing everything the previous runs landed. Two tasks
+/// in a row from a phone would have had the second silently re-implementing
+/// against stale code and opening a pull request that reverted the first.
+///
+/// Only refs move here - no checkout, no local branch, no merge - so it is safe
+/// with uncommitted work in the tree. A machine with no network still starts:
+/// the fetch may fail and the local tip is used with a warning, because
+/// refusing to run offline is a worse failure than running against a base the
+/// operator can see for themselves.
+///
+/// One function, called by both entry points. Two answers to "where does a run
+/// branch from" is the kind of drift nobody notices until a diff is wrong.
+async fn resolve_base(repo: &Path, base_branch: &str, remote: &str) -> Result<String> {
+    let tracking = format!("{remote}/{base_branch}");
+    let fetched = git::fetch(repo, remote, base_branch).await;
+    if let Ok(out) = &fetched
+        && out.ok()
+        && git::rev_exists(repo, &tracking).await
+    {
+        return git::rev_parse(repo, &tracking).await;
+    }
+    let why = match &fetched {
+        Ok(out) if !out.ok() => out.stderr.lines().next().unwrap_or("").to_owned(),
+        Ok(_) => format!("{remote} has no {base_branch}"),
+        Err(e) => e.to_string(),
+    };
+    tracing::warn!(
+        "could not read {tracking} ({why}); branching off the local \
+         {base_branch} instead, which may be behind"
+    );
+    git::rev_parse(repo, base_branch).await.with_context(|| {
+        format!(
+            "cannot resolve `{base_branch}`; set [merge] base in magi.toml to a \
+             branch that exists"
+        )
+    })
+}
+
 impl Runner {
     /// Start a fresh run against `repo`.
     pub async fn start(repo: &Path, instruction: String, config: Config) -> Result<Self> {
@@ -88,21 +133,24 @@ impl Runner {
                 missing.join(", ")
             );
         }
-        if !git::is_clean(&repo).await? {
-            let dirty = git::status_porcelain(&repo).await?;
-            bail!(
-                "{} has uncommitted changes; candidates branch off HEAD and \
-                 would silently exclude them:\n{dirty}",
-                repo.display()
-            );
-        }
         let base_branch = match config.merge.base.clone() {
             Some(b) => b,
             None => git::current_branch(&repo)
                 .await?
                 .context("HEAD is detached; set [merge] base in magi.toml")?,
         };
-        let base_commit = git::rev_parse(&repo, "HEAD").await?;
+        let base_commit = resolve_base(&repo, &base_branch, &config.merge.remote).await?;
+        // Still worth saying out loud. The operator's uncommitted work is not
+        // part of this run, and someone watching a candidate fail to use a
+        // change they just made deserves to know why.
+        if !git::is_clean(&repo).await? {
+            tracing::warn!(
+                "{} has uncommitted changes; they are not part of this run, \
+                 which branches off {base_branch} ({})",
+                repo.display(),
+                &base_commit[..base_commit.len().min(8)]
+            );
+        }
         let roles = config.resolve_roles()?;
         let max_parallel = config.graph.max_parallel.max(1);
         let mut state = RunState::new(repo, base_branch, base_commit, instruction, config);
@@ -150,7 +198,7 @@ impl Runner {
         if base_branch == branch {
             bail!("`{branch}` is the base branch; there is nothing to review against");
         }
-        let base_commit = git::rev_parse(&repo, &base_branch).await?;
+        let base_commit = resolve_base(&repo, &base_branch, &config.merge.remote).await?;
 
         let roles = config.resolve_roles()?;
         let max_parallel = config.graph.max_parallel.max(1);

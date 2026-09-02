@@ -700,7 +700,8 @@ function createTaskCard() {
   const source = el("span");
   const repo = el("span", { class: "repo" });
   const attempts = el("span");
-  const meta = el("div", { class: "card-meta" }, source, repo, attempts);
+  const outcome = el("span");
+  const meta = el("div", { class: "card-meta" }, source, repo, attempts, outcome);
   const note = el("p", { class: "card-note" });
   const error = el("pre", { class: "err" });
   const instruction = el("details", { class: "advanced" },
@@ -714,7 +715,7 @@ function createTaskCard() {
     el("div", { class: "card-top" }, chipSlot, priority, whenSlot),
     title, meta, note, error, instruction, actions,
   );
-  card.refs = { card, chipSlot, priority, whenSlot, title, source, repo, attempts, note, error, instruction, runLink, hold };
+  card.refs = { card, chipSlot, priority, whenSlot, title, source, repo, attempts, outcome, note, error, instruction, runLink, hold };
   return card;
 }
 
@@ -767,6 +768,21 @@ function updateTaskCard(row, task) {
     setText(r.runLink, `Run ${shortId(latest)}`);
   }
   show(r.runLink, Boolean(latest));
+
+  /* A task reads `done` the moment its run reaches a terminal success, and
+     `ready` is one of those - the winner passed the gate but was never merged,
+     because the run was configured not to. Side by side that looked like the
+     Queue and the Runs page disagreeing, and it hid the fact that there is
+     still something to land. Joined from the runs already loaded, so this
+     costs no request and says nothing when the run is too old to be in the
+     list. */
+  const run = latest ? (state.runs || []).find((x) => x.id === latest) : null;
+  const outcome = run && status === "done" && run.status !== "merged"
+    ? `run ended ${run.status} — nothing merged it`
+    : "";
+  setText(r.outcome, outcome);
+  show(r.outcome, Boolean(outcome));
+  separate(r.outcome.parentNode);
 
   /* Hold and release are the only mutations the contract exposes; there is
      deliberately no delete. */
