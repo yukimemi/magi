@@ -618,13 +618,6 @@ upstream CRLF, not drift worth committing — normalise back to LF and
   stays `Stalled` and the marker is persisted (the normal end-of-execute save
   sits below the `Stalled` return), so it stays resumable for a later retry.
 
-### Running magi on magi
-
-`magi.toml` in this repo sets `e2e = cargo test` and `gate = cargo make check`.
-Every candidate worktree compiles from scratch — no shared `target/` — so a
-self-run is slow and disk-hungry (`candidates + judges + reviewers` worktrees at
-peak). `magi fold --all` afterwards.
-
 ### The TUI: pure state, one render function, one terminal function
 
 `src/tui.rs` keeps `App` as pure state with pure transitions, `draw` as the only
@@ -643,8 +636,8 @@ Three things that are load-bearing:
   order.
 - **Quit is checked before anything modal.** A help overlay that swallows
   `Ctrl-C` is how a TUI earns a reputation for trapping people;
-  `help_is_modal_but_never_swallows_a_quit` pins it, and it was a real bug in the
-  first draft.
+  `help_is_modal_but_never_swallows_a_quit` pins it, and it was a real bug in
+  the first draft.
 - **The report pane renders `report::run`'s own ANSI** through `ansi-to-tui`
   rather than reimplementing the report against ratatui spans. One
   implementation of the report, one place to change it. Colour therefore has to
@@ -653,6 +646,37 @@ Three things that are load-bearing:
 
 The deck is read-only. Adding a key that mutates a run means adding a
 confirmation flow and an undo story; `magi fold` already exists for cleanup.
+
+### Running magi on magi
+
+`magi.toml` in this repo sets `e2e = cargo test` and `gate = cargo make check`,
+both with a **shared** `CARGO_TARGET_DIR` under `{{ vars.cache }}`. Without it
+every review round rebuilds this crate from scratch in the winner's worktree,
+which dwarfs the agent latency it is measuring. `magi fold --all` afterwards:
+`candidates + judges + reviewers` worktrees exist at peak.
+
+**Never build by hand into the directory `verify` uses.** Two different source
+trees alternating through one `CARGO_TARGET_DIR` will link a test against the
+other tree's stale `libmagi`, and the compiler then reports missing fields on
+types that plainly have them — `no field met_quorum on type &Tally` for a struct
+whose declaration is right there. That cost half an hour of chasing a phantom
+rebase. Give every manual build its own directory:
+
+```sh
+CARGO_TARGET_DIR=/tmp/magi-dev cargo make check       # in the main worktree
+CARGO_TARGET_DIR=/tmp/magi-<run> cargo make check     # in a candidate's
+```
+
+### The local toolchain may not be the one CI uses
+
+`rust-toolchain.toml` pins `stable`, but a `RUSTUP_TOOLCHAIN` environment
+variable overrides it silently, and this machine has had it set to an older
+release — so a clippy lint that CI fails on is invisible locally. Verify with
+the channel CI actually runs:
+
+```sh
+RUSTUP_TOOLCHAIN=stable cargo make check
+```
 
 ### Bare `magi` must not raise a screen in a pipe
 
