@@ -230,6 +230,13 @@ impl Runner {
             changed_votes: 0,
             unanimous_final: false,
             tie_break: Some("review-only run: nothing competed".to_owned()),
+            // No panel sat, so no quorum applies. Zero judges is the correct
+            // number for work that never competed, and must not be reported as
+            // a collapsed panel.
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
         });
         state.status = RunStatus::Reviewing;
         state.event(
