@@ -716,6 +716,24 @@ fetched.
   records a winner label, so the verdict marker is gated on `tally.met_quorum`
   and shows "provisional" when it is false.
 
+### Landing a run's winner by hand
+
+A candidate branch holds one commit, subject `magi: candidate A (uncommitted
+work)`. `gh pr merge --squash` prefers that commit's message over the PR title
+when there is only one commit, so `main` ends up reading
+`magi: candidate A (uncommitted work) (#16)` — which says nothing about what
+landed. Pass the subject explicitly:
+
+```sh
+gh pr merge <n> --squash --delete-branch --subject "feat: what it actually did"
+```
+
+Also **rebase before opening the PR**. A run branches from the commit it
+started on, and anything merged in the meantime shows up in its diff as a
+deletion — the first autonomous run appeared to delete a test that had landed
+while it was thinking. `magi run --merge pr` builds its title from the first
+line of the body and is unaffected; this is only the hand-driven path.
+
 ### Running magi on magi
 
 `magi.toml` in this repo sets `e2e = cargo test` and `gate = cargo make check`,
