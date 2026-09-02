@@ -22,11 +22,14 @@
 #![deny(missing_docs)]
 
 pub mod agent;
+pub mod ask;
 pub mod blind;
 pub mod config;
 pub mod daemon;
 pub mod git;
 pub mod graph;
+pub mod land;
+pub mod plan;
 pub mod prompt;
 pub mod queue;
 pub mod report;

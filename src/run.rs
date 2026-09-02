@@ -361,6 +361,28 @@ pub struct Event {
     pub message: String,
 }
 
+/// What the land loop saw last time it looked at the pull request.
+///
+/// Strings for `state` and `checks` on purpose: they are `gh`'s vocabulary, and
+/// pinning them into an enum here would mean a new GitHub check conclusion
+/// turns a readable status into a deserialisation error on a run someone is
+/// trying to look at.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrRecord {
+    /// Pull request url.
+    pub url: String,
+    /// Pull request number.
+    pub number: u64,
+    /// `open`, `merged` or `closed`.
+    pub state: String,
+    /// `pending`, `green`, `red` or `unknown`.
+    pub checks: String,
+    /// Land round, 1-based, or 0 before the first fix.
+    pub round: usize,
+    /// Land round budget.
+    pub rounds: usize,
+}
+
 /// The whole run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
@@ -422,6 +444,14 @@ pub struct RunState {
     /// Per-seat conversation state.
     #[serde(default)]
     pub seats: BTreeMap<String, SeatState>,
+    /// Last observation of the winner's pull request, when a land loop ran.
+    ///
+    /// Persisted rather than derived from the event log because the phone asks
+    /// two questions about a run that has opened a PR - how are its checks and
+    /// which round is it on - and parsing prose out of events to answer them
+    /// would break the first time an event message was reworded.
+    #[serde(default)]
+    pub pr: Option<PrRecord>,
     /// Node log.
     #[serde(default)]
     pub events: Vec<Event>,
@@ -462,6 +492,7 @@ impl RunState {
             leaks: Vec::new(),
             quota: Vec::new(),
             seats: BTreeMap::new(),
+            pr: None,
             events: Vec::new(),
         }
     }

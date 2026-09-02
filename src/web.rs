@@ -58,6 +58,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::ask::{Answer, Question, Questions};
 use crate::queue::{Queue, Source, Task, title_from};
 use crate::run::{RunState, RunStatus};
 use crate::{daemon, report, run};
@@ -154,6 +155,7 @@ impl Default for Opts {
 #[derive(Debug, Clone)]
 pub struct Ui {
     queue: Queue,
+    questions: Questions,
     runs: PathBuf,
     home: PathBuf,
     repo: PathBuf,
@@ -161,18 +163,32 @@ pub struct Ui {
 
 impl Ui {
     /// A server over explicit paths.
-    pub fn new(queue: Queue, runs: PathBuf, home: PathBuf, repo: PathBuf) -> Self {
+    pub fn new(
+        queue: Queue,
+        questions: Questions,
+        runs: PathBuf,
+        home: PathBuf,
+        repo: PathBuf,
+    ) -> Self {
         Self {
             queue,
+            questions,
             runs,
             home,
             repo,
         }
     }
 
-    /// The operator's own state: `<home>/queue`, `<home>/runs`.
+    /// The operator's own state: `<home>/queue`, `<home>/questions`,
+    /// `<home>/runs`.
     pub fn open(repo: PathBuf) -> Self {
-        Self::new(Queue::open(), run::runs_root(), run::home(), repo)
+        Self::new(
+            Queue::open(),
+            Questions::open(),
+            run::runs_root(),
+            run::home(),
+            repo,
+        )
     }
 
     /// The router, with this state baked in.
@@ -192,6 +208,8 @@ impl Ui {
             .route("/api/queue", get(queue_list).post(queue_post))
             .route("/api/queue/{id}/hold", post(queue_hold))
             .route("/api/queue/{id}/release", post(queue_release))
+            .route("/api/questions", get(questions_list))
+            .route("/api/questions/{id}/answer", post(question_answer))
             .route("/api/events", get(events))
             .with_state(Arc::new(self))
     }
@@ -327,6 +345,19 @@ impl ApiError {
     }
 
     /// Someone else owns the thing the client wants to change.
+    /// Re-badge an error whose default mapping is wrong for this route.
+    fn with_status(mut self, status: StatusCode) -> Self {
+        self.status = status;
+        self
+    }
+
+    /// A rules violation from a domain type, reported as the caller's fault.
+    /// `Question::answer` rejects an unoffered choice, and that is a bad
+    /// request, not a server error.
+    fn bad_request_from(e: anyhow::Error) -> Self {
+        Self::bad_request(format!("{e:#}"))
+    }
+
     fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
@@ -411,6 +442,11 @@ struct HealthView {
     /// terminal deck learned the same lesson: a run that fails to parse must
     /// not disappear from the count.
     runs_unreadable: usize,
+    /// Questions nobody has answered yet.
+    ///
+    /// The one number here that means "nothing will happen until a human
+    /// acts": a parked run consumes nothing and progresses never.
+    questions_open: usize,
     daemon: DaemonView,
 }
 
@@ -461,6 +497,7 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             queue_rev: ui.queue.revision(),
             runs_rev: runs_revision(&ui.runs),
             runs_unreadable: runs_unreadable(&ui.runs),
+            questions_open: ui.questions.count_open(),
             daemon: DaemonView::of(daemon::read_status(&ui.home)),
         }))
     })
@@ -491,10 +528,19 @@ struct RunSummary {
     reviews: usize,
     quota_losses: usize,
     event: Option<String>,
+    /// Blocked on a question nobody has answered.
+    ///
+    /// Derived from the question store rather than stored on the run: an agent
+    /// calling `magi ask` blocks mid-node, and writing a status from there
+    /// would race the graph's own save of `run.json` and be overwritten at the
+    /// next node boundary. Asking the store is always true and never races.
+    waiting: bool,
+    /// The land loop's last look at the pull request, when there is one.
+    pr: Option<crate::run::PrRecord>,
 }
 
 impl RunSummary {
-    fn of(state: &RunState) -> Self {
+    fn of(state: &RunState, waiting: bool) -> Self {
         Self {
             id: state.id.clone(),
             short: state.short().to_owned(),
@@ -517,6 +563,8 @@ impl RunSummary {
             reviews: state.reviews.len(),
             quota_losses: state.quota.len(),
             event: state.events.last().map(|e| e.message.clone()),
+            waiting,
+            pr: state.pr.clone(),
         }
     }
 }
@@ -548,7 +596,10 @@ async fn runs_list(
             // asking "what happened to that run" ends up.
             .filter_map(|id| read_run(&ui.runs, &id).ok())
             .take(limit)
-            .map(|state| RunSummary::of(&state))
+            .map(|state| {
+                let waiting = !ui.questions.open_for(&state.id).is_empty();
+                RunSummary::of(&state, waiting)
+            })
             .collect();
         Ok(Json(summaries))
     })
@@ -706,14 +757,18 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(4);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(POLL);
-        let mut last: Option<(u64, u64)> = None;
+        let mut last: Option<(u64, u64, u64)> = None;
         loop {
             // The first tick completes immediately, which is what makes the
             // stream announce the current revisions on connect.
             ticker.tick().await;
             let state = Arc::clone(&ui);
             let revisions = tokio::task::spawn_blocking(move || {
-                (state.queue.revision(), runs_revision(&state.runs))
+                (
+                    state.queue.revision(),
+                    runs_revision(&state.runs),
+                    state.questions.revision(),
+                )
             })
             .await;
             let Ok(revisions) = revisions else { break };
@@ -724,6 +779,7 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
             let payload = serde_json::json!({
                 "queue_rev": revisions.0,
                 "runs_rev": revisions.1,
+                "questions_rev": revisions.2,
             });
             // Serializing two integers cannot fail; giving up beats looping.
             let Ok(event) = Event::default().event("change").json_data(payload) else {
@@ -823,6 +879,84 @@ fn resolve_task(queue: &Queue, id: &str) -> ApiResult<String> {
     pick(queue.list().into_iter().map(|t| t.id).collect(), id, "task")
 }
 
+/// `GET /api/questions`.
+///
+/// Everything, not just the open ones: an answered question is the record of a
+/// decision, and the phone is where the operator goes back to check what they
+/// told an agent at 3am. `ask::Questions::list` already ranks open first.
+async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<Question>>> {
+    blocking(move || Ok(Json(ui.questions.list()))).await
+}
+
+/// The body of `POST /api/questions/{id}/answer`.
+///
+/// Exactly one of the two fields, mirroring `ask::Answer`. Both or neither is
+/// a bad request rather than a guess: an answer magi invented is worse than a
+/// question left open.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct NewAnswer {
+    choice: Option<String>,
+    text: Option<String>,
+}
+
+async fn question_answer(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<NewAnswer>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult<Json<Question>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    let answer = match (body.choice, body.text) {
+        (Some(c), None) => Answer::Choice(c),
+        (None, Some(t)) => Answer::Text(t),
+        (Some(_), Some(_)) => {
+            return Err(ApiError::bad_request(
+                "send either `choice` or `text`, not both",
+            ));
+        }
+        (None, None) => {
+            return Err(ApiError::bad_request("send a `choice` or a `text`"));
+        }
+    };
+
+    blocking(move || {
+        let id = resolve_question(&ui.questions, &id)?;
+        let mut q = ui
+            .questions
+            .get(&id)
+            .map_err(|e| ApiError::from(e).with_status(StatusCode::INTERNAL_SERVER_ERROR))?;
+        if !q.status.open() {
+            // Answered from the terminal, or by another phone, in between the
+            // list and the tap. The UI shows the recorded answer rather than an
+            // error, so it needs the record, not just the status.
+            return Err(ApiError::conflict(format!(
+                "question {} is already {}",
+                q.short(),
+                q.status.as_str()
+            )));
+        }
+        // `Question::answer` owns the rules - an unoffered choice, free text on
+        // a multiple-choice question, an empty reply - so the route does not
+        // restate them and cannot drift from the CLI's behaviour.
+        q.answer(answer).map_err(ApiError::bad_request_from)?;
+        ui.questions.put(&mut q)?;
+        Ok(Json(q))
+    })
+    .await
+}
+
+/// Expand an id or short id to exactly one question id.
+fn resolve_question(store: &Questions, id: &str) -> ApiResult<String> {
+    if store.path_of(id).is_file() {
+        return Ok(id.to_owned());
+    }
+    pick(
+        store.list().into_iter().map(|q| q.id).collect(),
+        id,
+        "question",
+    )
+}
+
 /// The one prefix rule, used for both runs and tasks: a leading match for a
 /// full id, a trailing match for the short form an operator reads off a
 /// report. Written here rather than borrowed from `queue::resolve_id` because
@@ -873,7 +1007,13 @@ mod tests {
             let queue = Queue::at(home.join("queue"));
             let runs = home.join("runs");
             std::fs::create_dir_all(&runs).expect("runs dir");
-            let ui = Ui::new(queue, runs, home.to_path_buf(), PathBuf::from("/repo/magi"));
+            let ui = Ui::new(
+                queue,
+                Questions::at(home.join("questions")),
+                runs,
+                home.to_path_buf(),
+                PathBuf::from("/repo/magi"),
+            );
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
                 .expect("bind loopback");
@@ -886,6 +1026,10 @@ mod tests {
 
         fn queue(&self) -> Queue {
             Queue::at(self.home.path().join("queue"))
+        }
+
+        fn questions(&self) -> Questions {
+            Questions::at(self.home.path().join("questions"))
         }
 
         fn runs(&self) -> PathBuf {
@@ -982,6 +1126,134 @@ mod tests {
             "polls": 143,
         });
         std::fs::write(home.join("daemon.json"), body.to_string()).expect("write daemon.json");
+    }
+
+    /// File an open question directly in the store the server reads.
+    fn ask(fx: &Fixture, summary: &str, choices: &[&str]) -> String {
+        let store = fx.questions();
+        let mut q = Question::new(
+            "20260902-000000-beef".to_owned(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            summary.to_owned(),
+            "because it matters".to_owned(),
+            choices.iter().map(|c| (*c).to_owned()).collect(),
+        );
+        store.put(&mut q).expect("put question");
+        q.id
+    }
+
+    #[tokio::test]
+    async fn a_run_with_an_open_question_reads_as_waiting() {
+        let fx = Fixture::start().await;
+        let run = "20260902-000000-beef".to_owned();
+        write_run(&fx.runs(), &run, RunStatus::Implementing);
+
+        let before = fx.get("/api/runs").await.json();
+        assert_eq!(before[0]["waiting"], false, "{before}");
+
+        let store = fx.questions();
+        let mut q = Question::new(
+            run.clone(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            "Which backend?".to_owned(),
+            String::new(),
+            vec!["SQLite".to_owned()],
+        );
+        store.put(&mut q).expect("put");
+
+        let during = fx.get("/api/runs").await.json();
+        assert_eq!(during[0]["waiting"], true, "{during}");
+
+        // Answered: the run is moving again, and the flag has to follow without
+        // anything having rewritten run.json.
+        q.answer(Answer::Choice("SQLite".to_owned()))
+            .expect("answer");
+        store.put(&mut q).expect("put");
+        let after = fx.get("/api/runs").await.json();
+        assert_eq!(after[0]["waiting"], false, "{after}");
+    }
+
+    #[tokio::test]
+    async fn an_open_question_is_listed_and_counted_by_health() {
+        let fx = Fixture::start().await;
+        assert_eq!(fx.get("/api/health").await.json()["questions_open"], 0);
+
+        let id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+        let listed = fx.get("/api/questions").await.json();
+        assert_eq!(listed.as_array().expect("array").len(), 1);
+        assert_eq!(listed[0]["id"], id);
+        assert_eq!(listed[0]["status"], "open");
+        assert_eq!(listed[0]["choices"][1], "Redis");
+        // The count is what makes the phone's indicator honest: it is the one
+        // number meaning nothing will move until a human acts.
+        assert_eq!(fx.get("/api/health").await.json()["questions_open"], 1);
+    }
+
+    #[tokio::test]
+    async fn answering_records_the_choice_and_a_second_answer_conflicts() {
+        let fx = Fixture::start().await;
+        let id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+        let path = format!("/api/questions/{id}/answer");
+
+        let res = fx.post(&path, Some(r#"{"choice":"Redis"}"#)).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let body = res.json();
+        assert_eq!(body["status"], "answered");
+        assert_eq!(body["answer"]["choice"], "Redis");
+
+        // Answered from the terminal in between the list and the tap: the UI
+        // must be able to tell this from a bad request, so it can show the
+        // recorded answer instead of an error.
+        let again = fx.post(&path, Some(r#"{"choice":"SQLite"}"#)).await;
+        assert_eq!(again.status, 409, "{}", again.body);
+        assert_eq!(fx.get("/api/health").await.json()["questions_open"], 0);
+    }
+
+    #[tokio::test]
+    async fn an_answer_the_question_does_not_offer_is_refused() {
+        let fx = Fixture::start().await;
+        let id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+        let path = format!("/api/questions/{id}/answer");
+
+        for body in [
+            r#"{"choice":"Postgres"}"#,
+            r#"{"text":"whatever you think"}"#,
+            r#"{"choice":"Redis","text":"both"}"#,
+            r#"{}"#,
+        ] {
+            let res = fx.post(&path, Some(body)).await;
+            assert_eq!(res.status, 400, "{body} should be refused: {}", res.body);
+            assert!(res.json()["error"].is_string(), "{}", res.body);
+        }
+        // Nothing above may have answered it.
+        assert_eq!(fx.get("/api/health").await.json()["questions_open"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_free_text_question_takes_text_and_not_a_choice() {
+        let fx = Fixture::start().await;
+        let id = ask(&fx, "What should the flag be called?", &[]);
+        let path = format!("/api/questions/{id}/answer");
+
+        assert_eq!(
+            fx.post(&path, Some(r#"{"choice":"--json"}"#)).await.status,
+            400
+        );
+        let res = fx.post(&path, Some(r#"{"text":"--json"}"#)).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        assert_eq!(res.json()["answer"]["text"], "--json");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_question_is_a_json_404() {
+        let fx = Fixture::start().await;
+        let res = fx
+            .post("/api/questions/nope/answer", Some(r#"{"text":"x"}"#))
+            .await;
+        assert_eq!(res.status, 404, "{}", res.body);
+        assert!(res.json()["error"].is_string());
     }
 
     #[tokio::test]

@@ -27,8 +27,9 @@ use tokio::sync::Semaphore;
 
 use crate::agent::{self, AgentOutput, Invocation, SeatState};
 use crate::blind;
-use crate::config::{AgentSpec, Config, LeakPolicy, MergeMode, ResolvedRoles};
+use crate::config::{AgentSpec, Config, LeakPolicy, MergeMode, Prompts, ResolvedRoles};
 use crate::git;
+use crate::land;
 use crate::prompt::{self, CandidateView, Turn};
 use crate::run::{
     Candidate, CommandOutcome, DeliberationRound, DeliberationTurn, FixRecord, Judgement,
@@ -434,8 +435,11 @@ impl Runner {
 
     async fn implement(&mut self) -> Result<()> {
         // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
-        // agent files with `magi task add` name the run that paid for it.
+        // agent files with `magi task add` name the run that paid for it. The
+        // prompt overlay is cloned alongside it because the waves borrow it
+        // while `self` is mutably borrowed by the node's own bookkeeping.
         let run_id = self.state.id.clone();
+        let prompts = self.state.config.prompts.clone();
         let todo: Vec<usize> = self
             .state
             .candidates
@@ -481,7 +485,7 @@ impl Runner {
             "implement",
             format!("{} candidates in parallel", jobs.len()),
         );
-        let results = wave(jobs, Arc::clone(&self.sem), &run_id, "implement").await;
+        let results = wave(jobs, Arc::clone(&self.sem), &run_id, "implement", &prompts).await;
 
         for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
             let seat_key = seat.key.clone();
@@ -635,8 +639,11 @@ impl Runner {
 
     async fn judge(&mut self) -> Result<()> {
         // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
-        // agent files with `magi task add` name the run that paid for it.
+        // agent files with `magi task add` name the run that paid for it. The
+        // prompt overlay is cloned alongside it because the waves borrow it
+        // while `self` is mutably borrowed by the node's own bookkeeping.
         let run_id = self.state.id.clone();
+        let prompts = self.state.config.prompts.clone();
         if !self.state.judgements.is_empty() {
             return Ok(());
         }
@@ -705,6 +712,7 @@ impl Runner {
             self.state.config.graph.retries,
             &run_id,
             "judge",
+            &prompts,
             &mut quota_losses,
             &move |r: &Ranking| r.validate(&labels_for_check),
         )
@@ -756,8 +764,11 @@ impl Runner {
 
     async fn deliberate(&mut self) -> Result<()> {
         // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
-        // agent files with `magi task add` name the run that paid for it.
+        // agent files with `magi task add` name the run that paid for it. The
+        // prompt overlay is cloned alongside it because the waves borrow it
+        // while `self` is mutably borrowed by the node's own bookkeeping.
         let run_id = self.state.id.clone();
+        let prompts = self.state.config.prompts.clone();
         if !self.state.deliberation.is_empty() {
             return Ok(());
         }
@@ -834,7 +845,7 @@ impl Runner {
                     stem: format!("delib-{round}-judge-{}", j + 1),
                 };
                 let (updated, out) =
-                    run_one(job, Arc::clone(&self.sem), &run_id, "deliberate").await;
+                    run_one(job, Arc::clone(&self.sem), &run_id, "deliberate", &prompts).await;
                 seat = updated;
                 let agent_id = seat.agent.clone();
                 let seat_key = seat.key.clone();
@@ -895,8 +906,11 @@ impl Runner {
 
     async fn vote(&mut self) -> Result<()> {
         // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
-        // agent files with `magi task add` name the run that paid for it.
+        // agent files with `magi task add` name the run that paid for it. The
+        // prompt overlay is cloned alongside it because the waves borrow it
+        // while `self` is mutably borrowed by the node's own bookkeeping.
         let run_id = self.state.id.clone();
+        let prompts = self.state.config.prompts.clone();
         if !self.state.votes.is_empty() {
             return Ok(());
         }
@@ -964,6 +978,7 @@ impl Runner {
             self.state.config.graph.retries,
             &run_id,
             "vote",
+            &prompts,
             &mut quota_losses,
             &move |v: &FinalVote| match v.label() {
                 Some(c) if allowed.contains(&c) => Ok(()),
@@ -1202,8 +1217,11 @@ impl Runner {
     #[allow(clippy::too_many_lines)]
     async fn recover_stall(&mut self) -> Result<bool> {
         // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
-        // agent files with `magi task add` name the run that paid for it.
+        // agent files with `magi task add` name the run that paid for it. The
+        // prompt overlay is cloned alongside it because the waves borrow it
+        // while `self` is mutably borrowed by the node's own bookkeeping.
         let run_id = self.state.id.clone();
+        let prompts = self.state.config.prompts.clone();
         // Absent seats = quota-lost at any node, or failed outright. Mirroring
         // `tally`'s presence test (rather than the old quota-judge/vote filter)
         // is what keeps a non-quota collapse — or a quota loss recorded at the
@@ -1279,6 +1297,7 @@ impl Runner {
             self.state.config.graph.retries,
             &run_id,
             "judge",
+            &prompts,
             &mut judge_losses,
             &move |r: &Ranking| r.validate(&labels_for_check),
         )
@@ -1345,6 +1364,7 @@ impl Runner {
             self.state.config.graph.retries,
             &run_id,
             "vote",
+            &prompts,
             &mut vote_losses,
             &move |v: &FinalVote| match v.label() {
                 Some(c) if allowed.contains(&c) => Ok(()),
@@ -1444,8 +1464,11 @@ impl Runner {
 
     async fn review_loop(&mut self) -> Result<()> {
         // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
-        // agent files with `magi task add` name the run that paid for it.
+        // agent files with `magi task add` name the run that paid for it. The
+        // prompt overlay is cloned alongside it because the waves borrow it
+        // while `self` is mutably borrowed by the node's own bookkeeping.
         let run_id = self.state.id.clone();
+        let prompts = self.state.config.prompts.clone();
         let Some(winner) = self.state.winner().cloned() else {
             return Ok(());
         };
@@ -1528,6 +1551,7 @@ impl Runner {
                 self.state.config.graph.retries,
                 &run_id,
                 "review",
+                &prompts,
                 &mut quota_losses,
                 &|_: &Review| Ok(()),
             )
@@ -1678,7 +1702,7 @@ impl Runner {
                 stem: format!("fix-{round}"),
             };
             let before = git::rev_parse(&winner.worktree, "HEAD").await?;
-            let (seat, out) = run_one(job, Arc::clone(&self.sem), &run_id, "fix").await;
+            let (seat, out) = run_one(job, Arc::clone(&self.sem), &run_id, "fix", &prompts).await;
             let agent_id = seat.agent.clone();
             let seat_key = seat.key.clone();
             self.state.seats.insert(seat.key.clone(), seat);
@@ -1895,6 +1919,41 @@ impl Runner {
         );
         self.state.merge = Some(outcome);
         self.state.save()?;
+
+        // The PR is open and the run would historically stop here, leaving the
+        // operator to watch checks, feed review comments back to a fixer, and
+        // merge. That was done by hand six times in one session before this
+        // existed. Opt-in, because merging is the one irreversible thing magi
+        // can do to a repository.
+        if self.state.config.graph.land
+            && mode == MergeMode::Pr
+            && self.state.status == RunStatus::Merged
+        {
+            let url = self
+                .state
+                .merge
+                .as_ref()
+                .map(|m| m.detail.clone())
+                .unwrap_or_default();
+            let url = url.lines().next().unwrap_or("").trim().to_owned();
+            if url.starts_with("http") {
+                // A land failure is not a lost run: the work is on a branch and
+                // the PR is open, which is exactly where a human takes over.
+                match land::land(&mut self.state, &url).await {
+                    Ok(pr) => {
+                        self.state.status = match pr.state {
+                            land::PrLifecycle::Merged => RunStatus::Merged,
+                            _ => RunStatus::Blocked,
+                        };
+                    }
+                    Err(e) => {
+                        self.state.status = RunStatus::Blocked;
+                        self.state.event("land", format!("gave up: {e}"));
+                    }
+                }
+                self.state.save()?;
+            }
+        }
         Ok(())
     }
 
@@ -2021,8 +2080,9 @@ async fn run_one(
     sem: Arc<Semaphore>,
     run: &str,
     node: &str,
+    prompts: &Prompts,
 ) -> (SeatState, AgentOutcome) {
-    let (_, seat, out) = wave(vec![job], sem, run, node)
+    let (_, seat, out) = wave(vec![job], sem, run, node, prompts)
         .await
         .pop()
         .expect("one job in, one result out");
@@ -2040,9 +2100,12 @@ async fn wave(
     sem: Arc<Semaphore>,
     run: &str,
     node: &str,
+    prompts: &Prompts,
 ) -> Vec<(usize, SeatState, AgentOutcome)> {
     let mut set = tokio::task::JoinSet::new();
-    for (i, job) in jobs.into_iter().enumerate() {
+    let overlay = prompts.overlay(node);
+    for (i, mut job) in jobs.into_iter().enumerate() {
+        job.prompt = prompt::with_overlay(job.prompt, overlay.clone());
         let sem = Arc::clone(&sem);
         let run = run.to_owned();
         let node = node.to_owned();
@@ -2114,6 +2177,7 @@ async fn ask_json_wave<T>(
     retries: usize,
     run: &str,
     node: &str,
+    prompts: &Prompts,
     losses: &mut Vec<QuotaLoss>,
     validate: &(dyn Fn(&T) -> Result<()> + Send + Sync),
 ) -> Vec<(SeatState, Result<(T, AgentOutput)>)>
@@ -2164,7 +2228,7 @@ where
             });
         }
 
-        let results = wave(batch, Arc::clone(&sem), run, node).await;
+        let results = wave(batch, Arc::clone(&sem), run, node, prompts).await;
         let mut still = Vec::new();
         for (&i, (_wi, seat, out)) in pending.iter().zip(results) {
             seats[i] = seat;

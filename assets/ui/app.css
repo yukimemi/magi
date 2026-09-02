@@ -297,6 +297,69 @@ a { color: inherit; text-decoration: none; }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 
+/* ---- ask bar ----------------------------------------------------------- *
+ * Sits in the same authoritative band as the daemon strip because it answers
+ * the same question the strip does — "is anything going to happen?" — with
+ * the one answer the operator can act on. An unanswered question is the only
+ * state in this product where the machine is burning nothing and moving
+ * nowhere, so it is loud: a gold rule across the top edge, a filled mark and
+ * the commit-coloured button. It is also disciplined, because it appears on
+ * every view: one clamped line of summary, no animated text, and a fixed
+ * min-height so a second question arriving cannot reflow the page under a
+ * thumb. */
+.ask-bar {
+  display: flex; align-items: center; gap: var(--s3);
+  padding: var(--s2) var(--s4);
+  padding-left: calc(var(--s4) + env(safe-area-inset-left));
+  padding-right: calc(var(--s4) + env(safe-area-inset-right));
+  background: var(--tint-gold); color: var(--on-gold);
+  border-bottom: 1px solid var(--gold-line);
+  box-shadow: inset 0 3px 0 var(--gold-line);
+  min-height: 58px;
+}
+.ask-mark {
+  position: relative;
+  width: 26px; height: 26px; flex: none;
+  display: grid; place-items: center;
+  border-radius: 50%;
+  background: var(--on-gold); color: var(--tint-gold);
+  font: 800 var(--t4)/1 var(--sans);
+}
+/* A slow expanding ring rather than a flash. It catches the eye on arrival
+   and then stops being something you have to read past. Drawn on a
+   pseudo-element so the animation is opacity and transform only, which the
+   reduced-motion rule at the bottom of this file can flatten to nothing. */
+.ask-mark::after {
+  content: ""; position: absolute; inset: -6px;
+  border-radius: 50%; border: 2px solid var(--on-gold);
+  animation: ring 2.8s var(--ease) infinite;
+}
+@keyframes ring {
+  0%        { transform: scale(.7); opacity: .65; }
+  60%, 100% { transform: scale(1.15); opacity: 0; }
+}
+
+.ask-bar-text { flex: 1; min-width: 0; display: flex; flex-direction: column; line-height: 1.3; }
+.ask-bar-count { font-size: var(--t3); font-weight: 700; }
+.ask-bar-summary {
+  font-size: var(--t2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ask-bar-go { flex: none; padding: 0 var(--s3); }
+
+/* The count on the nav item itself, so an open question is still visible once
+   the operator has scrolled the bar off the top of a 390px screen. */
+.badge {
+  display: inline-grid; place-items: center;
+  min-width: 18px; height: 18px; padding: 0 5px;
+  border-radius: 999px;
+  background: var(--on-gold); color: var(--tint-gold);
+  font: 700 var(--t1)/1 var(--sans);
+}
+.rail-link .badge { margin-left: 6px; }
+.dock-glyph { position: relative; display: block; }
+.dock-glyph .badge { position: absolute; top: -5px; right: -10px; border: 2px solid var(--surface); }
+
 /* ---- alert ------------------------------------------------------------- */
 .alert {
   display: flex; align-items: center; gap: var(--s3);
@@ -385,6 +448,21 @@ main {
     var(--hatch) 0 3px, transparent 3px 7px);
 }
 
+/* waiting: an agent stopped and asked the owner something. Gold is the
+   decision colour in the mark, so a decision that is merely owed is gold in a
+   ring — filled gold stays reserved for a decision that was actually made.
+   The ring, the `?` glyph and the halted phase rail are three channels saying
+   the same thing, because `waiting` must never be skimmed as `implementing`:
+   one is progress, the other is a full stop. */
+.chip[data-status="waiting"],
+.chip[data-status="open"] {
+  background: var(--tint-gold); color: var(--on-gold);
+  outline: 2px solid var(--on-gold); outline-offset: 2px;
+}
+.chip[data-status="answered"]  { background: var(--tint-teal); color: var(--on-teal); }
+/* The run went away before anyone answered; the question is history, not work. */
+.chip[data-status="abandoned"] { background: var(--tint-ink); color: var(--on-ink); border-style: dashed; }
+
 /* ---- cards (runs + queue) ---------------------------------------------- */
 .cards { display: flex; flex-direction: column; gap: var(--s3); }
 
@@ -402,6 +480,10 @@ main {
 .card[data-tone="blue"]   { border-left-color: var(--blue); }
 .card[data-tone="rust"]   { border-left-color: var(--rust); }
 .card[data-tone="ink"]    { border-left-color: var(--line-2); }
+/* Parked on a question. Gold like a verdict, dashed like everything else in
+   this interface that is pending rather than settled, so it is not the same
+   card edge as `merged` at a glance or in greyscale. */
+.card[data-tone="wait"] { border-left-color: var(--gold-line); border-left-style: dashed; }
 a.card:active { background: var(--sunk); }
 
 .card-top { display: flex; align-items: center; gap: var(--s2); }
@@ -455,9 +537,195 @@ a.card:active { background: var(--sunk); }
 .phase { width: 100%; height: 3px; border-radius: 2px; background: var(--line); }
 .phase[data-on="1"] { background: var(--blue); }
 .phase[data-now="1"] { background: var(--blue); animation: pulse 1.8s var(--ease) infinite; }
+/* A run parked on a question keeps its rail, because how far it got still
+   matters, but the segment it stopped on is bracketed by the empty track
+   showing through on both sides, and it does not pulse. So the rail says
+   "stopped here" as a shape and as an absence of motion, not only in gold:
+   `waiting` and `implementing` have to stay apart in greyscale. */
+.phase[data-parked="1"] {
+  background: var(--gold-line);
+  border-left: 3px solid var(--line); border-right: 3px solid var(--line);
+  animation: none;
+}
 
 .card-actions { display: flex; gap: var(--s2); margin-top: var(--s3); flex-wrap: wrap; }
 .card-actions .btn { flex: 1 1 auto; min-width: 120px; }
+
+/* ---- card tail --------------------------------------------------------- *
+ * A run card is one big anchor, which is the affordance the phone layout
+ * depends on, and an anchor may contain neither another anchor nor a button.
+ * The pull-request link and the Answer action therefore live in a sibling
+ * strip drawn as the bottom of the same card: same tone rail, no gap, a
+ * dashed rule marking where the card-wide tap target ends. */
+.cards > li { display: flex; flex-direction: column; }
+li[data-tail="1"] { border-radius: var(--radius); box-shadow: var(--shadow); }
+li[data-tail="1"] > .card, li[data-tail="1"] > .card-tail { box-shadow: none; }
+li[data-tail="1"] > .card {
+  border-bottom: 0;
+  border-bottom-left-radius: 0; border-bottom-right-radius: 0;
+}
+.card-tail {
+  display: flex; align-items: center; gap: var(--s2) var(--s4); flex-wrap: wrap;
+  padding: 0 var(--s4) var(--s2);
+  background: var(--surface);
+  border: 1px solid var(--line); border-top: 1px dashed var(--line);
+  border-left: 3px solid var(--line-2);
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+li[data-tone="gold"] > .card-tail { border-left-color: var(--gold-line); }
+li[data-tone="teal"] > .card-tail { border-left-color: var(--teal); }
+li[data-tone="blue"] > .card-tail { border-left-color: var(--blue); }
+li[data-tone="rust"] > .card-tail { border-left-color: var(--rust); }
+li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-left-style: dashed; }
+/* The note explains, the button acts, so they stack in that order whether or
+   not there is a pull request above them. Explicit `order` rather than DOM
+   order because a full-width note between two inline items would otherwise
+   split the pull-request row in half. */
+.tail-note { order: 1; flex: 1 1 100%; font-size: var(--t2); color: var(--ink-2); }
+.tail-go { order: 2; margin-left: auto; }
+
+/* A pull request is a place, so it is a real link with a real target, marked
+   as leaving the deck. */
+.pr-link {
+  display: inline-flex; align-items: center; gap: 5px;
+  min-height: var(--tap);
+  font-family: var(--mono); font-size: var(--t2); font-weight: 700; color: var(--ink);
+  text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 3px;
+}
+.pr-link::after { content: "\2197"; font-family: var(--sans); color: var(--ink-3); }
+.pr-round { font-size: var(--t2); color: var(--ink-2); }
+
+/* Check state carries its own glyph and its own sentence. `red` is not a
+   verdict on the run — it schedules another fixer round — so it deliberately
+   does not borrow the shape of the blocked chip. Pending spins, because it is
+   the one check state that resolves on its own without anybody doing
+   anything. */
+.checks {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: var(--t2); font-weight: 650; color: var(--ink-2);
+}
+.checks::before {
+  content: attr(data-glyph);
+  width: 17px; height: 17px; flex: none;
+  display: grid; place-items: center;
+  border: 1.5px solid currentColor; border-radius: 50%;
+  font-size: var(--t1); font-weight: 700;
+}
+.checks[data-checks="green"]   { color: var(--on-teal); }
+.checks[data-checks="red"]     { color: var(--on-rust); }
+.checks[data-checks="pending"] { color: var(--on-blue); }
+.checks[data-checks="pending"]::before { border-style: dashed; animation: spin 3.4s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---- landing ----------------------------------------------------------- */
+.land { display: flex; flex-direction: column; gap: var(--s3); }
+.land-top { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
+.land-note { font-size: var(--t2); color: var(--ink-2); }
+.land .phases { margin-top: 0; }
+.phase[data-round="1"] { background: var(--gold-line); }
+
+/* ---- questions --------------------------------------------------------- *
+ * An open question outranks everything else on screen: it is the only card
+ * that has stopped work outright, and the only one whose controls are the
+ * point rather than a detail. It gets the answer buttons in place, because a
+ * question the operator has to navigate somewhere else to answer is a
+ * question that stays unanswered until the morning. */
+.asks { display: flex; flex-direction: column; gap: var(--s4); }
+.ask {
+  display: flex; flex-direction: column; gap: var(--s3);
+  padding: var(--s4);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--gold-line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+/* Settled: the record of a decision, not a demand for one. Sunk, flat, thin
+   edge — still fully readable, because this is what was decided and why. */
+.ask[data-state="answered"], .ask[data-state="abandoned"] {
+  background: var(--sunk);
+  border-left: 3px solid var(--line-2);
+  box-shadow: none;
+}
+.panel-ask { border-left: 4px solid var(--gold-line); }
+.panel-ask .ask { background: var(--bg); box-shadow: none; }
+/* .panel h2 gives every panel heading the small-caps section treatment. A
+   question's summary is the operator's decision to make, written by an agent,
+   and has to read as the sentence it is. */
+.panel-ask .ask-summary {
+  font-size: var(--t5); color: var(--ink);
+  text-transform: none; letter-spacing: -.015em;
+}
+.panel-ask .ask[data-state="open"] .ask-summary { font-size: var(--t6); }
+
+.ask-top { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.ask-when { margin-left: auto; font-size: var(--t1); color: var(--ink-3); white-space: nowrap; }
+/* align-self keeps the box the width of the text, so the focus ring the ask
+   bar leaves on arrival outlines a heading rather than drawing what looks
+   like an empty input across the card. */
+.ask-summary {
+  align-self: flex-start; max-width: 100%;
+  font-size: var(--t5); font-weight: 650; line-height: 1.35; color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.ask[data-state="open"] .ask-summary { font-size: var(--t6); letter-spacing: -.015em; }
+/* The run link is a real destination on a touch screen, so the metadata row
+   is given over to a full tap target rather than leaving a 19px link that
+   only a mouse can hit. */
+.ask-where { display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--s2); min-height: var(--tap); font-size: var(--t2); color: var(--ink-2); }
+.ask-where a { display: inline-flex; align-items: center; min-height: var(--tap); text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 3px; }
+.ask-seat { font-family: var(--mono); font-size: var(--t1); font-weight: 600; color: var(--ink); }
+
+/* Choices are stacked, left-aligned and full width: they are sentences, not
+   labels, and a row of them would truncate at 390px. */
+.choices { display: flex; flex-direction: column; gap: var(--s2); }
+.choices .btn {
+  justify-content: flex-start; text-align: left;
+  height: auto; padding: var(--s3) var(--s4);
+  line-height: 1.35; font-size: var(--t4);
+}
+.choices .btn::before {
+  content: "\25c7"; margin-right: var(--s2); flex: none;
+  color: var(--gold-line); font-size: var(--t5);
+}
+.ask-free { display: flex; flex-direction: column; gap: var(--s2); }
+.ask-free .btn { align-self: flex-start; }
+
+/* The decision, kept as a quotation, because this is the text the run acted
+   on and the only durable record of the exchange. */
+.answer {
+  display: flex; flex-direction: column; gap: var(--s1);
+  padding: var(--s3);
+  background: var(--tint-teal); color: var(--on-teal);
+  border-radius: var(--radius-sm);
+}
+.answer-label { font-size: var(--t1); font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
+.answer-text { font-size: var(--t4); font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* ---- markdown-ish ------------------------------------------------------ *
+ * A question detail is agent prose and will contain fenced blocks and code
+ * spans. It is parsed into nodes below in app.js and never assigned as
+ * markup, so a fence containing a script tag renders as the characters of a
+ * script tag. */
+.md { display: flex; flex-direction: column; gap: var(--s2); font-size: var(--t3); color: var(--ink-2); }
+.md p { overflow-wrap: anywhere; }
+.md h4 { margin: var(--s1) 0 0; font-size: var(--t3); font-weight: 700; color: var(--ink); }
+.md ul { display: flex; flex-direction: column; gap: var(--s1); padding-left: var(--s4); }
+.md li { position: relative; overflow-wrap: anywhere; }
+.md li::before { content: "\2013"; position: absolute; left: calc(-1 * var(--s4)); color: var(--ink-3); }
+.md code {
+  font-family: var(--mono); font-size: .92em;
+  background: var(--sunk); border: 1px solid var(--line); border-radius: 4px;
+  padding: 0 4px; overflow-wrap: anywhere;
+}
+.md pre {
+  margin: 0; padding: var(--s3);
+  background: var(--sunk); border-radius: var(--radius-sm);
+  font-family: var(--mono); font-size: var(--t1); line-height: 1.5; color: var(--ink);
+  white-space: pre; overflow-x: auto; overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+.md pre code { padding: 0; border: 0; background: none; font-size: inherit; }
 
 /* ---- panels (run detail) ----------------------------------------------- */
 .panel {
@@ -536,6 +804,7 @@ a.card:active { background: var(--sunk); }
 .tag[data-tone="teal"] { background: var(--tint-teal); color: var(--on-teal); }
 .tag[data-tone="rust"] { background: var(--tint-rust); color: var(--on-rust); }
 .tag[data-tone="ink"]  { background: var(--tint-ink);  color: var(--on-ink); }
+.tag[data-tone="gold"] { background: var(--tint-gold); color: var(--on-gold); }
 .round-head .head-sha { margin-left: auto; font-family: var(--mono); font-size: var(--t1); color: var(--ink-3); }
 
 .findings { display: flex; flex-direction: column; gap: var(--s2); margin-top: var(--s3); }
@@ -701,6 +970,17 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: var(--s4); }
   .card { display: flex; flex-direction: column; }
   .card-event { margin-top: auto; padding-top: var(--s2); }
+  /* The `li` is the grid item now that a card may carry a tail; the card
+     itself has to stretch or the tails in a row would not line up. */
+  .cards > li > .card { flex: 1; }
+  /* A question is read, not scanned: one column, measured, even when there is
+     room for two. */
+  #view-questions .asks { max-width: 780px; }
+  /* With room, the options sit side by side and stay the width of their own
+     text; a 780px-wide button labelled "Redis" reads like a mistake. A long
+     option still wraps onto its own line. */
+  .choices { flex-direction: row; flex-wrap: wrap; }
+  .choices .btn { flex: 0 1 auto; }
 }
 
 /* The two run-detail wrappers are inert on a phone: their children flow into
@@ -734,7 +1014,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 
 /* ---- print ------------------------------------------------------------- */
 @media print {
-  .top, .daemon, .dock, .back, .sheet { display: none; }
+  .top, .daemon, .ask-bar, .dock, .back, .sheet { display: none; }
   .card, .panel { box-shadow: none; break-inside: avoid; }
   .report { max-height: none; white-space: pre-wrap; }
 }

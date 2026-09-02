@@ -166,6 +166,20 @@ pub struct Graph {
     pub retries: usize,
     /// Root for candidate / judge worktrees. Defaults to `~/wt/magi`.
     pub worktree_root: Option<PathBuf>,
+    /// After the pull request is open, keep going: watch its checks and
+    /// reviews, run a fix round when they are unhappy, and merge when they are
+    /// not.
+    ///
+    /// Off by default, and deliberately so. Merging is the one irreversible
+    /// thing magi can do to a repository, and it must be something the
+    /// operator turned on rather than something they discovered.
+    pub land: bool,
+    /// Land rounds - watch, fix, push - before the run is left for a human.
+    pub land_rounds: usize,
+    /// How long to wait for an owner to answer a question before the run is
+    /// abandoned, seconds. A parked run costs nothing, so this is generous;
+    /// it exists so a forgotten question cannot pin a worktree forever.
+    pub answer_timeout: u64,
 }
 
 impl Default for Graph {
@@ -185,6 +199,9 @@ impl Default for Graph {
             timeout_fix: 1800,
             retries: 1,
             worktree_root: None,
+            land: false,
+            land_rounds: 4,
+            answer_timeout: 86_400,
         }
     }
 }
@@ -364,6 +381,80 @@ pub struct Config {
     pub merge: Merge,
     /// Self-update policy.
     pub update: Update,
+    /// Project-specific text appended to the node prompts.
+    pub prompts: Prompts,
+    /// How the operator is told a run is waiting on them.
+    pub notify: Notify,
+}
+
+/// Project-specific text appended to each node's prompt.
+///
+/// **Additive by construction.** These fields cannot replace magi's prompts,
+/// only extend them, and that restriction is the whole design. The built-in
+/// prompts carry the invariants the competition rests on: a judging prompt
+/// names no authors, every structured answer must arrive as one fenced `json`
+/// block, and a judge is told not to speculate about who wrote what. A config
+/// that could overwrite them would let a typo silently un-blind the panel or
+/// break the parser, and the symptom would be "the judges got worse" rather
+/// than an error.
+///
+/// Repository-wide context belongs in `AGENTS.md`, which every agent already
+/// reads from the checkout. Use these fields for the things a *magi node*
+/// needs to know and a repository file cannot say - for instance that
+/// reviewers here should ignore formatting because a hook owns it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Prompts {
+    /// Appended to every node's prompt.
+    pub all: String,
+    /// Appended for implementers.
+    pub implement: String,
+    /// Appended for judges, both ranking and voting.
+    pub judge: String,
+    /// Appended for reviewers.
+    pub review: String,
+    /// Appended for the fixer.
+    pub fix: String,
+}
+
+impl Prompts {
+    /// The overlay for one node, or `None` when nothing is configured.
+    ///
+    /// `node` is the graph's own node name, so a new node gets no overlay
+    /// rather than the wrong one.
+    pub fn overlay(&self, node: &str) -> Option<String> {
+        let specific = match node {
+            "implement" => &self.implement,
+            "judge" | "vote" | "deliberate" => &self.judge,
+            "review" => &self.review,
+            "fix" => &self.fix,
+            _ => "",
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        for p in [self.all.trim(), specific.trim()] {
+            if !p.is_empty() {
+                parts.push(p);
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(parts.join("\n\n"))
+    }
+}
+
+/// How the operator is told that a run is waiting on them.
+///
+/// A command rather than a built-in integration: magi is one binary with no
+/// network dependencies, and every operator's notification path is different -
+/// ntfy, a Slack webhook, a Windows toast, an SSH to a machine that beeps.
+/// Shelling out keeps all of them possible and none of them magi's problem.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Notify {
+    /// Command and arguments. `{summary}`, `{run}` and `{url}` are replaced.
+    /// Empty means no notification - the web UI is then the only surface.
+    pub command: Vec<String>,
 }
 
 /// Roles resolved to concrete agent specs for one run.
