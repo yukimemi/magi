@@ -271,9 +271,16 @@ a { color: inherit; text-decoration: none; }
 [data-theme="light"] .theme-glyph { background: currentColor; }
 [data-theme="dark"] .theme-glyph { background: none; box-shadow: inset -5px 0 0 currentColor; }
 
-/* ---- daemon strip ------------------------------------------------------ */
+/* ---- loop strip -------------------------------------------------------- *
+ * A two-column grid rather than a flex row: on a 390px screen the control
+ * drops to its own full-width row under the sentence, which is the only way
+ * a 44px target and a two-line explanation both fit without the text being
+ * squeezed to one word per line. */
 .daemon {
-  display: flex; align-items: center; gap: var(--s2);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--s2) var(--s2);
   padding: var(--s2) var(--s4);
   padding-left: calc(var(--s4) + env(safe-area-inset-left));
   padding-right: calc(var(--s4) + env(safe-area-inset-right));
@@ -285,20 +292,64 @@ a { color: inherit; text-decoration: none; }
 .daemon-dot {
   width: 8px; height: 8px; flex: none; border-radius: 50%;
   background: var(--ink-3);
+  /* Aligned to the first line of the sentence rather than centred in a block
+     that may be three lines tall: a dot floating beside the explanation reads
+     as a bullet for it. */
+  align-self: start; margin-top: .55em;
 }
+.daemon-body { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .daemon-text { min-width: 0; }
 .daemon-text b { color: var(--ink); font-weight: 650; }
 .daemon-run { font-family: var(--mono); font-size: var(--t1); }
+/* What the control is about to spend, or why there is no control. Small, but
+   never the same colour as the dot: it is a sentence to read, not a hint to
+   skip. */
+.daemon-why { font-size: var(--t1); }
+.daemon-btn {
+  grid-column: 1 / -1;
+  width: 100%;
+  font-size: var(--t3);
+  background: var(--surface); border-color: var(--edge); color: var(--ink);
+}
+.daemon-btn[data-kind="start"] { background: var(--gold); border-color: var(--gold); color: #241d05; }
 
 .daemon[data-state="working"] { background: var(--tint-blue); color: var(--on-blue); border-bottom-color: var(--tint-blue); }
 .daemon[data-state="working"] .daemon-dot { background: var(--on-blue); animation: pulse 1.8s var(--ease) infinite; }
 .daemon[data-state="working"] .daemon-text b { color: var(--on-blue); }
 .daemon[data-state="idle"] .daemon-dot { background: var(--teal); }
-/* Down is stated, not implied: this is the difference between an empty queue
-   and a queue nothing will ever read. */
-.daemon[data-state="down"] { background: var(--tint-rust); color: var(--on-rust); border-bottom-color: var(--tint-rust); }
-.daemon[data-state="down"] .daemon-dot { background: var(--on-rust); box-shadow: 0 0 0 2px var(--tint-rust), 0 0 0 3px var(--on-rust); }
-.daemon[data-state="down"] .daemon-text b { color: var(--on-rust); }
+/* Off with an empty queue is a choice, not a fault: neutral, and the control
+   beside it is an offer. */
+.daemon[data-state="off"] .daemon-dot { background: var(--ink-3); box-shadow: 0 0 0 2px var(--sunk), 0 0 0 3px var(--line-2); }
+/* Off with runnable tasks in the queue is the state this strip exists for:
+   nothing will happen until the operator taps. Gold, the colour this
+   interface uses for "your turn", rather than the rust of a fault — the loop
+   being off is not a failure, and colouring it like one taught the operator
+   to ignore it. */
+.daemon[data-state="waiting"] { background: var(--tint-gold); color: var(--on-gold); border-bottom-color: var(--gold-line); }
+.daemon[data-state="waiting"] .daemon-dot { background: var(--on-gold); box-shadow: 0 0 0 2px var(--tint-gold), 0 0 0 3px var(--on-gold); }
+.daemon[data-state="waiting"] .daemon-text b { color: var(--on-gold); }
+/* Stopping is in flight, not finished, so it keeps the pulsing dot of work in
+   progress: a run is still going. */
+.daemon[data-state="stopping"] { background: var(--tint-ink); color: var(--on-ink); border-bottom-color: var(--line-2); }
+.daemon[data-state="stopping"] .daemon-dot { background: var(--on-ink); animation: pulse 1.8s var(--ease) infinite; }
+.daemon[data-state="stopping"] .daemon-text b { color: var(--on-ink); }
+/* A loop that died is the one state here that is a fault, so it is the only
+   one in rust: the two ordinary "off" states must not be able to borrow this
+   colour, or the operator would stop being able to tell a stop from a crash.
+   The error text itself is shown beside it. */
+.daemon[data-state="failed"] { background: var(--tint-rust); color: var(--on-rust); border-bottom-color: var(--tint-rust); }
+.daemon[data-state="failed"] .daemon-dot { background: var(--on-rust); box-shadow: 0 0 0 2px var(--tint-rust), 0 0 0 3px var(--on-rust); }
+.daemon[data-state="failed"] .daemon-text b { color: var(--on-rust); }
+.daemon[data-state="failed"] .daemon-btn { background: var(--surface); border-color: var(--on-rust); color: var(--ink); }
+/* Someone else's loop. The dashed ring is the same vocabulary the cards use
+   for "not this page's to settle", and there is no button at all rather than
+   one that would answer 409. */
+.daemon[data-owned="no"] .daemon-dot {
+  background: none;
+  border: 2px dashed currentColor;
+  width: 12px; height: 12px;
+  animation: none;
+}
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 
@@ -1214,6 +1265,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
   body { padding-bottom: var(--s6); }
   .dock { display: none; }
   .rail { display: flex; align-items: center; gap: var(--s1); }
+  /* With room, the control returns to the end of the same row: a full-width
+     button across a 1280px strip would read as a banner, not a switch. */
+  .daemon { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .daemon-btn { grid-column: auto; width: auto; }
   .rail-link {
     display: inline-flex; align-items: center;
     min-height: var(--tap); padding: 0 var(--s3);

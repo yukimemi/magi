@@ -199,7 +199,90 @@ pub fn write_status_to(path: &Path, status: &Status) -> Result<()> {
 /// Delete the status file. Called on the way out so a clean exit reads as
 /// "no daemon" rather than as a daemon whose heartbeat merely stopped.
 pub fn clear_status() {
-    let _ = std::fs::remove_file(status_path());
+    clear_status_at(&status_path());
+}
+
+/// Delete a status file at an explicit path, so the loop's teardown and
+/// [`clear_status`] cannot drift apart: the loop is handed the path it
+/// published to, and a test can watch a temp file disappear.
+fn clear_status_at(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// A cooperative stop, shared with whoever asked the loop to run.
+///
+/// Cloning is how the request travels: [`serve_until`] keeps one handle, the
+/// Ctrl-C listener and the web UI keep others, and every clone points at the
+/// same flag. There is no channel because there is nothing to send — the only
+/// message is "stop", it is idempotent, and a flag cannot be missed by a
+/// receiver that was not listening yet.
+///
+/// The handle also answers the question the operator's screen asks next: a
+/// stop does not take effect until the run in flight has finished, so
+/// [`Stop::finishing`] reports "asked to stop, still working" rather than
+/// leaving a caller to infer it from a heartbeat and hope.
+#[derive(Debug, Clone, Default)]
+pub struct Stop {
+    /// Set once, never cleared: a stop is not something an operator takes back
+    /// half way through, and a clearable flag would let a start racing a stop
+    /// resurrect a loop that is already unwinding.
+    stopped: Arc<AtomicBool>,
+    /// Whether a run is in flight, so `finishing` can distinguish a stop that
+    /// has landed from one that is waiting on `execute`.
+    busy: Arc<AtomicBool>,
+    /// Wakes the idle wait. Without this a stop would not be seen until the
+    /// poll interval elapsed, and an operator tapping stop on a phone would
+    /// watch a button do nothing for five seconds.
+    wake: Arc<Notify>,
+}
+
+impl Stop {
+    /// A stop nobody has asked for yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the loop to stop. Idempotent, and safe to call before the loop
+    /// starts: the flag is checked before the first poll.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        // `notify_one` rather than `notify_waiters` because the loop may not be
+        // parked yet: this stores a permit, so a wait that registers a moment
+        // later returns at once instead of sleeping out the whole interval.
+        self.wake.notify_one();
+    }
+
+    /// Has a stop been asked for?
+    #[must_use]
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Has a stop been asked for that has not taken effect yet, because a run
+    /// is still in flight?
+    ///
+    /// This is the state a screen has to be able to show. A stop never abandons
+    /// a run — see [`serve_until`] — so between the tap and the loop's return
+    /// there is a window of tens of minutes in which "running" and "stopped"
+    /// are both misleading answers.
+    #[must_use]
+    pub fn finishing(&self) -> bool {
+        self.stopped() && self.busy.load(Ordering::SeqCst)
+    }
+
+    /// Mark a run as in flight, or finished, for [`Stop::finishing`].
+    fn busy(&self, running: bool) {
+        self.busy.store(running, Ordering::SeqCst);
+    }
+
+    /// Wait out one poll interval, returning early once a stop is asked for.
+    async fn idle(&self, poll: Duration) {
+        tokio::select! {
+            () = tokio::time::sleep(poll) => {}
+            () = self.wake.notified() => {}
+        }
+    }
 }
 
 /// The daemon's published state, read permissively.
@@ -334,18 +417,56 @@ pub fn settle(task: &mut Task, status: RunStatus, detail: &str, max_attempts: us
 
 /// Run the loop until Ctrl-C, or until the queue drains with [`Opts::once`].
 ///
-/// Ctrl-C does not abandon a run in flight. Killing the graph mid-node leaves
-/// worktrees, branches and agent sessions behind, and every agent call already
-/// paid for is lost; finishing the run costs the operator a wait and saves them
-/// a cleanup. The signal therefore sets a flag: the current `execute` runs to
-/// its terminal status, the task's outcome is recorded, and only then does the
-/// loop return. An operator who genuinely wants the run dead still has a second
-/// Ctrl-C, which the runtime turns into a process kill — and the task left
-/// `Running` then tells the next daemon, and the next human, where to look.
+/// A thin wrapper over [`serve_until`] with a stop nothing but Ctrl-C ever
+/// sets, so there is one loop body rather than two that drift apart the first
+/// time the retry policy changes on only one of them.
 pub async fn serve(opts: Opts) -> Result<()> {
-    let queue = Queue::open();
+    serve_until(opts, Stop::new()).await
+}
 
-    let swept = sweep_stale_claims(&queue, STALE_CLAIM);
+/// [`serve`], but stopping when `stop` is set as well as on Ctrl-C.
+///
+/// Neither a signal nor a `stop` abandons a run in flight. Killing the graph
+/// mid-node leaves worktrees, branches and agent sessions behind, and every
+/// agent call already paid for is lost; finishing the run costs the operator a
+/// wait and saves them a cleanup. A stop therefore only sets a flag: the
+/// current `execute` runs to its terminal status, the task's outcome is
+/// recorded, and only then does the loop return. That window is what
+/// [`Stop::finishing`] is for. An operator who genuinely wants the run dead
+/// still has a second Ctrl-C, which the runtime turns into a process kill —
+/// and the task left `Running` then tells the next daemon, and the next human,
+/// where to look.
+///
+/// While the queue is empty the stop is honoured within one wakeup rather than
+/// one poll interval: the wait is a `select!` against [`Stop`]'s notify, so a
+/// caller that taps stop does not sit through the remainder of a sleep.
+pub async fn serve_until(opts: Opts, stop: Stop) -> Result<()> {
+    let signal = {
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                stop.stop();
+                tracing::info!("shutdown requested; a run in flight will be finished first");
+            }
+        })
+    };
+
+    let outcome = drive(&opts, &Queue::open(), &status_path(), &stop).await;
+
+    signal.abort();
+    outcome
+}
+
+/// The loop proper: setup, poll, teardown, with the queue and the status file
+/// supplied rather than discovered.
+///
+/// Both are parameters because [`crate::run::home`] is process-global and its
+/// override is a `OnceLock`, so a unit test that pinned it would fight every
+/// other test in the binary — and a loop that resolved the home itself could
+/// only be exercised against the operator's real one, publishing over a live
+/// daemon's status file and claiming tasks out of a live backlog.
+async fn drive(opts: &Opts, queue: &Queue, status_file: &Path, stop: &Stop) -> Result<()> {
+    let swept = sweep_stale_claims(queue, STALE_CLAIM);
     if !swept.is_empty() {
         tracing::warn!(
             "swept {} stale claim(s) left behind by an earlier daemon: {}",
@@ -362,22 +483,8 @@ pub async fn serve(opts: Opts) -> Result<()> {
     // for no gain. The lock is only ever held across a field assignment, never
     // across an await.
     let status = Arc::new(Mutex::new(Status::new()));
-    write_status(&lock(&status)).context("publish the daemon status file")?;
-    let beat = tokio::spawn(heartbeat(Arc::clone(&status)));
-
-    let stopping = Arc::new(AtomicBool::new(false));
-    let wake = Arc::new(Notify::new());
-    let signal = {
-        let stopping = Arc::clone(&stopping);
-        let wake = Arc::clone(&wake);
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                stopping.store(true, Ordering::SeqCst);
-                wake.notify_waiters();
-                tracing::info!("shutdown requested; a run in flight will be finished first");
-            }
-        })
-    };
+    write_status_to(status_file, &lock(&status)).context("publish the daemon status file")?;
+    let beat = tokio::spawn(heartbeat(Arc::clone(&status), status_file.to_path_buf()));
 
     tracing::info!(
         "magi serve: queue {} (poll {}s, {} attempts per task, one run at a time)",
@@ -386,11 +493,10 @@ pub async fn serve(opts: Opts) -> Result<()> {
         opts.max_attempts
     );
 
-    let outcome = drive(&opts, &queue, &status, &stopping, &wake).await;
+    let outcome = poll(opts, queue, &status, stop).await;
 
     beat.abort();
-    signal.abort();
-    clear_status();
+    clear_status_at(status_file);
     outcome
 }
 
@@ -399,7 +505,7 @@ pub async fn serve(opts: Opts) -> Result<()> {
 /// Separate from the loop because a run takes tens of minutes: a status file
 /// written only between tasks would look stale for the whole of every run, and
 /// a reader would report the daemon dead exactly while it was busiest.
-async fn heartbeat(status: Arc<Mutex<Status>>) {
+async fn heartbeat(status: Arc<Mutex<Status>>, path: PathBuf) {
     loop {
         tokio::time::sleep(HEARTBEAT).await;
         let snapshot = {
@@ -407,7 +513,7 @@ async fn heartbeat(status: Arc<Mutex<Status>>) {
             guard.updated_at = Timestamp::now();
             guard.clone()
         };
-        if let Err(e) = write_status(&snapshot) {
+        if let Err(e) = write_status_to(&path, &snapshot) {
             // A failed heartbeat must not take the daemon down: the loop is the
             // product, the status file is only the window onto it.
             tracing::warn!("could not refresh the daemon status file: {e:#}");
@@ -415,21 +521,16 @@ async fn heartbeat(status: Arc<Mutex<Status>>) {
     }
 }
 
-/// The loop proper, factored out so [`serve`] owns only setup and teardown.
-async fn drive(
-    opts: &Opts,
-    queue: &Queue,
-    status: &Arc<Mutex<Status>>,
-    stopping: &AtomicBool,
-    wake: &Notify,
-) -> Result<()> {
+/// Poll the queue until stopped, factored out so [`drive`] owns only setup and
+/// teardown and cannot skip the teardown on an early return.
+async fn poll(opts: &Opts, queue: &Queue, status: &Arc<Mutex<Status>>, stop: &Stop) -> Result<()> {
     // Only consulted by `once`, where a task that just failed is still
     // `runnable` and would otherwise be picked up again inside the same drain.
     // In the long-running mode a later poll retrying a failed task is the point,
     // and the attempt counter is what bounds it.
     let mut attempted: Vec<String> = Vec::new();
 
-    while !stopping.load(Ordering::SeqCst) {
+    while !stop.stopped() {
         lock(status).polls += 1;
 
         let candidates: Vec<Task> = runnable(queue)
@@ -439,7 +540,7 @@ async fn drive(
 
         let mut ran = false;
         for candidate in candidates {
-            if stopping.load(Ordering::SeqCst) {
+            if stop.stopped() {
                 break;
             }
             // A claim we cannot take means another daemon, or a human running
@@ -462,7 +563,11 @@ async fn drive(
             };
             attempted.push(task.id.clone());
             lock(status).idle = false;
+            // A stop asked for from here on is "finishing", not "stopped": the
+            // run gets to reach a terminal status before the loop returns.
+            stop.busy(true);
             attempt(opts, queue, status, &mut task).await;
+            stop.busy(false);
             {
                 let mut guard = lock(status);
                 guard.current = None;
@@ -480,10 +585,7 @@ async fn drive(
         if opts.once {
             return Ok(());
         }
-        tokio::select! {
-            () = tokio::time::sleep(opts.poll) => {}
-            () = wake.notified() => {}
-        }
+        stop.idle(opts.poll).await;
     }
     Ok(())
 }
@@ -916,5 +1018,145 @@ mod tests {
         assert_eq!(merge_mode("local").unwrap(), MergeMode::Local);
         assert_eq!(merge_mode("pr").unwrap(), MergeMode::Pr);
         assert!(merge_mode("squash").is_err());
+    }
+
+    /// A loop whose queue lives in a temp tree and whose poll interval is far
+    /// longer than the test's patience, so anything that waits out a poll
+    /// instead of noticing the stop fails rather than merely being slow.
+    fn idle_loop(dir: &Path) -> (Opts, Queue, PathBuf) {
+        let opts = Opts {
+            poll: Duration::from_secs(30),
+            ..Opts::default()
+        };
+        // The status file goes in a directory that does not exist yet, so its
+        // creation is itself evidence the loop published one.
+        (
+            opts,
+            Queue::at(dir.join("queue")),
+            dir.join("home").join("daemon.json"),
+        )
+    }
+
+    #[test]
+    fn a_stop_is_idempotent_and_once_set_stays_set() {
+        let stop = Stop::new();
+        assert!(!stop.stopped());
+
+        stop.stop();
+        assert!(stop.stopped());
+        stop.stop();
+        assert!(stop.stopped(), "a second stop is not a toggle");
+
+        let shared = stop.clone();
+        assert!(
+            shared.stopped(),
+            "a clone is the same stop; that is how the loop and its caller share one"
+        );
+    }
+
+    #[test]
+    fn only_a_stop_with_a_run_in_flight_reads_as_finishing() {
+        let stop = Stop::new();
+        stop.busy(true);
+        assert!(
+            !stop.finishing(),
+            "a busy loop nobody has asked to stop is just running"
+        );
+
+        stop.stop();
+        assert!(
+            stop.finishing(),
+            "a stop asked for mid-run has not landed until the run is settled"
+        );
+
+        stop.busy(false);
+        assert!(
+            !stop.finishing(),
+            "once the run is settled the stop has landed and there is nothing to finish"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loop_already_asked_to_stop_returns_without_waiting_out_a_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opts, queue, status_file) = idle_loop(dir.path());
+        let stop = Stop::new();
+        stop.stop();
+
+        let began = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            drive(&opts, &queue, &status_file, &stop),
+        )
+        .await
+        .expect("a stopped loop must return, not sit out its poll interval")
+        .expect("the loop's own setup and teardown must not fail");
+        assert!(
+            began.elapsed() < opts.poll,
+            "returned only after {:?}, which is a poll interval, not a stop",
+            began.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_idle_wakes_the_wait_instead_of_sleeping_it_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opts, queue, status_file) = idle_loop(dir.path());
+        let stop = Stop::new();
+
+        // Asked for after the loop is already parked on its empty queue, which
+        // is the case an operator tapping stop on a phone actually hits.
+        let asker = {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                stop.stop();
+            })
+        };
+
+        let began = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            drive(&opts, &queue, &status_file, &stop),
+        )
+        .await
+        .expect("a stop asked for while idle must wake the wait")
+        .expect("the loop's own setup and teardown must not fail");
+        asker.await.unwrap();
+        assert!(
+            began.elapsed() < opts.poll,
+            "returned only after {:?}, so the stop waited on the sleep",
+            began.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_loop_leaves_no_status_file_claiming_it_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opts, queue, status_file) = idle_loop(dir.path());
+        let home = status_file.parent().unwrap().to_path_buf();
+        let stop = Stop::new();
+        stop.stop();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            drive(&opts, &queue, &status_file, &stop),
+        )
+        .await
+        .expect("a stopped loop must return")
+        .expect("the loop's own setup and teardown must not fail");
+
+        assert!(
+            home.is_dir(),
+            "the loop did publish a status file, so its removal is the teardown and not an absence"
+        );
+        assert!(
+            !status_file.exists(),
+            "a stopped loop clears its status file"
+        );
+        assert!(
+            read_status(&home).is_none(),
+            "a reader must see no daemon at all, not a heartbeat that merely stopped"
+        );
     }
 }
