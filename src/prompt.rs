@@ -46,14 +46,42 @@ pub struct Turn {
     pub body: String,
 }
 
-fn lang(language: &str) -> String {
-    if language.trim().is_empty() || language.eq_ignore_ascii_case("en") {
-        String::new()
-    } else {
-        format!(
-            "\n\nWrite all prose in {language}. Keep the JSON keys and the labels as specified."
-        )
+/// The language an agent is told to write in, by name.
+///
+/// `[graph] language` takes a code or a name, and a code reached the prompt
+/// verbatim: "Write all prose in ja" is an instruction a model can read as
+/// noise, and the questions agents asked came back in English on a repository
+/// configured for Japanese. Naming the language is the whole fix.
+fn language_name(language: &str) -> &str {
+    match language.trim() {
+        "ja" | "jp" => "Japanese",
+        "en" => "English",
+        "de" => "German",
+        "fr" => "French",
+        "es" => "Spanish",
+        "ko" => "Korean",
+        "zh" => "Chinese",
+        // Anything else is passed through: the setting has always accepted a
+        // language name, and inventing a mapping for one magi cannot verify
+        // would be worse than repeating what the operator wrote.
+        other => other,
     }
+}
+
+/// Is this the default, where nothing needs saying?
+fn is_english(language: &str) -> bool {
+    let l = language.trim();
+    l.is_empty() || l.eq_ignore_ascii_case("en") || l.eq_ignore_ascii_case("english")
+}
+
+fn lang(language: &str) -> String {
+    if is_english(language) {
+        return String::new();
+    }
+    format!(
+        "\n\nWrite all prose in {}. Keep the JSON keys and the labels as specified.",
+        language_name(language)
+    )
 }
 
 /// Append the project's overlay for a node, under a heading of its own.
@@ -97,6 +125,55 @@ fn truncate_patch(patch: &str, branch: &str) -> String {
     )
 }
 
+/// What every writing node is told about reaching the owner.
+///
+/// Advertised in the prompt because a capability an agent does not know about
+/// is a capability nobody uses. The panel matters more than it looks: without
+/// it a question is one line of prose, and an owner asked to choose between
+/// two designs on a phone with no evidence will either guess or ignore it.
+fn ask_the_owner(language: &str) -> String {
+    let mut s = String::from(
+        "\
+# Asking the owner\n\n\
+If a decision is genuinely the owner's - a product choice, a tradeoff with no \
+technically correct answer, something that would be expensive to undo - stop \
+and ask instead of guessing:\n\n\
+```sh\n\
+magi ask --summary \"Which storage backend?\" --choice SQLite --choice Redis\n\
+```\n\n\
+It blocks and prints the owner's answer on stdout. Omit `--choice` for a \
+free-text reply.\n\n\
+You can attach a page you format yourself, which is how the owner actually \
+judges: a diff, a table of what changes, a rendered before and after.\n\n\
+```sh\n\
+magi ask --summary \"...\" --choice A --choice B --panel panel.html --asset shot.png\n\
+```\n\n\
+The panel is your own HTML and CSS, rendered in a sandbox: **no JavaScript \
+runs and nothing may load from the network**. Inline your styles, reference \
+attached assets by their bare filename, and use `data:` URIs for anything \
+small. A `<script>`, a remote font or an external image is silently blocked, \
+so do not spend effort on them.\n\n\
+Ask sparingly. A question stops the run until a human notices it, and asking \
+about something you could have decided yourself is how that channel becomes \
+noise the owner learns to ignore.",
+    );
+    if !is_english(language) {
+        // Load-bearing, and separate from `lang()` on purpose: the summary,
+        // the choices and the panel are arguments to a command, and a model
+        // reads a command's arguments as tooling rather than as prose. Without
+        // saying it here, questions arrive in English on a repository whose
+        // language is set to something else - which is exactly what happened.
+        s.push_str(&format!(
+            "\n\n**Write the question in {0}.** The summary, the choices and \
+             every word of the panel are read by the owner, not by magi, so \
+             they must be in {0} even though the flags and the filenames are \
+             not.",
+            language_name(language)
+        ));
+    }
+    s
+}
+
 /// Prompt for an implementer.
 pub fn implement(instruction: &str, cwd: &str, language: &str) -> String {
     format!(
@@ -123,7 +200,8 @@ pub fn implement(instruction: &str, cwd: &str, language: &str) -> String {
          - what you changed (max 10 bullets)\n\
          - why, where it is not obvious\n\
          - risks a reviewer should check\n\
-         - how to verify by hand{}",
+         - how to verify by hand\n\n{}{}",
+        ask_the_owner(language),
         lang(language)
     )
 }
@@ -374,6 +452,8 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
          \"title\":\"short\",\"detail\":\"trigger and consequence\"}]}\n\
          ```",
     );
+    s.push('\n');
+    s.push_str(&ask_the_owner(language));
     s.push_str(&lang(language));
     s
 }
@@ -434,6 +514,8 @@ pub fn fix(
          \"<finding id>\",\"why\":\"...\"}],\"notes\":\"what changed\"}\n\
          ```",
     );
+    s.push('\n');
+    s.push_str(&ask_the_owner(language));
     s.push_str(&lang(language));
     s
 }
@@ -651,5 +733,49 @@ mod tests {
         for agent in ["alpha", "beta", "gamma"] {
             assert!(!p.contains(agent), "an overlay must not add authorship");
         }
+    }
+    #[test]
+    fn an_implementer_is_told_it_can_ask_and_how_the_panel_is_sandboxed() {
+        let p = implement("do it", "/tmp/wt", "en");
+        // A capability an agent is not told about is one nobody uses.
+        assert!(p.contains("magi ask"), "{p}");
+        assert!(p.contains("--panel"), "{p}");
+        // And it has to know the two limits, or it will waste a turn writing
+        // JavaScript and a remote stylesheet that the CSP silently drops.
+        assert!(p.contains("no JavaScript"), "{p}");
+        assert!(p.contains("nothing may load from the network"), "{p}");
+        // Asking is not free: it stops the run until a human notices.
+        assert!(p.contains("Ask sparingly"), "{p}");
+    }
+    #[test]
+    fn a_question_is_asked_in_the_operators_language_not_in_a_language_code() {
+        // Reported from a real run: `language = "ja"` was set and the questions
+        // still arrived in English. Two causes, both fixed here.
+        let ja = implement("do it", "/tmp/wt", "ja");
+
+        // 1. The code reached the prompt verbatim - "Write all prose in ja" is
+        //    an instruction a model can read as noise.
+        assert!(ja.contains("Japanese"), "the language must be named: {ja}");
+        assert!(
+            !ja.contains("prose in ja."),
+            "a bare code is not an instruction: {ja}"
+        );
+
+        // 2. `lang()` speaks about prose, and a model reads a command's
+        //    arguments as tooling. The question needs saying separately.
+        assert!(
+            ja.contains("Write the question in Japanese."),
+            "the question itself must be claimed for the operator's language: {ja}"
+        );
+
+        // English is the default and must stay silent rather than adding a
+        // paragraph telling the model to do what it was going to do anyway.
+        let en = implement("do it", "/tmp/wt", "en");
+        assert!(!en.contains("Write the question in"), "{en}");
+        assert!(!en.contains("Write all prose in"), "{en}");
+
+        // A language magi has no code for is repeated as the operator wrote it.
+        let other = implement("do it", "/tmp/wt", "Brazilian Portuguese");
+        assert!(other.contains("Write the question in Brazilian Portuguese."));
     }
 }

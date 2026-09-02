@@ -27,6 +27,17 @@ const API = {
   release: (id) => `/api/queue/${encodeURIComponent(id)}/release`,
   questions: "/api/questions",
   answer: (id) => `/api/questions/${encodeURIComponent(id)}/answer`,
+  /* Agent-authored HTML, served by its own endpoint so it lands in a
+     sandboxed frame of its own document rather than in this one. */
+  /* Ends in a filename on purpose: a panel references its attachments by bare
+     name, and a document served at `.../panel` would resolve `shot.png` to
+     `.../shot.png`, which is not where the assets are. `base-uri 'none'`
+     forbids fixing that from inside the frame, which is why it is fixed here. */
+  panel: (id) => `/api/questions/${encodeURIComponent(id)}/panel/index.html`,
+  chats: "/api/chats",
+  chat: (id) => `/api/chats/${encodeURIComponent(id)}`,
+  say: (id) => `/api/chats/${encodeURIComponent(id)}/say`,
+  file: (id) => `/api/chats/${encodeURIComponent(id)}/file`,
   events: "/api/events",
 };
 
@@ -77,6 +88,22 @@ const QUESTION_STATUS = {
   answered:  { glyph: "\u2713", tone: "teal" },
   abandoned: { glyph: "\u2296", tone: "ink" },
 };
+
+/* A planning conversation. `filed` is the only ending that produced
+   something, so it is the only one that gets the verdict colour; an open
+   interview is not work in flight anywhere, it is waiting on the operator,
+   so it does not borrow the pulsing blue of a running run. */
+const CHAT_STATUS = {
+  open:      { glyph: "\u25cc", tone: "blue" },
+  filed:     { glyph: "\u25c6", tone: "gold" },
+  abandoned: { glyph: "\u2296", tone: "ink" },
+};
+
+/* The graph node the land loop asks its approval question from. Keyed on the
+   node rather than on the summary text, and confirmed against the choice
+   pair, because a routine question that happened to offer "merge" must not
+   inherit the two-step guard and a real merge approval must never miss it. */
+const MERGE_NODE = "land-approval";
 
 /* Check state on the pull request the land loop is watching. `red` is
    deliberately not called a failure: the loop answers it with another fixer
@@ -342,7 +369,26 @@ const state = {
   queue: null,
   detail: { id: null, run: null, report: null },
   questions: null,
-  rev: { queue: null, runs: null, questions: null },
+  chats: null,
+  chatDetail: { id: null, chat: null },
+  /* The id of the conversation whose turn is in flight, and the transcript
+     length it started from. One turn at a time is the whole rule: a second
+     one fired into the same chat would interleave with the first. */
+  chatBusy: null,
+  busyTurns: 0,
+  /* The message that turn is carrying, shown as the operator's bubble until
+     the recorded transcript has caught up with it. */
+  pending: null,
+  waitFrom: 0,
+  waitTimer: null,
+  /* Problems the server found in a draft, kept per conversation so a
+     re-render does not wipe the list the operator is working through. */
+  chatProblems: { id: null, list: [] },
+  /* Whether a question's panel endpoint actually answers. A sandboxed frame
+     is opaque, so a 404 inside it is indistinguishable from a rendered
+     panel; this is the answer to that, asked once per question. */
+  panelOk: new Map(),
+  rev: { queue: null, runs: null, questions: null, chats: null },
   streamOpen: false,
   wrap: false,
 };
@@ -354,14 +400,20 @@ async function request(url, init) {
   const res = await fetch(url, init);
   if (!res.ok) {
     let message = `${res.status} ${res.statusText || "request failed"}`;
+    let problems = null;
     try {
       const body = await res.json();
       if (body && typeof body.error === "string") message = body.error;
+      /* POST /api/chats/{id}/file answers a bad draft with every problem it
+         found. They are carried on the error so one pass of fixes is
+         possible, instead of a rejection at a time. */
+      if (body && Array.isArray(body.problems) && body.problems.length) problems = body.problems;
     } catch {
       /* an error body is not guaranteed to be JSON; the status stands in */
     }
     const error = new Error(message);
     error.status = res.status;
+    if (problems) error.problems = problems;
     throw error;
   }
   return res;
@@ -881,6 +933,213 @@ function inline(text) {
   return nodes;
 }
 
+/* ---- agent-authored panels --------------------------------------------- *
+ * A question may hand over a whole HTML page instead of a paragraph: a table
+ * of changed files, a coloured diff, an inline image. This client otherwise
+ * refuses to put API data into markup at all, and that rule is not being
+ * relaxed here — the panel is never parsed, inspected or inserted by this
+ * document. It is fetched by the browser from its own endpoint into an
+ * <iframe sandbox> carrying NO tokens, which means no script inside it runs,
+ * it has no origin, and it can reach neither this document, nor its cookies,
+ * nor localStorage. The endpoint additionally sends a Content-Security-Policy
+ * of `default-src 'none'`, so nothing inside the frame can reach the network
+ * either: a panel cannot beacon out through a remote image.
+ *
+ * Nothing below may add a sandbox token. `allow-scripts` would hand a
+ * scriptable document to agent-authored HTML and `allow-same-origin` would
+ * hand it this session; either one, and rendering the panel stops being
+ * defensible. Everything the design wants is done in the frame's own CSS or
+ * not at all.
+ */
+
+/* A tokenless frame is opaque in both directions, so a 404 inside it looks
+   exactly like a rendered panel and would leave a silent blank hole where the
+   evidence should be. The status is therefore asked for directly, once per
+   question — the panel of a given question never changes — with HEAD, which
+   the route answers identically to GET without sending the body. */
+async function panelReachable(id) {
+  if (state.panelOk.has(id)) return state.panelOk.get(id);
+  let reachable = false;
+  try {
+    const res = await fetch(API.panel(id), { method: "HEAD", cache: "no-store" });
+    reachable = res.ok;
+  } catch {
+    reachable = false;   /* the server went away; that is a failed panel too */
+  }
+  state.panelOk.set(id, reachable);
+  return reachable;
+}
+
+/* The one place an iframe is built. `sandbox: ""` is deliberate and load
+   bearing: `el` writes an empty attribute value for it, which is a sandbox
+   with every capability withheld. An omitted `sandbox` attribute would be no
+   sandbox at all, and any token inside it would give some of them back. */
+function panelFrame(question, label) {
+  return el("iframe", {
+    src: API.panel(question.id),
+    sandbox: "",
+    referrerpolicy: "no-referrer",
+    title: `${label}: ${question.summary || shortId(question.id)}`,
+  });
+}
+
+function mountPanel(row, question) {
+  const r = row.refs;
+  clear(r.panelBox);
+
+  const assets = Array.isArray(question.assets) ? question.assets : [];
+  const full = el("button", {
+    class: "btn btn-quiet", type: "button", text: "Full screen",
+    "aria-label": `Open the panel full screen: ${question.summary || shortId(question.id)}`,
+    onclick: () => openPanel(question),
+  });
+  const pending = el("p", { class: "frame-note", text: "Loading the panel\u2026" });
+  r.panelBox.append(
+    el("div", { class: "ask-panel-bar" },
+      el("span", { class: "ask-panel-label", text: "Panel from the agent" }),
+      full),
+    pending,
+  );
+
+  panelReachable(question.id).then((reachable) => {
+    if (row.dataset.panel !== question.id) return;   /* the row was reused */
+    pending.remove();
+    if (!reachable) {
+      full.disabled = true;
+      r.panelBox.append(el("div", { class: "frame-fail" },
+        el("span", { text: "The agent attached a panel, but this server cannot serve it." }),
+        el("span", { class: "hint", text: "The summary and the context above are all of it that survived \u2014 and the question is still answerable below." }),
+      ));
+      return;
+    }
+    r.panelBox.append(
+      /* The sill: a fade at the bottom edge saying the panel continues past
+         it. It is not the only signal, because a gradient is not a sentence
+         and cannot be read out; the note below says the same thing in
+         words. */
+      el("div", { class: "frame-wrap" }, panelFrame(question, "Panel for"), el("div", { class: "frame-more" })),
+      el("p", { class: "frame-note", text: `${assets.length ? `${plural(assets.length, "attachment", "attachments")} \u00b7 ` : ""}The panel scrolls inside this window. Full screen shows all of it.` }),
+    );
+  });
+}
+
+function renderPanel(row, question) {
+  const r = row.refs;
+  const wanted = question.panel === true;
+  show(r.panelBox, wanted);
+  if (!wanted) {
+    if (row.dataset.panel) {
+      row.dataset.panel = "";
+      clear(r.panelBox);
+    }
+    return;
+  }
+  /* Mounted once. Re-mounting on every SSE tick would restart the frame's
+     load and throw away wherever the operator had scrolled inside it. */
+  if (row.dataset.panel === question.id) return;
+  row.dataset.panel = question.id;
+  mountPanel(row, question);
+}
+
+/* Full screen, which on a phone is where a unified diff becomes legible at
+   all. The frame is built on open and dropped on close, so a dismissed
+   dialog holds no live document and no decoded image. */
+function openPanel(question) {
+  const dialog = $("panel-full");
+  setText($("panel-full-h"), question.summary || `Panel ${shortId(question.id)}`);
+  const body = $("panel-full-body");
+  clear(body);
+  body.append(panelFrame(question, "Panel, full screen, for"));
+  if (!dialog.open) dialog.showModal();
+  requestAnimationFrame(() => $("panel-full-close").focus());
+}
+
+function closePanel() {
+  const dialog = $("panel-full");
+  if (dialog.open) dialog.close();
+  clear($("panel-full-body"));
+}
+
+/* ---- merge approval ---------------------------------------------------- *
+ * The land loop asks before it merges. Every other question in this product
+ * chooses between two futures that can both be revisited; this one ends in a
+ * merge, and magi has no way to take that back. So it does not get the same
+ * card, and it does not get a single tap.
+ */
+function isMergeQuestion(question) {
+  const choices = (Array.isArray(question.choices) ? question.choices : []).map((c) => String(c).toLowerCase());
+  const pair = choices.includes("merge") && choices.includes("hold");
+  return pair && (question.node === MERGE_NODE || choices.length === 2);
+}
+
+/* The answer is sent back exactly as the question spelt it, whatever case the
+   node used, so the land loop's own comparison cannot miss it. */
+function choiceNamed(question, want) {
+  const choices = Array.isArray(question.choices) ? question.choices : [];
+  return choices.find((choice) => String(choice).toLowerCase() === want) || want;
+}
+
+/* Two taps, not a timer. The first arms; the confirm row it reveals begins
+   with the warning sentence and puts Cancel where the arm button just was, so
+   the pixel under a thumb that was only scrolling is never the irreversible
+   one. Nothing is disabled and nothing counts down, so an operator who means
+   it is two deliberate taps away rather than made to wait. */
+function renderStakes(row, question) {
+  const r = row.refs;
+  const armed = row.dataset.armed === "1";
+  clear(r.stakes);
+
+  r.stakes.append(el("p", { class: "stakes-what" },
+    "Merging closes this run: the branch goes into ",
+    el("span", { class: "ask-seat", text: "the base branch" }),
+    " and magi has no undo for it.",
+  ));
+
+  if (armed) {
+    const cancel = el("button", {
+      class: "btn btn-quiet", type: "button", text: "Cancel",
+      onclick: () => { row.dataset.armed = ""; renderStakes(row, question); },
+    });
+    r.stakes.append(el("div", { class: "stakes-confirm" },
+      el("p", { class: "stakes-warn", text: "Tapping merge now merges it." }),
+      el("div", { class: "stakes-row" },
+        cancel,
+        el("button", {
+          class: "btn btn-gold", type: "button", text: "Yes, merge now",
+          onclick: () => answerQuestion(question.id, { choice: choiceNamed(question, "merge") }, row),
+        }),
+      ),
+    ));
+    /* The caret lands on Cancel, never on the button that merges: a stray
+       Enter after arming must not be the last thing that happens. */
+    requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+  } else {
+    r.stakes.append(el("button", {
+      class: "btn btn-gold stakes-arm", type: "button", text: "Merge this pull request\u2026",
+      onclick: () => { row.dataset.armed = "1"; renderStakes(row, question); },
+    }));
+  }
+
+  /* Hold is the safe answer, so it keeps a full target and a real edge
+     instead of being demoted to a text link nobody can hit. */
+  r.stakes.append(el("button", {
+    class: "btn btn-quiet stakes-hold", type: "button", text: "Hold \u2014 do not merge",
+    onclick: () => answerQuestion(question.id, { choice: choiceNamed(question, "hold") }, row),
+  }));
+
+  /* A land-approval question that also offered something else keeps those
+     options: the two-step guard is for merge, not a reason to hide a choice
+     the agent asked for. */
+  for (const choice of Array.isArray(question.choices) ? question.choices : []) {
+    const name = String(choice).toLowerCase();
+    if (name === "merge" || name === "hold") continue;
+    r.stakes.append(el("button", {
+      class: "btn", type: "button", text: choice,
+      onclick: () => answerQuestion(question.id, { choice }, row),
+    }));
+  }
+}
+
 /* ---- question card ----------------------------------------------------- *
  * Reconciled rather than rebuilt, because the free-text box may hold a
  * half-typed answer: an SSE tick arriving mid-sentence must not throw it
@@ -906,13 +1165,22 @@ function createAskCard() {
   const answerText = el("p", { class: "answer-text" });
   const answer = el("div", { class: "answer" }, answerLabel, answerText);
   const note = el("p", { class: "panel-note" });
+  /* Both are always present and hidden until they apply, so reconciling a
+     card never has to move a node the operator is mid-tap on. */
+  const band = el("p", { class: "stakes-band" });
+  const panelBox = el("div", { class: "ask-panel" });
+  const stakes = el("div", { class: "stakes" });
 
   const row = el("li", { class: "ask" },
+    band,
     el("div", { class: "ask-top" }, chipSlot, whenSlot),
-    summary, where, detail, hint, choices, free, error, answer, note,
+    /* The panel sits above the prose: when there is one, it is the case for
+       the decision and the detail is the footnote. */
+    summary, where, panelBox, detail, hint, stakes, choices, free, error, answer, note,
   );
   row.refs = { chipSlot, whenSlot, summary, runLink, node, seat, where, detail,
-               hint, choices, text, send, free, error, answerLabel, answerText, answer, note };
+               hint, choices, text, send, free, error, answerLabel, answerText, answer, note,
+               band, panelBox, stakes };
   return row;
 }
 
@@ -922,7 +1190,16 @@ function updateAskCard(row, question, { compact = false } = {}) {
   const open = status === "open";
   const choices = Array.isArray(question.choices) ? question.choices : [];
 
+  /* The land loop's approval question. It is detected here rather than
+     styled by the server, because the client is what knows the difference
+     between a card that can be tapped through and one that cannot. */
+  const merge = isMergeQuestion(question);
   setAttr(row, "data-state", status);
+  setAttr(row, "data-stakes", merge ? "merge" : null);
+  setText(r.band, merge
+    ? (open ? "Irreversible \u00b7 this merges the pull request" : "Merge decision")
+    : "");
+  show(r.band, merge);
 
   const next = chip(status, QUESTION_STATUS);
   if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
@@ -945,6 +1222,8 @@ function updateAskCard(row, question, { compact = false } = {}) {
   show(r.seat, Boolean(question.seat));
   separate(r.where);
 
+  renderPanel(row, question);
+
   /* The detail is immutable for a given question, so it is parsed once. An
      open question shows it outright — it is the case for the decision. A
      settled one folds it away, so the record does not push the next open
@@ -963,26 +1242,37 @@ function updateAskCard(row, question, { compact = false } = {}) {
   }
   show(r.detail, detail !== "");
 
-  const choiceKey = choices.join("\u0000");
+  /* The choice set is keyed with the treatment as well, so a question that
+     turns out to be a merge approval cannot keep a row of plain buttons. */
+  const choiceKey = `${merge ? "merge" : "plain"}:${choices.join("\u0000")}`;
   if (row.dataset.choiceKey !== choiceKey) {
     row.dataset.choiceKey = choiceKey;
+    row.dataset.armed = "";
     clear(r.choices);
-    for (const choice of choices) {
-      r.choices.append(el("button", {
-        class: "btn", type: "button", text: choice,
-        onclick: () => answerQuestion(question.id, { choice }, row),
-      }));
+    clear(r.stakes);
+    if (merge) {
+      renderStakes(row, question);
+    } else {
+      for (const choice of choices) {
+        r.choices.append(el("button", {
+          class: "btn", type: "button", text: choice,
+          onclick: () => answerQuestion(question.id, { choice }, row),
+        }));
+      }
     }
   }
   r.send.onclick = () => answerQuestion(question.id, { text: r.text.value }, row);
 
   setText(r.hint, !open
     ? ""
-    : choices.length
-      ? "Pick one. The run resumes as soon as you do."
-      : "No options were offered \u2014 answer in your own words.");
+    : merge
+      ? "Read the panel, then decide. Nothing merges until you say so twice."
+      : choices.length
+        ? "Pick one. The run resumes as soon as you do."
+        : "No options were offered \u2014 answer in your own words.");
   show(r.hint, open);
-  show(r.choices, open && choices.length > 0);
+  show(r.stakes, open && merge);
+  show(r.choices, open && !merge && choices.length > 0);
   show(r.free, open && choices.length === 0);
   show(r.error, open && !r.error.hidden && r.error.textContent !== "");
 
@@ -1012,7 +1302,11 @@ function updateAskCard(row, question, { compact = false } = {}) {
    shown as settled with a line saying why it changed under them. */
 async function answerQuestion(id, body, row) {
   const r = row.refs;
-  const buttons = [...row.querySelectorAll("button")];
+  /* Only the answer controls are locked while the answer is in flight. The
+     panel's own controls are not part of the decision, and one of them is
+     deliberately disabled when the panel failed to load — re-enabling it
+     here would offer a full-screen view of something that is not there. */
+  const buttons = [...row.querySelectorAll("button")].filter((b) => !b.closest(".ask-panel"));
   const value = typeof body.choice === "string" ? body.choice : String(body.text || "");
 
   if (!value.trim()) {
@@ -1104,9 +1398,13 @@ function renderTitle() {
     ? "Backlog \u2014 magi"
     : state.route.name === "questions"
       ? "Questions \u2014 magi"
-      : state.route.name === "run"
-        ? `Run ${shortId(state.route.id)} \u2014 magi`
-        : "magi \u2014 observation deck";
+      : state.route.name === "chats"
+        ? "Planning \u2014 magi"
+        : state.route.name === "chat"
+          ? `Planning ${shortId(state.route.id)} \u2014 magi`
+          : state.route.name === "run"
+            ? `Run ${shortId(state.route.id)} \u2014 magi`
+            : "magi \u2014 observation deck";
   document.title = count > 0 ? `(${count}) ${base}` : base;
 }
 
@@ -1139,6 +1437,474 @@ function focusFirstAsk() {
     const first = $("questions-list").querySelector('.ask[data-state="open"] .ask-summary');
     if (first) first.focus({ preventScroll: true });
   });
+}
+
+/* ---- planning conversation --------------------------------------------- *
+ * `magi plan` interviews the operator and writes a task file. It does that by
+ * handing the terminal to an agent CLI, which is exactly the thing a phone
+ * does not have. So the same interview runs here, one turn at a time, driven
+ * headlessly by the server, and ends in the same place: a validated task file
+ * in the queue.
+ *
+ * Two facts shape everything below. A turn takes tens of seconds, because a
+ * real model is reading and thinking — so the wait is stated in words, with a
+ * count that visibly advances, and never as a bare spinner that is
+ * indistinguishable from a server that has stopped answering. And a second
+ * turn fired into the same conversation while the first is in flight would
+ * interleave two half-exchanges, so exactly one is allowed to be outstanding
+ * and the composer says why while it is.
+ */
+const chatTurns = (chat) => (chat && Array.isArray(chat.turns) ? chat.turns : []);
+
+/* What the operator opened with, which is the only thing that names a
+   conversation before it has produced a draft. */
+function chatOpener(chat) {
+  const first = chatTurns(chat).find((turn) => turn.who === "operator");
+  return first ? String(first.body || "") : "";
+}
+
+const chatDraft = (chat) => (chat && typeof chat.draft === "string" ? chat.draft : "");
+
+/* When the interviewing agent times out, fails or runs out of quota, the
+   server still records the exchange and writes the failure as an agent turn
+   whose body begins with `magi: `. That is magi speaking, not the model, and
+   it must not be read as an answer to the operator's question — so it is
+   drawn as a third kind of turn. */
+const MAGI_PREFIX = "magi: ";
+function turnWho(turn) {
+  if (turn.who === "agent" && String(turn.body || "").startsWith(MAGI_PREFIX)) return "system";
+  return turn.who === "operator" ? "operator" : "agent";
+}
+
+/* Open first, newest first inside each group: the same rule as the question
+   list, for the same reason — the ones still needing the operator come
+   first, and the filed ones are the record. */
+function sortChats(list) {
+  return list.slice().sort((a, b) => {
+    const rank = (a.status === "open" ? 0 : 1) - (b.status === "open" ? 0 : 1);
+    const when_ = (chat) => Date.parse(chat.updated_at || chat.created_at) || 0;
+    return rank || when_(b) - when_(a);
+  });
+}
+
+/* ---- the list ---------------------------------------------------------- */
+function createChatCard() {
+  const chipSlot = el("span");
+  const ready = el("span", { class: "tag chat-ready", "data-tone": "gold", text: "draft ready" });
+  const whenSlot = el("time", { class: "card-when" });
+  const title = el("h2", { class: "card-title" });
+  const agent = el("span", { class: "repo" });
+  const turns = el("span");
+  const task = el("span", { class: "win" });
+  const meta = el("div", { class: "card-meta" }, agent, turns, task);
+  const last = el("p", { class: "card-event" });
+
+  const card = el("a", { class: "card" },
+    el("div", { class: "card-top" }, chipSlot, ready, whenSlot),
+    title, meta, last,
+  );
+  const row = el("li", {}, card);
+  row.refs = { card, chipSlot, ready, whenSlot, title, agent, turns, task, last };
+  return row;
+}
+
+function updateChatCard(row, chat) {
+  const r = row.refs;
+  const status = String(chat.status || "open");
+  const turns = chatTurns(chat);
+  const tone = toneOf(status, CHAT_STATUS);
+
+  r.card.setAttribute("href", `#/plan/${chat.id}`);
+  setAttr(r.card, "data-tone", tone);
+  setAttr(row, "data-tone", tone);
+
+  const next = chip(status, CHAT_STATUS);
+  if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
+  else r.chipSlot.append(next);
+
+  /* A draft waiting to be filed is the one thing in this list that is
+     actually the operator's turn, so it is called out on the card rather
+     than found by opening each conversation. */
+  show(r.ready, status === "open" && chatDraft(chat).trim() !== "");
+
+  const at = when(chat.updated_at || chat.created_at);
+  setText(r.whenSlot, at.text);
+  setAttr(r.whenSlot, "datetime", chat.updated_at || chat.created_at);
+  setAttr(r.whenSlot, "title", `updated ${at.title}`);
+
+  setText(r.title, firstLine(chatOpener(chat)) || `conversation ${shortId(chat.id)}`);
+  setText(r.agent, chat.agent || "");
+  show(r.agent, Boolean(chat.agent));
+  setText(r.turns, plural(turns.length, "turn", "turns"));
+  setText(r.task, chat.task ? `task ${shortId(chat.task)}` : "");
+  show(r.task, Boolean(chat.task));
+  separate(r.turns.parentNode);
+
+  const tail = turns.length ? turns[turns.length - 1] : null;
+  setText(r.last, tail && tail.who === "agent" ? firstLine(tail.body) : "");
+  show(r.last, Boolean(tail && tail.who === "agent"));
+}
+
+function renderChats() {
+  const list = $("chats-list");
+  const chats = state.chats;
+
+  if (chats === null) {
+    const open = Number(state.health && state.health.chats_open) || 0;
+    setText($("chats-count"), open ? `${plural(open, "conversation open", "conversations open")}` : "Loading\u2026");
+    return;
+  }
+
+  const open = chats.filter((c) => c.status === "open").length;
+  const filed = chats.filter((c) => c.status === "filed").length;
+  setText($("chats-count"), chats.length === 0
+    ? "No interviews yet"
+    : [open ? `${plural(open, "conversation open", "conversations open")}` : "nothing open",
+       filed ? `${plural(filed, "task filed from here", "tasks filed from here")}` : null]
+        .filter(Boolean).join(" \u00b7 "));
+
+  show($("chats-empty"), chats.length === 0);
+  syncList(list, sortChats(chats), (c) => c.id, createChatCard, updateChatCard);
+}
+
+/* ---- one conversation -------------------------------------------------- */
+function createTurnRow() {
+  const who = el("span", { class: "turn-who" });
+  const body = el("div", { class: "turn-body" });
+  const at = el("time", { class: "turn-at" });
+  const row = el("li", { class: "turn" }, who, body, at);
+  row.refs = { who, body, at };
+  return row;
+}
+
+function updateTurnRow(row, item) {
+  const r = row.refs;
+  const turn = item.turn;
+  const kind = turnWho(turn);
+  const body = String(turn.body || "");
+
+  setAttr(row, "data-who", kind);
+  setText(r.who, kind === "operator" ? "You" : kind === "system" ? "magi" : "Agent");
+
+  /* A turn never changes once it is on disk, so its body is built once. The
+     agent's is markdown-ish prose and is rendered as nodes, never as markup:
+     the rule that no API data is ever assigned as HTML holds everywhere
+     outside the sandboxed panel frame, and a model that writes a script tag
+     into a fence has to see the characters of one. */
+  const key = `${kind}:${body.length}`;
+  if (row.dataset.turnKey !== key) {
+    row.dataset.turnKey = key;
+    clear(r.body);
+    if (kind === "agent") {
+      r.body.append(el("div", { class: "md" }, markdownish(body)));
+    } else {
+      r.body.append(el("p", {
+        class: "turn-text",
+        text: kind === "system" ? body.slice(MAGI_PREFIX.length) : body,
+      }));
+    }
+  }
+
+  const at = when(turn.at);
+  setText(r.at, at.text);
+  setAttr(r.at, "datetime", turn.at || null);
+  setAttr(r.at, "title", at.title);
+}
+
+function renderProblems(problems) {
+  const box = $("chat-problems");
+  clear(box);
+  if (!problems || problems.length === 0) {
+    show(box, false);
+    return;
+  }
+  /* Every problem at once. The operator asked for one pass of fixes, not a
+     rejection at a time, and the draft stays on screen above this. */
+  box.append(
+    el("h3", { text: `Not fileable yet \u2014 ${plural(problems.length, "problem", "problems")}` }),
+    /* The validator names sections and symbols in backticks; `inline` turns
+       those into code spans as nodes, so the operator reads `## Acceptance`
+       as the heading it is and no markup is ever assigned. */
+    el("ul", {}, problems.map((problem) => el("li", {}, inline(String(problem))))),
+  );
+  show(box, true);
+}
+
+function chatError(message) {
+  const box = $("chat-error");
+  setText(box, message || "");
+  show(box, Boolean(message));
+}
+
+function renderChat() {
+  const chat = state.chatDetail.chat;
+  const busy = state.chatBusy !== null && state.chatBusy === state.chatDetail.id;
+
+  if (!chat) {
+    setText($("chat-h"), "Loading conversation\u2026");
+    setText($("chat-meta"), "");
+    clear($("chat-status"));
+    clear($("chat-turns"));
+    show($("chat-draft-panel"), false);
+    show($("chat-filed-panel"), false);
+    show($("chat-say"), false);
+    show($("chat-closed"), false);
+    show($("chat-wait"), false);
+    show($("chat-problems"), false);
+    return;
+  }
+
+  const status = String(chat.status || "open");
+  /* The operator's own message, while the turn that carries it is still in
+     flight. It is composed in here rather than pushed into the loaded chat,
+     because the ten-second re-read below replaces that chat wholesale and
+     would otherwise make the message the operator just sent vanish for the
+     rest of the wait. */
+  const pending = busy && state.pending && state.pending.id === chat.id
+    && chatTurns(chat).length <= state.busyTurns
+    ? [{ who: "operator", body: state.pending.body, at: state.pending.at }]
+    : [];
+  const turns = [...chatTurns(chat), ...pending];
+
+  const head = $("chat-status");
+  clear(head);
+  head.append(chip(status, CHAT_STATUS));
+
+  setText($("chat-h"), firstLine(chatOpener(chat)) || `Conversation ${shortId(chat.id)}`);
+  const started = when(chat.created_at);
+  setText($("chat-meta"),
+    `${shortId(chat.id)} \u00b7 ${chat.agent || "agent"} \u00b7 ${plural(turns.length, "turn", "turns")} \u00b7 started ${started.text}`);
+  setAttr($("chat-meta"), "title", `${chat.id}\nstarted ${started.title}`);
+
+  /* Turns are append-only, so the index is a stable key and reconciling can
+     never rebuild the transcript the operator is reading. */
+  syncList($("chat-turns"), turns.map((turn, i) => ({ turn, key: String(i) })),
+    (item) => item.key, createTurnRow, updateTurnRow);
+
+  const draft = chatDraft(chat);
+  const hasDraft = draft.trim() !== "";
+  show($("chat-draft-panel"), hasDraft);
+  if (hasDraft) setText($("chat-draft"), draft);
+  setText($("chat-draft-tag"), status === "filed" ? "filed" : "draft");
+  setAttr($("chat-draft-tag"), "data-tone", status === "filed" ? "teal" : "gold");
+  show($("chat-file"), hasDraft && status === "open");
+  renderProblems(state.chatProblems.id === chat.id ? state.chatProblems.list : []);
+
+  show($("chat-filed-panel"), status === "filed");
+  setText($("chat-filed-note"), chat.task
+    ? `Filed as task ${shortId(chat.task)}. It is in the backlog now, and the loop claims it in priority order.`
+    : "Filed into the backlog.");
+
+  const canSay = status === "open";
+  show($("chat-say"), canSay);
+  show($("chat-closed"), !canSay);
+  /* The guard against a second turn: the field and the button are both dead
+     while one is outstanding, and the button says what it is waiting for
+     rather than just greying out. */
+  $("f-say").disabled = busy;
+  $("chat-send").disabled = busy;
+  setText($("chat-send"), busy ? "Thinking\u2026" : "Send");
+  show($("chat-wait"), busy);
+}
+
+/* The wait, in words. The sentence in the live region changes only twice —
+   once when the turn starts and once when it has been going long enough to
+   need saying — while the seconds tick in a span that assistive technology
+   never reads, because a counter announced every second is unusable. */
+function tickWait() {
+  const box = $("chat-wait");
+  if (state.chatBusy === null) {
+    show(box, false);
+    return;
+  }
+  const secs = Math.max(Math.round((Date.now() - state.waitFrom) / 1000), 0);
+  setText(box.querySelector(".waiting-text"), secs >= 90
+    ? "The agent is still thinking. Long, but not stuck \u2014 it is allowed to take its time, and the reply will appear here."
+    : "The agent is thinking about your message. A turn usually takes under a minute.");
+  setText(box.querySelector(".waiting-secs"), `${secs}s`);
+  show(box, state.chatBusy === state.chatDetail.id);
+
+  /* Cheap insurance for the one case the button cannot cover: the turn was
+     started somewhere else, or the stream is down, so nothing will tell this
+     page that the reply has landed. */
+  if (secs > 0 && secs % 10 === 0) loadChat(state.chatBusy);
+}
+
+function beginTurn(id, before) {
+  state.chatBusy = id;
+  state.busyTurns = before;
+  state.waitFrom = Date.now();
+  tickWait();
+  if (!state.waitTimer) state.waitTimer = setInterval(tickWait, 1000);
+}
+
+function endTurn(id) {
+  if (state.chatBusy !== id) return;
+  state.chatBusy = null;
+  state.pending = null;
+  if (state.waitTimer) {
+    clearInterval(state.waitTimer);
+    state.waitTimer = null;
+  }
+  show($("chat-wait"), false);
+}
+
+async function loadChats() {
+  try {
+    const list = await getJson(API.chats);
+    state.chats = Array.isArray(list) ? list : [];
+    renderChats();
+    ok();
+  } catch (error) {
+    fail(`Could not load conversations: ${error.message}`);
+  }
+}
+
+async function loadChat(id) {
+  if (state.chatDetail.id !== id) state.chatDetail = { id, chat: null };
+  try {
+    const chat = await getJson(API.chat(id));
+    if (state.chatDetail.id !== id) return;   /* the operator navigated away */
+    state.chatDetail.chat = chat;
+    /* The transcript having grown by the operator's turn and a reply is what
+       proves the turn finished, whoever started it and whether or not this
+       page's own request has come back yet. */
+    if (state.chatBusy === id && chatTurns(chat).length >= state.busyTurns + 2) endTurn(id);
+    renderChat();
+    ok();
+  } catch (error) {
+    fail(`Could not load conversation ${shortId(id)}: ${error.message}`);
+  }
+}
+
+/* Starting an interview runs the agent's first turn, so this is as slow as
+   any other turn and says so instead of leaving a dead button. */
+async function startChat() {
+  const box = $("f-idea");
+  const error = $("chat-start-error");
+  const go = $("chat-start-go");
+  const idea = box.value;
+
+  if (!idea.trim()) {
+    setText(error, "Describe the idea first \u2014 a sentence is enough.");
+    show(error, true);
+    box.focus();
+    return;
+  }
+
+  show(error, false);
+  go.disabled = true;
+  setText(go, "Starting\u2026");
+  show($("chat-start-wait"), true);
+
+  try {
+    const chat = await postJson(API.chats, { idea, agent: null });
+    state.chats = sortChats([chat, ...(state.chats || []).filter((c) => c.id !== chat.id)]);
+    state.chatDetail = { id: chat.id, chat };
+    box.value = "";
+    renderChats();
+    announce("The interview has started.");
+    location.hash = `#/plan/${chat.id}`;
+    ok();
+  } catch (failure) {
+    setText(error, failure.message);
+    show(error, true);
+  } finally {
+    go.disabled = false;
+    setText(go, "Start the interview");
+    show($("chat-start-wait"), false);
+  }
+}
+
+async function sendTurn(event) {
+  event.preventDefault();
+  const id = state.chatDetail.id;
+  const box = $("f-say");
+  const text = box.value;
+
+  /* One turn at a time, checked here as well as by the disabled button: a
+     double tap can beat a re-render, and a keyboard shortcut does not care
+     that the button looks dead. */
+  if (!id || state.chatBusy !== null) return;
+  if (!text.trim()) {
+    chatError("Say something first.");
+    box.focus();
+    return;
+  }
+
+  chatError("");
+  const before = chatTurns(state.chatDetail.chat).length;
+  beginTurn(id, before);
+
+  /* The operator's own words go up immediately, held as the pending turn
+     until the transcript on disk has grown past it. */
+  state.pending = { id, body: text, at: new Date().toISOString() };
+  box.value = "";
+  renderChat();
+  $("chat-wait").scrollIntoView({ block: "nearest" });
+
+  try {
+    const fresh = await postJson(API.say(id), { text });
+    endTurn(id);
+    if (state.chatDetail.id === id) {
+      state.chatDetail.chat = fresh;
+      renderChat();
+      const tail = chatTurns(fresh);
+      const last = tail.length ? tail[tail.length - 1] : null;
+      announce(last && turnWho(last) === "system"
+        ? "The interviewing agent could not answer. Its message is in the conversation."
+        : "The agent replied.");
+      const rows = $("chat-turns").children;
+      if (rows.length) rows[rows.length - 1].scrollIntoView({ block: "nearest" });
+    }
+    loadChats();
+    ok();
+  } catch (error) {
+    if (error.status === 409) {
+      /* A turn is already running on this conversation — another phone, or a
+         tap that beat the button being disabled. Nothing has gone wrong, so
+         the wait stays up: the reply lands when it lands, and the revision
+         or the ten-second re-read will bring it. */
+      announce("A turn is already running on this conversation. Waiting for it.");
+      return;
+    }
+    endTurn(id);
+    chatError(`The turn could not be run: ${error.message}`);
+    /* Whatever the server did or did not record is the truth, not the
+       optimistic bubble above. */
+    await loadChat(id);
+  }
+}
+
+async function fileDraft() {
+  const id = state.chatDetail.id;
+  const button = $("chat-file");
+  if (!id) return;
+
+  button.disabled = true;
+  setText(button, "Filing\u2026");
+  state.chatProblems = { id, list: [] };
+  renderProblems([]);
+  chatError("");
+
+  try {
+    const body = await postJson(API.file(id), {});
+    const task = body && typeof body.task === "string" ? body.task : null;
+    announce(task ? `Filed as task ${shortId(task)}.` : "Filed.");
+    await Promise.allSettled([loadChat(id), loadChats(), loadQueue()]);
+    ok();
+  } catch (error) {
+    const list = Array.isArray(error.problems) && error.problems.length
+      ? error.problems
+      : [error.message];
+    state.chatProblems = { id, list };
+    renderProblems(list);
+    announce(`The draft was not filed: ${plural(list.length, "problem", "problems")} to fix.`);
+    $("chat-problems").scrollIntoView({ block: "nearest" });
+  } finally {
+    button.disabled = false;
+    setText(button, "File this task");
+  }
 }
 
 /* ---- landing ----------------------------------------------------------- *
@@ -1699,6 +2465,7 @@ async function applyRevisions_(source) {
   const queueRev = source.queue_rev;
   const runsRev = source.runs_rev;
   const questionsRev = source.questions_rev;
+  const chatsRev = source.chats_rev;
   const jobs = [];
 
   if (queueRev !== state.rev.queue) {
@@ -1713,6 +2480,13 @@ async function applyRevisions_(source) {
   if (questionsRev !== state.rev.questions) {
     state.rev.questions = questionsRev;
     jobs.push(loadQuestions());
+  }
+  /* A turn landing on disk is what bumps this, so it is also how the reply
+     reaches a phone whose own POST is still outstanding. */
+  if (chatsRev !== state.rev.chats) {
+    state.rev.chats = chatsRev;
+    jobs.push(loadChats());
+    if (state.route.name === "chat" && state.chatDetail.id) jobs.push(loadChat(state.chatDetail.id));
   }
   if (jobs.length) {
     await Promise.allSettled(jobs);
@@ -1763,6 +2537,9 @@ function parseRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (parts[0] === "queue") return { name: "queue", id: null };
   if (parts[0] === "questions") return { name: "questions", id: null };
+  /* `plan` rather than `chats`, because that is the command it replaces. */
+  if (parts[0] === "plan" && parts[1]) return { name: "chat", id: decodeURIComponent(parts[1]) };
+  if (parts[0] === "plan") return { name: "chats", id: null };
   if (parts[0] === "runs" && parts[1]) return { name: "run", id: decodeURIComponent(parts[1]) };
   return { name: "runs", id: null };
 }
@@ -1776,8 +2553,10 @@ function applyRoute() {
   show($("view-run"), route.name === "run");
   show($("view-queue"), route.name === "queue");
   show($("view-questions"), route.name === "questions");
+  show($("view-chats"), route.name === "chats");
+  show($("view-chat"), route.name === "chat");
 
-  const section = route.name === "run" ? "runs" : route.name;
+  const section = route.name === "run" ? "runs" : route.name === "chat" ? "chats" : route.name;
   for (const link of document.querySelectorAll("[data-nav]")) {
     setAttr(link, "aria-current", link.dataset.nav === section ? "page" : null);
   }
@@ -1786,6 +2565,24 @@ function applyRoute() {
     if (state.detail.id !== route.id) loadRun(route.id);
   } else {
     state.detail = { id: null, run: null, report: null };
+  }
+
+  /* A conversation that is not on screen is dropped so the next one cannot
+     flash the previous transcript first. The in-flight turn is deliberately
+     not cancelled: it is running on the server either way, and coming back
+     to the conversation re-reads it. */
+  if (route.name === "chat") {
+    if (state.chatDetail.id !== route.id) {
+      state.chatDetail = { id: route.id, chat: null };
+      loadChat(route.id);
+    }
+    /* Rendered unconditionally: starting an interview sets the conversation
+       and then changes the hash, so by the time this runs the chat is already
+       loaded and the id already matches. Rendering only on a change left that
+       path showing "Loading conversation" forever. */
+    renderChat();
+  } else if (state.chatDetail.id) {
+    state.chatDetail = { id: null, chat: null };
   }
 
   if (changed) window.scrollTo({ top: 0 });
@@ -1906,8 +2703,28 @@ function wire() {
     ok();
     loadHealth({ applyRevisions: true });
     loadQuestions();
+    loadChats();
     if (state.route.name === "run" && state.detail.id) loadRun(state.detail.id);
+    if (state.route.name === "chat" && state.chatDetail.id) loadChat(state.chatDetail.id);
   });
+
+  $("chat-start-go").addEventListener("click", startChat);
+  $("chat-say").addEventListener("submit", sendTurn);
+  $("chat-file").addEventListener("click", fileDraft);
+  /* Enter inserts a newline, because on a phone that is the only way to type
+     a paragraph. Ctrl or Cmd with Enter sends, for the desktop. */
+  $("f-say").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      $("chat-say").requestSubmit();
+    }
+  });
+
+  $("panel-full-close").addEventListener("click", closePanel);
+  /* Escape closes a dialog without a click, so the frame is dropped from the
+     close event rather than from the button: a dismissed panel must not go
+     on holding a live document. */
+  $("panel-full").addEventListener("close", () => clear($("panel-full-body")));
 
   window.addEventListener("hashchange", applyRoute);
 
@@ -1928,8 +2745,9 @@ async function boot() {
     state.rev.queue = state.health.queue_rev;
     state.rev.runs = state.health.runs_rev;
     state.rev.questions = state.health.questions_rev;
+    state.rev.chats = state.health.chats_rev;
   }
-  await Promise.allSettled([loadRuns(), loadQueue(), loadQuestions()]);
+  await Promise.allSettled([loadRuns(), loadQueue(), loadQuestions(), loadChats()]);
 
   subscribe();
   setInterval(() => {

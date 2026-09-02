@@ -239,6 +239,15 @@ enum Command {
         /// Seconds to wait. Defaults to the config's answer_timeout.
         #[arg(long)]
         timeout: Option<u64>,
+        /// An HTML page to show with the question: a diff, a table, images.
+        ///
+        /// Rendered in a sandbox with no JavaScript and no network access, so
+        /// inline the CSS and reference assets by bare filename.
+        #[arg(long)]
+        panel: Option<PathBuf>,
+        /// A file the panel references, copied in beside it; repeat for more.
+        #[arg(long = "asset", requires = "panel")]
+        assets: Vec<PathBuf>,
         /// Repository, for the config that supplies the notify command.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -594,8 +603,21 @@ async fn dispatch(command: Command) -> Result<()> {
             detail,
             choices,
             timeout,
+            panel,
+            assets,
             repo,
-        } => ask_cmd(summary, detail, choices, timeout, &repo).await,
+        } => {
+            ask_cmd(AskArgs {
+                summary,
+                detail,
+                choices,
+                timeout,
+                panel,
+                assets,
+                repo,
+            })
+            .await
+        }
 
         Command::Answer { id, reply, list } => answer_cmd(id, reply, list),
 
@@ -721,13 +743,28 @@ async fn task_text(words: &[String], file: Option<&Path>, issue: Option<u64>) ->
 /// zero with the answer on stdout, non-zero when nobody answered in time. An
 /// agent that cannot tell "the owner said Redis" from "the owner never came
 /// back" would happily implement a guess.
-async fn ask_cmd(
+/// Everything `magi ask` was given, kept together because clap's arms and this
+/// function would otherwise drift apart one argument at a time.
+struct AskArgs {
     summary: String,
     detail: Option<String>,
     choices: Vec<String>,
     timeout: Option<u64>,
-    repo: &Path,
-) -> Result<()> {
+    panel: Option<PathBuf>,
+    assets: Vec<PathBuf>,
+    repo: PathBuf,
+}
+
+async fn ask_cmd(args: AskArgs) -> Result<()> {
+    let AskArgs {
+        summary,
+        detail,
+        choices,
+        timeout,
+        panel,
+        assets,
+        repo,
+    } = args;
     let detail = match detail {
         Some(d) => d,
         // Long explanations arrive on stdin for the same reason task bodies do:
@@ -750,11 +787,19 @@ async fn ask_cmd(
     let node = std::env::var("MAGI_NODE").unwrap_or_else(|_| "ask".to_owned());
     let seat = std::env::var("MAGI_SEAT").unwrap_or_else(|_| "operator".to_owned());
 
-    let (cfg, _) = Config::discover(repo, None).unwrap_or_default();
+    let (cfg, _) = Config::discover(&repo, None).unwrap_or_default();
     let wait = std::time::Duration::from_secs(timeout.unwrap_or(cfg.graph.answer_timeout));
 
     let store = ask::Questions::open();
     let mut q = ask::Question::new(run, node, seat, summary, detail, choices);
+    // The panel is attached before the question is filed: a question that
+    // appears on the phone a moment before its evidence does is a question the
+    // owner answers without the evidence.
+    if let Some(path) = &panel {
+        let html =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        store.put_panel(&mut q, &html, &assets)?;
+    }
     store.put(&mut q)?;
     eprintln!("asked {} — waiting for the owner", q.short());
 

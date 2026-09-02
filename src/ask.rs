@@ -74,6 +74,54 @@ const NOTIFY_TIMEOUT: Duration = Duration::from_secs(20);
 /// listening on is worse than one carrying no link at all.
 pub const WEB_URL_ENV: &str = "MAGI_WEB_URL";
 
+/// Largest panel magi will store, html plus assets.
+///
+/// Checked as a total, before a single byte is written, because the failure
+/// this prevents is not a full disk but a half-copied panel: an agent that
+/// points at a 200 MB screen recording must get one clean error, not a
+/// directory holding the three small files that fitted before the copy died.
+/// Eight mebibytes is far more than a diff, a table and a handful of images
+/// need, and small enough that a phone on a hotel link still renders it.
+pub const PANEL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Suffix of the directory holding one question's panel.
+///
+/// A sibling of `<id>.json` rather than a subdirectory of the store, so
+/// [`Questions::list`] - which takes every `*.json` in the root - cannot ever
+/// see it, and so a panel travels with the question it belongs to.
+const PANEL_DIR: &str = ".panel";
+
+/// The panel's entry point inside its directory.
+const PANEL_HTML: &str = "index.html";
+
+/// Scratch directory a panel is assembled in before it is swapped into place.
+const PANEL_TMP: &str = ".panel.tmp";
+
+/// The one asset filename rule, applied on write **and** on read.
+///
+/// Exactly `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, and additionally never
+/// containing `..`. The pattern is this narrow because the name arrives from
+/// two untrusted directions and is then joined onto a path: an agent naming
+/// the asset, and a URL naming it back to [`Questions::panel_asset`]. Every
+/// character that could change what the join means is outside the set - `/`
+/// and `\` cannot appear, so no name can descend or escape; a leading `.` is
+/// refused, so no name can be `..`, `.` or a dotfile; a drive letter's `:` is
+/// refused, which matters because on Windows `Path::join` with an absolute
+/// path *discards the whole prefix* and would serve any file on the disk.
+/// `..` is refused anywhere rather than only at the front so the rule reads
+/// the same as the sentence "no traversal" to anyone auditing it.
+///
+/// The length bound keeps a name inside every filesystem's limit, so a panel
+/// that stores cannot fail to store on the operator's other machine.
+pub fn valid_asset_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 || name.contains("..") {
+        return false;
+    }
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 /// Where a question is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -145,6 +193,22 @@ pub struct Question {
     /// is the whole difference between the two kinds of question, on disk, in
     /// the UI, and in [`Question::answer`]'s validation.
     pub choices: Vec<String>,
+    /// Does this question have an agent-authored HTML panel beside it?
+    ///
+    /// Serialised with a default so a question written by an older magi - or
+    /// by hand - still deserialises rather than failing the whole store, which
+    /// under [`Questions::list`]'s skip-unreadable rule would quietly hide the
+    /// open question the operator was looking for.
+    #[serde(default)]
+    pub panel: bool,
+    /// Files copied in beside the panel's html, by base name, sorted.
+    ///
+    /// The list exists so a reader knows what a panel is made of without
+    /// walking the directory, and every entry satisfies [`valid_asset_name`].
+    /// Sorted because it is compared - a question re-asked with the same
+    /// assets in a different argument order is not a different question.
+    #[serde(default)]
+    pub assets: Vec<String>,
     /// Current state.
     pub status: QuestionStatus,
     /// When the agent asked.
@@ -175,6 +239,8 @@ impl Question {
             summary,
             detail,
             choices,
+            panel: false,
+            assets: Vec::new(),
             status: QuestionStatus::Open,
             asked_at: Timestamp::now(),
             answered_at: None,
@@ -319,6 +385,175 @@ impl Questions {
     /// Path for one question id.
     pub fn path_of(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.json"))
+    }
+
+    /// Directory holding one question's panel, `<root>/<id>.panel`.
+    pub fn panel_dir(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}{PANEL_DIR}"))
+    }
+
+    /// Store a panel: the html, plus `assets` copied in under their base
+    /// names. Updates `q.panel` and `q.assets`; the caller then [`put`]s the
+    /// question, or the record on disk will deny having a panel that exists.
+    ///
+    /// The assets are **copied, not referenced**. An agent authors its panel
+    /// inside a candidate worktree and points at files there, and `magi fold`
+    /// deletes those worktrees; a question is the permanent record of a
+    /// decision the owner took, so a panel that referenced its own images
+    /// would render as broken boxes exactly when someone went back to ask why
+    /// the decision was made. Copying follows symlinks - [`std::fs::copy`]
+    /// does, and so does the [`std::fs::metadata`] the size is measured with,
+    /// so the bytes counted and the bytes written are the same target file's -
+    /// which is the intent: storing a link would leave the panel pointing at
+    /// the worktree again, one indirection further away.
+    ///
+    /// Everything that can be rejected is rejected before the first byte is
+    /// written, and the panel is then assembled in a scratch directory and
+    /// swapped in. So a refusal leaves the previous panel intact, and a
+    /// success replaces it *wholesale* rather than merging: a re-asked
+    /// question showing one attempt's diff next to another attempt's table
+    /// would be a panel neither agent ever wrote.
+    ///
+    /// [`put`]: Questions::put
+    pub fn put_panel(&self, q: &mut Question, html: &str, assets: &[PathBuf]) -> Result<()> {
+        if !valid_asset_name(&q.id) {
+            bail!(
+                "question id `{}` is not a name magi will build a panel path from",
+                q.id
+            );
+        }
+        if html.trim().is_empty() {
+            bail!(
+                "question {} was handed an empty panel; an empty frame reads to \
+                 the owner as \"the agent had nothing to say\", which is a lie",
+                q.short()
+            );
+        }
+
+        // Names, then sizes, then writing - in that order, so nothing below
+        // can leave a partial panel on disk.
+        let mut named: Vec<(String, &Path)> = Vec::with_capacity(assets.len());
+        for src in assets {
+            let name = src.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if !valid_asset_name(name) {
+                bail!(
+                    "panel asset `{}` cannot be stored: a panel file name must \
+                     match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}$ and contain no `..`",
+                    src.display()
+                );
+            }
+            if let Some((_, first)) = named.iter().find(|(n, _)| n == name) {
+                bail!(
+                    "two panel assets are both named `{name}` - {} and {} - and \
+                     the panel can only show one of them; rename one at the source",
+                    first.display(),
+                    src.display()
+                );
+            }
+            named.push((name.to_owned(), src.as_path()));
+        }
+
+        let mut total = html.len() as u64;
+        for (_, src) in &named {
+            let meta = std::fs::metadata(src)
+                .with_context(|| format!("stat panel asset {}", src.display()))?;
+            if !meta.is_file() {
+                bail!(
+                    "panel asset `{}` is not a file; a panel is html plus files \
+                     copied beside it",
+                    src.display()
+                );
+            }
+            total = total.saturating_add(meta.len());
+        }
+        if total > PANEL_MAX_BYTES {
+            bail!(
+                "panel for question {} is {total} bytes, over magi's cap of \
+                 {PANEL_MAX_BYTES} bytes; nothing was written",
+                q.short()
+            );
+        }
+
+        let tmp = self.root.join(format!("{}{PANEL_TMP}", q.id));
+        let dir = self.panel_dir(&q.id);
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("create {}", self.root.display()))?;
+        clear_dir(&tmp)?;
+        std::fs::create_dir(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        if let Err(e) = fill_panel(&tmp, html, &named) {
+            // A copy that dies halfway must not become the panel, and must not
+            // leave scratch behind for the next call to inherit.
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+        clear_dir(&dir)?;
+        std::fs::rename(&tmp, &dir)
+            .with_context(|| format!("move panel into {}", dir.display()))?;
+
+        q.panel = true;
+        q.assets = named.into_iter().map(|(n, _)| n).collect();
+        q.assets.sort_unstable();
+        Ok(())
+    }
+
+    /// The panel's html, or `None` when the question has no panel.
+    ///
+    /// `None` rather than an error for a missing panel because the caller is a
+    /// web handler whose answer is 404 either way, and an unreadable panel is
+    /// not a reason to fail the question it belongs to.
+    pub fn panel_html(&self, id: &str) -> Option<String> {
+        if !valid_asset_name(id) {
+            return None;
+        }
+        std::fs::read_to_string(self.panel_dir(id).join(PANEL_HTML)).ok()
+    }
+
+    /// One file from a panel. `Ok(None)` is "no such file"; `Err` is "that is
+    /// not a name a panel file can have".
+    ///
+    /// Rejects a name failing [`valid_asset_name`] **before touching the
+    /// filesystem**, which is the whole point of the second check: the name
+    /// arrives from a URL, the directory is on disk where any process could
+    /// have dropped a file, and `<root>/<id>.panel/../../id_rsa` is a path the
+    /// operating system would resolve perfectly happily. The two callers'
+    /// distinct outcomes - 400 for a name, 404 for a file - are why this is
+    /// `Result<Option<_>>` rather than one flattened `Option`.
+    pub fn panel_asset(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        if !valid_asset_name(name) {
+            bail!(
+                "`{name}` is not a panel file name; it must match \
+                 ^[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}$ and contain no `..`"
+            );
+        }
+        if !valid_asset_name(id) {
+            return Ok(None);
+        }
+        let dir = self.panel_dir(id);
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        let path = dir.join(name);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+        }
+    }
+
+    /// Delete a question's panel, and any scratch a killed [`put_panel`] left.
+    ///
+    /// Succeeds when there is nothing to delete, so a caller cleaning up does
+    /// not have to know whether a panel was ever written. The question record
+    /// is not touched: the caller clears `panel` and `assets` and `put`s it,
+    /// in the same order as everywhere else here.
+    ///
+    /// [`put_panel`]: Questions::put_panel
+    pub fn drop_panel(&self, id: &str) -> Result<()> {
+        if !valid_asset_name(id) {
+            bail!("question id `{id}` is not a name magi will build a panel path from");
+        }
+        clear_dir(&self.panel_dir(id))?;
+        clear_dir(&self.root.join(format!("{id}{PANEL_TMP}")))
     }
 
     /// Write a question, atomically, so a process killed mid-write leaves the
@@ -614,6 +849,33 @@ fn question_url(base: &str) -> String {
     format!("{base}/#/questions")
 }
 
+/// Assemble a panel's contents in an already-empty directory.
+///
+/// Split out so [`Questions::put_panel`] can delete the whole directory on the
+/// first error without an early `return` skipping that cleanup.
+fn fill_panel(dir: &Path, html: &str, assets: &[(String, &Path)]) -> Result<()> {
+    let index = dir.join(PANEL_HTML);
+    std::fs::write(&index, html).with_context(|| format!("write {}", index.display()))?;
+    for (name, src) in assets {
+        let dst = dir.join(name);
+        std::fs::copy(src, &dst)
+            .with_context(|| format!("copy {} to {}", src.display(), dst.display()))?;
+    }
+    Ok(())
+}
+
+/// Remove a directory and everything under it, treating "not there" as done.
+///
+/// A panel is replaced wholesale and dropped idempotently, and in both cases
+/// the absence of the directory is the desired end state, not an error.
+fn clear_dir(path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
 fn read_path(path: &Path) -> Result<Question> {
     let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let q: Question =
@@ -701,10 +963,12 @@ mod tests {
                 "answer",
                 "answered_at",
                 "asked_at",
+                "assets",
                 "choices",
                 "detail",
                 "id",
                 "node",
+                "panel",
                 "run",
                 "schema",
                 "seat",
@@ -1041,5 +1305,274 @@ mod tests {
         );
         // Unset expands to nothing rather than to a guessed address.
         assert_eq!(question_url("  "), "");
+    }
+
+    /// A question with a fixed id, so a panel's path on disk is predictable.
+    fn panelled() -> Question {
+        let mut q = choice_question();
+        q.id = "20260903-014455-ab12".to_owned();
+        q
+    }
+
+    #[test]
+    fn a_panel_round_trips_verbatim_with_its_assets_listed_sorted() {
+        let (dir, s) = store();
+        let work = dir.path().join("worktree");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("diff.svg"), "<svg/>").unwrap();
+        std::fs::write(work.join("table.png"), b"\x89PNG").unwrap();
+
+        let mut q = panelled();
+        let html = "<h1>Merge?</h1>\n<img src=\"asset/diff.svg\">\n";
+        s.put_panel(
+            &mut q,
+            html,
+            &[work.join("table.png"), work.join("diff.svg")],
+        )
+        .unwrap();
+        s.put(&mut q).unwrap();
+
+        assert!(q.panel);
+        assert_eq!(
+            q.assets,
+            ["diff.svg", "table.png"],
+            "sorted, not in the order the agent happened to pass them"
+        );
+        assert_eq!(
+            s.panel_html(&q.id).as_deref(),
+            Some(html),
+            "the html is stored byte for byte; the agent authored the markup"
+        );
+        assert_eq!(
+            s.panel_asset(&q.id, "diff.svg").unwrap().as_deref(),
+            Some(&b"<svg/>"[..])
+        );
+
+        // The record on disk carries the same two fields the front end reads.
+        let body = std::fs::read_to_string(s.path_of(&q.id)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["panel"], true);
+        assert_eq!(json["assets"], serde_json::json!(["diff.svg", "table.png"]));
+        let back = s.get(&q.id).unwrap();
+        assert!(back.panel);
+        assert_eq!(back.assets, q.assets);
+
+        // The assets were copied, so the panel still renders after `magi fold`
+        // has deleted the candidate worktree the agent authored it in.
+        std::fs::remove_dir_all(&work).unwrap();
+        assert_eq!(
+            s.panel_asset(&q.id, "table.png").unwrap().as_deref(),
+            Some(&b"\x89PNG"[..]),
+            "a referenced asset would be gone with the worktree"
+        );
+    }
+
+    #[test]
+    fn a_traversal_asset_name_is_refused_before_the_filesystem_is_touched() {
+        let (dir, s) = store();
+        let mut q = panelled();
+        s.put_panel(&mut q, "<p>ok</p>", &[]).unwrap();
+        s.put(&mut q).unwrap();
+
+        // A file exactly one level up from the panel directory - which is
+        // where `..` lands - holding content a read would make visible.
+        let secret = "this must never reach the browser";
+        std::fs::write(s.root().join("id_rsa"), secret).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(s.panel_dir(&q.id).join("../id_rsa")).unwrap(),
+            secret,
+            "the traversal is real: the operating system resolves this path \
+             happily, which is why the name has to be refused before the join"
+        );
+
+        let long = "x".repeat(200);
+        for name in [
+            "..",
+            "../id_rsa",
+            "..\\id_rsa",
+            "sub/../id_rsa",
+            "/",
+            "\\",
+            "/etc/passwd",
+            "C:\\Windows\\win.ini",
+            "",
+            ".hidden",
+            ".",
+            long.as_str(),
+        ] {
+            assert!(!valid_asset_name(name), "`{name}` must fail the pattern");
+            let e = s.panel_asset(&q.id, name).unwrap_err().to_string();
+            assert!(
+                e.contains("not a panel file name"),
+                "`{name}` must be refused as a name, not attempted: {e}"
+            );
+            assert!(!e.contains(secret), "`{name}` reached the filesystem: {e}");
+        }
+        // A name that is allowed still finds its file, so the refusals above
+        // were the rule at work and not a store that reads nothing.
+        assert!(s.panel_asset(&q.id, "index.html").unwrap().is_some());
+
+        // The same rule on the write side, where the name comes from a source
+        // file's base name, and a refusal leaves the stored panel untouched.
+        let hidden = dir.path().join(".hidden");
+        std::fs::write(&hidden, "x").unwrap();
+        let e = s
+            .put_panel(&mut q, "<p>replacement</p>", &[hidden])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(".hidden") && e.contains("A-Za-z0-9"), "{e}");
+        assert_eq!(s.panel_html(&q.id).as_deref(), Some("<p>ok</p>"));
+        assert!(q.assets.is_empty());
+    }
+
+    #[test]
+    fn the_panel_size_cap_refuses_an_oversized_asset_set_and_writes_nothing() {
+        let (dir, s) = store();
+        let mut q = panelled();
+        s.put(&mut q).unwrap();
+
+        // Sized rather than filled: the cap reads the file's length, and a
+        // test that actually produced eight mebibytes would only be slower.
+        let big = dir.path().join("recording.png");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(PANEL_MAX_BYTES)
+            .unwrap();
+
+        let html = "<p>see the recording</p>";
+        let total = PANEL_MAX_BYTES + html.len() as u64;
+        let e = s.put_panel(&mut q, html, &[big]).unwrap_err().to_string();
+        assert!(
+            e.contains(&PANEL_MAX_BYTES.to_string()),
+            "the cap is named so the agent knows the limit: {e}"
+        );
+        assert!(
+            e.contains(&total.to_string()),
+            "the actual size is named so the agent knows by how much: {e}"
+        );
+
+        assert!(!q.panel);
+        assert!(q.assets.is_empty());
+        let left: Vec<String> = std::fs::read_dir(s.root())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            [format!("{}.json", q.id)],
+            "a refused panel leaves neither a directory nor scratch: {left:?}"
+        );
+    }
+
+    #[test]
+    fn two_assets_sharing_a_base_name_are_refused_rather_than_one_hiding_the_other() {
+        let (dir, s) = store();
+        let (before, after) = (dir.path().join("before"), dir.path().join("after"));
+        std::fs::create_dir_all(&before).unwrap();
+        std::fs::create_dir_all(&after).unwrap();
+        std::fs::write(before.join("diff.png"), "before").unwrap();
+        std::fs::write(after.join("diff.png"), "after").unwrap();
+
+        let mut q = panelled();
+        let e = s
+            .put_panel(
+                &mut q,
+                "<p>x</p>",
+                &[before.join("diff.png"), after.join("diff.png")],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("diff.png"), "{e}");
+        assert!(
+            e.contains("before") && e.contains("after"),
+            "both sources are named, because the fix is to rename one: {e}"
+        );
+        assert!(!q.panel);
+        assert!(!s.panel_dir(&q.id).exists());
+    }
+
+    #[test]
+    fn storing_a_panel_twice_replaces_it_rather_than_merging_two_attempts() {
+        let (dir, s) = store();
+        std::fs::write(dir.path().join("old.png"), "old").unwrap();
+        std::fs::write(dir.path().join("new.png"), "new").unwrap();
+
+        let mut q = panelled();
+        s.put_panel(&mut q, "<p>first</p>", &[dir.path().join("old.png")])
+            .unwrap();
+        s.put_panel(&mut q, "<p>second</p>", &[dir.path().join("new.png")])
+            .unwrap();
+
+        assert_eq!(q.assets, ["new.png"]);
+        assert_eq!(s.panel_html(&q.id).as_deref(), Some("<p>second</p>"));
+        assert!(
+            s.panel_asset(&q.id, "old.png").unwrap().is_none(),
+            "an asset from the first attempt would show a mix of two answers"
+        );
+
+        s.drop_panel(&q.id).unwrap();
+        assert!(s.panel_html(&q.id).is_none());
+        assert!(!s.panel_dir(&q.id).exists());
+        s.drop_panel(&q.id)
+            .expect("dropping a panel that is already gone is the desired state");
+    }
+
+    #[test]
+    fn a_question_with_no_panel_reports_none_rather_than_an_error() {
+        let (_dir, s) = store();
+        let mut q = panelled();
+        s.put(&mut q).unwrap();
+
+        assert!(!q.panel);
+        assert!(s.panel_html(&q.id).is_none());
+        assert!(
+            s.panel_asset(&q.id, "diff.svg").unwrap().is_none(),
+            "a missing file is a 404 for the caller, not a failure of the store"
+        );
+        let json = serde_json::to_value(&q).unwrap();
+        assert_eq!(json["panel"], false);
+        assert_eq!(json["assets"], serde_json::json!([]));
+
+        // And an empty panel is refused, because an empty frame reads to the
+        // owner as "the agent had nothing to say".
+        let e = s.put_panel(&mut q, "  \n", &[]).unwrap_err().to_string();
+        assert!(e.contains("empty panel"), "{e}");
+        assert!(!s.panel_dir(&q.id).exists());
+    }
+
+    #[test]
+    fn a_question_written_before_panels_existed_still_deserialises() {
+        let (_dir, s) = store();
+        std::fs::create_dir_all(s.root()).unwrap();
+        let id = "20260902-231501-ab12";
+        // Byte for byte what an older magi wrote: no `panel`, no `assets`.
+        let body = r#"{
+  "schema": 1,
+  "id": "20260902-231501-ab12",
+  "run": "20260902-201256-9fb7",
+  "node": "implement",
+  "seat": "impl-A",
+  "summary": "Which storage backend should the cache use?",
+  "detail": "Both are already dependencies.",
+  "choices": ["SQLite", "Redis"],
+  "status": "open",
+  "asked_at": "2026-09-02T23:15:01Z",
+  "answered_at": null,
+  "answer": null
+}"#;
+        std::fs::write(s.path_of(id), body).unwrap();
+
+        let q = s.get(id).unwrap();
+        assert!(
+            !q.panel,
+            "an absent field means no panel, not a parse error"
+        );
+        assert!(q.assets.is_empty());
+        assert_eq!(q.summary, "Which storage backend should the cache use?");
+        assert_eq!(
+            s.list().len(),
+            1,
+            "and it is still listed; skipping it would hide an open question"
+        );
     }
 }

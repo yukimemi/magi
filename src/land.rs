@@ -47,6 +47,7 @@ use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
 use crate::agent::{self, Invocation, SeatState};
+use crate::ask;
 use crate::config::{AgentSpec, MergeMode};
 use crate::git;
 use crate::run::{MergeOutcome, RunState, RunStatus, tail};
@@ -300,6 +301,564 @@ pub fn merge_subject(pr_title: &str, instruction: &str) -> String {
         .find(|l| !l.is_empty())
         .unwrap_or("magi: land the winning candidate");
     first.trim_start_matches(['#', ' ']).to_owned()
+}
+
+/// The choice that lets the merge happen, verbatim as the owner taps it.
+pub const APPROVE: &str = "merge";
+
+/// The choice that leaves the pull request open.
+pub const HOLD: &str = "hold";
+
+/// Graph node recorded on the approval question.
+///
+/// The phone keys its high-stakes card off this rather than off the choice
+/// strings, so renaming a button cannot silently downgrade the card that
+/// guards the one irreversible action magi takes.
+pub const APPROVAL_NODE: &str = "land-approval";
+
+/// Unified diff lines carried in the panel before it is truncated.
+///
+/// Four hundred: the panel is read on a 390px phone, where a diff line often
+/// wraps to two rows, so this is already a few thousand rows of scrolling -
+/// past that nobody is reading, and the bytes still count against the panel's
+/// 8 MiB cap. A larger diff is not hidden: the note says how many lines were
+/// cut and which worktree holds the whole patch.
+pub const DIFF_MAX_LINES: usize = 400;
+
+/// What the owner's answer to the approval question means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    /// The owner said [`APPROVE`]. Merge.
+    Merge,
+    /// Anything else, including silence. Leave the pull request open.
+    Hold,
+}
+
+/// Read the owner's answer, where `None` is an unanswered question.
+///
+/// Silence is a hold. A timed-out question means the owner never saw it or
+/// never decided, and defaulting an irreversible merge to "yes" would make this
+/// gate worse than no gate at all: it would merge unattended while claiming to
+/// have asked. Only the exact [`APPROVE`] choice merges, so an answer this
+/// function does not recognise holds too.
+pub fn approval(answer: Option<&str>) -> Approval {
+    match answer {
+        Some(a) if a.trim().eq_ignore_ascii_case(APPROVE) => Approval::Merge,
+        _ => Approval::Hold,
+    }
+}
+
+/// Escape text for HTML, including both quote characters.
+///
+/// Every string in the panel is agent-influenced: a branch name, a file path, a
+/// commit subject, a review comment. The sandboxed frame stops such text from
+/// *running*, but it does not stop a `<` from ending the document early or a
+/// `"` from ending an attribute and inventing a new one - the panel would then
+/// render a lie, or not render at all. Both quotes are escaped because the same
+/// function is used inside attributes, where remembering which quote style the
+/// caller used is one mistake away from an injected attribute.
+fn esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// One row of the diffstat table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatRow {
+    path: String,
+    /// `None` for a binary file, which `git` reports as `-`.
+    added: Option<u64>,
+    removed: Option<u64>,
+}
+
+impl StatRow {
+    /// Lines touched, for sorting. A binary file counts as zero rather than as
+    /// unknown, which puts it at the bottom where it needs no attention.
+    fn churn(&self) -> u64 {
+        self.added.unwrap_or(0) + self.removed.unwrap_or(0)
+    }
+}
+
+/// Parse `git diff --numstat` into rows, biggest churn first.
+///
+/// `--numstat` and not `--stat`: the `+++---` bar in `--stat` is *scaled* to the
+/// terminal width, so counting its characters would print fabricated numbers in
+/// the one table an operator approves an irreversible action from.
+fn parse_numstat(numstat: &str) -> Vec<StatRow> {
+    let mut rows: Vec<StatRow> = numstat
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let added = parts.next()?.trim();
+            let removed = parts.next()?.trim();
+            let path = parts.next()?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(StatRow {
+                path: path.to_owned(),
+                added: added.parse().ok(),
+                removed: removed.parse().ok(),
+            })
+        })
+        .collect();
+    // Path breaks the tie so the same change always renders the same table; an
+    // operator comparing two panels should not see rows shuffle.
+    rows.sort_by(|a, b| b.churn().cmp(&a.churn()).then_with(|| a.path.cmp(&b.path)));
+    rows
+}
+
+/// How one diff line is shown: a gutter character, a style, and the body to
+/// print - which is the line minus its marker, so the marker appears exactly
+/// once, in the gutter.
+///
+/// The gutter is why this exists at all. The operator may be colour blind, or
+/// reading in sunlight with the screen dimmed, so an added line is never
+/// distinguished by its background alone: `+` and `-` sit in a fixed column,
+/// the same mark they already read in a terminal.
+fn diff_row(line: &str) -> (&'static str, &'static str, &str) {
+    if line.starts_with("+++") || line.starts_with("---") {
+        (" ", "color:#57606a;font-weight:600", line)
+    } else if let Some(body) = line.strip_prefix('+') {
+        ("+", "background:#e6ffec;color:#0a3622", body)
+    } else if let Some(body) = line.strip_prefix('-') {
+        ("-", "background:#ffebe9;color:#5c1a17", body)
+    } else if line.starts_with("@@") {
+        ("~", "background:#eef2ff;color:#3730a3", line)
+    } else if let Some(body) = line.strip_prefix(' ') {
+        (" ", "", body)
+    } else {
+        (" ", "color:#57606a;font-weight:600", line)
+    }
+}
+
+/// The handful of words the approval panel says in its own voice.
+///
+/// magi's own text, not an agent's, so `[graph] language` has to reach it too:
+/// the operator asked why the merge question spoke English on a repository
+/// configured for Japanese, and "because that string is a literal in Rust" is
+/// not an answer. Only the languages magi can actually check are translated;
+/// anything else falls back to English rather than shipping a guess, and that
+/// fallback is deliberate.
+struct Words {
+    html_lang: &'static str,
+    checks: &'static str,
+    nothing_failing: &'static str,
+    files_changed: &'static str,
+    commits: &'static str,
+    no_commits: &'static str,
+    comments: &'static str,
+    no_comments: &'static str,
+    diff: &'static str,
+    truncated: &'static str,
+    lands_as: &'static str,
+}
+
+const EN: Words = Words {
+    html_lang: "en",
+    checks: "Checks",
+    nothing_failing: "Nothing failing.",
+    files_changed: "file(s) changed",
+    commits: "Commits being squashed",
+    no_commits: "No commit subjects could be read from the branch.",
+    comments: "Review comments",
+    no_comments: "Nothing outstanding at this observation.",
+    diff: "Diff",
+    truncated: "Truncated",
+    lands_as: "They land as one commit titled",
+};
+
+const JA: Words = Words {
+    html_lang: "ja",
+    checks: "チェック",
+    nothing_failing: "失敗しているものはありません。",
+    files_changed: "ファイル変更",
+    commits: "squash されるコミット",
+    no_commits: "ブランチからコミット件名を読めませんでした。",
+    comments: "レビューコメント",
+    no_comments: "この時点で未対応のものはありません。",
+    diff: "差分",
+    truncated: "省略",
+    lands_as: "これらは次の件名の1コミットとして入ります:",
+};
+
+impl Words {
+    /// The clause after the merge subject. Split out because word order moves:
+    /// Japanese puts the subject before the verb, so a shared template with a
+    /// hole in the middle would read as machine translation.
+    fn lands_as_tail(&self) -> &'static str {
+        if self.html_lang == "ja" {
+            "。この件名も承認の対象です。"
+        } else {
+            ", which you are approving too."
+        }
+    }
+
+    /// The question's own one-line summary, which is what a phone shows first.
+    fn approval_summary(&self, number: u64, subject: &str) -> String {
+        if self.html_lang == "ja" {
+            format!("プルリクエスト #{number} をマージ: {subject}")
+        } else {
+            format!("merge pull request #{number}: {subject}")
+        }
+    }
+
+    /// The body under the summary, above the panel.
+    fn approval_detail(&self, url: &str, base: &str, subject: &str) -> String {
+        if self.html_lang == "ja" {
+            format!(
+                "{url} はチェックが緑で、`{base}` へ `{subject}` として squash \
+                 できる状態です。差分の要約・パッチ・squash されるコミットは\
+                 下のパネルにあります。"
+            )
+        } else {
+            format!(
+                "{url} is green and ready to squash into `{base}` as `{subject}`. \
+                 The panel holds the diffstat, the patch and the commits being squashed."
+            )
+        }
+    }
+
+    /// The truncation note, written whole in each language for the same reason.
+    fn truncated_note(
+        &self,
+        omitted: usize,
+        total: usize,
+        shown: usize,
+        where_: &str,
+        base: &str,
+        head: &str,
+    ) -> String {
+        if self.html_lang == "ja" {
+            format!(
+                "先頭 {shown} 行のあと、差分 {total} 行のうち {omitted} 行を省略しました。\
+                 全体は <code>{where_}</code>(<code>git diff {base}...{head}</code>)と\
+                 プルリクエストにあります。"
+            )
+        } else {
+            format!(
+                "{omitted} of {total} diff lines omitted after the first {shown}. \
+                 The whole patch is in <code>{where_}</code> \
+                 (<code>git diff {base}...{head}</code>) and on the pull request."
+            )
+        }
+    }
+}
+
+/// Pick the panel's language. Codes and names both, because `[graph] language`
+/// has always accepted either.
+fn words(language: &str) -> &'static Words {
+    let l = language.trim();
+    if l.eq_ignore_ascii_case("ja")
+        || l.eq_ignore_ascii_case("jp")
+        || l.eq_ignore_ascii_case("japanese")
+        || l.eq_ignore_ascii_case("日本語")
+    {
+        &JA
+    } else {
+        &EN
+    }
+}
+
+/// The approval panel's html: what is about to land, and the evidence for it.
+///
+/// Pure, so the whole document is asserted in tests without `gh`, without a
+/// network and without a repository. The caller gathers `diffstat`
+/// (`git diff --numstat`), `diff` (the unified patch), `commits` (the subjects
+/// being squashed) and `subject` (what the squash will be called) from the
+/// winner's worktree.
+///
+/// It emits no `<script>`, no `<form>` and no remote url, because the frame's
+/// content security policy blocks all three: anything of the sort here would be
+/// dead markup that misleads the next reader into thinking it works.
+pub fn approval_panel(
+    state: &RunState,
+    pr: &PrState,
+    diffstat: &str,
+    diff: &str,
+    commits: &[String],
+    subject: &str,
+) -> String {
+    let rows = parse_numstat(diffstat);
+    let w = words(&state.config.graph.language);
+    let mut h = String::with_capacity(4_096 + diff.len().min(200_000));
+
+    let _ = writeln!(
+        h,
+        "<!doctype html>\n<html lang=\"{}\">\n<head>\n<meta charset=\"utf-8\">\n\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+        w.html_lang
+    );
+    let _ = writeln!(
+        h,
+        "<title>merge #{} — {}</title>\n</head>",
+        pr.number,
+        esc(subject)
+    );
+    h.push_str(
+        "<body style=\"margin:0;padding:12px;font:15px/1.5 -apple-system,\
+         'Segoe UI',system-ui,sans-serif;color:#1f2328;background:#fff;\
+         word-break:break-word\">\n",
+    );
+
+    // The decision, in the words the operator is approving.
+    let _ = writeln!(
+        h,
+        "<h1 style=\"margin:0 0 4px;font-size:19px\">Merge #{} into \
+         <code style=\"background:#f6f8fa;padding:1px 4px;border-radius:4px\">{}</code></h1>\n\
+         <p style=\"margin:0 0 4px;font-size:17px;font-weight:600\">{}</p>\n\
+         <p style=\"margin:0 0 12px;font-size:13px;color:#57606a\">squash merge · run {} · \
+         <a href=\"{}\" style=\"color:#0969da\">{}</a></p>",
+        pr.number,
+        esc(&state.base_branch),
+        esc(subject),
+        esc(&state.id),
+        esc(&pr.url),
+        esc(&pr.url),
+    );
+
+    let _ = writeln!(
+        h,
+        "<h2 style=\"margin:16px 0 6px;font-size:15px\">{}: {}</h2>",
+        w.checks,
+        esc(pr.checks.as_str())
+    );
+    if pr.failing.is_empty() {
+        let _ = writeln!(
+            h,
+            "<p style=\"margin:0;font-size:13px;color:#57606a\">{}</p>",
+            w.nothing_failing
+        );
+    } else {
+        h.push_str("<ul style=\"margin:0;padding-left:20px;font-size:13px\">\n");
+        for f in &pr.failing {
+            let _ = writeln!(h, "<li>{}</li>", esc(f));
+        }
+        h.push_str("</ul>\n");
+    }
+
+    // Diffstat as a real table, so a phone reads what moved without scrolling
+    // sideways through a terminal bar chart.
+    let _ = writeln!(
+        h,
+        "<h2 style=\"margin:16px 0 6px;font-size:15px\">{} {}</h2>",
+        rows.len(),
+        w.files_changed
+    );
+    h.push_str(
+        "<table style=\"width:100%;border-collapse:collapse;font-size:13px\">\n\
+         <thead><tr>\
+         <th style=\"text-align:left;border-bottom:1px solid #d0d7de;padding:4px 2px\">file</th>\
+         <th style=\"text-align:right;border-bottom:1px solid #d0d7de;padding:4px 2px\">added</th>\
+         <th style=\"text-align:right;border-bottom:1px solid #d0d7de;padding:4px 2px\">removed\
+         </th></tr></thead>\n<tbody>\n",
+    );
+    let mut total_added = 0u64;
+    let mut total_removed = 0u64;
+    for r in &rows {
+        total_added += r.added.unwrap_or(0);
+        total_removed += r.removed.unwrap_or(0);
+        let cell = |n: Option<u64>| match n {
+            Some(n) => n.to_string(),
+            None => "bin".to_owned(),
+        };
+        let _ = writeln!(
+            h,
+            "<tr>\
+             <td style=\"padding:4px 2px;border-bottom:1px solid #eaeef2;\
+             font-family:ui-monospace,monospace\">{}</td>\
+             <td style=\"padding:4px 2px;border-bottom:1px solid #eaeef2;text-align:right;\
+             color:#0a3622\">{}</td>\
+             <td style=\"padding:4px 2px;border-bottom:1px solid #eaeef2;text-align:right;\
+             color:#5c1a17\">{}</td></tr>",
+            esc(&r.path),
+            cell(r.added),
+            cell(r.removed),
+        );
+    }
+    let _ = writeln!(
+        h,
+        "</tbody>\n<tfoot><tr style=\"font-weight:600\">\
+         <td style=\"padding:4px 2px\">total</td>\
+         <td style=\"padding:4px 2px;text-align:right\">{total_added}</td>\
+         <td style=\"padding:4px 2px;text-align:right\">{total_removed}</td>\
+         </tr></tfoot>\n</table>"
+    );
+
+    // The commits being squashed, and the subject that replaces them.
+    let _ = writeln!(
+        h,
+        "<h2 style=\"margin:16px 0 6px;font-size:15px\">{}</h2>",
+        w.commits
+    );
+    if commits.is_empty() {
+        h.push_str(&format!(
+            "<p style=\"margin:0;font-size:13px;color:#57606a\">{}</p>\n",
+            w.no_commits
+        ));
+    } else {
+        h.push_str("<ol style=\"margin:0;padding-left:20px;font-size:13px\">\n");
+        for c in commits {
+            let _ = writeln!(h, "<li>{}</li>", esc(c));
+        }
+        h.push_str("</ol>\n");
+    }
+    let _ = writeln!(
+        h,
+        "<p style=\"margin:8px 0 0;font-size:13px\">{} <strong>{}</strong>{}</p>",
+        w.lands_as,
+        esc(subject),
+        w.lands_as_tail()
+    );
+
+    // The review comments that shaped this branch, and who asked for them.
+    let _ = writeln!(
+        h,
+        "<h2 style=\"margin:16px 0 6px;font-size:15px\">{}</h2>",
+        w.comments
+    );
+    if pr.review_comments.is_empty() {
+        h.push_str(&format!(
+            "<p style=\"margin:0;font-size:13px;color:#57606a\">{}</p>\n",
+            w.no_comments
+        ));
+    } else {
+        for c in &pr.review_comments {
+            let anchor = match (&c.path, c.line) {
+                (Some(p), Some(l)) => format!("{p}:{l}"),
+                (Some(p), None) => p.clone(),
+                _ => "pull request thread".to_owned(),
+            };
+            let _ = writeln!(
+                h,
+                "<div style=\"margin:0 0 8px;padding:8px;background:#f6f8fa;border-radius:6px\">\
+                 <div style=\"font-size:12px;color:#57606a\">{} · {}</div>\
+                 <div style=\"white-space:pre-wrap;font-size:13px\">{}</div></div>",
+                esc(&c.author),
+                esc(&anchor),
+                esc(&tail(&c.body, 800)),
+            );
+        }
+    }
+
+    // The patch itself.
+    let total = diff.lines().count();
+    let shown = total.min(DIFF_MAX_LINES);
+    let _ = writeln!(
+        h,
+        "<h2 style=\"margin:16px 0 6px;font-size:15px\">{}</h2>",
+        w.diff
+    );
+    h.push_str(
+        "<div style=\"font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;\
+         border:1px solid #d0d7de;border-radius:6px;overflow-x:auto\">\n",
+    );
+    for line in diff.lines().take(shown) {
+        let (gutter, style, body) = diff_row(line);
+        let _ = writeln!(
+            h,
+            "<div style=\"display:flex;{style}\">\
+             <span style=\"flex:0 0 1.4em;text-align:center;user-select:none;\
+             border-right:1px solid #d0d7de\">{gutter}</span>\
+             <span style=\"white-space:pre;padding-left:6px\">{}</span></div>",
+            esc(body),
+        );
+    }
+    h.push_str("</div>\n");
+    if total > shown {
+        let omitted = total - shown;
+        let head = state.winner().map_or("HEAD", |w| w.branch.as_str());
+        let where_ = state.winner().map_or_else(
+            || state.repo.display().to_string(),
+            |w| w.worktree.display().to_string(),
+        );
+        let _ = writeln!(
+            h,
+            "<p style=\"margin:8px 0 0;padding:8px;background:#fff8c5;border-radius:6px;\
+             font-size:13px\">{}: {}</p>",
+            w.truncated,
+            w.truncated_note(
+                omitted,
+                total,
+                shown,
+                &esc(&where_),
+                &esc(&state.base_branch),
+                &esc(head),
+            ),
+        );
+    }
+
+    h.push_str("</body>\n</html>\n");
+    h
+}
+
+/// Ask the owner before merging, with the whole case attached as a panel.
+///
+/// The evidence is gathered from the winner's own worktree with the `git` CLI,
+/// never from the network, so a phone on a slow link gets the diff magi is
+/// looking at rather than a link it has to go and open.
+async fn request_approval(state: &mut RunState, pr: &PrState, subject: &str) -> Result<Approval> {
+    let (worktree, head) = match state.winner() {
+        Some(w) => (w.worktree.clone(), w.branch.clone()),
+        None => (state.repo.clone(), "HEAD".to_owned()),
+    };
+    let base = state.base_branch.clone();
+    let range = format!("{base}...{head}");
+    // A failed `git` must not decide the merge: the panel degrades to less
+    // evidence and the owner still chooses. Merging because the diff could not
+    // be read would be the worst of both.
+    let numstat = git::git_raw(&worktree, &["diff", "--numstat", "-M", &range])
+        .await
+        .map(|o| o.stdout)
+        .unwrap_or_default();
+    let diff = git::diff(&worktree, &base, &head).await.unwrap_or_default();
+    let commits: Vec<String> = git::git_raw(
+        &worktree,
+        &[
+            "log",
+            "--reverse",
+            "--format=%s",
+            &format!("{base}..{head}"),
+        ],
+    )
+    .await
+    .map(|o| o.stdout)
+    .unwrap_or_default()
+    .lines()
+    .filter(|l| !l.trim().is_empty())
+    .map(str::to_owned)
+    .collect();
+
+    let w = words(&state.config.graph.language);
+    let html = approval_panel(state, pr, &numstat, &diff, &commits, subject);
+    let store = ask::Questions::open();
+    let mut q = ask::Question::new(
+        state.id.clone(),
+        APPROVAL_NODE.to_owned(),
+        "land".to_owned(),
+        w.approval_summary(pr.number, subject),
+        w.approval_detail(&pr.url, &base, subject),
+        vec![APPROVE.to_owned(), HOLD.to_owned()],
+    );
+    store
+        .put_panel(&mut q, &html, &[])
+        .context("write the merge approval panel")?;
+    state.event("land", format!("asking for merge approval ({})", q.short()));
+    state.save()?;
+
+    let timeout = Duration::from_secs(state.config.graph.answer_timeout);
+    let said = ask::ask_and_wait(&mut q, &store, &state.config.notify, timeout).await?;
+    Ok(approval(said.as_deref()))
 }
 
 /// Parse `gh pr view --json url,number,state,statusCheckRollup,reviews,comments`
@@ -598,6 +1157,20 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
             }
             Step::Merge => {
                 let subject = merge_subject(&seen.title, &state.instruction);
+                // The owner sees the panel before the one irreversible step,
+                // and an unanswered question is a hold: silence never merges.
+                if state.config.graph.land_approval
+                    && request_approval(state, &pr, &subject).await? == Approval::Hold
+                {
+                    stop(
+                        state,
+                        &repo,
+                        &pr,
+                        "the owner did not approve the merge (held or unanswered)",
+                    )
+                    .await?;
+                    return Ok(pr);
+                }
                 let argv = merge_argv(pr.number, &subject);
                 let out = gh(&repo, &argv).await?;
                 if out.0 {
@@ -1744,5 +2317,211 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             },
         );
         assert!(out.is_empty());
+    }
+
+    /// A run with no tally, so [`RunState::winner`] is `None` and the panel
+    /// falls back to the repository - which keeps these tests free of a
+    /// worktree, a `git` invocation and a network.
+    fn run_state() -> RunState {
+        RunState::new(
+            std::path::PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "abcdef1234".to_owned(),
+            "add retries to the uploader".to_owned(),
+            crate::config::Config::default(),
+        )
+    }
+
+    fn green_pr() -> PrState {
+        PrState {
+            url: "https://github.com/yukimemi/magi/pull/42".to_owned(),
+            number: 42,
+            state: PrLifecycle::Open,
+            checks: Checks::Green,
+            failing: Vec::new(),
+            review_comments: vec![ReviewComment {
+                author: "coderabbitai".to_owned(),
+                path: Some("src/land.rs".to_owned()),
+                line: Some(212),
+                body: "this branch never checks the exit code".to_owned(),
+            }],
+        }
+    }
+
+    const NUMSTAT: &str = "12\t3\tsrc/land.rs\n40\t1\tsrc/web.rs\n-\t-\tassets/logo.png";
+
+    fn panel() -> String {
+        approval_panel(
+            &run_state(),
+            &green_pr(),
+            NUMSTAT,
+            "diff --git a/src/land.rs b/src/land.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line\n context",
+            &[
+                "land: ask before merging".to_owned(),
+                "land: colour the diff".to_owned(),
+            ],
+            "feat: merge approval from the phone",
+        )
+    }
+
+    #[test]
+    fn the_approval_panel_carries_the_whole_case_for_the_merge() {
+        let html = panel();
+        for needle in [
+            "42",
+            "main",
+            "src/land.rs",
+            "src/web.rs",
+            "assets/logo.png",
+            "feat: merge approval from the phone",
+            "land: ask before merging",
+            "land: colour the diff",
+            "coderabbitai",
+            "this branch never checks the exit code",
+            "green",
+        ] {
+            assert!(html.contains(needle), "the panel must state `{needle}`");
+        }
+    }
+
+    #[test]
+    fn the_approval_panel_contains_nothing_the_frames_policy_would_block() {
+        let html = panel();
+        assert!(!html.contains("<script"), "no script survives the csp");
+        assert!(!html.contains("<form"), "form-action is 'none'");
+        let pr = green_pr();
+        assert_eq!(
+            html.matches("http").count(),
+            html.matches(pr.url.as_str()).count(),
+            "the only http url in the panel is the pull request's own link"
+        );
+    }
+
+    #[test]
+    fn added_and_removed_diff_lines_are_distinguishable_without_colour() {
+        let html = panel();
+        assert!(
+            html.contains(">+</span>"),
+            "an added line carries a `+` in the gutter, not only a background"
+        );
+        assert!(
+            html.contains(">-</span>"),
+            "a removed line carries a `-` in the gutter, not only a background"
+        );
+        assert!(
+            html.contains(">new line</span>"),
+            "the marker is moved to the gutter, so the body is printed once without it"
+        );
+    }
+
+    #[test]
+    fn a_diff_past_the_threshold_is_cut_with_an_honest_count() {
+        let total = DIFF_MAX_LINES + 100;
+        let diff: String = (0..total).map(|i| format!("+line {i}\n")).collect();
+        let html = approval_panel(
+            &run_state(),
+            &green_pr(),
+            NUMSTAT,
+            &diff,
+            &[],
+            "feat: something long",
+        );
+        assert!(
+            html.contains(&format!("100 of {total} diff lines omitted")),
+            "the note must say exactly how much was cut"
+        );
+        assert!(html.contains(&format!("line {}", DIFF_MAX_LINES - 1)));
+        assert!(
+            !html.contains(&format!("line {DIFF_MAX_LINES}")),
+            "nothing past the threshold is rendered"
+        );
+        assert!(
+            html.contains("/repo/magi"),
+            "the note says where the rest is"
+        );
+    }
+
+    #[test]
+    fn a_path_with_html_metacharacters_is_escaped_rather_than_rendered() {
+        let html = approval_panel(
+            &run_state(),
+            &green_pr(),
+            "1\t2\tsrc/<b>&\"x\"'.rs",
+            "",
+            &[],
+            "subject",
+        );
+        assert!(html.contains("src/&lt;b&gt;&amp;&quot;x&quot;&#39;.rs"));
+        assert!(
+            !html.contains("<b>"),
+            "an agent-influenced path must never become markup"
+        );
+    }
+
+    #[test]
+    fn only_the_merge_choice_merges_and_silence_holds() {
+        let table = [
+            (None, Approval::Hold),
+            (Some("merge"), Approval::Merge),
+            (Some(" merge\n"), Approval::Merge),
+            (Some("hold"), Approval::Hold),
+            (Some(""), Approval::Hold),
+            (Some("yes"), Approval::Hold),
+        ];
+        for (answer, want) in table {
+            assert_eq!(
+                approval(answer),
+                want,
+                "answer {answer:?} must resolve to {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_diffstat_table_is_ordered_by_churn_with_binaries_last() {
+        let rows = parse_numstat(NUMSTAT);
+        assert_eq!(
+            rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            ["src/web.rs", "src/land.rs", "assets/logo.png"]
+        );
+        assert_eq!(rows[2].added, None, "a binary file has no line counts");
+    }
+    #[test]
+    fn the_approval_speaks_the_language_the_repository_is_configured_for() {
+        // Reported from a real run: the merge question arrived in English on a
+        // repository with `language = "ja"`. magi's own strings have to follow
+        // that setting too - "it is a literal in Rust" is not an answer.
+        let mut state = run_state();
+        state.config.graph.language = "ja".to_owned();
+        let pr = green_pr();
+        let commits = ["c1".to_owned()];
+
+        let ja = approval_panel(&state, &pr, "3\t1\tsrc/a.rs", "+ x", &commits, "feat: x");
+        assert!(ja.contains("lang=\"ja\""), "the document must declare it");
+        assert!(ja.contains("squash されるコミット"), "{ja}");
+        assert!(ja.contains("レビューコメント"), "{ja}");
+        assert!(ja.contains("差分"), "{ja}");
+        assert!(
+            !ja.contains("Commits being squashed"),
+            "no English left over"
+        );
+
+        let w = words("ja");
+        assert!(w.approval_summary(17, "feat: x").contains("マージ"));
+        assert!(
+            w.approval_detail("http://x/1", "main", "feat: x")
+                .contains("パネル")
+        );
+
+        // The evidence itself is language-neutral and must survive either way.
+        assert!(ja.contains("src/a.rs"), "the diffstat is not prose");
+        assert!(ja.contains("feat: x"), "nor is the merge subject");
+
+        // English stays the default, and a language magi cannot check falls
+        // back to it rather than shipping a guess.
+        state.config.graph.language = "en".to_owned();
+        let en = approval_panel(&state, &pr, "3\t1\tsrc/a.rs", "+ x", &commits, "feat: x");
+        assert!(en.contains("Commits being squashed"), "{en}");
+        assert_eq!(words("Klingon").html_lang, "en");
     }
 }

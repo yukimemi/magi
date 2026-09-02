@@ -692,6 +692,36 @@ those variables, which is what makes "most of the backlog was filed by agents" a
 measurement rather than a claim. `Invocation` carries `run`/`node` purely for
 this; they must not influence behaviour.
 
+### Panels: the sandbox is the whole argument
+
+Agent-authored HTML is rendered in the operator's browser, which the rest of
+this UI refuses to do. Three things make that acceptable, and none of them is
+optional:
+
+1. **`<iframe sandbox>` with no tokens.** One function in `app.js` builds it.
+   `allow-scripts` would hand a scriptable document to agent HTML;
+   `allow-same-origin` would give it the operator's origin. Neither is ever
+   added, and a comment above the function says so.
+2. **`PANEL_CSP`, asserted as a whole string** by a test, so weakening one
+   directive fails it. `img-src 'self' data:` is what lets a panel show its
+   own attachments while every external load is refused.
+3. **Asset names validated twice** - on write and on read - against
+   `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` with no `..` anywhere. `:` is excluded
+   deliberately: on Windows `Path::join` with a drive-absolute name discards
+   the prefix and would serve any file on the disk.
+
+**The panel's URL ends in a filename.** A document served at `.../panel`
+resolves `shot.png` to `.../shot.png`, which is not the asset route, so panels
+written exactly as the prompt instructs showed broken images. `base-uri 'none'`
+means a `<base>` tag cannot fix it from inside, which is why the route does.
+
+**Measure before you loosen a policy.** That broken image was diagnosed as
+"a tokenless sandbox has an opaque origin, so `img-src 'self'` can never
+match", and the fix was going to be widening `img-src` to a dynamic host. The
+theory was wrong: `'self'` matches fine in a sandboxed frame, and the real
+cause was a corrupt fixture PNG. Chrome's `Log.entryAdded` prints CSP
+violations verbatim - read it instead of reasoning about it.
+
 ### The web UI: one binary, no authentication, and no lying empty states
 
 `src/web.rs` serves `assets/ui/{index.html,app.css,app.js}` through

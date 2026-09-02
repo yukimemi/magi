@@ -24,6 +24,7 @@
 pub mod agent;
 pub mod ask;
 pub mod blind;
+pub mod chat;
 pub mod config;
 pub mod daemon;
 pub mod git;
