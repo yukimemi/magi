@@ -153,9 +153,37 @@ async fn a_run_branches_off_what_the_remote_has_not_a_stale_local_ref() {
         .await
         .expect("start");
 
+    // Diagnose in the assertion rather than in a later debugging session: this
+    // passed locally and failed on all three CI runners, and "left != right"
+    // says nothing about which of fetch, the refspec or the ref name gave way.
+    let fetched = std::process::Command::new("git")
+        .args(["fetch", "origin", &base])
+        .current_dir(&fx.repo)
+        .output()
+        .expect("git fetch");
+    let tracking = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &format!("origin/{base}")])
+        .current_dir(&fx.repo)
+        .output()
+        .expect("git rev-parse tracking");
+    let refspec = std::process::Command::new("git")
+        .args(["config", "--get-all", "remote.origin.fetch"])
+        .current_dir(&fx.repo)
+        .output()
+        .expect("git config");
     assert_eq!(
-        runner.state.base_commit, remote_tip,
-        "a run must branch off what the remote has, not a stale local ref"
+        runner.state.base_commit,
+        remote_tip,
+        "a run must branch off what the remote has, not a stale local ref.\n\
+         base branch: {base}\n\
+         local tip:   {local_tip}\n\
+         fetch: status={:?} stderr={:?}\n\
+         origin/{base} = {:?}\n\
+         refspec = {:?}",
+        fetched.status.code(),
+        String::from_utf8_lossy(&fetched.stderr).trim(),
+        String::from_utf8_lossy(&tracking.stdout).trim(),
+        String::from_utf8_lossy(&refspec.stdout).trim(),
     );
     // And the landed file is reachable from the run's base, which is the whole
     // point: the next task builds on the last one.
