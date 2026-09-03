@@ -97,6 +97,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 use anyhow::{Context, Result};
 use axum::Json;
@@ -531,6 +532,30 @@ impl Ui {
         })
     }
 
+    /// Park the loop for an upgrade, and report the run that is parking.
+    ///
+    /// A park rather than a stop: a stop waits out the whole competition, and
+    /// not waiting is the point of upgrading from a phone. `None` means
+    /// nothing was in flight, which is worth saying so the operator is not
+    /// told a run is parking when none is.
+    fn park_for_upgrade(&self) -> ApiResult<Option<String>> {
+        let parking = {
+            let mut state = self.lock_loop();
+            let Some(live) = state.live.as_ref() else {
+                return Ok(None);
+            };
+            let busy = live.stop.busy_now();
+            live.stop.park();
+            state.rev += 1;
+            busy
+        };
+        Ok(if parking {
+            daemon::current_work(&self.home, jiff::Timestamp::now()).map(|c| c.run)
+        } else {
+            None
+        })
+    }
+
     /// Claim a run for a resume, on the same reasoning as [`Ui::begin_turn`]:
     /// a guard that releases on drop, so a disconnected phone does not wedge
     /// the run until the server restarts.
@@ -564,6 +589,7 @@ impl Ui {
             .route("/app.js", get(app_js))
             .route("/api/health", get(health))
             .route("/api/loop", get(loop_get).post(loop_post))
+            .route("/api/upgrade", post(upgrade_post))
             .route("/api/runs", get(runs_list))
             .route("/api/runs/{id}", get(run_detail).delete(run_delete))
             .route("/api/runs/{id}/report", get(run_report))
@@ -629,6 +655,70 @@ impl Drop for ResumeGuard {
     }
 }
 
+async fn bind_waiting(socket: SocketAddr) -> Result<tokio::net::TcpListener> {
+    const WINDOW: Duration = Duration::from_secs(10);
+    const GAP: Duration = Duration::from_millis(250);
+
+    let deadline = std::time::Instant::now() + WINDOW;
+    let mut said = false;
+    loop {
+        match tokio::net::TcpListener::bind(socket).await {
+            Ok(listener) => return Ok(listener),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    && std::time::Instant::now() < deadline =>
+            {
+                if !said {
+                    said = true;
+                    tracing::info!(
+                        "{socket} is still held - waiting up to {}s for it, \
+                         which is what a restart looks like from here",
+                        WINDOW.as_secs()
+                    );
+                }
+                tokio::time::sleep(GAP).await;
+            }
+            Err(e) => return Err(e).with_context(|| format!("bind {socket}")),
+        }
+    }
+}
+
+/// Signalled when an upgrade has replaced the binary and the successor should
+/// take this address over. One per process: there is one address to hand on.
+static HANDOVER: std::sync::LazyLock<Notify> = std::sync::LazyLock::new(Notify::new);
+
+/// Start this binary again with the same arguments, detached.
+///
+/// Called from [`serve`]'s exit path, *after* the listener has been dropped,
+/// so the address is already free when the successor binds it. The first
+/// attempt at this spawned the successor two hundred milliseconds before
+/// exiting instead, and the released binary - which has no bind retry - died
+/// on "address already in use" with its stdio sent to null, so the deck
+/// simply never came back.
+///
+/// Detached and without inherited stdio: the successor has to outlive this
+/// process, and must not hold open a pipe a terminal is waiting on.
+fn spawn_successor() -> Result<()> {
+    let exe = std::env::current_exe().context("find this binary")?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    tracing::info!("restarting: {} {}", exe.display(), args.join(" "));
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: no console to inherit,
+        // and Ctrl-C in the old terminal must not reach the successor.
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    cmd.spawn().context("start the successor")?;
+    Ok(())
+}
+
 /// Serve the UI until Ctrl-C, finishing a run the loop has in flight.
 ///
 /// The server itself owns no state, so nothing here is graceful for the HTTP
@@ -646,6 +736,15 @@ impl Drop for ResumeGuard {
 /// finished first, for the reason [`daemon::serve`] gives: killing the graph
 /// mid-node leaves worktrees, branches and agent sessions behind and throws
 /// away every agent call already paid for.
+/// Bind the port, waiting briefly for a predecessor to let go of it.
+///
+/// A restart hands the address from one process to the next, and the old one
+/// holds its listener until it unwinds. A single `bind` can lose that race,
+/// and for a restart triggered from a phone that means the deck never comes
+/// back with no terminal around to say why.
+///
+/// Bounded, and only for the one error a wait can fix: anything else fails at
+/// once, because retrying it would turn a clear message into a silence.
 pub async fn serve(opts: Opts) -> Result<()> {
     let (addr, warning) = resolve_bind(&opts.bind);
     if let Some(warning) = warning {
@@ -662,9 +761,7 @@ pub async fn serve(opts: Opts) -> Result<()> {
     let ui = Ui::open(opts.repo).with_merge(opts.merge);
     let looping = ui.looping();
     let socket = SocketAddr::new(addr, opts.port);
-    let listener = tokio::net::TcpListener::bind(socket)
-        .await
-        .with_context(|| format!("bind {socket}"))?;
+    let listener = bind_waiting(socket).await?;
     let url = format!("http://{addr}:{}", opts.port);
     tracing::info!(
         "magi web UI on {url} - there is no authentication, so anyone who can \
@@ -693,12 +790,20 @@ pub async fn serve(opts: Opts) -> Result<()> {
             std::future::pending::<()>().await;
         }
     };
+    let handover = HANDOVER.notified();
     tokio::select! {
         outcome = served => outcome.context("serve the web UI"),
         () = interrupted => {
             tracing::info!("shutting down the web UI");
             finish_loop(&looping).await;
             Ok(())
+        }
+        () = handover => {
+            tracing::info!("upgraded - handing this address to the successor");
+            // The loop was parked by the request, so this waits for a node
+            // boundary rather than for a whole competition.
+            finish_loop(&looping).await;
+            spawn_successor()
         }
     }
 }
@@ -1254,6 +1359,95 @@ async fn loop_post(
         Ok(Json(ui.loop_view(reading)))
     })
     .await
+}
+
+/// What `POST /api/upgrade` set in motion.
+#[derive(Debug, Serialize)]
+struct UpgradeView {
+    /// The version this process is running.
+    from: String,
+    /// A run was parked first, and this is its id.
+    parked: Option<String>,
+    /// What the operator should expect to happen next.
+    detail: String,
+}
+
+/// `POST /api/upgrade` - replace this binary with the newest release and come
+/// back on it.
+///
+/// The one thing the deck could not do for itself. Every fix landed today
+/// either waited for a competition to end or went in with the deck stopped,
+/// because `cargo install` cannot overwrite a running executable on Windows.
+/// `kaishin` can: `self_replace` **renames** the running image aside and puts
+/// the new one in its place, so the swap itself needs no downtime. Only the
+/// restart does, and the order is the whole design:
+///
+/// 1. **Park.** A run in flight stops at its next node boundary and stays
+///    resumable, so this costs at most the node in progress rather than the
+///    competition. Without it the honest choices were waiting an hour or
+///    discarding paid agent work.
+/// 2. **Replace.** The new binary goes into place while this one still runs.
+/// 3. **Hand over.** [`serve`] drops the listener, *then* spawns the
+///    successor - see [`spawn_successor`] for what happens in the other
+///    order.
+/// 4. **Resume.** The next loop carries the parked run on rather than
+///    competing again; see `daemon::attempt`.
+///
+/// Answers **202**: the reply has to reach the phone while this process can
+/// still send one, and the phone learns the deck is back by reconnecting.
+async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<UpgradeView>)> {
+    let reading = daemon::read_status(&ui.home);
+    if let Some(other) = Foreign::of(reading.as_ref()) {
+        return Err(ApiError::conflict(format!(
+            "the loop belongs to {}, so replacing this binary would leave \
+             that process running an old one against the same queue. Upgrade \
+             where it was started.",
+            other.who()
+        )));
+    }
+
+    // Parked before anything is replaced: a successor that came up while a
+    // run was mid-node would find a run nobody is driving.
+    let parked = ui.park_for_upgrade()?;
+    let detail = match &parked {
+        Some(run) => format!(
+            "Run {} is parking at its next step. The deck replaces itself, \
+             comes back, and the loop carries that run on from where it \
+             stopped.",
+            crate::run::short_of(run)
+        ),
+        None => "The deck replaces itself and comes back. Nothing was in \
+                 flight to park."
+            .to_owned(),
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = upgrade_and_restart().await {
+            tracing::error!("the upgrade did not complete: {e:#}");
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(UpgradeView {
+            from: env!("CARGO_PKG_VERSION").to_owned(),
+            parked,
+            detail,
+        }),
+    ))
+}
+
+/// Replace the binary, then ask [`serve`] to hand the address over.
+///
+/// Separated from the handler so the 202 is already on its way, and separated
+/// from the spawn so the successor starts only after the listener is dropped.
+async fn upgrade_and_restart() -> Result<()> {
+    // `yes` and non-interactive: nobody is at a terminal, and a prompt would
+    // hang the upgrade for as long as the process lives.
+    crate::updater::run_self_update(true, false, true).await?;
+    tracing::info!("binary replaced - asking the server to hand over");
+    HANDOVER.notify_one();
+    Ok(())
 }
 
 /// One row in the run list.
@@ -4700,6 +4894,56 @@ mod tests {
         // Choosing the conversation on screen belongs to the router.
         let router = &APP_JS[APP_JS.find("function applyRoute(").expect("applyRoute")..];
         assert!(router.contains("state.chatDetail = { id: route.id, chat: null }"));
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_is_refused_when_the_loop_belongs_to_another_process() {
+        let fx = Fixture::start().await;
+        // Somebody else's `magi serve` owns the queue. Replacing this binary
+        // would leave that process running an old one against the same
+        // claims, which is worse than refusing.
+        let mut beat = crate::daemon::Status::new();
+        beat.pid = 4321;
+        beat.updated_at = jiff::Timestamp::now();
+        crate::daemon::write_status_to(&fx.home.path().join("daemon.json"), &beat)
+            .expect("publish a heartbeat");
+
+        let res = fx.post("/api/upgrade", None).await;
+        assert_eq!(res.status, 409);
+        let err = res.json()["error"].as_str().unwrap().to_owned();
+        assert!(err.contains("4321"), "the refusal names the owner: {err}");
+        assert!(err.contains("old one against the same queue"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_with_nothing_in_flight_says_so() {
+        let fx = Fixture::start().await;
+        // No loop, nothing to park: the answer must not claim a run is
+        // parking when none is, because that is the sentence the operator
+        // waits on before touching the process.
+        let res = fx.post("/api/upgrade", None).await;
+        assert_eq!(res.status, 202, "the reply leaves before the restart does");
+        let body = res.json();
+        assert_eq!(body["from"], env!("CARGO_PKG_VERSION"));
+        assert!(body["parked"].is_null());
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Nothing was in flight to park"),
+            "{body:?}"
+        );
+    }
+
+    #[test]
+    fn the_upgrade_button_arms_before_it_restarts_anything() {
+        // It ends the process the operator is talking to, and a phone in a
+        // pocket taps things. One tap arms, the second commits.
+        assert!(APP_JS.contains("upgrade: \"/api/upgrade\""));
+        assert!(APP_JS.contains("Replace the binary and restart?"));
+        assert!(APP_JS.contains("function confirmed("));
+        // Hidden when the loop is somebody else's, matching the 409 above.
+        assert!(APP_JS.contains("show(upgradeBtn, !foreign)"));
     }
 
     #[test]
