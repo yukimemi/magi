@@ -1307,6 +1307,12 @@ async fn run_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiRes
         let dir = ui.runs.join(&id);
         std::fs::remove_dir_all(&dir)
             .with_context(|| format!("remove run directory {}", dir.display()))?;
+        // The agent that asked died with the run, so an open question would
+        // keep asking the operator for a decision nobody can deliver.
+        ui.questions.abandon_for_run(
+            &id,
+            &format!("run {id} was deleted, so nothing is waiting for this answer"),
+        )?;
         Ok(StatusCode::NO_CONTENT)
     })
     .await

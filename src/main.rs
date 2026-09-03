@@ -1140,7 +1140,19 @@ fn run_rm_cmd(id: &str) -> Result<()> {
     let dir = magi::run::run_dir(&resolved);
     std::fs::remove_dir_all(&dir)
         .with_context(|| format!("remove run directory {}", dir.display()))?;
+    // The agent that asked died with the run, so an open question would keep
+    // asking for a decision nobody can deliver.
+    let abandoned = ask::Questions::open().abandon_for_run(
+        &resolved,
+        &format!("run {resolved} was deleted, so nothing is waiting for this answer"),
+    )?;
     println!("removed {resolved}");
+    if abandoned > 0 {
+        println!(
+            "abandoned {abandoned} open question{}",
+            if abandoned == 1 { "" } else { "s" }
+        );
+    }
     Ok(())
 }
 
