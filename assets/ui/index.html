@@ -80,6 +80,10 @@
     <span class="daemon-why" id="loop-why" hidden></span>
   </span>
   <button class="btn daemon-btn" type="button" id="loop-toggle" aria-describedby="loop-why" hidden></button>
+  <!-- The escalation, shown only while a stop is waiting out a run: parking
+       stops at the run's next step instead, which is what an operator waiting
+       to replace the binary actually wants. -->
+  <button class="btn btn-quiet daemon-btn" type="button" id="loop-park" aria-describedby="loop-why" hidden></button>
 </div>
 
 <!-- An unanswered question is the only state in this product where nothing at

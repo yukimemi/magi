@@ -427,7 +427,7 @@ impl Ui {
     /// Idempotent: a second tap on stop is not an error, because the first one
     /// leaves the loop running for as long as the run in flight takes and the
     /// operator has no way to tell a slow stop from a lost one.
-    fn stop_loop(&self, foreign: Option<Foreign>) -> ApiResult<()> {
+    fn stop_loop(&self, foreign: Option<Foreign>, park: bool) -> ApiResult<()> {
         if let Some(other) = foreign {
             return Err(ApiError::conflict(format!(
                 "the loop belongs to {}, and this process cannot stop it - \
@@ -440,12 +440,20 @@ impl Ui {
         let Some(live) = state.live.as_ref() else {
             return Ok(());
         };
-        if live.stop.stopped() {
+        // A park upgrades a stop that has already been asked for: the
+        // operator who tapped "stop" and then realised the run has an hour
+        // left must not have to restart the loop to change their mind.
+        if live.stop.stopped() && (!park || live.stop.parking()) {
             return Ok(());
         }
-        live.stop.stop();
+        if park {
+            live.stop.park();
+            tracing::info!("the loop was asked to park; the run stops at its next node boundary");
+        } else {
+            live.stop.stop();
+            tracing::info!("the loop was asked to stop; a run in flight is finished first");
+        }
         state.rev += 1;
-        tracing::info!("the loop was asked to stop; a run in flight is finished first");
         Ok(())
     }
 
@@ -463,6 +471,7 @@ impl Ui {
         LoopView {
             running: live.is_some(),
             stopping: live.is_some_and(|live| live.stop.finishing()),
+            parking: live.is_some_and(|live| live.stop.parking()),
             owned: live.is_some(),
             repo: live
                 .map_or(&self.repo, |live| &live.opts.repo)
@@ -1042,6 +1051,14 @@ struct LoopView {
     /// mid-run keeps going for as long as the graph takes. The operator needs
     /// to be told which of those they are waiting for.
     stopping: bool,
+    /// A park was asked for: the run in flight stops at its next node
+    /// boundary rather than finishing.
+    ///
+    /// Separate from `stopping` because the two promise different waits. A
+    /// stop is "when this competition ends", which can be an hour; a park is
+    /// "after the step it is on", which is minutes and is what an operator
+    /// waiting to replace the binary needs to see.
+    parking: bool,
     /// The loop is this process's own.
     ///
     /// Spelled separately from `running` for the front end's sake, even
@@ -1193,6 +1210,17 @@ async fn loop_get(State(ui): State<Arc<Ui>>) -> ApiResult<Json<LoopView>> {
 #[serde(deny_unknown_fields)]
 struct LoopCommand {
     running: bool,
+    /// Stop the run in flight at its next node boundary rather than letting it
+    /// finish.
+    ///
+    /// Defaults to false, so the plain stop keeps meaning what it meant: a
+    /// competition is tens of minutes of paid work and finishing it is
+    /// normally the cheapest thing to do. A park is for the operator who
+    /// wants the process gone now - to replace the binary, most of all - and
+    /// it costs at most the node in progress because every node writes its
+    /// state before the next one starts.
+    #[serde(default)]
+    park: bool,
 }
 
 /// `POST /api/loop` - start the loop in this process, or ask it to stop.
@@ -1215,7 +1243,7 @@ async fn loop_post(
         if body.running {
             ui.start_loop(foreign)?;
         } else {
-            ui.stop_loop(foreign)?;
+            ui.stop_loop(foreign, body.park)?;
         }
         Ok(Json(ui.loop_view(reading)))
     })

@@ -714,6 +714,39 @@ other seats had long finished. A retry that re-sends the whole prompt, because
 the seat kept no context, keeps the whole budget: that one really is the job
 again.
 
+### A run is interrupted at a node boundary, never mid-node
+
+`graph::Pause` is checked between nodes in `execute`, and that is the only
+place it may be checked. The cheapness of a park is entirely a property of the
+boundary: every node saves the run's state before the next one starts, and
+every node skips what is already on disk — `prep` returns early once
+candidates exist, `implement` asks only the seats with nothing recorded,
+`judge` returns early once judgements exist. A park therefore resumes into
+exactly the node it stopped before and throws nothing away. A check *inside* a
+node would abandon the wave in flight, which for an implement wave is an hour
+of paid calls.
+
+Two rules follow, and neither is optional:
+
+- **A parked run is not a failed one.** `Verdict::parked` refunds the attempt.
+  It is the operator asking for the process back — to replace the binary,
+  usually — and a few upgrades must not exhaust a budget meant for agents that
+  misbehaved.
+- **An unfinished run is resumed, never re-competed.** `attempt` looks for a
+  non-terminal run of the task and calls `Runner::resume` on it. When it did
+  not, run 01c2 was blocked and the loop immediately started 3cbf on the same
+  task, paying three implementers to redo two and a half hours of work that
+  was already on a branch.
+
+### Integration tests that mint runs must take `home_lock`
+
+`run::set_home` is a process-global `OnceLock`, so every test in one
+integration binary shares a magi home. Two that mint runs concurrently clobber
+each other: a park test and a resume test in one file failed with "no
+candidate produced a change" because the other test's fixture had taken the
+home. `tests/common::home_lock()` serializes them, and any test that calls
+`fixture()` has to hold it for the duration.
+
 ### Autonomy is bounded, and the bound is the point
 
 `src/daemon.rs` runs one competition at a time — no `--jobs`. The graph is
