@@ -362,21 +362,46 @@ impl Queue {
         }
     }
 
-    /// Newest modification time in the queue, in milliseconds, for change
-    /// detection. The web UI compares this instead of re-reading every task,
-    /// so an idle phone on a slow link costs one `stat` per file rather than
-    /// the whole backlog.
+    /// Change detection token for the queue.
+    ///
+    /// Combines file names and modification times of all task files in the
+    /// queue, so adding, modifying, or deleting any task — even an older one —
+    /// moves the revision and notifies connected clients via the change stream.
+    /// Returns 0 when the queue is completely empty.
     pub fn revision(&self) -> u64 {
-        std::fs::read_dir(&self.root)
+        use std::hash::{Hash as _, Hasher as _};
+
+        let mut entries: Vec<(String, u64)> = std::fs::read_dir(&self.root)
             .into_iter()
             .flatten()
             .flatten()
-            .filter_map(|e| e.metadata().ok())
-            .filter_map(|m| m.modified().ok())
-            .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64)
-            .max()
-            .unwrap_or(0)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let mtime = e
+                    .metadata()
+                    .ok()?
+                    .modified()
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_millis() as u64;
+                Some((name, mtime))
+            })
+            .collect();
+
+        if entries.is_empty() {
+            return 0;
+        }
+
+        entries.sort_unstable();
+        let mut hasher = std::hash::DefaultHasher::new();
+        for (name, mtime) in &entries {
+            name.hash(&mut hasher);
+            mtime.hash(&mut hasher);
+        }
+        let h = hasher.finish();
+        if h == 0 { 1 } else { h }
     }
 }
 
@@ -676,6 +701,26 @@ mod tests {
         let mut t = task("first");
         q.put(&mut t).unwrap();
         assert!(q.revision() > 0, "a written task moves the revision");
+    }
+
+    #[test]
+    fn revision_moves_when_deleting_an_older_task() {
+        let (_dir, q) = queue();
+        let mut t1 = task("older");
+        q.put(&mut t1).unwrap();
+        // Ensure mtime ticks forward.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut t2 = task("newer");
+        q.put(&mut t2).unwrap();
+
+        let rev_before = q.revision();
+        q.remove(&t1.id).unwrap();
+        let rev_after = q.revision();
+
+        assert_ne!(
+            rev_before, rev_after,
+            "deleting an older task must change the revision so other clients see the deletion"
+        );
     }
 
     #[test]

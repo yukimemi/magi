@@ -60,18 +60,88 @@ impl MergeArg {
     }
 }
 
+/// Execution knobs a competition run takes, shared by `magi run <instruction>`
+/// and the free-text fallback of `magi run rm <words...>` (see [`RunCmd::Rm`]):
+/// once clap commits to the `rm` subcommand it stops recognising `Run`'s own
+/// flags, so a flag placed after prose that happens to start with "rm"
+/// (`magi run rm the dead code --candidates 3`) needs its own declaration or
+/// parsing fails outright. Left unset (`None`/default) on whichever side of
+/// "rm" the caller did not use.
+#[derive(Debug, Clone, Default, clap::Args)]
+struct RunOpts {
+    /// Repository to work on.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    /// Config file; defaults to <repo>/magi.toml.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Parallel implementations.
+    #[arg(short = 'c', long)]
+    candidates: Option<usize>,
+    /// Independent judges.
+    #[arg(short = 'j', long)]
+    judges: Option<usize>,
+    /// Review + fix rounds before giving up.
+    #[arg(long)]
+    review_rounds: Option<usize>,
+    /// What to do with the winning branch.
+    #[arg(long, value_enum)]
+    merge: Option<MergeArg>,
+    /// Seed for label assignment, to reproduce a run.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Prepare and print the plan without spending an agent call.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+impl RunOpts {
+    /// Combines the flags clap captured on each side of a literal "rm" that
+    /// turned out to be prose. Only one side is ever populated in practice —
+    /// a flag is either before "rm" or after it — so preferring `self` is an
+    /// arbitrary but harmless tie-break for the case of a flag on both sides.
+    fn merge(self, other: Self) -> Self {
+        Self {
+            repo: self.repo.or(other.repo),
+            config: self.config.or(other.config),
+            candidates: self.candidates.or(other.candidates),
+            judges: self.judges.or(other.judges),
+            review_rounds: self.review_rounds.or(other.review_rounds),
+            merge: self.merge.or(other.merge),
+            seed: self.seed.or(other.seed),
+            dry_run: self.dry_run || other.dry_run,
+        }
+    }
+}
+
+/// Operations on recorded runs.
+#[derive(Debug, Subcommand)]
+enum RunCmd {
+    /// Delete a recorded run.
+    ///
+    /// Takes every remaining word, not just one: clap commits to this
+    /// subcommand as soon as it sees the literal token "rm", so an
+    /// instruction that happens to start with "rm" (`magi run rm the dead
+    /// code`) must still parse here rather than erroring out. Dispatch tells
+    /// the two apart by word count — exactly one word is a run id, more than
+    /// one is free-text instruction that starts with "rm".
+    Rm {
+        /// Run id or unambiguous prefix/suffix.
+        #[arg(required = true)]
+        id: Vec<String>,
+        #[command(flatten)]
+        opts: Box<RunOpts>,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run a competition for one task.
     Run {
+        #[command(subcommand)]
+        command: Option<RunCmd>,
         /// The task. Omit when using --file, --issue, or --resume.
         instruction: Vec<String>,
-        /// Repository to work on.
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
-        /// Config file; defaults to <repo>/magi.toml.
-        #[arg(long)]
-        config: Option<PathBuf>,
         /// Read the task from a file.
         #[arg(long, conflicts_with = "instruction")]
         file: Option<PathBuf>,
@@ -81,24 +151,8 @@ enum Command {
         /// Continue an interrupted run.
         #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["instruction", "file", "issue"])]
         resume: Option<String>,
-        /// Parallel implementations.
-        #[arg(short = 'c', long)]
-        candidates: Option<usize>,
-        /// Independent judges.
-        #[arg(short = 'j', long)]
-        judges: Option<usize>,
-        /// Review + fix rounds before giving up.
-        #[arg(long)]
-        review_rounds: Option<usize>,
-        /// What to do with the winning branch.
-        #[arg(long, value_enum)]
-        merge: Option<MergeArg>,
-        /// Seed for label assignment, to reproduce a run.
-        #[arg(long)]
-        seed: Option<u64>,
-        /// Prepare and print the plan without spending an agent call.
-        #[arg(long)]
-        dry_run: bool,
+        #[command(flatten)]
+        opts: RunOpts,
     },
     /// Run only the review + verification + gate loop, on work that already
     /// exists on a branch. Nothing competes: no implementation, no judging, no
@@ -416,19 +470,32 @@ fn spawn_update_check(command: &Command) -> Option<updater::Pending> {
 async fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::Run {
+            command,
             instruction,
-            repo,
-            config,
             file,
             issue,
             resume,
-            candidates,
-            judges,
-            review_rounds,
-            merge,
-            seed,
-            dry_run,
+            opts,
         } => {
+            // A single trailing word is a run id: `magi run rm <id>`. More
+            // than one means clap only grabbed "rm" because it matches the
+            // subcommand name — this is really an instruction that starts
+            // with "rm" (`magi run rm the dead code in auth.rs`), so put the
+            // word back and fall through to the normal instruction path,
+            // taking along whatever flags clap parsed after "rm" merged with
+            // whatever it parsed before.
+            let (instruction, opts) = match command {
+                Some(RunCmd::Rm { id, .. }) if id.len() == 1 => {
+                    return run_rm_cmd(&id[0]);
+                }
+                Some(RunCmd::Rm { id, opts: rm_opts }) => {
+                    let mut full = vec!["rm".to_owned()];
+                    full.extend(id);
+                    (full, rm_opts.merge(opts))
+                }
+                None => (instruction, opts),
+            };
+            let repo = opts.repo.unwrap_or_else(|| PathBuf::from("."));
             let mut runner = if let Some(id) = resume {
                 let runner = Runner::resume(&id)?;
                 println!(
@@ -438,27 +505,27 @@ async fn dispatch(command: Command) -> Result<()> {
                 runner
             } else {
                 let task = task_text(&instruction, file.as_deref(), issue).await?;
-                let (mut cfg, from) = Config::discover(&repo, config.as_deref())?;
-                if let Some(n) = candidates {
+                let (mut cfg, from) = Config::discover(&repo, opts.config.as_deref())?;
+                if let Some(n) = opts.candidates {
                     cfg.graph.candidates = n;
                 }
-                if let Some(n) = judges {
+                if let Some(n) = opts.judges {
                     cfg.graph.judges = n;
                 }
-                if let Some(n) = review_rounds {
+                if let Some(n) = opts.review_rounds {
                     cfg.graph.review_rounds = n;
                 }
-                if let Some(m) = merge {
+                if let Some(m) = opts.merge {
                     cfg.merge.mode = m.into();
                 }
-                if let Some(s) = seed {
+                if let Some(s) = opts.seed {
                     cfg.blind.seed = Some(s);
                 }
                 println!("config: {}", describe_layers(&from));
                 Runner::start(&repo, task, cfg).await?
             };
 
-            if dry_run {
+            if opts.dry_run {
                 print!("{}", report::run(&runner.state));
                 println!("\ndry run: stopping before the first agent call");
                 return Ok(());
@@ -989,6 +1056,18 @@ async fn task_cmd(command: TaskCmd) -> Result<()> {
     }
 }
 
+/// Delete a recorded run directory.
+fn run_rm_cmd(id: &str) -> Result<()> {
+    let resolved = resolve_id(id)?;
+    let state = RunState::load(&resolved)?;
+    state.ensure_can_delete()?;
+    let dir = magi::run::run_dir(&resolved);
+    std::fs::remove_dir_all(&dir)
+        .with_context(|| format!("remove run directory {}", dir.display()))?;
+    println!("removed {resolved}");
+    Ok(())
+}
+
 /// Who is filing this task.
 ///
 /// An agent inside a run is identified by the environment the graph gave it, so
@@ -1217,6 +1296,7 @@ async fn probe(program: &str, args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magi::run::RunStatus;
 
     #[test]
     fn cli_definition_is_valid() {
@@ -1346,5 +1426,201 @@ mod tests {
         let text = doctor_queue_and_loop(dir.path());
 
         assert!(text.contains("unreadable 1"), "{text}");
+    }
+
+    #[test]
+    fn run_rm_cli_argument_parsing() {
+        // 1. magi run rm <id> succeeds and parses id
+        let parsed = Cli::try_parse_from(["magi", "run", "rm", "20260902-140501-a1b2"]).unwrap();
+        match parsed.command {
+            Some(Command::Run {
+                command: Some(RunCmd::Rm { id, .. }),
+                ..
+            }) => {
+                assert_eq!(id, vec!["20260902-140501-a1b2"]);
+            }
+            other => panic!("expected RunCmd::Rm, got {other:?}"),
+        }
+
+        // 2. magi run rm without id fails
+        let err = Cli::try_parse_from(["magi", "run", "rm"]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "omitting id from magi run rm must fail clap parsing: {err}"
+        );
+
+        // 3. magi run <instruction> still parses instruction normally
+        let parsed_normal = Cli::try_parse_from(["magi", "run", "fix", "a", "bug"]).unwrap();
+        match parsed_normal.command {
+            Some(Command::Run {
+                command: None,
+                instruction,
+                ..
+            }) => {
+                assert_eq!(instruction, vec!["fix", "a", "bug"]);
+            }
+            other => panic!("expected normal Command::Run, got {other:?}"),
+        }
+
+        // 4. an instruction that merely starts with "rm" must still parse —
+        // clap only recognises the literal token "rm" as the subcommand, it
+        // cannot know in advance that this is prose, not a run id.
+        let parsed_prose =
+            Cli::try_parse_from(["magi", "run", "rm", "this", "is", "a", "task"]).unwrap();
+        match parsed_prose.command {
+            Some(Command::Run {
+                command: Some(RunCmd::Rm { id, .. }),
+                ..
+            }) => {
+                assert_eq!(id, vec!["this", "is", "a", "task"]);
+            }
+            other => panic!("expected RunCmd::Rm carrying the prose, got {other:?}"),
+        }
+
+        // 5. a flag placed after rm-led prose must still parse and carry its
+        // value, not just avoid erroring: clap only declares --candidates on
+        // Run itself, so it has to be declared on RunCmd::Rm too.
+        let parsed_flag_after = Cli::try_parse_from([
+            "magi",
+            "run",
+            "rm",
+            "the",
+            "dead",
+            "code",
+            "--candidates",
+            "3",
+        ])
+        .unwrap();
+        match parsed_flag_after.command {
+            Some(Command::Run {
+                command: Some(RunCmd::Rm { id, opts }),
+                ..
+            }) => {
+                assert_eq!(id, vec!["the", "dead", "code"]);
+                assert_eq!(opts.candidates, Some(3));
+            }
+            other => panic!("expected RunCmd::Rm carrying --candidates, got {other:?}"),
+        }
+
+        // 6. a flag before "rm" must still reach the instruction path even
+        // though a different flag also appears after the prose — the two
+        // sides are parsed into separate RunOpts and must be merged rather
+        // than one clobbering the other.
+        let parsed_flag_both_sides = Cli::try_parse_from([
+            "magi",
+            "run",
+            "--candidates",
+            "3",
+            "rm",
+            "the",
+            "dead",
+            "code",
+            "--seed",
+            "7",
+        ])
+        .unwrap();
+        match parsed_flag_both_sides.command {
+            Some(Command::Run {
+                command: Some(RunCmd::Rm { id, opts: rm_opts }),
+                opts,
+                ..
+            }) => {
+                assert_eq!(id, vec!["the", "dead", "code"]);
+                assert_eq!(opts.candidates, Some(3));
+                assert_eq!(rm_opts.seed, Some(7));
+                let merged = rm_opts.merge(opts);
+                assert_eq!(merged.candidates, Some(3));
+                assert_eq!(merged.seed, Some(7));
+            }
+            other => panic!("expected RunCmd::Rm with flags on both sides, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_rm_cmd_guards_and_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("MAGI_HOME", dir.path());
+        }
+        let runs = dir.path().join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+
+        // 1. Running run fails to delete
+        let run_running = "20260901-000000-rung";
+        let dir_rung = runs.join(run_running);
+        std::fs::create_dir_all(&dir_rung).unwrap();
+        let mut s_rung = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "inst".to_owned(),
+            Config::default(),
+        );
+        s_rung.id = run_running.to_owned();
+        s_rung.status = RunStatus::Prep;
+        std::fs::write(
+            dir_rung.join("run.json"),
+            serde_json::to_string(&s_rung).unwrap(),
+        )
+        .unwrap();
+
+        let err = run_rm_cmd(run_running).unwrap_err().to_string();
+        assert!(err.contains("still running"), "{err}");
+        assert!(dir_rung.exists(), "running run must be kept");
+
+        // 2. Unfolded run fails to delete and suggests magi fold
+        let run_unfolded = "20260901-000000-unfd";
+        let dir_unfd = runs.join(run_unfolded);
+        std::fs::create_dir_all(&dir_unfd).unwrap();
+        let mut s_unfd = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "inst".to_owned(),
+            Config::default(),
+        );
+        s_unfd.id = run_unfolded.to_owned();
+        s_unfd.status = RunStatus::Merged;
+        s_unfd.candidates.push(magi::run::Candidate {
+            index: 0,
+            label: 'A',
+            agent: "a".to_owned(),
+            branch: "b".to_owned(),
+            worktree: PathBuf::from("/w"),
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        std::fs::write(
+            dir_unfd.join("run.json"),
+            serde_json::to_string(&s_unfd).unwrap(),
+        )
+        .unwrap();
+
+        let err = run_rm_cmd(run_unfolded).unwrap_err().to_string();
+        assert!(err.contains("magi fold"), "{err}");
+        assert!(dir_unfd.exists(), "unfolded run must be kept");
+
+        // 3. Finished and folded run succeeds
+        s_unfd.candidates[0].folded = true;
+        std::fs::write(
+            dir_unfd.join("run.json"),
+            serde_json::to_string(&s_unfd).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir_unfd.join("artifacts")).unwrap();
+        std::fs::write(dir_unfd.join("artifacts").join("diff.patch"), "patch").unwrap();
+
+        assert!(
+            run_rm_cmd("unfd").is_ok(),
+            "prefix/suffix resolution succeeds"
+        );
+        assert!(!dir_unfd.exists(), "run directory is removed");
     }
 }

@@ -21,8 +21,10 @@ const API = {
   health: "/api/health",
   runs: (limit) => `/api/runs?limit=${limit}`,
   run: (id) => `/api/runs/${encodeURIComponent(id)}`,
+  deleteRun: (id) => `/api/runs/${encodeURIComponent(id)}`,
   report: (id) => `/api/runs/${encodeURIComponent(id)}/report`,
   queue: "/api/queue",
+  deleteTask: (id) => `/api/queue/${encodeURIComponent(id)}`,
   hold: (id) => `/api/queue/${encodeURIComponent(id)}/hold`,
   release: (id) => `/api/queue/${encodeURIComponent(id)}/release`,
   questions: "/api/questions",
@@ -451,6 +453,8 @@ const postJson = (url, body) =>
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body === undefined ? {} : body),
   }).then((r) => r.json());
+
+const deleteReq = (url) => request(url, { method: "DELETE" });
 
 /* ---- alert ------------------------------------------------------------- */
 function fail(message) {
@@ -963,13 +967,14 @@ function createTaskCard() {
     el("p", { class: "instruction" }));
   const runLink = el("a", { class: "btn btn-quiet" });
   const hold = el("button", { class: "btn btn-quiet", type: "button" });
-  const actions = el("div", { class: "card-actions" }, runLink, hold);
+  const deleteBox = el("span", { class: "task-delete-box" });
+  const actions = el("div", { class: "card-actions" }, runLink, hold, deleteBox);
 
   const card = el("li", { class: "card" },
     el("div", { class: "card-top" }, chipSlot, priority, whenSlot),
     title, meta, note, error, instruction, actions,
   );
-  card.refs = { card, chipSlot, priority, whenSlot, title, source, repo, attempts, outcome, note, error, instruction, runLink, hold };
+  card.refs = { card, chipSlot, priority, whenSlot, title, source, repo, attempts, outcome, note, error, instruction, runLink, hold, deleteBox };
   return card;
 }
 
@@ -1038,14 +1043,65 @@ function updateTaskCard(row, task) {
   show(r.outcome, Boolean(outcome));
   separate(r.outcome.parentNode);
 
-  /* Hold and release are the only mutations the contract exposes; there is
-     deliberately no delete. */
   const held = status === "held";
   setText(r.hold, held ? "Release" : "Hold");
   setAttr(r.hold, "aria-label", `${held ? "Release" : "Hold"} task ${task.title || task.id}`);
   r.hold.disabled = status === "running" || status === "done";
   r.hold.onclick = () => mutateTask(task.id, held ? "release" : "hold", r.hold);
   show(r.hold, status !== "done");
+
+  /* Two-step delete: first tap arms, second tap sends the DELETE request.
+     Cancel takes the position of the initial button and receives focus. */
+  clear(r.deleteBox);
+  const armed = row.dataset.armedDelete === "1";
+  if (armed) {
+    const cancel = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Cancel",
+      onclick: () => {
+        row.dataset.armedDelete = "";
+        updateTaskCard(row, task);
+      },
+    });
+    const confirm = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Delete now",
+      onclick: () => deleteTask(task.id, row),
+    });
+    r.deleteBox.append(cancel, confirm);
+    requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+  } else {
+    const del = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Delete",
+      disabled: status === "running",
+      onclick: () => {
+        row.dataset.armedDelete = "1";
+        updateTaskCard(row, task);
+      },
+    });
+    setAttr(del, "aria-label", `Delete task ${task.title || task.id}`);
+    r.deleteBox.append(del);
+  }
+}
+
+async function deleteTask(id, row) {
+  try {
+    await deleteReq(API.deleteTask(id));
+    ok();
+    announce(`Task ${shortId(id)} removed.`);
+    await loadQueue();
+  } catch (error) {
+    if (row) {
+      row.dataset.armedDelete = "";
+      const task = (state.queue || []).find((t) => t.id === id);
+      if (task) updateTaskCard(row, task);
+    }
+    fail(`Could not delete task ${shortId(id)}: ${error.message}`);
+  }
 }
 
 async function mutateTask(id, action, button) {
@@ -2259,9 +2315,12 @@ function renderRunDetail() {
        different one is not merely stale, it is wrong. */
     show($("run-ask-panel"), false);
     show($("run-land-panel"), false);
+    show($("run-delete-panel"), false);
     setText($("run-report"), report === null ? "Loading\u2026" : report);
     return;
   }
+
+  show($("run-delete-panel"), true);
 
   /* The detail payload carries the run's own status; the list carries the
      derived `waiting`. Prefer whichever says the run is parked, because that
@@ -2297,8 +2356,100 @@ function renderRunDetail() {
   renderReviews(run);
   renderQuota(run);
   renderTimeline(run);
+  renderRunDelete(run);
 
   setText($("run-report"), report === null ? "Loading\u2026" : report);
+}
+
+let armedRunDelete = null;
+
+function runDeleteReason(run) {
+  const terminal = ["merged", "ready", "stalled", "blocked", "failed"].includes(String(run.status || ""));
+  if (!terminal) {
+    return "This run is still in flight and cannot be deleted.";
+  }
+  const candidates = Array.isArray(run.candidates) ? run.candidates : [];
+  if (candidates.some((c) => !c.folded)) {
+    return "Candidates must be folded before deleting. Run `magi fold` first.";
+  }
+  return null;
+}
+
+function renderRunDelete(run) {
+  const box = $("run-delete-box");
+  if (!box) return;
+  clear(box);
+
+  const reason = runDeleteReason(run);
+  if (reason) {
+    const disabledBtn = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Delete run\u2026",
+      disabled: true,
+    });
+    box.append(
+      el("div", { class: "stakes-confirm" },
+        disabledBtn,
+        el("p", { class: "card-note", text: reason }),
+      ),
+    );
+    return;
+  }
+
+  const armed = armedRunDelete === run.id;
+  if (armed) {
+    const cancel = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Cancel",
+      onclick: () => {
+        armedRunDelete = null;
+        renderRunDelete(run);
+      },
+    });
+    const confirm = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Yes, delete run now",
+      onclick: () => deleteRun(run.id),
+    });
+    box.append(
+      el("div", { class: "stakes-confirm" },
+        el("p", { class: "stakes-warn", text: "Deleting removes all recorded state and artifacts. This cannot be undone." }),
+        el("div", { class: "stakes-row" },
+          cancel,
+          confirm,
+        ),
+      ),
+    );
+    requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+  } else {
+    box.append(
+      el("button", {
+        class: "btn btn-quiet",
+        type: "button",
+        text: "Delete run\u2026",
+        onclick: () => {
+          armedRunDelete = run.id;
+          renderRunDelete(run);
+        },
+      }),
+    );
+  }
+}
+
+async function deleteRun(id) {
+  try {
+    await deleteReq(API.deleteRun(id));
+    ok();
+    announce(`Run ${shortId(id)} removed.`);
+    armedRunDelete = null;
+    location.hash = "#/runs";
+  } catch (error) {
+    armedRunDelete = null;
+    fail(`Could not delete run ${shortId(id)}: ${error.message}`);
+  }
 }
 
 /* Every question this run has ever asked, open ones first: the answered ones

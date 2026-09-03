@@ -587,6 +587,24 @@ impl RunState {
             .strftime("%Y-%m-%d %H:%M:%S")
             .to_string()
     }
+
+    /// Assert that this run is safe to delete.
+    ///
+    /// Refuses deletion when the run is still in flight (not finished) or has
+    /// candidate worktrees and branches that have not been folded away with
+    /// `magi fold`.
+    pub fn ensure_can_delete(&self) -> Result<()> {
+        if !self.status.done() {
+            bail!("run {} is still running", self.short());
+        }
+        if self.candidates.iter().any(|c| !c.folded) {
+            bail!(
+                "run {} has unfolded candidates; fold first with `magi fold`",
+                self.short()
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Where magi keeps its runs.
@@ -820,5 +838,40 @@ mod tests {
         assert_eq!(back.id, s.id);
         assert_eq!(back.instruction, "add retries");
         assert_eq!(back.status, RunStatus::Prep);
+    }
+
+    #[test]
+    fn ensure_can_delete_guards_running_and_unfolded_runs() {
+        let mut s = state();
+        // 1. Running run (Prep is not done)
+        s.status = RunStatus::Prep;
+        assert!(s.ensure_can_delete().is_err());
+
+        // 2. Terminal run with unfolded candidate
+        s.status = RunStatus::Merged;
+        s.candidates.push(Candidate {
+            index: 0,
+            label: 'A',
+            agent: "a".to_owned(),
+            branch: "b".to_owned(),
+            worktree: PathBuf::from("/w"),
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        let err = s.ensure_can_delete().unwrap_err().to_string();
+        assert!(
+            err.contains("magi fold"),
+            "error must suggest `magi fold`: {err}"
+        );
+
+        // 3. Terminal run with all candidates folded
+        s.candidates[0].folded = true;
+        assert!(s.ensure_can_delete().is_ok());
     }
 }
