@@ -733,18 +733,25 @@ async fn attempt(
         }
     };
 
-    // An unfinished run of this task is carried on, never re-competed. The
-    // candidates are built and paid for, and a fresh competition would race a
-    // second implementation against them: that is what happened when run 01c2
-    // was blocked and the loop immediately started 3cbf on the same task,
-    // duplicating two and a half hours of agent work.
+    // A resumable run of this task is carried on, never re-competed. The
+    // candidates are built and paid for, and a fresh competition races a
+    // second implementation against them.
+    //
+    // Two runs paid for that lesson. Run 01c2 was blocked and the loop
+    // started 3cbf on the same task a moment later, duplicating two and a
+    // half hours of agent work. Then b25f stalled on a judge that timed out
+    // and one that answered with no JSON - `quota: 0`, so nothing the machine
+    // was to blame for - and 4043 started **one second** later, buying three
+    // fresh implementations to reach the same panel. `RunStatus::resumable`
+    // rather than `!done()` is what catches the second case: a stall is
+    // terminal, and its cheap recovery re-asks only the absent seats.
     let unfinished = task
         .runs
         .iter()
         .rev()
         .find(|id| {
             RunState::load(id)
-                .map(|s| !s.status.done())
+                .map(|s| s.status.resumable())
                 .unwrap_or(false)
         })
         .cloned();
