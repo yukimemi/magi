@@ -1319,7 +1319,24 @@ fn doctor_queue_and_loop(home: &Path) -> String {
     // heartbeat this build calls fresh must never disagree with what the web
     // UI or the daemon's own log already said about the same file.
     let now = jiff::Timestamp::now();
-    match daemon::read_status(home) {
+    let status = daemon::read_status(home);
+    let alive = status.as_ref().is_some_and(|s| s.running(now));
+
+    if running > 0 && !alive {
+        // Worse than held, and easier to miss: nothing will ever settle these.
+        // The loop only offers itself runnable tasks, and `running` is not one
+        // of them, so a task whose daemon was killed mid-competition sits
+        // there forever while the summary above cheerfully counts it as work
+        // in progress.
+        let _ = writeln!(
+            s,
+            "orphaned   {running} task{} left running by a daemon that is gone — \
+             `magi task release` to try again, `magi task rm` to drop",
+            if running == 1 { "" } else { "s" }
+        );
+    }
+
+    match &status {
         Some(status) if status.running(now) => {
             match status.pid {
                 Some(pid) => {
@@ -1440,6 +1457,42 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("loop       not running"), "{text}");
+    }
+
+    #[test]
+    fn a_task_left_running_by_a_dead_daemon_is_called_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = magi::queue::Task::new(
+            "port the retry logic".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("/repo"),
+            magi::queue::Source::Human,
+        );
+        t.start("20260903-080619-01c2".to_owned());
+        q.put(&mut t).unwrap();
+
+        // No daemon at all: the task can only be sitting there.
+        let orphaned = doctor_queue_and_loop(dir.path());
+        assert!(
+            orphaned.contains("orphaned   1 task left running"),
+            "{orphaned}"
+        );
+        assert!(
+            orphaned.contains("magi task release"),
+            "the report must name the way out: {orphaned}"
+        );
+
+        // A live daemon working on it is ordinary progress, not an orphan.
+        let mut beat = daemon::Status::new();
+        beat.current = Some(daemon::Current {
+            task: t.id.clone(),
+            run: "20260903-080619-01c2".to_owned(),
+        });
+        beat.updated_at = jiff::Timestamp::now();
+        daemon::write_status_to(&dir.path().join("daemon.json"), &beat).unwrap();
+        let working = doctor_queue_and_loop(dir.path());
+        assert!(!working.contains("orphaned"), "{working}");
     }
 
     #[test]
