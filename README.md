@@ -480,6 +480,13 @@ repository states its own. Naming the same array in two layers is an error that
 names both files, rather than a roster you did not ask for and are paying for.
 `magi doctor` prints what actually resolved.
 
+It also names the states nothing will move on its own: tasks **held** for a
+person, and tasks left **running** by a daemon that is no longer alive. The
+second is the one worth having a line for — the loop only ever offers itself
+runnable tasks, and `running` is not one, so a competition interrupted by a
+killed daemon leaves its task sitting there forever while the summary counts
+it as work in progress.
+
 The full surface:
 
 ```toml
