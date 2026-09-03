@@ -804,6 +804,14 @@ fetched.
   resume is offered first, and the fold's confirmation says the run can no
   longer be resumed. A resume that has nothing left to continue from is
   disabled with that sentence rather than left to fail on tap.
+- **A refresh must never navigate.** `loadChat` opened by assigning
+  `state.chatDetail`, which made every refresh a navigation: with a turn in
+  flight, `tickWait`'s ten-second insurance refreshes the *waiting*
+  conversation whatever the operator is reading, so the transcript on screen
+  was replaced by a different one every ten seconds while the address bar went
+  on naming the chosen conversation. Only `applyRoute` and an explicitly
+  started interview choose what is displayed. A loader that finds its subject
+  off screen settles whatever bookkeeping it owes and then returns.
 - **Anything that spends agent calls answers 202 and runs in the background.**
   `say` and `resume` both take minutes; a held connection on a phone is a coin
   flip, and the change stream is how every other moving part reports itself.
