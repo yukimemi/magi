@@ -111,6 +111,7 @@ magi fold --all               # remove a run's worktrees and branches
 magi self-update              # or let the background check tell you
 magi task add "port the retry logic to the uploader"
 magi task list                # the backlog `magi serve` drains
+magi task done <id>           # work that landed some other way
 magi serve                    # run the queue unattended
 magi web                      # the phone UI, over Tailscale
 magi plan "rework the config loader"   # interview, then file the task it writes
@@ -191,7 +192,13 @@ burn on the agent-CLI quota that is the real constraint.
 | `magi task list` | the backlog, newest first |
 | `magi task show <id>` | one task in full |
 | `magi task hold` / `release` | park work, or give it a real second chance |
+| `magi task done` | mark it finished, for work that landed by a route the loop did not see |
 | `magi task rm` | delete it |
+
+`done` and `release` are one keystroke apart and do opposite things. Reach for
+`done` when the work is already in `main` — merged by hand, or merged by a run
+that recorded its own merge as a failure. `release` would put the task back in
+line and pay for the whole competition again to redo it.
 
 ### Agents file their own work
 
