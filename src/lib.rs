@@ -30,6 +30,7 @@ pub mod daemon;
 pub mod git;
 pub mod graph;
 pub mod land;
+pub mod md;
 pub mod plan;
 pub mod prompt;
 pub mod queue;

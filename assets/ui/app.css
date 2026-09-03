@@ -759,23 +759,54 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .answer-label { font-size: var(--t1); font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
 .answer-text { font-size: var(--t4); font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
 
-/* ---- markdown-ish ------------------------------------------------------ *
- * A question detail is agent prose and will contain fenced blocks and code
- * spans. It is parsed into nodes below in app.js and never assigned as
- * markup, so a fence containing a script tag renders as the characters of a
- * script tag. */
+/* ---- markdown ------------------------------------------------------------
+ * GFM markdown - a question's detail, a chat's agent turn, a run or task
+ * instruction, a chat's draft - is parsed into a node tree server-side
+ * (`magi::md`) and turned into these elements by `buildMd` in app.js. Never
+ * assigned as markup: a fence containing a script tag renders as the
+ * characters of a script tag. */
 .md { display: flex; flex-direction: column; gap: var(--s2); font-size: var(--t3); color: var(--ink-2); }
 .md p { overflow-wrap: anywhere; }
-.md h4 { margin: var(--s1) 0 0; font-size: var(--t3); font-weight: 700; color: var(--ink); }
-.md ul { display: flex; flex-direction: column; gap: var(--s1); padding-left: var(--s4); }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
+  margin: var(--s1) 0 0; font-weight: 700; color: var(--ink); overflow-wrap: anywhere;
+}
+.md h1 { font-size: var(--t6); }
+.md h2 { font-size: var(--t5); }
+.md h3 { font-size: var(--t4); }
+.md h4, .md h5, .md h6 { font-size: var(--t3); }
+.md ul, .md ol { display: flex; flex-direction: column; gap: var(--s1); padding-left: var(--s4); }
+.md ol { list-style: decimal; }
+.md ul { list-style: none; }
 .md li { position: relative; overflow-wrap: anywhere; }
-.md li::before { content: "\2013"; position: absolute; left: calc(-1 * var(--s4)); color: var(--ink-3); }
+.md ul > li::before { content: "\2013"; position: absolute; left: calc(-1 * var(--s4)); color: var(--ink-3); }
+.md li.task {
+  list-style: none; display: flex; align-items: flex-start; gap: var(--s2);
+  margin-left: calc(-1 * var(--s4));
+}
+.md li.task::before { content: none; }
+.md li.task > input[type="checkbox"] { margin-top: 4px; accent-color: var(--teal); flex: none; }
+.md blockquote {
+  margin: 0; padding: var(--s1) var(--s3);
+  border-left: 3px solid var(--line-2);
+  color: var(--ink-2); font-style: italic;
+}
+.md hr { border: 0; border-top: 1px solid var(--line); margin: var(--s1) 0; }
+.md strong { color: var(--ink); font-weight: 700; }
+.md em { font-style: italic; }
+.md s { color: var(--ink-3); text-decoration-color: var(--ink-3); }
+.md a {
+  color: var(--blue); text-decoration: underline;
+  text-decoration-color: var(--line-2); text-underline-offset: 3px;
+  overflow-wrap: anywhere;
+}
+.md img { max-width: 100%; height: auto; border-radius: var(--radius-sm); display: block; }
 .md code {
   font-family: var(--mono); font-size: .92em;
   background: var(--sunk); border: 1px solid var(--line); border-radius: 4px;
   padding: 0 4px; overflow-wrap: anywhere;
 }
 .md pre {
+  position: relative;
   margin: 0; padding: var(--s3);
   background: var(--sunk); border-radius: var(--radius-sm);
   font-family: var(--mono); font-size: var(--t1); line-height: 1.5; color: var(--ink);
@@ -783,6 +814,29 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   -webkit-overflow-scrolling: touch;
 }
 .md pre code { padding: 0; border: 0; background: none; font-size: inherit; }
+/* The fence's info string, carried through as a label only - magi adds no
+   syntax highlighting dependency, so this names the language without
+   colouring a single token of it. */
+.md pre[data-lang]::before {
+  content: attr(data-lang);
+  position: absolute; top: var(--s2); right: var(--s3);
+  font-family: var(--sans); font-size: var(--t1); font-weight: 700;
+  letter-spacing: .04em; text-transform: uppercase; color: var(--ink-3);
+}
+
+/* A table can be wider than a 390px screen; it scrolls inside its own frame
+   rather than pushing the page wide. */
+.md .table-scroll {
+  overflow-x: auto; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+}
+.md table { border-collapse: collapse; width: 100%; min-width: max-content; font-size: var(--t3); }
+.md th, .md td { padding: var(--s2) var(--s3); border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+.md tr:last-child > td { border-bottom: 0; }
+.md th { background: var(--sunk); color: var(--ink); font-weight: 700; }
+.md td { color: var(--ink-2); }
+.md th[data-align="center"], .md td[data-align="center"] { text-align: center; }
+.md th[data-align="right"], .md td[data-align="right"] { text-align: right; }
 
 /* ---- panels (run detail) ----------------------------------------------- */
 .panel {
@@ -1223,8 +1277,13 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 .say textarea { margin-top: 0; flex: 1; min-width: 0; }
 .say .btn { flex: none; }
 
+/* Formatted is the default read of the draft; raw is the exact bytes that
+   would be filed, one tap away, so the toggle sits above both and only ever
+   one of the two is visible. */
+.draft-view-toggle { display: flex; justify-content: flex-end; }
+
 /* The task file, as the file it is: monospace, wrapped rather than scrolled
-   sideways, and readable at 390px. */
+   sideways, and readable at 390px. Shown when the raw view is selected. */
 .draft {
   margin: 0; padding: var(--s3);
   background: var(--sunk); color: var(--ink);

@@ -115,6 +115,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::ask::{Answer, Question, Questions};
 use crate::chat::{Chat, Chats};
 use crate::config::Config;
+use crate::md;
 use crate::queue::{Queue, Source, Task, title_from};
 use crate::run::{RunState, RunStatus};
 use crate::{chat, daemon, report, run};
@@ -1280,13 +1281,35 @@ async fn runs_list(
     .await
 }
 
+/// A run as the detail route hands it to the phone.
+///
+/// The whole state, flattened, plus `instruction_md`: the Task panel renders
+/// the instruction as markdown, and the raw `instruction` field this struct
+/// still carries (unchanged) is what a client wanting the exact bytes reads
+/// instead.
+#[derive(Debug, Serialize)]
+struct RunDetailView {
+    #[serde(flatten)]
+    state: RunState,
+    instruction_md: Vec<md::Node>,
+}
+
+impl From<RunState> for RunDetailView {
+    fn from(state: RunState) -> Self {
+        Self {
+            instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
+            state,
+        }
+    }
+}
+
 async fn run_detail(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
-) -> ApiResult<Json<RunState>> {
+) -> ApiResult<Json<RunDetailView>> {
     blocking(move || {
         let id = resolve_run(&ui.runs, &id)?;
-        Ok(Json(read_run(&ui.runs, &id)?))
+        Ok(Json(RunDetailView::from(read_run(&ui.runs, &id)?)))
     })
     .await
 }
@@ -1344,6 +1367,10 @@ struct TaskView {
     task: Task,
     source_label: String,
     status_str: &'static str,
+    /// The instruction, parsed as markdown, for the Queue card's "Full
+    /// instruction" panel. `task.instruction` is unchanged and still carries
+    /// the raw text.
+    instruction_md: Vec<md::Node>,
 }
 
 impl From<Task> for TaskView {
@@ -1351,6 +1378,7 @@ impl From<Task> for TaskView {
         Self {
             source_label: task.source.label(),
             status_str: task.status.as_str(),
+            instruction_md: md::to_nodes(&task.instruction, &md::ImageBase::None),
             task,
         }
     }
@@ -1630,13 +1658,51 @@ fn resolve_task(queue: &Queue, id: &str) -> ApiResult<String> {
     pick(queue.list().into_iter().map(|t| t.id).collect(), id, "task")
 }
 
+/// A question as the phone reads it.
+///
+/// `detail`, the reasoning an agent wrote, is markdown; `detail_md` is that
+/// text already parsed into a node tree so the client never runs its own
+/// markdown reader over agent-authored prose. A relative image path in it
+/// resolves against this question's own panel asset route, which is the one
+/// place [`md::ImageBase::QuestionPanel`] is used - the panel iframe is a
+/// separate, sandboxed document, but `detail` is rendered inline in the
+/// operator's own page, so an image reference in it may only ever point at
+/// files magi itself already serves for this question.
+#[derive(Debug, Serialize)]
+struct QuestionView {
+    #[serde(flatten)]
+    question: Question,
+    detail_md: Vec<md::Node>,
+}
+
+impl From<Question> for QuestionView {
+    fn from(question: Question) -> Self {
+        let base = md::ImageBase::QuestionPanel {
+            id: question.id.clone(),
+        };
+        Self {
+            detail_md: md::to_nodes(&question.detail, &base),
+            question,
+        }
+    }
+}
+
 /// `GET /api/questions`.
 ///
 /// Everything, not just the open ones: an answered question is the record of a
 /// decision, and the phone is where the operator goes back to check what they
 /// told an agent at 3am. `ask::Questions::list` already ranks open first.
-async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<Question>>> {
-    blocking(move || Ok(Json(ui.questions.list()))).await
+async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<QuestionView>>> {
+    blocking(move || {
+        Ok(Json(
+            ui.questions
+                .list()
+                .into_iter()
+                .map(QuestionView::from)
+                .collect(),
+        ))
+    })
+    .await
 }
 
 /// The body of `POST /api/questions/{id}/answer`.
@@ -1655,7 +1721,7 @@ async fn question_answer(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
     body: std::result::Result<Json<NewAnswer>, axum::extract::rejection::JsonRejection>,
-) -> ApiResult<Json<Question>> {
+) -> ApiResult<Json<QuestionView>> {
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
     let answer = match (body.choice, body.text) {
         (Some(c), None) => Answer::Choice(c),
@@ -1691,7 +1757,7 @@ async fn question_answer(
         // restate them and cannot drift from the CLI's behaviour.
         q.answer(answer).map_err(ApiError::bad_request_from)?;
         ui.questions.put(&mut q)?;
-        Ok(Json(q))
+        Ok(Json(QuestionView::from(q)))
     })
     .await
 }
@@ -1868,6 +1934,41 @@ fn panel_response(content_type: &'static str, download: bool, body: Vec<u8>) -> 
     res
 }
 
+/// A chat as the phone reads it.
+///
+/// Every field of [`Chat`] verbatim, plus the two things `app.js` would
+/// otherwise have to parse itself: `turn_bodies_md`, one markdown node tree
+/// per entry of `turns` in the same order, and `draft_md`, the parsed form of
+/// `draft` when there is one. `turns` and `draft` are untouched - a client
+/// reading the exact bytes a chat turn holds, or the exact bytes that would
+/// be filed as a task, still can.
+#[derive(Debug, Serialize)]
+struct ChatView {
+    #[serde(flatten)]
+    chat: Chat,
+    turn_bodies_md: Vec<Vec<md::Node>>,
+    draft_md: Option<Vec<md::Node>>,
+}
+
+impl From<Chat> for ChatView {
+    fn from(chat: Chat) -> Self {
+        let turn_bodies_md = chat
+            .turns
+            .iter()
+            .map(|turn| md::to_nodes(&turn.body, &md::ImageBase::None))
+            .collect();
+        let draft_md = chat
+            .draft
+            .as_deref()
+            .map(|draft| md::to_nodes(draft, &md::ImageBase::None));
+        Self {
+            turn_bodies_md,
+            draft_md,
+            chat,
+        }
+    }
+}
+
 /// `GET /api/chats`.
 ///
 /// Every interview, open ones first and newest first, which is
@@ -1875,14 +1976,22 @@ fn panel_response(content_type: &'static str, download: bool, body: Vec<u8>) -> 
 /// conversation is a few kilobytes, the phone renders it directly, and a
 /// summary here would mean a second round trip to read the only thing a chat
 /// is made of.
-async fn chats_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<Chat>>> {
-    blocking(move || Ok(Json(ui.chats.list()))).await
+async fn chats_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<ChatView>>> {
+    blocking(move || {
+        Ok(Json(
+            ui.chats.list().into_iter().map(ChatView::from).collect(),
+        ))
+    })
+    .await
 }
 
-async fn chat_detail(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<Json<Chat>> {
+async fn chat_detail(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ChatView>> {
     blocking(move || {
         let id = resolve_chat(&ui.chats, &id)?;
-        Ok(Json(ui.chats.get(&id)?))
+        Ok(Json(ChatView::from(ui.chats.get(&id)?)))
     })
     .await
 }
@@ -1927,7 +2036,7 @@ async fn chat_post(
     let chat = chat::start(&ui.chats, &cfg, repo, &body.idea, body.agent.as_deref())
         .await
         .map_err(ApiError::from)?;
-    Ok((StatusCode::CREATED, Json(chat)))
+    Ok((StatusCode::CREATED, Json(ChatView::from(chat))))
 }
 
 /// The body of `POST /api/chats/{id}/say`.
@@ -1966,7 +2075,7 @@ async fn chat_say(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
     body: std::result::Result<Json<NewTurn>, JsonRejection>,
-) -> ApiResult<(StatusCode, Json<Chat>)> {
+) -> ApiResult<(StatusCode, Json<ChatView>)> {
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
     if body.text.trim().is_empty() {
         return Err(ApiError::bad_request("say something"));
@@ -2034,7 +2143,7 @@ async fn chat_say(
     // 202: the operator's message is recorded and a turn is running. The front
     // end learns the reply from the change stream, the same way it learns
     // everything else.
-    Ok((StatusCode::ACCEPTED, Json(queued)))
+    Ok((StatusCode::ACCEPTED, Json(ChatView::from(queued))))
 }
 
 /// The body of `POST /api/chats/{id}/file`, which the phone sends empty.

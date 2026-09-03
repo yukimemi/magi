@@ -62,6 +62,11 @@ teravars = { version = "0.2.1", features = ["merge"] }
 # `cargo install magi-cli` yields a working phone UI with nothing else to fetch.
 axum = "0.8.9"
 tokio-stream = "0.1.19"
+# GFM markdown -> node tree for the web UI (see `md`). `default-features =
+# false` because the crate's defaults pull in `syntect` for fenced-code
+# syntax highlighting, which magi does not want: a fence is shown as plain
+# text, never colored, so there is nothing for a highlighter to do here.
+comrak = { version = "0.54.0", default-features = false }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
