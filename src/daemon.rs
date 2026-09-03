@@ -342,6 +342,20 @@ pub fn read_status(home: &Path) -> Option<Reading> {
     serde_json::from_str(&body).ok()
 }
 
+/// Whether a live daemon is working on this run at this moment.
+///
+/// One definition, because the CLI and the web UI both gate a deletion on it
+/// and two copies of this rule would eventually disagree about whether the
+/// same run is safe to remove. A stale heartbeat reads as "no daemon": that is
+/// [`Reading::running`]'s judgement, and a run left at `implementing` by a
+/// killed daemon is a leftover record rather than work in progress.
+#[must_use]
+pub fn is_working_on(home: &Path, run: &str, now: Timestamp) -> bool {
+    read_status(home).is_some_and(|reading| {
+        reading.running(now) && reading.current.is_some_and(|c| c.run == run)
+    })
+}
+
 /// Remove claim files older than `older_than` and return the task ids swept.
 ///
 /// A daemon killed with `SIGKILL` never runs [`crate::queue::Claim`]'s
@@ -392,6 +406,7 @@ pub fn sweep_stale_claims(queue: &Queue, older_than: Duration) -> Vec<String> {
 /// |-----------------------|---------------------|---------------|
 /// | `Merged`, `Ready`     | `Done`              | yes           |
 /// | `Stalled`             | `Failed` (requeued) | **no**        |
+/// | `Blocked` with a PR   | `Held`              | yes           |
 /// | `Blocked`, `Failed`   | `Failed`, or `Held` | yes           |
 /// | anything non-terminal | `Failed`, or `Held` | yes           |
 ///
@@ -400,10 +415,20 @@ pub fn sweep_stale_claims(queue: &Queue, older_than: Duration) -> Vec<String> {
 /// an attempt. A non-terminal status means `execute` returned while the graph
 /// was still mid-flight, which is a bug rather than a verdict; it is treated as
 /// a failure so that a task cannot loop on it forever.
-pub fn settle(task: &mut Task, status: RunStatus, detail: &str, max_attempts: usize) {
+///
+/// `left_pr` splits the `Blocked` row, and it is the difference between a run
+/// that failed and a run that finished into a gate. See [`Task::handed_off`].
+pub fn settle(
+    task: &mut Task,
+    status: RunStatus,
+    detail: &str,
+    max_attempts: usize,
+    left_pr: bool,
+) {
     match status {
         RunStatus::Merged | RunStatus::Ready => task.succeed(),
         RunStatus::Stalled => task.stall(detail),
+        RunStatus::Blocked if left_pr => task.handed_off(detail),
         RunStatus::Blocked | RunStatus::Failed => task.fail(detail, max_attempts),
         other => task.fail(
             format!(
@@ -641,7 +666,16 @@ async fn attempt(opts: &Opts, queue: &Queue, status: &Arc<Mutex<Status>>, task: 
         Ok(()) => describe(&runner.state),
         Err(e) => format!("{e:#}"),
     };
-    settle(task, runner.state.status, &detail, opts.max_attempts);
+    // A run that opened a pull request handed its work over, whatever the
+    // gate then decided about merging it.
+    let left_pr = runner.state.pr.is_some();
+    settle(
+        task,
+        runner.state.status,
+        &detail,
+        opts.max_attempts,
+        left_pr,
+    );
     record(queue, task);
     tracing::info!(
         "task {} is {} after run {} ({})",
@@ -795,7 +829,7 @@ mod tests {
         for (run, want, attempts) in table {
             let mut t = task();
             t.start("20260902-000000-aaaa".to_owned());
-            settle(&mut t, run, "why", 2);
+            settle(&mut t, run, "why", 2, false);
             assert_eq!(t.status, want, "task status after {}", label(run));
             assert_eq!(t.attempts, attempts, "attempts after {}", label(run));
         }
@@ -805,7 +839,7 @@ mod tests {
     fn a_quota_stall_costs_the_task_no_attempt_but_a_block_does() {
         let mut stalled = task();
         stalled.start("20260902-000000-aaaa".to_owned());
-        settle(&mut stalled, RunStatus::Stalled, "quota", 1);
+        settle(&mut stalled, RunStatus::Stalled, "quota", 1, false);
         assert_eq!(stalled.attempts, 0);
         assert!(
             stalled.status.runnable(),
@@ -814,13 +848,56 @@ mod tests {
 
         let mut blocked = task();
         blocked.start("20260902-000000-aaaa".to_owned());
-        settle(&mut blocked, RunStatus::Blocked, "findings open", 1);
+        settle(&mut blocked, RunStatus::Blocked, "findings open", 1, false);
         assert_eq!(blocked.attempts, 1);
         assert_eq!(
             blocked.status,
             TaskStatus::Held,
             "the last attempt hands the task to a human"
         );
+    }
+
+    #[test]
+    fn a_run_that_opened_a_pull_request_is_never_re_competed() {
+        // Attempts to spare: without the pull request this task would go
+        // straight back in line and run the whole competition again.
+        let mut delivered = task();
+        delivered.start("20260903-080619-01c2".to_owned());
+        settle(
+            &mut delivered,
+            RunStatus::Blocked,
+            "no check status",
+            4,
+            true,
+        );
+        assert_eq!(
+            delivered.status,
+            TaskStatus::Held,
+            "a pull request waiting on CI or a person is not a retryable failure"
+        );
+        assert!(
+            !delivered.status.runnable(),
+            "the loop must not pick this task up again"
+        );
+        assert_eq!(
+            delivered.last_error.as_deref(),
+            Some("no check status"),
+            "the operator needs to be told what the gate was waiting for"
+        );
+
+        // The same status without a pull request is a plain failure, and with
+        // attempts left it is retried.
+        let mut empty_handed = task();
+        empty_handed.start("20260903-080619-01c2".to_owned());
+        settle(
+            &mut empty_handed,
+            RunStatus::Blocked,
+            "findings open",
+            4,
+            false,
+        );
+        assert_eq!(empty_handed.status, TaskStatus::Failed);
+        assert!(empty_handed.status.runnable());
     }
 
     #[test]
@@ -971,6 +1048,40 @@ mod tests {
         write_status_to(&dir.path().join("daemon.json"), &status).unwrap();
         let fresh = read_status(dir.path()).unwrap();
         assert!(fresh.running(Timestamp::now()));
+    }
+
+    #[test]
+    fn only_a_live_daemon_on_this_very_run_counts_as_working_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Timestamp::now();
+        let mine = "20260903-080619-01c2";
+
+        assert!(
+            !is_working_on(dir.path(), mine, now),
+            "no status file means nobody is working on anything"
+        );
+
+        let mut status = Status::new();
+        status.current = Some(Current {
+            task: "20260903-080340-0167".to_owned(),
+            run: mine.to_owned(),
+        });
+        status.updated_at = now;
+        write_status_to(&dir.path().join("daemon.json"), &status).unwrap();
+        assert!(is_working_on(dir.path(), mine, now));
+        assert!(
+            !is_working_on(dir.path(), "20260903-105039-3cbf", now),
+            "a daemon busy with one run is not working on another"
+        );
+
+        // A killed daemon stops writing heartbeats but leaves the file behind
+        // naming the run it died in. That run must not be undeletable forever.
+        status.updated_at = now - jiff::SignedDuration::from_secs(600);
+        write_status_to(&dir.path().join("daemon.json"), &status).unwrap();
+        assert!(
+            !is_working_on(dir.path(), mine, now),
+            "a stale heartbeat is a dead daemon, so its run is a leftover"
+        );
     }
 
     #[test]

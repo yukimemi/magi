@@ -215,6 +215,22 @@ impl Task {
         self.status = TaskStatus::Held;
     }
 
+    /// Record a run that produced a pull request without merging it.
+    ///
+    /// The task is held rather than retried, and it costs no further attempt
+    /// either way. The work the task asked for exists: it is sitting on a
+    /// branch, in a pull request, waiting for CI or for a person. Retrying
+    /// would spend the whole competition budget a second time and then race a
+    /// second branch against the pull request the first one opened - which is
+    /// exactly what happened to run 01c2, whose finished and green pull request
+    /// was re-competed from scratch four seconds after it opened.
+    ///
+    /// A pull request nobody merged is a request for a person, not a failure.
+    pub fn handed_off(&mut self, why: impl Into<String>) {
+        self.last_error = Some(why.into());
+        self.status = TaskStatus::Held;
+    }
+
     /// Put a held or finished task back in line, with its attempt count reset
     /// so a release is a real second chance rather than an instant re-hold.
     /// The run history is kept: attempts reset, evidence does not.

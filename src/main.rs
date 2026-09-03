@@ -467,6 +467,70 @@ fn spawn_update_check(command: &Command) -> Option<updater::Pending> {
     updater::spawn(&cfg.update, &tokio::runtime::Handle::current())
 }
 
+/// Every word clap accepts as a subcommand, at any depth, including aliases.
+///
+/// Read off the parser rather than listed by hand: a hand-written copy would
+/// be one refactor away from disagreeing with the command it is meant to
+/// describe, and a guard that silently stops guarding is worse than none.
+fn subcommand_words() -> std::collections::BTreeSet<String> {
+    fn walk(cmd: &clap::Command, into: &mut std::collections::BTreeSet<String>) {
+        for sub in cmd.get_subcommands() {
+            into.insert(sub.get_name().to_owned());
+            for alias in sub.get_all_aliases() {
+                into.insert(alias.to_owned());
+            }
+            walk(sub, into);
+        }
+    }
+    let mut words = std::collections::BTreeSet::new();
+    walk(&<Cli as clap::CommandFactory>::command(), &mut words);
+    words
+}
+
+/// Refuse an instruction that is really a mistyped command, and say how to
+/// insist.
+///
+/// `magi run show 3cbf` reads like a query and is not one: there is no `run
+/// show`, so every word becomes the task, and magi opens worktrees and starts
+/// paying agents to implement the sentence "show 3cbf". That happened twice in
+/// one morning - once to an agent verifying its own change to this very
+/// argument parsing, which is how a run nobody asked for came to exist, and
+/// once to the operator.
+///
+/// The rule is deliberately blunt: a first word that names any subcommand is a
+/// typo unless the caller wrote `--`. It costs a legitimate instruction like
+/// "add retries to the client" one extra token, and it costs a mistyped
+/// command nothing at all instead of a full competition.
+fn mistyped_command(
+    instruction: &[String],
+    separator: bool,
+    words: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    if separator {
+        return None;
+    }
+    let first = instruction.first()?;
+    if !words.contains(first.as_str()) {
+        return None;
+    }
+    Some(format!(
+        "`{first}` names a magi subcommand, so `magi run {}` looks like a \
+         mistyped command rather than a task, and starting a competition for \
+         it would cost real agent calls. Write `magi run -- {}` to mean it \
+         literally.",
+        instruction.join(" "),
+        instruction.join(" ")
+    ))
+}
+
+/// Whether the caller wrote a literal `--` separator.
+///
+/// clap consumes it and `ArgMatches` cannot be asked about it afterwards, so
+/// the raw argv is the only place the answer still exists.
+fn had_separator() -> bool {
+    std::env::args_os().any(|arg| arg == "--")
+}
+
 async fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::Run {
@@ -495,6 +559,10 @@ async fn dispatch(command: Command) -> Result<()> {
                 }
                 None => (instruction, opts),
             };
+            if let Some(why) = mistyped_command(&instruction, had_separator(), &subcommand_words())
+            {
+                bail!(why);
+            }
             let repo = opts.repo.unwrap_or_else(|| PathBuf::from("."));
             let mut runner = if let Some(id) = resume {
                 let runner = Runner::resume(&id)?;
@@ -1060,7 +1128,9 @@ async fn task_cmd(command: TaskCmd) -> Result<()> {
 fn run_rm_cmd(id: &str) -> Result<()> {
     let resolved = resolve_id(id)?;
     let state = RunState::load(&resolved)?;
-    state.ensure_can_delete()?;
+    let in_flight =
+        magi::daemon::is_working_on(&magi::run::home(), &resolved, jiff::Timestamp::now());
+    state.ensure_can_delete(in_flight)?;
     let dir = magi::run::run_dir(&resolved);
     std::fs::remove_dir_all(&dir)
         .with_context(|| format!("remove run directory {}", dir.display()))?;
@@ -1429,6 +1499,40 @@ mod tests {
     }
 
     #[test]
+    fn a_mistyped_subcommand_never_becomes_a_task() {
+        let words = subcommand_words();
+        // The words that actually bit: `run show` does not exist, so every
+        // word became the instruction and a competition started.
+        assert!(
+            words.contains("show"),
+            "the guard reads clap's own commands"
+        );
+        assert!(words.contains("rm"));
+        assert!(words.contains("task"));
+
+        let typo: Vec<String> = ["show", "3cbf"].iter().map(|s| (*s).to_owned()).collect();
+        let why = mistyped_command(&typo, false, &words).expect("refused");
+        assert!(why.contains("`show` names a magi subcommand"), "{why}");
+        assert!(
+            why.contains("magi run -- show 3cbf"),
+            "the error must show the way through: {why}"
+        );
+
+        // `--` is the way through, and it is honoured.
+        assert!(mistyped_command(&typo, true, &words).is_none());
+
+        // A real instruction is untouched, whatever it says about runs.
+        let real: Vec<String> = "delete the runs nobody wants any more"
+            .split(' ')
+            .map(ToOwned::to_owned)
+            .collect();
+        assert!(mistyped_command(&real, false, &words).is_none());
+
+        // Nothing to run is not this guard's business; clap already says so.
+        assert!(mistyped_command(&[], false, &words).is_none());
+    }
+
+    #[test]
     fn run_rm_cli_argument_parsing() {
         // 1. magi run rm <id> succeeds and parses id
         let parsed = Cli::try_parse_from(["magi", "run", "rm", "20260902-140501-a1b2"]).unwrap();
@@ -1540,9 +1644,12 @@ mod tests {
     #[test]
     fn run_rm_cmd_guards_and_removes() {
         let dir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("MAGI_HOME", dir.path());
-        }
+        // `set_home` rather than setting `MAGI_HOME`: this binary runs its
+        // tests as threads in one process, and an environment variable written
+        // from a test is read by every other thread - including the ones that
+        // already resolved the operator's real data directory. The pin is the
+        // mechanism `run::home` documents for exactly this.
+        magi::run::set_home(dir.path().to_path_buf());
         let runs = dir.path().join("runs");
         std::fs::create_dir_all(&runs).unwrap();
 
@@ -1565,9 +1672,20 @@ mod tests {
         )
         .unwrap();
 
+        // A heartbeat naming this run is what makes it refusable: an
+        // unfinished run with no live daemon behind it is a leftover from a
+        // killed process, and deleting those is the point of the command.
+        let mut beat = magi::daemon::Status::new();
+        beat.current = Some(magi::daemon::Current {
+            task: "20260901-000000-task".to_owned(),
+            run: run_running.to_owned(),
+        });
+        beat.updated_at = jiff::Timestamp::now();
+        magi::daemon::write_status_to(&dir.path().join("daemon.json"), &beat).unwrap();
+
         let err = run_rm_cmd(run_running).unwrap_err().to_string();
-        assert!(err.contains("still running"), "{err}");
-        assert!(dir_rung.exists(), "running run must be kept");
+        assert!(err.contains("live daemon"), "{err}");
+        assert!(dir_rung.exists(), "a run in flight must be kept");
 
         // 2. Unfolded run fails to delete and suggests magi fold
         let run_unfolded = "20260901-000000-unfd";

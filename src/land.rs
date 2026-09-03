@@ -66,6 +66,19 @@ pub const POLL: Duration = Duration::from_secs(30);
 /// and all of which a person needs to see.
 pub const WAIT_CEILING: Duration = Duration::from_secs(45 * 60);
 
+/// How long the checks may stay unreadable before landing gives up on them.
+///
+/// GitHub registers a workflow run some seconds after the branch is pushed, so
+/// immediately after a pull request is opened "no checks" and "no CI in this
+/// repository" look identical. Measured on run 01c2: magi opened pull request
+/// 22, read `unknown` four seconds later, refused to merge on a guess and
+/// marked the run blocked - and every check on that pull request was green
+/// minutes afterwards, with the whole competition then re-run from scratch for
+/// a task that was already finished. Three minutes is well past the observed
+/// registration delay and still bounded, so a repository that genuinely has no
+/// checks costs one three-minute wait and then says so.
+pub const CHECKS_GRACE: Duration = Duration::from_secs(3 * 60);
+
 /// Bytes of failing log kept per check. The fixer needs the assertion and the
 /// frame around it, not the forty thousand lines of `cargo` output above it.
 const LOG_TAIL: usize = 4_000;
@@ -212,7 +225,11 @@ pub enum Step {
 ///    address half - the fix pushes and restarts the whole suite anyway.
 /// 3. **Comments outrank green.** An unresolved comment holds the merge even
 ///    when CI is happy; that is what a review is for.
-pub fn decide(pr: &PrState, round: usize, budget: usize) -> Step {
+/// 4. **Unreadable is not absent.** Checks that cannot be read yet are waited
+///    on for [`CHECKS_GRACE`], because a pull request opened a moment ago has
+///    not been given its workflow runs yet. Past the grace they are treated as
+///    genuinely missing and magi stops rather than merge on a guess.
+pub fn decide(pr: &PrState, round: usize, budget: usize, waited: Duration) -> Step {
     match pr.state {
         PrLifecycle::Merged => return Step::Done { merged: true },
         PrLifecycle::Closed => return Step::Done { merged: false },
@@ -222,9 +239,13 @@ pub fn decide(pr: &PrState, round: usize, budget: usize) -> Step {
     let spent = round >= budget;
     match pr.checks {
         Checks::Pending => Step::Wait,
+        Checks::Unknown if waited < CHECKS_GRACE => Step::Wait,
         Checks::Unknown => Step::GiveUp {
-            reason: "no check status is readable on the pull request; refusing to merge on a guess"
-                .to_owned(),
+            reason: format!(
+                "no check status is readable on the pull request after {} minute(s); \
+                 refusing to merge on a guess",
+                CHECKS_GRACE.as_secs() / 60
+            ),
         },
         Checks::Red => {
             let what = format!(
@@ -1122,7 +1143,7 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
         });
         state.save()?;
 
-        match decide(&pr, round, budget) {
+        match decide(&pr, round, budget, waited) {
             Step::Wait => {
                 if waited >= WAIT_CEILING {
                     let why = format!(
@@ -2082,7 +2103,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             "the only comment is CodeRabbit's trigger notice: {:?}",
             state.review_comments
         );
-        assert_eq!(decide(&state, 0, 4), Step::Merge);
+        assert_eq!(decide(&state, 0, 4, Duration::ZERO), Step::Merge);
     }
 
     #[test]
@@ -2090,7 +2111,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let state = parse_pr(RED_OPEN).expect("red fixture parses");
         assert_eq!(state.checks, Checks::Red);
         assert_eq!(state.failing, vec!["editorconfig".to_owned()]);
-        match decide(&state, 0, 4) {
+        match decide(&state, 0, 4, Duration::ZERO) {
             Step::Fix { reason } => {
                 assert!(reason.contains("editorconfig"), "reason: {reason}");
                 assert!(reason.contains("failing"), "reason: {reason}");
@@ -2103,14 +2124,17 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     fn a_check_still_running_parses_as_pending_and_is_waited_for() {
         let state = parse_pr(PENDING_OPEN).expect("pending fixture parses");
         assert_eq!(state.checks, Checks::Pending);
-        assert_eq!(decide(&state, 0, 4), Step::Wait);
+        assert_eq!(decide(&state, 0, 4, Duration::ZERO), Step::Wait);
     }
 
     #[test]
     fn a_pull_request_merged_underneath_us_is_done_rather_than_a_failure() {
         let state = parse_pr(MERGED).expect("merged fixture parses");
         assert_eq!(state.state, PrLifecycle::Merged);
-        assert_eq!(decide(&state, 0, 4), Step::Done { merged: true });
+        assert_eq!(
+            decide(&state, 0, 4, Duration::ZERO),
+            Step::Done { merged: true }
+        );
     }
 
     #[test]
@@ -2127,7 +2151,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             vec!["claude"],
             "CodeRabbit's walkthrough is machinery; Claude's review is a finding"
         );
-        match decide(&state, 0, 4) {
+        match decide(&state, 0, 4, Duration::ZERO) {
             Step::Fix { reason } => assert!(reason.contains("unresolved"), "reason: {reason}"),
             other => panic!("expected a fix round, got {other:?}"),
         }
@@ -2166,7 +2190,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             body: CODERABBIT_TRIGGER.to_owned(),
         });
         clean.review_comments.retain(|c| !is_noise(&c.body));
-        assert_eq!(decide(&clean, 0, 4), Step::Merge);
+        assert_eq!(decide(&clean, 0, 4, Duration::ZERO), Step::Merge);
 
         let mut found = pr(Checks::Green, &[], 0);
         found.review_comments.push(ReviewComment {
@@ -2176,17 +2200,21 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             body: CLAUDE_FINDING.to_owned(),
         });
         found.review_comments.retain(|c| !is_noise(&c.body));
-        assert!(matches!(decide(&found, 0, 4), Step::Fix { .. }));
+        assert!(matches!(
+            decide(&found, 0, 4, Duration::ZERO),
+            Step::Fix { .. }
+        ));
     }
 
     #[test]
     fn the_policy_table_holds_for_every_combination_that_matters() {
-        let cases: Vec<(&str, PrState, usize, usize, Step)> = vec![
+        let cases: Vec<(&str, PrState, usize, usize, Duration, Step)> = vec![
             (
                 "pending checks are waited for, even on the last round",
                 pr(Checks::Pending, &[], 0),
                 4,
                 4,
+                Duration::ZERO,
                 Step::Wait,
             ),
             (
@@ -2194,6 +2222,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 pr(Checks::Red, &["editorconfig"], 0),
                 0,
                 4,
+                Duration::ZERO,
                 Step::Fix {
                     reason: "1 check(s) failing: editorconfig".to_owned(),
                 },
@@ -2203,6 +2232,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 pr(Checks::Green, &[], 2),
                 1,
                 4,
+                Duration::ZERO,
                 Step::Fix {
                     reason: "checks are green but 2 review comment(s) are unresolved: coderabbitai"
                         .to_owned(),
@@ -2213,22 +2243,32 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 pr(Checks::Green, &[], 0),
                 3,
                 4,
+                Duration::ZERO,
                 Step::Merge,
             ),
             (
-                "an unreadable rollup is never merged",
+                "an unreadable rollup is waited on while the grace lasts",
                 pr(Checks::Unknown, &[], 0),
                 0,
                 4,
+                Duration::ZERO,
+                Step::Wait,
+            ),
+            (
+                "an unreadable rollup is never merged once the grace is spent",
+                pr(Checks::Unknown, &[], 0),
+                0,
+                4,
+                CHECKS_GRACE,
                 Step::GiveUp {
-                    reason: "no check status is readable on the pull request; refusing to merge \
-                             on a guess"
+                    reason: "no check status is readable on the pull request after 3 minute(s); \
+                             refusing to merge on a guess"
                         .to_owned(),
                 },
             ),
         ];
-        for (what, state, round, budget, want) in cases {
-            assert_eq!(decide(&state, round, budget), want, "{what}");
+        for (what, state, round, budget, waited, want) in cases {
+            assert_eq!(decide(&state, round, budget, waited), want, "{what}");
         }
     }
 
@@ -2237,7 +2277,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let mut state = pr(Checks::Red, &["editorconfig"], 3);
         state.state = PrLifecycle::Closed;
         assert_eq!(
-            decide(&state, 0, 4),
+            decide(&state, 0, 4, Duration::ZERO),
             Step::Done { merged: false },
             "a human closing the pull request ends the loop, whatever CI says"
         );
@@ -2245,7 +2285,12 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
 
     #[test]
     fn the_last_round_gives_up_with_a_reason_naming_what_is_still_failing() {
-        let red = decide(&pr(Checks::Red, &["editorconfig", "test (macos)"], 0), 4, 4);
+        let red = decide(
+            &pr(Checks::Red, &["editorconfig", "test (macos)"], 0),
+            4,
+            4,
+            Duration::ZERO,
+        );
         match red {
             Step::GiveUp { reason } => {
                 assert!(reason.contains("editorconfig"), "reason: {reason}");
@@ -2255,7 +2300,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             other => panic!("expected a give-up, got {other:?}"),
         }
 
-        let commented = decide(&pr(Checks::Green, &[], 1), 2, 2);
+        let commented = decide(&pr(Checks::Green, &[], 1), 2, 2, Duration::ZERO);
         match commented {
             Step::GiveUp { reason } => {
                 assert!(reason.contains("unresolved"), "reason: {reason}");

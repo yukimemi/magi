@@ -117,6 +117,12 @@ magi plan "rework the config loader"   # interview, then file the task it writes
 magi answer                   # what an agent is waiting to hear from you
 ```
 
+`magi run` starts spending money, so an instruction whose first word names a
+subcommand is refused as a probable typo: there is no `magi run show`, and
+without the guard `magi run show 3cbf` opens worktrees and pays agents to
+implement the sentence "show 3cbf". Write `magi run -- show 3cbf` when that is
+genuinely the task.
+
 A run branches off the **base branch's tip**, not off your working copy, so it
 starts whether or not you have uncommitted work — and that work is not part of
 the competition. `magi serve` would otherwise decline every task for as long as
@@ -360,6 +366,14 @@ It **never force-merges**: out of rounds leaves the pull request open with a
 comment saying what is still failing, and `checks: unknown` — no signal at all —
 never merges either.
 
+A pull request opened a second ago has no checks yet, and "not yet" is
+indistinguishable from "this repository has no CI". So magi waits three minutes
+for the checks to appear before believing there are none. Whatever it then
+decides, a run that got as far as opening a pull request is never re-competed:
+the task is **held** with the reason, because the implementation exists and is
+waiting on CI or on you. Retrying would race a second branch against your open
+pull request and spend the whole competition budget again.
+
 ## Project conventions in the prompts
 
 ```toml
@@ -398,9 +412,29 @@ It is still one binary. The interface is three files compiled in with
 fetched at runtime. `cargo install magi-cli` gives you the phone UI too.
 
 You can watch runs, read the full report, browse the queue, hold and release
-tasks, and file new work from the compose form. You cannot delete a run or fold
-a worktree: same reasoning as the terminal deck, one tap from browsing is the
-wrong place for a destructive key.
+tasks, file new work from the compose form, and delete a task or a finished run
+that is no longer wanted. Deletion is guarded rather than hidden: a task the
+daemon is holding a claim on, and a run a live daemon is working on right now,
+are refused with the reason. So is any run whose candidate worktrees have not
+been folded — that is the guard that keeps "delete" meaning "remove a record"
+rather than "throw away a worktree". A run left unfinished by a killed daemon
+is a leftover, not work in progress, and can be removed once it is folded.
+
+**The loop runs inside `magi web`.** `GET /api/loop` reports whether it is
+running and who owns it; `POST /api/loop {"running": true|false}` starts and
+stops it. Only the process serving the page can control its own loop — a loop
+started elsewhere is reported with the owning pid and both calls are refused,
+because a button that silently did nothing would be worse than a refusal, and
+two loops on one queue race for the same claims and bill the agent quota twice.
+
+Answering an interview turn returns **202** immediately and runs the agent in
+the background: a turn takes twenty to ninety seconds, and a phone that walks
+behind a wall while the request is open loses the answer the server had already
+produced. The operator's turn is persisted before the response returns, so the
+transcript is never missing what you actually said.
+
+Every list is ordered by creation, never by last activity. A list that reorders
+itself while you are reading it moves the row out from under your thumb.
 
 ## Configuration
 
@@ -481,6 +515,8 @@ max_parallel = 4
 language = "en"          # prose language for the agents; "ja" etc.
 sessions = true
 timeout_implement = 3600
+# A re-ask that only has to restate an answer the seat already worked out gets
+# a quarter of these budgets, not the whole one again.
 worktree_root = "~/wt/magi"   # optional
 
 [blind]
