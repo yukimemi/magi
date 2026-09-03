@@ -64,9 +64,17 @@ impl MergeArg {
 #[derive(Debug, Subcommand)]
 enum RunCmd {
     /// Delete a recorded run.
+    ///
+    /// Takes every remaining word, not just one: clap commits to this
+    /// subcommand as soon as it sees the literal token "rm", so an
+    /// instruction that happens to start with "rm" (`magi run rm the dead
+    /// code`) must still parse here rather than erroring out. Dispatch tells
+    /// the two apart by word count — exactly one word is a run id, more than
+    /// one is free-text instruction that starts with "rm".
     Rm {
         /// Run id or unambiguous prefix/suffix.
-        id: String,
+        #[arg(required = true)]
+        id: Vec<String>,
     },
 }
 
@@ -434,11 +442,22 @@ async fn dispatch(command: Command) -> Result<()> {
             seed,
             dry_run,
         } => {
-            if let Some(cmd) = command {
-                return match cmd {
-                    RunCmd::Rm { id } => run_rm_cmd(&id),
-                };
-            }
+            // A single trailing word is a run id: `magi run rm <id>`. More
+            // than one means clap only grabbed "rm" because it matches the
+            // subcommand name — this is really an instruction that starts
+            // with "rm" (`magi run rm the dead code in auth.rs`), so put the
+            // word back and fall through to the normal instruction path.
+            let instruction = match command {
+                Some(RunCmd::Rm { id }) if id.len() == 1 => {
+                    return run_rm_cmd(&id[0]);
+                }
+                Some(RunCmd::Rm { id }) => {
+                    let mut full = vec!["rm".to_owned()];
+                    full.extend(id);
+                    full
+                }
+                None => instruction,
+            };
             let mut runner = if let Some(id) = resume {
                 let runner = Runner::resume(&id)?;
                 println!(
@@ -1374,7 +1393,7 @@ mod tests {
                 command: Some(RunCmd::Rm { id }),
                 ..
             }) => {
-                assert_eq!(id, "20260902-140501-a1b2");
+                assert_eq!(id, vec!["20260902-140501-a1b2"]);
             }
             other => panic!("expected RunCmd::Rm, got {other:?}"),
         }
@@ -1398,6 +1417,21 @@ mod tests {
                 assert_eq!(instruction, vec!["fix", "a", "bug"]);
             }
             other => panic!("expected normal Command::Run, got {other:?}"),
+        }
+
+        // 4. an instruction that merely starts with "rm" must still parse —
+        // clap only recognises the literal token "rm" as the subcommand, it
+        // cannot know in advance that this is prose, not a run id.
+        let parsed_prose =
+            Cli::try_parse_from(["magi", "run", "rm", "this", "is", "a", "task"]).unwrap();
+        match parsed_prose.command {
+            Some(Command::Run {
+                command: Some(RunCmd::Rm { id }),
+                ..
+            }) => {
+                assert_eq!(id, vec!["this", "is", "a", "task"]);
+            }
+            other => panic!("expected RunCmd::Rm carrying the prose, got {other:?}"),
         }
     }
 
