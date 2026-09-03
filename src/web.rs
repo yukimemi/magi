@@ -115,7 +115,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::ask::{Answer, Question, Questions};
 use crate::chat::{Chat, Chats};
 use crate::config::Config;
-use crate::queue::{Queue, Source, Task, TaskStatus, title_from};
+use crate::queue::{Queue, Source, Task, title_from};
 use crate::run::{RunState, RunStatus};
 use crate::{chat, daemon, report, run};
 
@@ -1417,26 +1417,18 @@ async fn queue_release(
 
 /// `DELETE /api/queue/{id}`.
 ///
-/// Remove a task from the backlog. Running tasks cannot be deleted (a daemon
-/// is working on them), and the deletion must acquire the queue's claim lock
-/// just as mutations do. The associated runs, if any, are kept: a run is
-/// self-contained history and not an appendage of the task.
+/// Remove a task from the backlog. Refused only while a live daemon's heartbeat
+/// names this task: a `running` status or an orphaned `.lock` left behind by a
+/// killed daemon is a leftover, and treating either as authority made the
+/// task undeletable from the phone for good. The associated runs, if any, are
+/// kept: a run is self-contained history and not an appendage of the task.
 async fn queue_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     blocking(move || {
         let id = resolve_task(&ui.queue, &id)?;
-        let task = ui.queue.get(&id)?;
-        if task.status == TaskStatus::Running {
-            return Err(ApiError::conflict(format!(
-                "task {} is currently running - a daemon is running this task, so it cannot be deleted",
-                task.short()
-            )));
-        }
-        let _claim = ui.queue.claim(&id).map_err(|e| {
-            ApiError::conflict(format!(
-                "{e:#} - a daemon is running this task, so it cannot be deleted yet"
-            ))
-        })?;
-        ui.queue.remove(&id)?;
+        let in_flight = crate::daemon::is_working_on_task(&ui.home, &id, jiff::Timestamp::now());
+        ui.queue
+            .remove(&id, in_flight)
+            .map_err(|e| ApiError::conflict(format!("{e:#}")))?;
         Ok(StatusCode::NO_CONTENT)
     })
     .await
@@ -3827,7 +3819,7 @@ mod tests {
             "run directory must not be deleted when its task is deleted"
         );
 
-        // 2. A running task is refused with 409
+        // 2. A task a live daemon is running is refused with 409.
         let mut t2 = Task::new(
             "Task 2".to_owned(),
             "Instruction 2".to_owned(),
@@ -3836,24 +3828,48 @@ mod tests {
         );
         t2.status = TaskStatus::Running;
         q.put(&mut t2).expect("put t2");
+        let mut beat = crate::daemon::Status::new();
+        beat.current = Some(crate::daemon::Current {
+            task: t2.id.clone(),
+            run: "20260901-000000-r222".to_owned(),
+        });
+        beat.updated_at = jiff::Timestamp::now();
+        crate::daemon::write_status_to(&fx.home.path().join("daemon.json"), &beat)
+            .expect("publish a heartbeat");
         let res = fx.delete(&format!("/api/queue/{}", t2.id)).await;
         assert_eq!(res.status, 409);
-        assert!(res.json()["error"].as_str().unwrap().contains("daemon"));
-        assert!(q.path_of(&t2.id).exists(), "running task file is kept");
+        assert!(
+            res.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("live daemon")
+        );
+        assert!(q.path_of(&t2.id).exists(), "a task in flight is kept");
 
-        // 3. A task with a lock is refused with 409
+        // 3. The same `running` status and an orphaned lock, with no daemon
+        // behind either, is a leftover and deletable. Before this the phone
+        // refused it for good: the status never changes on its own and
+        // nothing drops a lock whose process is gone.
+        // The daemon is killed: the file stays, the heartbeat stops.
+        beat.updated_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(600);
+        crate::daemon::write_status_to(&fx.home.path().join("daemon.json"), &beat)
+            .expect("leave a stale heartbeat");
         let mut t3 = Task::new(
             "Task 3".to_owned(),
             "Instruction 3".to_owned(),
             PathBuf::from("/repo"),
             Source::Human,
         );
+        t3.status = TaskStatus::Running;
         q.put(&mut t3).expect("put t3");
-        let _claim = q.claim(&t3.id).expect("claim t3");
+        std::mem::forget(q.claim(&t3.id).expect("claim t3"));
         let res = fx.delete(&format!("/api/queue/{}", t3.id)).await;
-        assert_eq!(res.status, 409);
-        assert!(q.path_of(&t3.id).exists(), "locked task file is kept");
-        drop(_claim);
+        assert_eq!(res.status, 204);
+        assert!(!q.path_of(&t3.id).exists(), "the task file is gone");
+        assert!(
+            q.claim(&t3.id).is_ok(),
+            "the stale lock went with it, so the id is claimable again"
+        );
 
         // 4. Missing id returns 404
         let res = fx.delete("/api/queue/nonexistent").await;

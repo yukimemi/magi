@@ -289,13 +289,39 @@ impl Queue {
         read_path(&self.path_of(&resolved))
     }
 
-    /// Delete a task. The only destructive operation in here, and the web UI
-    /// does not expose it.
-    pub fn remove(&self, id: &str) -> Result<String> {
+    /// Remove a task, and the claim lock that belongs to it.
+    ///
+    /// `in_flight` comes from the caller — a live daemon's heartbeat naming
+    /// this task — because the task's own `running` status cannot answer the
+    /// question. A daemon killed mid-competition leaves the status at
+    /// `running` and an orphaned `.lock` behind, and a guard that trusted
+    /// either would make the task undeletable for good: the phone showed
+    /// exactly that, refusing a task whose daemon had been gone for an hour.
+    ///
+    /// So the lock is removed with the task rather than respected. Any lock
+    /// still there once no live daemon claims the task is by definition stale,
+    /// and leaving it would make a deleted task look claimed to
+    /// [`Queue::claim`] and to whoever reads the directory.
+    pub fn remove(&self, id: &str, in_flight: bool) -> Result<String> {
         let resolved = self.resolve_id(id)?;
+        if in_flight {
+            bail!("task {resolved} is being run by a live daemon right now");
+        }
         let path = self.path_of(&resolved);
         std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        let lock = self.lock_path(&resolved);
+        if let Err(e) = std::fs::remove_file(&lock) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e).with_context(|| format!("remove {}", lock.display()));
+            }
+        }
         Ok(resolved)
+    }
+
+    /// Path of the claim lock for a task. One definition, so `claim` and
+    /// `remove` cannot end up naming different files.
+    fn lock_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.lock"))
     }
 
     /// Every task on disk, newest first. Unreadable files are skipped rather
@@ -337,7 +363,7 @@ impl Queue {
     pub fn claim(&self, id: &str) -> Result<Claim> {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
-        let path = self.root.join(format!("{id}.lock"));
+        let path = self.lock_path(id);
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -730,7 +756,7 @@ mod tests {
         q.put(&mut t2).unwrap();
 
         let rev_before = q.revision();
-        q.remove(&t1.id).unwrap();
+        q.remove(&t1.id, false).unwrap();
         let rev_after = q.revision();
 
         assert_ne!(
@@ -744,9 +770,44 @@ mod tests {
         let (_dir, q) = queue();
         let mut t = task("delete me");
         q.put(&mut t).unwrap();
-        let removed = q.remove(t.short()).unwrap();
+        let removed = q.remove(t.short(), false).unwrap();
         assert_eq!(removed, t.id, "a prefix resolves before deleting");
         assert!(q.list().is_empty());
-        assert!(q.remove(&t.id).is_err(), "removing twice is an error");
+        assert!(
+            q.remove(&t.id, false).is_err(),
+            "removing twice is an error"
+        );
+    }
+
+    #[test]
+    fn removing_a_task_takes_its_stale_lock_with_it() {
+        let (_dir, q) = queue();
+        let mut t = task("interrupted");
+        q.put(&mut t).unwrap();
+
+        // A daemon killed mid-run leaves this behind. Nothing holds it: the
+        // process that would have dropped the guard is gone.
+        let claim = q.claim(&t.id).unwrap();
+        std::mem::forget(claim);
+        assert!(
+            q.claim(&t.id).is_err(),
+            "the orphaned lock is what makes the task look claimed"
+        );
+
+        // A live daemon on this task is refused, whatever the lock says.
+        let err = q.remove(&t.id, true).unwrap_err().to_string();
+        assert!(err.contains("live daemon"), "{err}");
+        assert!(q.get(&t.id).is_ok(), "a refused delete keeps the task");
+
+        // With no daemon behind it, the lock is stale and goes with the task.
+        q.remove(&t.id, false).unwrap();
+        assert!(q.list().is_empty());
+        let mut again = task("interrupted");
+        again.id = t.id.clone();
+        q.put(&mut again).unwrap();
+        assert!(
+            q.claim(&t.id).is_ok(),
+            "a task that comes back must be claimable, which a left-behind lock would prevent"
+        );
     }
 }

@@ -342,18 +342,31 @@ pub fn read_status(home: &Path) -> Option<Reading> {
     serde_json::from_str(&body).ok()
 }
 
-/// Whether a live daemon is working on this run at this moment.
+/// What a live daemon is working on right now, or `None`.
 ///
-/// One definition, because the CLI and the web UI both gate a deletion on it
-/// and two copies of this rule would eventually disagree about whether the
-/// same run is safe to remove. A stale heartbeat reads as "no daemon": that is
-/// [`Reading::running`]'s judgement, and a run left at `implementing` by a
-/// killed daemon is a leftover record rather than work in progress.
+/// One definition of liveness, because deleting a task and deleting a run are
+/// both gated on it from both the CLI and the web UI - four callers that must
+/// never disagree about whether the same thing is in flight. A stale heartbeat
+/// reads as "no daemon": that is [`Reading::running`]'s judgement, and a task
+/// left at `running` or a run left at `implementing` by a killed daemon is a
+/// leftover record rather than work in progress.
+#[must_use]
+pub fn current_work(home: &Path, now: Timestamp) -> Option<Current> {
+    read_status(home)
+        .filter(|reading| reading.running(now))
+        .and_then(|reading| reading.current)
+}
+
+/// Whether a live daemon is working on this run at this moment.
 #[must_use]
 pub fn is_working_on(home: &Path, run: &str, now: Timestamp) -> bool {
-    read_status(home).is_some_and(|reading| {
-        reading.running(now) && reading.current.is_some_and(|c| c.run == run)
-    })
+    current_work(home, now).is_some_and(|c| c.run == run)
+}
+
+/// Whether a live daemon is working on this task at this moment.
+#[must_use]
+pub fn is_working_on_task(home: &Path, task: &str, now: Timestamp) -> bool {
+    current_work(home, now).is_some_and(|c| c.task == task)
 }
 
 /// Remove claim files older than `older_than` and return the task ids swept.
