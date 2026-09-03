@@ -210,6 +210,46 @@ pub enum Step {
     },
 }
 
+/// The outcome to record when `gh pr merge` exits non-zero, given what the
+/// pull request looked like immediately afterwards.
+///
+/// `gh pr merge` merges server-side first and only then does local work -
+/// deleting the branch, switching back to a base branch - so a non-zero exit
+/// does not mean the merge did not happen. In a jj-colocated repository it
+/// reliably does not mean that: git HEAD is detached, and `--delete-branch`
+/// ends with "could not determine current branch: not on any branch" *after*
+/// the merge has landed. Run ec12 merged pull request 28 into `main` and
+/// recorded `ok: false`, and its task was held waiting for a merge that was
+/// already done.
+///
+/// So the forge is asked, and its answer wins - the same authority [`decide`]
+/// gives the pull request's own state over everything else. The recorded
+/// detail carries both facts, because "the command failed and the merge
+/// happened anyway" is exactly what someone reading the run later needs to
+/// know.
+///
+/// `None` means the merge really did not happen, including when the pull
+/// request could not be read at all: an unreadable answer is not evidence of
+/// success.
+fn merged_after_all(
+    argv: &[String],
+    stderr: &str,
+    after: Option<PrLifecycle>,
+) -> Option<MergeOutcome> {
+    if after? != PrLifecycle::Merged {
+        return None;
+    }
+    Some(MergeOutcome {
+        mode: MergeMode::Pr,
+        ok: true,
+        detail: format!(
+            "gh {} (the command reported `{}`, but the pull request is merged)",
+            argv.join(" "),
+            stderr.trim()
+        ),
+    })
+}
+
 /// Decide the next step. No I/O.
 ///
 /// `round` counts the fix rounds already spent, so `round == budget` means the
@@ -1201,6 +1241,15 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                         ok: true,
                         detail: format!("gh {}", argv.join(" ")),
                     });
+                    state.event("land", format!("merged {} as `{subject}`", pr.url));
+                    state.save()?;
+                    pr.state = PrLifecycle::Merged;
+                    return Ok(pr);
+                }
+                let after = observe(&repo, pr_url).await.ok().map(|s| s.pr.state);
+                if let Some(outcome) = merged_after_all(&argv, &out.1, after) {
+                    state.status = RunStatus::Merged;
+                    state.merge = Some(outcome);
                     state.event("land", format!("merged {} as `{subject}`", pr.url));
                     state.save()?;
                     pr.state = PrLifecycle::Merged;
@@ -2270,6 +2319,33 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         for (what, state, round, budget, waited, want) in cases {
             assert_eq!(decide(&state, round, budget, waited), want, "{what}");
         }
+    }
+
+    #[test]
+    fn a_merge_command_that_failed_after_merging_is_still_a_merge() {
+        let argv = merge_argv(28, "Merge magi run ec12 (candidate B)");
+        // The exact stderr from run ec12, in a jj-colocated repository.
+        let jj = "could not determine current branch: failed to run git: not on any branch";
+
+        let landed = merged_after_all(&argv, jj, Some(PrLifecycle::Merged))
+            .expect("the forge says merged, so it merged");
+        assert!(landed.ok);
+        assert!(
+            landed.detail.contains("but the pull request is merged"),
+            "the record must not read as a clean success: {}",
+            landed.detail
+        );
+        assert!(
+            landed.detail.contains("not on any branch"),
+            "and it must keep what the command actually said: {}",
+            landed.detail
+        );
+
+        // A pull request still open means the merge really failed.
+        assert!(merged_after_all(&argv, jj, Some(PrLifecycle::Open)).is_none());
+        assert!(merged_after_all(&argv, jj, Some(PrLifecycle::Closed)).is_none());
+        // And an unreadable answer is not evidence of success.
+        assert!(merged_after_all(&argv, jj, None).is_none());
     }
 
     #[test]

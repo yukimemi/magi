@@ -834,6 +834,21 @@ deletion — the first autonomous run appeared to delete a test that had landed
 while it was thinking. `magi run --merge pr` builds its title from the first
 line of the body and is unaffected; this is only the hand-driven path.
 
+**A non-zero `gh pr merge` does not mean the merge failed.** In this
+repository it usually means the opposite. jj keeps git HEAD detached, so
+`--delete-branch` finishes with
+
+```
+could not determine current branch: failed to run git: not on any branch
+```
+
+*after* GitHub has already merged. Every hand-driven merge in this repo prints
+it. Check `gh pr view <n> --json state` — or `git log origin/main` — before
+concluding anything, and never re-run the merge on the strength of the exit
+code. `land::merged_after_all` is that rule for the unattended path: run ec12
+landed pull request 28 and recorded `ok: false`, and its task was held waiting
+for a merge that was already in `main`.
+
 ### Running magi on magi
 
 `magi.toml` in this repo sets `e2e = cargo test` and `gate = cargo make check`,
