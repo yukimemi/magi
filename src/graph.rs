@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
@@ -68,12 +69,52 @@ enum AgentOutcome {
     Failed(String),
 }
 
+/// A request to park the run at its next node boundary.
+///
+/// Cloning is how the request travels: the loop keeps one handle and hands a
+/// clone to each [`Runner`], and every clone points at the same flag. There
+/// is no channel because there is nothing to send - the only message is
+/// "park", it is idempotent, and a flag cannot be missed by a receiver that
+/// was not listening yet.
+///
+/// The boundary is what makes this cheap. Every node writes the run's state
+/// before the next one starts, and every node skips what is already recorded:
+/// `prep` returns early once candidates exist, `implement` asks only the seats
+/// with nothing on disk, `judge` returns early once judgements exist. So a
+/// parked run resumes into exactly the node it stopped before, and no agent
+/// work is thrown away. Killing the process mid-node, by contrast, loses
+/// whatever the seats in flight had not yet written - which for an implement
+/// wave is an hour of paid work.
+#[derive(Debug, Clone, Default)]
+pub struct Pause(Arc<AtomicBool>);
+
+impl Pause {
+    /// A pause nobody has asked for yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the run to park at its next node boundary. Idempotent.
+    pub fn park(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Has a park been asked for?
+    #[must_use]
+    pub fn parked(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// Drives one run.
 pub struct Runner {
     /// Run state; public so the CLI can report on it.
     pub state: RunState,
     roles: ResolvedRoles,
     sem: Arc<Semaphore>,
+    /// Set when someone wants the run parked at its next node boundary.
+    pause: Pause,
 }
 
 /// The commit a run branches from: the base branch as the remote has it.
@@ -160,6 +201,7 @@ impl Runner {
             state,
             roles,
             sem: Arc::new(Semaphore::new(max_parallel)),
+            pause: Pause::new(),
         })
     }
 
@@ -300,6 +342,7 @@ impl Runner {
             state,
             roles,
             sem: Arc::new(Semaphore::new(max_parallel)),
+            pause: Pause::new(),
         })
     }
 
@@ -312,11 +355,17 @@ impl Runner {
             state,
             roles,
             sem: Arc::new(Semaphore::new(max_parallel)),
+            pause: Pause::new(),
         })
     }
 
     /// Walk the graph to a terminal state, skipping nodes already recorded.
     pub async fn execute(&mut self) -> Result<()> {
+        // Moving again, so it is no longer parked. Set before the walk rather
+        // than in `resume`, so every way of re-entering the graph clears it
+        // and a card cannot claim a run is waiting to be resumed while the
+        // agents are already working.
+        self.state.parked = false;
         // A run that already lost its quorum never resumes into the verdict
         // machinery: `deliberate` and `vote` would otherwise clobber the
         // stalled marker back to Voting and the run would keep going past a
@@ -339,10 +388,25 @@ impl Runner {
             return Ok(());
         }
         self.prep().await?;
+        if self.park_here()? {
+            return Ok(());
+        }
         self.implement().await?;
+        if self.park_here()? {
+            return Ok(());
+        }
         self.judge().await?;
+        if self.park_here()? {
+            return Ok(());
+        }
         self.deliberate().await?;
+        if self.park_here()? {
+            return Ok(());
+        }
         self.vote().await?;
+        if self.park_here()? {
+            return Ok(());
+        }
         self.tally()?;
         // A verdict that lost its quorum is not trustworthy: do not review,
         // gate, or merge on it. Everything already done is kept, so the run
@@ -357,6 +421,33 @@ impl Runner {
         }
         self.finish_after_tally().await?;
         Ok(())
+    }
+
+    /// Park here if asked to, recording it in the run's own timeline.
+    ///
+    /// Returns whether the caller should stop walking the graph. The state is
+    /// saved either way by the node that just finished; this adds the event so
+    /// the operator's card says why a run that is neither finished nor moving
+    /// is sitting where it is.
+    fn park_here(&mut self) -> Result<bool> {
+        if !self.pause.parked() {
+            return Ok(false);
+        }
+        self.state.event(
+            "park",
+            format!(
+                "parked after `{}` — resume to carry on from here",
+                self.state.status.as_str()
+            ),
+        );
+        self.state.parked = true;
+        self.state.save()?;
+        Ok(true)
+    }
+
+    /// Hand the runner a pause to watch.
+    pub fn on_pause(&mut self, pause: Pause) {
+        self.pause = pause;
     }
 
     /// The tail of the graph after a trustworthy tally: fold losers, review,

@@ -457,6 +457,23 @@ Before this the delete button greyed itself out and said "Run `magi fold`
 first" — a phone being told to open a terminal, in the one product whose point
 is that it does not need one.
 
+**Stop, replace the binary, resume.** A plain stop never abandons a run: it
+finishes the competition it is on, which can be an hour. That is right when
+you only want the queue to drain, and useless when you have fixes to install —
+and killing the process instead loses whatever the seats in flight had not
+written.
+
+So a stop that is waiting out a run offers **Park at the next step**. The run
+stops at its next node boundary, which costs at most the node in progress
+because every node writes its state before the next one starts and every node
+skips what is already recorded. The run comes back as parked-and-resumable,
+the process exits, the binary can be replaced, and the next loop **resumes
+that run** rather than competing again — or you tap Resume yourself.
+
+A park spends no attempt. It is the operator asking for the process back, not
+a run that failed, and a few upgrades must not exhaust a budget meant for
+agents that actually misbehaved.
+
 **The loop runs inside `magi web`.** `GET /api/loop` reports whether it is
 running and who owns it; `POST /api/loop {"running": true|false}` starts and
 stops it. Only the process serving the page can control its own loop — a loop

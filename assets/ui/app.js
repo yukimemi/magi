@@ -552,6 +552,10 @@ function renderLoop() {
     button.onclick = null;
   };
 
+  const park = $("loop-park");
+  show(park, false);
+  park.disabled = false;
+
   const control = (kind, label, note) => {
     setText(why, note);
     show(why, true);
@@ -560,6 +564,18 @@ function renderLoop() {
     show(button, true);
     button.disabled = false;
     button.onclick = () => setLoop(kind === "start");
+  };
+
+  /* Offered only while a stop is waiting out a run, which is the moment the
+     wait is actually felt. A park stops at the run's next node boundary: the
+     work already recorded is kept and the run comes back as resumable, so the
+     binary can be replaced without waiting out a competition and without
+     throwing away an hour of paid agent calls. */
+  const parkControl = (label, note) => {
+    setText(park, label);
+    setAttr(park, "title", note);
+    show(park, true);
+    park.onclick = () => setLoop(false, true);
   };
 
   if (!state.health) {
@@ -617,6 +633,12 @@ function renderLoop() {
     quiet(loop.stopping
       ? `Nothing new will be claimed after it${tail}. You can start it again once it has stopped.`
       : `Nothing new will be claimed${tail}. This takes a few seconds when no run is in flight.`);
+    if (loop.parking) {
+      text.append(" Parking at the next step.");
+    } else if (loop.stopping) {
+      parkControl("Park at the next step",
+        "Stops the run after the step it is on and leaves it resumable, instead of waiting for the whole competition. Use this when you want to replace the binary.");
+    }
     return;
   }
 
@@ -711,12 +733,18 @@ function renderLoop() {
    actually gone false, not from the tap. A 409 is followed by a refetch,
    which is what replaces a button this page cannot honour with the sentence
    explaining why. */
-async function setLoop(running) {
+async function setLoop(running, park = false) {
   const button = $("loop-toggle");
+  const parkBtn = $("loop-park");
   button.disabled = true;
-  setText(button, running ? "Starting\u2026" : "Stopping\u2026");
+  if (park) {
+    parkBtn.disabled = true;
+    setText(parkBtn, "Parking\u2026");
+  } else {
+    setText(button, running ? "Starting\u2026" : "Stopping\u2026");
+  }
   try {
-    const view = await postJson(API.loop, { running });
+    const view = await postJson(API.loop, { running, park });
     /* Set before applyLoop, so the render that follows already knows this
        page asked \u2014 that is what puts an idle loop into `stopping`. */
     state.stopAskedAt = running ? 0 : Date.now();

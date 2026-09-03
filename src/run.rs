@@ -477,6 +477,14 @@ pub struct RunState {
     /// Seats lost to a CLI rate limit / quota, in the order they hit.
     #[serde(default)]
     pub quota: Vec<QuotaLoss>,
+    /// Parked at a node boundary, waiting to be resumed.
+    ///
+    /// A run that is neither finished nor being worked on is otherwise
+    /// indistinguishable from one whose daemon was killed, and the two want
+    /// opposite things from an operator: the first is expected to be resumed,
+    /// the second is a leftover. Cleared by the resume that carries it on.
+    #[serde(default)]
+    pub parked: bool,
     /// Per-seat conversation state.
     #[serde(default)]
     pub seats: BTreeMap<String, SeatState>,
@@ -527,6 +535,7 @@ impl RunState {
             merge: None,
             leaks: Vec::new(),
             quota: Vec::new(),
+            parked: false,
             seats: BTreeMap::new(),
             pr: None,
             events: Vec::new(),

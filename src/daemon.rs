@@ -234,6 +234,9 @@ pub struct Stop {
     /// poll interval elapsed, and an operator tapping stop on a phone would
     /// watch a button do nothing for five seconds.
     wake: Arc<Notify>,
+    /// Handed to the run in flight, so a stop can also mean "park at the next
+    /// node boundary" instead of "finish the whole competition first".
+    pause: crate::graph::Pause,
 }
 
 impl Stop {
@@ -269,6 +272,33 @@ impl Stop {
     #[must_use]
     pub fn finishing(&self) -> bool {
         self.stopped() && self.busy.load(Ordering::SeqCst)
+    }
+
+    /// Ask the loop to stop *and* the run in flight to park at its next node
+    /// boundary.
+    ///
+    /// The plain [`Stop::stop`] never abandons a run, which is right when the
+    /// operator only wants the queue to drain: a competition is tens of
+    /// minutes and its worktrees are paid for. But an operator who wants to
+    /// replace the binary cannot wait out a run that has an hour left, and
+    /// killing the process loses whatever the seats in flight had not written.
+    /// Parking costs at most the node in progress and leaves the run
+    /// resumable.
+    pub fn park(&self) {
+        self.pause.park();
+        self.stop();
+    }
+
+    /// Has a park been asked for?
+    #[must_use]
+    pub fn parking(&self) -> bool {
+        self.pause.parked()
+    }
+
+    /// The pause handle to give a runner.
+    #[must_use]
+    pub fn pause(&self) -> crate::graph::Pause {
+        self.pause.clone()
     }
 
     /// Mark a run as in flight, or finished, for [`Stop::finishing`].
@@ -423,6 +453,8 @@ pub struct Verdict {
     pub left_pr: bool,
     /// At least one seat was lost to a rate limit.
     pub quota_hit: bool,
+    /// The run parked at a node boundary because it was asked to.
+    pub parked: bool,
 }
 
 /// Record a finished run against the task it came from.
@@ -433,6 +465,7 @@ pub struct Verdict {
 ///
 /// | run status              | task becomes        | attempt spent |
 /// |-------------------------|---------------------|---------------|
+/// | parked at a boundary    | `Failed` (requeued) | **no**        |
 /// | `Merged`, `Ready`       | `Done`              | yes           |
 /// | `Stalled`, quota hit    | `Failed` (requeued) | **no**        |
 /// | `Stalled`, no quota     | `Failed`, or `Held` | yes           |
@@ -457,6 +490,15 @@ pub struct Verdict {
 /// `left_pr` splits the `Blocked` row, and it is the difference between a run
 /// that failed and a run that finished into a gate. See [`Task::handed_off`].
 pub fn settle(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usize) {
+    // A parked run is the operator's own doing, and its work is intact on
+    // disk. The task goes back in line with its attempt refunded so the next
+    // loop resumes the same run - which `one_task` prefers over competing
+    // again - and so that swapping the binary a few times cannot exhaust a
+    // budget meant for agents that actually misbehaved.
+    if verdict.parked {
+        task.stall(detail);
+        return;
+    }
     match verdict.status {
         RunStatus::Merged | RunStatus::Ready => task.succeed(),
         RunStatus::Stalled if verdict.quota_hit => task.stall(detail),
@@ -624,7 +666,7 @@ async fn poll(opts: &Opts, queue: &Queue, status: &Arc<Mutex<Status>>, stop: &St
             // A stop asked for from here on is "finishing", not "stopped": the
             // run gets to reach a terminal status before the loop returns.
             stop.busy(true);
-            attempt(opts, queue, status, &mut task).await;
+            attempt(opts, queue, status, stop, &mut task).await;
             stop.busy(false);
             {
                 let mut guard = lock(status);
@@ -653,7 +695,13 @@ async fn poll(opts: &Opts, queue: &Queue, status: &Arc<Mutex<Status>>, stop: &St
 /// Every transition is flushed to the queue as it happens, so the state on disk
 /// is what actually occurred rather than what this process still intends to
 /// write.
-async fn attempt(opts: &Opts, queue: &Queue, status: &Arc<Mutex<Status>>, task: &mut Task) {
+async fn attempt(
+    opts: &Opts,
+    queue: &Queue,
+    status: &Arc<Mutex<Status>>,
+    stop: &Stop,
+    task: &mut Task,
+) {
     let repo = repo_for(task, &opts.repo);
     tracing::info!(
         "task {} — {} (repo {})",
@@ -675,7 +723,29 @@ async fn attempt(opts: &Opts, queue: &Queue, status: &Arc<Mutex<Status>>, task: 
         }
     };
 
-    let mut runner = match Runner::start(&repo, task.instruction.clone(), config).await {
+    // An unfinished run of this task is carried on, never re-competed. The
+    // candidates are built and paid for, and a fresh competition would race a
+    // second implementation against them: that is what happened when run 01c2
+    // was blocked and the loop immediately started 3cbf on the same task,
+    // duplicating two and a half hours of agent work.
+    let unfinished = task
+        .runs
+        .iter()
+        .rev()
+        .find(|id| {
+            RunState::load(id)
+                .map(|s| !s.status.done())
+                .unwrap_or(false)
+        })
+        .cloned();
+    let started = match &unfinished {
+        Some(id) => {
+            tracing::info!("resuming run {id} rather than competing again");
+            Runner::resume(id)
+        }
+        None => Runner::start(&repo, task.instruction.clone(), config).await,
+    };
+    let mut runner = match started {
         Ok(r) => r,
         Err(e) => {
             task.attempts += 1;
@@ -684,6 +754,8 @@ async fn attempt(opts: &Opts, queue: &Queue, status: &Arc<Mutex<Status>>, task: 
             return;
         }
     };
+    // A stop that means "park" reaches the graph through this handle.
+    runner.on_pause(stop.pause());
 
     // `start` has minted the run, so the task can now point at it. Persisting
     // `Running` before `execute` is what makes a crash mid-run legible.
@@ -706,6 +778,10 @@ async fn attempt(opts: &Opts, queue: &Queue, status: &Arc<Mutex<Status>>, task: 
         left_pr: runner.state.pr.is_some(),
         // Only a rate limit earns the task its attempt back.
         quota_hit: !runner.state.quota.is_empty(),
+        // A run that parked was asked to stop; that is not a failure and must
+        // not spend an attempt, or replacing the binary a few times would
+        // exhaust a task's budget without an agent ever misbehaving.
+        parked: runner.state.parked,
     };
     settle(task, verdict, &detail, opts.max_attempts);
     record(queue, task);
@@ -856,6 +932,7 @@ mod tests {
                 Verdict {
                     status: run,
                     left_pr: false,
+                    parked: false,
                     quota_hit: matches!(run, RunStatus::Stalled),
                 },
                 "why",
@@ -875,6 +952,7 @@ mod tests {
             Verdict {
                 status: RunStatus::Stalled,
                 left_pr: false,
+                parked: false,
                 quota_hit: true,
             },
             "quota",
@@ -893,6 +971,7 @@ mod tests {
             Verdict {
                 status: RunStatus::Blocked,
                 left_pr: false,
+                parked: false,
                 quota_hit: false,
             },
             "findings open",
@@ -917,6 +996,7 @@ mod tests {
             Verdict {
                 status: RunStatus::Blocked,
                 left_pr: true,
+                parked: false,
                 quota_hit: false,
             },
             "no check status",
@@ -946,6 +1026,7 @@ mod tests {
             Verdict {
                 status: RunStatus::Blocked,
                 left_pr: false,
+                parked: false,
                 quota_hit: false,
             },
             "findings open",
@@ -953,6 +1034,55 @@ mod tests {
         );
         assert_eq!(empty_handed.status, TaskStatus::Failed);
         assert!(empty_handed.status.runnable());
+    }
+
+    #[test]
+    fn parking_costs_the_task_no_attempt_and_leaves_it_in_line() {
+        // Parking is the operator asking for the process back - to replace the
+        // binary, most of all. The run's work is intact on disk, so this is
+        // not a failed attempt, and charging for it would mean a few upgrades
+        // could exhaust a budget meant for agents that misbehaved.
+        let mut parked = task();
+        parked.start("20260903-183634-2d98".to_owned());
+        settle(
+            &mut parked,
+            Verdict {
+                status: RunStatus::Implementing,
+                left_pr: false,
+                quota_hit: false,
+                parked: true,
+            },
+            "parked after `implementing`",
+            2,
+        );
+        assert_eq!(parked.attempts, 0, "a park is refunded");
+        assert!(
+            parked.status.runnable(),
+            "and the task stays in line so the next loop resumes its run"
+        );
+        assert_eq!(
+            parked.last_error.as_deref(),
+            Some("parked after `implementing`"),
+            "the card says where it stopped"
+        );
+
+        // Without the park flag the same non-terminal status is what it always
+        // was: `execute` returning mid-flight, which is a bug and spends an
+        // attempt so a task cannot loop on it forever.
+        let mut broken = task();
+        broken.start("20260903-183634-2d98".to_owned());
+        settle(
+            &mut broken,
+            Verdict {
+                status: RunStatus::Implementing,
+                left_pr: false,
+                quota_hit: false,
+                parked: false,
+            },
+            "returned mid-flight",
+            2,
+        );
+        assert_eq!(broken.attempts, 1);
     }
 
     #[test]
@@ -968,6 +1098,7 @@ mod tests {
             Verdict {
                 status: RunStatus::Stalled,
                 left_pr: false,
+                parked: false,
                 quota_hit: false,
             },
             "verdict rests on 1 of 3 judges",
@@ -987,6 +1118,7 @@ mod tests {
             Verdict {
                 status: RunStatus::Stalled,
                 left_pr: false,
+                parked: false,
                 quota_hit: true,
             },
             "judge-2, judge-3 out of quota",
@@ -1008,6 +1140,7 @@ mod tests {
             Verdict {
                 status: RunStatus::Stalled,
                 left_pr: false,
+                parked: false,
                 quota_hit: false,
             },
             "no quorum again",
