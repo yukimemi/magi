@@ -681,6 +681,29 @@ Do not "simplify" them into one flag: the useful middle state - magi does the
 watching and the fixing, a human owns the irreversible step - is exactly the
 default, and one flag cannot express it.
 
+**A pull request is a hand-off, not a failure.** `settle` takes `left_pr`, and
+a `Blocked` run that opened one holds its task instead of requeueing it. Run
+01c2 spent two and a half hours on a competition, opened a green pull request,
+and had the whole thing re-competed four seconds later because `land` read
+`checks: unknown` on a pull request GitHub had not yet attached workflow runs
+to. Two rules came out of that, and neither may be dropped:
+
+- **Unreadable is not absent.** `land::CHECKS_GRACE` waits three minutes before
+  believing a pull request has no CI. Refusing to merge without a signal is
+  right; concluding there will never be one four seconds in is not.
+- **Work that exists is never re-competed.** The artifact is on a branch
+  waiting for CI or a person. A retry races a second branch against the open
+  pull request and bills the whole roster again.
+
+**A re-ask is not the original job.** `graph::retry_budget` gives a nudge a
+quarter of the node's timeout, because a seat that already did the thinking
+only has to restate it. Two judges restated a ranking in 41 and 133 seconds
+while a third sat on a resumed session for eleven minutes, on the full 1200s
+budget it had inherited - one stuck nudge nearly doubled a judging round whose
+other seats had long finished. A retry that re-sends the whole prompt, because
+the seat kept no context, keeps the whole budget: that one really is the job
+again.
+
 ### Autonomy is bounded, and the bound is the point
 
 `src/daemon.rs` runs one competition at a time — no `--jobs`. The graph is

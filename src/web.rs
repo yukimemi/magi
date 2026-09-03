@@ -1300,8 +1300,9 @@ async fn run_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiRes
     blocking(move || {
         let id = resolve_run(&ui.runs, &id)?;
         let state = read_run(&ui.runs, &id)?;
+        let in_flight = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
         state
-            .ensure_can_delete()
+            .ensure_can_delete(in_flight)
             .map_err(|e| ApiError::conflict(format!("{e:#}")))?;
         let dir = ui.runs.join(&id);
         std::fs::remove_dir_all(&dir)
@@ -3903,14 +3904,32 @@ mod tests {
         assert!(res.body.is_empty(), "204 has no body");
         assert!(!dir.exists(), "run directory and artifacts must be deleted");
 
-        // 2. Running run is refused with 409
+        // 2. A run a live daemon is working on is refused with 409. The
+        // heartbeat is what makes it refusable: an unfinished run with no
+        // daemon behind it is a leftover from a killed process, and case 1
+        // above would otherwise be impossible to tell apart from this one.
         let run_running = "20260901-000000-rung";
         write_run(&runs, run_running, RunStatus::Prep);
+        let mut beat = crate::daemon::Status::new();
+        beat.current = Some(crate::daemon::Current {
+            task: "20260901-000000-task".to_owned(),
+            run: run_running.to_owned(),
+        });
+        beat.updated_at = jiff::Timestamp::now();
+        crate::daemon::write_status_to(&fx.home.path().join("daemon.json"), &beat)
+            .expect("publish a heartbeat");
         let res = fx.delete(&format!("/api/runs/{run_running}")).await;
         assert_eq!(res.status, 409);
         assert!(
+            res.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("live daemon"),
+            "the refusal must say who is holding it"
+        );
+        assert!(
             runs.join(run_running).exists(),
-            "running run directory is kept"
+            "a run in flight keeps its directory"
         );
 
         // 3. Finished run with unfolded candidate is refused with 409 and mentions `magi fold`

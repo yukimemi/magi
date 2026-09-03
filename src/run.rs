@@ -590,12 +590,26 @@ impl RunState {
 
     /// Assert that this run is safe to delete.
     ///
-    /// Refuses deletion when the run is still in flight (not finished) or has
-    /// candidate worktrees and branches that have not been folded away with
-    /// `magi fold`.
-    pub fn ensure_can_delete(&self) -> Result<()> {
-        if !self.status.done() {
-            bail!("run {} is still running", self.short());
+    /// Refuses a run a live daemon is working on, and refuses any run whose
+    /// candidate worktrees and branches have not been folded away with `magi
+    /// fold`. The fold requirement is the real protection: it is what makes
+    /// "delete" mean "remove a record" rather than "throw away a worktree
+    /// somebody may still be editing".
+    ///
+    /// `in_flight` has to come from the caller, because a run's own status
+    /// cannot answer the question. A daemon killed mid-run leaves its status at
+    /// `implementing` forever, and a guard that trusted that would make every
+    /// interrupted run permanently undeletable - the operator's only recourse
+    /// being to edit `run.json` by hand, which is exactly the sort of thing
+    /// this command exists to avoid. The queue already treats an orphaned
+    /// `.lock` from a `SIGKILL`ed daemon the same way; this is that rule for
+    /// runs.
+    pub fn ensure_can_delete(&self, in_flight: bool) -> Result<()> {
+        if in_flight {
+            bail!(
+                "run {} is being worked on by a live daemon right now",
+                self.short()
+            );
         }
         if self.candidates.iter().any(|c| !c.folded) {
             bail!(
@@ -841,13 +855,20 @@ mod tests {
     }
 
     #[test]
-    fn ensure_can_delete_guards_running_and_unfolded_runs() {
+    fn ensure_can_delete_guards_live_and_unfolded_runs() {
         let mut s = state();
-        // 1. Running run (Prep is not done)
+        // 1. A daemon is working on it right now.
         s.status = RunStatus::Prep;
-        assert!(s.ensure_can_delete().is_err());
+        let err = s.ensure_can_delete(true).unwrap_err().to_string();
+        assert!(err.contains("live daemon"), "{err}");
 
-        // 2. Terminal run with unfolded candidate
+        // 2. The same unfinished run with no daemon behind it is a leftover
+        // from a killed process, and deletable. Without this an interrupted
+        // run could never be removed: its status stays `prep` forever.
+        assert!(s.ensure_can_delete(false).is_ok());
+
+        // 3. Unfolded candidates are refused either way — that is the guard
+        // that stops a delete from discarding a worktree.
         s.status = RunStatus::Merged;
         s.candidates.push(Candidate {
             index: 0,
@@ -864,14 +885,14 @@ mod tests {
             duration_ms: 0,
             folded: false,
         });
-        let err = s.ensure_can_delete().unwrap_err().to_string();
+        let err = s.ensure_can_delete(false).unwrap_err().to_string();
         assert!(
             err.contains("magi fold"),
             "error must suggest `magi fold`: {err}"
         );
 
-        // 3. Terminal run with all candidates folded
+        // 4. Folded and nobody working on it.
         s.candidates[0].folded = true;
-        assert!(s.ensure_can_delete().is_ok());
+        assert!(s.ensure_can_delete(false).is_ok());
     }
 }

@@ -2206,6 +2206,28 @@ async fn wave(
     collected.into_iter().flatten().collect()
 }
 
+/// How long a re-ask may take, given the budget the first attempt had.
+///
+/// A `nudged` retry is a request to restate an answer the seat has already
+/// worked out: it carries no new work, so it does not deserve the original
+/// budget. Measured on run 01c2, two judges restated their ranking in 41 and
+/// 133 seconds while a third sat for over ten minutes on a resumed session
+/// holding 410 KB of prior output - and because the retry had inherited the
+/// full 1200s judge timeout, one stuck nudge nearly doubled the wall time of a
+/// judging round whose other seats were long finished.
+///
+/// A quarter of the budget, with a floor so that a deliberately short timeout
+/// does not collapse to nothing. A retry that re-sends the whole prompt
+/// (because the seat kept no context) is the original job again, and keeps the
+/// original budget.
+fn retry_budget(full: Duration, nudged: bool) -> Duration {
+    if nudged {
+        (full / 4).max(Duration::from_secs(120)).min(full)
+    } else {
+        full
+    }
+}
+
 /// Run a wave and parse each reply, re-asking the seats whose reply was
 /// unusable.
 ///
@@ -2245,26 +2267,30 @@ where
         let mut batch = Vec::with_capacity(pending.len());
         for &i in &pending {
             let src = &originals[i];
-            let prompt = if attempt == 0 {
-                src.prompt.clone()
+            // The prompt and the budget are one decision: a nudge restates
+            // finished work, a re-sent prompt redoes it.
+            let (prompt, timeout) = if attempt == 0 {
+                (src.prompt.clone(), src.timeout)
             } else {
                 let why = done[i]
                     .as_ref()
                     .and_then(|r| r.as_ref().err().map(ToString::to_string))
                     .unwrap_or_else(|| "no parsable answer".to_owned());
                 let nudge = prompt::nudge(&why);
-                if has_context(&src.spec, &seats[i], src.sessions) {
+                let nudged = has_context(&src.spec, &seats[i], src.sessions);
+                let prompt = if nudged {
                     nudge
                 } else {
                     format!("{}\n\n---\n\n{}", src.prompt, nudge)
-                }
+                };
+                (prompt, retry_budget(src.timeout, nudged))
             };
             batch.push(SeatJob {
                 spec: src.spec.clone(),
                 seat: seats[i].clone(),
                 cwd: src.cwd.clone(),
                 prompt,
-                timeout: src.timeout,
+                timeout,
                 allow_write: src.allow_write,
                 sessions: src.sessions,
                 artifacts: src.artifacts.clone(),
@@ -2444,4 +2470,39 @@ pub fn worst_open(state: &RunState) -> Option<Severity> {
         .flat_map(|r| r.findings.iter())
         .map(|f| f.severity)
         .max()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_budget;
+    use std::time::Duration;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn a_nudge_gets_a_quarter_of_the_budget() {
+        // The judge and implement budgets magi ships with.
+        assert_eq!(retry_budget(secs(1200), true), secs(300));
+        assert_eq!(retry_budget(secs(3600), true), secs(900));
+    }
+
+    #[test]
+    fn a_resent_prompt_keeps_the_whole_budget() {
+        // The seat kept no context, so the retry is the original job again and
+        // shortening it would only guarantee a second failure.
+        assert_eq!(retry_budget(secs(1200), false), secs(1200));
+        assert_eq!(retry_budget(secs(60), false), secs(60));
+    }
+
+    #[test]
+    fn the_floor_never_exceeds_the_original_budget() {
+        // A short configured timeout must not be *raised* by the floor: the
+        // operator asked for a bound, and a retry may not outlast the attempt
+        // it is retrying.
+        assert_eq!(retry_budget(secs(60), true), secs(60));
+        assert_eq!(retry_budget(secs(480), true), secs(120));
+        assert_eq!(retry_budget(secs(0), true), secs(0));
+    }
 }
