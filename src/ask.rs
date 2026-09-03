@@ -611,6 +611,28 @@ impl Questions {
             .collect()
     }
 
+    /// Abandon every open question belonging to a run, and report how many.
+    ///
+    /// Called when a run's record is deleted. The agent that asked died with
+    /// the run, so there is nobody left to hand an answer to, and a question
+    /// left open would keep asking the operator for a decision that can no
+    /// longer be delivered - the phone showed exactly that: "auth.rs というファ
+    /// イルが見つかりません" with two buttons, for a run whose directory had
+    /// been gone for two hours.
+    ///
+    /// Abandoned rather than deleted, because [`Question::abandon`] already
+    /// means "this can no longer be answered" and the record of having asked
+    /// is worth keeping. Answered questions are left exactly as they are.
+    pub fn abandon_for_run(&self, run: &str, why: &str) -> Result<usize> {
+        let mut abandoned = 0;
+        for mut q in self.open_for(run) {
+            q.abandon(why);
+            self.put(&mut q)?;
+            abandoned += 1;
+        }
+        Ok(abandoned)
+    }
+
     /// Expand an id prefix to exactly one question id. The short id the phone
     /// and the reports show is a suffix, so that is accepted too.
     pub fn resolve_id(&self, prefix: &str) -> Result<String> {
@@ -911,6 +933,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Questions::at(dir.path().join("questions"));
         (dir, s)
+    }
+
+    #[test]
+    fn deleting_a_run_stops_its_questions_asking() {
+        let (_dir, store) = store();
+
+        let mut open_one = choice_question();
+        store.put(&mut open_one).unwrap();
+        let mut answered = free_question();
+        answered
+            .answer(Answer::Text("keep this".to_owned()))
+            .unwrap();
+        store.put(&mut answered).unwrap();
+        let mut elsewhere = choice_question();
+        elsewhere.run = "20260903-105039-3cbf".to_owned();
+        store.put(&mut elsewhere).unwrap();
+
+        let n = store
+            .abandon_for_run(&open_one.run, "run was deleted")
+            .unwrap();
+        assert_eq!(n, 1, "only the open question of that run");
+
+        let back = store.get(&open_one.id).unwrap();
+        assert!(!back.status.open(), "it no longer asks for a decision");
+        assert!(
+            back.detail.contains("run was deleted"),
+            "the operator can see why: {}",
+            back.detail
+        );
+
+        let kept = store.get(&answered.id).unwrap();
+        assert_eq!(
+            kept.status,
+            QuestionStatus::Answered,
+            "an answered question is a decision on record, not something to revoke"
+        );
+        assert!(
+            store.get(&elsewhere.id).unwrap().status.open(),
+            "another run's question is untouched"
+        );
+        assert!(store.open_for(&open_one.run).is_empty());
     }
 
     fn choice_question() -> Question {
