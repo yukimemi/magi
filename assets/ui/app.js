@@ -2149,20 +2149,38 @@ async function loadChats() {
   }
 }
 
+/* Refresh one conversation. This **must not** decide which conversation is on
+   screen: that is the router's job, in `applyRoute`.
+ *
+ * It used to open with `state.chatDetail = { id, chat: null }`, which turned
+ * every refresh into a navigation. With a turn in flight, `tickWait`'s
+ * ten-second insurance calls this for the *waiting* chat no matter what the
+ * operator is reading, so every ten seconds the transcript on screen was
+ * replaced by a different conversation while the address bar went on naming
+ * the one the operator had chosen. Reported as "the screen switches by itself
+ * when a plan reply arrives", and reproduced exactly that way.
+ *
+ * The turn is still settled from here, before the on-screen check, because
+ * that is the whole point of the insurance: the reply may well land while the
+ * operator is somewhere else, and the wait strip has to stop either way. */
 async function loadChat(id) {
-  if (state.chatDetail.id !== id) state.chatDetail = { id, chat: null };
   try {
     const chat = await getJson(API.chat(id));
-    if (state.chatDetail.id !== id) return;   /* the operator navigated away */
-    state.chatDetail.chat = chat;
     /* The transcript having grown by the operator's turn and a reply is what
        proves the turn finished, whoever started it and whether or not this
        page's own request has come back yet. */
     if (state.chatBusy === id && chatTurns(chat).length >= state.busyTurns + 2) endTurn(id);
+    if (state.chatDetail.id !== id) return;   /* not on screen: nothing to draw */
+    state.chatDetail.chat = chat;
     renderChat();
     ok();
   } catch (error) {
-    fail(`Could not load conversation ${shortId(id)}: ${error.message}`);
+    /* Only complain about the conversation the operator is actually reading:
+       the ten-second insurance refreshes one that may be off screen, and an
+       alert about that is noise over whatever they chose to look at. */
+    if (state.chatDetail.id === id) {
+      fail(`Could not load conversation ${shortId(id)}: ${error.message}`);
+    }
   }
 }
 

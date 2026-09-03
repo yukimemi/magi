@@ -4414,6 +4414,38 @@ mod tests {
     }
 
     #[test]
+    fn refreshing_a_conversation_never_navigates_to_it() {
+        // Reproduced on the deck: send a turn in one conversation, open
+        // another, and ten seconds later the transcript on screen was the
+        // first one while the address bar still named the second.
+        // `tickWait`'s insurance calls `loadChat` for the *waiting* chat, and
+        // `loadChat` opened by assigning `state.chatDetail`, so a refresh was
+        // a navigation.
+        let body = &APP_JS[APP_JS.find("async function loadChat(").expect("loadChat")
+            ..APP_JS.find("async function startChat(").expect("startChat")];
+        assert!(
+            !body.contains("state.chatDetail = {"),
+            "loadChat must not decide which conversation is on screen: {body}"
+        );
+        assert!(
+            body.contains("if (state.chatDetail.id !== id) return;"),
+            "it returns instead of drawing a chat the operator is not reading"
+        );
+
+        // The turn still has to be settled from there, and before that check,
+        // because the insurance exists for a reply that lands while the
+        // operator is elsewhere - otherwise the wait strip runs forever.
+        assert!(
+            body.find("endTurn(id)") < body.find("if (state.chatDetail.id !== id) return;"),
+            "settle the turn before the on-screen check"
+        );
+
+        // Choosing the conversation on screen belongs to the router.
+        let router = &APP_JS[APP_JS.find("function applyRoute(").expect("applyRoute")..];
+        assert!(router.contains("state.chatDetail = { id: route.id, chat: null }"));
+    }
+
+    #[test]
     fn the_deck_never_sends_the_operator_to_a_terminal() {
         // The whole point of the phone UI is that a terminal is not needed.
         // The delete control used to answer with "Run `magi fold` first."
