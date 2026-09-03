@@ -82,7 +82,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt as _;
@@ -91,7 +91,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::ask::{Answer, Question, Questions};
 use crate::chat::{Chat, Chats};
 use crate::config::Config;
-use crate::queue::{Queue, Source, Task, title_from};
+use crate::queue::{Queue, Source, Task, TaskStatus, title_from};
 use crate::run::{RunState, RunStatus};
 use crate::{chat, daemon, report, run};
 
@@ -314,9 +314,10 @@ impl Ui {
             .route("/app.js", get(app_js))
             .route("/api/health", get(health))
             .route("/api/runs", get(runs_list))
-            .route("/api/runs/{id}", get(run_detail))
+            .route("/api/runs/{id}", get(run_detail).delete(run_delete))
             .route("/api/runs/{id}/report", get(run_report))
             .route("/api/queue", get(queue_list).post(queue_post))
+            .route("/api/queue/{id}", delete(queue_delete))
             .route("/api/queue/{id}/hold", post(queue_hold))
             .route("/api/queue/{id}/release", post(queue_release))
             .route("/api/questions", get(questions_list))
@@ -815,6 +816,26 @@ async fn run_detail(
     .await
 }
 
+/// `DELETE /api/runs/{id}`.
+///
+/// Remove a finished, folded run directory along with its artifacts.
+/// Running runs and runs with unfolded candidate worktrees/branches cannot be
+/// deleted. This never touches git worktrees or branches.
+async fn run_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    blocking(move || {
+        let id = resolve_run(&ui.runs, &id)?;
+        let state = read_run(&ui.runs, &id)?;
+        state
+            .ensure_can_delete()
+            .map_err(|e| ApiError::conflict(format!("{e:#}")))?;
+        let dir = ui.runs.join(&id);
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("remove run directory {}", dir.display()))?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
 async fn run_report(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
@@ -918,6 +939,33 @@ async fn queue_release(
     mutate(ui, id, Task::release).await
 }
 
+/// `DELETE /api/queue/{id}`.
+///
+/// Remove a task from the backlog. Running tasks cannot be deleted (a daemon
+/// is working on them), and the deletion must acquire the queue's claim lock
+/// just as mutations do. The associated runs, if any, are kept: a run is
+/// self-contained history and not an appendage of the task.
+async fn queue_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    blocking(move || {
+        let id = resolve_task(&ui.queue, &id)?;
+        let task = ui.queue.get(&id)?;
+        if task.status == TaskStatus::Running {
+            return Err(ApiError::conflict(format!(
+                "task {} is currently running - a daemon is running this task, so it cannot be deleted",
+                task.short()
+            )));
+        }
+        let _claim = ui.queue.claim(&id).map_err(|e| {
+            ApiError::conflict(format!(
+                "{e:#} - a daemon is running this task, so it cannot be deleted yet"
+            ))
+        })?;
+        ui.queue.remove(&id)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
 /// Read a task, change it, write it back, under the queue's own lock.
 ///
 /// Taking the same claim a daemon takes is what makes hold and release safe to
@@ -994,22 +1042,46 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
         .keep_alive(KeepAlive::new().interval(KEEPALIVE))
 }
 
-/// Newest `run.json` modification time under `runs`, in milliseconds.
+/// Change detection token for recorded runs under `runs`.
 ///
-/// One `stat` per run rather than a parse per run: this is the number the
-/// change stream polls every second, so it has to stay cheap even with a
-/// thousand runs on disk.
+/// Combines the id and `run.json` modification time of each run, so adding,
+/// updating, or deleting any run — even an older one — moves the revision and
+/// notifies connected clients via the change stream. Returns 0 when no runs
+/// exist.
 fn runs_revision(runs: &FsPath) -> u64 {
-    std::fs::read_dir(runs)
+    use std::hash::{Hash as _, Hasher as _};
+
+    let mut entries: Vec<(String, u64)> = std::fs::read_dir(runs)
         .into_iter()
         .flatten()
         .flatten()
-        .filter_map(|e| e.path().join("run.json").metadata().ok())
-        .filter_map(|m| m.modified().ok())
-        .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .max()
-        .unwrap_or(0)
+        .filter_map(|e| {
+            let path = e.path().join("run.json");
+            let mtime = path
+                .metadata()
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_millis() as u64;
+            let id = e.file_name().to_string_lossy().into_owned();
+            Some((id, mtime))
+        })
+        .collect();
+
+    if entries.is_empty() {
+        return 0;
+    }
+
+    entries.sort_unstable();
+    let mut hasher = std::hash::DefaultHasher::new();
+    for (id, mtime) in &entries {
+        id.hash(&mut hasher);
+        mtime.hash(&mut hasher);
+    }
+    let h = hasher.finish();
+    if h == 0 { 1 } else { h }
 }
 
 /// Run ids under `runs`, newest first.
@@ -1628,6 +1700,10 @@ mod tests {
 
         async fn post(&self, path: &str, body: Option<&str>) -> Res {
             request(self.addr, "POST", path, body).await
+        }
+
+        async fn delete(&self, path: &str) -> Res {
+            request(self.addr, "DELETE", path, None).await
         }
     }
 
@@ -2901,5 +2977,214 @@ mod tests {
             fx.head(&format!("/api/questions/{id}/panel")).await.status,
             200
         );
+    }
+
+    #[test]
+    fn runs_revision_moves_when_deleting_an_older_run() {
+        let temp = TempDir::new().expect("tempdir");
+        let runs = temp.path().join("runs");
+        std::fs::create_dir_all(&runs).expect("create runs dir");
+
+        assert_eq!(runs_revision(&runs), 0, "empty runs has 0 revision");
+
+        write_run(&runs, "20260901-100000-old1", RunStatus::Merged);
+        std::thread::sleep(Duration::from_millis(10));
+        write_run(&runs, "20260902-100000-new2", RunStatus::Merged);
+
+        let rev_before = runs_revision(&runs);
+        assert!(rev_before > 0);
+
+        let old_dir = runs.join("20260901-100000-old1");
+        std::fs::remove_dir_all(&old_dir).expect("remove old run");
+
+        let rev_after = runs_revision(&runs);
+        assert_ne!(
+            rev_before, rev_after,
+            "deleting an older run must change the revision so other clients see the deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_queue_task_deletes_file_and_guards_running_and_locked() {
+        let fx = Fixture::start().await;
+        let q = fx.queue();
+
+        // 1. A queued task with runs attached can be deleted.
+        let mut t1 = Task::new(
+            "Task 1".to_owned(),
+            "Instruction 1".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        let run_id = "20260901-000000-r111";
+        t1.runs.push(run_id.to_owned());
+        write_run(&fx.runs(), run_id, RunStatus::Merged);
+        q.put(&mut t1).expect("put t1");
+
+        // Delete by short id
+        let res = fx.delete(&format!("/api/queue/{}", t1.short())).await;
+        assert_eq!(res.status, 204);
+        assert!(res.body.is_empty(), "204 No Content has no body");
+        assert!(!q.path_of(&t1.id).exists(), "task file is deleted");
+        assert!(
+            fx.runs().join(run_id).exists(),
+            "run directory must not be deleted when its task is deleted"
+        );
+
+        // 2. A running task is refused with 409
+        let mut t2 = Task::new(
+            "Task 2".to_owned(),
+            "Instruction 2".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        t2.status = TaskStatus::Running;
+        q.put(&mut t2).expect("put t2");
+        let res = fx.delete(&format!("/api/queue/{}", t2.id)).await;
+        assert_eq!(res.status, 409);
+        assert!(res.json()["error"].as_str().unwrap().contains("daemon"));
+        assert!(q.path_of(&t2.id).exists(), "running task file is kept");
+
+        // 3. A task with a lock is refused with 409
+        let mut t3 = Task::new(
+            "Task 3".to_owned(),
+            "Instruction 3".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        q.put(&mut t3).expect("put t3");
+        let _claim = q.claim(&t3.id).expect("claim t3");
+        let res = fx.delete(&format!("/api/queue/{}", t3.id)).await;
+        assert_eq!(res.status, 409);
+        assert!(q.path_of(&t3.id).exists(), "locked task file is kept");
+        drop(_claim);
+
+        // 4. Missing id returns 404
+        let res = fx.delete("/api/queue/nonexistent").await;
+        assert_eq!(res.status, 404);
+    }
+
+    #[tokio::test]
+    async fn delete_run_deletes_directory_and_guards_running_and_unfolded() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+
+        // 1. Finished and folded run can be deleted along with artifacts
+        let run_id = "20260901-000000-fold";
+        let mut state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "instruction".to_owned(),
+            Config::default(),
+        );
+        state.id = run_id.to_owned();
+        state.status = RunStatus::Merged;
+        state.candidates.push(crate::run::Candidate {
+            index: 0,
+            label: 'A',
+            agent: "a".to_owned(),
+            branch: "b".to_owned(),
+            worktree: PathBuf::from("/w"),
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: true,
+        });
+        let dir = runs.join(run_id);
+        std::fs::create_dir_all(dir.join("artifacts")).expect("create artifacts");
+        std::fs::write(dir.join("artifacts").join("patch.diff"), "dummy diff")
+            .expect("write artifact");
+        std::fs::write(dir.join("run.json"), serde_json::to_string(&state).unwrap())
+            .expect("write run.json");
+
+        // Delete by short id
+        let res = fx.delete(&format!("/api/runs/{}", state.short())).await;
+        assert_eq!(res.status, 204);
+        assert!(res.body.is_empty(), "204 has no body");
+        assert!(!dir.exists(), "run directory and artifacts must be deleted");
+
+        // 2. Running run is refused with 409
+        let run_running = "20260901-000000-rung";
+        write_run(&runs, run_running, RunStatus::Prep);
+        let res = fx.delete(&format!("/api/runs/{run_running}")).await;
+        assert_eq!(res.status, 409);
+        assert!(
+            runs.join(run_running).exists(),
+            "running run directory is kept"
+        );
+
+        // 3. Finished run with unfolded candidate is refused with 409 and mentions `magi fold`
+        let run_unfolded = "20260901-000000-unfd";
+        let mut state2 = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "instruction".to_owned(),
+            Config::default(),
+        );
+        state2.id = run_unfolded.to_owned();
+        state2.status = RunStatus::Ready;
+        state2.candidates.push(crate::run::Candidate {
+            index: 0,
+            label: 'A',
+            agent: "a".to_owned(),
+            branch: "b".to_owned(),
+            worktree: PathBuf::from("/w"),
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        let dir2 = runs.join(run_unfolded);
+        std::fs::create_dir_all(&dir2).expect("create dir2");
+        std::fs::write(
+            dir2.join("run.json"),
+            serde_json::to_string(&state2).unwrap(),
+        )
+        .expect("write run.json");
+
+        let res = fx.delete(&format!("/api/runs/{run_unfolded}")).await;
+        assert_eq!(res.status, 409);
+        assert!(res.json()["error"].as_str().unwrap().contains("magi fold"));
+        assert!(dir2.exists(), "unfolded run directory is kept");
+
+        // 4. Missing id returns 404
+        let res = fx.delete("/api/runs/nonexistent").await;
+        assert_eq!(res.status, 404);
+    }
+
+    #[test]
+    fn web_ui_delete_contract_in_front_end() {
+        // 1. API block has both delete endpoints
+        assert!(APP_JS.contains("deleteRun:"));
+        assert!(APP_JS.contains("deleteTask:"));
+
+        // 2. #runs-list card builder (createRunCard / updateRunCard) has no delete entry
+        let run_cards_slice = &APP_JS[APP_JS.find("function createRunCard").unwrap()
+            ..APP_JS.find("function renderRuns").unwrap()];
+        assert!(!run_cards_slice.to_lowercase().contains("delete"));
+
+        // 3. Run detail has delete entry and reasons
+        assert!(APP_JS.contains("renderRunDelete"));
+        assert!(APP_JS.contains("runDeleteReason"));
+        assert!(APP_JS.contains("magi fold"));
+        assert!(APP_JS.contains("This run is still in flight and cannot be deleted."));
+
+        // 4. Two-step delete arming and focus on Cancel
+        assert!(APP_JS.contains("cancel.focus"));
+        assert!(APP_JS.contains("armedRunDelete"));
+        assert!(APP_JS.contains("armedDelete"));
+
+        // 5. Running task has disabled delete
+        assert!(APP_JS.contains("disabled: status === \"running\""));
     }
 }

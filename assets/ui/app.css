@@ -555,6 +555,7 @@ a.card:active { background: var(--sunk); }
 
 .card-actions { display: flex; gap: var(--s2); margin-top: var(--s3); flex-wrap: wrap; }
 .card-actions .btn { flex: 1 1 auto; min-width: 120px; }
+.task-delete-box { display: contents; }
 
 /* ---- card tail --------------------------------------------------------- *
  * A run card is one big anchor, which is the affordance the phone layout

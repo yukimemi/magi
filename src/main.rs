@@ -60,10 +60,22 @@ impl MergeArg {
     }
 }
 
+/// Operations on recorded runs.
+#[derive(Debug, Subcommand)]
+enum RunCmd {
+    /// Delete a recorded run.
+    Rm {
+        /// Run id or unambiguous prefix/suffix.
+        id: String,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run a competition for one task.
     Run {
+        #[command(subcommand)]
+        command: Option<RunCmd>,
         /// The task. Omit when using --file, --issue, or --resume.
         instruction: Vec<String>,
         /// Repository to work on.
@@ -408,6 +420,7 @@ fn spawn_update_check(command: &Command) -> Option<updater::Pending> {
 async fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::Run {
+            command,
             instruction,
             repo,
             config,
@@ -421,6 +434,11 @@ async fn dispatch(command: Command) -> Result<()> {
             seed,
             dry_run,
         } => {
+            if let Some(cmd) = command {
+                return match cmd {
+                    RunCmd::Rm { id } => run_rm_cmd(&id),
+                };
+            }
             let mut runner = if let Some(id) = resume {
                 let runner = Runner::resume(&id)?;
                 println!(
@@ -975,6 +993,18 @@ async fn task_cmd(command: TaskCmd) -> Result<()> {
     }
 }
 
+/// Delete a recorded run directory.
+fn run_rm_cmd(id: &str) -> Result<()> {
+    let resolved = resolve_id(id)?;
+    let state = RunState::load(&resolved)?;
+    state.ensure_can_delete()?;
+    let dir = magi::run::run_dir(&resolved);
+    std::fs::remove_dir_all(&dir)
+        .with_context(|| format!("remove run directory {}", dir.display()))?;
+    println!("removed {resolved}");
+    Ok(())
+}
+
 /// Who is filing this task.
 ///
 /// An agent inside a run is identified by the environment the graph gave it, so
@@ -1203,6 +1233,7 @@ async fn probe(program: &str, args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magi::run::RunStatus;
 
     #[test]
     fn cli_definition_is_valid() {
@@ -1332,5 +1363,128 @@ mod tests {
         let text = doctor_queue_and_loop(dir.path());
 
         assert!(text.contains("unreadable 1"), "{text}");
+    }
+
+    #[test]
+    fn run_rm_cli_argument_parsing() {
+        // 1. magi run rm <id> succeeds and parses id
+        let parsed = Cli::try_parse_from(["magi", "run", "rm", "20260902-140501-a1b2"]).unwrap();
+        match parsed.command {
+            Some(Command::Run {
+                command: Some(RunCmd::Rm { id }),
+                ..
+            }) => {
+                assert_eq!(id, "20260902-140501-a1b2");
+            }
+            other => panic!("expected RunCmd::Rm, got {other:?}"),
+        }
+
+        // 2. magi run rm without id fails
+        let err = Cli::try_parse_from(["magi", "run", "rm"]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "omitting id from magi run rm must fail clap parsing: {err}"
+        );
+
+        // 3. magi run <instruction> still parses instruction normally
+        let parsed_normal = Cli::try_parse_from(["magi", "run", "fix", "a", "bug"]).unwrap();
+        match parsed_normal.command {
+            Some(Command::Run {
+                command: None,
+                instruction,
+                ..
+            }) => {
+                assert_eq!(instruction, vec!["fix", "a", "bug"]);
+            }
+            other => panic!("expected normal Command::Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_rm_cmd_guards_and_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("MAGI_HOME", dir.path());
+        }
+        let runs = dir.path().join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+
+        // 1. Running run fails to delete
+        let run_running = "20260901-000000-rung";
+        let dir_rung = runs.join(run_running);
+        std::fs::create_dir_all(&dir_rung).unwrap();
+        let mut s_rung = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "inst".to_owned(),
+            Config::default(),
+        );
+        s_rung.id = run_running.to_owned();
+        s_rung.status = RunStatus::Prep;
+        std::fs::write(
+            dir_rung.join("run.json"),
+            serde_json::to_string(&s_rung).unwrap(),
+        )
+        .unwrap();
+
+        let err = run_rm_cmd(run_running).unwrap_err().to_string();
+        assert!(err.contains("still running"), "{err}");
+        assert!(dir_rung.exists(), "running run must be kept");
+
+        // 2. Unfolded run fails to delete and suggests magi fold
+        let run_unfolded = "20260901-000000-unfd";
+        let dir_unfd = runs.join(run_unfolded);
+        std::fs::create_dir_all(&dir_unfd).unwrap();
+        let mut s_unfd = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "inst".to_owned(),
+            Config::default(),
+        );
+        s_unfd.id = run_unfolded.to_owned();
+        s_unfd.status = RunStatus::Merged;
+        s_unfd.candidates.push(magi::run::Candidate {
+            index: 0,
+            label: 'A',
+            agent: "a".to_owned(),
+            branch: "b".to_owned(),
+            worktree: PathBuf::from("/w"),
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        std::fs::write(
+            dir_unfd.join("run.json"),
+            serde_json::to_string(&s_unfd).unwrap(),
+        )
+        .unwrap();
+
+        let err = run_rm_cmd(run_unfolded).unwrap_err().to_string();
+        assert!(err.contains("magi fold"), "{err}");
+        assert!(dir_unfd.exists(), "unfolded run must be kept");
+
+        // 3. Finished and folded run succeeds
+        s_unfd.candidates[0].folded = true;
+        std::fs::write(
+            dir_unfd.join("run.json"),
+            serde_json::to_string(&s_unfd).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir_unfd.join("artifacts")).unwrap();
+        std::fs::write(dir_unfd.join("artifacts").join("diff.patch"), "patch").unwrap();
+
+        assert!(
+            run_rm_cmd("unfd").is_ok(),
+            "prefix/suffix resolution succeeds"
+        );
+        assert!(!dir_unfd.exists(), "run directory is removed");
     }
 }
