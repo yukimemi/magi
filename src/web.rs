@@ -4132,4 +4132,36 @@ mod tests {
         // 5. Running task has disabled delete
         assert!(APP_JS.contains("disabled: status === \"running\""));
     }
+
+    #[test]
+    fn a_finished_run_explains_itself_with_its_own_last_line() {
+        // The deck used to answer "why did this stop?" with a sentence chosen
+        // by status alone. Run e633 stalled because two judges answered with
+        // the wrong JSON shape and its card said "The panel collapsed on
+        // agent quota" - with `quota: []` in the record and a quota-loss
+        // counter right above it that correctly said nothing.
+        assert!(
+            !APP_JS.contains("collapsed on agent quota"),
+            "a stall must not be explained by a cause the deck did not check"
+        );
+        assert!(
+            !APP_JS.contains("Review rounds ran out with findings still open, or the gate failed"),
+            "and a block must not offer a guess with an `or` in it"
+        );
+
+        // The reason it does have is `run.event`, which must reach finished
+        // runs: gating it on movement hid the recorded truth at the one moment
+        // the operator is reading the card to find out what happened.
+        assert!(
+            APP_JS.contains("setText(r.event, run.event || \"\")"),
+            "the run's last line is rendered unconditionally"
+        );
+        assert!(
+            !APP_JS.contains("moving && run.event"),
+            "and never gated on the run still moving"
+        );
+
+        // Quota keeps its own counter, fed by the number actually recorded.
+        assert!(APP_JS.contains("lost to quota"));
+    }
 }
