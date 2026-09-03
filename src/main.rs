@@ -60,6 +60,60 @@ impl MergeArg {
     }
 }
 
+/// Execution knobs a competition run takes, shared by `magi run <instruction>`
+/// and the free-text fallback of `magi run rm <words...>` (see [`RunCmd::Rm`]):
+/// once clap commits to the `rm` subcommand it stops recognising `Run`'s own
+/// flags, so a flag placed after prose that happens to start with "rm"
+/// (`magi run rm the dead code --candidates 3`) needs its own declaration or
+/// parsing fails outright. Left unset (`None`/default) on whichever side of
+/// "rm" the caller did not use.
+#[derive(Debug, Clone, Default, clap::Args)]
+struct RunOpts {
+    /// Repository to work on.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    /// Config file; defaults to <repo>/magi.toml.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Parallel implementations.
+    #[arg(short = 'c', long)]
+    candidates: Option<usize>,
+    /// Independent judges.
+    #[arg(short = 'j', long)]
+    judges: Option<usize>,
+    /// Review + fix rounds before giving up.
+    #[arg(long)]
+    review_rounds: Option<usize>,
+    /// What to do with the winning branch.
+    #[arg(long, value_enum)]
+    merge: Option<MergeArg>,
+    /// Seed for label assignment, to reproduce a run.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Prepare and print the plan without spending an agent call.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+impl RunOpts {
+    /// Combines the flags clap captured on each side of a literal "rm" that
+    /// turned out to be prose. Only one side is ever populated in practice —
+    /// a flag is either before "rm" or after it — so preferring `self` is an
+    /// arbitrary but harmless tie-break for the case of a flag on both sides.
+    fn merge(self, other: Self) -> Self {
+        Self {
+            repo: self.repo.or(other.repo),
+            config: self.config.or(other.config),
+            candidates: self.candidates.or(other.candidates),
+            judges: self.judges.or(other.judges),
+            review_rounds: self.review_rounds.or(other.review_rounds),
+            merge: self.merge.or(other.merge),
+            seed: self.seed.or(other.seed),
+            dry_run: self.dry_run || other.dry_run,
+        }
+    }
+}
+
 /// Operations on recorded runs.
 #[derive(Debug, Subcommand)]
 enum RunCmd {
@@ -75,6 +129,8 @@ enum RunCmd {
         /// Run id or unambiguous prefix/suffix.
         #[arg(required = true)]
         id: Vec<String>,
+        #[command(flatten)]
+        opts: Box<RunOpts>,
     },
 }
 
@@ -86,12 +142,6 @@ enum Command {
         command: Option<RunCmd>,
         /// The task. Omit when using --file, --issue, or --resume.
         instruction: Vec<String>,
-        /// Repository to work on.
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
-        /// Config file; defaults to <repo>/magi.toml.
-        #[arg(long)]
-        config: Option<PathBuf>,
         /// Read the task from a file.
         #[arg(long, conflicts_with = "instruction")]
         file: Option<PathBuf>,
@@ -101,24 +151,8 @@ enum Command {
         /// Continue an interrupted run.
         #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["instruction", "file", "issue"])]
         resume: Option<String>,
-        /// Parallel implementations.
-        #[arg(short = 'c', long)]
-        candidates: Option<usize>,
-        /// Independent judges.
-        #[arg(short = 'j', long)]
-        judges: Option<usize>,
-        /// Review + fix rounds before giving up.
-        #[arg(long)]
-        review_rounds: Option<usize>,
-        /// What to do with the winning branch.
-        #[arg(long, value_enum)]
-        merge: Option<MergeArg>,
-        /// Seed for label assignment, to reproduce a run.
-        #[arg(long)]
-        seed: Option<u64>,
-        /// Prepare and print the plan without spending an agent call.
-        #[arg(long)]
-        dry_run: bool,
+        #[command(flatten)]
+        opts: RunOpts,
     },
     /// Run only the review + verification + gate loop, on work that already
     /// exists on a branch. Nothing competes: no implementation, no judging, no
@@ -430,34 +464,30 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Run {
             command,
             instruction,
-            repo,
-            config,
             file,
             issue,
             resume,
-            candidates,
-            judges,
-            review_rounds,
-            merge,
-            seed,
-            dry_run,
+            opts,
         } => {
             // A single trailing word is a run id: `magi run rm <id>`. More
             // than one means clap only grabbed "rm" because it matches the
             // subcommand name — this is really an instruction that starts
             // with "rm" (`magi run rm the dead code in auth.rs`), so put the
-            // word back and fall through to the normal instruction path.
-            let instruction = match command {
-                Some(RunCmd::Rm { id }) if id.len() == 1 => {
+            // word back and fall through to the normal instruction path,
+            // taking along whatever flags clap parsed after "rm" merged with
+            // whatever it parsed before.
+            let (instruction, opts) = match command {
+                Some(RunCmd::Rm { id, .. }) if id.len() == 1 => {
                     return run_rm_cmd(&id[0]);
                 }
-                Some(RunCmd::Rm { id }) => {
+                Some(RunCmd::Rm { id, opts: rm_opts }) => {
                     let mut full = vec!["rm".to_owned()];
                     full.extend(id);
-                    full
+                    (full, rm_opts.merge(opts))
                 }
-                None => instruction,
+                None => (instruction, opts),
             };
+            let repo = opts.repo.unwrap_or_else(|| PathBuf::from("."));
             let mut runner = if let Some(id) = resume {
                 let runner = Runner::resume(&id)?;
                 println!(
@@ -467,27 +497,27 @@ async fn dispatch(command: Command) -> Result<()> {
                 runner
             } else {
                 let task = task_text(&instruction, file.as_deref(), issue).await?;
-                let (mut cfg, from) = Config::discover(&repo, config.as_deref())?;
-                if let Some(n) = candidates {
+                let (mut cfg, from) = Config::discover(&repo, opts.config.as_deref())?;
+                if let Some(n) = opts.candidates {
                     cfg.graph.candidates = n;
                 }
-                if let Some(n) = judges {
+                if let Some(n) = opts.judges {
                     cfg.graph.judges = n;
                 }
-                if let Some(n) = review_rounds {
+                if let Some(n) = opts.review_rounds {
                     cfg.graph.review_rounds = n;
                 }
-                if let Some(m) = merge {
+                if let Some(m) = opts.merge {
                     cfg.merge.mode = m.into();
                 }
-                if let Some(s) = seed {
+                if let Some(s) = opts.seed {
                     cfg.blind.seed = Some(s);
                 }
                 println!("config: {}", describe_layers(&from));
                 Runner::start(&repo, task, cfg).await?
             };
 
-            if dry_run {
+            if opts.dry_run {
                 print!("{}", report::run(&runner.state));
                 println!("\ndry run: stopping before the first agent call");
                 return Ok(());
@@ -1390,7 +1420,7 @@ mod tests {
         let parsed = Cli::try_parse_from(["magi", "run", "rm", "20260902-140501-a1b2"]).unwrap();
         match parsed.command {
             Some(Command::Run {
-                command: Some(RunCmd::Rm { id }),
+                command: Some(RunCmd::Rm { id, .. }),
                 ..
             }) => {
                 assert_eq!(id, vec!["20260902-140501-a1b2"]);
@@ -1426,12 +1456,70 @@ mod tests {
             Cli::try_parse_from(["magi", "run", "rm", "this", "is", "a", "task"]).unwrap();
         match parsed_prose.command {
             Some(Command::Run {
-                command: Some(RunCmd::Rm { id }),
+                command: Some(RunCmd::Rm { id, .. }),
                 ..
             }) => {
                 assert_eq!(id, vec!["this", "is", "a", "task"]);
             }
             other => panic!("expected RunCmd::Rm carrying the prose, got {other:?}"),
+        }
+
+        // 5. a flag placed after rm-led prose must still parse and carry its
+        // value, not just avoid erroring: clap only declares --candidates on
+        // Run itself, so it has to be declared on RunCmd::Rm too.
+        let parsed_flag_after = Cli::try_parse_from([
+            "magi",
+            "run",
+            "rm",
+            "the",
+            "dead",
+            "code",
+            "--candidates",
+            "3",
+        ])
+        .unwrap();
+        match parsed_flag_after.command {
+            Some(Command::Run {
+                command: Some(RunCmd::Rm { id, opts }),
+                ..
+            }) => {
+                assert_eq!(id, vec!["the", "dead", "code"]);
+                assert_eq!(opts.candidates, Some(3));
+            }
+            other => panic!("expected RunCmd::Rm carrying --candidates, got {other:?}"),
+        }
+
+        // 6. a flag before "rm" must still reach the instruction path even
+        // though a different flag also appears after the prose — the two
+        // sides are parsed into separate RunOpts and must be merged rather
+        // than one clobbering the other.
+        let parsed_flag_both_sides = Cli::try_parse_from([
+            "magi",
+            "run",
+            "--candidates",
+            "3",
+            "rm",
+            "the",
+            "dead",
+            "code",
+            "--seed",
+            "7",
+        ])
+        .unwrap();
+        match parsed_flag_both_sides.command {
+            Some(Command::Run {
+                command: Some(RunCmd::Rm { id, opts: rm_opts }),
+                opts,
+                ..
+            }) => {
+                assert_eq!(id, vec!["the", "dead", "code"]);
+                assert_eq!(opts.candidates, Some(3));
+                assert_eq!(rm_opts.seed, Some(7));
+                let merged = rm_opts.merge(opts);
+                assert_eq!(merged.candidates, Some(3));
+                assert_eq!(merged.seed, Some(7));
+            }
+            other => panic!("expected RunCmd::Rm with flags on both sides, got {other:?}"),
         }
     }
 
