@@ -79,8 +79,12 @@ const RUN_STATUS = {
   gating:       { glyph: "\u25b8", tone: "blue", flight: true },
   merged:       { glyph: "\u25c6", tone: "gold", note: "Winner merged." },
   ready:        { glyph: "\u25c7", tone: "teal", note: "Winner passed the gate. Merge was not requested." },
-  stalled:      { glyph: "\u26a0", tone: "rust", note: "The panel collapsed on agent quota, so no verdict was recorded. The work is kept \u2014 resume it once the limits reset." },
-  blocked:      { glyph: "\u2298", tone: "rust", note: "Review rounds ran out with findings still open, or the gate failed." },
+  /* Neither of these names a cause. A stall has several, and the run's own
+     last line — shown for finished runs too — says which one it was; quota
+     losses are counted separately above, from `losses`, so a note that
+     assumed them contradicted the card it sat on. */
+  stalled:      { glyph: "\u26a0", tone: "rust", note: "The judging panel never reached a quorum, so no verdict was recorded. The work is kept." },
+  blocked:      { glyph: "\u2298", tone: "rust", note: "magi stopped short of merging." },
   failed:       { glyph: "\u2715", tone: "ink",  note: "The graph could not complete." },
   /* Derived from RunSummary.waiting rather than trusted from the status
      string: the run parked in some node and the summary still names it. */
@@ -849,9 +853,15 @@ function updateRunCard(row, run) {
   setText(r.note, spell ? meta.note : "");
   show(r.note, spell);
 
+  /* The run's own last line, on finished runs as well as moving ones. It used
+     to be hidden the moment a run stopped, which is exactly when it is worth
+     most: a `stalled` card then explained itself with a generic note while
+     "verdict rests on 1 of 3 judges (quorum 2)" sat unread in the record, and
+     a `blocked` one offered a guess with an "or" in it instead of "no check
+     status is readable on the pull request". */
   const moving = !run.done;
-  setText(r.event, moving && run.event ? run.event : "");
-  show(r.event, Boolean(moving && run.event));
+  setText(r.event, run.event || "");
+  show(r.event, Boolean(run.event));
 
   /* A parked run keeps its rail so the operator can see how far it got, with
      the node it stopped in drawn halted rather than pulsing. */
