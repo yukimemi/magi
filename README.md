@@ -220,6 +220,12 @@ judging panel collapses, the run stops as `stalled`, and the task goes back in
 line *without* spending an attempt — a quota window closing at 4am must not
 leave a backlog of tasks that were never actually judged.
 
+Only a rate limit earns that refund. A judging panel can also collapse because
+the judges answered with the wrong shape — which is ordinary flakiness, can
+recur on every attempt, and is charged to the task, so the attempt counter
+still bounds it. Refunding *that* would take the bound off the loop entirely
+and pay for a fresh implement wave every time.
+
 ## Working out what to build, with someone
 
 A task file without completion criteria produces a competition whose candidates
