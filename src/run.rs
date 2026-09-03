@@ -70,6 +70,42 @@ impl RunStatus {
             Self::Merged | Self::Ready | Self::Stalled | Self::Blocked | Self::Failed
         )
     }
+
+    /// The name this status is written and shown under, matching the
+    /// `snake_case` serde spelling so a log line, an error message and the
+    /// JSON a phone reads all say the same word.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prep => "prep",
+            Self::Implementing => "implementing",
+            Self::Judging => "judging",
+            Self::Deliberating => "deliberating",
+            Self::Voting => "voting",
+            Self::Reviewing => "reviewing",
+            Self::Gating => "gating",
+            Self::Merged => "merged",
+            Self::Ready => "ready",
+            Self::Stalled => "stalled",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Can this run be carried on from where it stopped?
+    ///
+    /// `Stalled` is the case this was written for: the candidates exist and
+    /// are paid for, and the panel merely lost its quorum, so continuing means
+    /// re-asking the absent seats rather than competing three fresh
+    /// implementations. `Blocked` qualifies too — review rounds ran out, or
+    /// the gate failed, and a resume re-enters that loop against work that is
+    /// already on a branch.
+    ///
+    /// `Failed` does not: the graph could not complete, and there is no
+    /// established point to continue from. Nor does a finished run, whose
+    /// answer is a new competition.
+    pub fn resumable(self) -> bool {
+        matches!(self, Self::Stalled | Self::Blocked)
+    }
 }
 
 /// One candidate implementation.
@@ -504,7 +540,7 @@ impl RunState {
 
     /// Short form used in branch names and reports.
     pub fn short(&self) -> &str {
-        self.id.split('-').next_back().unwrap_or(&self.id)
+        short_of(&self.id)
     }
 
     /// Branch name for a label.
@@ -619,6 +655,16 @@ impl RunState {
         }
         Ok(())
     }
+}
+
+/// The short form of a run id: the trailing block after the last `-`.
+///
+/// A free function as well as [`RunState::short`], because callers that have
+/// only an id - an error message, a daemon status, a route handler - were
+/// otherwise reimplementing the split, and two spellings of "short id" is one
+/// rename away from branch names that no longer match their run.
+pub fn short_of(id: &str) -> &str {
+    id.split('-').next_back().unwrap_or(id)
 }
 
 /// Where magi keeps its runs.

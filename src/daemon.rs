@@ -789,21 +789,11 @@ fn describe(state: &RunState) -> String {
 }
 
 /// Stable lower-case name for a run status, for logs and task errors.
+/// One definition of a status's name, on the type that owns it: this table
+/// used to live here as a second copy, and a status renamed in one place would
+/// have gone on reading correctly in the other.
 fn label(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Prep => "prep",
-        RunStatus::Implementing => "implementing",
-        RunStatus::Judging => "judging",
-        RunStatus::Deliberating => "deliberating",
-        RunStatus::Voting => "voting",
-        RunStatus::Reviewing => "reviewing",
-        RunStatus::Gating => "gating",
-        RunStatus::Merged => "merged",
-        RunStatus::Ready => "ready",
-        RunStatus::Stalled => "stalled",
-        RunStatus::Blocked => "blocked",
-        RunStatus::Failed => "failed",
-    }
+    status.as_str()
 }
 
 /// Parse a merge mode override.
