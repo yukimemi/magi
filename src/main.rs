@@ -1117,7 +1117,13 @@ async fn task_cmd(command: TaskCmd) -> Result<()> {
         }
 
         TaskCmd::Rm { id } => {
-            let removed = q.remove(&id)?;
+            let resolved = q.resolve_id(&id)?;
+            let in_flight = magi::daemon::is_working_on_task(
+                &magi::run::home(),
+                &resolved,
+                jiff::Timestamp::now(),
+            );
+            let removed = q.remove(&resolved, in_flight)?;
             println!("removed {removed}");
             Ok(())
         }
