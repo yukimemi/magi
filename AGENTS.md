@@ -793,6 +793,20 @@ fetched.
 - **A stalled run must never render as a decided one.** A collapsed panel still
   records a winner label, so the verdict marker is gated on `tally.met_quorum`
   and shows "provisional" when it is false.
+- **Never tell the phone to open a terminal.** The delete control used to grey
+  itself out with "Candidates must be folded before deleting. Run `magi fold`
+  first." — in the one product whose whole argument is that an operator does
+  not need a terminal. If a guard names a command, the command belongs on the
+  screen: `POST /api/runs/{id}/fold` and `POST /api/runs/{id}/resume` exist
+  for exactly that reason. The same applies to any future refusal.
+- **Fold and resume are opposites and must read as opposites.** A fold throws
+  away the worktrees a resume would continue from, so they share one row, the
+  resume is offered first, and the fold's confirmation says the run can no
+  longer be resumed. A resume that has nothing left to continue from is
+  disabled with that sentence rather than left to fail on tap.
+- **Anything that spends agent calls answers 202 and runs in the background.**
+  `say` and `resume` both take minutes; a held connection on a phone is a coin
+  flip, and the change stream is how every other moving part reports itself.
 
 ### Never take a port you did not check
 

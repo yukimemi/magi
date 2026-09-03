@@ -433,6 +433,30 @@ been folded — that is the guard that keeps "delete" meaning "remove a record"
 rather than "throw away a worktree". A run left unfinished by a killed daemon
 is a leftover, not work in progress, and can be removed once it is folded.
 
+**A stalled run can be folded and resumed from the phone.** Those are the two
+halves of "this run is in the way", and they are opposites, so the run's page
+offers both and says so:
+
+- **Resume** carries the run on from where it stopped, re-asking only the
+  seats whose absence collapsed the panel. The candidates are already built
+  and paid for; the alternative an operator actually had was releasing the
+  task, which competes three fresh implementations against work that exists.
+  It answers **202** and runs in the background — a resume takes minutes, and
+  a phone that locks mid-request must not lose it.
+- **Fold** removes the run's worktrees and branches, which is what the delete
+  button is waiting for, and is where the disk goes: three finished runs here
+  were holding 53 GB. Folding a run makes it unresumable, which the
+  confirmation says in as many words.
+
+Both are refused while a live daemon is working on that run. A resume is also
+refused while the loop is running *at all*, not merely on that run: magi runs
+one competition at a time on purpose, and a tap that quietly started a second
+graph would double the quota burn for no extra throughput.
+
+Before this the delete button greyed itself out and said "Run `magi fold`
+first" — a phone being told to open a terminal, in the one product whose point
+is that it does not need one.
+
 **The loop runs inside `magi web`.** `GET /api/loop` reports whether it is
 running and who owns it; `POST /api/loop {"running": true|false}` starts and
 stops it. Only the process serving the page can control its own loop — a loop

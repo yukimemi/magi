@@ -22,6 +22,8 @@ const API = {
   runs: (limit) => `/api/runs?limit=${limit}`,
   run: (id) => `/api/runs/${encodeURIComponent(id)}`,
   deleteRun: (id) => `/api/runs/${encodeURIComponent(id)}`,
+  foldRun: (id) => `/api/runs/${encodeURIComponent(id)}/fold`,
+  resumeRun: (id) => `/api/runs/${encodeURIComponent(id)}/resume`,
   report: (id) => `/api/runs/${encodeURIComponent(id)}/report`,
   queue: "/api/queue",
   deleteTask: (id) => `/api/queue/${encodeURIComponent(id)}`,
@@ -2406,6 +2408,7 @@ function renderRunDetail() {
   renderReviews(run);
   renderQuota(run);
   renderTimeline(run);
+  renderRunActions(run);
   renderRunDelete(run);
 
   setText($("run-report"), report === null ? "Loading\u2026" : report);
@@ -2418,11 +2421,122 @@ function runDeleteReason(run) {
   if (!terminal) {
     return "This run is still in flight and cannot be deleted.";
   }
-  const candidates = Array.isArray(run.candidates) ? run.candidates : [];
-  if (candidates.some((c) => !c.folded)) {
-    return "Candidates must be folded before deleting. Run `magi fold` first.";
+  if (unfolded(run)) {
+    return "Fold the candidate worktrees first \u2014 the button below does it.";
   }
   return null;
+}
+
+/* Whether any candidate still holds a worktree and a branch. Delete refuses
+   these, and folding is how an operator clears them; before there was a
+   button, the deck told a phone to go and run `magi fold` in a terminal. */
+function unfolded(run) {
+  const candidates = Array.isArray(run.candidates) ? run.candidates : [];
+  return candidates.some((c) => !c.folded);
+}
+
+let armedFold = null;
+let foldBusy = null;
+let resumeBusy = null;
+
+/* Fold and resume are opposites and share this row, so the copy has to be
+   blunt about it: folding throws away the worktrees a resume would continue
+   from. Resume is offered first for that reason. */
+function renderRunActions(run) {
+  const box = $("run-actions-box");
+  if (!box) return;
+  clear(box);
+
+  const status = String(run.status || "");
+  if (["stalled", "blocked"].includes(status)) {
+    const busy = resumeBusy === run.id;
+    const gone = !unfolded(run);
+    box.append(
+      el("div", { class: "stakes-confirm" },
+        el("button", {
+          class: "btn",
+          type: "button",
+          text: busy ? "Resuming\u2026" : "Resume this run",
+          disabled: busy || gone,
+          onclick: () => resumeRun(run.id),
+        }),
+        el("p", { class: "card-note", text: gone
+          ? "The candidate worktrees are gone, so there is nothing left to continue from. File the task again instead."
+          : "Carries on from where it stopped, re-asking only the seats that went missing. It spends agent calls." }),
+      ),
+    );
+  }
+
+  if (!unfolded(run)) return;
+
+  if (armedFold === run.id) {
+    const cancel = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Cancel",
+      onclick: () => { armedFold = null; renderRunActions(run); },
+    });
+    box.append(
+      el("div", { class: "stakes-confirm" },
+        el("p", { class: "stakes-warn", text: "Folding removes this run's worktrees and branches. Anything not committed goes with them, and the run can no longer be resumed." }),
+        el("div", { class: "stakes-row" },
+          cancel,
+          el("button", {
+            class: "btn btn-quiet",
+            type: "button",
+            text: "Yes, fold worktrees",
+            onclick: () => foldRun(run.id),
+          }),
+        ),
+      ),
+    );
+    requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+  } else {
+    box.append(
+      el("div", { class: "stakes-confirm" },
+        el("button", {
+          class: "btn btn-quiet",
+          type: "button",
+          text: foldBusy === run.id ? "Folding\u2026" : "Fold worktrees\u2026",
+          disabled: foldBusy === run.id,
+          onclick: () => { armedFold = run.id; renderRunActions(run); },
+        }),
+        el("p", { class: "card-note", text: "Frees the disk this run is holding, and is what the delete button is waiting for." }),
+      ),
+    );
+  }
+}
+
+async function foldRun(id) {
+  armedFold = null;
+  foldBusy = id;
+  try {
+    const out = await postJson(API.foldRun(id));
+    ok();
+    const n = Number(out.removed_count || 0);
+    announce(n > 0
+      ? `Folded ${shortId(id)}: ${n} worktree${n === 1 ? "" : "s"} and branches removed.`
+      : `Run ${shortId(id)} had nothing left to fold.`);
+    await loadRun(id);
+  } catch (error) {
+    fail(`Could not fold run ${shortId(id)}: ${error.message}`);
+  } finally {
+    foldBusy = null;
+  }
+}
+
+async function resumeRun(id) {
+  resumeBusy = id;
+  try {
+    await postJson(API.resumeRun(id));
+    ok();
+    announce(`Run ${shortId(id)} is being resumed. The card will follow it.`);
+    await loadRun(id);
+  } catch (error) {
+    fail(`Could not resume run ${shortId(id)}: ${error.message}`);
+  } finally {
+    resumeBusy = null;
+  }
 }
 
 function renderRunDelete(run) {

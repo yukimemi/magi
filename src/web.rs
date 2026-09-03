@@ -260,6 +260,13 @@ pub struct Ui {
     /// see it, and a second `magi web` on the same home is already a
     /// misconfiguration the queue's claims would catch first.
     turns: Arc<Mutex<HashSet<String>>>,
+    /// Runs this process is resuming right now.
+    ///
+    /// Separate from `turns` because a run and a chat are different things to
+    /// hold, and a resume is far more expensive to start twice: it re-asks
+    /// agent seats. Same reasoning about scope as `turns` — this guards two
+    /// taps and two phones, which is this process's own concurrency.
+    resuming: Arc<Mutex<HashSet<String>>>,
     /// Merge mode override handed to the loop this process starts.
     merge: Option<String>,
     /// The loop this process is running, if it is running one.
@@ -296,6 +303,7 @@ impl Ui {
             home,
             repo,
             turns: Arc::default(),
+            resuming: Arc::default(),
             merge: None,
             looping: Arc::default(),
             launch: launch_daemon,
@@ -509,6 +517,25 @@ impl Ui {
         })
     }
 
+    /// Claim a run for a resume, on the same reasoning as [`Ui::begin_turn`]:
+    /// a guard that releases on drop, so a disconnected phone does not wedge
+    /// the run until the server restarts.
+    fn begin_resume(&self, id: &str) -> ApiResult<ResumeGuard> {
+        let mut live = self
+            .resuming
+            .lock()
+            .map_err(|_| ApiError::internal("the resume lock was poisoned"))?;
+        if !live.insert(id.to_owned()) {
+            return Err(ApiError::conflict(format!(
+                "run {id} is already being resumed"
+            )));
+        }
+        Ok(ResumeGuard {
+            run: id.to_owned(),
+            resuming: Arc::clone(&self.resuming),
+        })
+    }
+
     /// The router, with this state baked in.
     ///
     /// The three front-end files get one explicit route each rather than a
@@ -526,6 +553,8 @@ impl Ui {
             .route("/api/runs", get(runs_list))
             .route("/api/runs/{id}", get(run_detail).delete(run_delete))
             .route("/api/runs/{id}/report", get(run_report))
+            .route("/api/runs/{id}/fold", post(run_fold))
+            .route("/api/runs/{id}/resume", post(run_resume))
             .route("/api/queue", get(queue_list).post(queue_post))
             .route("/api/queue/{id}", delete(queue_delete))
             .route("/api/queue/{id}/hold", post(queue_hold))
@@ -567,6 +596,20 @@ impl Drop for TurnGuard {
     fn drop(&mut self) {
         if let Ok(mut live) = self.turns.lock() {
             live.remove(&self.chat);
+        }
+    }
+}
+
+/// Releases a resume claim, so a run is resumable again after the attempt.
+struct ResumeGuard {
+    run: String,
+    resuming: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for ResumeGuard {
+    fn drop(&mut self) {
+        if let Ok(mut live) = self.resuming.lock() {
+            live.remove(&self.run);
         }
     }
 }
@@ -1247,7 +1290,10 @@ impl RunSummary {
 /// `RunStatus` as the wire spells it. Every variant is one word, so this is
 /// the same string `serde` writes for the status inside a full run.
 fn status_word(status: RunStatus) -> String {
-    format!("{status:?}").to_lowercase()
+    // `RunStatus::as_str` rather than lowercasing the `Debug` spelling: this
+    // was a third way of naming the same statuses, and one that changed
+    // silently with a derive.
+    status.as_str().to_owned()
 }
 
 /// `?limit=`, clamped by the handler.
@@ -1339,6 +1385,127 @@ async fn run_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiRes
         Ok(StatusCode::NO_CONTENT)
     })
     .await
+}
+
+/// `POST /api/runs/{id}/fold`.
+///
+/// Remove a run's candidate worktrees and branches, keeping its record.
+///
+/// This exists because the deck answered "delete this run" with *"Candidates
+/// must be folded before deleting. Run `magi fold` first."* — a phone being
+/// told to open a terminal, in the one product whose point is that it does
+/// not need one. The runs an operator most wants gone are the stalled and
+/// blocked ones, and those are exactly the runs still holding worktrees:
+/// three of them here held 53 GB.
+///
+/// The winner's tree goes too. A fold is what someone asks for when they are
+/// finished with a run, and leaving one tree behind would leave the delete
+/// button disabled for the same reason as before.
+///
+/// Refused while a live daemon is working on the run, on the rule that guards
+/// deletion: folding underneath a running agent would pull the tree it is
+/// editing out from under it.
+async fn run_fold(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<Json<FoldView>> {
+    let (id, mut state) = {
+        let ui = Arc::clone(&ui);
+        blocking(move || {
+            let id = resolve_run(&ui.runs, &id)?;
+            let state = read_run(&ui.runs, &id)?;
+            if crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now()) {
+                return Err(ApiError::conflict(format!(
+                    "run {} is being worked on by a live daemon right now",
+                    state.short()
+                )));
+            }
+            Ok((id, state))
+        })
+        .await?
+    };
+    let removed = crate::graph::fold_run(&mut state, true)
+        .await
+        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    Ok(Json(FoldView {
+        run: id,
+        removed_count: removed.len(),
+        removed,
+    }))
+}
+
+/// What a fold took away, so the deck can say so rather than only re-render.
+#[derive(Debug, Serialize)]
+struct FoldView {
+    run: String,
+    /// Worktree paths and branch names removed, in the order they went.
+    removed: Vec<String>,
+    removed_count: usize,
+}
+
+/// `POST /api/runs/{id}/resume`.
+///
+/// Carry a stalled run on from where it stopped, in the background.
+///
+/// A stalled card says "the work is kept" and used to offer no way to act on
+/// that: the candidates are built and paid for, and continuing means re-asking
+/// only the seats whose absence collapsed the panel. The alternative an
+/// operator actually had was releasing the task, which competes three fresh
+/// implementations against work that already exists.
+///
+/// **202, not 200.** A resume runs agents for minutes; holding the connection
+/// is the mistake `POST /api/chats/{id}/say` already made and had fixed. The
+/// phone learns the outcome from the change stream.
+///
+/// Refused when the loop is running at all, not merely when it is on this run.
+/// magi runs one competition at a time on purpose — the scarce resource is the
+/// agent CLIs' quota — and a tap that quietly started a second graph would
+/// double the burn for no extra throughput.
+async fn run_resume(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<(StatusCode, Json<RunSummary>)> {
+    let (id, state) = {
+        let ui = Arc::clone(&ui);
+        blocking(move || {
+            let id = resolve_run(&ui.runs, &id)?;
+            let state = read_run(&ui.runs, &id)?;
+            Ok((id, state))
+        })
+        .await?
+    };
+    if !state.status.resumable() {
+        return Err(ApiError::conflict(format!(
+            "run {} is `{}`, and only a stalled or blocked run can be resumed",
+            state.short(),
+            status_word(state.status)
+        )));
+    }
+    if let Some(work) = crate::daemon::current_work(&ui.home, jiff::Timestamp::now()) {
+        return Err(ApiError::conflict(format!(
+            "the loop is running run {} right now; magi runs one competition at \
+             a time so the agent quota is not spent twice over. Stop the loop \
+             first.",
+            crate::run::short_of(&work.run)
+        )));
+    }
+    let _resume = ui.begin_resume(&id)?;
+
+    // The same shape the list route returns, so the phone updates the card it
+    // already has rather than learning a second schema for one button.
+    let queued = RunSummary::of(&state, !ui.questions.open_for(&id).is_empty());
+    let run = id.clone();
+    tokio::spawn(async move {
+        let _resume = _resume;
+        match crate::graph::Runner::resume(&run) {
+            Ok(mut runner) => {
+                if let Err(e) = runner.execute().await {
+                    tracing::warn!("resume of run {run} stopped: {e:#}");
+                }
+            }
+            // The run's own record is what the phone reads; this line is for
+            // the operator's terminal.
+            Err(e) => tracing::warn!("run {run} could not be resumed: {e:#}"),
+        }
+    });
+    Ok((StatusCode::ACCEPTED, Json(queued)))
 }
 
 async fn run_report(
@@ -4131,6 +4298,140 @@ mod tests {
 
         // 5. Running task has disabled delete
         assert!(APP_JS.contains("disabled: status === \"running\""));
+    }
+
+    #[tokio::test]
+    async fn folding_from_the_phone_reports_what_it_removed() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+
+        // A run with no candidates has nothing to fold, which is a 200 with an
+        // honest count rather than an error: the operator asked for the trees
+        // to be gone and they are.
+        let id = "20260901-000000-fold";
+        write_run(&runs, id, RunStatus::Stalled);
+        let res = fx.post(&format!("/api/runs/{id}/fold"), None).await;
+        assert_eq!(res.status, 200);
+        assert_eq!(res.json()["removed_count"], 0);
+        assert_eq!(res.json()["run"], id);
+        assert!(
+            runs.join(id).exists(),
+            "a fold keeps the run's record; only the worktrees go"
+        );
+    }
+
+    #[tokio::test]
+    async fn folding_is_refused_while_a_daemon_is_working_on_the_run() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let id = "20260901-000000-live";
+        write_run(&runs, id, RunStatus::Implementing);
+
+        let mut beat = crate::daemon::Status::new();
+        beat.current = Some(crate::daemon::Current {
+            task: "20260901-000000-task".to_owned(),
+            run: id.to_owned(),
+        });
+        beat.updated_at = jiff::Timestamp::now();
+        crate::daemon::write_status_to(&fx.home.path().join("daemon.json"), &beat)
+            .expect("publish a heartbeat");
+
+        let res = fx.post(&format!("/api/runs/{id}/fold"), None).await;
+        assert_eq!(res.status, 409);
+        assert!(
+            res.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("live daemon"),
+            "folding under a running agent would pull its worktree away"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_is_refused_unless_the_run_stopped_somewhere_it_can_continue() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+
+        for (status, word) in [
+            (RunStatus::Merged, "merged"),
+            (RunStatus::Ready, "ready"),
+            (RunStatus::Failed, "failed"),
+            (RunStatus::Implementing, "implementing"),
+        ] {
+            let id = format!("20260901-000000-{}", &word[..4]);
+            write_run(&runs, &id, status);
+            let res = fx.post(&format!("/api/runs/{id}/resume"), None).await;
+            assert_eq!(res.status, 409, "{word} must not be resumable");
+            let err = res.json()["error"].as_str().unwrap().to_owned();
+            assert!(err.contains(word), "the refusal names the status: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_is_refused_while_the_loop_is_running() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let stalled = "20260901-000000-stal";
+        write_run(&runs, stalled, RunStatus::Stalled);
+
+        // The loop is busy with a *different* run, and that is still a refusal:
+        // one competition at a time is the point, not one per run.
+        let mut beat = crate::daemon::Status::new();
+        beat.current = Some(crate::daemon::Current {
+            task: "20260901-000000-task".to_owned(),
+            run: "20260901-000000-othr".to_owned(),
+        });
+        beat.updated_at = jiff::Timestamp::now();
+        crate::daemon::write_status_to(&fx.home.path().join("daemon.json"), &beat)
+            .expect("publish a heartbeat");
+
+        let res = fx.post(&format!("/api/runs/{stalled}/resume"), None).await;
+        assert_eq!(res.status, 409);
+        let err = res.json()["error"].as_str().unwrap().to_owned();
+        assert!(err.contains("othr"), "it names what the loop is on: {err}");
+        assert!(err.contains("one competition at a time"), "{err}");
+    }
+
+    #[test]
+    fn a_run_cannot_be_resumed_twice_at_once() {
+        let home = TempDir::new().expect("temp home");
+        let ui = Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            Chats::at(home.path().join("chats")),
+            home.path().join("runs"),
+            home.path().to_path_buf(),
+            PathBuf::from("/repo"),
+        );
+        let first = ui.begin_resume("20260901-000000-once").expect("claimed");
+        let again = ui.begin_resume("20260901-000000-once");
+        assert!(again.is_err(), "a second tap must not start a second graph");
+        drop(first);
+        assert!(
+            ui.begin_resume("20260901-000000-once").is_ok(),
+            "and the claim is released when the attempt ends"
+        );
+    }
+
+    #[test]
+    fn the_deck_never_sends_the_operator_to_a_terminal() {
+        // The whole point of the phone UI is that a terminal is not needed.
+        // The delete control used to answer with "Run `magi fold` first."
+        assert!(
+            !APP_JS.contains("Run `magi fold` first"),
+            "the deck must offer the fold, not prescribe a shell command"
+        );
+        assert!(APP_JS.contains("foldRun:"));
+        assert!(APP_JS.contains("resumeRun:"));
+        assert!(APP_JS.contains("renderRunActions"));
+
+        // Folding is destructive and armed in two steps, like deleting.
+        assert!(APP_JS.contains("armedFold"));
+        assert!(APP_JS.contains("Yes, fold worktrees"));
+
+        // And the copy has to say that the two actions are opposites, because
+        // folding throws away exactly what a resume would continue from.
+        assert!(APP_JS.contains("can no longer be resumed"));
     }
 
     #[test]
