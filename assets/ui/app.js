@@ -50,6 +50,7 @@ const API = {
   /* The loop itself: GET reports it, POST {running} starts or stops the one
      inside this server. */
   loop: "/api/loop",
+  upgrade: "/api/upgrade",
   events: "/api/events",
 };
 
@@ -564,6 +565,9 @@ function renderLoop() {
   const park = $("loop-park");
   show(park, false);
   park.disabled = false;
+  const upgradeBtn = $("loop-upgrade");
+  show(upgradeBtn, false);
+
 
   const control = (kind, label, note) => {
     setText(why, note);
@@ -615,6 +619,18 @@ function renderLoop() {
      also why `running` above is not enough to tell the two apart. */
   const foreign = Boolean(daemon.running) && loop.owned === false && !loop.running;
   setAttr(box, "data-owned", foreign ? "no" : null);
+
+  /* Offered whenever this process owns the deck, running or not: the binary
+     can be replaced either way, and an operator with fixes waiting should not
+     have to start the loop to install them. Hidden when the loop belongs to
+     somebody else, because replacing this binary would leave that process
+     running an old one against the same queue. */
+  show(upgradeBtn, !foreign);
+  if (!foreign && upgradeBtn.dataset.armed !== "yes") {
+    setText(upgradeBtn, "Update & restart");
+    upgradeBtn.disabled = false;
+    upgradeBtn.onclick = upgrade;
+  }
 
   /* Asked to stop. Two shapes reach here, and both are checked before
      `running`, because the loop is still running while it winds down:
@@ -742,6 +758,54 @@ function renderLoop() {
    actually gone false, not from the tap. A 409 is followed by a refetch,
    which is what replaces a button this page cannot honour with the sentence
    explaining why. */
+/* Replace the binary and come back on it.
+ *
+ * The one thing the deck could not do for itself: `cargo install` cannot
+ * overwrite a running executable, so every fix waited for a competition to end
+ * or went in with the deck stopped. `kaishin` renames the running image aside
+ * instead, so only the restart needs arranging - and the run in flight is
+ * parked at its next node boundary first, which is why this costs at most one
+ * step rather than a whole competition.
+ *
+ * The server answers 202 and then exits, so there is nothing to await here
+ * beyond that acknowledgement: the phone learns the deck is back the same way
+ * it learns everything else, by reconnecting. */
+async function upgrade() {
+  const btn = $("loop-upgrade");
+  if (!confirmed(btn, "Replace the binary and restart?")) return;
+  btn.disabled = true;
+  setText(btn, "Upgrading\u2026");
+  try {
+    const out = await postJson(API.upgrade);
+    ok();
+    announce(out.detail || "The deck is replacing itself and will come back.");
+  } catch (error) {
+    setText(btn, "Update & restart");
+    btn.disabled = false;
+    fail(`Could not upgrade: ${error.message}`);
+  }
+}
+
+/* One tap arms, the second commits, and the label says which state it is in.
+   Used for the upgrade because it ends the process the operator is talking
+   to - and a mis-tap that restarts the deck mid-competition is the kind of
+   thing a phone in a pocket does. */
+function confirmed(btn, question) {
+  if (btn.dataset.armed === "yes") {
+    btn.dataset.armed = "";
+    return true;
+  }
+  btn.dataset.armed = "yes";
+  setText(btn, question);
+  setTimeout(() => {
+    if (btn.dataset.armed === "yes") {
+      btn.dataset.armed = "";
+      setText(btn, "Update & restart");
+    }
+  }, 6000);
+  return false;
+}
+
 async function setLoop(running, park = false) {
   const button = $("loop-toggle");
   const parkBtn = $("loop-park");

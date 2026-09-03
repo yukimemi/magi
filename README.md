@@ -459,6 +459,23 @@ Before this the delete button greyed itself out and said "Run `magi fold`
 first" — a phone being told to open a terminal, in the one product whose point
 is that it does not need one.
 
+**Update & restart, from the phone.** One tap arms it, the second replaces
+this binary with the newest release and brings the deck back on it:
+
+1. a run in flight **parks** at its next node boundary and stays resumable, so
+   this costs at most the step it is on rather than the competition;
+2. `kaishin` puts the new binary in place — it *renames* the running image
+   aside, so the swap itself needs no downtime;
+3. the server drops its listener, spawns a detached successor, and exits; the
+   successor waits out the address and binds it;
+4. the loop resumes the parked run rather than competing again.
+
+Measured end to end on a 0.1.0 deck upgrading itself to the 0.2.0 release:
+**eleven seconds** from the request to the successor answering on the same
+address, with no terminal involved. Refused when the loop belongs to another
+process, because replacing this binary would leave that one running an old
+binary against the same queue.
+
 **Stop, replace the binary, resume.** A plain stop never abandons a run: it
 finishes the competition it is on, which can be an hour. That is right when
 you only want the queue to drain, and useless when you have fixes to install —

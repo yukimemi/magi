@@ -301,6 +301,16 @@ impl Stop {
         self.pause.clone()
     }
 
+    /// Is a run in flight right now?
+    ///
+    /// `finishing` answers "a stop is waiting on a run", which is false until
+    /// someone asks to stop. An upgrade needs the plain question, because it
+    /// is about to be the one asking.
+    #[must_use]
+    pub fn busy_now(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
     /// Mark a run as in flight, or finished, for [`Stop::finishing`].
     fn busy(&self, running: bool) {
         self.busy.store(running, Ordering::SeqCst);

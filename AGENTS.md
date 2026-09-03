@@ -688,6 +688,29 @@ other seats had long finished. A retry that re-sends the whole prompt, because
 the seat kept no context, keeps the whole budget: that one really is the job
 again.
 
+### Handing the address over: release, then spawn
+
+`POST /api/upgrade` ends the process it is serving from, and the order of the
+last two steps is the whole thing:
+
+1. `upgrade_and_restart` replaces the binary and signals `HANDOVER`.
+2. `serve`'s `select!` wakes on it, parks and drains the loop, **drops the
+   listener by returning**, and only then calls `spawn_successor`.
+
+The first attempt did it the other way round — spawn, sleep 200 ms, `exit(0)`
+— and the successor died on "address already in use" with its stdio sent to
+null, so the deck never came back and there was no terminal to say why. Note
+that the successor is whatever binary was just installed, so it cannot be
+assumed to carry `bind_waiting`: correctness has to come from the ordering,
+and the retry is only belt to that braces.
+
+Two more rules here:
+
+- **Refuse when the loop is foreign.** Replacing this binary would leave
+  somebody else's `magi serve` running an old one against the same claims.
+- **Answer 202 before restarting.** The reply has to leave while this process
+  can still send one; the phone learns the deck is back by reconnecting.
+
 ### A run is interrupted at a node boundary, never mid-node
 
 `graph::Pause` is checked between nodes in `execute`, and that is the only
