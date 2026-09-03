@@ -1,15 +1,37 @@
 root = true
 
 [*]
+# No `indent_size`: see the note below the Rust section. The checker's
+# left-padding rule cannot be satisfied alongside the formatters and the
+# alignment styles actually used here - 248 of the 255 remaining errors were
+# that one rule against markdown prose, CSS declarations and JS comment
+# blocks. Scope kept to what a checker can usefully enforce: encoding, line
+# endings, trailing whitespace, final newline.
 indent_style = space
-indent_size = 2
 end_of_line = lf
 charset = utf-8
 trim_trailing_whitespace = true
 insert_final_newline = true
 
-[*.{rs,toml}]
-indent_size = 4
+# No `indent_size` for Rust or TOML, for the reason the kata block below
+# spells out at length: `editorconfig-checker` counts leading spaces in `//`
+# and `/* */` comment bodies, rustfmt leaves those alone, and the dominant
+# style in this tree aligns continuation lines under `/* ` - three columns,
+# never a multiple of four. The two tools cannot both be satisfied, so the
+# one that formats wins and the one that only complains says nothing.
+#
+# `pj-base` dropped its own copy of this rule in 6bd536f; this hand-written
+# section kept it, which is why the `editorconfig` job went red on every
+# commit after that one - 454 errors, all `want multiple of 4`, on a tree
+# `cargo fmt --check` and `clippy` both call clean.
+
+[src/land.rs]
+# Holds verbatim copies of what the forge actually sends - a CodeRabbit
+# trigger notice, a Claude checklist, `gh api ... /comments` output - so the
+# comment parser is tested against real payloads rather than a tidied idea of
+# them. Several of those lines end in a space, and stripping them would make
+# the fixtures no longer verbatim, which is the one property they exist for.
+trim_trailing_whitespace = false
 
 [Makefile,*.mk]
 indent_style = tab
