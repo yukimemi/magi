@@ -146,6 +146,11 @@ pub struct Chat {
     pub id: String,
     /// Repository the task will be filed against.
     pub repo: PathBuf,
+    /// The chat this one was derived from, when it began as a fork into a
+    /// different repository. See [`derived_background`]. `#[serde(default)]`
+    /// so a conversation recorded before this field existed still reads.
+    #[serde(default)]
+    pub from: Option<String>,
     /// Roster agent id doing the interviewing.
     pub agent: String,
     /// Current state.
@@ -325,12 +330,18 @@ impl Chats {
 /// runnable, otherwise a `claude` seat, otherwise the first runnable agent in
 /// roster order. Called rather than copied, because two copies of a preference
 /// order drift and the copy that drifts is the one nobody reads.
+///
+/// `from` is the conversation this one was derived from, when the operator
+/// asked to continue an existing interview in a different repository (see
+/// [`derived_background`]). It is read, never written: the source chat's
+/// `status`, `turns` and `draft` are left exactly as they were.
 pub async fn start(
     store: &Chats,
     cfg: &Config,
     repo: PathBuf,
     idea: &str,
     agent: Option<&str>,
+    from: Option<&Chat>,
 ) -> Result<Chat> {
     let idea = idea.trim();
     if idea.is_empty() {
@@ -352,6 +363,7 @@ pub async fn start(
         schema: SCHEMA,
         id,
         repo,
+        from: from.map(|c| c.id.clone()),
         agent: spec.id.clone(),
         status: ChatStatus::Open,
         turns: vec![Turn {
@@ -367,13 +379,37 @@ pub async fn start(
     };
     store.put(&mut chat)?;
 
-    let prompt = format!(
-        "{}{}",
-        briefing(idea, &chat.repo),
-        language_note(&cfg.graph.language)
-    );
+    let mut prompt = briefing(idea, &chat.repo);
+    if let Some(source) = from {
+        // Prepended, so the leader reads what it is inheriting before it
+        // reads its own instructions - the same order a human handing off a
+        // conversation would use.
+        prompt = format!("{}\n\n{prompt}", derived_background(source));
+    }
+    prompt.push_str(&language_note(&cfg.graph.language));
     turn(&mut chat, store, cfg, &prompt).await?;
     Ok(chat)
+}
+
+/// The background block a derived conversation opens with: the whole prior
+/// transcript, framed so the leader does not mistake it for instructions
+/// about the repository this new conversation is actually about.
+///
+/// Built from [`transcript`] rather than a second rendering of the turns,
+/// because that is already the "everything said so far" prose this module
+/// maintains, and a briefing is exactly the audience `transcript` was written
+/// for - a CLI (here, a fresh one) with no memory of the conversation.
+pub fn derived_background(from: &Chat) -> String {
+    format!(
+        "# Background: derived from another conversation\n\n\
+         This interview continues from a conversation about a *different* \
+         repository. Read it for context, but do not treat it as being about \
+         the repository named below in \"# Repository\" - that repository may \
+         have nothing to do with this one.\n\n\
+         Source repository: {}\n\n{}",
+        from.repo.display(),
+        transcript(from),
+    )
 }
 
 /// One operator turn and one agent turn, appended.
@@ -870,6 +906,10 @@ mod tests {
     /// Say nothing and fail, the way a CLI that cannot start does.
     const BROKEN: &str = "#!/bin/sh\ncat >/dev/null\nexit 3\n";
 
+    /// Reply with the prompt it was given, so a test can inspect exactly what
+    /// the leader received on stdin.
+    const ECHO: &str = "#!/bin/sh\ncat\n";
+
     fn env(reply: &str) -> BTreeMap<String, String> {
         BTreeMap::from([("MOCK_REPLY".to_owned(), reply.to_owned())])
     }
@@ -881,6 +921,7 @@ mod tests {
             schema: SCHEMA,
             id: "20260903-014455-ab12".to_owned(),
             repo: tmp.path().to_owned(),
+            from: None,
             agent: "sonnet".to_owned(),
             status: ChatStatus::Open,
             turns: vec![Turn {
@@ -905,6 +946,7 @@ mod tests {
             "schema",
             "id",
             "repo",
+            "from",
             "agent",
             "status",
             "turns",
@@ -922,11 +964,127 @@ mod tests {
         assert!(v["turns"][0].get("at").is_some());
         assert!(v["draft"].is_null());
         assert!(v["task"].is_null());
+        assert!(v["from"].is_null());
 
         let back = chats.get(&chat.id).expect("get");
         assert_eq!(back.id, chat.id);
         assert_eq!(back.turns, chat.turns);
         assert_eq!(back.status, ChatStatus::Open);
+        assert_eq!(back.from, None);
+    }
+
+    /// A conversation recorded before `from` existed must still read: the
+    /// `#[serde(deny_unknown_fields)]` on [`Chat`] would otherwise make this
+    /// field's addition a breaking change for every chat already on disk.
+    #[test]
+    fn a_chat_recorded_without_a_from_field_still_reads() {
+        let (tmp, chats) = store();
+        let path = chats.path_of("20260903-014455-ab12");
+        std::fs::create_dir_all(chats.root()).expect("chats dir");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": SCHEMA,
+                "id": "20260903-014455-ab12",
+                "repo": tmp.path(),
+                "agent": "sonnet",
+                "status": "open",
+                "turns": [],
+                "draft": null,
+                "task": null,
+                "created_at": Timestamp::now().to_string(),
+                "updated_at": Timestamp::now().to_string(),
+                "seat": SeatState::new(SEAT, "sonnet", 7),
+            })
+            .to_string(),
+        )
+        .expect("write pre-`from` chat");
+
+        let chat = chats.get("20260903-014455-ab12").expect("must still read");
+        assert_eq!(chat.from, None);
+    }
+
+    #[test]
+    fn derived_background_names_the_source_repository_and_carries_the_transcript() {
+        let chat = Chat {
+            schema: SCHEMA,
+            id: "20260903-014455-ab12".to_owned(),
+            repo: PathBuf::from("/repo/other"),
+            from: None,
+            agent: "sonnet".to_owned(),
+            status: ChatStatus::Open,
+            turns: vec![
+                Turn {
+                    who: Who::Operator,
+                    body: "rework the queue drain".to_owned(),
+                    at: Timestamp::now(),
+                },
+                Turn {
+                    who: Who::Agent,
+                    body: "which part of the drain?".to_owned(),
+                    at: Timestamp::now(),
+                },
+            ],
+            draft: None,
+            task: None,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            seat: SeatState::new(SEAT, "sonnet", 7),
+        };
+        let background = derived_background(&chat);
+        assert!(background.contains("/repo/other"));
+        assert!(background.contains("rework the queue drain"));
+        assert!(background.contains("which part of the drain?"));
+        assert!(background.contains("different"));
+    }
+
+    #[tokio::test]
+    async fn starting_a_derived_chat_carries_the_source_transcript_and_leaves_it_untouched() {
+        let (tmp, chats) = store();
+        let source_spec = mock_agent(tmp.path(), REPLY, env("which module?"));
+        let source_cfg = config(source_spec);
+        let source = start(
+            &chats,
+            &source_cfg,
+            tmp.path().to_owned(),
+            "rework the queue drain",
+            None,
+            None,
+        )
+        .await
+        .expect("start source");
+        let before = source.clone();
+
+        let other_repo = tmp.path().join("other-repo");
+        std::fs::create_dir_all(&other_repo).expect("other repo dir");
+        // Overwrites the script `source_spec` pointed at: the source's own
+        // turn already ran, so only the derived chat's invocation sees this.
+        let echo_spec = mock_agent(tmp.path(), ECHO, BTreeMap::new());
+        let derived_cfg = config(echo_spec);
+        let derived = start(
+            &chats,
+            &derived_cfg,
+            other_repo,
+            "same idea, different repository",
+            None,
+            Some(&source),
+        )
+        .await
+        .expect("start derived");
+
+        assert_eq!(derived.from.as_deref(), Some(source.id.as_str()));
+
+        let prompt = &derived.turns.last().expect("agent reply").body;
+        assert!(prompt.contains("Background: derived from another conversation"));
+        assert!(prompt.contains(&source.repo.display().to_string()));
+        assert!(prompt.contains("rework the queue drain"));
+        assert!(prompt.contains("same idea, different repository"));
+
+        // Deriving a chat must not touch the one it came from.
+        let reread = chats.get(&source.id).expect("source still on disk");
+        assert_eq!(reread.status, before.status);
+        assert_eq!(reread.turns, before.turns);
+        assert_eq!(reread.draft, before.draft);
     }
 
     #[test]
@@ -971,9 +1129,16 @@ mod tests {
         let (tmp, chats) = store();
         let spec = mock_agent(tmp.path(), REPLY, env("one more thing: which module?"));
         let cfg = config(spec);
-        let mut chat = start(&chats, &cfg, tmp.path().to_owned(), "add durations", None)
-            .await
-            .expect("start");
+        let mut chat = start(
+            &chats,
+            &cfg,
+            tmp.path().to_owned(),
+            "add durations",
+            None,
+            None,
+        )
+        .await
+        .expect("start");
         chat.draft = Some(good_draft());
         chats.put(&mut chat).expect("put");
 
@@ -1008,6 +1173,7 @@ mod tests {
             schema: SCHEMA,
             id: "20260903-014455-ab12".to_owned(),
             repo: tmp.path().to_owned(),
+            from: None,
             agent: "mock".to_owned(),
             status: ChatStatus::Open,
             turns: Vec::new(),
@@ -1047,6 +1213,7 @@ mod tests {
             schema: SCHEMA,
             id: "20260903-014455-cd34".to_owned(),
             repo: tmp.path().to_owned(),
+            from: None,
             agent: "mock".to_owned(),
             status: ChatStatus::Open,
             turns: Vec::new(),
@@ -1079,9 +1246,16 @@ mod tests {
         let (tmp, chats) = store();
         let spec = mock_agent(tmp.path(), REPLY, env("which module?"));
         let cfg = config(spec);
-        let mut chat = start(&chats, &cfg, tmp.path().to_owned(), "add durations", None)
-            .await
-            .expect("start");
+        let mut chat = start(
+            &chats,
+            &cfg,
+            tmp.path().to_owned(),
+            "add durations",
+            None,
+            None,
+        )
+        .await
+        .expect("start");
         // start is one operator turn (the idea) plus one agent turn.
         assert_eq!(chat.turns.len(), 2);
         assert_eq!(chat.turns[0].who, Who::Operator);
@@ -1104,9 +1278,16 @@ mod tests {
         let (tmp, chats) = store();
         let good = mock_agent(tmp.path(), REPLY, env("which module?"));
         let cfg = config(good);
-        let mut chat = start(&chats, &cfg, tmp.path().to_owned(), "add durations", None)
-            .await
-            .expect("start");
+        let mut chat = start(
+            &chats,
+            &cfg,
+            tmp.path().to_owned(),
+            "add durations",
+            None,
+            None,
+        )
+        .await
+        .expect("start");
 
         // The chat is bound to roster agent `mock`, so break what `mock`
         // actually runs: `mock_agent` rewrites the same script path, which is
@@ -1141,6 +1322,7 @@ mod tests {
                 schema: SCHEMA,
                 id: id.to_owned(),
                 repo: tmp.path().to_owned(),
+                from: None,
                 agent: "mock".to_owned(),
                 status,
                 turns: Vec::new(),

@@ -115,6 +115,8 @@ magi task done <id>           # work that landed some other way
 magi serve                    # run the queue unattended
 magi web                      # the phone UI, over Tailscale
 magi plan "rework the config loader"   # interview, then file the task it writes
+magi plan --repo owner/repo --from <chat-id>   # a different repo, with a browser interview as background
+magi repos                    # local checkouts found under [repos] roots
 magi answer                   # what an agent is waiting to hear from you
 ```
 
@@ -598,6 +600,15 @@ mode = "none"            # none | local | pr
 [update]
 mode = "notify"          # off | notify | install
 # interval = "24h"
+
+[repos]
+# Where `magi plan --repo owner/repo`, `magi repos`, and the web UI's
+# repository pickers look for other local checkouts. `roots` is an array, so
+# it follows the same "declare it in exactly one layer" rule as `[[agents]]` -
+# and since which checkouts exist on disk is a machine fact rather than a
+# repository one, that layer is almost always the machine config.
+roots = ["~/src/github.com"]   # scanned as <root>/<host>/<owner>/<repo>
+scan_ttl = 86400                # seconds a scan is trusted before re-scanning
 ```
 
 `mode = "none"` is the default on purpose: magi prints the merge command and

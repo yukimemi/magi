@@ -42,6 +42,11 @@ const API = {
   chat: (id) => `/api/chats/${encodeURIComponent(id)}`,
   say: (id) => `/api/chats/${encodeURIComponent(id)}/say`,
   file: (id) => `/api/chats/${encodeURIComponent(id)}/file`,
+  /* Local checkouts under `[repos] roots`, for the repository pickers on the
+     "start a conversation" panel and the "continue in another repository"
+     action. `?refresh=1` bypasses the server's cache regardless of its TTL. */
+  repos: "/api/repos",
+  reposRefresh: "/api/repos?refresh=1",
   /* The loop itself: GET reports it, POST {running} starts or stops the one
      inside this server. */
   loop: "/api/loop",
@@ -401,6 +406,10 @@ const state = {
   detail: { id: null, run: null, report: null },
   questions: null,
   chats: null,
+  /* Local checkouts under `[repos] roots`, shared by both repository
+     pickers - the one on the "start a conversation" panel and the one on
+     "continue in another repository". `null` before the first load. */
+  repos: null,
   chatDetail: { id: null, chat: null },
   /* The id of the conversation whose turn is in flight, and the transcript
      length it started from. One turn at a time is the whole rule: a second
@@ -2060,6 +2069,7 @@ function renderChat() {
     show($("chat-closed"), false);
     show($("chat-wait"), false);
     show($("chat-problems"), false);
+    show($("chat-derived-from"), false);
     return;
   }
 
@@ -2084,6 +2094,13 @@ function renderChat() {
   setText($("chat-meta"),
     `${shortId(chat.id)} \u00b7 ${chat.agent || "agent"} \u00b7 ${plural(turns.length, "turn", "turns")} \u00b7 started ${started.text}`);
   setAttr($("chat-meta"), "title", `${chat.id}\nstarted ${started.title}`);
+
+  show($("chat-derived-from"), Boolean(chat.from));
+  if (chat.from) {
+    const link = $("chat-derived-from-link");
+    setText(link, shortId(chat.from));
+    setAttr(link, "href", `#/plan/${chat.from}`);
+  }
 
   /* Turns are append-only, so the index is a stable key and reconciling can
      never rebuild the transcript the operator is reading. */
@@ -2166,6 +2183,33 @@ function endTurn(id) {
   show($("chat-wait"), false);
 }
 
+/* ---- repository picker -------------------------------------------------- *
+ * One list, `state.repos`, feeds both selects below: the one that starts a
+ * new conversation and the one that derives a conversation into a different
+ * repository. Neither select is the source of truth for what gets sent -
+ * the text input beside each is, so a repository outside `[repos] roots`
+ * (nothing scanned, or the operator's own path) is always reachable. */
+function renderRepoOptions(select) {
+  const current = select.value;
+  clear(select);
+  select.append(el("option", { value: "", text: select.dataset.placeholder || "" }));
+  for (const repo of state.repos || []) {
+    select.append(el("option", { value: repo.path, text: repo.name }));
+  }
+  if ([...select.options].some((option) => option.value === current)) select.value = current;
+}
+
+async function loadRepos(refresh) {
+  try {
+    state.repos = await getJson(refresh ? API.reposRefresh : API.repos);
+  } catch {
+    /* The pickers just stay empty; typing a path still works. */
+    state.repos = state.repos || [];
+  }
+  renderRepoOptions($("chat-start-repo-select"));
+  renderRepoOptions($("chat-derive-repo-select"));
+}
+
 async function loadChats() {
   try {
     const list = await getJson(API.chats);
@@ -2232,8 +2276,10 @@ async function startChat() {
   setText(go, "Starting\u2026");
   show($("chat-start-wait"), true);
 
+  const repo = $("chat-start-repo").value.trim();
+
   try {
-    const chat = await postJson(API.chats, { idea, agent: null });
+    const chat = await postJson(API.chats, { idea, agent: null, repo: repo || null });
     state.chats = sortChats([chat, ...(state.chats || []).filter((c) => c.id !== chat.id)]);
     state.chatDetail = { id: chat.id, chat };
     box.value = "";
@@ -2248,6 +2294,47 @@ async function startChat() {
     go.disabled = false;
     setText(go, "Start the interview");
     show($("chat-start-wait"), false);
+  }
+}
+
+/* "Continue in another repository": derives a new conversation from the one
+   on screen, carrying its whole transcript and repository into the new one's
+   opening briefing as background (see `chat::derived_background` server-side).
+   The conversation on screen is left exactly as it is - this only ever
+   creates a new one. */
+async function deriveChat() {
+  const chat = state.chatDetail.chat;
+  const error = $("chat-derive-error");
+  const go = $("chat-derive-go");
+  if (!chat) return;
+
+  const repo = $("chat-derive-repo").value.trim();
+  if (!repo) {
+    setText(error, "Pick a repository, or type a path, first.");
+    show(error, true);
+    return;
+  }
+
+  show(error, false);
+  go.disabled = true;
+  setText(go, "Starting\u2026");
+
+  try {
+    const derived = await postJson(API.chats, {
+      idea: "Continue this conversation in a different repository.",
+      repo,
+      from: chat.id,
+    });
+    state.chats = sortChats([derived, ...(state.chats || []).filter((c) => c.id !== derived.id)]);
+    renderChats();
+    announce("Started a new conversation in the other repository.");
+    location.hash = `#/plan/${derived.id}`;
+  } catch (failure) {
+    setText(error, failure.message);
+    show(error, true);
+  } finally {
+    go.disabled = false;
+    setText(go, "Continue here");
   }
 }
 
@@ -3380,6 +3467,18 @@ function wire() {
   $("chat-start-go").addEventListener("click", startChat);
   $("chat-say").addEventListener("submit", sendTurn);
   $("chat-file").addEventListener("click", fileDraft);
+  $("chat-derive-go").addEventListener("click", deriveChat);
+
+  /* Picking a repository fills the text field beside it, which is what
+     actually gets sent - so a checkout outside `[repos] roots` stays
+     reachable by typing a path even when the picker has nothing in it. */
+  $("chat-start-repo-select").addEventListener("change", (event) => {
+    $("chat-start-repo").value = event.target.value;
+  });
+  $("chat-derive-repo-select").addEventListener("change", (event) => {
+    $("chat-derive-repo").value = event.target.value;
+  });
+  $("chat-start-repo-refresh").addEventListener("click", () => loadRepos(true));
   /* Enter inserts a newline, because on a phone that is the only way to type
      a paragraph. Ctrl or Cmd with Enter sends, for the desktop. */
   $("f-say").addEventListener("keydown", (event) => {
@@ -3418,7 +3517,7 @@ async function boot() {
     state.rev.loop = state.health.loop_rev;
     if (state.health.loop) state.loop = state.health.loop;
   }
-  await Promise.allSettled([loadRuns(), loadQueue(), loadQuestions(), loadChats()]);
+  await Promise.allSettled([loadRuns(), loadQueue(), loadQuestions(), loadChats(), loadRepos(false)]);
 
   subscribe();
   setInterval(() => {

@@ -35,6 +35,7 @@ pub mod plan;
 pub mod prompt;
 pub mod queue;
 pub mod report;
+pub mod repos;
 pub mod rng;
 pub mod run;
 pub mod stats;

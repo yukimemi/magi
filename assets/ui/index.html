@@ -246,6 +246,16 @@
         <textarea id="f-idea" rows="4" aria-describedby="f-idea-hint"
                   placeholder="rework the config loader — discovery is doing too much"></textarea>
       </div>
+      <div class="field">
+        <label for="chat-start-repo">Repository <span class="opt">optional</span></label>
+        <p class="hint" id="chat-start-repo-hint">Defaults to the repository this server was started against. Pick a known checkout, or type a path.</p>
+        <select id="chat-start-repo-select" data-placeholder="Server default" aria-describedby="chat-start-repo-hint">
+          <option value="">Server default</option>
+        </select>
+        <input id="chat-start-repo" name="repo" type="text" spellcheck="false" autocapitalize="off"
+               aria-describedby="chat-start-repo-hint" placeholder="/home/yukimemi/src/github.com/yukimemi/magi">
+        <button class="btn btn-quiet" type="button" id="chat-start-repo-refresh">Rescan repositories</button>
+      </div>
       <p class="form-error" id="chat-start-error" role="alert" hidden></p>
       <button class="btn btn-gold" type="button" id="chat-start-go">Start the interview</button>
       <p class="waiting" id="chat-start-wait" role="status" hidden>
@@ -268,6 +278,9 @@
       <div class="run-status" id="chat-status"></div>
       <h1 id="chat-h">Loading conversation…</h1>
       <p class="view-sub" id="chat-meta"></p>
+      <p class="panel-note" id="chat-derived-from" hidden>
+        Derived from <a id="chat-derived-from-link" href="#"></a>.
+      </p>
     </div>
 
     <ol class="turns" id="chat-turns"></ol>
@@ -317,6 +330,18 @@
     <p class="panel-note" id="chat-closed" hidden>
       This conversation is closed. Start another from Planning.
     </p>
+
+    <div class="panel" id="chat-derive-panel">
+      <h2>Continue in another repository</h2>
+      <p class="panel-note">Starts a new conversation with this whole transcript as background, against a different checkout. This conversation is left exactly as it is.</p>
+      <select id="chat-derive-repo-select" data-placeholder="Choose a repository…">
+        <option value="">Choose a repository…</option>
+      </select>
+      <input id="chat-derive-repo" type="text" spellcheck="false" autocapitalize="off"
+             placeholder="/home/yukimemi/src/github.com/yukimemi/rvpm">
+      <p class="form-error" id="chat-derive-error" role="alert" hidden></p>
+      <button class="btn btn-quiet" type="button" id="chat-derive-go">Continue here</button>
+    </div>
   </section>
 </main>
 
