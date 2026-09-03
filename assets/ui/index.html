@@ -155,7 +155,7 @@
 
       <div class="panel" id="run-task-panel">
         <h2>Task</h2>
-        <p class="instruction" id="run-instruction"></p>
+        <div class="instruction md" id="run-instruction"></div>
       </div>
 
       <div class="panel" id="run-cands-panel" hidden>
@@ -285,7 +285,14 @@
         <span class="tag" data-tone="gold" id="chat-draft-tag">draft</span>
       </div>
       <p class="panel-note">This is what gets filed. Read it before you do.</p>
-      <pre class="draft" id="chat-draft" tabindex="0" aria-label="Draft task file"></pre>
+      <!-- Formatted is the default read; raw is one tap away and shows the
+           exact bytes that would be filed, unaltered - the operator must
+           always be able to check that before filing. -->
+      <div class="draft-view-toggle">
+        <button class="btn btn-quiet" type="button" id="chat-draft-raw-toggle" aria-pressed="false">Show raw</button>
+      </div>
+      <div class="md" id="chat-draft-rendered"></div>
+      <pre class="draft" id="chat-draft" tabindex="0" aria-label="Draft task file (raw)" hidden></pre>
       <div class="problems" id="chat-problems" role="alert" hidden></div>
       <button class="btn btn-gold" type="button" id="chat-file">File this task</button>
     </div>

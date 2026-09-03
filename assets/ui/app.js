@@ -416,6 +416,10 @@ const state = {
   rev: { queue: null, runs: null, questions: null, chats: null, loop: null },
   streamOpen: false,
   wrap: false,
+  /* The draft panel's own view toggle: formatted by default, the exact bytes
+     that would be filed one tap away. Global rather than per-chat - there is
+     only ever one draft panel on screen at a time. */
+  draftRaw: false,
 };
 
 let fallbackTimer = null;
@@ -964,7 +968,7 @@ function createTaskCard() {
   const error = el("pre", { class: "err" });
   const instruction = el("details", { class: "advanced" },
     el("summary", { text: "Full instruction" }),
-    el("p", { class: "instruction" }));
+    el("div", { class: "instruction md" }));
   const runLink = el("a", { class: "btn btn-quiet" });
   const hold = el("button", { class: "btn btn-quiet", type: "button" });
   const deleteBox = el("span", { class: "task-delete-box" });
@@ -1017,7 +1021,11 @@ function updateTaskCard(row, task) {
   show(r.error, Boolean(task.last_error));
 
   const full = task.instruction || "";
-  setText(r.instruction.querySelector(".instruction"), full);
+  const instructionBox = r.instruction.querySelector(".instruction");
+  if (instructionBox.dataset.forTask !== task.id) {
+    instructionBox.dataset.forTask = task.id;
+    renderMd(instructionBox, task.instruction_md);
+  }
   show(r.instruction, full.trim() !== (task.title || "").trim() && full !== "");
 
   const runs = Array.isArray(task.runs) ? task.runs : [];
@@ -1181,86 +1189,89 @@ function isWaiting(run) {
   return state.questions === null || openFor(run.id).length > 0;
 }
 
-/* ---- markdown-ish ------------------------------------------------------ *
- * A question's detail is agent-authored markdown and can be long. There is no
- * library here and there will not be one, so this handles the four things a
- * decision brief actually contains — fenced blocks, headings, dash lists and
- * paragraphs — plus inline code spans, and treats everything else as text.
- *
- * It returns nodes. Nothing from the API is ever assigned as markup anywhere
- * in this client, and least of all here: this string was written by a process
- * the operator did not author, and a fence containing a script tag has to
- * render as the characters of a script tag. */
-function markdownish(text) {
-  const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
-  const out = [];
-  let paragraph = [];
-  let bullets = null;
+/* ---- markdown ----------------------------------------------------------- *
+ * Parsing markdown happens once, server-side (`magi::md`), which hands back a
+ * tree of typed nodes rather than a string of HTML. What follows is the one
+ * and only place this client turns that tree into DOM, with createElement and
+ * textContent exactly as everywhere else — there is no second reader of
+ * markdown syntax in this file, and no innerHTML anywhere in it. A run's
+ * instruction, a chat's agent turn, a question's detail and a chat's draft
+ * all go through `renderMd`; nothing here re-derives structure from the raw
+ * string the way the old hand-rolled reader did. */
 
-  const flush = () => {
-    if (paragraph.length) {
-      out.push(el("p", {}, inline(paragraph.join(" "))));
-      paragraph = [];
+/* One markdown node to one DOM node. The server already refused to build a
+   `link`/`image` node for anything it would be unsafe to render (see
+   `magi::md::normalize_link`/`normalize_image`), so this never has to
+   inspect a URL itself — it only has to trust the shape it was handed. */
+function buildMd(node) {
+  switch (node && node.type) {
+    case "paragraph":
+      return el("p", {}, (node.children || []).map(buildMd));
+    case "heading": {
+      const level = Math.min(6, Math.max(1, Number(node.level) || 1));
+      return el(`h${level}`, {}, (node.children || []).map(buildMd));
     }
-    if (bullets) {
-      out.push(el("ul", {}, bullets.map((item) => el("li", {}, inline(item)))));
-      bullets = null;
-    }
-  };
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const fence = /^\s{0,3}(`{3,}|~{3,})/.exec(lines[i]);
-    if (fence) {
-      flush();
-      const closer = fence[1][0].repeat(3);
-      const body = [];
-      i += 1;
-      while (i < lines.length && !lines[i].trimStart().startsWith(closer)) {
-        body.push(lines[i]);
-        i += 1;
+    case "bullet_list":
+      return el("ul", {}, (node.items || []).map(buildMd));
+    case "ordered_list":
+      return el("ol", { start: node.start && node.start !== 1 ? node.start : null },
+        (node.items || []).map(buildMd));
+    case "list_item":
+      if (node.checked === null || node.checked === undefined) {
+        return el("li", {}, (node.children || []).map(buildMd));
       }
-      out.push(el("pre", {}, el("code", { text: body.join("\n") })));
-      continue;
-    }
-
-    const heading = /^ {0,3}#{1,6}\s+(.*)$/.exec(lines[i]);
-    if (heading) {
-      flush();
-      out.push(el("h4", {}, inline(heading[1].trim())));
-      continue;
-    }
-
-    const bullet = /^ {0,3}[-*+]\s+(.*)$/.exec(lines[i]);
-    if (bullet) {
-      if (paragraph.length) flush();
-      if (!bullets) bullets = [];
-      bullets.push(bullet[1]);
-      continue;
-    }
-
-    if (!lines[i].trim()) {
-      flush();
-      continue;
-    }
-    /* A wrapped continuation line belongs to whatever is already open. */
-    if (bullets) bullets[bullets.length - 1] += ` ${lines[i].trim()}`;
-    else paragraph.push(lines[i].trim());
+      return el("li", { class: "task" },
+        el("input", { type: "checkbox", checked: Boolean(node.checked), disabled: true }),
+        (node.children || []).map(buildMd));
+    case "block_quote":
+      return el("blockquote", {}, (node.children || []).map(buildMd));
+    case "thematic_break":
+      return el("hr");
+    case "code_block":
+      return el("pre", { "data-lang": node.lang || null }, el("code", { text: node.code || "" }));
+    case "code":
+      return el("code", { text: node.code || "" });
+    case "emphasis":
+      return el("em", {}, (node.children || []).map(buildMd));
+    case "strong":
+      return el("strong", {}, (node.children || []).map(buildMd));
+    case "strikethrough":
+      return el("s", {}, (node.children || []).map(buildMd));
+    case "link":
+      return el("a", { href: node.href, target: "_blank", rel: "noopener noreferrer" },
+        (node.children || []).map(buildMd));
+    case "image":
+      return el("img", { src: node.src, alt: node.alt || "", loading: "lazy" });
+    case "table":
+      return buildMdTable(node);
+    case "soft_break":
+      return document.createTextNode(" ");
+    case "line_break":
+      return el("br");
+    case "text":
+      return document.createTextNode(node.value ?? "");
+    default:
+      return document.createTextNode("");
   }
-
-  flush();
-  return out;
 }
 
-/* Code spans only. Emphasis is left alone on purpose: a parser cheap enough
-   to belong in this file would read the asterisks in a glob as italics and
-   silently eat them out of a path the operator was meant to see. */
-function inline(text) {
-  const nodes = [];
-  String(text).split(/`([^`]+)`/g).forEach((part, i) => {
-    if (part === "") return;
-    nodes.push(i % 2 === 1 ? el("code", { text: part }) : document.createTextNode(part));
-  });
-  return nodes;
+function buildMdTable(node) {
+  const rows = Array.isArray(node.rows) ? node.rows : [];
+  const row = (cells) => el("tr", {}, (Array.isArray(cells) ? cells : []).map((cell) =>
+    el(cell.header ? "th" : "td",
+      { "data-align": cell.align && cell.align !== "none" ? cell.align : null },
+      (cell.children || []).map(buildMd))));
+  const head = rows.length ? el("thead", {}, row(rows[0])) : null;
+  const body = el("tbody", {}, rows.slice(1).map(row));
+  return el("div", { class: "table-scroll" }, el("table", {}, head, body));
+}
+
+/* Replace `container`'s children with `nodes` (a server-sent markdown tree)
+   turned into DOM. The one call every one of the five markdown surfaces in
+   this UI goes through. */
+function renderMd(container, nodes) {
+  clear(container);
+  append(container, (Array.isArray(nodes) ? nodes : []).map(buildMd));
 }
 
 /* ---- agent-authored panels --------------------------------------------- *
@@ -1564,7 +1575,8 @@ function updateAskCard(row, question, { compact = false } = {}) {
     row.dataset.detailKey = key;
     clear(r.detail);
     if (detail) {
-      const body = el("div", { class: "md" }, markdownish(detail));
+      const body = el("div", { class: "md" });
+      renderMd(body, question.detail_md);
       r.detail.append(open
         ? body
         : el("details", { class: "advanced" }, el("summary", { text: "Context" }), body));
@@ -1786,6 +1798,12 @@ function focusFirstAsk() {
  */
 const chatTurns = (chat) => (chat && Array.isArray(chat.turns) ? chat.turns : []);
 
+/* Parallel to `chatTurns`: one parsed markdown tree per real turn, server-
+   built so this client never re-derives it. The synthetic "still sending"
+   turn `renderChat` appends locally has no entry and needs none - it is
+   always the operator's own text, shown as plain text. */
+const chatTurnsMd = (chat) => (chat && Array.isArray(chat.turn_bodies_md) ? chat.turn_bodies_md : []);
+
 /* What the operator opened with, which is the only thing that names a
    conversation before it has produced a draft. */
 function chatOpener(chat) {
@@ -1928,16 +1946,18 @@ function updateTurnRow(row, item) {
   setText(r.who, kind === "operator" ? "You" : kind === "system" ? "magi" : "Agent");
 
   /* A turn never changes once it is on disk, so its body is built once. The
-     agent's is markdown-ish prose and is rendered as nodes, never as markup:
-     the rule that no API data is ever assigned as HTML holds everywhere
-     outside the sandboxed panel frame, and a model that writes a script tag
-     into a fence has to see the characters of one. */
+     agent's is markdown prose, already parsed server-side, and is rendered as
+     nodes, never as markup: the rule that no API data is ever assigned as
+     HTML holds everywhere outside the sandboxed panel frame, and a model that
+     writes a script tag into a fence has to see the characters of one. */
   const key = `${kind}:${body.length}`;
   if (row.dataset.turnKey !== key) {
     row.dataset.turnKey = key;
     clear(r.body);
     if (kind === "agent") {
-      r.body.append(el("div", { class: "md" }, markdownish(body)));
+      const div = el("div", { class: "md" });
+      renderMd(div, item.md);
+      r.body.append(div);
     } else {
       r.body.append(el("p", {
         class: "turn-text",
@@ -1963,10 +1983,7 @@ function renderProblems(problems) {
      rejection at a time, and the draft stays on screen above this. */
   box.append(
     el("h3", { text: `Not fileable yet \u2014 ${plural(problems.length, "problem", "problems")}` }),
-    /* The validator names sections and symbols in backticks; `inline` turns
-       those into code spans as nodes, so the operator reads `## Acceptance`
-       as the heading it is and no markup is ever assigned. */
-    el("ul", {}, problems.map((problem) => el("li", {}, inline(String(problem))))),
+    el("ul", {}, problems.map((problem) => el("li", { text: String(problem) }))),
   );
   show(box, true);
 }
@@ -1975,6 +1992,17 @@ function chatError(message) {
   const box = $("chat-error");
   setText(box, message || "");
   show(box, Boolean(message));
+}
+
+/* Switches the draft panel between its formatted read and the raw bytes that
+   would actually be filed. Both stay in the DOM; only `hidden` moves, so
+   toggling never re-parses or re-fetches anything. */
+function applyDraftView() {
+  const raw = state.draftRaw;
+  show($("chat-draft-rendered"), !raw);
+  show($("chat-draft"), raw);
+  setText($("chat-draft-raw-toggle"), raw ? "Show formatted" : "Show raw");
+  setAttr($("chat-draft-raw-toggle"), "aria-pressed", String(raw));
 }
 
 function renderChat() {
@@ -2019,13 +2047,21 @@ function renderChat() {
 
   /* Turns are append-only, so the index is a stable key and reconciling can
      never rebuild the transcript the operator is reading. */
-  syncList($("chat-turns"), turns.map((turn, i) => ({ turn, key: String(i) })),
+  const turnsMd = chatTurnsMd(chat);
+  syncList($("chat-turns"), turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i) })),
     (item) => item.key, createTurnRow, updateTurnRow);
 
   const draft = chatDraft(chat);
   const hasDraft = draft.trim() !== "";
   show($("chat-draft-panel"), hasDraft);
-  if (hasDraft) setText($("chat-draft"), draft);
+  if (hasDraft) {
+    setText($("chat-draft"), draft);
+    if ($("chat-draft-rendered").dataset.forDraft !== draft) {
+      $("chat-draft-rendered").dataset.forDraft = draft;
+      renderMd($("chat-draft-rendered"), chat.draft_md);
+    }
+  }
+  applyDraftView();
   setText($("chat-draft-tag"), status === "filed" ? "filed" : "draft");
   setAttr($("chat-draft-tag"), "data-tone", status === "filed" ? "teal" : "gold");
   show($("chat-file"), hasDraft && status === "open");
@@ -2347,7 +2383,11 @@ function renderRunDetail() {
     `${shortId(run.id)} \u00b7 ${repoName} \u00b7 ${run.base_branch || ""} \u00b7 started ${created.text} \u00b7 updated ${updated.text}`);
   setAttr($("run-meta"), "title", `${run.id}\n${run.repo || ""}\nstarted ${created.title}\nupdated ${updated.title}`);
 
-  setText($("run-instruction"), run.instruction || "");
+  const instructionEl = $("run-instruction");
+  if (instructionEl.dataset.forRun !== run.id) {
+    instructionEl.dataset.forRun = run.id;
+    renderMd(instructionEl, run.instruction_md);
+  }
 
   renderAsks(run);
   renderLand(run);
@@ -3151,6 +3191,11 @@ function wire() {
     state.wrap = !state.wrap;
     event.currentTarget.setAttribute("aria-pressed", String(state.wrap));
     $("run-report").dataset.wrap = state.wrap ? "1" : "0";
+  });
+
+  $("chat-draft-raw-toggle").addEventListener("click", () => {
+    state.draftRaw = !state.draftRaw;
+    applyDraftView();
   });
 
   $("alert-retry").addEventListener("click", () => {
