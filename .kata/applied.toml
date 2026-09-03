@@ -1,14 +1,14 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-08-30T16:01:04.6614202Z"
+applied_at = "2026-09-03T13:28:47.6271372Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "10cd49c09b95af8add4daf71c5151835821cb670"
+rev = "08989f887002780557cb6e0ce18141d7abf2c85e"
 version = "0.18.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "e9ed48b62025bbe80e1d35cdccca11ec2ee88d3e"
+rev = "f94771ad56008e68553341d4df4341d192d58e0d"
 version = "0.8.1"
 
 [[templates]]
@@ -23,6 +23,7 @@ once_applied = true
 once_applied = true
 
 [files.".editorconfig"]
+content_hash = "02e4337db1bb05d6b19fdfb51328eb000ceb17c635273c63a66767698242b0a4"
 once_applied = true
 
 [files.".gemini/settings.json"]
@@ -38,7 +39,7 @@ content_hash = "0ac5ed2847ab6e1041e34209dcc2396a582722ea9537d03bd950e1db1851a4b7
 content_hash = "4e2735f40c2ae61014810159a2458da2edc1646589f5f65d9f2f3d099366c9a8"
 
 [files.".github/workflows/ci.yml"]
-content_hash = "3e2b071337a00167805781cc078cb08e1bf05e67be2e0bb226eeb11586396cc0"
+content_hash = "bbc5b62bfe5f37033ea9d4d5fb9f0ef4e4df460a6a7920e1408b43dbb87b9304"
 
 [files.".github/workflows/claude-review.yml"]
 content_hash = "4a8e47aabb3cdf2a59030d5194467022f0efb53bb1819d4495752020d10be773"
@@ -56,7 +57,7 @@ content_hash = "ef4db54ac86c63962de0e95bcdca4fe7d6ca8f6b28c358a65c98686aa984b5f0
 content_hash = "4bebd1c3417c33f9d1c51f011694f6d82b098bbb1a5a102ba56e97ab01a866ef"
 
 [files.".kata/vars.toml"]
-content_hash = "8e573305bc9b45b40e4c4c24c0da7728771a12d81c4c1631d6e35f25a189cf84"
+content_hash = "84daa3d716a28510f2dba69e3c95eb43936d89916df8f16c39b60d0473f9e818"
 once_applied = true
 
 [files."AGENTS.md"]
@@ -72,7 +73,7 @@ content_hash = "3670f70a2f0be4013926bab6e878b90a42ad64c17899080aef4d193b246fa390
 once_applied = true
 
 [files."Makefile.toml"]
-content_hash = "930554e54d2c4090b4e0ba6014dd0692a05884ff6af803897f9d1c1647818b94"
+content_hash = "23145feefcd54c44e8b8fee83baab72b6b5114ea076022c5cb81decda34f358f"
 
 [files."OPENCODE.md"]
 content_hash = "11993dc7feec5fca8e83934f135de33879b88f100c48aeba0729de2f57a11a48"
