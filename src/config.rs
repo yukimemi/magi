@@ -411,6 +411,42 @@ pub struct Config {
     pub prompts: Prompts,
     /// How the operator is told a run is waiting on them.
     pub notify: Notify,
+    /// Local repositories the plan surface can start or derive a conversation
+    /// against.
+    pub repos: Repos,
+}
+
+/// Where `magi plan` and the browser interview look for a repository other
+/// than the one they were started against.
+///
+/// `roots` is an array, so per [`array_keys`] it can only be declared in one
+/// config layer - the machine layer, since which checkouts exist on disk is a
+/// *machine* fact in the same way the agent roster is: a repository's own
+/// `magi.toml` cannot state where its siblings live before magi has resolved
+/// which repository to read that file from in the first place.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Repos {
+    /// Roots to scan for a ghq-layout checkout: `<root>/<host>/<owner>/<repo>`
+    /// with a `.git` directory. Empty by default - nothing is scanned unless
+    /// asked to be.
+    pub roots: Vec<PathBuf>,
+    /// How long a scan is trusted before the next request re-scans it,
+    /// seconds. `0` means never trust it: scan on every request. Defaults to
+    /// a day, the same order of magnitude as [`Graph::answer_timeout`] for
+    /// the same reason - a checkout does not usually appear or vanish inside
+    /// a session, so there is little to gain from scanning more often than
+    /// that, and an explicit refresh exists for the moment one does.
+    pub scan_ttl: u64,
+}
+
+impl Default for Repos {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            scan_ttl: 86_400,
+        }
+    }
 }
 
 /// Project-specific text appended to each node's prompt.
@@ -907,6 +943,22 @@ mod tests {
     #[test]
     fn empty_roster_is_an_error() {
         assert!(Config::default().resolve_roles().is_err());
+    }
+
+    #[test]
+    fn repos_default_to_no_roots_and_a_day_of_trust() {
+        assert_eq!(Config::default().repos.roots, Vec::<PathBuf>::new());
+        assert_eq!(Config::default().repos.scan_ttl, 86_400);
+    }
+
+    #[test]
+    fn a_config_file_with_no_repos_table_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        std::fs::write(&path, "[graph]\ncandidates = 2\n").unwrap();
+        let cfg = Config::load(&path).expect("must load without [repos]");
+        assert_eq!(cfg.repos.roots, Vec::<PathBuf>::new());
+        assert_eq!(cfg.repos.scan_ttl, 86_400);
     }
 
     #[test]

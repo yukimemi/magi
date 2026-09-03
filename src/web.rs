@@ -118,7 +118,7 @@ use crate::config::Config;
 use crate::md;
 use crate::queue::{Queue, Source, Task, title_from};
 use crate::run::{RunState, RunStatus};
-use crate::{chat, daemon, report, run};
+use crate::{chat, daemon, report, repos, run};
 
 /// Default port. Chosen high and memorable; nothing else in the fleet uses it.
 pub const DEFAULT_PORT: u16 = 7878;
@@ -267,6 +267,10 @@ pub struct Ui {
     /// agent seats. Same reasoning about scope as `turns` — this guards two
     /// taps and two phones, which is this process's own concurrency.
     resuming: Arc<Mutex<HashSet<String>>>,
+    /// The last scan of `[repos] roots`, and when it happened. Shared across
+    /// requests so a phone opening the repository picker repeatedly does not
+    /// repeat the filesystem walk every time - see [`repos::Cache`].
+    repos_cache: repos::Cache,
     /// Merge mode override handed to the loop this process starts.
     merge: Option<String>,
     /// The loop this process is running, if it is running one.
@@ -304,6 +308,7 @@ impl Ui {
             repo,
             turns: Arc::default(),
             resuming: Arc::default(),
+            repos_cache: repos::Cache::new(),
             merge: None,
             looping: Arc::default(),
             launch: launch_daemon,
@@ -566,6 +571,7 @@ impl Ui {
             .route("/api/runs/{id}/resume", post(run_resume))
             .route("/api/queue", get(queue_list).post(queue_post))
             .route("/api/queue/{id}", delete(queue_delete))
+            .route("/api/repos", get(repos_list))
             .route("/api/queue/{id}/hold", post(queue_hold))
             .route("/api/queue/{id}/release", post(queue_release))
             .route("/api/questions", get(questions_list))
@@ -1579,6 +1585,37 @@ impl From<Task> for TaskView {
     }
 }
 
+/// `?refresh=1` forces a re-scan even inside the TTL. Any other value, or
+/// its absence, leaves the cache to decide.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ReposQuery {
+    refresh: u8,
+}
+
+/// `GET /api/repos` - the repository picker for the plan surface's "start a
+/// conversation" panel and its "continue in another repository" action.
+///
+/// Reads `[repos] roots` and `[repos] scan_ttl` off the same config the rest
+/// of the plan surface uses, discovered against `ui.repo` so an edit to
+/// `magi.toml` takes effect without a restart, the same reasoning
+/// [`config_for`] documents for the chat routes.
+async fn repos_list(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<ReposQuery>,
+) -> ApiResult<Json<Vec<repos::Repo>>> {
+    let refresh = q.refresh != 0;
+    blocking(move || {
+        let (cfg, _) = Config::discover(&ui.repo, None)?;
+        Ok(Json(ui.repos_cache.list(
+            &cfg.repos.roots,
+            Duration::from_secs(cfg.repos.scan_ttl),
+            refresh,
+        )))
+    })
+    .await
+}
+
 async fn queue_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TaskView>>> {
     blocking(move || {
         Ok(Json(
@@ -2194,14 +2231,20 @@ async fn chat_detail(
 /// The body of `POST /api/chats`.
 ///
 /// `agent` names a seat from the roster to do the interviewing; absent means
-/// the configured default, which is what the phone sends. Unknown fields are
-/// ignored so a newer front end still starts an interview against an older
-/// binary.
+/// the configured default, which is what the phone sends. `repo` is a path,
+/// not a short name - resolving `owner/repo` against `[repos] roots` is the
+/// job of whatever built the picker the operator chose from, i.e.
+/// `GET /api/repos`, so this route only ever has to trust a path. `from`
+/// derives this conversation from an existing one - see [`chat::start`].
+/// Unknown fields are ignored so a newer front end still starts an interview
+/// against an older binary.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct NewChat {
     idea: String,
     agent: Option<String>,
+    repo: Option<PathBuf>,
+    from: Option<String>,
 }
 
 /// `POST /api/chats`.
@@ -2223,14 +2266,37 @@ async fn chat_post(
         ));
     }
 
+    // Resolved before the agent runs, so a bad `from` id is a 4xx that names
+    // it rather than a wasted agent turn against a conversation that does not
+    // exist.
+    let from = {
+        let ui = Arc::clone(&ui);
+        let from_id = body.from.clone();
+        blocking(move || match from_id {
+            None => Ok(None),
+            Some(id) => {
+                let resolved = resolve_chat(&ui.chats, &id)?;
+                Ok(Some(ui.chats.get(&resolved)?))
+            }
+        })
+        .await?
+    };
+
     // Read the configuration for this request rather than at startup, so an
     // edit to `magi.toml` - a new seat, a different interviewer - takes effect
     // without restarting the server the operator reaches from their phone.
-    let repo = ui.repo.clone();
+    let repo = body.repo.clone().unwrap_or_else(|| ui.repo.clone());
     let cfg = config_for(&repo).await?;
-    let chat = chat::start(&ui.chats, &cfg, repo, &body.idea, body.agent.as_deref())
-        .await
-        .map_err(ApiError::from)?;
+    let chat = chat::start(
+        &ui.chats,
+        &cfg,
+        repo,
+        &body.idea,
+        body.agent.as_deref(),
+        from.as_ref(),
+    )
+    .await
+    .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ChatView::from(chat))))
 }
 
@@ -2456,11 +2522,20 @@ mod tests {
         /// A fixture whose loop is `launch`.
         async fn with_loop(launch: Launch) -> Self {
             let home = TempDir::new().expect("temp home");
-            let addr = Self::serve(home.path(), launch).await;
+            let addr = Self::serve(home.path(), PathBuf::from("/repo/magi"), launch).await;
             Self { home, addr }
         }
 
-        async fn serve(home: &FsPath, launch: Launch) -> SocketAddr {
+        /// A fixture whose `ui.repo` is a real directory rather than the
+        /// usual placeholder - for the routes that read config off it
+        /// (`GET /api/repos`) and would otherwise have nothing to discover.
+        async fn with_repo(repo: PathBuf) -> Self {
+            let home = TempDir::new().expect("temp home");
+            let addr = Self::serve(home.path(), repo, launch_idle).await;
+            Self { home, addr }
+        }
+
+        async fn serve(home: &FsPath, repo: PathBuf, launch: Launch) -> SocketAddr {
             let queue = Queue::at(home.join("queue"));
             let runs = home.join("runs");
             std::fs::create_dir_all(&runs).expect("runs dir");
@@ -2470,7 +2545,7 @@ mod tests {
                 Chats::at(home.join("chats")),
                 runs,
                 home.to_path_buf(),
-                PathBuf::from("/repo/magi"),
+                repo,
             )
             .with_launch(launch);
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -3394,6 +3469,160 @@ mod tests {
                 .is_some_and(|i| i.starts_with("# Rework the config loader\n\nIt re-reads")),
             "the instruction reaches the graph verbatim, markers and all: {}",
             task["instruction"]
+        );
+    }
+
+    /// `<repo>/host/owner/repo/.git`, the ghq layout [`repos::scan`] expects.
+    fn make_checkout(root: &FsPath, host: &str, owner: &str, repo: &str) {
+        std::fs::create_dir_all(root.join(host).join(owner).join(repo).join(".git"))
+            .expect("checkout dir");
+    }
+
+    #[tokio::test]
+    async fn repos_list_returns_name_and_path_for_every_configured_root() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let root = tmp.path().join("root");
+        make_checkout(&root, "github.com", "yukimemi", "magi");
+        std::fs::write(
+            repo.join("magi.toml"),
+            format!(
+                "[repos]\nroots = [{:?}]\n",
+                root.to_string_lossy().into_owned()
+            ),
+        )
+        .expect("write magi.toml");
+
+        let f = Fixture::with_repo(repo).await;
+        let res = f.get("/api/repos").await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let list = res.json();
+        let repos = list.as_array().expect("an array");
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0]["name"], "yukimemi/magi");
+        assert!(
+            repos[0]["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("magi") || p.contains("magi")),
+            "{list}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repos_list_only_rescans_within_the_ttl_when_asked_to() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let root = tmp.path().join("root");
+        make_checkout(&root, "github.com", "yukimemi", "magi");
+        std::fs::write(
+            repo.join("magi.toml"),
+            format!(
+                "[repos]\nroots = [{:?}]\nscan_ttl = 3600\n",
+                root.to_string_lossy().into_owned()
+            ),
+        )
+        .expect("write magi.toml");
+
+        let f = Fixture::with_repo(repo).await;
+        let first = f.get("/api/repos").await;
+        assert_eq!(first.json().as_array().map(Vec::len), Some(1));
+
+        // A second checkout appears; within the TTL the cached answer must
+        // not notice it.
+        make_checkout(&root, "github.com", "yukimemi", "rvpm");
+        let second = f.get("/api/repos").await;
+        assert_eq!(
+            second.json().as_array().map(Vec::len),
+            Some(1),
+            "a fresh cache must not rescan inside the TTL"
+        );
+
+        let refreshed = f.get("/api/repos?refresh=1").await;
+        assert_eq!(
+            refreshed.json().as_array().map(Vec::len),
+            Some(2),
+            "an explicit refresh must rescan even inside the TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn posting_a_chat_with_an_unknown_from_names_the_id_in_a_4xx() {
+        let f = Fixture::start().await;
+        let res = f
+            .post(
+                "/api/chats",
+                Some(r#"{"idea":"same idea, another repo","from":"nosuchchat"}"#),
+            )
+            .await;
+        assert!(res.status >= 400 && res.status < 500, "{}", res.status);
+        assert!(
+            res.json()["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("nosuchchat")),
+            "the error names the id that does not exist: {}",
+            res.body
+        );
+        assert!(
+            f.chats().list().is_empty(),
+            "a chat must not be created against an unresolvable `from`"
+        );
+    }
+
+    /// A `kind = "command"` agent that ignores its prompt and answers a fixed
+    /// string, declared straight in a repository's own `magi.toml` rather
+    /// than the operator's real roster. No real agent CLI is spawned - `sh`
+    /// is the interpreter, the same as `chat::tests::mock_agent` uses - so
+    /// this is safe to run over a real HTTP round trip, unlike every other
+    /// `POST /api/chats` test in this module.
+    ///
+    /// `[roles] planner` is pinned here too, and not left to the built-in
+    /// "first runnable agent" fallback: an operator's own machine layer can
+    /// (and, on at least one real machine this was written and tested on,
+    /// does) already pin a `planner` naming a roster seat this file does not
+    /// have. `roles.planner` is a scalar, so restating it in this
+    /// higher-precedence repo layer is not the array conflict
+    /// `config::array_keys` refuses - it is exactly the override the layering
+    /// exists for, and it is what keeps this test's outcome independent of
+    /// whatever the machine layer happens to say.
+    const MOCK_AGENT_TOML: &str = "[roles]\nplanner = \"mock\"\n\n[[agents]]\nid = \"mock\"\nkind = \"command\"\ncommand = [\"sh\", \"-c\", \"cat >/dev/null && printf ok\"]\n";
+
+    #[tokio::test]
+    async fn a_posted_chat_takes_the_given_repo_and_otherwise_keeps_the_servers_own() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::create_dir_all(&other).expect("other repo dir");
+        // Both need their own roster: `chat_post` re-discovers config against
+        // whichever repo the request names, and a repo with no `magi.toml` of
+        // its own would fall back to the operator's real, installed agent CLIs.
+        std::fs::write(repo.join("magi.toml"), MOCK_AGENT_TOML).expect("write magi.toml");
+        std::fs::write(other.join("magi.toml"), MOCK_AGENT_TOML).expect("write magi.toml");
+
+        let f = Fixture::with_repo(repo.clone()).await;
+
+        let default_res = f
+            .post("/api/chats", Some(r#"{"idea":"rework the config loader"}"#))
+            .await;
+        assert_eq!(default_res.status, 201, "{}", default_res.body);
+        assert_eq!(
+            default_res.json()["repo"],
+            repo.canonicalize().unwrap().display().to_string(),
+            "omitting `repo` must keep the server's own"
+        );
+
+        let body = format!(
+            r#"{{"idea":"rework the config loader","repo":{:?}}}"#,
+            other.to_string_lossy()
+        );
+        let explicit_res = f.post("/api/chats", Some(&body)).await;
+        assert_eq!(explicit_res.status, 201, "{}", explicit_res.body);
+        assert_eq!(
+            explicit_res.json()["repo"],
+            other.canonicalize().unwrap().display().to_string(),
+            "an explicit `repo` must override the server's own"
         );
     }
 

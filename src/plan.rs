@@ -44,8 +44,10 @@ use std::process::Stdio;
 
 use anyhow::{Context as _, Result, bail};
 
+use crate::chat;
 use crate::config::{AgentKind, AgentSpec, Config, which};
 use crate::queue::{self, Queue, Source, Task};
+use crate::repos;
 use crate::run;
 
 /// The task-file shape the leader is asked to produce.
@@ -160,6 +162,13 @@ pub struct Opts {
     pub priority: i32,
     /// File the draft without the confirmation prompt.
     pub yes: bool,
+    /// A browser-interview chat id (or unambiguous prefix/suffix) to
+    /// continue here. Its whole transcript and repository are folded into
+    /// this interview's opening briefing as background - see
+    /// [`chat::derived_background`]. `magi chat`, the CLI-side counterpart
+    /// that could name a terminal interview as `from`, does not exist yet
+    /// (issue #21), so only a browser chat can be named.
+    pub from: Option<String>,
 }
 
 impl Default for Opts {
@@ -171,6 +180,7 @@ impl Default for Opts {
             agent: None,
             priority: 0,
             yes: false,
+            from: None,
         }
     }
 }
@@ -191,23 +201,32 @@ pub async fn plan(opts: Opts) -> Result<Task> {
         );
     }
 
-    // Absolute, because the daemon that eventually runs this task has its own
-    // working directory and `.` would mean the wrong repository.
-    let repo = opts
-        .repo
-        .canonicalize()
-        .unwrap_or_else(|_| opts.repo.clone());
+    // `--repo` accepts a path or a short `owner/repo` name; see
+    // `resolve_repo`. Absolute either way, because the daemon that eventually
+    // runs this task has its own working directory and a relative path -
+    // `.`, or a short name once resolved to one - would mean the wrong
+    // repository.
+    let repo = resolve_repo(&opts.repo, opts.config.as_deref())?;
+    let repo = repo.canonicalize().unwrap_or(repo);
     let (config, _sources) = Config::discover(&repo, opts.config.as_deref())?;
     // `--agent` beats the config, the config beats the built-in order.
     let want = opts.agent.as_deref().or(config.roles.planner.as_deref());
     let leader = pick(&config.agents, want, &installed)?;
+
+    let background = from_background(&chat::Chats::open(), opts.from.as_deref())?;
 
     let dir = drafts_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let id = new_id();
     let draft = dir.join(format!("{id}.md"));
     let brief_path = dir.join(format!("{id}.briefing.md"));
-    let brief = briefing(opts.idea.as_deref(), &repo, &draft, &config.graph.language);
+    let mut brief = briefing(opts.idea.as_deref(), &repo, &draft, &config.graph.language);
+    if let Some(background) = &background {
+        // Prepended, so the leader reads what it is inheriting before its own
+        // instructions - the order a human handing off a conversation would
+        // use.
+        brief = format!("{background}\n\n{brief}");
+    }
     std::fs::write(&brief_path, &brief)
         .with_context(|| format!("write {}", brief_path.display()))?;
 
@@ -406,6 +425,38 @@ fn new_id() -> String {
     let stamp = jiff::Zoned::now().strftime("%Y%m%d-%H%M%S");
     let seed = crate::rng::entropy();
     format!("{stamp}-{:04x}", (seed ^ (seed >> 32)) & 0xffff)
+}
+
+/// Resolve `--repo` to a directory.
+///
+/// An existing directory is used as-is. Anything else is tried as a short
+/// name (`owner/repo`) against `[repos] roots` - which needs a config lookup
+/// of its own, since the roots have to be known before a name can be resolved
+/// against them. That lookup uses `raw` exactly as [`Config::discover`]
+/// itself would, so a short name that happens to also be a config layer's
+/// directory is not treated specially - it already failed the `is_dir` check
+/// above, so this is purely about finding `[repos] roots`, most often from
+/// the machine layer.
+fn resolve_repo(raw: &Path, explicit_config: Option<&Path>) -> Result<PathBuf> {
+    if raw.is_dir() {
+        return Ok(raw.to_owned());
+    }
+    let (cfg, _) = Config::discover(raw, explicit_config)?;
+    repos::resolve(&cfg.repos.roots, &raw.to_string_lossy())
+}
+
+/// The background block for `--from`, if given.
+///
+/// Split out of [`plan`] so the one mistake an operator can make with this
+/// flag - naming a chat that does not exist - is testable without a
+/// terminal. Reuses [`chat::derived_background`] rather than rendering the
+/// transcript a second way, so the terminal interview and the browser
+/// interview describe a derived conversation identically.
+fn from_background(chats: &chat::Chats, from: Option<&str>) -> Result<Option<String>> {
+    match from {
+        None => Ok(None),
+        Some(id) => Ok(Some(chat::derived_background(&chats.get(id)?))),
+    }
 }
 
 /// Can this agent's CLI actually be run on this machine?
@@ -1052,5 +1103,63 @@ mod tests {
         // reason, and quietly using a different model wastes the conversation.
         let err = pick(&agents, Some("oc"), &without(&["oc"])).expect_err("not runnable");
         assert!(err.to_string().contains("oc"), "{err}");
+    }
+
+    #[test]
+    fn resolve_repo_uses_an_existing_directory_as_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_repo(dir.path(), None).expect("an existing directory resolves");
+        assert_eq!(resolved, dir.path());
+    }
+
+    #[test]
+    fn resolve_repo_resolves_a_short_name_against_configured_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let checkout = root.join("github.com").join("yukimemi").join("magi");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+
+        let config_path = tmp.path().join("machine.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[repos]\nroots = [{:?}]\n",
+                root.to_string_lossy().into_owned()
+            ),
+        )
+        .unwrap();
+
+        let resolved =
+            resolve_repo(Path::new("yukimemi/magi"), Some(&config_path)).expect("must resolve");
+        assert_eq!(resolved, checkout.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_repo_reports_an_unresolvable_short_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("machine.toml");
+        std::fs::write(&config_path, "[repos]\nroots = []\n").unwrap();
+
+        let err = resolve_repo(Path::new("nope/nope"), Some(&config_path))
+            .expect_err("nothing configured to match")
+            .to_string();
+        assert!(err.contains("nope/nope"), "{err}");
+    }
+
+    #[test]
+    fn from_background_is_none_when_no_chat_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chats = chat::Chats::at(tmp.path().join("chats"));
+        assert_eq!(from_background(&chats, None).unwrap(), None);
+    }
+
+    #[test]
+    fn from_background_names_the_missing_chat_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chats = chat::Chats::at(tmp.path().join("chats"));
+        let err = from_background(&chats, Some("nope"))
+            .expect_err("no such chat")
+            .to_string();
+        assert!(err.contains("nope"), "{err}");
     }
 }

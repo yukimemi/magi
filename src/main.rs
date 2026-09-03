@@ -10,7 +10,7 @@ use magi::config::{Config, MergeMode};
 use magi::graph::{Runner, fold_run};
 use magi::queue::{self, Queue, Source, Task, TaskStatus};
 use magi::run::{RunState, latest_id, list_ids, resolve_id};
-use magi::{agent, ask, daemon, plan, report, stats, tui, updater, web};
+use magi::{agent, ask, daemon, plan, report, repos, stats, tui, updater, web};
 
 /// Blind multi-agent implementation competition.
 #[derive(Debug, Parser)]
@@ -271,7 +271,8 @@ enum Command {
         /// A rough starting idea. Omit to start from nothing.
         #[arg(value_name = "IDEA", trailing_var_arg = true)]
         idea: Vec<String>,
-        /// Repository the task will be competed in.
+        /// Repository the task will be competed in: a path, or a short
+        /// `owner/repo` name resolved against `[repos] roots`.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
         /// Config file; defaults to <repo>/magi.toml.
@@ -286,6 +287,20 @@ enum Command {
         /// File the draft without the confirmation prompt.
         #[arg(long)]
         yes: bool,
+        /// A browser-interview chat id (or unambiguous prefix/suffix) to
+        /// continue here: its transcript and repository go into this
+        /// interview's opening briefing as background.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// List local repositories found under `[repos] roots`.
+    Repos {
+        /// Re-scan rather than trust anything cached. The CLI keeps no cache
+        /// between invocations, so this only matters for symmetry with
+        /// `GET /api/repos?refresh=1` - every `magi repos` already scans
+        /// fresh.
+        #[arg(long)]
+        refresh: bool,
     },
     /// Ask the owner something and wait. Meant for agents inside a run.
     Ask {
@@ -742,6 +757,7 @@ async fn dispatch(command: Command) -> Result<()> {
             agent,
             priority,
             yes,
+            from,
         } => {
             let idea = idea.join(" ");
             let task = plan::plan(plan::Opts {
@@ -751,11 +767,14 @@ async fn dispatch(command: Command) -> Result<()> {
                 agent,
                 priority,
                 yes,
+                from,
             })
             .await?;
             println!("filed {} {}", task.short(), task.title);
             Ok(())
         }
+
+        Command::Repos { refresh: _ } => repos_cmd(),
 
         Command::Ask {
             summary,
@@ -1148,6 +1167,38 @@ async fn task_cmd(command: TaskCmd) -> Result<()> {
     }
 }
 
+/// `magi repos`: everything [`repos::scan`] finds under `[repos] roots`, one
+/// per line as `owner/repo` and its path.
+///
+/// Reads config against the current directory - `[repos] roots` is a machine
+/// fact, most often declared in the machine config layer, so which repository
+/// this command happens to run inside rarely matters. No cache: a one-shot
+/// process has nothing to keep one in, so every invocation already scans
+/// fresh - `--refresh` on this command is accepted for symmetry with
+/// `GET /api/repos?refresh=1` and changes nothing.
+fn repos_cmd() -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let (cfg, _) = Config::discover(&cwd, None)?;
+    print!("{}", repos_text(&repos::scan(&cfg.repos.roots)));
+    Ok(())
+}
+
+/// The text `magi repos` prints: one `owner/repo` and its path per line.
+///
+/// Separated from [`repos_cmd`] so the format is assertable without a real
+/// `[repos] roots` scan - the same split [`doctor_queue_and_loop`] uses for
+/// the same reason.
+fn repos_text(found: &[repos::Repo]) -> String {
+    if found.is_empty() {
+        return "no repositories found under [repos] roots\n".to_owned();
+    }
+    let mut s = String::new();
+    for r in found {
+        let _ = writeln!(s, "{}  {}", r.name, r.path.display());
+    }
+    s
+}
+
 /// Delete a recorded run directory.
 fn run_rm_cmd(id: &str) -> Result<()> {
     let resolved = resolve_id(id)?;
@@ -1470,6 +1521,39 @@ mod tests {
         );
         t.status = status;
         t
+    }
+
+    #[test]
+    fn repos_text_says_nothing_found_rather_than_printing_an_empty_table() {
+        let text = repos_text(&[]);
+        assert!(text.contains("no repositories found"), "{text}");
+    }
+
+    #[test]
+    fn repos_text_prints_one_line_of_name_and_path_per_repository() {
+        let found = [
+            repos::Repo {
+                name: "yukimemi/magi".to_owned(),
+                path: PathBuf::from("/home/yukimemi/src/github.com/yukimemi/magi"),
+            },
+            repos::Repo {
+                name: "yukimemi/rvpm".to_owned(),
+                path: PathBuf::from("/home/yukimemi/src/github.com/yukimemi/rvpm"),
+            },
+        ];
+        let text = repos_text(&found);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(
+            lines[0].contains("yukimemi/magi")
+                && lines[0].contains("/home/yukimemi/src/github.com/yukimemi/magi"),
+            "{text}"
+        );
+        assert!(
+            lines[1].contains("yukimemi/rvpm")
+                && lines[1].contains("/home/yukimemi/src/github.com/yukimemi/rvpm"),
+            "{text}"
+        );
     }
 
     #[test]
