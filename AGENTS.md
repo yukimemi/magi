@@ -661,10 +661,20 @@ confirmation flow and an undo story; `magi fold` already exists for cleanup.
 - `Task::fail` decides whether an attempt was the last one, with no disk in
   the way, so the retry policy is asserted directly.
 
-**A quota stall is refunded.** `Task::stall` decrements `attempts`. A rate
-limit is a property of the machine, not of the task, and a quota window closing
-overnight must not leave a backlog of `held` tasks that were never actually
-judged. Do not "simplify" this into `fail`.
+**A quota stall is refunded, and only a quota stall.** `Task::stall`
+decrements `attempts`. A rate limit is a property of the machine, not of the
+task, and a quota window closing overnight must not leave a backlog of `held`
+tasks that were never actually judged. Do not "simplify" this into `fail`.
+
+But the refund is keyed on `Verdict::quota_hit`, not on the `Stalled` status,
+and that distinction is load-bearing. A quorum can collapse for a reason that
+has nothing to do with quota: run e633 stalled with `quota: []` because two
+judges answered with the wrong JSON shape, twice each, nudge included. That is
+ordinary flakiness, it can recur every time, and refunding it removes the
+bound from the retry loop — each attempt paying for another hour-long
+implement wave before it reaches the same judges. `max_attempts` exists so
+that cannot happen. Refund the machine's failures; charge the task for its
+own.
 
 ### Two gates guard the merge, and both are on
 

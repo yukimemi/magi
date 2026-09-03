@@ -409,40 +409,60 @@ pub fn sweep_stale_claims(queue: &Queue, older_than: Duration) -> Vec<String> {
     swept
 }
 
+/// What a finished run tells the queue about the task it came from.
+///
+/// A struct rather than a fourth and fifth boolean argument: the two flags
+/// answer different questions about the same run, and a call site passing
+/// `(…, true, false)` is one transposition away from refunding attempts
+/// forever.
+#[derive(Debug, Clone, Copy)]
+pub struct Verdict {
+    /// Where the graph stopped.
+    pub status: RunStatus,
+    /// The run opened a pull request.
+    pub left_pr: bool,
+    /// At least one seat was lost to a rate limit.
+    pub quota_hit: bool,
+}
+
 /// Record a finished run against the task it came from.
 ///
 /// Kept pure and separate from the loop because this mapping *is* the retry
 /// policy, and a policy that can only be exercised by spawning a graph is a
 /// policy nobody checks. The table:
 ///
-/// | run status            | task becomes        | attempt spent |
-/// |-----------------------|---------------------|---------------|
-/// | `Merged`, `Ready`     | `Done`              | yes           |
-/// | `Stalled`             | `Failed` (requeued) | **no**        |
-/// | `Blocked` with a PR   | `Held`              | yes           |
-/// | `Blocked`, `Failed`   | `Failed`, or `Held` | yes           |
-/// | anything non-terminal | `Failed`, or `Held` | yes           |
+/// | run status              | task becomes        | attempt spent |
+/// |-------------------------|---------------------|---------------|
+/// | `Merged`, `Ready`       | `Done`              | yes           |
+/// | `Stalled`, quota hit    | `Failed` (requeued) | **no**        |
+/// | `Stalled`, no quota     | `Failed`, or `Held` | yes           |
+/// | `Blocked` with a PR     | `Held`              | yes           |
+/// | `Blocked`, `Failed`     | `Failed`, or `Held` | yes           |
+/// | anything non-terminal   | `Failed`, or `Held` | yes           |
 ///
-/// `Stalled` is the interesting row: the judging panel lost its quorum because
-/// agent CLIs hit their quota, so the task goes back in line without spending
-/// an attempt. A non-terminal status means `execute` returned while the graph
-/// was still mid-flight, which is a bug rather than a verdict; it is treated as
-/// a failure so that a task cannot loop on it forever.
+/// The two `Stalled` rows are the ones worth reading twice. A quorum lost to
+/// rate limits is a property of the machine and not of the task, so the
+/// attempt is refunded and a reset quota picks the work up where it stopped.
+/// A quorum lost to judges that answered with the wrong shape is ordinary
+/// flakiness, and refunding *that* takes the bound off the retry loop
+/// entirely: run e633 stalled with `quota: []` after two judges wrote
+/// unusable JSON, was refunded, and the next attempt paid for a fresh
+/// hour-long implement wave before it could fail the same way. `max_attempts`
+/// exists precisely so that cannot repeat forever.
+///
+/// A non-terminal status means `execute` returned while the graph was still
+/// mid-flight, which is a bug rather than a verdict; it is treated as a
+/// failure so that a task cannot loop on it either.
 ///
 /// `left_pr` splits the `Blocked` row, and it is the difference between a run
 /// that failed and a run that finished into a gate. See [`Task::handed_off`].
-pub fn settle(
-    task: &mut Task,
-    status: RunStatus,
-    detail: &str,
-    max_attempts: usize,
-    left_pr: bool,
-) {
-    match status {
+pub fn settle(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usize) {
+    match verdict.status {
         RunStatus::Merged | RunStatus::Ready => task.succeed(),
-        RunStatus::Stalled => task.stall(detail),
-        RunStatus::Blocked if left_pr => task.handed_off(detail),
-        RunStatus::Blocked | RunStatus::Failed => task.fail(detail, max_attempts),
+        RunStatus::Stalled if verdict.quota_hit => task.stall(detail),
+        RunStatus::Stalled | RunStatus::Failed => task.fail(detail, max_attempts),
+        RunStatus::Blocked if verdict.left_pr => task.handed_off(detail),
+        RunStatus::Blocked => task.fail(detail, max_attempts),
         other => task.fail(
             format!(
                 "the graph stopped at `{}` without reaching a terminal status: {detail}",
@@ -679,16 +699,15 @@ async fn attempt(opts: &Opts, queue: &Queue, status: &Arc<Mutex<Status>>, task: 
         Ok(()) => describe(&runner.state),
         Err(e) => format!("{e:#}"),
     };
-    // A run that opened a pull request handed its work over, whatever the
-    // gate then decided about merging it.
-    let left_pr = runner.state.pr.is_some();
-    settle(
-        task,
-        runner.state.status,
-        &detail,
-        opts.max_attempts,
-        left_pr,
-    );
+    let verdict = Verdict {
+        status: runner.state.status,
+        // A run that opened a pull request handed its work over, whatever the
+        // gate then decided about merging it.
+        left_pr: runner.state.pr.is_some(),
+        // Only a rate limit earns the task its attempt back.
+        quota_hit: !runner.state.quota.is_empty(),
+    };
+    settle(task, verdict, &detail, opts.max_attempts);
     record(queue, task);
     tracing::info!(
         "task {} is {} after run {} ({})",
@@ -842,7 +861,16 @@ mod tests {
         for (run, want, attempts) in table {
             let mut t = task();
             t.start("20260902-000000-aaaa".to_owned());
-            settle(&mut t, run, "why", 2, false);
+            settle(
+                &mut t,
+                Verdict {
+                    status: run,
+                    left_pr: false,
+                    quota_hit: matches!(run, RunStatus::Stalled),
+                },
+                "why",
+                2,
+            );
             assert_eq!(t.status, want, "task status after {}", label(run));
             assert_eq!(t.attempts, attempts, "attempts after {}", label(run));
         }
@@ -852,7 +880,16 @@ mod tests {
     fn a_quota_stall_costs_the_task_no_attempt_but_a_block_does() {
         let mut stalled = task();
         stalled.start("20260902-000000-aaaa".to_owned());
-        settle(&mut stalled, RunStatus::Stalled, "quota", 1, false);
+        settle(
+            &mut stalled,
+            Verdict {
+                status: RunStatus::Stalled,
+                left_pr: false,
+                quota_hit: true,
+            },
+            "quota",
+            1,
+        );
         assert_eq!(stalled.attempts, 0);
         assert!(
             stalled.status.runnable(),
@@ -861,7 +898,16 @@ mod tests {
 
         let mut blocked = task();
         blocked.start("20260902-000000-aaaa".to_owned());
-        settle(&mut blocked, RunStatus::Blocked, "findings open", 1, false);
+        settle(
+            &mut blocked,
+            Verdict {
+                status: RunStatus::Blocked,
+                left_pr: false,
+                quota_hit: false,
+            },
+            "findings open",
+            1,
+        );
         assert_eq!(blocked.attempts, 1);
         assert_eq!(
             blocked.status,
@@ -878,10 +924,13 @@ mod tests {
         delivered.start("20260903-080619-01c2".to_owned());
         settle(
             &mut delivered,
-            RunStatus::Blocked,
+            Verdict {
+                status: RunStatus::Blocked,
+                left_pr: true,
+                quota_hit: false,
+            },
             "no check status",
             4,
-            true,
         );
         assert_eq!(
             delivered.status,
@@ -904,13 +953,78 @@ mod tests {
         empty_handed.start("20260903-080619-01c2".to_owned());
         settle(
             &mut empty_handed,
-            RunStatus::Blocked,
+            Verdict {
+                status: RunStatus::Blocked,
+                left_pr: false,
+                quota_hit: false,
+            },
             "findings open",
             4,
-            false,
         );
         assert_eq!(empty_handed.status, TaskStatus::Failed);
         assert!(empty_handed.status.runnable());
+    }
+
+    #[test]
+    fn only_a_rate_limit_buys_the_task_its_attempt_back() {
+        // Run e633: quorum lost because two judges answered with the wrong
+        // JSON shape, `quota: []`. Refunding that takes the bound off the
+        // retry loop, and each retry pays for a fresh hour-long implement
+        // wave before it can fail the same way.
+        let mut flaky = task();
+        flaky.start("20260903-123023-e633".to_owned());
+        settle(
+            &mut flaky,
+            Verdict {
+                status: RunStatus::Stalled,
+                left_pr: false,
+                quota_hit: false,
+            },
+            "verdict rests on 1 of 3 judges",
+            2,
+        );
+        assert_eq!(
+            flaky.attempts, 1,
+            "flakiness spends an attempt, so `max_attempts` still bounds it"
+        );
+        assert!(flaky.status.runnable(), "and it is still worth retrying");
+
+        // The same status, lost to a rate limit, is the machine's fault.
+        let mut limited = task();
+        limited.start("20260903-123023-e633".to_owned());
+        settle(
+            &mut limited,
+            Verdict {
+                status: RunStatus::Stalled,
+                left_pr: false,
+                quota_hit: true,
+            },
+            "judge-2, judge-3 out of quota",
+            2,
+        );
+        assert_eq!(limited.attempts, 0, "a quota window is refunded");
+        assert!(limited.status.runnable());
+
+        // And the bound really binds: a task that keeps stalling on flakiness
+        // reaches a human instead of running the roster forever.
+        let mut worn = task();
+        for _ in 0..2 {
+            worn.release();
+        }
+        worn.start("20260903-123023-e633".to_owned());
+        worn.attempts = 2;
+        settle(
+            &mut worn,
+            Verdict {
+                status: RunStatus::Stalled,
+                left_pr: false,
+                quota_hit: false,
+            },
+            "no quorum again",
+            2,
+        );
+        assert_eq!(worn.status, TaskStatus::Held);
+        assert!(!worn.status.runnable());
     }
 
     #[test]
