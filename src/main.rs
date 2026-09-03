@@ -413,6 +413,16 @@ enum TaskCmd {
         /// Task id or unambiguous prefix/suffix.
         id: String,
     },
+    /// Mark a task finished, without running anything.
+    ///
+    /// For work that landed by a route the loop did not see: merged by hand,
+    /// or a run whose merge succeeded while the run recorded a failure. The
+    /// alternative was `release`, which puts the task back in line and pays
+    /// for the whole competition again to redo something already in `main`.
+    Done {
+        /// Task id or unambiguous prefix/suffix.
+        id: String,
+    },
     /// Delete a task.
     Rm {
         /// Task id or unambiguous prefix/suffix.
@@ -1108,6 +1118,14 @@ async fn task_cmd(command: TaskCmd) -> Result<()> {
             Ok(())
         }
 
+        TaskCmd::Done { id } => {
+            let mut t = q.get(&id)?;
+            t.succeed();
+            q.put(&mut t)?;
+            println!("done {} {}", t.short(), t.title);
+            Ok(())
+        }
+
         TaskCmd::Release { id } => {
             let mut t = q.get(&id)?;
             t.release();
@@ -1601,6 +1619,43 @@ mod tests {
 
         // Nothing to run is not this guard's business; clap already says so.
         assert!(mistyped_command(&[], false, &words).is_none());
+    }
+
+    #[test]
+    fn task_done_is_its_own_verb_and_not_release() {
+        // These two are one keystroke apart and do opposite things: `done`
+        // finishes a task, `release` puts it back in line and pays for the
+        // whole competition again. Wiring `done` to `release` by accident is
+        // exactly how work already merged into `main` gets re-competed.
+        let done = Cli::try_parse_from(["magi", "task", "done", "199c"]).unwrap();
+        match done.command {
+            Some(Command::Task {
+                command: TaskCmd::Done { id },
+            }) => assert_eq!(id, "199c"),
+            other => panic!("expected TaskCmd::Done, got {other:?}"),
+        }
+
+        let released = Cli::try_parse_from(["magi", "task", "release", "199c"]).unwrap();
+        assert!(matches!(
+            released.command,
+            Some(Command::Task {
+                command: TaskCmd::Release { .. }
+            })
+        ));
+
+        // And the transitions they stand for really are opposite.
+        let mut t = magi::queue::Task::new(
+            "landed by hand".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("/repo"),
+            magi::queue::Source::Human,
+        );
+        t.start("20260903-134458-ec12".to_owned());
+        t.succeed();
+        assert_eq!(t.status, magi::queue::TaskStatus::Done);
+        assert!(!t.status.runnable(), "a finished task is not offered again");
+        t.release();
+        assert!(t.status.runnable(), "and release is the way back in");
     }
 
     #[test]
