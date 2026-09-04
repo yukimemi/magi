@@ -1503,10 +1503,16 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
     // run was mid-node would find a run nobody is driving.
     let parked = ui.park_for_upgrade()?;
     let detail = match &parked {
+        // Honest about the wait. A park takes effect at the *next* node
+        // boundary, so a run mid-implement finishes that wave first - up to
+        // `timeout_implement`, an hour by default. Saying "restarting now"
+        // would make the deck look wedged for the rest of it.
         Some(run) => format!(
-            "Run {} is parking at its next step. The deck replaces itself, \
-             comes back, and the loop carries that run on from where it \
-             stopped.",
+            "Run {} is parking at its next step, which can take as long as \
+             the step it is on - up to an hour for an implement wave. The \
+             deck replaces itself once it parks, comes back, and the loop \
+             carries that run on from where it stopped. Nothing is lost if \
+             you close this.",
             crate::run::short_of(run)
         ),
         None => "The deck replaces itself and comes back. Nothing was in \
@@ -5110,6 +5116,16 @@ mod tests {
         assert!(APP_JS.contains("function confirmed("));
         // Hidden when the loop is somebody else's, matching the 409 above.
         assert!(APP_JS.contains("show(upgradeBtn, !foreign)"));
+        // A park waits for the node in flight, up to an hour for an implement
+        // wave. Leaving the button reading "Upgrading…" for that long is the
+        // same mistake as an error rendered off screen: it looks wedged.
+        assert!(
+            APP_JS.contains("Parking, then restarting"),
+            "the button says what it is waiting for"
+        );
+        // And nothing to install must give the button back rather than
+        // pretending a restart is coming.
+        assert!(APP_JS.contains("if (!out.to)"));
     }
 
     #[test]
