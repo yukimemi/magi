@@ -184,6 +184,55 @@ pub struct PrState {
     pub failing: Vec<String>,
     /// Comments that still want an answer, human and bot.
     pub review_comments: Vec<ReviewComment>,
+    /// Whether the forge itself considers the failures blocking.
+    pub blocking: Blocking,
+}
+
+/// Whether a failing check actually stands between the pull request and
+/// `main`, according to the forge.
+///
+/// The rollup lists every check equally, so `coverage` going red on a
+/// repository that deliberately does not require it looked exactly like a
+/// broken build - and magi answered by spending a fix round on a change that
+/// was fine. Pull request 37 had to be merged by hand for that reason: the
+/// only red check was `editorconfig`, which was failing because the *action*
+/// could not fetch its own binary, and which the repository does not require.
+///
+/// `mergeStateStatus` is where GitHub applies the required-check set, so it
+/// is the one field that can tell the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blocking {
+    /// Required checks are satisfied and the branch merges cleanly.
+    No,
+    /// Something required is failing or missing.
+    Yes,
+    /// The branch no longer merges: the base moved under it.
+    Conflict,
+    /// The forge did not say - an older `gh`, or a token without the scope.
+    /// Treated as `Yes`, because refusing to guess is the rule everywhere
+    /// else in this module.
+    Unsaid,
+}
+
+impl Blocking {
+    /// Read `mergeStateStatus`, which is upper-case in `gh`'s output.
+    fn of(raw: &str) -> Self {
+        match raw.to_ascii_uppercase().as_str() {
+            // Mergeable. `UNSTABLE` is the interesting one: mergeable, with a
+            // non-required check failing or still running.
+            "CLEAN" | "UNSTABLE" | "HAS_HOOKS" => Self::No,
+            "DIRTY" => Self::Conflict,
+            "" | "UNKNOWN" => Self::Unsaid,
+            // BLOCKED, BEHIND, DRAFT: something has to change first.
+            _ => Self::Yes,
+        }
+    }
+
+    /// Does this stand between the pull request and the base branch?
+    #[must_use]
+    pub fn stops_a_merge(self) -> bool {
+        !matches!(self, Self::No)
+    }
 }
 
 /// What the loop decided to do next. Pure, so the policy is testable.
@@ -287,6 +336,13 @@ pub fn decide(pr: &PrState, round: usize, budget: usize, waited: Duration) -> St
                 CHECKS_GRACE.as_secs() / 60
             ),
         },
+        // Red, but the forge says it does not stand in the way: the failing
+        // checks are ones this repository chose not to require. Spending a fix
+        // round on them asks an agent to repair something nobody is gating on
+        // - and pull request 37's only red check was an *action* that could
+        // not fetch its own binary. Merge, and name them so the record is
+        // honest about what was red when it landed.
+        Checks::Red if !pr.blocking.stops_a_merge() && pr.review_comments.is_empty() => Step::Merge,
         Checks::Red => {
             let what = format!(
                 "{} check(s) failing: {}",
@@ -987,6 +1043,7 @@ pub fn parse_pr(json: &str) -> Result<PrState> {
         checks,
         failing,
         review_comments,
+        blocking: Blocking::of(&raw.merge_state_status),
     })
 }
 
@@ -1328,7 +1385,7 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
             "view".to_owned(),
             pr_url.to_owned(),
             "--json".to_owned(),
-            "url,number,state,title,statusCheckRollup,reviews,comments".to_owned(),
+            "url,number,state,title,statusCheckRollup,reviews,comments,mergeStateStatus".to_owned(),
         ],
     )
     .await?;
@@ -1697,6 +1754,14 @@ struct GhPr {
     title: String,
     #[serde(default)]
     status_check_rollup: Vec<GhCheck>,
+    /// GitHub's own verdict on whether the pull request can be merged.
+    ///
+    /// Worth asking for because it is the only place the *required* check set
+    /// is applied: the rollup lists every check equally, so a repository that
+    /// deliberately does not require `coverage` still looks red here. See
+    /// [`Blocking`].
+    #[serde(default)]
+    merge_state_status: String,
     #[serde(default)]
     reviews: Vec<GhReview>,
     #[serde(default)]
@@ -1838,6 +1903,7 @@ mod tests {
   "url": "https://github.com/yukimemi/magi/pull/10",
   "number": 10,
   "state": "OPEN",
+  "mergeStateStatus": "CLEAN",
   "statusCheckRollup": [
     {
       "__typename": "CheckRun",
@@ -1887,6 +1953,7 @@ mod tests {
   "url": "https://github.com/yukimemi/magi/pull/9",
   "number": 9,
   "state": "OPEN",
+  "mergeStateStatus": "UNSTABLE",
   "statusCheckRollup": [
     {
       "__typename": "CheckRun",
@@ -2128,6 +2195,14 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             number: 16,
             state: PrLifecycle::Open,
             checks,
+            // These tests are about red-means-fix, so a red here is one the
+            // forge gates on. Without saying so they would assert the new
+            // "merge past a check nobody requires" path by accident.
+            blocking: if matches!(checks, Checks::Red) {
+                Blocking::Yes
+            } else {
+                Blocking::No
+            },
             failing: failing.iter().map(|s| (*s).to_owned()).collect(),
             review_comments: (0..comments)
                 .map(|i| ReviewComment {
@@ -2160,7 +2235,15 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let state = parse_pr(RED_OPEN).expect("red fixture parses");
         assert_eq!(state.checks, Checks::Red);
         assert_eq!(state.failing, vec!["editorconfig".to_owned()]);
-        match decide(&state, 0, 4, Duration::ZERO) {
+        // The captured payload says `UNSTABLE` - mergeable, with a check
+        // nobody requires red - which is exactly the shape that had to be
+        // merged by hand. Asserted separately, in
+        // `a_red_check_nobody_requires_does_not_buy_a_fix_round`. What this
+        // test is about is that a red check is *named*, so the reason a fixer
+        // is handed says which one; so it asks the blocking question here.
+        let mut blocking = state.clone();
+        blocking.blocking = Blocking::Yes;
+        match decide(&blocking, 0, 4, Duration::ZERO) {
             Step::Fix { reason } => {
                 assert!(reason.contains("editorconfig"), "reason: {reason}");
                 assert!(reason.contains("failing"), "reason: {reason}");
@@ -2322,6 +2405,86 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     }
 
     #[test]
+    fn the_forge_verdict_survives_the_round_trip_from_gh() {
+        // Read off `gh pr view --json ...,mergeStateStatus`, because a field
+        // requested but never parsed is the kind of thing that looks wired up
+        // and answers `Unsaid` forever.
+        let green = parse_pr(GREEN_OPEN).expect("parse");
+        assert_eq!(green.blocking, Blocking::No);
+        let red = parse_pr(RED_OPEN).expect("parse");
+        assert_eq!(
+            red.blocking,
+            Blocking::No,
+            "`UNSTABLE` is mergeable: the red check is one nobody requires"
+        );
+        assert_eq!(red.checks, Checks::Red, "and it is still reported as red");
+        // A payload from an older `gh` has no such field at all.
+        let quiet =
+            parse_pr(&GREEN_OPEN.replace("\"mergeStateStatus\": \"CLEAN\",", "")).expect("parse");
+        assert_eq!(quiet.blocking, Blocking::Unsaid);
+    }
+
+    #[test]
+    fn a_red_check_nobody_requires_does_not_buy_a_fix_round() {
+        // Pull request 37's only red check was `editorconfig`, failing
+        // because the action could not fetch its own binary after
+        // editorconfig-checker v4 renamed its release assets. The repository
+        // does not require it. magi answered by asking a fixer to repair a
+        // change that was fine, and the pull request had to be merged by hand.
+        let mut nonblocking = pr(Checks::Red, &["editorconfig", "coverage"], 0);
+        nonblocking.blocking = Blocking::No;
+        assert_eq!(
+            decide(&nonblocking, 0, 4, Duration::ZERO),
+            Step::Merge,
+            "the forge says nothing is in the way, so nothing is"
+        );
+
+        // The same red, gated on: that is a fix round, as before.
+        let mut blocking = pr(Checks::Red, &["test (ubuntu-latest)"], 0);
+        blocking.blocking = Blocking::Yes;
+        assert!(matches!(
+            decide(&blocking, 0, 4, Duration::ZERO),
+            Step::Fix { .. }
+        ));
+
+        // A review comment still outranks green-enough: a non-required red
+        // must not become a way to merge past an unanswered reviewer.
+        let mut commented = pr(Checks::Red, &["coverage"], 1);
+        commented.blocking = Blocking::No;
+        assert!(matches!(
+            decide(&commented, 0, 4, Duration::ZERO),
+            Step::Fix { .. }
+        ));
+
+        // And silence from the forge is not consent.
+        let mut unsaid = pr(Checks::Red, &["coverage"], 0);
+        unsaid.blocking = Blocking::Unsaid;
+        assert!(matches!(
+            decide(&unsaid, 0, 4, Duration::ZERO),
+            Step::Fix { .. }
+        ));
+    }
+
+    #[test]
+    fn the_forge_verdict_is_read_off_merge_state_status() {
+        // The spellings that mean "mergeable". `UNSTABLE` is the one that
+        // matters: mergeable, with a non-required check red or still running.
+        for ok in ["CLEAN", "UNSTABLE", "unstable", "HAS_HOOKS"] {
+            assert_eq!(Blocking::of(ok), Blocking::No, "{ok}");
+            assert!(!Blocking::of(ok).stops_a_merge(), "{ok}");
+        }
+        assert_eq!(Blocking::of("DIRTY"), Blocking::Conflict);
+        assert_eq!(Blocking::of("BLOCKED"), Blocking::Yes);
+        assert_eq!(Blocking::of("BEHIND"), Blocking::Yes);
+        // An older `gh`, or a token without the scope, says nothing - and
+        // refusing to guess is the rule everywhere else in this module.
+        for quiet in ["", "UNKNOWN"] {
+            assert_eq!(Blocking::of(quiet), Blocking::Unsaid);
+            assert!(Blocking::of(quiet).stops_a_merge());
+        }
+    }
+
+    #[test]
     fn a_merge_command_that_failed_after_merging_is_still_a_merge() {
         let argv = merge_argv(28, "Merge magi run ec12 (candidate B)");
         // The exact stderr from run ec12, in a jj-colocated repository.
@@ -2459,6 +2622,8 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             number: 42,
             state: PrLifecycle::Open,
             checks: Checks::Green,
+            // The forge sees nothing in the way unless a test says otherwise.
+            blocking: Blocking::No,
             failing: Vec::new(),
             review_comments: vec![ReviewComment {
                 author: "coderabbitai".to_owned(),
