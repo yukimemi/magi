@@ -965,6 +965,10 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
     let node = std::env::var("MAGI_NODE").unwrap_or_else(|_| "ask".to_owned());
     let seat = std::env::var("MAGI_SEAT").unwrap_or_else(|_| "operator".to_owned());
 
+    if let Some(why) = asking_is_not_this_seat_s_job(&node) {
+        bail!(why);
+    }
+
     let (cfg, _) = Config::discover(&repo, None).unwrap_or_default();
     let wait = std::time::Duration::from_secs(timeout.unwrap_or(cfg.graph.answer_timeout));
 
@@ -1223,6 +1227,42 @@ fn run_rm_cmd(id: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Refuse a question from a seat whose answer could not change what it
+/// produces, and say what to do instead.
+///
+/// `magi ask` blocks the node it is called from until the operator answers,
+/// and wakes a phone to do it. That is worth it for a seat that is *making*
+/// something and has hit a genuine ambiguity in the task - an implementer
+/// that cannot find the file the instruction names, a planner working out
+/// what to build. It is worth nothing from a reviewer:
+///
+/// > ラウンド 2 のレビュー結果を提出しますか？パッチに問題は見つかりませんでした。
+/// > `run b455  node review  seat review-2`
+///
+/// A reviewer asking permission to submit its own findings cannot act on the
+/// answer - its output is a verdict on a patch that is already written - and
+/// while it waits, the round's clock runs and the operator is interrupted for
+/// nothing. A judge asking anything is worse: the panel ranks blind, and an
+/// operator's reply is a channel out of that.
+///
+/// So the making nodes may ask and the judging ones may not. `MAGI_NODE` is
+/// set only by `agent::invoke`, which is what makes this un-forgeable rather
+/// than a convention - the same property `MAGI_RUN` gives task attribution.
+fn asking_is_not_this_seat_s_job(node: &str) -> Option<String> {
+    const MUTE: &[&str] = &["review", "judge", "deliberate", "vote"];
+    if !MUTE.contains(&node) {
+        return None;
+    }
+    Some(format!(
+        "a `{node}` seat cannot ask the operator anything: your answer is a \
+         verdict on work that is already written, so nothing the operator \
+         replies could change it, and asking blocks this node while it waits. \
+         Return your findings in the reply format the prompt asked for. If the \
+         task itself is ambiguous, say so as a finding - that reaches the \
+         operator too, without stopping the run."
+    ))
 }
 
 /// Who is filing this task.
@@ -1703,6 +1743,37 @@ mod tests {
 
         // Nothing to run is not this guard's business; clap already says so.
         assert!(mistyped_command(&[], false, &words).is_none());
+    }
+
+    #[test]
+    fn only_a_seat_that_makes_something_may_ask_the_operator() {
+        // The question that prompted this, verbatim from the deck:
+        //   ラウンド 2 のレビュー結果を提出しますか？パッチに問題は見つかりませんでした。
+        //   run b455  node review  seat review-2
+        // A reviewer asking permission to submit its own findings cannot act
+        // on the answer, and blocks the round while it waits.
+        for mute in ["review", "judge", "deliberate", "vote"] {
+            let why = asking_is_not_this_seat_s_job(mute)
+                .unwrap_or_else(|| panic!("{mute} must not ask"));
+            assert!(why.contains(mute), "the refusal names the node: {why}");
+            assert!(
+                why.contains("Return your findings"),
+                "and says what to do instead: {why}"
+            );
+            assert!(
+                why.contains("say so as a finding"),
+                "including the escape for a genuinely ambiguous task: {why}"
+            );
+        }
+
+        // The making nodes keep it: an implementer that cannot find the file
+        // the instruction names has a question only the operator can answer.
+        for allowed in ["implement", "fix", "plan", "land-approval", "ask"] {
+            assert!(
+                asking_is_not_this_seat_s_job(allowed).is_none(),
+                "{allowed} must still be able to ask"
+            );
+        }
     }
 
     #[test]
