@@ -882,12 +882,19 @@ function createRunCard() {
   const reviews = el("span");
   const meta = el("div", { class: "card-meta" }, repo, counts, winner, reviews);
   const note = el("p", { class: "card-note" });
+  /* Two attempts at one task are two cards with the same title, and the deck
+     used to give no hint which was which - "why are there two of the same,
+     one stalled and one blocked?" was the reasonable question. The older one
+     now says what replaced it. Sits with the note rather than in the chip
+     row: it explains the card's standing, and a chip would read as another
+     status. */
+  const superseded = el("p", { class: "card-note card-superseded" });
   const event = el("p", { class: "card-event" });
   const rail = el("div");
 
   const card = el("a", { class: "card" },
     el("div", { class: "card-top" }, chipSlot, whenSlot),
-    title, meta, note, event, rail,
+    title, meta, note, superseded, event, rail,
   );
 
   /* The card is one big anchor, which is the affordance the whole phone
@@ -962,6 +969,10 @@ function updateRunCard(row, run) {
   const spell = Boolean(meta.note) && status !== "merged" && status !== "ready" && status !== "waiting";
   setText(r.note, spell ? meta.note : "");
   show(r.note, spell);
+
+  const later = typeof run.superseded_by === "string" ? run.superseded_by : null;
+  setText(r.superseded, later ? `Superseded by ${later} \u2014 a later attempt at the same task.` : "");
+  show(r.superseded, Boolean(later));
 
   /* The run's own last line, on finished runs as well as moving ones. It used
      to be hidden the moment a run stopped, which is exactly when it is worth

@@ -381,6 +381,13 @@ It **never force-merges**: out of rounds leaves the pull request open with a
 comment saying what is still failing, and `checks: unknown` — no signal at all —
 never merges either.
 
+**A branch the base moved under is rebased, not fixed.** A competition that
+runs for two hours against a repository merging pull requests all day will
+conflict on the way in, and that is arithmetic rather than a defect. magi
+rebases the winner onto the base *as the remote has it* and force-pushes with
+a lease. A rebase that does not apply is a decision rather than a chore: it
+stops and hands over what git said.
+
 A pull request opened a second ago has no checks yet, and "not yet" is
 indistinguishable from "this repository has no CI". So magi waits three minutes
 for the checks to appear before believing there are none. Whatever it then
