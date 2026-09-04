@@ -180,12 +180,6 @@
         <p class="panel-note">A collapsed panel is a machine problem, not a verdict.</p>
         <ul class="plain" id="run-quota"></ul>
       </div>
-
-      <div class="panel" id="run-delete-panel">
-        <h2>Delete run</h2>
-        <div id="run-actions-box"></div>
-        <div id="run-delete-box"></div>
-      </div>
     </div>
 
     <div class="run-side">
@@ -348,6 +342,19 @@
   </section>
 </main>
 
+<!-- RUN ACTIONS: Resume / Fold / Delete used to sit at the bottom of the run
+     detail's report, so reaching them cost a scroll past the whole write-up.
+     This fixed button is the one entry point into them now, shown only while
+     run detail itself is on screen (see applyRoute in app.js). Unlike the
+     dock, it has no wide-screen replacement, so it is not hidden by width. -->
+<button class="run-actions-fab" type="button" id="run-actions-fab" aria-label="Run actions" hidden>
+  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <circle cx="12" cy="5" r="1.7" fill="currentColor"/>
+    <circle cx="12" cy="12" r="1.7" fill="currentColor"/>
+    <circle cx="12" cy="19" r="1.7" fill="currentColor"/>
+  </svg>
+</button>
+
 <!-- Bottom dock: the only navigation on a phone, because the top of a 390x844
      screen is not thumb-reachable one-handed. -->
 <nav class="dock" aria-label="Sections">
@@ -399,6 +406,22 @@
     <span>New task</span>
   </button>
 </nav>
+
+<!-- RUN ACTIONS SHEET ---------------------------------------------------- -->
+<dialog class="sheet" id="run-actions-sheet" aria-labelledby="run-actions-h">
+  <div class="sheet-head">
+    <h2 id="run-actions-h">Run actions</h2>
+    <button class="icon-btn" type="button" id="run-actions-close" aria-label="Close">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <path d="M6 6l12 12M18 6L6 18"/>
+      </svg>
+    </button>
+  </div>
+  <div class="sheet-body">
+    <div id="run-actions-box"></div>
+    <div id="run-delete-box"></div>
+  </div>
+</dialog>
 
 <!-- COMPOSE ------------------------------------------------------------- -->
 <dialog class="sheet" id="compose" aria-labelledby="compose-h">

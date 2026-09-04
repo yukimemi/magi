@@ -996,6 +996,42 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .dock-new { color: var(--on-gold); }
 .dock-new .dock-glyph svg { stroke-width: 2.4; }
 
+/* ---- run actions fab ---------------------------------------------------- *
+ * The one entry point into Resume / Fold / Delete on a run detail. Fixed so
+ * it is reachable without scrolling past the report, and shown at every
+ * width — unlike the dock, it has no wide-screen replacement to hand off
+ * to. Positioned clear of the dock and the home indicator the same way .say
+ * clears the dock: tap height plus a gap plus the safe area. */
+.run-actions-fab {
+  position: fixed; z-index: 15;
+  right: calc(var(--s4) + env(safe-area-inset-right));
+  bottom: calc(var(--tap) + var(--s3) + env(safe-area-inset-bottom));
+  width: var(--tap); height: var(--tap); flex: none;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; border: 1px solid var(--gold-line);
+  background: var(--gold); color: #241d05;
+  box-shadow: var(--shadow);
+  cursor: pointer;
+}
+.run-actions-fab svg { width: 22px; height: 22px; }
+.run-actions-fab:active { transform: scale(.97); }
+
+/* Clears the fab so the last panel in run detail is never permanently hidden
+   behind it. */
+#view-run { padding-bottom: calc(var(--tap) + var(--s6)); }
+
+/* The fab's sheet has no <form> — its content is built and rerendered
+   from JS — so it gets its own head/body padding instead of borrowing
+   .sheet form's, which stays specific to compose. */
+#run-actions-sheet[open] { display: flex; flex-direction: column; }
+#run-actions-sheet .sheet-head { flex: none; padding: var(--s4) var(--s4) 0; }
+#run-actions-sheet .sheet-body {
+  display: flex; flex-direction: column; gap: var(--s4);
+  padding: var(--s4);
+  padding-bottom: calc(var(--s4) + env(safe-area-inset-bottom));
+  overflow-y: auto; min-height: 0;
+}
+
 /* ---- compose sheet ----------------------------------------------------- */
 .sheet {
   width: 100%; max-width: 560px; padding: 0; margin: auto auto 0;
