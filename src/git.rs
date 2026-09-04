@@ -294,6 +294,65 @@ pub async fn push(repo: &Path, remote: &str, branch: &str) -> Result<GitOut> {
     git_raw(repo, &["push", "-u", remote, branch]).await
 }
 
+/// Force-push a branch that has been rewritten, refusing to clobber work
+/// pushed since this side last looked.
+///
+/// `--force-with-lease` rather than `--force`: a rebase replaces the branch's
+/// commits, so a plain push is rejected, but a blind force would also throw
+/// away anything a person pushed to the same branch meanwhile. The lease
+/// turns that case into a failure instead of a loss.
+pub async fn push_rewritten(repo: &Path, remote: &str, branch: &str) -> Result<GitOut> {
+    git_raw(repo, &["push", "--force-with-lease", remote, branch]).await
+}
+
+/// Rebase a branch onto `onto`, inside a throwaway worktree.
+///
+/// A worktree of its own for two reasons. The repository magi runs in may be
+/// jj-colocated, where git `HEAD` is detached and a rebase in the primary
+/// tree would move it under the operator; and a rebase that hits a conflict
+/// leaves state behind, which is far easier to discard with the whole
+/// directory than to unpick in a tree somebody is using.
+///
+/// `Ok(None)` means it applied and the branch now points at the rebased
+/// commits. `Ok(Some(why))` means it did not: the branch is untouched, and
+/// the string is what git said - a person has to decide.
+pub async fn rebase_branch_in_temp(
+    repo: &Path,
+    scratch: &Path,
+    branch: &str,
+    onto: &str,
+) -> Result<Option<String>> {
+    // Removed first so a leftover from an interrupted attempt cannot make
+    // `worktree add` fail on a path that already exists.
+    worktree_remove(repo, scratch).await.ok();
+    git_raw(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--force",
+            &scratch.to_string_lossy(),
+            branch,
+        ],
+    )
+    .await?;
+
+    let out = git_raw(scratch, &["rebase", onto]).await?;
+    if out.ok() {
+        worktree_remove(repo, scratch).await.ok();
+        return Ok(None);
+    }
+    // Leave nothing half-rebased behind: abort, then drop the tree entirely.
+    git_raw(scratch, &["rebase", "--abort"]).await.ok();
+    let why = if out.stderr.trim().is_empty() {
+        out.stdout.trim().to_owned()
+    } else {
+        out.stderr.trim().to_owned()
+    };
+    worktree_remove(repo, scratch).await.ok();
+    Ok(Some(why))
+}
+
 /// Fetch one branch from `remote`, updating its remote-tracking ref.
 ///
 /// The refspec is spelled out rather than left to `git fetch <remote>
@@ -341,6 +400,73 @@ mod tests {
         git(&repo, &["add", "-A"]).await.unwrap();
         git(&repo, &["commit", "-m", "init"]).await.unwrap();
         (dir, repo)
+    }
+
+    #[tokio::test]
+    async fn a_branch_rebases_onto_a_moved_base_and_says_when_it_cannot() {
+        let (_g, repo) = scratch().await;
+
+        // A side branch touching a different file: rebases cleanly.
+        git(&repo, &["checkout", "-b", "side"]).await.unwrap();
+        tokio::fs::write(repo.join("b.txt"), "side\n")
+            .await
+            .unwrap();
+        git(&repo, &["add", "-A"]).await.unwrap();
+        git(&repo, &["commit", "-m", "side work"]).await.unwrap();
+
+        // main moves under it, which is what a repository merging other
+        // pull requests does to a competition that took two hours.
+        git(&repo, &["checkout", "main"]).await.unwrap();
+        tokio::fs::write(repo.join("c.txt"), "main\n")
+            .await
+            .unwrap();
+        git(&repo, &["add", "-A"]).await.unwrap();
+        git(&repo, &["commit", "-m", "main moved"]).await.unwrap();
+
+        let scratch_tree = repo.parent().unwrap().join("rebase-scratch");
+        let clean = rebase_branch_in_temp(&repo, &scratch_tree, "side", "main")
+            .await
+            .unwrap();
+        assert!(clean.is_none(), "a disjoint change rebases: {clean:?}");
+        assert_eq!(
+            commits_ahead(&repo, "main", "side").await.unwrap(),
+            1,
+            "one commit, replayed onto the new base"
+        );
+        assert!(
+            !scratch_tree.exists(),
+            "the throwaway worktree is not left behind"
+        );
+
+        // A real conflict: both sides edit the same line.
+        git(&repo, &["checkout", "-b", "clash"]).await.unwrap();
+        tokio::fs::write(repo.join("a.txt"), "clash\n")
+            .await
+            .unwrap();
+        git(&repo, &["add", "-A"]).await.unwrap();
+        git(&repo, &["commit", "-m", "clash"]).await.unwrap();
+        git(&repo, &["checkout", "main"]).await.unwrap();
+        tokio::fs::write(repo.join("a.txt"), "main edit\n")
+            .await
+            .unwrap();
+        git(&repo, &["add", "-A"]).await.unwrap();
+        git(&repo, &["commit", "-m", "main edit"]).await.unwrap();
+
+        let before = rev_parse(&repo, "clash").await.unwrap();
+        let why = rebase_branch_in_temp(&repo, &scratch_tree, "clash", "main")
+            .await
+            .unwrap()
+            .expect("a same-line clash cannot be rebased silently");
+        assert!(
+            why.to_lowercase().contains("conflict"),
+            "the reason is what git said, which is what a person needs: {why}"
+        );
+        assert_eq!(
+            rev_parse(&repo, "clash").await.unwrap(),
+            before,
+            "a failed rebase leaves the branch exactly where it was"
+        );
+        assert!(!scratch_tree.exists(), "and cleans up after itself");
     }
 
     #[tokio::test]

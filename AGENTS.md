@@ -665,6 +665,16 @@ Do not "simplify" them into one flag: the useful middle state - magi does the
 watching and the fixing, a human owns the irreversible step - is exactly the
 default, and one flag cannot express it.
 
+**A conflict is a rebase, not a fix round.** `Step::Rebase` is decided before
+the checks, because every check on a branch that cannot land is an answer
+about a state that cannot land. It is bounded by the same budget as a fix and
+spends none of it, since the change is not what is wrong. The rebase happens
+in a throwaway worktree - this repository is jj-colocated, so a rebase in the
+primary tree would move a detached `HEAD` under the operator - and pushes with
+`--force-with-lease`, so a person's push to the same branch fails the step
+instead of being lost. A rebase that conflicts stops and reports what git
+said: that is judgement, and it belongs to a person.
+
 **A pull request is a hand-off, not a failure.** `settle` takes `left_pr`, and
 a `Blocked` run that opened one holds its task instead of requeueing it. Run
 01c2 spent two and a half hours on a competition, opened a green pull request,

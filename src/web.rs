@@ -90,7 +90,7 @@
 //! answers immediately rather than waiting, because the wait is measured in
 //! tens of minutes and the operator is holding a phone.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path as FsPath, PathBuf};
@@ -1007,22 +1007,87 @@ where
     }
 }
 
-async fn index() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        INDEX_HTML,
-    )
+/// Cache policy for the three compiled-in front-end files.
+///
+/// The whole interface is `include_str!`ed into the binary, so its content
+/// changes only when the binary does - and a phone that keeps a copy is
+/// welcome to, right up until the deck is replaced. Without a single cache
+/// header, browsers were free to invent their own policy, and one did:
+/// yukimemi's phone went on showing "Candidates must be folded before
+/// deleting. Run `magi fold` first." - a sentence deleted two releases
+/// earlier - from a run detail served by a deck that no longer contained it.
+/// The delete button he was told about was right there, and unreachable.
+///
+/// `must-revalidate` with an `ETag` keyed on the version: the phone asks
+/// every time, the answer is a 304 costing one small round trip while the
+/// deck is unchanged, and the moment it is replaced the tag differs and the
+/// new interface arrives. Correctness over bytes - this is one file of a few
+/// tens of kilobytes on a tailnet, and being a version behind is not a
+/// cosmetic problem when the difference is whether a button exists.
+const ASSET_CACHE: &str = "no-cache, must-revalidate";
+
+/// `ETag` for the compiled-in assets, distinct per build.
+///
+/// The version alone would leave a locally built deck - `cargo install
+/// --path .` twice at the same version, which is the normal way to iterate -
+/// serving a stale tag for changed bytes. The build timestamp is what makes
+/// two builds of `0.3.0` differ.
+fn asset_etag() -> &'static str {
+    static TAG: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!(
+            "\"{}-{}\"",
+            env!("CARGO_PKG_VERSION"),
+            // Length is a cheap, deterministic stand-in for a hash: the
+            // three files are compiled in together, so any edit to any of
+            // them almost certainly changes the total, and a rebuild is what
+            // this needs to track rather than every possible byte pattern.
+            INDEX_HTML.len() + APP_CSS.len() + APP_JS.len()
+        )
+    });
+    &TAG
 }
 
-async fn app_css() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS)
+/// Headers for a compiled-in asset of `mime`.
+fn asset_headers(mime: &'static str) -> [(header::HeaderName, &'static str); 3] {
+    [
+        (header::CONTENT_TYPE, mime),
+        (header::CACHE_CONTROL, ASSET_CACHE),
+        (header::ETAG, asset_etag()),
+    ]
 }
 
-async fn app_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        APP_JS,
-    )
+/// Serve a compiled-in asset, answering `304` when the client already has it.
+///
+/// axum does not compare `If-None-Match` for us, and a header the server sets
+/// but never honours is worse than none: the phone revalidates on every load
+/// and is handed the whole file back each time. Doing the comparison is what
+/// makes `must-revalidate` cost one small round trip rather than the
+/// interface.
+fn asset(headers: &header::HeaderMap, mime: &'static str, body: &'static str) -> Response {
+    let tag = asset_etag();
+    let known = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        // A revalidating client may send several, and a proxy may weaken the
+        // tag to `W/"..."`; matching on containment covers both without
+        // parsing the grammar.
+        .is_some_and(|sent| sent.split(',').any(|one| one.trim().ends_with(tag)));
+    if known {
+        return (StatusCode::NOT_MODIFIED, asset_headers(mime)).into_response();
+    }
+    (asset_headers(mime), body).into_response()
+}
+
+async fn index(headers: header::HeaderMap) -> Response {
+    asset(&headers, "text/html; charset=utf-8", INDEX_HTML)
+}
+
+async fn app_css(headers: header::HeaderMap) -> Response {
+    asset(&headers, "text/css; charset=utf-8", APP_CSS)
+}
+
+async fn app_js(headers: header::HeaderMap) -> Response {
+    asset(&headers, "text/javascript; charset=utf-8", APP_JS)
 }
 
 /// What `/api/health` answers.
@@ -1503,6 +1568,11 @@ struct RunSummary {
     reviews: usize,
     quota_losses: usize,
     event: Option<String>,
+    /// The later attempt at the same task that replaced this one, if any.
+    ///
+    /// Two cards with one title is otherwise unreadable: this is what lets
+    /// the deck say "superseded by 4043" on the older of the pair.
+    superseded_by: Option<String>,
     /// Blocked on a question nobody has answered.
     ///
     /// Derived from the question store rather than stored on the run: an agent
@@ -1539,6 +1609,9 @@ impl RunSummary {
             quota_losses: state.quota.len(),
             event: state.events.last().map(|e| e.message.clone()),
             waiting,
+            // Filled in by the list route, which is the only place that can
+            // see a task's other attempts.
+            superseded_by: None,
             pr: state.pr.clone(),
         }
     }
@@ -1566,6 +1639,7 @@ async fn runs_list(
 ) -> ApiResult<Json<Vec<RunSummary>>> {
     let limit = q.limit.unwrap_or(LIST_DEFAULT).min(LIST_MAX);
     blocking(move || {
+        let superseded = superseded_runs(&ui.queue);
         let summaries = run_ids(&ui.runs)
             .into_iter()
             // A run whose state cannot be read is skipped, not fatal: a run
@@ -1576,12 +1650,39 @@ async fn runs_list(
             .take(limit)
             .map(|state| {
                 let waiting = !ui.questions.open_for(&state.id).is_empty();
-                RunSummary::of(&state, waiting)
+                let by = superseded.get(&state.id).cloned();
+                let mut row = RunSummary::of(&state, waiting);
+                row.superseded_by = by.as_deref().map(crate::run::short_of).map(str::to_owned);
+                row
             })
             .collect();
         Ok(Json(summaries))
     })
     .await
+}
+
+/// Runs that a later attempt at the same task replaced, mapped to the id of
+/// the attempt that replaced them.
+///
+/// A task keeps its attempts in order, and the deck showed them as two cards
+/// with the same title and no hint which was which: yukimemi asked why
+/// `stalled` and `blocked` appeared twice for one task, and the answer -
+/// "those are two tries, and the second one exists because of a bug since
+/// fixed" - was not on the screen anywhere.
+///
+/// Read from the queue rather than stored on the run, because the ordering is
+/// the queue's fact: a `RunState` has no idea another attempt happened after
+/// it.
+fn superseded_runs(queue: &Queue) -> HashMap<String, String> {
+    let mut by = HashMap::new();
+    for task in queue.list() {
+        for pair in task.runs.windows(2) {
+            if let [earlier, later] = pair {
+                by.insert(earlier.clone(), later.clone());
+            }
+        }
+    }
+    by
 }
 
 /// A run as the detail route hands it to the phone.
@@ -2813,6 +2914,10 @@ mod tests {
             request(self.addr, "POST", path, body).await
         }
 
+        async fn get_with(&self, path: &str, extra: &[(&str, &str)]) -> Res {
+            request_with(self.addr, "GET", path, None, extra).await
+        }
+
         async fn delete(&self, path: &str) -> Res {
             request(self.addr, "DELETE", path, None).await
         }
@@ -2853,7 +2958,23 @@ mod tests {
     /// A one-shot HTTP/1.1 client. `Connection: close` is what lets the reply
     /// be read to end-of-stream without parsing framing.
     async fn request(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> Res {
+        request_with(addr, method, path, body, &[]).await
+    }
+
+    /// As [`request`], with extra request headers - conditional GETs need
+    /// `If-None-Match`, and a server that sets an `ETag` it never compares is
+    /// worse than one that sets none.
+    async fn request_with(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> Res {
         let mut head = format!("{method} {path} HTTP/1.1\r\nHost: magi\r\nConnection: close\r\n");
+        for (name, value) in extra {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
         if let Some(body) = body {
             head.push_str("Content-Type: application/json\r\n");
             head.push_str(&format!("Content-Length: {}\r\n", body.len()));
@@ -5019,6 +5140,91 @@ mod tests {
             alert.contains("var(--s4) + var(--tap) + var(--s3)"),
             "the FAB's column stays free: {alert}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_older_attempt_says_what_replaced_it() {
+        let fx = Fixture::start().await;
+        let q = fx.queue();
+        let runs = fx.runs();
+        let (first, second) = ("20260901-000000-aaaa", "20260901-000000-bbbb");
+        write_run(&runs, first, RunStatus::Stalled);
+        write_run(&runs, second, RunStatus::Blocked);
+
+        let mut t = Task::new(
+            "one task".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        t.runs = vec![first.to_owned(), second.to_owned()];
+        q.put(&mut t).expect("put");
+
+        // Two cards with the same title and no hint which is which was the
+        // question: "why are there two of the same, one stalled and one
+        // blocked?" The older one now names its replacement.
+        let rows = fx.get("/api/runs").await.json();
+        let by = |short: &str| -> Value {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["short"] == short)
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        assert_eq!(by("aaaa")["superseded_by"], "bbbb");
+        assert!(
+            by("bbbb")["superseded_by"].is_null(),
+            "the latest attempt is not superseded by anything"
+        );
+        // Front end: the note has to be rendered, not just carried.
+        assert!(APP_JS.contains("run.superseded_by"));
+        assert!(APP_JS.contains("Superseded by"));
+    }
+
+    #[tokio::test]
+    async fn a_replaced_deck_is_not_served_from_a_phone_s_cache() {
+        let fx = Fixture::start().await;
+        // No cache header at all meant browsers invented their own policy,
+        // and one did: a phone went on showing "Candidates must be folded
+        // before deleting. Run `magi fold` first." - deleted two releases
+        // earlier - from a deck that no longer contained the sentence. The
+        // button it named was right there, and unreachable.
+        let js = fx.get("/app.js").await;
+        assert_eq!(js.status, 200);
+        let tag = js
+            .header("etag")
+            .expect("an etag to revalidate against")
+            .to_owned();
+        assert!(tag.contains(env!("CARGO_PKG_VERSION")), "tag: {tag}");
+        assert_eq!(
+            js.header("cache-control"),
+            Some("no-cache, must-revalidate"),
+            "the phone has to ask every time"
+        );
+
+        // And the asking has to be cheap, or `must-revalidate` just means
+        // "send the whole interface on every load".
+        let again = fx
+            .get_with("/app.js", &[("if-none-match", tag.as_str())])
+            .await;
+        assert_eq!(
+            again.status, 304,
+            "a deck it already has costs one round trip"
+        );
+        assert!(again.body.is_empty(), "304 carries no body");
+
+        // A weakened tag from a proxy still matches; a different build does
+        // not, which is the case that has to deliver the new interface.
+        let weak = fx
+            .get_with("/app.js", &[("if-none-match", &format!("W/{tag}"))])
+            .await;
+        assert_eq!(weak.status, 304);
+        let stale = fx
+            .get_with("/app.js", &[("if-none-match", "\"0.0.1-1\"")])
+            .await;
+        assert_eq!(stale.status, 200, "an older build must be replaced");
+        assert!(stale.body.contains("renderRunActions"));
     }
 
     #[test]

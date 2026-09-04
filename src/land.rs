@@ -240,6 +240,14 @@ impl Blocking {
 pub enum Step {
     /// Checks are still running; re-read the pull request after [`POLL`].
     Wait,
+    /// The base moved and the branch no longer merges: rebase it.
+    ///
+    /// Not a fix round. Nothing is wrong with the change - a competition
+    /// that runs for two hours against a repository merging pull requests
+    /// all day conflicts on the way in, and that is arithmetic rather than a
+    /// defect. Pull requests 35 and 37 were both rebased by hand for exactly
+    /// this.
+    Rebase,
     /// Red checks or unresolved comments; run a fix round.
     Fix {
         /// What is unhappy, in one line, for the run log and the fix prompt.
@@ -323,6 +331,12 @@ pub fn decide(pr: &PrState, round: usize, budget: usize, waited: Duration) -> St
         PrLifecycle::Merged => return Step::Done { merged: true },
         PrLifecycle::Closed => return Step::Done { merged: false },
         PrLifecycle::Open => {}
+    }
+
+    // Before the checks: every check on a branch that cannot land is an
+    // answer about a state that cannot land.
+    if pr.blocking == Blocking::Conflict {
+        return Step::Rebase;
     }
 
     let spent = round >= budget;
@@ -1216,6 +1230,9 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
     let repo = state.repo.clone();
     let budget = state.config.graph.land_rounds;
     let mut round = 0usize;
+    // Counted apart from `round`: a rebase is not a fix, and a base that
+    // moved is not the change's fault.
+    let mut rebases = 0usize;
     let mut waited = Duration::ZERO;
     // Comment bodies the fixer has already been shown. A comment is
     // outstanding until it has been handed over once; after that it is a
@@ -1320,6 +1337,79 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                 )
                 .await?;
                 return Ok(pr);
+            }
+            Step::Rebase => {
+                // Bounded by the same budget as a fix, because a rebase that
+                // keeps being needed means the base moves faster than this
+                // run can land and a person should decide what to do. It
+                // spends none of that budget: the change is not what is
+                // wrong.
+                if rebases >= budget {
+                    let why = format!(
+                        "the base moved under this branch {budget} time(s) and it still does \
+                         not merge; rebasing again would only race it"
+                    );
+                    stop(state, &repo, &pr, &why).await?;
+                    return Ok(pr);
+                }
+                rebases += 1;
+                let Some(branch) = state.winner().map(|w| w.branch.clone()) else {
+                    stop(
+                        state,
+                        &repo,
+                        &pr,
+                        "the pull request conflicts and this run has no winning branch to rebase",
+                    )
+                    .await?;
+                    return Ok(pr);
+                };
+                let base = state.base_branch.clone();
+                state.event(
+                    "land",
+                    format!("{} no longer merges; rebasing onto {base}", pr.url),
+                );
+                state.save()?;
+
+                // Onto the base as the *remote* has it: the local ref may be
+                // behind, and rebasing onto a stale base produces a branch
+                // that conflicts all over again.
+                git::fetch(&repo, "origin", &base).await.ok();
+                let scratch = state.dir().join("rebase");
+                let onto = format!("origin/{base}");
+                match git::rebase_branch_in_temp(&repo, &scratch, &branch, &onto).await {
+                    Ok(None) => {
+                        let pushed = git::push_rewritten(&repo, "origin", &branch).await?;
+                        if !pushed.ok() {
+                            let why = format!(
+                                "rebased {branch} but could not push it: {}",
+                                pushed.stderr.trim()
+                            );
+                            stop(state, &repo, &pr, &why).await?;
+                            return Ok(pr);
+                        }
+                        state.event("land", format!("rebased {branch} onto {base}"));
+                        state.save()?;
+                        // The forge has to re-run its checks against the
+                        // rebased head before anything else can be decided.
+                        waited = Duration::ZERO;
+                        tokio::time::sleep(POLL).await;
+                    }
+                    // A conflict is a decision, not a chore.
+                    Ok(Some(conflict)) => {
+                        let why = format!(
+                            "{} conflicts with {base} and the rebase did not apply: {}",
+                            pr.url,
+                            conflict.chars().take(600).collect::<String>()
+                        );
+                        stop(state, &repo, &pr, &why).await?;
+                        return Ok(pr);
+                    }
+                    Err(e) => {
+                        let why = format!("could not rebase {branch} onto {base}: {e:#}");
+                        stop(state, &repo, &pr, &why).await?;
+                        return Ok(pr);
+                    }
+                }
             }
             Step::GiveUp { reason } => {
                 stop(state, &repo, &pr, &reason).await?;
@@ -2463,6 +2553,33 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             decide(&unsaid, 0, 4, Duration::ZERO),
             Step::Fix { .. }
         ));
+    }
+
+    #[test]
+    fn a_branch_the_base_moved_under_is_rebased_not_fixed() {
+        // Pull requests 35 and 37 were both rebased by hand: a competition
+        // that runs for two hours against a repository merging pull requests
+        // all day conflicts on the way in, and that is arithmetic rather
+        // than a defect in the change.
+        let mut conflicted = pr(Checks::Green, &[], 0);
+        conflicted.blocking = Blocking::Conflict;
+        assert_eq!(decide(&conflicted, 0, 4, Duration::ZERO), Step::Rebase);
+
+        // Decided before the checks, and even with the rounds spent: every
+        // check on a branch that cannot land is an answer about a state that
+        // cannot land, and a conflict is not the change's fault.
+        let mut red = pr(Checks::Red, &["test (ubuntu-latest)"], 2);
+        red.blocking = Blocking::Conflict;
+        assert_eq!(decide(&red, 4, 4, Duration::ZERO), Step::Rebase);
+
+        // The lifecycle still wins over everything, conflict included.
+        let mut merged = pr(Checks::Red, &[], 0);
+        merged.blocking = Blocking::Conflict;
+        merged.state = PrLifecycle::Merged;
+        assert_eq!(
+            decide(&merged, 0, 4, Duration::ZERO),
+            Step::Done { merged: true }
+        );
     }
 
     #[test]
