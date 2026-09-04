@@ -2560,6 +2560,15 @@ function renderRunDetail() {
        different one is not merely stale, it is wrong. */
     show($("run-ask-panel"), false);
     show($("run-land-panel"), false);
+    /* The fab and its sheet stay reachable across this route (see
+       applyRoute), so a switch to a different run id \u2014 the daemon strip's
+       currentRunLink, or back/forward between two run pages \u2014 must not leave
+       the previous run's Resume/Fold/Delete buttons sitting in the sheet:
+       their onclick closures still carry the old id, and Delete says itself
+       "cannot be undone". Clearing here, before the new run's data arrives,
+       is what used to happen for free when the whole panel was hidden. */
+    clear($("run-actions-box"));
+    clear($("run-delete-box"));
     setText($("run-report"), report === null ? "Loading\u2026" : report);
     return;
   }
