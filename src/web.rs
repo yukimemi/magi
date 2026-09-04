@@ -655,6 +655,15 @@ impl Drop for ResumeGuard {
     }
 }
 
+/// Bind the port, waiting briefly for a predecessor to let go of it.
+///
+/// A restart hands the address from one process to the next, and the old one
+/// holds its listener until it unwinds. A single `bind` can lose that race,
+/// and for a restart triggered from a phone that means the deck never comes
+/// back with no terminal around to say why.
+///
+/// Bounded, and only for the one error a wait can fix: anything else fails at
+/// once, because retrying it would turn a clear message into a silence.
 async fn bind_waiting(socket: SocketAddr) -> Result<tokio::net::TcpListener> {
     const WINDOW: Duration = Duration::from_secs(10);
     const GAP: Duration = Duration::from_millis(250);
@@ -736,15 +745,13 @@ fn spawn_successor() -> Result<()> {
 /// finished first, for the reason [`daemon::serve`] gives: killing the graph
 /// mid-node leaves worktrees, branches and agent sessions behind and throws
 /// away every agent call already paid for.
-/// Bind the port, waiting briefly for a predecessor to let go of it.
 ///
-/// A restart hands the address from one process to the next, and the old one
-/// holds its listener until it unwinds. A single `bind` can lose that race,
-/// and for a restart triggered from a phone that means the deck never comes
-/// back with no terminal around to say why.
-///
-/// Bounded, and only for the one error a wait can fix: anything else fails at
-/// once, because retrying it would turn a clear message into a silence.
+/// The server therefore runs on a task of its own rather than inside the
+/// `select!`: an arm that resolves *drops* the futures the other arms were
+/// polling, so serving the address from inside one would take the deck down
+/// at the instant the handover began and keep it down for the whole park -
+/// up to `timeout_implement`, an hour by default. See [`hand_over`], which
+/// owns the order.
 pub async fn serve(opts: Opts) -> Result<()> {
     let (addr, warning) = resolve_bind(&opts.bind);
     if let Some(warning) = warning {
@@ -780,7 +787,9 @@ pub async fn serve(opts: Opts) -> Result<()> {
         println!("{url}");
     }
 
-    let served = axum::serve(listener, ui.router()).into_future();
+    // On its own task, so nothing this function awaits can stop the address
+    // being answered. `hand_over` is where it is given up.
+    let mut served = tokio::spawn(axum::serve(listener, ui.router()).into_future());
     let interrupted = async {
         if tokio::signal::ctrl_c().await.is_err() {
             // No handler on this platform, so there is no signal to act on.
@@ -792,7 +801,10 @@ pub async fn serve(opts: Opts) -> Result<()> {
     };
     let handover = HANDOVER.notified();
     tokio::select! {
-        outcome = served => outcome.context("serve the web UI"),
+        joined = &mut served => match joined {
+            Ok(outcome) => outcome.context("serve the web UI"),
+            Err(e) => Err(e).context("the task serving the web UI ended"),
+        },
         () = interrupted => {
             tracing::info!("shutting down the web UI");
             finish_loop(&looping).await;
@@ -800,12 +812,42 @@ pub async fn serve(opts: Opts) -> Result<()> {
         }
         () = handover => {
             tracing::info!("upgraded - handing this address to the successor");
-            // The loop was parked by the request, so this waits for a node
-            // boundary rather than for a whole competition.
-            finish_loop(&looping).await;
-            spawn_successor()
+            hand_over(&looping, served, spawn_successor).await
         }
     }
+}
+
+/// Park the loop, then release the address, then start the successor.
+///
+/// The order is the whole function, and each step is answerable to a failure
+/// this arrangement has already had:
+///
+/// 1. **Park.** The loop was asked to stop by the request that replaced the
+///    binary, and this waits for it, because killing the graph mid-node
+///    leaves worktrees, branches and agent sessions behind and throws away
+///    every agent call already paid for. It takes as long as the node in
+///    flight - up to `timeout_implement`, an hour by default - and the deck
+///    goes on answering for all of it, which is the reason `served` is a task
+///    rather than an arm of [`serve`]'s `select!`. It was an arm once: the
+///    first upgrade from a phone that caught a run mid-implement dropped the
+///    listener the moment it was asked to, and the operator got
+///    `Cannot reach magi: Failed to fetch` with no way to see the park it was
+///    waiting on and nothing but a process list to say the run was alive.
+/// 2. **Release.** Aborting *and awaiting* the task is what frees the socket:
+///    the join resolves only once the task's future has been dropped, so the
+///    address is unbound before the next line rather than merely on its way
+///    there.
+/// 3. **Start the successor**, which binds the address this process has just
+///    let go of - see [`spawn_successor`] for what the other order cost.
+async fn hand_over(
+    looping: &Mutex<LoopState>,
+    served: tokio::task::JoinHandle<std::io::Result<()>>,
+    successor: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    finish_loop(looping).await;
+    served.abort();
+    let _ = served.await;
+    successor()
 }
 
 /// Ask the loop to stop and wait for it, on the way out of [`serve`].
@@ -3089,6 +3131,39 @@ mod tests {
         })
     }
 
+    /// The address the parking loop knocks on, and what it heard there.
+    ///
+    /// A [`Launch`] is a plain function pointer, so a stand-in loop cannot
+    /// capture a fixture's address; this is how it is handed one. Only
+    /// `the_deck_answers_while_it_parks_and_frees_the_address_first` touches
+    /// these, so nothing else in this binary can race them.
+    static PARK_KNOCK: std::sync::Mutex<Option<SocketAddr>> = std::sync::Mutex::new(None);
+    static PARK_HEARD: std::sync::Mutex<Option<u16>> = std::sync::Mutex::new(None);
+
+    /// A loop that, once it is asked to stop, checks the deck still answers
+    /// before it goes.
+    ///
+    /// It stands in for a run mid-node: `finish_loop` waits for this future,
+    /// so the request it makes is strictly inside the park window - no sleep
+    /// and no polling needed to be sure of that.
+    fn launch_knocking_on_the_way_out(
+        _opts: daemon::Opts,
+        stop: daemon::Stop,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+        Box::pin(async move {
+            while !stop.stopped() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let addr = PARK_KNOCK
+                .lock()
+                .expect("park knock")
+                .expect("the test set an address");
+            let heard = request(addr, "GET", "/api/health", None).await.status;
+            *PARK_HEARD.lock().expect("park heard") = Some(heard);
+            Ok(())
+        })
+    }
+
     /// The loop view once `want` accepts it.
     ///
     /// Polled rather than asserted straight after the POST because stopping
@@ -4319,6 +4394,69 @@ mod tests {
             again.json()["last_error"],
             Value::Null,
             "a fresh start does not keep showing why the last one died"
+        );
+    }
+
+    /// An upgrade parks the run in flight before it restarts, and a park waits
+    /// for the node - up to `timeout_implement`, an hour by default. The deck
+    /// has to answer for all of it: the operator has just been told a run is
+    /// finishing first, and this address is the only place that says how it is
+    /// going. It did not, once - the listener went with the `select!` arm that
+    /// began the handover, and the phone got `Cannot reach magi: Failed to
+    /// fetch` for the rest of the wave.
+    ///
+    /// The other half is the older rule: the address must be free *before* the
+    /// successor is started, or it dies on "address already in use" with its
+    /// stdio sent to null and the deck never comes back.
+    #[tokio::test]
+    async fn the_deck_answers_while_it_parks_and_frees_the_address_first() {
+        let home = TempDir::new().expect("temp home");
+        let runs = home.path().join("runs");
+        std::fs::create_dir_all(&runs).expect("runs dir");
+        let ui = Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            Chats::at(home.path().join("chats")),
+            runs,
+            home.path().to_path_buf(),
+            PathBuf::from("/repo/magi"),
+        )
+        .with_launch(launch_knocking_on_the_way_out);
+        let looping = ui.looping();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        *PARK_KNOCK.lock().expect("park knock") = Some(addr);
+        let served = tokio::spawn(axum::serve(listener, ui.router()).into_future());
+
+        let started = request(addr, "POST", "/api/loop", Some(r#"{"running":true}"#)).await;
+        assert_eq!(started.status, 200, "the loop starts: {}", started.body);
+
+        // The successor's whole job, and the one thing it cannot do while this
+        // process still holds the socket.
+        let bound = std::sync::Mutex::new(None);
+        hand_over(&looping, served, || {
+            let attempt = std::net::TcpListener::bind(addr).map_err(|e| e.to_string());
+            *bound.lock().expect("bound") = Some(attempt);
+            Ok(())
+        })
+        .await
+        .expect("hand over");
+
+        assert_eq!(
+            *PARK_HEARD.lock().expect("park heard"),
+            Some(200),
+            "the deck must answer while the loop is parking"
+        );
+        let attempt = bound
+            .lock()
+            .expect("bound")
+            .take()
+            .expect("the successor was started");
+        assert!(
+            attempt.is_ok(),
+            "and the address must be free by the time it is: {attempt:?}"
         );
     }
 
