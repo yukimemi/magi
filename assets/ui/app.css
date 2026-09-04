@@ -1021,8 +1021,11 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 }
 .dock-glyph svg { width: 22px; height: 22px; display: block; }
 .dock-item[aria-current="page"] { color: var(--ink); border-top-color: var(--gold-line); }
-.dock-new { color: var(--on-gold); }
-.dock-new .dock-glyph svg { stroke-width: 2.4; }
+/* Plan is the only way work gets in from this UI, so the dock's Plan item is
+   gold — the colour that everywhere else means "the commit action" — and it
+   stays gold even while a different page is active. */
+.dock-item.dock-plan { color: var(--on-gold); }
+.dock-item.dock-plan .dock-glyph svg { stroke-width: 2.4; }
 
 /* ---- run actions fab ---------------------------------------------------- *
  * The one entry point into Resume / Fold / Delete on a run detail. Fixed so
@@ -1049,8 +1052,8 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 #view-run { padding-bottom: calc(var(--tap) + var(--s6)); }
 
 /* The fab's sheet has no <form> — its content is built and rerendered
-   from JS — so it gets its own head/body padding instead of borrowing
-   .sheet form's, which stays specific to compose. */
+   from JS — so it gets its own head/body padding instead of borrowing a
+   form's, a shape this document no longer has. */
 #run-actions-sheet[open] { display: flex; flex-direction: column; }
 #run-actions-sheet .sheet-head { flex: none; padding: var(--s4) var(--s4) 0; }
 #run-actions-sheet .sheet-body {
@@ -1060,7 +1063,7 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   overflow-y: auto; min-height: 0;
 }
 
-/* ---- compose sheet ----------------------------------------------------- */
+/* ---- sheet -------------------------------------------------------------- */
 .sheet {
   width: 100%; max-width: 560px; padding: 0; margin: auto auto 0;
   border: 0; border-radius: var(--radius) var(--radius) 0 0;
@@ -1069,12 +1072,6 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   max-height: 92dvh;
 }
 .sheet::backdrop { background: rgba(20, 18, 14, .55); }
-.sheet form {
-  display: flex; flex-direction: column; gap: var(--s4);
-  padding: var(--s4);
-  padding-bottom: calc(var(--s4) + env(safe-area-inset-bottom));
-  max-height: 92dvh; overflow-y: auto;
-}
 .sheet-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); }
 .sheet-head h2 { font-size: var(--t5); text-transform: none; letter-spacing: -.01em; color: var(--ink); }
 
@@ -1111,8 +1108,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
   transition: transform .18s var(--ease);
 }
 .advanced[open] > summary::before { transform: rotate(45deg); }
-.sheet-actions { display: flex; gap: var(--s2); }
-.sheet-actions .btn { flex: 1; }
 .form-error {
   padding: var(--s2) var(--s3);
   background: var(--tint-rust); color: var(--on-rust);
@@ -1400,7 +1395,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
     font-size: var(--t3); font-weight: 650; color: var(--ink-3);
   }
   .rail-link[aria-current="page"] { color: var(--ink); background: var(--sunk); }
-  .rail-new { margin-left: var(--s3); }
+  /* The rail's Plan entry is the primary action: a filled gold button, not
+     another grey link — the same gold as the dock's plan item and every
+     start-the-interview button, and the only .btn among the links. */
+  .rail-link.btn-gold { color: #241d05; background: var(--gold); border-color: var(--gold); }
   main { padding: var(--s5); }
   h1 { font-size: var(--t7); }
   .view { gap: var(--s5); }
@@ -1408,7 +1406,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
     margin: auto; border-radius: var(--radius);
     max-height: min(86dvh, 760px);
   }
-  .sheet form { max-height: min(86dvh, 760px); }
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: var(--s4); }
   .card { display: flex; flex-direction: column; }
   .card-event { margin-top: auto; padding-top: var(--s2); }

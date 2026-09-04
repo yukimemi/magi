@@ -434,8 +434,9 @@ It is still one binary. The interface is three files compiled in with
 fetched at runtime. `cargo install magi-cli` gives you the phone UI too.
 
 You can watch runs, read the full report, browse the queue, hold and release
-tasks, file new work from the compose form, and delete a task or a finished run
-that is no longer wanted. Deletion is guarded rather than hidden: a task the
+tasks, plan new work — an agent interviews you into a task file, the way
+`magi plan` would in a terminal — and delete a task or a finished run that
+is no longer wanted. Deletion is guarded rather than hidden: a task the
 daemon is holding a claim on, and a run a live daemon is working on right now,
 are refused with the reason. So is any run whose candidate worktrees have not
 been folded — that is the guard that keeps "delete" meaning "remove a record"

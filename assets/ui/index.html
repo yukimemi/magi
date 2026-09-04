@@ -51,9 +51,12 @@
   <nav class="rail" aria-label="Sections">
     <a class="rail-link" href="#/runs" data-nav="runs">Runs</a>
     <a class="rail-link" href="#/queue" data-nav="queue">Queue</a>
-    <a class="rail-link" href="#/plan" data-nav="chats">Plan</a>
+    <!-- Plan is the only way work gets in from this UI: work is interviewed
+         into a task file, not typed straight into the queue. So it is the one
+         gold button in the nav and the dock, and it only ever opens the
+         planning panel. -->
+    <a class="rail-link btn btn-gold" href="#/plan" data-nav="chats" data-plan>Plan</a>
     <a class="rail-link" href="#/questions" data-nav="questions">Questions<span class="badge" id="ask-badge-rail" hidden></span></a>
-    <button class="btn btn-gold rail-new" type="button" data-compose>New task</button>
   </nav>
 
   <button class="icon-btn" type="button" id="theme-toggle" aria-label="Colour theme: follow system">
@@ -117,8 +120,9 @@
     </div>
     <ol class="cards" id="runs-list"></ol>
     <p class="empty" id="runs-empty" hidden>
-      No competitions yet. File a task and the loop will pick it up.
-      <button class="btn btn-gold" type="button" data-compose>File the first task</button>
+      No competitions yet. Start from an idea and an agent will interview you
+      into a task the loop can pick up.
+      <button class="btn btn-gold" type="button" data-plan>Start from an idea</button>
     </p>
     <p class="empty" id="runs-unreadable" hidden>
       There are runs on disk, but this build cannot read their state — almost
@@ -206,8 +210,9 @@
     </div>
     <ol class="cards" id="queue-list"></ol>
     <p class="empty" id="queue-empty" hidden>
-      The backlog is empty. Nothing is waiting to be claimed.
-      <button class="btn btn-gold" type="button" data-compose>File a task</button>
+      The backlog is empty. Start from an idea and an agent will interview you
+      into a task for it.
+      <button class="btn btn-gold" type="button" data-plan>Start from an idea</button>
     </p>
   </section>
 
@@ -376,7 +381,7 @@
     </span>
     <span>Queue</span>
   </a>
-  <a class="dock-item" href="#/plan" data-nav="chats">
+  <a class="dock-item dock-plan" href="#/plan" data-nav="chats" data-plan>
     <span class="dock-glyph" aria-hidden="true">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
         <path d="M4.5 5.5h9l6 6v7a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2z"/>
@@ -397,14 +402,6 @@
     </span>
     <span>Questions</span>
   </a>
-  <button class="dock-item dock-new" type="button" data-compose>
-    <span class="dock-glyph" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-        <path d="M12 5v14M5 12h14"/>
-      </svg>
-    </span>
-    <span>New task</span>
-  </button>
 </nav>
 
 <!-- RUN ACTIONS SHEET ---------------------------------------------------- -->
@@ -421,62 +418,6 @@
     <div id="run-actions-box"></div>
     <div id="run-delete-box"></div>
   </div>
-</dialog>
-
-<!-- COMPOSE ------------------------------------------------------------- -->
-<dialog class="sheet" id="compose" aria-labelledby="compose-h">
-  <form id="compose-form" method="dialog">
-    <div class="sheet-head">
-      <h2 id="compose-h">File a task</h2>
-      <button class="icon-btn" type="button" id="compose-close" aria-label="Close">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-          <path d="M6 6l12 12M18 6L6 18"/>
-        </svg>
-      </button>
-    </div>
-
-    <div class="field">
-      <label for="f-instruction">Instruction</label>
-      <p class="hint" id="f-instruction-hint">What the agents must implement. This is the whole brief they get.</p>
-      <textarea id="f-instruction" name="instruction" rows="7" required
-                aria-describedby="f-instruction-hint"
-                placeholder="Add a --json flag to magi list that prints one object per run."></textarea>
-    </div>
-
-    <div class="field">
-      <label for="f-title">Title <span class="opt">optional</span></label>
-      <p class="hint" id="f-title-hint">Defaults to the first meaningful line of the instruction.</p>
-      <input id="f-title" name="title" type="text" maxlength="72" aria-describedby="f-title-hint">
-    </div>
-
-    <div class="field">
-      <label for="f-priority">Priority</label>
-      <p class="hint" id="f-priority-hint">Higher runs first; ties break oldest-first.</p>
-      <select id="f-priority" name="priority" aria-describedby="f-priority-hint">
-        <option value="2">2 — urgent</option>
-        <option value="1">1 — high</option>
-        <option value="0" selected>0 — normal</option>
-        <option value="-1">-1 — low</option>
-      </select>
-    </div>
-
-    <details class="advanced">
-      <summary>Advanced</summary>
-      <div class="field">
-        <label for="f-repo">Repository path <span class="opt">optional</span></label>
-        <p class="hint" id="f-repo-hint">Defaults to the repository this server was started against.</p>
-        <input id="f-repo" name="repo" type="text" spellcheck="false" autocapitalize="off"
-               aria-describedby="f-repo-hint" placeholder="/home/yukimemi/src/github.com/yukimemi/magi">
-      </div>
-    </details>
-
-    <p class="form-error" id="compose-error" role="alert" hidden></p>
-
-    <div class="sheet-actions">
-      <button class="btn btn-quiet" type="button" id="compose-cancel">Cancel</button>
-      <button class="btn btn-gold" type="submit" id="compose-submit">File task</button>
-    </div>
-  </form>
 </dialog>
 
 <!-- PANEL, FULL SCREEN -------------------------------------------------- *

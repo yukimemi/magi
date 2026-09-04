@@ -118,7 +118,7 @@ use crate::chat::{Chat, Chats};
 use crate::config::Config;
 use crate::md;
 use crate::proc::Quiet as _;
-use crate::queue::{Queue, Source, Task, title_from};
+use crate::queue::{Queue, Task, title_from};
 use crate::run::{RunState, RunStatus};
 use crate::{chat, daemon, report, repos, run};
 
@@ -596,7 +596,7 @@ impl Ui {
             .route("/api/runs/{id}/report", get(run_report))
             .route("/api/runs/{id}/fold", post(run_fold))
             .route("/api/runs/{id}/resume", post(run_resume))
-            .route("/api/queue", get(queue_list).post(queue_post))
+            .route("/api/queue", get(queue_list))
             .route("/api/queue/{id}", delete(queue_delete))
             .route("/api/repos", get(repos_list))
             .route("/api/queue/{id}/hold", post(queue_hold))
@@ -1999,48 +1999,6 @@ async fn queue_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TaskView>>>
     .await
 }
 
-/// The body of `POST /api/queue`.
-///
-/// Every field defaults so the phone can send only what the operator typed,
-/// and unknown fields are ignored so a newer front end talking to an older
-/// binary still files the task.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct NewTask {
-    instruction: String,
-    title: Option<String>,
-    repo: Option<PathBuf>,
-    priority: Option<i32>,
-}
-
-async fn queue_post(
-    State(ui): State<Arc<Ui>>,
-    body: std::result::Result<Json<NewTask>, JsonRejection>,
-) -> ApiResult<impl IntoResponse> {
-    // Taken as a `Result` so a malformed body is the 400 the contract promises
-    // rather than axum's default 422, which the UI has no branch for.
-    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    if body.instruction.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "instruction must not be blank: an empty task would burn a whole \
-             competition on nothing",
-        ));
-    }
-    let view = blocking(move || {
-        let title = body
-            .title
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| title_from(&body.instruction, TITLE_MAX));
-        let repo = body.repo.unwrap_or_else(|| ui.repo.clone());
-        let mut task = Task::new(title, body.instruction, repo, Source::Human);
-        task.priority = body.priority.unwrap_or(0);
-        ui.queue.put(&mut task)?;
-        Ok(TaskView::from(task))
-    })
-    .await?;
-    Ok((StatusCode::CREATED, Json(view)))
-}
-
 async fn queue_hold(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
@@ -2876,7 +2834,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::queue::TaskStatus;
+    use crate::queue::{Source, TaskStatus};
 
     /// A home with a queue and a runs directory, and a router serving it on
     /// loopback. `tower`'s `oneshot` is not reachable - `tower` is axum's
@@ -3827,76 +3785,6 @@ mod tests {
             .await;
         assert_eq!(res.status, 404, "{}", res.body);
         assert!(res.json()["error"].is_string());
-    }
-
-    #[tokio::test]
-    async fn a_blank_instruction_is_rejected_and_files_nothing() {
-        let f = Fixture::start().await;
-
-        let res = f
-            .post("/api/queue", Some(r#"{"instruction":"   \n  "}"#))
-            .await;
-
-        assert_eq!(res.status, 400);
-        assert!(
-            res.json()["error"].as_str().is_some_and(|e| !e.is_empty()),
-            "a rejection has to say why: {}",
-            res.body
-        );
-        assert!(
-            f.queue().list().is_empty(),
-            "a rejected task must not reach the disk"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_malformed_body_is_a_bad_request_not_an_unprocessable_entity() {
-        let f = Fixture::start().await;
-
-        let res = f.post("/api/queue", Some("{not json")).await;
-
-        // The UI branches on 400; axum's default for a bad body is 422, which
-        // it would report as an unknown failure.
-        assert_eq!(res.status, 400);
-    }
-
-    #[tokio::test]
-    async fn a_posted_task_is_queued_with_a_title_taken_from_its_instruction() {
-        let f = Fixture::start().await;
-
-        let created = f
-            .post(
-                "/api/queue",
-                Some(
-                    r##"{"instruction":"# Rework the config loader\n\nIt re-reads the file on every lookup"}"##,
-                ),
-            )
-            .await;
-        assert_eq!(created.status, 201);
-
-        let listed = f.get("/api/queue").await;
-        let tasks = listed.json();
-        let task = &tasks[0];
-
-        assert_eq!(tasks.as_array().map(Vec::len), Some(1));
-        // The title the server derives is the summary the author already
-        // wrote, without its marker.
-        assert_eq!(task["title"], "Rework the config loader");
-        assert_eq!(task["source_label"], "human");
-        assert_eq!(task["status_str"], "queued");
-        assert_eq!(task["repo"], "/repo/magi", "the server's default repo");
-        assert_eq!(
-            task["id"],
-            created.json()["id"],
-            "the posted task is the listed one"
-        );
-        assert!(
-            task["instruction"]
-                .as_str()
-                .is_some_and(|i| i.starts_with("# Rework the config loader\n\nIt re-reads")),
-            "the instruction reaches the graph verbatim, markers and all: {}",
-            task["instruction"]
-        );
     }
 
     /// `<repo>/host/owner/repo/.git`, the ghq layout [`repos::scan`] expects.
