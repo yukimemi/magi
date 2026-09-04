@@ -4,7 +4,7 @@
 # publishes as `yui-cli`: the repo, the binary and the library all stay `magi`,
 # only the published package name carries the suffix.
 name = "magi-cli"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["yukimemi <yukimemi@gmail.com>"]
