@@ -777,6 +777,16 @@ function renderLoop() {
  * The server answers 202 and then exits, so there is nothing to await here
  * beyond that acknowledgement: the phone learns the deck is back the same way
  * it learns everything else, by reconnecting. */
+/* The upgrade's own line under the strip. Kept out of `fail`'s alert: this is
+   not an error, and it has to survive the change-stream refreshes that redraw
+   the strip while the loop parks. */
+function quietNote(text) {
+  const why = $("loop-why");
+  if (!why) return;
+  setText(why, text);
+  show(why, Boolean(text));
+}
+
 async function upgrade() {
   const btn = $("loop-upgrade");
   if (!confirmed(btn, "Replace the binary and restart?")) return;
@@ -785,7 +795,22 @@ async function upgrade() {
   try {
     const out = await postJson(API.upgrade);
     ok();
-    announce(out.detail || "The deck is replacing itself and will come back.");
+    const detail = out.detail || "The deck is replacing itself and will come back.";
+    announce(detail);
+    /* Nothing newer to install: say so and give the button back, rather than
+       leaving "Upgrading…" on a deck that did not move. */
+    if (!out.to) {
+      setText(btn, "Update & restart");
+      btn.disabled = false;
+      quietNote(detail);
+      return;
+    }
+    /* A park waits for the node in flight, which can be an hour. Leaving the
+       button reading "Upgrading…" for that long is the same mistake as an
+       error rendered off screen: it looks wedged. The strip says what it is
+       waiting for, and the phone finds out it is back by reconnecting. */
+    setText(btn, "Parking, then restarting\u2026");
+    quietNote(detail);
   } catch (error) {
     setText(btn, "Update & restart");
     btn.disabled = false;
