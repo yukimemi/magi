@@ -4992,6 +4992,36 @@ mod tests {
     }
 
     #[test]
+    fn an_error_is_visible_from_where_the_button_is() {
+        // The alert used to sit in the flow under the header. On a phone
+        // scrolled 13 500 px down to a run's action sheet that is off screen,
+        // so tapping Resume and being told "the loop is running run b455
+        // right now" looked exactly like a button that did nothing.
+        let alert = &APP_CSS[APP_CSS.find(".alert {").expect(".alert")
+            ..APP_CSS.find(".alert-text").expect(".alert-text")];
+        assert!(
+            alert.contains("position: fixed"),
+            "an error about the thing under your thumb has to be visible from \
+             where your thumb is: {alert}"
+        );
+        assert!(
+            alert.contains("z-index: 25"),
+            "above the dock (20) and the run-actions FAB (15), so neither \
+             buries it: {alert}"
+        );
+        assert!(
+            alert.contains("var(--tap)"),
+            "and clear of the dock and the home indicator: {alert}"
+        );
+        // The FAB sits at the same height on the right. An error that covered
+        // it would hide the button the operator reaches for next.
+        assert!(
+            alert.contains("var(--s4) + var(--tap) + var(--s3)"),
+            "the FAB's column stays free: {alert}"
+        );
+    }
+
+    #[test]
     fn the_deck_never_sends_the_operator_to_a_terminal() {
         // The whole point of the phone UI is that a terminal is not needed.
         // The delete control used to answer with "Run `magi fold` first."
