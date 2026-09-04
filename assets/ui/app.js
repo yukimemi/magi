@@ -2560,12 +2560,18 @@ function renderRunDetail() {
        different one is not merely stale, it is wrong. */
     show($("run-ask-panel"), false);
     show($("run-land-panel"), false);
-    show($("run-delete-panel"), false);
+    /* The fab and its sheet stay reachable across this route (see
+       applyRoute), so a switch to a different run id \u2014 the daemon strip's
+       currentRunLink, or back/forward between two run pages \u2014 must not leave
+       the previous run's Resume/Fold/Delete buttons sitting in the sheet:
+       their onclick closures still carry the old id, and Delete says itself
+       "cannot be undone". Clearing here, before the new run's data arrives,
+       is what used to happen for free when the whole panel was hidden. */
+    clear($("run-actions-box"));
+    clear($("run-delete-box"));
     setText($("run-report"), report === null ? "Loading\u2026" : report);
     return;
   }
-
-  show($("run-delete-panel"), true);
 
   /* The detail payload carries the run's own status; the list carries the
      derived `waiting`. Prefer whichever says the run is parked, because that
@@ -2612,6 +2618,9 @@ function renderRunDetail() {
 }
 
 let armedRunDelete = null;
+/* Mirrors armedFoldFocused: only the render that just armed the delete
+   confirmation moves focus to Cancel, not every periodic redraw after it. */
+let armedRunDeleteFocused = null;
 
 function runDeleteReason(run) {
   const terminal = ["merged", "ready", "stalled", "blocked", "failed"].includes(String(run.status || ""));
@@ -2633,6 +2642,10 @@ function unfolded(run) {
 }
 
 let armedFold = null;
+/* Which armed run last received the focus-on-arm below, so a periodic
+   re-render (loadRun runs every 5s) does not steal focus back to Cancel on
+   every redraw — only the render that actually just armed does. */
+let armedFoldFocused = null;
 let foldBusy = null;
 let resumeBusy = null;
 
@@ -2687,8 +2700,12 @@ function renderRunActions(run) {
         ),
       ),
     );
-    requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+    if (armedFoldFocused !== run.id) {
+      armedFoldFocused = run.id;
+      requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+    }
   } else {
+    armedFoldFocused = null;
     box.append(
       el("div", { class: "stakes-confirm" },
         el("button", {
@@ -2714,8 +2731,12 @@ async function foldRun(id) {
     announce(n > 0
       ? `Folded ${shortId(id)}: ${n} worktree${n === 1 ? "" : "s"} and branches removed.`
       : `Run ${shortId(id)} had nothing left to fold.`);
+    closeRunActions();
     await loadRun(id);
   } catch (error) {
+    /* The alert banner sits in normal flow, under the sheet's own top-layer
+       backdrop, so it must close first or the failure is unreadable. */
+    closeRunActions();
     fail(`Could not fold run ${shortId(id)}: ${error.message}`);
   } finally {
     foldBusy = null;
@@ -2728,8 +2749,10 @@ async function resumeRun(id) {
     await postJson(API.resumeRun(id));
     ok();
     announce(`Run ${shortId(id)} is being resumed. The card will follow it.`);
+    closeRunActions();
     await loadRun(id);
   } catch (error) {
+    closeRunActions();
     fail(`Could not resume run ${shortId(id)}: ${error.message}`);
   } finally {
     resumeBusy = null;
@@ -2759,6 +2782,7 @@ function renderRunDelete(run) {
   }
 
   const armed = armedRunDelete === run.id;
+  if (!armed) armedRunDeleteFocused = null;
   if (armed) {
     const cancel = el("button", {
       class: "btn btn-quiet",
@@ -2784,7 +2808,10 @@ function renderRunDelete(run) {
         ),
       ),
     );
-    requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+    if (armedRunDeleteFocused !== run.id) {
+      armedRunDeleteFocused = run.id;
+      requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+    }
   } else {
     box.append(
       el("button", {
@@ -2806,9 +2833,11 @@ async function deleteRun(id) {
     ok();
     announce(`Run ${shortId(id)} removed.`);
     armedRunDelete = null;
+    closeRunActions();
     location.hash = "#/runs";
   } catch (error) {
     armedRunDelete = null;
+    closeRunActions();
     fail(`Could not delete run ${shortId(id)}: ${error.message}`);
   }
 }
@@ -3371,6 +3400,12 @@ function applyRoute() {
   show($("view-chats"), route.name === "chats");
   show($("view-chat"), route.name === "chat");
 
+  /* The fab is the only entry point into Resume / Fold / Delete, so it must
+     not survive a navigation away from the run it belongs to — nor stay
+     around to be tapped from another screen. */
+  show($("run-actions-fab"), route.name === "run");
+  if (route.name !== "run") closeRunActions();
+
   const section = route.name === "run" ? "runs" : route.name === "chat" ? "chats" : route.name;
   for (const link of document.querySelectorAll("[data-nav]")) {
     setAttr(link, "aria-current", link.dataset.nav === section ? "page" : null);
@@ -3405,6 +3440,17 @@ function applyRoute() {
      it rather than on the top of the document. */
   if (changed && route.name === "questions") focusFirstAsk();
   renderTitle();
+}
+
+/* ---- run actions sheet -------------------------------------------------- */
+function openRunActions() {
+  const dialog = $("run-actions-sheet");
+  if (!dialog.open) dialog.showModal();
+}
+
+function closeRunActions() {
+  const dialog = $("run-actions-sheet");
+  if (dialog.open) dialog.close();
 }
 
 /* ---- compose ----------------------------------------------------------- */
@@ -3502,6 +3548,21 @@ function wire() {
   $("compose-form").addEventListener("submit", submitCompose);
   $("compose-close").addEventListener("click", closeCompose);
   $("compose-cancel").addEventListener("click", closeCompose);
+
+  $("run-actions-fab").addEventListener("click", openRunActions);
+  $("run-actions-close").addEventListener("click", closeRunActions);
+  /* Clicking the backdrop hits the dialog element itself, since nothing else
+     is there to catch it — a click on the sheet's own content lands on a
+     descendant instead and never reaches this listener. */
+  $("run-actions-sheet").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeRunActions();
+  });
+  /* Fires for every close path — the close button, Escape (which the
+     dialog's default "cancel" handling turns into a close), and the backdrop
+     handler above — so the focus return only has to live in one place. */
+  $("run-actions-sheet").addEventListener("close", () => {
+    $("run-actions-fab").focus({ preventScroll: true });
+  });
 
   $("theme-toggle").addEventListener("click", () => {
     const next = THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length];
