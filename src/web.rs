@@ -1366,6 +1366,8 @@ async fn loop_post(
 struct UpgradeView {
     /// The version this process is running.
     from: String,
+    /// The release it is replacing itself with, when there is one.
+    to: Option<String>,
     /// A run was parked first, and this is its id.
     parked: Option<String>,
     /// What the operator should expect to happen next.
@@ -1406,6 +1408,32 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
         )));
     }
 
+    // Asked before anything is disturbed. Restarting when there is nothing
+    // to install is not a harmless no-op: it parks the run in flight and
+    // drops every connection to pay for an upgrade that did not happen. A
+    // probe against a deck already on the newest build did exactly that.
+    let (cfg, _) = Config::discover(&ui.repo, None).unwrap_or_default();
+    let latest = match crate::updater::Checker::new(&cfg.update) {
+        Some(checker) => checker
+            .newer_release()
+            .await
+            .map_err(|e| ApiError::internal(format!("check for a release: {e:#}")))?,
+        None => None,
+    };
+    let Some(latest) = latest else {
+        return Ok((
+            StatusCode::OK,
+            Json(UpgradeView {
+                from: env!("CARGO_PKG_VERSION").to_owned(),
+                to: None,
+                parked: None,
+                detail: "Already on the newest release. Nothing was parked \
+                         and nothing restarted."
+                    .to_owned(),
+            }),
+        ));
+    };
+
     // Parked before anything is replaced: a successor that came up while a
     // run was mid-node would find a run nobody is driving.
     let parked = ui.park_for_upgrade()?;
@@ -1431,6 +1459,7 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
         StatusCode::ACCEPTED,
         Json(UpgradeView {
             from: env!("CARGO_PKG_VERSION").to_owned(),
+            to: Some(latest.tag_name.clone()),
             parked,
             detail,
         }),
@@ -4803,11 +4832,15 @@ mod tests {
         let fx = Fixture::start().await;
         let runs = fx.runs();
 
+        // Only a finished run and a failed one. An *interrupted* run - a
+        // parked one, or one whose daemon was killed mid-node - is the case
+        // resuming exists for: run 4043 sat at `reviewing` with the deck
+        // saying it could not be resumed, which was the one state where
+        // resuming was the only sensible answer.
         for (status, word) in [
             (RunStatus::Merged, "merged"),
             (RunStatus::Ready, "ready"),
             (RunStatus::Failed, "failed"),
-            (RunStatus::Implementing, "implementing"),
         ] {
             let id = format!("20260901-000000-{}", &word[..4]);
             write_run(&runs, &id, status);
@@ -4816,6 +4849,15 @@ mod tests {
             let err = res.json()["error"].as_str().unwrap().to_owned();
             assert!(err.contains(word), "the refusal names the status: {err}");
         }
+
+        // And an interrupted run is accepted: 202, with the resume running in
+        // the background. `Runner::resume` fails immediately here - the
+        // fixture's run points at a repository that does not exist - which is
+        // the point: the handler must not wait for it to find out.
+        let mid = "20260901-000000-midf";
+        write_run(&runs, mid, RunStatus::Reviewing);
+        let res = fx.post(&format!("/api/runs/{mid}/resume"), None).await;
+        assert_eq!(res.status, 202, "an interrupted run is resumable");
     }
 
     #[tokio::test]
@@ -4916,21 +4958,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_upgrade_with_nothing_in_flight_says_so() {
+    async fn an_upgrade_with_nothing_to_install_changes_nothing() {
         let fx = Fixture::start().await;
-        // No loop, nothing to park: the answer must not claim a run is
-        // parking when none is, because that is the sentence the operator
-        // waits on before touching the process.
+        // The fixture's repo has no update config that resolves to a newer
+        // release, so this is the "already current" path. It must answer 200
+        // and leave the process alone: restarting for an upgrade that did not
+        // happen parks the run in flight and drops every connection to pay
+        // for nothing. A probe against a deck already on the newest build did
+        // exactly that, which is how this case got its own branch.
         let res = fx.post("/api/upgrade", None).await;
-        assert_eq!(res.status, 202, "the reply leaves before the restart does");
+        assert_eq!(res.status, 200, "not 202: nothing was set in motion");
         let body = res.json();
-        assert_eq!(body["from"], env!("CARGO_PKG_VERSION"));
-        assert!(body["parked"].is_null());
+        assert!(body["to"].is_null(), "there was no release to move to");
+        assert!(body["parked"].is_null(), "and nothing was parked");
         assert!(
             body["detail"]
                 .as_str()
                 .unwrap()
-                .contains("Nothing was in flight to park"),
+                .contains("nothing restarted"),
             "{body:?}"
         );
     }

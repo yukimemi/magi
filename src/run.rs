@@ -93,18 +93,28 @@ impl RunStatus {
 
     /// Can this run be carried on from where it stopped?
     ///
-    /// `Stalled` is the case this was written for: the candidates exist and
-    /// are paid for, and the panel merely lost its quorum, so continuing means
-    /// re-asking the absent seats rather than competing three fresh
-    /// implementations. `Blocked` qualifies too — review rounds ran out, or
-    /// the gate failed, and a resume re-enters that loop against work that is
-    /// already on a branch.
+    /// Everything except a finished run and a failed one. `execute` skips
+    /// nodes already recorded, so re-entering is cheap wherever the run
+    /// stopped, and the alternative is always a fresh competition against
+    /// work that already exists.
     ///
-    /// `Failed` does not: the graph could not complete, and there is no
-    /// established point to continue from. Nor does a finished run, whose
+    /// - `Stalled` re-asks only the seats whose absence collapsed the panel,
+    ///   keeping the candidates that were already paid for.
+    /// - `Blocked` re-enters the review loop against a branch that is built.
+    /// - **A non-terminal status** means the run was interrupted: a parked
+    ///   run waiting for its upgrade, or one whose daemon was killed. This
+    ///   used to be excluded, which left run 4043 stuck at `reviewing` with
+    ///   the deck telling the operator it could not be resumed - the one
+    ///   state where resuming is the only sensible answer.
+    ///
+    /// `Failed` does not qualify: the graph could not complete and there is
+    /// no established point to continue from. Nor does a finished run, whose
     /// answer is a new competition.
+    ///
+    /// Whether anything is *already* driving the run is a separate question,
+    /// answered by `daemon::is_working_on` at the callers that need it.
     pub fn resumable(self) -> bool {
-        matches!(self, Self::Stalled | Self::Blocked)
+        !matches!(self, Self::Merged | Self::Ready | Self::Failed)
     }
 }
 

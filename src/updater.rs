@@ -118,6 +118,16 @@ impl Checker {
         self.inner.should_check()
     }
 
+    /// Ask the forge now: is there a release newer than this build?
+    ///
+    /// Unlike [`Checker::cached_update`] this is not throttled, because the
+    /// caller is an operator who just pressed a button and is owed an answer
+    /// about the state of the world rather than about the last time magi
+    /// looked.
+    pub async fn newer_release(&self) -> Result<Option<kaishin::LatestRelease>> {
+        self.inner.check_and_save().await
+    }
+
     /// A newer release already known from a previous run.
     pub fn cached_update(&self) -> Option<kaishin::LatestRelease> {
         self.inner.cached_update()
