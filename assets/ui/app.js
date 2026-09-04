@@ -417,6 +417,13 @@ const state = {
      one fired into the same chat would interleave with the first. */
   chatBusy: null,
   busyTurns: 0,
+  /* Whether the current view was entered via a route change to a chat.
+     Cleared after the first scroll, so a subsequent renderChat() with the
+     same turn count does not re-scroll. */
+  openingChat: false,
+  /* Turn count from the previous renderChat() call, used to detect new
+     turns arriving while the conversation is already on screen. */
+  prevTurnCount: 0,
   /* The message that turn is carrying, shown as the operator's bubble until
      the recorded transcript has caught up with it. */
   pending: null,
@@ -2118,6 +2125,22 @@ function applyDraftView() {
   setAttr($("chat-draft-raw-toggle"), "aria-pressed", String(raw));
 }
 
+/* Scroll the page so the last turn's top sits just below the sticky header.
+   The header (.top) uses position:sticky;top:0, so scrollIntoView would hide
+   the first line behind it. We account for its height with scroll-margin-top
+   set via JS on the target element, using getBoundingClientRect for a
+   reliable measurement regardless of safe-area insets or zoom level. */
+function scrollToLastTurn() {
+  const turns = $("chat-turns");
+  if (!turns.children.length) return;
+  const last = turns.lastElementChild;
+  const header = document.querySelector(".top");
+  const gap = header ? Math.ceil(header.getBoundingClientRect().height) + 4 : 0;
+  last.style.scrollMarginTop = `${gap}px`;
+  const motion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  last.scrollIntoView({ behavior: motion ? "auto" : "smooth", block: "start" });
+}
+
 function renderChat() {
   const chat = state.chatDetail.chat;
   const busy = state.chatBusy !== null && state.chatBusy === state.chatDetail.id;
@@ -2171,6 +2194,21 @@ function renderChat() {
   const turnsMd = chatTurnsMd(chat);
   syncList($("chat-turns"), turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i) })),
     (item) => item.key, createTurnRow, updateTurnRow);
+
+  /* Auto-scroll: on first open and when a new turn arrives. Not when the
+     turn count is unchanged (status refresh, 10-second re-read, draft
+     update) and not for the pending optimistic turn the operator just sent. */
+  const turnCount = turns.length;
+  const lastIsPending = busy && state.pending && state.pending.id === chat.id
+    && turns.length > 0 && turns[turns.length - 1].who === "operator"
+    && turns[turns.length - 1].body === state.pending.body;
+  if (state.openingChat) {
+    state.openingChat = false;
+    if (turnCount > 0) requestAnimationFrame(scrollToLastTurn);
+  } else if (turnCount > state.prevTurnCount && !lastIsPending) {
+    requestAnimationFrame(scrollToLastTurn);
+  }
+  state.prevTurnCount = turnCount;
 
   const draft = chatDraft(chat);
   const hasDraft = draft.trim() !== "";
@@ -3422,6 +3460,16 @@ function applyRoute() {
      not cancelled: it is running on the server either way, and coming back
      to the conversation re-reads it. */
   if (route.name === "chat") {
+    /* A chat routes to the last turn's top instead of the page top. Set
+       before the renderChat() calls below — including the synchronous one a
+       few lines down — so it is already true whether the chat is fetched
+       here (loadChat's later renderChat picks it up) or was already cached
+       (e.g. startChat() sets state.chatDetail before changing the hash, so
+       the render below is the only one that runs). Arriving via a hash
+       change to the same chat (e.g. tapping the same conversation again) is
+       not a route change here, so it scrolls to top as before and
+       openingChat stays false. */
+    if (changed) state.openingChat = true;
     if (state.chatDetail.id !== route.id) {
       state.chatDetail = { id: route.id, chat: null };
       loadChat(route.id);
