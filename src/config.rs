@@ -656,18 +656,6 @@ impl Config {
         Ok(())
     }
 
-    /// Every config layer that applies to `repo`, in increasing precedence.
-    pub fn layers(repo: &Path) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if let Some(dir) = dirs::config_dir() {
-            paths.push(dir.join("magi").join("config.toml"));
-        }
-        paths.push(repo.join(".magi").join("config.toml"));
-        paths.push(repo.join("magi.toml"));
-        paths.retain(|p| p.is_file());
-        paths
-    }
-
     /// Resolve the config for `repo`, honouring an explicit `--config` path.
     ///
     /// Returns the config and the layers it came from, empty for built-in
@@ -682,6 +670,64 @@ impl Config {
             return Ok((Self::autodetected(), paths));
         }
         Ok((Self::load_layers(&paths)?, paths))
+    }
+    /// Environment variable that relocates the machine-wide config layer.
+    ///
+    /// Set it to a directory and magi reads `<dir>/magi/config.toml` instead
+    /// of the one under [`dirs::config_dir`]; set it to the empty string and
+    /// magi reads no machine layer at all.
+    ///
+    /// This exists because the machine layer is otherwise unavoidable, and a
+    /// test that builds a config fixture is not asking for the operator's
+    /// preferences to be merged into it. Adding `[repos] roots` to the real
+    /// machine config on a development box turned two passing tests red -
+    /// `repos_list_returns_name_and_path_for_every_configured_root` and
+    /// `repos_list_only_rescans_within_the_ttl_when_asked_to`, whose fixtures
+    /// declare `[repos] roots` of their own, which [`Config::layers`] then
+    /// found in two layers and [`Config::refuse_split_arrays`] correctly
+    /// refused. CI never saw it: a runner has no machine config, so the suite
+    /// was green there and red only where somebody actually uses magi.
+    ///
+    /// An operator gets the same escape hatch for free: a second machine
+    /// config, or none, without moving files about.
+    pub const CONFIG_DIR_ENV: &str = "MAGI_CONFIG_DIR";
+
+    /// Every config layer that applies to `repo`, in increasing precedence.
+    ///
+    /// The machine layer is whatever [`Config::machine_layer`] resolves to,
+    /// which is nothing at all in a test build.
+    pub fn layers(repo: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        paths.extend(Self::machine_layer());
+        paths.push(repo.join(".magi").join("config.toml"));
+        paths.push(repo.join("magi.toml"));
+        paths.retain(|p| p.is_file());
+        paths
+    }
+
+    /// The machine-wide layer's path, when there is one.
+    ///
+    /// **A test build has none unless it names one.** A fixture is a complete
+    /// statement of the config under test, and the operator's own preferences
+    /// have no business being merged into it - least of all silently, on one
+    /// machine, in a suite that is green everywhere else.
+    #[cfg(test)]
+    fn machine_layer() -> Option<PathBuf> {
+        std::env::var(Self::CONFIG_DIR_ENV)
+            .ok()
+            .filter(|dir| !dir.trim().is_empty())
+            .map(|dir| PathBuf::from(dir).join("magi").join("config.toml"))
+    }
+
+    /// The machine-wide layer's path, when there is one.
+    #[cfg(not(test))]
+    fn machine_layer() -> Option<PathBuf> {
+        match std::env::var(Self::CONFIG_DIR_ENV) {
+            // Named, and empty on purpose: no machine layer.
+            Ok(dir) if dir.trim().is_empty() => None,
+            Ok(dir) => Some(PathBuf::from(dir).join("magi").join("config.toml")),
+            Err(_) => dirs::config_dir().map(|dir| dir.join("magi").join("config.toml")),
+        }
     }
 
     /// Built-in config whose roster is the agent CLIs found on `PATH`.
@@ -960,6 +1006,41 @@ mod tests {
         let cfg = Config::load(&path).expect("must load without [repos]");
         assert_eq!(cfg.repos.roots, Vec::<PathBuf>::new());
         assert_eq!(cfg.repos.scan_ttl, 86_400);
+    }
+
+    /// A fixture is the whole config under test.
+    ///
+    /// `layers` used to reach for `dirs::config_dir()` unconditionally, so on
+    /// a machine where somebody had written `<config_dir>/magi/config.toml`
+    /// the suite silently loaded it as the lowest layer. Adding `[repos]
+    /// roots` there turned two web tests red - their fixtures declare
+    /// `[repos] roots` too, and `refuse_split_arrays` rightly refuses one
+    /// array key spread across two layers. CI stayed green throughout,
+    /// because a runner has no such file: the suite failed only where magi is
+    /// actually used.
+    ///
+    /// So a test build has no machine layer unless it asks for one, and this
+    /// is that promise. Written against a real file at the real location so
+    /// it fails if `machine_layer` starts reading it again.
+    #[test]
+    fn a_test_build_does_not_read_the_operators_machine_config() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("magi.toml"), "[graph]\ncandidates = 2\n").unwrap();
+
+        let layers = Config::layers(repo.path());
+        assert_eq!(
+            layers,
+            vec![repo.path().join("magi.toml")],
+            "only the fixture's own file may be a layer"
+        );
+        if let Some(real) = dirs::config_dir() {
+            let machine = real.join("magi").join("config.toml");
+            assert!(
+                !layers.contains(&machine),
+                "the operator's {} must not be a layer in a test build",
+                machine.display()
+            );
+        }
     }
 
     #[test]
