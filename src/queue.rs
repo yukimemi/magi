@@ -127,6 +127,18 @@ pub struct Task {
     /// Higher runs first; ties break oldest-first so nothing starves.
     #[serde(default)]
     pub priority: i32,
+    /// Run this task alone: one implementer, no panel of judges to convince.
+    ///
+    /// `#[serde(default)]` so a queue file written before this field existed
+    /// still reads, as `false` - the ordinary multi-candidate competition,
+    /// unchanged. A task set to `solo` still runs the whole graph; only the
+    /// candidate count the daemon builds it with changes, and
+    /// [`crate::graph::Runner`] already collapses a single-candidate run to
+    /// implement → review → gate → merge on its own (see
+    /// [`crate::graph::Runner::review`]'s doc), so nothing about judging,
+    /// deliberation or voting had to change to support this.
+    #[serde(default)]
+    pub solo: bool,
     /// Current state.
     pub status: TaskStatus,
     /// How many times this task has been claimed.
@@ -156,6 +168,7 @@ impl Task {
             repo,
             source,
             priority: 0,
+            solo: false,
             status: TaskStatus::Queued,
             attempts: 0,
             runs: Vec::new(),
@@ -719,6 +732,32 @@ mod tests {
         let listed = q.list();
         assert_eq!(listed.len(), 1, "the readable task still lists");
         assert_eq!(listed[0].id, t.id);
+    }
+
+    #[test]
+    fn a_task_recorded_without_a_solo_field_still_reads_as_not_solo() {
+        let (_dir, q) = queue();
+        let path = q.path_of("20260101-000000-aaaa");
+        std::fs::create_dir_all(q.root()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": SCHEMA,
+                "id": "20260101-000000-aaaa",
+                "title": "from before solo existed",
+                "instruction": "from before solo existed",
+                "repo": ".",
+                "source": { "kind": "human" },
+                "status": "queued",
+                "created_at": Timestamp::now().to_string(),
+                "updated_at": Timestamp::now().to_string(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let task = q.get("20260101-000000-aaaa").expect("must still read");
+        assert!(!task.solo, "a queue file with no `solo` field means false");
     }
 
     #[test]

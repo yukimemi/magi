@@ -42,6 +42,12 @@ const API = {
   chat: (id) => `/api/chats/${encodeURIComponent(id)}`,
   say: (id) => `/api/chats/${encodeURIComponent(id)}/say`,
   file: (id) => `/api/chats/${encodeURIComponent(id)}/file`,
+  /* The standing chat: a separate store from Planning's, so the two never
+     appear in each other's lists (see `POST /api/talks`'s doc). */
+  talks: "/api/talks",
+  talk: (id) => `/api/talks/${encodeURIComponent(id)}`,
+  talkSay: (id) => `/api/talks/${encodeURIComponent(id)}/say`,
+  talkClose: (id) => `/api/talks/${encodeURIComponent(id)}/close`,
   /* Local checkouts under `[repos] roots`, for the repository pickers on the
      "start a conversation" panel and the "continue in another repository"
      action. `?refresh=1` bypasses the server's cache regardless of its TTL. */
@@ -125,6 +131,13 @@ const CHAT_STATUS = {
   open:      { glyph: "\u25cc", tone: "blue" },
   filed:     { glyph: "\u25c6", tone: "gold" },
   abandoned: { glyph: "\u2296", tone: "ink" },
+};
+
+/* The standing chat only ever has two states - see `talk::TalkStatus` - so
+   there is no third entry here for a filed or abandoned conversation. */
+const TALK_STATUS = {
+  open:   { glyph: "\u25cc", tone: "blue" },
+  closed: { glyph: "\u2296", tone: "ink" },
 };
 
 /* The graph node the land loop asks its approval question from. Keyed on the
@@ -440,7 +453,18 @@ const state = {
      is opaque, so a 404 inside it is indistinguishable from a rendered
      panel; this is the answer to that, asked once per question. */
   panelOk: new Map(),
-  rev: { queue: null, runs: null, questions: null, chats: null, loop: null },
+  /* The standing chat - a separate store and a separate piece of state from
+     `chats`/`chatDetail`, on the same reasoning `talk::Talks` documents: two
+     conversations with different meanings must not share one list or one
+     turn guard. */
+  talks: null,
+  talkDetail: { id: null, talk: null },
+  talkBusy: null,
+  talkBusyTurns: 0,
+  talkPending: null,
+  talkWaitFrom: 0,
+  talkWaitTimer: null,
+  rev: { queue: null, runs: null, questions: null, chats: null, talks: null, loop: null },
   streamOpen: false,
   wrap: false,
   /* The draft panel's own view toggle: formatted by default, the exact bytes
@@ -1117,6 +1141,11 @@ function renderRuns() {
 function createTaskCard() {
   const chipSlot = el("span");
   const priority = el("span", { class: "tag", "data-tone": "ink" });
+  /* `solo` runs one implementer straight into review instead of the usual
+     multi-agent competition - a fact about how the task will be spent that a
+     card must show, the same way priority is shown, rather than something
+     only visible by opening the full instruction. */
+  const solo = el("span", { class: "tag", "data-tone": "teal", text: "solo" });
   const whenSlot = el("time", { class: "card-when" });
   const title = el("h2", { class: "card-title" });
   const source = el("span");
@@ -1135,10 +1164,10 @@ function createTaskCard() {
   const actions = el("div", { class: "card-actions" }, runLink, hold, deleteBox);
 
   const card = el("li", { class: "card" },
-    el("div", { class: "card-top" }, chipSlot, priority, whenSlot),
+    el("div", { class: "card-top" }, chipSlot, priority, solo, whenSlot),
     title, meta, note, error, instruction, actions,
   );
-  card.refs = { card, chipSlot, priority, whenSlot, title, source, repo, attempts, outcome, note, error, instruction, runLink, hold, deleteBox };
+  card.refs = { card, chipSlot, priority, solo, whenSlot, title, source, repo, attempts, outcome, note, error, instruction, runLink, hold, deleteBox };
   return card;
 }
 
@@ -1157,6 +1186,8 @@ function updateTaskCard(row, task) {
   setText(r.priority, priority > 0 ? `priority +${priority}` : `priority ${priority}`);
   setAttr(r.priority, "data-tone", priority > 0 ? "rust" : "ink");
   show(r.priority, priority !== 0);
+
+  show(r.solo, Boolean(task.solo));
 
   const at = when(task.updated_at || task.created_at);
   setText(r.whenSlot, at.text);
@@ -1904,9 +1935,13 @@ function renderTitle() {
         ? "Planning \u2014 magi"
         : state.route.name === "chat"
           ? `Planning ${shortId(state.route.id)} \u2014 magi`
-          : state.route.name === "run"
-            ? `Run ${shortId(state.route.id)} \u2014 magi`
-            : "magi \u2014 observation deck";
+          : state.route.name === "talks"
+            ? "Chat \u2014 magi"
+            : state.route.name === "talk"
+              ? `Chat ${shortId(state.route.id)} \u2014 magi`
+              : state.route.name === "run"
+                ? `Run ${shortId(state.route.id)} \u2014 magi`
+                : "magi \u2014 observation deck";
   document.title = count > 0 ? `(${count}) ${base}` : base;
 }
 
@@ -2571,6 +2606,356 @@ async function fileDraft() {
   } finally {
     button.disabled = false;
     setText(button, "File this task");
+  }
+}
+
+/* ---- standing chat ------------------------------------------------------ *
+ * A conversation that stays open, for questions, investigation and thinking
+ * out loud between tasks - as opposed to Planning above, which is a
+ * one-shot interview that ends the moment a task file is written. Opening
+ * one takes no agent turn, because there is nothing yet to answer (see
+ * `talk::begin`'s doc); a turn here can run for `talk::TURN_TIMEOUT`, three
+ * times a planning turn's budget, since the agent is expected to run
+ * commands and read their output rather than answer from what it already
+ * knows. The composer and the wait strip below are otherwise the same
+ * pattern as Planning's `sendTurn`/`beginTurn`/`endTurn`, kept as separate
+ * functions and separate state (`talkBusy`, not `chatBusy`) because the two
+ * surfaces talk to two different stores and must not contend for one turn
+ * guard.
+ */
+const talkTurns = (talk) => (talk && Array.isArray(talk.turns) ? talk.turns : []);
+const talkTurnsMd = (talk) => (talk && Array.isArray(talk.turn_bodies_md) ? talk.turn_bodies_md : []);
+
+/* What names a conversation before it has a title of its own: the first
+   thing the operator said, if anything has been said yet. */
+function talkOpener(talk) {
+  const first = talkTurns(talk).find((turn) => turn.who === "operator");
+  return first ? String(first.body || "") : "";
+}
+
+/* Open first, then newest first - the same ordering `Talks::list` uses on
+   the server, and the same reasoning `sortChats` gives for Planning: what
+   the operator is still using belongs above what they are done with. Unlike
+   Planning a talk never reorders itself out from under a filed task, since
+   filing one does not change its status - but the rule is kept anyway, so a
+   closed conversation does not jump to the top of the list the moment it is
+   closed. */
+function sortTalks(list) {
+  return list.slice().sort((a, b) => {
+    const rank = (a.status === "open" ? 0 : 1) - (b.status === "open" ? 0 : 1);
+    const started = (talk) => Date.parse(talk.created_at) || 0;
+    return rank || started(b) - started(a);
+  });
+}
+
+function createTalkCard() {
+  const chipSlot = el("span");
+  const whenSlot = el("time", { class: "card-when" });
+  const title = el("h2", { class: "card-title" });
+  const agent = el("span", { class: "repo" });
+  const turns = el("span");
+  const tasks = el("span", { class: "win" });
+  const meta = el("div", { class: "card-meta" }, agent, turns, tasks);
+  const last = el("p", { class: "card-event" });
+
+  const card = el("a", { class: "card" },
+    el("div", { class: "card-top" }, chipSlot, whenSlot),
+    title, meta, last,
+  );
+  const row = el("li", {}, card);
+  row.refs = { card, chipSlot, whenSlot, title, agent, turns, tasks, last };
+  return row;
+}
+
+function updateTalkCard(row, talk) {
+  const r = row.refs;
+  const status = String(talk.status || "open");
+  const turns = talkTurns(talk);
+  const tone = toneOf(status, TALK_STATUS);
+
+  r.card.setAttribute("href", `#/chat/${talk.id}`);
+  setAttr(r.card, "data-tone", tone);
+  setAttr(row, "data-tone", tone);
+
+  const next = chip(status, TALK_STATUS);
+  if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
+  else r.chipSlot.append(next);
+
+  const at = when(talk.updated_at || talk.created_at);
+  setText(r.whenSlot, at.text);
+  setAttr(r.whenSlot, "datetime", talk.updated_at || talk.created_at);
+  setAttr(r.whenSlot, "title", `updated ${at.title}`);
+
+  setText(r.title, firstLine(talkOpener(talk)) || `conversation ${shortId(talk.id)}`);
+  setText(r.agent, talk.agent || "");
+  show(r.agent, Boolean(talk.agent));
+  setText(r.turns, plural(turns.length, "turn", "turns"));
+  const tasks = Array.isArray(talk.tasks) ? talk.tasks.length : 0;
+  setText(r.tasks, tasks ? plural(tasks, "task filed", "tasks filed") : "");
+  show(r.tasks, tasks > 0);
+  separate(r.turns.parentNode);
+
+  const tail = turns.length ? turns[turns.length - 1] : null;
+  setText(r.last, tail && tail.who === "agent" ? firstLine(tail.body) : "");
+  show(r.last, Boolean(tail && tail.who === "agent"));
+}
+
+function renderTalks() {
+  const list = $("talks-list");
+  const talks = state.talks;
+
+  if (talks === null) {
+    setText($("talks-count"), "Loading…");
+    return;
+  }
+
+  const open = talks.filter((t) => t.status === "open").length;
+  setText($("talks-count"), talks.length === 0
+    ? "No conversations yet"
+    : open ? `${plural(open, "conversation open", "conversations open")}` : "nothing open");
+
+  show($("talks-empty"), talks.length === 0);
+  syncList(list, sortTalks(talks), (t) => t.id, createTalkCard, updateTalkCard);
+}
+
+async function loadTalks() {
+  try {
+    const list = await getJson(API.talks);
+    state.talks = Array.isArray(list) ? list : [];
+    renderTalks();
+    ok();
+  } catch (error) {
+    fail(`Could not load conversations: ${error.message}`);
+  }
+}
+
+/* Refresh one conversation, on the same rule `loadChat` documents: this must
+   not decide which conversation is on screen, and the wait strip is settled
+   from here whether or not the reply landed while the operator was looking
+   at something else. */
+async function loadTalk(id) {
+  try {
+    const talk = await getJson(API.talk(id));
+    if (state.talkBusy === id && talkTurns(talk).length >= state.talkBusyTurns + 2) endTalkTurn(id);
+    if (state.talkDetail.id !== id) return;
+    state.talkDetail.talk = talk;
+    renderTalk();
+    ok();
+  } catch (error) {
+    if (state.talkDetail.id === id) {
+      fail(`Could not load conversation ${shortId(id)}: ${error.message}`);
+    }
+  }
+}
+
+function renderTalkTasks(talk) {
+  const panel = $("talk-tasks-panel");
+  const tasks = Array.isArray(talk && talk.tasks) ? talk.tasks : [];
+  show(panel, tasks.length > 0);
+  if (tasks.length === 0) return;
+  setText($("talk-tasks-count"), String(tasks.length));
+  syncList($("talk-tasks"), tasks, (t) => t.id, createTalkTaskRow, updateTalkTaskRow);
+}
+
+function createTalkTaskRow() {
+  const chipSlot = el("span");
+  const title = el("span");
+  const row = el("li", {}, chipSlot, title);
+  row.refs = { chipSlot, title };
+  return row;
+}
+
+function updateTalkTaskRow(row, task) {
+  const r = row.refs;
+  const status = String(task.status_str || task.status || "");
+  const next = chip(status, TASK_STATUS);
+  if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
+  else r.chipSlot.append(next);
+  setText(r.title, `${task.title || task.id} · ${shortId(task.id)}`);
+}
+
+function renderTalk() {
+  const talk = state.talkDetail.talk;
+  const busy = state.talkBusy !== null && state.talkBusy === state.talkDetail.id;
+
+  if (!talk) {
+    setText($("talk-h"), "Loading conversation…");
+    setText($("talk-meta"), "");
+    clear($("talk-status"));
+    clear($("talk-turns"));
+    show($("talk-tasks-panel"), false);
+    show($("talk-say"), false);
+    show($("talk-closed"), false);
+    show($("talk-wait"), false);
+    return;
+  }
+
+  const status = String(talk.status || "open");
+  /* The operator's own message, shown immediately and held until the
+     transcript on disk has grown past it - the same accommodation
+     `renderChat` makes, for the same reason: the ten-second re-read below
+     replaces the whole conversation and would otherwise make the message
+     the operator just sent vanish for the rest of the wait. */
+  const pending = busy && state.talkPending && state.talkPending.id === talk.id
+    && talkTurns(talk).length <= state.talkBusyTurns
+    ? [{ who: "operator", body: state.talkPending.body, at: state.talkPending.at }]
+    : [];
+  const turns = [...talkTurns(talk), ...pending];
+
+  const head = $("talk-status");
+  clear(head);
+  head.append(chip(status, TALK_STATUS));
+
+  setText($("talk-h"), firstLine(talkOpener(talk)) || `Conversation ${shortId(talk.id)}`);
+  const started = when(talk.created_at);
+  setText($("talk-meta"),
+    `${shortId(talk.id)} · ${talk.agent || "agent"} · ${plural(turns.length, "turn", "turns")} · started ${started.text}`);
+  setAttr($("talk-meta"), "title", `${talk.id}\nstarted ${started.title}`);
+
+  const turnsMd = talkTurnsMd(talk);
+  syncList($("talk-turns"), turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i) })),
+    (item) => item.key, createTurnRow, updateTurnRow);
+
+  renderTalkTasks(talk);
+
+  const canSay = status === "open";
+  show($("talk-say"), canSay);
+  show($("talk-closed"), !canSay);
+  show($("talk-close-go"), canSay);
+  $("f-talk-say").disabled = busy;
+  $("talk-send").disabled = busy;
+  setText($("talk-send"), busy ? "Thinking…" : "Send");
+  show($("talk-wait"), busy);
+}
+
+function tickTalkWait() {
+  const box = $("talk-wait");
+  if (state.talkBusy === null) {
+    show(box, false);
+    return;
+  }
+  const secs = Math.max(Math.round((Date.now() - state.talkWaitFrom) / 1000), 0);
+  setText(box.querySelector(".waiting-text"), secs >= 90
+    ? "Still working — a standing chat turn can run for several minutes while the agent investigates. Long, but not stuck."
+    : "The agent is looking into it.");
+  setText(box.querySelector(".waiting-secs"), `${secs}s`);
+  show(box, state.talkBusy === state.talkDetail.id);
+
+  /* Cheap insurance for the case nothing else will tell this page the reply
+     landed: the turn was started somewhere else, or the stream is down. */
+  if (secs > 0 && secs % 10 === 0) loadTalk(state.talkBusy);
+}
+
+function beginTalkTurn(id, before) {
+  state.talkBusy = id;
+  state.talkBusyTurns = before;
+  state.talkWaitFrom = Date.now();
+  tickTalkWait();
+  if (!state.talkWaitTimer) state.talkWaitTimer = setInterval(tickTalkWait, 1000);
+}
+
+function endTalkTurn(id) {
+  if (state.talkBusy !== id) return;
+  state.talkBusy = null;
+  state.talkPending = null;
+  if (state.talkWaitTimer) {
+    clearInterval(state.talkWaitTimer);
+    state.talkWaitTimer = null;
+  }
+  show($("talk-wait"), false);
+}
+
+function talkError(message) {
+  const box = $("talk-error");
+  setText(box, message || "");
+  show(box, Boolean(message));
+}
+
+/* Opening a talk takes no agent turn - see `talk::begin`'s doc - so this is
+   as fast as any other write and needs none of `startChat`'s waiting state. */
+async function startTalk() {
+  const go = $("talk-start-go");
+  go.disabled = true;
+  setText(go, "Opening…");
+  try {
+    const talk = await postJson(API.talks, {});
+    state.talks = sortTalks([talk, ...(state.talks || []).filter((t) => t.id !== talk.id)]);
+    state.talkDetail = { id: talk.id, talk };
+    renderTalks();
+    announce("Conversation opened.");
+    location.hash = `#/chat/${talk.id}`;
+    ok();
+  } catch (failure) {
+    fail(`Could not open a conversation: ${failure.message}`);
+  } finally {
+    go.disabled = false;
+    setText(go, "Start a conversation");
+  }
+}
+
+async function sendTalkTurn(event) {
+  event.preventDefault();
+  const id = state.talkDetail.id;
+  const box = $("f-talk-say");
+  const text = box.value;
+
+  if (!id || state.talkBusy !== null) return;
+  if (!text.trim()) {
+    talkError("Say something first.");
+    box.focus();
+    return;
+  }
+
+  talkError("");
+  const before = talkTurns(state.talkDetail.talk).length;
+  beginTalkTurn(id, before);
+
+  state.talkPending = { id, body: text, at: new Date().toISOString() };
+  box.value = "";
+  renderTalk();
+  $("talk-wait").scrollIntoView({ block: "nearest" });
+
+  try {
+    /* 202, for exactly the reason `sendTurn` documents: a turn here can run
+       for the whole of `talk::TURN_TIMEOUT`, and holding a connection open
+       that long is not a thing to ask a phone to do. The reply arrives
+       through the change stream's `talks_rev`, or the ten-second insurance
+       in `tickTalkWait`. */
+    const queued = await postJson(API.talkSay(id), { text });
+    if (state.talkDetail.id === id) {
+      state.talkDetail.talk = queued;
+      renderTalk();
+      announce("Sent. The agent is answering.");
+    }
+    loadTalks();
+    ok();
+  } catch (error) {
+    if (error.status === 409) {
+      announce("A turn is already running on this conversation. Waiting for it.");
+      return;
+    }
+    endTalkTurn(id);
+    talkError(`The message may not have been sent: ${error.message}`);
+    await loadTalk(id);
+  }
+}
+
+async function closeTalk() {
+  const id = state.talkDetail.id;
+  const button = $("talk-close-go");
+  if (!id) return;
+  button.disabled = true;
+  try {
+    const talk = await postJson(API.talkClose(id), {});
+    state.talkDetail.talk = talk;
+    renderTalk();
+    await loadTalks();
+    announce("Conversation closed.");
+    ok();
+  } catch (error) {
+    fail(`Could not close the conversation: ${error.message}`);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -3377,6 +3762,7 @@ async function applyRevisions_(source) {
   const runsRev = source.runs_rev;
   const questionsRev = source.questions_rev;
   const chatsRev = source.chats_rev;
+  const talksRev = source.talks_rev;
   const jobs = [];
 
   if (queueRev !== state.rev.queue) {
@@ -3398,6 +3784,13 @@ async function applyRevisions_(source) {
     state.rev.chats = chatsRev;
     jobs.push(loadChats());
     if (state.route.name === "chat" && state.chatDetail.id) jobs.push(loadChat(state.chatDetail.id));
+  }
+  /* See the `chatsRev` block above: same reasoning, the standing chat's own
+     store and its own revision. */
+  if (talksRev !== state.rev.talks) {
+    state.rev.talks = talksRev;
+    jobs.push(loadTalks());
+    if (state.route.name === "talk" && state.talkDetail.id) jobs.push(loadTalk(state.talkDetail.id));
   }
   /* Bumped by this process whenever the loop it owns starts, stops, claims or
      finishes, so a phone learns about a tap it did not make. Guarded on the
@@ -3462,6 +3855,8 @@ function parseRoute() {
   /* `plan` rather than `chats`, because that is the command it replaces. */
   if (parts[0] === "plan" && parts[1]) return { name: "chat", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "plan") return { name: "chats", id: null };
+  if (parts[0] === "chat" && parts[1]) return { name: "talk", id: decodeURIComponent(parts[1]) };
+  if (parts[0] === "chat") return { name: "talks", id: null };
   if (parts[0] === "runs" && parts[1]) return { name: "run", id: decodeURIComponent(parts[1]) };
   return { name: "runs", id: null };
 }
@@ -3477,6 +3872,8 @@ function applyRoute() {
   show($("view-questions"), route.name === "questions");
   show($("view-chats"), route.name === "chats");
   show($("view-chat"), route.name === "chat");
+  show($("view-talks"), route.name === "talks");
+  show($("view-talk"), route.name === "talk");
 
   /* The fab is the only entry point into Resume / Fold / Delete, so it must
      not survive a navigation away from the run it belongs to — nor stay
@@ -3484,7 +3881,10 @@ function applyRoute() {
   show($("run-actions-fab"), route.name === "run");
   if (route.name !== "run") closeRunActions();
 
-  const section = route.name === "run" ? "runs" : route.name === "chat" ? "chats" : route.name;
+  const section = route.name === "run" ? "runs"
+    : route.name === "chat" ? "chats"
+    : route.name === "talk" ? "talks"
+    : route.name;
   for (const link of document.querySelectorAll("[data-nav]")) {
     setAttr(link, "aria-current", link.dataset.nav === section ? "page" : null);
   }
@@ -3521,6 +3921,17 @@ function applyRoute() {
     renderChat();
   } else if (state.chatDetail.id) {
     state.chatDetail = { id: null, chat: null };
+  }
+
+  /* Same rule as the chat block above, for the standing chat's own store. */
+  if (route.name === "talk") {
+    if (state.talkDetail.id !== route.id) {
+      state.talkDetail = { id: route.id, talk: null };
+      loadTalk(route.id);
+    }
+    renderTalk();
+  } else if (state.talkDetail.id) {
+    state.talkDetail = { id: null, talk: null };
   }
 
   if (changed) window.scrollTo({ top: 0 });
@@ -3637,12 +4048,25 @@ function wire() {
     loadChats();
     if (state.route.name === "run" && state.detail.id) loadRun(state.detail.id);
     if (state.route.name === "chat" && state.chatDetail.id) loadChat(state.chatDetail.id);
+    if (state.route.name === "talk" && state.talkDetail.id) loadTalk(state.talkDetail.id);
   });
 
   $("chat-start-go").addEventListener("click", startChat);
   $("chat-say").addEventListener("submit", sendTurn);
   $("chat-file").addEventListener("click", fileDraft);
   $("chat-derive-go").addEventListener("click", deriveChat);
+
+  $("talk-start-go").addEventListener("click", startTalk);
+  $("talk-say").addEventListener("submit", sendTalkTurn);
+  $("talk-close-go").addEventListener("click", closeTalk);
+  /* Same accommodation `f-say` gets: Enter is a newline on a phone, Ctrl/Cmd
+     with Enter sends. */
+  $("f-talk-say").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      $("talk-say").requestSubmit();
+    }
+  });
 
   /* Picking a repository fills the text field beside it, which is what
      actually gets sent - so a checkout outside `[repos] roots` stays
@@ -3689,10 +4113,13 @@ async function boot() {
     state.rev.runs = state.health.runs_rev;
     state.rev.questions = state.health.questions_rev;
     state.rev.chats = state.health.chats_rev;
+    state.rev.talks = state.health.talks_rev;
     state.rev.loop = state.health.loop_rev;
     if (state.health.loop) state.loop = state.health.loop;
   }
-  await Promise.allSettled([loadRuns(), loadQueue(), loadQuestions(), loadChats(), loadRepos(false)]);
+  await Promise.allSettled([
+    loadRuns(), loadQueue(), loadQuestions(), loadChats(), loadTalks(), loadRepos(false),
+  ]);
 
   subscribe();
   setInterval(() => {

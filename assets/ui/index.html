@@ -57,6 +57,7 @@
          planning panel. -->
     <a class="rail-link btn btn-gold" href="#/plan" data-nav="chats" data-plan>Plan</a>
     <a class="rail-link" href="#/questions" data-nav="questions">Questions<span class="badge" id="ask-badge-rail" hidden></span></a>
+    <a class="rail-link" href="#/chat" data-nav="talks">Chat</a>
   </nav>
 
   <button class="icon-btn" type="button" id="theme-toggle" aria-label="Colour theme: follow system">
@@ -345,6 +346,65 @@
       <button class="btn btn-quiet" type="button" id="chat-derive-go">Continue here</button>
     </div>
   </section>
+
+  <!-- CHAT: the list ------------------------------------------------------ *
+       A standing conversation for questions, investigation and thinking out
+       loud - distinct from Planning, which ends the moment a task file is
+       written. This one does not end: any number of tasks can be filed from
+       it with `magi task add --solo`, and the conversation stays open. -->
+  <section class="view" id="view-talks" aria-labelledby="talks-h" hidden>
+    <div class="view-head">
+      <h1 id="talks-h">Chat</h1>
+      <p class="view-sub" id="talks-count">Loading…</p>
+    </div>
+
+    <button class="btn btn-gold" type="button" id="talk-start-go">Start a conversation</button>
+
+    <ol class="cards" id="talks-list"></ol>
+    <p class="empty" id="talks-empty" hidden>
+      No conversations yet. Open one to ask a question, look something up, or
+      think an idea through with an agent that can read the repository and
+      run commands, but will not write to it.
+    </p>
+  </section>
+
+  <!-- CHAT: one conversation ----------------------------------------------- -->
+  <section class="view" id="view-talk" aria-labelledby="talk-h" hidden>
+    <a class="back" href="#/chat">Chat</a>
+    <div class="view-head">
+      <div class="run-status" id="talk-status"></div>
+      <h1 id="talk-h">Loading conversation…</h1>
+      <p class="view-sub" id="talk-meta"></p>
+    </div>
+
+    <ol class="turns" id="talk-turns"></ol>
+
+    <!-- A turn can run for `talk::TURN_TIMEOUT` while the agent investigates,
+         so the wait is stated in words with elapsed time, the same as
+         Planning's - a silent spinner and a hung server look identical. -->
+    <p class="waiting" id="talk-wait" role="status" hidden>
+      <span class="waiting-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span class="waiting-text"></span>
+      <span class="waiting-secs" aria-hidden="true"></span>
+    </p>
+
+    <div class="panel" id="talk-tasks-panel" hidden>
+      <h2>Filed from here <span class="count" id="talk-tasks-count"></span></h2>
+      <ol class="plain" id="talk-tasks"></ol>
+    </div>
+
+    <form class="say" id="talk-say">
+      <label class="sr-only" for="f-talk-say">Your message</label>
+      <textarea id="f-talk-say" rows="2" placeholder="Ask, investigate, think out loud…"></textarea>
+      <button class="btn btn-gold" type="submit" id="talk-send">Send</button>
+    </form>
+    <p class="form-error" id="talk-error" role="alert" hidden></p>
+    <p class="panel-note" id="talk-closed" hidden>
+      This conversation is closed.
+    </p>
+
+    <button class="btn btn-quiet" type="button" id="talk-close-go">Close this conversation</button>
+  </section>
 </main>
 
 <!-- RUN ACTIONS: Resume / Fold / Delete used to sit at the bottom of the run
@@ -401,6 +461,14 @@
       <span class="badge" id="ask-badge-dock" hidden></span>
     </span>
     <span>Questions</span>
+  </a>
+  <a class="dock-item" href="#/chat" data-nav="talks">
+    <span class="dock-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 5.5h16v10h-9l-4 3.5v-3.5H4z"/>
+      </svg>
+    </span>
+    <span>Chat</span>
   </a>
 </nav>
 
