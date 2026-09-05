@@ -5045,6 +5045,92 @@ mod tests {
         assert!(APP_JS.contains("disabled: status === \"running\""));
     }
 
+    /// Every element a run card's updater reaches for must be in the `refs`
+    /// the builder handed it.
+    ///
+    /// `createRunCard` builds its elements, appends them to the card, and then
+    /// lists them again in `row.refs`. That second list is the one the updater
+    /// uses, and nothing connects the two - an element can be built, appended
+    /// and rendered, and still be missing from `refs`. `superseded` was, for
+    /// two releases: `setText(r.superseded, ...)` threw on the first card, the
+    /// exception took `syncList` with it, and the deck showed
+    /// "13 runs, 2 in flight, 8 unreadable" above an empty list. The count
+    /// line is computed before the cards, which is why the failure looked like
+    /// a server that had lost its runs rather than a front end that had
+    /// stopped rendering them.
+    ///
+    /// A `cargo test` cannot execute the front end, so this reads the two
+    /// halves out of the source and compares them as sets. It is not a check
+    /// on the wording of either list: adding an element, renaming one, or
+    /// reordering them all keeps this passing, and only using one the builder
+    /// never published fails it.
+    #[test]
+    fn every_ref_a_run_card_uses_is_one_its_builder_published() {
+        let build = APP_JS
+            .find("function createRunCard")
+            .expect("createRunCard exists");
+        let update = APP_JS
+            .find("function updateRunCard")
+            .expect("updateRunCard exists");
+        let end = APP_JS
+            .find("function renderRuns")
+            .expect("renderRuns exists");
+
+        // The builder's published set: the object literal assigned to `refs`.
+        let builder = &APP_JS[build..update];
+        let open = builder.find("refs = {").expect("createRunCard sets refs");
+        let literal = &builder[open + "refs = {".len()..];
+        let close = literal.find('}').expect("the refs literal is closed");
+        let published: HashSet<&str> = literal[..close]
+            .split(',')
+            // `name` and `name: value` both bind `name`.
+            .filter_map(|entry| entry.split(':').next())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+        assert!(
+            published.len() > 5,
+            "the refs literal did not parse into names: {published:?}"
+        );
+
+        // What the updaters reach for: every `r.<name>`, where `r` is the
+        // `const r = row.refs` alias both functions open with.
+        let mut used: Vec<&str> = Vec::new();
+        let updaters = &APP_JS[update..end];
+        for (at, _) in updaters.match_indices("r.") {
+            // `r` must be the whole identifier, not the tail of another one
+            // (`Number.parseFloat`, `pr.url`, `for.` and friends).
+            let before = updaters[..at].chars().next_back();
+            if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$' || c == '.') {
+                continue;
+            }
+            let rest = &updaters[at + 2..];
+            let len = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                .unwrap_or(rest.len());
+            if len > 0 {
+                used.push(&rest[..len]);
+            }
+        }
+        assert!(
+            used.len() > 5,
+            "no `r.<name>` uses were found; the updaters must have been rewritten: {used:?}"
+        );
+
+        let missing: Vec<&str> = used
+            .iter()
+            .copied()
+            .filter(|name| !published.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "a run card's updater reaches for {missing:?}, which `createRunCard` \
+             never put in `refs` - every card will throw and the list will \
+             render empty under a count line that says otherwise. Published: \
+             {published:?}"
+        );
+    }
+
     #[tokio::test]
     async fn folding_from_the_phone_reports_what_it_removed() {
         let fx = Fixture::start().await;

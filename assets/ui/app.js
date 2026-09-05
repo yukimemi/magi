@@ -934,8 +934,8 @@ function createRunCard() {
   const tail = el("div", { class: "card-tail" }, prLink, checks, prRound, tailGo, tailNote);
 
   const row = el("li", {}, card, tail);
-  row.refs = { card, chipSlot, whenSlot, title, repo, counts, winner, reviews, note, event, rail,
-               tail, prLink, checks, prRound, tailGo, tailNote };
+  row.refs = { card, chipSlot, whenSlot, title, repo, counts, winner, reviews, note, superseded,
+               event, rail, tail, prLink, checks, prRound, tailGo, tailNote };
   return row;
 }
 
