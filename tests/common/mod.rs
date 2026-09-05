@@ -72,6 +72,17 @@ if [ -n "$MOCK_QUOTA_SEAT" ] && { case ",$MOCK_QUOTA_SEAT," in *",$seat,"*) true
   exit 1
 fi
 
+# Dropped-stream simulation: a matching implement seat's first reply is the
+# "billed work, nothing delivered" shape a CLI leaves when it hangs up on its
+# own stream mid-response (see `agent::dropped_stream`). The resumed call is
+# recognisable by the words `prompt::resume_after_drop` actually sends, and
+# falls through to the ordinary implementation branch at the bottom so it
+# always succeeds.
+if [ -n "$MOCK_DROPPED_SEAT" ] && { case ",$MOCK_DROPPED_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && ! grep -q "Your last reply never reached me" "$p"; then
+  printf '{"conversation_id":"mock-convo-%s","status":"ERROR","response":"","error":"subscriber fell behind updates, stalled for 5s","usage":{"output_tokens":500}}\n' "$seat"
+  exit 1
+fi
+
 # Ordinary-failure simulation: a matching judge seat produces no usable output
 # and exits non-zero — distinctly NOT the rate-limit shape above, so the graph
 # must treat it as a plain failure (retried the configured number of times),
@@ -84,6 +95,16 @@ fi
 if grep -q "Final vote" "$p"; then
   printf '```json\n{"vote":"%s","reason":"mock final vote"}\n```\n' "$MOCK_VOTE"
   exit 0
+fi
+
+# Dropped-stream simulation, deliberation-only: a matching judge's
+# *deliberation round* reply (never its initial ranking or its vote) is the
+# same "billed work, nothing delivered" shape as above. Regression coverage
+# for `deliberate()`'s own `AgentOutcome` handling, which must skip the turn
+# rather than record the CLI's raw error JSON as the judge's position.
+if [ -n "$MOCK_DROPPED_DELIBERATE_SEAT" ] && { case ",$MOCK_DROPPED_DELIBERATE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && grep -q "deliberation round" "$p"; then
+  printf '{"conversation_id":"mock-convo-%s","status":"ERROR","response":"","error":"subscriber fell behind updates, stalled for 5s","usage":{"output_tokens":500}}\n' "$seat"
+  exit 1
 fi
 
 if grep -q "deliberation round" "$p"; then
@@ -263,6 +284,34 @@ pub fn fixture_with_failure(failed_seats: &[&str]) -> Fixture {
     let value = failed_seats.join(",");
     for a in &mut fx.config.agents {
         a.env.insert("MOCK_FAILED_SEAT".to_owned(), value.clone());
+    }
+    fx
+}
+
+/// Like [`fixture`], but the given implement seats' first reply is the
+/// "billed work, nothing delivered" shape a CLI leaves when it hung up on its
+/// own stream — the counterpart to [`fixture_with_failure`] for
+/// `agent::dropped_stream`. The resumed call always succeeds, so a candidate
+/// that gets resumed ends up healthy and one that does not (no session left to
+/// resume) ends up looking like an ordinary failure.
+pub fn fixture_with_dropped_stream(seats: &[&str]) -> Fixture {
+    let mut fx = fixture(Judges::Unanimous, false);
+    let value = seats.join(",");
+    for a in &mut fx.config.agents {
+        a.env.insert("MOCK_DROPPED_SEAT".to_owned(), value.clone());
+    }
+    fx
+}
+
+/// Like [`fixture_with_dropped_stream`], but the dropped shape happens on a
+/// judge's *deliberation round* reply instead of an implementer's. Needs
+/// `Judges::Split` — deliberation only opens once judges disagree.
+pub fn fixture_with_dropped_deliberation(seats: &[&str]) -> Fixture {
+    let mut fx = fixture(Judges::Split, false);
+    let value = seats.join(",");
+    for a in &mut fx.config.agents {
+        a.env
+            .insert("MOCK_DROPPED_DELIBERATE_SEAT".to_owned(), value.clone());
     }
     fx
 }
