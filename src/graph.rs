@@ -31,6 +31,7 @@ use crate::blind;
 use crate::config::{AgentSpec, Config, LeakPolicy, MergeMode, Prompts, ResolvedRoles};
 use crate::git;
 use crate::land;
+use crate::proc::Quiet as _;
 use crate::prompt::{self, CandidateView, Turn};
 use crate::run::{
     Candidate, CommandOutcome, DeliberationRound, DeliberationTurn, FixRecord, Judgement,
@@ -2456,6 +2457,7 @@ async fn run_commands(
     for command in commands {
         let started = Instant::now();
         let mut cmd = tokio::process::Command::new(&shell[0]);
+        cmd.quiet();
         cmd.args(&shell[1..])
             .arg(command)
             .current_dir(cwd)

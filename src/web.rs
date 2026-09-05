@@ -117,6 +117,7 @@ use crate::ask::{Answer, Question, Questions};
 use crate::chat::{Chat, Chats};
 use crate::config::Config;
 use crate::md;
+use crate::proc::Quiet as _;
 use crate::queue::{Queue, Source, Task, title_from};
 use crate::run::{RunState, RunStatus};
 use crate::{chat, daemon, report, repos, run};
@@ -899,6 +900,7 @@ pub fn resolve_bind(bind: &Bind) -> (IpAddr, Option<String>) {
 fn tailscale_ip() -> std::result::Result<Ipv4Addr, String> {
     let out = std::process::Command::new("tailscale")
         .args(["ip", "-4"])
+        .quiet()
         .output()
         .map_err(|e| format!("could not run `tailscale ip -4` ({e})"))?;
     if !out.status.success() {

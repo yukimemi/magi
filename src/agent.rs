@@ -40,6 +40,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::Command;
 
 use crate::config::{AgentKind, AgentSpec, Delivery};
+use crate::proc::Quiet as _;
 use crate::rng::SplitMix64;
 
 /// Conversation state for one seat, persisted with the run so `magi run
@@ -255,7 +256,10 @@ pub async fn invoke(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        // No console window. `magi web` has no console of its own, so Windows
+        // would give each agent a fresh one - and draw it. See `crate::proc`.
+        .quiet();
 
     let mut child = cmd
         .spawn()

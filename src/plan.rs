@@ -46,6 +46,7 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::chat;
 use crate::config::{AgentKind, AgentSpec, Config, which};
+use crate::proc::Quiet as _;
 use crate::queue::{self, Queue, Source, Task};
 use crate::repos;
 use crate::run;
@@ -242,6 +243,7 @@ pub async fn plan(opts: Opts) -> Result<Task> {
     println!("talk it through, then let the leader write the task file and exit.\n");
 
     let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.quiet();
     cmd.args(&argv[1..])
         .current_dir(&repo)
         .envs(&leader.env)
