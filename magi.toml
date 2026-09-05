@@ -64,7 +64,13 @@ reviewers = ["sonnet", "oc"]
 fixer = "sonnet"
 
 [graph]
-candidates = 3
+# One seat, and the roster above is unchanged: a competition is now something a
+# task asks for rather than what every task pays for. 13 runs here produced 0
+# merges while everything that landed went through `magi review`, and the
+# judges' first choices split in 8 of 11 tallies. `oc` did beat `sonnet` in 3 of
+# those, so competing still wins work worth having - which is why the roster
+# stays and `--candidates N` exists. See `Graph::candidates` for the numbers.
+candidates = 1
 judges = 3
 deliberate_rounds = 1
 reviewers = 2
