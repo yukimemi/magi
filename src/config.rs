@@ -141,7 +141,34 @@ pub struct Roles {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Graph {
-    /// Parallel implementations of the same task.
+    /// Parallel implementations of the same task. **One by default.**
+    ///
+    /// Competition is the thing magi is for, and it is still here - it is just
+    /// no longer what every task buys without being asked. Three days and 13
+    /// runs on this repository, which is the workload these numbers are drawn
+    /// from:
+    ///
+    /// - **0 of 13** competed runs reached a merge. Everything that landed in
+    ///   that window went through `magi review` - the cheap half, no
+    ///   competition - and passed on the first try.
+    /// - The judges' first choices **split 73% of the time** (8 of 11
+    ///   tallies). Candidates that close together make the ranking a weak
+    ///   signal for what it costs to produce.
+    /// - One run's own breakdown: implement 60min, judge 40min, fix 40min,
+    ///   review 28min, **verify 5min** - and verify is the node that caught a
+    ///   defect every reviewer had passed as clean. The cheapest step is the
+    ///   one that earns its place every time.
+    ///
+    /// It is not worthless: `oc` won 3 of those tallies against `sonnet`, so a
+    /// single-seat default would have shipped the worse implementation in
+    /// roughly a quarter of them. That is exactly why this is a *default* and
+    /// not a removal - `magi run --candidates N` and a per-task seat count are
+    /// how a task that deserves a competition gets one.
+    ///
+    /// A single-candidate run needs no special case: `Runner::review`'s doc
+    /// records that `execute` already degrades to implement -> review -> gate
+    /// -> merge, because `judge` skips a one-candidate field, `deliberate` has
+    /// no two first choices to reconcile and `vote` returns early.
     pub candidates: usize,
     /// Independent judges.
     pub judges: usize,
@@ -210,7 +237,7 @@ pub struct Graph {
 impl Default for Graph {
     fn default() -> Self {
         Self {
-            candidates: 3,
+            candidates: 1,
             judges: 3,
             deliberate_rounds: 1,
             reviewers: 2,
@@ -930,8 +957,14 @@ mod tests {
 
     #[test]
     fn empty_roles_rotate_judges_off_their_own_candidate() {
+        // Three seats, said out loud: this is a test about *rotation*, and it
+        // has nothing to say about how many candidates a task buys by default.
         let cfg = Config {
             agents: vec![spec("a"), spec("b"), spec("c")],
+            graph: Graph {
+                candidates: 3,
+                ..Graph::default()
+            },
             ..Config::default()
         };
         let roles = cfg.resolve_roles().unwrap();
@@ -948,6 +981,10 @@ mod tests {
     fn single_agent_roster_fills_every_seat() {
         let cfg = Config {
             agents: vec![spec("solo")],
+            graph: Graph {
+                candidates: 3,
+                ..Graph::default()
+            },
             ..Config::default()
         };
         let roles = cfg.resolve_roles().unwrap();
