@@ -40,6 +40,7 @@ pub mod repos;
 pub mod rng;
 pub mod run;
 pub mod stats;
+pub mod talk;
 pub mod tui;
 pub mod updater;
 pub mod verdict;

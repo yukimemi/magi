@@ -720,7 +720,7 @@ async fn attempt(
         repo.display()
     );
 
-    let config = match prepare(&repo, opts) {
+    let mut config = match prepare(&repo, opts) {
         Ok(c) => c,
         Err(e) => {
             // A setup failure spends an attempt even though no run was minted.
@@ -732,6 +732,7 @@ async fn attempt(
             return;
         }
     };
+    apply_solo(&mut config, task);
 
     // A resumable run of this task is carried on, never re-competed. The
     // candidates are built and paid for, and a fresh competition races a
@@ -809,6 +810,21 @@ async fn attempt(
         runner.state.short(),
         label(runner.state.status)
     );
+}
+
+/// Cut this attempt's candidate count to one when the task asked to run
+/// alone.
+///
+/// Pure and separate from [`attempt`] so the one thing this feature changes -
+/// which `candidates` a `solo` task's run is built with - can be asserted
+/// without minting a run: `attempt` drives `graph::Runner`, which spawns real
+/// agent CLIs, and no test may do that. `config` is mutated in place, taken by
+/// value from the caller's own copy, so a repository's `magi.toml` on disk is
+/// never touched - only the `Config` this one attempt hands to `Runner::start`.
+fn apply_solo(config: &mut Config, task: &Task) {
+    if task.solo {
+        config.graph.candidates = 1;
+    }
 }
 
 /// Load the config for a task's repository, with the merge override applied.
@@ -1387,6 +1403,31 @@ mod tests {
             repo_for(&task(), fallback),
             PathBuf::from("/repo"),
             "a task that names a repository keeps it"
+        );
+    }
+
+    #[test]
+    fn a_solo_task_runs_with_one_candidate_and_a_plain_task_keeps_the_configs() {
+        // Three seats said out loud. What `solo` promises is one candidate
+        // *whatever the config asks for*, so the contrast has to be a number
+        // this test owns - it used to be `Config::default()`'s, which became
+        // 1 when one implementation became the default and left the two
+        // halves of this test asserting the same thing.
+        let mut solo_cfg = Config::default();
+        solo_cfg.graph.candidates = 3;
+        let mut solo_task = task();
+        solo_task.solo = true;
+        apply_solo(&mut solo_cfg, &solo_task);
+        assert_eq!(solo_cfg.graph.candidates, 1);
+
+        let mut plain_cfg = Config::default();
+        plain_cfg.graph.candidates = 3;
+        let plain_task = task();
+        assert!(!plain_task.solo);
+        apply_solo(&mut plain_cfg, &plain_task);
+        assert_eq!(
+            plain_cfg.graph.candidates, 3,
+            "a task that did not ask to run alone keeps the config's candidates"
         );
     }
 

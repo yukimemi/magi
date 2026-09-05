@@ -120,7 +120,8 @@ use crate::md;
 use crate::proc::Quiet as _;
 use crate::queue::{Queue, Task, title_from};
 use crate::run::{RunState, RunStatus};
-use crate::{chat, daemon, report, repos, run};
+use crate::talk::{Talk, Talks};
+use crate::{chat, daemon, report, repos, run, talk};
 
 /// Default port. Chosen high and memorable; nothing else in the fleet uses it.
 pub const DEFAULT_PORT: u16 = 7878;
@@ -251,6 +252,7 @@ pub struct Ui {
     queue: Queue,
     questions: Questions,
     chats: Chats,
+    talks: Talks,
     runs: PathBuf,
     home: PathBuf,
     repo: PathBuf,
@@ -262,6 +264,11 @@ pub struct Ui {
     /// see it, and a second `magi web` on the same home is already a
     /// misconfiguration the queue's claims would catch first.
     turns: Arc<Mutex<HashSet<String>>>,
+    /// Talks with an agent turn in flight right now. Separate from `turns`
+    /// because a talk and a chat are different stores with different ids;
+    /// sharing one set would let a chat id collide with a talk id in theory,
+    /// and there is no reason to make the two surfaces share a guard at all.
+    talk_turns: Arc<Mutex<HashSet<String>>>,
     /// Runs this process is resuming right now.
     ///
     /// Separate from `turns` because a run and a chat are different things to
@@ -297,6 +304,7 @@ impl Ui {
         queue: Queue,
         questions: Questions,
         chats: Chats,
+        talks: Talks,
         runs: PathBuf,
         home: PathBuf,
         repo: PathBuf,
@@ -305,10 +313,12 @@ impl Ui {
             queue,
             questions,
             chats,
+            talks,
             runs,
             home,
             repo,
             turns: Arc::default(),
+            talk_turns: Arc::default(),
             resuming: Arc::default(),
             repos_cache: repos::Cache::new(),
             merge: None,
@@ -318,12 +328,13 @@ impl Ui {
     }
 
     /// The operator's own state: `<home>/queue`, `<home>/questions`,
-    /// `<home>/chats`, `<home>/runs`.
+    /// `<home>/chats`, `<home>/talks`, `<home>/runs`.
     pub fn open(repo: PathBuf) -> Self {
         Self::new(
             Queue::open(),
             Questions::open(),
             Chats::open(),
+            Talks::open(),
             run::runs_root(),
             run::home(),
             repo,
@@ -533,6 +544,25 @@ impl Ui {
         })
     }
 
+    /// [`Ui::begin_turn`]'s counterpart for a talk. Same reasoning throughout:
+    /// a talk's seat is resumed the same way a planning chat's is, so two
+    /// turns running at once would race to append to one CLI conversation.
+    fn begin_talk_turn(&self, id: &str) -> ApiResult<TalkTurnGuard> {
+        let mut live = self
+            .talk_turns
+            .lock()
+            .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
+        if !live.insert(id.to_owned()) {
+            return Err(ApiError::conflict(format!(
+                "talk {id} is already taking a turn"
+            )));
+        }
+        Ok(TalkTurnGuard {
+            talk: id.to_owned(),
+            turns: Arc::clone(&self.talk_turns),
+        })
+    }
+
     /// Park the loop for an upgrade, and report the run that is parking.
     ///
     /// A park rather than a stop: a stop waits out the whole competition, and
@@ -618,6 +648,10 @@ impl Ui {
             .route("/api/chats/{id}", get(chat_detail))
             .route("/api/chats/{id}/say", post(chat_say))
             .route("/api/chats/{id}/file", post(chat_file))
+            .route("/api/talks", get(talks_list).post(talk_post))
+            .route("/api/talks/{id}", get(talk_detail))
+            .route("/api/talks/{id}/say", post(talk_say))
+            .route("/api/talks/{id}/close", post(talk_close))
             .route("/api/events", get(events))
             .with_state(Arc::new(self))
     }
@@ -638,6 +672,21 @@ impl Drop for TurnGuard {
     fn drop(&mut self) {
         if let Ok(mut live) = self.turns.lock() {
             live.remove(&self.chat);
+        }
+    }
+}
+
+/// [`TurnGuard`]'s counterpart for a talk's turn slot.
+#[derive(Debug)]
+struct TalkTurnGuard {
+    talk: String,
+    turns: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for TalkTurnGuard {
+    fn drop(&mut self) {
+        if let Ok(mut live) = self.turns.lock() {
+            live.remove(&self.talk);
         }
     }
 }
@@ -1155,6 +1204,11 @@ struct HealthView {
     questions_rev: u64,
     /// See [`HealthView::questions_rev`].
     chats_rev: u64,
+    /// See [`HealthView::questions_rev`]. The standing chat's own store,
+    /// separate from `chats_rev`: a `/api/talks` reply moving must not be
+    /// mistaken for a `/api/chats` one, or a phone open on Planning would sit
+    /// still while a talk it has open gets a reply.
+    talks_rev: u64,
     /// See [`HealthView::questions_rev`]. The loop's counter is the one that
     /// is not on disk anywhere, so a phone with no change stream has no other
     /// way to notice that the loop it is waiting on was started from another
@@ -1247,6 +1301,7 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             runs_rev: runs_revision(&ui.runs),
             questions_rev: ui.questions.revision(),
             chats_rev: ui.chats.revision(),
+            talks_rev: ui.talks.revision(),
             loop_rev,
             runs_unreadable: runs_unreadable(&ui.runs),
             questions_open: ui.questions.count_open(),
@@ -2069,7 +2124,7 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(4);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(POLL);
-        let mut last: Option<(u64, u64, u64, u64, u64)> = None;
+        let mut last: Option<(u64, u64, u64, u64, u64, u64)> = None;
         loop {
             // The first tick completes immediately, which is what makes the
             // stream announce the current revisions on connect.
@@ -2081,6 +2136,7 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
                     runs_revision(&state.runs),
                     state.questions.revision(),
                     state.chats.revision(),
+                    state.talks.revision(),
                     // The loop's counter is in-process state rather than a
                     // file, so nothing the three stats above look at would
                     // tell this phone that another one started the loop.
@@ -2098,7 +2154,8 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
                 "runs_rev": revisions.1,
                 "questions_rev": revisions.2,
                 "chats_rev": revisions.3,
-                "loop_rev": revisions.4,
+                "talks_rev": revisions.4,
+                "loop_rev": revisions.5,
             });
             // Serializing five integers cannot fail; giving up beats looping.
             let Ok(event) = Event::default().event("change").json_data(payload) else {
@@ -2791,6 +2848,209 @@ fn resolve_chat(store: &Chats, id: &str) -> ApiResult<String> {
     pick(store.list().into_iter().map(|c| c.id).collect(), id, "chat")
 }
 
+/// A talk as the phone reads it.
+///
+/// Every field of [`Talk`] verbatim, plus `turn_bodies_md` - one markdown node
+/// tree per entry of `turns`, in order - the same accommodation
+/// [`ChatView`] makes so `app.js` never parses markdown itself.
+#[derive(Debug, Serialize)]
+struct TalkView {
+    #[serde(flatten)]
+    talk: Talk,
+    turn_bodies_md: Vec<Vec<md::Node>>,
+}
+
+impl From<Talk> for TalkView {
+    fn from(talk: Talk) -> Self {
+        let turn_bodies_md = talk
+            .turns
+            .iter()
+            .map(|turn| md::to_nodes(&turn.body, &md::ImageBase::None))
+            .collect();
+        Self {
+            turn_bodies_md,
+            talk,
+        }
+    }
+}
+
+/// `GET /api/talks/{id}`'s answer: a [`TalkView`] plus the queue tasks this
+/// conversation has filed, so the phone can follow one from inside the
+/// conversation that asked for it rather than hunting the Queue for a task id
+/// it may not remember.
+#[derive(Debug, Serialize)]
+struct TalkDetailView {
+    #[serde(flatten)]
+    view: TalkView,
+    tasks: Vec<TaskView>,
+}
+
+/// `GET /api/talks`.
+///
+/// Every conversation, open ones first and newest first - [`Talks::list`]'s
+/// own order, the same one [`chats_list`] reports for Planning.
+async fn talks_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TalkView>>> {
+    blocking(move || {
+        Ok(Json(
+            ui.talks.list().into_iter().map(TalkView::from).collect(),
+        ))
+    })
+    .await
+}
+
+/// The body of `POST /api/talks`, all of it optional: opening a talk needs no
+/// message, unlike starting a Planning interview. `repo` defaults to the
+/// server's own; `agent` to `[roles] planner`, [`talk::begin`]'s own default.
+/// Unknown fields are ignored so a newer front end still opens a talk against
+/// an older binary.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct NewTalk {
+    agent: Option<String>,
+    repo: Option<PathBuf>,
+}
+
+/// `POST /api/talks` - open a conversation. Takes no agent turn: see
+/// [`talk::begin`]'s doc for why there is nothing yet for one to answer.
+async fn talk_post(
+    State(ui): State<Arc<Ui>>,
+    body: std::result::Result<Json<NewTalk>, JsonRejection>,
+) -> ApiResult<impl IntoResponse> {
+    // An absent body, or an empty one, is the normal way to open a talk - see
+    // `NewTalk`'s doc - so a missing content type is treated the same as `{}`
+    // rather than refused, the same accommodation `chat_file` makes.
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(JsonRejection::MissingJsonContentType(_)) => NewTalk::default(),
+        Err(e) => return Err(ApiError::bad_request(e.body_text())),
+    };
+    let repo = body.repo.clone().unwrap_or_else(|| ui.repo.clone());
+    let cfg = config_for(&repo).await?;
+    let view = blocking(move || {
+        let talk = talk::begin(&ui.talks, &cfg, repo, body.agent.as_deref())?;
+        Ok(TalkView::from(talk))
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+/// `GET /api/talks/{id}`.
+async fn talk_detail(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<TalkDetailView>> {
+    blocking(move || {
+        let id = resolve_talk(&ui.talks, &id)?;
+        let talk = ui.talks.get(&id)?;
+        let tasks = talk::tasks_of(&ui.queue, &talk.id)
+            .into_iter()
+            .map(TaskView::from)
+            .collect();
+        Ok(Json(TalkDetailView {
+            view: TalkView::from(talk),
+            tasks,
+        }))
+    })
+    .await
+}
+
+/// The body of `POST /api/talks/{id}/say`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct NewTalkTurn {
+    text: String,
+}
+
+/// `POST /api/talks/{id}/say` - one turn of the conversation.
+///
+/// The same asynchronous shape as [`chat_say`], for the same reason: this
+/// route spawns an agent CLI and a turn here can run for the whole of
+/// [`talk::TURN_TIMEOUT`] - fifteen minutes, three times a planning turn's
+/// budget, because a research turn is expected to run commands rather than
+/// answer from what it already knows. Holding an HTTP connection open that
+/// long is not a thing to ask a phone to do; the operator's message is
+/// recorded and answered for immediately, and the reply lands in the
+/// background, discovered through the change stream's `talks_rev` the same
+/// way every other update on this surface is.
+async fn talk_say(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<NewTalkTurn>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<TalkView>)> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    if body.text.trim().is_empty() {
+        return Err(ApiError::bad_request("say something"));
+    }
+
+    let id = {
+        let ui = Arc::clone(&ui);
+        let asked = id.clone();
+        blocking(move || resolve_talk(&ui.talks, &asked)).await?
+    };
+    // Claimed before the talk is loaded, so the record this turn appends to
+    // was read after the claim and cannot be a snapshot another turn has
+    // since replaced - the same ordering `chat_say` relies on.
+    let _turn = ui.begin_talk_turn(&id)?;
+
+    let (talk, cfg) = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || {
+            let talk = ui.talks.get(&id)?;
+            let (cfg, _) = Config::discover(&talk.repo, None)?;
+            Ok((talk, cfg))
+        })
+        .await?
+    };
+
+    let talks = ui.talks.clone();
+    let text = {
+        let mut talk = talk.clone();
+        let talks = talks.clone();
+        let said = body.text.clone();
+        blocking(move || Ok(talk::record(&mut talk, &talks, &said)?)).await?
+    };
+    // Re-read so the spawned task appends to the record that now holds the
+    // operator's turn, rather than to the snapshot taken before it.
+    let talk = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || Ok(ui.talks.get(&id)?)).await?
+    };
+    let queued = talk.clone();
+    tokio::spawn(async move {
+        let _turn = _turn;
+        let mut talk = talk;
+        if let Err(e) = talk::respond(&mut talk, &talks, &cfg, &text).await {
+            // `respond` records the failure in the transcript itself, which is
+            // what the phone reads; this line is for the operator's terminal.
+            tracing::warn!("talk {id} turn failed: {e:#}");
+        }
+    });
+
+    // 202: the operator's message is recorded and a turn is running.
+    Ok((StatusCode::ACCEPTED, Json(TalkView::from(queued))))
+}
+
+/// `POST /api/talks/{id}/close`.
+async fn talk_close(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<TalkView>> {
+    blocking(move || {
+        let id = resolve_talk(&ui.talks, &id)?;
+        let mut talk = ui.talks.get(&id)?;
+        talk::close(&mut talk, &ui.talks)?;
+        Ok(Json(TalkView::from(talk)))
+    })
+    .await
+}
+
+/// Expand an id or short id to exactly one talk id.
+fn resolve_talk(store: &Talks, id: &str) -> ApiResult<String> {
+    pick(store.list().into_iter().map(|t| t.id).collect(), id, "talk")
+}
+
 /// The configuration for a repository, read off the disk for this request.
 ///
 /// Through [`blocking`] because discovery reads and merges several TOML files,
@@ -2875,6 +3135,7 @@ mod tests {
                 queue,
                 Questions::at(home.join("questions")),
                 Chats::at(home.join("chats")),
+                Talks::at(home.join("talks")),
                 runs,
                 home.to_path_buf(),
                 repo,
@@ -2900,6 +3161,10 @@ mod tests {
 
         fn chats(&self) -> Chats {
             Chats::at(self.home.path().join("chats"))
+        }
+
+        fn talks(&self) -> Talks {
+            Talks::at(self.home.path().join("talks"))
         }
 
         fn runs(&self) -> PathBuf {
@@ -3228,6 +3493,29 @@ mod tests {
         // A chat the server cannot parse would make every assertion below a
         // 500 that says nothing about the route under test.
         store.get(id).expect("the seeded chat has to be readable");
+        id.to_owned()
+    }
+
+    /// A talk on disk, without talking to a model. Mirrors [`interview`] for
+    /// `talk::Talk`.
+    fn seed_talk(fx: &Fixture, id: &str, status: &str) -> String {
+        let store = fx.talks();
+        std::fs::create_dir_all(store.root()).expect("talks dir");
+        let seat = serde_json::to_value(crate::agent::SeatState::new("talk", "mock", 7))
+            .expect("serialize a seat");
+        let body = serde_json::json!({
+            "schema": 1,
+            "id": id,
+            "repo": "/repo/magi",
+            "agent": "mock",
+            "status": status,
+            "turns": [],
+            "created_at": Timestamp::now().to_string(),
+            "updated_at": Timestamp::now().to_string(),
+            "seat": seat,
+        });
+        std::fs::write(store.path_of(id), body.to_string()).expect("write the talk");
+        store.get(id).expect("the seeded talk has to be readable");
         id.to_owned()
     }
 
@@ -3625,6 +3913,7 @@ mod tests {
             fx.queue(),
             fx.questions(),
             fx.chats(),
+            fx.talks(),
             fx.runs(),
             fx.home.path().to_path_buf(),
             PathBuf::from("/repo/magi"),
@@ -3939,6 +4228,147 @@ mod tests {
             other.canonicalize().unwrap().display().to_string(),
             "an explicit `repo` must override the server's own"
         );
+    }
+
+    /// A repo carrying `MOCK_AGENT_TOML`, for the talk routes that need a
+    /// real `Config::discover` to find an agent - `talk::begin` resolves one
+    /// even though it takes no turn, and `talk_say` invokes one.
+    async fn talk_fixture() -> (TempDir, PathBuf, Fixture) {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::write(repo.join("magi.toml"), MOCK_AGENT_TOML).expect("write magi.toml");
+        let f = Fixture::with_repo(repo.clone()).await;
+        (tmp, repo, f)
+    }
+
+    #[tokio::test]
+    async fn posting_a_talk_with_no_body_opens_one_and_takes_no_turn() {
+        let (_tmp, _repo, f) = talk_fixture().await;
+
+        // No body at all - `f.post(.., None)` sends no `Content-Type` either -
+        // is the ordinary way a phone opens a talk.
+        let opened = f.post("/api/talks", None).await;
+        assert_eq!(opened.status, 201, "{}", opened.body);
+        let body = opened.json();
+        assert_eq!(body["status"], "open");
+        assert_eq!(
+            body["turns"].as_array().unwrap().len(),
+            0,
+            "opening takes no agent turn: there is nothing yet to answer"
+        );
+
+        // An explicit empty object is the same request as none at all.
+        let also_opened = f.post("/api/talks", Some("{}")).await;
+        assert_eq!(also_opened.status, 201, "{}", also_opened.body);
+
+        let listed = f.get("/api/talks").await.json();
+        assert_eq!(listed.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn talk_detail_lists_the_tasks_it_has_filed_and_stays_open() {
+        let f = Fixture::start().await;
+        let talk_id = seed_talk(&f, "20260904-014455-ab12", "open");
+        let queue = f.queue();
+        let mut mine = Task::new(
+            "rename the loader".to_owned(),
+            "rename the loader".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Agent {
+                run: talk_id.clone(),
+                node: "chat".to_owned(),
+            },
+        );
+        queue.put(&mut mine).expect("file the task");
+        let mut theirs = Task::new(
+            "unrelated".to_owned(),
+            "unrelated".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        queue.put(&mut theirs).expect("file the task");
+
+        let res = f.get(&format!("/api/talks/{talk_id}")).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let body = res.json();
+        assert_eq!(
+            body["status"], "open",
+            "filing a task does not close a talk"
+        );
+        let tasks = body["tasks"].as_array().expect("tasks array");
+        assert_eq!(tasks.len(), 1, "only this talk's own task is listed");
+        assert_eq!(tasks[0]["id"], mine.id);
+    }
+
+    #[tokio::test]
+    async fn talk_say_records_the_operators_turn_before_the_agents_reply_lands() {
+        let (_tmp, _repo, f) = talk_fixture().await;
+        let id = f.post("/api/talks", None).await.json()["id"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+
+        let res = f
+            .post(
+                &format!("/api/talks/{id}/say"),
+                Some(r#"{"text":"what does the queue module do?"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 202, "{}", res.body);
+        let queued = res.json();
+        let turns = queued["turns"].as_array().expect("turns array");
+        assert_eq!(
+            turns.len(),
+            1,
+            "the answer reflects only what is on disk the instant it is sent, \
+             before the agent's turn - which can run for `talk::TURN_TIMEOUT` \
+             - has a chance to land: {queued}"
+        );
+        assert_eq!(turns[0]["who"], "operator");
+        assert_eq!(turns[0]["body"], "what does the queue module do?");
+
+        let mut turns_after = 1;
+        for _ in 0..200 {
+            let detail = f.get(&format!("/api/talks/{id}")).await.json();
+            turns_after = detail["turns"].as_array().expect("turns array").len();
+            if turns_after == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(turns_after, 2, "the agent's reply eventually lands");
+    }
+
+    #[tokio::test]
+    async fn talk_close_makes_the_talk_refuse_further_turns() {
+        let f = Fixture::start().await;
+        let id = seed_talk(&f, "20260904-014455-cd34", "open");
+
+        let closed = f.post(&format!("/api/talks/{id}/close"), None).await;
+        assert_eq!(closed.status, 200, "{}", closed.body);
+        assert_eq!(closed.json()["status"], "closed");
+
+        // Idempotent: closing an already-closed talk is not an error.
+        let closed_again = f.post(&format!("/api/talks/{id}/close"), None).await;
+        assert_eq!(closed_again.status, 200);
+        assert_eq!(closed_again.json()["status"], "closed");
+    }
+
+    #[tokio::test]
+    async fn talks_never_appear_in_the_planning_chat_list() {
+        let (_tmp, _repo, f) = talk_fixture().await;
+
+        let opened = f.post("/api/talks", None).await;
+        assert_eq!(opened.status, 201, "{}", opened.body);
+
+        let chats = f.get("/api/chats").await.json();
+        assert!(
+            chats.as_array().unwrap().is_empty(),
+            "a talk must never surface as a planning chat: {chats}"
+        );
+        let talks = f.get("/api/talks").await.json();
+        assert_eq!(talks.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -4307,6 +4737,7 @@ mod tests {
             Queue::at(home.path().join("queue")),
             Questions::at(home.path().join("questions")),
             Chats::at(home.path().join("chats")),
+            Talks::at(home.path().join("talks")),
             runs,
             home.path().to_path_buf(),
             PathBuf::from("/repo/magi"),
@@ -4540,12 +4971,13 @@ mod tests {
                 && payload["runs_rev"].is_u64()
                 && payload["questions_rev"].is_u64()
                 && payload["chats_rev"].is_u64()
+                && payload["talks_rev"].is_u64()
                 && payload["loop_rev"].is_u64(),
             "the client needs one revision per store to know what to refetch, \
-             and `chats_rev` is the only notification a slow interview gets - \
-             a phone whose radio slept through a turn learns about it here, as \
-             does one whose operator started the loop from another device: \
-             {payload}"
+             and `chats_rev` / `talks_rev` are the only notification a slow \
+             interview or a standing talk get - a phone whose radio slept \
+             through a turn learns about it here, as does one whose operator \
+             started the loop from another device: {payload}"
         );
 
         // The front end re-polls health on a timer and on wake, and takes the
@@ -4560,6 +4992,7 @@ mod tests {
             "runs_rev",
             "questions_rev",
             "chats_rev",
+            "talks_rev",
             "loop_rev",
         ] {
             assert!(
@@ -4567,6 +5000,32 @@ mod tests {
                 "health is the change stream's fallback and is missing `{key}`: {health}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_new_turn_on_a_talk_moves_the_change_stream_revision() {
+        let f = Fixture::start().await;
+        let before = f.get("/api/health").await.json()["talks_rev"]
+            .as_u64()
+            .expect("talks_rev");
+
+        let talk = seed_talk(&f, "20260904-014455-ab12", "open");
+        std::thread::sleep(Duration::from_millis(10));
+        let mut on_disk = f.talks().get(&talk).expect("get seeded talk");
+        on_disk.turns.push(crate::talk::Turn {
+            who: crate::talk::Who::Operator,
+            body: "a new turn".to_owned(),
+            at: Timestamp::now(),
+        });
+        f.talks().put(&mut on_disk).expect("record a turn");
+
+        let after = f.get("/api/health").await.json()["talks_rev"]
+            .as_u64()
+            .expect("talks_rev");
+        assert_ne!(
+            before, after,
+            "a phone must be able to notice a talk's reply without polling every store"
+        );
     }
 
     #[test]
@@ -5133,6 +5592,7 @@ mod tests {
             Queue::at(home.path().join("queue")),
             Questions::at(home.path().join("questions")),
             Chats::at(home.path().join("chats")),
+            Talks::at(home.path().join("talks")),
             home.path().join("runs"),
             home.path().to_path_buf(),
             PathBuf::from("/repo"),

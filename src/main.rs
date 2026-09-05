@@ -397,6 +397,12 @@ enum TaskCmd {
         /// Repository the task applies to.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// Run this task alone: one implementer, straight into review, rather
+        /// than the usual multi-candidate competition. For work whose design
+        /// is already settled and only needs building - the shape a standing
+        /// chat's `magi task add --solo` files.
+        #[arg(long)]
+        solo: bool,
         /// Print the filed task as JSON.
         #[arg(long)]
         json: bool,
@@ -1046,7 +1052,15 @@ fn answer_cmd(id: Option<String>, reply: Option<String>, list: bool) -> Result<(
 
 /// The `magi task` verbs.
 async fn task_cmd(command: TaskCmd) -> Result<()> {
-    let q = Queue::open();
+    task_cmd_on(command, Queue::open()).await
+}
+
+/// [`task_cmd`], against an explicit queue rather than the operator's own -
+/// what makes `--solo` testable without pinning the process-global home
+/// `Queue::open` reads, which only the first caller in the binary may do (see
+/// `run::set_home`'s doc and `run_rm_cmd_guards_and_removes`, the test that
+/// already claims that spot).
+async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
     match command {
         TaskCmd::Add {
             instruction,
@@ -1055,6 +1069,7 @@ async fn task_cmd(command: TaskCmd) -> Result<()> {
             title,
             priority,
             repo,
+            solo,
             json,
         } => {
             let text = task_text(&instruction, file.as_deref(), issue).await?;
@@ -1065,6 +1080,7 @@ async fn task_cmd(command: TaskCmd) -> Result<()> {
             let repo = repo.canonicalize().unwrap_or(repo);
             let mut task = Task::new(title, text, repo, source);
             task.priority = priority;
+            task.solo = solo;
             q.put(&mut task)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&task)?);
@@ -1811,6 +1827,74 @@ mod tests {
         assert!(!t.status.runnable(), "a finished task is not offered again");
         t.release();
         assert!(t.status.runnable(), "and release is the way back in");
+    }
+
+    #[test]
+    fn task_add_solo_parses_and_defaults_to_false() {
+        let solo = Cli::try_parse_from(["magi", "task", "add", "--solo", "do it"]).unwrap();
+        match solo.command {
+            Some(Command::Task {
+                command: TaskCmd::Add { solo, .. },
+            }) => assert!(solo),
+            other => panic!("expected TaskCmd::Add, got {other:?}"),
+        }
+
+        let plain = Cli::try_parse_from(["magi", "task", "add", "do it"]).unwrap();
+        match plain.command {
+            Some(Command::Task {
+                command: TaskCmd::Add { solo, .. },
+            }) => assert!(!solo, "omitting --solo must not turn it on"),
+            other => panic!("expected TaskCmd::Add, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_add_solo_flag_is_what_sets_the_queued_tasks_solo_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+
+        task_cmd_on(
+            TaskCmd::Add {
+                instruction: vec!["do".to_owned(), "the".to_owned(), "thing".to_owned()],
+                file: None,
+                issue: None,
+                title: None,
+                priority: 0,
+                repo: PathBuf::from("."),
+                solo: true,
+                json: false,
+            },
+            q.clone(),
+        )
+        .await
+        .expect("file a solo task");
+
+        task_cmd_on(
+            TaskCmd::Add {
+                instruction: vec!["do".to_owned(), "another".to_owned(), "thing".to_owned()],
+                file: None,
+                issue: None,
+                title: None,
+                priority: 0,
+                repo: PathBuf::from("."),
+                solo: false,
+                json: false,
+            },
+            q.clone(),
+        )
+        .await
+        .expect("file a plain task");
+
+        let mut tasks = q.list();
+        tasks.sort_unstable_by(|a, b| a.title.cmp(&b.title));
+        assert_eq!(tasks.len(), 2);
+        let solo = tasks.iter().find(|t| t.title == "do the thing").unwrap();
+        let plain = tasks
+            .iter()
+            .find(|t| t.title == "do another thing")
+            .unwrap();
+        assert!(solo.solo, "--solo must land on the queued task");
+        assert!(!plain.solo, "no --solo must leave the task as false");
     }
 
     #[test]
