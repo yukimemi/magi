@@ -524,7 +524,7 @@ impl RunState {
         let seed = config.blind.seed.unwrap_or_else(crate::rng::entropy);
         Self {
             schema: SCHEMA,
-            id: new_id(seed),
+            id: new_id(),
             repo,
             base_branch,
             base_commit,
@@ -760,9 +760,28 @@ pub fn latest_id() -> Option<String> {
 }
 
 /// `YYYYMMDD-HHMMSS-xxxx`, sortable and short enough for a branch name.
-fn new_id(seed: u64) -> String {
+///
+/// The four hex digits are fresh entropy, **not** `blind.seed`. They were the
+/// seed, and a pinned seed then made the whole id a function of the second it
+/// started in: two runs a second apart were distinguishable, two in the same
+/// second were not. Everything keyed on the id collided with them - the run
+/// directory, `artifacts/`, and the candidate worktrees under
+/// `wt/magi/<short>/`.
+///
+/// `tests/common` pins the seed on purpose, so its integration tests all share
+/// one suffix. On Windows the suite is slow enough that the seconds differ and
+/// nothing showed; on Linux `graph_dropped_stream`'s three tests run inside
+/// 16s, so two of them shared a run directory and the second read an artifact
+/// the first had written (`impl-B-resume.out`) - a failure that looked like the
+/// resume logic misbehaving and was really two runs in one directory.
+///
+/// A seed exists to make the *blind* decisions reproducible: label assignment
+/// and per-judge presentation order. It was never meant to name the run, and
+/// `RunState::seed` still carries it for what it is for.
+fn new_id() -> String {
     let stamp = Zoned::now().strftime("%Y%m%d-%H%M%S");
-    format!("{stamp}-{:04x}", (seed ^ (seed >> 32)) & 0xffff)
+    let entropy = crate::rng::entropy();
+    format!("{stamp}-{:04x}", (entropy ^ (entropy >> 32)) & 0xffff)
 }
 
 /// Keep the last `max` bytes of `text`, on a line boundary.
@@ -836,8 +855,19 @@ mod tests {
         assert!(!b.contains("claude"));
     }
 
+    /// A pinned seed reproduces the blind decisions. It must **not** reproduce
+    /// the run's identity.
+    ///
+    /// `assert_eq!(a.short(), b.short())` used to stand where the last
+    /// assertion is now, and it was pinning the defect: with the id's suffix
+    /// derived from the seed, two runs started in the same second were the
+    /// same run as far as the filesystem was concerned - one directory, one
+    /// `artifacts/`, one set of candidate worktrees. `tests/common` pins a
+    /// seed for every integration test, so on Linux, where the suite is fast,
+    /// two tests in `graph_dropped_stream` shared a directory and one read the
+    /// other's artifact.
     #[test]
-    fn seed_from_config_makes_the_run_reproducible() {
+    fn a_pinned_seed_is_reproducible_but_never_the_run_id() {
         let mut cfg = Config::default();
         cfg.blind.seed = Some(1234);
         let a = RunState::new(
@@ -854,9 +884,15 @@ mod tests {
             "t".to_owned(),
             cfg,
         );
+        // What the seed is for: the same shuffles, run after run.
         assert_eq!(a.seed, 1234);
         assert_eq!(a.seed, b.seed);
-        assert_eq!(a.short(), b.short());
+        // What it is not for. Two runs are two runs, in the same second or
+        // not, and everything keyed on the id depends on that.
+        assert_ne!(
+            a.id, b.id,
+            "two runs sharing an id share a directory, artifacts and worktrees"
+        );
     }
 
     #[test]
