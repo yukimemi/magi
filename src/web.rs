@@ -5200,13 +5200,31 @@ mod tests {
 
     #[tokio::test]
     async fn an_upgrade_with_nothing_to_install_changes_nothing() {
-        let fx = Fixture::start().await;
-        // The fixture's repo has no update config that resolves to a newer
-        // release, so this is the "already current" path. It must answer 200
-        // and leave the process alone: restarting for an upgrade that did not
-        // happen parks the run in flight and drops every connection to pay
-        // for nothing. A probe against a deck already on the newest build did
-        // exactly that, which is how this case got its own branch.
+        // `[update] mode = "off"` so `updater::Checker::new` returns `None`
+        // and the route answers from its own logic.
+        //
+        // This test used to lean on the fixture's placeholder repo failing
+        // config discovery, which left `mode = "notify"` - and a live,
+        // unauthenticated call to the GitHub releases API inside a unit test.
+        // GitHub allows 60 of those an hour per address, so the suite went red
+        // on `macos-latest` and nowhere else, in bursts, and stayed red for as
+        // long as somebody kept re-running it: every attempt spent another
+        // request. Six reruns across four pull requests were charged to that
+        // before it was read as a rate limit rather than a flake.
+        //
+        // What the assertion is about is the "already current" branch, which
+        // is reached by there being no newer release *or* nowhere to look. The
+        // second one needs no network and cannot be rate limited.
+        let repo = TempDir::new().expect("repo dir");
+        std::fs::write(repo.path().join("magi.toml"), "[update]\nmode = \"off\"\n")
+            .expect("write magi.toml");
+        let fx = Fixture::with_repo(repo.path().to_path_buf()).await;
+
+        // It must answer 200 and leave the process alone: restarting for an
+        // upgrade that did not happen parks the run in flight and drops every
+        // connection to pay for nothing. A probe against a deck already on the
+        // newest build did exactly that, which is how this case got its own
+        // branch.
         let res = fx.post("/api/upgrade", None).await;
         assert_eq!(res.status, 200, "not 202: nothing was set in motion");
         let body = res.json();

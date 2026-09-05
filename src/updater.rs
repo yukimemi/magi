@@ -97,8 +97,23 @@ pub struct Checker {
 }
 
 impl Checker {
-    /// Build a checker honouring `cfg`.
+    /// Build a checker honouring `cfg`, or `None` when checking is off.
+    ///
+    /// The `Option` had no `None` arm: every caller that asked for a checker
+    /// got one, so `[update] mode = "off"` was honoured by the *notify* path
+    /// alone (see [`cached_update`], which matches on the mode itself) and
+    /// ignored everywhere else. `POST /api/upgrade` therefore called the
+    /// GitHub releases API on a deck configured never to check - and so did
+    /// every unit test that reached that route, unauthenticated, against
+    /// GitHub's 60-per-hour-per-address limit.
+    ///
+    /// An operator who writes `mode = "off"` means it. The button is still
+    /// theirs to press; what it may not do is go to the network behind a
+    /// configuration that says not to.
     pub fn new(cfg: &Update) -> Option<Self> {
+        if cfg.mode == UpdateMode::Off {
+            return None;
+        }
         let mut inner = kaishin::Checker::new(BIN, options());
         if let Some(path) = state_path() {
             inner = inner.state_path(path);
@@ -252,5 +267,36 @@ mod tests {
     #[tokio::test]
     async fn finalize_of_nothing_is_a_no_op() {
         finalize(None, Duration::from_millis(1)).await;
+    }
+
+    /// `mode = "off"` means no checker, for every caller.
+    ///
+    /// It used to mean it only for the notify path: `Checker::new` returned
+    /// `Some` unconditionally, so `POST /api/upgrade` went to the GitHub
+    /// releases API on a deck configured never to check. A test that reached
+    /// that route made a live, unauthenticated request, and GitHub's
+    /// 60-per-hour-per-address limit then turned the suite red on one runner
+    /// at a time - for as long as anyone kept re-running it, since each
+    /// attempt spent another request.
+    #[test]
+    fn checking_is_off_for_every_caller_when_the_config_says_off() {
+        assert!(
+            Checker::new(&Update {
+                mode: UpdateMode::Off,
+                interval: None,
+            })
+            .is_none(),
+            "an operator who writes mode = \"off\" means it"
+        );
+        for mode in [UpdateMode::Notify, UpdateMode::Install] {
+            assert!(
+                Checker::new(&Update {
+                    mode,
+                    interval: None,
+                })
+                .is_some(),
+                "{mode:?} still asks the forge"
+            );
+        }
     }
 }
