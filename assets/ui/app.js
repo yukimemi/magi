@@ -421,6 +421,10 @@ const state = {
      Cleared after the first scroll, so a subsequent renderChat() with the
      same turn count does not re-scroll. */
   openingChat: false,
+  /* Whether a Plan control asked to focus the idea box on arrival. Set by
+     openPlan() when the planning page is not showing, cleared by applyRoute
+     once the caret has landed. */
+  planFocus: false,
   /* Turn count from the previous renderChat() call, used to detect new
      turns arriving while the conversation is already on screen. */
   prevTurnCount: 0,
@@ -3523,6 +3527,12 @@ function applyRoute() {
   /* The operator arrived to answer one specific thing, so the caret goes on
      it rather than on the top of the document. */
   if (changed && route.name === "questions") focusFirstAsk();
+  /* Same for a Plan control that navigated here: the caret goes on the idea
+     box, not the top of the document. */
+  if (changed && route.name === "chats" && state.planFocus) {
+    state.planFocus = false;
+    requestAnimationFrame(() => $("f-idea").focus());
+  }
   renderTitle();
 }
 
@@ -3537,65 +3547,24 @@ function closeRunActions() {
   if (dialog.open) dialog.close();
 }
 
-/* ---- compose ----------------------------------------------------------- */
-function openCompose() {
-  const dialog = $("compose");
-  show($("compose-error"), false);
-  if (!dialog.open) dialog.showModal();
-  /* Focus the field that matters, not the first tabbable element. */
-  requestAnimationFrame(() => $("f-instruction").focus());
-}
-
-function closeCompose() {
-  const dialog = $("compose");
-  if (dialog.open) dialog.close();
-}
-
-async function submitCompose(event) {
-  event.preventDefault();
-  const submit = $("compose-submit");
-  const error = $("compose-error");
-  const instruction = $("f-instruction").value;
-
-  if (!instruction.trim()) {
-    setText(error, "An instruction is required.");
-    show(error, true);
-    $("f-instruction").focus();
+/* ---- plan -------------------------------------------------------------- */
+/* Planning is the only way work gets in from this UI: an agent interviews
+   the operator into a task file, the way `magi plan` would in a terminal.
+   So every Plan control - the nav items and the empty-state buttons - lands
+   on the planning page and puts the caret in the idea box, even when that
+   page is already showing. */
+function openPlan() {
+  if (location.hash === "#/plan") {
+    /* Already there, so no hash change will unwrap a hidden view: the caret
+       can go straight in. */
+    requestAnimationFrame(() => $("f-idea").focus());
     return;
   }
-
-  const title = $("f-title").value.trim();
-  const repo = $("f-repo").value.trim();
-  const priority = Number($("f-priority").value);
-
-  submit.disabled = true;
-  setText(submit, "Filing\u2026");
-  show(error, false);
-
-  try {
-    const task = await postJson(API.queue, {
-      instruction,
-      title: title || null,
-      repo: repo || null,
-      priority: Number.isFinite(priority) ? priority : null,
-    });
-
-    /* Reflect it immediately rather than waiting for the stream to notice. */
-    state.queue = [task, ...(state.queue || []).filter((t) => t.id !== task.id)];
-    renderQueue();
-    announce(`Task ${shortId(task.id)} filed.`);
-
-    $("compose-form").reset();
-    closeCompose();
-    if (state.route.name !== "queue") location.hash = "#/queue";
-    loadQueue();
-  } catch (failure) {
-    setText(error, failure.message);
-    show(error, true);
-  } finally {
-    submit.disabled = false;
-    setText(submit, "File task");
-  }
+  /* On the way there the focus has to wait for applyRoute to unhide the
+     panel - an element inside a hidden view cannot take focus. The flag
+     rides the route change and is cleared once the caret has landed. */
+  state.planFocus = true;
+  location.hash = "#/plan";
 }
 
 /* ---- theme ------------------------------------------------------------- */
@@ -3626,12 +3595,9 @@ function applyTheme(theme) {
 
 /* ---- boot -------------------------------------------------------------- */
 function wire() {
-  for (const button of document.querySelectorAll("[data-compose]")) {
-    button.addEventListener("click", openCompose);
+  for (const entry of document.querySelectorAll("[data-plan]")) {
+    entry.addEventListener("click", openPlan);
   }
-  $("compose-form").addEventListener("submit", submitCompose);
-  $("compose-close").addEventListener("click", closeCompose);
-  $("compose-cancel").addEventListener("click", closeCompose);
 
   $("run-actions-fab").addEventListener("click", openRunActions);
   $("run-actions-close").addEventListener("click", closeRunActions);
