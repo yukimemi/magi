@@ -55,13 +55,30 @@ kind = "antigravity"
 # as its slowest reporting seat - but the candidate competes, so dropping the
 # seat would throw away a working implementation. Fix the reporting, not the
 # roster.
-implementers = ["oc", "agy", "sonnet"]
-# Rotated so no judge sits on its own candidate: opus/oc/agy against oc/agy/sonnet.
-judges = ["opus", "oc", "agy"]
+#
+# **Order matters now that one seat is the default.** `resolve_roles` takes the
+# first `candidates` entries, so entry one is who implements a solo task -
+# and on this workload that should be the seat with the best record: sonnet
+# won 5 of 8 entries (62%), oc 3 of 7 (43%). agy's 0 of 4 is a reporting
+# defect, not a verdict on its patches (see above, and #57), but a solo task
+# has no second candidate to fall back on, so the seat that reports reliably
+# goes first.
+implementers = ["sonnet", "oc", "agy"]
+# Rotated so no judge sits on its own candidate: opus/oc/agy against
+# sonnet/oc/agy. Only matters when a task asks for more than one candidate.
+judges = ["opus", "agy", "oc"]
 reviewers = ["sonnet", "oc"]
 # Not the winner's own author by default: the fixer would inherit the
 # implementer's 100-turn session, and with it the whole accumulated cache-read
 # bill.
+#
+# **That no longer holds for a solo task**, where sonnet implements and sonnet
+# fixes, so the fix round does inherit the implement session. Left as it is on
+# purpose: the reason above is cost, not correctness, and the seat that just
+# wrote the patch is the one that knows why. Today's fix rounds - where the
+# fixer took three Major findings from a review of hand-written work and
+# addressed them - are the evidence for keeping it. Revisit if the cache-read
+# bill on solo runs says otherwise.
 fixer = "sonnet"
 
 [graph]
