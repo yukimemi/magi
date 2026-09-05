@@ -1,101 +1,33 @@
 # magi competing on its own repository.
 #
+# **Only what is peculiar to this checkout lives here.** The roster, the seat
+# assignment, the shape of a run and the update policy moved to the machine
+# layer (`<config_dir>/magi/config.toml`), because none of them are facts about
+# this repository: they are facts about which agent CLIs are installed and what
+# the operator is willing to spend. Stating them once there is the point of
+# having layers, and it keeps this file to the things a different machine would
+# still need to be told.
+#
+# What that leaves, and why each one has to be here:
+#
+# - `[verify]` runs `cargo`. A repository that is not Rust cannot inherit it.
+# - `[merge] base` names this repository's branch, and is required at all
+#   because of how this checkout is set up (see below).
+# - `[prompts]` are this project's conventions.
+#
+# Note that an array may be declared in exactly one layer
+# (`Config::refuse_split_arrays`), so `[verify]`'s arrays being here is also
+# why the roster's arrays are *only* over there.
+#
 # Rendered by teravars. Tera braces are live everywhere in this file, but
 # comments are stripped before Tera sees them (teravars >= 0.2.2), so a comment
 # may quote `{{ ... }}` freely.
-#
-# Gemini CLI is absent on purpose: Google retired the standalone client for
-# individual accounts, so the roster is claude (two models) plus opencode. Add
-# an `agy` entry once Antigravity's plan is worth a seat here.
 
 [vars]
 # Shared build cache for the verification commands. Override per machine with
-# MAGI_CACHE.
+# MAGI_CACHE. Lives beside its only consumer: `[vars]` is rendered per file, so
+# a value used by this file's templates is stated in this file.
 cache = "{{ env.MAGI_CACHE | default(value='/tmp') }}"
-
-[[agents]]
-id = "opus"
-kind = "claude"
-model = "opus"
-
-[[agents]]
-id = "sonnet"
-kind = "claude"
-model = "sonnet"
-
-[[agents]]
-id = "oc"
-kind = "opencode"
-
-[[agents]]
-id = "agy"
-kind = "antigravity"
-
-# Seat assignment is a cost decision, and the numbers are measured, not guessed.
-# One implement seat on this repo cost $12.09 on opus against $6.95 on sonnet
-# for the same task — 1.7x — while `oc` reported $0.00. The driver is internal
-# tool-loop iterations (111 and 134 turns respectively): every turn re-reads the
-# cached context, so cache_read ends up ~= turns * context size, and the
-# implement node is where the turns are.
-#
-# Hence: the expensive model never implements. opus judges instead, which is a
-# handful of turns, and the free CLIs carry the implementation load.
-[roles]
-# `agy` implements here, and the reason is worth writing down because it was
-# twice diagnosed wrongly. It routinely uses the whole 3600s implement budget
-# while its own process shows almost no CPU, and `impl-*.out` comes back empty -
-# which reads exactly like a hung agent that produced nothing. It is not. The
-# work happens in child processes, and the seat leaves a finished implementation
-# in its worktree without committing it or reporting a usable JSON reply: run
-# 01c2's candidate A was 7 files and a 35 KB patch, recorded as "rescued an
-# uncommitted tree". What agy fails at is finishing the conversation, not the
-# task.
-#
-# The cost is real - the wave ends up as slow as the timeout rather than as slow
-# as its slowest reporting seat - but the candidate competes, so dropping the
-# seat would throw away a working implementation. Fix the reporting, not the
-# roster.
-#
-# **Order matters now that one seat is the default.** `resolve_roles` takes the
-# first `candidates` entries, so entry one is who implements a solo task -
-# and on this workload that should be the seat with the best record: sonnet
-# won 5 of 8 entries (62%), oc 3 of 7 (43%). agy's 0 of 4 is a reporting
-# defect, not a verdict on its patches (see above, and #57), but a solo task
-# has no second candidate to fall back on, so the seat that reports reliably
-# goes first.
-implementers = ["sonnet", "oc", "agy"]
-# Rotated so no judge sits on its own candidate: opus/oc/agy against
-# sonnet/oc/agy. Only matters when a task asks for more than one candidate.
-judges = ["opus", "agy", "oc"]
-reviewers = ["sonnet", "oc"]
-# Not the winner's own author by default: the fixer would inherit the
-# implementer's 100-turn session, and with it the whole accumulated cache-read
-# bill.
-#
-# **That no longer holds for a solo task**, where sonnet implements and sonnet
-# fixes, so the fix round does inherit the implement session. Left as it is on
-# purpose: the reason above is cost, not correctness, and the seat that just
-# wrote the patch is the one that knows why. Today's fix rounds - where the
-# fixer took three Major findings from a review of hand-written work and
-# addressed them - are the evidence for keeping it. Revisit if the cache-read
-# bill on solo runs says otherwise.
-fixer = "sonnet"
-
-[graph]
-# One seat, and the roster above is unchanged: a competition is now something a
-# task asks for rather than what every task pays for. 13 runs here produced 0
-# merges while everything that landed went through `magi review`, and the
-# judges' first choices split in 8 of 11 tallies. `oc` did beat `sonnet` in 3 of
-# those, so competing still wins work worth having - which is why the roster
-# stays and `--candidates N` exists. See `Graph::candidates` for the numbers.
-candidates = 1
-judges = 3
-deliberate_rounds = 1
-reviewers = 2
-review_rounds = 3
-max_parallel = 3
-language = "ja"
-sessions = true
 
 [verify]
 # The real-machine leg, run in the winner's worktree once per review round.
@@ -116,9 +48,6 @@ mode = "none"
 # `git symbolic-ref HEAD`. Teaching magi to read the jj bookmark instead is a
 # real feature, not a workaround — tracked as its own competition.
 base = "main"
-
-[update]
-mode = "notify"
 
 # Project conventions appended to the node prompts, never merged into them.
 # Repository-wide context lives in AGENTS.md, which every agent already reads
