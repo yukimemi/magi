@@ -507,8 +507,10 @@ under review every round. Do not "fix" this by withholding `--auto`.
 
 `Config::load_layers` runs every layer through teravars, so:
 
-- **Comments are templates too.** `# see {{ system.* }}` is a render error, not
-  a comment. `Config::starter_toml` learned this the hard way.
+- **Comments are stripped before Tera renders** (teravars >= 0.2.2), so a
+  comment may quote `{{ ... }}` or `{% ... %}` freely — it is gone before the
+  template parser sees it. Before 0.2.2 the opposite held: `# see {{ system.* }}`
+  was a render error, not a comment, and `Config::starter_toml` warned about it.
 - **Rendering happens before TOML unescaping.** `value=\"/tmp\"` inside a TOML
   string reaches Tera as `value=\"/tmp\"`, backslashes included, and fails. Use
   single quotes: `value='/tmp'`.

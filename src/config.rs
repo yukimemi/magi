@@ -776,10 +776,11 @@ impl Config {
              #   -> blind judging -> deliberation -> private final vote\n\
              #   -> fold losers -> review + E2E loop -> gate -> merge.\n\
              #\n\
-             # Rendered by teravars, comments included: a `[vars]` table, env\n\
-             # and system lookups, and `include = [...]` all work. Note that\n\
-             # Tera braces are live everywhere in this file, so do not write\n\
-             # them in a comment unless you mean them.\n\
+             # Rendered by teravars: a `[vars]` table, env\n\
+             # and system lookups, and `include = [...]` all work. Tera\n\
+             # braces are live everywhere in this file, but comments are\n\
+             # stripped before rendering (teravars >= 0.2.2), so a comment\n\
+             # may quote `{{ ... }}` freely.\n\
              #\n\
              # Layers deep-merge in increasing\n\
              # precedence, so the roster can live once per machine in\n\
@@ -1035,6 +1036,23 @@ mod tests {
         std::fs::write(&path, "[graph]\nlanguage = \"{{ nope.\"\n").unwrap();
         let err = Config::load(&path).expect_err("must not silently ignore");
         assert!(err.to_string().contains("teravars"), "{err}");
+    }
+
+    #[test]
+    fn tera_syntax_in_comments_is_inert() {
+        // teravars >= 0.2.2 strips `#` comments before Tera sees the file, so a
+        // comment may quote template syntax without rendering. Before 0.2.2 this
+        // load failed: the commented-out braces reached the template parser.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        std::fs::write(
+            &path,
+            "# a comment may quote templates: `{{ env.NOPE | default(value='x') }}` and `{% if %}`\n\
+             [graph]\ncandidates = 2\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("comments must be inert, not rendered");
+        assert_eq!(cfg.graph.candidates, 2);
     }
 
     #[test]

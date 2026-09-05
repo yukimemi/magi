@@ -1,7 +1,8 @@
 # magi competing on its own repository.
 #
-# Rendered by teravars. Note that Tera braces are live everywhere in this file,
-# comments included.
+# Rendered by teravars. Tera braces are live everywhere in this file, but
+# comments are stripped before Tera sees them (teravars >= 0.2.2), so a comment
+# may quote `{{ ... }}` freely.
 #
 # Gemini CLI is absent on purpose: Google retired the standalone client for
 # individual accounts, so the roster is claude (two models) plus opencode. Add
