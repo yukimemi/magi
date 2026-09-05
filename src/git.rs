@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use crate::proc::Quiet as _;
 use anyhow::{Context as _, Result, bail};
 use tokio::process::Command;
 
@@ -33,6 +34,7 @@ pub async fn git_raw(cwd: &Path, args: &[&str]) -> Result<GitOut> {
     let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
+        .quiet()
         // A hook that opens an editor or a credential prompt would hang a
         // headless run forever.
         .env("GIT_TERMINAL_PROMPT", "0")

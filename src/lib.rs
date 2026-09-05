@@ -32,6 +32,7 @@ pub mod graph;
 pub mod land;
 pub mod md;
 pub mod plan;
+pub mod proc;
 pub mod prompt;
 pub mod queue;
 pub mod report;

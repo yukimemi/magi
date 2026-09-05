@@ -50,6 +50,7 @@ use crate::agent::{self, Invocation, SeatState};
 use crate::ask;
 use crate::config::{AgentSpec, MergeMode};
 use crate::git;
+use crate::proc::Quiet as _;
 use crate::run::{MergeOutcome, RunState, RunStatus, tail};
 
 /// How often the pull request is re-read while its checks are still running.
@@ -1808,6 +1809,7 @@ async fn gh(cwd: &Path, args: &[String]) -> Result<(bool, String)> {
     let out = tokio::process::Command::new("gh")
         .args(args)
         .current_dir(cwd)
+        .quiet()
         .stdin(std::process::Stdio::null())
         .output()
         .await

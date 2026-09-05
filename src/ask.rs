@@ -37,6 +37,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::config;
+use crate::proc::Quiet as _;
 
 /// On-disk format for a question. Bumped when a field's meaning changes.
 ///
@@ -791,6 +792,7 @@ pub async fn notify(cmd: &config::Notify, q: &Question) -> Result<()> {
     tracing::debug!(program = %program, args = ?argv, "notifying");
 
     let mut child = tokio::process::Command::new(program);
+    child.quiet();
     child
         .args(&argv)
         .stdin(std::process::Stdio::null())
