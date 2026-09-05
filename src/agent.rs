@@ -127,6 +127,21 @@ pub struct Quota {
     pub reset: Option<String>,
 }
 
+/// A CLI hung up on its own stream while the agent was working.
+///
+/// Separate from a failure because the work was done and billed, and separate
+/// from a [`Quota`] because it is worth asking again: the answer is in the
+/// conversation, not lost to a limit that has to reset first. See
+/// [`dropped_stream`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Dropped {
+    /// What the CLI said as it hung up, verbatim.
+    pub why: String,
+    /// Output tokens the CLI reported before it did - the evidence that this
+    /// was a delivery failure and not an agent that produced nothing.
+    pub output_tokens: u64,
+}
+
 /// Result of an agent invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentOutput {
@@ -145,6 +160,11 @@ pub struct AgentOutput {
     /// read — the conservative default.
     #[serde(default)]
     pub quota: Option<Quota>,
+    /// The CLI hung up on its own stream after the agent had done billed
+    /// work. `None` unless that exact shape was recognised — see
+    /// [`dropped_stream`].
+    #[serde(default)]
+    pub dropped: Option<Dropped>,
 }
 
 impl AgentOutput {
@@ -156,6 +176,14 @@ impl AgentOutput {
     /// Did this invocation run out of the CLI's rate limit / quota?
     pub fn quota_exhausted(&self) -> bool {
         self.quota.is_some()
+    }
+
+    /// Did the agent work and the CLI fail to deliver it?
+    ///
+    /// Worth re-asking, unlike [`AgentOutput::quota_exhausted`]: the answer is
+    /// in a conversation this process can resume.
+    pub fn work_undelivered(&self) -> bool {
+        self.dropped.is_some()
     }
 }
 
@@ -354,6 +382,7 @@ pub async fn invoke(
             file_name(&err_path),
         ],
         quota: extracted.quota,
+        dropped: extracted.dropped,
     })
 }
 
@@ -546,6 +575,7 @@ struct Extracted {
     session: Option<String>,
     status: Option<String>,
     quota: Option<Quota>,
+    dropped: Option<Dropped>,
 }
 
 /// Pull the agent's message (and any session id) out of a CLI's stdout.
@@ -576,6 +606,9 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                     }
                 }),
                 quota: claude_quota(&v),
+                // Claude reports a truncated stream as an ordinary error; the
+                // shape `dropped_stream` keys on is agy's.
+                dropped: None,
             }
         }
         AgentKind::Opencode => {
@@ -607,6 +640,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 session,
                 status: None,
                 quota: None,
+                dropped: None,
             }
         }
         AgentKind::Antigravity => {
@@ -635,6 +669,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                     .map(str::to_owned),
                 status: v.get("status").and_then(|s| s.as_str()).map(str::to_owned),
                 quota: None,
+                dropped: dropped_stream(&v),
             }
         }
         AgentKind::Command => {
@@ -642,14 +677,17 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
             // thin shim around `claude`). If its output is the claude error
             // shape we recognise the quota the same way, so tests and wrappers
             // do not need their own detection; anything else is just text.
-            let quota = serde_json::from_str::<serde_json::Value>(stdout.trim())
-                .ok()
-                .and_then(|v| claude_quota(&v));
+            let parsed = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
+            let quota = parsed.as_ref().and_then(claude_quota);
+            // A `command` fixture may also stand in for a CLI that hangs up on
+            // its own stream, which is how that path is tested.
+            let dropped = parsed.as_ref().and_then(dropped_stream);
             Extracted {
                 text: stdout.trim().to_owned(),
                 session: None,
                 status: None,
                 quota,
+                dropped,
             }
         }
     }
@@ -679,6 +717,66 @@ fn claude_quota(v: &serde_json::Value) -> Option<Quota> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
     Some(Quota { reset })
+}
+
+/// Recognise a CLI that gave up on its own stream while the agent was working.
+///
+/// Observed once, verbatim, from `agy` on a candidate that produced nothing:
+///
+/// ```text
+/// {"conversation_id":"36743d06-…","status":"ERROR","response":"",
+///  "error":"the connection to the agent was interrupted before the response
+///           finished: subscriber fell behind updates, stalled for 5s",
+///  "duration_seconds":431.19,"num_turns":1,
+///  "usage":{"input_tokens":260113,"output_tokens":14267,
+///           "thinking_tokens":9695,"cache_read_tokens":2200925}}
+/// ```
+///
+/// Seven minutes of work and fourteen thousand output tokens, billed, with an
+/// empty `response`: the agent did the job and the CLI's own subscriber fell
+/// behind and hung up. That is **not** an agent that failed to implement, and
+/// counting it as one is how `agy` came to read as 0 wins in 4 entries with
+/// five empty candidates - a number that has twice been used to argue the seat
+/// out of the roster, and twice been wrong (see `cb6b830`, which reverted the
+/// first removal: *"agy does not fail to implement, it fails to report"*).
+///
+/// The distinction that matters is **billed work with nothing delivered**, so
+/// that is what this keys on: an error status, an empty response, and a usage
+/// report showing output tokens. Everything else - including an error with no
+/// usage at all - returns `None` and stays an ordinary failure, the
+/// conservative side, exactly as [`claude_quota`] treats shapes it does not
+/// recognise.
+///
+/// Unlike a quota, this **is** worth re-asking: the work exists in the
+/// conversation the CLI just abandoned, and `conversation_id` is right there.
+fn dropped_stream(v: &serde_json::Value) -> Option<Dropped> {
+    let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    if !status.eq_ignore_ascii_case("error") {
+        return None;
+    }
+    let response = v.get("response").and_then(|r| r.as_str()).unwrap_or("");
+    if !response.trim().is_empty() {
+        // It answered. Whatever the status says, there is something to read.
+        return None;
+    }
+    let produced = v
+        .get("usage")
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if produced == 0 {
+        // An error with nothing produced is just an error.
+        return None;
+    }
+    Some(Dropped {
+        why: v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("the CLI ended the stream without delivering its answer")
+            .trim()
+            .to_owned(),
+        output_tokens: produced,
+    })
 }
 
 /// Preflight: which configured agents are not runnable here?
@@ -1011,6 +1109,85 @@ mod tests {
         assert_eq!(out.text, "persimmon");
         assert_eq!(out.session.as_deref(), Some("eaf2d00a"));
         assert_eq!(out.status.as_deref(), Some("SUCCESS"));
+    }
+
+    /// Run 26c7's candidate B, verbatim from `artifacts/impl-B.out`.
+    ///
+    /// The seat read as an empty candidate. It was seven minutes of work and
+    /// 14,267 output tokens, billed, that the CLI then declined to hand over.
+    /// Five such candidates are why `agy` reads as 0 wins in 4 entries, and
+    /// that number has twice been used to argue the seat out of the roster.
+    const AGY_DROPPED: &str = concat!(
+        r#"{"conversation_id":"36743d06-c0b3-4b79-9fa2-23869289d7b6","status":"ERROR","#,
+        r#""response":"","error":"the connection to the agent was interrupted before "#,
+        r#"the response finished: subscriber fell behind updates, stalled for 5s","#,
+        r#""duration_seconds":431.1941803,"num_turns":1,"usage":{"input_tokens":260113,"#,
+        r#""output_tokens":14267,"thinking_tokens":9695,"cache_read_tokens":2200925,"#,
+        r#""total_tokens":274380}}"#
+    );
+
+    #[test]
+    fn a_cli_that_hangs_up_on_billed_work_is_not_an_agent_that_produced_nothing() {
+        let out = extract(AgentKind::Antigravity, AGY_DROPPED);
+        let dropped = out.dropped.expect("recognised as undelivered work");
+        assert_eq!(dropped.output_tokens, 14267);
+        assert!(
+            dropped.why.contains("subscriber fell behind"),
+            "the CLI's own words are kept for the record: {}",
+            dropped.why
+        );
+        // And the conversation is still there to resume, which is the whole
+        // reason this is worth re-asking where a quota is not.
+        assert_eq!(
+            out.session.as_deref(),
+            Some("36743d06-c0b3-4b79-9fa2-23869289d7b6")
+        );
+        assert!(out.quota.is_none(), "a dropped stream is not a rate limit");
+    }
+
+    #[test]
+    fn an_error_with_nothing_produced_stays_an_ordinary_failure() {
+        // No usage at all: the agent never got going, so there is nothing in
+        // the conversation to resume and nothing was billed. Treating this as
+        // undelivered work would buy a second call for no reason.
+        let bare = r#"{"conversation_id":"c1","status":"ERROR","response":"","error":"boom"}"#;
+        assert!(extract(AgentKind::Antigravity, bare).dropped.is_none());
+
+        // Produced tokens, but it did answer - so there is something to read
+        // and the status is not our business.
+        let answered = concat!(
+            r#"{"conversation_id":"c2","status":"ERROR","response":"here it is","#,
+            r#""usage":{"output_tokens":10}}"#
+        );
+        assert!(extract(AgentKind::Antigravity, answered).dropped.is_none());
+
+        // A success is a success.
+        let ok = concat!(
+            r#"{"conversation_id":"c3","status":"SUCCESS","response":"done","#,
+            r#""usage":{"output_tokens":10}}"#
+        );
+        assert!(extract(AgentKind::Antigravity, ok).dropped.is_none());
+    }
+
+    #[test]
+    fn an_undelivered_output_is_not_usable_but_is_worth_asking_again() {
+        let out = AgentOutput {
+            text: String::new(),
+            exit_code: Some(1),
+            timed_out: false,
+            duration_ms: 431_194,
+            artifacts: Vec::new(),
+            quota: None,
+            dropped: Some(Dropped {
+                why: "subscriber fell behind updates".to_owned(),
+                output_tokens: 14267,
+            }),
+        };
+        assert!(!out.usable());
+        assert!(out.work_undelivered());
+        // The distinction the retry policy rests on: a quota fails the same way
+        // until it resets, an abandoned conversation can be picked up.
+        assert!(!out.quota_exhausted());
     }
 
     #[test]

@@ -530,6 +530,28 @@ pub fn nudge(err: &str) -> String {
     )
 }
 
+/// Follow-up when the CLI hung up before delivering an answer.
+///
+/// Deliberately not [`nudge`]: nothing was wrong with the reply's *shape*, and
+/// telling an agent its answer "could not be used" invites it to redo the
+/// thinking. The work happened - it was billed - and this is the same
+/// conversation resumed, so the only thing being asked for is the part that
+/// never arrived: the files on disk.
+///
+/// Says nothing about what the task was. The seat still has it.
+pub fn resume_after_drop(why: &str) -> String {
+    format!(
+        "Your last reply never reached me — the CLI ended the stream before it \
+         finished ({why}). Nothing you wrote was recorded, and the working \
+         tree is unchanged.\n\n\
+         Continue where you left off and **write your work to disk**: apply \
+         the edits you had decided on, to the files themselves. Do not start \
+         over and do not re-plan — you already did the thinking, and it is \
+         still in this conversation. Keep the reply short; the files are what \
+         matter, not the message."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

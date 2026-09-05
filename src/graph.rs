@@ -44,6 +44,11 @@ use crate::verdict::{self, FinalVote, FixReport, Position, Ranking, Review, Seve
 const OUTPUT_TAIL: usize = 8_000;
 
 /// One queued agent invocation.
+///
+/// `Clone` so a node can keep the jobs it sent and re-send one: a seat whose
+/// CLI hung up on its own stream is asked again from the same job rather than
+/// rebuilt from scratch. See [`Runner::resume_undelivered`].
+#[derive(Clone)]
 struct SeatJob {
     spec: AgentSpec,
     seat: SeatState,
@@ -60,12 +65,21 @@ struct SeatJob {
 ///
 /// Quota is split out from an ordinary failure on purpose: a rate-limited call
 /// is known to fail again if retried now, so the retry loop must not spend an
-/// attempt on it.
+/// attempt on it. `Dropped` is split out for the opposite reason: unlike
+/// `Failed`, it is worth re-asking, and unlike `Ok`, its text is the CLI's raw
+/// error JSON, never the agent's answer — a caller that matched only
+/// `Ok`/`Quota`/`Failed` before `Dropped` existed must be updated rather than
+/// left to read that JSON as if it were usable output. `resume_undelivered`
+/// is the only caller that acts on it; everywhere else it is reported like an
+/// ordinary failure.
 enum AgentOutcome {
     /// A usable output.
     Ok(AgentOutput),
     /// The CLI ran out of quota / rate limit. Retrying now is pointless.
     Quota(AgentOutput),
+    /// The CLI hung up on its own stream after billed work. See
+    /// [`agent::AgentOutput::work_undelivered`].
+    Dropped(AgentOutput),
     /// Any other failure: a timeout, a bad exit code, an empty reply.
     Failed(String),
 }
@@ -625,7 +639,12 @@ impl Runner {
             "implement",
             format!("{} candidates in parallel", jobs.len()),
         );
-        let results = wave(jobs, Arc::clone(&self.sem), &run_id, "implement", &prompts).await;
+        // Kept so a seat whose CLI hung up can be asked again from the same
+        // job: `wave` consumes what it is given.
+        let sent = jobs.clone();
+        let mut results = wave(jobs, Arc::clone(&self.sem), &run_id, "implement", &prompts).await;
+        self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
+            .await;
 
         for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
             let seat_key = seat.key.clone();
@@ -645,6 +664,23 @@ impl Runner {
                         }
                     });
                     (text, o.duration_ms, failed)
+                }
+                // Left un-resumed by `resume_undelivered` (a dirty tree
+                // already rescues the work, or there was no session left to
+                // resume into) — reported like the ordinary failure it is,
+                // never as if `o.text` (the CLI's raw error JSON) were an
+                // answer.
+                AgentOutcome::Dropped(o) => {
+                    let why = o
+                        .dropped
+                        .as_ref()
+                        .map(|d| d.why.as_str())
+                        .unwrap_or("the CLI ended the stream without delivering its answer");
+                    (
+                        String::new(),
+                        o.duration_ms,
+                        Some(format!("the CLI dropped the stream ({why})")),
+                    )
                 }
                 AgentOutcome::Quota(o) => {
                     self.state.quota.push(QuotaLoss {
@@ -715,6 +751,98 @@ impl Runner {
         }
 
         self.after_implement()
+    }
+
+    /// Ask again, once, for work a CLI did and then failed to hand over.
+    ///
+    /// [`agent::dropped_stream`] recognises the one shape observed: an error
+    /// status with an empty response and a usage report showing output tokens,
+    /// i.e. **billed work with nothing delivered**. Run 26c7's candidate B was
+    /// seven minutes and 14,267 output tokens that arrived as an empty
+    /// candidate, because `agy`'s own subscriber fell behind and hung up.
+    ///
+    /// Two conditions, and both matter:
+    ///
+    /// - **Only when the tree is untouched.** Often the agent has already
+    ///   written its files and only the closing message was lost; the rescue
+    ///   commit below picks that up and there is nothing to ask for. Re-asking
+    ///   then would pay for a second implementation of work already on disk.
+    /// - **Once.** A CLI that drops one stream can drop the next, and this
+    ///   node is the most expensive in the graph.
+    ///
+    /// The re-ask is a resume, not a re-run: `has_context` is true because the
+    /// dropped reply still carried its `conversation_id`, so the seat is asked
+    /// to finish what it was doing rather than sent the whole task again. It
+    /// therefore gets a nudge's budget ([`retry_budget`]) - a quarter of the
+    /// node's - for the same reason a re-ranked judge does: restating finished
+    /// work is not the work.
+    ///
+    /// Unlike a quota this is worth retrying at all: a rate limit fails the
+    /// same way until it resets, while an abandoned conversation is still
+    /// there to be picked up.
+    async fn resume_undelivered(
+        &mut self,
+        results: &mut [(usize, SeatState, AgentOutcome)],
+        sent: &[SeatJob],
+        prompts: &Prompts,
+        run_id: &str,
+    ) {
+        for (wi, seat, out) in results.iter_mut() {
+            let Some(dropped) = (match &*out {
+                AgentOutcome::Dropped(o) => o.dropped.clone(),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let Some(job) = sent.get(*wi) else { continue };
+            // Already on disk? Then only the closing message was lost.
+            if !git::is_clean(&job.cwd).await.unwrap_or(true) {
+                self.state.event(
+                    "implement",
+                    format!(
+                        "{}: the CLI dropped the stream after {} output tokens ({}), but the \
+                         work is in the tree",
+                        seat.key, dropped.output_tokens, dropped.why
+                    ),
+                );
+                continue;
+            }
+            // The re-ask only makes sense as a resume: `resume_after_drop`
+            // says nothing about the task, trusting the seat to still hold it.
+            // Without a session to resume — sessions disabled, or this CLI's
+            // drop shape happened not to carry a session id — that prompt
+            // would open a brand-new conversation with no context at all,
+            // which is worse than leaving this as the ordinary failure it
+            // already is.
+            if !has_context(&job.spec, seat, job.sessions) {
+                self.state.event(
+                    "implement",
+                    format!(
+                        "{}: the CLI dropped the stream after {} output tokens ({}), but there \
+                         is no session left to resume",
+                        seat.key, dropped.output_tokens, dropped.why
+                    ),
+                );
+                continue;
+            }
+            self.state.event(
+                "implement",
+                format!(
+                    "{}: the CLI dropped the stream after {} output tokens ({}); resuming the \
+                     conversation",
+                    seat.key, dropped.output_tokens, dropped.why
+                ),
+            );
+            let mut retry = job.clone();
+            retry.seat = seat.clone();
+            retry.prompt = prompt::resume_after_drop(&dropped.why);
+            retry.timeout = retry_budget(job.timeout, true);
+            retry.stem = format!("{}-resume", job.stem);
+            let (resumed_seat, resumed) =
+                run_one(retry, Arc::clone(&self.sem), run_id, "implement", prompts).await;
+            *seat = resumed_seat;
+            *out = resumed;
+        }
     }
 
     fn after_implement(&mut self) -> Result<()> {
@@ -992,6 +1120,23 @@ impl Runner {
                 self.state.seats.insert(seat.key.clone(), seat);
                 let body = match out {
                     AgentOutcome::Ok(o) => verdict::section(&o.text, "position").unwrap_or(o.text),
+                    // Never read the CLI's raw error JSON as this judge's
+                    // position — skip the seat instead, the same as any other
+                    // failed turn.
+                    AgentOutcome::Dropped(o) => {
+                        let why =
+                            o.dropped.as_ref().map(|d| d.why.as_str()).unwrap_or(
+                                "the CLI ended the stream without delivering its answer",
+                            );
+                        self.state.event(
+                            "deliberate",
+                            format!(
+                                "judge {} skipped: the CLI dropped the stream ({why})",
+                                j + 1
+                            ),
+                        );
+                        continue;
+                    }
                     AgentOutcome::Quota(o) => {
                         self.state.quota.push(QuotaLoss {
                             seat: seat_key,
@@ -1869,6 +2014,16 @@ impl Runner {
                         Err(e) => fix.failed = Some(format!("unparsable fix report: {e}")),
                     }
                 }
+                // The CLI's raw error JSON is not a fix report to parse.
+                AgentOutcome::Dropped(o) => {
+                    fix.duration_ms = o.duration_ms;
+                    let why = o
+                        .dropped
+                        .as_ref()
+                        .map(|d| d.why.as_str())
+                        .unwrap_or("the CLI ended the stream without delivering its answer");
+                    fix.failed = Some(format!("the CLI dropped the stream ({why})"));
+                }
                 AgentOutcome::Quota(o) => {
                     self.state.quota.push(QuotaLoss {
                         seat: seat_key,
@@ -2271,6 +2426,14 @@ async fn wave(
             let out = match out {
                 Ok(o) if o.usable() => AgentOutcome::Ok(o),
                 Ok(o) if o.quota_exhausted() => AgentOutcome::Quota(o),
+                // Billed work the CLI failed to hand over is not an ordinary
+                // failure, but its text is the CLI's raw error JSON, not an
+                // answer — `Dropped` keeps it out of `Ok` so a caller cannot
+                // read it as one by forgetting to check. `usable()` is always
+                // false here (dropped implies an empty response), so this has
+                // to be checked before the catch-all `Failed` below or the
+                // one shape this exists for is lost with the rest.
+                Ok(o) if o.work_undelivered() => AgentOutcome::Dropped(o),
                 Ok(o) if o.timed_out => AgentOutcome::Failed("timed out".to_owned()),
                 Ok(o) => AgentOutcome::Failed(format!(
                     "exited with {:?} and no usable output",
@@ -2419,6 +2582,21 @@ where
                     (
                         Err(anyhow::anyhow!("rate limited (quota); not retrying now")),
                         true,
+                    )
+                }
+                // Not a parseable answer, but also not worth a special-cased
+                // retry here: the nudge loop above already re-asks anything
+                // that fails to parse, which is exactly what a dropped stream
+                // needs. Just don't hand its raw error JSON to `extract_json`.
+                AgentOutcome::Dropped(o) => {
+                    let why = o
+                        .dropped
+                        .as_ref()
+                        .map(|d| d.why.as_str())
+                        .unwrap_or("the CLI ended the stream without delivering its answer");
+                    (
+                        Err(anyhow::anyhow!("the CLI dropped the stream ({why})")),
+                        false,
                     )
                 }
                 AgentOutcome::Failed(e) => (Err(anyhow::anyhow!(e)), false),
