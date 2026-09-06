@@ -3783,6 +3783,9 @@ function renderReviews(run) {
         round.clean
           ? el("span", { class: "tag", "data-tone": "teal", text: "clean" })
           : el("span", { class: "tag", "data-tone": "rust", text: `${plural(blocking, "blocker", "blockers")}` }),
+        round.verify_retried
+          ? el("span", { class: "tag", "data-tone": "gold", text: "verify retried" })
+          : null,
         round.head ? el("span", { class: "head-sha", text: String(round.head).slice(0, 7) }) : null,
       ),
     );
@@ -3821,12 +3824,17 @@ function renderReviews(run) {
       const rejected = Array.isArray(fix.rejected) ? fix.rejected : [];
       node.append(el("div", { class: "reviewer" },
         el("p", {}, el("span", { class: "reviewer-name", text: `fix \u00b7 ${fix.agent || ""}` })),
-        numbers([
-          `${addressed.length} addressed`,
-          `${rejected.length} declined`,
-          fix.committed ? "committed" : "no commit",
-        ]),
-        fix.failed ? el("p", { class: "card-note", text: fix.failed }) : null,
+        // A lost adoption report is not "0 addressed / 0 declined": that
+        // literal reads as every finding reviewed and rejected, when the
+        // truth is magi never learned what the fixer did with them.
+        fix.failed
+          ? numbers([fix.committed ? "committed" : "no commit"])
+          : numbers([
+              `${addressed.length} addressed`,
+              `${rejected.length} declined`,
+              fix.committed ? "committed" : "no commit",
+            ]),
+        fix.failed ? el("p", { class: "card-note", text: `adoption report lost: ${fix.failed}` }) : null,
         fix.notes ? el("p", { class: "cand-summary", text: fix.notes }) : null,
         rejected.length ? el("div", { class: "findings" }, rejected.map((r) =>
           el("div", { class: "finding" },

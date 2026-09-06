@@ -375,10 +375,32 @@ pub struct CommandOutcome {
     pub duration_ms: u64,
 }
 
+/// Substrings that mark a Cargo/rustc/link failure: the toolchain could not
+/// produce a binary to run at all, as opposed to producing one that ran and
+/// failed. A Windows link race against a shared `CARGO_TARGET_DIR` (see
+/// AGENTS.md, "Running magi on magi") looks exactly like a red command
+/// otherwise, and a run has concluded `Blocked` on nothing but that race.
+const BUILD_FAILURE_MARKERS: &[&str] = &[
+    "error: could not compile",
+    "error: linking with",
+    "LINK : fatal error",
+    "fatal error LNK",
+];
+
 impl CommandOutcome {
     /// Did it pass?
     pub fn ok(&self) -> bool {
         self.code == Some(0)
+    }
+
+    /// Did this command fail because the code could not be built or linked,
+    /// rather than because it ran and produced a wrong result? A failure here
+    /// is not a verdict on the patch under review.
+    pub fn build_failed(&self) -> bool {
+        !self.ok()
+            && BUILD_FAILURE_MARKERS
+                .iter()
+                .any(|m| self.output_tail.contains(m))
     }
 }
 
@@ -394,6 +416,12 @@ pub struct ReviewRound {
     /// E2E command outcomes for this round.
     #[serde(default)]
     pub e2e: Vec<CommandOutcome>,
+    /// True when the first verify attempt this round could not build or
+    /// link, and `e2e` above holds a second attempt run before concluding.
+    /// A run must never be decided on a red it could not tell from an
+    /// unrelated build race.
+    #[serde(default)]
+    pub verify_retried: bool,
     /// Fixer response, absent when the round was already clean.
     #[serde(default)]
     pub fix: Option<FixRecord>,
@@ -1071,6 +1099,42 @@ mod tests {
         c.empty = false;
         c.failed = Some("timeout".to_owned());
         assert!(!c.viable());
+    }
+
+    #[test]
+    fn build_failure_is_distinguished_from_a_failing_test() {
+        let link_race = CommandOutcome {
+            command: "cargo test".to_owned(),
+            code: Some(1),
+            output_tail: "LINK : fatal error LNK1104: cannot open file \
+                          'graph_dirty_tree-71d4dc8e.exe'\n\
+                          error: could not compile `magi-cli` (test \"graph_dirty_tree\")"
+                .to_owned(),
+            duration_ms: 500,
+        };
+        assert!(!link_race.ok());
+        assert!(link_race.build_failed());
+
+        let failing_test = CommandOutcome {
+            command: "cargo test".to_owned(),
+            code: Some(101),
+            output_tail: "thread 'it_works' panicked at 'assertion failed'".to_owned(),
+            duration_ms: 500,
+        };
+        assert!(!failing_test.ok());
+        assert!(
+            !failing_test.build_failed(),
+            "a real test failure must not be classed as a build failure"
+        );
+
+        let passing = CommandOutcome {
+            command: "cargo test".to_owned(),
+            code: Some(0),
+            output_tail: String::new(),
+            duration_ms: 500,
+        };
+        assert!(passing.ok());
+        assert!(!passing.build_failed());
     }
 
     #[test]

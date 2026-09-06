@@ -1949,7 +1949,7 @@ impl Runner {
                 records.push(record);
             }
 
-            let e2e = run_commands(
+            let mut e2e = run_commands(
                 &shell,
                 &self.state.config.verify.e2e,
                 &winner.worktree,
@@ -1959,17 +1959,42 @@ impl Runner {
             for o in &e2e {
                 self.state.event(
                     "verify",
-                    format!(
-                        "round {round}: `{}` -> {}",
-                        o.command,
-                        if o.ok() {
-                            "pass".to_owned()
-                        } else {
-                            format!("FAIL ({:?})", o.code)
-                        }
-                    ),
+                    format!("round {round}: `{}` -> {}", o.command, e2e_outcome_label(o)),
                 );
             }
+
+            // A build/link failure is not a verdict on the patch — it is
+            // frequently a race against a shared `CARGO_TARGET_DIR` (see
+            // AGENTS.md). Give verify one retry before letting a red like
+            // that decide the round.
+            let verify_retried = e2e.iter().any(CommandOutcome::build_failed);
+            if verify_retried {
+                self.state.event(
+                    "verify",
+                    format!(
+                        "round {round}: verify could not build/link, not a test result — \
+                         retrying once before concluding"
+                    ),
+                );
+                e2e = run_commands(
+                    &shell,
+                    &self.state.config.verify.e2e,
+                    &winner.worktree,
+                    Duration::from_secs(self.state.config.graph.timeout_review),
+                )
+                .await;
+                for o in &e2e {
+                    self.state.event(
+                        "verify",
+                        format!(
+                            "round {round}: retry `{}` -> {}",
+                            o.command,
+                            e2e_outcome_label(o)
+                        ),
+                    );
+                }
+            }
+
             let e2e_failures: String = e2e
                 .iter()
                 .filter(|o| !o.ok())
@@ -1984,6 +2009,7 @@ impl Runner {
                 head: head.clone(),
                 reviews: records,
                 e2e,
+                verify_retried,
                 fix: None,
                 blocking,
                 clean,
@@ -2113,18 +2139,28 @@ impl Runner {
             .ok();
             let after = git::rev_parse(&winner.worktree, "HEAD").await?;
             fix.committed = after != before;
+            let commit_note = if fix.committed {
+                "committed"
+            } else {
+                "NO new commit"
+            };
             self.state.event(
                 "fix",
-                format!(
-                    "round {round}: {} addressed, {} rejected, {}",
-                    fix.addressed.len(),
-                    fix.rejected.len(),
-                    if fix.committed {
-                        "committed"
-                    } else {
-                        "NO new commit"
+                match &fix.failed {
+                    // Distinct on purpose from "0 addressed, 0 rejected": the
+                    // fixer's own diff still landed (blocking counts do keep
+                    // falling round over round), only its adoption report did
+                    // not come back, so this must never read like every
+                    // finding was reviewed and declined.
+                    Some(reason) => {
+                        format!("round {round}: fixer's adoption report was lost ({reason}); {commit_note}")
                     }
-                ),
+                    None => format!(
+                        "round {round}: {} addressed, {} rejected, {commit_note}",
+                        fix.addressed.len(),
+                        fix.rejected.len(),
+                    ),
+                },
             );
             let stalled = !fix.committed;
             round_record.fix = Some(fix);
@@ -2727,6 +2763,19 @@ where
         .collect()
 }
 
+/// Describe one verify command's outcome for the event log, distinguishing a
+/// build/link failure — the toolchain never produced a binary to run — from
+/// an actual test failure, since only the latter is a verdict on the patch.
+fn e2e_outcome_label(o: &CommandOutcome) -> String {
+    if o.ok() {
+        "pass".to_owned()
+    } else if o.build_failed() {
+        format!("COULD NOT RUN ({:?}, build/link failure)", o.code)
+    } else {
+        format!("FAIL ({:?})", o.code)
+    }
+}
+
 /// Run configured shell commands in `cwd`, in order.
 async fn run_commands(
     shell: &[String],
@@ -2942,6 +2991,7 @@ mod tests {
             fix: None,
             blocking: 0,
             clean: true,
+            verify_retried: false,
         }];
         state.gate = vec![CommandOutcome {
             command: "test".to_owned(),

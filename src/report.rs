@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::MergeMode;
-use crate::run::{RunState, RunStatus};
+use crate::run::{CommandOutcome, RunState, RunStatus};
 use crate::stats::Stats;
 
 static COLOR: AtomicBool = AtomicBool::new(true);
@@ -304,12 +304,22 @@ pub fn run(state: &RunState) -> String {
         let _ = writeln!(s, "\n{}", bold("review + verification"));
         for r in &state.reviews {
             let raised: usize = r.reviews.iter().map(|x| x.findings.len()).sum();
+            // A build/link failure is not a verdict on the patch (a shared
+            // `CARGO_TARGET_DIR` link race looks exactly like one), so it
+            // must not read the same as a real test failure.
             let e2e = if r.e2e.is_empty() {
                 dim("no e2e")
             } else if r.e2e.iter().all(|o| o.ok()) {
                 green("e2e green")
+            } else if r.e2e.iter().any(CommandOutcome::build_failed) {
+                yellow("e2e could not run (build/link failure)")
             } else {
                 red("e2e RED")
+            };
+            let e2e = if r.verify_retried {
+                format!("{e2e}, retried once")
+            } else {
+                e2e
             };
             let _ = writeln!(
                 s,
@@ -322,16 +332,31 @@ pub fn run(state: &RunState) -> String {
                 },
                 short(&r.head),
                 r.blocking,
-                r.fix.as_ref().map_or(String::new(), |f| format!(
-                    "  fix: {} addressed / {} rejected{}",
-                    f.addressed.len(),
-                    f.rejected.len(),
-                    if f.committed {
-                        String::new()
-                    } else {
-                        red(" (NO COMMIT)")
-                    }
-                ))
+                r.fix.as_ref().map_or(String::new(), |f| match &f.failed {
+                    // Never the same shape as "N addressed / M rejected": the
+                    // fixer's diff may well have landed (see the `fix` node's
+                    // own event), but whether it addressed anything is
+                    // unknown, not zero.
+                    Some(reason) => format!(
+                        "  fix: {}{}",
+                        yellow(&format!("adoption report lost ({reason})")),
+                        if f.committed {
+                            String::new()
+                        } else {
+                            red(" (NO COMMIT)")
+                        }
+                    ),
+                    None => format!(
+                        "  fix: {} addressed / {} rejected{}",
+                        f.addressed.len(),
+                        f.rejected.len(),
+                        if f.committed {
+                            String::new()
+                        } else {
+                            red(" (NO COMMIT)")
+                        }
+                    ),
+                })
             );
             for rec in &r.reviews {
                 for f in &rec.findings {
@@ -523,7 +548,9 @@ pub fn stats(stats: &Stats) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::run::{Candidate, MergeOutcome, RunState, Tally};
+    use crate::run::{
+        Candidate, CommandOutcome, FixRecord, MergeOutcome, ReviewRound, RunState, Tally,
+    };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard};
@@ -743,6 +770,86 @@ mod tests {
         let mut s = state();
         s.instruction = "x".repeat(200);
         assert!(line(&s).contains('…'));
+    }
+
+    #[test]
+    fn a_lost_fix_report_reads_differently_from_zero_adoption() {
+        let _guard = plain();
+        let mut lost = state();
+        lost.reviews = vec![ReviewRound {
+            round: 1,
+            head: "abc1234".to_owned(),
+            reviews: Vec::new(),
+            e2e: Vec::new(),
+            verify_retried: false,
+            fix: Some(FixRecord {
+                agent: "opus".to_owned(),
+                addressed: Vec::new(),
+                rejected: Vec::new(),
+                notes: String::new(),
+                committed: true,
+                failed: Some("timed out".to_owned()),
+                duration_ms: 0,
+            }),
+            blocking: 3,
+            clean: false,
+        }];
+        let text = run(&lost);
+        assert!(text.contains("adoption report lost (timed out)"), "{text}");
+        assert!(
+            !text.contains("0 addressed"),
+            "a lost report must never read as `0 addressed`: {text}"
+        );
+
+        let mut rejected_all = state();
+        rejected_all.reviews = vec![ReviewRound {
+            round: 1,
+            head: "abc1234".to_owned(),
+            reviews: Vec::new(),
+            e2e: Vec::new(),
+            verify_retried: false,
+            fix: Some(FixRecord {
+                agent: "opus".to_owned(),
+                addressed: Vec::new(),
+                rejected: Vec::new(),
+                notes: String::new(),
+                committed: true,
+                failed: None,
+                duration_ms: 0,
+            }),
+            blocking: 3,
+            clean: false,
+        }];
+        let text2 = run(&rejected_all);
+        assert!(
+            text2.contains("0 addressed / 0 rejected"),
+            "a round the fixer actually reported on keeps the count: {text2}"
+        );
+    }
+
+    #[test]
+    fn a_build_failure_is_not_reported_as_a_test_failure() {
+        let _guard = plain();
+        let mut s = state();
+        s.reviews = vec![ReviewRound {
+            round: 1,
+            head: "abc1234".to_owned(),
+            reviews: Vec::new(),
+            e2e: vec![CommandOutcome {
+                command: "cargo test".to_owned(),
+                code: Some(1),
+                output_tail: "LINK : fatal error LNK1104: cannot open file".to_owned(),
+                duration_ms: 100,
+            }],
+            verify_retried: true,
+            fix: None,
+            blocking: 0,
+            clean: false,
+        }];
+        let text = run(&s);
+        assert!(text.contains("could not run"), "{text}");
+        assert!(text.contains("retried once"), "{text}");
+        assert!(!text.contains("e2e RED"), "{text}");
     }
 
     #[test]
