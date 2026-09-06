@@ -514,6 +514,7 @@ mod tests {
             answered: 2,
             expected: 2,
             clean: false,
+            progressed: true,
         };
         let stats = collect(&[state_with(vec![round], 'A', RunStatus::Ready)]);
         let alpha = stats.reviewers.iter().find(|r| r.agent == "alpha").unwrap();
@@ -566,6 +567,7 @@ mod tests {
             answered: 1,
             expected: 1,
             clean: false,
+            progressed: false,
         };
         let stats = collect(&[state_with(vec![submitted], 'A', RunStatus::Ready)]);
         assert!(
@@ -606,6 +608,7 @@ mod tests {
             answered: 1,
             expected: 2,
             clean: false,
+            progressed: false,
         };
         let stats = collect(&[state_with(vec![round], 'A', RunStatus::Blocked)]);
 
@@ -675,6 +678,7 @@ mod tests {
             answered: 1,
             expected: 2,
             clean: false,
+            progressed: false,
         };
         let stats = collect(&[state_with(vec![round], 'A', RunStatus::Blocked)]);
 
@@ -709,6 +713,7 @@ mod tests {
             answered: 0,
             expected: 0,
             clean: false,
+            progressed: false,
         };
         let alongside = ReviewRound {
             round: 2,
@@ -721,6 +726,7 @@ mod tests {
             answered: 0,
             expected: 0,
             clean: false,
+            progressed: false,
         };
         let stats = collect(&[state_with(vec![sole, alongside], 'A', RunStatus::Ready)]);
         assert_eq!(stats.e2e.rounds, 2);

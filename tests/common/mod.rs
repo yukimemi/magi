@@ -154,6 +154,14 @@ if grep -q "reviewers of" "$p"; then
 fi
 
 if grep -q "Your patch was reviewed" "$p"; then
+  id=$(grep -o 'R[0-9]*-[0-9]*-[0-9]*' "$p" | head -1)
+  # A fixer that claims to have addressed the finding but never touches the
+  # tree — the self-report `graph::Runner::review_loop` no longer trusts for
+  # whether a round made progress.
+  if [ -n "$MOCK_FIXER_NOOP" ]; then
+    printf '{"addressed":["%s"],"rejected":[],"notes":"claims to have fixed it"}\n' "$id"
+    exit 0
+  fi
   # Appended with a nonce so a fixer invoked round after round always has a
   # real diff to commit — otherwise `git commit` on an unchanged `fixed.txt`
   # fails with nothing to commit, and the loop stops early on "the fixer
@@ -161,7 +169,6 @@ if grep -q "Your patch was reviewed" "$p"; then
   echo "fixed $$" >> fixed.txt
   git add -A >/dev/null 2>&1
   git commit -q -m "address review findings" >/dev/null 2>&1
-  id=$(grep -o 'R[0-9]*-[0-9]*-[0-9]*' "$p" | head -1)
   printf '{"addressed":["%s"],"rejected":[],"notes":"created fixed.txt"}\n' "$id"
   exit 0
 fi
@@ -325,12 +332,17 @@ pub fn fixture_with_dropped_stream(seats: &[&str]) -> Fixture {
 
 /// A solo candidate (`graph.candidates = 1`, the shipped default) whose
 /// reviewers raise a blocking finding every round, no matter what the fixer
-/// does — so the review loop exhausts its budget and the run ends `Blocked`.
-/// Built for reentry tests: a single viable candidate is what makes `judge`
-/// skip the panel instead of asking it.
+/// does, **and** whose own e2e never passes — so the review loop exhausts
+/// its budget with a real red command in hand and the run ends `Blocked`.
+/// A round budget spent with *green* verification is a hand-off, not a
+/// block (see `graph::Runner::stop_reviewing`); this fixture is for the
+/// genuinely-blocked leg specifically. Built for reentry tests: a single
+/// viable candidate is what makes `judge` skip the panel instead of asking
+/// it.
 pub fn fixture_always_blocked() -> Fixture {
     let mut fx = fixture(Judges::Unanimous, true);
     fx.config.graph.candidates = 1;
+    fx.config.verify.e2e = vec!["false".to_owned()];
     for a in &mut fx.config.agents {
         a.env
             .insert("MOCK_ALWAYS_FINDING".to_owned(), "1".to_owned());
@@ -372,6 +384,33 @@ pub fn fixture_with_silent_review_seat(silent_seats: &[&str]) -> Fixture {
     let value = silent_seats.join(",");
     for a in &mut fx.config.agents {
         a.env.insert("MOCK_SILENT_SEAT".to_owned(), value.clone());
+    }
+    fx
+}
+
+/// Reviewers that never run out of a blocking finding to raise, so the review
+/// loop can be driven all the way to `rounds` without ever going clean. The
+/// fixer still runs and still commits a real, distinct change every round
+/// (see the mock script) — the point of this fixture is a round budget spent
+/// on a change that keeps moving, never a tree that stopped moving.
+pub fn fixture_that_never_clears(rounds: usize) -> Fixture {
+    let mut fx = fixture(Judges::Unanimous, false);
+    fx.config.graph.review_rounds = rounds;
+    for a in &mut fx.config.agents {
+        a.env
+            .insert("MOCK_ALWAYS_FINDING".to_owned(), "1".to_owned());
+    }
+    fx
+}
+
+/// Like [`fixture_that_never_clears`], but the fixer also never actually
+/// touches the tree — it reports `addressed` while leaving the diff exactly
+/// as it was. This is what a vibrating round looks like from `git`'s side,
+/// as opposed to what the fixer's own report claims.
+pub fn fixture_with_noop_fixer(rounds: usize) -> Fixture {
+    let mut fx = fixture_that_never_clears(rounds);
+    for a in &mut fx.config.agents {
+        a.env.insert("MOCK_FIXER_NOOP".to_owned(), "1".to_owned());
     }
     fx
 }
