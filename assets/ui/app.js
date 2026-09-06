@@ -358,8 +358,14 @@ function phaseOf(node) {
    so the position is derived from the status against the fixed node order.
    A parked run passes the node its question came from, so the rail still says
    how far the run got while marking that segment stopped instead of pulsing:
-   the same rail cannot mean "working" and "halted" on colour alone. */
-function phaseRail(status, node) {
+   the same rail cannot mean "working" and "halted" on colour alone.
+
+   `note`, when given, is which seat(s) in the current phase have not answered
+   yet — the answer to "is it agy again?" without opening the seats panel.
+   It only ever touches the label: the rail's squares are one per *node*, not
+   one per seat, so a seat that is still out changes what the current square
+   means, not how many squares there are. */
+function phaseRail(status, node, note) {
   const parked = phaseOf(node);
   const at = PHASES.indexOf(parked || status);
   if (at < 0) return null;
@@ -368,7 +374,7 @@ function phaseRail(status, node) {
     role: "img",
     "aria-label": parked
       ? `Stopped at phase ${at + 1} of ${PHASES.length}, ${parked}, waiting for your answer`
-      : `Phase ${at + 1} of ${PHASES.length}: ${status}`,
+      : `Phase ${at + 1} of ${PHASES.length}: ${status}${note ? ` — ${note}` : ""}`,
   });
   for (let i = 0; i < PHASES.length; i += 1) {
     const here = i === at;
@@ -3239,6 +3245,7 @@ function renderRunDetail() {
        different one is not merely stale, it is wrong. */
     show($("run-ask-panel"), false);
     show($("run-land-panel"), false);
+    show($("run-active-panel"), false);
     /* The fab and its sheet stay reachable across this route (see
        applyRoute), so a switch to a different run id \u2014 the daemon strip's
        currentRunLink, or back/forward between two run pages \u2014 must not leave
@@ -3264,7 +3271,9 @@ function renderRunDetail() {
   clear(head);
   head.append(chip(status, RUN_STATUS));
   const parkedAt = parkedNow ? (openFor(run.id)[0] || {}).node || null : null;
-  const rail = PHASES.includes(status) || parkedAt ? phaseRail(status, parkedAt) : null;
+  const rail = PHASES.includes(status) || parkedAt
+    ? phaseRail(status, parkedAt, activeNote(run))
+    : null;
   if (rail) head.append(rail);
   if (meta.note) head.append(el("p", { class: "card-note", text: meta.note }));
 
@@ -3285,6 +3294,7 @@ function renderRunDetail() {
 
   renderAsks(run);
   renderLand(run);
+  renderActive(run);
   renderVerdict(run);
   renderCandidates(run);
   renderReviews(run);
@@ -3873,6 +3883,74 @@ function commandList(heading, commands) {
   );
 }
 
+/* One line for the phase rail's label: which seat(s) the current phase is
+   still waiting on, or null when nothing is out. Seat identifiers only —
+   never an agent id, since a judge or reviewer seat is blind. */
+function activeNote(run) {
+  const active = run.active && typeof run.active === "object" ? run.active : {};
+  const seats = Object.keys(active).sort();
+  if (seats.length === 0) return null;
+  if (!run.live) return `${plural(seats.length, "seat", "seats")} left mid-answer by a dead process`;
+  return seats.length === 1
+    ? `${seats[0]} has not answered yet`
+    : `${plural(seats.length, "seat", "seats")} have not answered yet (${seats.join(", ")})`;
+}
+
+/* Seats still mid-answer, for the panel between "Landing" and "Verdict" —
+   the same place in the column as the ask panel's reasoning: while a seat is
+   still out, nothing below it that depends on the panel is going to change.
+
+   `run.active` is keyed by seat, not by candidate or judge number, and on
+   purpose carries no agent id: a judge or reviewer seat is blind, and the
+   identifier alone ("judge-2", "review-1") is what the operator needs to
+   answer "which seat is quiet" without this view becoming a second place
+   that could leak who is behind it mid-run. `run.live` says whether a daemon
+   is actually still asking these seats anything right now, or whether they
+   are a leftover from a process that died before it could say so itself —
+   see `ActiveSeat`'s Rust docs for why the entry alone never proves that. */
+function renderActive(run) {
+  const active = run.active && typeof run.active === "object" ? run.active : {};
+  const seats = Object.keys(active).sort();
+  show($("run-active-panel"), seats.length > 0);
+  if (seats.length === 0) return;
+
+  setText($("run-active-count"), String(seats.length));
+  const note = $("run-active-note");
+  show(note, !run.live);
+  if (!run.live) {
+    setText(note, "No live daemon claims this run right now — likely left behind by a killed process, not a seat that is actually still working.");
+  }
+
+  const list = $("run-active");
+  clear(list);
+  const now = Date.now();
+  for (const key of seats) {
+    const a = active[key];
+    const startedMs = Date.parse(a.started_at || "");
+    const elapsed = Number.isFinite(startedMs) ? Math.max(Math.round((now - startedMs) / 1000), 0) : null;
+    const budget = Number(a.timeout_secs) || 0;
+    const remaining = elapsed === null ? null : Math.max(budget - elapsed, 0);
+    const retry = Number(a.attempt) > 0 ? ` · retry ${a.attempt}` : "";
+    list.append(el("li", {},
+      el("span", { class: "seat", text: key }),
+      el("span", { text: `${a.node || "?"}${retry}` }),
+      el("span", {
+        text: elapsed === null
+          ? "in progress"
+          : `${elapsed}s elapsed · ${remaining}s left of ${budget}s`,
+      }),
+    ));
+  }
+}
+
+/* Local clock tick, not a fetch: `renderActive` only recomputes the elapsed /
+   remaining text from data already in hand, so a run with one seat quiet for
+   ten minutes does not sit there showing the number from whenever the change
+   stream last had a reason to fire. Nothing here talks to the network. */
+function tickActive() {
+  if (state.route.name === "run" && state.detail.run) renderActive(state.detail.run);
+}
+
 function renderQuota(run) {
   const losses = Array.isArray(run.quota) ? run.quota : [];
   show($("run-quota-panel"), losses.length > 0);
@@ -4422,6 +4500,7 @@ async function boot() {
     if (document.hidden) return;
     loadHealth({ applyRevisions: !state.streamOpen });
   }, HEALTH_MS);
+  setInterval(tickActive, 1000);
 }
 
 boot();

@@ -382,6 +382,15 @@ impl Runner {
         // and a card cannot claim a run is waiting to be resumed while the
         // agents are already working.
         self.state.parked = false;
+        // Any seat this state still lists as answering belongs to whatever
+        // process last drove this run — this one included, if it crashed
+        // mid-wave. Cleared and flushed immediately, before anything else
+        // runs, so a resume can never show a seat as live when nothing is
+        // asking it anything yet; the node that actually dispatches the next
+        // wave repopulates it.
+        if self.state.clear_active() {
+            self.state.save()?;
+        }
         // A run that already lost its quorum never resumes into the verdict
         // machinery: `deliberate` and `vote` would otherwise clobber the
         // stalled marker back to Voting and the run would keep going past a
@@ -643,15 +652,14 @@ impl Runner {
         // Kept so a seat whose CLI hung up can be asked again from the same
         // job: `wave` consumes what it is given.
         let sent = jobs.clone();
-        let mut results = wave(
-            jobs,
-            Arc::clone(&self.sem),
-            &run_id,
-            "implement",
-            &prompts,
-            self.state.config.cache_dir().as_deref(),
-        )
-        .await;
+        let cache = self.state.config.cache_dir();
+        let ctx = WaveCtx {
+            run: &run_id,
+            node: "implement",
+            prompts: &prompts,
+            cache: cache.as_deref(),
+        };
+        let mut results = wave(jobs, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
         self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
             .await;
 
@@ -847,15 +855,15 @@ impl Runner {
             retry.prompt = prompt::resume_after_drop(&dropped.why);
             retry.timeout = retry_budget(job.timeout, true);
             retry.stem = format!("{}-resume", job.stem);
-            let (resumed_seat, resumed) = run_one(
-                retry,
-                Arc::clone(&self.sem),
-                run_id,
-                "implement",
+            let cache = self.state.config.cache_dir();
+            let ctx = WaveCtx {
+                run: run_id,
+                node: "implement",
                 prompts,
-                self.state.config.cache_dir().as_deref(),
-            )
-            .await;
+                cache: cache.as_deref(),
+            };
+            let (resumed_seat, resumed) =
+                run_one(retry, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
             *seat = resumed_seat;
             *out = resumed;
         }
@@ -997,15 +1005,20 @@ impl Runner {
         );
         let labels_for_check = labels.clone();
         let mut quota_losses = Vec::new();
+        let cache = self.state.config.cache_dir();
+        let ctx = WaveCtx {
+            run: &run_id,
+            node: "judge",
+            prompts: &prompts,
+            cache: cache.as_deref(),
+        };
         let results = ask_json_wave::<Ranking>(
             jobs,
             Arc::clone(&self.sem),
             self.state.config.graph.retries,
-            &run_id,
-            "judge",
-            &prompts,
-            self.state.config.cache_dir().as_deref(),
+            &ctx,
             &mut quota_losses,
+            &mut self.state,
             &move |r: &Ranking| r.validate(&labels_for_check),
         )
         .await;
@@ -1136,15 +1149,15 @@ impl Runner {
                     artifacts: artifacts.clone(),
                     stem: format!("delib-{round}-judge-{}", j + 1),
                 };
-                let (updated, out) = run_one(
-                    job,
-                    Arc::clone(&self.sem),
-                    &run_id,
-                    "deliberate",
-                    &prompts,
-                    self.state.config.cache_dir().as_deref(),
-                )
-                .await;
+                let cache = self.state.config.cache_dir();
+                let ctx = WaveCtx {
+                    run: &run_id,
+                    node: "deliberate",
+                    prompts: &prompts,
+                    cache: cache.as_deref(),
+                };
+                let (updated, out) =
+                    run_one(job, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
                 seat = updated;
                 let agent_id = seat.agent.clone();
                 let seat_key = seat.key.clone();
@@ -1288,15 +1301,20 @@ impl Runner {
         );
         let allowed = viable.clone();
         let mut quota_losses = Vec::new();
+        let cache = self.state.config.cache_dir();
+        let ctx = WaveCtx {
+            run: &run_id,
+            node: "vote",
+            prompts: &prompts,
+            cache: cache.as_deref(),
+        };
         let results = ask_json_wave::<FinalVote>(
             jobs,
             Arc::clone(&self.sem),
             self.state.config.graph.retries,
-            &run_id,
-            "vote",
-            &prompts,
-            self.state.config.cache_dir().as_deref(),
+            &ctx,
             &mut quota_losses,
+            &mut self.state,
             &move |v: &FinalVote| match v.label() {
                 Some(c) if allowed.contains(&c) => Ok(()),
                 other => bail!("vote {other:?} is not one of {allowed:?}"),
@@ -1622,15 +1640,21 @@ impl Runner {
 
         let labels_for_check = labels.clone();
         let mut judge_losses = Vec::new();
+        let retries = self.state.config.graph.retries;
+        let cache = self.state.config.cache_dir();
+        let ctx = WaveCtx {
+            run: &run_id,
+            node: "judge",
+            prompts: &prompts,
+            cache: cache.as_deref(),
+        };
         let results = ask_json_wave::<Ranking>(
             judge_jobs,
             Arc::clone(&self.sem),
-            self.state.config.graph.retries,
-            &run_id,
-            "judge",
-            &prompts,
-            self.state.config.cache_dir().as_deref(),
+            retries,
+            &ctx,
             &mut judge_losses,
+            &mut self.state,
             &move |r: &Ranking| r.validate(&labels_for_check),
         )
         .await;
@@ -1690,15 +1714,21 @@ impl Runner {
         }
         let allowed = labels.clone();
         let mut vote_losses = Vec::new();
+        let vote_retries = self.state.config.graph.retries;
+        let vote_cache = self.state.config.cache_dir();
+        let ctx = WaveCtx {
+            run: &run_id,
+            node: "vote",
+            prompts: &prompts,
+            cache: vote_cache.as_deref(),
+        };
         let votes = ask_json_wave::<FinalVote>(
             vote_jobs,
             Arc::clone(&self.sem),
-            self.state.config.graph.retries,
-            &run_id,
-            "vote",
-            &prompts,
-            self.state.config.cache_dir().as_deref(),
+            vote_retries,
+            &ctx,
             &mut vote_losses,
+            &mut self.state,
             &move |v: &FinalVote| match v.label() {
                 Some(c) if allowed.contains(&c) => Ok(()),
                 other => bail!("vote {other:?} is not one of {allowed:?}"),
@@ -1891,15 +1921,21 @@ impl Runner {
                 ),
             );
             let mut quota_losses = Vec::new();
+            let review_retries = self.state.config.graph.retries;
+            let review_cache = self.state.config.cache_dir();
+            let ctx = WaveCtx {
+                run: &run_id,
+                node: "review",
+                prompts: &prompts,
+                cache: review_cache.as_deref(),
+            };
             let results = ask_json_wave::<Review>(
                 jobs,
                 Arc::clone(&self.sem),
-                self.state.config.graph.retries,
-                &run_id,
-                "review",
-                &prompts,
-                self.state.config.cache_dir().as_deref(),
+                review_retries,
+                &ctx,
                 &mut quota_losses,
+                &mut self.state,
                 &|_: &Review| Ok(()),
             )
             .await;
@@ -2075,15 +2111,14 @@ impl Runner {
                 stem: format!("fix-{round}"),
             };
             let before = git::rev_parse(&winner.worktree, "HEAD").await?;
-            let (seat, out) = run_one(
-                job,
-                Arc::clone(&self.sem),
-                &run_id,
-                "fix",
-                &prompts,
-                self.state.config.cache_dir().as_deref(),
-            )
-            .await;
+            let cache = self.state.config.cache_dir();
+            let ctx = WaveCtx {
+                run: &run_id,
+                node: "fix",
+                prompts: &prompts,
+                cache: cache.as_deref(),
+            };
+            let (seat, out) = run_one(job, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
             let agent_id = seat.agent.clone();
             let seat_key = seat.key.clone();
             self.state.seats.insert(seat.key.clone(), seat);
@@ -2499,16 +2534,32 @@ fn make_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What every seat in one batch shares: where the answers are attributed, the
+/// prompt overlay they inherit, and the build cache they are told to use.
+///
+/// A struct rather than four more parameters: `wave` also needs the run's
+/// state (to record who is answering right now) and the attempt number, and
+/// eight positional arguments is both unreadable and a clippy error.
+struct WaveCtx<'a> {
+    /// Exported as `MAGI_RUN`, so a task an agent files names the run that
+    /// paid for it.
+    run: &'a str,
+    /// Exported as `MAGI_NODE`, and the key the prompt overlay is chosen by.
+    node: &'a str,
+    prompts: &'a Prompts,
+    /// The shared `CARGO_TARGET_DIR`, when the config declares one.
+    cache: Option<&'a Path>,
+}
+
 /// Run one job, honouring the parallelism budget.
 async fn run_one(
     job: SeatJob,
     sem: Arc<Semaphore>,
-    run: &str,
-    node: &str,
-    prompts: &Prompts,
-    cache: Option<&Path>,
+    ctx: &WaveCtx<'_>,
+    state: &mut RunState,
+    attempt: usize,
 ) -> (SeatState, AgentOutcome) {
-    let (_, seat, out) = wave(vec![job], sem, run, node, prompts, cache)
+    let (_, seat, out) = wave(vec![job], sem, ctx, state, attempt)
         .await
         .pop()
         .expect("one job in, one result out");
@@ -2517,18 +2568,32 @@ async fn run_one(
 
 /// Run every job concurrently, capped by the semaphore, preserving order.
 ///
-/// `run` and `node` are attribution, not behaviour: they reach the agent as
-/// `MAGI_RUN` / `MAGI_NODE` so a task the agent files with `magi task add` can
-/// name the seat that asked for it. They are cloned per job because each job is
-/// spawned onto its own task and cannot borrow from this frame.
+/// Every seat in the batch is recorded into [`RunState::active`] before the
+/// wave starts and cleared as each answer lands, so the run's own record says
+/// who is still being waited on rather than only who finished.
 async fn wave(
     jobs: Vec<SeatJob>,
     sem: Arc<Semaphore>,
-    run: &str,
-    node: &str,
-    prompts: &Prompts,
-    cache: Option<&Path>,
+    ctx: &WaveCtx<'_>,
+    state: &mut RunState,
+    attempt: usize,
 ) -> Vec<(usize, SeatState, AgentOutcome)> {
+    let WaveCtx {
+        run,
+        node,
+        prompts,
+        cache,
+    } = *ctx;
+    for job in &jobs {
+        state.seat_started(node, &job.seat.key, job.timeout, attempt);
+    }
+    if let Err(e) = state.save() {
+        // A failed persist of "who is answering right now" must not abort the
+        // wave: the seats are already being asked, and the alternative is
+        // losing the answers to save a status line nobody may even be
+        // watching.
+        tracing::warn!("could not persist in-progress seats: {e:#}");
+    }
     let mut set = tokio::task::JoinSet::new();
     let overlay = prompts.overlay(node);
     for (i, mut job) in jobs.into_iter().enumerate() {
@@ -2586,15 +2651,39 @@ async fn wave(
     while let Some(joined) = set.join_next().await {
         let (i, seat, out) = match joined {
             Ok(v) => v,
+            // No seat to clear: a panicked task never reported which one it
+            // was. The defensive sweep below this loop is what stops that
+            // seat's `active` entry from surviving forever.
             Err(e) => {
                 tracing::error!("agent task panicked: {e}");
                 continue;
             }
         };
+        state.seat_finished(&seat.key);
+        if let Err(e) = state.save() {
+            tracing::warn!("could not persist a seat's completion: {e:#}");
+        }
         if collected.len() <= i {
             collected.resize_with(i + 1, || None);
         }
         collected[i] = Some((i, seat, out));
+    }
+    // Belt-and-braces for the panic branch above: every seat this exact batch
+    // started shares this `(node, attempt)` pair, and every seat that finished
+    // normally already cleared itself, so anything left tagged with it here
+    // can only be a panicked task's leftover. Cleared unconditionally rather
+    // than left to read as still answering forever.
+    if state
+        .active
+        .values()
+        .any(|a| a.node == node && a.attempt == attempt)
+    {
+        state
+            .active
+            .retain(|_, a| !(a.node == node && a.attempt == attempt));
+        if let Err(e) = state.save() {
+            tracing::warn!("could not persist the end of a wave: {e:#}");
+        }
     }
     collected.into_iter().flatten().collect()
 }
@@ -2638,11 +2727,9 @@ async fn ask_json_wave<T>(
     jobs: Vec<SeatJob>,
     sem: Arc<Semaphore>,
     retries: usize,
-    run: &str,
-    node: &str,
-    prompts: &Prompts,
-    cache: Option<&Path>,
+    ctx: &WaveCtx<'_>,
     losses: &mut Vec<QuotaLoss>,
+    state: &mut RunState,
     validate: &(dyn Fn(&T) -> Result<()> + Send + Sync),
 ) -> Vec<(SeatState, Result<(T, AgentOutput)>)>
 where
@@ -2696,7 +2783,17 @@ where
             });
         }
 
-        let results = wave(batch, Arc::clone(&sem), run, node, prompts, cache).await;
+        if attempt > 0 {
+            let seats_out: Vec<&str> = pending
+                .iter()
+                .map(|&i| originals[i].seat.key.as_str())
+                .collect();
+            state.event(
+                ctx.node,
+                format!("retry {attempt}: re-asking {}", seats_out.join(", ")),
+            );
+        }
+        let results = wave(batch, Arc::clone(&sem), ctx, state, attempt).await;
         let mut still = Vec::new();
         for (&i, (_wi, seat, out)) in pending.iter().zip(results) {
             seats[i] = seat;
@@ -2714,7 +2811,7 @@ where
                 AgentOutcome::Quota(o) => {
                     losses.push(QuotaLoss {
                         seat: originals[i].seat.key.clone(),
-                        node: node.to_owned(),
+                        node: ctx.node.to_owned(),
                         at: Timestamp::now(),
                         reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
                     });

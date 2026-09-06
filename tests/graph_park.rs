@@ -76,6 +76,50 @@ async fn a_parked_run_keeps_its_work_and_resumes_into_the_next_node() {
 }
 
 #[tokio::test]
+async fn a_resumed_run_drops_a_stale_active_marker_left_by_a_killed_process() {
+    let _home = home_lock().await;
+    let fx = fixture(Judges::Unanimous, false);
+    let pause = Pause::new();
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.on_pause(pause.clone());
+    pause.park();
+    runner.execute().await.expect("execute parks cleanly");
+
+    // A daemon `SIGKILL`ed mid-wave never gets to clear the seat it was
+    // asking, so its last batch is exactly what a reload would see: an entry
+    // in `active` with nobody left to answer it.
+    runner.state.seat_started(
+        "implement",
+        "impl-B",
+        std::time::Duration::from_secs(3600),
+        0,
+    );
+    runner.state.save().expect("save");
+    let id = runner.state.id.clone();
+    drop(runner);
+
+    let resumed = Runner::resume(&id).expect("resume");
+    assert!(
+        resumed.state.active.contains_key("impl-B"),
+        "loading a run reflects exactly what was on disk, stale or not"
+    );
+
+    // `execute` must not read that leftover as "impl-B is still running" and
+    // must not let it survive into the run it carries on: the very next thing
+    // it does is drop it, before dispatching any wave of its own.
+    let mut resumed = resumed;
+    resumed.execute().await.expect("execute to a verdict");
+    assert!(
+        !resumed.state.active.contains_key("impl-B"),
+        "a resumed run must not go on claiming a leftover seat is still \
+         answering: {:?}",
+        resumed.state.active
+    );
+}
+
+#[tokio::test]
 async fn a_park_asked_for_mid_walk_stops_at_the_boundary_after_it() {
     let _home = home_lock().await;
     let fx = fixture(Judges::Unanimous, false);

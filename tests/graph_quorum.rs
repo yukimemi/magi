@@ -216,6 +216,25 @@ async fn a_plain_failure_collapse_stalls_and_recovers_on_resume() {
         state.quota.is_empty(),
         "a plain failure is not a quota loss"
     );
+    // The retry itself is a fact in the timeline, not only an artifact on
+    // disk: an operator staring at a stalled run needs to see that a nudge
+    // was sent without going digging in `artifacts/`.
+    assert!(
+        state
+            .events
+            .iter()
+            .any(|e| e.node == "judge" && e.message.contains("retry 1")),
+        "no retry event recorded: {:?}",
+        state.events
+    );
+    // Every seat this run ever marked as answering was cleared once it did,
+    // whatever the outcome — a stalled run must not still claim a seat is
+    // running.
+    assert!(
+        state.active.is_empty(),
+        "a finished attempt leaves nothing marked as still answering: {:?}",
+        state.active
+    );
     let failed_j = |seat: &str| {
         state
             .judgements
