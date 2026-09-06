@@ -143,6 +143,31 @@ pub async fn worktree_remove(repo: &Path, path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Unregister a linked worktree whose directory is about to be deleted by
+/// hand, so the path can be `worktree add`-ed again.
+///
+/// A linked worktree's `.git` is a file whose `gitdir:` line names the
+/// bookkeeping entry inside its repository's admin directory; pruning from
+/// there removes the registration without touching the directory. No-op when
+/// `dir` is not a registered worktree (`.git` missing or not a `gitdir:`
+/// link): nothing was registered, nothing survives removal.
+pub async fn remove_worktree_from_linked(dir: &Path) {
+    let Ok(link) = std::fs::read_to_string(dir.join(".git")) else {
+        return;
+    };
+    let Some(admin) = link.strip_prefix("gitdir:").map(str::trim) else {
+        return;
+    };
+    // `<repo>/.git/worktrees/<name>`, so the repository's git dir is two
+    // levels up from here.
+    let admin = Path::new(admin);
+    let Some(common) = admin.parent().and_then(Path::parent) else {
+        return;
+    };
+    let common_s = common.to_string_lossy();
+    let _ = git_raw(dir, &["--git-dir", &common_s, "worktree", "prune"]).await;
+}
+
 /// Delete a branch, ignoring "not found".
 pub async fn branch_delete(repo: &Path, branch: &str) -> Result<bool> {
     Ok(git_raw(repo, &["branch", "-D", branch]).await?.ok())

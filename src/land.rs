@@ -51,6 +51,7 @@ use crate::ask;
 use crate::config::{AgentSpec, MergeMode};
 use crate::git;
 use crate::proc::Quiet as _;
+use crate::prompt;
 use crate::run::{MergeOutcome, RunState, RunStatus, tail};
 
 /// How often the pull request is re-read while its checks are still running.
@@ -1568,6 +1569,11 @@ async fn fix_round(
     let prompt = fix_prompt(state, pr, round, budget, reason, logs);
     let mut seat = seat_of(state, &seat_key, &spec.id);
     let artifacts = agent::artifacts_dir(&state.dir());
+    let prompt = if state.config.cache_dir().is_some() {
+        format!("{prompt}\n\n{}", prompt::build_cache_note())
+    } else {
+        prompt
+    };
     let out = agent::invoke(
         &spec,
         &mut seat,
@@ -1581,6 +1587,7 @@ async fn fix_round(
             stem: &format!("land-{round}"),
             run: &state.id,
             node: "land",
+            cache_dir: state.config.cache_dir().as_deref(),
         },
     )
     .await;
