@@ -1753,6 +1753,27 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
         )));
     }
 
+    // The same kill switch the background check honours (`disabled_by_env`),
+    // checked before anything else for the same reason it is read before the
+    // config there: an operator who set `MAGI_NO_AUTOUPDATE` means "never
+    // contact GitHub from this process", and a button press must not
+    // override that any more than a broken `magi.toml` may.
+    if crate::updater::disabled_by_env() {
+        return Ok((
+            StatusCode::OK,
+            Json(UpgradeView {
+                from: env!("CARGO_PKG_VERSION").to_owned(),
+                to: None,
+                parked: None,
+                detail: format!(
+                    "Automatic updates are disabled by {}. Nothing was parked \
+                     and nothing restarted.",
+                    crate::updater::NO_AUTOUPDATE_ENV
+                ),
+            }),
+        ));
+    }
+
     // Asked before anything is disturbed. Restarting when there is nothing
     // to install is not a harmless no-op: it parks the run in flight and
     // drops every connection to pay for an upgrade that did not happen. A
@@ -6489,6 +6510,40 @@ mod tests {
         let err = res.json()["error"].as_str().unwrap().to_owned();
         assert!(err.contains("4321"), "the refusal names the owner: {err}");
         assert!(err.contains("old one against the same queue"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_is_refused_by_the_no_autoupdate_kill_switch() {
+        // The same env var the background check honours (`disabled_by_env`)
+        // must also stop a button press before it ever calls
+        // `Checker::newer_release` - an operator who set `MAGI_NO_AUTOUPDATE`
+        // means "never contact GitHub from this process", and a tap on the
+        // upgrade button must not override that any more than a broken
+        // `magi.toml` may. Left unset, this fixture's default config would
+        // otherwise reach a real, unauthenticated GitHub call.
+        //
+        // SAFETY: single-threaded as far as this variable goes - nothing else
+        // in this binary reads `MAGI_NO_AUTOUPDATE` concurrently, the same
+        // reasoning `updater::tests::env_kill_switch_semantics` relies on.
+        unsafe {
+            std::env::set_var(crate::updater::NO_AUTOUPDATE_ENV, "1");
+        }
+        let fx = Fixture::start().await;
+        let res = fx.post("/api/upgrade", None).await;
+        unsafe {
+            std::env::remove_var(crate::updater::NO_AUTOUPDATE_ENV);
+        }
+        assert_eq!(res.status, 200, "not 202: nothing was set in motion");
+        let body = res.json();
+        assert!(body["to"].is_null(), "there was no release to move to");
+        assert!(body["parked"].is_null(), "and nothing was parked");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("disabled by MAGI_NO_AUTOUPDATE"),
+            "{body:?}"
+        );
     }
 
     #[tokio::test]
