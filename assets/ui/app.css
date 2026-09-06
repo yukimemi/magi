@@ -305,6 +305,16 @@ a { color: inherit; text-decoration: none; }
    never the same colour as the dot: it is a sentence to read, not a hint to
    skip. */
 .daemon-why { font-size: var(--t1); }
+/* The build answering this page. Monospace because it is an exact string an
+   operator compares against a release tag, and quiet because it is a fact to
+   check rather than something to read on every glance. */
+.daemon-version {
+  align-self: start;
+  font-family: var(--mono);
+  font-size: var(--t1);
+  color: var(--ink-3);
+  white-space: nowrap;
+}
 .daemon-btn {
   grid-column: 1 / -1;
   width: 100%;
