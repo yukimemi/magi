@@ -351,6 +351,17 @@ a { color: inherit; text-decoration: none; }
 .daemon[data-state="failed"] .daemon-dot { background: var(--on-rust); box-shadow: 0 0 0 2px var(--tint-rust), 0 0 0 3px var(--on-rust); }
 .daemon[data-state="failed"] .daemon-text b { color: var(--on-rust); }
 .daemon[data-state="failed"] .daemon-btn { background: var(--surface); border-color: var(--on-rust); color: var(--ink); }
+/* This deck's own upgrade, in flight. The same blue as "working": it is work
+   in progress, not a fault, and a fault colour here would make an ordinary
+   restart look like an incident. */
+.daemon[data-state="upgrading"] { background: var(--tint-blue); color: var(--on-blue); border-bottom-color: var(--tint-blue); }
+.daemon[data-state="upgrading"] .daemon-dot { background: var(--on-blue); animation: pulse 1.8s var(--ease) infinite; }
+.daemon[data-state="upgrading"] .daemon-text b { color: var(--on-blue); }
+/* A past upgrade that did not complete, layered on the dot rather than on
+   `data-state`: the loop keeps whatever state it actually has regardless of
+   whether its last upgrade succeeded, and a ring rather than a takeover is
+   what lets the note sit beside start/stop/park instead of hiding them. */
+.daemon[data-upgrade-failed="yes"] .daemon-dot { box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--on-rust); }
 /* Someone else's loop. The dashed ring is the same vocabulary the cards use
    for "not this page's to settle", and there is no button at all rather than
    one that would answer 409. */

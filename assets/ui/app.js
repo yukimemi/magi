@@ -80,6 +80,21 @@ const STOP_ASK_MS = 20000;
    announced. */
 const QUIET_HOLD_MS = 4000;
 
+/* Stages `health.upgrade.stage` can be while something is actually moving -
+   everything between "the binary is being replaced" and "the address has
+   been handed to the successor". Not `done` or `failed`: those are the two
+   ways an upgrade stops moving. */
+const UPGRADE_BUSY_STAGES = new Set(["downloading", "replaced", "parking", "restarting"]);
+/* The ceiling on how long this page keeps quietly waiting for an upgrade to
+   finish - by reconnecting on its own, or by rendering the busy stages above
+   - before it says a human needs to look. A park waits for the run in flight
+   to reach its next node boundary, which can take as long as
+   `timeout_implement` (an hour, by default) for a run mid-implement, and that
+   whole wait is meant to look like patience, not failure. The margin past an
+   hour covers the download-and-replace step ahead of it and normal clock
+   skew between this page and the deck. */
+const UPGRADE_WAIT_LIMIT_MS = 70 * 60 * 1000;
+
 /* ---- status vocabulary ------------------------------------------------- *
  * Every status carries a glyph as well as a colour. `stalled` additionally
  * gets a hatched, double-bordered chip in CSS: a panel that collapsed on
@@ -476,6 +491,10 @@ const state = {
   rev: { queue: null, runs: null, questions: null, chats: null, talks: null, loop: null },
   streamOpen: false,
   wrap: false,
+  /* The upgrade stage last rendered, so a transition into "done" can be told
+     apart from just being on it already - the loop strip re-renders on every
+     health poll, and only a transition is worth announcing. */
+  lastUpgradeStage: null,
   /* The draft panel's own view toggle: formatted by default, the exact bytes
      that would be filed one tap away. Global rather than per-chat - there is
      only ever one draft panel on screen at a time. */
@@ -593,15 +612,58 @@ function startCost(loop) {
   return `It claims the highest-priority task and runs an implementation competition, which spends agent calls.${mode}`;
 }
 
+/* Has `upgrade` been busy longer than this page is willing to wait quietly?
+   See `UPGRADE_WAIT_LIMIT_MS` for why that ceiling is where it is. */
+function upgradeOverdue(upgrade) {
+  const startedAt = Date.parse(upgrade.started_at);
+  return Number.isFinite(startedAt) && Date.now() - startedAt > UPGRADE_WAIT_LIMIT_MS;
+}
+
+/* The headline for a busy upgrade stage. Kept short: the sentence that
+   actually says what is happening is `upgrade.waiting_on` or
+   `upgradeStageDetail`, next to it. */
+function upgradeStageLabel(stage) {
+  switch (stage) {
+    case "downloading": return "Replacing the binary.";
+    case "replaced": return "Binary replaced.";
+    case "parking": return "Parking before it restarts.";
+    case "restarting": return "Restarting.";
+    default: return "Upgrading.";
+  }
+}
+
+/* A generic sentence for a busy stage, used when the server has nothing more
+   specific to say - `upgrade.waiting_on` is preferred when it is set, which
+   is only while `parking` names a run it is actually waiting on. */
+function upgradeStageDetail(stage) {
+  switch (stage) {
+    case "downloading": return "Fetching and installing the new binary. This takes a few seconds.";
+    case "replaced": return "About to hand the address to the successor.";
+    case "parking": return "Nothing was in flight; handing the address to the successor next.";
+    case "restarting": return "The address is released and the successor is starting. This page reconnects on its own.";
+    default: return "";
+  }
+}
+
 function renderLoop() {
   const box = $("daemon");
   const text = box.querySelector(".daemon-text");
   const why = $("loop-why");
   const button = $("loop-toggle");
+  /* A past upgrade failure, folded into whatever note the loop's own state
+     below already shows, rather than replacing it. `Stage::Failed` is
+     terminal on the server and nothing clears it automatically, so taking
+     the whole strip over for it - as the busy stages do, which is fine
+     because those are transient - would leave start/stop/park unreachable
+     from the phone until a fresh upgrade attempt happened to overwrite the
+     record. Declared here, before `quiet`/`control` close over it, and
+     assigned once the upgrade stage is known below. */
+  let upgradeFailNote = "";
 
   const quiet = (note) => {
-    setText(why, note || "");
-    show(why, Boolean(note));
+    const full = [note, upgradeFailNote].filter(Boolean).join(" ");
+    setText(why, full);
+    show(why, Boolean(full));
     show(button, false);
     button.onclick = null;
   };
@@ -627,7 +689,7 @@ function renderLoop() {
 
 
   const control = (kind, label, note) => {
-    setText(why, note);
+    setText(why, [note, upgradeFailNote].filter(Boolean).join(" "));
     show(why, true);
     setAttr(button, "data-kind", kind);
     setText(button, label);
@@ -652,8 +714,57 @@ function renderLoop() {
     setAttr(box, "data-state", null);
     setAttr(box, "data-owned", null);
     setText(text, "Connecting\u2026");
+    setText(versionChip, "");
+    show(versionChip, false);
     quiet(null);
     return;
+  }
+
+  /* An upgrade this deck set in motion, ahead of every other loop state:
+     while the binary is being replaced or the deck is waiting to hand the
+     address over, that is the one fact on screen worth reporting, and the
+     states below either do not apply yet (the successor has not started, so
+     `loop`/`daemon` here are still this process's own) or say nothing about
+     why the deck went quiet. */
+  /* Named `upgradeInfo` rather than `upgrade`: this scope also has to say
+     `upgradeBtn.onclick = upgrade` further down, naming the function that
+     posts `/api/upgrade` - a `const upgrade` here would shadow it for the
+     rest of this function and silently turn that click handler into data. */
+  const upgradeInfo = state.health.upgrade || null;
+  const upgradeStage = upgradeInfo ? upgradeInfo.stage : null;
+
+  if (upgradeStage && UPGRADE_BUSY_STAGES.has(upgradeStage)) {
+    const overdue = upgradeOverdue(upgradeInfo);
+    setAttr(box, "data-state", overdue ? "failed" : "upgrading");
+    setAttr(box, "data-owned", null);
+    clear(text);
+    text.append(el("b", {
+      text: overdue ? "The upgrade is taking longer than expected." : upgradeStageLabel(upgradeStage),
+    }));
+    quiet(overdue
+      ? `Asked for ${upgradeInfo.to || "an update"} more than an hour ago and has not come back. Check on it by hand.`
+      : (upgradeInfo.waiting_on || upgradeStageDetail(upgradeStage)));
+    state.lastUpgradeStage = upgradeStage;
+    return;
+  }
+
+  /* The transition into "done" or "failed" is what is worth announcing -
+     being on either already (a fresh page load after the fact) is not news.
+     `failed` does not take the strip over the way the busy stages above do:
+     it is terminal on the server and nothing clears it on its own, so a
+     takeover here would have permanently hidden start/stop/park behind an
+     upgrade notice the operator has no way to dismiss. `upgradeFailNote`
+     carries it into the loop's own note instead, below. */
+  if (upgradeStage === "done" && UPGRADE_BUSY_STAGES.has(state.lastUpgradeStage)) {
+    announce(`Updated to ${upgradeInfo.to || "the new build"} \u2014 back and running.`);
+  }
+  if (upgradeStage === "failed" && state.lastUpgradeStage !== "failed") {
+    announce(`The upgrade to ${upgradeInfo.to || "a new release"} did not complete.${upgradeInfo.detail ? ` ${upgradeInfo.detail}` : ""} The loop itself is unaffected.`);
+  }
+  state.lastUpgradeStage = upgradeStage;
+  setAttr(box, "data-upgrade-failed", upgradeStage === "failed" ? "yes" : null);
+  if (upgradeStage === "failed") {
+    upgradeFailNote = `The last upgrade to ${upgradeInfo.to || "a new release"} did not complete${upgradeInfo.detail ? ` (${upgradeInfo.detail})` : ""} \u2014 check on it by hand.`;
   }
 
   const loop = state.health.loop || state.loop || {};
@@ -677,14 +788,20 @@ function renderLoop() {
   const foreign = Boolean(daemon.running) && loop.owned === false && !loop.running;
   setAttr(box, "data-owned", foreign ? "no" : null);
 
-  /* Offered whenever this process owns the deck, running or not: the binary
-     can be replaced either way, and an operator with fixes waiting should not
-     have to start the loop to install them. Hidden when the loop belongs to
-     somebody else, because replacing this binary would leave that process
-     running an old one against the same queue. */
-  show(upgradeBtn, !foreign);
-  if (!foreign && upgradeBtn.dataset.armed !== "yes") {
-    setText(upgradeBtn, "Update & restart");
+  /* Offered whenever this process owns the deck, running or not, *and* a
+     newer release is actually known to exist: the binary can be replaced
+     either way, and an operator with fixes waiting should not have to start
+     the loop to install them. Hidden when the loop belongs to somebody else,
+     because replacing this binary would leave that process running an old
+     one against the same queue - and hidden with nothing to install, because
+     restarting for an upgrade that would not happen used to park the run in
+     flight and drop every connection for nothing. The version this deck is
+     actually running is shown unconditionally, next to the strip, whether or
+     not there is anything newer. */
+  const update = state.health.update || { available: false, to: null };
+  show(upgradeBtn, !foreign && update.available);
+  if (!foreign && update.available && upgradeBtn.dataset.armed !== "yes") {
+    setText(upgradeBtn, update.to ? `Update to ${update.to}` : "Update & restart");
     upgradeBtn.disabled = false;
     upgradeBtn.onclick = upgrade;
   }
@@ -4027,6 +4144,31 @@ async function loadQuestions() {
   }
 }
 
+/* A restart hands the address from one process to the next, and the gap is
+   meant to be sub-second (see `bind_waiting` server-side) - a fetch landing
+   in it is not a fault. Reported as an error it used to read
+   `Cannot reach magi: Failed to fetch` with a Retry button that fixed
+   nothing: this page already retries on its own by polling health, and
+   reconnects the moment the successor is listening. Returns whether it
+   handled the failure, so `loadHealth` knows not to also call `fail`.
+   `UPGRADE_WAIT_LIMIT_MS` is the one exception - past it, patience stops
+   being the right read and a human is told instead. */
+function reportUnreachableDuringUpgrade(error) {
+  const upgradeInfo = state.health && state.health.upgrade;
+  if (!upgradeInfo || !UPGRADE_BUSY_STAGES.has(upgradeInfo.stage)) return false;
+  if (upgradeOverdue(upgradeInfo)) {
+    fail(`Cannot reach magi: ${error.message}. It was replacing itself with ${upgradeInfo.to || "a new release"} and has not come back in over an hour — check on it by hand.`);
+    return true;
+  }
+  setAttr($("daemon"), "data-state", "upgrading");
+  setAttr($("daemon"), "data-owned", null);
+  const why = $("loop-why");
+  setText(why, "The deck is restarting on the new build. This page reconnects on its own.");
+  show(why, true);
+  show($("loop-toggle"), false);
+  return true;
+}
+
 async function loadHealth({ applyRevisions = false } = {}) {
   try {
     state.health = await getJson(API.health);
@@ -4041,7 +4183,7 @@ async function loadHealth({ applyRevisions = false } = {}) {
     if (applyRevisions) await applyRevisions_(state.health);
     ok();
   } catch (error) {
-    fail(`Cannot reach magi: ${error.message}`);
+    if (!reportUnreachableDuringUpgrade(error)) fail(`Cannot reach magi: ${error.message}`);
   }
 }
 
