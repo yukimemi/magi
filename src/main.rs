@@ -1521,16 +1521,18 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
     }
     println!(
         "\nverify.e2e   {}\nverify.gate  {}\nmerge        {:?}",
-        if cfg.verify.e2e.is_empty() {
-            "(none — the review loop has no real-machine leg)".to_owned()
-        } else {
-            cfg.verify.e2e.join(" && ")
-        },
-        if cfg.verify.gate.is_empty() {
-            "(none — nothing blocks a merge)".to_owned()
-        } else {
-            cfg.verify.gate.join(" && ")
-        },
+        Config::describe_composed(
+            &from,
+            &cfg.verify.e2e,
+            "verify.e2e",
+            "(none — the review loop has no real-machine leg)"
+        ),
+        Config::describe_composed(
+            &from,
+            &cfg.verify.gate,
+            "verify.gate",
+            "(none — nothing blocks a merge)"
+        ),
         cfg.merge.mode
     );
     println!("runs         {}", magi::run::runs_root().display());
