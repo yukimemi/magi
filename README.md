@@ -75,6 +75,7 @@ already said. magi therefore keeps one CLI conversation per seat:
 | `claude` | `--session-id <uuid>` (magi mints it) | `--resume <uuid>` | addressable before the first turn |
 | `opencode` | `run --format json` reports `sessionID` | `run -s <id>` | id captured from the event stream |
 | `agy` (Antigravity) | `--output-format json` reports `conversation_id` | `--conversation <id>` | `--print-timeout` is raised to the node budget |
+| `codex` | `exec --json` reports `thread.started.thread_id` | `exec … resume <id>` | `resume` is a subcommand: every option precedes it. The prompt goes on stdin |
 
 When a seat has no live conversation — sessions disabled, or a first turn that
 never reported an id — magi re-sends the full context instead of letting the
@@ -91,7 +92,8 @@ dead code. `kind = "command"` covers anything else.
 cargo install magi-cli
 ```
 
-magi drives *subscription CLIs*, not API keys: `claude`, `opencode`, `agy`, or
+magi drives *subscription CLIs*, not API keys: `claude`, `opencode`, `agy`,
+`codex`, or
 any command you point it at. It spends your existing plan and nothing else.
 
 ## Use
@@ -573,7 +575,7 @@ The full surface:
 ```toml
 [[agents]]
 id = "opus"
-kind = "claude"        # claude | opencode | antigravity | command
+kind = "claude"        # claude | opencode | antigravity | codex | command
 model = "opus"
 
 [[agents]]

@@ -611,6 +611,23 @@ fn interactive_argv(
         // cannot work around by editing a config file. They read the briefing
         // because magi printed its path before handing over the terminal.
         AgentKind::Opencode => argv.push("opencode".to_owned()),
+        // Codex's interactive form takes an opening prompt positionally, and
+        // it needs no widening: `codex` reads any absolute path the sandbox
+        // allows, and the interview is read-only until the operator agrees a
+        // task file should be written.
+        AgentKind::Codex => {
+            argv.push("codex".to_owned());
+            if let Some(m) = &spec.model {
+                argv.push("-m".to_owned());
+                argv.push(m.clone());
+            }
+            argv.push(format!(
+                "Read the file at {} and follow it. Interview me about the \
+                 change first; write the task file only once I say the plan is \
+                 right.",
+                brief_path.display()
+            ));
+        }
         AgentKind::Antigravity => {
             argv.push("agy".to_owned());
             argv.push("--add-dir".to_owned());
