@@ -858,6 +858,39 @@ fetched.
   `say` and `resume` both take minutes; a held connection on a phone is a coin
   flip, and the change stream is how every other moving part reports itself.
 
+### The shared build cache is only shared if both sides name the same path
+
+`magi.toml` renders `CARGO_TARGET_DIR` from `{{ vars.cache }}`, whose default
+is `/tmp`. The verification commands run under a POSIX shell, which resolves
+`/tmp` to its own temp directory; magi measures the string literally. On
+Windows those are two different places, so the janitor pruned and the health
+view sized a path that never existed while 17 GB of build output sat in the
+shell's `/tmp`. `magi cache show` now says so instead of printing `0 bytes`.
+
+**Set `MAGI_CACHE` to a real absolute path on any machine whose shell rewrites
+`/tmp`** (this one: `C:/Users/yukimemi/AppData/Local/Temp`, set as a user
+environment variable). Forward slashes, so the same string works in the shell
+command and in `std::fs`.
+
+### The disk is a resource the graph can exhaust
+
+A run costs a candidate worktree plus a reviewer worktree per reviewer, each
+with its own multi-GB `target/`. Two failures came out of that, both silent:
+
+- **A save that runs out of disk leaves `<home>/runs/<id>/run.json.tmp` and
+  nothing else.** `run::list_ids` therefore keys on the directory's *name*
+  ([`run::is_run_id`]), never on a readable `run.json`: filtering on the state
+  file made run `88c0` invisible to `magi list`, to `runs_unreadable`, and to
+  every phone route, so nothing could report it and nothing could clear it.
+- **An agent that cannot write files reports it in prose and nowhere else.**
+  Run `4043`'s implementer said the disk had 8.9 MB free; the run was recorded
+  as "blocked with one finding open". `daemon::disk_gate` holds a task before
+  minting a run instead, which spends no attempt and leaves it in the list.
+
+Housekeeping is best-effort by construction: one run's fold failure is a
+`tracing::warn` and the pass continues (`clean::fold_due`). A `?` there stopped
+automatic folding permanently at the first run git refused to let go of.
+
 ### Never take a port you did not check
 
 A UI verification fixture was started on **8791** in a temp directory, and that

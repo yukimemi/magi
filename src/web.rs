@@ -256,6 +256,13 @@ pub struct Ui {
     runs: PathBuf,
     home: PathBuf,
     repo: PathBuf,
+    /// Where the runs' worktrees live, for the health disk figures.
+    ///
+    /// Spelled independently of [`crate::run::default_worktree_root`] so the
+    /// test servers can point it at their own temp directory: the health route
+    /// sizes it, and sizing the operator's real `~/wt/magi` from a test would
+    /// be measuring the machine instead of the server.
+    worktrees_root: PathBuf,
     /// Chats with an agent turn in flight right now.
     ///
     /// In-process and therefore not durable, which is correct: it guards
@@ -317,6 +324,10 @@ impl Ui {
             runs,
             home,
             repo,
+            // The default location, overridden by `with_worktrees_root` - a
+            // builder step rather than a ninth parameter, for the reason
+            // `with_merge` gives.
+            worktrees_root: run::default_worktree_root(),
             turns: Arc::default(),
             talk_turns: Arc::default(),
             resuming: Arc::default(),
@@ -350,6 +361,16 @@ impl Ui {
     #[must_use]
     pub fn with_merge(mut self, merge: Option<String>) -> Self {
         self.merge = merge;
+        self
+    }
+
+    /// Where the runs' worktrees live, when it is not the default.
+    ///
+    /// The health view sizes this directory, so a test that leaves it at the
+    /// default would be measuring the operator's own machine.
+    #[must_use]
+    pub fn with_worktrees_root(mut self, root: PathBuf) -> Self {
+        self.worktrees_root = root;
         self
     }
 
@@ -1222,6 +1243,14 @@ struct HealthView {
     /// terminal deck learned the same lesson: a run that fails to parse must
     /// not disappear from the count.
     runs_unreadable: usize,
+    /// The disk, and what the runs and their worktrees occupy on it.
+    ///
+    /// This is the incident the janitor exists for: magi alone put 30 GB into
+    /// one shared cache and 6.7-11 GB into each run's worktrees, and a phone
+    /// is exactly where the operator learns "the disk is the constraint" -
+    /// the diagnosis that a run is being held for want of space has to be
+    /// checkable on the same screen.
+    disk: DiskView,
     /// Questions nobody has answered yet.
     ///
     /// The one number here that means "nothing will happen until a human
@@ -1243,6 +1272,40 @@ struct HealthView {
     /// somewhere, and this says whether it is one this UI can stop.
     #[serde(rename = "loop")]
     looping: LoopView,
+}
+
+/// The disk figures `/api/health` carries. Every number is produced by
+/// [`crate::disk`], the same code that decides a run may not start, so the
+/// health screen and the gate cannot disagree about what the machine looks
+/// like.
+#[derive(Debug, Serialize)]
+struct DiskView {
+    /// Free bytes on the volume holding the runs, when measurable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    free_bytes: Option<u64>,
+    /// Everything the runs directory occupies, unreadable runs included.
+    runs_bytes: u64,
+    /// Everything the runs' worktrees occupy.
+    worktrees_bytes: u64,
+    /// The shared build cache's size, when the config names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_bytes: Option<u64>,
+}
+
+impl DiskView {
+    /// Measure the three directories and re-read the config's cache.
+    fn of(ui: &Ui) -> Self {
+        let cache_bytes = Config::discover(&ui.repo, None)
+            .ok()
+            .and_then(|(cfg, _)| cfg.cache_dir())
+            .map(|dir| crate::disk::dir_size(&dir));
+        Self {
+            free_bytes: crate::disk::free_bytes(&ui.runs).ok(),
+            runs_bytes: crate::disk::dir_size(&ui.runs),
+            worktrees_bytes: crate::disk::dir_size(&ui.worktrees_root),
+            cache_bytes,
+        }
+    }
 }
 
 /// The daemon's state as the UI presents it.
@@ -1308,6 +1371,7 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             chats_open: ui.chats.count_open(),
             daemon: DaemonView::of(reading.clone()),
             looping: ui.loop_view(reading),
+            disk: DiskView::of(&ui),
         }))
     })
     .await
@@ -1827,27 +1891,60 @@ async fn run_detail(
 ///
 /// Remove a finished, folded run directory along with its artifacts.
 /// Running runs and runs with unfolded candidate worktrees/branches cannot be
-/// deleted. This never touches git worktrees or branches.
+/// deleted. This never touches git worktrees or branches - except for a run
+/// whose state this build cannot read at all, where there is no candidate
+/// list to check and the wholesale removal `magi fold` already uses for that
+/// case is the only meaningful "delete".
 async fn run_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    let (id, unreadable) = {
+        let ui = Arc::clone(&ui);
+        blocking(move || {
+            let id = resolve_run(&ui.runs, &id)?;
+            match read_run(&ui.runs, &id) {
+                Ok(state) => {
+                    let in_flight =
+                        crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
+                    state
+                        .ensure_can_delete(in_flight)
+                        .map_err(|e| ApiError::conflict(format!("{e:#}")))?;
+                    let dir = ui.runs.join(&id);
+                    std::fs::remove_dir_all(&dir)
+                        .with_context(|| format!("remove run directory {}", dir.display()))?;
+                    Ok((id, false))
+                }
+                Err(_) => {
+                    // Unreadable: there is no candidate list to guard on, so
+                    // a live daemon's claim is the only thing left to check -
+                    // the same rule `run_fold` applies for the same reason.
+                    if crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now()) {
+                        return Err(ApiError::conflict(format!(
+                            "run {id} is being worked on by a live daemon right now"
+                        )));
+                    }
+                    Ok((id, true))
+                }
+            }
+        })
+        .await?
+    };
+    if unreadable {
+        crate::clean::fold_unreadable(&ui.runs, &ui.worktrees_root, &id)
+            .await
+            .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    }
+    let ui = Arc::clone(&ui);
+    let done = id.clone();
     blocking(move || {
-        let id = resolve_run(&ui.runs, &id)?;
-        let state = read_run(&ui.runs, &id)?;
-        let in_flight = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
-        state
-            .ensure_can_delete(in_flight)
-            .map_err(|e| ApiError::conflict(format!("{e:#}")))?;
-        let dir = ui.runs.join(&id);
-        std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("remove run directory {}", dir.display()))?;
         // The agent that asked died with the run, so an open question would
         // keep asking the operator for a decision nobody can deliver.
         ui.questions.abandon_for_run(
-            &id,
-            &format!("run {id} was deleted, so nothing is waiting for this answer"),
+            &done,
+            &format!("run {done} was deleted, so nothing is waiting for this answer"),
         )?;
-        Ok(StatusCode::NO_CONTENT)
+        Ok(())
     })
-    .await
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /api/runs/{id}/fold`.
@@ -1868,25 +1965,34 @@ async fn run_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiRes
 /// Refused while a live daemon is working on the run, on the rule that guards
 /// deletion: folding underneath a running agent would pull the tree it is
 /// editing out from under it.
+///
+/// A run whose state this build cannot read at all falls back to
+/// [`crate::clean::fold_unreadable`] - there is no candidate list to fold
+/// selectively, so the whole record's worktree goes wholesale, exactly what
+/// `magi fold` does on the command line for the same run.
 async fn run_fold(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<Json<FoldView>> {
-    let (id, mut state) = {
+    let (id, state) = {
         let ui = Arc::clone(&ui);
         blocking(move || {
             let id = resolve_run(&ui.runs, &id)?;
-            let state = read_run(&ui.runs, &id)?;
             if crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now()) {
                 return Err(ApiError::conflict(format!(
-                    "run {} is being worked on by a live daemon right now",
-                    state.short()
+                    "run {id} is being worked on by a live daemon right now"
                 )));
             }
+            let state = read_run(&ui.runs, &id).ok();
             Ok((id, state))
         })
         .await?
     };
-    let removed = crate::graph::fold_run(&mut state, true)
-        .await
-        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    let removed = match state {
+        Some(mut state) => crate::graph::fold_run(&mut state, true)
+            .await
+            .map_err(|e| ApiError::internal(format!("{e:#}")))?,
+        None => crate::clean::fold_unreadable(&ui.runs, &ui.worktrees_root, &id)
+            .await
+            .map_err(|e| ApiError::internal(format!("{e:#}")))?,
+    };
     Ok(Json(FoldView {
         run: id,
         removed_count: removed.len(),
@@ -3131,6 +3237,8 @@ mod tests {
             let queue = Queue::at(home.join("queue"));
             let runs = home.join("runs");
             std::fs::create_dir_all(&runs).expect("runs dir");
+            let worktrees = home.join("wt").join("magi");
+            std::fs::create_dir_all(&worktrees).expect("worktrees dir");
             let ui = Ui::new(
                 queue,
                 Questions::at(home.join("questions")),
@@ -3140,6 +3248,7 @@ mod tests {
                 home.to_path_buf(),
                 repo,
             )
+            .with_worktrees_root(worktrees)
             .with_launch(launch);
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
@@ -3917,7 +4026,8 @@ mod tests {
             fx.runs(),
             fx.home.path().to_path_buf(),
             PathBuf::from("/repo/magi"),
-        );
+        )
+        .with_worktrees_root(fx.home.path().join("wt"));
 
         // The claim a running `POST /say` holds. Taken directly rather than by
         // starting a turn, because a turn spawns an agent CLI and no test here
@@ -4742,6 +4852,7 @@ mod tests {
             home.path().to_path_buf(),
             PathBuf::from("/repo/magi"),
         )
+        .with_worktrees_root(home.path().join("wt"))
         .with_launch(launch_knocking_on_the_way_out);
         let looping = ui.looping();
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -5501,6 +5612,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn folding_an_unreadable_run_falls_back_to_removing_it_wholesale() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let wt = fx.home.path().join("wt").join("magi").join("dead");
+        let id = "20260901-000000-dead";
+        std::fs::create_dir_all(runs.join(id)).expect("run dir");
+        std::fs::write(runs.join(id).join("run.json"), "not json").expect("garbage state");
+        std::fs::create_dir_all(&wt).expect("worktree dir");
+
+        let res = fx.post(&format!("/api/runs/{id}/fold"), None).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        assert!(
+            res.json()["removed_count"].as_u64().unwrap() > 0,
+            "the worktree this build could not read a state for still went"
+        );
+        assert!(
+            !runs.join(id).exists(),
+            "an unreadable run has no candidate list to fold selectively, so \
+             the whole record goes - same as `magi fold` on the CLI"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_unreadable_run_removes_it_wholesale() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let wt = fx.home.path().join("wt").join("magi").join("gone");
+        let id = "20260901-000000-gone";
+        std::fs::create_dir_all(runs.join(id)).expect("run dir");
+        std::fs::write(runs.join(id).join("run.json"), "not json").expect("garbage state");
+        std::fs::create_dir_all(&wt).expect("worktree dir");
+
+        let res = fx.delete(&format!("/api/runs/{id}")).await;
+        assert_eq!(res.status, 204, "{}", res.body);
+        assert!(!runs.join(id).exists(), "the broken record is gone");
+        assert!(!wt.exists(), "its worktree is gone too");
+    }
+
+    #[tokio::test]
     async fn folding_is_refused_while_a_daemon_is_working_on_the_run() {
         let fx = Fixture::start().await;
         let runs = fx.runs();
@@ -5596,7 +5746,8 @@ mod tests {
             home.path().join("runs"),
             home.path().to_path_buf(),
             PathBuf::from("/repo"),
-        );
+        )
+        .with_worktrees_root(home.path().join("wt"));
         let first = ui.begin_resume("20260901-000000-once").expect("claimed");
         let again = ui.begin_resume("20260901-000000-once");
         assert!(again.is_err(), "a second tap must not start a second graph");

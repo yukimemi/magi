@@ -49,6 +49,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
+use crate::clean;
 use crate::config::{Config, MergeMode};
 use crate::graph::Runner;
 use crate::queue::{Queue, Task};
@@ -561,7 +562,14 @@ pub async fn serve_until(opts: Opts, stop: Stop) -> Result<()> {
         })
     };
 
-    let outcome = drive(&opts, &Queue::open(), &status_path(), &stop).await;
+    let outcome = drive(
+        &opts,
+        &Queue::open(),
+        &status_path(),
+        &crate::run::home(),
+        &stop,
+    )
+    .await;
 
     signal.abort();
     outcome
@@ -575,7 +583,13 @@ pub async fn serve_until(opts: Opts, stop: Stop) -> Result<()> {
 /// other test in the binary — and a loop that resolved the home itself could
 /// only be exercised against the operator's real one, publishing over a live
 /// daemon's status file and claiming tasks out of a live backlog.
-async fn drive(opts: &Opts, queue: &Queue, status_file: &Path, stop: &Stop) -> Result<()> {
+async fn drive(
+    opts: &Opts,
+    queue: &Queue,
+    status_file: &Path,
+    home: &Path,
+    stop: &Stop,
+) -> Result<()> {
     let swept = sweep_stale_claims(queue, STALE_CLAIM);
     if !swept.is_empty() {
         tracing::warn!(
@@ -584,6 +598,7 @@ async fn drive(opts: &Opts, queue: &Queue, status_file: &Path, stop: &Stop) -> R
             swept.join(", ")
         );
     }
+    janitor(&opts.repo, opts, home).await;
 
     // The status file is a *snapshot*, not a stream of events: a reader only
     // ever wants the latest values, and every tick rewrites the whole file
@@ -603,7 +618,7 @@ async fn drive(opts: &Opts, queue: &Queue, status_file: &Path, stop: &Stop) -> R
         opts.max_attempts
     );
 
-    let outcome = poll(opts, queue, &status, stop).await;
+    let outcome = poll(opts, queue, &status, home, stop).await;
 
     beat.abort();
     clear_status_at(status_file);
@@ -633,7 +648,13 @@ async fn heartbeat(status: Arc<Mutex<Status>>, path: PathBuf) {
 
 /// Poll the queue until stopped, factored out so [`drive`] owns only setup and
 /// teardown and cannot skip the teardown on an early return.
-async fn poll(opts: &Opts, queue: &Queue, status: &Arc<Mutex<Status>>, stop: &Stop) -> Result<()> {
+async fn poll(
+    opts: &Opts,
+    queue: &Queue,
+    status: &Arc<Mutex<Status>>,
+    home: &Path,
+    stop: &Stop,
+) -> Result<()> {
     // Only consulted by `once`, where a task that just failed is still
     // `runnable` and would otherwise be picked up again inside the same drain.
     // In the long-running mode a later poll retrying a failed task is the point,
@@ -678,6 +699,10 @@ async fn poll(opts: &Opts, queue: &Queue, status: &Arc<Mutex<Status>>, stop: &St
             stop.busy(true);
             attempt(opts, queue, status, stop, &mut task).await;
             stop.busy(false);
+            // A task just ended: the disk is quiet, so it is the idle point for
+            // the janitor. Folding worktrees and pruning a cache mid-build
+            // would race the very compile the prune exists to keep.
+            janitor(&opts.repo, opts, home).await;
             {
                 let mut guard = lock(status);
                 guard.current = None;
@@ -733,6 +758,21 @@ async fn attempt(
         }
     };
     apply_solo(&mut config, task);
+
+    // The free-space gate, checked *before* anything is minted: a task that
+    // waits out a full disk costs nothing yet, and must not spend an attempt
+    // or start a run the machine cannot finish. Held tasks stay in the list
+    // for the human to see, and `magi task release` re-queues them when space
+    // comes back - the same recovery as any other hold. A volume whose free
+    // space cannot be measured closes the gate too: starting a run blind on a
+    // disk that may be full is how the machine ends up with 6.7 GB free.
+    if let Some(reason) = disk_gate(&repo, &config) {
+        task.last_error = Some(reason.clone());
+        task.hold();
+        record(queue, task);
+        tracing::warn!("holding {} for want of disk space: {reason}", task.short());
+        return;
+    }
 
     // A resumable run of this task is carried on, never re-competed. The
     // candidates are built and paid for, and a fresh competition races a
@@ -834,6 +874,70 @@ fn prepare(repo: &Path, opts: &Opts) -> Result<Config> {
         config.merge.mode = merge_mode(mode)?;
     }
     Ok(config)
+}
+
+/// The disk janitor, with its housekeeping logged rather than fatal.
+///
+/// Called only at the loop's idle points, for the reason the caller documents:
+/// a prune racing a live compile would delete files mid-build. The config is
+/// re-read on every call because the repository that just ran may not be the
+/// daemon's own default, and the cache directory is a repository fact.
+///
+/// `home` is a parameter rather than [`crate::run::home`] read here, for the
+/// same reason [`drive`] takes its queue and status file rather than
+/// resolving them: a test driving the loop must not reach through to the
+/// operator's real home just because the janitor runs on every idle tick.
+async fn janitor(repo: &Path, opts: &Opts, home: &Path) {
+    let cfg = match prepare(repo, opts) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!("housekeep: no config: {e:#}");
+            return;
+        }
+    };
+    let out = clean::housekeep(
+        &cfg,
+        home,
+        &crate::run::default_worktree_root(),
+        Timestamp::now(),
+    )
+    .await;
+    if out.folded > 0 {
+        let unreadable = if out.unreadable > 0 {
+            format!(" ({} unreadable)", out.unreadable)
+        } else {
+            String::new()
+        };
+        tracing::info!("housekeep: folded {} run(s){unreadable}", out.folded);
+    }
+    if out.cache_files > 0 {
+        tracing::info!(
+            "housekeep: pruned {} file(s) ({} bytes) from the shared cache",
+            out.cache_files,
+            out.cache_freed
+        );
+    }
+}
+
+/// The free-space gate: what stands between this task and a new run, if
+/// anything. `Some(reason)` holds the task; `None` lets it start.
+///
+/// A zero [`Config::disk::min_free_bytes`] opens the gate unconditionally -
+/// the operator opted out. A measurement failure is a gate, not a pass: both
+/// sides of "cannot tell" are served by not starting.
+fn disk_gate(repo: &Path, config: &Config) -> Option<String> {
+    let min = config.disk.min_free_bytes;
+    if min == 0 {
+        return None;
+    }
+    match crate::disk::free_bytes(repo) {
+        Ok(free) => crate::disk::gate(free, min),
+        Err(e) => Some(format!(
+            "could not measure free space on {} ({e}); the disk gate refuses \
+             to let a run start blind",
+            repo.display()
+        )),
+    }
 }
 
 /// Which repository a task runs in. A task that names none — the normal case
@@ -1442,17 +1546,19 @@ mod tests {
     /// A loop whose queue lives in a temp tree and whose poll interval is far
     /// longer than the test's patience, so anything that waits out a poll
     /// instead of noticing the stop fails rather than merely being slow.
-    fn idle_loop(dir: &Path) -> (Opts, Queue, PathBuf) {
+    fn idle_loop(dir: &Path) -> (Opts, Queue, PathBuf, PathBuf) {
         let opts = Opts {
             poll: Duration::from_secs(30),
             ..Opts::default()
         };
         // The status file goes in a directory that does not exist yet, so its
         // creation is itself evidence the loop published one.
+        let home = dir.join("home");
         (
             opts,
             Queue::at(dir.join("queue")),
-            dir.join("home").join("daemon.json"),
+            home.join("daemon.json"),
+            home,
         )
     }
 
@@ -1498,14 +1604,14 @@ mod tests {
     #[tokio::test]
     async fn a_loop_already_asked_to_stop_returns_without_waiting_out_a_poll() {
         let dir = tempfile::tempdir().unwrap();
-        let (opts, queue, status_file) = idle_loop(dir.path());
+        let (opts, queue, status_file, home) = idle_loop(dir.path());
         let stop = Stop::new();
         stop.stop();
 
         let began = std::time::Instant::now();
         tokio::time::timeout(
             Duration::from_secs(2),
-            drive(&opts, &queue, &status_file, &stop),
+            drive(&opts, &queue, &status_file, &home, &stop),
         )
         .await
         .expect("a stopped loop must return, not sit out its poll interval")
@@ -1520,7 +1626,7 @@ mod tests {
     #[tokio::test]
     async fn a_stop_while_idle_wakes_the_wait_instead_of_sleeping_it_out() {
         let dir = tempfile::tempdir().unwrap();
-        let (opts, queue, status_file) = idle_loop(dir.path());
+        let (opts, queue, status_file, home) = idle_loop(dir.path());
         let stop = Stop::new();
 
         // Asked for after the loop is already parked on its empty queue, which
@@ -1536,7 +1642,7 @@ mod tests {
         let began = std::time::Instant::now();
         tokio::time::timeout(
             Duration::from_secs(2),
-            drive(&opts, &queue, &status_file, &stop),
+            drive(&opts, &queue, &status_file, &home, &stop),
         )
         .await
         .expect("a stop asked for while idle must wake the wait")
@@ -1552,14 +1658,13 @@ mod tests {
     #[tokio::test]
     async fn a_stopped_loop_leaves_no_status_file_claiming_it_is_running() {
         let dir = tempfile::tempdir().unwrap();
-        let (opts, queue, status_file) = idle_loop(dir.path());
-        let home = status_file.parent().unwrap().to_path_buf();
+        let (opts, queue, status_file, home) = idle_loop(dir.path());
         let stop = Stop::new();
         stop.stop();
 
         tokio::time::timeout(
             Duration::from_secs(2),
-            drive(&opts, &queue, &status_file, &stop),
+            drive(&opts, &queue, &status_file, &home, &stop),
         )
         .await
         .expect("a stopped loop must return")

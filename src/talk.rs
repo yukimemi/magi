@@ -436,6 +436,9 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
 
     let artifacts = store.artifacts_of(&talk.id);
     let stem = format!("turn-{}", talk.seat.turns + 1);
+    // The chat's build cache is the same shared one the graph's seats get, so
+    // a conversation that compiles does not mint another multi-GB target dir.
+    let cache_dir = cfg.cache_dir();
     let inv = Invocation {
         cwd: &talk.repo,
         prompt: &body,
@@ -452,6 +455,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         // attributed to this conversation - see `Source::Agent`.
         run: &talk.id,
         node: "chat",
+        cache_dir: cache_dir.as_deref(),
     };
 
     let outcome = agent::invoke(spec, &mut talk.seat, &inv).await;

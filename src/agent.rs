@@ -112,6 +112,12 @@ pub struct Invocation<'a> {
     /// `MAGI_NODE` for the same reason: "who asked for this" is the first
     /// question about an autonomously created task.
     pub node: &'a str,
+    /// Shared build cache the seat should build into, from the rendered
+    /// `CARGO_TARGET_DIR=` in the verify commands. Exported as
+    /// `CARGO_TARGET_DIR` so the implementer's compile lands inside the same
+    /// directory `verify` reads back from - one cache, one prune, and the
+    /// build the agent just paid for is the build the gate reuses.
+    pub cache_dir: Option<&'a Path>,
 }
 
 /// Evidence that a CLI ran out of its rate limit / quota, distinct from an
@@ -288,6 +294,11 @@ pub async fn invoke(
         // No console window. `magi web` has no console of its own, so Windows
         // would give each agent a fresh one - and draw it. See `crate::proc`.
         .quiet();
+    if let Some(cache) = inv.cache_dir {
+        // Same directory the verify commands build into: one cache to prune,
+        // and the compile the seat pays for is the compile the gate reuses.
+        cmd.env("CARGO_TARGET_DIR", cache);
+    }
 
     let mut child = cmd
         .spawn()
@@ -830,6 +841,7 @@ mod tests {
             stem: "t",
             run: "test-run",
             node: "test",
+            cache_dir: None,
         }
     }
 
@@ -997,6 +1009,7 @@ mod tests {
                 stem: "t",
                 run: "test-run",
                 node: "test",
+                cache_dir: None,
             },
             Path::new("/art/p.md"),
         )
@@ -1217,6 +1230,7 @@ mod tests {
                 stem: "impl-A",
                 run: "test-run",
                 node: "test",
+                cache_dir: None,
             },
         )
         .await
@@ -1226,6 +1240,54 @@ mod tests {
         assert_eq!(seat.turns, 1);
         assert!(art.join("impl-A.prompt.md").is_file());
         assert!(art.join("impl-A.out").is_file());
+    }
+
+    #[tokio::test]
+    async fn the_invocation_cache_dir_reaches_the_seat_as_cargo_target_dir() {
+        // The whole point of threading the cache path through `Invocation`:
+        // the compile the agent pays for lands in the directory `verify` reads
+        // back out of its rendered commands, so one cache has one prune.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("magi-cache");
+        let mut seat = SeatState::new("impl-A", "a", 7);
+        let mut s = spec(AgentKind::Command, None);
+        if cfg!(windows) {
+            s.command = vec![
+                "cmd".to_owned(),
+                "/C".to_owned(),
+                "echo %CARGO_TARGET_DIR%".to_owned(),
+            ];
+        } else {
+            s.command = vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "echo $CARGO_TARGET_DIR".to_owned(),
+            ];
+        }
+        let out = invoke(
+            &s,
+            &mut seat,
+            &Invocation {
+                cwd: dir.path(),
+                prompt: "unused",
+                timeout: Duration::from_secs(30),
+                allow_write: true,
+                sessions: true,
+                artifacts: &dir.path().join("artifacts"),
+                stem: "cache",
+                run: "test-run",
+                node: "test",
+                cache_dir: Some(&cache),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(out.usable(), "{out:?}");
+        assert_eq!(
+            out.text.trim(),
+            cache.to_string_lossy(),
+            "the seat must see CARGO_TARGET_DIR = the shared cache"
+        );
     }
 
     #[tokio::test]
@@ -1250,6 +1312,7 @@ mod tests {
                 stem: "big",
                 run: "test-run",
                 node: "test",
+                cache_dir: None,
             },
         )
         .await
@@ -1277,6 +1340,7 @@ mod tests {
                 stem: "slow",
                 run: "test-run",
                 node: "test",
+                cache_dir: None,
             },
         )
         .await
@@ -1318,6 +1382,7 @@ mod tests {
                 stem: "chatty",
                 run: "test-run",
                 node: "test",
+                cache_dir: None,
             },
         )
         .await
