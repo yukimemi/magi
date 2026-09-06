@@ -150,6 +150,20 @@ pub struct Task {
     /// Why the last attempt did not land.
     #[serde(default)]
     pub last_error: Option<String>,
+    /// What a human hold is waiting on.
+    ///
+    /// `None` covers both the ordinary cases: a hold the loop makes itself
+    /// (out of attempts, or the disk gate closed) explains itself through
+    /// [`Task::last_error`] instead, and a human hold nobody bothered to
+    /// explain is still a valid hold. The queue has no way to express a
+    /// dependency between two tasks, so on the occasions a hold really is
+    /// "wait for that other task first", this is the only place that reason
+    /// survives - see [`Task::hold`] and [`Task::release`].
+    ///
+    /// `#[serde(default)]` so a queue file written before this field existed
+    /// still reads, with no reason recorded rather than a parse error.
+    #[serde(default)]
+    pub hold_reason: Option<String>,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -173,6 +187,7 @@ impl Task {
             attempts: 0,
             runs: Vec::new(),
             last_error: None,
+            hold_reason: None,
             created_at: now,
             updated_at: now,
         }
@@ -192,9 +207,17 @@ impl Task {
     }
 
     /// Record a successful run.
+    ///
+    /// Both `magi task done` and `POST /api/queue/{id}/done` can close a held
+    /// task directly, with no release in between, so this clears
+    /// `hold_reason` the same way [`Task::release`] does. Otherwise a task
+    /// held for "waiting on 3ed9" and then closed as done without ever being
+    /// released would still read as waiting on something in `magi task show`
+    /// and on its card, after it no longer is.
     pub fn succeed(&mut self) {
         self.status = TaskStatus::Done;
         self.last_error = None;
+        self.hold_reason = None;
     }
 
     /// Record a failed attempt. Out of attempts means held for a human, rather
@@ -224,8 +247,61 @@ impl Task {
     }
 
     /// Take this task out of the loop's reach without deleting it.
-    pub fn hold(&mut self) {
+    ///
+    /// `reason` replaces whatever was recorded before when it is given.
+    /// Passing `None` - the loop's own holds do this - leaves any existing
+    /// reason alone, so a machine-initiated hold cannot erase what a human
+    /// wrote down about a previous one.
+    pub fn hold(&mut self, reason: Option<String>) {
         self.status = TaskStatus::Held;
+        if reason.is_some() {
+            self.hold_reason = reason;
+        }
+    }
+
+    /// Change how urgently this task should run next.
+    ///
+    /// Refused once the task is `running`: priority only feeds the sort
+    /// [`Queue::next_runnable`] does over tasks waiting to be claimed, and a
+    /// running task has already left that pool. Accepting the write anyway
+    /// would look like it worked while changing nothing until - and unless -
+    /// this attempt fails and the task becomes runnable again, which is a
+    /// surprise the phone should not hand back as a success.
+    pub fn set_priority(&mut self, priority: i32) -> Result<()> {
+        if self.status == TaskStatus::Running {
+            bail!(
+                "task {} is running; its priority cannot be changed until \
+                 this attempt finishes",
+                self.short()
+            );
+        }
+        self.priority = priority;
+        Ok(())
+    }
+
+    /// Replace this task's title and instruction wholesale.
+    ///
+    /// Restricted to `queued` and `held`. A `running` task's instruction has
+    /// already been handed to the graph, so a run in flight and the file on
+    /// disk must not be allowed to disagree about what was asked; a `done` or
+    /// `failed` task is a record of what actually happened and editing it
+    /// after the fact would falsify that record. `id`, `created_at`,
+    /// `source`, and `runs` are left untouched on purpose - an edit stands in
+    /// for "delete and refile", and keeping the id, the timestamp, the
+    /// attribution, and the run history is the entire reason it exists
+    /// instead.
+    pub fn edit(&mut self, title: String, instruction: String) -> Result<()> {
+        if !matches!(self.status, TaskStatus::Queued | TaskStatus::Held) {
+            bail!(
+                "task {} is {}; only a queued or held task's instruction can \
+                 be edited",
+                self.short(),
+                self.status.as_str()
+            );
+        }
+        self.title = title;
+        self.instruction = instruction;
+        Ok(())
     }
 
     /// Record a run that produced a pull request without merging it.
@@ -251,6 +327,9 @@ impl Task {
         self.status = TaskStatus::Queued;
         self.attempts = 0;
         self.last_error = None;
+        // Otherwise the next person who holds this task reads a reason that
+        // belonged to whatever it was waiting on last time.
+        self.hold_reason = None;
     }
 }
 
@@ -337,9 +416,18 @@ impl Queue {
         self.root.join(format!("{id}.lock"))
     }
 
-    /// Every task on disk, newest first. Unreadable files are skipped rather
-    /// than fatal: one corrupt task must not take the queue - or the web UI,
-    /// or an unattended daemon - down with it.
+    /// Every task on disk, highest priority first and newest first within a
+    /// priority. This is what `magi task list` and `GET /api/queue` print, so
+    /// a raised priority has to move a task here the moment it is saved, not
+    /// only in [`Queue::next_runnable`]'s own ordering - the operator reading
+    /// the backlog and the loop about to drain it must agree on what "first"
+    /// means. Every existing task defaults to priority 0, so this is a no-op
+    /// change from the old newest-first order for a queue nobody has
+    /// reprioritised.
+    ///
+    /// Unreadable files are skipped rather than fatal: one corrupt task must
+    /// not take the queue - or the web UI, or an unattended daemon - down
+    /// with it.
     pub fn list(&self) -> Vec<Task> {
         let mut tasks: Vec<Task> = std::fs::read_dir(&self.root)
             .into_iter()
@@ -349,7 +437,7 @@ impl Queue {
             .filter(|p| p.extension().is_some_and(|x| x == "json"))
             .filter_map(|p| read_path(&p).ok())
             .collect();
-        tasks.sort_unstable_by(|a, b| b.id.cmp(&a.id));
+        tasks.sort_unstable_by(|a, b| b.priority.cmp(&a.priority).then_with(|| b.id.cmp(&a.id)));
         tasks
     }
 
@@ -586,7 +674,7 @@ mod tests {
 
         // Priority first...
         assert_eq!(q.next_runnable().unwrap().id, c.id);
-        c.hold();
+        c.hold(None);
         q.put(&mut c).unwrap();
         // ...then oldest, so a burst of new work cannot starve older work.
         assert_eq!(q.next_runnable().unwrap().id, a.id);
@@ -600,7 +688,7 @@ mod tests {
         q.put(&mut t).unwrap();
         assert!(q.next_runnable().is_some());
 
-        t.hold();
+        t.hold(None);
         q.put(&mut t).unwrap();
         assert!(
             q.next_runnable().is_none(),
@@ -682,6 +770,200 @@ mod tests {
             1,
             "history is kept: attempts reset, evidence does not"
         );
+    }
+
+    #[test]
+    fn a_hold_reason_survives_and_a_release_clears_it() {
+        let mut t = task("waiting on something else");
+        t.hold(Some(
+            "waiting for 20260101-000000-aaaa to land first".to_owned(),
+        ));
+        assert_eq!(t.status, TaskStatus::Held);
+        assert_eq!(
+            t.hold_reason.as_deref(),
+            Some("waiting for 20260101-000000-aaaa to land first")
+        );
+
+        // Holding again with no reason must not erase the one already there.
+        t.hold(None);
+        assert_eq!(
+            t.hold_reason.as_deref(),
+            Some("waiting for 20260101-000000-aaaa to land first"),
+            "a bare re-hold keeps whatever a human already wrote down"
+        );
+
+        // A hold with no reason at all is still an ordinary, allowed hold.
+        let mut plain = task("no reason given");
+        plain.hold(None);
+        assert_eq!(plain.status, TaskStatus::Held);
+        assert!(plain.hold_reason.is_none());
+
+        t.release();
+        assert_eq!(t.status, TaskStatus::Queued);
+        assert!(
+            t.hold_reason.is_none(),
+            "a stale reason must not greet the next person who holds this task"
+        );
+    }
+
+    #[test]
+    fn closing_a_held_task_as_done_clears_its_hold_reason_too() {
+        // `done` can close a held task directly - neither `magi task done`
+        // nor `POST /api/queue/{id}/done` requires a release first - so a
+        // task held for "waiting on 3ed9" and then closed without ever being
+        // released must not still read as waiting on it afterwards.
+        let mut t = task("landed by hand while held");
+        t.hold(Some("waiting on 3ed9".to_owned()));
+        assert_eq!(t.hold_reason.as_deref(), Some("waiting on 3ed9"));
+
+        t.succeed();
+        assert_eq!(t.status, TaskStatus::Done);
+        assert!(
+            t.hold_reason.is_none(),
+            "a done task cannot still be waiting on something"
+        );
+    }
+
+    #[test]
+    fn priority_can_be_changed_while_queued_but_not_while_running() {
+        let mut t = task("reprioritise me");
+        t.set_priority(5).unwrap();
+        assert_eq!(t.priority, 5);
+
+        t.start("run-1".to_owned());
+        let err = t.set_priority(9).unwrap_err().to_string();
+        assert!(err.contains("running"), "{err}");
+        assert_eq!(t.priority, 5, "the rejected write must not partially apply");
+    }
+
+    #[test]
+    fn changing_priority_moves_a_task_ahead_in_the_real_queue_order() {
+        let (_dir, q) = queue();
+        let mut a = task("first filed");
+        let mut b = task("second filed");
+        a.id = "20260101-000001-aaaa".to_owned();
+        b.id = "20260101-000002-bbbb".to_owned();
+        q.put(&mut a).unwrap();
+        q.put(&mut b).unwrap();
+
+        assert_eq!(
+            q.next_runnable().unwrap().id,
+            a.id,
+            "with equal priority the older task goes first, so a burst of \
+             new work cannot starve it"
+        );
+        assert_eq!(
+            q.list()[0].id,
+            b.id,
+            "but the list an operator reads is newest first, the same as \
+             before priority existed - a's turn to run does not make it the \
+             newest task"
+        );
+
+        let mut a = q.get(&a.id).unwrap();
+        a.set_priority(10).unwrap();
+        q.put(&mut a).unwrap();
+
+        assert_eq!(
+            q.next_runnable().unwrap().id,
+            a.id,
+            "a raised priority must be reflected the moment it is saved"
+        );
+        // `magi task list` and `GET /api/queue` both print `Queue::list()`
+        // directly, so the raised task has to lead there too - not only in
+        // what the loop would claim next.
+        assert_eq!(
+            q.list()[0].id,
+            a.id,
+            "the raised task must sort first in the list an operator reads, \
+             not only in next_runnable's own ordering"
+        );
+    }
+
+    #[test]
+    fn editing_replaces_title_and_instruction_but_keeps_identity_and_history() {
+        let mut t = Task::new(
+            "old title".to_owned(),
+            "old instruction".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Agent {
+                run: "20260101-000000-beef".to_owned(),
+                node: "implement".to_owned(),
+            },
+        );
+        let id = t.id.clone();
+        let created_at = t.created_at;
+        t.runs.push("20260101-000000-beef".to_owned());
+
+        t.edit("new title".to_owned(), "new instruction".to_owned())
+            .unwrap();
+
+        assert_eq!(t.title, "new title");
+        assert_eq!(t.instruction, "new instruction");
+        assert_eq!(t.id, id, "editing must not mint a new id");
+        assert_eq!(t.created_at, created_at);
+        assert_eq!(
+            t.source,
+            Source::Agent {
+                run: "20260101-000000-beef".to_owned(),
+                node: "implement".to_owned(),
+            },
+            "editing must not turn agent attribution into human"
+        );
+        assert_eq!(t.runs, ["20260101-000000-beef"]);
+    }
+
+    #[test]
+    fn editing_is_refused_once_a_task_is_running_or_finished() {
+        let mut running = task("in flight");
+        running.start("run-1".to_owned());
+        let err = running
+            .edit("x".to_owned(), "y".to_owned())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("running"), "{err}");
+
+        let mut done = task("finished");
+        done.succeed();
+        let err = done
+            .edit("x".to_owned(), "y".to_owned())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("done"), "{err}");
+
+        // Both queued and held are the point of the feature and must work.
+        let mut queued = task("waiting");
+        queued.edit("x".to_owned(), "y".to_owned()).unwrap();
+        let mut held = task("parked");
+        held.hold(None);
+        held.edit("x".to_owned(), "y".to_owned()).unwrap();
+    }
+
+    #[test]
+    fn a_task_recorded_without_a_hold_reason_still_reads_as_none() {
+        let (_dir, q) = queue();
+        let path = q.path_of("20260101-000000-aaaa");
+        std::fs::create_dir_all(q.root()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": SCHEMA,
+                "id": "20260101-000000-aaaa",
+                "title": "from before hold reasons existed",
+                "instruction": "from before hold reasons existed",
+                "repo": ".",
+                "source": { "kind": "human" },
+                "status": "held",
+                "created_at": Timestamp::now().to_string(),
+                "updated_at": Timestamp::now().to_string(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let task = q.get("20260101-000000-aaaa").expect("must still read");
+        assert!(task.hold_reason.is_none());
+        assert_eq!(SCHEMA, 1, "this feature must not bump the schema");
     }
 
     #[test]

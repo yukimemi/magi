@@ -652,6 +652,9 @@ impl Ui {
             .route("/api/repos", get(repos_list))
             .route("/api/queue/{id}/hold", post(queue_hold))
             .route("/api/queue/{id}/release", post(queue_release))
+            .route("/api/queue/{id}/priority", post(queue_priority))
+            .route("/api/queue/{id}/edit", post(queue_edit))
+            .route("/api/queue/{id}/done", post(queue_done))
             .route("/api/questions", get(questions_list))
             .route("/api/questions/{id}/answer", post(question_answer))
             .route("/api/questions/{id}/panel", get(question_panel))
@@ -2160,18 +2163,106 @@ async fn queue_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TaskView>>>
     .await
 }
 
+/// The body of `POST /api/queue/{id}/hold`, sent empty when the operator
+/// gives no reason - which must keep working, since not every hold has one.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct HoldBody {
+    reason: Option<String>,
+}
+
 async fn queue_hold(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
+    body: std::result::Result<Json<HoldBody>, JsonRejection>,
 ) -> ApiResult<Json<TaskView>> {
-    mutate(ui, id, Task::hold).await
+    // An absent body is the ordinary case - most holds are unexplained, and
+    // that has to stay a one-tap action rather than a form. A body that is
+    // present and malformed is still a bad request.
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(JsonRejection::MissingJsonContentType(_)) => HoldBody::default(),
+        Err(e) => return Err(ApiError::bad_request(e.body_text())),
+    };
+    let reason = body.reason.filter(|r| !r.trim().is_empty());
+    mutate(ui, id, move |t| {
+        t.hold(reason.clone());
+        Ok(())
+    })
+    .await
 }
 
 async fn queue_release(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskView>> {
-    mutate(ui, id, Task::release).await
+    mutate(ui, id, |t| {
+        t.release();
+        Ok(())
+    })
+    .await
+}
+
+/// The body of `POST /api/queue/{id}/priority`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PriorityBody {
+    priority: i32,
+}
+
+/// `POST /api/queue/{id}/priority` - the up/down control on the Queue card.
+///
+/// [`Task::set_priority`] is the one place the "not while running" rule is
+/// stated; this route only carries the body to it and lets its `Err` become
+/// the 4xx the card shows.
+async fn queue_priority(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<PriorityBody>, JsonRejection>,
+) -> ApiResult<Json<TaskView>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    mutate(ui, id, move |t| t.set_priority(body.priority)).await
+}
+
+/// The body of `POST /api/queue/{id}/edit`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditBody {
+    title: String,
+    instruction: String,
+}
+
+/// `POST /api/queue/{id}/edit` - the full-text replacement the phone's edit
+/// sheet sends. [`Task::edit`] refuses anything but `queued` and `held`, and
+/// that refusal's message is what the sheet shows back.
+async fn queue_edit(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<EditBody>, JsonRejection>,
+) -> ApiResult<Json<TaskView>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    mutate(ui, id, move |t| {
+        t.edit(body.title.clone(), body.instruction.clone())
+    })
+    .await
+}
+
+/// `POST /api/queue/{id}/done` - close a task as finished without deleting
+/// it, so the phone's other way to clear a task from the backlog does not
+/// have to cost the run history, the attribution, and `created_at` the way
+/// [`queue_delete`] does. Behaves exactly like `magi task done`: any status
+/// can be marked done by hand, because this is for the run the loop never
+/// saw land - a merge done by hand, or a gate that misreported - and that can
+/// happen from any status the task was left in.
+async fn queue_done(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<TaskView>> {
+    mutate(ui, id, |t| {
+        t.succeed();
+        Ok(())
+    })
+    .await
 }
 
 /// `DELETE /api/queue/{id}`.
@@ -2195,10 +2286,17 @@ async fn queue_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiR
 
 /// Read a task, change it, write it back, under the queue's own lock.
 ///
-/// Taking the same claim a daemon takes is what makes hold and release safe to
-/// press while magi is running: without it the daemon's next save would land
-/// on top of the operator's hold and the task would keep going.
-async fn mutate(ui: Arc<Ui>, id: String, change: fn(&mut Task)) -> ApiResult<Json<TaskView>> {
+/// Taking the same claim a daemon takes is what makes hold, release,
+/// priority, edit, and done safe to press while magi is running: without it
+/// the daemon's next save would land on top of the operator's change and
+/// undo it. `change` can refuse - [`Task::set_priority`] and [`Task::edit`]
+/// both do, for a running task - and that refusal becomes the 4xx the card
+/// shows, same as any other domain rule.
+async fn mutate(
+    ui: Arc<Ui>,
+    id: String,
+    change: impl FnOnce(&mut Task) -> Result<()> + Send + 'static,
+) -> ApiResult<Json<TaskView>> {
     blocking(move || {
         let id = resolve_task(&ui.queue, &id)?;
         // `claim` fails when the lock file already exists, which is the
@@ -2212,7 +2310,7 @@ async fn mutate(ui: Arc<Ui>, id: String, change: fn(&mut Task)) -> ApiResult<Jso
             ))
         })?;
         let mut task = ui.queue.get(&id)?;
-        change(&mut task);
+        change(&mut task).map_err(ApiError::bad_request_from)?;
         ui.queue.put(&mut task)?;
         Ok(Json(TaskView::from(task)))
     })
@@ -4544,6 +4642,314 @@ mod tests {
             queue.get(&task.id).expect("reload").status,
             TaskStatus::Queued,
             "the refused hold changed nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn holding_with_a_reason_reads_back_from_show_and_the_card_and_release_clears_it() {
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let mut task = Task::new(
+            "waiting on the migration".to_owned(),
+            "Do the thing".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        queue.put(&mut task).expect("file the task");
+
+        let held = f
+            .post(
+                &format!("/api/queue/{}/hold", task.id),
+                Some(r#"{"reason":"waiting for 20260101-000000-aaaa to land"}"#),
+            )
+            .await;
+        assert_eq!(held.status, 200, "{}", held.body);
+        assert_eq!(held.json()["status_str"], "held");
+        assert_eq!(
+            held.json()["hold_reason"],
+            "waiting for 20260101-000000-aaaa to land"
+        );
+
+        let listed = f.get("/api/queue").await.json();
+        assert_eq!(
+            listed[0]["hold_reason"], "waiting for 20260101-000000-aaaa to land",
+            "the card reads the reason off the same list route"
+        );
+
+        // A hold with no body at all must keep working - most holds have no
+        // reason to give.
+        let mut plain = Task::new(
+            "no reason given".to_owned(),
+            "Do another thing".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        queue.put(&mut plain).expect("file the task");
+        let held_plain = f.post(&format!("/api/queue/{}/hold", plain.id), None).await;
+        assert_eq!(held_plain.status, 200, "{}", held_plain.body);
+        assert!(held_plain.json()["hold_reason"].is_null());
+
+        let released = f
+            .post(&format!("/api/queue/{}/release", task.id), None)
+            .await;
+        assert_eq!(released.status, 200);
+        assert!(
+            released.json()["hold_reason"].is_null(),
+            "a release must clear the reason so the next hold does not inherit it"
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_can_be_raised_from_the_phone_and_moves_the_task_ahead() {
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let mut older = Task::new(
+            "filed first".to_owned(),
+            "x".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        older.id = "20260101-000001-aaaa".to_owned();
+        let mut newer = Task::new(
+            "filed second".to_owned(),
+            "x".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        newer.id = "20260101-000002-bbbb".to_owned();
+        queue.put(&mut older).expect("file older");
+        queue.put(&mut newer).expect("file newer");
+
+        // Equal priority: the newer task leads, the same order the old
+        // newest-first `list()` already gave every equal-priority queue.
+        let before = f.get("/api/queue").await.json();
+        assert_eq!(before[0]["id"], newer.id);
+        assert_eq!(before[1]["id"], older.id);
+
+        // Raising the *older* task is the meaningful case: it can only lead
+        // now because its priority says so, not because it happens to be
+        // newest.
+        let raised = f
+            .post(
+                &format!("/api/queue/{}/priority", older.id),
+                Some(r#"{"priority":10}"#),
+            )
+            .await;
+        assert_eq!(raised.status, 200, "{}", raised.body);
+        assert_eq!(raised.json()["priority"], 10);
+
+        let after = f.get("/api/queue").await.json();
+        let names: Vec<&str> = after
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        // Highest priority first, which is the order next_runnable and
+        // `magi task list` both use - GET /api/queue must agree with it
+        // immediately, not just once the loop claims the task.
+        assert_eq!(names[0], older.id, "the raised task now sorts first");
+    }
+
+    #[tokio::test]
+    async fn priority_is_refused_on_a_running_task_with_a_reason_in_the_body() {
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let mut task = Task::new(
+            "in flight".to_owned(),
+            "x".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        task.start("20260902-140502-bbbb".to_owned());
+        queue.put(&mut task).expect("file the task");
+
+        let res = f
+            .post(
+                &format!("/api/queue/{}/priority", task.id),
+                Some(r#"{"priority":9}"#),
+            )
+            .await;
+        assert_eq!(res.status, 400, "{}", res.body);
+        assert!(
+            res.json()["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("running")),
+            "{}",
+            res.body
+        );
+        assert_eq!(
+            queue.get(&task.id).expect("reload").priority,
+            0,
+            "the refused write must not partially apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn editing_replaces_title_and_instruction_and_keeps_id_created_at_source_and_runs() {
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let mut task = Task::new(
+            "old title".to_owned(),
+            "old instruction".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Agent {
+                run: "20260101-000000-beef".to_owned(),
+                node: "implement".to_owned(),
+            },
+        );
+        task.runs.push("20260101-000000-beef".to_owned());
+        queue.put(&mut task).expect("file the task");
+        let created_at = task.created_at;
+
+        let edited = f
+            .post(
+                &format!("/api/queue/{}/edit", task.id),
+                Some(r#"{"title":"new title","instruction":"new instruction"}"#),
+            )
+            .await;
+        assert_eq!(edited.status, 200, "{}", edited.body);
+        let body = edited.json();
+        assert_eq!(body["title"], "new title");
+        assert_eq!(body["instruction"], "new instruction");
+        assert_eq!(body["id"], task.id, "editing must not mint a new id");
+        assert_eq!(body["created_at"], created_at.to_string());
+        assert_eq!(
+            body["source"]["kind"], "agent",
+            "editing a task an agent filed must not turn it human: {body}"
+        );
+        assert_eq!(body["runs"], serde_json::json!(["20260101-000000-beef"]));
+
+        let reloaded = queue.get(&task.id).expect("reload");
+        assert_eq!(reloaded.title, "new title");
+        assert_eq!(reloaded.instruction, "new instruction");
+    }
+
+    #[tokio::test]
+    async fn editing_a_running_task_is_refused_with_a_reason_in_the_response() {
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let mut task = Task::new(
+            "in flight".to_owned(),
+            "do not touch".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        task.start("20260902-140502-bbbb".to_owned());
+        queue.put(&mut task).expect("file the task");
+
+        let res = f
+            .post(
+                &format!("/api/queue/{}/edit", task.id),
+                Some(r#"{"title":"x","instruction":"y"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 400, "{}", res.body);
+        assert!(
+            res.json()["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("running")),
+            "{}",
+            res.body
+        );
+        assert_eq!(
+            queue.get(&task.id).expect("reload").instruction,
+            "do not touch",
+            "the refused edit must not change the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claimed_task_refuses_priority_and_edit_the_same_way_it_refuses_hold() {
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let mut task = Task::new(
+            "busy".to_owned(),
+            "Running right now".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        queue.put(&mut task).expect("file the task");
+        let _claim = queue.claim(&task.id).expect("stand in for the daemon");
+
+        let priority = f
+            .post(
+                &format!("/api/queue/{}/priority", task.id),
+                Some(r#"{"priority":9}"#),
+            )
+            .await;
+        assert_eq!(priority.status, 409, "{}", priority.body);
+
+        let edit = f
+            .post(
+                &format!("/api/queue/{}/edit", task.id),
+                Some(r#"{"title":"x","instruction":"y"}"#),
+            )
+            .await;
+        assert_eq!(edit.status, 409, "{}", edit.body);
+    }
+
+    #[tokio::test]
+    async fn done_from_the_phone_keeps_runs_source_and_created_at_unlike_delete() {
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let mut task = Task::new(
+            "shipped by hand".to_owned(),
+            "merged outside the loop".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Agent {
+                run: "20260101-000000-b455".to_owned(),
+                node: "implement".to_owned(),
+            },
+        );
+        task.runs.push("20260101-000000-b455".to_owned());
+        task.runs.push("20260101-000000-9af4".to_owned());
+        queue.put(&mut task).expect("file the task");
+        let created_at = task.created_at;
+
+        let done = f.post(&format!("/api/queue/{}/done", task.id), None).await;
+        assert_eq!(done.status, 200, "{}", done.body);
+        assert_eq!(done.json()["status_str"], "done");
+
+        let reloaded = queue.get(&task.id).expect("a done task is still on disk");
+        assert_eq!(
+            reloaded.runs,
+            ["20260101-000000-b455", "20260101-000000-9af4"]
+        );
+        assert_eq!(
+            reloaded.source,
+            Source::Agent {
+                run: "20260101-000000-b455".to_owned(),
+                node: "implement".to_owned(),
+            }
+        );
+        assert_eq!(reloaded.created_at, created_at);
+    }
+
+    #[tokio::test]
+    async fn closing_a_held_task_as_done_from_the_phone_clears_its_hold_reason() {
+        // `done` is allowed on any status, including `held`, with no release
+        // in between - so a task held for a reason and then closed directly
+        // must not keep reading as "waiting on" it afterwards, on its card or
+        // in `magi task show`.
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let mut task = Task::new(
+            "landed while held".to_owned(),
+            "x".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        task.hold(Some("waiting on 3ed9".to_owned()));
+        queue.put(&mut task).expect("file the held task");
+
+        let done = f.post(&format!("/api/queue/{}/done", task.id), None).await;
+        assert_eq!(done.status, 200, "{}", done.body);
+        assert_eq!(done.json()["status_str"], "done");
+        assert!(
+            done.json()["hold_reason"].is_null(),
+            "a done task cannot still be waiting on something: {}",
+            done.body
         );
     }
 

@@ -492,6 +492,36 @@
   </div>
 </dialog>
 
+<!-- TASK EDIT SHEET -------------------------------------------------------
+     Full-text replacement of a queued or held task's title and instruction —
+     the alternative to deleting the task and filing it again, so the id,
+     when it was filed, who filed it, and its run history all stay. Refused
+     by the server once a task is running or finished; the error from that
+     lands in #task-edit-error the same way a bad chat draft's does. -->
+<dialog class="sheet" id="task-edit-sheet" aria-labelledby="task-edit-h">
+  <div class="sheet-head">
+    <h2 id="task-edit-h">Edit task</h2>
+    <button class="icon-btn" type="button" id="task-edit-close" aria-label="Close">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <path d="M6 6l12 12M18 6L6 18"/>
+      </svg>
+    </button>
+  </div>
+  <div class="sheet-body">
+    <div class="field">
+      <label for="task-edit-title">Title</label>
+      <input id="task-edit-title" type="text" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="task-edit-instruction">Instruction</label>
+      <p class="hint">Opens with what is already there. Add to it, or replace it outright — either way this is the whole instruction a run will read.</p>
+      <textarea id="task-edit-instruction" rows="10"></textarea>
+    </div>
+    <p class="form-error" id="task-edit-error" role="alert" hidden></p>
+    <button class="btn btn-gold" type="button" id="task-edit-save">Save</button>
+  </div>
+</dialog>
+
 <!-- PANEL, FULL SCREEN -------------------------------------------------- *
      An agent-authored panel is rendered inside <iframe sandbox> with NO
      tokens, so no script in it runs and it can reach neither this document

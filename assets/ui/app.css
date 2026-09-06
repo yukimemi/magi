@@ -644,7 +644,14 @@ a.card:active { background: var(--sunk); }
 
 .card-actions { display: flex; gap: var(--s2); margin-top: var(--s3); flex-wrap: wrap; }
 .card-actions .btn { flex: 1 1 auto; min-width: 120px; }
-.task-delete-box { display: contents; }
+.task-priority-box, .task-hold-box, .task-done-box, .task-delete-box { display: contents; }
+/* Priority is a step, not a task-sized action - `120px` would make a
+   button labelled "+" look like a mistake. */
+.card-actions .btn-step { flex: 0 0 auto; min-width: var(--tap); padding: 0 var(--s3); }
+/* A card's own confirm/input box (hold's reason field, delete's and done's
+   warnings) always takes the whole action row rather than being squeezed
+   between the other buttons it replaces. */
+.card-actions .stakes-confirm { flex: 1 1 100%; }
 
 /* ---- card tail --------------------------------------------------------- *
  * A run card is one big anchor, which is the affordance the phone layout
@@ -1073,6 +1080,17 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   overflow-y: auto; min-height: 0;
 }
 
+/* The task edit sheet has no <form> either - the same reason and the same
+   fixed-head, scrolling-body split as run-actions-sheet above. */
+#task-edit-sheet[open] { display: flex; flex-direction: column; }
+#task-edit-sheet .sheet-head { flex: none; padding: var(--s4) var(--s4) 0; }
+#task-edit-sheet .sheet-body {
+  display: flex; flex-direction: column; gap: var(--s4);
+  padding: var(--s4);
+  padding-bottom: calc(var(--s4) + env(safe-area-inset-bottom));
+  overflow-y: auto; min-height: 0;
+}
+
 /* ---- sheet -------------------------------------------------------------- */
 .sheet {
   width: 100%; max-width: 560px; padding: 0; margin: auto auto 0;
@@ -1442,7 +1460,13 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
   /* A transcript is read, so it is measured; and with the dock gone the
      composer sticks to the bottom of the viewport instead of above it. */
   #view-chat { max-width: 780px; }
-  #view-chats .cards { max-width: 780px; }
+  /* Planning's list used to cap at 780px too, on the same "measure what you
+     read" reasoning as #view-chat above and #view-questions .asks below -
+     but a list of chats is a list of cards to scan, not a document to read
+     start to finish, and the cap left it stuck at two columns at widths
+     where Queue, the same `.cards` grid, already ran to three. Dropping the
+     override here rather than adding one to Queue keeps the rule for "a
+     list of cards" in exactly one place: the shared `.cards` rule above. */
   .say { bottom: 0; padding-bottom: var(--s4); }
   .turn { max-width: 80%; }
 }

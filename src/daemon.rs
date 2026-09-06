@@ -562,12 +562,12 @@ fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize) {
             settle(task, verdict, &detail, max_attempts);
         }
         None => {
-            task.last_error = Some(
-                "task was `running` with no live daemon and no readable run to \
-                 recover; held for a human to check what happened"
-                    .to_owned(),
-            );
-            task.hold();
+            let why = "task was `running` with no live daemon and no readable \
+                       run to recover; held for a human to check what happened";
+            task.last_error = Some(why.to_owned());
+            // The phone shows `hold_reason`, so a task held by the machine
+            // says why there too and not only in `last_error`.
+            task.hold(Some(why.to_owned()));
         }
     }
 }
@@ -871,7 +871,7 @@ async fn attempt(
     // disk that may be full is how the machine ends up with 6.7 GB free.
     if let Some(reason) = disk_gate(&repo, &config) {
         task.last_error = Some(reason.clone());
-        task.hold();
+        task.hold(Some(reason.clone()));
         record(queue, task);
         tracing::warn!("holding {} for want of disk space: {reason}", task.short());
         return;
@@ -1403,7 +1403,7 @@ mod tests {
         let mut held = task();
         held.id = "20260909-000000-9999".to_owned();
         held.priority = 99;
-        held.hold();
+        held.hold(None);
         queue.put(&mut held).unwrap();
 
         let order: Vec<String> = runnable(&queue).into_iter().map(|t| t.id).collect();

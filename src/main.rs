@@ -440,11 +440,47 @@ enum TaskCmd {
     Hold {
         /// Task id or unambiguous prefix/suffix.
         id: String,
+        /// What this is waiting on. The queue cannot express a dependency
+        /// between two tasks, so when a hold is really "wait for that other
+        /// task first", this is the only place that reason survives.
+        #[arg(value_name = "REASON", trailing_var_arg = true)]
+        reason: Vec<String>,
     },
     /// Put a held or finished task back in line, attempts reset.
     Release {
         /// Task id or unambiguous prefix/suffix.
         id: String,
+    },
+    /// Change how urgently a queued or held task should run next.
+    ///
+    /// Refused once the task is running: priority only affects which task the
+    /// loop claims next, and a running task has already been claimed.
+    Priority {
+        /// Task id or unambiguous prefix/suffix.
+        id: String,
+        /// Higher runs first.
+        #[arg(allow_negative_numbers = true)]
+        priority: i32,
+    },
+    /// Replace a queued or held task's title and instruction wholesale.
+    ///
+    /// This is the alternative to deleting the task and filing it again: the
+    /// id, `created_at`, who asked, and the run history all stay. Refused
+    /// once the task is running or finished, so a run's recorded instruction
+    /// can never end up disagreeing with what it actually read.
+    Edit {
+        /// Task id or unambiguous prefix/suffix.
+        id: String,
+        /// The new task text. Text as arguments, or --file, or on stdin.
+        #[arg(value_name = "TASK", trailing_var_arg = true)]
+        instruction: Vec<String>,
+        /// Read the new task text from a file.
+        #[arg(long, conflicts_with = "instruction")]
+        file: Option<PathBuf>,
+        /// One-line summary. Defaults to the first meaningful line of the
+        /// new instruction.
+        #[arg(long)]
+        title: Option<String>,
     },
     /// Mark a task finished, without running anything.
     ///
@@ -1270,15 +1306,54 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             if let Some(e) = &t.last_error {
                 println!("last      {e}");
             }
+            if let Some(r) = &t.hold_reason {
+                println!("held for  {r}");
+            }
             println!("\n{}", t.instruction.trim_end());
             Ok(())
         }
 
-        TaskCmd::Hold { id } => {
+        TaskCmd::Hold { id, reason } => {
             let mut t = q.get(&id)?;
-            t.hold();
+            let reason = reason.join(" ");
+            t.hold((!reason.is_empty()).then_some(reason));
             q.put(&mut t)?;
             println!("held {} {}", t.short(), t.title);
+            Ok(())
+        }
+
+        TaskCmd::Priority { id, priority } => {
+            let resolved = q.resolve_id(&id)?;
+            // Claimed the same way the phone's edit routes are: a `.lock`
+            // means a daemon owns this task's file right now, and a write
+            // from here would be lost under its next save - or worse, land
+            // between two of its writes.
+            let _claim = q
+                .claim(&resolved)
+                .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
+            let mut t = q.get(&resolved)?;
+            t.set_priority(priority)?;
+            q.put(&mut t)?;
+            println!("{} priority now {} - {}", t.short(), t.priority, t.title);
+            Ok(())
+        }
+
+        TaskCmd::Edit {
+            id,
+            instruction,
+            file,
+            title,
+        } => {
+            let resolved = q.resolve_id(&id)?;
+            let _claim = q
+                .claim(&resolved)
+                .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
+            let mut t = q.get(&resolved)?;
+            let text = task_text(&instruction, file.as_deref(), None).await?;
+            let title = title.unwrap_or_else(|| queue::title_from(&text, 72));
+            t.edit(title, text)?;
+            q.put(&mut t)?;
+            println!("edited {} {}", t.short(), t.title);
             Ok(())
         }
 
@@ -2023,6 +2098,249 @@ mod tests {
             .unwrap();
         assert!(solo.solo, "--solo must land on the queued task");
         assert!(!plain.solo, "no --solo must leave the task as false");
+    }
+
+    #[test]
+    fn task_hold_parses_a_trailing_reason_and_an_absent_one() {
+        let with_reason =
+            Cli::try_parse_from(["magi", "task", "hold", "199c", "waiting", "on", "3ed9"]).unwrap();
+        match with_reason.command {
+            Some(Command::Task {
+                command: TaskCmd::Hold { id, reason },
+            }) => {
+                assert_eq!(id, "199c");
+                assert_eq!(reason, vec!["waiting", "on", "3ed9"]);
+            }
+            other => panic!("expected TaskCmd::Hold, got {other:?}"),
+        }
+
+        let bare = Cli::try_parse_from(["magi", "task", "hold", "199c"]).unwrap();
+        match bare.command {
+            Some(Command::Task {
+                command: TaskCmd::Hold { id, reason },
+            }) => {
+                assert_eq!(id, "199c");
+                assert!(reason.is_empty(), "a bare hold gives no reason");
+            }
+            other => panic!("expected TaskCmd::Hold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_priority_parses_negative_values() {
+        let parsed = Cli::try_parse_from(["magi", "task", "priority", "199c", "-3"]).unwrap();
+        match parsed.command {
+            Some(Command::Task {
+                command: TaskCmd::Priority { id, priority },
+            }) => {
+                assert_eq!(id, "199c");
+                assert_eq!(priority, -3);
+            }
+            other => panic!("expected TaskCmd::Priority, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_hold_cli_records_a_reason_that_show_can_read_and_release_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = magi::queue::Task::new(
+            "needs a decision".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("."),
+            magi::queue::Source::Human,
+        );
+        q.put(&mut t).unwrap();
+
+        task_cmd_on(
+            TaskCmd::Hold {
+                id: t.id.clone(),
+                reason: vec!["waiting".to_owned(), "on".to_owned(), "3ed9".to_owned()],
+            },
+            q.clone(),
+        )
+        .await
+        .expect("hold with a reason");
+        let held = q.get(&t.id).unwrap();
+        assert_eq!(held.status, magi::queue::TaskStatus::Held);
+        assert_eq!(held.hold_reason.as_deref(), Some("waiting on 3ed9"));
+
+        task_cmd_on(TaskCmd::Release { id: t.id.clone() }, q.clone())
+            .await
+            .expect("release");
+        let released = q.get(&t.id).unwrap();
+        assert_eq!(released.status, magi::queue::TaskStatus::Queued);
+        assert!(
+            released.hold_reason.is_none(),
+            "release must clear the reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_priority_cli_changes_order_and_refuses_a_running_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut older = magi::queue::Task::new(
+            "filed first".to_owned(),
+            "x".to_owned(),
+            PathBuf::from("."),
+            magi::queue::Source::Human,
+        );
+        older.id = "20260101-000001-aaaa".to_owned();
+        let mut newer = magi::queue::Task::new(
+            "filed second".to_owned(),
+            "x".to_owned(),
+            PathBuf::from("."),
+            magi::queue::Source::Human,
+        );
+        newer.id = "20260101-000002-bbbb".to_owned();
+        q.put(&mut older).unwrap();
+        q.put(&mut newer).unwrap();
+
+        // Raising the *older* task is the meaningful case: with equal
+        // priority the newer one already leads, so this only proves
+        // something if the older one displaces it.
+        task_cmd_on(
+            TaskCmd::Priority {
+                id: older.id.clone(),
+                priority: 10,
+            },
+            q.clone(),
+        )
+        .await
+        .expect("raise priority");
+        assert_eq!(q.next_runnable().unwrap().id, older.id);
+        // `magi task list` prints `q.list()` directly - the raised priority
+        // has to be visible there immediately, not only in what the loop
+        // would claim next.
+        assert_eq!(
+            q.list()[0].id,
+            older.id,
+            "the list magi task list prints must lead with the raised task"
+        );
+
+        // A running task's priority is refused, not silently accepted.
+        let mut running = magi::queue::Task::new(
+            "in flight".to_owned(),
+            "x".to_owned(),
+            PathBuf::from("."),
+            magi::queue::Source::Human,
+        );
+        running.start("20260902-140502-bbbb".to_owned());
+        q.put(&mut running).unwrap();
+        let err = task_cmd_on(
+            TaskCmd::Priority {
+                id: running.id.clone(),
+                priority: 5,
+            },
+            q.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("running"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn task_edit_cli_replaces_text_but_keeps_identity_and_is_refused_once_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = magi::queue::Task::new(
+            "old title".to_owned(),
+            "old instruction".to_owned(),
+            PathBuf::from("."),
+            magi::queue::Source::Agent {
+                run: "20260101-000000-beef".to_owned(),
+                node: "implement".to_owned(),
+            },
+        );
+        let id = t.id.clone();
+        let created_at = t.created_at;
+        t.runs.push("20260101-000000-beef".to_owned());
+        q.put(&mut t).unwrap();
+
+        task_cmd_on(
+            TaskCmd::Edit {
+                id: id.clone(),
+                instruction: vec!["new".to_owned(), "instruction".to_owned()],
+                file: None,
+                title: Some("new title".to_owned()),
+            },
+            q.clone(),
+        )
+        .await
+        .expect("edit a queued task");
+        let edited = q.get(&id).unwrap();
+        assert_eq!(edited.title, "new title");
+        assert_eq!(edited.instruction, "new instruction");
+        assert_eq!(edited.id, id);
+        assert_eq!(edited.created_at, created_at);
+        assert_eq!(
+            edited.source,
+            magi::queue::Source::Agent {
+                run: "20260101-000000-beef".to_owned(),
+                node: "implement".to_owned(),
+            },
+            "editing must not turn agent attribution into human"
+        );
+        assert_eq!(edited.runs, ["20260101-000000-beef"]);
+
+        let mut running = q.get(&id).unwrap();
+        running.start("20260902-140502-bbbb".to_owned());
+        q.put(&mut running).unwrap();
+        let err = task_cmd_on(
+            TaskCmd::Edit {
+                id: id.clone(),
+                instruction: vec!["nope".to_owned()],
+                file: None,
+                title: None,
+            },
+            q.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("running"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn task_priority_and_edit_refuse_a_claimed_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = magi::queue::Task::new(
+            "busy".to_owned(),
+            "x".to_owned(),
+            PathBuf::from("."),
+            magi::queue::Source::Human,
+        );
+        q.put(&mut t).unwrap();
+        let _claim = q.claim(&t.id).expect("stand in for a running daemon");
+
+        let priority_err = task_cmd_on(
+            TaskCmd::Priority {
+                id: t.id.clone(),
+                priority: 9,
+            },
+            q.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(priority_err.contains("claimed"), "{priority_err}");
+
+        let edit_err = task_cmd_on(
+            TaskCmd::Edit {
+                id: t.id.clone(),
+                instruction: vec!["nope".to_owned()],
+                file: None,
+                title: None,
+            },
+            q.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(edit_err.contains("claimed"), "{edit_err}");
     }
 
     #[test]
