@@ -17,16 +17,24 @@
 //! [`RunStatus::Stalled`]. Serialising the loop is what keeps a full backlog
 //! from converting the whole day's quota into a pile of untrustworthy verdicts.
 //!
-//! # A crash is legible
+//! # A crash is legible, and the loop notices on its own
 //!
 //! The task is written as [`crate::queue::TaskStatus::Running`], with its run
 //! id, *before* the graph starts, and is only rewritten once the run reaches a
 //! terminal status. A daemon killed mid-run therefore leaves the task
-//! `Running` and pointing at the run that was in flight, which is the state a
-//! human needs to see: the run's own report explains how far it got, and the
-//! task can be released deliberately. The alternative — reverting the task to
-//! `Queued` on the way out — would hide the abandoned run and re-spend its
-//! quota on the next poll.
+//! `Running` and pointing at the run that was in flight. The alternative —
+//! reverting the task to `Queued` on the way out — would hide the abandoned
+//! run and re-spend its quota on the next poll.
+//!
+//! A task left `Running` forever is not the point, though:
+//! [`crate::queue::TaskStatus::runnable`] never offers it again, so a daemon
+//! that died mid-run would otherwise strand its task for good.
+//! [`reclaim_orphaned_running`] runs on every poll and settles exactly the
+//! tasks no live process is actually driving — proven by [`Queue::claim`]
+//! succeeding rather than by a staleness guess — against whatever their last
+//! run actually became, through the same [`settle`] a live finish uses. A run
+//! that genuinely cannot be read still holds its task for a human; the run's
+//! own report explains how far it got.
 //!
 //! # Retries are bounded
 //!
@@ -52,7 +60,7 @@ use tokio::sync::Notify;
 use crate::clean;
 use crate::config::{Config, MergeMode};
 use crate::graph::Runner;
-use crate::queue::{Queue, Task};
+use crate::queue::{Queue, Task, TaskStatus};
 use crate::run::{RunState, RunStatus};
 
 /// On-disk format for [`Status`]. Bumped when a field's meaning changes.
@@ -424,8 +432,10 @@ pub fn is_working_on_task(home: &Path, task: &str, now: Timestamp) -> bool {
 /// one-sided: a run that outlives `older_than` can have its claim swept while
 /// it is still working, letting a second daemon start a second run on the same
 /// task. [`STALE_CLAIM`] is therefore set an order of magnitude above any
-/// plausible run, and the sweep is only ever called at startup, when this
-/// process knows it holds no claims of its own.
+/// plausible run. It runs at startup and on every poll after, always safe
+/// because a daemon only ever holds a claim of its own while [`attempt`] is
+/// running — between iterations of the very loop that calls this, never at
+/// the top of one.
 pub fn sweep_stale_claims(queue: &Queue, older_than: Duration) -> Vec<String> {
     let mut swept: Vec<String> = std::fs::read_dir(queue.root())
         .into_iter()
@@ -526,6 +536,89 @@ pub fn settle(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usi
     }
 }
 
+/// Reconcile a task left at [`TaskStatus::Running`] by a daemon that never
+/// got back to [`settle`] for it — a crash, a `SIGKILL`, or a run carried on
+/// by some other means entirely, like a manual `magi run` resume that
+/// finishes the graph outside the queue's bookkeeping.
+///
+/// Pure and separate from [`reclaim_orphaned_running`] for the same reason
+/// `settle` is separate from `attempt`: a task recovered this way must land
+/// exactly where a live daemon would have put it — the same policy table,
+/// not a second one that quietly drifts from it — and that is only checkable
+/// without spawning a real run.
+fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize) {
+    match last_run {
+        Some(state) => {
+            let verdict = Verdict {
+                status: state.status,
+                left_pr: state.pr.is_some(),
+                quota_hit: !state.quota.is_empty(),
+                parked: state.parked,
+            };
+            let detail = format!(
+                "recovered a `running` task whose daemon never recorded the outcome: {}",
+                describe(&state)
+            );
+            settle(task, verdict, &detail, max_attempts);
+        }
+        None => {
+            task.last_error = Some(
+                "task was `running` with no live daemon and no readable run to \
+                 recover; held for a human to check what happened"
+                    .to_owned(),
+            );
+            task.hold();
+        }
+    }
+}
+
+/// Find every task left at `running` that no live process is actually
+/// driving, and settle each one against whatever its last run became.
+///
+/// # Why a claim is proof, not a guess
+///
+/// [`poll`] takes a task's [`Queue::claim`] *before* [`Task::start`] writes
+/// `running`, and the guard is held for the task's whole time in that status:
+/// `attempt` does not return, and the loop does not move past the scope
+/// holding the claim, until the run has settled. So a `running` task whose
+/// lock is gone cannot have a live owner — this process or any other —
+/// without needing a staleness threshold or a pid check the way
+/// [`sweep_stale_claims`] does for the narrower case of a lock left next to a
+/// task that never got as far as `running` at all. Taking the claim here is
+/// the whole test: it either fails, because something really does hold it
+/// and the task is left alone, or it succeeds, which is the proof — and it is
+/// kept for the rest of the decision so nothing else can start a competing
+/// run while this one is being written.
+///
+/// Called on every poll, not only at startup, for the reason
+/// [`sweep_stale_claims`] now is too: a daemon that has been up for days must
+/// keep noticing this, not only on the one morning it happened to restart.
+fn reclaim_orphaned_running(queue: &Queue, max_attempts: usize) -> Vec<String> {
+    let mut reclaimed = Vec::new();
+    for listed in queue.list() {
+        if listed.status != TaskStatus::Running {
+            continue;
+        }
+        let Ok(_claim) = queue.claim(&listed.id) else {
+            continue;
+        };
+        // Re-read under the claim: a release or an edit landed by a human
+        // between the listing above and the claim just taken must not be
+        // clobbered by a decision based on the stale copy.
+        let Ok(mut task) = queue.get(&listed.id) else {
+            continue;
+        };
+        if task.status != TaskStatus::Running {
+            continue;
+        }
+        let last_run = task.runs.last().and_then(|id| RunState::load(id).ok());
+        reclaim(&mut task, last_run, max_attempts);
+        record(queue, &mut task);
+        reclaimed.push(task.id.clone());
+    }
+    reclaimed
+}
+
 /// Run the loop until Ctrl-C, or until the queue drains with [`Opts::once`].
 ///
 /// A thin wrapper over [`serve_until`] with a stop nothing but Ctrl-C ever
@@ -590,14 +683,6 @@ async fn drive(
     home: &Path,
     stop: &Stop,
 ) -> Result<()> {
-    let swept = sweep_stale_claims(queue, STALE_CLAIM);
-    if !swept.is_empty() {
-        tracing::warn!(
-            "swept {} stale claim(s) left behind by an earlier daemon: {}",
-            swept.len(),
-            swept.join(", ")
-        );
-    }
     janitor(&opts.repo, opts, home).await;
 
     // The status file is a *snapshot*, not a stream of events: a reader only
@@ -664,6 +749,24 @@ async fn poll(
     while !stop.stopped() {
         lock(status).polls += 1;
 
+        let swept = sweep_stale_claims(queue, STALE_CLAIM);
+        if !swept.is_empty() {
+            tracing::warn!(
+                "swept {} stale claim(s) left behind by an earlier daemon: {}",
+                swept.len(),
+                swept.join(", ")
+            );
+        }
+        let reclaimed = reclaim_orphaned_running(queue, opts.max_attempts);
+        if !reclaimed.is_empty() {
+            tracing::warn!(
+                "reclaimed {} task(s) left `running` by a daemon that never \
+                 recorded the outcome: {}",
+                reclaimed.len(),
+                reclaimed.join(", ")
+            );
+        }
+
         let candidates: Vec<Task> = runnable(queue)
             .into_iter()
             .filter(|t| !opts.once || !attempted.contains(&t.id))
@@ -679,7 +782,7 @@ async fn poll(
             // must not spend one of its attempts: move to the next candidate
             // rather than recording a failure.
             let Ok(_claim) = queue.claim(&candidate.id) else {
-                tracing::debug!("task {} is claimed elsewhere; skipping", candidate.short());
+                tracing::info!("task {} is claimed elsewhere; skipping", candidate.short());
                 continue;
             };
             // Re-read under the claim: the task on disk may have been held or
@@ -1348,6 +1451,95 @@ mod tests {
             "a lock younger than the threshold still protects its task"
         );
         drop((abandoned, live));
+    }
+
+    fn run_state(status: RunStatus) -> RunState {
+        let mut state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234def".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        state.status = status;
+        state
+    }
+
+    #[test]
+    fn reclaim_settles_a_running_task_against_its_last_run() {
+        let mut t = task();
+        t.start("20260904-000000-4043".to_owned());
+        reclaim(&mut t, Some(run_state(RunStatus::Ready)), 2);
+        assert_eq!(
+            t.status,
+            TaskStatus::Done,
+            "a run that actually finished must not stay `running` forever"
+        );
+    }
+
+    #[test]
+    fn reclaim_reuses_the_same_retry_policy_as_a_live_settle() {
+        // A blocked run with attempts left goes back to `Failed`, exactly as
+        // it would from `attempt` itself - `reclaim` must not invent a second
+        // policy for a task a daemon merely stopped without reporting.
+        let mut t = task();
+        t.start("20260904-000000-4043".to_owned());
+        reclaim(&mut t, Some(run_state(RunStatus::Blocked)), 2);
+        assert_eq!(t.status, TaskStatus::Failed);
+        assert!(t.status.runnable());
+    }
+
+    #[test]
+    fn reclaim_holds_a_running_task_whose_run_cannot_be_found() {
+        let mut t = task();
+        t.start("20260904-000000-4043".to_owned());
+        reclaim(&mut t, None, 2);
+        assert_eq!(t.status, TaskStatus::Held);
+        assert!(
+            t.last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("running")),
+            "the operator needs to know why this task was held"
+        );
+    }
+
+    #[test]
+    fn orphaned_running_tasks_are_reclaimed_but_live_ones_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().to_path_buf());
+
+        // No run recorded, so this never has to touch `RunState::load`.
+        let mut orphaned = task();
+        orphaned.id = "20260904-000000-orph".to_owned();
+        orphaned.status = TaskStatus::Running;
+        orphaned.attempts = 1;
+        queue.put(&mut orphaned).unwrap();
+
+        let mut alive = task();
+        alive.id = "20260904-000000-live".to_owned();
+        alive.status = TaskStatus::Running;
+        alive.attempts = 1;
+        queue.put(&mut alive).unwrap();
+        let _held_by_a_live_daemon = queue.claim(&alive.id).unwrap();
+
+        let mut queued = task();
+        queued.id = "20260904-000000-wait".to_owned();
+        queue.put(&mut queued).unwrap();
+
+        let reclaimed = reclaim_orphaned_running(&queue, 2);
+        assert_eq!(reclaimed, vec![orphaned.id.clone()]);
+
+        assert_eq!(
+            queue.get(&orphaned.id).unwrap().status,
+            TaskStatus::Held,
+            "nothing was driving it and there was no run to recover"
+        );
+        assert_eq!(
+            queue.get(&alive.id).unwrap().status,
+            TaskStatus::Running,
+            "a live claim must protect the task it belongs to"
+        );
+        assert_eq!(queue.get(&queued.id).unwrap().status, TaskStatus::Queued);
     }
 
     #[test]
