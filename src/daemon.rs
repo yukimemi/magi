@@ -61,7 +61,7 @@ use crate::clean;
 use crate::config::{Config, MergeMode};
 use crate::graph::Runner;
 use crate::queue::{Queue, Task, TaskStatus};
-use crate::run::{RunState, RunStatus};
+use crate::run::{QuotaLoss, RunState, RunStatus};
 
 /// On-disk format for [`Status`]. Bumped when a field's meaning changes.
 pub const SCHEMA: u32 = 1;
@@ -476,6 +476,13 @@ pub struct Verdict {
     pub quota_hit: bool,
     /// The run parked at a node boundary because it was asked to.
     pub parked: bool,
+    /// The run never produced a single candidate a judge could look at.
+    ///
+    /// Distinct from `quota_hit`: a run can lose a seat to a rate limit and
+    /// still have another candidate worth judging, in which case the loss was
+    /// not the reason nothing came of the run. This is `true` only when the
+    /// implement wave ended with nothing viable at all.
+    pub no_viable_candidates: bool,
 }
 
 /// Record a finished run against the task it came from.
@@ -484,25 +491,32 @@ pub struct Verdict {
 /// policy, and a policy that can only be exercised by spawning a graph is a
 /// policy nobody checks. The table:
 ///
-/// | run status              | task becomes        | attempt spent |
-/// |-------------------------|---------------------|---------------|
-/// | parked at a boundary    | `Failed` (requeued) | **no**        |
-/// | `Merged`, `Ready`       | `Done`              | yes           |
-/// | `Stalled`, quota hit    | `Failed` (requeued) | **no**        |
-/// | `Stalled`, no quota     | `Failed`, or `Held` | yes           |
-/// | `Blocked` with a PR     | `Held`              | yes           |
-/// | `Blocked`, `Failed`     | `Failed`, or `Held` | yes           |
-/// | anything non-terminal   | `Failed`, or `Held` | yes           |
+/// | run status                           | task becomes        | attempt spent |
+/// |---------------------------------------|---------------------|---------------|
+/// | parked at a boundary                  | `Failed` (requeued) | **no**        |
+/// | `Merged`, `Ready`                      | `Done`               | yes          |
+/// | `Stalled`, quota hit                   | `Failed` (requeued) | **no**        |
+/// | `Failed`, quota hit, no viable cand.   | `Failed` (requeued) | **no**        |
+/// | `Stalled`, no quota                    | `Failed`, or `Held`  | yes          |
+/// | `Blocked` with a PR                    | `Held`               | yes          |
+/// | `Blocked`, `Failed` otherwise          | `Failed`, or `Held`  | yes          |
+/// | anything non-terminal                  | `Failed`, or `Held`  | yes          |
 ///
-/// The two `Stalled` rows are the ones worth reading twice. A quorum lost to
-/// rate limits is a property of the machine and not of the task, so the
-/// attempt is refunded and a reset quota picks the work up where it stopped.
-/// A quorum lost to judges that answered with the wrong shape is ordinary
-/// flakiness, and refunding *that* takes the bound off the retry loop
-/// entirely: run e633 stalled with `quota: []` after two judges wrote
-/// unusable JSON, was refunded, and the next attempt paid for a fresh
-/// hour-long implement wave before it could fail the same way. `max_attempts`
-/// exists precisely so that cannot repeat forever.
+/// The `Stalled`-quota and `Failed`-quota rows are the ones worth reading
+/// twice, together. A quorum lost to rate limits is a property of the machine
+/// and not of the task, so the attempt is refunded and a reset quota picks
+/// the work up where it stopped — and that is just as true when every
+/// implement seat lost the same race and `after_implement` bails with nothing
+/// to judge, which surfaces as `Failed` rather than `Stalled` but is the same
+/// machine fact. The `no_viable_candidates` guard is what keeps that row
+/// narrow: a `Failed` run that produced a real candidate which then lost for
+/// some other reason still spends the attempt, exactly like the quorum lost
+/// to judges that answered with the wrong shape is ordinary flakiness, and
+/// refunding *that* takes the bound off the retry loop entirely: run e633
+/// stalled with `quota: []` after two judges wrote unusable JSON, was
+/// refunded, and the next attempt paid for a fresh hour-long implement wave
+/// before it could fail the same way. `max_attempts` exists precisely so
+/// that cannot repeat forever.
 ///
 /// A non-terminal status means `execute` returned while the graph was still
 /// mid-flight, which is a bug rather than a verdict; it is treated as a
@@ -523,6 +537,9 @@ pub fn settle(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usi
     match verdict.status {
         RunStatus::Merged | RunStatus::Ready => task.succeed(),
         RunStatus::Stalled if verdict.quota_hit => task.stall(detail),
+        RunStatus::Failed if verdict.quota_hit && verdict.no_viable_candidates => {
+            task.stall(detail)
+        }
         RunStatus::Stalled | RunStatus::Failed => task.fail(detail, max_attempts),
         RunStatus::Blocked if verdict.left_pr => task.handed_off(detail),
         RunStatus::Blocked => task.fail(detail, max_attempts),
@@ -554,6 +571,7 @@ fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize) {
                 left_pr: state.pr.is_some(),
                 quota_hit: !state.quota.is_empty(),
                 parked: state.parked,
+                no_viable_candidates: state.viable().is_empty(),
             };
             let detail = format!(
                 "recovered a `running` task whose daemon never recorded the outcome: {}",
@@ -800,7 +818,7 @@ async fn poll(
             // A stop asked for from here on is "finishing", not "stopped": the
             // run gets to reach a terminal status before the loop returns.
             stop.busy(true);
-            attempt(opts, queue, status, stop, &mut task).await;
+            let quota = attempt(opts, queue, status, stop, &mut task).await;
             stop.busy(false);
             // A task just ended: the disk is quiet, so it is the idle point for
             // the janitor. Folding worktrees and pruning a cache mid-build
@@ -812,6 +830,33 @@ async fn poll(
                 guard.completed += 1;
             }
             ran = true;
+            // A quota loss is a fact about the machine, not this task, and the
+            // next candidate the loop offers is no less likely to hit the same
+            // wall: without a pause here a whole backlog can be run - and
+            // failed - in the seconds it takes each attempt to notice the CLI
+            // is out of quota. `stop.idle` rather than a plain sleep so a stop
+            // or park asked for during the wait still lands at once.
+            if !quota.is_empty() && !stop.stopped() {
+                let hint = quota.iter().find_map(|q| q.reset.as_deref());
+                let reset_at = hint.and_then(|h| parse_reset_hint(h, Timestamp::now()));
+                let wait = quota_wait(
+                    reset_at,
+                    Timestamp::now(),
+                    QUOTA_WAIT_FALLBACK,
+                    QUOTA_WAIT_CAP,
+                );
+                match hint {
+                    Some(h) => tracing::warn!(
+                        "quota hit; waiting {}s before taking another task (CLI reported reset: {h})",
+                        wait.as_secs()
+                    ),
+                    None => tracing::warn!(
+                        "quota hit; waiting {}s before taking another task (no reset hint reported)",
+                        wait.as_secs()
+                    ),
+                }
+                stop.idle(wait).await;
+            }
             break;
         }
 
@@ -839,7 +884,7 @@ async fn attempt(
     status: &Arc<Mutex<Status>>,
     stop: &Stop,
     task: &mut Task,
-) {
+) -> Vec<QuotaLoss> {
     let repo = repo_for(task, &opts.repo);
     tracing::info!(
         "task {} — {} (repo {})",
@@ -857,7 +902,7 @@ async fn attempt(
             task.attempts += 1;
             task.fail(format!("config: {e:#}"), opts.max_attempts);
             record(queue, task);
-            return;
+            return Vec::new();
         }
     };
     apply_solo(&mut config, task);
@@ -874,7 +919,7 @@ async fn attempt(
         task.hold(Some(reason.clone()));
         record(queue, task);
         tracing::warn!("holding {} for want of disk space: {reason}", task.short());
-        return;
+        return Vec::new();
     }
 
     // A resumable run of this task is carried on, never re-competed. The
@@ -912,7 +957,7 @@ async fn attempt(
             task.attempts += 1;
             task.fail(format!("could not start the run: {e:#}"), opts.max_attempts);
             record(queue, task);
-            return;
+            return Vec::new();
         }
     };
     // A stop that means "park" reaches the graph through this handle.
@@ -943,6 +988,9 @@ async fn attempt(
         // not spend an attempt, or replacing the binary a few times would
         // exhaust a task's budget without an agent ever misbehaving.
         parked: runner.state.parked,
+        // A quota loss that left nothing viable is the same machine fact as a
+        // `Stalled` quota loss; see `settle`'s doc table.
+        no_viable_candidates: runner.state.viable().is_empty(),
     };
     settle(task, verdict, &detail, opts.max_attempts);
     record(queue, task);
@@ -953,6 +1001,7 @@ async fn attempt(
         runner.state.short(),
         label(runner.state.status)
     );
+    runner.state.quota
 }
 
 /// Cut this attempt's candidate count to one when the task asked to run
@@ -1041,6 +1090,93 @@ fn disk_gate(repo: &Path, config: &Config) -> Option<String> {
             repo.display()
         )),
     }
+}
+
+/// How long to wait before offering another task when a run lost a seat to a
+/// rate limit and its [`QuotaLoss::reset`] carried no hint [`parse_reset_hint`]
+/// could read, or carried nothing at all. Long enough that a quota outage
+/// cannot burn through a whole backlog in the few seconds each doomed attempt
+/// takes to fail; short enough that a quota which clears early is not left
+/// idle for the fallback's sake.
+const QUOTA_WAIT_FALLBACK: Duration = Duration::from_secs(5 * 60);
+
+/// Longest a parsed reset hint may push the wait out to. The hint comes from
+/// the CLI's own words, not a contract, so a parsing slip that lands a day
+/// away must not leave the loop asleep for a day.
+const QUOTA_WAIT_CAP: Duration = Duration::from_secs(30 * 60);
+
+/// How long [`poll`] should wait before offering the next task, after a run
+/// lost at least one seat to a rate limit.
+///
+/// Pure and separate from the loop so the policy can be exercised without a
+/// real quota outage. `reset_at` is the time [`parse_reset_hint`] made of the
+/// CLI's free-text hint, if it could; `fallback` is what to wait when there is
+/// nothing to parse, or the parsed time has already passed; `cap` bounds how
+/// far a parsed hint is trusted to push the wait out.
+fn quota_wait(
+    reset_at: Option<Timestamp>,
+    now: Timestamp,
+    fallback: Duration,
+    cap: Duration,
+) -> Duration {
+    match reset_at {
+        Some(at) if at > now => {
+            let secs = u64::try_from(at.as_second() - now.as_second()).unwrap_or(0);
+            Duration::from_secs(secs).min(cap)
+        }
+        _ => fallback,
+    }
+}
+
+/// Best-effort reading of a [`QuotaLoss::reset`] hint into a concrete time.
+///
+/// `reset` is deliberately free text — see [`crate::agent::Quota`], which
+/// explains why parsing it exactly "would be a bug factory" — so this only
+/// recognises the one shape actually observed in the wild, `"H:MMam/pm
+/// (Zone)"`, and returns `None` for anything else rather than guess at a
+/// format nobody has seen. A clock reading already past today is read as
+/// tomorrow's: a CLI naming a same-day reset that has already gone by means
+/// the window rolled over while nothing was watching.
+fn parse_reset_hint(text: &str, now: Timestamp) -> Option<Timestamp> {
+    let open = text.find('(')?;
+    let close = text.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let zone = text[open + 1..close].trim();
+    let clock = text[..open].trim().to_lowercase();
+    let (digits, pm) = clock
+        .strip_suffix("am")
+        .map(|d| (d, false))
+        .or_else(|| clock.strip_suffix("pm").map(|d| (d, true)))?;
+    let (h, m) = digits.trim().split_once(':')?;
+    let mut hour: i8 = h.trim().parse().ok()?;
+    let minute: i8 = m.trim().parse().ok()?;
+    if !(1..=12).contains(&hour) || !(0..=59).contains(&minute) {
+        return None;
+    }
+    if pm && hour != 12 {
+        hour += 12;
+    } else if !pm && hour == 12 {
+        hour = 0;
+    }
+    let tz = jiff::tz::TimeZone::get(zone).ok()?;
+    let candidate = now
+        .to_zoned(tz)
+        .with()
+        .hour(hour)
+        .minute(minute)
+        .second(0)
+        .millisecond(0)
+        .microsecond(0)
+        .nanosecond(0)
+        .build()
+        .ok()?;
+    let mut at = candidate.timestamp();
+    if at <= now {
+        at += jiff::SignedDuration::from_hours(24);
+    }
+    Some(at)
 }
 
 /// Which repository a task runs in. A task that names none — the normal case
@@ -1174,6 +1310,7 @@ mod tests {
                     left_pr: false,
                     parked: false,
                     quota_hit: matches!(run, RunStatus::Stalled),
+                    no_viable_candidates: false,
                 },
                 "why",
                 2,
@@ -1194,6 +1331,7 @@ mod tests {
                 left_pr: false,
                 parked: false,
                 quota_hit: true,
+                no_viable_candidates: false,
             },
             "quota",
             1,
@@ -1213,6 +1351,7 @@ mod tests {
                 left_pr: false,
                 parked: false,
                 quota_hit: false,
+                no_viable_candidates: false,
             },
             "findings open",
             1,
@@ -1238,6 +1377,7 @@ mod tests {
                 left_pr: true,
                 parked: false,
                 quota_hit: false,
+                no_viable_candidates: false,
             },
             "no check status",
             4,
@@ -1268,6 +1408,7 @@ mod tests {
                 left_pr: false,
                 parked: false,
                 quota_hit: false,
+                no_viable_candidates: false,
             },
             "findings open",
             4,
@@ -1291,6 +1432,7 @@ mod tests {
                 left_pr: false,
                 quota_hit: false,
                 parked: true,
+                no_viable_candidates: false,
             },
             "parked after `implementing`",
             2,
@@ -1318,6 +1460,7 @@ mod tests {
                 left_pr: false,
                 quota_hit: false,
                 parked: false,
+                no_viable_candidates: false,
             },
             "returned mid-flight",
             2,
@@ -1340,6 +1483,7 @@ mod tests {
                 left_pr: false,
                 parked: false,
                 quota_hit: false,
+                no_viable_candidates: false,
             },
             "verdict rests on 1 of 3 judges",
             2,
@@ -1360,6 +1504,7 @@ mod tests {
                 left_pr: false,
                 parked: false,
                 quota_hit: true,
+                no_viable_candidates: false,
             },
             "judge-2, judge-3 out of quota",
             2,
@@ -1382,12 +1527,93 @@ mod tests {
                 left_pr: false,
                 parked: false,
                 quota_hit: false,
+                no_viable_candidates: false,
             },
             "no quorum again",
             2,
         );
         assert_eq!(worn.status, TaskStatus::Held);
         assert!(!worn.status.runnable());
+    }
+
+    #[test]
+    fn a_quota_wipeout_that_leaves_nothing_to_judge_also_costs_no_attempt() {
+        // The implement wave loses every seat to the same rate limit and
+        // `after_implement` bails with nothing viable, which surfaces as
+        // `Failed` rather than `Stalled`. That is the same machine fact the
+        // `Stalled`-quota row already refunds, and must be refunded the same
+        // way, or a quota outage quietly holds every task it touches instead
+        // of leaving them in line for the reset.
+        let mut wiped_out = task();
+        wiped_out.start("20260907-025000-a1b2".to_owned());
+        settle(
+            &mut wiped_out,
+            Verdict {
+                status: RunStatus::Failed,
+                left_pr: false,
+                parked: false,
+                quota_hit: true,
+                no_viable_candidates: true,
+            },
+            "no candidate produced a change; nothing to judge",
+            2,
+        );
+        assert_eq!(wiped_out.attempts, 0, "a total quota wipeout is refunded");
+        assert!(
+            wiped_out.status.runnable(),
+            "a machine problem must leave the task in line"
+        );
+
+        // This is the exemption that must stay narrow: a candidate that did
+        // produce a change, and then failed for some other reason, still
+        // spends the attempt even though a seat elsewhere hit its quota.
+        // Otherwise every ordinary failure that happens to share a run with
+        // an unrelated rate limit would be refunded for free.
+        let mut partial_progress = task();
+        partial_progress.start("20260907-025500-c3d4".to_owned());
+        settle(
+            &mut partial_progress,
+            Verdict {
+                status: RunStatus::Failed,
+                left_pr: false,
+                parked: false,
+                quota_hit: true,
+                no_viable_candidates: false,
+            },
+            "gate failed on the winning candidate",
+            2,
+        );
+        assert_eq!(
+            partial_progress.attempts, 1,
+            "a candidate that actually produced a change spends the attempt \
+             even though some other seat hit its quota"
+        );
+        assert!(partial_progress.status.runnable());
+    }
+
+    #[test]
+    fn reclaim_refunds_a_recovered_quota_wipeout_the_same_way_a_live_settle_does() {
+        // `reclaim` builds its own `Verdict` from a `RunState` it loads off
+        // disk, and that construction must reach the same conclusion as the
+        // one `attempt` builds from a live run, or a crash at exactly the
+        // wrong moment gives a recovered task a different policy than one a
+        // daemon finished settling itself.
+        let mut t = task();
+        t.start("20260907-025000-a1b2".to_owned());
+        let mut state = run_state(RunStatus::Failed);
+        state.quota.push(QuotaLoss {
+            seat: "cand-a".to_owned(),
+            node: "implement".to_owned(),
+            at: Timestamp::now(),
+            reset: None,
+        });
+        assert!(
+            state.viable().is_empty(),
+            "no candidate was added, so nothing is viable"
+        );
+        reclaim(&mut t, Some(state), 2);
+        assert_eq!(t.attempts, 0, "a recovered quota wipeout is refunded");
+        assert!(t.status.runnable());
     }
 
     #[test]
@@ -1733,6 +1959,57 @@ mod tests {
         assert_eq!(merge_mode("local").unwrap(), MergeMode::Local);
         assert_eq!(merge_mode("pr").unwrap(), MergeMode::Pr);
         assert!(merge_mode("squash").is_err());
+    }
+
+    #[test]
+    fn quota_wait_uses_a_future_reset_time_capped_and_falls_back_otherwise() {
+        let now = Timestamp::now();
+        let fallback = Duration::from_secs(300);
+        let cap = Duration::from_secs(1800);
+
+        // No reset hint at all: the fallback.
+        assert_eq!(quota_wait(None, now, fallback, cap), fallback);
+
+        // A reset ten minutes out, well inside the cap: waited for exactly.
+        let soon = now + jiff::SignedDuration::from_secs(600);
+        assert_eq!(
+            quota_wait(Some(soon), now, fallback, cap),
+            Duration::from_secs(600)
+        );
+
+        // A reset already in the past is not trusted: the fallback, not a
+        // zero or negative wait that would spin the loop right back around.
+        let past = now - jiff::SignedDuration::from_secs(60);
+        assert_eq!(quota_wait(Some(past), now, fallback, cap), fallback);
+
+        // A reset further out than the cap is trusted for direction but not
+        // for magnitude: a parsing slip must not sleep the loop for a day.
+        let far = now + jiff::SignedDuration::from_secs(3 * 3600);
+        assert_eq!(quota_wait(Some(far), now, fallback, cap), cap);
+    }
+
+    #[test]
+    fn parse_reset_hint_reads_the_claude_cli_shape_and_rolls_a_past_clock_to_tomorrow() {
+        let now = "2026-09-07T02:50:00Z".parse::<Timestamp>().unwrap();
+
+        let at = parse_reset_hint("4:50am (UTC)", now).expect("a recognised shape parses");
+        assert_eq!(at.to_string(), "2026-09-07T04:50:00Z");
+
+        // Same clock reading, but it has already gone by today: read as
+        // tomorrow's, since the CLI would not still be reporting a limit past
+        // its own stated reset.
+        let already_past =
+            parse_reset_hint("1:00am (UTC)", now).expect("a recognised shape parses");
+        assert_eq!(already_past.to_string(), "2026-09-08T01:00:00Z");
+
+        assert!(
+            parse_reset_hint("session limit reached", now).is_none(),
+            "free text with no recognised shape is not guessed at"
+        );
+        assert!(
+            parse_reset_hint("4:50am (Nowhere/Fake)", now).is_none(),
+            "an unresolvable zone name is not guessed at either"
+        );
     }
 
     /// A loop whose queue lives in a temp tree and whose poll interval is far
