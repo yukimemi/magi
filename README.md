@@ -546,9 +546,10 @@ cache = "{{ env.MAGI_CACHE | default(value='/tmp') }}"
 gate = ["CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo make check"]
 ```
 
-Two traps: the whole file is a template, **comments included**, and teravars
-renders the raw text before TOML unescaping — so use single quotes inside the
-braces (`value='/tmp'`, never `value=\"/tmp\"`).
+One trap, not two: teravars renders the raw text before TOML unescaping, so use
+single quotes inside the braces (`value='/tmp'`, never `value=\"/tmp\"`).
+Comments used to be the other one — since teravars 0.2.2 they are stripped
+before Tera renders, so a comment may quote `{{ ... }}` or `{% ... %}` freely.
 
 **Tables merge; arrays do not.** teravars appends arrays when it merges layers,
 which is wrong for every array magi has: `implementers` is an ordered list of
