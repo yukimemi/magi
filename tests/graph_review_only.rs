@@ -7,7 +7,7 @@
 //! so it is exactly the kind of thing that would rot silently.
 mod common;
 
-use common::{Judges, fixture};
+use common::{Judges, fixture, fixture_with_silent_review_seat};
 use magi::graph::Runner;
 use magi::run::RunStatus;
 
@@ -26,6 +26,11 @@ fn run_git(repo: &std::path::Path, args: &[&str]) {
 
 #[tokio::test]
 async fn a_review_only_run_reviews_an_existing_branch_without_competing() {
+    // `fixture()` sets a process-wide home directory, so any two tests in
+    // this binary that build one must not run concurrently — every test here
+    // must take this lock, not just the slow one, or the two that don't will
+    // still race each other underneath it.
+    let _home = common::home_lock().await;
     let fx = fixture(Judges::Unanimous, true);
 
     // Hand-written work on a branch: the thing `magi run` would never produce.
@@ -92,7 +97,46 @@ async fn a_review_only_run_reviews_an_existing_branch_without_competing() {
 }
 
 #[tokio::test]
+async fn a_reviewer_that_never_answered_is_never_reported_as_a_clean_round() {
+    let _home = common::home_lock().await;
+    let mut fx = fixture_with_silent_review_seat(&["review-2"]);
+    // One round is enough to exercise "budget exhausted while incomplete".
+    fx.config.graph.review_rounds = 1;
+
+    run_git(&fx.repo, &["checkout", "-q", "-b", "feat/by-hand"]);
+    std::fs::write(fx.repo.join("note.txt"), "written by a human\n").unwrap();
+    run_git(&fx.repo, &["add", "-A"]);
+    run_git(&fx.repo, &["commit", "-q", "-m", "add note.txt by hand"]);
+    run_git(&fx.repo, &["checkout", "-q", "main"]);
+
+    let mut runner = Runner::review(&fx.repo, "feat/by-hand", fx.config.clone())
+        .await
+        .expect("open a review-only run");
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    assert_eq!(state.reviews.len(), 1, "{:?}", state.reviews);
+    for round in &state.reviews {
+        // review-1 answered and found nothing; review-2 never came back. That
+        // must never look the same as a panel that read the patch and passed
+        // it: half the panel is not evidence of anything.
+        assert_eq!(round.answered, 1);
+        assert_eq!(round.expected, 2);
+        assert!(round.incomplete());
+        assert_eq!(round.blocking, 0, "the seat that did answer found nothing");
+        assert!(
+            !round.clean,
+            "a round missing half its panel must never be reported clean: {round:?}"
+        );
+    }
+    // Nothing was ever raised to fix, so the fixer never ran.
+    assert!(state.reviews.iter().all(|r| r.fix.is_none()));
+    assert_eq!(state.status, RunStatus::Blocked);
+}
+
+#[tokio::test]
 async fn review_refuses_the_cases_that_cannot_mean_anything() {
+    let _home = common::home_lock().await;
     let fx = fixture(Judges::Unanimous, false);
 
     let missing = Runner::review(&fx.repo, "no/such/branch", fx.config.clone()).await;

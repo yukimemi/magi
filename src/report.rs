@@ -321,15 +321,43 @@ pub fn run(state: &RunState) -> String {
             } else {
                 e2e
             };
+            // Three distinct facts, not two: a round can be *open* (blocking
+            // findings still standing), *incomplete* (a seat never answered,
+            // so what the round says is missing input) or genuinely clean.
+            let status = if r.incomplete() {
+                yellow("incomplete")
+            } else if r.clean {
+                green("clean")
+            } else {
+                yellow("open")
+            };
+            // A missing seat must stay visible even when `warn` policy let
+            // the round gate as clean: the reader should never have to take
+            // "clean" on faith when the panel wasn't full.
+            let panel = if r.incomplete() {
+                let missing: Vec<String> = r
+                    .reviews
+                    .iter()
+                    .filter_map(|x| {
+                        x.failed
+                            .as_ref()
+                            .map(|why| format!("review-{}: {why}", x.reviewer))
+                    })
+                    .collect();
+                format!(
+                    "  {}/{} reviewers answered ({})",
+                    r.answered,
+                    r.expected,
+                    missing.join(", ")
+                )
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 s,
-                "  round {}  {} @ {}  {raised} finding(s), {} blocking, {e2e}{}",
+                "  round {}  {} @ {}{panel}  {raised} finding(s), {} blocking, {e2e}{}",
                 r.round,
-                if r.clean {
-                    green("clean")
-                } else {
-                    yellow("open")
-                },
+                status,
                 short(&r.head),
                 r.blocking,
                 r.fix.as_ref().map_or(String::new(), |f| match &f.failed {
@@ -583,19 +611,20 @@ pub fn stats(stats: &Stats) -> String {
         let _ = writeln!(s, "\n{}", bold("review"));
         let _ = writeln!(
             s,
-            "  {:<14}{:>8}{:>10}{:>11}{:>9}{:>9}",
-            "reviewer", "rounds", "submitted", "adopted/rd", "precision", "unique"
+            "  {:<14}{:>8}{:>10}{:>11}{:>9}{:>9}{:>9}",
+            "reviewer", "rounds", "submitted", "adopted/rd", "precision", "unique", "timeout"
         );
         for r in &stats.reviewers {
             let _ = writeln!(
                 s,
-                "  {:<14}{:>8}{:>10}{:>11.2}{:>8.0}%{:>8.0}%",
+                "  {:<14}{:>8}{:>10}{:>11.2}{:>8.0}%{:>8.0}%{:>8.0}%",
                 r.agent,
                 r.rounds,
                 r.submitted,
                 r.adopted_per_round(),
                 r.precision(),
-                r.unique_rate()
+                r.unique_rate(),
+                r.timeout_rate()
             );
         }
     }
@@ -620,7 +649,8 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::run::{
-        Candidate, CommandOutcome, FixRecord, MergeOutcome, ReviewRound, RunState, Tally,
+        Candidate, CommandOutcome, FixRecord, MergeOutcome, ReviewRecord, ReviewRound, RunState,
+        Tally,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -863,6 +893,8 @@ mod tests {
                 duration_ms: 0,
             }),
             blocking: 3,
+            answered: 0,
+            expected: 0,
             clean: false,
         }];
         let text = run(&lost);
@@ -889,12 +921,71 @@ mod tests {
                 duration_ms: 0,
             }),
             blocking: 3,
+            answered: 0,
+            expected: 0,
             clean: false,
         }];
         let text2 = run(&rejected_all);
         assert!(
             text2.contains("0 addressed / 0 rejected"),
             "a round the fixer actually reported on keeps the count: {text2}"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_panel_and_a_lost_fix_report_both_stay_on_the_round_line() {
+        // Two independent facts share this one line, and each arrived from a
+        // different change: a seat that never answered, and a fixer whose
+        // adoption report was lost. Rendering either must not shadow the
+        // other, and neither may collapse into the plain `clean`/`open`
+        // pair the line used to carry.
+        let _guard = plain();
+        let mut s = state();
+        s.reviews = vec![ReviewRound {
+            round: 1,
+            head: "abc1234".to_owned(),
+            reviews: vec![
+                ReviewRecord {
+                    reviewer: 1,
+                    agent: "alpha".to_owned(),
+                    summary: String::new(),
+                    findings: Vec::new(),
+                    failed: None,
+                    duration_ms: 0,
+                },
+                ReviewRecord {
+                    reviewer: 2,
+                    agent: "beta".to_owned(),
+                    summary: String::new(),
+                    findings: Vec::new(),
+                    failed: Some("agent timed out".to_owned()),
+                    duration_ms: 0,
+                },
+            ],
+            e2e: Vec::new(),
+            verify_retried: false,
+            fix: Some(FixRecord {
+                agent: "opus".to_owned(),
+                addressed: Vec::new(),
+                rejected: Vec::new(),
+                notes: String::new(),
+                committed: true,
+                failed: Some("timed out".to_owned()),
+                duration_ms: 0,
+            }),
+            blocking: 0,
+            answered: 1,
+            expected: 2,
+            clean: false,
+        }];
+        let text = run(&s);
+        assert!(text.contains("incomplete"), "{text}");
+        assert!(text.contains("1/2 reviewers answered"), "{text}");
+        assert!(text.contains("review-2: agent timed out"), "{text}");
+        assert!(text.contains("adoption report lost (timed out)"), "{text}");
+        assert!(
+            !text.contains("clean"),
+            "a round missing half its panel must never render as clean: {text}"
         );
     }
 
@@ -915,6 +1006,8 @@ mod tests {
             verify_retried: true,
             fix: None,
             blocking: 0,
+            answered: 0,
+            expected: 0,
             clean: false,
         }];
         let text = run(&s);

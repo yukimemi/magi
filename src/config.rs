@@ -242,6 +242,9 @@ pub struct Graph {
     /// abandoned, seconds. A parked run costs nothing, so this is generous;
     /// it exists so a forgotten question cannot pin a worktree forever.
     pub answer_timeout: u64,
+    /// What a round does when one or more reviewer seats never answered
+    /// (timeout, crash, unparsable output).
+    pub incomplete_review: IncompleteReviewPolicy,
 }
 
 impl Default for Graph {
@@ -265,8 +268,29 @@ impl Default for Graph {
             land_rounds: 4,
             land_approval: true,
             answer_timeout: 86_400,
+            incomplete_review: IncompleteReviewPolicy::Block,
         }
     }
+}
+
+/// What a review round does when a reviewer seat never answered.
+///
+/// A round where half the panel timed out is not evidence of a clean patch —
+/// it is evidence of nothing. The default refuses to call that clean; `warn`
+/// exists for an operator who would rather keep a flaky seat from stalling
+/// every run, and accepts that the gap is on them to read in the report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IncompleteReviewPolicy {
+    /// A round with a missing seat is never `clean`: with nothing raised to
+    /// fix, the round is re-reviewed instead of gating; with the max rounds
+    /// exhausted, the run is left `Blocked` rather than declared ready.
+    Block,
+    /// A round with a missing seat can still gate as clean, once every seat
+    /// that *did* answer raised nothing blocking and verification is green.
+    /// The record keeps the gap visible (`magi show`, `magi stats`) even
+    /// though the run does not wait on it.
+    Warn,
 }
 
 /// What to do when vendor-identifying text is found in material shown to judges.

@@ -129,6 +129,22 @@ if grep -q "independent judges" "$p"; then
 fi
 
 if grep -q "reviewers of" "$p"; then
+  # Silent-seat simulation: a matching review seat produces nothing usable and
+  # exits non-zero, which is exactly the record a real timeout leaves — the
+  # graph sees one `ReviewRecord` with `failed` set either way.
+  #
+  # Not `sleep`ing past a short `timeout_review` to make the kill do it: on
+  # Windows there is no `execve`, so MSYS emulates `exec` by spawning a fresh
+  # process and letting the shell exit. magi kills the process it spawned —
+  # the shell — and the sleeper survives it, holding the inherited stdout
+  # handle and a cwd inside the run's temp tree. The test then pays the whole
+  # sleep at teardown rather than one timeout: measured at 302s against a 45s
+  # `timeout_review`. The timeout leg itself is covered where it belongs, in
+  # `agent::tests::timeout_is_reported_not_hung`.
+  if [ -n "$MOCK_SILENT_SEAT" ] && { case ",$MOCK_SILENT_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+    echo 'not a review at all'
+    exit 1
+  fi
   if [ -n "$MOCK_ALWAYS_FINDING" ] || { [ -n "$MOCK_FINDING" ] && [ ! -f fixed.txt ]; }; then
     printf '{"summary":"mock review","findings":[{"severity":"blocker","file":"note.txt","line":1,"title":"needs a fixed marker","detail":"create fixed.txt"}]}\n'
   else
@@ -331,6 +347,31 @@ pub fn fixture_with_dropped_deliberation(seats: &[&str]) -> Fixture {
     for a in &mut fx.config.agents {
         a.env
             .insert("MOCK_DROPPED_DELIBERATE_SEAT".to_owned(), value.clone());
+    }
+    fx
+}
+
+/// Like [`fixture`], but the given review seats never answer: they exit
+/// non-zero with nothing a `Review` can be parsed out of, so the round records
+/// them with `failed` set. The other seats review normally with no findings,
+/// so the only reason any round is not clean is the missing seat.
+///
+/// That record is what a real reviewer timeout also leaves — the graph cannot
+/// tell the two apart, and does not need to. Simulating the timeout itself
+/// with a sleep costs the *whole sleep* on Windows rather than one
+/// `timeout_review` (see the `MOCK_SILENT_SEAT` comment in the mock: 302s
+/// measured against a 45s budget), and the timeout leg has its own coverage in
+/// `agent::tests::timeout_is_reported_not_hung`. The classification this
+/// fixture feeds is additionally pinned process-free by the
+/// `graph::tests::round_is_clean` family.
+pub fn fixture_with_silent_review_seat(silent_seats: &[&str]) -> Fixture {
+    let mut fx = fixture(Judges::Unanimous, false);
+    // No re-ask: the seat is meant to be absent from the round, not absent
+    // once and then absent again.
+    fx.config.graph.retries = 0;
+    let value = silent_seats.join(",");
+    for a in &mut fx.config.agents {
+        a.env.insert("MOCK_SILENT_SEAT".to_owned(), value.clone());
     }
     fx
 }
