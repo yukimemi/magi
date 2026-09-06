@@ -301,15 +301,25 @@ impl Talks {
 /// not said anything into yet is a normal, valid thing to have sitting on the
 /// phone.
 ///
-/// `agent` is resolved the same way `magi plan` and [`crate::chat::start`]
-/// resolve their interviewer: [`plan::pick`] against `[roles] planner`, so
-/// this surface adds no configuration of its own.
+/// `agent` beats `[roles] chatter`, which beats `[roles] planner` -
+/// [`plan::pick`] run against the same preference order [`crate::chat::start`]
+/// uses for its own resident conversation. This is a standing chat, not an
+/// interview, so `chatter` rather than `planner` is the field this
+/// conversation is actually about; `planner` remains the fallback so an
+/// operator who never set `chatter` sees no change. `chatter` exists at all
+/// because this conversation stays open far longer than a single planning
+/// interview, and opening it against the same seat as a judge is what
+/// produced the `agent ... did not answer within 300s` timeout that led to
+/// splitting the two roles apart - see `[roles] chatter`'s own doc in
+/// [`crate::config`].
 pub fn begin(store: &Talks, cfg: &Config, repo: PathBuf, agent: Option<&str>) -> Result<Talk> {
     // Absolute, for the same reason `chat::start` canonicalizes: a relative
     // path means the wrong repository once anything other than this process
     // reads it back.
     let repo = repo.canonicalize().unwrap_or(repo);
-    let want = agent.or(cfg.roles.planner.as_deref());
+    let want = agent
+        .or(cfg.roles.chatter.as_deref())
+        .or(cfg.roles.planner.as_deref());
     let spec = plan::pick(&cfg.agents, want, &plan::installed)?;
 
     let now = Timestamp::now();
@@ -738,6 +748,45 @@ mod tests {
 
         let on_disk = talks.get(&talk.id).expect("get");
         assert_eq!(on_disk.turns.len(), 0);
+    }
+
+    /// `roles.chatter`, not `roles.planner`, decides who holds this
+    /// conversation - the same distinction [`crate::chat::start`] makes for
+    /// its own resident chat, and for the same reason: a Talk stays open far
+    /// longer than a `magi plan` interview, and opening it against the same
+    /// seat as a judge is what produced the `agent ... did not answer within
+    /// 300s` timeout `[roles] chatter` exists to avoid. See
+    /// `a_chat_prefers_the_chatter_role_over_the_planner_role` in
+    /// `src/chat.rs`, which this mirrors.
+    #[test]
+    fn a_talk_prefers_the_chatter_role_over_the_planner_role() {
+        let (tmp, talks) = store();
+        let planner_spec = mock_agent(tmp.path(), BROKEN, BTreeMap::new());
+        let mut chatter_spec = mock_agent(tmp.path(), BROKEN, BTreeMap::new());
+        chatter_spec.id = "chatter-mock".to_owned();
+
+        let mut cfg = Config {
+            agents: vec![planner_spec.clone(), chatter_spec.clone()],
+            graph: Graph {
+                language: "en".to_owned(),
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        cfg.roles.planner = Some(planner_spec.id.clone());
+        cfg.roles.chatter = Some(chatter_spec.id.clone());
+
+        let talk =
+            begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin with chatter set");
+        assert_eq!(talk.agent, chatter_spec.id, "chatter must win over planner");
+
+        cfg.roles.chatter = None;
+        let fallback =
+            begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin with chatter unset");
+        assert_eq!(
+            fallback.agent, planner_spec.id,
+            "unset chatter must fall back to planner, unchanged from before this role existed"
+        );
     }
 
     #[tokio::test]
