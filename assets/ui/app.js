@@ -603,6 +603,19 @@ function renderLoop() {
   const upgradeBtn = $("loop-upgrade");
   show(upgradeBtn, false);
 
+  /* The build answering, straight from /api/health - which is the only place
+     that knows it, and until now the only place it could be read at all: an
+     operator who tapped Update & restart had to curl the server to find out
+     whether the new binary came back. Hidden rather than guessed while the
+     first health tick is outstanding. */
+  const versionChip = $("loop-version");
+  const version = state.health && typeof state.health.version === "string"
+    ? state.health.version.trim()
+    : "";
+  setText(versionChip, version ? `v${version}` : "");
+  setAttr(versionChip, "title", version ? `magi ${version} is serving this page` : null);
+  show(versionChip, Boolean(version));
+
 
   const control = (kind, label, note) => {
     setText(why, note);

@@ -83,6 +83,10 @@
     <span class="daemon-text">Connecting…</span>
     <span class="daemon-why" id="loop-why" hidden></span>
   </span>
+  <!-- Which build is answering. This strip is already about this process and
+       it carries Update & restart, so after an upgrade the operator can tell
+       from the same place whether the new binary is the one serving them. -->
+  <span class="daemon-version" id="loop-version" hidden></span>
   <button class="btn daemon-btn" type="button" id="loop-toggle" aria-describedby="loop-why" hidden></button>
   <!-- The escalation, shown only while a stop is waiting out a run: parking
        stops at the run's next step instead, which is what an operator waiting
