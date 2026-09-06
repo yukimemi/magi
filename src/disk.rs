@@ -110,12 +110,20 @@ fn free_bytes_by_os(path: &Path) -> Result<u64> {
 #[cfg(windows)]
 fn free_bytes_by_os(path: &Path) -> Result<u64> {
     // `fsutil volume diskfree` needs an elevated shell; the .NET DriveInfo in
-    // the Windows PowerShell that ships with the OS does not. The constructor
-    // takes any rooted path and derives the volume, so an absolute path is
-    // passed straight in.
+    // the Windows PowerShell that ships with the OS does not.
+    //
+    // DriveInfo is handed the **volume root**, never the path itself: its
+    // constructor accepts a drive letter or a root directory and throws on
+    // anything else, including every verbatim path. The queue stores repo
+    // paths as `\\?\C:\...` (that is what `std::path::absolute` yields for a
+    // canonicalised root), so passing the path through closed the disk gate
+    // for every task with `the disk gate refuses to let a run start blind` -
+    // nine tasks were `held` for a disk that had 164 GiB free.
     let abs = std::path::absolute(path)
         .with_context(|| format!("absolute path for {}", path.display()))?;
-    let quoted = abs.to_string_lossy().replace('\'', "''");
+    let root = volume_root(&abs)
+        .with_context(|| format!("no volume root in {} to measure", abs.display()))?;
+    let quoted = root.replace('\'', "''");
     let script = format!("[System.IO.DriveInfo]::new('{quoted}').AvailableFreeSpace");
     let out = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -146,6 +154,29 @@ pub fn parse_df_available(line: &str) -> Option<u64> {
     fields.next()?; // used
     let blocks: u64 = fields.next()?.parse().ok()?;
     Some(blocks.saturating_mul(1024))
+}
+
+/// The volume root of an absolute Windows path, as DriveInfo wants it:
+/// `C:\`, never `C:\Users\...` and never a verbatim `\\?\C:\...`.
+///
+/// Pure and platform-independent so the verbatim form - which is what the
+/// queue stores and what closed the disk gate on every task - is asserted
+/// without a Windows runner. `None` when there is no drive letter to name: a
+/// UNC share has no DriveInfo of its own, and a caller must say it cannot
+/// measure rather than invent a volume.
+pub fn volume_root(path: &Path) -> Option<String> {
+    let text = path.to_str()?;
+    // Verbatim (`\\?\C:\x`) and verbatim-UNC (`\\?\UNC\server\share`) prefixes.
+    let bare = text
+        .strip_prefix(r"\\?\")
+        .or_else(|| text.strip_prefix("//?/"))
+        .unwrap_or(text);
+    let mut chars = bare.chars();
+    let letter = chars.next()?;
+    if !letter.is_ascii_alphabetic() || chars.next()? != ':' {
+        return None;
+    }
+    Some(format!(r"{letter}:\"))
 }
 
 /// A bare unsigned integer line, which is all PowerShell prints for a long.
@@ -366,6 +397,34 @@ mod tests {
     fn a_powershell_number_is_one_unsigned_integer() {
         assert_eq!(parse_u64("     82072211456\r\n"), Some(82_072_211_456));
         assert_eq!(parse_u64("nah"), None);
+    }
+
+    /// DriveInfo takes a volume, and the queue hands out verbatim paths.
+    #[test]
+    fn the_volume_root_is_a_drive_not_the_path_it_came_from() {
+        // The form that closed the gate on every queued task: the queue
+        // records the repo as `\\?\C:\...`.
+        assert_eq!(
+            volume_root(Path::new(
+                r"\\?\C:\Users\yukimemi\src\github.com\yukimemi\magi"
+            )),
+            Some(r"C:\".to_owned())
+        );
+        assert_eq!(
+            volume_root(Path::new(r"C:\Users\yukimemi")),
+            Some(r"C:\".to_owned())
+        );
+        assert_eq!(volume_root(Path::new(r"D:\")), Some(r"D:\".to_owned()));
+        // Forward slashes reach magi from configs written by hand.
+        assert_eq!(
+            volume_root(Path::new("C:/Users/yukimemi/src")),
+            Some(r"C:\".to_owned())
+        );
+        // No drive to name: a share has no DriveInfo, and a POSIX path has no
+        // volume at all. The caller has to report that it cannot measure.
+        assert_eq!(volume_root(Path::new(r"\\server\share\dir")), None);
+        assert_eq!(volume_root(Path::new(r"\\?\UNC\server\share")), None);
+        assert_eq!(volume_root(Path::new("/home/yukimemi")), None);
     }
 
     #[test]
