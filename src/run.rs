@@ -428,9 +428,27 @@ pub struct ReviewRound {
     /// Findings that hold the merge.
     #[serde(default)]
     pub blocking: usize,
-    /// Round ended with no blocking findings and green verification.
+    /// Reviewer seats that answered (did not time out, crash, or return
+    /// something unparsable).
+    #[serde(default)]
+    pub answered: usize,
+    /// Reviewer seats the round expected an answer from — normally
+    /// `graph.reviewers`, but recorded per round so a config change between
+    /// runs never has to be inferred from history.
+    #[serde(default)]
+    pub expected: usize,
+    /// Round ended with no blocking findings and green verification, judged
+    /// against the seats that answered. See [`Self::incomplete`] for whether
+    /// that verdict is missing input.
     #[serde(default)]
     pub clean: bool,
+}
+
+impl ReviewRound {
+    /// Did at least one reviewer seat fail to answer this round?
+    pub fn incomplete(&self) -> bool {
+        self.answered < self.expected
+    }
 }
 
 /// What happened to the winning branch.

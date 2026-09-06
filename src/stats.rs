@@ -38,14 +38,26 @@ impl AgentStats {
 pub struct ReviewerStats {
     /// Agent id.
     pub agent: String,
-    /// Review rounds it sat in.
+    /// Review rounds it sat in whose adoption could be scored — a round whose
+    /// fixer never reported back is excluded, so this is the denominator of
+    /// [`Self::adopted_per_round`], not a headcount of appearances. For that,
+    /// see [`Self::seated`].
     pub rounds: usize,
+    /// Review rounds it was on the panel for at all, scoreable or not.
+    /// Whether a seat answered is a fact about the seat and does not depend
+    /// on what later became of the fixer's report, so this — not `rounds` —
+    /// is the honest denominator for [`Self::timeout_rate`].
+    pub seated: usize,
     /// Findings it submitted.
     pub submitted: usize,
     /// Findings the fixer acted on.
     pub adopted: usize,
     /// Findings no other reviewer in the same round also raised.
     pub unique: usize,
+    /// Rounds it was seated in but never answered (timeout, crash, unparsable
+    /// output) — kept apart from `submitted`/`adopted` so a silent seat
+    /// cannot read as a seat with nothing to say.
+    pub timeouts: usize,
 }
 
 impl ReviewerStats {
@@ -58,7 +70,9 @@ impl ReviewerStats {
         }
     }
 
-    /// Adopted over submitted: how often its findings are real.
+    /// Adopted over submitted: how often its findings are real. Rounds where
+    /// the seat never answered are not in `submitted`, so a timeout cannot
+    /// dilute (or hide behind) this rate.
     pub fn precision(&self) -> f64 {
         if self.submitted == 0 {
             0.0
@@ -73,6 +87,15 @@ impl ReviewerStats {
             0.0
         } else {
             100.0 * self.unique as f64 / self.submitted as f64
+        }
+    }
+
+    /// Share of the rounds it was seated in where it never answered.
+    pub fn timeout_rate(&self) -> f64 {
+        if self.seated == 0 {
+            0.0
+        } else {
+            100.0 * self.timeouts as f64 / self.seated as f64
         }
     }
 }
@@ -241,36 +264,46 @@ pub fn collect(states: &[RunState]) -> Stats {
             // unrecorded — so it stays out of the adoption-rate denominator
             // entirely rather than silently becoming a round of 0 adoptions.
             let report_lost = round.fix.as_ref().is_some_and(|f| f.failed.is_some());
-            if !report_lost {
-                let adopted: Vec<&String> = round
-                    .fix
-                    .as_ref()
-                    .map(|f| f.addressed.iter().collect())
-                    .unwrap_or_default();
+            let adopted: Vec<&String> = round
+                .fix
+                .as_ref()
+                .map(|f| f.addressed.iter().collect())
+                .unwrap_or_default();
 
-                for rec in &round.reviews {
-                    let entry =
-                        reviewers
-                            .entry(rec.agent.clone())
-                            .or_insert_with(|| ReviewerStats {
-                                agent: rec.agent.clone(),
-                                ..ReviewerStats::default()
-                            });
-                    entry.rounds += 1;
-                    entry.submitted += rec.findings.len();
-                    for f in &rec.findings {
-                        if adopted.iter().any(|a| **a == f.id) {
-                            entry.adopted += 1;
-                        }
-                        let overlapped = round
-                            .reviews
-                            .iter()
-                            .filter(|other| other.reviewer != rec.reviewer)
-                            .flat_map(|other| other.findings.iter())
-                            .any(|g| same_defect(f, g));
-                        if !overlapped {
-                            entry.unique += 1;
-                        }
+            for rec in &round.reviews {
+                let entry = reviewers
+                    .entry(rec.agent.clone())
+                    .or_insert_with(|| ReviewerStats {
+                        agent: rec.agent.clone(),
+                        ..ReviewerStats::default()
+                    });
+                // Seating and answering are facts about the seat itself: they
+                // hold whether or not this round's adoption is scoreable, so
+                // they are counted before the lost-report guard. A seat that
+                // never answered stays out of every scoring denominator —
+                // silence is not a review that found nothing.
+                entry.seated += 1;
+                if rec.failed.is_some() {
+                    entry.timeouts += 1;
+                    continue;
+                }
+                if report_lost {
+                    continue;
+                }
+                entry.rounds += 1;
+                entry.submitted += rec.findings.len();
+                for f in &rec.findings {
+                    if adopted.iter().any(|a| **a == f.id) {
+                        entry.adopted += 1;
+                    }
+                    let overlapped = round
+                        .reviews
+                        .iter()
+                        .filter(|other| other.reviewer != rec.reviewer)
+                        .flat_map(|other| other.findings.iter())
+                        .any(|g| same_defect(f, g));
+                    if !overlapped {
+                        entry.unique += 1;
                     }
                 }
             }
@@ -294,6 +327,11 @@ pub fn collect(states: &[RunState]) -> Stats {
             .then(b.entered.cmp(&a.entered))
     });
     let mut reviewers: Vec<ReviewerStats> = reviewers.into_values().collect();
+    // A seat only sighted in rounds whose adoption could not be scored has
+    // nothing to report: no scoreable round, no silence to flag. It stays out
+    // of the table entirely rather than appearing as a row of zeroes, which
+    // would read as a reviewer that produced nothing.
+    reviewers.retain(|r| r.rounds > 0 || r.timeouts > 0);
     reviewers.sort_by(|a, b| {
         b.adopted_per_round()
             .total_cmp(&a.adopted_per_round())
@@ -473,6 +511,8 @@ mod tests {
                 duration_ms: 0,
             }),
             blocking: 3,
+            answered: 2,
+            expected: 2,
             clean: false,
         };
         let stats = collect(&[state_with(vec![round], 'A', RunStatus::Ready)]);
@@ -523,6 +563,8 @@ mod tests {
                 duration_ms: 0,
             }),
             blocking: 4,
+            answered: 1,
+            expected: 1,
             clean: false,
         };
         let stats = collect(&[state_with(vec![submitted], 'A', RunStatus::Ready)]);
@@ -530,6 +572,120 @@ mod tests {
             stats.reviewers.is_empty(),
             "a round with no adoption signal must not enter any reviewer's \
              denominator: {:?}",
+            stats.reviewers
+        );
+    }
+
+    #[test]
+    fn timed_out_seat_counts_as_a_timeout_not_a_clean_submission() {
+        let round = ReviewRound {
+            round: 1,
+            head: "h".to_owned(),
+            reviews: vec![
+                ReviewRecord {
+                    reviewer: 1,
+                    agent: "alpha".to_owned(),
+                    summary: String::new(),
+                    findings: Vec::new(),
+                    failed: None,
+                    duration_ms: 0,
+                },
+                ReviewRecord {
+                    reviewer: 2,
+                    agent: "beta".to_owned(),
+                    summary: String::new(),
+                    findings: Vec::new(),
+                    failed: Some("agent timed out".to_owned()),
+                    duration_ms: 0,
+                },
+            ],
+            e2e: Vec::new(),
+            verify_retried: false,
+            fix: None,
+            blocking: 0,
+            answered: 1,
+            expected: 2,
+            clean: false,
+        };
+        let stats = collect(&[state_with(vec![round], 'A', RunStatus::Blocked)]);
+
+        let alpha = stats.reviewers.iter().find(|r| r.agent == "alpha").unwrap();
+        assert_eq!(alpha.seated, 1);
+        assert_eq!(alpha.rounds, 1);
+        assert_eq!(alpha.timeouts, 0);
+        assert_eq!(alpha.submitted, 0);
+
+        let beta = stats.reviewers.iter().find(|r| r.agent == "beta").unwrap();
+        assert_eq!(beta.seated, 1);
+        assert_eq!(beta.timeouts, 1);
+        assert_eq!(beta.submitted, 0);
+        // A timeout must never read as a submission with nothing found: it
+        // stays out of the scoring denominators entirely rather than becoming
+        // a 0/0 that looks identical to a reviewer who answered and passed.
+        assert_eq!(beta.rounds, 0);
+        assert_eq!(beta.timeout_rate(), 100.0);
+    }
+
+    #[test]
+    fn a_timeout_is_still_recorded_when_the_round_also_lost_its_fix_report() {
+        // Two independent gaps in one round: `beta` never answered, and the
+        // fixer's adoption report never came back. The lost report suppresses
+        // adoption scoring (see `a_lost_fix_report_does_not_count_as_zero_
+        // adoption`) — it must not also swallow the fact that a seat was
+        // silent, which is a property of the seat and not of the fixer.
+        let round = ReviewRound {
+            round: 1,
+            head: "h".to_owned(),
+            reviews: vec![
+                ReviewRecord {
+                    reviewer: 1,
+                    agent: "alpha".to_owned(),
+                    summary: String::new(),
+                    findings: vec![finding(
+                        "R1-1-1",
+                        "src/a.rs",
+                        10,
+                        "panics on empty",
+                        Severity::Blocker,
+                    )],
+                    failed: None,
+                    duration_ms: 0,
+                },
+                ReviewRecord {
+                    reviewer: 2,
+                    agent: "beta".to_owned(),
+                    summary: String::new(),
+                    findings: Vec::new(),
+                    failed: Some("agent timed out".to_owned()),
+                    duration_ms: 0,
+                },
+            ],
+            e2e: Vec::new(),
+            verify_retried: false,
+            fix: Some(FixRecord {
+                agent: "alpha".to_owned(),
+                addressed: Vec::new(),
+                rejected: Vec::new(),
+                notes: String::new(),
+                committed: true,
+                failed: Some("unparsable fix report".to_owned()),
+                duration_ms: 0,
+            }),
+            blocking: 1,
+            answered: 1,
+            expected: 2,
+            clean: false,
+        };
+        let stats = collect(&[state_with(vec![round], 'A', RunStatus::Blocked)]);
+
+        let beta = stats.reviewers.iter().find(|r| r.agent == "beta").unwrap();
+        assert_eq!(beta.timeouts, 1);
+        assert_eq!(beta.timeout_rate(), 100.0);
+        // `alpha` answered, so the lost report keeps it out of the table
+        // altogether — nothing about its findings can be scored.
+        assert!(
+            !stats.reviewers.iter().any(|r| r.agent == "alpha"),
+            "{:?}",
             stats.reviewers
         );
     }
@@ -550,6 +706,8 @@ mod tests {
             verify_retried: false,
             fix: None,
             blocking: 0,
+            answered: 0,
+            expected: 0,
             clean: false,
         };
         let alongside = ReviewRound {
@@ -560,6 +718,8 @@ mod tests {
             verify_retried: false,
             fix: None,
             blocking: 2,
+            answered: 0,
+            expected: 0,
             clean: false,
         };
         let stats = collect(&[state_with(vec![sole, alongside], 'A', RunStatus::Ready)]);

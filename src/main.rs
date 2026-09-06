@@ -10,7 +10,7 @@ use magi::config::{Config, MergeMode};
 use magi::graph::{Runner, fold_run};
 use magi::proc::Quiet as _;
 use magi::queue::{self, Queue, Source, Task, TaskStatus};
-use magi::run::{RunState, latest_id, list_ids, resolve_id};
+use magi::run::{RunState, RunStatus, latest_id, list_ids, resolve_id};
 use magi::{agent, ask, daemon, plan, report, repos, stats, tui, updater, web};
 
 /// Blind multi-agent implementation competition.
@@ -637,6 +637,33 @@ fn had_separator() -> bool {
     std::env::args_os().any(|arg| arg == "--")
 }
 
+/// Fold a run's terminal status into the process exit code.
+///
+/// `execute()` returns `Ok(())` whenever the graph walks to completion —
+/// `Blocked` and `Stalled` included: findings still open after the round
+/// budget, a reviewer panel that never fully answered, or a judging quorum
+/// lost to rate limits. A caller scripting on exit code alone (CI, a gate)
+/// must not read either as success just because nothing panicked, so a run
+/// that finished in one of them turns into an error here, after the report
+/// has already been printed. An earlier `Err` from `execute()` itself is
+/// left untouched.
+///
+/// One `Blocked` shape is deliberately exempted: `left_pr` (a pull request
+/// is open — `runner.state.pr.is_some()`) means the run handed off to a
+/// human rather than failing, mirroring `daemon::settle`'s own
+/// `Blocked if left_pr => handed_off` row. Treating that as an error would
+/// contradict the very distinction this repo relies on elsewhere between a
+/// stopped-but-delivered PR and a run that never converged.
+fn exit_status(result: Result<()>, status: RunStatus, left_pr: bool) -> Result<()> {
+    result.and_then(|()| match status {
+        RunStatus::Blocked if left_pr => Ok(()),
+        RunStatus::Blocked | RunStatus::Stalled => {
+            bail!("run ended {} — see the report above", status.as_str())
+        }
+        _ => Ok(()),
+    })
+}
+
 async fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::Run {
@@ -718,7 +745,7 @@ async fn dispatch(command: Command) -> Result<()> {
 
             let result = runner.execute().await;
             print!("{}", report::run(&runner.state));
-            result
+            exit_status(result, runner.state.status, runner.state.pr.is_some())
         }
 
         Command::Review {
@@ -743,7 +770,7 @@ async fn dispatch(command: Command) -> Result<()> {
             let mut runner = Runner::review(&repo, &branch, cfg).await?;
             let result = runner.execute().await;
             print!("{}", report::run(&runner.state));
-            result
+            exit_status(result, runner.state.status, runner.state.pr.is_some())
         }
 
         Command::List { limit } => {
@@ -1741,11 +1768,45 @@ async fn probe(program: &str, args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi::run::RunStatus;
 
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_blocked_run_that_did_not_error_still_exits_non_zero() {
+        // `execute()` returns `Ok(())` for a run that walked to completion,
+        // `Blocked` included — a caller reading only the exit code must not
+        // mistake that for success.
+        assert!(exit_status(Ok(()), RunStatus::Blocked, false).is_err());
+    }
+
+    #[test]
+    fn a_stalled_run_that_did_not_error_still_exits_non_zero() {
+        // `Stalled` means the verdict itself is not trustworthy (quorum
+        // lost); it must read no better than `Blocked` from the exit code.
+        assert!(exit_status(Ok(()), RunStatus::Stalled, false).is_err());
+    }
+
+    #[test]
+    fn a_blocked_run_that_left_a_pull_request_open_still_exits_zero() {
+        // `daemon::settle` treats `Blocked` with a PR open as a hand-off, not
+        // a failure — the exit code must agree, or a land loop that stopped
+        // waiting on CI/approval would look like a broken run from the shell.
+        assert!(exit_status(Ok(()), RunStatus::Blocked, true).is_ok());
+    }
+
+    #[test]
+    fn a_ready_or_merged_run_exits_zero() {
+        assert!(exit_status(Ok(()), RunStatus::Ready, false).is_ok());
+        assert!(exit_status(Ok(()), RunStatus::Merged, false).is_ok());
+    }
+
+    #[test]
+    fn an_earlier_error_is_never_swallowed_by_the_status_check() {
+        let err = exit_status(Err(anyhow::anyhow!("boom")), RunStatus::Ready, false);
+        assert_eq!(err.unwrap_err().to_string(), "boom");
     }
 
     #[tokio::test]

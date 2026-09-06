@@ -602,6 +602,7 @@ judges = 3
 deliberate_rounds = 1
 reviewers = 2
 review_rounds = 6
+incomplete_review = "block"  # block | warn — a round a seat never answered in
 max_parallel = 4
 language = "en"          # prose language for the agents; "ja" etc.
 sessions = true
@@ -673,15 +674,33 @@ Finding ids (`R2-1-3`) are assigned by magi, never by the agent, because the
 fixer's adoption report is keyed by them — that is what makes reviewer precision
 measurable rather than self-reported.
 
+**A seat that never answered is not a seat that found nothing.** Every round
+records how many reviewers it expected against how many actually came back, so
+a timeout, a crash or an unparsable reply cannot pass for a clean pass. `magi
+show` labels such a round `incomplete` and names the seats that went missing,
+`magi stats` carries a per-seat timeout rate, and by default
+(`graph.incomplete_review = "block"`) the round is never treated as clean: with
+nothing raised to fix, it is re-reviewed, and if the round budget runs out
+while the panel is still short the run ends `blocked` rather than `ready`. Set
+`incomplete_review = "warn"` to let the round gate on whatever did answer — the
+gap stays in the report either way.
+
+`magi run` and `magi review` **exit non-zero when the run ends `blocked` or
+`stalled`**, after printing the report — a script or CI step that only reads
+the exit code must not take "nothing panicked" for "the change is reviewed".
+The one exception is a run that left a pull request open: that is a hand-off
+to a human, not a failure, and exits 0.
+
 ## Statistics
 
 `magi stats` aggregates every run on disk:
 
 - **implementation** — win rate per agent, and how often an agent produced
   nothing at all.
-- **review** — findings per round, precision (adopted / submitted), and unique
+- **review** — findings per round, precision (adopted / submitted), unique
   find rate (findings no other reviewer in the same round raised, matched by
-  normalised title or same file within five lines).
+  normalised title or same file within five lines), and the share of its
+  seated rounds a seat never answered in at all.
 - **verification** — how often E2E failed while every static review was clean:
   the runtime defects only execution found.
 

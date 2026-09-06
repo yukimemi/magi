@@ -28,7 +28,9 @@ use tokio::sync::Semaphore;
 
 use crate::agent::{self, AgentOutput, Invocation, SeatState};
 use crate::blind;
-use crate::config::{AgentSpec, Config, LeakPolicy, MergeMode, Prompts, ResolvedRoles};
+use crate::config::{
+    AgentSpec, Config, IncompleteReviewPolicy, LeakPolicy, MergeMode, Prompts, ResolvedRoles,
+};
 use crate::git;
 use crate::land;
 use crate::proc::Quiet as _;
@@ -2231,8 +2233,13 @@ impl Runner {
                 .map(|o| format!("$ {}\n{}\n", o.command, o.output_tail))
                 .collect();
 
+            let expected = records.len();
+            let answered = records.iter().filter(|r| r.failed.is_none()).count();
+            let incomplete = answered < expected;
             let blocking = all_findings.iter().filter(|f| f.severity.blocks()).count();
-            let clean = blocking == 0 && e2e.iter().all(CommandOutcome::ok);
+            let e2e_ok = e2e.iter().all(CommandOutcome::ok);
+            let policy = self.state.config.graph.incomplete_review;
+            let clean = round_is_clean(blocking, e2e_ok, answered, expected, policy);
 
             let mut round_record = ReviewRound {
                 round,
@@ -2242,18 +2249,65 @@ impl Runner {
                 verify_retried,
                 fix: None,
                 blocking,
+                answered,
+                expected,
                 clean,
             };
+
+            if incomplete {
+                let missing: Vec<String> = round_record
+                    .reviews
+                    .iter()
+                    .filter(|r| r.failed.is_some())
+                    .map(|r| format!("review-{}", r.reviewer))
+                    .collect();
+                self.state.event(
+                    "review",
+                    format!(
+                        "round {round}: {answered}/{expected} reviewer(s) answered ({} never answered)",
+                        missing.join(", ")
+                    ),
+                );
+            }
 
             if clean {
                 self.state.event(
                     "review",
-                    format!("round {round}: clean — no blocking findings, verification green"),
+                    if incomplete {
+                        format!(
+                            "round {round}: clean (warn policy, incomplete panel) — no \
+                             blocking findings from the seats that answered, verification green"
+                        )
+                    } else {
+                        format!("round {round}: clean — no blocking findings, verification green")
+                    },
                 );
                 self.state.reviews.push(round_record);
                 self.state.status = RunStatus::Gating;
                 self.state.save()?;
                 return Ok(());
+            }
+
+            // Nothing was raised and verification passed, but not every seat
+            // answered and the policy refuses to call that clean: re-review
+            // rather than send the fixer after a round with nothing to fix.
+            if incomplete && blocking == 0 && e2e_ok {
+                self.state.reviews.push(round_record);
+                self.state.save()?;
+                if round == max_rounds {
+                    self.state.status = RunStatus::Blocked;
+                    self.state.event(
+                        "review",
+                        format!(
+                            "{} reviewer seat(s) never answered after {max_rounds} rounds; \
+                             refusing to call it clean",
+                            expected - answered
+                        ),
+                    );
+                    return Ok(());
+                }
+                prev_e2e = None;
+                continue;
             }
 
             if round == max_rounds {
@@ -2895,6 +2949,25 @@ async fn wave(
     collected.into_iter().flatten().collect()
 }
 
+/// Is a review round clean, given how many reviewer seats answered against
+/// how many the round expected?
+///
+/// A seat that never answered (timeout, crash, unparsable output) is not a
+/// seat that read the patch and found nothing — treating it as such is
+/// exactly the bug this function exists to close. Under the default `block`
+/// policy a missing seat can never be clean; `warn` still requires the seats
+/// that *did* answer to have found nothing blocking and verification to be
+/// green.
+fn round_is_clean(
+    blocking: usize,
+    e2e_ok: bool,
+    answered: usize,
+    expected: usize,
+    policy: IncompleteReviewPolicy,
+) -> bool {
+    blocking == 0 && e2e_ok && (answered == expected || policy == IncompleteReviewPolicy::Warn)
+}
+
 /// How long a re-ask may take, given the budget the first attempt had.
 ///
 /// A `nudged` retry is a request to restate an answer the seat has already
@@ -3204,6 +3277,62 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    // `round_is_clean` is the exact decision this task fixed: a round with a
+    // seat that never answered must not read the same as a round every seat
+    // actually reviewed. These are deterministic and process-free by design —
+    // the equivalent end-to-end check (a real reviewer timing out under a
+    // live graph run) is a genuine race against wall-clock contention, and a
+    // spawn slow enough to blow even a generous budget under a loaded test
+    // run must not turn this specific regression check flaky.
+
+    #[test]
+    fn a_full_panel_that_found_nothing_is_clean() {
+        assert!(round_is_clean(0, true, 2, 2, IncompleteReviewPolicy::Block));
+    }
+
+    #[test]
+    fn a_missing_seat_is_never_clean_under_the_default_policy() {
+        assert!(!round_is_clean(
+            0,
+            true,
+            1,
+            2,
+            IncompleteReviewPolicy::Block
+        ));
+    }
+
+    #[test]
+    fn warn_policy_still_refuses_a_missing_seat_with_open_findings() {
+        assert!(!round_is_clean(1, true, 1, 2, IncompleteReviewPolicy::Warn));
+    }
+
+    #[test]
+    fn warn_policy_gates_a_missing_seat_once_what_answered_is_clean() {
+        assert!(round_is_clean(0, true, 1, 2, IncompleteReviewPolicy::Warn));
+    }
+
+    #[test]
+    fn a_full_panel_with_an_open_finding_is_not_clean() {
+        assert!(!round_is_clean(
+            1,
+            true,
+            2,
+            2,
+            IncompleteReviewPolicy::Block
+        ));
+    }
+
+    #[test]
+    fn a_full_panel_with_a_red_e2e_is_not_clean() {
+        assert!(!round_is_clean(
+            0,
+            false,
+            2,
+            2,
+            IncompleteReviewPolicy::Block
+        ));
+    }
+
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
     }
@@ -3294,6 +3423,8 @@ mod tests {
             e2e: Vec::new(),
             fix: None,
             blocking: 0,
+            answered: 0,
+            expected: 0,
             clean: true,
             verify_retried: false,
         }];
