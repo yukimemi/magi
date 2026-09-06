@@ -352,9 +352,14 @@ pub async fn start(
     // repository.
     let repo = repo.canonicalize().unwrap_or(repo);
     // The API's `agent` beats the config, the config beats the built-in order.
-    // On a phone there is no flag to pass, so `[roles] planner` is the only
-    // way an operator states who they want to be interviewed by.
-    let want = agent.or(cfg.roles.planner.as_deref());
+    // On a phone there is no flag to pass, so `[roles] chatter` (falling back
+    // to `planner`, so an operator who never set `chatter` sees no change) is
+    // the only way an operator states who answers this conversation - kept
+    // separate from `planner` so the resident chat does not compete with a
+    // judge seat for the same account by default.
+    let want = agent
+        .or(cfg.roles.chatter.as_deref())
+        .or(cfg.roles.planner.as_deref());
     let spec = plan::pick(&cfg.agents, want, &plan::installed)?;
 
     let now = Timestamp::now();
@@ -1087,6 +1092,58 @@ mod tests {
         assert_eq!(reread.status, before.status);
         assert_eq!(reread.turns, before.turns);
         assert_eq!(reread.draft, before.draft);
+    }
+
+    /// `roles.chatter`, not `roles.planner`, decides who answers this
+    /// conversation - and when `chatter` is unset, `planner` still does, so
+    /// an operator who only ever named a planner sees no change. This is the
+    /// distinction the resident chat's timeout under a triple-booked `opus`
+    /// (planner, chatter, and a judge seat all at once) turned up.
+    #[tokio::test]
+    async fn a_chat_prefers_the_chatter_role_over_the_planner_role() {
+        let (tmp, chats) = store();
+        let planner_spec = mock_agent(tmp.path(), REPLY, env("from the planner"));
+        let mut chatter_spec = mock_agent(tmp.path(), REPLY, env("from the chatter"));
+        chatter_spec.id = "chatter-mock".to_owned();
+
+        let mut cfg = Config {
+            agents: vec![planner_spec.clone(), chatter_spec.clone()],
+            graph: Graph {
+                language: "en".to_owned(),
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        cfg.roles.planner = Some(planner_spec.id.clone());
+        cfg.roles.chatter = Some(chatter_spec.id.clone());
+
+        let chat = start(
+            &chats,
+            &cfg,
+            tmp.path().to_owned(),
+            "rework the drain",
+            None,
+            None,
+        )
+        .await
+        .expect("start with chatter set");
+        assert_eq!(chat.agent, chatter_spec.id, "chatter must win over planner");
+
+        cfg.roles.chatter = None;
+        let fallback = start(
+            &chats,
+            &cfg,
+            tmp.path().to_owned(),
+            "rework the drain again",
+            None,
+            None,
+        )
+        .await
+        .expect("start with chatter unset");
+        assert_eq!(
+            fallback.agent, planner_spec.id,
+            "unset chatter must fall back to planner, unchanged from before this role existed"
+        );
     }
 
     #[test]

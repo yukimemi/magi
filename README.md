@@ -595,6 +595,10 @@ implementers = ["opus", "sonnet", "oc"]
 judges = ["sonnet", "oc", "opus"]
 reviewers = ["opus", "oc"]
 # fixer defaults to the winner's own author, continuing its own conversation.
+# planner is who `magi plan` and the browser interview ask; chatter is who the
+# resident chat asks and defaults to planner when unset. Split them if one
+# agent is also a judge seat — the resident chat opens far more often than
+# `magi plan` and would otherwise compete with that judge for the account.
 
 [graph]
 candidates = 3

@@ -145,6 +145,18 @@ pub struct Roles {
     /// necessarily the one that writes the best patch, and on a phone there is
     /// no `--agent` to type.
     pub planner: Option<String>,
+    /// Agent that answers the resident chat's quick turns (`src/chat.rs`),
+    /// distinct from `planner` on purpose.
+    ///
+    /// Unset falls back to `planner`, which was the only behaviour before
+    /// this field existed - so an existing config that named a planner needs
+    /// no change to keep working. Splitting it out matters once `planner` is
+    /// also carrying a judge seat: the resident chat is opened far more often
+    /// than `magi plan`, and every open competes with that judge seat for the
+    /// same account's concurrency. A timeout on an ordinary chat turn traced
+    /// to exactly this - `opus` triple-booked as planner, chatter, and judge
+    /// - is what this field exists to let an operator break apart.
+    pub chatter: Option<String>,
 }
 
 /// Graph shape and limits.
