@@ -650,6 +650,7 @@ impl Ui {
             .route("/api/queue", get(queue_list))
             .route("/api/queue/{id}", delete(queue_delete))
             .route("/api/repos", get(repos_list))
+            .route("/api/drafts/{id}/advisors", get(draft_advisors))
             .route("/api/queue/{id}/hold", post(queue_hold))
             .route("/api/queue/{id}/release", post(queue_release))
             .route("/api/queue/{id}/priority", post(queue_priority))
@@ -2322,6 +2323,28 @@ async fn repos_list(
             Duration::from_secs(cfg.repos.scan_ttl),
             refresh,
         )))
+    })
+    .await
+}
+
+/// `GET /api/drafts/{id}/advisors` - the raw record of `magi plan`'s headless
+/// design-deliberation stage for one draft: every advisor seat's proposal, or
+/// why it has none, and nothing about whether a synthesis happened - the
+/// draft's own content already carries that.
+///
+/// `magi plan` runs from a terminal, and a phone has none: this is the plan
+/// surface's read of what the CLI interview produced, straight off
+/// `<magi home>/drafts/<id>.advisors.json` - the file [`crate::advise::run`]
+/// writes unconditionally, before any check of its own that could still bail.
+async fn draft_advisors(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    blocking(move || {
+        let path = ui.home.join("drafts").join(format!("{id}.advisors.json"));
+        let text = std::fs::read_to_string(&path)
+            .map_err(|_| ApiError::not_found(format!("no advisor record for draft `{id}`")))?;
+        Ok(([(header::CONTENT_TYPE, "application/json")], text))
     })
     .await
 }
@@ -4678,6 +4701,27 @@ mod tests {
             Some(2),
             "an explicit refresh must rescan even inside the TTL"
         );
+    }
+
+    #[tokio::test]
+    async fn draft_advisors_serves_the_raw_record_a_cli_plan_run_wrote() {
+        let f = Fixture::start().await;
+        let drafts = f.home.path().join("drafts");
+        std::fs::create_dir_all(&drafts).expect("drafts dir");
+        let record = r#"{"records":[{"seat":"advisor-1","agent":"sage-a","duration_ms":1200}]}"#;
+        std::fs::write(drafts.join("20260906-000000-ab12.advisors.json"), record)
+            .expect("write advisor record");
+
+        let res = f.get("/api/drafts/20260906-000000-ab12/advisors").await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        assert_eq!(res.json()["records"][0]["seat"], "advisor-1");
+    }
+
+    #[tokio::test]
+    async fn draft_advisors_404s_for_a_draft_with_no_deliberation_on_disk() {
+        let f = Fixture::start().await;
+        let res = f.get("/api/drafts/nosuchdraft/advisors").await;
+        assert_eq!(res.status, 404, "{}", res.body);
     }
 
     #[tokio::test]

@@ -169,6 +169,49 @@ pub struct Position {
     pub tentative: Option<String>,
 }
 
+/// One advisor's independent design proposal, gathered by
+/// [`crate::advise`] between a `magi plan` interview and the task file it
+/// files.
+///
+/// No patch and no plan of tool calls - a design proposal is cheap exactly
+/// because it is a few paragraphs an agent can write without touching the
+/// repository, which is what makes running three of them, on every task,
+/// affordable in a way three full implementations were not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Proposal {
+    /// What to do and how, in the advisor's own words.
+    pub approach: String,
+    /// The one tradeoff this design turns on.
+    pub key_tradeoff: String,
+    /// What could go wrong.
+    #[serde(default)]
+    pub risks: Vec<String>,
+    /// Files or modules the design touches.
+    #[serde(default)]
+    pub touches: Vec<String>,
+    /// Why this earns its complexity over the obvious first draft - the
+    /// question that keeps a proposal from being a restatement of the task.
+    pub why_not_naive: String,
+}
+
+impl Proposal {
+    /// Reject a proposal with an empty field that matters, so a malformed or
+    /// lazy answer is retried instead of silently thinning the panel down to
+    /// prose nobody can act on.
+    pub fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("approach", &self.approach),
+            ("key_tradeoff", &self.key_tradeoff),
+            ("why_not_naive", &self.why_not_naive),
+        ] {
+            if value.trim().is_empty() {
+                bail!("`{field}` is empty");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Extract the last balanced JSON object in `text` that parses as `T`.
 ///
 /// Handles fenced blocks, trailing prose, and multiple objects. Strings and
@@ -378,5 +421,38 @@ mod tests {
         );
         assert_eq!(section(text, "notes").unwrap(), "ignore me");
         assert!(section(text, "missing").is_none());
+    }
+
+    fn proposal() -> Proposal {
+        Proposal {
+            approach: "extract a helper".to_owned(),
+            key_tradeoff: "one more indirection for less duplication".to_owned(),
+            risks: vec!["callers must agree on the new signature".to_owned()],
+            touches: vec!["src/config.rs".to_owned()],
+            why_not_naive: "the naive copy-paste drifts the next time a field is added".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_complete_proposal_validates() {
+        assert!(proposal().validate().is_ok());
+    }
+
+    #[test]
+    fn a_proposal_missing_why_not_naive_is_rejected() {
+        let mut p = proposal();
+        p.why_not_naive = "   ".to_owned();
+        let err = p.validate().expect_err("must be rejected").to_string();
+        assert!(err.contains("why_not_naive"), "{err}");
+    }
+
+    #[test]
+    fn a_proposal_parses_from_a_fenced_json_block_with_no_risks_or_touches_given() {
+        let text = "```json\n{\"approach\":\"a\",\"key_tradeoff\":\"b\",\
+                     \"why_not_naive\":\"c\"}\n```\n";
+        let p: Proposal = extract_json(text).unwrap();
+        assert!(p.validate().is_ok());
+        assert!(p.risks.is_empty());
+        assert!(p.touches.is_empty());
     }
 }

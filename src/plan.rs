@@ -25,7 +25,8 @@
 //!    operator is talking to that CLI directly, in its own UI, with no magi in
 //!    the middle. Nothing is captured and there is no timeout: a human deciding
 //!    what to build takes as long as it takes.
-//! 3. When the agent exits, read the output path, check it with
+//! 3. When the agent exits, read the output path, run it through
+//!    [`crate::advise`]'s headless design deliberation, check the result with
 //!    [`review_draft`], and file it.
 //!
 //! # The draft is never thrown away
@@ -35,8 +36,10 @@
 //! interview that ends in a validation failure must leave the operator holding
 //! the draft, named in the error message, so the fix is an edit and
 //! `magi task add --file` rather than a second interview. That is the single
-//! most important behaviour here, and [`vet`] is the only place that can break
-//! it.
+//! most important behaviour here. [`vet`] is the only place that can break it
+//! by failing validation; [`crate::advise::run`] keeps the same contract for
+//! its own, different kind of failure - it never writes its synthesis over
+//! the draft until it has one complete enough to write.
 
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -44,6 +47,7 @@ use std::process::Stdio;
 
 use anyhow::{Context as _, Result, bail};
 
+use crate::advise;
 use crate::chat;
 use crate::config::{AgentKind, AgentSpec, Config, which};
 use crate::proc::Quiet as _;
@@ -267,6 +271,25 @@ pub async fn plan(opts: Opts) -> Result<Task> {
         // written - still leaves something worth filing. Whether there is a
         // draft is the question that matters, and `vet` answers it next.
         eprintln!("note: {} exited with {status}", argv[0]);
+    }
+
+    // Headless, and after the interview is over: three advisors sketch a
+    // design each and the planner seat folds them into the draft's `##
+    // Context` and `## Change`, all without asking the operator anything -
+    // see `crate::advise`'s doc for why this replaced diversity at the
+    // implement stage rather than adding a fourth thing to sit through.
+    // `advise::run` never touches `draft` before it has a complete
+    // replacement, so its own failure leaves the interview's draft exactly as
+    // written, named in the error the same way a `vet` failure already is.
+    if config.graph.advise {
+        let advice = advise::run(&config, &repo, &draft, &dir, &id).await?;
+        println!(
+            "design deliberation: {} of {} advisor(s) produced a proposal; \
+             synthesis folded into {}",
+            advice.proposals().len(),
+            advice.records.len(),
+            draft.display()
+        );
     }
 
     let (body, warnings) = vet(&draft)?;
