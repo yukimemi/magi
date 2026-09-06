@@ -564,6 +564,118 @@ impl Drop for MarkerLock {
     }
 }
 
+/// How often a blocked caller checks whether [`MarkerLock`] has freed up.
+const LOCK_POLL: Duration = Duration::from_secs(5);
+
+/// How long a caller waits for a contended lock before giving up on this
+/// merge's own judgement entirely.
+///
+/// A first version of this gate gave up the instant the lock was taken,
+/// which meant a change landing while another host's decision call was
+/// still running was never judged at all - not even recorded as pending,
+/// not escalated later, just dropped. The lock is only ever held for one
+/// `after_merge` call, so waiting past it is what lets that call's own
+/// decision reach [`pending_action`] against a marker the other side just
+/// finished writing, instead of finding nothing to check against. Set just
+/// under [`LOCK_STALE_AFTER`]: a lock still held this long after that point
+/// is reclaimed as abandoned rather than waited on further.
+const LOCK_WAIT_CEILING: Duration = Duration::from_secs(25 * 60);
+
+/// Wait for [`MarkerLock`] to free up, polling rather than blocking forever.
+/// `Ok(None)` means the ceiling passed with the lock still held.
+async fn wait_for_marker_lock(marker: &Path) -> Result<Option<MarkerLock>> {
+    wait_for_marker_lock_with(marker, LOCK_POLL, LOCK_WAIT_CEILING).await
+}
+
+/// [`wait_for_marker_lock`] with the poll interval and ceiling as parameters,
+/// so the retry behaviour is testable without a test actually waiting out
+/// [`LOCK_WAIT_CEILING`].
+async fn wait_for_marker_lock_with(
+    marker: &Path,
+    poll: Duration,
+    ceiling: Duration,
+) -> Result<Option<MarkerLock>> {
+    let mut waited = Duration::ZERO;
+    loop {
+        if let Some(lock) = MarkerLock::acquire(marker)? {
+            return Ok(Some(lock));
+        }
+        if waited >= ceiling {
+            return Ok(None);
+        }
+        tokio::time::sleep(poll).await;
+        waited += poll;
+    }
+}
+
+/// Which digit differs between `from` and `to`? `None` when they are equal.
+///
+/// Used to recover the level a pull request found by [`find_open_release_pr`]
+/// was judged at: the forge has the resulting version (in the branch name and
+/// the title) but not the digit an agent chose to get there, and this is the
+/// one other host-independent fact every host can compute the same way from
+/// it.
+fn level_between(from: Version, to: Version) -> Option<BumpLevel> {
+    if to.major != from.major {
+        Some(BumpLevel::Major)
+    } else if to.minor != from.minor {
+        Some(BumpLevel::Minor)
+    } else if to.patch != from.patch {
+        Some(BumpLevel::Patch)
+    } else {
+        None
+    }
+}
+
+/// Parse `gh pr list --state open --json url,headRefName` output, returning
+/// the first pull request whose branch is one of this module's own. No I/O.
+fn parse_open_release_pr(json: &str) -> Result<Option<(String, String)>> {
+    #[derive(Deserialize)]
+    struct Pr {
+        url: String,
+        #[serde(rename = "headRefName")]
+        head_ref_name: String,
+    }
+    let list: Vec<Pr> =
+        serde_json::from_str(json).context("parse `gh pr list --json url,headRefName` output")?;
+    Ok(list
+        .into_iter()
+        .find(|p| p.head_ref_name.starts_with("chore/release-v"))
+        .map(|p| (p.head_ref_name, p.url)))
+}
+
+/// Ask the forge directly whether a release bump is already open, for a host
+/// that has never seen it.
+///
+/// [`MarkerLock`] and the marker file only ever coordinate *this* host - a
+/// marker written on one machine is not visible to `run::home()` on another,
+/// so two hosts landing runs against the same repository at the same time
+/// can each read "nothing pending" and open a competing pull request no
+/// local lock can see. `gh pr list` is the one place every host actually
+/// shares a view, so it is consulted whenever this host's own marker says
+/// there is nothing pending, before a fresh decision is allowed to open a
+/// second pull request. This narrows the race to the gap between this call
+/// and whichever host's `gh pr create` lands first - it does not close it -
+/// because turning that into a real distributed lock would need coordination
+/// this crate has no dependency for.
+async fn find_open_release_pr(repo: &Path) -> Result<Option<(String, String)>> {
+    let out = tokio::process::Command::new("gh")
+        .args(["pr", "list", "--state", "open", "--json", "url,headRefName"])
+        .current_dir(repo)
+        .quiet()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("spawn gh pr list")?;
+    if !out.status.success() {
+        bail!(
+            "gh pr list: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    parse_open_release_pr(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// After a merge lands, ask an agent how big the change was and open a
 /// release bump sized to it.
 ///
@@ -599,11 +711,12 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
     // sequence below is the critical section two `after_merge` calls landing
     // within the same window must not both be inside at once. See
     // `MarkerLock`'s own doc for why a second, unrelated bump PR is what
-    // that race produces without it.
-    let Some(_lock) = MarkerLock::acquire(&marker)? else {
+    // that race produces without it, and `wait_for_marker_lock`'s for why
+    // this waits rather than giving up the instant it is contended.
+    let Some(_lock) = wait_for_marker_lock(&marker).await? else {
         state.event(
             "bump",
-            "another release bump decision is already in progress on this host; skipping this round",
+            "another release bump decision held the lock past the wait ceiling; skipping this round",
         );
         return Ok(());
     };
@@ -640,6 +753,34 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
                 // same question this merge would get on a fresh path, so a
                 // more severe change landing while it waits can escalate it
                 // instead of being silently absorbed at the wrong digit.
+            }
+        }
+    }
+
+    if pending.is_none() {
+        // This host's own marker has nothing to say - check the forge itself
+        // before trusting that to mean a fresh pull request is safe to open.
+        // See `find_open_release_pr`'s own doc for what this does and does
+        // not close.
+        if let Ok(Some((branch, url))) = find_open_release_pr(&repo).await
+            && let Some(target) = branch
+                .strip_prefix("chore/release-v")
+                .and_then(|v| Version::parse(v).ok())
+        {
+            let base_parsed = Version::parse(&base_version)?;
+            if target > base_parsed
+                && let Some(level) = level_between(base_parsed, target)
+            {
+                let adopted = PendingBump {
+                    target_version: target.to_string(),
+                    level,
+                    branch,
+                    pr_url: url,
+                };
+                // Best-effort: worst case this host asks the forge again
+                // next time instead of finding its own record of it.
+                let _ = write_marker(&marker, &adopted);
+                pending = Some(adopted);
             }
         }
     }
@@ -725,12 +866,15 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
     git::worktree_remove(&repo, &worktree).await.ok();
     let (pr_url_opened, automerge_warning) = opened?;
 
-    // Written before the automerge warning is even known: the pull request
-    // exists on the forge either way, and a marker that only appears on the
-    // fully-happy path is exactly what let a failed `gh pr merge --auto`
-    // both hide the URL this function already has and leave the next merge
-    // free to open a second, competing pull request.
-    write_marker(
+    // The pull request exists on the forge the moment `open_bump_pr` returns
+    // its URL, regardless of what happens next - so the event that names it
+    // is unconditional, and a marker write failing (a full disk, a missing
+    // `home/bump` directory) is reported as its own warning rather than
+    // swallowing that URL entirely the way propagating it with `?` would.
+    // `find_open_release_pr` is the fallback if this leaves no local record:
+    // the next merge that finds no marker still finds this pull request on
+    // the forge before opening a second one.
+    let marker_write = write_marker(
         &marker,
         &PendingBump {
             target_version: next.clone(),
@@ -738,7 +882,7 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
             branch,
             pr_url: pr_url_opened.clone(),
         },
-    )?;
+    );
     state.event(
         "bump",
         format!(
@@ -747,6 +891,16 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
             decision.reason
         ),
     );
+    if let Err(e) = marker_write {
+        state.event(
+            "bump",
+            format!(
+                "could not record the pending release bump marker for v{next}: {e:#}; a later \
+                 merge may open a duplicate pull request if it cannot find {pr_url_opened} on \
+                 the forge either"
+            ),
+        );
+    }
     if let Some(warning) = automerge_warning {
         state.event(
             "bump",
@@ -797,7 +951,11 @@ async fn escalate_pending(
         );
     }
 
-    let result: Result<()> = async {
+    // Only the substantive change - the commit landing on the remote branch
+    // - has to succeed for the escalation to have happened at all. Anything
+    // after the push is a follow-up, not a precondition: the branch already
+    // carries the new version whether or not it succeeds.
+    let pushed: Result<()> = async {
         let cargo_toml_path = worktree.join("Cargo.toml");
         let toml = tokio::fs::read_to_string(&cargo_toml_path)
             .await
@@ -823,18 +981,30 @@ async fn escalate_pending(
         if !pushed.ok() {
             bail!("pushing {} failed: {}", pending.branch, pushed.stderr);
         }
-        gh_pr_edit_title(
-            &worktree,
-            &pending.pr_url,
-            &format!("chore: release v{next}"),
-        )
-        .await
+        Ok(())
     }
     .await;
-    git::worktree_remove(repo, &worktree).await.ok();
-    result?;
+    if let Err(e) = pushed {
+        git::worktree_remove(repo, &worktree).await.ok();
+        return Err(e);
+    }
 
-    write_marker(
+    // The commit is on the remote branch now regardless of what happens
+    // below - the title edit is cosmetic, and the marker and the event must
+    // both reflect the real, already-pushed state even if it fails.
+    let title_warning = match gh_pr_edit_title(
+        &worktree,
+        &pending.pr_url,
+        &format!("chore: release v{next}"),
+    )
+    .await
+    {
+        Ok(()) => None,
+        Err(e) => Some(e.to_string()),
+    };
+    git::worktree_remove(repo, &worktree).await.ok();
+
+    let marker_write = write_marker(
         marker,
         &PendingBump {
             target_version: next.clone(),
@@ -842,7 +1012,7 @@ async fn escalate_pending(
             branch: pending.branch.clone(),
             pr_url: pending.pr_url.clone(),
         },
-    )?;
+    );
     state.event(
         "bump",
         format!(
@@ -853,6 +1023,25 @@ async fn escalate_pending(
             pending.pr_url
         ),
     );
+    if let Err(e) = marker_write {
+        state.event(
+            "bump",
+            format!(
+                "could not update the pending release bump marker to v{next}: {e:#}; a later \
+                 merge may misjudge whether it is already covered"
+            ),
+        );
+    }
+    if let Some(warning) = title_warning {
+        state.event(
+            "bump",
+            format!(
+                "pushed v{next} to {} but could not update its title: {warning}; the squashed \
+                 subject may still read the superseded version",
+                pending.pr_url
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -1345,6 +1534,101 @@ foo = { version = \"1.2.3\" }\n";
             MarkerLock::acquire(&marker).unwrap().is_some(),
             "a lock older than the stale window must be reclaimed rather than block forever"
         );
+    }
+
+    #[tokio::test]
+    async fn a_contended_lock_is_retried_until_the_holder_releases_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("bump").join("deadbeefdeadbeef.json");
+        let held = MarkerLock::acquire(&marker)
+            .unwrap()
+            .expect("seed the contention");
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+        });
+        let waited =
+            wait_for_marker_lock_with(&marker, Duration::from_millis(5), Duration::from_secs(5))
+                .await
+                .unwrap();
+        assert!(
+            waited.is_some(),
+            "a merge landing behind another's still-running decision must not be dropped - it \
+             must wait for that decision to finish and then judge against what it left behind"
+        );
+        releaser.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lock_held_past_the_ceiling_gives_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("bump").join("deadbeefdeadbeef.json");
+        let _held = MarkerLock::acquire(&marker).unwrap().unwrap();
+        let waited =
+            wait_for_marker_lock_with(&marker, Duration::from_millis(2), Duration::from_millis(10))
+                .await
+                .unwrap();
+        assert!(
+            waited.is_none(),
+            "a lock genuinely held past the ceiling must eventually give up rather than wait \
+             forever"
+        );
+    }
+
+    #[test]
+    fn level_between_reads_off_the_differing_digit() {
+        assert_eq!(
+            level_between(
+                Version::parse("0.8.0").unwrap(),
+                Version::parse("1.0.0").unwrap()
+            ),
+            Some(BumpLevel::Major)
+        );
+        assert_eq!(
+            level_between(
+                Version::parse("0.8.0").unwrap(),
+                Version::parse("0.9.0").unwrap()
+            ),
+            Some(BumpLevel::Minor)
+        );
+        assert_eq!(
+            level_between(
+                Version::parse("0.8.0").unwrap(),
+                Version::parse("0.8.1").unwrap()
+            ),
+            Some(BumpLevel::Patch)
+        );
+        assert_eq!(
+            level_between(
+                Version::parse("0.8.0").unwrap(),
+                Version::parse("0.8.0").unwrap()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn open_release_pr_is_found_among_unrelated_pull_requests() {
+        let json = r#"[
+            {"url": "https://example.invalid/pull/1", "headRefName": "feat/something"},
+            {"url": "https://example.invalid/pull/2", "headRefName": "chore/release-v0.9.0"}
+        ]"#;
+        let found = parse_open_release_pr(json).unwrap();
+        assert_eq!(
+            found,
+            Some((
+                "chore/release-v0.9.0".to_owned(),
+                "https://example.invalid/pull/2".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn no_open_release_pr_reads_as_none_not_an_error() {
+        let json =
+            r#"[{"url": "https://example.invalid/pull/1", "headRefName": "feat/something"}]"#;
+        assert_eq!(parse_open_release_pr(json).unwrap(), None);
+        assert_eq!(parse_open_release_pr("[]").unwrap(), None);
     }
 
     #[test]
