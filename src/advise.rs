@@ -21,18 +21,33 @@
 //! interview already did that, and turning this stage into three more
 //! conversations would be exactly the cost this module exists to avoid.
 //!
-//! # Read-only is enforced by disposability, not by the prompt
+//! # Disposability narrows the blast radius, it does not forbid writing
 //!
 //! `allow_write: false` alone is not a guarantee: opencode has no read-only
 //! mode at all, and Claude's `--disallowed-tools` stops its edit tools but not
-//! a `rm` or a redirect run through its Bash tool. Judge and reviewer seats in
-//! [`crate::graph`] get away with that weak guarantee because their `cwd` is
-//! already a worktree the run treats as disposable; this stage runs before
-//! any run exists, so it makes its own - [`checkout_worktrees`] gives every
-//! advisor seat, and the planner's synthesis, a `git worktree add --detach`
-//! checkout at `HEAD` that is thrown away when [`run`] returns. A seat that
-//! writes anyway still only ever touches its own disposable copy, never the
-//! operator's checkout and never another seat's.
+//! a `rm` or a redirect run through its Bash tool. That is the existing,
+//! accepted risk model for every read-only seat in this codebase - judge and
+//! reviewer seats in [`crate::graph`] carry exactly the same weak guarantee,
+//! and get away with it because their `cwd` is already a worktree the run
+//! treats as disposable. This stage runs before any run exists, so it was
+//! pointed at the operator's own checkout until [`checkout_worktrees`] gave
+//! every advisor seat, and the planner's synthesis, a `git worktree add
+//! --detach` checkout at `HEAD` of their own, thrown away when [`run`]
+//! returns - the same protection judges and reviewers already had, closing
+//! the one gap unique to this stage rather than inventing a stronger
+//! guarantee nothing else here provides.
+//!
+//! What this buys: a relative-path write from a seat that ignores its
+//! instructions lands in that seat's own disposable checkout, not in the
+//! operator's repository and not in another seat's. What it does not buy: an
+//! absolute-path write, or an edit to the shared `.git` metadata a linked
+//! worktree does not copy (its own config extension aside), can still reach
+//! outside the checkout - the same as it always could for a judge or a
+//! reviewer. Closing that would mean sandboxing the process itself (a
+//! container, a chroot, an OS-level read-only mount), which no seat of any
+//! kind in this codebase has today; adding one is a different, much larger
+//! change than a design-deliberation stage, not something this module can
+//! give an advisor seat on its own.
 //!
 //! # The draft survives every failure short of success
 //!
@@ -169,8 +184,9 @@ pub async fn run(
 }
 
 /// Disposable, detached worktrees at `HEAD`, one per advisor seat - see the
-/// module doc's "Read-only is enforced by disposability" section for why a
-/// seat needs one of these rather than the operator's own checkout.
+/// module doc's "Disposability narrows the blast radius" section for why a
+/// seat needs one of these rather than the operator's own checkout, and for
+/// what it does and does not protect against.
 ///
 /// Sequential, not parallel: `git worktree add` takes a lock on the
 /// repository's own `.git` metadata, and setup is a one-time cost paid once
@@ -633,13 +649,16 @@ mod tests {
         }
     }
 
-    /// Reported: `allow_write: false` is not enforced by every CLI kind
-    /// (opencode has no read-only mode at all), so a seat that writes anyway
-    /// used to write into the operator's own repository - the one directory
-    /// this stage must never touch. A seat that writes now can only ever
-    /// reach its own disposable worktree.
+    /// This does not prove a seat *cannot* write - `allow_write: false` is
+    /// not enforced by every CLI kind (opencode has no read-only mode at
+    /// all), and nothing here forbids an absolute-path write either. What it
+    /// proves is the gap that was unique to this stage: a relative-path
+    /// write from a seat that ignores its instructions used to land in the
+    /// operator's own repository - the one directory this stage must never
+    /// touch - and now lands in that seat's own disposable checkout instead.
     #[tokio::test]
-    async fn an_advisors_write_lands_in_its_worktree_never_in_the_operators_repository() {
+    async fn a_relative_path_write_from_an_advisor_lands_in_its_worktree_not_the_operators_repository()
+     {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         init_repo(&repo);

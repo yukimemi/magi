@@ -2636,7 +2636,11 @@ function renderDraftDetail() {
 
   setText($("plan-draft-detail-title"), `Design deliberation — ${shortId(id)}`);
   const list = $("plan-draft-detail-list");
+  const bodyEl = $("plan-draft-detail-body");
   clear(list);
+  clear(bodyEl);
+  show(bodyEl, false);
+  show($("plan-draft-detail-no-body"), false);
 
   if (error) {
     list.append(el("li", { class: "form-error", text: error }));
@@ -2646,6 +2650,18 @@ function renderDraftDetail() {
     list.append(el("li", { text: "Loading…" }));
     return;
   }
+
+  /* The task file the deliberation produced - what the planner actually
+     kept from the proposals below, not just what was on offer. Rendered the
+     same way every other markdown surface in this client is: a server-parsed
+     tree, never a client-side parse of agent-authored text. */
+  if (advice.draft_md) {
+    renderMd(bodyEl, advice.draft_md);
+    show(bodyEl, true);
+  } else {
+    show($("plan-draft-detail-no-body"), true);
+  }
+
   for (const record of advice.records || []) {
     const head = el("h3", { text: `${record.seat} (${record.agent || "—"})` });
     const body = el("ul", { class: "proposal" });

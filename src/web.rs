@@ -2385,24 +2385,63 @@ async fn drafts_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<DraftSumma
     .await
 }
 
+/// The wire shape of `GET /api/drafts/{id}/advisors`: the raw advisor
+/// records, `#[serde(flatten)]`ed so `records` reads exactly as it does in
+/// `<id>.advisors.json`, plus the task file the deliberation actually
+/// produced.
+///
+/// The proposals alone answer "what did the advisors argue"; they cannot
+/// answer "which of that actually shaped the task file", which is the
+/// question the attribution [`prompt::synthesize`] asks the planner to write
+/// is supposed to let the operator check. Reading that check requires the
+/// synthesized `## Context` / `## Change` themselves, not just the inputs to
+/// them - so this carries the draft's own text alongside the record it was
+/// built from.
+#[derive(Debug, Serialize)]
+struct DraftAdvisorsView {
+    #[serde(flatten)]
+    advice: advise::Advice,
+    /// The task file's current text. `None` only if `<id>.md` is missing on
+    /// disk (removed by hand) - never because synthesis has not run yet: by
+    /// the time `<id>.advisors.json` exists at all, [`crate::advise::run`]
+    /// has already overwritten the draft with its synthesis, or the whole
+    /// stage failed and this endpoint has nothing to serve in the first
+    /// place.
+    draft: Option<String>,
+    /// The same text, pre-parsed - the plan surface's other markdown views
+    /// all render a server-parsed tree rather than trusting a client-side
+    /// parser with agent-authored text.
+    draft_md: Option<Vec<md::Node>>,
+}
+
 /// `GET /api/drafts/{id}/advisors` - the raw record of `magi plan`'s headless
-/// design-deliberation stage for one draft: every advisor seat's proposal, or
-/// why it has none, and nothing about whether a synthesis happened - the
-/// draft's own content already carries that.
+/// design-deliberation stage for one draft, plus the task file it produced.
 ///
 /// `magi plan` runs from a terminal, and a phone has none: this is the plan
 /// surface's read of what the CLI interview produced, straight off
 /// `<magi home>/drafts/<id>.advisors.json` - the file [`crate::advise::run`]
-/// writes unconditionally, before any check of its own that could still bail.
+/// writes unconditionally, before any check of its own that could still bail
+/// - and `<id>.md` alongside it.
 async fn draft_advisors(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
-) -> ApiResult<impl IntoResponse> {
+) -> ApiResult<Json<DraftAdvisorsView>> {
     blocking(move || {
-        let path = ui.home.join("drafts").join(format!("{id}.advisors.json"));
-        let text = std::fs::read_to_string(&path)
+        let dir = ui.home.join("drafts");
+        let path = dir.join(format!("{id}.advisors.json"));
+        let raw = std::fs::read_to_string(&path)
             .map_err(|_| ApiError::not_found(format!("no advisor record for draft `{id}`")))?;
-        Ok(([(header::CONTENT_TYPE, "application/json")], text))
+        let advice: advise::Advice = serde_json::from_str(&raw)
+            .map_err(|e| ApiError::internal(format!("parse {}: {e:#}", path.display())))?;
+        let draft = std::fs::read_to_string(dir.join(format!("{id}.md"))).ok();
+        let draft_md = draft
+            .as_deref()
+            .map(|body| md::to_nodes(body, &md::ImageBase::None));
+        Ok(Json(DraftAdvisorsView {
+            advice,
+            draft,
+            draft_md,
+        }))
     })
     .await
 }
@@ -4773,6 +4812,45 @@ mod tests {
         let res = f.get("/api/drafts/20260906-000000-ab12/advisors").await;
         assert_eq!(res.status, 200, "{}", res.body);
         assert_eq!(res.json()["records"][0]["seat"], "advisor-1");
+        assert!(
+            res.json()["draft"].is_null(),
+            "no .md on disk must read as no draft, not as an error: {}",
+            res.body
+        );
+    }
+
+    /// Reported: the plan surface could read what each advisor argued but
+    /// never what the planner actually kept - the half of the deliberation
+    /// that answers "so what happened".
+    #[tokio::test]
+    async fn draft_advisors_includes_the_synthesized_task_file_the_deliberation_produced() {
+        let f = Fixture::start().await;
+        let drafts = f.home.path().join("drafts");
+        std::fs::create_dir_all(&drafts).expect("drafts dir");
+        std::fs::write(
+            drafts.join("20260906-000000-mn34.advisors.json"),
+            r#"{"records":[{"seat":"advisor-1","agent":"sage-a","duration_ms":1}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            drafts.join("20260906-000000-mn34.md"),
+            "# Rework the config loader\n\n## Context\n\nadvisor-1 argued for X.\n\n## Completion criteria\n\n- [ ] it works\n",
+        )
+        .unwrap();
+
+        let res = f.get("/api/drafts/20260906-000000-mn34/advisors").await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let body = res.json();
+        assert!(
+            body["draft"]
+                .as_str()
+                .is_some_and(|d| d.contains("advisor-1 argued for X")),
+            "{body}"
+        );
+        assert!(
+            body["draft_md"].is_array(),
+            "the draft must also arrive pre-parsed, like every other markdown surface: {body}"
+        );
     }
 
     #[tokio::test]
