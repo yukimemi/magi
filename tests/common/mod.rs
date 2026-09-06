@@ -278,6 +278,7 @@ pub fn fixture(judges: Judges, require_fix: bool) -> Fixture {
             mode: MergeMode::None,
             base: None,
             remote: "origin".to_owned(),
+            release_bump: true,
         },
         // Tests must never reach the network.
         update: Update {

@@ -25,6 +25,7 @@ pub mod advise;
 pub mod agent;
 pub mod ask;
 pub mod blind;
+pub mod bump;
 pub mod chat;
 pub mod clean;
 pub mod config;
