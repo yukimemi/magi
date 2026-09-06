@@ -1443,7 +1443,7 @@ async fn task_source(issue: Option<u64>) -> Source {
 async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
     println!("git        {}", probe("git", &["--version"]).await);
     println!("gh         {}", probe("gh", &["--version"]).await);
-    for kind in ["claude", "opencode", "agy"] {
+    for kind in ["claude", "opencode", "agy", "codex"] {
         println!(
             "{kind:<10} {}",
             if magi::config::which(kind) {

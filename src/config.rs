@@ -27,6 +27,10 @@ pub enum AgentKind {
     /// retired the standalone client for individual accounts in favour of this
     /// one, so an adapter for it would be dead code on a live machine.
     Antigravity,
+    /// OpenAI Codex CLI (`codex exec`). The one roster member with a real
+    /// read-only mode: `--sandbox read-only` is enforced by the CLI, not by
+    /// the prompt.
+    Codex,
     /// Arbitrary command. The escape hatch, and what the test suite drives.
     Command,
 }
@@ -38,6 +42,7 @@ impl AgentKind {
             Self::Claude => Some("claude"),
             Self::Opencode => Some("opencode"),
             Self::Antigravity => Some("agy"),
+            Self::Codex => Some("codex"),
             Self::Command => None,
         }
     }
@@ -48,6 +53,7 @@ impl AgentKind {
             Self::Claude => "claude",
             Self::Opencode => "opencode",
             Self::Antigravity => "antigravity",
+            Self::Codex => "codex",
             Self::Command => "command",
         }
     }
@@ -100,6 +106,10 @@ impl AgentSpec {
     pub fn delivery(&self) -> Delivery {
         self.prompt_delivery.unwrap_or(match self.kind {
             AgentKind::Claude | AgentKind::Command => Delivery::Stdin,
+            // `codex exec -` reads the prompt from stdin, so the whole
+            // instruction arrives without an argv length limit and without a
+            // tool round-trip to open a file.
+            AgentKind::Codex => Delivery::Stdin,
             AgentKind::Opencode | AgentKind::Antigravity => Delivery::File,
         })
     }
@@ -841,6 +851,7 @@ impl Config {
             (AgentKind::Claude, "sonnet", Some("sonnet")),
             (AgentKind::Antigravity, "antigravity", None),
             (AgentKind::Opencode, "opencode", None),
+            (AgentKind::Codex, "codex", None),
         ] {
             if kind.program().is_some_and(which) && !cfg.agents.iter().any(|a| a.id == id) {
                 cfg.agents.push(AgentSpec {
@@ -951,7 +962,7 @@ impl Config {
         if detected.agents.is_empty() {
             s.push_str(
                 "# No agent CLI was found on PATH. Fill this in by hand.\n\
-                 # kind = claude | opencode | antigravity | command\n\
+                 # kind = claude | opencode | antigravity | codex | command\n\
                  [[agents]]\nid = \"opus\"\nkind = \"claude\"\nmodel = \"opus\"\n\n",
             );
         } else {

@@ -461,8 +461,9 @@ unrelated crate by another author.
 
 ### Agent CLIs are the only backend
 
-magi drives subscription CLIs (`claude -p`, `opencode run`, `agy -p`) and never
-an HTTP API. That is a product decision, not an unfinished one: the CLIs carry
+magi drives subscription CLIs (`claude -p`, `opencode run`, `agy -p`,
+`codex exec`) and never an HTTP API. That is a product decision, not an
+unfinished one: the CLIs carry
 the operator's own plan and expose the agent's whole tool loop. **Do not add an
 API-key path**, and do not add a `reqwest`-shaped dependency — `examples/smoke.rs`
 deliberately exercises filesystem and serialization instead of a TLS handshake
@@ -479,7 +480,7 @@ escape hatch for any other CLI is `kind = "command"`.
 ### Session mechanics are per-CLI and verified by hand
 
 Multi-turn nodes (deliberation, the review loop) depend on each seat keeping one
-CLI conversation. The three mechanics were established empirically, not from
+CLI conversation. The mechanics were established empirically, not from
 docs, and each is asserted in `src/agent.rs` tests:
 
 | CLI | open | resume | trap |
@@ -487,6 +488,7 @@ docs, and each is asserted in `src/agent.rs` tests:
 | `claude` | `--session-id <uuid>` | `--resume <uuid>` | the uuid must be RFC 4122 v4 or the CLI rejects it (`src/rng.rs` mints it) |
 | `opencode` | `--format json` → `sessionID` | `-s <id>` | nothing to resume until a turn reported an id |
 | `agy` | `--output-format json` → `conversation_id` | `--conversation <id>` | print mode defaults to a **5 minute** timeout; `--print-timeout` must track the node budget. `--disable-slash-commands` silently disables `--mode`, so magi never passes it |
+| `codex` | `exec --json` → `thread.started.thread_id` | `exec … resume <id>` | `resume` is a **subcommand** and rejects every `exec` option that follows it (`unexpected argument '--sandbox'`), so magi emits all options first and the subcommand last. The prompt goes on stdin, which codex reads only when the prompt argument is `-`. The answer is the **last** `item.completed` whose item is an `agent_message`: earlier ones narrate the tool loop |
 
 `agent::has_session` is the single place that decides whether a follow-up prompt
 may rely on memory. If it says no, the node re-sends full context. Never assume
@@ -502,6 +504,19 @@ panel. So magi always passes `--auto` for `kind = "opencode"`, and read-only-nes
 for those seats rests on the prompt plus the fact that judge worktrees are
 deleted after the tally and reviewer worktrees are `reset --hard` to the commit
 under review every round. Do not "fix" this by withholding `--auto`.
+
+### codex is the only seat whose read-only mode is enforced
+
+`--sandbox read-only` is refused by the CLI, not by the prompt, so a codex
+judge or reviewer cannot write even if it decides to. Implementers get
+`workspace-write`. **Nothing ever gets
+`--dangerously-bypass-approvals-and-sandbox`** — it would throw away the one
+enforced guarantee in the roster, and `codex_is_sandboxed_reads_stdin_and_puts_resume_last`
+fails if it appears.
+
+Unattended seats also pass `-c approval_policy="never"`: a seat that stops to
+ask blocks until its node timeout kills it, and there is nobody at the
+terminal during a run.
 
 ### teravars renders the whole config file
 

@@ -81,7 +81,9 @@ pub fn has_session(kind: AgentKind, seat: &SeatState, sessions_enabled: bool) ->
     }
     match kind {
         AgentKind::Claude => seat.claude_session.is_some(),
-        AgentKind::Opencode | AgentKind::Antigravity => seat.captured_session.is_some(),
+        AgentKind::Opencode | AgentKind::Antigravity | AgentKind::Codex => {
+            seat.captured_session.is_some()
+        }
         AgentKind::Command => true,
     }
 }
@@ -361,7 +363,9 @@ pub async fn invoke(
     if let Some(session) = extracted.session {
         match spec.kind {
             AgentKind::Claude => seat.claude_session = Some(session),
-            AgentKind::Opencode | AgentKind::Antigravity => seat.captured_session = Some(session),
+            AgentKind::Opencode | AgentKind::Antigravity | AgentKind::Codex => {
+                seat.captured_session = Some(session);
+            }
             AgentKind::Command => {}
         }
     }
@@ -537,6 +541,50 @@ fn build_command(
                 argv.push(inv.artifacts.to_string_lossy().into_owned());
             }
         }
+        AgentKind::Codex => {
+            argv.push("codex".to_owned());
+            argv.push("exec".to_owned());
+            argv.push("--json".to_owned());
+            // The worktrees magi hands out are real checkouts, but a judge's
+            // is detached and a fixture's may be no repository at all.
+            argv.push("--skip-git-repo-check".to_owned());
+            argv.push("-C".to_owned());
+            argv.push(inv.cwd.to_string_lossy().into_owned());
+            // Codex is the only kind whose read-only-ness is enforced by the
+            // CLI rather than by the prompt: a judge or reviewer seat cannot
+            // write even if it decides to try. Implementers get the workspace,
+            // and nothing ever gets `--dangerously-bypass-approvals-and-sandbox`.
+            argv.push("--sandbox".to_owned());
+            argv.push(
+                if inv.allow_write {
+                    "workspace-write"
+                } else {
+                    "read-only"
+                }
+                .to_owned(),
+            );
+            // Nothing is watching to approve anything: an unattended seat that
+            // asks blocks until its timeout kills it.
+            argv.push("-c".to_owned());
+            argv.push("approval_policy=\"never\"".to_owned());
+            if let Some(m) = &spec.model {
+                argv.push("-m".to_owned());
+                argv.push(m.clone());
+            }
+            // `resume` is a subcommand of `exec`, and it rejects the flags
+            // above when they follow it - so every option is emitted first and
+            // the subcommand last. Established by hand against codex-cli
+            // 0.153.4: with the order reversed the CLI exits on
+            // `unexpected argument '--sandbox'`.
+            if resuming {
+                argv.push("resume".to_owned());
+                argv.push(
+                    seat.captured_session
+                        .clone()
+                        .expect("has_session checked the id is present"),
+                );
+            }
+        }
         AgentKind::Command => {
             if spec.command.is_empty() {
                 bail!("agent `{}` has kind = \"command\" but no command", spec.id);
@@ -565,6 +613,11 @@ fn build_command(
     // emitted right before whatever the delivery mode produces.
     if spec.kind == AgentKind::Antigravity {
         argv.push("-p".to_owned());
+    }
+    // `codex exec` reads stdin only when its prompt argument is `-`; without
+    // it the CLI waits on a prompt it will never be given.
+    if spec.kind == AgentKind::Codex && delivery == Delivery::Stdin {
+        argv.push("-".to_owned());
     }
     match delivery {
         Delivery::Stdin if spec.kind == AgentKind::Antigravity => {
@@ -681,6 +734,52 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 status: v.get("status").and_then(|s| s.as_str()).map(str::to_owned),
                 quota: None,
                 dropped: dropped_stream(&v),
+            }
+        }
+        AgentKind::Codex => {
+            // A JSONL event stream, prefixed on a real machine by tracing
+            // lines the CLI writes about its own config and skills - so
+            // non-JSON lines are skipped rather than treated as the answer.
+            //
+            // The thread id arrives once, in `thread.started`, and a resumed
+            // turn reports the same one. The answer is the last
+            // `item.completed` carrying an `agent_message`: earlier ones are
+            // the model narrating its way through the tool loop, and taking
+            // the first would hand the caller a progress note instead of a
+            // verdict.
+            let mut text = String::new();
+            let mut session = None;
+            let mut status = None;
+            for line in stdout.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                    continue;
+                };
+                match v.get("type").and_then(|t| t.as_str()) {
+                    Some("thread.started") => {
+                        session = v
+                            .get("thread_id")
+                            .and_then(|s| s.as_str())
+                            .map(str::to_owned);
+                    }
+                    Some("item.completed") => {
+                        let item = v.get("item").unwrap_or(&serde_json::Value::Null);
+                        if item.get("type").and_then(|t| t.as_str()) == Some("agent_message")
+                            && let Some(t) = item.get("text").and_then(|t| t.as_str())
+                        {
+                            text = t.trim().to_owned();
+                        }
+                    }
+                    Some("turn.completed") => status = Some("success".to_owned()),
+                    Some("turn.failed") => status = Some("error".to_owned()),
+                    _ => {}
+                }
+            }
+            Extracted {
+                text,
+                session,
+                status,
+                quota: None,
+                dropped: None,
             }
         }
         AgentKind::Command => {
@@ -933,6 +1032,114 @@ mod tests {
                 "opencode needs --auto even to read (allow_write = {allow_write})"
             );
         }
+    }
+
+    /// The three things about `codex exec` that were established by hand and
+    /// that a rewrite would silently get wrong.
+    #[test]
+    fn codex_is_sandboxed_reads_stdin_and_puts_resume_last() {
+        let mut seat = SeatState::new("judge-1", "a", 7);
+
+        // 1. Read-only is enforced by the CLI, not by the prompt - the only
+        //    roster member for which that is true - and nothing ever asks for
+        //    the bypass.
+        let ro = plan_for(AgentKind::Codex, &seat, false);
+        assert!(ro.argv.windows(2).any(|w| w == ["--sandbox", "read-only"]));
+        let rw = plan_for(AgentKind::Codex, &seat, true);
+        assert!(
+            rw.argv
+                .windows(2)
+                .any(|w| w == ["--sandbox", "workspace-write"])
+        );
+        for p in [&ro, &rw] {
+            assert!(
+                !p.argv
+                    .iter()
+                    .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+                "the bypass defeats the only enforced read-only mode we have"
+            );
+            // Nobody is watching to approve anything.
+            assert!(
+                p.argv
+                    .windows(2)
+                    .any(|w| w == ["-c", "approval_policy=\"never\""]),
+                "an unattended seat that asks for approval blocks until timeout"
+            );
+        }
+
+        // 2. The prompt arrives on stdin, and `-` is what makes codex read it.
+        assert_eq!(ro.stdin.as_deref(), Some("do the thing"));
+        assert_eq!(
+            ro.argv.last().map(String::as_str),
+            Some("-"),
+            "without the `-` argument codex waits for a prompt it never gets"
+        );
+
+        // 3. `resume` is a subcommand and rejects the options above when they
+        //    follow it, so it has to be emitted after all of them - and only
+        //    once the CLI has reported a thread id.
+        seat.turns = 1;
+        assert!(!has_session(AgentKind::Codex, &seat, true));
+        assert!(
+            !plan_for(AgentKind::Codex, &seat, true)
+                .argv
+                .iter()
+                .any(|a| a == "resume")
+        );
+        seat.captured_session = Some("01a07440-4545-7492-85c1-024e3259a90a".to_owned());
+        let resumed = plan_for(AgentKind::Codex, &seat, true);
+        let at = resumed
+            .argv
+            .iter()
+            .position(|a| a == "resume")
+            .expect("resumes by subcommand");
+        assert_eq!(resumed.argv[at + 1], "01a07440-4545-7492-85c1-024e3259a90a");
+        assert!(
+            resumed.argv[..at].iter().any(|a| a == "--sandbox"),
+            "every option precedes the subcommand"
+        );
+        assert_eq!(resumed.argv.last().map(String::as_str), Some("-"));
+    }
+
+    /// A real `codex exec --json` stream, tracing prefix included.
+    #[test]
+    fn codex_takes_the_last_agent_message_and_the_thread_id() {
+        let stream = concat!(
+            "2026-09-06T01:05:49.394445Z ERROR codex_models_manager: failed to load models cache\n",
+            r#"{"type":"thread.started","thread_id":"01a07440-4545-7492-85c1-024e3259a90a"}"#,
+            "\n",
+            r#"{"type":"turn.started"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Looking into it."}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","text":"cargo test"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\"verdict\": \"ok\"}"}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":17137}}"#,
+            "\n",
+        );
+        let out = extract(AgentKind::Codex, stream);
+        assert_eq!(
+            out.text, "{\"verdict\": \"ok\"}",
+            "the last agent message is the answer; earlier ones narrate"
+        );
+        assert_eq!(
+            out.session.as_deref(),
+            Some("01a07440-4545-7492-85c1-024e3259a90a")
+        );
+        assert_eq!(out.status.as_deref(), Some("success"));
+
+        let failed = concat!(
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            "\n",
+            r#"{"type":"turn.failed","error":{"message":"nope"}}"#,
+            "\n",
+        );
+        assert_eq!(
+            extract(AgentKind::Codex, failed).status.as_deref(),
+            Some("error")
+        );
     }
 
     #[test]
