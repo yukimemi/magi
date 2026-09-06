@@ -39,12 +39,21 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 use crate::proc::Quiet as _;
 
-/// On-disk format for a question. Bumped when a field's meaning changes.
+/// On-disk format for a question. Bumped when a field's meaning changes, or -
+/// as with [`Question::thread`] - when a new field is added that a much older
+/// magi has no notion of at all.
 ///
 /// The web UI is written against this shape by hand - there is no shared schema
 /// between the front end and this struct - so a field that changes meaning
 /// without a bump here is a UI that lies silently.
-pub const SCHEMA: u32 = 1;
+///
+/// A file is refused only when its own `schema` is *greater* than this one -
+/// see [`read_path`] - never merely different: `#[serde(default)]` on every
+/// field added since 1 is what makes an older file's absence of `thread` mean
+/// "no conversation yet" rather than "unreadable", and a strict equality check
+/// would turn every bump into an upgrade that breaks reading yesterday's
+/// question files.
+pub const SCHEMA: u32 = 2;
 
 /// How often the wait re-reads the question file.
 ///
@@ -55,6 +64,18 @@ pub const SCHEMA: u32 = 1;
 /// no lock, no open handle - because `magi web` and `magi answer` write the
 /// same file from other processes.
 const POLL: Duration = Duration::from_secs(3);
+
+/// How long an agent's reply may go unnoticed before it earns its own
+/// notification.
+///
+/// An operator reading the card when the agent replies does not need paging
+/// again for a conversation they are already in; one who walked away still
+/// needs the tap on the shoulder. Five minutes is a judgement call about that
+/// line, not a policy a repository has an opinion about, which is why it lives
+/// here rather than in `magi.toml`: the operator cannot tell from `magi.toml`
+/// whether they are still looking at the phone, and neither can this build, so
+/// there is nothing for a per-repository setting to be *right* about.
+const REPLY_QUIET_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// How long the operator's notification command may run before it is killed.
 ///
@@ -168,6 +189,44 @@ pub enum Answer {
     Text(String),
 }
 
+/// Who wrote one turn of a question's conversation.
+///
+/// Two values, not three: [`Question::thread`] is the record of a single
+/// question stopping and resuming, and the agent that resumes it is always
+/// the one that asked - a fresh consultant would have to be caught up on
+/// everything the first agent already knows, which is the round trip this
+/// module exists to avoid. The names and the wire spelling deliberately match
+/// [`crate::chat::Who`], which this module does not depend on: the two are the
+/// same idea in two products, and giving them the same shape is what lets the
+/// phone render both with one component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Who {
+    /// The person the agent asked.
+    Operator,
+    /// The agent that asked, replying to a question of its own rather than
+    /// answering.
+    Agent,
+}
+
+/// One turn in a question's back-and-forth, after the question itself was
+/// asked.
+///
+/// The question's own `summary`/`detail`/`choices` already carry the agent's
+/// opening move, so a turn only exists from the moment the owner talks back -
+/// [`Question::thread`] starts empty and stays that way for the overwhelming
+/// majority of questions, which are answered on the first read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Turn {
+    /// Who said it.
+    pub who: Who,
+    /// What they said.
+    pub body: String,
+    /// When they said it.
+    pub at: Timestamp,
+}
+
 /// One decision magi will not take on the owner's behalf.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -218,6 +277,16 @@ pub struct Question {
     pub answered_at: Option<Timestamp>,
     /// What they said.
     pub answer: Option<Answer>,
+    /// Everything said after the question itself, oldest first: the owner
+    /// asking back, the agent replying, as many times as it takes before an
+    /// [`Answer`] lands.
+    ///
+    /// `#[serde(default)]` so a question written before this field existed -
+    /// every question on disk before this build - still deserialises as one
+    /// with no conversation yet, rather than failing [`Questions::list`]'s
+    /// read and quietly hiding an open question from the operator.
+    #[serde(default)]
+    pub thread: Vec<Turn>,
 }
 
 impl Question {
@@ -246,6 +315,7 @@ impl Question {
             asked_at: Timestamp::now(),
             answered_at: None,
             answer: None,
+            thread: Vec::new(),
         }
     }
 
@@ -357,6 +427,108 @@ impl Question {
             }
             _ => None,
         }
+    }
+
+    /// The owner speaking back without answering: a request for context, a
+    /// clarifying question, anything short of a decision.
+    ///
+    /// Rejects the same two states [`Question::answer`] does, and for the same
+    /// reason - a question with a recorded [`Answer`] or an abandoned one has
+    /// no run left listening for a reply - and an empty turn, which would tell
+    /// the agent nothing it didn't already know. Never changes `status`: the
+    /// question stays [`QuestionStatus::Open`], because the owner did not
+    /// decide anything, they only spoke, and `count_open`/`open_for` must keep
+    /// counting this as the one question it always was.
+    pub fn say(&mut self, body: impl Into<String>) -> Result<()> {
+        match self.status {
+            QuestionStatus::Answered => bail!(
+                "question {} was already answered; there is nothing left to \
+                 discuss",
+                self.short()
+            ),
+            QuestionStatus::Abandoned => bail!(
+                "question {} was abandoned and the run behind it is gone",
+                self.short()
+            ),
+            QuestionStatus::Open => {}
+        }
+        let body = body.into();
+        if body.trim().is_empty() {
+            bail!("a message to question {} cannot be empty", self.short());
+        }
+        self.thread.push(Turn {
+            who: Who::Operator,
+            body,
+            at: Timestamp::now(),
+        });
+        Ok(())
+    }
+
+    /// The agent replying to the owner's last word, in place of an answer:
+    /// same question, same id, another round.
+    ///
+    /// `choices` replaces [`Question::choices`] wholesale rather than merging,
+    /// on the same reasoning [`Questions::put_panel`] replaces a panel
+    /// wholesale: the whole point of asking back is that what should be
+    /// offered next may have changed, and a caller that wanted the old set
+    /// unchanged can simply pass it again. An empty `Vec` means free text,
+    /// exactly as it does when the question is first asked.
+    pub fn reply(&mut self, body: impl Into<String>, choices: Vec<String>) -> Result<()> {
+        match self.status {
+            QuestionStatus::Answered => bail!(
+                "question {} was already answered; replying now would not \
+                 reach anyone",
+                self.short()
+            ),
+            QuestionStatus::Abandoned => bail!(
+                "question {} was abandoned and the run behind it is gone",
+                self.short()
+            ),
+            QuestionStatus::Open => {}
+        }
+        let body = body.into();
+        if body.trim().is_empty() {
+            bail!("a reply to question {} cannot be empty", self.short());
+        }
+        self.choices = choices;
+        self.thread.push(Turn {
+            who: Who::Agent,
+            body,
+            at: Timestamp::now(),
+        });
+        Ok(())
+    }
+
+    /// Is the ball in the agent's court?
+    ///
+    /// True from the moment the owner speaks back until the agent's next
+    /// [`Question::reply`], and never on a fresh or an already-settled
+    /// question. [`QuestionStatus`] does not move for either side of this -
+    /// see [`Question::say`] - so this is the one place that state is
+    /// readable at all, which is why [`crate::web::QuestionView`] carries it
+    /// separately rather than asking the phone to infer it from the thread.
+    pub fn waiting_on_agent(&self) -> bool {
+        self.status.open() && matches!(self.thread.last(), Some(t) if t.who == Who::Operator)
+    }
+
+    /// Should a notification go out right now?
+    ///
+    /// Always, for the very first ask: [`Question::thread`] is still empty, so
+    /// there is no earlier operator turn to have already caught anyone's
+    /// attention. After that, only once [`REPLY_QUIET_WINDOW`] has passed
+    /// since the owner's own last word - see that constant for why the window
+    /// exists at all and why its length is not configurable.
+    fn should_notify(&self, now: Timestamp) -> bool {
+        let Some(last) = self
+            .thread
+            .iter()
+            .rev()
+            .find(|t| t.who == Who::Operator)
+            .map(|t| t.at)
+        else {
+            return true;
+        };
+        now.as_second() - last.as_second() > REPLY_QUIET_WINDOW.as_secs() as i64
     }
 }
 
@@ -680,21 +852,33 @@ impl Questions {
     }
 }
 
+/// How a wait over [`Question`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wait {
+    /// The owner decided. Carries [`Question::resolution`].
+    Answered(String),
+    /// The owner spoke back without deciding - see [`Question::say`]. The
+    /// question is still [`QuestionStatus::Open`] and carries no [`Answer`];
+    /// the caller's move is to hand this text to the agent and let it call
+    /// `magi ask --thread` to keep talking, not to treat it as a decision.
+    Replied(String),
+    /// Nobody said anything before the deadline, or the question was closed
+    /// out from under the wait with no decision recorded - a run deleted out
+    /// from under it, most often. Either way [`QuestionStatus::Abandoned`] is
+    /// now on disk.
+    Abandoned,
+}
+
 /// File a question and wait for the owner, polling the store.
 ///
-/// Returns `Ok(None)` when the wait times out, so the caller can park the run
-/// rather than treat a slow human as an error. The question is left on disk as
-/// [`QuestionStatus::Abandoned`]; the caller that parks the run and the operator
-/// who finds it in the morning both need to see what was asked.
-///
-/// `q` is updated in place from disk when the answer lands, so the caller can
-/// record the answered question without re-reading it.
+/// The question is updated in place from disk whenever the wait ends, so the
+/// caller can act on it without re-reading it.
 pub async fn ask_and_wait(
     q: &mut Question,
     store: &Questions,
     notify: &config::Notify,
     timeout: Duration,
-) -> Result<Option<String>> {
+) -> Result<Wait> {
     wait_for_owner(q, store, notify, timeout, POLL).await
 }
 
@@ -709,17 +893,20 @@ async fn wait_for_owner(
     cfg: &config::Notify,
     timeout: Duration,
     poll: Duration,
-) -> Result<Option<String>> {
+) -> Result<Wait> {
     store.put(q).context("file the question")?;
-    if let Err(e) = notify(cfg, q).await {
-        // A broken webhook is not a reason to throw away an implementation.
-        // The question is already on disk and the web UI already shows it, so
-        // the operator still has a way in; only the tap on the shoulder is lost.
-        tracing::warn!(
-            "could not notify about question {}: {e:#} - the web UI is the \
-             only surface for it now",
-            q.short()
-        );
+    if q.should_notify(Timestamp::now()) {
+        if let Err(e) = notify(cfg, q).await {
+            // A broken webhook is not a reason to throw away an implementation.
+            // The question is already on disk and the web UI already shows it,
+            // so the operator still has a way in; only the tap on the shoulder
+            // is lost.
+            tracing::warn!(
+                "could not notify about question {}: {e:#} - the web UI is the \
+                 only surface for it now",
+                q.short()
+            );
+        }
     }
     tracing::info!(
         "question {} from {} is waiting for you: {}",
@@ -728,6 +915,11 @@ async fn wait_for_owner(
         q.summary
     );
 
+    // Turns already on the question when this wait started - which for a
+    // `--thread` reply includes the operator's own last word - so a *new*
+    // operator turn appearing mid-wait is unambiguous even though the agent's
+    // own reply just added one too.
+    let starting_turns = q.thread.len();
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let now = tokio::time::Instant::now();
@@ -743,7 +935,7 @@ async fn wait_for_owner(
                 q.short(),
                 timeout.as_secs()
             );
-            return Ok(None);
+            return Ok(Wait::Abandoned);
         }
         tokio::time::sleep(poll.min(deadline - now)).await;
         match store.get(&q.id) {
@@ -752,7 +944,26 @@ async fn wait_for_owner(
                 // owns the record now, so adopt theirs wholesale rather than
                 // merging into a copy that predates it.
                 *q = fresh;
-                return Ok(q.resolution());
+                return Ok(match q.resolution() {
+                    Some(a) => Wait::Answered(a),
+                    // Closed with no decision - abandoned elsewhere, most
+                    // often by the run behind it being deleted mid-wait.
+                    None => Wait::Abandoned,
+                });
+            }
+            Ok(fresh) if fresh.thread.len() > starting_turns => {
+                *q = fresh;
+                if let Some(said) = q
+                    .thread
+                    .iter()
+                    .rev()
+                    .find(|t| t.who == Who::Operator)
+                    .map(|t| t.body.clone())
+                {
+                    return Ok(Wait::Replied(said));
+                }
+                // The new turn was not the owner's - nothing this wait cares
+                // about happened, so keep polling.
             }
             Ok(_) => {}
             Err(e) => {
@@ -904,10 +1115,14 @@ fn read_path(path: &Path) -> Result<Question> {
     let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let q: Question =
         serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
-    if q.schema != SCHEMA {
+    if q.schema > SCHEMA {
+        // Strictly newer, not merely different: every field added since
+        // schema 1 carries `#[serde(default)]`, so an *older* schema reads
+        // here as "no thread yet" rather than as garbage. Only a schema this
+        // build has never heard of is refused.
         bail!(
-            "question {} was written by a different magi (schema {}, this \
-             build speaks {SCHEMA})",
+            "question {} was written by a newer magi (schema {}, this build \
+             only speaks up to {SCHEMA})",
             q.id,
             q.schema
         );
@@ -1039,10 +1254,12 @@ mod tests {
                 "seat",
                 "status",
                 "summary",
+                "thread",
             ],
             "the on-disk field set is a contract with the front end"
         );
-        assert_eq!(open["schema"], 1);
+        assert_eq!(open["schema"], 2);
+        assert_eq!(open["thread"], serde_json::json!([]));
         assert_eq!(open["id"], "20260902-231501-ab12");
         assert_eq!(open["run"], "20260902-201256-9fb7");
         assert_eq!(open["node"], "implement");
@@ -1227,7 +1444,7 @@ mod tests {
         .unwrap();
 
         handle.await.unwrap();
-        assert_eq!(got.as_deref(), Some("SQLite"));
+        assert_eq!(got, Wait::Answered("SQLite".to_owned()));
         assert_eq!(
             q.status,
             QuestionStatus::Answered,
@@ -1251,7 +1468,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(got.is_none(), "a slow human is not an error; the run parks");
+        assert_eq!(
+            got,
+            Wait::Abandoned,
+            "a slow human is not an error; the run parks"
+        );
         assert_eq!(q.status, QuestionStatus::Abandoned);
         let on_disk = s.get(&q.id).expect("the record of what was asked survives");
         assert_eq!(on_disk.status, QuestionStatus::Abandoned);
@@ -1300,7 +1521,7 @@ mod tests {
         .await
         .unwrap();
         handle.await.unwrap();
-        assert_eq!(got.as_deref(), Some("Redis"));
+        assert_eq!(got, Wait::Answered("Redis".to_owned()));
 
         // No command at all is the default, and is silence rather than failure.
         assert!(notify(&quiet(), &q).await.is_ok());
@@ -1633,11 +1854,194 @@ mod tests {
             "an absent field means no panel, not a parse error"
         );
         assert!(q.assets.is_empty());
+        // Schema 1 predates `thread` entirely - not merely predates it having
+        // any turns - and this build now speaks schema 2. Reading it must not
+        // be an error: `q.schema > SCHEMA` is false for 1 > 2, so the file is
+        // accepted and the missing field defaults to no conversation yet.
+        assert_eq!(q.schema, 1);
+        assert!(q.thread.is_empty());
+        assert!(!q.waiting_on_agent());
         assert_eq!(q.summary, "Which storage backend should the cache use?");
         assert_eq!(
             s.list().len(),
             1,
             "and it is still listed; skipping it would hide an open question"
         );
+    }
+
+    fn turn(who: Who, body: &str, at: Timestamp) -> Turn {
+        Turn {
+            who,
+            body: body.to_owned(),
+            at,
+        }
+    }
+
+    #[test]
+    fn a_turn_round_trips_as_who_body_at_with_two_named_speakers() {
+        // The phone reads this shape by hand, same as the question itself: a
+        // rename here is a card that silently drops every message in it.
+        let mut q = choice_question();
+        q.thread
+            .push(turn(Who::Operator, "why not Postgres?", Timestamp::now()));
+        let value = serde_json::to_value(&q.thread[0]).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["at", "body", "who"]);
+        assert_eq!(value["who"], "operator");
+        assert_eq!(value["body"], "why not Postgres?");
+
+        let agent_turn = serde_json::json!({"who": "agent", "body": "hi", "at": value["at"]});
+        let parsed: Turn = serde_json::from_value(agent_turn).unwrap();
+        assert_eq!(parsed.who, Who::Agent);
+    }
+
+    #[test]
+    fn saying_something_appends_an_operator_turn_without_deciding_anything() {
+        let mut q = choice_question();
+        q.say("does the cache need eviction?").unwrap();
+        assert_eq!(q.thread.len(), 1);
+        assert_eq!(q.thread[0].who, Who::Operator);
+        assert_eq!(q.thread[0].body, "does the cache need eviction?");
+        // Speaking is not deciding: the status and the answer are untouched,
+        // which is the whole point of the round trip existing at all.
+        assert_eq!(q.status, QuestionStatus::Open);
+        assert!(q.answer.is_none());
+        assert!(q.waiting_on_agent(), "the ball is now in the agent's court");
+    }
+
+    #[test]
+    fn saying_and_replying_are_refused_on_a_settled_question_and_on_empty_text() {
+        let mut answered = choice_question();
+        answered
+            .answer(Answer::Choice("SQLite".to_owned()))
+            .unwrap();
+        let a = answered.say("still there?").unwrap_err().to_string();
+        assert!(a.contains("already answered"), "{a}");
+        let b = answered
+            .reply("still there?", vec![])
+            .unwrap_err()
+            .to_string();
+        assert!(b.contains("already answered"), "{b}");
+
+        let mut abandoned = choice_question();
+        abandoned.abandon("timed out");
+        let c = abandoned.say("hello?").unwrap_err().to_string();
+        assert!(c.contains("abandoned"), "{c}");
+
+        let mut open = choice_question();
+        let d = open.say("   ").unwrap_err().to_string();
+        assert!(d.contains("empty"), "{d}");
+        let e = open.reply("  \n", vec![]).unwrap_err().to_string();
+        assert!(e.contains("empty"), "{e}");
+        assert!(open.thread.is_empty(), "a refused turn leaves no trace");
+    }
+
+    #[test]
+    fn a_reply_replaces_the_choices_and_moves_the_ball_back_to_the_owner() {
+        let mut q = choice_question();
+        q.say("SQLite or Redis, but what about disk space?")
+            .unwrap();
+        assert!(q.waiting_on_agent());
+
+        q.reply(
+            "SQLite: it is one file, no server to run.",
+            vec!["SQLite".to_owned()],
+        )
+        .unwrap();
+
+        assert_eq!(q.choices, ["SQLite"]);
+        assert!(
+            !q.waiting_on_agent(),
+            "the agent spoke, so the owner is the one being waited on now"
+        );
+        assert_eq!(q.thread.len(), 2);
+        assert_eq!(q.thread[1].who, Who::Agent);
+
+        // The new choice set is what a subsequent answer is checked against.
+        assert!(q.answer(Answer::Choice("Redis".to_owned())).is_err());
+        q.answer(Answer::Choice("SQLite".to_owned())).unwrap();
+        assert_eq!(q.resolution().as_deref(), Some("SQLite"));
+    }
+
+    #[test]
+    fn notification_fires_for_the_first_ask_and_only_after_the_quiet_window_on_a_reply() {
+        let mut fresh = choice_question();
+        assert!(
+            fresh.should_notify(Timestamp::now()),
+            "nobody has been notified yet, so the first ask always pages"
+        );
+
+        fresh.say("why not Postgres?").unwrap();
+        let just_said = fresh.thread[0].at;
+        assert!(
+            !fresh.should_notify(just_said + jiff::SignedDuration::from_secs(60)),
+            "still on the screen a minute later; no need to page again"
+        );
+        assert!(
+            !fresh.should_notify(just_said + jiff::SignedDuration::from_secs(300)),
+            "exactly the window: `>` means this side stays quiet"
+        );
+        assert!(
+            fresh.should_notify(just_said + jiff::SignedDuration::from_secs(301)),
+            "past the window: they may have walked away"
+        );
+    }
+
+    #[test]
+    fn a_round_trip_of_turns_still_counts_as_one_open_question() {
+        let (_dir, s) = store();
+        let mut q = choice_question();
+        s.put(&mut q).unwrap();
+        q.say("why not Postgres?").unwrap();
+        s.put(&mut q).unwrap();
+        q.reply("no server to run", vec!["SQLite".to_owned()])
+            .unwrap();
+        s.put(&mut q).unwrap();
+
+        assert_eq!(
+            s.count_open(),
+            1,
+            "one question that talked twice is still one open question"
+        );
+        assert_eq!(s.open_for(&q.run).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_wait_returns_to_the_caller_when_the_owner_talks_back_without_deciding() {
+        let (dir, s) = store();
+        let mut q = choice_question();
+        let id = q.id.clone();
+        let writer = Questions::at(dir.path().join("questions"));
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let mut fresh = writer.get(&id).expect("the question was filed first");
+            fresh.say("why not Postgres?").unwrap();
+            writer.put(&mut fresh).unwrap();
+        });
+
+        let got = wait_for_owner(
+            &mut q,
+            &s,
+            &quiet(),
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+
+        handle.await.unwrap();
+        assert_eq!(got, Wait::Replied("why not Postgres?".to_owned()));
+        assert_eq!(
+            q.status,
+            QuestionStatus::Open,
+            "talking back is not a decision; the question stays open"
+        );
+        assert!(q.answer.is_none());
     }
 }

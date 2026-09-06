@@ -315,14 +315,27 @@ enum Command {
         refresh: bool,
     },
     /// Ask the owner something and wait. Meant for agents inside a run.
+    ///
+    /// The owner may talk back instead of answering, in which case this
+    /// returns with their words on stdout and exit code 0 rather than
+    /// blocking forever or failing (see [`ask::Wait::Replied`]). `--thread`
+    /// is how the same agent picks the conversation back up: it appends
+    /// `--summary` (`--detail` too, if given) to the question's thread as
+    /// this agent's own turn and waits again, rather than filing a new
+    /// question the owner would have no context for.
     Ask {
-        /// One-line question.
+        /// One-line question, or - with `--thread` - this agent's reply.
         #[arg(long)]
         summary: String,
         /// Longer explanation, markdown. Reads stdin when omitted.
         #[arg(long)]
         detail: Option<String>,
         /// An answer to offer; repeat for more. Omit for a free-text reply.
+        ///
+        /// With `--thread`, replaces the question's choices wholesale rather
+        /// than adding to them - asking back is usually exactly the moment the
+        /// right choices change, and a caller that wants the old set kept can
+        /// just repeat it.
         #[arg(long = "choice")]
         choices: Vec<String>,
         /// Seconds to wait. Defaults to the config's answer_timeout.
@@ -340,14 +353,27 @@ enum Command {
         /// Repository, for the config that supplies the notify command.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// Reply to an open question of this run's instead of asking a new
+        /// one: id or unambiguous prefix/suffix. Refused for a question this
+        /// run did not ask, or one already answered or abandoned.
+        #[arg(long)]
+        thread: Option<String>,
     },
-    /// Answer a question an agent is waiting on.
+    /// Answer a question an agent is waiting on, or ask it back.
     Answer {
         /// Question id or unambiguous prefix/suffix. Omit for the oldest open one.
         id: Option<String>,
         /// The answer: one of the offered choices, or free text.
-        #[arg(long, conflicts_with = "list")]
+        #[arg(long, conflicts_with_all = ["list", "say"])]
         reply: Option<String>,
+        /// Speak back without deciding: a clarifying question, a request for
+        /// more context. The run stays parked; the agent picks the
+        /// conversation back up with `magi ask --thread`. Exclusive with
+        /// `--reply` - a question is either answered or asked back, not both
+        /// at once, and the terminal has the same choice the phone's "Send"
+        /// box does.
+        #[arg(long, conflicts_with_all = ["list", "reply"])]
+        say: Option<String>,
         /// Show the open questions and stop.
         #[arg(long)]
         list: bool,
@@ -931,6 +957,7 @@ async fn dispatch(command: Command) -> Result<()> {
             panel,
             assets,
             repo,
+            thread,
         } => {
             ask_cmd(AskArgs {
                 summary,
@@ -940,11 +967,17 @@ async fn dispatch(command: Command) -> Result<()> {
                 panel,
                 assets,
                 repo,
+                thread,
             })
             .await
         }
 
-        Command::Answer { id, reply, list } => answer_cmd(id, reply, list),
+        Command::Answer {
+            id,
+            reply,
+            say,
+            list,
+        } => answer_cmd(id, reply, say, list),
 
         Command::Task { command } => task_cmd(command).await,
 
@@ -1119,12 +1152,14 @@ async fn task_text(words: &[String], file: Option<&Path>, issue: Option<u64>) ->
     bail!("give a task: as arguments, --file, --issue, or on stdin");
 }
 
-/// `magi ask`: file a question and block until the owner answers.
+/// `magi ask`: file a question and block until the owner answers, or reply to
+/// one already open and wait again.
 ///
 /// This is the command an agent runs, so its exit status carries the outcome:
-/// zero with the answer on stdout, non-zero when nobody answered in time. An
-/// agent that cannot tell "the owner said Redis" from "the owner never came
-/// back" would happily implement a guess.
+/// zero whenever a run can go on (an answer, or the owner talking back rather
+/// than deciding), non-zero when nobody answered in time. An agent that cannot
+/// tell "the owner said Redis" from "the owner never came back" would happily
+/// implement a guess.
 /// Everything `magi ask` was given, kept together because clap's arms and this
 /// function would otherwise drift apart one argument at a time.
 struct AskArgs {
@@ -1135,6 +1170,20 @@ struct AskArgs {
     panel: Option<PathBuf>,
     assets: Vec<PathBuf>,
     repo: PathBuf,
+    thread: Option<String>,
+}
+
+/// The one message `--summary`/`--detail` make, whether that is a fresh
+/// question or an agent's reply on `--thread`. A reply has no separate
+/// "reasoning" field the way a question does - [`ask::Turn::body`] is one
+/// string - so the two are joined the same way the phone would read them
+/// stacked: the one-liner first, the longer explanation under it.
+fn thread_message(summary: &str, detail: &str) -> String {
+    if detail.trim().is_empty() {
+        summary.to_owned()
+    } else {
+        format!("{summary}\n\n{detail}")
+    }
 }
 
 async fn ask_cmd(args: AskArgs) -> Result<()> {
@@ -1146,6 +1195,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         panel,
         assets,
         repo,
+        thread,
     } = args;
     let detail = match detail {
         Some(d) => d,
@@ -1177,24 +1227,71 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
     let wait = std::time::Duration::from_secs(timeout.unwrap_or(cfg.graph.answer_timeout));
 
     let store = ask::Questions::open();
-    let mut q = ask::Question::new(run, node, seat, summary, detail, choices);
-    // The panel is attached before the question is filed: a question that
-    // appears on the phone a moment before its evidence does is a question the
-    // owner answers without the evidence.
-    if let Some(path) = &panel {
-        let html =
-            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        store.put_panel(&mut q, &html, &assets)?;
-    }
-    store.put(&mut q)?;
-    eprintln!("asked {} — waiting for the owner", q.short());
+    let mut q = match thread {
+        Some(id) => {
+            let resolved = store.resolve_id(&id)?;
+            let mut q = store.get(&resolved)?;
+            // A question belongs to the run that asked it; a different run
+            // replying would be a stranger continuing someone else's
+            // conversation, and the owner has no way to tell the two apart on
+            // the card.
+            if !run.is_empty() && run != q.run {
+                bail!(
+                    "question {} belongs to run {}, not this one ({run}); only \
+                     the run that asked can reply to it",
+                    q.short(),
+                    q.run
+                );
+            }
+            q.reply(thread_message(&summary, &detail), choices)?;
+            // Re-attached the same way a fresh ask's panel is: before the
+            // question is filed, so the owner never sees the reply a moment
+            // before the evidence for it.
+            if let Some(path) = &panel {
+                let html = std::fs::read_to_string(path)
+                    .with_context(|| format!("read {}", path.display()))?;
+                store.put_panel(&mut q, &html, &assets)?;
+            }
+            store.put(&mut q)?;
+            eprintln!("replied on {} — waiting for the owner again", q.short());
+            q
+        }
+        None => {
+            let mut q = ask::Question::new(run, node, seat, summary, detail, choices);
+            // The panel is attached before the question is filed: a question
+            // that appears on the phone a moment before its evidence does is a
+            // question the owner answers without the evidence.
+            if let Some(path) = &panel {
+                let html = std::fs::read_to_string(path)
+                    .with_context(|| format!("read {}", path.display()))?;
+                store.put_panel(&mut q, &html, &assets)?;
+            }
+            store.put(&mut q)?;
+            eprintln!("asked {} — waiting for the owner", q.short());
+            q
+        }
+    };
 
     match ask::ask_and_wait(&mut q, &store, &cfg.notify, wait).await? {
-        Some(answer) => {
+        ask::Wait::Answered(answer) => {
             println!("{answer}");
             Ok(())
         }
-        None => bail!(
+        // Not an answer: the run can go on, but the decision the caller was
+        // waiting for has not been made. Exit zero, so the agent CLIs that
+        // invoke this do not read a stopped conversation as a failed command
+        // and retry it, and print both what the owner said and the exact way
+        // to keep talking.
+        ask::Wait::Replied(said) => {
+            println!(
+                "the owner replied without deciding yet:\n\n{said}\n\n\
+                 continue the conversation with:\n  magi ask --thread {} \
+                 --summary \"...\"",
+                q.id
+            );
+            Ok(())
+        }
+        ask::Wait::Abandoned => bail!(
             "question {} went unanswered for {}s; it is recorded as abandoned",
             q.short(),
             wait.as_secs()
@@ -1202,9 +1299,14 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
     }
 }
 
-/// `magi answer`: reply from the terminal, so the phone is a convenience and
-/// never the only way to unblock a run.
-fn answer_cmd(id: Option<String>, reply: Option<String>, list: bool) -> Result<()> {
+/// `magi answer`: reply or ask back from the terminal, so the phone is a
+/// convenience and never the only way to unblock a run.
+fn answer_cmd(
+    id: Option<String>,
+    reply: Option<String>,
+    say: Option<String>,
+    list: bool,
+) -> Result<()> {
     let store = ask::Questions::open();
     let open: Vec<ask::Question> = store
         .list()
@@ -1212,7 +1314,7 @@ fn answer_cmd(id: Option<String>, reply: Option<String>, list: bool) -> Result<(
         .filter(|q| q.status.open())
         .collect();
 
-    if list || (id.is_none() && reply.is_none()) {
+    if list || (id.is_none() && reply.is_none() && say.is_none()) {
         if open.is_empty() {
             println!("nothing is waiting on you");
             return Ok(());
@@ -1236,7 +1338,17 @@ fn answer_cmd(id: Option<String>, reply: Option<String>, list: bool) -> Result<(
             .next_back()
             .context("nothing is waiting on you")?,
     };
-    let reply = reply.context("give the answer with --reply")?;
+
+    if let Some(body) = say {
+        // Not a decision: the question stays open and the run stays parked,
+        // waiting on the agent's `magi ask --thread` rather than on the owner.
+        q.say(body)?;
+        store.put(&mut q)?;
+        println!("sent to {} — waiting for the agent's reply", q.short());
+        return Ok(());
+    }
+
+    let reply = reply.context("give the answer with --reply, or ask back with --say")?;
     let answer = if q.free_text() {
         ask::Answer::Text(reply)
     } else {
@@ -1807,6 +1919,60 @@ mod tests {
     fn an_earlier_error_is_never_swallowed_by_the_status_check() {
         let err = exit_status(Err(anyhow::anyhow!("boom")), RunStatus::Ready, false);
         assert_eq!(err.unwrap_err().to_string(), "boom");
+    }
+
+    #[test]
+    fn ask_thread_parses_and_answer_say_is_exclusive_with_reply_and_list() {
+        let asked = Cli::try_parse_from([
+            "magi",
+            "ask",
+            "--summary",
+            "no server to run",
+            "--thread",
+            "ab12",
+            "--choice",
+            "SQLite",
+        ])
+        .unwrap();
+        match asked.command {
+            Some(Command::Ask {
+                thread, choices, ..
+            }) => {
+                assert_eq!(thread.as_deref(), Some("ab12"));
+                assert_eq!(choices, ["SQLite"]);
+            }
+            other => panic!("expected Command::Ask, got {other:?}"),
+        }
+
+        // A fresh ask carries no `--thread` at all: the flag must not force
+        // the flow it exists to make optional.
+        let fresh = Cli::try_parse_from(["magi", "ask", "--summary", "which backend?"]).unwrap();
+        match fresh.command {
+            Some(Command::Ask { thread, .. }) => assert!(thread.is_none()),
+            other => panic!("expected Command::Ask, got {other:?}"),
+        }
+
+        let say = Cli::try_parse_from(["magi", "answer", "ab12", "--say", "why?"]).unwrap();
+        match say.command {
+            Some(Command::Answer { say, reply, .. }) => {
+                assert_eq!(say.as_deref(), Some("why?"));
+                assert!(reply.is_none());
+            }
+            other => panic!("expected Command::Answer, got {other:?}"),
+        }
+
+        // `--say` and `--reply` are two different answers to the same
+        // question and cannot both be given - a question is either answered
+        // or asked back, never both in one call.
+        let clash = Cli::try_parse_from([
+            "magi", "answer", "ab12", "--say", "why?", "--reply", "SQLite",
+        ])
+        .unwrap_err();
+        assert_eq!(clash.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let clash_list =
+            Cli::try_parse_from(["magi", "answer", "ab12", "--say", "why?", "--list"]).unwrap_err();
+        assert_eq!(clash_list.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[tokio::test]

@@ -153,6 +153,17 @@ runs and nothing may load from the network**. Inline your styles, reference \
 attached assets by their bare filename, and use `data:` URIs for anything \
 small. A `<script>`, a remote font or an external image is silently blocked, \
 so do not spend effort on them.\n\n\
+The owner may answer back with a question of their own instead of deciding - \
+`magi ask` then exits 0 and prints what they said, because that is not a \
+failure, it is the conversation continuing. Read it, and reply on the same \
+question with `--thread`:\n\n\
+```sh\n\
+magi ask --thread <question-id> --summary \"...\" --choice A --choice B\n\
+```\n\n\
+This appends your reply and waits again; it does not start a new question, so \
+say only what is new. Restate `--choice` if the right answers changed because \
+of what the owner asked - the previous choices are gone otherwise, not kept. \
+Keep replying on the same thread until an answer comes back.\n\n\
 Ask sparingly. A question stops the run until a human notices it, and asking \
 about something you could have decided yourself is how that channel becomes \
 noise the owner learns to ignore.",
@@ -167,7 +178,8 @@ noise the owner learns to ignore.",
             "\n\n**Write the question in {0}.** The summary, the choices and \
              every word of the panel are read by the owner, not by magi, so \
              they must be in {0} even though the flags and the filenames are \
-             not.",
+             not. The same goes for every reply you send with `--thread`: the \
+             owner reads that text too.",
             language_name(language)
         ));
     }
@@ -804,6 +816,19 @@ mod tests {
         assert!(note.contains("pruned oldest-first by magi"));
     }
 
+    #[test]
+    fn an_implementer_is_told_how_to_reply_when_the_owner_asks_back() {
+        let p = implement("do it", "/tmp/wt", "en");
+        assert!(p.contains("--thread"), "{p}");
+        assert!(
+            p.contains("exits 0"),
+            "the agent must not read being asked back as a failed command: {p}"
+        );
+        assert!(
+            p.contains("Restate `--choice`"),
+            "the old choices are not kept across a reply: {p}"
+        );
+    }
     #[test]
     fn a_question_is_asked_in_the_operators_language_not_in_a_language_code() {
         // Reported from a real run: `language = "ja"` was set and the questions

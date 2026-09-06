@@ -657,6 +657,7 @@ impl Ui {
             .route("/api/queue/{id}/done", post(queue_done))
             .route("/api/questions", get(questions_list))
             .route("/api/questions/{id}/answer", post(question_answer))
+            .route("/api/questions/{id}/say", post(question_say))
             .route("/api/questions/{id}/panel", get(question_panel))
             // The same asset, reachable from inside the panel by its bare
             // filename. A document served at `.../panel` resolves `shot.png`
@@ -2648,6 +2649,16 @@ struct QuestionView {
     #[serde(flatten)]
     question: Question,
     detail_md: Vec<md::Node>,
+    /// Is the ball in the agent's court right now?
+    ///
+    /// [`QuestionStatus`] stays `Open` for the whole of a round trip - see
+    /// [`Question::say`] - so this is the one field that tells the phone to
+    /// disable the answer controls and show "waiting for the agent" instead of
+    /// a card the owner can act on. Computed rather than stored on
+    /// [`Question`] itself, on the same reasoning as `waiting` on
+    /// [`RunSummary`]: it is a read of `thread`'s own last entry, and keeping
+    /// it here means the client never has to re-derive that rule.
+    waiting_on_agent: bool,
 }
 
 impl From<Question> for QuestionView {
@@ -2657,6 +2668,7 @@ impl From<Question> for QuestionView {
         };
         Self {
             detail_md: md::to_nodes(&question.detail, &base),
+            waiting_on_agent: question.waiting_on_agent(),
             question,
         }
     }
@@ -2731,6 +2743,52 @@ async fn question_answer(
         // a multiple-choice question, an empty reply - so the route does not
         // restate them and cannot drift from the CLI's behaviour.
         q.answer(answer).map_err(ApiError::bad_request_from)?;
+        ui.questions.put(&mut q)?;
+        Ok(Json(QuestionView::from(q)))
+    })
+    .await
+}
+
+/// The body of `POST /api/questions/{id}/say`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewSay {
+    body: String,
+}
+
+/// `POST /api/questions/{id}/say` - the owner talks back without deciding.
+///
+/// Synchronous, unlike `POST /api/chats/{id}/say`: that route spawns an agent
+/// CLI and waits on it, this one only appends a [`ask::Turn`] and writes the
+/// file, so there is no turn to serialize against and no [`Ui::begin_turn`]
+/// guard to take. The agent waiting on this question is a *different*
+/// process - the run parked behind `magi ask` - and picks the reply up on its
+/// own poll of the very same file, same as an answer does.
+async fn question_say(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<NewSay>, JsonRejection>,
+) -> ApiResult<Json<QuestionView>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    blocking(move || {
+        let id = resolve_question(&ui.questions, &id)?;
+        let mut q = ui
+            .questions
+            .get(&id)
+            .map_err(|e| ApiError::from(e).with_status(StatusCode::INTERNAL_SERVER_ERROR))?;
+        if !q.status.open() {
+            // Same granularity as `question_answer`: answered or abandoned in
+            // between the list and the tap is not this route's error to
+            // explain any differently.
+            return Err(ApiError::conflict(format!(
+                "question {} is already {}",
+                q.short(),
+                q.status.as_str()
+            )));
+        }
+        // `Question::say` owns the one rule that matters here - an empty
+        // message tells the agent nothing - so the route does not restate it.
+        q.say(body.body).map_err(ApiError::bad_request_from)?;
         ui.questions.put(&mut q)?;
         Ok(Json(QuestionView::from(q)))
     })
@@ -4387,6 +4445,67 @@ mod tests {
         let again = fx.post(&path, Some(r#"{"choice":"SQLite"}"#)).await;
         assert_eq!(again.status, 409, "{}", again.body);
         assert_eq!(fx.get("/api/health").await.json()["questions_open"], 0);
+    }
+
+    #[tokio::test]
+    async fn saying_something_appends_a_turn_without_answering() {
+        let fx = Fixture::start().await;
+        let id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+        let path = format!("/api/questions/{id}/say");
+
+        let res = fx
+            .post(&path, Some(r#"{"body":"why not Postgres?"}"#))
+            .await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let body = res.json();
+        assert_eq!(body["status"], "open", "talking back is not a decision");
+        assert_eq!(body["answer"], Value::Null);
+        assert_eq!(body["thread"][0]["who"], "operator");
+        assert_eq!(body["thread"][0]["body"], "why not Postgres?");
+        assert_eq!(body["waiting_on_agent"], true);
+        // Still open, still counted, still exactly one question.
+        assert_eq!(fx.get("/api/health").await.json()["questions_open"], 1);
+    }
+
+    #[tokio::test]
+    async fn saying_something_is_refused_when_empty_answered_or_abandoned() {
+        let fx = Fixture::start().await;
+        let store = fx.questions();
+
+        let empty_id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+        let res = fx
+            .post(
+                &format!("/api/questions/{empty_id}/say"),
+                Some(r#"{"body":"   "}"#),
+            )
+            .await;
+        assert_eq!(res.status, 400, "{}", res.body);
+
+        let answered_id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+        let mut answered = store.get(&answered_id).expect("get");
+        answered
+            .answer(Answer::Choice("SQLite".to_owned()))
+            .expect("answer");
+        store.put(&mut answered).expect("put");
+        let res = fx
+            .post(
+                &format!("/api/questions/{answered_id}/say"),
+                Some(r#"{"body":"still there?"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 409, "{}", res.body);
+
+        let abandoned_id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+        let mut abandoned = store.get(&abandoned_id).expect("get");
+        abandoned.abandon("timed out");
+        store.put(&mut abandoned).expect("put");
+        let res = fx
+            .post(
+                &format!("/api/questions/{abandoned_id}/say"),
+                Some(r#"{"body":"still there?"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 409, "{}", res.body);
     }
 
     #[tokio::test]
