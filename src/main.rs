@@ -8,6 +8,7 @@ use clap::{ArgAction, CommandFactory as _, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use magi::config::{Config, MergeMode};
 use magi::graph::{Runner, fold_run};
+use magi::proc::Quiet as _;
 use magi::queue::{self, Queue, Source, Task, TaskStatus};
 use magi::run::{RunState, latest_id, list_ids, resolve_id};
 use magi::{agent, ask, daemon, plan, report, repos, stats, tui, updater, web};
@@ -1635,6 +1636,9 @@ fn doctor_queue_and_loop(home: &Path) -> String {
 async fn probe(program: &str, args: &[&str]) -> String {
     match tokio::process::Command::new(program)
         .args(args)
+        // `magi doctor` probes five CLIs; unquieted that is five console
+        // windows blinking past on Windows.
+        .quiet()
         .output()
         .await
     {

@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 
+use crate::proc::Quiet as _;
+
 /// Are `free` bytes above the floor for starting a run?
 ///
 /// Pure on purpose: the threshold logic is asserted against injected numbers,
@@ -88,6 +90,7 @@ fn free_bytes_by_os(path: &Path) -> Result<u64> {
     let out = std::process::Command::new("df")
         .args(["-k", "-P"])
         .arg(path)
+        .quiet()
         .output()
         .with_context(|| format!("run `df` for {}", path.display()))?;
     if !out.status.success() {
@@ -116,6 +119,11 @@ fn free_bytes_by_os(path: &Path) -> Result<u64> {
     let script = format!("[System.IO.DriveInfo]::new('{quoted}').AvailableFreeSpace");
     let out = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        // Without this the operator watches a console window blink open for
+        // every measurement - and the health view measures on every tick, so
+        // merely leaving the deck open in a browser flashed one every few
+        // seconds. `Quiet` exists for exactly this and the probe skipped it.
+        .quiet()
         .output()
         .with_context(|| format!("run PowerShell for {}", abs.display()))?;
     if !out.status.success() {
