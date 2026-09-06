@@ -203,6 +203,17 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Inspect and shrink the shared build cache.
+    ///
+    /// `CARGO_TARGET_DIR` is read back out of the rendered verify commands in
+    /// the repository's magi.toml, so `magi cache` in a repository whose
+    /// config sets none has nothing to show.
+    Cache {
+        /// The cache is pruned automatically once a day's work overgrows it
+        /// only when the overflow is real.
+        #[command(subcommand)]
+        command: CacheCmd,
+    },
     /// Read, file, and hold work in the queue that `magi serve` drains.
     ///
     /// This is the surface an agent uses too: an implementer that spots
@@ -451,6 +462,33 @@ enum TaskCmd {
     },
 }
 
+/// Operations on the shared build cache.
+#[derive(Debug, Subcommand)]
+enum CacheCmd {
+    /// Print the cache's path, size, and cap.
+    Show {
+        /// Repository, for the config that names the cache.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Config file; defaults to <repo>/magi.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Delete the whole cache directory and print how many bytes were freed.
+    ///
+    /// The cache is derived state - a rebuilt crate is the same source compiled
+    /// again - so clearing it loses nothing but the operator's next build time.
+    /// Homework-sized repairs for the one thing magi already prunes on its own.
+    Clear {
+        /// Repository, for the config that names the cache.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Config file; defaults to <repo>/magi.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -621,6 +659,17 @@ async fn dispatch(command: Command) -> Result<()> {
                     cfg.blind.seed = Some(s);
                 }
                 println!("config: {}", describe_layers(&from));
+                // The same free-space gate the daemon obeys: a run that cannot
+                // finish must not start, and a held task must not spend an
+                // attempt on the way in.
+                let min = cfg.disk.min_free_bytes;
+                if min > 0 {
+                    let free = magi::disk::free_bytes(&repo)
+                        .with_context(|| format!("measure free space on {}", repo.display()))?;
+                    if let Some(reason) = magi::disk::gate(free, min) {
+                        bail!("{reason}");
+                    }
+                }
                 Runner::start(&repo, task, cfg).await?
             };
 
@@ -709,8 +758,24 @@ async fn dispatch(command: Command) -> Result<()> {
                 Some(i) => resolve_id(&i)?,
                 None => latest_id().context("no runs yet")?,
             };
-            let mut state = RunState::load(&id)?;
-            let removed = fold_run(&mut state, all).await?;
+            // A run whose state file is unreadable (missing, garbage, or an
+            // unknown schema) cannot be folded through the graph path: loading
+            // it fails. It is still occupying its run directory and worktree,
+            // so fold it wholesale instead.
+            let removed = match RunState::load(&id) {
+                Ok(mut state) => fold_run(&mut state, all).await?,
+                Err(e) => {
+                    println!(
+                        "{id}: state unreadable ({e}); removing the run and its worktree wholesale"
+                    );
+                    magi::clean::fold_unreadable(
+                        &magi::run::runs_root(),
+                        &magi::run::default_worktree_root(),
+                        &id,
+                    )
+                    .await?
+                }
+            };
             if removed.is_empty() {
                 println!("{id}: nothing left to fold");
             } else {
@@ -720,6 +785,8 @@ async fn dispatch(command: Command) -> Result<()> {
             }
             Ok(())
         }
+
+        Command::Cache { command } => cache(command),
 
         Command::Serve {
             repo,
@@ -833,6 +900,63 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::SelfUpdate { check_only, yes } => {
             updater::run_self_update(yes, check_only, !std::io::stdin().is_terminal()).await
         }
+    }
+}
+
+/// `magi cache show` and `magi cache clear`.
+///
+/// The cache is whatever `[verify]` renders as `CARGO_TARGET_DIR`; a config
+/// that sets none has nothing to show or clear.
+fn cache(command: CacheCmd) -> Result<()> {
+    let (repo, config) = match &command {
+        CacheCmd::Show { repo, config } | CacheCmd::Clear { repo, config } => {
+            (repo, config.as_deref())
+        }
+    };
+    let (cfg, _from) = Config::discover(repo, config)?;
+    let Some(dir) = cfg.cache_dir() else {
+        println!("no shared build cache configured (no CARGO_TARGET_DIR in `[verify]`)");
+        return Ok(());
+    };
+    match command {
+        CacheCmd::Show { .. } => {
+            println!("cache       {}", dir.display());
+            println!("configured  {}", bytes(cfg.disk.cache_limit_bytes));
+            // A cache that is not there reads as an empty one, and "0 bytes"
+            // for a 30 GB directory is how a full disk stays invisible: on
+            // Windows the `[verify]` command runs under a shell that resolves
+            // `/tmp` to its own temp directory, while magi measures the path
+            // literally. Say which of the two happened.
+            if dir.exists() {
+                println!("on disk     {}", bytes(magi::disk::dir_size(&dir)));
+            } else {
+                println!(
+                    "on disk     nothing at that path — the verification \
+                     commands are building somewhere else, so nothing here \
+                     is pruned or measured"
+                );
+            }
+        }
+        CacheCmd::Clear { .. } => {
+            if !dir.exists() {
+                println!("cache not present on disk: {}", dir.display());
+                return Ok(());
+            }
+            let freed = magi::disk::dir_size(&dir);
+            std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+            println!("removed {} ({} freed)", dir.display(), bytes(freed));
+        }
+    }
+    Ok(())
+}
+
+/// A byte count as the operator reads it.
+fn bytes(n: u64) -> String {
+    let gib = 1024.0 * 1024.0 * 1024.0;
+    if n >= gib as u64 {
+        format!("{:.1} GiB", n as f64 / gib)
+    } else {
+        format!("{n} bytes")
     }
 }
 

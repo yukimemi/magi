@@ -573,12 +573,7 @@ impl RunState {
             .graph
             .worktree_root
             .clone()
-            .unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("wt")
-                    .join("magi")
-            })
+            .unwrap_or_else(default_worktree_root)
             .join(self.short())
     }
 
@@ -691,16 +686,45 @@ pub fn short_of(id: &str) -> &str {
 /// `MAGI_HOME` overrides the default, and [`set_home`] overrides both — which
 /// is what lets the integration tests drive a whole graph without writing into
 /// the operator's real history.
+///
+/// In a unit test build (`cfg(test)`), falling through to the real
+/// `<data_local>/magi` is not a fallback worth having: it is exactly how
+/// three broken fixture runs ended up in the operator's actual history and
+/// were counted as `unreadable` by the deck. A test that reaches this point
+/// forgot to call [`set_home`] (or set `MAGI_HOME`) - that is a bug in the
+/// test, not a case to serve, so it panics instead of writing anywhere.
 pub fn home() -> PathBuf {
-    if let Some(dir) = HOME.get() {
-        return dir.clone();
+    resolve_home(HOME.get().cloned(), std::env::var_os("MAGI_HOME"))
+}
+
+/// The decision `home` makes, taking its two overrides as plain values
+/// instead of reading the `OnceLock` and the environment itself.
+///
+/// Pulled out so the `cfg(test)` panic is asserted directly against a
+/// `None, None` input, rather than racing every other unit test in the
+/// binary for who touches the process-global `HOME` first.
+fn resolve_home(pinned: Option<PathBuf>, magi_home_env: Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(dir) = pinned {
+        return dir;
     }
-    if let Some(dir) = std::env::var_os("MAGI_HOME") {
+    if let Some(dir) = magi_home_env {
         return PathBuf::from(dir);
     }
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("magi")
+    #[cfg(test)]
+    {
+        panic!(
+            "run::home() was reached in a test without run::set_home() or \
+             MAGI_HOME; this would write into the operator's real \
+             <data_local>/magi. Call `run::set_home(temp_dir)` before any \
+             code path that touches a RunState."
+        );
+    }
+    #[cfg(not(test))]
+    {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("magi")
+    }
 }
 
 /// Pin the run home for this process. The first call wins.
@@ -715,28 +739,77 @@ pub fn runs_root() -> PathBuf {
     home().join("runs")
 }
 
+/// The worktree root a run uses when the config sets none: `~/wt/magi`.
+///
+/// One definition of the default, so the folder the janitor folds and the
+/// folder the health view sizes cannot drift apart: a run with no configured
+/// [`crate::config::Graph::worktree_root`] lays its worktrees exactly here.
+pub fn default_worktree_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("wt")
+        .join("magi")
+}
+
 /// Directory for one run id.
 pub fn run_dir(id: &str) -> PathBuf {
     runs_root().join(id)
 }
 
 /// Every run id on disk, newest first.
+///
+/// A directory is a run because of its **name**, not because it holds a
+/// readable `run.json`. A run whose very first save lost the machine's last
+/// free bytes leaves `<id>/run.json.tmp` and nothing else, and filtering on
+/// `run.json` made that run invisible everywhere: not in `magi list`, not in
+/// `runs_unreadable`, not on the phone, so nothing could report it and no
+/// route could clear it. `88c0` sat like that for two days. Unreadable is
+/// counted, never hidden - the readers already say why each one cannot be
+/// read, and `fold_unreadable` is how a record like this leaves.
 pub fn list_ids() -> Vec<String> {
     let mut ids: Vec<String> = std::fs::read_dir(runs_root())
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.path().join("run.json").is_file())
+        .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| is_run_id(name))
         .collect();
     // Ids start with a sortable timestamp.
     ids.sort_unstable_by(|a, b| b.cmp(a));
     ids
 }
 
+/// Does `name` have the shape [`new_id`] mints: `YYYYMMDD-HHMMSS-xxxx`?
+///
+/// The test for "this directory is a run", so a stray folder under
+/// `<home>/runs` is not reported as a broken run.
+///
+/// The tag is checked for length and for being alphanumeric, not for being
+/// hex: real ids are hex, but fixtures across this crate name runs
+/// `...-dead` / `...-gone` / `...-once`, and a predicate that disowned those
+/// would be asserting the fixtures' spelling rather than the shape.
+pub fn is_run_id(name: &str) -> bool {
+    let mut parts = name.split('-');
+    let (Some(day), Some(time), Some(tag), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    day.len() == 8
+        && day.bytes().all(|b| b.is_ascii_digit())
+        && time.len() == 6
+        && time.bytes().all(|b| b.is_ascii_digit())
+        && tag.len() == 4
+        && tag.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// Expand an id prefix to exactly one run id.
 pub fn resolve_id(prefix: &str) -> Result<String> {
-    if run_dir(prefix).join("run.json").is_file() {
+    // A whole id names its directory, readable state or not: the run whose
+    // `run.json` never landed still has to be reachable by `magi show` and
+    // by the fold route, which is the only way its record ever leaves.
+    if is_run_id(prefix) && run_dir(prefix).is_dir() {
         return Ok(prefix.to_owned());
     }
     let hits: Vec<String> = list_ids()
@@ -834,6 +907,48 @@ mod tests {
             "add retries".to_owned(),
             Config::default(),
         )
+    }
+
+    #[test]
+    fn resolve_home_prefers_the_pin_then_the_env_var() {
+        let pinned = PathBuf::from("/pinned");
+        assert_eq!(
+            resolve_home(Some(pinned.clone()), Some("/env".into())),
+            pinned,
+            "a pin wins even over MAGI_HOME"
+        );
+        assert_eq!(
+            resolve_home(None, Some("/env".into())),
+            PathBuf::from("/env")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "run::set_home()")]
+    fn resolve_home_refuses_to_fall_back_to_the_operators_real_home() {
+        // Neither override present is exactly the state a test reaches by
+        // forgetting `set_home`/`MAGI_HOME` - the accident that put three
+        // broken fixture runs into the operator's real history. Asserted
+        // against the pure decision directly, not `home()` itself, because
+        // `HOME` is a process-wide `OnceLock` another test may have already
+        // set - this must not depend on test execution order.
+        resolve_home(None, None);
+    }
+
+    #[test]
+    fn a_run_is_named_by_shape_so_a_state_less_directory_is_still_a_run() {
+        // The shape `new_id` mints. A directory answering to it is a run even
+        // with no readable `run.json`: that is how a save that ran out of
+        // disk stays visible instead of vanishing from every listing.
+        assert!(is_run_id(&new_id()));
+        assert!(is_run_id("20260904-014540-88c0"));
+        // Not runs: a stray folder, a truncated id, a non-hex tag, and an id
+        // with an extra segment (a worktree label, say).
+        assert!(!is_run_id("scratch"));
+        assert!(!is_run_id("20260904-014540"));
+        assert!(!is_run_id("20260904-014540-88c0f"));
+        assert!(!is_run_id("2026090x-014540-88c0"));
+        assert!(!is_run_id("20260904-014540-88c0-A"));
     }
 
     #[test]

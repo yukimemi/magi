@@ -349,6 +349,80 @@ pub struct Verify {
     pub shell: Option<Vec<String>>,
 }
 
+impl Verify {
+    /// The `CARGO_TARGET_DIR=` value of the first rendered command that sets
+    /// one, if any. See [`crate::disk::extract_cargo_target_dir`] for the shape
+    /// this reads back. One rendering is enough - they all set the same
+    /// rendered `{{ vars.cache }}` path via the same shell - and the first e2e
+    /// command is checked before the gate because the e2e rebuilds the crate.
+    pub fn cache_dir(&self) -> Option<PathBuf> {
+        self.e2e
+            .iter()
+            .chain(self.gate.iter())
+            .find_map(|cmd| crate::disk::extract_cargo_target_dir(cmd))
+    }
+}
+
+/// Disk hygiene: how hard magi is allowed to press on the machine's free space.
+///
+/// The numbers below come from one incident, not from theory: a machine with
+/// 951.8 GB free ran a few competitions and plans and best read 6.7 GB free.
+/// Three multi-gigabyte classes of junk accumulated side by side - per-run
+/// worktrees that end as `Merged`/`Ready`/`Failed`, a shared build cache whose
+/// each verify round and each implementation wave recompiles the derived
+/// section of the project into, and the outputs of runs that were removed but
+/// whose folders nobody deleted.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Disk {
+    /// Free space, in bytes, below which no new run may start: the daemon and
+    /// the `magi run` gate answer with "the disk is full" instead of letting
+    /// the graph fill it the rest of the way. `0` turns the gate off.
+    ///
+    /// Default 8 GiB. The incident ran down to 6.7 GB free of 951.8 GB total
+    /// before anybody noticed; 8 GiB is enough headroom for the compile a fresh
+    /// competition triggers and small enough that a 1 TB disk with 100 GB free
+    /// is nowhere near the threshold.
+    pub min_free_bytes: u64,
+    /// Fold finished runs without being asked. `Merged`, `Ready` and `Failed`
+    /// runs older than [`fold_grace_secs`](Self::fold_grace_secs) have their
+    /// worktrees removed. `0` turns the janitor off.
+    ///
+    /// Default true.
+    pub auto_fold: bool,
+    /// How old a finished run must be before the janitor folds it, seconds.
+    ///
+    /// Default 6 hours. A run that `Ready` at 8am is the operator's answer; a
+    /// run that `Ready` a week ago is worktrees holding a compile each. Six
+    /// hours is long enough that nobody loses an answer in the gap between
+    /// reading the report and starting from it, and short enough that a backlog
+    /// cannot pile up across two nights.
+    pub fold_grace_secs: u64,
+    /// Ceiling for the shared build cache (`CARGO_TARGET_DIR` in the rendered
+    /// verify commands), in bytes. When the janitor runs and the cache is over
+    /// it, files are dropped oldest-first until it is not. `0` turns pruning
+    /// off - the cache then only ever grows, which is the operator's call.
+    ///
+    /// Default 10 GiB. This is what the incident measured: 30.61 GB sat in the
+    /// shared cache on top of ~16 GB in the primary target directory and 6.7-
+    /// 11.15 GB in each of four per-worktree targets. 10 GiB holds a healthy
+    /// stack of prebuilt dependencies (cargo's per-file fingerprinting means
+    /// pruning only costs the rebuild of the dropped files, not of the world)
+    /// without letting one addled cache swallow the machine.
+    pub cache_limit_bytes: u64,
+}
+
+impl Default for Disk {
+    fn default() -> Self {
+        Self {
+            min_free_bytes: 8 * 1024 * 1024 * 1024,
+            auto_fold: true,
+            fold_grace_secs: 6 * 60 * 60,
+            cache_limit_bytes: 10 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
 /// What to do with the winning branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -430,6 +504,8 @@ pub struct Config {
     pub blind: Blind,
     /// Verification commands.
     pub verify: Verify,
+    /// Disk hygiene.
+    pub disk: Disk,
     /// Merge policy.
     pub merge: Merge,
     /// Self-update policy.
@@ -781,6 +857,12 @@ impl Config {
         cfg
     }
 
+    /// The shared build cache the verify commands and the agents both build
+    /// into, when the config declares one. See [`Verify::cache_dir`].
+    pub fn cache_dir(&self) -> Option<PathBuf> {
+        self.verify.cache_dir()
+    }
+
     /// Look an agent up by id.
     pub fn agent(&self, id: &str) -> Result<&AgentSpec> {
         self.agents
@@ -1122,6 +1204,25 @@ mod tests {
             cfg.verify.gate,
             ["CARGO_TARGET_DIR=/shared/t cargo test".to_owned()]
         );
+        // The rendered command is where the cache path is read back from.
+        assert_eq!(cfg.cache_dir(), Some(PathBuf::from("/shared/t")));
+    }
+
+    #[test]
+    fn the_disk_defaults_are_the_measurements_made_up_front() {
+        let cfg = Config::default();
+        assert_eq!(cfg.disk.min_free_bytes, 8 * 1024 * 1024 * 1024);
+        assert!(cfg.disk.auto_fold);
+        assert_eq!(cfg.disk.fold_grace_secs, 6 * 60 * 60);
+        assert_eq!(cfg.disk.cache_limit_bytes, 10 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn an_unset_disk_section_is_the_safe_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("magi.toml"), "[graph]\ncandidates = 1\n").unwrap();
+        let cfg = Config::load(&dir.path().join("magi.toml")).expect("load");
+        assert_eq!(cfg.disk, Disk::default());
     }
 
     #[test]
