@@ -21,6 +21,19 @@
 //! interview already did that, and turning this stage into three more
 //! conversations would be exactly the cost this module exists to avoid.
 //!
+//! # Read-only is enforced by disposability, not by the prompt
+//!
+//! `allow_write: false` alone is not a guarantee: opencode has no read-only
+//! mode at all, and Claude's `--disallowed-tools` stops its edit tools but not
+//! a `rm` or a redirect run through its Bash tool. Judge and reviewer seats in
+//! [`crate::graph`] get away with that weak guarantee because their `cwd` is
+//! already a worktree the run treats as disposable; this stage runs before
+//! any run exists, so it makes its own - [`checkout_worktrees`] gives every
+//! advisor seat, and the planner's synthesis, a `git worktree add --detach`
+//! checkout at `HEAD` that is thrown away when [`run`] returns. A seat that
+//! writes anyway still only ever touches its own disposable copy, never the
+//! operator's checkout and never another seat's.
+//!
 //! # The draft survives every failure short of success
 //!
 //! [`run`] never writes to `draft` until it holds a complete, synthesized
@@ -31,7 +44,7 @@
 //! keeps for a validation failure. The raw advisor records are written to
 //! disk unconditionally, before that check even runs, so a total failure
 //! still leaves something for the operator to read.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
@@ -40,6 +53,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{self, Invocation, SeatState};
 use crate::chat;
 use crate::config::{AgentSpec, Config};
+use crate::git;
 use crate::plan;
 use crate::prompt;
 use crate::verdict::{self, Proposal};
@@ -116,24 +130,123 @@ pub async fn run(
         );
     }
 
-    let language = config.graph.language.clone();
-    // Read + reason, no write: the same shape of work `[graph] timeout_judge`
-    // already budgets for judges, so a stage-specific timeout nobody asked
-    // for would be one more number to tune for no benefit.
-    let timeout = Duration::from_secs(config.graph.timeout_judge.max(1));
-    let artifacts = dir.join(format!("{id}.advisors"));
-    let seed = crate::rng::entropy();
+    let worktrees = checkout_worktrees(repo, dir, id, seats.len())
+        .await
+        .with_context(|| {
+            format!(
+                "could not prepare a disposable checkout for the advisor \
+                 seats; the interview draft is unchanged at {d} - file it \
+                 as-is with `magi task add --file {d}`, or retry `magi plan`.",
+                d = draft.display(),
+            )
+        })?;
+
+    // Split out so the worktrees are removed on every path out of here,
+    // success or failure - Rust has no `try`/`finally` to hang this off of.
+    let outcome = deliberate(
+        &requirements,
+        &seats,
+        &worktrees,
+        &DeliberationCtx {
+            config,
+            draft,
+            dir,
+            id,
+            language: &config.graph.language,
+            // Read + reason, no write: the same shape of work `[graph]
+            // timeout_judge` already budgets for judges, so a stage-specific
+            // timeout nobody asked for would be one more number to tune for
+            // no benefit.
+            timeout: Duration::from_secs(config.graph.timeout_judge.max(1)),
+            seed: crate::rng::entropy(),
+        },
+    )
+    .await;
+
+    remove_worktrees(repo, &worktrees).await;
+
+    outcome
+}
+
+/// Disposable, detached worktrees at `HEAD`, one per advisor seat - see the
+/// module doc's "Read-only is enforced by disposability" section for why a
+/// seat needs one of these rather than the operator's own checkout.
+///
+/// Sequential, not parallel: `git worktree add` takes a lock on the
+/// repository's own `.git` metadata, and setup is a one-time cost paid once
+/// per `magi plan` invocation, not on the hot path a parallel seat wave
+/// exists to keep cheap.
+async fn checkout_worktrees(repo: &Path, dir: &Path, id: &str, n: usize) -> Result<Vec<PathBuf>> {
+    let root = dir.join(format!("{id}.repo"));
+    let mut paths = Vec::with_capacity(n);
+    for i in 0..n {
+        let wt = root.join(format!("advisor-{}", i + 1));
+        if let Err(e) = git::worktree_add_detached(repo, &wt, "HEAD").await {
+            // Partial setup must not leak the worktrees it did manage to
+            // register before the failure that stopped it.
+            remove_worktrees(repo, &paths).await;
+            return Err(e);
+        }
+        paths.push(wt);
+    }
+    Ok(paths)
+}
+
+/// Best-effort teardown. A worktree `magi plan` fails to remove costs the
+/// operator disk, not correctness - the advisor stage already answered or
+/// already failed by the time this runs - so a removal error is logged and
+/// moved past rather than turned into a second error on top of whatever
+/// [`run`] is already returning.
+async fn remove_worktrees(repo: &Path, worktrees: &[PathBuf]) {
+    for wt in worktrees {
+        if let Err(e) = git::worktree_remove(repo, wt).await {
+            tracing::warn!(
+                "could not remove disposable advisor worktree {}: {e:#}",
+                wt.display()
+            );
+        }
+    }
+    // Only succeeds once every child above is gone; harmless otherwise.
+    if let Some(root) = worktrees.first().and_then(|w| w.parent()) {
+        let _ = std::fs::remove_dir(root);
+    }
+}
+
+/// Everything [`deliberate`] needs once a disposable checkout exists per
+/// seat, bundled so the function takes one borrow instead of a parameter per
+/// field - the same reason [`crate::graph`]'s wave takes a `WaveCtx`.
+struct DeliberationCtx<'a> {
+    config: &'a Config,
+    draft: &'a Path,
+    dir: &'a Path,
+    id: &'a str,
+    language: &'a str,
+    timeout: Duration,
+    seed: u64,
+}
+
+/// The body of [`run`]: gather, record, synthesize, validate, write. Split out
+/// only so [`run`] can guarantee `worktrees` are removed on every exit from
+/// this, not so it can be called independently of a checkout existing.
+async fn deliberate(
+    requirements: &str,
+    seats: &[AgentSpec],
+    worktrees: &[PathBuf],
+    ctx: &DeliberationCtx<'_>,
+) -> Result<Advice> {
+    let draft = ctx.draft;
+    let artifacts = ctx.dir.join(format!("{}.advisors", ctx.id));
 
     let advice = gather(
-        &seats,
-        &requirements,
+        seats,
+        requirements,
+        worktrees,
         &GatherCtx {
-            repo,
             artifacts: &artifacts,
-            run: id,
-            language: &language,
-            timeout,
-            seed,
+            run: ctx.id,
+            language: ctx.language,
+            timeout: ctx.timeout,
+            seed: ctx.seed,
         },
     )
     .await;
@@ -141,7 +254,7 @@ pub async fn run(
     // Written before the checks below can bail: a total failure must still
     // leave the raw attempts on disk, or "nobody produced a proposal" is a
     // claim the operator has no way to check.
-    let advice_path = dir.join(format!("{id}.advisors.json"));
+    let advice_path = ctx.dir.join(format!("{}.advisors.json", ctx.id));
     std::fs::write(
         &advice_path,
         serde_json::to_string_pretty(&advice).context("serialize the advisor records")?,
@@ -161,25 +274,31 @@ pub async fn run(
     }
 
     let planner = plan::pick(
-        &config.agents,
-        config.roles.planner.as_deref(),
+        &ctx.config.agents,
+        ctx.config.roles.planner.as_deref(),
         &plan::installed,
     )
     .context("resolving the planner seat for design synthesis")?;
-    let mut seat = SeatState::new("plan-synthesis", &planner.id, seed);
-    let synth_prompt = prompt::synthesize(&requirements, &proposals, &language);
+    let mut seat = SeatState::new("plan-synthesis", &planner.id, ctx.seed);
+    let synth_prompt = prompt::synthesize(requirements, &proposals, ctx.language);
     let out = agent::invoke(
         &planner,
         &mut seat,
         &Invocation {
-            cwd: repo,
+            // The first advisor's disposable checkout, reused: every advisor
+            // task has already finished by this point (`gather` awaited them
+            // all), so there is nothing left to race with, and a fourth
+            // checkout just for synthesis would buy nothing this one does
+            // not already give it - a read-only view of the repository that
+            // is not the operator's own.
+            cwd: &worktrees[0],
             prompt: &synth_prompt,
-            timeout,
+            timeout: ctx.timeout,
             allow_write: false,
             sessions: false,
             artifacts: &artifacts,
             stem: "synthesis",
-            run: id,
+            run: ctx.id,
             node: "plan-advise",
             cache_dir: None,
         },
@@ -212,16 +331,42 @@ pub async fn run(
         )
     })?;
 
+    // Checked before a single byte reaches `draft`: `extract_draft` accepts an
+    // unclosed fence as "whatever came before end of stream", so a synthesis
+    // that stopped mid-sentence - a truncated reply, not a system timeout -
+    // would otherwise overwrite a perfectly good interview draft with
+    // something `vet` rejects one call later, at which point the operator's
+    // requirements are already gone. The same shape `vet` itself uses: length
+    // alone warns rather than refuses, everything else must hold.
+    if let Err(problems) = plan::review_draft(&synthesized) {
+        let hard: Vec<&String> = problems
+            .iter()
+            .filter(|p| p.as_str() != plan::SHORT_DRAFT)
+            .collect();
+        if !hard.is_empty() {
+            let list = hard
+                .iter()
+                .map(|p| format!("  - {p}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "the planner seat's synthesis is not a usable task file:\n{list}\n\n\
+                 the interview draft is unchanged at {d} - file it as-is with \
+                 `magi task add --file {d}`, or retry `magi plan`.",
+                d = draft.display(),
+            );
+        }
+    }
+
     std::fs::write(draft, &synthesized).with_context(|| format!("write {}", draft.display()))?;
 
     Ok(advice)
 }
 
-/// The parts of [`run`]'s setup every advisor seat needs, bundled so
+/// The parts of [`deliberate`]'s setup every advisor seat needs, bundled so
 /// [`gather`] takes one borrow instead of a parameter per field - the same
 /// reason [`crate::graph`]'s wave takes a `WaveCtx`.
 struct GatherCtx<'a> {
-    repo: &'a Path,
     artifacts: &'a Path,
     run: &'a str,
     language: &'a str,
@@ -229,16 +374,22 @@ struct GatherCtx<'a> {
     seed: u64,
 }
 
-/// Ask every seat for a design proposal, in parallel, headless and read-only.
+/// Ask every seat for a design proposal, in parallel, headless and read-only,
+/// each in its own disposable worktree (`worktrees[i]` for `seats[i]`).
 ///
 /// Failures are per-seat, not fatal to the wave: a seat that crashes or
 /// answers unparsably still produces an [`AdvisorRecord`], so one bad seat
 /// does not cost the operator the other two.
-async fn gather(seats: &[AgentSpec], requirements: &str, ctx: &GatherCtx<'_>) -> Advice {
+async fn gather(
+    seats: &[AgentSpec],
+    requirements: &str,
+    worktrees: &[PathBuf],
+    ctx: &GatherCtx<'_>,
+) -> Advice {
     let n = seats.len();
     let mut set = tokio::task::JoinSet::new();
     for (i, spec) in seats.iter().cloned().enumerate() {
-        let repo = ctx.repo.to_owned();
+        let cwd = worktrees[i].clone();
         let requirements = requirements.to_owned();
         let artifacts = ctx.artifacts.to_owned();
         let run = ctx.run.to_owned();
@@ -254,7 +405,7 @@ async fn gather(seats: &[AgentSpec], requirements: &str, ctx: &GatherCtx<'_>) ->
                 &spec,
                 &mut seat,
                 &Invocation {
-                    cwd: &repo,
+                    cwd: &cwd,
                     prompt: &prompt,
                     timeout,
                     allow_write: false,
@@ -403,6 +554,32 @@ mod tests {
         )
     }
 
+    /// A real git repository with one commit, so `checkout_worktrees` has a
+    /// `HEAD` to detach from. A plain temp directory is enough for the tests
+    /// that fail before that point (no draft, zero advisors); only the ones
+    /// that reach the disposable checkout need this.
+    fn init_repo(dir: &Path) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::create_dir_all(dir).unwrap();
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.name", "magi test"]);
+        run(&["config", "user.email", "magi@example.com"]);
+        std::fs::write(dir.join("README.md"), "# fixture\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "init"]);
+    }
+
     #[tokio::test]
     async fn gather_records_every_seat_including_one_that_fails() {
         let seats = vec![
@@ -410,11 +587,15 @@ mod tests {
             command("sage-b", "not json at all"),
         ];
         let dir = tempfile::tempdir().unwrap();
+        let worktrees = vec![dir.path().join("wt-1"), dir.path().join("wt-2")];
+        for wt in &worktrees {
+            std::fs::create_dir_all(wt).unwrap();
+        }
         let advice = gather(
             &seats,
             "the requirements",
+            &worktrees,
             &GatherCtx {
-                repo: dir.path(),
                 artifacts: &dir.path().join("artifacts"),
                 run: "test-run",
                 language: "en",
@@ -452,9 +633,65 @@ mod tests {
         }
     }
 
+    /// Reported: `allow_write: false` is not enforced by every CLI kind
+    /// (opencode has no read-only mode at all), so a seat that writes anyway
+    /// used to write into the operator's own repository - the one directory
+    /// this stage must never touch. A seat that writes now can only ever
+    /// reach its own disposable worktree.
+    #[tokio::test]
+    async fn an_advisors_write_lands_in_its_worktree_never_in_the_operators_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let dir = tmp.path().join("drafts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let draft = dir.join("20260906-000000-kl12.md");
+        std::fs::write(&draft, good_draft()).unwrap();
+
+        // Ignores its own read-only instruction and writes a file anyway -
+        // standing in for a CLI kind (or a Bash tool) `allow_write: false`
+        // does not actually stop.
+        let writer = AgentSpec {
+            id: "sage-a".to_owned(),
+            kind: AgentKind::Command,
+            model: None,
+            command: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!(
+                    "cat >/dev/null && touch leaked-by-advisor.txt && cat <<'EOF'\n{}\nEOF",
+                    proposal_json("do X")
+                ),
+            ],
+            extra_args: Vec::new(),
+            env: Default::default(),
+            prompt_delivery: None,
+        };
+
+        let cfg = config(
+            vec![
+                writer,
+                command("sage-b", &proposal_json("do Y")),
+                command("planner", &synthesized_task_block()),
+            ],
+            2,
+        );
+
+        run(&cfg, &repo, &draft, &dir, "20260906-000000-kl12")
+            .await
+            .expect("deliberation still succeeds even though a seat wrote something");
+
+        assert!(
+            !repo.join("leaked-by-advisor.txt").exists(),
+            "an advisor's write must land in its disposable worktree, never in the operator's repository"
+        );
+    }
+
     #[tokio::test]
     async fn run_writes_the_raw_records_and_overwrites_the_draft_with_the_synthesis() {
         let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
         let dir = tmp.path().join("drafts");
         std::fs::create_dir_all(&dir).unwrap();
         let draft = dir.join("20260906-000000-ab12.md");
@@ -469,7 +706,7 @@ mod tests {
             2,
         );
 
-        let advice = run(&cfg, tmp.path(), &draft, &dir, "20260906-000000-ab12")
+        let advice = run(&cfg, &repo, &draft, &dir, "20260906-000000-ab12")
             .await
             .expect("deliberation succeeds");
         assert_eq!(advice.proposals().len(), 2);
@@ -485,11 +722,21 @@ mod tests {
             "the draft must be overwritten with the synthesis: {final_draft}"
         );
         assert!(final_draft.contains("## Completion criteria"));
+
+        // The disposable checkouts must not survive a successful run - a
+        // seat's worktree left behind would be exactly the write surface this
+        // whole isolation exists to avoid leaving around.
+        assert!(
+            !dir.join("20260906-000000-ab12.repo").exists(),
+            "advisor worktrees must be cleaned up after the run"
+        );
     }
 
     #[tokio::test]
     async fn run_leaves_the_draft_untouched_when_no_advisor_produces_a_proposal() {
         let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
         let dir = tmp.path().join("drafts");
         std::fs::create_dir_all(&dir).unwrap();
         let draft = dir.join("20260906-000000-cd34.md");
@@ -505,7 +752,7 @@ mod tests {
             2,
         );
 
-        let err = run(&cfg, tmp.path(), &draft, &dir, "20260906-000000-cd34")
+        let err = run(&cfg, &repo, &draft, &dir, "20260906-000000-cd34")
             .await
             .expect_err("no proposal must fail the stage");
         let msg = err.to_string();
@@ -524,6 +771,8 @@ mod tests {
     #[tokio::test]
     async fn run_leaves_the_draft_untouched_when_the_planner_replies_with_no_task_block() {
         let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
         let dir = tmp.path().join("drafts");
         std::fs::create_dir_all(&dir).unwrap();
         let draft = dir.join("20260906-000000-ef56.md");
@@ -539,12 +788,50 @@ mod tests {
             2,
         );
 
-        let err = run(&cfg, tmp.path(), &draft, &dir, "20260906-000000-ef56")
+        let err = run(&cfg, &repo, &draft, &dir, "20260906-000000-ef56")
             .await
             .expect_err("a synthesis with no task block must fail the stage");
         let msg = err.to_string();
         assert!(msg.contains(&draft.display().to_string()), "{msg}");
         assert_eq!(std::fs::read_to_string(&draft).unwrap(), original);
+    }
+
+    /// Reported: `chat::extract_draft` accepts an unclosed fence as whatever
+    /// came before end of stream, so a planner reply that stops mid-sentence
+    /// - not a timeout, `out.usable()` is still true - used to overwrite a
+    /// perfectly good interview draft with a stub `vet` then rejected one
+    /// call later, by which point the original requirements were gone.
+    #[tokio::test]
+    async fn run_leaves_the_draft_untouched_when_the_synthesis_fence_never_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let dir = tmp.path().join("drafts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let draft = dir.join("20260906-000000-ij90.md");
+        let original = good_draft();
+        std::fs::write(&draft, &original).unwrap();
+
+        let cfg = config(
+            vec![
+                command("sage-a", &proposal_json("do X")),
+                command("sage-b", &proposal_json("do Y")),
+                command("planner", "```task\n# incomplete"),
+            ],
+            2,
+        );
+
+        let err = run(&cfg, &repo, &draft, &dir, "20260906-000000-ij90")
+            .await
+            .expect_err("an incomplete synthesis must not become the task file");
+        let msg = err.to_string();
+        assert!(msg.contains(&draft.display().to_string()), "{msg}");
+        assert!(msg.contains("not a usable task file"), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(&draft).unwrap(),
+            original,
+            "the interview draft must survive an incomplete synthesis"
+        );
     }
 
     #[tokio::test]

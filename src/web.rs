@@ -113,6 +113,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::advise;
 use crate::ask::{Answer, Question, Questions};
 use crate::chat::{Chat, Chats};
 use crate::config::Config;
@@ -650,6 +651,7 @@ impl Ui {
             .route("/api/queue", get(queue_list))
             .route("/api/queue/{id}", delete(queue_delete))
             .route("/api/repos", get(repos_list))
+            .route("/api/drafts", get(drafts_list))
             .route("/api/drafts/{id}/advisors", get(draft_advisors))
             .route("/api/queue/{id}/hold", post(queue_hold))
             .route("/api/queue/{id}/release", post(queue_release))
@@ -2323,6 +2325,62 @@ async fn repos_list(
             Duration::from_secs(cfg.repos.scan_ttl),
             refresh,
         )))
+    })
+    .await
+}
+
+/// One `magi plan` draft the plan surface can point at, summarized for
+/// `GET /api/drafts`.
+#[derive(Debug, Serialize)]
+struct DraftSummary {
+    id: String,
+    title: String,
+    seats: usize,
+    proposals: usize,
+}
+
+/// `GET /api/drafts` - every draft that finished a design-deliberation stage,
+/// newest first - the plan surface's index into `draft_advisors` below.
+///
+/// `magi plan` is a terminal command; a phone that opens later has no other
+/// way to learn which draft ids exist. Listing only the ids with an
+/// `<id>.advisors.json` on disk, rather than every `<id>.md`, keeps this to
+/// what the design-deliberation stage actually produced - an interview
+/// abandoned before it wrote anything, or one filed with the stage off, has
+/// nothing here to show.
+async fn drafts_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<DraftSummary>>> {
+    blocking(move || {
+        let dir = ui.home.join("drafts");
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(Json(out));
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".advisors.json")) else {
+                continue;
+            };
+            let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(advice) = serde_json::from_str::<advise::Advice>(&raw) else {
+                continue;
+            };
+            let title = std::fs::read_to_string(dir.join(format!("{id}.md")))
+                .ok()
+                .map(|body| title_from(&body, TITLE_MAX))
+                .unwrap_or_else(|| id.to_owned());
+            out.push(DraftSummary {
+                id: id.to_owned(),
+                title,
+                seats: advice.records.len(),
+                proposals: advice.proposals().len(),
+            });
+        }
+        // The id is a `%Y%m%d-%H%M%S-xxxx` stamp (see `plan::new_id`), so a
+        // plain string sort is already newest-first in reverse.
+        out.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(Json(out))
     })
     .await
 }
@@ -4722,6 +4780,51 @@ mod tests {
         let f = Fixture::start().await;
         let res = f.get("/api/drafts/nosuchdraft/advisors").await;
         assert_eq!(res.status, 404, "{}", res.body);
+    }
+
+    #[tokio::test]
+    async fn drafts_list_surfaces_only_drafts_that_finished_deliberation_newest_first() {
+        let f = Fixture::start().await;
+        let drafts = f.home.path().join("drafts");
+        std::fs::create_dir_all(&drafts).expect("drafts dir");
+        // Older draft, with a title and two proposals.
+        std::fs::write(
+            drafts.join("20260901-000000-aaaa.md"),
+            "# Rework the config loader\n",
+        )
+        .unwrap();
+        std::fs::write(
+            drafts.join("20260901-000000-aaaa.advisors.json"),
+            r#"{"records":[
+                {"seat":"advisor-1","agent":"a","duration_ms":1,
+                 "proposal":{"approach":"x","key_tradeoff":"y","why_not_naive":"z"}},
+                {"seat":"advisor-2","agent":"b","duration_ms":1,"error":"boom"}
+            ]}"#,
+        )
+        .unwrap();
+        // Newer draft, no title on disk (already filed and its .md removed).
+        std::fs::write(
+            drafts.join("20260902-000000-bbbb.advisors.json"),
+            r#"{"records":[]}"#,
+        )
+        .unwrap();
+        // A plain interview draft with no deliberation must not appear.
+        std::fs::write(drafts.join("20260903-000000-cccc.md"), "# no advisors\n").unwrap();
+
+        let res = f.get("/api/drafts").await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let list = res.json();
+        let rows = list.as_array().expect("an array");
+        assert_eq!(rows.len(), 2, "{list}");
+        assert_eq!(rows[0]["id"], "20260902-000000-bbbb", "newest first");
+        assert_eq!(
+            rows[0]["title"], "20260902-000000-bbbb",
+            "falls back to the id"
+        );
+        assert_eq!(rows[1]["id"], "20260901-000000-aaaa");
+        assert_eq!(rows[1]["title"], "Rework the config loader");
+        assert_eq!(rows[1]["seats"], 2);
+        assert_eq!(rows[1]["proposals"], 1);
     }
 
     #[tokio::test]

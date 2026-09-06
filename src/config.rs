@@ -1161,6 +1161,15 @@ impl Config {
     /// [`crate::advise`]): `[roles] advisors` when set, otherwise the judge
     /// roster - see [`Roles::advisors`] for why that fallback and not the
     /// whole roster.
+    ///
+    /// The fallback rotates with `offset = 1`, matching the judges line in
+    /// [`Config::resolve_roles`] exactly, `ids` and offset both - not just
+    /// `roles.judges`, which is empty whenever judges themselves are
+    /// unconfigured and rotating the whole roster. Falling back with
+    /// `offset = 0` there would silently hand the advisors a *different*
+    /// agent set than the judges an unconfigured run would actually get,
+    /// which is the one thing [`Roles::advisors`]'s doc promises will not
+    /// happen.
     pub fn advisors(&self) -> Result<Vec<AgentSpec>> {
         if self.agents.is_empty() {
             bail!(
@@ -1169,12 +1178,10 @@ impl Config {
                  magi.toml."
             );
         }
-        let ids = if self.roles.advisors.is_empty() {
-            &self.roles.judges
-        } else {
-            &self.roles.advisors
-        };
-        self.rotate(ids, self.graph.advisors, 0)
+        if !self.roles.advisors.is_empty() {
+            return self.rotate(&self.roles.advisors, self.graph.advisors, 0);
+        }
+        self.rotate(&self.roles.judges, self.graph.advisors, 1)
     }
 
     /// Shell prefix for [`Verify`] commands.
@@ -1423,6 +1430,31 @@ mod tests {
         };
         let advisors = cfg.advisors().expect("advisors resolve");
         assert!(advisors.iter().all(|a| a.id == "a"));
+    }
+
+    /// Reported: with neither `[roles] advisors` nor `[roles] judges` set, the
+    /// fallback rotated the roster from offset 0 while `resolve_roles` gives
+    /// judges offset 1 - two different agent sets, contradicting the doc's
+    /// promise that an unset `advisors` is "the judge roster".
+    #[test]
+    fn an_unconfigured_advisor_and_judge_roster_resolve_to_the_same_agents() {
+        let cfg = Config {
+            agents: vec![spec("a"), spec("b"), spec("c"), spec("d")],
+            graph: Graph {
+                judges: 3,
+                advisors: 3,
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        let judges = cfg.resolve_roles().expect("roles resolve").judges;
+        let advisors = cfg.advisors().expect("advisors resolve");
+        let judge_ids: Vec<&str> = judges.iter().map(|a| a.id.as_str()).collect();
+        let advisor_ids: Vec<&str> = advisors.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            advisor_ids, judge_ids,
+            "an unconfigured advisor roster must be the same seats an unconfigured judge panel gets"
+        );
     }
 
     #[test]

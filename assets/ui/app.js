@@ -57,6 +57,11 @@ const API = {
      action. `?refresh=1` bypasses the server's cache regardless of its TTL. */
   repos: "/api/repos",
   reposRefresh: "/api/repos?refresh=1",
+  /* `magi plan`'s headless design-deliberation stage: run from a terminal, so
+     the phone's only way to learn a draft's raw advisor record is to ask for
+     the list magi itself wrote to disk. */
+  drafts: "/api/drafts",
+  draftAdvisors: (id) => `/api/drafts/${encodeURIComponent(id)}/advisors`,
   /* The loop itself: GET reports it, POST {running} starts or stops the one
      inside this server. */
   loop: "/api/loop",
@@ -449,6 +454,16 @@ const state = {
      pickers - the one on the "start a conversation" panel and the one on
      "continue in another repository". `null` before the first load. */
   repos: null,
+  /* `magi plan` drafts that finished a design-deliberation stage, from
+     `GET /api/drafts`. `null` before the first load; fetched once on
+     arrival and again on an explicit tap, the same as `repos` above - there
+     is no revision to poll, since the CLI process that writes these files is
+     not this server. */
+  drafts: null,
+  /* The raw advisor record currently open below the drafts list, or `null`
+     when nothing is open. `error` carries a failed fetch so the panel can say
+     so instead of silently staying empty. */
+  draftDetail: { id: null, advice: null, error: null },
   chatDetail: { id: null, chat: null },
   /* The id of the conversation whose turn is in flight, and the transcript
      length it started from. One turn at a time is the whole rule: a second
@@ -2547,6 +2562,118 @@ function renderChats() {
   syncList(list, sortChats(chats), (c) => c.id, createChatCard, updateChatCard);
 }
 
+/* ---- design deliberations -----------------------------------------------
+ * `magi plan` runs from a terminal and gathers its three advisors headless,
+ * on whatever machine the operator typed the command on - so this is the
+ * only place a phone ever gets to read what they argued. There is no
+ * revision to poll for these: the files are written by that CLI process, not
+ * by this server, so the list is a snapshot fetched on arrival and again on
+ * an explicit tap, the same contract `repos` above already has. */
+function createDraftCard() {
+  const title = el("h2", { class: "card-title" });
+  const meta = el("p", { class: "card-meta" });
+  const card = el("div", { class: "card", tabindex: "0", role: "button" }, title, meta);
+  const row = el("li", {}, card);
+  row.refs = { card, title, meta };
+  return row;
+}
+
+function updateDraftCard(row, draft) {
+  const r = row.refs;
+  setText(r.title, draft.title || draft.id);
+  setText(
+    r.meta,
+    `${plural(draft.proposals, "proposal", "proposals")} of ${plural(draft.seats, "advisor", "advisors")}`,
+  );
+  r.card.onclick = () => viewDraftAdvisors(draft.id);
+  r.card.onkeydown = (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      viewDraftAdvisors(draft.id);
+    }
+  };
+}
+
+function renderDrafts() {
+  const list = $("plan-drafts-list");
+  const drafts = state.drafts;
+  if (drafts === null) return;
+  show($("plan-drafts-empty"), drafts.length === 0);
+  syncList(list, drafts, (d) => d.id, createDraftCard, updateDraftCard);
+}
+
+async function loadDrafts() {
+  try {
+    state.drafts = await getJson(API.drafts);
+    renderDrafts();
+  } catch {
+    /* Nothing worth interrupting Planning over - the list just stays at
+       whatever it last showed, same as a failed repository scan. */
+    state.drafts = state.drafts || [];
+    renderDrafts();
+  }
+}
+
+/* A proposal's own fields, one row each - never innerHTML, since every word
+   here came from an agent the operator has not read yet. */
+function renderProposal(list, proposal) {
+  const add = (label, value) => {
+    if (!value) return;
+    list.append(el("li", {}, el("strong", { text: `${label}: ` }), el("span", { text: value })));
+  };
+  add("Approach", proposal.approach);
+  add("Key tradeoff", proposal.key_tradeoff);
+  add("Risks", (proposal.risks || []).join("; "));
+  add("Touches", (proposal.touches || []).join(", "));
+  add("Why not the naive approach", proposal.why_not_naive);
+}
+
+function renderDraftDetail() {
+  const panel = $("plan-draft-detail-panel");
+  const { id, advice, error } = state.draftDetail;
+  show(panel, Boolean(id));
+  if (!id) return;
+
+  setText($("plan-draft-detail-title"), `Design deliberation — ${shortId(id)}`);
+  const list = $("plan-draft-detail-list");
+  clear(list);
+
+  if (error) {
+    list.append(el("li", { class: "form-error", text: error }));
+    return;
+  }
+  if (!advice) {
+    list.append(el("li", { text: "Loading…" }));
+    return;
+  }
+  for (const record of advice.records || []) {
+    const head = el("h3", { text: `${record.seat} (${record.agent || "—"})` });
+    const body = el("ul", { class: "proposal" });
+    if (record.proposal) renderProposal(body, record.proposal);
+    else body.append(el("li", { class: "form-error", text: record.error || "no proposal" }));
+    list.append(el("li", {}, head, body));
+  }
+  if ((advice.records || []).length === 0) {
+    list.append(el("li", { text: "No advisor records." }));
+  }
+}
+
+async function viewDraftAdvisors(id) {
+  state.draftDetail = { id, advice: null, error: null };
+  renderDraftDetail();
+  try {
+    state.draftDetail = { id, advice: await getJson(API.draftAdvisors(id)), error: null };
+  } catch (error) {
+    state.draftDetail = { id, advice: null, error: error.message };
+  }
+  renderDraftDetail();
+}
+
+function closeDraftDetail() {
+  state.draftDetail = { id: null, advice: null, error: null };
+  renderDraftDetail();
+}
+
 /* ---- one conversation -------------------------------------------------- */
 function createTurnRow() {
   const who = el("span", { class: "turn-who" });
@@ -4485,6 +4612,10 @@ function applyRoute() {
     state.planFocus = false;
     requestAnimationFrame(() => $("f-idea").focus());
   }
+  /* No revision to poll here (see the "design deliberations" block above),
+     so a first arrival is the trigger - same as `loadRepos` never being
+     re-fetched on its own either. */
+  if (route.name === "chats" && state.drafts === null) loadDrafts();
   renderTitle();
 }
 
@@ -4681,6 +4812,8 @@ function wire() {
     $("chat-derive-repo").value = event.target.value;
   });
   $("chat-start-repo-refresh").addEventListener("click", () => loadRepos(true));
+  $("plan-drafts-refresh").addEventListener("click", () => loadDrafts());
+  $("plan-draft-detail-close").addEventListener("click", closeDraftDetail);
   /* Enter inserts a newline, because on a phone that is the only way to type
      a paragraph. Ctrl or Cmd with Enter sends, for the desktop. */
   $("f-say").addEventListener("keydown", (event) => {
