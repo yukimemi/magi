@@ -774,7 +774,17 @@ async fn dispatch(command: Command) -> Result<()> {
                         .with_context(|| format!("read {}", path.display()))?
                 );
             } else {
-                print!("{}", report::run(&RunState::load(&id)?));
+                let state = RunState::load(&id)?;
+                let live = magi::daemon::is_working_on(
+                    &magi::run::home(),
+                    &state.id,
+                    jiff::Timestamp::now(),
+                );
+                print!(
+                    "{}{}",
+                    report::run(&state),
+                    report::active_seats(&state, live)
+                );
             }
             Ok(())
         }

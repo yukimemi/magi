@@ -445,6 +445,50 @@ pub struct MergeOutcome {
     pub detail: String,
 }
 
+/// A seat currently mid-answer: a prompt was sent and no reply has landed yet.
+///
+/// This is not the whole story of "is it alive" — a daemon killed mid-wave
+/// leaves its last wave's entries here forever, since nothing ran to clear
+/// them. A reader must cross-check a live daemon's heartbeat
+/// (`daemon::is_working_on`) before trusting one of these as "still running"
+/// rather than "abandoned". [`RunState::clear_active`] is what keeps that
+/// leftover from surviving into the next attempt at this run: `execute` calls
+/// it before doing anything else, so a resumed run never carries a stale
+/// entry into its own report before the next wave repopulates it.
+///
+/// Deliberately carries no agent id: an implementer's agent is no secret, but
+/// a judge or reviewer seat is blind (`SeatState::key` is keyed by seat, never
+/// agent, for exactly this reason), and this struct has no way to tell which
+/// kind of seat it describes. The seat key alone — already in the map this
+/// lives under — is what every caller needs to say which seat is running.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveSeat {
+    /// Node the seat is answering for, e.g. `implement`, `judge`, `review`.
+    pub node: String,
+    /// When this attempt was sent.
+    pub started_at: Timestamp,
+    /// The CLI's wall-clock budget for this attempt.
+    pub timeout_secs: u64,
+    /// 0 for the first ask, N for the Nth nudge or resume.
+    #[serde(default)]
+    pub attempt: usize,
+}
+
+impl ActiveSeat {
+    /// Seconds since this attempt was sent.
+    #[must_use]
+    pub fn elapsed_secs(&self, now: Timestamp) -> i64 {
+        (now.as_second() - self.started_at.as_second()).max(0)
+    }
+
+    /// Seconds left before this attempt's own timeout fires, floored at zero
+    /// rather than going negative once the CLI has overrun its budget.
+    #[must_use]
+    pub fn remaining_secs(&self, now: Timestamp) -> i64 {
+        (self.timeout_secs as i64 - self.elapsed_secs(now)).max(0)
+    }
+}
+
 /// A timestamped note about a node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
@@ -556,6 +600,15 @@ pub struct RunState {
     /// Per-seat conversation state.
     #[serde(default)]
     pub seats: BTreeMap<String, SeatState>,
+    /// Seats currently mid-answer, keyed by seat.
+    ///
+    /// An entry exists from the moment a prompt is sent until a reply (of any
+    /// kind — success, failure, quota, drop) comes back, so its keys are
+    /// exactly "who hasn't answered yet" for whichever node populated it. See
+    /// [`ActiveSeat`] for why a reader still has to check a live daemon
+    /// before trusting one of these as "running" rather than "abandoned".
+    #[serde(default)]
+    pub active: BTreeMap<String, ActiveSeat>,
     /// Last observation of the winner's pull request, when a land loop ran.
     ///
     /// Persisted rather than derived from the event log because the phone asks
@@ -606,6 +659,7 @@ impl RunState {
             quota: Vec::new(),
             parked: false,
             seats: BTreeMap::new(),
+            active: BTreeMap::new(),
             pr: None,
             events: Vec::new(),
         }
@@ -645,6 +699,51 @@ impl RunState {
             node: node.to_owned(),
             message,
         });
+    }
+
+    /// Record that `seat` was just sent a prompt for `node`, with the given
+    /// wall-clock budget. `attempt` is 0 for the first ask and N for the Nth
+    /// nudge or resume, purely for display — it does not change how the seat
+    /// is treated.
+    pub fn seat_started(
+        &mut self,
+        node: &str,
+        seat: &str,
+        timeout: std::time::Duration,
+        attempt: usize,
+    ) {
+        self.active.insert(
+            seat.to_owned(),
+            ActiveSeat {
+                node: node.to_owned(),
+                started_at: Timestamp::now(),
+                timeout_secs: timeout.as_secs(),
+                attempt,
+            },
+        );
+    }
+
+    /// Record that `seat` has answered, whatever the answer was.
+    pub fn seat_finished(&mut self, seat: &str) {
+        self.active.remove(seat);
+    }
+
+    /// Drop every seat this state still lists as answering, reporting whether
+    /// anything was dropped.
+    ///
+    /// Called first thing in `execute`, on every entry — fresh, resumed, or
+    /// recovering a stall — because an entry here only means something while
+    /// the process that wrote it is still asking that seat something. A
+    /// process killed mid-wave leaves its last batch of seats here with
+    /// nobody left to clear them, and the next process to touch this run must
+    /// not let that leftover read as "still going" before it has asked
+    /// anyone anything.
+    pub fn clear_active(&mut self) -> bool {
+        if self.active.is_empty() {
+            return false;
+        }
+        self.active.clear();
+        true
     }
 
     /// Flush to `run.json`, atomically.
@@ -1163,6 +1262,118 @@ mod tests {
         assert_eq!(back.id, s.id);
         assert_eq!(back.instruction, "add retries");
         assert_eq!(back.status, RunStatus::Prep);
+    }
+
+    #[test]
+    fn seat_started_and_finished_track_who_has_not_answered_yet() {
+        let mut s = state();
+        s.seat_started("judge", "judge-1", std::time::Duration::from_secs(60), 0);
+        s.seat_started("judge", "judge-2", std::time::Duration::from_secs(60), 0);
+        assert_eq!(s.active.len(), 2, "both seats are still out");
+
+        s.seat_finished("judge-1");
+        assert_eq!(
+            s.active.keys().collect::<Vec<_>>(),
+            vec!["judge-2"],
+            "only the seat that answered drops out; judge-2 is still waited on"
+        );
+    }
+
+    #[test]
+    fn a_retry_is_recorded_as_a_later_attempt_on_the_same_seat() {
+        let mut s = state();
+        s.seat_started("review", "review-2", std::time::Duration::from_secs(30), 0);
+        s.seat_finished("review-2");
+        // A nudge re-asks the same seat; attempt says this is not the first
+        // time, which is the only trace a nudge otherwise leaves behind.
+        s.seat_started("review", "review-2", std::time::Duration::from_secs(30), 1);
+        assert_eq!(s.active["review-2"].attempt, 1);
+    }
+
+    #[test]
+    fn active_seat_reports_elapsed_and_remaining_time() {
+        let now = Timestamp::now();
+        let started = now - jiff::SignedDuration::from_secs(30);
+        let seat = ActiveSeat {
+            node: "judge".to_owned(),
+            started_at: started,
+            timeout_secs: 100,
+            attempt: 0,
+        };
+        assert_eq!(seat.elapsed_secs(now), 30);
+        assert_eq!(seat.remaining_secs(now), 70);
+    }
+
+    #[test]
+    fn remaining_time_never_goes_negative_past_the_timeout() {
+        // `agy`'s own print-timeout occasionally overruns by a hair before the
+        // kill lands; a naive subtraction would print a negative "time left".
+        let now = Timestamp::now();
+        let started = now - jiff::SignedDuration::from_secs(200);
+        let seat = ActiveSeat {
+            node: "implement".to_owned(),
+            started_at: started,
+            timeout_secs: 100,
+            attempt: 1,
+        };
+        assert_eq!(seat.remaining_secs(now), 0);
+    }
+
+    #[test]
+    fn clear_active_drops_stale_seats_and_reports_whether_it_did() {
+        let mut s = state();
+        assert!(!s.clear_active(), "nothing to clear on a fresh run");
+        s.seat_started(
+            "implement",
+            "impl-B",
+            std::time::Duration::from_secs(3600),
+            0,
+        );
+        assert!(s.clear_active(), "a leftover entry is reported as cleared");
+        assert!(s.active.is_empty());
+    }
+
+    #[test]
+    fn active_seat_carries_nothing_that_could_be_read_as_output_bytes() {
+        // `agy` prints exactly one JSON object, at the very end (see
+        // `agent::dropped_stream`'s doc comment) — a seat can sit at zero
+        // captured bytes for its whole timeout while working normally. So
+        // `ActiveSeat` records only the wall-clock facts (when it started,
+        // its budget, which attempt), never a byte count, which is what
+        // keeps a reader from being able to build "0 bytes => dead" out of
+        // it even by accident.
+        let seat = ActiveSeat {
+            node: "implement".to_owned(),
+            started_at: Timestamp::now(),
+            timeout_secs: 60,
+            attempt: 0,
+        };
+        let value = serde_json::to_value(&seat).unwrap();
+        let keys: std::collections::BTreeSet<String> =
+            value.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "node".to_owned(),
+                "started_at".to_owned(),
+                "timeout_secs".to_owned(),
+                "attempt".to_owned(),
+            ]),
+            "a byte count here would be a lever to declare a silent-but-healthy seat dead"
+        );
+    }
+
+    #[test]
+    fn an_old_run_json_without_active_seats_still_loads() {
+        // Schema did not bump for this field: an already-written run.json
+        // simply lacks the key, and `#[serde(default)]` must fill it in
+        // rather than fail the whole read.
+        let s = state();
+        let mut value = serde_json::to_value(&s).unwrap();
+        value.as_object_mut().unwrap().remove("active");
+        let back: RunState = serde_json::from_value(value).unwrap();
+        assert!(back.active.is_empty());
+        assert_eq!(back.schema, SCHEMA);
     }
 
     #[test]

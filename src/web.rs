@@ -1868,12 +1868,23 @@ struct RunDetailView {
     #[serde(flatten)]
     state: RunState,
     instruction_md: Vec<md::Node>,
+    /// Whether a live daemon currently claims this run.
+    ///
+    /// `state.active` (flattened in above) is only ever cleared by the
+    /// process that populated it; a killed one leaves its last wave's
+    /// entries behind. Carrying this alongside is what lets the phone rail
+    /// tell "this seat is still answering" from "this seat was still
+    /// answering when whatever was driving this run died" without a second
+    /// route — see `ActiveSeat`'s own docs for why the entry alone is not
+    /// proof of either.
+    live: bool,
 }
 
-impl From<RunState> for RunDetailView {
-    fn from(state: RunState) -> Self {
+impl RunDetailView {
+    fn of(state: RunState, live: bool) -> Self {
         Self {
             instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
+            live,
             state,
         }
     }
@@ -1885,7 +1896,9 @@ async fn run_detail(
 ) -> ApiResult<Json<RunDetailView>> {
     blocking(move || {
         let id = resolve_run(&ui.runs, &id)?;
-        Ok(Json(RunDetailView::from(read_run(&ui.runs, &id)?)))
+        let state = read_run(&ui.runs, &id)?;
+        let live = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
+        Ok(Json(RunDetailView::of(state, live)))
     })
     .await
 }
@@ -2089,7 +2102,13 @@ async fn run_report(
         // Colour is off for the whole process, set once in `serve`. Rendering
         // is CPU work over the full state, which is the other reason this is
         // not on the executor.
-        Ok(report::run(&read_run(&ui.runs, &id)?))
+        let state = read_run(&ui.runs, &id)?;
+        let live = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
+        Ok(format!(
+            "{}{}",
+            report::run(&state),
+            report::active_seats(&state, live)
+        ))
     })
     .await?;
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text))
@@ -5384,6 +5403,48 @@ mod tests {
         assert_eq!(detail.json()["id"], "20260902-140501-a1b2");
     }
 
+    /// `RunState::active` is only ever cleared by whoever populated it, so the
+    /// detail route also has to say whether a daemon is actually still
+    /// driving this run right now — otherwise a seat from a killed process's
+    /// last wave would read as live forever.
+    #[tokio::test]
+    async fn run_detail_reports_active_seats_and_whether_a_daemon_confirms_them() {
+        let f = Fixture::start().await;
+        // Matches `write_daemon`'s hard-coded `current.run`, so the second
+        // half of this test can claim the daemon is working on it without a
+        // second helper.
+        let id = "20260902-140502-bbbb";
+        let mut state = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "Add a web UI".to_owned(),
+            Config::default(),
+        );
+        state.id = id.to_owned();
+        state.status = RunStatus::Judging;
+        state.seat_started("judge", "judge-2", std::time::Duration::from_secs(120), 0);
+        let dir = f.runs().join(id);
+        std::fs::create_dir_all(&dir).expect("run dir");
+        std::fs::write(
+            dir.join("run.json"),
+            serde_json::to_string_pretty(&state).expect("serialize run"),
+        )
+        .expect("write run.json");
+
+        // No daemon.json at all: the entry cannot be told from a leftover, so
+        // the route must say so rather than let the phone assume it is live.
+        let cold = f.get(&format!("/api/runs/{id}")).await.json();
+        assert_eq!(cold["active"]["judge-2"]["node"], "judge");
+        assert_eq!(cold["live"], false, "{cold}");
+
+        // A fresh heartbeat naming exactly this run: the same entry now reads
+        // as confirmed, not merely recorded.
+        write_daemon(f.home.path(), Timestamp::now());
+        let warm = f.get(&format!("/api/runs/{id}")).await.json();
+        assert_eq!(warm["live"], true, "{warm}");
+    }
+
     #[tokio::test]
     async fn the_run_list_is_newest_first_and_honours_a_limit() {
         let f = Fixture::start().await;
@@ -5682,6 +5743,59 @@ mod tests {
         assert_ne!(
             rev_before, rev_after,
             "deleting an older run must change the revision so other clients see the deletion"
+        );
+    }
+
+    /// A run's own `run.json` on an explicit `runs` root, bypassing the
+    /// process-global home entirely — `RunState::save` writes through
+    /// `run::home()`, whose `set_home` is a `OnceLock` no unit test may touch
+    /// (see `tests::home_lock` in the integration suite for why).
+    fn write_state(runs: &FsPath, state: &RunState) {
+        let dir = runs.join(&state.id);
+        std::fs::create_dir_all(&dir).expect("run dir");
+        std::fs::write(
+            dir.join("run.json"),
+            serde_json::to_string_pretty(state).expect("serialize run"),
+        )
+        .expect("write run.json");
+    }
+
+    /// A seat starting or finishing is a write to `run.json` like any other,
+    /// so it moves the same revision the change stream already watches —
+    /// nothing new for `/api/events` to learn, but the property this feature
+    /// depends on to reach the phone without a poll.
+    #[test]
+    fn runs_revision_moves_when_a_seat_starts_and_again_when_it_finishes() {
+        let temp = TempDir::new().expect("tempdir");
+        let runs = temp.path().join("runs");
+        std::fs::create_dir_all(&runs).expect("create runs dir");
+        let mut state = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        );
+        state.id = "20260902-100000-c0de".to_owned();
+        write_state(&runs, &state);
+
+        let rev_idle = runs_revision(&runs);
+        std::thread::sleep(Duration::from_millis(10));
+        state.seat_started("judge", "judge-1", std::time::Duration::from_secs(60), 0);
+        write_state(&runs, &state);
+        let rev_started = runs_revision(&runs);
+        assert_ne!(
+            rev_idle, rev_started,
+            "a seat starting must move the revision"
+        );
+
+        std::thread::sleep(Duration::from_millis(10));
+        state.seat_finished("judge-1");
+        write_state(&runs, &state);
+        let rev_finished = runs_revision(&runs);
+        assert_ne!(
+            rev_started, rev_finished,
+            "and clearing it again must move the revision a second time"
         );
     }
 

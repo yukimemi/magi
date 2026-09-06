@@ -455,6 +455,55 @@ pub fn run(state: &RunState) -> String {
     s
 }
 
+/// The seats currently mid-answer, for `magi show` and the raw report route.
+///
+/// Separate from [`run`] on purpose: [`run`] is printed straight after `magi
+/// run` / `magi review`'s own `execute()`, and by then this process has
+/// nothing left in flight to report; the TUI does not track daemon liveness
+/// either. Only a caller reading someone *else's* run — `magi show <id>`, or
+/// the web UI's raw-report route — needs this, and both already know how to
+/// ask whether a daemon is currently driving it.
+///
+/// `live` is whether a daemon's heartbeat currently names this run
+/// (`daemon::is_working_on`). An [`ActiveSeat`](crate::run::ActiveSeat) left
+/// behind by a killed process is not lied about as running just because
+/// nobody has cleared it from disk yet — see that type's own docs for why an
+/// entry alone is not proof of anything.
+pub fn active_seats(state: &RunState, live: bool) -> String {
+    if state.active.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    let _ = writeln!(s, "\n{}", bold("running now"));
+    if !live {
+        let _ = writeln!(
+            s,
+            "  {}",
+            yellow(
+                "no live daemon claims this run right now — likely left behind by a killed process"
+            )
+        );
+    }
+    let now = jiff::Timestamp::now();
+    for (seat, a) in &state.active {
+        let retry = if a.attempt > 0 {
+            format!(" retry {}", a.attempt)
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            s,
+            "  {:<12} {:<12}{retry}  {}s elapsed, {}s left of {}s",
+            seat,
+            a.node,
+            a.elapsed_secs(now),
+            a.remaining_secs(now),
+            a.timeout_secs
+        );
+    }
+    s
+}
+
 /// Aggregate tables, for `magi stats`.
 pub fn stats(stats: &Stats) -> String {
     let t = &stats.totals;
@@ -850,6 +899,36 @@ mod tests {
         assert!(text.contains("could not run"), "{text}");
         assert!(text.contains("retried once"), "{text}");
         assert!(!text.contains("e2e RED"), "{text}");
+    }
+
+    #[test]
+    fn active_seats_shows_who_has_not_answered_and_how_long_is_left() {
+        let _guard = plain();
+        let mut s = state();
+        s.seat_started("judge", "judge-2", std::time::Duration::from_secs(120), 0);
+        let text = active_seats(&s, true);
+        assert!(text.contains("running now"));
+        assert!(text.contains("judge-2"));
+        assert!(text.contains("judge"));
+        assert!(!text.contains("no live daemon"), "{text}");
+    }
+
+    #[test]
+    fn active_seats_flags_a_leftover_from_a_dead_process() {
+        let _guard = plain();
+        let mut s = state();
+        s.seat_started("implement", "impl-B", std::time::Duration::from_secs(60), 0);
+        let text = active_seats(&s, false);
+        assert!(
+            text.contains("no live daemon"),
+            "a stale entry must not read as running: {text}"
+        );
+    }
+
+    #[test]
+    fn active_seats_is_empty_when_nothing_is_running() {
+        let _guard = plain();
+        assert_eq!(active_seats(&state(), true), "");
     }
 
     #[test]
