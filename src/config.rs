@@ -532,11 +532,15 @@ pub struct Config {
 /// Where `magi plan` and the browser interview look for a repository other
 /// than the one they were started against.
 ///
-/// `roots` is an array, so per [`array_keys`] it can only be declared in one
-/// config layer - the machine layer, since which checkouts exist on disk is a
-/// *machine* fact in the same way the agent roster is: a repository's own
-/// `magi.toml` cannot state where its siblings live before magi has resolved
-/// which repository to read that file from in the first place.
+/// `roots` is one of the array keys [`array_merge_policy`] marks as
+/// append-across-layers: which checkouts exist in general is a *machine*
+/// fact in the same way the agent roster is - a repository's own `magi.toml`
+/// cannot state where its siblings live before magi has resolved which
+/// repository to read that file from in the first place - but a repository
+/// that genuinely has an extra root worth scanning is not forced to choose
+/// between an error and losing the machine's roots outright. Both layers'
+/// roots are scanned; see [`Config::refuse_split_arrays`] for the keys that
+/// are still refused.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Repos {
@@ -671,6 +675,63 @@ fn array_keys(table: &toml::value::Table, prefix: &str) -> Vec<String> {
     out
 }
 
+/// How an array key behaves when two config layers both declare it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrayMerge {
+    /// Two layers may both declare it; the composed value is the
+    /// low-to-high-priority concatenation teravars already produces (see
+    /// [`Config::load_layers`]'s doc for why that order and no dedup).
+    Append,
+    /// Two layers declaring it is refused; see
+    /// [`Config::refuse_split_arrays`].
+    Replace,
+}
+
+/// The single place that decides, for a dotted array key (as returned by
+/// [`array_keys`]), whether declaring it in two config layers is a
+/// concatenation the operator asked for or a silent accident.
+///
+/// Kept as one match so the whole policy is visible in one place - the same
+/// reason `claude_quota` and `dropped_stream` close their own classification
+/// in one spot elsewhere in this codebase. Anything not listed defaults to
+/// [`ArrayMerge::Replace`]: refusing is the safe default for a key nobody has
+/// reasoned about yet, and a new array key added later has to be added here
+/// deliberately to become appendable.
+///
+/// - `verify.e2e` / `verify.gate` — a "run all of these, all must exit 0"
+///   gate. Concatenating two of them is exactly the checks both layers
+///   wanted, which is what lets a common gate (e.g. `editorconfig-checker`)
+///   live in a shared layer while a repository's own layer adds its own
+///   command, instead of every repository copying the shared command into
+///   its own file.
+/// - `repos.roots` — a set of directories to scan for checkouts. A
+///   repository adding its own root on top of the machine's is additive by
+///   nature, not a replacement of where the machine looks; see
+///   [`Repos::roots`].
+///
+/// Left on the refuse side, and why:
+/// - `roles.implementers` / `roles.judges` / `roles.reviewers` — an ordered
+///   list of *seats*, not a set. A machine's two implementers plus a
+///   repository's one is three seats nobody asked for and nobody is paying
+///   for on purpose.
+/// - `notify.command` — an argv. Concatenating two argvs does not produce a
+///   program that runs; it produces `["ntfy", "publish", "curl", "-X"]`.
+/// - `blind.strip_lines` — technically safe to concatenate (each entry is
+///   matched as an independent substring, so a longer list only strips
+///   *more*), but left on the refuse side anyway: the same list also drives
+///   `commit_msg_hook`'s generated `sed` addresses, where position matters,
+///   and a silent three-layer merge is exactly the kind of surprise
+///   `refuse_split_arrays` exists to catch rather than to reason about
+///   case-by-case. A repository that wants one more stripped phrase restates
+///   the whole list; that restatement is visible in review, an accidental
+///   concatenation would not be.
+fn array_merge_policy(key: &str) -> ArrayMerge {
+    match key {
+        "verify.e2e" | "verify.gate" | "repos.roots" => ArrayMerge::Append,
+        _ => ArrayMerge::Replace,
+    }
+}
+
 impl Config {
     /// Load one file through teravars: Tera rendering, `[vars]` resolution,
     /// and the `include = [...]` directive.
@@ -678,20 +739,17 @@ impl Config {
         Self::load_layers(&[path.to_path_buf()])
     }
 
-    /// Load and deep-merge a stack of config files, later files winning.
+    /// The Tera render context shared by every layer: `system.*` (from
+    /// teravars), `env` (magi's own addition - a config that names a shared
+    /// build-cache directory or a machine-specific path needs
+    /// `{{ env.NAME | default(value='...') }}`), and `repo` / `repo_name`
+    /// derived from the last (highest-priority) path's parent directory.
     ///
-    /// This is why the config is TOML-through-teravars rather than plain serde:
-    /// the roster is a *machine* fact (which CLIs and plans you pay for) while
-    /// the gate is a *repository* fact (`cargo make check` here, `pnpm test`
-    /// there). Picking one file and ignoring the other would force every repo
-    /// to restate the roster.
-    pub fn load_layers(paths: &[PathBuf]) -> Result<Self> {
-        let mut engine = teravars::Engine::default();
+    /// Factored out so [`Config::array_provenance`] can re-render a single
+    /// layer under the exact same context [`Config::load_layers`] uses for
+    /// the joint render, rather than drifting from it by accident.
+    fn render_ctx(paths: &[PathBuf]) -> teravars::Context {
         let mut ctx = teravars::system_context();
-        // teravars ships `system.*` and `vars`; `env` is left to the consumer.
-        // A config that has to name a shared build-cache directory or a
-        // machine-specific path needs it, so magi provides it as a map:
-        // `{{ env.NAME | default(value='...') }}`.
         let env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
         ctx.insert("env", &env);
         if let Some(last) = paths.last()
@@ -703,6 +761,19 @@ impl Config {
                 &dir.file_name().unwrap_or_default().to_string_lossy(),
             );
         }
+        ctx
+    }
+
+    /// Load and deep-merge a stack of config files, later files winning.
+    ///
+    /// This is why the config is TOML-through-teravars rather than plain serde:
+    /// the roster is a *machine* fact (which CLIs and plans you pay for) while
+    /// the gate is a *repository* fact (`cargo make check` here, `pnpm test`
+    /// there). Picking one file and ignoring the other would force every repo
+    /// to restate the roster.
+    pub fn load_layers(paths: &[PathBuf]) -> Result<Self> {
+        let mut engine = teravars::Engine::default();
+        let ctx = Self::render_ctx(paths);
         if paths.len() > 1 {
             Self::refuse_split_arrays(paths, &mut engine, &ctx)?;
         }
@@ -725,23 +796,29 @@ impl Config {
             .context("deserializing magi config")
     }
 
-    /// Refuse an array that two layers both declare.
+    /// Refuse an array that two layers both declare, unless
+    /// [`array_merge_policy`] says that key is meant to accumulate.
     ///
     /// teravars **appends** arrays when it merges layers, and that is wrong for
-    /// every array magi has: `implementers` is an ordered list of seats,
-    /// `verify.gate` is the commands to run, `notify.command` is an argv.
-    /// Concatenating two of them yields something nobody wrote - three
-    /// implementers out of a machine's two and a repository's one, or an argv
-    /// of `["ntfy", "publish", "curl", "-X"]`.
+    /// most arrays magi has: `implementers` is an ordered list of seats,
+    /// `notify.command` is an argv. Concatenating two of them yields something
+    /// nobody wrote - three implementers out of a machine's two and a
+    /// repository's one, or an argv of `["ntfy", "publish", "curl", "-X"]`.
     ///
-    /// Replacing instead would be the right merge rule, but the rule lives in
-    /// teravars, which several other projects depend on; changing it there is
-    /// a decision for that crate, not something to fake here by re-reading the
-    /// files with different semantics and hoping the two paths agree.
+    /// Replacing instead would be the right merge rule for those keys, but the
+    /// rule lives in teravars, which several other projects depend on;
+    /// changing it there is a decision for that crate, not something to fake
+    /// here by re-reading the files with different semantics and hoping the
+    /// two paths agree.
     ///
-    /// So magi refuses the ambiguity rather than resolving it silently. The
-    /// cost of guessing is a roster the operator did not ask for and is paying
-    /// for by the token.
+    /// So magi refuses the ambiguity rather than resolving it silently, for
+    /// every array key except the short, deliberate list
+    /// [`array_merge_policy`] marks [`ArrayMerge::Append`] - for those, the
+    /// concatenation teravars already produces *is* what both files say, so
+    /// there is nothing to refuse. The cost of guessing wrong on the refused
+    /// keys is a roster the operator did not ask for and is paying for by the
+    /// token; the append keys carry no such risk because every element runs
+    /// (or every directory is scanned) regardless of order.
     fn refuse_split_arrays(
         paths: &[PathBuf],
         engine: &mut teravars::Engine,
@@ -752,6 +829,9 @@ impl Config {
             let one = teravars::load_merged([path], engine, ctx)
                 .with_context(|| format!("rendering {}", path.display()))?;
             for key in array_keys(&one.config, "") {
+                if array_merge_policy(&key) == ArrayMerge::Append {
+                    continue;
+                }
                 if let Some(first) = seen.get(&key) {
                     bail!(
                         "`{key}` is an array declared in two config layers:\n  \
@@ -767,6 +847,90 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Which layers contributed to a composed, appendable array key (e.g.
+    /// `"verify.gate"`), in the same low-to-high-priority order
+    /// [`Config::load_layers`] concatenates them in. Layers that do not
+    /// declare `key` at all are omitted.
+    ///
+    /// This is a **display aid for `magi doctor` only.** The command list
+    /// that actually runs always comes from the one joint
+    /// [`teravars::load_merged`] call in `load_layers`, never from this
+    /// function - the exact hazard [`Config::refuse_split_arrays`] warns
+    /// about is two merge paths that might disagree, so this function must
+    /// never become a second source of the *composed* value, only of which
+    /// file wrote which line in it.
+    ///
+    /// Re-rendering each layer alone can, in principle, resolve a
+    /// `{{ vars.x }}` differently than the joint render would, if `x` is
+    /// defined in one layer and referenced in another - the same caveat
+    /// `refuse_split_arrays`'s structural, key-only check already lives with.
+    /// None of magi's own gate commands cross that line, and a doctor listing
+    /// is read by a human who can compare it against the joint one printed
+    /// alongside it, so this is judged worth the simplicity of not
+    /// threading provenance through the real load path.
+    pub fn array_provenance(paths: &[PathBuf], key: &str) -> Vec<(PathBuf, Vec<String>)> {
+        let mut engine = teravars::Engine::default();
+        let ctx = Self::render_ctx(paths);
+        let mut out = Vec::new();
+        for path in paths {
+            let Ok(one) = teravars::load_merged([path], &mut engine, &ctx) else {
+                continue;
+            };
+            let mut cur = &one.config;
+            let mut found = None;
+            let parts: Vec<&str> = key.split('.').collect();
+            for (i, part) in parts.iter().enumerate() {
+                match cur.get(*part) {
+                    Some(toml::Value::Array(a)) if i == parts.len() - 1 => {
+                        found = Some(a);
+                        break;
+                    }
+                    Some(toml::Value::Table(t)) => cur = t,
+                    _ => break,
+                }
+            }
+            let Some(values) = found else { continue };
+            let strings: Vec<String> = values
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            if !strings.is_empty() {
+                out.push((path.clone(), strings));
+            }
+        }
+        out
+    }
+
+    /// Render a composed command list for `magi doctor`: the joined command
+    /// line the run actually uses, plus - only when more than one layer
+    /// contributed - which layer wrote which line.
+    ///
+    /// A single contributing layer (the common case today) stays the plain
+    /// one-line summary magi has always printed, `empty` included: that
+    /// honest "(none — ...)" is what caught a real gate-composition gap
+    /// before this array could compose at all, and composition should not
+    /// make the common case noisier.
+    pub fn describe_composed(
+        paths: &[PathBuf],
+        commands: &[String],
+        key: &str,
+        empty: &str,
+    ) -> String {
+        if commands.is_empty() {
+            return empty.to_owned();
+        }
+        let joined = commands.join(" && ");
+        let provenance = Self::array_provenance(paths, key);
+        if provenance.len() <= 1 {
+            return joined;
+        }
+        let mut out = joined;
+        for (path, cmds) in &provenance {
+            out.push_str(&format!("\n    [{}] {}", path.display(), cmds.join(" && ")));
+        }
+        out
     }
 
     /// Resolve the config for `repo`, honouring an explicit `--config` path.
@@ -1350,5 +1514,132 @@ mod tests {
         assert_eq!(cfg.roles.planner.as_deref(), Some("opus"));
         assert_eq!(cfg.roles.implementers, ["oc"]);
         assert_eq!(cfg.agents.len(), 1, "the roster is not doubled");
+    }
+
+    #[test]
+    fn two_layers_declaring_verify_gate_run_both_in_priority_order() {
+        // The `editorconfig-checker` distribution problem: a shared layer
+        // wants to add a gate command without erasing the repository's own.
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.toml");
+        let repo = dir.path().join("magi.toml");
+        std::fs::write(&machine, "[verify]\ngate = [\"editorconfig-checker\"]\n").unwrap();
+        std::fs::write(&repo, "[verify]\ngate = [\"cargo make check\"]\n").unwrap();
+
+        let cfg = Config::load_layers(&[machine, repo]).expect("appendable arrays must merge");
+        assert_eq!(
+            cfg.verify.gate,
+            [
+                "editorconfig-checker".to_owned(),
+                "cargo make check".to_owned()
+            ],
+            "low-priority (machine) command first, high-priority (repo) command after"
+        );
+    }
+
+    #[test]
+    fn two_layers_declaring_verify_e2e_run_both_in_priority_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.toml");
+        let repo = dir.path().join("magi.toml");
+        std::fs::write(&machine, "[verify]\ne2e = [\"shared-smoke-test\"]\n").unwrap();
+        std::fs::write(&repo, "[verify]\ne2e = [\"cargo test\"]\n").unwrap();
+
+        let cfg = Config::load_layers(&[machine, repo]).expect("appendable arrays must merge");
+        assert_eq!(
+            cfg.verify.e2e,
+            ["shared-smoke-test".to_owned(), "cargo test".to_owned()]
+        );
+    }
+
+    #[test]
+    fn two_layers_declaring_repos_roots_are_both_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.toml");
+        let repo = dir.path().join("magi.toml");
+        std::fs::write(&machine, "[repos]\nroots = [\"/machine/root\"]\n").unwrap();
+        std::fs::write(&repo, "[repos]\nroots = [\"/repo/root\"]\n").unwrap();
+
+        let cfg = Config::load_layers(&[machine, repo]).expect("appendable arrays must merge");
+        assert_eq!(
+            cfg.repos.roots,
+            [PathBuf::from("/machine/root"), PathBuf::from("/repo/root")]
+        );
+    }
+
+    #[test]
+    fn duplicate_gate_commands_across_layers_both_run() {
+        // Dropping the duplicate would be a silent surprise; the operator
+        // sees a slower gate, never a missing one.
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.toml");
+        let repo = dir.path().join("magi.toml");
+        std::fs::write(&machine, "[verify]\ngate = [\"same-command\"]\n").unwrap();
+        std::fs::write(&repo, "[verify]\ngate = [\"same-command\"]\n").unwrap();
+
+        let cfg = Config::load_layers(&[machine, repo]).expect("appendable arrays must merge");
+        assert_eq!(
+            cfg.verify.gate,
+            ["same-command".to_owned(), "same-command".to_owned()]
+        );
+    }
+
+    #[test]
+    fn notify_command_is_still_refused_across_two_layers() {
+        // An argv, not a set: concatenating two of them is not a program.
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.toml");
+        let repo = dir.path().join("magi.toml");
+        std::fs::write(&machine, "[notify]\ncommand = [\"ntfy\", \"publish\"]\n").unwrap();
+        std::fs::write(&repo, "[notify]\ncommand = [\"curl\", \"-X\"]\n").unwrap();
+
+        let err = Config::load_layers(&[machine.clone(), repo.clone()])
+            .expect_err("an argv split across layers must not concatenate")
+            .to_string();
+        assert!(err.contains("notify.command"), "{err}");
+        assert!(err.contains("machine.toml"), "{err}");
+        assert!(err.contains("magi.toml"), "{err}");
+    }
+
+    #[test]
+    fn one_layer_declaring_verify_gate_runs_unchanged() {
+        // The classification must not change behaviour for the configuration
+        // this very repository has today: exactly one layer names the gate.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        std::fs::write(&path, "[verify]\ngate = [\"cargo make check\"]\n").unwrap();
+
+        let cfg = Config::load(&path).expect("single layer must still load");
+        assert_eq!(cfg.verify.gate, ["cargo make check".to_owned()]);
+    }
+
+    #[test]
+    fn describe_composed_names_the_contributing_layers_only_when_there_are_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.toml");
+        let repo = dir.path().join("magi.toml");
+        std::fs::write(&machine, "[verify]\ngate = [\"editorconfig-checker\"]\n").unwrap();
+        std::fs::write(&repo, "[verify]\ngate = [\"cargo make check\"]\n").unwrap();
+        let paths = vec![machine.clone(), repo.clone()];
+
+        let cfg = Config::load_layers(&paths).expect("appendable arrays must merge");
+        let described =
+            Config::describe_composed(&paths, &cfg.verify.gate, "verify.gate", "(none)");
+        assert!(described.contains("editorconfig-checker && cargo make check"));
+        assert!(
+            described.contains(&machine.display().to_string()),
+            "{described}"
+        );
+        assert!(
+            described.contains(&repo.display().to_string()),
+            "{described}"
+        );
+
+        // A single contributing layer stays the plain one-line summary.
+        let single = vec![repo.clone()];
+        let solo_cfg = Config::load_layers(&single).expect("single layer loads");
+        let solo_described =
+            Config::describe_composed(&single, &solo_cfg.verify.gate, "verify.gate", "(none)");
+        assert_eq!(solo_described, "cargo make check");
     }
 }
