@@ -40,7 +40,15 @@ use crate::verdict::{Finding, Rejection};
 /// judges present" forever, because a tally is computed once and never
 /// recomputed on resume; the bump keeps that stale reading from being mixed
 /// with the new meaning.
-pub const SCHEMA: u32 = 3;
+///
+/// 4: added `ReviewRound::progressed`. `graph::STAGNANT_LIMIT` counts
+/// consecutive rounds with `progressed == false` to decide whether the
+/// review loop should give up early, and a schema-3 record's default
+/// `false` would misreport a round that, at the time, actually committed a
+/// real diff — the field simply did not exist yet to say so. Without the
+/// bump, resuming an old multi-round review could spuriously trip the
+/// stagnation check on rounds that were never stagnant.
+pub const SCHEMA: u32 = 4;
 
 /// Where a run got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,6 +450,20 @@ pub struct ReviewRound {
     /// that verdict is missing input.
     #[serde(default)]
     pub clean: bool,
+    /// Did the tree actually move against `base` this round, comparing the
+    /// diff after the fix to the diff the reviewers saw at the start of the
+    /// round?
+    ///
+    /// Never derived from the fixer's own `addressed`/`rejected` count: that
+    /// self-report has been caught lying twice on this workload (runs `b455`
+    /// and `6218`, both of which committed a real, substantial diff while
+    /// reporting `0 addressed`). `git` does not lie about whether the tree
+    /// changed, so this is what `graph::Runner::review_loop` counts rounds of
+    /// no progress against. Absent on a round with no fix attempt (already
+    /// clean, or the round the budget ran out on), where it defaults to
+    /// `false` and is not consulted.
+    #[serde(default)]
+    pub progressed: bool,
 }
 
 impl ReviewRound {
@@ -837,6 +859,41 @@ impl RunState {
     /// Candidates eligible for judging.
     pub fn viable(&self) -> Vec<&Candidate> {
         self.candidates.iter().filter(|c| c.viable()).collect()
+    }
+
+    /// Findings still open when the review loop stopped trying: the last
+    /// round's, exactly when that round was not clean. Empty on a run that
+    /// never reviewed, or whose last round was clean.
+    ///
+    /// This is the last round's findings regardless of what the fixer claims
+    /// to have addressed in that same round: a round that stopped the loop
+    /// (round budget spent, or no tree progress for
+    /// [`crate::graph::STAGNANT_LIMIT`] rounds) never had a *following* round
+    /// to confirm the fix actually landed, and the self-reported adoption
+    /// count is not trusted for that judgement either — see
+    /// [`ReviewRound::progressed`].
+    pub fn open_findings(&self) -> Vec<&Finding> {
+        match self.reviews.last() {
+            Some(r) if !r.clean => r
+                .reviews
+                .iter()
+                .flat_map(|rec| rec.findings.iter())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Did this run reach a mergeable status (`Ready` or `Merged`) with
+    /// review findings still open?
+    ///
+    /// That combination is the point of the review hand-off: the review
+    /// round budget (or an unproductive round, see [`ReviewRound::progressed`])
+    /// was spent while gate and e2e stayed green, so the run was handed off
+    /// rather than blocked — but the findings did not disappear, and whoever
+    /// reads the result should be told they are still there.
+    pub fn handed_off_with_open_findings(&self) -> bool {
+        matches!(self.status, RunStatus::Ready | RunStatus::Merged)
+            && self.reviews.last().is_some_and(|r| !r.clean)
     }
 
     /// Local-time creation stamp for reports.
@@ -1303,6 +1360,86 @@ mod tests {
         let t = tail(&text, 10);
         assert!(t.contains("earlier bytes omitted"));
         assert!(t.ends_with('あ'));
+    }
+
+    fn finding(id: &str, severity: crate::verdict::Severity) -> crate::verdict::Finding {
+        crate::verdict::Finding {
+            id: id.to_owned(),
+            severity,
+            file: None,
+            line: None,
+            title: "x".to_owned(),
+            detail: String::new(),
+        }
+    }
+
+    fn round(clean: bool, findings: Vec<crate::verdict::Finding>) -> ReviewRound {
+        ReviewRound {
+            round: 1,
+            head: "h".to_owned(),
+            reviews: vec![ReviewRecord {
+                reviewer: 1,
+                agent: "a".to_owned(),
+                summary: String::new(),
+                findings,
+                failed: None,
+                duration_ms: 0,
+            }],
+            e2e: Vec::new(),
+            verify_retried: false,
+            fix: None,
+            blocking: 0,
+            answered: 1,
+            expected: 1,
+            clean,
+            progressed: false,
+        }
+    }
+
+    #[test]
+    fn open_findings_is_empty_when_the_last_round_was_clean() {
+        let mut s = state();
+        s.reviews = vec![round(
+            true,
+            vec![finding("R1-1-1", crate::verdict::Severity::Minor)],
+        )];
+        assert!(s.open_findings().is_empty());
+    }
+
+    #[test]
+    fn open_findings_reads_the_last_non_clean_round() {
+        let mut s = state();
+        s.reviews = vec![round(
+            false,
+            vec![finding("R1-1-1", crate::verdict::Severity::Major)],
+        )];
+        let open = s.open_findings();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, "R1-1-1");
+    }
+
+    #[test]
+    fn handed_off_with_open_findings_needs_a_mergeable_status_and_an_open_round() {
+        let mut s = state();
+        s.reviews = vec![round(
+            false,
+            vec![finding("R1-1-1", crate::verdict::Severity::Major)],
+        )];
+
+        s.status = RunStatus::Blocked;
+        assert!(
+            !s.handed_off_with_open_findings(),
+            "a blocked run is not a hand-off"
+        );
+
+        s.status = RunStatus::Ready;
+        assert!(s.handed_off_with_open_findings());
+
+        s.reviews = vec![round(true, Vec::new())];
+        assert!(
+            !s.handed_off_with_open_findings(),
+            "a clean last round has nothing to hand off"
+        );
     }
 
     #[test]

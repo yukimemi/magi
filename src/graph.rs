@@ -45,6 +45,25 @@ use crate::verdict::{self, FinalVote, FixReport, Position, Ranking, Review, Seve
 /// How much verification output is kept and fed back to the fixer.
 const OUTPUT_TAIL: usize = 8_000;
 
+/// Bytes of a failing command's output kept in an event, so the reason a run
+/// stopped is readable from the report without opening `run.json`.
+const EVENT_OUTPUT_TAIL: usize = 2_000;
+
+/// Consecutive review rounds with no tree progress (see
+/// [`crate::run::ReviewRound::progressed`]) before `review_loop` hands off
+/// instead of spending the rest of the round budget.
+///
+/// Not 1: a single non-progressing round is not yet a pattern — a fixer that
+/// legitimately finds nothing left to change (its previous round's fix already
+/// covered it, and this round's reviewers re-raised only nits) looks the same
+/// as one that is spinning, for exactly one round. Two in a row is where the
+/// two stop being distinguishable, and a review round on this workload has
+/// been measured at 30-45 minutes of reviewer-plus-fixer agent time, so a
+/// third attempt at a tree that has not moved twice running is pure cost.
+/// This does not touch `review_rounds` itself, which stays the operator's
+/// call.
+pub(crate) const STAGNANT_LIMIT: usize = 2;
+
 /// How many times [`Runner::sync_to_base`] will re-land the winner's tree on
 /// a base that moved before giving up and leaving the run `Blocked` for a
 /// person.
@@ -2032,21 +2051,17 @@ impl Runner {
             return Ok(());
         };
         let max_rounds = self.state.config.graph.review_rounds;
-        if max_rounds == 0 || self.state.reviews.iter().any(|r| r.clean) {
-            self.state.status = RunStatus::Gating;
-            self.state.save()?;
-            return Ok(());
-        }
-        if self.state.reviews.len() >= max_rounds {
-            // Every round is already spent and none was clean — this is a
-            // reentry into a run that reached `Blocked` and stopped. The loop
-            // below runs an empty range in that case and would otherwise fall
-            // through without touching `status`, silently handing back
-            // whatever an earlier node in this same walk clobbered it to (a
-            // solo-candidate `judge`/`deliberate` skip both rewrite `status`
-            // on every reentry). Restate the conclusion instead of leaving it
-            // to chance.
-            self.state.status = RunStatus::Blocked;
+        // A clean round, an exhausted round budget, or a stalled tree (see
+        // `STAGNANT_LIMIT`) are all already-decided conclusions the moment
+        // they are recorded — recomputed here, not read off `status`, so a
+        // reentry into a run that already stopped restates the identical
+        // verdict instead of silently handing back whatever an earlier node
+        // in this same walk clobbered `status` to (a solo-candidate
+        // `judge`/`deliberate` skip rewrites it on every reentry). The loop
+        // below runs an empty range once the budget is spent, and would
+        // otherwise fall through without touching `status` at all.
+        if let Some(status) = review_conclusion(&self.state.reviews, max_rounds) {
+            self.state.status = status;
             self.state.save()?;
             return Ok(());
         }
@@ -2252,6 +2267,7 @@ impl Runner {
                 answered,
                 expected,
                 clean,
+                progressed: false,
             };
 
             if incomplete {
@@ -2312,13 +2328,9 @@ impl Runner {
 
             if round == max_rounds {
                 self.state.reviews.push(round_record);
-                self.state.status = RunStatus::Blocked;
-                self.state.event(
-                    "review",
-                    format!("{blocking} blocking finding(s) still open after {max_rounds} rounds"),
-                );
-                self.state.save()?;
-                return Ok(());
+                return self.stop_reviewing(&format!(
+                    "{blocking} blocking finding(s) still open after {max_rounds} round(s)"
+                ));
             }
 
             // Fix. The winner's own implementer seat continues its conversation:
@@ -2422,10 +2434,24 @@ impl Runner {
             .ok();
             let after = git::rev_parse(&winner.worktree, "HEAD").await?;
             fix.committed = after != before;
+            // Judged by what `git` says moved against base, never by the
+            // fixer's own `addressed`/`rejected` count — see
+            // `ReviewRound::progressed`. Propagated with `?`, the same as the
+            // `patch` snapshot above: swallowing this error would default
+            // `diff_after` to empty, which almost always differs from a
+            // non-empty `patch` and reads as "progressed" — exactly backwards
+            // for a `git` failure the stagnation check cannot see through.
+            let diff_after = git::diff(&winner.worktree, &base, "HEAD").await?;
+            let progressed = diff_after != patch;
             let commit_note = if fix.committed {
                 "committed"
             } else {
                 "NO new commit"
+            };
+            let tree_note = if progressed {
+                "changed vs base"
+            } else {
+                "unchanged vs base"
             };
             self.state.event(
                 "fix",
@@ -2436,33 +2462,89 @@ impl Runner {
                     // not come back, so this must never read like every
                     // finding was reviewed and declined.
                     Some(reason) => {
-                        format!("round {round}: fixer's adoption report was lost ({reason}); {commit_note}")
+                        format!(
+                            "round {round}: fixer's adoption report was lost ({reason}); \
+                             {commit_note}, tree {tree_note}"
+                        )
                     }
                     None => format!(
-                        "round {round}: {} addressed, {} rejected, {commit_note}",
+                        "round {round}: {} addressed, {} rejected, {commit_note}, tree {tree_note}",
                         fix.addressed.len(),
                         fix.rejected.len(),
                     ),
                 },
             );
-            let stalled = !fix.committed;
             round_record.fix = Some(fix);
+            round_record.progressed = progressed;
             self.state.reviews.push(round_record);
             self.state.save()?;
 
             prev_e2e = (!e2e_failures.is_empty()).then_some(e2e_failures);
 
-            if stalled {
-                self.state.status = RunStatus::Blocked;
-                self.state.event(
-                    "review",
-                    "the fixer produced no commit; stopping instead of looping on an unchanged tree"
-                        .to_owned(),
-                );
-                self.state.save()?;
-                return Ok(());
+            let streak = self
+                .state
+                .reviews
+                .iter()
+                .rev()
+                .take_while(|r| !r.progressed)
+                .count();
+            if streak >= STAGNANT_LIMIT {
+                return self.stop_reviewing(&format!(
+                    "the tree has not moved against base for {streak} round(s) in a row"
+                ));
             }
         }
+        Ok(())
+    }
+
+    /// Decide, from the last recorded round's own verification, whether
+    /// stopping the review loop is a hand-off or a genuine block.
+    ///
+    /// Called once the loop has given up trying — the round budget is spent,
+    /// or the tree stopped moving (see [`STAGNANT_LIMIT`]) — with blocking
+    /// findings still open, never while a round is still clean or the
+    /// incomplete-panel case handled inline above. Gate and e2e are facts
+    /// about the tree; a lingering review finding is an opinion, and this
+    /// workload's own `magi stats` puts reviewer precision low enough
+    /// (12-33%, 0.18-0.29 adopted per round) that a panel of open findings
+    /// must not by itself stand between a green, verified change and the
+    /// human who decides what to do with it. A red e2e is not an opinion, so
+    /// that case still blocks, with the failing command and a tail of its
+    /// output recorded here rather than left in `run.json` for someone to go
+    /// find.
+    fn stop_reviewing(&mut self, why: &str) -> Result<()> {
+        let last = self
+            .state
+            .reviews
+            .last()
+            .expect("a round was just recorded before this is called");
+        let red: Vec<String> = last
+            .e2e
+            .iter()
+            .filter(|o| !o.ok())
+            .map(|o| {
+                format!(
+                    "`{}` -> {:?}\n{}",
+                    o.command,
+                    o.code,
+                    tail(&o.output_tail, EVENT_OUTPUT_TAIL)
+                )
+            })
+            .collect();
+        let open: usize = last.reviews.iter().map(|r| r.findings.len()).sum();
+
+        if red.is_empty() {
+            self.state.event(
+                "review",
+                format!("{why}; e2e is green — handing off with {open} finding(s) still open"),
+            );
+            self.state.status = RunStatus::Gating;
+        } else {
+            self.state
+                .event("review", format!("{why}; e2e failed:\n{}", red.join("\n")));
+            self.state.status = RunStatus::Blocked;
+        }
+        self.state.save()?;
         Ok(())
     }
 
@@ -2473,7 +2555,10 @@ impl Runner {
         // candidate's `judge`/`deliberate` skip rewrites `status` on every
         // reentry (see `judge`), and trusting it here is exactly how a run
         // that exhausted its review budget got gated and merged a second
-        // time around. The last round's `clean` flag is the actual verdict.
+        // time around. `review_conclusion` recomputes the review loop's own
+        // verdict from the round records themselves — `Gating` for a clean
+        // round or a hand-off (see `stop_reviewing`), anything else means the
+        // loop is still going or genuinely blocked.
         // A base the winner could not be replayed onto is a decision, not a
         // round: there is no landing tree to gate. Read as its own record for
         // the same reason the review verdict is.
@@ -2483,7 +2568,8 @@ impl Runner {
                 .base_sync
                 .as_ref()
                 .is_some_and(|s| s.conflict.is_some())
-            || self.state.reviews.last().is_some_and(|r| !r.clean)
+            || review_conclusion(&self.state.reviews, self.state.config.graph.review_rounds)
+                != Some(RunStatus::Gating)
         {
             return Ok(());
         }
@@ -2511,7 +2597,11 @@ impl Runner {
                     if o.ok() {
                         "pass".to_owned()
                     } else {
-                        format!("FAIL ({:?})", o.code)
+                        format!(
+                            "FAIL ({:?})\n{}",
+                            o.code,
+                            tail(&o.output_tail, EVENT_OUTPUT_TAIL)
+                        )
                     }
                 ),
             );
@@ -2532,13 +2622,16 @@ impl Runner {
         // Same reasoning as `gate`: ask the review and gate records directly
         // rather than `status`, which a solo-candidate `judge`/`deliberate`
         // skip can rewrite on reentry to something that no longer says
-        // `Blocked`.
+        // `Blocked`. `review_conclusion` is the same derivation `gate` uses,
+        // so a hand-off (open findings, green verification) reaches merge
+        // exactly like a genuinely clean round does.
         if self
             .state
             .base_sync
             .as_ref()
             .is_some_and(|s| s.conflict.is_some())
-            || self.state.reviews.last().is_some_and(|r| !r.clean)
+            || review_conclusion(&self.state.reviews, self.state.config.graph.review_rounds)
+                != Some(RunStatus::Gating)
             || self.state.gate.iter().any(|o| !o.ok())
         {
             return Ok(());
@@ -2560,10 +2653,7 @@ impl Runner {
         let repo = self.state.repo.clone();
         let base = self.state.base_branch.clone();
         let mode = self.state.config.merge.mode;
-        let message = format!(
-            "Merge magi run {} (candidate {})\n\n{}",
-            self.state.id, winner.label, self.state.instruction
-        );
+        let message = pr_body(&self.state, winner.label);
 
         let outcome = match mode {
             MergeMode::None => MergeOutcome {
@@ -2968,6 +3058,40 @@ fn round_is_clean(
     blocking == 0 && e2e_ok && (answered == expected || policy == IncompleteReviewPolicy::Warn)
 }
 
+/// The review loop's own conclusion, derived entirely from its persisted
+/// round records and the round budget that produced them — never from
+/// `status`, so a reentry (or `gate`/`merge` reading it independently)
+/// recomputes the identical answer regardless of what an earlier node in the
+/// same walk, or a previous walk, did to `status`.
+///
+/// `None` while more rounds remain to try, including when review never ran
+/// at all (`review_rounds = 0`, or nothing yet recorded). Once a round has
+/// gone clean, or the budget is spent, or the tree has stopped moving (see
+/// [`STAGNANT_LIMIT`]), the answer is one of two things:
+///
+/// - An incomplete panel that raised nothing is missing input, not a
+///   verified tree — never a hand-off candidate, whatever verification said
+///   (see [`ReviewRound::incomplete`], `IncompleteReviewPolicy`).
+/// - Otherwise, green e2e on the last round hands off (see
+///   [`Runner::stop_reviewing`]); red e2e blocks.
+fn review_conclusion(reviews: &[ReviewRound], max_rounds: usize) -> Option<RunStatus> {
+    if max_rounds == 0 || reviews.iter().any(|r| r.clean) {
+        return Some(RunStatus::Gating);
+    }
+    let last = reviews.last()?;
+    let stagnant = reviews.iter().rev().take_while(|r| !r.progressed).count() >= STAGNANT_LIMIT;
+    if reviews.len() < max_rounds && !stagnant {
+        return None;
+    }
+    Some(if last.incomplete() && last.blocking == 0 {
+        RunStatus::Blocked
+    } else if last.e2e.iter().all(CommandOutcome::ok) {
+        RunStatus::Gating
+    } else {
+        RunStatus::Blocked
+    })
+}
+
 /// How long a re-ask may take, given the budget the first attempt had.
 ///
 /// A `nudged` retry is a request to restate an answer the seat has already
@@ -3145,12 +3269,14 @@ where
 /// an actual test failure, since only the latter is a verdict on the patch.
 fn e2e_outcome_label(o: &CommandOutcome) -> String {
     if o.ok() {
-        "pass".to_owned()
-    } else if o.build_failed() {
+        return "pass".to_owned();
+    }
+    let reason = if o.build_failed() {
         format!("COULD NOT RUN ({:?}, build/link failure)", o.code)
     } else {
         format!("FAIL ({:?})", o.code)
-    }
+    };
+    format!("{reason}\n{}", tail(&o.output_tail, EVENT_OUTPUT_TAIL))
 }
 
 /// Run configured shell commands in `cwd`, in order.
@@ -3193,6 +3319,37 @@ async fn run_commands(
         });
     }
     out
+}
+
+/// The merge commit / pull request body: the task, and — when the winning
+/// review round was not clean — the findings still open and whatever the
+/// fixer declined, so `merge = "pr"` hands the reader the same material
+/// `magi show` does rather than a pull request that reads clean while
+/// `run.json` disagrees.
+fn pr_body(state: &RunState, winner: char) -> String {
+    let mut message = format!(
+        "Merge magi run {} (candidate {winner})\n\n{}",
+        state.id, state.instruction
+    );
+
+    let open = state.open_findings();
+    if !open.is_empty() {
+        message.push_str("\n\n## Open review findings\n\n");
+        for f in &open {
+            message.push_str(&format!("- `{}` [{:?}] {}\n", f.id, f.severity, f.title));
+        }
+    }
+
+    if let Some(fix) = state.reviews.last().and_then(|r| r.fix.as_ref())
+        && !fix.rejected.is_empty()
+    {
+        message.push_str("\n## Declined by the fixer\n\n");
+        for r in &fix.rejected {
+            message.push_str(&format!("- `{}`: {}\n", r.id, r.why));
+        }
+    }
+
+    message
 }
 
 /// `gh pr create`, returning the PR url.
@@ -3333,6 +3490,90 @@ mod tests {
         ));
     }
 
+    // `review_conclusion` is the exact decision the review hand-off task
+    // fixed: a round budget spent (or a tree that stopped moving) must not
+    // collapse into `Blocked` regardless of what verification actually
+    // said. Deterministic and process-free for the same reason the
+    // `round_is_clean` family above is.
+    fn review_round(
+        clean: bool,
+        blocking: usize,
+        answered: usize,
+        expected: usize,
+        progressed: bool,
+        e2e_ok: bool,
+    ) -> ReviewRound {
+        ReviewRound {
+            round: 1,
+            head: "h".to_owned(),
+            reviews: Vec::new(),
+            e2e: vec![CommandOutcome {
+                command: "test".to_owned(),
+                code: Some(if e2e_ok { 0 } else { 1 }),
+                output_tail: String::new(),
+                duration_ms: 0,
+            }],
+            verify_retried: false,
+            fix: None,
+            blocking,
+            answered,
+            expected,
+            clean,
+            progressed,
+        }
+    }
+
+    #[test]
+    fn review_conclusion_is_none_when_nothing_has_run() {
+        assert_eq!(review_conclusion(&[], 3), None);
+    }
+
+    #[test]
+    fn review_conclusion_is_none_while_rounds_remain() {
+        let rounds = vec![review_round(false, 1, 2, 2, true, true)];
+        assert_eq!(review_conclusion(&rounds, 3), None);
+    }
+
+    #[test]
+    fn review_conclusion_is_gating_once_a_round_is_clean() {
+        let rounds = vec![review_round(true, 0, 2, 2, false, true)];
+        assert_eq!(review_conclusion(&rounds, 3), Some(RunStatus::Gating));
+    }
+
+    #[test]
+    fn review_conclusion_hands_off_when_the_budget_is_spent_and_e2e_is_green() {
+        let rounds = vec![
+            review_round(false, 1, 2, 2, true, true),
+            review_round(false, 1, 2, 2, true, true),
+        ];
+        assert_eq!(review_conclusion(&rounds, 2), Some(RunStatus::Gating));
+    }
+
+    #[test]
+    fn review_conclusion_blocks_when_the_budget_is_spent_and_e2e_is_red() {
+        let rounds = vec![
+            review_round(false, 1, 2, 2, true, true),
+            review_round(false, 1, 2, 2, true, false),
+        ];
+        assert_eq!(review_conclusion(&rounds, 2), Some(RunStatus::Blocked));
+    }
+
+    #[test]
+    fn review_conclusion_blocks_an_incomplete_panel_that_raised_nothing_even_with_green_e2e() {
+        // Missing input, not a verified tree — never a hand-off candidate.
+        let rounds = vec![review_round(false, 0, 1, 2, false, true)];
+        assert_eq!(review_conclusion(&rounds, 1), Some(RunStatus::Blocked));
+    }
+
+    #[test]
+    fn review_conclusion_hands_off_when_the_tree_stagnates_before_the_budget_is_spent() {
+        let rounds = vec![
+            review_round(false, 1, 2, 2, false, true),
+            review_round(false, 1, 2, 2, false, true),
+        ];
+        assert_eq!(review_conclusion(&rounds, 10), Some(RunStatus::Gating));
+    }
+
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
     }
@@ -3427,6 +3668,7 @@ mod tests {
             expected: 0,
             clean: true,
             verify_retried: false,
+            progressed: false,
         }];
         state.gate = vec![CommandOutcome {
             command: "test".to_owned(),
@@ -3469,6 +3711,108 @@ mod tests {
             Some("already concluded"),
             "merge must not run again once the node already recorded an outcome"
         );
+    }
+
+    fn state_with_round(round: ReviewRound) -> RunState {
+        let mut s = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        s.reviews = vec![round];
+        s
+    }
+
+    fn finding(id: &str, severity: Severity, title: &str) -> crate::verdict::Finding {
+        crate::verdict::Finding {
+            id: id.to_owned(),
+            severity,
+            file: None,
+            line: None,
+            title: title.to_owned(),
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn pr_body_names_open_findings_and_declined_ones() {
+        let round = ReviewRound {
+            round: 2,
+            head: "deadbee".to_owned(),
+            reviews: vec![ReviewRecord {
+                reviewer: 1,
+                agent: "alpha".to_owned(),
+                summary: String::new(),
+                findings: vec![finding("R2-1-1", Severity::Minor, "unused import")],
+                failed: None,
+                duration_ms: 0,
+            }],
+            e2e: vec![CommandOutcome {
+                command: "cargo test".to_owned(),
+                code: Some(0),
+                output_tail: String::new(),
+                duration_ms: 0,
+            }],
+            verify_retried: false,
+            fix: Some(FixRecord {
+                agent: "alpha".to_owned(),
+                addressed: Vec::new(),
+                rejected: vec![crate::verdict::Rejection {
+                    id: "R1-1-1".to_owned(),
+                    why: "not reachable from any caller".to_owned(),
+                }],
+                notes: String::new(),
+                committed: true,
+                failed: None,
+                duration_ms: 0,
+            }),
+            blocking: 0,
+            answered: 1,
+            expected: 1,
+            clean: false,
+            progressed: true,
+        };
+        let state = state_with_round(round);
+        let body = pr_body(&state, 'A');
+
+        assert!(body.contains("add retries"), "the task must still be there");
+        assert!(body.contains("R2-1-1"), "{body}");
+        assert!(body.contains("unused import"), "{body}");
+        assert!(body.contains("R1-1-1"), "the declined finding: {body}");
+        assert!(
+            body.contains("not reachable from any caller"),
+            "the reason it was declined: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_body_says_nothing_extra_when_the_round_was_clean() {
+        let round = ReviewRound {
+            round: 1,
+            head: "deadbee".to_owned(),
+            reviews: vec![ReviewRecord {
+                reviewer: 1,
+                agent: "alpha".to_owned(),
+                summary: String::new(),
+                findings: Vec::new(),
+                failed: None,
+                duration_ms: 0,
+            }],
+            e2e: Vec::new(),
+            verify_retried: false,
+            fix: None,
+            blocking: 0,
+            answered: 1,
+            expected: 1,
+            clean: true,
+            progressed: false,
+        };
+        let state = state_with_round(round);
+        let body = pr_body(&state, 'A');
+        assert!(!body.contains("Open review findings"), "{body}");
+        assert!(!body.contains("Declined"), "{body}");
     }
 
     #[test]

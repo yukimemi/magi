@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::MergeMode;
-use crate::run::{CommandOutcome, RunState, RunStatus};
+use crate::run::{CommandOutcome, RunState, RunStatus, tail};
 use crate::stats::Stats;
 
 static COLOR: AtomicBool = AtomicBool::new(true);
@@ -360,30 +360,37 @@ pub fn run(state: &RunState) -> String {
                 status,
                 short(&r.head),
                 r.blocking,
-                r.fix.as_ref().map_or(String::new(), |f| match &f.failed {
-                    // Never the same shape as "N addressed / M rejected": the
-                    // fixer's diff may well have landed (see the `fix` node's
-                    // own event), but whether it addressed anything is
-                    // unknown, not zero.
-                    Some(reason) => format!(
-                        "  fix: {}{}",
-                        yellow(&format!("adoption report lost ({reason})")),
-                        if f.committed {
-                            String::new()
-                        } else {
-                            red(" (NO COMMIT)")
-                        }
-                    ),
-                    None => format!(
-                        "  fix: {} addressed / {} rejected{}",
-                        f.addressed.len(),
-                        f.rejected.len(),
-                        if f.committed {
-                            String::new()
-                        } else {
-                            red(" (NO COMMIT)")
-                        }
-                    ),
+                r.fix.as_ref().map_or(String::new(), |f| {
+                    let tree = if r.progressed {
+                        green("changed")
+                    } else {
+                        yellow("unchanged")
+                    };
+                    match &f.failed {
+                        // Never the same shape as "N addressed / M rejected": the
+                        // fixer's diff may well have landed (see the `fix` node's
+                        // own event), but whether it addressed anything is
+                        // unknown, not zero.
+                        Some(reason) => format!(
+                            "  fix: {}, tree {tree}{}",
+                            yellow(&format!("adoption report lost ({reason})")),
+                            if f.committed {
+                                String::new()
+                            } else {
+                                red(" (NO COMMIT)")
+                            }
+                        ),
+                        None => format!(
+                            "  fix: {} addressed / {} rejected, tree {tree}{}",
+                            f.addressed.len(),
+                            f.rejected.len(),
+                            if f.committed {
+                                String::new()
+                            } else {
+                                red(" (NO COMMIT)")
+                            }
+                        ),
+                    }
                 })
             );
             for rec in &r.reviews {
@@ -406,6 +413,28 @@ pub fn run(state: &RunState) -> String {
                     );
                 }
             }
+            if let Some(fix) = &r.fix {
+                for rej in &fix.rejected {
+                    let _ = writeln!(
+                        s,
+                        "      {} {}: {}",
+                        dim(&rej.id),
+                        yellow("declined"),
+                        rej.why
+                    );
+                }
+            }
+        }
+        if state.handed_off_with_open_findings() {
+            let _ = writeln!(
+                s,
+                "\n  {}",
+                yellow(&format!(
+                    "handed off with {} finding(s) still open — gate and e2e were green; \
+                     see above for what a person should still look at",
+                    state.open_findings().len()
+                ))
+            );
         }
     }
 
@@ -440,6 +469,9 @@ pub fn run(state: &RunState) -> String {
                 if o.ok() { green("pass") } else { red("FAIL") },
                 o.command
             );
+            if !o.ok() {
+                let _ = writeln!(s, "{}", dim(&tail(&o.output_tail, 2_000)));
+            }
         }
     }
 
@@ -896,6 +928,7 @@ mod tests {
             answered: 0,
             expected: 0,
             clean: false,
+            progressed: false,
         }];
         let text = run(&lost);
         assert!(text.contains("adoption report lost (timed out)"), "{text}");
@@ -924,6 +957,7 @@ mod tests {
             answered: 0,
             expected: 0,
             clean: false,
+            progressed: false,
         }];
         let text2 = run(&rejected_all);
         assert!(
@@ -977,6 +1011,7 @@ mod tests {
             answered: 1,
             expected: 2,
             clean: false,
+            progressed: true,
         }];
         let text = run(&s);
         assert!(text.contains("incomplete"), "{text}");
@@ -1009,11 +1044,89 @@ mod tests {
             answered: 0,
             expected: 0,
             clean: false,
+            progressed: false,
         }];
         let text = run(&s);
         assert!(text.contains("could not run"), "{text}");
         assert!(text.contains("retried once"), "{text}");
         assert!(!text.contains("e2e RED"), "{text}");
+    }
+
+    #[test]
+    fn a_declined_finding_shows_its_reason() {
+        use crate::verdict::{Finding, Rejection, Severity};
+
+        let _guard = plain();
+        let mut s = state();
+        s.status = RunStatus::Ready;
+        s.reviews = vec![ReviewRound {
+            round: 1,
+            head: "deadbee".to_owned(),
+            reviews: vec![ReviewRecord {
+                reviewer: 1,
+                agent: "alpha".to_owned(),
+                summary: String::new(),
+                findings: vec![Finding {
+                    id: "R1-1-1".to_owned(),
+                    severity: Severity::Major,
+                    file: None,
+                    line: None,
+                    title: "still open".to_owned(),
+                    detail: String::new(),
+                }],
+                failed: None,
+                duration_ms: 0,
+            }],
+            e2e: vec![CommandOutcome {
+                command: "cargo test".to_owned(),
+                code: Some(0),
+                output_tail: String::new(),
+                duration_ms: 0,
+            }],
+            verify_retried: false,
+            fix: Some(FixRecord {
+                agent: "alpha".to_owned(),
+                addressed: Vec::new(),
+                rejected: vec![Rejection {
+                    id: "R1-1-2".to_owned(),
+                    why: "cannot be triggered from any caller".to_owned(),
+                }],
+                notes: String::new(),
+                committed: true,
+                failed: None,
+                duration_ms: 0,
+            }),
+            blocking: 1,
+            answered: 1,
+            expected: 1,
+            clean: false,
+            progressed: true,
+        }];
+
+        let text = run(&s);
+        assert!(text.contains("R1-1-2"), "{text}");
+        assert!(text.contains("cannot be triggered"), "{text}");
+        assert!(text.contains("still open"), "{text}");
+        assert!(
+            text.contains("handed off"),
+            "a mergeable run with an open round must say so: {text}"
+        );
+    }
+
+    #[test]
+    fn a_failing_gate_command_shows_its_output() {
+        let _guard = plain();
+        let mut s = state();
+        s.status = RunStatus::Blocked;
+        s.gate = vec![CommandOutcome {
+            command: "cargo make check".to_owned(),
+            code: Some(101),
+            output_tail: "error[E0308]: mismatched types".to_owned(),
+            duration_ms: 0,
+        }];
+
+        let text = run(&s);
+        assert!(text.contains("mismatched types"), "{text}");
     }
 
     #[test]
