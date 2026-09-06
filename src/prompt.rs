@@ -174,6 +174,31 @@ noise the owner learns to ignore.",
     s
 }
 
+/// What a seat that may build is told about the shared build cache.
+///
+/// Spliced into every node prompt (in [`crate::graph::wave`]) when the run's
+/// config declares a `CARGO_TARGET_DIR` — which is also the directory the
+/// verify commands build into. The text is stable so tests can assert on it;
+/// the value of the variable is not spelled out because the seat reads it from
+/// its own environment, and a prompt that hardcodes a path would go stale the
+/// moment the config moves the cache.
+///
+/// The fund-transfer reality it exists to prevent: an implementer that builds
+/// with its own `CARGO_TARGET_DIR` (or lets cargo create a fresh `target/` in
+/// the worktree) is compiling a second copy of the world that nobody prunes,
+/// on a machine that has already had that exact failure once.
+pub fn build_cache_note() -> &'static str {
+    "\
+# The build cache\n\n\
+This environment sets `CARGO_TARGET_DIR` to a shared build cache. Build and \
+test through it — the verify commands use the same directory, so a compile \
+you pay for is a compile the gate does not redo.\n\n\
+The cache is size-capped and pruned oldest-first by magi. Never create your \
+own build directory — no `CARGO_TARGET_DIR` of your own, no local `target/` \
+in the worktree. A private target directory is exactly the multi-gigabyte \
+junk the cap exists to keep down."
+}
+
 /// Prompt for an implementer.
 pub fn implement(instruction: &str, cwd: &str, language: &str) -> String {
     format!(
@@ -769,6 +794,16 @@ mod tests {
         // Asking is not free: it stops the run until a human notices.
         assert!(p.contains("Ask sparingly"), "{p}");
     }
+    #[test]
+    fn the_build_cache_note_says_the_load_bearing_things() {
+        let note = build_cache_note();
+        // The two sentences that carry the invariant: build through the shared
+        // variable, and never create your own cache.
+        assert!(note.contains("CARGO_TARGET_DIR` to a shared build cache"));
+        assert!(note.contains("Never create your own build directory"));
+        assert!(note.contains("pruned oldest-first by magi"));
+    }
+
     #[test]
     fn a_question_is_asked_in_the_operators_language_not_in_a_language_code() {
         // Reported from a real run: `language = "ja"` was set and the questions

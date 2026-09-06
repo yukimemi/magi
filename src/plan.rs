@@ -871,6 +871,8 @@ mod tests {
 
     #[test]
     fn a_draft_lives_under_the_run_home_so_it_outlives_the_command_that_wrote_it() {
+        let dir = tempfile::tempdir().unwrap();
+        run::set_home(dir.path().to_path_buf());
         assert_eq!(drafts_dir(), run::home().join("drafts"));
     }
 

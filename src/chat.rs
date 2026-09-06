@@ -513,6 +513,7 @@ async fn turn(chat: &mut Chat, store: &Chats, cfg: &Config, prompt: &str) -> Res
 
     let artifacts = store.artifacts_of(&chat.id);
     let stem = format!("turn-{}", chat.seat.turns + 1);
+    let cache_dir = cfg.cache_dir();
     let inv = Invocation {
         cwd: &chat.repo,
         prompt: &body,
@@ -527,6 +528,7 @@ async fn turn(chat: &mut Chat, store: &Chats, cfg: &Config, prompt: &str) -> Res
         stem: &stem,
         run: &chat.id,
         node: "chat",
+        cache_dir: cache_dir.as_deref(),
     };
 
     let outcome = agent::invoke(spec, &mut chat.seat, &inv).await;

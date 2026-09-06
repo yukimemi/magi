@@ -642,7 +642,15 @@ impl Runner {
         // Kept so a seat whose CLI hung up can be asked again from the same
         // job: `wave` consumes what it is given.
         let sent = jobs.clone();
-        let mut results = wave(jobs, Arc::clone(&self.sem), &run_id, "implement", &prompts).await;
+        let mut results = wave(
+            jobs,
+            Arc::clone(&self.sem),
+            &run_id,
+            "implement",
+            &prompts,
+            self.state.config.cache_dir().as_deref(),
+        )
+        .await;
         self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
             .await;
 
@@ -838,8 +846,15 @@ impl Runner {
             retry.prompt = prompt::resume_after_drop(&dropped.why);
             retry.timeout = retry_budget(job.timeout, true);
             retry.stem = format!("{}-resume", job.stem);
-            let (resumed_seat, resumed) =
-                run_one(retry, Arc::clone(&self.sem), run_id, "implement", prompts).await;
+            let (resumed_seat, resumed) = run_one(
+                retry,
+                Arc::clone(&self.sem),
+                run_id,
+                "implement",
+                prompts,
+                self.state.config.cache_dir().as_deref(),
+            )
+            .await;
             *seat = resumed_seat;
             *out = resumed;
         }
@@ -981,6 +996,7 @@ impl Runner {
             &run_id,
             "judge",
             &prompts,
+            self.state.config.cache_dir().as_deref(),
             &mut quota_losses,
             &move |r: &Ranking| r.validate(&labels_for_check),
         )
@@ -1112,8 +1128,15 @@ impl Runner {
                     artifacts: artifacts.clone(),
                     stem: format!("delib-{round}-judge-{}", j + 1),
                 };
-                let (updated, out) =
-                    run_one(job, Arc::clone(&self.sem), &run_id, "deliberate", &prompts).await;
+                let (updated, out) = run_one(
+                    job,
+                    Arc::clone(&self.sem),
+                    &run_id,
+                    "deliberate",
+                    &prompts,
+                    self.state.config.cache_dir().as_deref(),
+                )
+                .await;
                 seat = updated;
                 let agent_id = seat.agent.clone();
                 let seat_key = seat.key.clone();
@@ -1264,6 +1287,7 @@ impl Runner {
             &run_id,
             "vote",
             &prompts,
+            self.state.config.cache_dir().as_deref(),
             &mut quota_losses,
             &move |v: &FinalVote| match v.label() {
                 Some(c) if allowed.contains(&c) => Ok(()),
@@ -1583,6 +1607,7 @@ impl Runner {
             &run_id,
             "judge",
             &prompts,
+            self.state.config.cache_dir().as_deref(),
             &mut judge_losses,
             &move |r: &Ranking| r.validate(&labels_for_check),
         )
@@ -1650,6 +1675,7 @@ impl Runner {
             &run_id,
             "vote",
             &prompts,
+            self.state.config.cache_dir().as_deref(),
             &mut vote_losses,
             &move |v: &FinalVote| match v.label() {
                 Some(c) if allowed.contains(&c) => Ok(()),
@@ -1837,6 +1863,7 @@ impl Runner {
                 &run_id,
                 "review",
                 &prompts,
+                self.state.config.cache_dir().as_deref(),
                 &mut quota_losses,
                 &|_: &Review| Ok(()),
             )
@@ -1987,7 +2014,15 @@ impl Runner {
                 stem: format!("fix-{round}"),
             };
             let before = git::rev_parse(&winner.worktree, "HEAD").await?;
-            let (seat, out) = run_one(job, Arc::clone(&self.sem), &run_id, "fix", &prompts).await;
+            let (seat, out) = run_one(
+                job,
+                Arc::clone(&self.sem),
+                &run_id,
+                "fix",
+                &prompts,
+                self.state.config.cache_dir().as_deref(),
+            )
+            .await;
             let agent_id = seat.agent.clone();
             let seat_key = seat.key.clone();
             self.state.seats.insert(seat.key.clone(), seat);
@@ -2376,8 +2411,9 @@ async fn run_one(
     run: &str,
     node: &str,
     prompts: &Prompts,
+    cache: Option<&Path>,
 ) -> (SeatState, AgentOutcome) {
-    let (_, seat, out) = wave(vec![job], sem, run, node, prompts)
+    let (_, seat, out) = wave(vec![job], sem, run, node, prompts, cache)
         .await
         .pop()
         .expect("one job in, one result out");
@@ -2396,14 +2432,20 @@ async fn wave(
     run: &str,
     node: &str,
     prompts: &Prompts,
+    cache: Option<&Path>,
 ) -> Vec<(usize, SeatState, AgentOutcome)> {
     let mut set = tokio::task::JoinSet::new();
     let overlay = prompts.overlay(node);
     for (i, mut job) in jobs.into_iter().enumerate() {
         job.prompt = prompt::with_overlay(job.prompt, overlay.clone());
+        if cache.is_some() {
+            job.prompt.push('\n');
+            job.prompt.push_str(prompt::build_cache_note());
+        }
         let sem = Arc::clone(&sem);
         let run = run.to_owned();
         let node = node.to_owned();
+        let cache = cache.map(Path::to_path_buf);
         set.spawn(async move {
             let _permit = sem.acquire().await;
             let mut seat = job.seat;
@@ -2420,6 +2462,7 @@ async fn wave(
                     stem: &job.stem,
                     run: &run,
                     node: &node,
+                    cache_dir: cache.as_deref(),
                 },
             )
             .await;
@@ -2503,6 +2546,7 @@ async fn ask_json_wave<T>(
     run: &str,
     node: &str,
     prompts: &Prompts,
+    cache: Option<&Path>,
     losses: &mut Vec<QuotaLoss>,
     validate: &(dyn Fn(&T) -> Result<()> + Send + Sync),
 ) -> Vec<(SeatState, Result<(T, AgentOutput)>)>
@@ -2557,7 +2601,7 @@ where
             });
         }
 
-        let results = wave(batch, Arc::clone(&sem), run, node, prompts).await;
+        let results = wave(batch, Arc::clone(&sem), run, node, prompts, cache).await;
         let mut still = Vec::new();
         for (&i, (_wi, seat, out)) in pending.iter().zip(results) {
             seats[i] = seat;
