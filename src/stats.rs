@@ -233,33 +233,44 @@ pub fn collect(states: &[RunState]) -> Stats {
 
         for round in &state.reviews {
             totals.review_rounds += 1;
-            let adopted: Vec<&String> = round
-                .fix
-                .as_ref()
-                .map(|f| f.addressed.iter().collect())
-                .unwrap_or_default();
 
-            for rec in &round.reviews {
-                let entry = reviewers
-                    .entry(rec.agent.clone())
-                    .or_insert_with(|| ReviewerStats {
-                        agent: rec.agent.clone(),
-                        ..ReviewerStats::default()
-                    });
-                entry.rounds += 1;
-                entry.submitted += rec.findings.len();
-                for f in &rec.findings {
-                    if adopted.iter().any(|a| **a == f.id) {
-                        entry.adopted += 1;
-                    }
-                    let overlapped = round
-                        .reviews
-                        .iter()
-                        .filter(|other| other.reviewer != rec.reviewer)
-                        .flat_map(|other| other.findings.iter())
-                        .any(|g| same_defect(f, g));
-                    if !overlapped {
-                        entry.unique += 1;
+            // A round whose fixer never reported back (crashed, timed out, or
+            // replied with something magi could not parse) leaves adoption
+            // unknown, not zero. Counting it would score every reviewer in
+            // that round as having been ignored, when the truth is simply
+            // unrecorded — so it stays out of the adoption-rate denominator
+            // entirely rather than silently becoming a round of 0 adoptions.
+            let report_lost = round.fix.as_ref().is_some_and(|f| f.failed.is_some());
+            if !report_lost {
+                let adopted: Vec<&String> = round
+                    .fix
+                    .as_ref()
+                    .map(|f| f.addressed.iter().collect())
+                    .unwrap_or_default();
+
+                for rec in &round.reviews {
+                    let entry =
+                        reviewers
+                            .entry(rec.agent.clone())
+                            .or_insert_with(|| ReviewerStats {
+                                agent: rec.agent.clone(),
+                                ..ReviewerStats::default()
+                            });
+                    entry.rounds += 1;
+                    entry.submitted += rec.findings.len();
+                    for f in &rec.findings {
+                        if adopted.iter().any(|a| **a == f.id) {
+                            entry.adopted += 1;
+                        }
+                        let overlapped = round
+                            .reviews
+                            .iter()
+                            .filter(|other| other.reviewer != rec.reviewer)
+                            .flat_map(|other| other.findings.iter())
+                            .any(|g| same_defect(f, g));
+                        if !overlapped {
+                            entry.unique += 1;
+                        }
                     }
                 }
             }
@@ -451,6 +462,7 @@ mod tests {
                 },
             ],
             e2e: Vec::new(),
+            verify_retried: false,
             fix: Some(FixRecord {
                 agent: "alpha".to_owned(),
                 addressed: vec!["R1-1-1".to_owned()],
@@ -479,6 +491,50 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_fix_report_does_not_count_as_zero_adoption() {
+        let submitted = ReviewRound {
+            round: 1,
+            head: "h".to_owned(),
+            reviews: vec![ReviewRecord {
+                reviewer: 1,
+                agent: "alpha".to_owned(),
+                summary: String::new(),
+                findings: vec![finding(
+                    "R1-1-1",
+                    "src/a.rs",
+                    10,
+                    "panics on empty",
+                    Severity::Blocker,
+                )],
+                failed: None,
+                duration_ms: 0,
+            }],
+            e2e: Vec::new(),
+            verify_retried: false,
+            // The fixer's diff may well have landed (blocking counts do fall
+            // round over round) — only its adoption report never came back.
+            fix: Some(FixRecord {
+                agent: "alpha".to_owned(),
+                addressed: Vec::new(),
+                rejected: Vec::new(),
+                notes: String::new(),
+                committed: true,
+                failed: Some("unparsable fix report".to_owned()),
+                duration_ms: 0,
+            }),
+            blocking: 4,
+            clean: false,
+        };
+        let stats = collect(&[state_with(vec![submitted], 'A', RunStatus::Ready)]);
+        assert!(
+            stats.reviewers.is_empty(),
+            "a round with no adoption signal must not enter any reviewer's \
+             denominator: {:?}",
+            stats.reviewers
+        );
+    }
+
+    #[test]
     fn e2e_sole_detection_needs_a_clean_static_review() {
         let fail = CommandOutcome {
             command: "cargo test".to_owned(),
@@ -491,6 +547,7 @@ mod tests {
             head: "h".to_owned(),
             reviews: Vec::new(),
             e2e: vec![fail.clone()],
+            verify_retried: false,
             fix: None,
             blocking: 0,
             clean: false,
@@ -500,6 +557,7 @@ mod tests {
             head: "h".to_owned(),
             reviews: Vec::new(),
             e2e: vec![fail],
+            verify_retried: false,
             fix: None,
             blocking: 2,
             clean: false,
