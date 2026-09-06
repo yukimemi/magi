@@ -27,7 +27,13 @@ use crate::verdict::{Finding, Rejection};
 /// the quorum fields on `Tally`. `RunState::load` already fails loudly and
 /// clearly on a schema mismatch; an old `run.json` from schema 1 now says so
 /// instead of silently half-reading.
-pub const SCHEMA: u32 = 2;
+///
+/// 3: added `RunState::judge_skipped`. A solo candidate makes `judge` write
+/// only an event, leaving `judgements` empty forever — indistinguishable from
+/// "not yet judged" on every later reentry, which is what let `judge` re-run
+/// on a finished run and clobber its status back to `Judging`. The flag is
+/// the missing record of the fact that judging was skipped on purpose.
+pub const SCHEMA: u32 = 3;
 
 /// Where a run got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -463,6 +469,15 @@ pub struct RunState {
     /// Initial blind rankings.
     #[serde(default)]
     pub judgements: Vec<Judgement>,
+    /// `judge` decided a solo candidate needs no panel and only logged it.
+    ///
+    /// `judgements` stays empty in that case — nothing to distinguish from
+    /// "not yet judged" — so this is the record that makes the skip
+    /// idempotent: without it, every reentry re-ran `judge`, re-logged the
+    /// same event, and rewrote `status` to `Judging` over whatever a later
+    /// node had already concluded.
+    #[serde(default)]
+    pub judge_skipped: bool,
     /// Deliberation, if it happened.
     #[serde(default)]
     pub deliberation: Vec<DeliberationRound>,
@@ -537,6 +552,7 @@ impl RunState {
             enabled_worktree_config: false,
             candidates: Vec::new(),
             judgements: Vec::new(),
+            judge_skipped: false,
             deliberation: Vec::new(),
             votes: Vec::new(),
             tally: None,
