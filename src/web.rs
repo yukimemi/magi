@@ -121,7 +121,7 @@ use crate::proc::Quiet as _;
 use crate::queue::{Queue, Task, title_from};
 use crate::run::{RunState, RunStatus};
 use crate::talk::{Talk, Talks};
-use crate::{chat, daemon, report, repos, run, talk};
+use crate::{chat, daemon, report, repos, run, talk, updater};
 
 /// Default port. Chosen high and memorable; nothing else in the fleet uses it.
 pub const DEFAULT_PORT: u16 = 7878;
@@ -840,6 +840,15 @@ pub async fn serve(opts: Opts) -> Result<()> {
     report::set_color(false);
 
     let ui = Ui::open(opts.repo).with_merge(opts.merge);
+    // Cloned before `ui.router()` consumes `ui` below: `hand_over` needs the
+    // home to bracket the parking and restarting stages, and by then there is
+    // no `ui` left to read it from.
+    let home = ui.home.clone();
+    // Settles a progress record a predecessor left non-terminal - either this
+    // *is* the successor `spawn_successor` started, or the previous process
+    // died mid-handover. Before the router starts answering, so the very
+    // first `/api/health` a phone gets from this process already reflects it.
+    updater::reconcile_after_restart(&home);
     let looping = ui.looping();
     let socket = SocketAddr::new(addr, opts.port);
     let listener = bind_waiting(socket).await?;
@@ -886,7 +895,7 @@ pub async fn serve(opts: Opts) -> Result<()> {
         }
         () = handover => {
             tracing::info!("upgraded - handing this address to the successor");
-            hand_over(&looping, served, spawn_successor).await
+            hand_over(&home, &looping, served, spawn_successor).await
         }
     }
 }
@@ -913,14 +922,28 @@ pub async fn serve(opts: Opts) -> Result<()> {
 ///    there.
 /// 3. **Start the successor**, which binds the address this process has just
 ///    let go of - see [`spawn_successor`] for what the other order cost.
+///
+/// The [`updater::Progress`] bookkeeping bracketing steps 1 and 3 is
+/// reporting, not part of the design: it exists so `/api/health` can say
+/// "parking, waiting on run X" instead of leaving the phone to guess why the
+/// deck went quiet, and dropping it would not change the order above.
 async fn hand_over(
+    home: &FsPath,
     looping: &Mutex<LoopState>,
     served: tokio::task::JoinHandle<std::io::Result<()>>,
     successor: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    if let Some(mut progress) = updater::read_progress(home) {
+        progress.advance(updater::Stage::Parking);
+        let _ = updater::write_progress(home, &progress);
+    }
     finish_loop(looping).await;
     served.abort();
     let _ = served.await;
+    if let Some(mut progress) = updater::read_progress(home) {
+        progress.advance(updater::Stage::Restarting);
+        let _ = updater::write_progress(home, &progress);
+    }
     successor()
 }
 
@@ -1275,6 +1298,93 @@ struct HealthView {
     /// somewhere, and this says whether it is one this UI can stop.
     #[serde(rename = "loop")]
     looping: LoopView,
+    /// Whether a release newer than this build is known, and which.
+    ///
+    /// From [`updater::Checker::cached_update`] - the same throttled state the
+    /// CLI's `notify` mode banners from - never a live check: this route is
+    /// polled every few seconds, and a live check on each poll would spend
+    /// GitHub's rate limit before the operator finished reading the strip.
+    update: UpdateView,
+    /// The self-upgrade this deck last set in motion, or `null` before the
+    /// first one. Read off disk, so the successor can report what its
+    /// predecessor started.
+    upgrade: Option<UpgradeProgressView>,
+}
+
+/// What `/api/health` knows about a release newer than this build.
+///
+/// A plain `Option<String>` for `to` could not distinguish "checked, and this
+/// is already the newest" from "never checked" - both are `None` - and the
+/// phone needs to tell those apart to decide whether the deck can be trusted
+/// to have an opinion at all.
+#[derive(Debug, Serialize)]
+struct UpdateView {
+    /// A newer release is known to exist.
+    available: bool,
+    /// Its tag, when `available`.
+    to: Option<String>,
+}
+
+/// [`updater::Progress`] as `/api/health` reports it.
+#[derive(Debug, Serialize)]
+struct UpgradeProgressView {
+    stage: updater::Stage,
+    from: String,
+    to: Option<String>,
+    /// What [`updater::Stage::Parking`] is waiting on, in words: the run and
+    /// the step it is finishing before the address is handed over.
+    waiting_on: Option<String>,
+    started_at: Timestamp,
+    updated_at: Timestamp,
+    detail: Option<String>,
+}
+
+/// [`UpdateView`] from the same throttled, disk-only state
+/// [`crate::updater::Checker::cached_update`] gives the CLI's `notify` mode -
+/// never a live check. `[update] mode = "off"` answers "unknown" the same as
+/// no cached state at all, which is correct: an operator who turned checking
+/// off gets no opinion, not a stale one.
+fn cached_update_view(repo: &FsPath) -> UpdateView {
+    let (cfg, _) = Config::discover(repo, None).unwrap_or_default();
+    let latest = updater::Checker::new(&cfg.update).and_then(|c| c.cached_update());
+    match latest {
+        Some(latest) => UpdateView {
+            available: true,
+            to: Some(latest.tag_name),
+        },
+        None => UpdateView {
+            available: false,
+            to: None,
+        },
+    }
+}
+
+/// [`updater::Progress`] as `/api/health` reports it, filling in `waiting_on`
+/// from the parked run's own state when the stage is
+/// [`updater::Stage::Parking`] - the run and the node it is finishing are
+/// already on disk in `run.json`, so this reads them fresh rather than
+/// trusting whatever was true the moment the park was requested.
+fn upgrade_progress_view(ui: &Ui, progress: updater::Progress) -> UpgradeProgressView {
+    let waiting_on = (progress.stage == updater::Stage::Parking)
+        .then_some(progress.parked_run.as_deref())
+        .flatten()
+        .and_then(|id| read_run(&ui.runs, id).ok())
+        .map(|run| {
+            format!(
+                "run {} is finishing {} before the address is handed over",
+                run.short(),
+                run.status.as_str()
+            )
+        });
+    UpgradeProgressView {
+        stage: progress.stage,
+        from: progress.from,
+        to: progress.to,
+        waiting_on,
+        started_at: progress.started_at,
+        updated_at: progress.updated_at,
+        detail: progress.detail,
+    }
 }
 
 /// The disk figures `/api/health` carries. Every number is produced by
@@ -1360,6 +1470,8 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
         // is not reentrant, and a guard taken as a temporary there would still
         // be held when `loop_view` took it again.
         let loop_rev = ui.lock_loop().rev;
+        let update = cached_update_view(&ui.repo);
+        let upgrade = updater::read_progress(&ui.home).map(|p| upgrade_progress_view(&ui, p));
         Ok(Json(HealthView {
             version: env!("CARGO_PKG_VERSION"),
             home: ui.home.display().to_string(),
@@ -1375,6 +1487,8 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             daemon: DaemonView::of(reading.clone()),
             looping: ui.loop_view(reading),
             disk: DiskView::of(&ui),
+            update,
+            upgrade,
         }))
     })
     .await
@@ -1644,6 +1758,7 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
     // drops every connection to pay for an upgrade that did not happen. A
     // probe against a deck already on the newest build did exactly that.
     let (cfg, _) = Config::discover(&ui.repo, None).unwrap_or_default();
+    let from = env!("CARGO_PKG_VERSION").to_owned();
     let latest = match crate::updater::Checker::new(&cfg.update) {
         Some(checker) => checker
             .newer_release()
@@ -1655,7 +1770,7 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
         return Ok((
             StatusCode::OK,
             Json(UpgradeView {
-                from: env!("CARGO_PKG_VERSION").to_owned(),
+                from,
                 to: None,
                 parked: None,
                 detail: "Already on the newest release. Nothing was parked \
@@ -1686,17 +1801,29 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
             .to_owned(),
     };
 
+    // Recorded before the spawn, not inside it: the phone's next `/api/health`
+    // poll must see a `Downloading` stage immediately, not whenever the
+    // spawned task happens to get scheduled.
+    let mut progress = updater::Progress::new(from.clone(), latest.tag_name.clone());
+    progress.parked_run = parked.clone();
+    let _ = updater::write_progress(&ui.home, &progress);
+
+    let home = ui.home.clone();
     tokio::spawn(async move {
-        if let Err(e) = upgrade_and_restart().await {
+        if let Err(e) = upgrade_and_restart(home.clone()).await {
             tracing::error!("the upgrade did not complete: {e:#}");
+            if let Some(mut progress) = updater::read_progress(&home) {
+                progress.fail(format!("{e:#}"));
+                let _ = updater::write_progress(&home, &progress);
+            }
         }
     });
 
     Ok((
         StatusCode::ACCEPTED,
         Json(UpgradeView {
-            from: env!("CARGO_PKG_VERSION").to_owned(),
-            to: Some(latest.tag_name.clone()),
+            from,
+            to: Some(latest.tag_name),
             parked,
             detail,
         }),
@@ -1707,11 +1834,15 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
 ///
 /// Separated from the handler so the 202 is already on its way, and separated
 /// from the spawn so the successor starts only after the listener is dropped.
-async fn upgrade_and_restart() -> Result<()> {
+async fn upgrade_and_restart(home: PathBuf) -> Result<()> {
     // `yes` and non-interactive: nobody is at a terminal, and a prompt would
     // hang the upgrade for as long as the process lives.
     crate::updater::run_self_update(true, false, true).await?;
     tracing::info!("binary replaced - asking the server to hand over");
+    if let Some(mut progress) = updater::read_progress(&home) {
+        progress.advance(updater::Stage::Replaced);
+        let _ = updater::write_progress(&home, &progress);
+    }
     HANDOVER.notify_one();
     Ok(())
 }
@@ -5293,7 +5424,7 @@ mod tests {
         // The successor's whole job, and the one thing it cannot do while this
         // process still holds the socket.
         let bound = std::sync::Mutex::new(None);
-        hand_over(&looping, served, || {
+        hand_over(home.path(), &looping, served, || {
             let attempt = std::net::TcpListener::bind(addr).map_err(|e| e.to_string());
             *bound.lock().expect("bound") = Some(attempt);
             Ok(())
@@ -6370,6 +6501,103 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn health_reports_the_running_version_and_no_pending_upgrade_by_default() {
+        // `mode = "off"` for the same reason as the test above: a default
+        // fixture repo falls back to `mode = "notify"`, which would make this
+        // route's new `update` field a live, unauthenticated GitHub call on
+        // every assertion in this suite that happens to hit `/api/health`.
+        let repo = TempDir::new().expect("repo dir");
+        std::fs::write(repo.path().join("magi.toml"), "[update]\nmode = \"off\"\n")
+            .expect("write magi.toml");
+        let fx = Fixture::with_repo(repo.path().to_path_buf()).await;
+
+        let health = fx.get("/api/health").await.json();
+        assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            health["update"]["available"], false,
+            "checking is off, which reads as \"unknown\", not \"none\""
+        );
+        assert!(health["update"]["to"].is_null());
+        assert!(
+            health["upgrade"].is_null(),
+            "nothing has ever asked this deck to upgrade"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_reports_a_parked_upgrade_and_what_it_is_waiting_on() {
+        let fx = Fixture::start().await;
+        write_run(&fx.runs(), "20260905-000000-cd51", RunStatus::Implementing);
+
+        let mut progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
+        progress.parked_run = Some("20260905-000000-cd51".to_owned());
+        progress.advance(crate::updater::Stage::Parking);
+        crate::updater::write_progress(fx.home.path(), &progress).expect("write upgrade.json");
+
+        let health = fx.get("/api/health").await.json();
+        assert_eq!(health["upgrade"]["stage"], "parking");
+        assert_eq!(health["upgrade"]["from"], "0.5.1");
+        assert_eq!(health["upgrade"]["to"], "0.5.2");
+        let waiting_on = health["upgrade"]["waiting_on"]
+            .as_str()
+            .expect("waiting_on is set while parking a known run");
+        assert!(waiting_on.contains("cd51"), "{waiting_on}");
+        assert!(waiting_on.contains("implementing"), "{waiting_on}");
+    }
+
+    #[tokio::test]
+    async fn health_reports_a_finished_upgrade_with_no_waiting_on() {
+        let fx = Fixture::start().await;
+        let mut progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
+        progress.advance(crate::updater::Stage::Done);
+        crate::updater::write_progress(fx.home.path(), &progress).expect("write upgrade.json");
+
+        let health = fx.get("/api/health").await.json();
+        assert_eq!(health["upgrade"]["stage"], "done");
+        assert!(
+            health["upgrade"]["waiting_on"].is_null(),
+            "nothing to wait on once it is done"
+        );
+    }
+
+    #[tokio::test]
+    async fn hand_over_advances_the_upgrade_progress_through_parking_and_restarting() {
+        let home = TempDir::new().expect("temp home");
+        let runs = home.path().join("runs");
+        std::fs::create_dir_all(&runs).expect("runs dir");
+        let ui = Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            Chats::at(home.path().join("chats")),
+            Talks::at(home.path().join("talks")),
+            runs,
+            home.path().to_path_buf(),
+            PathBuf::from("/repo/magi"),
+        )
+        .with_launch(launch_idle);
+        let looping = ui.looping();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback");
+        let served = tokio::spawn(axum::serve(listener, ui.router()).into_future());
+
+        let progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
+        crate::updater::write_progress(home.path(), &progress).expect("seed progress");
+
+        hand_over(home.path(), &looping, served, || Ok(()))
+            .await
+            .expect("hand over");
+
+        let after = crate::updater::read_progress(home.path()).expect("progress on disk");
+        assert_eq!(
+            after.stage,
+            crate::updater::Stage::Restarting,
+            "hand_over owns the record through parking and up to restarting; \
+             the successor is what finishes it"
+        );
+    }
+
     #[test]
     fn the_upgrade_button_arms_before_it_restarts_anything() {
         // It ends the process the operator is talking to, and a phone in a
@@ -6377,8 +6605,11 @@ mod tests {
         assert!(APP_JS.contains("upgrade: \"/api/upgrade\""));
         assert!(APP_JS.contains("Replace the binary and restart?"));
         assert!(APP_JS.contains("function confirmed("));
-        // Hidden when the loop is somebody else's, matching the 409 above.
-        assert!(APP_JS.contains("show(upgradeBtn, !foreign)"));
+        // Hidden when the loop is somebody else's, matching the 409 above -
+        // and hidden with nothing to install, matching the 200 "already
+        // current" branch: an operator on the newest build must not be
+        // offered a restart that would only park a run for nothing.
+        assert!(APP_JS.contains("show(upgradeBtn, !foreign && update.available)"));
         // A park waits for the node in flight, up to an hour for an implement
         // wave. Leaving the button reading "Upgrading…" for that long is the
         // same mistake as an error rendered off screen: it looks wedged.
@@ -6389,6 +6620,89 @@ mod tests {
         // And nothing to install must give the button back rather than
         // pretending a restart is coming.
         assert!(APP_JS.contains("if (!out.to)"));
+    }
+
+    #[test]
+    fn the_running_version_is_shown_regardless_of_whether_an_update_exists() {
+        assert!(
+            APP_JS.contains("state.health.version"),
+            "the operator wants to know what is running even with nothing newer"
+        );
+        assert!(APP_JS.contains("id=\"daemon-version\"") || APP_CSS.contains(".daemon-version"));
+    }
+
+    #[test]
+    fn the_upgrade_button_names_its_destination() {
+        assert!(
+            APP_JS.contains("`Update to ${update.to}`"),
+            "pressing the button should not be a surprise about what it moves to"
+        );
+    }
+
+    #[test]
+    fn an_upgrade_in_progress_is_shown_as_stages_not_as_an_error() {
+        for stage in ["downloading", "replaced", "parking", "restarting"] {
+            assert!(
+                APP_JS.contains(&format!("\"{stage}\"")),
+                "the phone must be able to tell {stage} apart from the others"
+            );
+        }
+        assert!(APP_JS.contains(".waiting_on"));
+        // What replaced the bare "Cannot reach magi: Failed to fetch": a
+        // fetch failing while an upgrade is in flight is not an error, it is
+        // the sub-second gap `bind_waiting` covers, and it must not be
+        // reported as one.
+        assert!(APP_JS.contains("function reportUnreachableDuringUpgrade("));
+        assert!(APP_JS.contains("reconnects on its own"));
+    }
+
+    #[test]
+    fn a_failed_upgrade_does_not_lock_the_loop_controls() {
+        // `Stage::Failed` is terminal on the server and nothing clears it on
+        // its own - not a fresh start, not time passing - so a full-strip
+        // takeover for it (the way the busy stages take the strip over,
+        // correctly, because those are transient) would have hidden
+        // start/stop/park behind an upgrade notice with no way back short of
+        // a person editing `upgrade.json` by hand or a later release
+        // happening to succeed. The failure must instead ride along as a note
+        // next to whatever control the loop's own state already offers.
+        let body = &APP_JS[APP_JS.find("function renderLoop(").expect("renderLoop")
+            ..APP_JS.find("function upgrade(").expect("upgrade")];
+        assert!(
+            !body.contains(
+                "upgradeStage === \"failed\") {\n    setAttr(box, \"data-state\", \"failed\")"
+            ),
+            "a failed upgrade must not take the whole strip over the way it used to"
+        );
+        assert!(
+            body.contains("upgradeFailNote"),
+            "the failure has to reach the loop's own note instead"
+        );
+        // `quiet` and `control` are the only two places `loop-why` is set from
+        // this function's own state; both must carry the note through, or a
+        // future edit to either one would silently drop it again.
+        assert_eq!(
+            body.matches("upgradeFailNote].filter(Boolean).join")
+                .count(),
+            2,
+            "both loop-why writers (quiet and control) must fold the note in"
+        );
+    }
+
+    #[test]
+    fn an_overdue_upgrade_eventually_asks_for_a_human() {
+        // The ceiling has to clear a full hour-long park with room to spare,
+        // or an ordinary implement wave would be reported as a stuck upgrade.
+        assert!(APP_JS.contains("UPGRADE_WAIT_LIMIT_MS = 70 * 60 * 1000"));
+        assert!(APP_JS.contains("function upgradeOverdue("));
+    }
+
+    #[test]
+    fn coming_back_from_an_upgrade_says_which_version_it_landed_on() {
+        assert!(
+            APP_JS.contains("Updated to ${upgradeInfo.to"),
+            "the operator who asked for the restart wants to know it worked"
+        );
     }
 
     #[test]
