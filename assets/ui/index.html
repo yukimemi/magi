@@ -282,6 +282,43 @@
       No conversations yet. Describe an idea above and an agent will ask you
       the questions a good task file needs answered.
     </p>
+
+    <!-- `magi plan` (the terminal command) runs its interview and its
+         design-deliberation stage on whatever machine the operator typed it
+         on - this list is how the raw advisor record reaches the phone
+         afterwards. Unrelated to the conversations above, which are the
+         browser's own interview. -->
+    <div class="panel" id="plan-drafts-panel">
+      <div class="panel-bar">
+        <h2>Design deliberations</h2>
+        <button class="btn btn-quiet" type="button" id="plan-drafts-refresh">Refresh</button>
+      </div>
+      <p class="panel-note">
+        Raw advisor proposals from `magi plan`'s headless design-deliberation
+        stage, run at a terminal - what each seat argued, before it was folded
+        into a task file.
+      </p>
+      <ol class="cards" id="plan-drafts-list"></ol>
+      <p class="empty" id="plan-drafts-empty" hidden>
+        No completed design deliberations yet.
+      </p>
+    </div>
+
+    <div class="panel" id="plan-draft-detail-panel" hidden>
+      <div class="panel-bar">
+        <h2 id="plan-draft-detail-title">Design deliberation</h2>
+        <button class="btn btn-quiet" type="button" id="plan-draft-detail-close">Close</button>
+      </div>
+      <!-- What the planner actually kept - the proposals below are the
+           inputs, this is the answer to "so what happened". -->
+      <h3>Task file</h3>
+      <div class="md" id="plan-draft-detail-body"></div>
+      <p class="panel-note" id="plan-draft-detail-no-body" hidden>
+        The task file is no longer on disk.
+      </p>
+      <h3>Advisor proposals</h3>
+      <ol id="plan-draft-detail-list"></ol>
+    </div>
   </section>
 
   <!-- PLANNING: one conversation ---------------------------------------- -->

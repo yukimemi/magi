@@ -1441,6 +1441,14 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 .filed-note .ask-seat { font-size: var(--t2); }
 .chat-ready { color: var(--on-gold); font-weight: 700; }
 
+/* One `magi plan` design deliberation's raw record: one block per advisor
+   seat, its proposal's fields as a plain list underneath. */
+#plan-draft-detail-list { display: flex; flex-direction: column; gap: var(--s3); }
+#plan-draft-detail-list h3 { font-size: var(--t3); font-weight: 700; }
+.proposal { display: flex; flex-direction: column; gap: var(--s1); font-size: var(--t3); }
+.proposal li { overflow-wrap: anywhere; }
+.proposal .form-error { font-weight: 600; }
+
 /* ---- wide screens ------------------------------------------------------ *
  * Not a stretched phone: the dock becomes a header rail, the run list becomes
  * a grid, and the report pane sits beside the analysis instead of below it. */

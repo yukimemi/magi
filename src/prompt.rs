@@ -13,7 +13,8 @@
 //!   what makes an unread patch defensible.
 use std::fmt::Write as _;
 
-use crate::verdict::Finding;
+use crate::plan;
+use crate::verdict::{Finding, Proposal};
 
 /// Patches above this size are truncated in the prompt; the judge is pointed at
 /// the branch instead. Agent context windows are large but not free, and a
@@ -589,6 +590,107 @@ pub fn resume_after_drop(why: &str) -> String {
     )
 }
 
+/// Prompt for one of the sages in `magi plan`'s design-deliberation stage.
+///
+/// Read-only and patch-free by construction: `seat` and `seats` tell the
+/// advisor it is one voice among several working at the same time, so it
+/// commits to one design rather than hedging with a menu it expects someone
+/// else to narrow down.
+pub fn advisor(requirements: &str, seat: usize, seats: usize, language: &str) -> String {
+    let mut s = format!(
+        "You are advisor {seat} of {seats}, asked to sketch a design for a \
+         change before anyone implements it. You do not implement anything and \
+         you must not modify the repository - read only.\n\n\
+         The other advisors are working independently, at the same time, \
+         without seeing your answer or you seeing theirs. Do not hedge with a \
+         menu of options for someone else to narrow down - commit to one \
+         design.\n\n\
+         # The change, as the interview settled it\n\n{requirements}\n\n\
+         # Your task\n\n\
+         Read the repository as far as you need to ground the design in what \
+         is actually there - the files it touches, the conventions already in \
+         use. Then propose one approach.\n\n\
+         # Output\n\n\
+         Exactly one fenced json block, and nothing after it:\n\n\
+         ```json\n\
+         {{\"approach\":\"what to do and how, a few sentences\",\
+         \"key_tradeoff\":\"the one tradeoff this design turns on\",\
+         \"risks\":[\"what could go wrong\"],\
+         \"touches\":[\"path/or/module\"],\
+         \"why_not_naive\":\"why this earns its complexity over the obvious \
+         first draft\"}}\n\
+         ```"
+    );
+    s.push_str(&lang(language));
+    s
+}
+
+/// Prompt for the planner seat that synthesizes the sages' proposals into the
+/// task file's `## Context` and `## Change`.
+///
+/// Deliberately titled "synthesize", not "choose": the planner is told, in so
+/// many words, not to pick a winner. `proposals` names each seat so the
+/// attribution the operator reads in the filed task file is the same label
+/// used here, not a summary that lost it.
+pub fn synthesize(draft: &str, proposals: &[(&str, &Proposal)], language: &str) -> String {
+    let mut s = format!(
+        "You are finishing a task file for magi, a blind multi-agent \
+         implementation competition. An interview already settled the scope \
+         below; independent advisors then each sketched a design for it \
+         without seeing each other's answer. Your job is not to pick a winner \
+         - it is to fold the good parts of each into one `## Context` and \
+         `## Change`, naming which advisor's idea you kept where, so the \
+         operator can see where each part came from.\n\n\
+         # The draft the interview produced\n\n{draft}\n\n\
+         # Advisor proposals\n"
+    );
+    for (seat, p) in proposals {
+        let _ = write!(
+            s,
+            "\n## {seat}\n\n\
+             Approach: {}\n\n\
+             Key tradeoff: {}\n\n\
+             Risks: {}\n\n\
+             Touches: {}\n\n\
+             Why not the naive approach: {}\n",
+            p.approach,
+            p.key_tradeoff,
+            if p.risks.is_empty() {
+                "(none given)".to_owned()
+            } else {
+                p.risks.join("; ")
+            },
+            if p.touches.is_empty() {
+                "(none given)".to_owned()
+            } else {
+                p.touches.join(", ")
+            },
+            p.why_not_naive,
+        );
+    }
+    let example = proposals.first().map_or("Advisor 1", |(seat, _)| seat);
+    let _ = write!(
+        s,
+        "\n# What to write\n\n\
+         Rewrite the task file above. Keep its title, `## Constraints`, \
+         `## Completion criteria` and `## Out of scope` as given - the \
+         interview already settled those; add a heading that is missing \
+         rather than inventing its content. Rewrite `## Context` and \
+         `## Change` to synthesize the advisors' thinking: name the advisor \
+         (e.g. \"{example} argued ...\") next to the idea you kept from them. \
+         You are combining, not choosing - do not discard a proposal wholesale \
+         just because another one also had a point.\n\n\
+         # Task file specification\n\n{spec}\n\n\
+         # Output\n\n\
+         The complete revised task file, and nothing else, inside one fenced \
+         block tagged `task`:\n\n\
+         ```task\n<the whole file>\n```",
+        spec = plan::TASK_FILE_SPEC,
+    );
+    s.push_str(&lang(language));
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,5 +961,53 @@ mod tests {
         // A language magi has no code for is repeated as the operator wrote it.
         let other = implement("do it", "/tmp/wt", "Brazilian Portuguese");
         assert!(other.contains("Write the question in Brazilian Portuguese."));
+    }
+
+    fn proposal(approach: &str) -> Proposal {
+        Proposal {
+            approach: approach.to_owned(),
+            key_tradeoff: "speed vs. clarity".to_owned(),
+            risks: vec!["misses an edge case".to_owned()],
+            touches: vec!["src/config.rs".to_owned()],
+            why_not_naive: "the naive version duplicates the rotation logic".to_owned(),
+        }
+    }
+
+    #[test]
+    fn advisor_prompt_forbids_writing_and_names_the_seat() {
+        let p = advisor("add retries", 2, 3, "en");
+        assert!(p.contains("advisor 2 of 3"));
+        assert!(p.contains("must not modify the repository"));
+        assert!(p.contains("approach"));
+        assert!(p.contains("why_not_naive"));
+    }
+
+    #[test]
+    fn synthesize_prompt_carries_the_draft_and_attributes_every_proposal() {
+        let a = proposal("extract a helper");
+        let b = proposal("inline it instead");
+        let p = synthesize(
+            "# Rework the config loader\n\n## Completion criteria\n\n- [ ] it works\n",
+            &[("advisor-1", &a), ("advisor-2", &b)],
+            "en",
+        );
+        assert!(p.contains("Rework the config loader"));
+        assert!(p.contains("## advisor-1"));
+        assert!(p.contains("## advisor-2"));
+        assert!(p.contains("extract a helper"));
+        assert!(p.contains("inline it instead"));
+        assert!(p.contains("not to pick a winner"));
+        assert!(p.contains("```task"));
+        assert!(p.contains("## Completion criteria"));
+    }
+
+    #[test]
+    fn synthesize_prompt_says_none_given_for_an_advisor_with_no_risks_or_touches() {
+        let mut p = proposal("do it");
+        p.risks.clear();
+        p.touches.clear();
+        let out = synthesize("# t\n", &[("advisor-1", &p)], "en");
+        assert!(out.contains("Risks: (none given)"));
+        assert!(out.contains("Touches: (none given)"));
     }
 }

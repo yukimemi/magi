@@ -113,6 +113,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::advise;
 use crate::ask::{Answer, Question, Questions};
 use crate::chat::{Chat, Chats};
 use crate::config::Config;
@@ -650,6 +651,8 @@ impl Ui {
             .route("/api/queue", get(queue_list))
             .route("/api/queue/{id}", delete(queue_delete))
             .route("/api/repos", get(repos_list))
+            .route("/api/drafts", get(drafts_list))
+            .route("/api/drafts/{id}/advisors", get(draft_advisors))
             .route("/api/queue/{id}/hold", post(queue_hold))
             .route("/api/queue/{id}/release", post(queue_release))
             .route("/api/queue/{id}/priority", post(queue_priority))
@@ -2322,6 +2325,123 @@ async fn repos_list(
             Duration::from_secs(cfg.repos.scan_ttl),
             refresh,
         )))
+    })
+    .await
+}
+
+/// One `magi plan` draft the plan surface can point at, summarized for
+/// `GET /api/drafts`.
+#[derive(Debug, Serialize)]
+struct DraftSummary {
+    id: String,
+    title: String,
+    seats: usize,
+    proposals: usize,
+}
+
+/// `GET /api/drafts` - every draft that finished a design-deliberation stage,
+/// newest first - the plan surface's index into `draft_advisors` below.
+///
+/// `magi plan` is a terminal command; a phone that opens later has no other
+/// way to learn which draft ids exist. Listing only the ids with an
+/// `<id>.advisors.json` on disk, rather than every `<id>.md`, keeps this to
+/// what the design-deliberation stage actually produced - an interview
+/// abandoned before it wrote anything, or one filed with the stage off, has
+/// nothing here to show.
+async fn drafts_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<DraftSummary>>> {
+    blocking(move || {
+        let dir = ui.home.join("drafts");
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(Json(out));
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".advisors.json")) else {
+                continue;
+            };
+            let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(advice) = serde_json::from_str::<advise::Advice>(&raw) else {
+                continue;
+            };
+            let title = std::fs::read_to_string(dir.join(format!("{id}.md")))
+                .ok()
+                .map(|body| title_from(&body, TITLE_MAX))
+                .unwrap_or_else(|| id.to_owned());
+            out.push(DraftSummary {
+                id: id.to_owned(),
+                title,
+                seats: advice.records.len(),
+                proposals: advice.proposals().len(),
+            });
+        }
+        // The id is a `%Y%m%d-%H%M%S-xxxx` stamp (see `plan::new_id`), so a
+        // plain string sort is already newest-first in reverse.
+        out.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(Json(out))
+    })
+    .await
+}
+
+/// The wire shape of `GET /api/drafts/{id}/advisors`: the raw advisor
+/// records, `#[serde(flatten)]`ed so `records` reads exactly as it does in
+/// `<id>.advisors.json`, plus the task file the deliberation actually
+/// produced.
+///
+/// The proposals alone answer "what did the advisors argue"; they cannot
+/// answer "which of that actually shaped the task file", which is the
+/// question the attribution [`prompt::synthesize`] asks the planner to write
+/// is supposed to let the operator check. Reading that check requires the
+/// synthesized `## Context` / `## Change` themselves, not just the inputs to
+/// them - so this carries the draft's own text alongside the record it was
+/// built from.
+#[derive(Debug, Serialize)]
+struct DraftAdvisorsView {
+    #[serde(flatten)]
+    advice: advise::Advice,
+    /// The task file's current text. `None` only if `<id>.md` is missing on
+    /// disk (removed by hand) - never because synthesis has not run yet: by
+    /// the time `<id>.advisors.json` exists at all, [`crate::advise::run`]
+    /// has already overwritten the draft with its synthesis, or the whole
+    /// stage failed and this endpoint has nothing to serve in the first
+    /// place.
+    draft: Option<String>,
+    /// The same text, pre-parsed - the plan surface's other markdown views
+    /// all render a server-parsed tree rather than trusting a client-side
+    /// parser with agent-authored text.
+    draft_md: Option<Vec<md::Node>>,
+}
+
+/// `GET /api/drafts/{id}/advisors` - the raw record of `magi plan`'s headless
+/// design-deliberation stage for one draft, plus the task file it produced.
+///
+/// `magi plan` runs from a terminal, and a phone has none: this is the plan
+/// surface's read of what the CLI interview produced, straight off
+/// `<magi home>/drafts/<id>.advisors.json` - the file [`crate::advise::run`]
+/// writes unconditionally, before any check of its own that could still bail
+/// - and `<id>.md` alongside it.
+async fn draft_advisors(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<DraftAdvisorsView>> {
+    blocking(move || {
+        let dir = ui.home.join("drafts");
+        let path = dir.join(format!("{id}.advisors.json"));
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|_| ApiError::not_found(format!("no advisor record for draft `{id}`")))?;
+        let advice: advise::Advice = serde_json::from_str(&raw)
+            .map_err(|e| ApiError::internal(format!("parse {}: {e:#}", path.display())))?;
+        let draft = std::fs::read_to_string(dir.join(format!("{id}.md"))).ok();
+        let draft_md = draft
+            .as_deref()
+            .map(|body| md::to_nodes(body, &md::ImageBase::None));
+        Ok(Json(DraftAdvisorsView {
+            advice,
+            draft,
+            draft_md,
+        }))
     })
     .await
 }
@@ -4678,6 +4798,111 @@ mod tests {
             Some(2),
             "an explicit refresh must rescan even inside the TTL"
         );
+    }
+
+    #[tokio::test]
+    async fn draft_advisors_serves_the_raw_record_a_cli_plan_run_wrote() {
+        let f = Fixture::start().await;
+        let drafts = f.home.path().join("drafts");
+        std::fs::create_dir_all(&drafts).expect("drafts dir");
+        let record = r#"{"records":[{"seat":"advisor-1","agent":"sage-a","duration_ms":1200}]}"#;
+        std::fs::write(drafts.join("20260906-000000-ab12.advisors.json"), record)
+            .expect("write advisor record");
+
+        let res = f.get("/api/drafts/20260906-000000-ab12/advisors").await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        assert_eq!(res.json()["records"][0]["seat"], "advisor-1");
+        assert!(
+            res.json()["draft"].is_null(),
+            "no .md on disk must read as no draft, not as an error: {}",
+            res.body
+        );
+    }
+
+    /// Reported: the plan surface could read what each advisor argued but
+    /// never what the planner actually kept - the half of the deliberation
+    /// that answers "so what happened".
+    #[tokio::test]
+    async fn draft_advisors_includes_the_synthesized_task_file_the_deliberation_produced() {
+        let f = Fixture::start().await;
+        let drafts = f.home.path().join("drafts");
+        std::fs::create_dir_all(&drafts).expect("drafts dir");
+        std::fs::write(
+            drafts.join("20260906-000000-mn34.advisors.json"),
+            r#"{"records":[{"seat":"advisor-1","agent":"sage-a","duration_ms":1}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            drafts.join("20260906-000000-mn34.md"),
+            "# Rework the config loader\n\n## Context\n\nadvisor-1 argued for X.\n\n## Completion criteria\n\n- [ ] it works\n",
+        )
+        .unwrap();
+
+        let res = f.get("/api/drafts/20260906-000000-mn34/advisors").await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let body = res.json();
+        assert!(
+            body["draft"]
+                .as_str()
+                .is_some_and(|d| d.contains("advisor-1 argued for X")),
+            "{body}"
+        );
+        assert!(
+            body["draft_md"].is_array(),
+            "the draft must also arrive pre-parsed, like every other markdown surface: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_advisors_404s_for_a_draft_with_no_deliberation_on_disk() {
+        let f = Fixture::start().await;
+        let res = f.get("/api/drafts/nosuchdraft/advisors").await;
+        assert_eq!(res.status, 404, "{}", res.body);
+    }
+
+    #[tokio::test]
+    async fn drafts_list_surfaces_only_drafts_that_finished_deliberation_newest_first() {
+        let f = Fixture::start().await;
+        let drafts = f.home.path().join("drafts");
+        std::fs::create_dir_all(&drafts).expect("drafts dir");
+        // Older draft, with a title and two proposals.
+        std::fs::write(
+            drafts.join("20260901-000000-aaaa.md"),
+            "# Rework the config loader\n",
+        )
+        .unwrap();
+        std::fs::write(
+            drafts.join("20260901-000000-aaaa.advisors.json"),
+            r#"{"records":[
+                {"seat":"advisor-1","agent":"a","duration_ms":1,
+                 "proposal":{"approach":"x","key_tradeoff":"y","why_not_naive":"z"}},
+                {"seat":"advisor-2","agent":"b","duration_ms":1,"error":"boom"}
+            ]}"#,
+        )
+        .unwrap();
+        // Newer draft, no title on disk (already filed and its .md removed).
+        std::fs::write(
+            drafts.join("20260902-000000-bbbb.advisors.json"),
+            r#"{"records":[]}"#,
+        )
+        .unwrap();
+        // A plain interview draft with no deliberation must not appear.
+        std::fs::write(drafts.join("20260903-000000-cccc.md"), "# no advisors\n").unwrap();
+
+        let res = f.get("/api/drafts").await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let list = res.json();
+        let rows = list.as_array().expect("an array");
+        assert_eq!(rows.len(), 2, "{list}");
+        assert_eq!(rows[0]["id"], "20260902-000000-bbbb", "newest first");
+        assert_eq!(
+            rows[0]["title"], "20260902-000000-bbbb",
+            "falls back to the id"
+        );
+        assert_eq!(rows[1]["id"], "20260901-000000-aaaa");
+        assert_eq!(rows[1]["title"], "Rework the config loader");
+        assert_eq!(rows[1]["seats"], 2);
+        assert_eq!(rows[1]["proposals"], 1);
     }
 
     #[tokio::test]

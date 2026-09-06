@@ -157,6 +157,16 @@ pub struct Roles {
     /// to exactly this - `opus` triple-booked as planner, chatter, and judge
     /// - is what this field exists to let an operator break apart.
     pub chatter: Option<String>,
+    /// Seats for `magi plan`'s design-deliberation stage (see
+    /// [`crate::advise`]): independent, read-only design proposals gathered
+    /// between the interview and the task file it files.
+    ///
+    /// Empty falls back to `judges` rather than to the whole roster: a panel
+    /// trusted to rank patches independently is exactly the panel worth
+    /// asking to sketch a design independently, and an operator who has
+    /// already thought about judge diversity gets advisor diversity for free
+    /// instead of a fourth roster to maintain.
+    pub advisors: Vec<String>,
 }
 
 /// Graph shape and limits.
@@ -257,6 +267,22 @@ pub struct Graph {
     /// What a round does when one or more reviewer seats never answered
     /// (timeout, crash, unparsable output).
     pub incomplete_review: IncompleteReviewPolicy,
+    /// Run `magi plan`'s design-deliberation stage: independent advisors
+    /// sketch a design each, headless, and the planner seat synthesizes them
+    /// into the task file's `## Context` and `## Change`. See
+    /// [`crate::advise`].
+    ///
+    /// On by default, and that is the point of this whole stage: candidate
+    /// diversity moved here from `implement` (see [`Graph::candidates`]'s
+    /// doc) precisely because a design sketch is a few paragraphs, not a
+    /// tool loop - so the competition magi is for is cheap enough to run on
+    /// every task again, not just the ones an operator remembers to ask for.
+    pub advise: bool,
+    /// How many independent design proposals the deliberation stage gathers.
+    /// **Three by default** - the number [`Graph::candidates`]'s doc names as
+    /// the point where a fourth judge's first choice stopped changing the
+    /// tally.
+    pub advisors: usize,
 }
 
 impl Default for Graph {
@@ -281,6 +307,8 @@ impl Default for Graph {
             land_approval: true,
             answer_timeout: 86_400,
             incomplete_review: IncompleteReviewPolicy::Block,
+            advise: true,
+            advisors: 3,
         }
     }
 }
@@ -1082,6 +1110,26 @@ impl Config {
             .with_context(|| format!("no agent with id `{id}` in the roster"))
     }
 
+    /// Rotate `count` seats out of `ids`, or out of the whole roster at
+    /// `offset` when `ids` is empty.
+    ///
+    /// Shared by [`Config::resolve_roles`] and [`Config::advisors`] so the
+    /// same rotation rule - explicit ids cycle, an empty list rotates the
+    /// roster - governs every seat count magi fills in, rather than each
+    /// caller reimplementing it and drifting apart.
+    fn rotate(&self, ids: &[String], count: usize, offset: usize) -> Result<Vec<AgentSpec>> {
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let spec = if ids.is_empty() {
+                self.agents[(i + offset) % self.agents.len()].clone()
+            } else {
+                self.agent(&ids[i % ids.len()])?.clone()
+            };
+            out.push(spec);
+        }
+        Ok(out)
+    }
+
     /// Fill the roles out to the configured widths.
     ///
     /// An empty role list rotates through the whole roster, so a three-agent
@@ -1096,22 +1144,10 @@ impl Config {
                  magi.toml."
             );
         }
-        let pick = |ids: &[String], count: usize, offset: usize| -> Result<Vec<AgentSpec>> {
-            let mut out = Vec::with_capacity(count);
-            for i in 0..count {
-                let spec = if ids.is_empty() {
-                    self.agents[(i + offset) % self.agents.len()].clone()
-                } else {
-                    self.agent(&ids[i % ids.len()])?.clone()
-                };
-                out.push(spec);
-            }
-            Ok(out)
-        };
         Ok(ResolvedRoles {
-            implementers: pick(&self.roles.implementers, self.graph.candidates, 0)?,
-            judges: pick(&self.roles.judges, self.graph.judges, 1)?,
-            reviewers: pick(&self.roles.reviewers, self.graph.reviewers, 0)?,
+            implementers: self.rotate(&self.roles.implementers, self.graph.candidates, 0)?,
+            judges: self.rotate(&self.roles.judges, self.graph.judges, 1)?,
+            reviewers: self.rotate(&self.roles.reviewers, self.graph.reviewers, 0)?,
             fixer: self
                 .roles
                 .fixer
@@ -1119,6 +1155,33 @@ impl Config {
                 .map(|f| self.agent(f).cloned())
                 .transpose()?,
         })
+    }
+
+    /// Advisor seats for `magi plan`'s design-deliberation stage (see
+    /// [`crate::advise`]): `[roles] advisors` when set, otherwise the judge
+    /// roster - see [`Roles::advisors`] for why that fallback and not the
+    /// whole roster.
+    ///
+    /// The fallback rotates with `offset = 1`, matching the judges line in
+    /// [`Config::resolve_roles`] exactly, `ids` and offset both - not just
+    /// `roles.judges`, which is empty whenever judges themselves are
+    /// unconfigured and rotating the whole roster. Falling back with
+    /// `offset = 0` there would silently hand the advisors a *different*
+    /// agent set than the judges an unconfigured run would actually get,
+    /// which is the one thing [`Roles::advisors`]'s doc promises will not
+    /// happen.
+    pub fn advisors(&self) -> Result<Vec<AgentSpec>> {
+        if self.agents.is_empty() {
+            bail!(
+                "agent roster is empty: no agent CLI found on PATH and no \
+                 [[agents]] in the config. Run `magi init` to write a starter \
+                 magi.toml."
+            );
+        }
+        if !self.roles.advisors.is_empty() {
+            return self.rotate(&self.roles.advisors, self.graph.advisors, 0);
+        }
+        self.rotate(&self.roles.judges, self.graph.advisors, 1)
     }
 
     /// Shell prefix for [`Verify`] commands.
@@ -1320,6 +1383,78 @@ mod tests {
     #[test]
     fn empty_roster_is_an_error() {
         assert!(Config::default().resolve_roles().is_err());
+    }
+
+    #[test]
+    fn advisors_default_to_three_and_are_on() {
+        let g = Graph::default();
+        assert_eq!(g.advisors, 3);
+        assert!(g.advise);
+    }
+
+    #[test]
+    fn unset_advisors_falls_back_to_the_judge_roster() {
+        let cfg = Config {
+            agents: vec![spec("a"), spec("b"), spec("c")],
+            roles: Roles {
+                judges: vec!["b".to_owned()],
+                ..Roles::default()
+            },
+            graph: Graph {
+                advisors: 2,
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        let advisors = cfg.advisors().expect("advisors resolve");
+        assert!(
+            advisors.iter().all(|a| a.id == "b"),
+            "an unset [roles] advisors must fall back to [roles] judges: {advisors:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_advisor_roster_wins_over_the_judge_fallback() {
+        let cfg = Config {
+            agents: vec![spec("a"), spec("b")],
+            roles: Roles {
+                judges: vec!["b".to_owned()],
+                advisors: vec!["a".to_owned()],
+                ..Roles::default()
+            },
+            graph: Graph {
+                advisors: 2,
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        let advisors = cfg.advisors().expect("advisors resolve");
+        assert!(advisors.iter().all(|a| a.id == "a"));
+    }
+
+    /// Reported: with neither `[roles] advisors` nor `[roles] judges` set, the
+    /// fallback rotated the roster from offset 0 while `resolve_roles` gives
+    /// judges offset 1 - two different agent sets, contradicting the doc's
+    /// promise that an unset `advisors` is "the judge roster".
+    #[test]
+    fn an_unconfigured_advisor_and_judge_roster_resolve_to_the_same_agents() {
+        let cfg = Config {
+            agents: vec![spec("a"), spec("b"), spec("c"), spec("d")],
+            graph: Graph {
+                judges: 3,
+                advisors: 3,
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        let judges = cfg.resolve_roles().expect("roles resolve").judges;
+        let advisors = cfg.advisors().expect("advisors resolve");
+        let judge_ids: Vec<&str> = judges.iter().map(|a| a.id.as_str()).collect();
+        let advisor_ids: Vec<&str> = advisors.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            advisor_ids, judge_ids,
+            "an unconfigured advisor roster must be the same seats an unconfigured judge panel gets"
+        );
     }
 
     #[test]
