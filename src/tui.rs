@@ -907,6 +907,7 @@ mod tests {
             present: 3,
             quorum: 2,
             met_quorum: true,
+            uncontested: None,
         });
         let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
         terminal.draw(|f| draw(f, &mut a)).unwrap();

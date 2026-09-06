@@ -335,7 +335,7 @@ impl Runner {
             deliberated: false,
             changed_votes: 0,
             unanimous_final: false,
-            tie_break: Some("review-only run: nothing competed".to_owned()),
+            tie_break: None,
             // No panel sat, so no quorum applies. Zero judges is the correct
             // number for work that never competed, and must not be reported as
             // a collapsed panel.
@@ -343,6 +343,7 @@ impl Runner {
             present: 0,
             quorum: 0,
             met_quorum: true,
+            uncontested: Some("review-only run: nothing competed".to_owned()),
         });
         state.status = RunStatus::Reviewing;
         state.event(
@@ -1445,37 +1446,50 @@ impl Runner {
         }
         // Strict majority of the configured panel. A bare majority is real
         // signal we can act on, while a minority verdict must never stand in
-        // for a healthy one. A one-candidate run needs no panel at all.
-        let judges_total = self.roles.judges.len();
+        // for a healthy one. A one-candidate run needs no panel at all, and
+        // `judges` stays `0` rather than the roster size a panel that never
+        // sat would otherwise be credited with.
         let needs_quorum = viable.len() > 1;
+        let judges_total = if needs_quorum {
+            self.roles.judges.len()
+        } else {
+            0
+        };
         let quorum = if needs_quorum {
             judges_total / 2 + 1
         } else {
             0
         };
         let met_quorum = !needs_quorum || present >= quorum;
+        let uncontested = (!needs_quorum).then(|| {
+            format!("only one candidate ({winner}) produced a usable change; no panel was asked")
+        });
 
         self.state.event(
             "tally",
-            format!(
-                "winner {winner} — votes {} | initial {} | {} changed | {present}/{judges_total} judges{}",
-                first_choice
-                    .iter()
-                    .map(|(k, v)| format!("{k}:{v}"))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                if unanimous_initial {
-                    "unanimous"
-                } else {
-                    "split"
-                },
-                changed_votes,
-                if met_quorum {
-                    String::new()
-                } else {
-                    format!(" — below quorum ({quorum} required)")
-                },
-            ),
+            match &uncontested {
+                Some(reason) => format!("winner {winner} — {reason}"),
+                None => format!(
+                    "winner {winner} — votes {} | initial {} | {} changed | \
+                     {present}/{judges_total} judges{}",
+                    first_choice
+                        .iter()
+                        .map(|(k, v)| format!("{k}:{v}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    if unanimous_initial {
+                        "unanimous"
+                    } else {
+                        "split"
+                    },
+                    changed_votes,
+                    if met_quorum {
+                        String::new()
+                    } else {
+                        format!(" — below quorum ({quorum} required)")
+                    },
+                ),
+            },
         );
         if !met_quorum {
             self.state.event(
@@ -1500,6 +1514,7 @@ impl Runner {
             present,
             quorum,
             met_quorum,
+            uncontested,
         });
         self.state.status = if met_quorum {
             RunStatus::Reviewing
@@ -2917,6 +2932,7 @@ mod tests {
             present: 0,
             quorum: 0,
             met_quorum: true,
+            uncontested: Some("only candidate A produced a change".to_owned()),
         });
         state.reviews = vec![ReviewRound {
             round: 1,

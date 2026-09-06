@@ -12,6 +12,7 @@
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::config::MergeMode;
 use crate::run::{RunState, RunStatus};
 use crate::stats::Stats;
 
@@ -215,28 +216,74 @@ pub fn run(state: &RunState) -> String {
         }
 
         let _ = writeln!(s, "\n{}", bold("tally"));
-        if t.judges > 0 {
-            let _ = writeln!(
-                s,
-                "  judges        {} present{}",
-                if t.met_quorum {
-                    green(&format!("{}/{}", t.present, t.judges))
-                } else {
-                    red(&format!("{}/{}", t.present, t.judges))
-                },
-                if t.quorum > 0 {
-                    format!(" ({quorum} required)", quorum = t.quorum)
-                } else {
-                    String::new()
+        // A tally with no panel (`uncontested`) must not fall through the
+        // judges/first-choice/after-votes lines below: they are written
+        // unconditionally and every one of them reads, in the words a panel
+        // that collapsed would also produce, as a run that lost its judges
+        // rather than one that never needed them.
+        match &t.uncontested {
+            Some(reason) => {
+                let _ = writeln!(
+                    s,
+                    "  judging       {}",
+                    cyan(&format!("not needed — {reason}"))
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    s,
+                    "  judges        {} present{}",
+                    if t.met_quorum {
+                        green(&format!("{}/{}", t.present, t.judges))
+                    } else {
+                        red(&format!("{}/{}", t.present, t.judges))
+                    },
+                    if t.quorum > 0 {
+                        format!(" ({quorum} required)", quorum = t.quorum)
+                    } else {
+                        String::new()
+                    }
+                );
+                if !t.met_quorum {
+                    let _ = writeln!(
+                        s,
+                        "  {}",
+                        bold(&red("BELOW QUORUM — verdict is not trustworthy"))
+                    );
                 }
-            );
-        }
-        if !t.met_quorum {
-            let _ = writeln!(
-                s,
-                "  {}",
-                bold(&red("BELOW QUORUM — verdict is not trustworthy"))
-            );
+                let _ = writeln!(
+                    s,
+                    "  first choice  {}",
+                    t.first_choice
+                        .iter()
+                        .map(|(k, v)| format!("{k}:{v}"))
+                        .collect::<Vec<_>>()
+                        .join("  ")
+                );
+                let _ = writeln!(
+                    s,
+                    "  initial       {}",
+                    match (t.rankings, t.unanimous_initial) {
+                        (0, _) => red("no usable ranking"),
+                        (1, _) => yellow("one usable ranking - not a consensus"),
+                        (_, true) => green("unanimous"),
+                        (_, false) => yellow("split"),
+                    }
+                );
+                let _ = writeln!(
+                    s,
+                    "  after votes   {}  ({} judge(s) moved)",
+                    if t.unanimous_final {
+                        green("unanimous")
+                    } else {
+                        yellow("still split")
+                    },
+                    t.changed_votes
+                );
+                if let Some(tb) = &t.tie_break {
+                    let _ = writeln!(s, "  tie break     {tb}");
+                }
+            }
         }
         if !state.quota.is_empty() {
             let _ = writeln!(
@@ -249,38 +296,6 @@ pub fn run(state: &RunState) -> String {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-        }
-        let _ = writeln!(
-            s,
-            "  first choice  {}",
-            t.first_choice
-                .iter()
-                .map(|(k, v)| format!("{k}:{v}"))
-                .collect::<Vec<_>>()
-                .join("  ")
-        );
-        let _ = writeln!(
-            s,
-            "  initial       {}",
-            match (t.rankings, t.unanimous_initial) {
-                (0, _) => red("no usable ranking"),
-                (1, _) => yellow("one usable ranking - not a consensus"),
-                (_, true) => green("unanimous"),
-                (_, false) => yellow("split"),
-            }
-        );
-        let _ = writeln!(
-            s,
-            "  after votes   {}  ({} judge(s) moved)",
-            if t.unanimous_final {
-                green("unanimous")
-            } else {
-                yellow("still split")
-            },
-            t.changed_votes
-        );
-        if let Some(tb) = &t.tie_break {
-            let _ = writeln!(s, "  tie break     {tb}");
         }
         let _ = writeln!(s, "  winner        {}", bold(&green(&t.winner.to_string())));
     }
@@ -355,17 +370,43 @@ pub fn run(state: &RunState) -> String {
 
     if let Some(m) = &state.merge {
         let _ = writeln!(s, "\n{}", bold("merge"));
-        let _ = writeln!(
-            s,
-            "  mode {:?}  {}\n  {}",
-            m.mode,
-            if m.ok {
-                green("ok")
-            } else {
-                yellow("not merged")
-            },
-            m.detail.lines().next().unwrap_or("")
-        );
+        if m.mode == MergeMode::None {
+            // `ok: true` here means "magi did nothing, as configured", not
+            // "landed" — a green `ok` next to a shell command reads as done,
+            // and the branch is still sitting unmerged.
+            let _ = writeln!(
+                s,
+                "  mode None  {}",
+                cyan("not landed — nothing to do by design")
+            );
+            if let Some(w) = state.winner() {
+                let _ = writeln!(
+                    s,
+                    "  branch {} still exists, unmerged into {}",
+                    w.branch, state.base_branch
+                );
+            }
+            let _ = writeln!(
+                s,
+                "  rebase onto {} before merging by hand, and pass an explicit \
+                 commit message — a squash merge otherwise inherits the \
+                 candidate's placeholder subject",
+                state.base_branch
+            );
+            let _ = writeln!(s, "  {}", m.detail.lines().next().unwrap_or(""));
+        } else {
+            let _ = writeln!(
+                s,
+                "  mode {:?}  {}\n  {}",
+                m.mode,
+                if m.ok {
+                    green("ok")
+                } else {
+                    yellow("not merged")
+                },
+                m.detail.lines().next().unwrap_or("")
+            );
+        }
     }
 
     if !state.leaks.is_empty() {
@@ -482,7 +523,7 @@ pub fn stats(stats: &Stats) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::run::{Candidate, RunState, Tally};
+    use crate::run::{Candidate, MergeOutcome, RunState, Tally};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard};
@@ -538,6 +579,7 @@ mod tests {
             present: 3,
             quorum: 2,
             met_quorum: true,
+            uncontested: None,
         });
         s
     }
@@ -572,6 +614,127 @@ mod tests {
         assert_eq!(l.lines().count(), 1);
         assert!(l.contains("add retries"));
         assert!(l.contains("win A (opus)"));
+    }
+
+    #[test]
+    fn an_uncontested_run_does_not_read_as_a_collapsed_panel() {
+        let _guard = plain();
+        let mut s = state();
+        s.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 0)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 0,
+            unanimous_initial: false,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: false,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some(
+                "only candidate A produced a usable change; no panel was asked".to_owned(),
+            ),
+        });
+        let text = run(&s);
+        assert!(
+            !text.contains("0/3"),
+            "no panel sat, so the judges line must not read as one that collapsed: {text}"
+        );
+        assert!(!text.contains("no usable ranking"), "{text}");
+        assert!(!text.contains("still split"), "{text}");
+        assert!(!text.contains("BELOW QUORUM"), "{text}");
+        assert!(
+            text.contains("not needed"),
+            "the report must say judging was skipped, not silent: {text}"
+        );
+        assert!(text.contains("winner        A"));
+    }
+
+    #[test]
+    fn a_below_quorum_run_still_reads_as_a_collapsed_panel() {
+        let _guard = plain();
+        let mut s = state();
+        s.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 1), ('B', 0)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: false,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: false,
+            tie_break: None,
+            judges: 3,
+            present: 1,
+            quorum: 2,
+            met_quorum: false,
+            uncontested: None,
+        });
+        let text = run(&s);
+        assert!(text.contains("1/3"), "{text}");
+        assert!(
+            text.contains("BELOW QUORUM"),
+            "a real collapse must still be flagged: {text}"
+        );
+        assert!(
+            !text.contains("not needed"),
+            "a collapsed panel must not be described as one that was never asked: {text}"
+        );
+    }
+
+    #[test]
+    fn a_mode_none_merge_does_not_read_as_landed() {
+        let _guard = plain();
+        let mut s = state();
+        s.merge = Some(MergeOutcome {
+            mode: crate::config::MergeMode::None,
+            ok: true,
+            detail: "git -C /repo merge --no-ff magi/x/A".to_owned(),
+        });
+        let text = run(&s);
+        assert!(
+            !text.contains("  ok"),
+            "mode none must not be shown as a landed merge: {text}"
+        );
+        assert!(text.contains("not landed"), "{text}");
+        assert!(
+            text.contains("branch magi/x/A"),
+            "the report must say what's left behind: {text}"
+        );
+        assert!(
+            text.contains("rebase"),
+            "the report must point at the hand-landing steps: {text}"
+        );
+    }
+
+    #[test]
+    fn the_list_line_does_not_flag_an_uncontested_run_as_short_judges() {
+        let _guard = plain();
+        let mut s = state();
+        s.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 0)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 0,
+            unanimous_initial: false,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: false,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("only candidate A produced a usable change".to_owned()),
+        });
+        let l = line(&s);
+        assert!(
+            !l.contains("judges") && !l.contains("quorum"),
+            "an uncontested run must not carry the same badge a short panel gets: {l}"
+        );
     }
 
     #[test]
