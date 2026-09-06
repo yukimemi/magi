@@ -500,6 +500,33 @@ pub struct Event {
     pub message: String,
 }
 
+/// How far the winner's tree trailed the landing base, last time it was
+/// checked, and what came of trying to close that gap.
+///
+/// Set by `graph::Runner::sync_to_base`, which runs before the review loop and
+/// again before the gate: verifying against a tree that does not yet contain
+/// the base's tip answers "green on the commit this run branched from", not
+/// "green on what is about to land", and a merge on that answer can revert
+/// whatever landed elsewhere while the run was thinking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaseSync {
+    /// `<remote>/<base>` tip the tree was last checked against.
+    pub tip: String,
+    /// Commits `tip` was ahead of the tree at that check, before any rebase
+    /// this round tried to close the gap. Zero means the tree already
+    /// contained `tip`.
+    pub behind: usize,
+    /// Rebase attempts spent so far this run, bounded by
+    /// `graph::BASE_SYNC_ROUNDS`.
+    pub attempts: usize,
+    /// What git said, if the most recent rebase attempt conflicted or could
+    /// not be pushed. `Some` here is what makes a `Blocked` run read as
+    /// "stopped on the base, not on review or the gate" - the rebase is not
+    /// retried again while this is set; a person has to look.
+    #[serde(default)]
+    pub conflict: Option<String>,
+}
+
 /// What the land loop saw last time it looked at the pull request.
 ///
 /// Strings for `state` and `checks` on purpose: they are `gh`'s vocabulary, and
@@ -617,6 +644,11 @@ pub struct RunState {
     /// would break the first time an event message was reworded.
     #[serde(default)]
     pub pr: Option<PrRecord>,
+    /// The last look at how far the winner's tree trailed the landing base,
+    /// and the rebase(s) tried to close that gap. `None` until the tree has a
+    /// winner to check.
+    #[serde(default)]
+    pub base_sync: Option<BaseSync>,
     /// Node log.
     #[serde(default)]
     pub events: Vec<Event>,
@@ -661,6 +693,7 @@ impl RunState {
             seats: BTreeMap::new(),
             active: BTreeMap::new(),
             pr: None,
+            base_sync: None,
             events: Vec::new(),
         }
     }

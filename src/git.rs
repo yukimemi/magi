@@ -380,6 +380,24 @@ pub async fn rebase_branch_in_temp(
     Ok(Some(why))
 }
 
+/// Bring an *attached* worktree's index and files in line with wherever its
+/// branch now points.
+///
+/// [`rebase_branch_in_temp`] moves a branch from a throwaway worktree on
+/// purpose - the whole point is never touching the tree someone else has
+/// checked out. But a worktree that already had that branch checked out
+/// shares the same ref: its `HEAD` resolves to the new commit the moment the
+/// rebase lands elsewhere, while its index and working directory keep
+/// whatever the old commit put there until something says otherwise. Left
+/// alone, the next `git status` there reads as the whole rebase turning up
+/// as an unstaged diff, and the next commit would be staged against stale
+/// content.
+pub async fn sync_to_head(worktree: &Path) -> Result<()> {
+    git(worktree, &["reset", "--hard", "HEAD"]).await?;
+    git(worktree, &["clean", "-fdx"]).await?;
+    Ok(())
+}
+
 /// Fetch one branch from `remote`, updating its remote-tracking ref.
 ///
 /// The refspec is spelled out rather than left to `git fetch <remote>
@@ -494,6 +512,64 @@ mod tests {
             "a failed rebase leaves the branch exactly where it was"
         );
         assert!(!scratch_tree.exists(), "and cleans up after itself");
+    }
+
+    #[tokio::test]
+    async fn a_sibling_worktree_stays_stale_after_a_rebase_until_synced() {
+        let (guard, repo) = scratch().await;
+
+        // An attached worktree of an existing branch - the shape a winner's
+        // worktree keeps in `graph::Runner`, not the detached checkouts used
+        // for judges and reviewers.
+        git(&repo, &["branch", "side"]).await.unwrap();
+        let side_wt = guard.path().join("side-wt");
+        git(
+            &repo,
+            &["worktree", "add", &side_wt.to_string_lossy(), "side"],
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(side_wt.join("b.txt"), "candidate\n")
+            .await
+            .unwrap();
+        git(&side_wt, &["add", "-A"]).await.unwrap();
+        git(&side_wt, &["commit", "-m", "side work"]).await.unwrap();
+
+        // main moves under it.
+        git(&repo, &["checkout", "main"]).await.unwrap();
+        tokio::fs::write(repo.join("c.txt"), "main\n")
+            .await
+            .unwrap();
+        git(&repo, &["add", "-A"]).await.unwrap();
+        git(&repo, &["commit", "-m", "main moved"]).await.unwrap();
+
+        // Rebase from a throwaway worktree, never from `side_wt` itself.
+        let scratch_tree = guard.path().join("rebase-scratch");
+        let clean = rebase_branch_in_temp(&repo, &scratch_tree, "side", "main")
+            .await
+            .unwrap();
+        assert!(clean.is_none());
+
+        // `HEAD` in the sibling worktree already resolves to the rebased
+        // commit - the ref is shared - but nothing has told its index or its
+        // files, which still hold the pre-rebase checkout.
+        assert_eq!(
+            rev_parse(&side_wt, "HEAD").await.unwrap(),
+            rev_parse(&repo, "side").await.unwrap(),
+            "HEAD follows the moved ref"
+        );
+        assert!(
+            !side_wt.join("c.txt").exists(),
+            "stale until synced: main's new file has not reached this worktree's disk"
+        );
+
+        sync_to_head(&side_wt).await.unwrap();
+        assert!(side_wt.join("c.txt").is_file(), "synced now");
+        assert!(
+            side_wt.join("b.txt").is_file(),
+            "the worktree's own committed work survives the sync"
+        );
+        assert!(is_clean(&side_wt).await.unwrap());
     }
 
     #[tokio::test]

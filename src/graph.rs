@@ -34,7 +34,7 @@ use crate::land;
 use crate::proc::Quiet as _;
 use crate::prompt::{self, CandidateView, Turn};
 use crate::run::{
-    Candidate, CommandOutcome, DeliberationRound, DeliberationTurn, FixRecord, Judgement,
+    BaseSync, Candidate, CommandOutcome, DeliberationRound, DeliberationTurn, FixRecord, Judgement,
     MergeOutcome, QuotaLoss, ReviewRecord, ReviewRound, RunState, RunStatus, Tally, VoteRecord,
     tail, write_artifact,
 };
@@ -42,6 +42,20 @@ use crate::verdict::{self, FinalVote, FixReport, Position, Ranking, Review, Seve
 
 /// How much verification output is kept and fed back to the fixer.
 const OUTPUT_TAIL: usize = 8_000;
+
+/// How many times [`Runner::sync_to_base`] will re-land the winner's tree on
+/// a base that moved before giving up and leaving the run `Blocked` for a
+/// person.
+///
+/// Mirrors `land::Step::Rebase`'s budget and the reasoning behind it: a base
+/// that keeps moving faster than a run can catch it is not something more
+/// rebasing fixes, it is a person's call. Not the same *number as*
+/// `land_rounds` - this budget is spent before a pull request exists, land's
+/// after - but bounded for the identical reason, so it uses the same
+/// default. Counted across both call sites in [`Runner::finish_after_tally`]
+/// (once before review, once before the gate), because either one finding
+/// the base still moving is the same signal.
+const BASE_SYNC_ROUNDS: usize = 4;
 
 /// One queued agent invocation.
 ///
@@ -479,7 +493,13 @@ impl Runner {
     /// gate, merge, and persist.
     async fn finish_after_tally(&mut self) -> Result<()> {
         self.fold_losers().await?;
+        // Before review starts, and again right before the gate: a run's
+        // review rounds can themselves take long enough for the base to move
+        // a second time, and the gate is the one node whose "green" gets
+        // acted on.
+        self.sync_to_base().await?;
         self.review_loop().await?;
+        self.sync_to_base().await?;
         self.gate().await?;
         self.merge().await?;
         self.state.save()?;
@@ -1823,9 +1843,183 @@ impl Runner {
         Ok(())
     }
 
+    // ------------------------------------------------------------ base sync
+
+    /// Land the winner's tree on the current tip of `<remote>/<base>` before
+    /// anything verifies it.
+    ///
+    /// `verify.e2e`, `verify.gate` and every reviewer in [`Self::review_loop`]
+    /// read whatever is checked out in the winner's worktree. Left alone that
+    /// tree stays rooted at `base_commit` - the base as [`resolve_base`] saw
+    /// it when the run *branched* - and a run takes long enough that the base
+    /// has usually moved by the time it gets here. A gate that ran there
+    /// answers "green on the commit this run started from", not "green on
+    /// what is about to land", and the difference showed up three times in
+    /// one day as a green run whose merge would have reverted a file another
+    /// pull request had already landed.
+    ///
+    /// Reuses [`git::rebase_branch_in_temp`] rather than a second
+    /// implementation of the same idea: `land::Step::Rebase` already worked
+    /// out the rules - throwaway worktree, conflict stops and reports rather
+    /// than feeding a fixer, nothing runs in the primary tree - and a second
+    /// rebase path is exactly the kind of drift `resolve_base`'s own doc
+    /// warns about ("two answers to a question nobody notices until a diff is
+    /// wrong").
+    ///
+    /// Bounded by [`BASE_SYNC_ROUNDS`], counted in `state.base_sync.attempts`
+    /// so it survives a park/resume. A conflict or a push failure sets
+    /// `state.base_sync.conflict` and leaves the branch and worktree exactly
+    /// as they were - untouched, for a person to look at - which is also what
+    /// makes re-entering this function afterwards a no-op instead of a second
+    /// attempt at the same wall.
+    async fn sync_to_base(&mut self) -> Result<()> {
+        if self
+            .state
+            .base_sync
+            .as_ref()
+            .is_some_and(|s| s.conflict.is_some())
+        {
+            return Ok(());
+        }
+        let Some(winner) = self.state.winner().cloned() else {
+            return Ok(());
+        };
+
+        let repo = self.state.repo.clone();
+        let remote = self.state.config.merge.remote.clone();
+        let base_branch = self.state.base_branch.clone();
+        let tracking = format!("{remote}/{base_branch}");
+
+        git::fetch(&repo, &remote, &base_branch).await.ok();
+        // No network, or the remote never had this branch: `resolve_base`
+        // already treats that as non-fatal at branch time, and a run that got
+        // this far must not be blocked by it here either.
+        let Ok(tip) = git::rev_parse(&repo, &tracking).await else {
+            return Ok(());
+        };
+
+        let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+        let behind = git::commits_ahead(&repo, &head, &tip).await.unwrap_or(0);
+        let attempts = self.state.base_sync.as_ref().map_or(0, |s| s.attempts);
+
+        if behind == 0 {
+            self.state.base_sync = Some(BaseSync {
+                tip,
+                behind: 0,
+                attempts,
+                conflict: None,
+            });
+            self.state.save()?;
+            return Ok(());
+        }
+
+        if attempts >= BASE_SYNC_ROUNDS {
+            let why = format!(
+                "{base_branch} moved {behind} commit(s) ahead of {} after {BASE_SYNC_ROUNDS} \
+                 rebase(s); rebasing again would only race it",
+                winner.branch
+            );
+            self.state.status = RunStatus::Blocked;
+            self.state.base_sync = Some(BaseSync {
+                tip,
+                behind,
+                attempts,
+                conflict: Some(why.clone()),
+            });
+            self.state.event("land", why);
+            self.state.save()?;
+            return Ok(());
+        }
+
+        self.state.event(
+            "land",
+            format!(
+                "{base_branch} moved {behind} commit(s) ahead of {}; rebasing before verifying",
+                winner.branch
+            ),
+        );
+        self.state.save()?;
+
+        let scratch = self.state.dir().join("base-sync");
+        let rebased = git::rebase_branch_in_temp(&repo, &scratch, &winner.branch, &tracking).await;
+        let attempts = attempts + 1;
+        match rebased {
+            Ok(None) => {
+                // The branch ref moved, but a worktree that already had it
+                // checked out (the winner's) was not told; sync its index and
+                // files before anything reads them.
+                git::sync_to_head(&winner.worktree).await?;
+                self.state.base_sync = Some(BaseSync {
+                    tip: tip.clone(),
+                    behind: 0,
+                    attempts,
+                    conflict: None,
+                });
+                self.state
+                    .event("land", format!("rebased {} onto {tracking}", winner.branch));
+            }
+            Ok(Some(conflict)) => {
+                let why = format!(
+                    "{} conflicts with {tracking} and did not rebase: {}",
+                    winner.branch,
+                    conflict.chars().take(600).collect::<String>()
+                );
+                self.state.status = RunStatus::Blocked;
+                self.state.base_sync = Some(BaseSync {
+                    tip,
+                    behind,
+                    attempts,
+                    conflict: Some(why.clone()),
+                });
+                self.state.event("land", why);
+            }
+            Err(e) => {
+                let why = format!("could not rebase {} onto {tracking}: {e:#}", winner.branch);
+                self.state.status = RunStatus::Blocked;
+                self.state.base_sync = Some(BaseSync {
+                    tip,
+                    behind,
+                    attempts,
+                    conflict: Some(why.clone()),
+                });
+                self.state.event("land", why);
+            }
+        }
+        self.state.save()?;
+        Ok(())
+    }
+
+    /// The commit review and gate diff against: the tip [`Self::sync_to_base`]
+    /// last landed the winner on, once it has run, else the commit the run
+    /// branched from.
+    ///
+    /// Only [`Self::review_loop`] reads this. `prep`, `judge`, `deliberate`
+    /// and `vote` all happen before there is a winner to rebase, so they
+    /// compare every candidate against the branch point on purpose, and a
+    /// base that moves after they are already done cannot change an answer
+    /// they already gave.
+    fn landing_base(&self) -> String {
+        self.state
+            .base_sync
+            .as_ref()
+            .map_or_else(|| self.state.base_commit.clone(), |s| s.tip.clone())
+    }
+
     // --------------------------------------------------------------- review
 
     async fn review_loop(&mut self) -> Result<()> {
+        // A base that would not rebase is a person's decision, not a review
+        // round: nothing here would change the answer, and reviewers and a
+        // fixer would be spending real budget on a tree that cannot land
+        // regardless of what they find.
+        if self
+            .state
+            .base_sync
+            .as_ref()
+            .is_some_and(|s| s.conflict.is_some())
+        {
+            return Ok(());
+        }
         // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
         // agent files with `magi task add` name the run that paid for it. The
         // prompt overlay is cloned alongside it because the waves borrow it
@@ -1861,9 +2055,9 @@ impl Runner {
         let language = self.state.config.graph.language.clone();
         let sessions = self.state.config.graph.sessions;
         let artifacts = agent::artifacts_dir(&self.state.dir());
-        let base_short = short(&self.state.base_commit);
+        let base = self.landing_base();
+        let base_short = short(&base);
         let reviewers = self.roles.reviewers.clone();
-        let base = self.state.base_commit.clone();
         let shell = self.state.config.shell();
 
         let mut prev_e2e: Option<String> = None;
@@ -2226,7 +2420,15 @@ impl Runner {
         // reentry (see `judge`), and trusting it here is exactly how a run
         // that exhausted its review budget got gated and merged a second
         // time around. The last round's `clean` flag is the actual verdict.
+        // A base the winner could not be replayed onto is a decision, not a
+        // round: there is no landing tree to gate. Read as its own record for
+        // the same reason the review verdict is.
         if self.state.status == RunStatus::Failed
+            || self
+                .state
+                .base_sync
+                .as_ref()
+                .is_some_and(|s| s.conflict.is_some())
             || self.state.reviews.last().is_some_and(|r| !r.clean)
         {
             return Ok(());
@@ -2277,7 +2479,12 @@ impl Runner {
         // rather than `status`, which a solo-candidate `judge`/`deliberate`
         // skip can rewrite on reentry to something that no longer says
         // `Blocked`.
-        if self.state.reviews.last().is_some_and(|r| !r.clean)
+        if self
+            .state
+            .base_sync
+            .as_ref()
+            .is_some_and(|s| s.conflict.is_some())
+            || self.state.reviews.last().is_some_and(|r| !r.clean)
             || self.state.gate.iter().any(|o| !o.ok())
         {
             return Ok(());

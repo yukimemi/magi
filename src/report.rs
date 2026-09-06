@@ -381,6 +381,28 @@ pub fn run(state: &RunState) -> String {
         }
     }
 
+    if let Some(bs) = &state.base_sync {
+        let _ = writeln!(s, "\n{}", bold("base sync"));
+        let status = if let Some(c) = &bs.conflict {
+            red(&format!("conflict: {}", first_line(c)))
+        } else if bs.behind == 0 {
+            green("in sync")
+        } else {
+            yellow(&format!("{} commit(s) behind, not yet rebased", bs.behind))
+        };
+        let _ = writeln!(
+            s,
+            "  {} @ {}  {status}{}",
+            state.base_branch,
+            short(&bs.tip),
+            if bs.attempts > 0 {
+                format!("  ({} rebase attempt(s))", bs.attempts)
+            } else {
+                String::new()
+            }
+        );
+    }
+
     if !state.gate.is_empty() {
         let _ = writeln!(s, "\n{}", bold("gate"));
         for o in &state.gate {
