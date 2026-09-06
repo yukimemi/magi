@@ -33,6 +33,13 @@ use crate::verdict::{Finding, Rejection};
 /// "not yet judged" on every later reentry, which is what let `judge` re-run
 /// on a finished run and clobber its status back to `Judging`. The flag is
 /// the missing record of the fact that judging was skipped on purpose.
+///
+/// Also 3: a single-viable-candidate tally records `Tally::judges` as `0` and
+/// fills `Tally::uncontested`, instead of leaving the full roster size sitting
+/// next to a panel that never sat. A schema-2 record keeps reading as "0 of 3
+/// judges present" forever, because a tally is computed once and never
+/// recomputed on resume; the bump keeps that stale reading from being mixed
+/// with the new meaning.
 pub const SCHEMA: u32 = 3;
 
 /// Where a run got to.
@@ -281,7 +288,9 @@ pub struct Tally {
     /// How the tie was broken, when it had to be.
     #[serde(default)]
     pub tie_break: Option<String>,
-    /// Configured judge count — the size of the full panel.
+    /// Configured judge count — the size of the full panel. `0` when no
+    /// panel was asked (see `uncontested`), not the roster size a panel that
+    /// never sat would have had.
     #[serde(default)]
     pub judges: usize,
     /// Judges who actually contributed to the decision (not taken out by a
@@ -297,6 +306,12 @@ pub struct Tally {
     /// `present >= quorum`, or no quorum was required.
     #[serde(default)]
     pub met_quorum: bool,
+    /// Why no panel was asked, when none was: a single viable candidate, or
+    /// a review-only run that never competed. `None` when judges actually
+    /// ranked and voted — including when too few of them survived to reach
+    /// quorum, which is a collapse and must keep reading as one.
+    #[serde(default)]
+    pub uncontested: Option<String>,
 }
 
 /// One reviewer's report in a round.

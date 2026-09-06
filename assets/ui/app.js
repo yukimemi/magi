@@ -3608,16 +3608,26 @@ function renderVerdict(run) {
     ["Winner", tally.winner
       ? `Candidate ${tally.winner}${decided ? "" : " \u2014 provisional only"}`
       : "\u2014"],
-    ["First choices", votes || "\u2014"],
-    ["Panel", `${Number(tally.present) || 0} of ${Number(tally.judges) || 0} present, quorum ${Number(tally.quorum) || 0}`],
-    /* Quorum is the field that says whether the verdict is worth anything. */
-    ["Quorum", tally.met_quorum ? "Met" : "NOT MET \u2014 the verdict is not trustworthy"],
-    ["Agreement", tally.unanimous_final
-      ? "Unanimous final vote"
-      : `Split; ${plural(Number(tally.changed_votes) || 0, "judge", "judges")} moved`],
-    ["Deliberated", tally.deliberated ? "Yes" : "No"],
   ];
-  if (tally.tie_break) rows.push(["Tie break", tally.tie_break]);
+  /* `uncontested` means no panel was asked \u2014 a single viable candidate, or
+     a review-only run. The panel/quorum/agreement rows below all describe a
+     panel that sat, so showing them here (0 of 0 present, "still split" with
+     nothing to split) would read as the same collapse a real stall produces. */
+  if (tally.uncontested) {
+    rows.push(["Judging", `Not needed \u2014 ${tally.uncontested}`]);
+  } else {
+    rows.push(
+      ["First choices", votes || "\u2014"],
+      ["Panel", `${Number(tally.present) || 0} of ${Number(tally.judges) || 0} present, quorum ${Number(tally.quorum) || 0}`],
+      /* Quorum is the field that says whether the verdict is worth anything. */
+      ["Quorum", tally.met_quorum ? "Met" : "NOT MET \u2014 the verdict is not trustworthy"],
+      ["Agreement", tally.unanimous_final
+        ? "Unanimous final vote"
+        : `Split; ${plural(Number(tally.changed_votes) || 0, "judge", "judges")} moved`],
+      ["Deliberated", tally.deliberated ? "Yes" : "No"],
+    );
+    if (tally.tie_break) rows.push(["Tie break", tally.tie_break]);
+  }
 
   for (const [term, value] of rows) {
     facts.append(el("dt", { text: term }), el("dd", { text: value }));

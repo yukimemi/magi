@@ -199,17 +199,25 @@ pub fn collect(states: &[RunState]) -> Stats {
         }
 
         if let Some(t) = &state.tally {
-            totals.tallied += 1;
-            if !t.unanimous_initial {
-                totals.split += 1;
-            }
-            if t.deliberated {
-                totals.deliberated += 1;
-                if t.changed_votes > 0 {
-                    totals.minds_changed += 1;
+            // A tally with no panel (`uncontested`) never split, never
+            // deliberated and never converged — it never happened, and
+            // folding it into the denominator would understate the real
+            // split rate with runs that carry no panel-agreement signal at
+            // all. The winner still earns its agent a win either way: an
+            // uncontested candidate is still the one that shipped.
+            if t.uncontested.is_none() {
+                totals.tallied += 1;
+                if !t.unanimous_initial {
+                    totals.split += 1;
                 }
-                if t.unanimous_final {
-                    totals.converged += 1;
+                if t.deliberated {
+                    totals.deliberated += 1;
+                    if t.changed_votes > 0 {
+                        totals.minds_changed += 1;
+                    }
+                    if t.unanimous_final {
+                        totals.converged += 1;
+                    }
                 }
             }
             if let Some(w) = state.candidates.iter().find(|c| c.label == t.winner) {
@@ -375,6 +383,7 @@ mod tests {
             present: 3,
             quorum: 2,
             met_quorum: true,
+            uncontested: None,
         });
         s.reviews = reviews;
         s.status = status;
