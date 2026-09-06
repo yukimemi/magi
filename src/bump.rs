@@ -83,6 +83,18 @@ impl BumpLevel {
             Self::Patch => "patch",
         }
     }
+
+    /// Severity for comparing two independent decisions: `patch < minor <
+    /// major`, spelled out explicitly rather than derived from declaration
+    /// order, which exists here only for readability and must not silently
+    /// become load-bearing.
+    fn severity(self) -> u8 {
+        match self {
+            Self::Patch => 0,
+            Self::Minor => 1,
+            Self::Major => 2,
+        }
+    }
 }
 
 /// The agent's answer: which digit, and why.
@@ -318,21 +330,30 @@ pub fn decision_prompt(
 /// burst of merges in quick succession does not each open a competing
 /// release.
 ///
-/// **Chosen policy: serialize, not coalesce.** A bump branch touches only
-/// `Cargo.toml` / `Cargo.lock`, so `gh pr merge --squash` applies it onto
-/// whatever the base branch has become by the time it lands - every commit
-/// merged while it was open rides along for free, at no extra cost, once it
-/// merges. Reconciling two independent `major`/`minor`/`patch` judgements
-/// into one decision would need a bigger call than either agent actually
-/// made, and would still race the first pull request's own merge. Letting
-/// the one open pull request absorb whatever lands after it needs no
-/// reconciliation at all: the next merge simply finds a bump already pending
-/// and does nothing, and the one after *that* runs a fresh decision once the
-/// base branch shows the pending bump has landed (or been superseded).
+/// **Chosen policy: serialize, not coalesce two independent decisions into
+/// one.** A bump branch touches only `Cargo.toml` / `Cargo.lock`, so `gh pr
+/// merge --squash` applies it onto whatever the base branch has become by
+/// the time it lands - every commit merged while it was open rides along
+/// for free, at no extra cost, once it merges. But the *digit* a still-open
+/// pull request targets was judged from only the first change, and a more
+/// severe change landing while it waits must not ship at the smaller digit
+/// just because it arrived second - so the serialization is at the pull
+/// request, not at the judgement: a later, more severe decision escalates
+/// the same open pull request (see [`pending_action`]) rather than opening a
+/// second one or being silently absorbed at the wrong digit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingBump {
     /// The version the open pull request bumps to.
     pub target_version: String,
+    /// The digit that version was judged to need, so a later, more severe
+    /// merge can tell it needs to escalate rather than assume it is covered.
+    pub level: BumpLevel,
+    /// The branch the open pull request is built from, so an escalation
+    /// knows what to check out and push to.
+    pub branch: String,
+    /// The pull request's URL, so a later merge can confirm it is still
+    /// open before trusting it to block a fresh decision.
+    pub pr_url: String,
 }
 
 /// Where [`PendingBump`] is recorded for `repo` - one file per repository, so
@@ -402,6 +423,147 @@ pub fn coalesce(pending: Option<&PendingBump>, current_version: &str) -> Result<
     })
 }
 
+/// What a still-open pending bump means once a fresh decision is in hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingAction {
+    /// The new decision is no more severe than what is already queued; the
+    /// open pull request covers it once it lands.
+    AlreadyCovered,
+    /// The new decision outranks the pending target - escalate the open
+    /// pull request instead of opening a second one or dropping it.
+    Escalate,
+}
+
+/// Compare a fresh decision against what a still-open pull request already
+/// targets.
+///
+/// A patch bump left pending while a breaking change lands does not become a
+/// breaking release just because the pull request that carries both is
+/// squashed into one commit: the *version number* still comes from whichever
+/// digit was judged, and a pending `patch` never widens itself to `minor` on
+/// its own. This is the check that decides an escalation is owed.
+pub fn pending_action(pending_level: BumpLevel, decision_level: BumpLevel) -> PendingAction {
+    if decision_level.severity() > pending_level.severity() {
+        PendingAction::Escalate
+    } else {
+        PendingAction::AlreadyCovered
+    }
+}
+
+/// Parse `gh pr view --json state` output. No I/O.
+fn parse_pr_state(json: &str) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct State {
+        state: String,
+    }
+    let parsed: State =
+        serde_json::from_str(json).context("parse `gh pr view --json state` output")?;
+    Ok(parsed.state.eq_ignore_ascii_case("OPEN"))
+}
+
+/// Is the pull request at `pr_url` still open?
+///
+/// Read fresh rather than trusted from the marker: a bump pull request can be
+/// closed without merging - CI that never goes green, an operator who
+/// decided against it - and nothing else in this module ever revisits a
+/// marker once it is written. Without this check, that close is invisible
+/// here forever: the marker still names a pending target, the base branch
+/// never reaches it because nothing ever merged the pull request, and every
+/// later merge skips in perpetuity. A `gh` failure (network, auth) answers
+/// `true` - the same "unreadable is not absent" rule `land::CHECKS_GRACE`
+/// uses - because guessing "closed" wrongly opens a second, competing pull
+/// request, while guessing "open" wrongly only costs one more merge's wait.
+async fn pr_is_open(repo: &Path, pr_url: &str) -> Result<bool> {
+    let out = tokio::process::Command::new("gh")
+        .args(["pr", "view", pr_url, "--json", "state"])
+        .current_dir(repo)
+        .quiet()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("spawn gh pr view")?;
+    if !out.status.success() {
+        bail!(
+            "gh pr view {pr_url}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    parse_pr_state(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// How long a stale lock file is trusted to mean its owner is still working,
+/// before it is reclaimed.
+///
+/// Long enough to cover the slowest real step this module takes - the agent
+/// decision call ([`DECISION_TIMEOUT`]) plus `cargo build` and a `gh pr
+/// create` - so a lock is only ever stolen from a process that has actually
+/// gone (crashed, killed), never one still inside its own critical section.
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// A host-local mutual exclusion for one repository's marker file.
+///
+/// Built on exclusive file creation rather than a locking crate: neither
+/// `flock` nor `fs2` is a dependency of this crate, and the constraints on
+/// this change forbid adding one. This is not a distributed lock and does
+/// not coordinate two machines racing the same repository - it exists to
+/// close the specific race two `after_merge` calls on the *same* host can
+/// hit landing within the same window (a human `magi run` alongside the
+/// daemon, or two review loops): both would otherwise read "nothing
+/// pending", judge independently, and open two competing pull requests, with
+/// whichever `write_marker` runs last silently erasing the other's record.
+struct MarkerLock {
+    path: PathBuf,
+}
+
+impl MarkerLock {
+    /// Try to take the lock for `marker`, stealing a stale one first if it is
+    /// old enough to mean its owner is gone rather than merely slow.
+    /// `Ok(None)` means someone else genuinely holds it right now.
+    fn acquire(marker: &Path) -> Result<Option<Self>> {
+        let path = marker.with_extension("lock");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        if Self::try_create(&path)? {
+            return Ok(Some(Self { path }));
+        }
+        if Self::is_stale(&path) {
+            let _ = std::fs::remove_file(&path);
+            if Self::try_create(&path)? {
+                return Ok(Some(Self { path }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn try_create(path: &Path) -> Result<bool> {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
+        }
+    }
+
+    fn is_stale(path: &Path) -> bool {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age >= LOCK_STALE_AFTER)
+    }
+}
+
+impl Drop for MarkerLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// After a merge lands, ask an agent how big the change was and open a
 /// release bump sized to it.
 ///
@@ -432,25 +594,52 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
         return Ok(());
     }
 
+    let marker = marker_path(&run::home(), &repo);
+    // Held for the rest of this function: the whole read-decide-write
+    // sequence below is the critical section two `after_merge` calls landing
+    // within the same window must not both be inside at once. See
+    // `MarkerLock`'s own doc for why a second, unrelated bump PR is what
+    // that race produces without it.
+    let Some(_lock) = MarkerLock::acquire(&marker)? else {
+        state.event(
+            "bump",
+            "another release bump decision is already in progress on this host; skipping this round",
+        );
+        return Ok(());
+    };
+
     git::fetch(&repo, &remote, &base).await.ok();
     let cargo_toml = git::git(&repo, &["show", &format!("{remote}/{base}:Cargo.toml")])
         .await
         .context("read Cargo.toml from the base branch")?;
     let base_version = current_version(&cargo_toml)?;
 
-    let marker = marker_path(&run::home(), &repo);
-    let pending = read_marker(&marker);
-    match coalesce(pending.as_ref(), &base_version)? {
-        Coalesce::Skip { target_version } => {
-            state.event(
-                "bump",
-                format!("a release bump to v{target_version} is already open; not opening another"),
-            );
-            return Ok(());
-        }
-        Coalesce::Proceed => {
-            if pending.is_some() {
+    let mut pending = read_marker(&marker);
+    if let Some(p) = &pending {
+        match coalesce(Some(p), &base_version)? {
+            Coalesce::Proceed => {
+                // Landed, or superseded by a manual bump: free for a fresh
+                // decision.
                 clear_marker(&marker);
+                pending = None;
+            }
+            Coalesce::Skip { target_version } => {
+                if !pr_is_open(&repo, &p.pr_url).await.unwrap_or(true) {
+                    state.event(
+                        "bump",
+                        format!(
+                            "the pending release bump to v{target_version} ({}) is no longer \
+                             open; treating it as abandoned",
+                            p.pr_url
+                        ),
+                    );
+                    clear_marker(&marker);
+                    pending = None;
+                }
+                // Otherwise still genuinely open: fall through and ask the
+                // same question this merge would get on a fresh path, so a
+                // more severe change landing while it waits can escalate it
+                // instead of being silently absorbed at the wrong digit.
             }
         }
     }
@@ -498,10 +687,31 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
         );
     }
     let decision = parse_decision(&out.text).context("parse the release-bump decision")?;
+
+    if let Some(p) = pending {
+        return match pending_action(p.level, decision.level) {
+            PendingAction::AlreadyCovered => {
+                state.event(
+                    "bump",
+                    format!(
+                        "a release bump to v{} ({}) already covers at least a {} change; not \
+                         opening another",
+                        p.target_version,
+                        p.pr_url,
+                        decision.level.as_str()
+                    ),
+                );
+                Ok(())
+            }
+            PendingAction::Escalate => {
+                escalate_pending(state, &repo, &remote, &p, &decision, &base_version, &marker).await
+            }
+        };
+    }
+
     let next = Version::parse(&base_version)?
         .bump(decision.level)
         .to_string();
-
     let branch = format!("chore/release-v{next}");
     let worktree = state.dir().join("bump");
     git::worktree_remove(&repo, &worktree).await.ok();
@@ -513,12 +723,20 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
     // release worktree left behind after a failed attempt would collide with
     // the next one this same run tries.
     git::worktree_remove(&repo, &worktree).await.ok();
-    let pr_url_opened = opened?;
+    let (pr_url_opened, automerge_warning) = opened?;
 
+    // Written before the automerge warning is even known: the pull request
+    // exists on the forge either way, and a marker that only appears on the
+    // fully-happy path is exactly what let a failed `gh pr merge --auto`
+    // both hide the URL this function already has and leave the next merge
+    // free to open a second, competing pull request.
     write_marker(
         &marker,
         &PendingBump {
             target_version: next.clone(),
+            level: decision.level,
+            branch,
+            pr_url: pr_url_opened.clone(),
         },
     )?;
     state.event(
@@ -529,11 +747,120 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
             decision.reason
         ),
     );
+    if let Some(warning) = automerge_warning {
+        state.event(
+            "bump",
+            format!("could not enable automerge on {pr_url_opened}: {warning}; merge it by hand"),
+        );
+    }
+    Ok(())
+}
+
+/// Bump an already-open release pull request further, because a change more
+/// severe than what it already covers landed while it waited on CI or
+/// automerge - see [`pending_action`].
+///
+/// Adds a second commit rather than rewriting the first: `gh pr merge
+/// --squash` prefers a single commit's own message over the pull request's
+/// title, and falls back to the title once there is more than one commit -
+/// so the title is what is kept honest here, via `gh pr edit`.
+async fn escalate_pending(
+    state: &mut RunState,
+    repo: &Path,
+    remote: &str,
+    pending: &PendingBump,
+    decision: &BumpDecision,
+    base_version: &str,
+    marker: &Path,
+) -> Result<()> {
+    let next = Version::parse(base_version)?
+        .bump(decision.level)
+        .to_string();
+    let worktree = state.dir().join("bump");
+    git::worktree_remove(repo, &worktree).await.ok();
+    let checked_out = git::git_raw(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--force",
+            &worktree.to_string_lossy(),
+            &pending.branch,
+        ],
+    )
+    .await?;
+    if !checked_out.ok() {
+        bail!(
+            "checking out the pending release branch {} failed: {}",
+            pending.branch,
+            checked_out.stderr
+        );
+    }
+
+    let result: Result<()> = async {
+        let cargo_toml_path = worktree.join("Cargo.toml");
+        let toml = tokio::fs::read_to_string(&cargo_toml_path)
+            .await
+            .with_context(|| format!("read {}", cargo_toml_path.display()))?;
+        let rewritten = rewrite_cargo_version(&toml, &next)?;
+        tokio::fs::write(&cargo_toml_path, rewritten)
+            .await
+            .with_context(|| format!("write {}", cargo_toml_path.display()))?;
+        sync_lockfile(&worktree, state.config.cache_dir().as_deref()).await?;
+        let committed = git::commit_all(
+            &worktree,
+            &format!(
+                "chore: release v{next} (supersedes v{})",
+                pending.target_version
+            ),
+        )
+        .await
+        .context("commit the escalated version bump")?;
+        if !committed {
+            bail!("escalating the version bump left nothing to commit");
+        }
+        let pushed = git::push(&worktree, remote, &pending.branch).await?;
+        if !pushed.ok() {
+            bail!("pushing {} failed: {}", pending.branch, pushed.stderr);
+        }
+        gh_pr_edit_title(
+            &worktree,
+            &pending.pr_url,
+            &format!("chore: release v{next}"),
+        )
+        .await
+    }
+    .await;
+    git::worktree_remove(repo, &worktree).await.ok();
+    result?;
+
+    write_marker(
+        marker,
+        &PendingBump {
+            target_version: next.clone(),
+            level: decision.level,
+            branch: pending.branch.clone(),
+            pr_url: pending.pr_url.clone(),
+        },
+    )?;
+    state.event(
+        "bump",
+        format!(
+            "escalated the pending release bump from v{} to v{next} to a {} change ({}): {}",
+            pending.target_version,
+            decision.level.as_str(),
+            decision.reason,
+            pending.pr_url
+        ),
+    );
     Ok(())
 }
 
 /// Edit the version, let the lockfile follow, commit, push, and open the pull
-/// request with automerge enabled. Returns the opened pull request's URL.
+/// request with automerge enabled. Returns the opened pull request's URL and,
+/// when enabling automerge itself failed, a note of why - the pull request
+/// still exists on the forge either way, and the caller must not lose track
+/// of its URL over that failure alone.
 async fn open_bump_pr(
     state: &RunState,
     worktree: &Path,
@@ -541,7 +868,7 @@ async fn open_bump_pr(
     next_version: &str,
     decision: &BumpDecision,
     source_pr_url: &str,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     let cargo_toml_path = worktree.join("Cargo.toml");
     let toml = tokio::fs::read_to_string(&cargo_toml_path)
         .await
@@ -577,8 +904,11 @@ async fn open_bump_pr(
         state.id,
     );
     let url = gh_pr_create(worktree, &state.base_branch, branch, &title, &body).await?;
-    gh_enable_automerge(worktree, &url).await?;
-    Ok(url)
+    let automerge_warning = match gh_enable_automerge(worktree, &url).await {
+        Ok(()) => None,
+        Err(e) => Some(e.to_string()),
+    };
+    Ok((url, automerge_warning))
 }
 
 /// Run `cargo build` so `Cargo.lock` follows the version bump, the same step
@@ -684,6 +1014,28 @@ async fn gh_enable_automerge(cwd: &Path, pr_url: &str) -> Result<()> {
     } else {
         bail!(
             "gh pr merge --auto: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+    }
+}
+
+/// Rewrite a pull request's title, used when [`escalate_pending`] adds a
+/// second commit: `gh pr merge --squash` only prefers a single commit's own
+/// message over the title, so once there are two the title is what lands.
+async fn gh_pr_edit_title(cwd: &Path, pr_url: &str, title: &str) -> Result<()> {
+    let out = tokio::process::Command::new("gh")
+        .args(["pr", "edit", pr_url, "--title", title])
+        .current_dir(cwd)
+        .quiet()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("spawn gh pr edit")?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "gh pr edit --title: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )
     }
@@ -885,11 +1237,20 @@ foo = { version = \"1.2.3\" }\n";
         assert_eq!(coalesce(None, "0.8.0").unwrap(), Coalesce::Proceed);
     }
 
+    /// A minimal, otherwise-plausible pending marker for tests that only
+    /// care about one field.
+    fn test_pending(target_version: &str, level: BumpLevel) -> PendingBump {
+        PendingBump {
+            target_version: target_version.to_owned(),
+            level,
+            branch: format!("chore/release-v{target_version}"),
+            pr_url: "https://example.invalid/pull/9".to_owned(),
+        }
+    }
+
     #[test]
     fn coalesce_skips_while_the_pending_target_is_still_ahead() {
-        let pending = PendingBump {
-            target_version: "0.9.0".to_owned(),
-        };
+        let pending = test_pending("0.9.0", BumpLevel::Minor);
         assert_eq!(
             coalesce(Some(&pending), "0.8.0").unwrap(),
             Coalesce::Skip {
@@ -900,9 +1261,7 @@ foo = { version = \"1.2.3\" }\n";
 
     #[test]
     fn coalesce_treats_a_landed_or_superseded_pending_bump_as_stale() {
-        let pending = PendingBump {
-            target_version: "0.9.0".to_owned(),
-        };
+        let pending = test_pending("0.9.0", BumpLevel::Minor);
         // The pending bump landed exactly: proceed with a fresh decision.
         assert_eq!(
             coalesce(Some(&pending), "0.9.0").unwrap(),
@@ -916,16 +1275,90 @@ foo = { version = \"1.2.3\" }\n";
     }
 
     #[test]
+    fn pending_action_escalates_only_for_a_more_severe_decision() {
+        assert_eq!(
+            pending_action(BumpLevel::Patch, BumpLevel::Patch),
+            PendingAction::AlreadyCovered
+        );
+        assert_eq!(
+            pending_action(BumpLevel::Patch, BumpLevel::Minor),
+            PendingAction::Escalate
+        );
+        assert_eq!(
+            pending_action(BumpLevel::Patch, BumpLevel::Major),
+            PendingAction::Escalate
+        );
+        assert_eq!(
+            pending_action(BumpLevel::Minor, BumpLevel::Patch),
+            PendingAction::AlreadyCovered
+        );
+        assert_eq!(
+            pending_action(BumpLevel::Major, BumpLevel::Minor),
+            PendingAction::AlreadyCovered
+        );
+        assert_eq!(
+            pending_action(BumpLevel::Major, BumpLevel::Major),
+            PendingAction::AlreadyCovered
+        );
+    }
+
+    #[test]
+    fn pr_state_parsing_reads_open_and_not_open() {
+        assert!(parse_pr_state(r#"{"state":"OPEN"}"#).unwrap());
+        assert!(!parse_pr_state(r#"{"state":"CLOSED"}"#).unwrap());
+        assert!(!parse_pr_state(r#"{"state":"MERGED"}"#).unwrap());
+    }
+
+    #[test]
+    fn a_lock_is_exclusive_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("bump").join("deadbeefdeadbeef.json");
+        let first = MarkerLock::acquire(&marker)
+            .unwrap()
+            .expect("first attempt takes the lock");
+        assert!(
+            MarkerLock::acquire(&marker).unwrap().is_none(),
+            "a second attempt must be refused while the first holds it"
+        );
+        drop(first);
+        assert!(
+            MarkerLock::acquire(&marker).unwrap().is_some(),
+            "dropping the guard releases the lock for the next attempt"
+        );
+    }
+
+    #[test]
+    fn a_stale_lock_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("bump").join("deadbeefdeadbeef.json");
+        let lock_path = marker.with_extension("lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, b"").unwrap();
+        let old = std::time::SystemTime::now() - LOCK_STALE_AFTER - Duration::from_secs(1);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(
+            MarkerLock::acquire(&marker).unwrap().is_some(),
+            "a lock older than the stale window must be reclaimed rather than block forever"
+        );
+    }
+
+    #[test]
     fn marker_round_trips_through_disk() {
         let dir = tempfile::tempdir().unwrap();
         let path = marker_path(dir.path(), Path::new("/repos/magi"));
         assert!(read_marker(&path).is_none());
 
-        let marker = PendingBump {
-            target_version: "0.9.0".to_owned(),
-        };
+        let marker = test_pending("0.9.0", BumpLevel::Patch);
         write_marker(&path, &marker).unwrap();
-        assert_eq!(read_marker(&path).unwrap().target_version, "0.9.0");
+        let read_back = read_marker(&path).unwrap();
+        assert_eq!(read_back.target_version, "0.9.0");
+        assert_eq!(read_back.level, BumpLevel::Patch);
+        assert_eq!(read_back.pr_url, marker.pr_url);
 
         clear_marker(&path);
         assert!(read_marker(&path).is_none());
