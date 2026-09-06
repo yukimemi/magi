@@ -29,6 +29,9 @@ const API = {
   deleteTask: (id) => `/api/queue/${encodeURIComponent(id)}`,
   hold: (id) => `/api/queue/${encodeURIComponent(id)}/hold`,
   release: (id) => `/api/queue/${encodeURIComponent(id)}/release`,
+  priority: (id) => `/api/queue/${encodeURIComponent(id)}/priority`,
+  editTask: (id) => `/api/queue/${encodeURIComponent(id)}/edit`,
+  doneTask: (id) => `/api/queue/${encodeURIComponent(id)}/done`,
   questions: "/api/questions",
   answer: (id) => `/api/questions/${encodeURIComponent(id)}/answer`,
   /* Agent-authored HTML, served by its own endpoint so it lands in a
@@ -1172,15 +1175,28 @@ function createTaskCard() {
     el("summary", { text: "Full instruction" }),
     el("div", { class: "instruction md" }));
   const runLink = el("a", { class: "btn btn-quiet" });
-  const hold = el("button", { class: "btn btn-quiet", type: "button" });
+  /* Priority is a step, not a typed value: the operator wants "ahead of
+     that other one", not to compose a number. +1/-1 both reach the same
+     places a competing task's priority already sits. */
+  const priorityDown = el("button", { class: "btn btn-quiet btn-step", type: "button", text: "−" });
+  const priorityUp = el("button", { class: "btn btn-quiet btn-step", type: "button", text: "+" });
+  const priorityBox = el("span", { class: "task-priority-box" }, priorityDown, priorityUp);
+  const editBtn = el("button", { class: "btn btn-quiet", type: "button", text: "Edit" });
+  const holdBox = el("span", { class: "task-hold-box" });
+  const doneBox = el("span", { class: "task-done-box" });
   const deleteBox = el("span", { class: "task-delete-box" });
-  const actions = el("div", { class: "card-actions" }, runLink, hold, deleteBox);
+  const actions = el("div", { class: "card-actions" },
+    runLink, priorityBox, editBtn, holdBox, doneBox, deleteBox);
 
   const card = el("li", { class: "card" },
     el("div", { class: "card-top" }, chipSlot, priority, solo, whenSlot),
     title, meta, note, error, instruction, actions,
   );
-  card.refs = { card, chipSlot, priority, solo, whenSlot, title, source, repo, attempts, outcome, note, error, instruction, runLink, hold, deleteBox };
+  card.refs = {
+    card, chipSlot, priority, solo, whenSlot, title, source, repo, attempts,
+    outcome, note, error, instruction, runLink, priorityDown, priorityUp,
+    editBtn, holdBox, doneBox, deleteBox,
+  };
   return card;
 }
 
@@ -1218,8 +1234,14 @@ function updateTaskCard(row, task) {
   show(r.attempts, attempts > 0);
   separate(r.attempts.parentNode);
 
-  setText(r.note, meta.note || "");
-  show(r.note, Boolean(meta.note));
+  /* A held task's note gains whatever the operator said it is waiting on,
+     since the queue cannot express a dependency between two tasks and this
+     is the one place that reason survives. */
+  const noteText = task.hold_reason && meta.note
+    ? `${meta.note} Waiting on: ${task.hold_reason}`
+    : meta.note || (task.hold_reason ? `Waiting on: ${task.hold_reason}` : "");
+  setText(r.note, noteText);
+  show(r.note, Boolean(noteText));
 
   setText(r.error, task.last_error || "");
   show(r.error, Boolean(task.last_error));
@@ -1255,12 +1277,30 @@ function updateTaskCard(row, task) {
   show(r.outcome, Boolean(outcome));
   separate(r.outcome.parentNode);
 
-  const held = status === "held";
-  setText(r.hold, held ? "Release" : "Hold");
-  setAttr(r.hold, "aria-label", `${held ? "Release" : "Hold"} task ${task.title || task.id}`);
-  r.hold.disabled = status === "running" || status === "done";
-  r.hold.onclick = () => mutateTask(task.id, held ? "release" : "hold", r.hold);
-  show(r.hold, status !== "done");
+  /* Priority only ever changes something for a task the loop could still
+     claim; a running task has already left that pool (see
+     `Task::set_priority`'s doc), so the buttons are disabled rather than
+     left to round-trip a 4xx. */
+  const priorityNow = Number(task.priority) || 0;
+  r.priorityDown.disabled = status === "running";
+  r.priorityUp.disabled = status === "running";
+  setAttr(r.priorityDown, "aria-label", `Lower priority of ${task.title || task.id}`);
+  setAttr(r.priorityUp, "aria-label", `Raise priority of ${task.title || task.id}`);
+  r.priorityDown.onclick = () => changePriority(task.id, priorityNow - 1);
+  r.priorityUp.onclick = () => changePriority(task.id, priorityNow + 1);
+
+  const editable = status === "queued" || status === "held";
+  r.editBtn.disabled = !editable;
+  setAttr(
+    r.editBtn,
+    "title",
+    editable ? "" : "Only a queued or held task's instruction can be edited.",
+  );
+  r.editBtn.onclick = () => openTaskEdit(task);
+  show(r.editBtn, status !== "done");
+
+  renderTaskHoldBox(row, task);
+  renderTaskDoneBox(row, task);
 
   /* Two-step delete: first tap arms, second tap sends the DELETE request.
      Cancel takes the position of the initial button and receives focus. */
@@ -1282,13 +1322,18 @@ function updateTaskCard(row, task) {
       text: "Delete now",
       onclick: () => deleteTask(task.id, row),
     });
-    r.deleteBox.append(cancel, confirm);
+    r.deleteBox.append(
+      el("div", { class: "stakes-confirm" },
+        el("p", { class: "stakes-warn", text: "Deletes the task file. Its id, who filed it, and any run history go with it and cannot be recovered." }),
+        el("div", { class: "stakes-row" }, cancel, confirm),
+      ),
+    );
     requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
   } else {
     const del = el("button", {
       class: "btn btn-quiet",
       type: "button",
-      text: "Delete",
+      text: "Delete…",
       disabled: status === "running",
       onclick: () => {
         row.dataset.armedDelete = "1";
@@ -1297,6 +1342,164 @@ function updateTaskCard(row, task) {
     });
     setAttr(del, "aria-label", `Delete task ${task.title || task.id}`);
     r.deleteBox.append(del);
+  }
+}
+
+/* Hold takes an optional reason, so unlike release it is not a single tap:
+   the first tap opens a short text field rather than acting immediately,
+   the same two-step shape delete already uses but for input instead of
+   confirmation. Release stays one tap - there is nothing to ask it. */
+function renderTaskHoldBox(row, task) {
+  const r = row.refs;
+  const status = String(task.status_str || task.status || "");
+  clear(r.holdBox);
+  if (status === "done") return;
+
+  if (status === "held") {
+    const release = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Release",
+      onclick: () => mutateTask(task.id, "release", release),
+    });
+    setAttr(release, "aria-label", `Release task ${task.title || task.id}`);
+    r.holdBox.append(release);
+    return;
+  }
+
+  if (row.dataset.armedHold === "1") {
+    const reasonInput = el("input", {
+      type: "text",
+      placeholder: "What is this waiting on? (optional)",
+    });
+    const cancel = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Cancel",
+      onclick: () => {
+        row.dataset.armedHold = "";
+        updateTaskCard(row, task);
+      },
+    });
+    const confirm = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Hold",
+      onclick: () => holdTask(task.id, reasonInput.value, row, confirm),
+    });
+    r.holdBox.append(
+      el("div", { class: "stakes-confirm" },
+        reasonInput,
+        el("div", { class: "stakes-row" }, cancel, confirm),
+      ),
+    );
+    requestAnimationFrame(() => reasonInput.focus({ preventScroll: true }));
+  } else {
+    const hold = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Hold…",
+      disabled: status === "running",
+      onclick: () => {
+        row.dataset.armedHold = "1";
+        updateTaskCard(row, task);
+      },
+    });
+    setAttr(hold, "aria-label", `Hold task ${task.title || task.id}`);
+    r.holdBox.append(hold);
+  }
+}
+
+async function holdTask(id, reason, row, button) {
+  const label = button.textContent;
+  button.disabled = true;
+  setText(button, "…");
+  try {
+    await postJson(API.hold(id), reason.trim() ? { reason: reason.trim() } : undefined);
+    ok();
+    announce(`Task ${shortId(id)} held.`);
+    row.dataset.armedHold = "";
+    await loadQueue();
+  } catch (error) {
+    setText(button, label);
+    button.disabled = false;
+    fail(`Could not hold task ${shortId(id)}: ${error.message}`);
+  }
+}
+
+/* Done and Delete both clear a task off the backlog, and are the two things
+   an operator could tap for "I am finished with this" without reading
+   closely - so the confirm text carries the difference, in the same tone
+   Delete's already does: one keeps the record, one removes it. */
+function renderTaskDoneBox(row, task) {
+  const r = row.refs;
+  const status = String(task.status_str || task.status || "");
+  clear(r.doneBox);
+  if (status === "done") return;
+
+  if (row.dataset.armedDone === "1") {
+    const cancel = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Cancel",
+      onclick: () => {
+        row.dataset.armedDone = "";
+        updateTaskCard(row, task);
+      },
+    });
+    const confirm = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Yes, mark done",
+      onclick: () => doneTask(task.id, row, confirm),
+    });
+    r.doneBox.append(
+      el("div", { class: "stakes-confirm" },
+        el("p", { class: "hint", text: "Marks the task finished. Its id, who filed it, and its run history are kept — nothing is deleted." }),
+        el("div", { class: "stakes-row" }, cancel, confirm),
+      ),
+    );
+    requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+  } else {
+    const done = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Mark done…",
+      onclick: () => {
+        row.dataset.armedDone = "1";
+        updateTaskCard(row, task);
+      },
+    });
+    setAttr(done, "aria-label", `Mark task ${task.title || task.id} done`);
+    r.doneBox.append(done);
+  }
+}
+
+async function doneTask(id, row, button) {
+  const label = button.textContent;
+  button.disabled = true;
+  setText(button, "…");
+  try {
+    await postJson(API.doneTask(id));
+    ok();
+    announce(`Task ${shortId(id)} marked done.`);
+    row.dataset.armedDone = "";
+    await loadQueue();
+  } catch (error) {
+    setText(button, label);
+    button.disabled = false;
+    fail(`Could not mark task ${shortId(id)} done: ${error.message}`);
+  }
+}
+
+async function changePriority(id, priority) {
+  try {
+    await postJson(API.priority(id), { priority });
+    ok();
+    announce(`Task ${shortId(id)} priority set to ${priority}.`);
+    await loadQueue();
+  } catch (error) {
+    fail(`Could not change priority of task ${shortId(id)}: ${error.message}`);
   }
 }
 
@@ -3971,6 +4174,59 @@ function closeRunActions() {
   if (dialog.open) dialog.close();
 }
 
+/* ---- task edit sheet ----------------------------------------------------
+ * Full-text replacement, not append: the operator may want to rewrite the
+ * task as much as add to it, so the field opens with the current instruction
+ * already in it rather than blank - overwriting is how "add a clause" gets
+ * typed, but starting from nothing is how the rest of it gets lost. */
+let editingTaskId = null;
+
+function openTaskEdit(task) {
+  editingTaskId = task.id;
+  $("task-edit-title").value = task.title || "";
+  $("task-edit-instruction").value = task.instruction || "";
+  show($("task-edit-error"), false);
+  setText($("task-edit-error"), "");
+  const dialog = $("task-edit-sheet");
+  if (!dialog.open) dialog.showModal();
+  requestAnimationFrame(() => $("task-edit-title").focus({ preventScroll: true }));
+}
+
+function closeTaskEdit() {
+  const dialog = $("task-edit-sheet");
+  if (dialog.open) dialog.close();
+  editingTaskId = null;
+}
+
+async function saveTaskEdit() {
+  if (!editingTaskId) return;
+  const id = editingTaskId;
+  const title = $("task-edit-title").value.trim();
+  const instruction = $("task-edit-instruction").value;
+  if (!title || !instruction.trim()) {
+    setText($("task-edit-error"), "Give both a title and an instruction.");
+    show($("task-edit-error"), true);
+    return;
+  }
+  const button = $("task-edit-save");
+  const label = button.textContent;
+  button.disabled = true;
+  setText(button, "Saving…");
+  try {
+    await postJson(API.editTask(id), { title, instruction });
+    ok();
+    announce(`Task ${shortId(id)} edited.`);
+    closeTaskEdit();
+    await loadQueue();
+  } catch (error) {
+    setText($("task-edit-error"), error.message);
+    show($("task-edit-error"), true);
+  } finally {
+    button.disabled = false;
+    setText(button, label);
+  }
+}
+
 /* ---- plan -------------------------------------------------------------- */
 /* Planning is the only way work gets in from this UI: an agent interviews
    the operator into a task file, the way `magi plan` would in a terminal.
@@ -4036,6 +4292,15 @@ function wire() {
      handler above — so the focus return only has to live in one place. */
   $("run-actions-sheet").addEventListener("close", () => {
     $("run-actions-fab").focus({ preventScroll: true });
+  });
+
+  $("task-edit-close").addEventListener("click", closeTaskEdit);
+  $("task-edit-save").addEventListener("click", saveTaskEdit);
+  $("task-edit-sheet").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeTaskEdit();
+  });
+  $("task-edit-sheet").addEventListener("close", () => {
+    editingTaskId = null;
   });
 
   $("theme-toggle").addEventListener("click", () => {
