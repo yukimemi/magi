@@ -815,6 +815,31 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .answer-label { font-size: var(--t1); font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
 .answer-text { font-size: var(--t4); font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
 
+/* The round trip: what was said after the question itself, oldest first.
+   Small and quiet compared to `.answer` on purpose - a turn is not a
+   decision, and must not compete with the summary or the choices for the eye
+   the way a settled answer is allowed to. */
+.ask-thread { display: flex; flex-direction: column; gap: var(--s2); list-style: none; padding: 0; margin: 0; }
+.ask-turn {
+  padding: var(--s2) var(--s3);
+  border-radius: var(--radius-sm);
+  font-size: var(--t3);
+}
+.ask-turn-who { font-weight: 700; text-transform: uppercase; font-size: var(--t1); letter-spacing: .04em; margin-right: var(--s2); }
+.ask-turn-when { font-size: var(--t1); color: var(--ink-3); }
+.ask-turn-body { margin: var(--s1) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ask-turn[data-who="operator"] { background: var(--tint-blue); color: var(--on-blue); }
+.ask-turn[data-who="agent"] { background: var(--surface); color: var(--ink); border: 1px solid var(--line); }
+
+/* Nobody is waiting on the owner right now - the agent is - so the answer
+   controls below stay visible but locked, and this is the one line saying
+   why they are greyed out instead of gone. */
+.ask-waiting { font-size: var(--t3); font-weight: 600; color: var(--ink-3); }
+
+.ask-say { display: flex; flex-direction: column; gap: var(--s2); padding-top: var(--s2); border-top: 1px solid var(--line-2); }
+.ask-say-label { font-size: var(--t2); color: var(--ink-3); }
+.ask-say .btn { align-self: flex-start; }
+
 /* ---- markdown ------------------------------------------------------------
  * GFM markdown - a question's detail, a chat's agent turn, a run or task
  * instruction, a chat's draft - is parsed into a node tree server-side

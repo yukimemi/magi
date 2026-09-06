@@ -34,6 +34,7 @@ const API = {
   doneTask: (id) => `/api/queue/${encodeURIComponent(id)}/done`,
   questions: "/api/questions",
   answer: (id) => `/api/questions/${encodeURIComponent(id)}/answer`,
+  questionSay: (id) => `/api/questions/${encodeURIComponent(id)}/say`,
   /* Agent-authored HTML, served by its own endpoint so it lands in a
      sandboxed frame of its own document rather than in this one. */
   /* Ends in a filename on purpose: a panel references its attachments by bare
@@ -2042,16 +2043,26 @@ function createAskCard() {
   const panelBox = el("div", { class: "ask-panel" });
   const stakes = el("div", { class: "stakes" });
 
+  /* The round trip: every turn after the question itself, oldest first, and a
+     box to add one without deciding anything. */
+  const thread = el("ol", { class: "ask-thread" });
+  const waitingNote = el("p", { class: "ask-waiting" });
+  const sayText = el("textarea", { rows: "3", "aria-label": "Ask the agent back" });
+  const saySend = el("button", { class: "btn", type: "button", text: "Ask back" });
+  const sayBox = el("div", { class: "ask-say" },
+    el("label", { class: "ask-say-label", text: "Not ready to decide? Ask back instead:" }),
+    sayText, saySend);
+
   const row = el("li", { class: "ask" },
     band,
     el("div", { class: "ask-top" }, chipSlot, whenSlot),
     /* The panel sits above the prose: when there is one, it is the case for
        the decision and the detail is the footnote. */
-    summary, where, panelBox, detail, hint, stakes, choices, free, error, answer, note,
+    summary, where, panelBox, detail, thread, hint, waitingNote, stakes, choices, free, sayBox, error, answer, note,
   );
   row.refs = { chipSlot, whenSlot, summary, runLink, node, seat, where, detail,
                hint, choices, text, send, free, error, answerLabel, answerText, answer, note,
-               band, panelBox, stakes };
+               band, panelBox, stakes, thread, waitingNote, sayText, saySend, sayBox };
   return row;
 }
 
@@ -2095,6 +2106,40 @@ function updateAskCard(row, question, { compact = false } = {}) {
 
   renderPanel(row, question);
 
+  /* The round trip after the question itself: the owner talking back, the
+     agent replying. `waiting_on_agent` names the one state nothing about
+     `status` can - the question is still open, but nobody is waiting on the
+     owner right now, they are waiting on the agent's `magi ask --thread`. */
+  const waitingOnAgent = open && question.waiting_on_agent === true;
+  setAttr(row, "data-waiting-agent", waitingOnAgent ? "1" : null);
+
+  const turns = Array.isArray(question.thread) ? question.thread : [];
+  const threadKey = String(turns.length);
+  if (row.dataset.threadKey !== threadKey) {
+    row.dataset.threadKey = threadKey;
+    clear(r.thread);
+    for (const turn of turns) {
+      const isAgent = turn.who === "agent";
+      const at = when(turn.at);
+      r.thread.append(el("li", { class: "ask-turn", "data-who": isAgent ? "agent" : "operator" },
+        el("span", { class: "ask-turn-who", text: isAgent ? "Agent" : "You" }),
+        el("time", { class: "ask-turn-when", datetime: turn.at, title: at.title, text: at.text }),
+        el("p", { class: "ask-turn-body", text: turn.body || "" }),
+      ));
+    }
+  }
+  show(r.thread, turns.length > 0);
+
+  setText(r.waitingNote, waitingOnAgent
+    ? "Waiting for the agent to reply. There is nothing to decide until it does."
+    : "");
+  show(r.waitingNote, waitingOnAgent);
+
+  r.saySend.onclick = () => sayToQuestion(question.id, r.sayText.value, row);
+  show(r.sayBox, open);
+  r.sayText.disabled = waitingOnAgent;
+  r.saySend.disabled = waitingOnAgent;
+
   /* The detail is immutable for a given question, so it is parsed once. An
      open question shows it outright — it is the case for the decision. A
      settled one folds it away, so the record does not push the next open
@@ -2135,18 +2180,26 @@ function updateAskCard(row, question, { compact = false } = {}) {
   }
   r.send.onclick = () => answerQuestion(question.id, { text: r.text.value }, row);
 
-  setText(r.hint, !open
+  setText(r.hint, !open || waitingOnAgent
     ? ""
     : merge
       ? "Read the panel, then decide. Nothing merges until you say so twice."
       : choices.length
         ? "Pick one. The run resumes as soon as you do."
         : "No options were offered \u2014 answer in your own words.");
-  show(r.hint, open);
+  show(r.hint, open && !waitingOnAgent);
   show(r.stakes, open && merge);
   show(r.choices, open && !merge && choices.length > 0);
   show(r.free, open && choices.length === 0);
   show(r.error, open && !r.error.hidden && r.error.textContent !== "");
+
+  // While the agent has not replied yet, deciding is not an option: the
+  // controls stay visible - the owner can still see what was on offer - but
+  // disabled, with `waitingNote` above saying why.
+  r.text.disabled = waitingOnAgent;
+  r.send.disabled = waitingOnAgent;
+  for (const btn of r.choices.querySelectorAll("button")) btn.disabled = waitingOnAgent;
+  for (const btn of r.stakes.querySelectorAll("button")) btn.disabled = waitingOnAgent;
 
   const given = question.answer && typeof question.answer === "object" ? question.answer : null;
   const value = given
@@ -2206,6 +2259,40 @@ async function answerQuestion(id, body, row) {
     show(r.error, true);
   }
   for (const button of buttons) button.disabled = false;
+}
+
+/* Talk back without deciding anything: `POST /api/questions/{id}/say`, the
+   phone's half of the round trip `magi ask --thread` completes from the
+   agent's side. Same 409 handling as `answerQuestion` - answered or abandoned
+   from elsewhere between the list and the tap reads as settled, not as an
+   error the operator has to parse. */
+async function sayToQuestion(id, text, row) {
+  const r = row.refs;
+  const value = String(text || "").trim();
+  if (!value) {
+    r.sayText.focus();
+    return;
+  }
+
+  r.sayText.disabled = true;
+  r.saySend.disabled = true;
+  try {
+    reflectQuestion(await postJson(API.questionSay(id), { body: value }));
+    r.sayText.value = "";
+    announce("Sent. Waiting for the agent to reply.");
+    ok();
+  } catch (error) {
+    if (error.status === 409) {
+      row.dataset.raced = "1";
+      announce("That question was already settled.");
+      await loadQuestions();
+      return;
+    }
+    setText(r.error, error.message);
+    show(r.error, true);
+    r.sayText.disabled = false;
+    r.saySend.disabled = false;
+  }
 }
 
 /* Show the answer without waiting for the stream to confirm it, including in

@@ -348,6 +348,33 @@ order to answer. Runs blocked on an unanswered question are marked as such in
 the runs list: a parked run consumes nothing and progresses never, so being
 noticed is the only thing that moves it.
 
+### Asking back
+
+Answering isn't the only move. If the question doesn't make sense yet, say so
+instead of guessing at an answer:
+
+```sh
+magi answer ab12 --say "why not Postgres, it's already a dependency?"
+```
+
+(the phone's question card has the same "ask back" box). `magi ask` on the
+agent's side returns at once — exit code 0, your words on stdout — and the
+agent replies on the same question rather than starting a new one it would
+have no context for:
+
+```sh
+magi ask --thread ab12 --summary "Postgres needs a server to run; this is a CLI tool" --choice SQLite
+```
+
+That appends the reply and waits again. The question never leaves the card it
+started on — the phone shows both turns stacked under the original summary —
+and it counts as one open question throughout, however many times you go back
+and forth. The one thing that changes: while your last word is waiting on the
+agent, the phone locks the answer buttons and says so, because there is
+nothing to decide until it replies. You won't be paged again for a reply that
+lands within five minutes of your own message — long enough to mean "still
+reading" — but a slower one still notifies, in case you stepped away.
+
 Set `[notify] command` to be told out of band:
 
 ```toml

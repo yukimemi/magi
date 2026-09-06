@@ -827,6 +827,47 @@ theory was wrong: `'self'` matches fine in a sandboxed frame, and the real
 cause was a corrupt fixture PNG. Chrome's `Log.entryAdded` prints CSP
 violations verbatim - read it instead of reasoning about it.
 
+### Asking back: a question is a conversation, not a form
+
+The owner is not limited to answering or letting a question time out. They can
+talk back - `POST /api/questions/{id}/say`, `magi answer <id> --say "..."` -
+and the agent that asked keeps the conversation going with
+`magi ask --thread <id>`, which appends its reply, re-arms
+`answer_timeout`, and waits again. No second agent is ever started: the
+process blocked in `magi ask` is returned to with exit code 0 and the
+owner's words on stdout, because the alternative - a fresh consultant that
+never saw the original task - would have to be caught up on everything the
+first agent already knows.
+
+- **`QuestionStatus` still has three values and means what it always meant.**
+  A round trip never touches `status`; it stays `Open` from the first "why not
+  Postgres?" to the eventual `Answer`. `Question::waiting_on_agent()` is the
+  one place "the ball is in the agent's court" is readable at all, and it is
+  why `count_open()`/`open_for()` do not need to change: ten turns of back and
+  forth are still one open question.
+- **`ask::SCHEMA` bumped to 2 for `Question::thread`, and the bump does not
+  mean what it used to.** Every field added since schema 1 (`panel`, `assets`,
+  now `thread`) carries `#[serde(default)]`, so `read_path` refuses a file only
+  when its `schema` is *greater* than this build's - a strict equality check
+  would turn this bump into an upgrade that stops reading yesterday's
+  questions.
+- **The quiet window is a judgement call, not a setting.** An agent's reply
+  pages the operator only when it has been more than five minutes since their
+  own last word (`REPLY_QUIET_WINDOW` in `src/ask.rs`) - still reading the
+  card, no second buzz; walked away, they still hear about it. It is a
+  constant, not a `magi.toml` key: the operator cannot express "am I still
+  looking at the phone" as a per-repository setting, and neither can this
+  build.
+- **`magi ask --thread` replaces `--choice` wholesale, same as everywhere
+  else this codebase replaces rather than merges.** Asking back is normally
+  exactly the moment the right choices change; a caller that wants the old set
+  kept just repeats it.
+- **`src/chat.rs` is a different product and this feature does not touch it.**
+  The wire shape (`who`/`body`/`at`, `"operator"`/`"agent"`) matches
+  `chat::Turn` on purpose - it lets the phone render both with one component -
+  but `ask::Turn` and `ask::Who` are their own types with no dependency on
+  `chat`.
+
 ### The web UI: one binary, no authentication, and no lying empty states
 
 `src/web.rs` serves `assets/ui/{index.html,app.css,app.js}` through

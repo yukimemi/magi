@@ -991,7 +991,14 @@ async fn request_approval(state: &mut RunState, pr: &PrState, subject: &str) -> 
 
     let timeout = Duration::from_secs(state.config.graph.answer_timeout);
     let said = ask::ask_and_wait(&mut q, &store, &state.config.notify, timeout).await?;
-    Ok(approval(said.as_deref()))
+    // The merge gate does not speak `--thread`: an owner who talks back
+    // instead of choosing has not approved anything, so it is treated the
+    // same as no answer at all and the safe default (hold) stands.
+    let answer = match said {
+        ask::Wait::Answered(a) => Some(a),
+        ask::Wait::Replied(_) | ask::Wait::Abandoned => None,
+    };
+    Ok(approval(answer.as_deref()))
 }
 
 /// Parse `gh pr view --json url,number,state,statusCheckRollup,reviews,comments`
