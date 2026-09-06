@@ -927,12 +927,18 @@ impl Runner {
         // while `self` is mutably borrowed by the node's own bookkeeping.
         let run_id = self.state.id.clone();
         let prompts = self.state.config.prompts.clone();
-        if !self.state.judgements.is_empty() {
+        if !self.state.judgements.is_empty() || self.state.judge_skipped {
             return Ok(());
         }
-        self.state.status = RunStatus::Judging;
         let viable: Vec<Candidate> = self.state.viable().into_iter().cloned().collect();
         if viable.len() == 1 {
+            // Recorded so this is a one-time event: `judgements` stays empty
+            // either way, which without this flag is indistinguishable from
+            // "not yet judged" on the next reentry — and status is left
+            // untouched, so a later node's conclusion (e.g. `Blocked` after
+            // the review budget ran out) survives a resume instead of being
+            // clobbered back to `Judging` by this node running again.
+            self.state.judge_skipped = true;
             self.state.event(
                 "judge",
                 format!(
@@ -943,6 +949,7 @@ impl Runner {
             self.state.save()?;
             return Ok(());
         }
+        self.state.status = RunStatus::Judging;
 
         let labels: Vec<char> = viable.iter().map(|c| c.label).collect();
         let language = self.state.config.graph.language.clone();
@@ -1789,6 +1796,19 @@ impl Runner {
             self.state.save()?;
             return Ok(());
         }
+        if self.state.reviews.len() >= max_rounds {
+            // Every round is already spent and none was clean — this is a
+            // reentry into a run that reached `Blocked` and stopped. The loop
+            // below runs an empty range in that case and would otherwise fall
+            // through without touching `status`, silently handing back
+            // whatever an earlier node in this same walk clobbered it to (a
+            // solo-candidate `judge`/`deliberate` skip both rewrite `status`
+            // on every reentry). Restate the conclusion instead of leaving it
+            // to chance.
+            self.state.status = RunStatus::Blocked;
+            self.state.save()?;
+            return Ok(());
+        }
         self.state.status = RunStatus::Reviewing;
 
         let repo = self.state.repo.clone();
@@ -2115,7 +2135,14 @@ impl Runner {
     // ----------------------------------------------------------------- gate
 
     async fn gate(&mut self) -> Result<()> {
-        if self.state.status == RunStatus::Blocked || self.state.status == RunStatus::Failed {
+        // Judged by the review record itself, not by `status`: a solo
+        // candidate's `judge`/`deliberate` skip rewrites `status` on every
+        // reentry (see `judge`), and trusting it here is exactly how a run
+        // that exhausted its review budget got gated and merged a second
+        // time around. The last round's `clean` flag is the actual verdict.
+        if self.state.status == RunStatus::Failed
+            || self.state.reviews.last().is_some_and(|r| !r.clean)
+        {
             return Ok(());
         }
         if !self.state.gate.is_empty() {
@@ -2160,7 +2187,24 @@ impl Runner {
     // ---------------------------------------------------------------- merge
 
     async fn merge(&mut self) -> Result<()> {
-        if self.state.status.done() && self.state.status != RunStatus::Ready {
+        // Same reasoning as `gate`: ask the review and gate records directly
+        // rather than `status`, which a solo-candidate `judge`/`deliberate`
+        // skip can rewrite on reentry to something that no longer says
+        // `Blocked`.
+        if self.state.reviews.last().is_some_and(|r| !r.clean)
+            || self.state.gate.iter().any(|o| !o.ok())
+        {
+            return Ok(());
+        }
+        // This node's own record, not `status`: `status == Ready` is not
+        // unique to the harmless `MergeMode::None` path this line was
+        // written for. `land` (below) sets it too, when a `MergeMode::Pr`
+        // run's PR was closed without merging — and on that run `mode` is
+        // still `Pr`, so a reentry that fell through here would push and
+        // open a second pull request. `self.state.merge` is set exactly once
+        // this node (or `land`) has already produced a verdict, under every
+        // mode, which is what "already done" actually means here.
+        if self.state.merge.is_some() {
             return Ok(());
         }
         let Some(winner) = self.state.winner().cloned() else {
@@ -2789,11 +2833,141 @@ pub fn worst_open(state: &RunState) -> Option<Severity> {
 
 #[cfg(test)]
 mod tests {
-    use super::retry_budget;
+    use super::*;
     use std::time::Duration;
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    /// A throwaway repo with one commit on `main`, for tests that need `merge`
+    /// to make real (and, if it runs at all, real*ly fail*) git calls.
+    fn init_repo(dir: &Path) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.name", "magi test"]);
+        run(&["config", "user.email", "magi@example.com"]);
+        std::fs::write(dir.join("README.md"), "# fixture\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "init"]);
+    }
+
+    /// `status == Ready` used to be read as "this is the harmless
+    /// `MergeMode::None` no-op path, nothing to guard" (graph.rs, prior to
+    /// this test). But `land` sets the very same status when a `MergeMode::Pr`
+    /// run's PR was closed without merging — and reentering `merge` with
+    /// `mode` still `Pr` does not know the difference, so it pushed and
+    /// opened a second pull request. `mode == Local` reproduces the same
+    /// blind spot without a network call: reentry must not attempt another
+    /// git merge once this node has already recorded an outcome.
+    #[tokio::test]
+    async fn merge_does_not_reattempt_once_a_run_has_concluded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let mut config = Config::default();
+        config.merge.mode = MergeMode::Local;
+
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            "deadbeef".to_owned(),
+            "task".to_owned(),
+            config,
+        );
+        state.candidates = vec![Candidate {
+            index: 0,
+            label: 'A',
+            agent: "alpha".to_owned(),
+            branch: "does-not-exist".to_owned(),
+            worktree: repo.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: false,
+        }];
+        state.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 1)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+        });
+        state.reviews = vec![ReviewRound {
+            round: 1,
+            head: "deadbeef".to_owned(),
+            reviews: Vec::new(),
+            e2e: Vec::new(),
+            fix: None,
+            blocking: 0,
+            clean: true,
+        }];
+        state.gate = vec![CommandOutcome {
+            command: "test".to_owned(),
+            code: Some(0),
+            output_tail: String::new(),
+            duration_ms: 0,
+        }];
+        // Reached its conclusion already — e.g. `land` closing the PR without
+        // merging it, which (like the honest `MergeMode::None` path) leaves
+        // `status` at `Ready`. The recorded outcome is what actually marks
+        // this node done.
+        state.status = RunStatus::Ready;
+        state.merge = Some(MergeOutcome {
+            mode: MergeMode::Local,
+            ok: false,
+            detail: "already concluded".to_owned(),
+        });
+
+        let mut runner = Runner {
+            state,
+            roles: ResolvedRoles {
+                implementers: Vec::new(),
+                judges: Vec::new(),
+                reviewers: Vec::new(),
+                fixer: None,
+            },
+            sem: Arc::new(Semaphore::new(1)),
+            pause: Pause::new(),
+        };
+
+        runner.merge().await.expect("merge");
+
+        assert_eq!(
+            runner.state.status,
+            RunStatus::Ready,
+            "a concluded run's status must not change on reentry"
+        );
+        assert_eq!(
+            runner.state.merge.as_ref().map(|m| m.detail.as_str()),
+            Some("already concluded"),
+            "merge must not run again once the node already recorded an outcome"
+        );
     }
 
     #[test]

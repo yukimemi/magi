@@ -129,7 +129,7 @@ if grep -q "independent judges" "$p"; then
 fi
 
 if grep -q "reviewers of" "$p"; then
-  if [ -n "$MOCK_FINDING" ] && [ ! -f fixed.txt ]; then
+  if [ -n "$MOCK_ALWAYS_FINDING" ] || { [ -n "$MOCK_FINDING" ] && [ ! -f fixed.txt ]; }; then
     printf '{"summary":"mock review","findings":[{"severity":"blocker","file":"note.txt","line":1,"title":"needs a fixed marker","detail":"create fixed.txt"}]}\n'
   else
     printf '{"summary":"mock review: clean","findings":[]}\n'
@@ -138,7 +138,11 @@ if grep -q "reviewers of" "$p"; then
 fi
 
 if grep -q "Your patch was reviewed" "$p"; then
-  echo "fixed" > fixed.txt
+  # Appended with a nonce so a fixer invoked round after round always has a
+  # real diff to commit — otherwise `git commit` on an unchanged `fixed.txt`
+  # fails with nothing to commit, and the loop stops early on "the fixer
+  # produced no commit" instead of actually exhausting `review_rounds`.
+  echo "fixed $$" >> fixed.txt
   git add -A >/dev/null 2>&1
   git commit -q -m "address review findings" >/dev/null 2>&1
   id=$(grep -o 'R[0-9]*-[0-9]*-[0-9]*' "$p" | head -1)
@@ -299,6 +303,21 @@ pub fn fixture_with_dropped_stream(seats: &[&str]) -> Fixture {
     let value = seats.join(",");
     for a in &mut fx.config.agents {
         a.env.insert("MOCK_DROPPED_SEAT".to_owned(), value.clone());
+    }
+    fx
+}
+
+/// A solo candidate (`graph.candidates = 1`, the shipped default) whose
+/// reviewers raise a blocking finding every round, no matter what the fixer
+/// does — so the review loop exhausts its budget and the run ends `Blocked`.
+/// Built for reentry tests: a single viable candidate is what makes `judge`
+/// skip the panel instead of asking it.
+pub fn fixture_always_blocked() -> Fixture {
+    let mut fx = fixture(Judges::Unanimous, true);
+    fx.config.graph.candidates = 1;
+    for a in &mut fx.config.agents {
+        a.env
+            .insert("MOCK_ALWAYS_FINDING".to_owned(), "1".to_owned());
     }
     fx
 }
