@@ -4434,6 +4434,37 @@ mod tests {
         assert!(res.json()["error"].is_string());
     }
 
+    /// Plan is the only entry for new work: an interview writes the task
+    /// file, so the compose form and its `POST /api/queue` are gone. The
+    /// three tests that covered that route's validation went with the route,
+    /// and nothing was left asserting it stays gone — so a phone still
+    /// holding the old form, or a re-added handler, would silently be back
+    /// to filing briefs no interview ever validated.
+    #[tokio::test]
+    async fn a_task_cannot_be_filed_directly_only_through_an_interview() {
+        let f = Fixture::start().await;
+
+        let res = f
+            .post(
+                "/api/queue",
+                Some(r#"{"instruction":"Add a --json flag to magi list"}"#),
+            )
+            .await;
+
+        assert_eq!(
+            res.status, 405,
+            "POST /api/queue must not be a route: {}",
+            res.body
+        );
+        assert!(
+            f.queue().list().is_empty(),
+            "a task that skipped the interview must not reach the disk"
+        );
+        // The path itself is still served — the Queue view reads it — and the
+        // per-task controls are untouched by the entry being removed.
+        assert_eq!(f.get("/api/queue").await.status, 200);
+    }
+
     /// `<repo>/host/owner/repo/.git`, the ghq layout [`repos::scan`] expects.
     fn make_checkout(root: &FsPath, host: &str, owner: &str, repo: &str) {
         std::fs::create_dir_all(root.join(host).join(owner).join(repo).join(".git"))
