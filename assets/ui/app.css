@@ -730,6 +730,84 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .checks[data-checks="pending"]::before { border-style: dashed; animation: spin 3.4s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ---- runs: sections, folded attempts, tree ------------------------------ *
+ * The flat, updated-first list becomes four <details> sections — Waiting on
+ * you, In flight, Landed, Ended — each collapsible, plus (wide screens only)
+ * a two-level tree beside them that narrows the cards to one section or one
+ * repo within it. Native <details>/<summary> carries the keyboard behaviour
+ * for free; the tree is a list of real <button>s for the same reason. */
+.runs-layout { display: block; }
+.runs-main { display: flex; flex-direction: column; gap: var(--s4); }
+
+.runs-filter {
+  display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap;
+  padding: var(--s2) var(--s3);
+  background: var(--sunk); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  font-size: var(--t3); color: var(--ink-2);
+}
+#runs-filter-text { flex: 1; min-width: 0; }
+
+#runs-sections { display: flex; flex-direction: column; gap: var(--s4); }
+
+.runs-section-head {
+  display: flex; align-items: center; gap: var(--s2);
+  min-height: var(--tap); cursor: pointer;
+}
+.runs-section-head::marker,
+.runs-section-head::-webkit-details-marker { display: none; content: ""; }
+.runs-section-head::before {
+  content: ""; flex: none;
+  width: 7px; height: 7px;
+  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  color: var(--ink-3);
+  transform: rotate(-45deg); margin-left: 2px;
+  transition: transform .18s var(--ease);
+}
+.runs-section[open] > .runs-section-head::before { transform: rotate(45deg); }
+.runs-section-title { font-size: var(--t4); color: var(--ink); }
+.runs-section-count, .runs-section-folded { font-size: var(--t2); color: var(--ink-3); white-space: nowrap; }
+.runs-section-count { margin-left: auto; }
+.runs-section .cards { margin-top: var(--s3); }
+
+/* An older attempt at the same task, folded under the card that replaced it.
+   `.advanced` (see the queue card's "Full instruction" disclosure) already
+   supplies the chevron and the flex row for its <summary>; this only adds the
+   indented list underneath. */
+.run-folded { margin-top: var(--s2); }
+.run-folded-summary { font-size: var(--t2); color: var(--ink-3); min-height: 36px; }
+.run-folded-list {
+  display: flex; flex-direction: column; gap: var(--s1);
+  margin-top: var(--s1); padding-left: var(--s3);
+  border-left: 2px solid var(--line);
+}
+.run-folded-link {
+  display: flex; align-items: center; gap: var(--s2);
+  min-height: var(--tap);
+  font-size: var(--t2); color: var(--ink-2);
+}
+.run-folded-id { font-family: var(--mono); color: var(--ink-3); }
+.run-folded-status { font-size: var(--t1); color: var(--ink-3); text-transform: uppercase; letter-spacing: .04em; }
+.run-folded-when { margin-left: auto; font-size: var(--t1); color: var(--ink-3); white-space: nowrap; }
+
+/* The filter tree. Hidden below the width where the runs list itself is
+   still a single column — see the 1080px override in the wide-screens block
+   — because a phone has no room to spare for a nav that is a shortcut, not
+   the only way to reach anything. */
+.runs-tree { display: none; }
+.runs-tree-list, .runs-tree-sub { display: flex; flex-direction: column; gap: 2px; }
+.runs-tree-sub { padding-left: var(--s4); margin-top: 2px; }
+.runs-tree-node {
+  display: flex; align-items: center; gap: var(--s2); width: 100%;
+  min-height: var(--tap); padding: 0 var(--s2);
+  background: none; border: 1px solid transparent; border-radius: var(--radius-sm);
+  font: 600 var(--t3)/1.3 var(--sans); color: var(--ink-2); text-align: left; cursor: pointer;
+}
+.runs-tree-node:hover { background: var(--sunk); }
+.runs-tree-node[aria-current="true"] { color: var(--ink); background: var(--sunk); border-color: var(--edge); }
+.runs-tree-repo { font-weight: 500; font-size: var(--t2); }
+.runs-tree-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.runs-tree-count { flex: none; font-size: var(--t1); color: var(--ink-3); }
+
 /* ---- landing ----------------------------------------------------------- */
 .land { display: flex; flex-direction: column; gap: var(--s3); }
 .land-top { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
@@ -1537,6 +1615,15 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
   .run-side { grid-column: 2; position: sticky; top: 96px; }
   .report { max-height: calc(100dvh - 260px); }
   .facts { grid-template-columns: 10rem 1fr; }
+
+  /* The Runs tree gets the same width this breakpoint already gives the run
+     detail's side column, so the two screens do not disagree about how much
+     room a sidebar is worth. */
+  .runs-layout {
+    display: grid; grid-template-columns: 220px minmax(0, 1fr);
+    align-items: start; gap: var(--s5);
+  }
+  .runs-tree { display: block; position: sticky; top: 96px; }
 }
 
 /* ---- motion ------------------------------------------------------------ */
