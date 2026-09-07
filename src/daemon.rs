@@ -484,38 +484,43 @@ pub fn is_working_on_task(home: &Path, task: &str, now: Timestamp) -> bool {
 /// unclaimable — the backlog would stop for good at exactly the task that was
 /// in flight when the machine went down.
 ///
-/// Two tests, either of which sweeps a lock:
+/// The pid recorded in the lock is the authority whenever it can be read at
+/// all; age is only a fallback for when it cannot be.
 ///
-/// - **The lock is older than `older_than`.** Checked first because it is
-///   free: a `stat` this process already paid for to list the directory,
-///   against no external process at all.
-/// - **The pid recorded in the lock is dead.** Checked only when the age test
-///   did not already settle it, because [`crate::proc::pid_alive`] spawns a
-///   helper process and a poll with several pending locks must not pay for
-///   one on every single one of them when the clock alone already answered.
-///   It answers "alive" for anything it cannot determine, so this path only
-///   fires when the owner is verifiably gone — a live process, one this build
-///   cannot check, or a lock with no parseable pid at all, all fall through to
-///   staying held rather than being swept on a guess. This is what lets a
-///   lock be reclaimed in seconds instead of waiting out [`STALE_CLAIM`]: a
-///   lock made 33 minutes before this daemon even started, next to a `queued`
-///   task, no longer has to sit for six hours before anything notices its
-///   owner is gone.
+/// - **A parseable pid wins outright.** [`crate::proc::pid_alive`] decides,
+///   full stop — dead sweeps the lock immediately, regardless of age; alive
+///   protects it, regardless of age. This is what lets a lock be reclaimed in
+///   seconds instead of waiting out [`STALE_CLAIM`]: a lock made 33 minutes
+///   before this daemon even started, next to a `queued` task, no longer has
+///   to sit for six hours before anything notices its owner is gone.
+/// - **A pid that cannot be parsed at all** — an empty or corrupt lock file —
+///   falls back to `older_than`, since there is nothing else to check.
 ///
-/// [`STALE_CLAIM`] itself stays large on purpose: pids are reused, and a
-/// helper program missing or its output unreadable must not be license to
-/// guess. A run that genuinely outlives it can still have its claim swept
-/// while working, letting a second daemon start a second run on the same
-/// task — the pid check is what makes the ordinary case (a process that is
-/// simply gone) both rare to need the age fallback at all, and fast when it
-/// does not.
+/// Age must never override a *positive* liveness confirmation. `sweep`
+/// [`poll`]s concurrently with every attempt this daemon itself has spawned —
+/// see [`InFlightGuard`] — not only between them the way a single sequential
+/// loop once did, so a run that legitimately runs longer than `older_than`
+/// (a multi-round review, a long land wait carried across several resumed
+/// attempts) still has this very process's own live pid sitting in its own
+/// lock file on every later sweep. Deciding by age alone in that case would
+/// delete this daemon's own still-valid claim on its own in-flight task,
+/// which [`reclaim_orphaned_running`] would then read as abandoned and hand
+/// to a second attempt — two `Runner`s writing the same `run.json` and the
+/// same worktree at once. `pid_alive` answering "alive" for anything it
+/// cannot determine (a live process, a pid this build cannot check, one
+/// under another account) is exactly what keeps that path from ever
+/// firing on a guess.
+///
+/// [`STALE_CLAIM`] itself stays large: a helper program missing or its
+/// output unreadable must not be license to guess, and the risk of an
+/// unparseable lock outliving a genuinely dead owner is bounded by an order
+/// of magnitude above any plausible run rather than by a positive check.
 ///
 /// Runs on every poll, not only at startup — a daemon up for days must keep
-/// noticing a lock some other, now-dead, daemon left behind just as readily as
-/// one it trips over on the way up. Always safe because a daemon only ever
-/// holds a claim of its own while [`attempt`] is running — between iterations
-/// of the very loop that calls this, never at the top of one.
+/// noticing a lock some other, now-dead, daemon left behind just as readily
+/// as one it trips over on the way up.
 pub fn sweep_stale_claims(queue: &Queue, older_than: Duration) -> Vec<String> {
+    let this_process = std::process::id();
     let mut swept: Vec<String> = std::fs::read_dir(queue.root())
         .into_iter()
         .flatten()
@@ -523,16 +528,21 @@ pub fn sweep_stale_claims(queue: &Queue, older_than: Duration) -> Vec<String> {
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "lock"))
         .filter(|p| {
-            let stale_by_age = p
-                .metadata()
-                .and_then(|m| m.modified())
-                .and_then(|t| t.elapsed().map_err(std::io::Error::other))
-                .is_ok_and(|age| age >= older_than);
-            stale_by_age
-                || std::fs::read_to_string(p)
-                    .ok()
-                    .and_then(|body| body.trim().parse::<u32>().ok())
-                    .is_some_and(|pid| !crate::proc::pid_alive(pid))
+            match std::fs::read_to_string(p)
+                .ok()
+                .and_then(|body| body.trim().parse::<u32>().ok())
+            {
+                // This process wrote it and is asking the question right
+                // now, so it is definitionally still alive - settled without
+                // spawning a helper process at all.
+                Some(pid) if pid == this_process => false,
+                Some(pid) => !crate::proc::pid_alive(pid),
+                None => p
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+                    .is_ok_and(|age| age >= older_than),
+            }
         })
         .filter(|p| std::fs::remove_file(p).is_ok())
         .filter_map(|p| {
@@ -1940,7 +1950,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_removes_an_abandoned_lock_and_keeps_a_live_one() {
+    fn sweep_removes_an_old_unparseable_lock_and_keeps_a_live_one() {
         let dir = tempfile::tempdir().unwrap();
         let queue = Queue::at(dir.path().to_path_buf());
         let mut old = task();
@@ -1950,7 +1960,10 @@ mod tests {
         fresh.id = "20260101-000000-new0".to_owned();
         queue.put(&mut fresh).unwrap();
 
-        let abandoned = queue.claim(&old.id).unwrap();
+        // No parseable pid at all, so age is the only signal there is to
+        // check - unlike a real `Queue::claim`, which always names a real,
+        // and therefore alive, pid this test cannot fake as dead.
+        std::fs::write(dir.path().join(format!("{}.lock", old.id)), "not a pid").unwrap();
         std::thread::sleep(Duration::from_millis(60));
         let live = queue.claim(&fresh.id).unwrap();
 
@@ -1958,13 +1971,45 @@ mod tests {
         assert_eq!(swept, vec![old.id.clone()]);
         assert!(
             queue.claim(&old.id).is_ok(),
-            "a swept task is claimable again"
+            "an unparseable lock older than the threshold is swept"
         );
         assert!(
             queue.claim(&fresh.id).is_err(),
-            "a lock younger than the threshold still protects its task"
+            "a live pid protects its lock regardless of age"
         );
-        drop((abandoned, live));
+        drop(live);
+    }
+
+    #[test]
+    fn an_old_lock_whose_pid_is_still_alive_is_never_swept_by_age_alone() {
+        // The regression this guards: `sweep` now runs concurrently with
+        // every attempt this daemon itself has spawned (see
+        // `InFlightGuard`), not only between them the way a single
+        // sequential loop once did. A run that legitimately outlives
+        // `older_than` still has this very process's own live pid sitting in
+        // its own lock file on every later sweep, and deciding by age alone
+        // would delete that still-valid claim out from under the attempt
+        // that holds it - which `reclaim_orphaned_running` would then read
+        // as abandoned and hand to a second, competing attempt.
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().to_path_buf());
+        let mut t = task();
+        t.id = "20260101-000000-live".to_owned();
+        queue.put(&mut t).unwrap();
+
+        let claim = queue.claim(&t.id).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+
+        let swept = sweep_stale_claims(&queue, Duration::from_millis(50));
+        assert!(
+            swept.is_empty(),
+            "a lock naming a live pid must never be swept by age, no matter how old: {swept:?}"
+        );
+        assert!(
+            queue.claim(&t.id).is_err(),
+            "the lock still protects its task"
+        );
+        drop(claim);
     }
 
     /// A pid past any real process table, but not `u32::MAX`: Windows'
