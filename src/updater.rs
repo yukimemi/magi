@@ -23,18 +23,31 @@ pub fn default_interval() -> Duration {
     kaishin::default_interval()
 }
 
-/// The interval `cfg` configures, or [`default_interval`] when unset or
-/// unparsable.
+/// Floor under [`effective_interval`], matching GitHub's unauthenticated rate
+/// limit for the releases API (60 requests/hour/address).
+///
+/// A one-off CLI invocation honouring a shorter configured interval could
+/// only ever make one call per process, so it was never at risk of tripping
+/// that limit on its own. The background recheck loop in `web.rs` is
+/// different: it polls for as long as `magi web` stays up, so an interval
+/// configured well below an hour would have it repeat the same call for as
+/// long as the deck runs - a shared floor here is what keeps it, and every
+/// other caller of [`Checker::new`], inside the budget regardless.
+const MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The interval `cfg` configures, floored at [`MIN_INTERVAL`], or
+/// [`default_interval`] when unset or unparsable.
 ///
 /// Shared by [`Checker::new`], which throttles the network call itself
-/// against it, and `web::recheck_poll_period`, which uses it to decide how
-/// often to even ask - a background recheck task cannot track an interval it
-/// never sees.
+/// against it, and the background recheck loop in `web.rs`, which uses it to
+/// decide how often to even ask - it cannot track an interval it never sees.
 pub fn effective_interval(cfg: &Update) -> Duration {
-    cfg.interval
+    let interval = cfg
+        .interval
         .as_deref()
         .and_then(|s| kaishin::parse_interval(s).ok())
-        .unwrap_or_else(default_interval)
+        .unwrap_or_else(default_interval);
+    interval.max(MIN_INTERVAL)
 }
 
 /// Is the background check switched off by the environment?
@@ -413,6 +426,34 @@ pub async fn finalize(pending: Option<Pending>, budget: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An interval configured below GitHub's unauthenticated 60 req/hour/IP
+    /// limit must be floored, or `web`'s background recheck loop - which,
+    /// unlike a one-off CLI invocation, keeps polling for as long as `magi
+    /// web` stays up - would repeat the same call far past that limit.
+    #[test]
+    fn effective_interval_floors_a_configured_interval_below_githubs_rate_limit() {
+        let cfg = Update {
+            mode: UpdateMode::Notify,
+            interval: Some("1s".to_owned()),
+        };
+        assert_eq!(
+            effective_interval(&cfg),
+            MIN_INTERVAL,
+            "an interval that would exceed GitHub's rate limit under continuous \
+             polling must be floored rather than honoured verbatim"
+        );
+
+        let sane = Update {
+            mode: UpdateMode::Notify,
+            interval: Some("2h".to_owned()),
+        };
+        assert_eq!(
+            effective_interval(&sane),
+            Duration::from_secs(2 * 60 * 60),
+            "an interval already above the floor must pass through unchanged"
+        );
+    }
 
     #[test]
     fn env_kill_switch_semantics() {
