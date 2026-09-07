@@ -3331,17 +3331,32 @@ function endChatTurn(id) {
  * that field. Starting a wait *is* taken from `thinking`, because that is the
  * only way this browser learns of a turn it did not itself send - another
  * tab, another device, or a reload that lost the chatWaits entry the first
- * beginChatTurn call made. */
+ * beginChatTurn call made.
+ *
+ * A fresh reconstruction only fires when the *last recorded turn* is the
+ * operator's. A turn is always exactly one operator message followed by one
+ * agent reply or failure note (see chat::turn), so an agent turn already on
+ * the end of the transcript means that turn already landed - `thinking` can
+ * still read `true` for an instant after (chat::turn writes the reply before
+ * its TurnGuard drops), and chat_say claims the guard before its own
+ * chat::record write lands (so the transcript here can still end on the
+ * *previous* agent turn while a new one is already in flight). Either way,
+ * there is nothing this browser can safely assume the count of remaining
+ * turns to be, so it waits for the next poll - typically the SSE `chats_rev`
+ * bump chat::record's own write causes - rather than guess and risk building
+ * a `target` that transcript growth can never reach (stuck "thinking") or one
+ * a single turn satisfies too early (a busy chat reported free). */
 function trackIfThinking(chat) {
   const wait = state.chatWaits.get(chat.id);
   if (wait) {
     if (chatTurns(chat).length >= wait.target) endChatTurn(chat.id);
     return;
   }
-  if (chat.thinking) {
-    const turns = chatTurns(chat).length;
-    beginChatTurn(chat.id, turns, turns + 1);
-  }
+  if (!chat.thinking) return;
+  const turns = chatTurns(chat);
+  const last = turns[turns.length - 1];
+  if (last && last.who === "agent") return;
+  beginChatTurn(chat.id, turns.length, turns.length + 1);
 }
 
 /* ---- repository picker -------------------------------------------------- *
