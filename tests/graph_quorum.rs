@@ -12,7 +12,7 @@ use magi::run::RunStatus;
 async fn below_quorum_run_is_stalled_not_ready_and_resumable() {
     let _home = common::home_lock().await;
     // Two of the three judges are rate-limited out at their ranking.
-    let fx = fixture_with_quota(&["judge-1", "judge-2"]);
+    let fx = fixture_with_quota(_home, &["judge-1", "judge-2"]);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");
@@ -71,7 +71,7 @@ async fn below_quorum_run_is_stalled_not_ready_and_resumable() {
 #[tokio::test]
 async fn a_rate_limited_seat_is_recorded_and_the_panel_accounts_for_it() {
     let _home = common::home_lock().await;
-    let fx = fixture_with_quota(&["judge-1"]);
+    let fx = fixture_with_quota(_home, &["judge-1"]);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");
@@ -123,7 +123,7 @@ async fn a_stalled_run_recovers_to_ready_once_the_quota_resets() {
     let _home = common::home_lock().await;
     // Phase 1: two of three judges are rate-limited out — below quorum,
     // the run collapses to `Stalled` and stops before review/gate/merge.
-    let fx = fixture_with_quota(&["judge-1", "judge-2"]);
+    let fx = fixture_with_quota(_home, &["judge-1", "judge-2"]);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");
@@ -173,7 +173,7 @@ async fn a_stalled_run_stays_stalled_when_the_quota_has_not_reset() {
     // judge-1 and judge-2 are still rate-limited on resume, so the run cannot
     // reach a quorum no matter how often it is retried: it must stay `Stalled`
     // and resumable rather than finish on the back of one surviving judge.
-    let fx = fixture_with_quota(&["judge-1", "judge-2"]);
+    let fx = fixture_with_quota(_home, &["judge-1", "judge-2"]);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");
@@ -198,7 +198,7 @@ async fn a_plain_failure_collapse_stalls_and_recovers_on_resume() {
     // Two of the three judges fail with an *ordinary* error — no usable output,
     // no rate-limit shape. That collapses the quorum exactly like quota, and the
     // run must not pretend to be healthy.
-    let fx = fixture_with_failure(&["judge-1", "judge-2"]);
+    let fx = fixture_with_failure(_home, &["judge-1", "judge-2"]);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");
@@ -277,7 +277,7 @@ async fn a_plain_failure_collapse_stalls_and_recovers_on_resume() {
 #[tokio::test]
 async fn a_plain_failure_collapse_stays_stalled_while_the_failure_persists() {
     let _home = common::home_lock().await;
-    let fx = fixture_with_failure(&["judge-1", "judge-2"]);
+    let fx = fixture_with_failure(_home, &["judge-1", "judge-2"]);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");
@@ -301,7 +301,7 @@ async fn the_full_panel_present_is_still_a_healthy_ready() {
     // No quota: all three judges rank and vote, so the run reaches Ready as
     // before. This is the control that proves the new quorum machinery does
     // not change what a healthy run looks like.
-    let fx = fixture_with_quota(&[]);
+    let fx = fixture_with_quota(_home, &[]);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");

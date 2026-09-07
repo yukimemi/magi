@@ -13,7 +13,8 @@ use magi::run::RunStatus;
 
 #[tokio::test]
 async fn a_single_candidate_run_is_uncontested_not_collapsed() {
-    let mut fx = fixture(Judges::Unanimous, false);
+    let home = common::home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
     fx.config.graph.candidates = 1;
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())

@@ -24,7 +24,7 @@ fn dirty(repo: &std::path::Path) {
 #[tokio::test]
 async fn a_run_starts_on_a_dirty_tree_and_branches_off_the_base() {
     let _home = common::home_lock().await;
-    let fx = common::fixture(common::Judges::Unanimous, false);
+    let fx = common::fixture(_home, common::Judges::Unanimous, false);
     dirty(&fx.repo);
 
     // The precondition this test exists for: the tree really is dirty.
@@ -79,7 +79,7 @@ async fn a_run_branches_off_what_the_remote_has_not_a_stale_local_ref() {
     // everything the previous runs landed. Two tasks in a row from a phone
     // would have had the second reverting the first.
     let _home = common::home_lock().await;
-    let fx = common::fixture(common::Judges::Unanimous, false);
+    let fx = common::fixture(_home, common::Judges::Unanimous, false);
 
     let base = {
         let out = std::process::Command::new("git")

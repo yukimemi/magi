@@ -15,7 +15,7 @@ use magi::run::RunStatus;
 #[tokio::test]
 async fn a_blocked_run_stays_blocked_on_reentry() {
     let _home = home_lock().await;
-    let fx = fixture_always_blocked();
+    let fx = fixture_always_blocked(_home);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");

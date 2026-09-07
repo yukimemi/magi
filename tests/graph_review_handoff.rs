@@ -15,7 +15,7 @@ use magi::run::RunStatus;
 #[tokio::test]
 async fn a_spent_round_budget_hands_off_when_gate_and_e2e_stay_green() {
     let _guard = common::home_lock().await;
-    let fx = fixture_that_never_clears(2);
+    let fx = fixture_that_never_clears(_guard, 2);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");
@@ -44,7 +44,7 @@ async fn a_spent_round_budget_hands_off_when_gate_and_e2e_stay_green() {
 #[tokio::test]
 async fn a_red_gate_after_the_round_budget_blocks_with_what_failed() {
     let _guard = common::home_lock().await;
-    let mut fx = fixture_that_never_clears(2);
+    let mut fx = fixture_that_never_clears(_guard, 2);
     // The review loop's own e2e (`test -f note.txt`) still passes; only the
     // final gate is red, so this exercises the gate path specifically.
     fx.config.verify.gate = vec!["false".to_owned()];
@@ -72,7 +72,7 @@ async fn a_red_gate_after_the_round_budget_blocks_with_what_failed() {
 #[tokio::test]
 async fn a_red_e2e_at_the_round_budget_blocks_with_what_failed() {
     let _guard = common::home_lock().await;
-    let mut fx = fixture_that_never_clears(2);
+    let mut fx = fixture_that_never_clears(_guard, 2);
     // Red inside the review loop's own verification, not the separate gate
     // step — this exercises `stop_reviewing`'s e2e branch directly.
     fx.config.verify.e2e = vec!["false".to_owned()];
@@ -103,7 +103,7 @@ async fn a_tree_that_stops_moving_hands_off_before_the_round_budget() {
     let _guard = common::home_lock().await;
     // A generous budget the run must not need: the fixer never actually
     // changes the tree, so two stagnant rounds must be enough to stop.
-    let fx = fixture_with_noop_fixer(6);
+    let fx = fixture_with_noop_fixer(_guard, 6);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");
@@ -138,7 +138,7 @@ async fn a_clean_round_is_unaffected_by_any_of_this() {
     // The ordinary happy path (one blocker, one fix, clean) must still behave
     // exactly as before: this guards against the round-ending refactor
     // changing what a genuinely clean run looks like.
-    let fx = fixture(Judges::Unanimous, true);
+    let fx = fixture(_guard, Judges::Unanimous, true);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");

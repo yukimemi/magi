@@ -12,7 +12,7 @@ use magi::run::RunStatus;
 #[tokio::test]
 async fn a_dropped_stream_is_resumed_once_and_the_candidate_recovers() {
     let _home = common::home_lock().await;
-    let fx = fixture_with_dropped_stream(&["impl-B"]);
+    let fx = fixture_with_dropped_stream(_home, &["impl-B"]);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");
@@ -57,7 +57,7 @@ async fn a_dropped_stream_is_resumed_once_and_the_candidate_recovers() {
 #[tokio::test]
 async fn a_dropped_stream_with_no_session_left_is_not_resumed_into_a_blank_prompt() {
     let _home = common::home_lock().await;
-    let mut fx = fixture_with_dropped_stream(&["impl-B"]);
+    let mut fx = fixture_with_dropped_stream(_home, &["impl-B"]);
     // No session continuation at all: `has_context` is false for every seat
     // regardless of what the dropped reply carried. Resuming anyway would
     // send the context-free `resume_after_drop` prompt to a brand-new
@@ -112,7 +112,7 @@ async fn a_dropped_deliberation_turn_is_skipped_not_read_as_the_judges_position(
     // `AgentOutcome::Ok` (any exit code, so long as `work_undelivered()` was
     // true) and get read by `deliberate()` as if the CLI's raw error JSON were
     // judge 1's argued position.
-    let fx = fixture_with_dropped_deliberation(&["judge-1"]);
+    let fx = fixture_with_dropped_deliberation(_home, &["judge-1"]);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");

@@ -85,7 +85,7 @@ fn land_on_origin(sideline: &std::path::Path, file: &str, content: &str) {
 #[tokio::test]
 async fn the_gate_runs_on_a_tree_that_contains_what_landed_while_the_run_was_thinking() {
     let _home = home_lock().await;
-    let fx = fixture(Judges::Unanimous, false);
+    let fx = fixture(_home, Judges::Unanimous, false);
     let origin = wire_origin(&fx);
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
@@ -143,7 +143,7 @@ async fn the_gate_runs_on_a_tree_that_contains_what_landed_while_the_run_was_thi
 #[tokio::test]
 async fn a_base_that_conflicts_stops_the_run_without_a_review_round_or_a_fixer() {
     let _home = home_lock().await;
-    let fx = fixture(Judges::Unanimous, false);
+    let fx = fixture(_home, Judges::Unanimous, false);
     let origin = wire_origin(&fx);
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
