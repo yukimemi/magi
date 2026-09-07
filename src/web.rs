@@ -135,14 +135,21 @@ const POLL: Duration = Duration::from_secs(1);
 /// the stream alive without waking the radio often enough to matter.
 const KEEPALIVE: Duration = Duration::from_secs(15);
 
-/// How often [`run_update_recheck`] wakes up to ask whether a check is due.
+/// Ceiling on how long [`run_update_recheck`] ever sleeps between wake-ups.
 ///
-/// Deliberately much shorter than `[update] interval` (a day, by default):
-/// this is only how promptly the task *notices* the interval has elapsed, not
-/// how often it reaches the network. [`update_recheck_due`] gates the actual
-/// call through [`updater::Checker::should_check`], so a short wake-up period
-/// costs nothing against GitHub's rate limit no matter how it is set.
-const UPDATE_RECHECK_POLL: Duration = Duration::from_secs(15 * 60);
+/// A fixed period this long would not track a `[update] interval` shorter
+/// than itself: an operator who set `interval = "1m"` to make the deck
+/// notice a release within a minute would still wait up to fifteen of them
+/// for the next wake-up to even ask [`updater::Checker::should_check`].
+/// [`recheck_poll_period`] scales the sleep with the configured interval
+/// instead, and this is only its ceiling - reached at the default interval
+/// of a day, where waking any more often would just spend cycles asking a
+/// question that stays "no" for hours.
+const UPDATE_RECHECK_POLL_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// Floor on the same, so a very short `[update] interval` cannot spin
+/// [`run_update_recheck`] in a near-busy loop.
+const UPDATE_RECHECK_POLL_MIN: Duration = Duration::from_secs(30);
 
 /// Runs returned when the client does not ask, and the ceiling if it asks for
 /// more. The cap exists because the list handler parses every `run.json` it
@@ -1391,6 +1398,22 @@ fn update_recheck_due(checker: &updater::Checker, progress: Option<&updater::Pro
     checker.should_check()
 }
 
+/// How long [`run_update_recheck`] sleeps before its next wake-up.
+///
+/// A fraction of the configured `[update] interval` rather than a fixed
+/// number: a fixed sleep longer than a short custom interval would leave the
+/// deck waiting on its own wake-up rather than on `should_check`, so an
+/// operator who set `interval = "1m"` to make the UI catch up quickly would
+/// not see that take effect until the next restart - exactly the bug this
+/// task exists to fix, just moved one level down. Scaling with the interval
+/// keeps the wake-up prompt relative to what was actually configured, while
+/// [`update_recheck_due`]'s call to [`updater::Checker::should_check`] is
+/// still what caps the network calls themselves at one per interval,
+/// regardless of how often this fires.
+fn recheck_poll_period(cfg: &Update) -> Duration {
+    (updater::effective_interval(cfg) / 8).clamp(UPDATE_RECHECK_POLL_MIN, UPDATE_RECHECK_POLL_MAX)
+}
+
 /// Keep `/api/health`'s `update` field current for as long as `magi web`
 /// stays up.
 ///
@@ -1402,7 +1425,8 @@ fn update_recheck_due(checker: &updater::Checker, progress: Option<&updater::Pro
 /// many releases ship afterwards. This is what notices the rest of them,
 /// re-reading the config each tick so a `magi.toml` edit while the server is
 /// up takes effect without a restart, the same way every other route here
-/// already does.
+/// already does - both for whether checking is on at all and for how long
+/// the next sleep should be.
 ///
 /// Not [`updater::spawn`]'s `auto_update` path, even under `mode =
 /// "install"`: swapping the running binary out from under a task or a run
@@ -1415,8 +1439,8 @@ fn update_recheck_due(checker: &updater::Checker, progress: Option<&updater::Pro
 /// the next process start.
 async fn run_update_recheck(repo: PathBuf, home: PathBuf) {
     loop {
-        tokio::time::sleep(UPDATE_RECHECK_POLL).await;
         let (cfg, _) = Config::discover(&repo, None).unwrap_or_default();
+        tokio::time::sleep(recheck_poll_period(&cfg.update)).await;
         if !should_spawn_recheck(&cfg.update) {
             continue;
         }
@@ -6981,6 +7005,37 @@ mod tests {
             mode: UpdateMode::Notify,
             interval: None,
         }));
+    }
+
+    /// [`recheck_poll_period`] must track a configured `[update] interval`
+    /// shorter than its own default ceiling - a fixed sleep here would leave
+    /// an operator's short interval waiting on the next wake-up instead of on
+    /// `should_check`, which is the same bug this whole task exists to fix,
+    /// just one level down.
+    #[test]
+    fn recheck_poll_period_tracks_a_short_configured_interval() {
+        let short = crate::config::Update {
+            mode: UpdateMode::Notify,
+            interval: Some("1m".to_owned()),
+        };
+        let period = recheck_poll_period(&short);
+        assert!(
+            period <= Duration::from_secs(30),
+            "a one-minute interval must wake the task far sooner than the \
+             default ceiling, or the deck would not notice within the \
+             interval the operator configured: got {period:?}"
+        );
+
+        let default = crate::config::Update {
+            mode: UpdateMode::Notify,
+            interval: None,
+        };
+        assert_eq!(
+            recheck_poll_period(&default),
+            UPDATE_RECHECK_POLL_MAX,
+            "the default day-long interval should poll at the (capped) \
+             ceiling rather than needlessly often"
+        );
     }
 
     /// [`update_recheck_due`] must not repeat a check made moments ago, the

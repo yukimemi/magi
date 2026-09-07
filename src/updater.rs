@@ -23,6 +23,20 @@ pub fn default_interval() -> Duration {
     kaishin::default_interval()
 }
 
+/// The interval `cfg` configures, or [`default_interval`] when unset or
+/// unparsable.
+///
+/// Shared by [`Checker::new`], which throttles the network call itself
+/// against it, and `web::recheck_poll_period`, which uses it to decide how
+/// often to even ask - a background recheck task cannot track an interval it
+/// never sees.
+pub fn effective_interval(cfg: &Update) -> Duration {
+    cfg.interval
+        .as_deref()
+        .and_then(|s| kaishin::parse_interval(s).ok())
+        .unwrap_or_else(default_interval)
+}
+
 /// Is the background check switched off by the environment?
 pub fn disabled_by_env() -> bool {
     match std::env::var(NO_AUTOUPDATE_ENV) {
@@ -120,13 +134,8 @@ impl Checker {
         if let Some(path) = state_path() {
             inner = inner.state_path(path);
         }
-        let interval = cfg
-            .interval
-            .as_deref()
-            .and_then(|s| kaishin::parse_interval(s).ok())
-            .unwrap_or_else(default_interval);
         Some(Self {
-            inner: inner.interval(interval),
+            inner: inner.interval(effective_interval(cfg)),
         })
     }
 
