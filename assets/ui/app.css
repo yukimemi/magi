@@ -730,12 +730,38 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .checks[data-checks="pending"]::before { border-style: dashed; animation: spin 3.4s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ---- runs: sections, folded attempts, tree ------------------------------ *
- * The flat, updated-first list becomes four <details> sections — Waiting on
- * you, In flight, Landed, Ended — each collapsible, plus (wide screens only)
- * a two-level tree beside them that narrows the cards to one section or one
- * repo within it. Native <details>/<summary> carries the keyboard behaviour
- * for free; the tree is a list of real <button>s for the same reason. */
+/* ---- shared: collapsible list sections ---------------------------------- *
+ * Both Runs and Backlog split their flat, single-order list into a handful
+ * of <details> sections — see RUN_SECTIONS and QUEUE_SECTIONS in app.js —
+ * and share this look for it. Native <details>/<summary> carries the
+ * keyboard behaviour for free. */
+#runs-sections, #queue-sections { display: flex; flex-direction: column; gap: var(--s4); }
+
+.list-section-head {
+  display: flex; align-items: center; gap: var(--s2);
+  min-height: var(--tap); cursor: pointer;
+}
+.list-section-head::marker,
+.list-section-head::-webkit-details-marker { display: none; content: ""; }
+.list-section-head::before {
+  content: ""; flex: none;
+  width: 7px; height: 7px;
+  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  color: var(--ink-3);
+  transform: rotate(-45deg); margin-left: 2px;
+  transition: transform .18s var(--ease);
+}
+.list-section[open] > .list-section-head::before { transform: rotate(45deg); }
+.list-section-title { font-size: var(--t4); color: var(--ink); }
+.list-section-count, .runs-section-folded { font-size: var(--t2); color: var(--ink-3); white-space: nowrap; }
+.list-section-count { margin-left: auto; }
+.list-section .cards { margin-top: var(--s3); }
+
+/* ---- runs: tree ---------------------------------------------------------- *
+ * The Runs list additionally gets (wide screens only) a two-level tree
+ * beside it that narrows the cards to one section or one repo within it.
+ * The tree is a list of real <button>s, for the same free keyboard
+ * behaviour <details> gives the sections above. */
 .runs-layout { display: block; }
 .runs-main { display: flex; flex-direction: column; gap: var(--s4); }
 
@@ -746,28 +772,6 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   font-size: var(--t3); color: var(--ink-2);
 }
 #runs-filter-text { flex: 1; min-width: 0; }
-
-#runs-sections { display: flex; flex-direction: column; gap: var(--s4); }
-
-.runs-section-head {
-  display: flex; align-items: center; gap: var(--s2);
-  min-height: var(--tap); cursor: pointer;
-}
-.runs-section-head::marker,
-.runs-section-head::-webkit-details-marker { display: none; content: ""; }
-.runs-section-head::before {
-  content: ""; flex: none;
-  width: 7px; height: 7px;
-  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
-  color: var(--ink-3);
-  transform: rotate(-45deg); margin-left: 2px;
-  transition: transform .18s var(--ease);
-}
-.runs-section[open] > .runs-section-head::before { transform: rotate(45deg); }
-.runs-section-title { font-size: var(--t4); color: var(--ink); }
-.runs-section-count, .runs-section-folded { font-size: var(--t2); color: var(--ink-3); white-space: nowrap; }
-.runs-section-count { margin-left: auto; }
-.runs-section .cards { margin-top: var(--s3); }
 
 /* An older attempt at the same task, folded under the card that replaced it.
    `.advanced` (see the queue card's "Full instruction" disclosure) already
