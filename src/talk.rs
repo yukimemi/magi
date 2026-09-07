@@ -11,14 +11,26 @@
 //!
 //! # Talking is not implementing
 //!
-//! Every turn here runs with `allow_write: false` - the same restriction
-//! [`crate::chat`] puts on its own interview, for the same reason. An agent
-//! that can edit files while the operator is mid-thought can leave the
-//! checkout in a state neither of them chose. When the operator wants a
-//! change made, the agent is told to run `magi task add --solo`
-//! ([`briefing`]) rather than reach for an editor: the change goes through
-//! magi's own queue, on the repository's own terms, and the operator can
-//! watch it happen instead of trusting that it did.
+//! Every turn here runs with `allow_write: false` by default - the same
+//! restriction [`crate::chat`] puts on its own interview, for the same
+//! reason: not security, but attribution. An agent that edits a checkout
+//! mid-conversation leaves a diff that belongs to no run and passed no
+//! review, and on a repository entered into magi's blind competition that
+//! makes every candidate's diff unjudgeable. That is why the default holds
+//! regardless of what a repository's own `magi.toml` says about anything
+//! else. When the operator wants a change made, the agent is told to run
+//! `magi task add --solo` ([`briefing`]) rather than reach for an editor: the
+//! change goes through magi's own queue, on the repository's own terms, and
+//! the operator can watch it happen instead of trusting that it did.
+//!
+//! `[talk] allow_write` ([`crate::config::Talk::allow_write`]) lets a
+//! specific repository opt out of that default - a dotfiles or personal
+//! config checkout that is never entered into a competition and never
+//! reviewed has nothing for the restriction to protect, and filing a task for
+//! a one-line edit there is pure overhead. Turning it on does not turn this
+//! conversation into an implementer: [`briefing`] still sends everything
+//! bigger than a small, operator-named edit to the queue, and still tells the
+//! agent to say what it changed.
 //!
 //! `--solo` rather than a plain `magi task add` is the point of pairing this
 //! module with [`crate::queue::Task::solo`]. A task that came out of a
@@ -426,7 +438,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     let body = if talk.seat.turns == 0 {
         format!(
             "{}\n\n# Operator\n\n{text}",
-            briefing(&talk.repo, &cfg.graph.language)
+            briefing(&talk.repo, &cfg.graph.language, cfg.talk.allow_write)
         )
     } else if resuming {
         text.to_owned()
@@ -443,11 +455,11 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         cwd: &talk.repo,
         prompt: &body,
         timeout: TURN_TIMEOUT,
-        // This conversation never writes to the repository: it tells the
-        // operator to run `magi task add --solo` instead, which is what keeps
-        // an implementer's diff attributable to a run rather than to a chat
-        // nobody reviewed.
-        allow_write: false,
+        // Off unless this repository's own config opts in - see
+        // `crate::config::Talk::allow_write` and this module's doc for why
+        // the default keeps a conversational edit from landing in a checkout
+        // no run or review can claim.
+        allow_write: cfg.talk.allow_write,
         sessions: cfg.graph.sessions,
         artifacts: &artifacts,
         stem: &stem,
@@ -553,22 +565,35 @@ fn transcript(talk: &Talk) -> String {
 /// The briefing the agent opens with, sent once as part of its first turn.
 ///
 /// Pure, so the properties that matter can be asserted without an interview:
-/// it names `magi task add --solo` (the only route this conversation has to
+/// it names `magi task add --solo` (the route this conversation always has to
 /// changing anything) and it does not carry
 /// [`crate::plan::TASK_FILE_SPEC`] - that spec describes a task *file*, which
 /// belongs to the planning interview and would tell this agent to write one
-/// here instead of filing through the queue.
-pub fn briefing(repo: &Path, language: &str) -> String {
+/// here instead of filing through the queue. `allow_write` only ever adds an
+/// extra permission on top of that; it never removes the queue as an option,
+/// which is why both branches keep the same `# When the operator wants
+/// something done` section - `write_policy` is the only part that changes.
+pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
+    let write_policy = if allow_write {
+        "This repository has set `[talk] allow_write = true`, so you may \
+         write files here - but only a small, already-decided edit the \
+         operator names outright in this conversation, not an \
+         implementation. Once you have made it, say plainly what you \
+         edited. Anything bigger, or anything still open-ended, still goes \
+         through the queue below rather than being done here."
+    } else {
+        "Do not write files. Implementing a change is not this \
+         conversation's job; a separate, blind competition of agents does \
+         that, and a repository this conversation has already edited would \
+         make their diffs unjudgeable."
+    };
     let mut out = format!(
         "You are magi's standing conversation partner for its operator, who \
          usually has this open on a phone. Keep replies short: no preamble, \
          no restating what they just said.\n\n\
          # Repository\n\n{repo}\n\n\
          You may look around: read files, run shell commands, search history, \
-         run tests - whatever answers the question. Do not write files. \
-         Implementing a change is not this conversation's job; a separate, \
-         blind competition of agents does that, and a repository this \
-         conversation has already edited would make their diffs unjudgeable.\n\n\
+         run tests - whatever answers the question. {write_policy}\n\n\
          # When the operator wants something done\n\n\
          Run:\n\n\
          magi task add --solo --repo {repo} <instruction>\n\n\
@@ -1017,7 +1042,7 @@ mod tests {
 
     #[test]
     fn the_briefing_names_solo_task_add_and_not_the_task_file_spec() {
-        let brief = briefing(Path::new("/repo"), "en");
+        let brief = briefing(Path::new("/repo"), "en", false);
         assert!(brief.contains("magi task add --solo"));
         assert!(!brief.contains(plan::TASK_FILE_SPEC));
         assert!(brief.contains("/repo"));
@@ -1026,7 +1051,22 @@ mod tests {
 
     #[test]
     fn the_briefing_names_the_language_when_it_is_not_english() {
-        let brief = briefing(Path::new("/repo"), "Japanese");
+        let brief = briefing(Path::new("/repo"), "Japanese", false);
         assert!(brief.contains("Hold this conversation in Japanese"));
+    }
+
+    #[test]
+    fn the_briefing_forbids_writes_unless_the_repository_opted_in() {
+        let read_only = briefing(Path::new("/repo"), "en", false);
+        assert!(read_only.contains("Do not write files"));
+        assert!(!read_only.contains("allow_write"));
+
+        let writable = briefing(Path::new("/repo"), "en", true);
+        assert!(!writable.contains("Do not write files"));
+        assert!(writable.contains("allow_write = true"));
+        // Still names the queue for anything past a small named edit, and
+        // still tells the agent to report what it changed.
+        assert!(writable.contains("magi task add --solo"));
+        assert!(writable.contains("say plainly what you"));
     }
 }
