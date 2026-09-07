@@ -54,6 +54,11 @@ pub struct Fixture {
     pub repo: PathBuf,
     /// Config with a three-agent roster of mocks.
     pub config: Config,
+    /// Held for as long as the fixture is: a reference would let the guard
+    /// backing it drop at the end of the constructor call instead of the end
+    /// of the test, which is exactly early enough to let two fixtures in the
+    /// same test binary race `run::set_home` again.
+    _home: HomeGuard,
 }
 
 const MOCK: &str = r#"#!/bin/sh
@@ -210,9 +215,10 @@ fn run_git(repo: &Path, args: &[&str]) {
 /// `require_fix` makes the reviewers raise one blocking finding on the first
 /// round, so the review + fix loop is actually exercised.
 ///
-/// `_home` proves the caller is already holding [`home_lock`] — see
-/// [`HomeGuard`] for why that has to be a parameter rather than a convention.
-pub fn fixture(_home: &HomeGuard, judges: Judges, require_fix: bool) -> Fixture {
+/// `home` is [`home_lock`]'s guard, taken by value and stored on the returned
+/// `Fixture` so it stays held for the fixture's own lifetime rather than
+/// dropping at the end of this call.
+pub fn fixture(home: HomeGuard, judges: Judges, require_fix: bool) -> Fixture {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -302,13 +308,18 @@ pub fn fixture(_home: &HomeGuard, judges: Judges, require_fix: bool) -> Fixture 
         ..Config::default()
     };
 
-    Fixture { tmp, repo, config }
+    Fixture {
+        tmp,
+        repo,
+        config,
+        _home: home,
+    }
 }
 
 /// Like [`fixture`], but the given judge seats hit a simulated rate limit at
 /// their initial ranking. `Judges::Unanimous` keeps the surviving judges
 /// agreeing, so the only variable left is how many seats remain.
-pub fn fixture_with_quota(home: &HomeGuard, quota_seats: &[&str]) -> Fixture {
+pub fn fixture_with_quota(home: HomeGuard, quota_seats: &[&str]) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, false);
     let value = quota_seats.join(",");
     for a in &mut fx.config.agents {
@@ -321,7 +332,7 @@ pub fn fixture_with_quota(home: &HomeGuard, quota_seats: &[&str]) -> Fixture {
 /// usable output) at their initial ranking — the non-quota counterpart to
 /// [`fixture_with_quota`]. Enough of these collapse the quorum the same way a
 /// rate limit does.
-pub fn fixture_with_failure(home: &HomeGuard, failed_seats: &[&str]) -> Fixture {
+pub fn fixture_with_failure(home: HomeGuard, failed_seats: &[&str]) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, false);
     let value = failed_seats.join(",");
     for a in &mut fx.config.agents {
@@ -336,7 +347,7 @@ pub fn fixture_with_failure(home: &HomeGuard, failed_seats: &[&str]) -> Fixture 
 /// `agent::dropped_stream`. The resumed call always succeeds, so a candidate
 /// that gets resumed ends up healthy and one that does not (no session left to
 /// resume) ends up looking like an ordinary failure.
-pub fn fixture_with_dropped_stream(home: &HomeGuard, seats: &[&str]) -> Fixture {
+pub fn fixture_with_dropped_stream(home: HomeGuard, seats: &[&str]) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, false);
     let value = seats.join(",");
     for a in &mut fx.config.agents {
@@ -354,7 +365,7 @@ pub fn fixture_with_dropped_stream(home: &HomeGuard, seats: &[&str]) -> Fixture 
 /// genuinely-blocked leg specifically. Built for reentry tests: a single
 /// viable candidate is what makes `judge` skip the panel instead of asking
 /// it.
-pub fn fixture_always_blocked(home: &HomeGuard) -> Fixture {
+pub fn fixture_always_blocked(home: HomeGuard) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, true);
     fx.config.graph.candidates = 1;
     fx.config.verify.e2e = vec!["false".to_owned()];
@@ -368,7 +379,7 @@ pub fn fixture_always_blocked(home: &HomeGuard) -> Fixture {
 /// Like [`fixture_with_dropped_stream`], but the dropped shape happens on a
 /// judge's *deliberation round* reply instead of an implementer's. Needs
 /// `Judges::Split` — deliberation only opens once judges disagree.
-pub fn fixture_with_dropped_deliberation(home: &HomeGuard, seats: &[&str]) -> Fixture {
+pub fn fixture_with_dropped_deliberation(home: HomeGuard, seats: &[&str]) -> Fixture {
     let mut fx = fixture(home, Judges::Split, false);
     let value = seats.join(",");
     for a in &mut fx.config.agents {
@@ -391,7 +402,7 @@ pub fn fixture_with_dropped_deliberation(home: &HomeGuard, seats: &[&str]) -> Fi
 /// `agent::tests::timeout_is_reported_not_hung`. The classification this
 /// fixture feeds is additionally pinned process-free by the
 /// `graph::tests::round_is_clean` family.
-pub fn fixture_with_silent_review_seat(home: &HomeGuard, silent_seats: &[&str]) -> Fixture {
+pub fn fixture_with_silent_review_seat(home: HomeGuard, silent_seats: &[&str]) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, false);
     // No re-ask: the seat is meant to be absent from the round, not absent
     // once and then absent again.
@@ -408,7 +419,7 @@ pub fn fixture_with_silent_review_seat(home: &HomeGuard, silent_seats: &[&str]) 
 /// fixer still runs and still commits a real, distinct change every round
 /// (see the mock script) — the point of this fixture is a round budget spent
 /// on a change that keeps moving, never a tree that stopped moving.
-pub fn fixture_that_never_clears(home: &HomeGuard, rounds: usize) -> Fixture {
+pub fn fixture_that_never_clears(home: HomeGuard, rounds: usize) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, false);
     fx.config.graph.review_rounds = rounds;
     for a in &mut fx.config.agents {
@@ -422,7 +433,7 @@ pub fn fixture_that_never_clears(home: &HomeGuard, rounds: usize) -> Fixture {
 /// touches the tree — it reports `addressed` while leaving the diff exactly
 /// as it was. This is what a vibrating round looks like from `git`'s side,
 /// as opposed to what the fixer's own report claims.
-pub fn fixture_with_noop_fixer(home: &HomeGuard, rounds: usize) -> Fixture {
+pub fn fixture_with_noop_fixer(home: HomeGuard, rounds: usize) -> Fixture {
     let mut fx = fixture_that_never_clears(home, rounds);
     for a in &mut fx.config.agents {
         a.env.insert("MOCK_FIXER_NOOP".to_owned(), "1".to_owned());

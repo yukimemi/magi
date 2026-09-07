@@ -9,7 +9,7 @@ use magi::run::RunStatus;
 #[tokio::test]
 async fn a_split_run_deliberates_then_collects_private_votes() {
     let home = common::home_lock().await;
-    let fx = fixture(&home, Judges::Split, true);
+    let fx = fixture(home, Judges::Split, true);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");
