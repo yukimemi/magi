@@ -116,7 +116,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::advise;
 use crate::ask::{Answer, Question, Questions};
 use crate::chat::{Chat, Chats};
-use crate::config::Config;
+use crate::config::{Config, Update, UpdateMode};
 use crate::md;
 use crate::proc::Quiet as _;
 use crate::queue::{Queue, Task, title_from};
@@ -134,6 +134,22 @@ const POLL: Duration = Duration::from_secs(1);
 /// an idle connection within a minute; a comment every fifteen seconds keeps
 /// the stream alive without waking the radio often enough to matter.
 const KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// Ceiling on how long [`run_update_recheck`] ever sleeps between wake-ups.
+///
+/// A fixed period this long would not track a `[update] interval` shorter
+/// than itself: an operator who set `interval = "1m"` to make the deck
+/// notice a release within a minute would still wait up to fifteen of them
+/// for the next wake-up to even ask [`updater::Checker::should_check`].
+/// [`recheck_poll_period`] scales the sleep with the configured interval
+/// instead, and this is only its ceiling - reached at the default interval
+/// of a day, where waking any more often would just spend cycles asking a
+/// question that stays "no" for hours.
+const UPDATE_RECHECK_POLL_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// Floor on the same, so a very short `[update] interval` cannot spin
+/// [`run_update_recheck`] in a near-busy loop.
+const UPDATE_RECHECK_POLL_MIN: Duration = Duration::from_secs(30);
 
 /// Runs returned when the client does not ask, and the ceiling if it asks for
 /// more. The cap exists because the list handler parses every `run.json` it
@@ -845,14 +861,25 @@ pub async fn serve(opts: Opts) -> Result<()> {
 
     let ui = Ui::open(opts.repo).with_merge(opts.merge);
     // Cloned before `ui.router()` consumes `ui` below: `hand_over` needs the
-    // home to bracket the parking and restarting stages, and by then there is
-    // no `ui` left to read it from.
+    // home to bracket the parking and restarting stages, and `run_update_recheck`
+    // needs both it and the repo, and by then there is no `ui` left to read
+    // them from.
     let home = ui.home.clone();
+    let repo = ui.repo.clone();
     // Settles a progress record a predecessor left non-terminal - either this
     // *is* the successor `spawn_successor` started, or the previous process
     // died mid-handover. Before the router starts answering, so the very
     // first `/api/health` a phone gets from this process already reflects it.
     updater::reconcile_after_restart(&home);
+    // `magi web` can stay up for days, and the one-time check `main.rs`'s
+    // `spawn_update_check` does at startup only ever runs once: after that,
+    // `/api/health`'s `update` field - and the phone's "Update & restart"
+    // button, which reads the very same cache - would stay frozen on
+    // whatever that single check found, no matter how many releases ship
+    // afterwards. This keeps it current instead. Detached: it must keep
+    // going for as long as this process serves, `serve` has nothing to await
+    // it for, and it exits on its own the moment the process does.
+    tokio::spawn(run_update_recheck(repo, home.clone()));
     let looping = ui.looping();
     let socket = SocketAddr::new(addr, opts.port);
     let listener = bind_waiting(socket).await?;
@@ -1341,6 +1368,93 @@ struct UpgradeProgressView {
     started_at: Timestamp,
     updated_at: Timestamp,
     detail: Option<String>,
+}
+
+/// Whether [`run_update_recheck`] may act at all this tick.
+///
+/// The same two conditions [`updater::Checker::new`] and
+/// [`upgrade_post`] already honour: an operator who wrote `[update] mode =
+/// "off"`, or who set [`updater::NO_AUTOUPDATE_ENV`], means "never contact
+/// GitHub from this process" - on a button press or on a timer alike.
+fn should_spawn_recheck(cfg: &Update) -> bool {
+    cfg.mode != UpdateMode::Off && !updater::disabled_by_env()
+}
+
+/// Whether this tick should actually reach the network, once checking itself
+/// is allowed.
+///
+/// An upgrade already in flight must not be raced by a check that discovers
+/// a *newer* release while one is still installing - a phone watching
+/// `/api/health` would see the answer change out from under the upgrade it
+/// already asked for. Past that, [`updater::Checker::should_check`] is the
+/// same throttle the CLI's own notify mode and [`cached_update_view`] rely
+/// on; deferring to it here, rather than to [`run_update_recheck`]'s own
+/// polling period, is what keeps this task's network use to at most once per
+/// `[update] interval` regardless of how often it wakes up.
+fn update_recheck_due(checker: &updater::Checker, progress: Option<&updater::Progress>) -> bool {
+    if progress.is_some_and(|p| !p.stage.terminal()) {
+        return false;
+    }
+    checker.should_check()
+}
+
+/// How long [`run_update_recheck`] sleeps before its next wake-up.
+///
+/// A fraction of the configured `[update] interval` rather than a fixed
+/// number: a fixed sleep longer than a short custom interval would leave the
+/// deck waiting on its own wake-up rather than on `should_check`, so an
+/// operator who set `interval = "1m"` to make the UI catch up quickly would
+/// not see that take effect until the next restart - exactly the bug this
+/// task exists to fix, just moved one level down. Scaling with the interval
+/// keeps the wake-up prompt relative to what was actually configured, while
+/// [`update_recheck_due`]'s call to [`updater::Checker::should_check`] is
+/// still what caps the network calls themselves at one per interval,
+/// regardless of how often this fires.
+fn recheck_poll_period(cfg: &Update) -> Duration {
+    (updater::effective_interval(cfg) / 8).clamp(UPDATE_RECHECK_POLL_MIN, UPDATE_RECHECK_POLL_MAX)
+}
+
+/// Keep `/api/health`'s `update` field current for as long as `magi web`
+/// stays up.
+///
+/// The CLI's own `spawn_update_check` (`main.rs`) runs once per invocation,
+/// which is enough for every other command: they exit in seconds. `magi web`
+/// can run for days, so a single startup check leaves the cache - and the
+/// phone's "Update & restart" button, which reads it via
+/// [`cached_update_view`] - frozen on whatever that one look found, however
+/// many releases ship afterwards. This is what notices the rest of them,
+/// re-reading the config each tick so a `magi.toml` edit while the server is
+/// up takes effect without a restart, the same way every other route here
+/// already does - both for whether checking is on at all and for how long
+/// the next sleep should be.
+///
+/// Not [`updater::spawn`]'s `auto_update` path, even under `mode =
+/// "install"`: swapping the running binary out from under a task or a run
+/// mid-node is exactly what `hand_over`'s parking exists to do deliberately,
+/// not as a side effect of a timer nobody asked to fire. This only ever
+/// calls [`updater::Checker::newer_release`], which refreshes
+/// `last_update_check.json` and nothing else - so under `mode = "install"`
+/// this behaves like `notify` for as long as the deck stays up, and an
+/// actual self-install still happens exactly where it always has: once, at
+/// the next process start.
+async fn run_update_recheck(repo: PathBuf, home: PathBuf) {
+    loop {
+        let (cfg, _) = Config::discover(&repo, None).unwrap_or_default();
+        tokio::time::sleep(recheck_poll_period(&cfg.update)).await;
+        if !should_spawn_recheck(&cfg.update) {
+            continue;
+        }
+        let Some(checker) = updater::Checker::new(&cfg.update) else {
+            continue;
+        };
+        let progress = updater::read_progress(&home);
+        if !update_recheck_due(&checker, progress.as_ref()) {
+            continue;
+        }
+        if let Err(e) = checker.newer_release().await {
+            tracing::warn!("background update recheck failed: {e:#}");
+        }
+    }
 }
 
 /// [`UpdateView`] from the same throttled, disk-only state
@@ -6854,6 +6968,119 @@ mod tests {
         let err = res.json()["error"].as_str().unwrap().to_owned();
         assert!(err.contains("4321"), "the refusal names the owner: {err}");
         assert!(err.contains("old one against the same queue"), "{err}");
+    }
+
+    /// [`should_spawn_recheck`] must refuse for the same two reasons
+    /// [`Checker::new`](crate::updater::Checker::new) and `upgrade_post`
+    /// already do: `mode = "off"` and the `MAGI_NO_AUTOUPDATE` kill switch.
+    /// Purely a predicate over config and the environment - no network, no
+    /// disk, no runtime - so unlike the fixture-based tests around it this
+    /// one needs neither.
+    #[test]
+    fn recheck_never_spawns_when_checking_is_off_or_killed_by_env() {
+        assert!(!should_spawn_recheck(&crate::config::Update {
+            mode: UpdateMode::Off,
+            interval: None,
+        }));
+
+        // SAFETY: single-threaded as far as this variable goes, the same
+        // reasoning `updater::tests::env_kill_switch_semantics` relies on.
+        unsafe {
+            std::env::set_var(crate::updater::NO_AUTOUPDATE_ENV, "1");
+        }
+        let killed = should_spawn_recheck(&crate::config::Update {
+            mode: UpdateMode::Notify,
+            interval: None,
+        });
+        unsafe {
+            std::env::remove_var(crate::updater::NO_AUTOUPDATE_ENV);
+        }
+        assert!(
+            !killed,
+            "MAGI_NO_AUTOUPDATE must stop the periodic recheck, not just the \
+             one-time startup check"
+        );
+
+        assert!(should_spawn_recheck(&crate::config::Update {
+            mode: UpdateMode::Notify,
+            interval: None,
+        }));
+    }
+
+    /// [`recheck_poll_period`] must track a configured `[update] interval`
+    /// shorter than its own default ceiling - a fixed sleep here would leave
+    /// an operator's short interval waiting on the next wake-up instead of on
+    /// `should_check`, which is the same bug this whole task exists to fix,
+    /// just one level down.
+    #[test]
+    fn recheck_poll_period_tracks_a_short_configured_interval() {
+        let short = crate::config::Update {
+            mode: UpdateMode::Notify,
+            interval: Some("1m".to_owned()),
+        };
+        let period = recheck_poll_period(&short);
+        assert!(
+            period <= Duration::from_secs(30),
+            "a one-minute interval must wake the task far sooner than the \
+             default ceiling, or the deck would not notice within the \
+             interval the operator configured: got {period:?}"
+        );
+
+        let default = crate::config::Update {
+            mode: UpdateMode::Notify,
+            interval: None,
+        };
+        assert_eq!(
+            recheck_poll_period(&default),
+            UPDATE_RECHECK_POLL_MAX,
+            "the default day-long interval should poll at the (capped) \
+             ceiling rather than needlessly often"
+        );
+    }
+
+    /// [`update_recheck_due`] must not repeat a check made moments ago, the
+    /// same throttle `updater::Checker::should_check` already gives the
+    /// CLI's notify mode. Built over an explicit state file via
+    /// `Checker::for_test`, never `Checker::new`, so this cannot read or
+    /// write the operator's real `last_update_check.json` - and therefore
+    /// cannot flake on whatever that file happens to say on the machine
+    /// running the test.
+    #[test]
+    fn recheck_skips_the_network_before_the_interval_elapses() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("state.json");
+        let state = kaishin::UpdateCheckState {
+            last_checked_unix: jiff::Timestamp::now().as_second() as u64,
+            last_known_latest: None,
+            last_known_url: None,
+        };
+        kaishin::save_check_state(&path, &state).expect("seed a just-checked state");
+
+        let checker = crate::updater::Checker::for_test(Duration::from_secs(24 * 60 * 60), path);
+        assert!(
+            !update_recheck_due(&checker, None),
+            "a check made moments ago must not be repeated before the \
+             configured interval elapses"
+        );
+    }
+
+    /// An upgrade this deck already started must not be raced by a recheck
+    /// that discovers a newer release mid-install - regardless of what
+    /// `should_check` says, which is why the state file here is missing
+    /// entirely: read alone, that alone would answer "never checked, go
+    /// ahead".
+    #[test]
+    fn recheck_defers_to_an_upgrade_already_in_flight() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("state.json");
+        let checker = crate::updater::Checker::for_test(Duration::from_secs(60 * 60), path);
+        let progress = crate::updater::Progress::new("0.8.0".to_owned(), "v0.9.0".to_owned());
+
+        assert!(
+            !update_recheck_due(&checker, Some(&progress)),
+            "a recheck must not run while an upgrade this deck started is \
+             still moving"
+        );
     }
 
     #[tokio::test]

@@ -23,6 +23,33 @@ pub fn default_interval() -> Duration {
     kaishin::default_interval()
 }
 
+/// Floor under [`effective_interval`], matching GitHub's unauthenticated rate
+/// limit for the releases API (60 requests/hour/address).
+///
+/// A one-off CLI invocation honouring a shorter configured interval could
+/// only ever make one call per process, so it was never at risk of tripping
+/// that limit on its own. The background recheck loop in `web.rs` is
+/// different: it polls for as long as `magi web` stays up, so an interval
+/// configured well below an hour would have it repeat the same call for as
+/// long as the deck runs - a shared floor here is what keeps it, and every
+/// other caller of [`Checker::new`], inside the budget regardless.
+const MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The interval `cfg` configures, floored at [`MIN_INTERVAL`], or
+/// [`default_interval`] when unset or unparsable.
+///
+/// Shared by [`Checker::new`], which throttles the network call itself
+/// against it, and the background recheck loop in `web.rs`, which uses it to
+/// decide how often to even ask - it cannot track an interval it never sees.
+pub fn effective_interval(cfg: &Update) -> Duration {
+    let interval = cfg
+        .interval
+        .as_deref()
+        .and_then(|s| kaishin::parse_interval(s).ok())
+        .unwrap_or_else(default_interval);
+    interval.max(MIN_INTERVAL)
+}
+
 /// Is the background check switched off by the environment?
 pub fn disabled_by_env() -> bool {
     match std::env::var(NO_AUTOUPDATE_ENV) {
@@ -120,13 +147,8 @@ impl Checker {
         if let Some(path) = state_path() {
             inner = inner.state_path(path);
         }
-        let interval = cfg
-            .interval
-            .as_deref()
-            .and_then(|s| kaishin::parse_interval(s).ok())
-            .unwrap_or_else(default_interval);
         Some(Self {
-            inner: inner.interval(interval),
+            inner: inner.interval(effective_interval(cfg)),
         })
     }
 
@@ -137,10 +159,15 @@ impl Checker {
 
     /// Ask the forge now: is there a release newer than this build?
     ///
-    /// Unlike [`Checker::cached_update`] this is not throttled, because the
-    /// caller is an operator who just pressed a button and is owed an answer
-    /// about the state of the world rather than about the last time magi
-    /// looked.
+    /// Unlike [`Checker::cached_update`] this method does not consult
+    /// [`Checker::should_check`] itself - it has two callers, and they throttle
+    /// differently. `POST /api/upgrade` calls it unconditionally, because the
+    /// caller there is an operator who just pressed a button and is owed an
+    /// answer about the state of the world rather than about the last time
+    /// magi looked. `magi web`'s background recheck (`web::run_update_recheck`)
+    /// calls [`Checker::should_check`] itself first and only reaches here when
+    /// it says yes, which is what keeps that task's network use to at most
+    /// once per `[update] interval` no matter how often it polls.
     pub async fn newer_release(&self) -> Result<Option<kaishin::LatestRelease>> {
         self.inner.check_and_save().await
     }
@@ -153,6 +180,20 @@ impl Checker {
     /// One-line "a newer version exists" banner.
     pub fn format_banner(&self, latest: &kaishin::LatestRelease) -> String {
         self.inner.format_banner(latest)
+    }
+
+    /// A checker over an explicit state path and interval, for a test that
+    /// must control throttle timing without touching the operator's real
+    /// cache directory - see [`state_path`] for why sharing it would be
+    /// unsafe.
+    #[cfg(test)]
+    pub(crate) fn for_test(interval: Duration, state_path: PathBuf) -> Self {
+        let opts = kaishin::KaishinOptions::new(OWNER, REPO, BIN, env!("CARGO_PKG_VERSION"));
+        Self {
+            inner: kaishin::Checker::new(BIN, opts)
+                .state_path(state_path)
+                .interval(interval),
+        }
     }
 }
 
@@ -385,6 +426,34 @@ pub async fn finalize(pending: Option<Pending>, budget: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An interval configured below GitHub's unauthenticated 60 req/hour/IP
+    /// limit must be floored, or `web`'s background recheck loop - which,
+    /// unlike a one-off CLI invocation, keeps polling for as long as `magi
+    /// web` stays up - would repeat the same call far past that limit.
+    #[test]
+    fn effective_interval_floors_a_configured_interval_below_githubs_rate_limit() {
+        let cfg = Update {
+            mode: UpdateMode::Notify,
+            interval: Some("1s".to_owned()),
+        };
+        assert_eq!(
+            effective_interval(&cfg),
+            MIN_INTERVAL,
+            "an interval that would exceed GitHub's rate limit under continuous \
+             polling must be floored rather than honoured verbatim"
+        );
+
+        let sane = Update {
+            mode: UpdateMode::Notify,
+            interval: Some("2h".to_owned()),
+        };
+        assert_eq!(
+            effective_interval(&sane),
+            Duration::from_secs(2 * 60 * 60),
+            "an interval already above the floor must pass through unchanged"
+        );
+    }
 
     #[test]
     fn env_kill_switch_semantics() {
