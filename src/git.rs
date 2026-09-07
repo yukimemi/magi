@@ -293,7 +293,9 @@ struct WorktreeConfigRef {
 /// A `std::sync::Mutex` guards the map itself, held only long enough to find
 /// or insert an entry and clone its `Arc`, never across an `.await`.
 static WORKTREE_CONFIG: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<WorktreeConfigRef>>>>,
+    std::sync::Mutex<
+        std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<WorktreeConfigRef>>>,
+    >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// The per-repository slot, creating it if this is the first run to ask.

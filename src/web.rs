@@ -6033,7 +6033,10 @@ mod tests {
         assert_eq!(fresh["daemon"]["idle"], false);
         assert_eq!(fresh["daemon"]["pid"], 4242);
         assert_eq!(fresh["daemon"]["completed"], 7);
-        assert_eq!(fresh["daemon"]["current"][0]["task"], "20260902-140501-aaaa");
+        assert_eq!(
+            fresh["daemon"]["current"][0]["task"],
+            "20260902-140501-aaaa"
+        );
         assert_eq!(fresh["version"], env!("CARGO_PKG_VERSION"));
     }
 

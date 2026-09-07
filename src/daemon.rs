@@ -378,11 +378,41 @@ pub struct Reading {
     pub idle: bool,
     /// What the daemon is working on. Empty means idle; more than one entry
     /// means more than one run is in flight at once.
+    ///
+    /// `deserialize_with` rather than the plain derive: a daemon started
+    /// before this field became a list is still out there writing the old
+    /// shape — a single `{"task":...,"run":...}` object, or its absence —
+    /// on every heartbeat until it is restarted, and a live process reading
+    /// that file during the rollout must still see it as running rather than
+    /// as absent. A bare type change here would fail the whole struct's
+    /// deserialization on a type mismatch, defeating the permissiveness this
+    /// type exists for.
+    #[serde(deserialize_with = "de_current")]
     pub current: Vec<Current>,
     /// Tasks this daemon process has finished.
     pub completed: u64,
     /// Queue polls this daemon process has made.
     pub polls: u64,
+}
+
+/// Accept the old single-`Current`-or-absent shape as well as the current
+/// list, so a reader never has to know which build wrote the file.
+fn de_current<'de, D>(deserializer: D) -> std::result::Result<Vec<Current>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Shape {
+        Many(Vec<Current>),
+        One(Current),
+    }
+    Ok(
+        Option::<Shape>::deserialize(deserializer)?.map_or_else(Vec::new, |shape| match shape {
+            Shape::Many(v) => v,
+            Shape::One(c) => vec![c],
+        }),
+    )
 }
 
 impl Reading {
@@ -847,15 +877,38 @@ fn land_resume_state(task: &Task) -> LandResume {
     if state.status != RunStatus::Landing || !state.parked {
         return LandResume::NotLanding;
     }
-    let waiting = ask::Questions::open()
+    let store = ask::Questions::open();
+    let waiting = store
         .list()
         .into_iter()
         .filter(|q| &q.run == run_id && q.node == land::APPROVAL_NODE)
         .max_by(|a, b| a.id.cmp(&b.id));
-    match waiting {
-        Some(q) if q.status.open() => LandResume::StillWaiting,
-        _ => LandResume::Ready,
+    let Some(mut q) = waiting else {
+        return LandResume::Ready;
+    };
+    if !q.status.open() {
+        return LandResume::Ready;
     }
+    // `ask::ask_and_wait`'s own deadline is what used to retire a question
+    // nobody ever answered; land's approval bypasses that wait entirely (see
+    // `land::approval_gate`), so the same deadline has to be enforced here
+    // instead, or `graph.answer_timeout` silently stops meaning anything for
+    // a land approval and a run can sit `StillWaiting` forever with nobody
+    // told to look at it.
+    let timeout = Duration::from_secs(state.config.graph.answer_timeout);
+    let elapsed = Timestamp::now().as_second() - q.asked_at.as_second();
+    if elapsed >= 0 && elapsed as u64 >= timeout.as_secs() {
+        q.abandon(format!(
+            "no answer within {}s of asking",
+            timeout.as_secs().max(1)
+        ));
+        // If this can't be persisted, do not treat the wait as settled on a
+        // guess: fall through and try again next poll.
+        if store.put(&mut q).is_ok() {
+            return LandResume::Ready;
+        }
+    }
+    LandResume::StillWaiting
 }
 
 /// How often the loop rechecks for new work while something it already
@@ -866,6 +919,31 @@ fn land_resume_state(task: &Task) -> LandResume {
 /// while another task is mid-competition be noticed and resumed within a
 /// fraction of a second, not within the next multi-second poll.
 const RECHECK_WHILE_BUSY: Duration = Duration::from_millis(200);
+
+/// Frees one attempt's concurrency slot - `Stop`'s busy count and its entry
+/// in `Status::current` - on drop, so both are released even if the attempt
+/// panics rather than returning.
+///
+/// A `Drop` impl rather than statements written after the `.await` it
+/// guards: a panic unwinds straight past code placed "after" a call, and
+/// `Runner::execute`'s chain reaches deep enough into agent-output parsing
+/// that ruling a panic out there is not a bet this loop can make. Without
+/// this, one panicking run would leave [`Stop::busy_now`] stuck `true`
+/// forever - the idle branch in [`poll`], and with it the janitor, would
+/// never run again - and a ghost entry in `Status::current` naming a task
+/// nothing is still working on.
+struct InFlightGuard<'a> {
+    status: &'a Arc<Mutex<Status>>,
+    stop: &'a Stop,
+    task_id: &'a str,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        lock(self.status).current.retain(|c| c.task != self.task_id);
+        self.stop.exit();
+    }
+}
 
 /// Poll the queue until stopped, factored out so [`drive`] owns only setup and
 /// teardown and cannot skip the teardown on an early return.
@@ -902,8 +980,14 @@ async fn poll(
         lock(status).polls += 1;
 
         // Reap whatever finished since the last tick without blocking on
-        // anything still running.
-        while inflight.try_join_next().is_some() {}
+        // anything still running. `InFlightGuard` already released the slot
+        // even if the spawned attempt panicked; this only surfaces that it
+        // happened, since a panic swallowed here otherwise leaves no trace.
+        while let Some(result) = inflight.try_join_next() {
+            if let Err(e) = result {
+                tracing::error!("a spawned attempt did not finish cleanly: {e}");
+            }
+        }
 
         let swept = sweep_stale_claims(queue, STALE_CLAIM);
         if !swept.is_empty() {
@@ -928,7 +1012,8 @@ async fn poll(
             .filter(|t| !opts.once || !attempted.contains(&t.id))
             .collect();
 
-        let cooling_down = lock(&quota_cooldown_until).is_some_and(|until| Timestamp::now() < until);
+        let cooling_down =
+            lock(&quota_cooldown_until).is_some_and(|until| Timestamp::now() < until);
 
         let mut started_any = false;
         for candidate in candidates {
@@ -994,13 +1079,14 @@ async fn poll(
                 // candidate, frees its concurrency slot back to the loop.
                 let _claim = claim;
                 let _permit = permit;
+                // See `InFlightGuard`: this must survive a panic inside `attempt`.
+                let _inflight = InFlightGuard {
+                    status: &status,
+                    stop: &stop,
+                    task_id: &task_id,
+                };
                 let quota = attempt(&opts, &queue, &status, &stop, &mut task).await;
-                {
-                    let mut guard = lock(&status);
-                    guard.current.retain(|c| c.task != task_id);
-                    guard.completed += 1;
-                }
-                stop.exit();
+                lock(&status).completed += 1;
                 // A quota loss is a fact about the machine, not this task, and
                 // the next ordinary candidate the loop offers is no less
                 // likely to hit the same wall: without a cooldown here a
@@ -1067,7 +1153,11 @@ async fn poll(
     // above exited: a stop only sets a flag - see `serve_until` - and
     // returning here while `inflight` still holds spawned work would abandon
     // it exactly as a mid-node kill would.
-    while inflight.join_next().await.is_some() {}
+    while let Some(result) = inflight.join_next().await {
+        if let Err(e) = result {
+            tracing::error!("a spawned attempt did not finish cleanly: {e}");
+        }
+    }
     Ok(())
 }
 
@@ -2007,6 +2097,74 @@ mod tests {
         state
     }
 
+    fn approval_question(run: &str) -> ask::Question {
+        ask::Question::new(
+            run.to_owned(),
+            land::APPROVAL_NODE.to_owned(),
+            "land".to_owned(),
+            "merge?".to_owned(),
+            String::new(),
+            vec!["merge".to_owned(), "hold".to_owned()],
+        )
+    }
+
+    #[test]
+    fn land_resume_state_leaves_a_fresh_open_question_waiting() {
+        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        let mut state = run_state(RunStatus::Landing);
+        state.id = "20260101-000000-fre1".to_owned();
+        state.parked = true;
+        state.save().unwrap();
+        ask::Questions::open()
+            .put(&mut approval_question(&state.id))
+            .unwrap();
+
+        let mut t = task();
+        t.runs.push(state.id.clone());
+        assert_eq!(
+            land_resume_state(&t),
+            LandResume::StillWaiting,
+            "nobody has answered and the timeout has not passed"
+        );
+    }
+
+    #[test]
+    fn land_resume_state_abandons_a_question_that_outlived_answer_timeout() {
+        // `ask::ask_and_wait`'s own deadline used to retire a question
+        // nobody answered; land's approval bypasses that wait (see
+        // `land::approval_gate`), so this is now the only place
+        // `graph.answer_timeout` is enforced for a land approval at all.
+        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        let mut state = run_state(RunStatus::Landing);
+        state.id = "20260101-000000-exp1".to_owned();
+        state.parked = true;
+        state.config.graph.answer_timeout = 60;
+        state.save().unwrap();
+
+        let store = ask::Questions::open();
+        let mut q = approval_question(&state.id);
+        q.asked_at = Timestamp::now() - jiff::SignedDuration::from_secs(120);
+        store.put(&mut q).unwrap();
+
+        let mut t = task();
+        t.runs.push(state.id.clone());
+        assert_eq!(
+            land_resume_state(&t),
+            LandResume::Ready,
+            "an expired question must not be waited on forever"
+        );
+
+        let after = store.get(&q.id).unwrap();
+        assert!(
+            !after.status.open(),
+            "the question is abandoned, not silently ignored"
+        );
+        assert!(
+            after.resolution().is_none(),
+            "an abandoned question is not read as a decision"
+        );
+    }
+
     #[test]
     fn reclaim_settles_a_running_task_against_its_last_run() {
         let mut t = task();
@@ -2226,6 +2384,71 @@ mod tests {
         assert!(reading.running(Timestamp::now()));
         assert!(reading.idle);
         assert!(reading.current.is_empty());
+    }
+
+    #[test]
+    fn an_older_daemons_single_object_current_still_reads_as_a_one_item_list() {
+        // A daemon started before `current` became a list keeps writing this
+        // shape on every heartbeat until it is restarted. A rolling upgrade
+        // - a newer `magi web` or `magi doctor` reading an older `magi
+        // serve`'s heartbeat - must still see the run it is on, not "no
+        // daemon" from a type mismatch failing the whole struct.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("daemon.json"),
+            serde_json::json!({
+                "schema": 1,
+                "pid": 4242,
+                "updated_at": Timestamp::now().to_string(),
+                "idle": false,
+                "current": {"task": "20260902-140501-aaaa", "run": "20260902-140502-bbbb"},
+                "completed": 3,
+                "polls": 9,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let reading = read_status(dir.path()).expect("an older shape must still parse");
+        assert!(reading.running(Timestamp::now()));
+        assert_eq!(
+            reading.current,
+            vec![Current {
+                task: "20260902-140501-aaaa".to_owned(),
+                run: "20260902-140502-bbbb".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_absent_or_null_current_reads_as_idle_not_a_parse_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("daemon.json"),
+            serde_json::json!({
+                "schema": 1,
+                "updated_at": Timestamp::now().to_string(),
+                "idle": true,
+                "current": null,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let with_null = read_status(dir.path()).expect("null must still parse");
+        assert!(with_null.current.is_empty());
+
+        std::fs::write(
+            dir.path().join("daemon.json"),
+            serde_json::json!({
+                "schema": 1,
+                "updated_at": Timestamp::now().to_string(),
+                "idle": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let absent = read_status(dir.path()).expect("a missing field must still parse");
+        assert!(absent.current.is_empty());
     }
 
     #[test]

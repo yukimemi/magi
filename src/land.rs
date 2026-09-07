@@ -38,9 +38,10 @@
 //! says nothing about what landed. `AGENTS.md` records the trap; this module is
 //! where it is prevented.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -1024,7 +1025,10 @@ async fn approval_gate(state: &mut RunState, pr: &PrState, subject: &str) -> Res
             store
                 .put(&mut fresh)
                 .context("file the merge approval question")?;
-            state.event("land", format!("asking for merge approval ({})", fresh.short()));
+            state.event(
+                "land",
+                format!("asking for merge approval ({})", fresh.short()),
+            );
             state.save()?;
             if let Err(e) = ask::notify(&state.config.notify, &fresh).await {
                 // A broken webhook is not a reason to lose the merge: the
@@ -1284,6 +1288,35 @@ fn drop_spans(s: &str, open: &str, close: &str) -> String {
     out
 }
 
+/// The lock that keeps at most one run per repository actually moving the
+/// base branch at a time: a rebase push, or `gh pr merge`.
+///
+/// Deliberately narrow. Everything else in [`land`]'s loop - watching CI,
+/// running a fix round in the winner's own worktree, waiting on the owner's
+/// approval - touches nothing a *different* run in the same repository could
+/// collide with, and holding a lock across any of that would serialise one
+/// run's CI wait (up to [`WAIT_CEILING`]) against another run's land-approval
+/// resume, which is precisely the "must not wait on another task" property
+/// the daemon's slot-freeing exists to give a resume. Only the two moments
+/// that actually write to the shared base branch need mutual exclusion, and
+/// both are brief.
+///
+/// One entry per repository, each its own `tokio::sync::Mutex`, so two
+/// different repositories' runs never wait on each other. The outer
+/// `std::sync::Mutex` guards only the map itself, held long enough to find or
+/// insert an entry and clone its `Arc`, never across an `.await`.
+fn repo_merge_lock(repo: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<
+        std::sync::Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+    LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(repo.to_path_buf())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Run the loop against a real pull request until it merges or the budget runs
 /// out.
 ///
@@ -1398,7 +1431,11 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                     }
                 }
                 let argv = merge_argv(pr.number, &subject);
-                let out = gh(&repo, &argv).await?;
+                let out = {
+                    let merge_lock = repo_merge_lock(&repo);
+                    let _merge_slot = merge_lock.lock().await;
+                    gh(&repo, &argv).await?
+                };
                 if out.0 {
                     state.status = RunStatus::Merged;
                     state.merge = Some(MergeOutcome {
@@ -1469,7 +1506,11 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                 let onto = format!("origin/{base}");
                 match git::rebase_branch_in_temp(&repo, &scratch, &branch, &onto).await {
                     Ok(None) => {
-                        let pushed = git::push_rewritten(&repo, "origin", &branch).await?;
+                        let pushed = {
+                            let merge_lock = repo_merge_lock(&repo);
+                            let _merge_slot = merge_lock.lock().await;
+                            git::push_rewritten(&repo, "origin", &branch).await?
+                        };
                         if !pushed.ok() {
                             let why = format!(
                                 "rebased {branch} but could not push it: {}",
@@ -2959,6 +3000,35 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         );
     }
 
+    #[tokio::test]
+    async fn the_merge_lock_serialises_one_repository_but_never_a_different_one() {
+        let a = std::path::PathBuf::from("/repo/a");
+        let b = std::path::PathBuf::from("/repo/b");
+
+        let held = repo_merge_lock(&a).lock_owned().await;
+
+        // A second, concurrent land run against the *same* repository must
+        // wait - `try_lock` fails while `held` is alive.
+        assert!(
+            repo_merge_lock(&a).try_lock().is_err(),
+            "a second merge into the same repository must not proceed concurrently"
+        );
+
+        // A run against a *different* repository must not be blocked by it -
+        // this is what keeps a slow rebase or `gh pr merge` in one
+        // repository from also stalling a land-approval resume in another.
+        assert!(
+            repo_merge_lock(&b).try_lock().is_ok(),
+            "a different repository's merge lock must be independent"
+        );
+
+        drop(held);
+        assert!(
+            repo_merge_lock(&a).try_lock().is_ok(),
+            "the lock is released once the holder is done"
+        );
+    }
+
     #[test]
     fn only_the_merge_choice_merges_and_silence_holds() {
         let table = [
@@ -3000,10 +3070,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .collect();
         assert_eq!(filed.len(), 1, "exactly one question is filed");
         assert_eq!(filed[0].node, APPROVAL_NODE);
-        assert_eq!(
-            filed[0].choices,
-            vec![APPROVE.to_owned(), HOLD.to_owned()]
-        );
+        assert_eq!(filed[0].choices, vec![APPROVE.to_owned(), HOLD.to_owned()]);
         assert!(filed[0].status.open());
 
         // A second visit - standing in for a resumed run whose slot the
@@ -3016,7 +3083,10 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .into_iter()
             .filter(|q| q.run == state.id)
             .count();
-        assert_eq!(still_one, 1, "asking twice must not double-file the question");
+        assert_eq!(
+            still_one, 1,
+            "asking twice must not double-file the question"
+        );
     }
 
     #[tokio::test]
@@ -3053,7 +3123,9 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let mut held_state = run_state();
         held_state.config.graph.land_approval = true;
         let pr = green_pr();
-        approval_gate(&mut held_state, &pr, "feat: x").await.unwrap();
+        approval_gate(&mut held_state, &pr, "feat: x")
+            .await
+            .unwrap();
         let mut q = store
             .list()
             .into_iter()

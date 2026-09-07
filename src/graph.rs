@@ -168,28 +168,6 @@ pub struct Runner {
     pause: Pause,
 }
 
-/// The lock that keeps at most one run per repository inside `land`, or the
-/// push/PR-create step just before it, at a time (see [`Runner::run_land`]).
-///
-/// One entry per repository, each its own `tokio::sync::Mutex`, so two
-/// different repositories' runs never wait on each other - only two runs
-/// against the *same* repository do, which is the point now that
-/// `Config::daemon.max_concurrent_runs` can put more than one run against a
-/// repository in flight at once. The outer `std::sync::Mutex` guards only the
-/// map itself, held long enough to find or insert an entry and clone its
-/// `Arc`, never across an `.await`.
-fn repo_land_lock(repo: &Path) -> Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: std::sync::LazyLock<
-        std::sync::Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
-    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
-    LOCKS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(repo.to_path_buf())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-}
-
 /// The commit a run branches from: the base branch as the remote has it.
 ///
 /// Two failures this replaces. A run used to branch off `HEAD` and so refused
@@ -2795,21 +2773,16 @@ impl Runner {
         Ok(())
     }
 
-    /// Enter `land`, holding the per-repository merge lock for as long as it
-    /// runs.
+    /// Enter `land`.
     ///
     /// Shared between a fresh run's first pass through [`Runner::merge`] and
-    /// a resumed run's re-entry, so both take the same lock the same way: two
-    /// runs against the same repository — one possible now that
-    /// `Config::daemon.max_concurrent_runs` can be more than one — must never
-    /// both be pushing, opening a pull request, or running `gh pr merge` at
-    /// once, and holding the lock across the whole of `land::land` rather
-    /// than only around the final `gh pr merge` call is what covers the push
-    /// and the rebase it can also decide to run. This does not reintroduce
-    /// the serialisation the daemon's concurrency exists to remove: `land`
-    /// itself returns promptly whenever it is waiting on something other
-    /// than this run's own work — an approval, a slow CI — so the lock is
-    /// held for actual git activity, not for a human's reaction time.
+    /// a resumed run's re-entry. `land::land` itself is what serialises the
+    /// two git-mutating moments inside the loop — the rebase push and
+    /// `gh pr merge` — per repository (see its own doc); nothing here needs
+    /// to hold a lock across the whole call, and doing so would serialise
+    /// this run's CI wait against a *different* run's land-approval resume
+    /// in the same repository, which is exactly the "must not wait on
+    /// another task" property the daemon's slot-freeing exists to give.
     async fn run_land(&mut self) -> Result<()> {
         let url = self
             .state
@@ -2821,9 +2794,6 @@ impl Runner {
         if !url.starts_with("http") {
             return Ok(());
         }
-        let repo = self.state.repo.clone();
-        let lock = repo_land_lock(&repo);
-        let _land_slot = lock.lock().await;
         // A land failure is not a lost run: the work is on a branch and the
         // pull request is open, which is exactly where a human takes over.
         match land::land(&mut self.state, &url).await {

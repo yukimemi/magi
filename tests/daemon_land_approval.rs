@@ -147,7 +147,9 @@ async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task() {
     let run_b = parked_run(&fx.repo, &config);
     let store = ask::Questions::open();
     let mut question = approval_question(&run_b.id);
-    store.put(&mut question).expect("file the approval question");
+    store
+        .put(&mut question)
+        .expect("file the approval question");
 
     let mut task_b = Task::new(
         "landing task".to_owned(),
@@ -187,7 +189,11 @@ async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task() {
         "task B is untouched, not reclaimed as an orphan and not re-attempted \
          while the question is still open: {after_b:?}"
     );
-    assert_eq!(after_b.runs, vec![run_b.id.clone()], "no second run was started");
+    assert_eq!(
+        after_b.runs,
+        vec![run_b.id.clone()],
+        "no second run was started"
+    );
 
     let run_after = RunState::load(&run_b.id).expect("the parked run's history survives");
     assert_eq!(
@@ -223,7 +229,9 @@ async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own() {
     question
         .answer(Answer::Choice("merge".to_owned()))
         .expect("record the approval");
-    store.put(&mut question).expect("file the answered question");
+    store
+        .put(&mut question)
+        .expect("file the answered question");
 
     let mut task = Task::new(
         "landing task".to_owned(),
@@ -275,10 +283,7 @@ async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own() {
         after.last_error
     );
     assert!(
-        run_after
-            .events
-            .iter()
-            .any(|e| e.node == "land"),
+        run_after.events.iter().any(|e| e.node == "land"),
         "the resume actually re-entered `land`: {:?}",
         run_after.events
     );
