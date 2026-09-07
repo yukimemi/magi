@@ -137,10 +137,15 @@ impl Checker {
 
     /// Ask the forge now: is there a release newer than this build?
     ///
-    /// Unlike [`Checker::cached_update`] this is not throttled, because the
-    /// caller is an operator who just pressed a button and is owed an answer
-    /// about the state of the world rather than about the last time magi
-    /// looked.
+    /// Unlike [`Checker::cached_update`] this method does not consult
+    /// [`Checker::should_check`] itself - it has two callers, and they throttle
+    /// differently. `POST /api/upgrade` calls it unconditionally, because the
+    /// caller there is an operator who just pressed a button and is owed an
+    /// answer about the state of the world rather than about the last time
+    /// magi looked. `magi web`'s background recheck (`web::run_update_recheck`)
+    /// calls [`Checker::should_check`] itself first and only reaches here when
+    /// it says yes, which is what keeps that task's network use to at most
+    /// once per `[update] interval` no matter how often it polls.
     pub async fn newer_release(&self) -> Result<Option<kaishin::LatestRelease>> {
         self.inner.check_and_save().await
     }
@@ -153,6 +158,20 @@ impl Checker {
     /// One-line "a newer version exists" banner.
     pub fn format_banner(&self, latest: &kaishin::LatestRelease) -> String {
         self.inner.format_banner(latest)
+    }
+
+    /// A checker over an explicit state path and interval, for a test that
+    /// must control throttle timing without touching the operator's real
+    /// cache directory - see [`state_path`] for why sharing it would be
+    /// unsafe.
+    #[cfg(test)]
+    pub(crate) fn for_test(interval: Duration, state_path: PathBuf) -> Self {
+        let opts = kaishin::KaishinOptions::new(OWNER, REPO, BIN, env!("CARGO_PKG_VERSION"));
+        Self {
+            inner: kaishin::Checker::new(BIN, opts)
+                .state_path(state_path)
+                .interval(interval),
+        }
     }
 }
 
