@@ -4732,6 +4732,27 @@ function renderCandidates(run) {
   });
 }
 
+/* `ReviewVote` on the wire: "approve" | "approve_with_findings" | "reject".
+   Same three-colour scale a finding's severity gets, since a vote is exactly
+   that kind of verdict — none, some, or stop. */
+function voteTone(vote) {
+  switch (vote) {
+    case "approve": return "teal";
+    case "approve_with_findings": return "gold";
+    case "reject": return "rust";
+    default: return null;
+  }
+}
+
+function voteLabel(vote) {
+  switch (vote) {
+    case "approve": return "approve";
+    case "approve_with_findings": return "approve w/ findings";
+    case "reject": return "reject";
+    default: return String(vote || "");
+  }
+}
+
 function renderReviews(run) {
   /* On the wire this is Vec<ReviewRound>, each round holding the reviewers'
      records. */
@@ -4758,6 +4779,12 @@ function renderReviews(run) {
         round.verify_retried
           ? el("span", { class: "tag", "data-tone": "gold", text: "verify retried" })
           : null,
+        round.verdict
+          ? el("span", { class: "tag", "data-tone": voteTone(round.verdict), text: `verdict: ${voteLabel(round.verdict)}` })
+          : null,
+        round.vote_split
+          ? el("span", { class: "tag", "data-tone": "gold", text: "votes split" })
+          : null,
         round.head ? el("span", { class: "head-sha", text: String(round.head).slice(0, 7) }) : null,
       ),
     );
@@ -4767,6 +4794,9 @@ function renderReviews(run) {
       node.append(el("div", { class: "reviewer" },
         el("p", {},
           el("span", { class: "reviewer-name", text: `reviewer ${record.reviewer} \u00b7 ${record.agent || ""}` }),
+          record.vote
+            ? el("span", { class: "tag", "data-tone": voteTone(record.vote), text: voteLabel(record.vote) })
+            : null,
         ),
         record.failed ? el("p", { class: "card-note", text: record.failed }) : null,
         record.summary ? el("p", { class: "cand-summary", text: record.summary }) : null,
@@ -4784,6 +4814,27 @@ function renderReviews(run) {
               : null,
             finding.detail ? el("p", { class: "finding-detail", text: finding.detail }) : null,
           ))) : null,
+      ));
+    }
+
+    // Reconsideration only ever has entries when the round's initial votes
+    // split \u2014 an empty array here means the panel already agreed, same as
+    // an empty judge `deliberation`.
+    const reconsideration = Array.isArray(round.reconsideration) ? round.reconsideration : [];
+    if (reconsideration.length) {
+      node.append(el("div", { class: "reviewer" },
+        el("p", {}, el("span", { class: "reviewer-name", text: "reconsideration" })),
+        el("div", { class: "findings" }, reconsideration.map((rv) =>
+          el("div", { class: "finding" },
+            el("div", { class: "finding-top" },
+              el("span", { class: "finding-id", text: `reviewer ${rv.reviewer}` }),
+              rv.vote
+                ? el("span", { class: "tag", "data-tone": voteTone(rv.vote), text: voteLabel(rv.vote) })
+                : el("span", { class: "tag", "data-tone": "rust", text: "no revote" }),
+            ),
+            rv.reason ? el("p", { class: "finding-detail", text: rv.reason }) : null,
+            rv.failed ? el("p", { class: "card-note", text: rv.failed }) : null,
+          ))),
       ));
     }
 

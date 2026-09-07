@@ -14,7 +14,7 @@
 use std::fmt::Write as _;
 
 use crate::plan;
-use crate::verdict::{Finding, Proposal};
+use crate::verdict::{Finding, Proposal, ReviewVote};
 
 /// Patches above this size are truncated in the prompt; the judge is pointed at
 /// the branch instead. Agent context windows are large but not free, and a
@@ -392,6 +392,70 @@ pub fn final_vote(labels: &[char], language: &str) -> String {
     )
 }
 
+/// One of the fixed angles a reviewer seat is assigned.
+///
+/// Every seat used to get the identical prompt, which made a two- or
+/// three-seat panel a duplication of one read rather than a panel of them.
+/// A lens is the cheap fix: no extra turns, no extra tool budget, just a
+/// different question asked of the same diff. Seats stay anonymous either
+/// way — a lens describes what to look at, never who is looking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lens {
+    /// Does the diff satisfy the task file's completion criteria, checked
+    /// one at a time.
+    Spec,
+    /// Existing behaviour, backward compatibility, error paths, and what a
+    /// failure looks like.
+    Regression,
+    /// Overengineering, duplication, and drift from this repository's own
+    /// patterns.
+    Simplicity,
+}
+
+impl Lens {
+    /// The fixed cycle seats are assigned from.
+    const ALL: [Lens; 3] = [Lens::Spec, Lens::Regression, Lens::Simplicity];
+
+    /// The lens for seat `seat` (0-based), cycling through [`Self::ALL`] —
+    /// a panel of two gets the first two, a panel of four repeats the first
+    /// rather than leaving the fourth seat with no brief at all.
+    pub fn for_seat(seat: usize) -> Lens {
+        Self::ALL[seat % Self::ALL.len()]
+    }
+
+    fn heading(self) -> &'static str {
+        match self {
+            Self::Spec => "Spec compliance",
+            Self::Regression => "Regressions and operations",
+            Self::Simplicity => "Simplicity and design",
+        }
+    }
+
+    fn brief(self) -> &'static str {
+        match self {
+            Self::Spec => {
+                "Go through the task file's completion criteria one at a time. For each \
+                 one, decide from the diff alone whether it is actually satisfied — not \
+                 whether the intent looks right, whether the specific behaviour is there. \
+                 A criterion the diff does not address is a finding, even if everything \
+                 else about the patch looks clean."
+            }
+            Self::Regression => {
+                "Assume the happy path works and look for what the patch breaks: existing \
+                 behaviour, backward compatibility, error paths, and what happens when \
+                 something the new code depends on fails. A finding here names the prior \
+                 behaviour and how the diff changes it."
+            }
+            Self::Simplicity => {
+                "Look for more code, or a more complex shape, than the task needed: \
+                 unnecessary abstraction, duplication, and departures from how this \
+                 repository already does the same thing elsewhere. A finding here names \
+                 the simpler alternative."
+            }
+        }
+    }
+}
+
 /// Everything a reviewer needs to know about the patch under review.
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewCtx<'a> {
@@ -417,8 +481,30 @@ pub struct ReviewCtx<'a> {
     /// telling the reviewer it beat two rivals would be a lie — and a lie that
     /// flatters the patch it is supposed to be sceptical about.
     pub competed: bool,
+    /// This seat's angle on the patch. See [`Lens`].
+    pub lens: Lens,
     /// Language for prose.
     pub language: &'a str,
+}
+
+/// The "patch under review" section, shared by [`review`] and, when a seat
+/// holds no session to remember it from, [`review_reconsider`] — a
+/// stateless reconsideration call must be as self-sufficient as the initial
+/// review was, not a bare vote tally with nothing to check it against.
+fn patch_block(branch: &str, base_short: &str, stat: &str, patch: &str) -> String {
+    format!(
+        "# Patch under review\n\n\
+         Branch `{branch}`, base {base_short}. Your working directory is a \
+         checkout of exactly this state: read it, run it, but do not modify \
+         files.\n\n\
+         Changed files:\n```\n{}\n```\n\n```diff\n{}\n```\n",
+        if stat.trim().is_empty() {
+            "(no changes)"
+        } else {
+            stat.trim()
+        },
+        truncate_patch(patch, branch)
+    )
 }
 
 /// Prompt for a reviewer of the winning patch.
@@ -434,6 +520,7 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
         round,
         rounds,
         competed,
+        lens,
         language,
     } = *ctx;
     let mut s = format!(
@@ -451,19 +538,15 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
     );
     let _ = write!(
         s,
-        "# The task\n\n{instruction}\n\n\
-         # Patch under review\n\n\
-         Branch `{branch}`, base {base_short}. Your working directory is a \
-         checkout of exactly this state: read it, run it, but do not modify \
-         files.\n\n\
-         Changed files:\n```\n{}\n```\n\n```diff\n{}\n```\n",
-        if stat.trim().is_empty() {
-            "(no changes)"
-        } else {
-            stat.trim()
-        },
-        truncate_patch(patch, branch)
+        "# Your lens: {}\n\n{}\n\nThe other reviewers on this patch are reading it \
+         from different angles — this is the one you are responsible for covering. A \
+         real defect outside your lens is still worth raising; do not manufacture one \
+         inside it to have something to say.\n\n",
+        lens.heading(),
+        lens.brief()
     );
+    let _ = write!(s, "# The task\n\n{instruction}\n\n");
+    s.push_str(&patch_block(branch, base_short, stat, patch));
     if let Some(out) = e2e {
         let _ = write!(
             s,
@@ -482,16 +565,167 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
          you could not trigger belongs in your prose, not in the list.\n\n\
          If the patch is sound, return an empty findings list. An empty review \
          is a valid review, and better than a padded one.\n\n\
+         # Your vote\n\n\
+         Cast exactly one: `approve` (no reservations), `approve_with_findings` \
+         (fine to proceed, but the findings below are worth fixing), or `reject` \
+         (do not proceed as-is). The vote is your verdict and the findings are your \
+         evidence — an empty findings list can still be `approve`, and neither should \
+         be padded or held back to make the other look justified.\n\n\
          # Output\n\n\
          Your reasoning first, then exactly one fenced json block, last:\n\n\
          ```json\n\
-         {\"summary\":\"one paragraph\",\"findings\":[{\"severity\":\
+         {\"summary\":\"one paragraph\",\"vote\":\"approve|approve_with_findings|reject\",\
+         \"findings\":[{\"severity\":\
          \"blocker|major|minor|nit\",\"file\":\"src/x.rs\",\"line\":42,\
          \"title\":\"short\",\"detail\":\"trigger and consequence\"}]}\n\
          ```",
     );
     s.push('\n');
     s.push_str(&ask_the_owner(language));
+    s.push_str(&lang(language));
+    s
+}
+
+/// One reviewer seat's report, as shown to the rest of the panel during
+/// reconsideration. Seats stay numbered, never named — the same convention
+/// [`review`] itself uses for panel size, not a disclosure of identity.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewSeatReport<'a> {
+    /// 1-based reviewer seat number.
+    pub reviewer: usize,
+    /// That seat's vote.
+    pub vote: ReviewVote,
+    /// That seat's summary prose.
+    pub summary: &'a str,
+    /// That seat's findings.
+    pub findings: &'a [Finding],
+}
+
+/// Everything a reviewer needs to reconsider its vote after a split round.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewReconsiderCtx<'a> {
+    /// The original task.
+    pub instruction: &'a str,
+    /// This seat's own number, 1-based.
+    pub reviewer: usize,
+    /// This seat's lens, restated so the revote stays anchored to it.
+    pub lens: Lens,
+    /// Every seat that cast an initial vote, in seat order, including this
+    /// one.
+    pub panel: &'a [ReviewSeatReport<'a>],
+    /// The patch, restated for a seat with no session to remember it from.
+    /// `None` when the seat's own conversation still holds the initial
+    /// review's prompt — the same distinction [`crate::graph`]'s
+    /// `has_context` draws for a judge's deliberation turn or final vote.
+    /// Without this, a stateless seat would revote on the panel's claims
+    /// alone, with nothing of its own to check them against.
+    pub patch: Option<ReviewPatch<'a>>,
+    /// Round budget.
+    pub rounds: usize,
+    /// 1-based round number.
+    pub round: usize,
+    /// Language for prose.
+    pub language: &'a str,
+}
+
+/// The patch text a stateless reconsideration call restates. See
+/// [`ReviewReconsiderCtx::patch`].
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewPatch<'a> {
+    /// Branch holding the winner.
+    pub branch: &'a str,
+    /// Abbreviated base commit.
+    pub base_short: &'a str,
+    /// `git diff --stat` output.
+    pub stat: &'a str,
+    /// The patch.
+    pub patch: &'a str,
+}
+
+/// Prompt for the one round of reconsideration a split review vote earns.
+///
+/// Mirrors [`crate::graph`]'s judge split → deliberate → revote shape, scaled
+/// to what a read-only review round can afford: one round, not several, and a
+/// revote instead of a multi-turn argument, because the panel already wrote
+/// its reasoning down as findings the first time — reading them is the
+/// deliberation.
+pub fn review_reconsider(ctx: &ReviewReconsiderCtx<'_>) -> String {
+    let ReviewReconsiderCtx {
+        instruction,
+        reviewer,
+        lens,
+        panel,
+        patch,
+        round,
+        rounds,
+        language,
+    } = *ctx;
+    let mut s = format!(
+        "You are Reviewer {reviewer} again, review round {round} of {rounds}. The \
+         panel's votes on this patch did not agree, so before the round concludes \
+         each seat gets one chance to read what every other seat found and revote. \
+         You still do not know who wrote the patch or who the other reviewers are.\n\n\
+         # The task\n\n{instruction}\n\n\
+         # Your lens: {}\n\n{}\n\n",
+        lens.heading(),
+        lens.brief()
+    );
+    // A seat with no live session has already forgotten the initial review's
+    // prompt by the time this call arrives — restate the patch it is voting
+    // on, the same way `graph::Runner::deliberate` restates the candidate
+    // set for a judge in the same position.
+    if let Some(p) = patch {
+        s.push_str(&patch_block(p.branch, p.base_short, p.stat, p.patch));
+        s.push('\n');
+    }
+    s.push_str("# The panel's votes and findings\n");
+    for entry in panel {
+        let _ = write!(
+            s,
+            "\n## Reviewer {}{}: {}\n\n{}\n",
+            entry.reviewer,
+            if entry.reviewer == reviewer {
+                " (you)"
+            } else {
+                ""
+            },
+            entry.vote.label(),
+            if entry.summary.trim().is_empty() {
+                "(no summary)"
+            } else {
+                entry.summary.trim()
+            }
+        );
+        for f in entry.findings {
+            let _ = writeln!(
+                s,
+                "- [{:?}] {}{}: {}",
+                f.severity,
+                f.title,
+                match (&f.file, f.line) {
+                    (Some(file), Some(line)) => format!(" ({file}:{line})"),
+                    (Some(file), None) => format!(" ({file})"),
+                    _ => String::new(),
+                },
+                f.detail.trim()
+            );
+        }
+    }
+    s.push_str(
+        "\n# Your revote\n\n\
+         Test the disagreement instead of restating your own findings: does another \
+         seat's finding change what your vote should be, or does it not hold up? \
+         Change your vote where the evidence says to; keep it where it does not, and \
+         say why in terms the other seats could check themselves. You are not asked \
+         to raise new findings here, only to revote.\n\n\
+         # Output\n\n\
+         Your reasoning first, then exactly one fenced json block, last:\n\n\
+         ```json\n\
+         {\"vote\":\"approve|approve_with_findings|reject\",\"reason\":\"why, one or \
+         two sentences\"}\n\
+         ```",
+    );
+    s.push('\n');
     s.push_str(&lang(language));
     s
 }
@@ -800,6 +1034,7 @@ mod tests {
             round: 1,
             rounds: 6,
             competed,
+            lens: Lens::Spec,
             language: "en",
         }
     }
@@ -809,6 +1044,125 @@ mod tests {
         let p = review(&review_ctx(true));
         assert!(p.contains("An empty review is a valid review"));
         assert!(p.contains("do not modify"));
+        assert!(p.contains("\"vote\""));
+    }
+
+    #[test]
+    fn lens_cycles_across_seats() {
+        assert_eq!(Lens::for_seat(0), Lens::Spec);
+        assert_eq!(Lens::for_seat(1), Lens::Regression);
+        assert_eq!(Lens::for_seat(2), Lens::Simplicity);
+        assert_eq!(
+            Lens::for_seat(3),
+            Lens::Spec,
+            "a fourth seat wraps back to the first lens rather than going unbriefed"
+        );
+    }
+
+    #[test]
+    fn each_lens_shapes_the_review_prompt_differently() {
+        let mut ctx = review_ctx(true);
+        ctx.lens = Lens::Spec;
+        let spec = review(&ctx);
+        ctx.lens = Lens::Regression;
+        let regression = review(&ctx);
+        ctx.lens = Lens::Simplicity;
+        let simplicity = review(&ctx);
+
+        assert!(spec.contains("completion criteria"));
+        assert!(regression.contains("backward compatibility"));
+        assert!(simplicity.contains("unnecessary abstraction"));
+        assert_ne!(spec, regression);
+        assert_ne!(regression, simplicity);
+    }
+
+    #[test]
+    fn reconsideration_prompt_shows_every_seat_and_asks_only_for_a_revote() {
+        let panel = [
+            ReviewSeatReport {
+                reviewer: 1,
+                vote: ReviewVote::Reject,
+                summary: "found a real bug",
+                findings: &[Finding {
+                    id: "R1-1-1".to_owned(),
+                    severity: Severity::Blocker,
+                    file: Some("src/a.rs".to_owned()),
+                    line: Some(9),
+                    title: "panics on empty input".to_owned(),
+                    detail: "empty slice".to_owned(),
+                }],
+            },
+            ReviewSeatReport {
+                reviewer: 2,
+                vote: ReviewVote::Approve,
+                summary: "looks fine",
+                findings: &[],
+            },
+        ];
+        let p = review_reconsider(&ReviewReconsiderCtx {
+            instruction: "task",
+            reviewer: 2,
+            lens: Lens::Regression,
+            panel: &panel,
+            patch: None,
+            round: 1,
+            rounds: 6,
+            language: "en",
+        });
+        assert!(p.contains("Reviewer 1"));
+        assert!(p.contains("Reviewer 2 (you)"));
+        assert!(p.contains("panics on empty input"));
+        assert!(p.contains("src/a.rs:9"));
+        assert!(p.contains("reject"));
+        assert!(p.contains("\"vote\""));
+        assert!(
+            !p.contains("\"findings\""),
+            "revote must not ask for new findings"
+        );
+    }
+
+    #[test]
+    fn reconsideration_restates_the_patch_only_for_a_seat_with_no_session() {
+        let panel = [ReviewSeatReport {
+            reviewer: 1,
+            vote: ReviewVote::Approve,
+            summary: "clean",
+            findings: &[],
+        }];
+        let without_session = review_reconsider(&ReviewReconsiderCtx {
+            instruction: "task",
+            reviewer: 1,
+            lens: Lens::Spec,
+            panel: &panel,
+            patch: None,
+            round: 1,
+            rounds: 6,
+            language: "en",
+        });
+        assert!(
+            !without_session.contains("Patch under review"),
+            "a seat with a live session already has the patch from its own \
+             initial review: {without_session}"
+        );
+
+        let with_session = review_reconsider(&ReviewReconsiderCtx {
+            instruction: "task",
+            reviewer: 1,
+            lens: Lens::Spec,
+            panel: &panel,
+            patch: Some(ReviewPatch {
+                branch: "magi/run/A",
+                base_short: "abc1234",
+                stat: " a | 1 +",
+                patch: "diff --git a/a b/a",
+            }),
+            round: 1,
+            rounds: 6,
+            language: "en",
+        });
+        assert!(with_session.contains("Patch under review"));
+        assert!(with_session.contains("magi/run/A"));
+        assert!(with_session.contains("diff --git a/a b/a"));
     }
 
     #[test]
