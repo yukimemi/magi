@@ -3222,12 +3222,17 @@ struct NewChat {
 ///
 /// The same asynchronous shape as [`chat_say`], for the same reason: starting
 /// an interview runs the first agent turn, and holding the connection for that
-/// is the coin flip on a phone `chat_say`'s doc explains. [`chat::open`]
-/// creates and persists the record synchronously - fast, and everything in it
-/// is checked before it is written - and the turn slot is claimed the instant
-/// the id exists, so a `POST .../say` racing this response still gets the
-/// 409 [`Ui::begin_turn`] promises rather than a chance to resume the same CLI
-/// session twice.
+/// is the coin flip on a phone `chat_say`'s doc explains. [`chat::build`]
+/// constructs the record in memory only - fast, and everything in it is
+/// checked before anything is written - so [`Ui::begin_turn`] can claim
+/// `chat.id` *before* [`Chats::put`] makes it visible to any other request.
+/// That order matters: the id does not exist anywhere until this handler
+/// publishes it, so nothing else can resolve it, let alone claim or record
+/// into it, ahead of the claim taken here. Publishing first and claiming
+/// second would reopen exactly the race `chat_say`'s own 409 exists to
+/// close - a `say` racing this response could win `begin_turn` first and
+/// record into a seat whose first turn never ran, while this handler's own
+/// claim then fails for a chat file it already created.
 ///
 /// Every failure that reaches this function before [`Ui::begin_turn`] is
 /// reported as a 4xx and creates no chat file: an empty `idea`, a bad `from`,
@@ -3276,34 +3281,42 @@ async fn chat_post(
         .await?
     };
 
-    // `chat::open`'s only reachable failure here is `plan::pick` refusing the
+    // `chat::build`'s only reachable failure here is `plan::pick` refusing the
     // roster - the idea was already checked non-empty above - which is again
-    // the caller's `agent`/`repo` choice, not a server fault.
+    // the caller's `agent`/`repo` choice, not a server fault. It only
+    // constructs `chat` in memory: nothing is written yet, and nothing else
+    // can see or claim `chat.id` until this handler publishes it below.
     let mut chat = {
-        let ui = Arc::clone(&ui);
         let cfg = cfg.clone();
         let idea = body.idea.clone();
         let agent = body.agent.clone();
         let from = from.clone();
         blocking(move || {
-            chat::open(
-                &ui.chats,
-                &cfg,
-                repo,
-                &idea,
-                agent.as_deref(),
-                from.as_ref(),
-            )
-            .map_err(ApiError::bad_request_from)
+            chat::build(&cfg, repo, &idea, agent.as_deref(), from.as_ref())
+                .map_err(ApiError::bad_request_from)
         })
         .await?
     };
 
-    // Claimed the moment the record exists and held across the spawned first
-    // turn below, on the same reasoning as `chat_say`: a `say` racing this
-    // response must see the chat as busy, not resume the CLI session this
-    // turn is about to start.
+    // Claimed *before* the record is written to disk, not after: once
+    // `Chats::put` below makes `chat.id` visible, `GET /api/chats` can name
+    // it and `POST /api/chats/{id}/say` can resolve it. A claim taken only
+    // after that write leaves a gap where a `say` racing this handler can
+    // win `begin_turn` first, record into a seat whose first turn never ran,
+    // and hand this handler a 409 for a chat file it just created - the
+    // opposite of the `chat_say`-shaped 409 this route means to give.
     let _turn = ui.begin_turn(&chat.id)?;
+
+    // Persist now that the id is claimed - safe to publish, because anyone
+    // who finds it will also find it already busy.
+    chat = {
+        let ui = Arc::clone(&ui);
+        blocking(move || {
+            ui.chats.put(&mut chat)?;
+            Ok(chat)
+        })
+        .await?
+    };
     let thinking = ui.is_thinking(&chat.id);
     let queued = ChatView::new(chat.clone(), thinking);
 

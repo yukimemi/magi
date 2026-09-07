@@ -319,12 +319,15 @@ impl Chats {
     }
 }
 
-/// Create a conversation record and persist it, without taking the first
-/// agent turn.
+/// Construct a conversation record in memory, without writing it anywhere.
 ///
-/// Split out of [`start`] so `POST /api/chats` can return the instant the
-/// record exists, the same way [`record`] lets `POST /api/chats/{id}/say`
-/// return before the agent answers - see [`first_turn`] for the other half.
+/// Split out of [`open`] so a caller can claim [`crate::web::Ui::begin_turn`]
+/// on `chat.id` *before* the record is ever written to disk - `chat_post`
+/// does exactly that, because [`Chats::put`] is what makes the id visible to
+/// every other request (`GET /api/chats`, `POST /api/chats/{id}/say`), and a
+/// gap between "the file exists" and "the turn is claimed" is a window for
+/// `chat_say` to claim and record into an interview whose first turn never
+/// ran - see `chat_post`'s doc for the failure that produces.
 ///
 /// `agent` is resolved by [`plan::pick`], the same policy `magi plan` uses: an
 /// explicit id wins and is an error rather than a fallback when it is not
@@ -336,8 +339,7 @@ impl Chats {
 /// asked to continue an existing interview in a different repository (see
 /// [`derived_background`]). It is read, never written: the source chat's
 /// `status`, `turns` and `draft` are left exactly as they were.
-pub fn open(
-    store: &Chats,
+pub fn build(
     cfg: &Config,
     repo: PathBuf,
     idea: &str,
@@ -365,7 +367,7 @@ pub fn open(
 
     let now = Timestamp::now();
     let id = new_id();
-    let mut chat = Chat {
+    Ok(Chat {
         schema: SCHEMA,
         id,
         repo,
@@ -382,7 +384,24 @@ pub fn open(
         created_at: now,
         updated_at: now,
         seat: SeatState::new(SEAT, &spec.id, crate::rng::entropy()),
-    };
+    })
+}
+
+/// [`build`], then persist. No first agent turn is taken.
+///
+/// Convenient when there is nothing racing the write - [`start`] is the only
+/// caller - but `POST /api/chats` cannot use it: see [`build`]'s doc for why
+/// the claim has to land between construction and this function's own
+/// [`Chats::put`].
+pub fn open(
+    store: &Chats,
+    cfg: &Config,
+    repo: PathBuf,
+    idea: &str,
+    agent: Option<&str>,
+    from: Option<&Chat>,
+) -> Result<Chat> {
+    let mut chat = build(cfg, repo, idea, agent, from)?;
     store.put(&mut chat)?;
     Ok(chat)
 }
@@ -1131,6 +1150,36 @@ mod tests {
         assert_eq!(reread.status, before.status);
         assert_eq!(reread.turns, before.turns);
         assert_eq!(reread.draft, before.draft);
+    }
+
+    /// [`build`] must not write the record anywhere: `chat_post` claims
+    /// [`crate::web::Ui::begin_turn`] on `chat.id` between calling this and
+    /// persisting it, and that ordering only closes the race it exists for
+    /// (see `chat_post`'s doc) if nothing observable exists yet for anyone
+    /// else to resolve, claim or record into ahead of the claim.
+    #[test]
+    fn build_constructs_the_record_without_writing_it_anywhere() {
+        let (tmp, chats) = store();
+        let spec = mock_agent(tmp.path(), REPLY, BTreeMap::new());
+        let cfg = config(spec);
+
+        let chat = build(
+            &cfg,
+            tmp.path().to_owned(),
+            "rework the config loader",
+            None,
+            None,
+        )
+        .expect("build");
+
+        assert!(
+            !chats.path_of(&chat.id).is_file(),
+            "build must not touch the filesystem"
+        );
+        assert!(
+            chats.list().is_empty(),
+            "no record must be resolvable until something calls `Chats::put`"
+        );
     }
 
     /// `roles.chatter`, not `roles.planner`, decides who answers this
