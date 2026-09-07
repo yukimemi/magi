@@ -123,18 +123,32 @@
       <h1 id="runs-h">Competitions</h1>
       <p class="view-sub" id="runs-count">Loading…</p>
     </div>
-    <ol class="cards" id="runs-list"></ol>
-    <p class="empty" id="runs-empty" hidden>
-      No competitions yet. Start from an idea and an agent will interview you
-      into a task the loop can pick up.
-      <button class="btn btn-gold" type="button" data-plan>Start from an idea</button>
-    </p>
-    <p class="empty" id="runs-unreadable" hidden>
-      There are runs on disk, but this build cannot read their state — almost
-      always because they were recorded before a schema change. They are kept,
-      not deleted; <code>magi fold</code> clears their worktrees when you are
-      done with them.
-    </p>
+    <div class="runs-layout">
+      <!-- Wide screens only; hidden by CSS on a phone, which also removes it
+           from the tab order, so a narrow viewport never has to skip past it. -->
+      <nav class="runs-tree" id="runs-tree" aria-label="Filter runs by state and repository" hidden></nav>
+      <div class="runs-main">
+        <div class="runs-filter" id="runs-filter" hidden>
+          <p id="runs-filter-text"></p>
+          <button class="btn btn-quiet" type="button" id="runs-filter-clear">Clear filter</button>
+        </div>
+        <div id="runs-sections"></div>
+        <p class="empty" id="runs-filter-empty" hidden>
+          No runs match this filter.
+        </p>
+        <p class="empty" id="runs-empty" hidden>
+          No competitions yet. Start from an idea and an agent will interview you
+          into a task the loop can pick up.
+          <button class="btn btn-gold" type="button" data-plan>Start from an idea</button>
+        </p>
+        <p class="empty" id="runs-unreadable" hidden>
+          There are runs on disk, but this build cannot read their state — almost
+          always because they were recorded before a schema change. They are kept,
+          not deleted; <code>magi fold</code> clears their worktrees when you are
+          done with them.
+        </p>
+      </div>
+    </div>
   </section>
 
   <!-- RUN DETAIL -------------------------------------------------------- -->

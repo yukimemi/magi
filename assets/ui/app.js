@@ -446,6 +446,14 @@ const state = {
      poll later, which without this looked like the tap had done nothing. */
   stopAskedAt: 0,
   runs: null,
+  /* Which node of the Runs tree is narrowing the card list, or neither set
+     when nothing is picked. Lives only in memory — reloading the page always
+     starts from the unfiltered list, since a filter is a lens on what's on
+     screen right now, not a saved view. */
+  runsFilter: { section: null, repo: null },
+  /* Open/closed per Runs section, restored from localStorage so a collapse
+     survives a reload; defaults to open (see isSectionOpen()). */
+  runsCollapsed: loadRunsCollapsed(),
   queue: null,
   detail: { id: null, run: null, report: null },
   questions: null,
@@ -1248,14 +1256,322 @@ function updateRunTail(row, run, { parked, ask }) {
   setAttr(row, "data-tail", tailed ? "1" : null);
 }
 
+/* ---- runs: grouping into sections ------------------------------------- *
+ * The plain, updated-first list stops being readable once a few dozen runs
+ * pile up, so it is split into the four questions an operator actually asks:
+ * is anything waiting on me, what's moving, what landed, and what didn't.
+ * `waiting` (the field, not the refined isWaiting() the card tail uses) wins
+ * over status here on purpose \u2014 a run parked on a question is the one
+ * thing that needs a human regardless of which node it stopped in. */
+const RUN_SECTIONS = [
+  { key: "waiting", label: "Waiting on you" },
+  { key: "flight", label: "In flight" },
+  { key: "landed", label: "Landed" },
+  { key: "ended", label: "Ended" },
+];
+
+function runSection(run) {
+  if (run.waiting) return "waiting";
+  const status = String(run.status || "");
+  if (status === "merged" || status === "ready") return "landed";
+  if (status === "stalled" || status === "blocked" || status === "failed") return "ended";
+  return "flight";
+}
+
+/* Which older attempts fold into which card. `superseded_by` names the
+   *successor*'s short id, so a chain is walked forward from an attempt to
+   whatever replaced it until nothing newer is known. The run that walk ends
+   on is the one shown; everything behind it folds under that card.
+
+   Walking stops the moment a `superseded_by` names a short id this page has
+   never heard of \u2014 cut off by `limit`, or unreadable \u2014 and the run
+   in hand is shown as-is rather than assumed superseded by something it
+   cannot point at. That is what keeps a run from disappearing when the
+   response happens to omit the attempt that replaced it. */
+function foldRuns(runs) {
+  const byShort = new Map();
+  for (const run of runs) if (run.short) byShort.set(run.short, run);
+
+  const headOf = new Map();
+  for (const run of runs) {
+    let head = run;
+    const seen = new Set([run.id]);
+    for (;;) {
+      const next = head.superseded_by && byShort.get(head.superseded_by);
+      if (!next || seen.has(next.id)) break;
+      seen.add(next.id);
+      head = next;
+    }
+    headOf.set(run.id, head);
+  }
+
+  const heads = [];
+  const childrenOf = new Map();
+  for (const run of runs) {
+    const head = headOf.get(run.id);
+    if (head.id === run.id) {
+      heads.push(run);
+    } else {
+      if (!childrenOf.has(head.id)) childrenOf.set(head.id, []);
+      childrenOf.get(head.id).push(run);
+    }
+  }
+  return { heads, childrenOf };
+}
+
+/* Section order preserved from RUN_SECTIONS; run order within a section
+   preserved from the order `heads` arrived in, which is /api/runs' own
+   updated-first order. */
+function groupBySection(heads) {
+  const bySection = new Map(RUN_SECTIONS.map((s) => [s.key, []]));
+  for (const run of heads) bySection.get(runSection(run)).push(run);
+  return bySection;
+}
+
+const repoLabel = (run) => run.repo_name || run.repo || "Unknown repository";
+
+/* The wide-screen tree: section, then repo, each carrying the count of cards
+   \u2014 cards, not raw runs, so this number always means the same thing as
+   the section heading it rolls up to. Built from the *unfiltered* heads, so
+   picking a node never shrinks the tree out from under the tap that picked
+   it. Sections and repos with nothing in them are left out rather than shown
+   at zero: an empty branch is not something to file into. */
+function buildRunsTree(bySection) {
+  const sections = [];
+  for (const { key, label } of RUN_SECTIONS) {
+    const heads = bySection.get(key);
+    if (heads.length === 0) continue;
+    const byRepo = new Map();
+    for (const run of heads) {
+      const repo = repoLabel(run);
+      if (!byRepo.has(repo)) byRepo.set(repo, 0);
+      byRepo.set(repo, byRepo.get(repo) + 1);
+    }
+    const repos = [...byRepo.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([repo, count]) => ({ repo, count }));
+    sections.push({ key, label, count: heads.length, repos });
+  }
+  return sections;
+}
+
+/* Only ever one filter active at a time: a section, or a section plus one of
+   its repos. There is no URL for it \u2014 the tree is a lens on the list
+   already on screen, not a place worth deep-linking to. */
+function matchesFilter(run) {
+  const { section, repo } = state.runsFilter;
+  if (!section) return true;
+  if (runSection(run) !== section) return false;
+  return !repo || repoLabel(run) === repo;
+}
+
+function selectRunsFilter(section, repo) {
+  const same = state.runsFilter.section === section && state.runsFilter.repo === (repo || null);
+  state.runsFilter = same ? { section: null, repo: null } : { section, repo: repo || null };
+  renderRuns();
+}
+
+function clearRunsFilter() {
+  state.runsFilter = { section: null, repo: null };
+  renderRuns();
+}
+
+function renderRunsTree(sections) {
+  const nav = $("runs-tree");
+  show(nav, sections.length > 0);
+
+  /* The tree is rebuilt from scratch below rather than reconciled node by
+     node — it is small, at most four sections and a handful of repos each —
+     but a full rebuild would otherwise drop keyboard focus on every poll, so
+     whichever node has it is found again afterwards by the (section, repo)
+     it names rather than by identity. */
+  const active = document.activeElement;
+  const focused = nav.contains(active)
+    ? { section: active.dataset.section, repo: active.dataset.repo || null }
+    : null;
+
+  if (sections.length === 0) {
+    clear(nav);
+    return;
+  }
+  const root = el("ul", { class: "runs-tree-list" });
+  for (const section of sections) {
+    const on = state.runsFilter.section === section.key && !state.runsFilter.repo;
+    const sub = el("ul", { class: "runs-tree-sub" });
+    for (const r of section.repos) {
+      const repoOn = state.runsFilter.section === section.key && state.runsFilter.repo === r.repo;
+      sub.append(el("li", {},
+        el("button", {
+          class: "runs-tree-node runs-tree-repo",
+          type: "button",
+          "data-section": section.key,
+          "data-repo": r.repo,
+          "aria-current": repoOn ? "true" : null,
+          onclick: () => selectRunsFilter(section.key, r.repo),
+        },
+          el("span", { class: "runs-tree-label", text: r.repo }),
+          el("span", { class: "runs-tree-count", text: String(r.count) }),
+        ),
+      ));
+    }
+    root.append(el("li", {},
+      el("button", {
+        class: "runs-tree-node",
+        type: "button",
+        "data-section": section.key,
+        "aria-current": on ? "true" : null,
+        onclick: () => selectRunsFilter(section.key, null),
+      },
+        el("span", { class: "runs-tree-label", text: section.label }),
+        el("span", { class: "runs-tree-count", text: String(section.count) }),
+      ),
+      sub,
+    ));
+  }
+  clear(nav);
+  nav.append(root);
+
+  if (focused) {
+    const match = [...nav.querySelectorAll(".runs-tree-node")].find((node) =>
+      node.dataset.section === focused.section && (node.dataset.repo || null) === focused.repo);
+    if (match) match.focus();
+  }
+}
+
+function renderRunsFilterBar() {
+  const bar = $("runs-filter");
+  const { section, repo } = state.runsFilter;
+  if (!section) {
+    show(bar, false);
+    return;
+  }
+  const label = (RUN_SECTIONS.find((s) => s.key === section) || {}).label || section;
+  setText($("runs-filter-text"), `Showing ${label}${repo ? ` \u203a ${repo}` : ""}.`);
+  show(bar, true);
+}
+
+/* ---- runs: section collapse, kept in localStorage ---------------------- */
+const RUNS_COLLAPSE_KEY = "magi-runs-sections";
+
+function loadRunsCollapsed() {
+  try {
+    const raw = localStorage.getItem(RUNS_COLLAPSE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};   /* localStorage denied (private mode) or the value was junk */
+  }
+}
+
+function saveRunsCollapsed() {
+  try {
+    localStorage.setItem(RUNS_COLLAPSE_KEY, JSON.stringify(state.runsCollapsed));
+  } catch {
+    /* localStorage denied in private mode; the choice just won't outlive the tab */
+  }
+}
+
+const isSectionOpen = (key) => state.runsCollapsed[key] !== false;
+
+/* ---- runs: one section (a native <details>, for free keyboard support) - */
+function createRunSection(key, label) {
+  const count = el("span", { class: "runs-section-count" });
+  const folded = el("span", { class: "runs-section-folded" });
+  const summary = el("summary", { class: "runs-section-head" },
+    el("h2", { class: "runs-section-title", text: label }), count, folded);
+  const list = el("ol", { class: "cards" });
+  const details = el("details", { class: "runs-section", open: isSectionOpen(key) }, summary, list);
+  details.addEventListener("toggle", () => {
+    state.runsCollapsed[key] = details.open;
+    saveRunsCollapsed();
+  });
+  details.refs = { count, folded, list };
+  return details;
+}
+
+function updateRunSection(node, heads, childrenOf) {
+  const foldedTotal = heads.reduce((sum, run) => sum + (childrenOf.get(run.id) || []).length, 0);
+  setText(node.refs.count, plural(heads.length, "run", "runs"));
+  setText(node.refs.folded, foldedTotal
+    ? `, ${plural(foldedTotal, "earlier attempt", "earlier attempts")} folded`
+    : "");
+  syncList(node.refs.list, heads, (r) => r.id, createRunRow,
+    (row, run) => updateRunRow(row, run, childrenOf.get(run.id) || []));
+}
+
+/* Keyed reconcile across sections, the same shape as syncList() above but one
+   level up: a section that empties out (everything in it superseded, or
+   filtered away) is removed rather than left on screen at "0 runs". */
+function syncRunSections(root, bySection, childrenOf) {
+  const existing = new Map();
+  for (const child of root.children) existing.set(child.dataset.key, child);
+
+  let previous = null;
+  for (const { key, label } of RUN_SECTIONS) {
+    const heads = bySection.get(key);
+    if (heads.length === 0) continue;
+    let node = existing.get(key);
+    if (node) existing.delete(key);
+    else {
+      node = createRunSection(key, label);
+      node.dataset.key = key;
+    }
+    updateRunSection(node, heads, childrenOf);
+    const wanted = previous ? previous.nextSibling : root.firstChild;
+    if (node !== wanted) root.insertBefore(node, wanted);
+    previous = node;
+  }
+  for (const stale of existing.values()) stale.remove();
+}
+
+/* ---- runs: one row, a card plus its folded-away earlier attempts ------- *
+ * createRunCard()/updateRunCard() build and fill the card itself and are
+ * left untouched; the folded list is a sibling appended to the same <li>,
+ * because the card is a single <a> and an anchor may not contain another
+ * interactive element. */
+function createRunRow() {
+  const row = createRunCard();
+  const summary = el("summary", { class: "run-folded-summary" });
+  const list = el("ul", { class: "run-folded-list" });
+  const folded = el("details", { class: "run-folded advanced" }, summary, list);
+  row.append(folded);
+  row.refs.folded = folded;
+  row.refs.foldedSummary = summary;
+  row.refs.foldedList = list;
+  return row;
+}
+
+function updateRunRow(row, run, children) {
+  updateRunCard(row, run);
+  const list = row.refs.foldedList;
+  clear(list);
+  for (const child of children) {
+    const at = when(child.updated_at || child.created_at);
+    list.append(el("li", {},
+      el("a", { class: "run-folded-link", href: `#/runs/${child.id}` },
+        el("span", { class: "run-folded-id", text: child.short || shortId(child.id) }),
+        el("span", { class: "run-folded-status", text: child.waiting ? "waiting" : String(child.status || "") }),
+        el("time", { class: "run-folded-when", text: at.text, title: at.title }),
+      ),
+    ));
+  }
+  setText(row.refs.foldedSummary, children.length
+    ? plural(children.length, "earlier attempt", "earlier attempts")
+    : "");
+  show(row.refs.folded, children.length > 0);
+}
+
 function renderRuns() {
-  const list = $("runs-list");
   const runs = state.runs;
+  const sectionsRoot = $("runs-sections");
 
   if (runs === null) {
     setText($("runs-count"), "Loading\u2026");
-    if (!list.dataset.skeleton) {
-      clear(list);
+    show($("runs-tree"), false);
+    show($("runs-filter"), false);
+    if (!sectionsRoot.dataset.skeleton) {
+      clear(sectionsRoot);
+      const list = el("ol", { class: "cards" });
       for (let i = 0; i < 3; i += 1) {
         list.append(el("li", { class: "card skeleton" },
           el("div", { class: "bar", style: "width:34%" }),
@@ -1263,14 +1579,15 @@ function renderRuns() {
           el("div", { class: "bar", style: "width:56%" }),
         ));
       }
-      list.dataset.skeleton = "1";
+      sectionsRoot.append(list);
+      sectionsRoot.dataset.skeleton = "1";
     }
     return;
   }
 
-  if (list.dataset.skeleton) {
-    clear(list);
-    delete list.dataset.skeleton;
+  if (sectionsRoot.dataset.skeleton) {
+    clear(sectionsRoot);
+    delete sectionsRoot.dataset.skeleton;
   }
 
   const moving = runs.filter((r) => !r.done).length;
@@ -1289,7 +1606,13 @@ function renderRuns() {
   // "file your first task" prompt, which would be wrong and confusing.
   show($("runs-empty"), runs.length === 0 && unreadable === 0);
   show($("runs-unreadable"), runs.length === 0 && unreadable > 0);
-  syncList(list, runs, (r) => r.id, createRunCard, updateRunCard);
+
+  const { heads, childrenOf } = foldRuns(runs);
+  renderRunsTree(buildRunsTree(groupBySection(heads)));
+  renderRunsFilterBar();
+  const visible = heads.filter(matchesFilter);
+  syncRunSections(sectionsRoot, groupBySection(visible), childrenOf);
+  show($("runs-filter-empty"), heads.length > 0 && Boolean(state.runsFilter.section) && visible.length === 0);
 }
 
 /* ---- queue ------------------------------------------------------------- */
@@ -4774,6 +5097,8 @@ function wire() {
   $("task-edit-sheet").addEventListener("close", () => {
     editingTaskId = null;
   });
+
+  $("runs-filter-clear").addEventListener("click", clearRunsFilter);
 
   $("theme-toggle").addEventListener("click", () => {
     const next = THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length];
