@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::config::MergeMode;
 use crate::run::{CommandOutcome, RunState, RunStatus, tail};
 use crate::stats::Stats;
+use crate::verdict::ReviewVote;
 
 static COLOR: AtomicBool = AtomicBool::new(true);
 
@@ -63,6 +64,18 @@ fn status_word(status: RunStatus) -> String {
         RunStatus::Blocked => yellow(&text),
         RunStatus::Failed => red(&text),
         _ => cyan(&text),
+    }
+}
+
+/// Colour for a reviewer vote — the same scale a finding's severity gets:
+/// green for no reservations, yellow for proceed-but-look-at-this, red for a
+/// vote that says stop.
+fn vote_tag(vote: ReviewVote) -> String {
+    let text = vote.label();
+    match vote {
+        ReviewVote::Approve => green(text),
+        ReviewVote::ApproveWithFindings => yellow(text),
+        ReviewVote::Reject => red(text),
     }
 }
 
@@ -353,9 +366,21 @@ pub fn run(state: &RunState) -> String {
             } else {
                 String::new()
             };
+            // The verdict is the one thing this loop cannot derive from
+            // `blocking`/`e2e` alone: three seats can agree there is nothing
+            // blocking and still split on whether the patch is fine to
+            // proceed as-is, which is exactly the disagreement a vote exists
+            // to surface.
+            let verdict = r.verdict.map_or(String::new(), |v| {
+                format!(
+                    ", verdict {}{}",
+                    vote_tag(v),
+                    if r.vote_split { " (panel split)" } else { "" }
+                )
+            });
             let _ = writeln!(
                 s,
-                "  round {}  {} @ {}{panel}  {raised} finding(s), {} blocking, {e2e}{}",
+                "  round {}  {} @ {}{panel}  {raised} finding(s), {} blocking, {e2e}{verdict}{}",
                 r.round,
                 status,
                 short(&r.head),
@@ -394,6 +419,9 @@ pub fn run(state: &RunState) -> String {
                 })
             );
             for rec in &r.reviews {
+                if let Some(vote) = rec.vote {
+                    let _ = writeln!(s, "      review-{} vote {}", rec.reviewer, vote_tag(vote));
+                }
                 for f in &rec.findings {
                     let adopted = r
                         .fix
@@ -422,6 +450,36 @@ pub fn run(state: &RunState) -> String {
                         yellow("declined"),
                         rej.why
                     );
+                }
+            }
+            // Reconsideration only ever has entries when the round's initial
+            // votes split — an empty list here means the panel agreed the
+            // first time, same as an empty `deliberation` for judges.
+            if !r.reconsideration.is_empty() {
+                let _ = writeln!(s, "      {}", dim("reconsideration:"));
+                for rv in &r.reconsideration {
+                    match rv.vote {
+                        Some(v) => {
+                            let _ = writeln!(
+                                s,
+                                "        review-{} -> {}  {}",
+                                rv.reviewer,
+                                vote_tag(v),
+                                rv.reason
+                            );
+                        }
+                        None => {
+                            let _ = writeln!(
+                                s,
+                                "        review-{} -> {}",
+                                rv.reviewer,
+                                red(&format!(
+                                    "no revote ({})",
+                                    rv.failed.as_deref().unwrap_or("unknown")
+                                ))
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -929,6 +987,9 @@ mod tests {
             expected: 0,
             clean: false,
             progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         }];
         let text = run(&lost);
         assert!(text.contains("adoption report lost (timed out)"), "{text}");
@@ -958,12 +1019,71 @@ mod tests {
             expected: 0,
             clean: false,
             progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         }];
         let text2 = run(&rejected_all);
         assert!(
             text2.contains("0 addressed / 0 rejected"),
             "a round the fixer actually reported on keeps the count: {text2}"
         );
+    }
+
+    #[test]
+    fn a_split_round_shows_every_seat_vote_and_the_reconsideration() {
+        use crate::run::ReviewRevoteRecord;
+        use crate::verdict::ReviewVote;
+
+        let _guard = plain();
+        let mut s = state();
+        s.reviews = vec![ReviewRound {
+            round: 1,
+            head: "abc1234".to_owned(),
+            reviews: vec![
+                ReviewRecord {
+                    reviewer: 1,
+                    agent: "alpha".to_owned(),
+                    summary: String::new(),
+                    findings: Vec::new(),
+                    vote: Some(ReviewVote::Approve),
+                    failed: None,
+                    duration_ms: 0,
+                },
+                ReviewRecord {
+                    reviewer: 2,
+                    agent: "beta".to_owned(),
+                    summary: String::new(),
+                    findings: Vec::new(),
+                    vote: Some(ReviewVote::Reject),
+                    failed: None,
+                    duration_ms: 0,
+                },
+            ],
+            e2e: Vec::new(),
+            verify_retried: false,
+            fix: None,
+            blocking: 0,
+            answered: 2,
+            expected: 2,
+            clean: false,
+            progressed: false,
+            vote_split: true,
+            reconsideration: vec![ReviewRevoteRecord {
+                reviewer: 2,
+                agent: "beta".to_owned(),
+                vote: Some(ReviewVote::ApproveWithFindings),
+                reason: "the other seat's read holds up".to_owned(),
+                failed: None,
+            }],
+            verdict: Some(ReviewVote::ApproveWithFindings),
+        }];
+        let text = run(&s);
+        assert!(text.contains("review-1 vote"), "{text}");
+        assert!(text.contains("review-2 vote"), "{text}");
+        assert!(text.contains("panel split"), "{text}");
+        assert!(text.contains("reconsideration"), "{text}");
+        assert!(text.contains("the other seat's read holds up"), "{text}");
     }
 
     #[test]
@@ -984,6 +1104,7 @@ mod tests {
                     agent: "alpha".to_owned(),
                     summary: String::new(),
                     findings: Vec::new(),
+                    vote: None,
                     failed: None,
                     duration_ms: 0,
                 },
@@ -992,6 +1113,7 @@ mod tests {
                     agent: "beta".to_owned(),
                     summary: String::new(),
                     findings: Vec::new(),
+                    vote: None,
                     failed: Some("agent timed out".to_owned()),
                     duration_ms: 0,
                 },
@@ -1012,6 +1134,9 @@ mod tests {
             expected: 2,
             clean: false,
             progressed: true,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         }];
         let text = run(&s);
         assert!(text.contains("incomplete"), "{text}");
@@ -1045,6 +1170,9 @@ mod tests {
             expected: 0,
             clean: false,
             progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         }];
         let text = run(&s);
         assert!(text.contains("could not run"), "{text}");
@@ -1074,6 +1202,7 @@ mod tests {
                     title: "still open".to_owned(),
                     detail: String::new(),
                 }],
+                vote: None,
                 failed: None,
                 duration_ms: 0,
             }],
@@ -1101,6 +1230,9 @@ mod tests {
             expected: 1,
             clean: false,
             progressed: true,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         }];
 
         let text = run(&s);

@@ -126,6 +126,46 @@ pub struct Finding {
     pub detail: String,
 }
 
+/// A reviewer seat's verdict on the patch, cast alongside its findings.
+///
+/// Three values, not a boolean, because "fine to proceed" and "fine, but
+/// look at these" are different signals for the operator watching the run —
+/// collapsing them would hide exactly the middle case a lens-based reviewer
+/// is most likely to land on. Ord follows declaration order (least to most
+/// cautious) so a round's [`ReviewVote::worst`] is a plain `max`, the same
+/// trick [`Severity`] uses for `blocks`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewVote {
+    /// No reservations.
+    Approve,
+    /// Fine to proceed, but the findings below are worth fixing.
+    ApproveWithFindings,
+    /// Do not proceed as-is.
+    Reject,
+}
+
+impl ReviewVote {
+    /// Operator-facing label, used in events and the report — never
+    /// `Debug`, so a rename of a variant does not silently reword history.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::ApproveWithFindings => "approve with findings",
+            Self::Reject => "reject",
+        }
+    }
+
+    /// The most cautious of a set of votes, or `None` if none were cast.
+    ///
+    /// A round's recorded verdict must never read softer than its most
+    /// cautious seat — the same reason a single blocking finding, not an
+    /// average of severities, decides whether a round is clean.
+    pub fn worst(votes: impl IntoIterator<Item = Self>) -> Option<Self> {
+        votes.into_iter().max()
+    }
+}
+
 /// A reviewer's report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Review {
@@ -135,6 +175,22 @@ pub struct Review {
     /// Reviewer's overall verdict prose.
     #[serde(default)]
     pub summary: String,
+    /// This seat's vote. Required, not defaulted: a reviewer that skips it
+    /// is retried the same as one that skipped `severity` on a finding,
+    /// rather than silently counted as an `approve`.
+    pub vote: ReviewVote,
+}
+
+/// A reviewer seat's revote after a split round, cast once it has read every
+/// seat's findings and votes (still numbered, never named — see
+/// [`crate::prompt::review_reconsider`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewRevote {
+    /// The seat's revote.
+    pub vote: ReviewVote,
+    /// Why, one or two sentences.
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// The fixer's response to a round of findings.
@@ -394,12 +450,41 @@ mod tests {
     #[test]
     fn review_parses_with_optional_fields_missing() {
         let r: Review = extract_json(
-            r#"{"findings":[{"severity":"blocker","title":"panics on empty input"}]}"#,
+            r#"{"vote":"reject","findings":[{"severity":"blocker","title":"panics on empty input"}]}"#,
         )
         .unwrap();
         assert_eq!(r.findings.len(), 1);
         assert!(r.findings[0].file.is_none());
         assert_eq!(r.findings[0].id, "");
+        assert_eq!(r.vote, ReviewVote::Reject);
+    }
+
+    #[test]
+    fn review_without_a_vote_is_rejected_rather_than_defaulted() {
+        let err = extract_json::<Review>(r#"{"findings":[]}"#).unwrap_err();
+        assert!(err.to_string().contains("no JSON object"), "{err}");
+    }
+
+    #[test]
+    fn review_vote_worst_is_the_most_cautious() {
+        assert_eq!(
+            ReviewVote::worst([ReviewVote::Approve, ReviewVote::Reject, ReviewVote::Approve]),
+            Some(ReviewVote::Reject)
+        );
+        assert_eq!(
+            ReviewVote::worst([ReviewVote::Approve, ReviewVote::ApproveWithFindings]),
+            Some(ReviewVote::ApproveWithFindings)
+        );
+        assert_eq!(ReviewVote::worst(Vec::<ReviewVote>::new()), None);
+    }
+
+    #[test]
+    fn review_revote_parses_the_reconsideration_shape() {
+        let r: ReviewRevote =
+            extract_json(r#"{"vote":"approve","reason":"the other findings do not hold"}"#)
+                .unwrap();
+        assert_eq!(r.vote, ReviewVote::Approve);
+        assert_eq!(r.reason, "the other findings do not hold");
     }
 
     #[test]

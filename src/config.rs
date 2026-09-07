@@ -206,7 +206,13 @@ pub struct Graph {
     pub judges: usize,
     /// Deliberation rounds when the judges' first choices disagree.
     pub deliberate_rounds: usize,
-    /// Reviewers per review round.
+    /// Reviewers per review round. **Three by default** - the smallest panel
+    /// a lens cycle (see [`crate::prompt::Lens`]) covers exactly once, so the
+    /// default panel reads the patch for spec compliance, regressions, and
+    /// simplicity without repeating an angle. Review is also the one stage
+    /// [`Self::candidates`]'s doc describes as running on every task
+    /// regardless of competition, which is what makes a panel worth its cost
+    /// here even though `candidates` itself defaults to one.
     pub reviewers: usize,
     /// Maximum review+fix rounds before the run is declared blocked.
     pub review_rounds: usize,
@@ -291,7 +297,7 @@ impl Default for Graph {
             candidates: 1,
             judges: 3,
             deliberate_rounds: 1,
-            reviewers: 2,
+            reviewers: 3,
             review_rounds: 6,
             max_parallel: 4,
             language: "en".to_owned(),
@@ -1277,7 +1283,7 @@ impl Config {
              candidates = 3\n\
              judges = 3\n\
              deliberate_rounds = 1\n\
-             reviewers = 2\n\
+             reviewers = 3\n\
              review_rounds = 6\n\
              max_parallel = 4\n\
              language = \"en\"\n\

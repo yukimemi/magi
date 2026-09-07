@@ -480,6 +480,7 @@ mod tests {
                         ),
                         finding("R1-1-2", "src/b.rs", 40, "leaks a handle", Severity::Major),
                     ],
+                    vote: None,
                     failed: None,
                     duration_ms: 0,
                 },
@@ -495,6 +496,7 @@ mod tests {
                         "empty input panic",
                         Severity::Blocker,
                     )],
+                    vote: None,
                     failed: None,
                     duration_ms: 0,
                 },
@@ -515,6 +517,9 @@ mod tests {
             expected: 2,
             clean: false,
             progressed: true,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         };
         let stats = collect(&[state_with(vec![round], 'A', RunStatus::Ready)]);
         let alpha = stats.reviewers.iter().find(|r| r.agent == "alpha").unwrap();
@@ -547,6 +552,7 @@ mod tests {
                     "panics on empty",
                     Severity::Blocker,
                 )],
+                vote: None,
                 failed: None,
                 duration_ms: 0,
             }],
@@ -568,6 +574,9 @@ mod tests {
             expected: 1,
             clean: false,
             progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         };
         let stats = collect(&[state_with(vec![submitted], 'A', RunStatus::Ready)]);
         assert!(
@@ -589,6 +598,7 @@ mod tests {
                     agent: "alpha".to_owned(),
                     summary: String::new(),
                     findings: Vec::new(),
+                    vote: None,
                     failed: None,
                     duration_ms: 0,
                 },
@@ -597,6 +607,7 @@ mod tests {
                     agent: "beta".to_owned(),
                     summary: String::new(),
                     findings: Vec::new(),
+                    vote: None,
                     failed: Some("agent timed out".to_owned()),
                     duration_ms: 0,
                 },
@@ -609,6 +620,9 @@ mod tests {
             expected: 2,
             clean: false,
             progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         };
         let stats = collect(&[state_with(vec![round], 'A', RunStatus::Blocked)]);
 
@@ -651,6 +665,7 @@ mod tests {
                         "panics on empty",
                         Severity::Blocker,
                     )],
+                    vote: None,
                     failed: None,
                     duration_ms: 0,
                 },
@@ -659,6 +674,7 @@ mod tests {
                     agent: "beta".to_owned(),
                     summary: String::new(),
                     findings: Vec::new(),
+                    vote: None,
                     failed: Some("agent timed out".to_owned()),
                     duration_ms: 0,
                 },
@@ -679,6 +695,9 @@ mod tests {
             expected: 2,
             clean: false,
             progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         };
         let stats = collect(&[state_with(vec![round], 'A', RunStatus::Blocked)]);
 
@@ -714,6 +733,9 @@ mod tests {
             expected: 0,
             clean: false,
             progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         };
         let alongside = ReviewRound {
             round: 2,
@@ -727,6 +749,9 @@ mod tests {
             expected: 0,
             clean: false,
             progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         };
         let stats = collect(&[state_with(vec![sole, alongside], 'A', RunStatus::Ready)]);
         assert_eq!(stats.e2e.rounds, 2);
