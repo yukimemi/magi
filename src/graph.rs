@@ -2974,6 +2974,7 @@ async fn wave(
                     run: &run,
                     node: &node,
                     cache_dir: cache.as_deref(),
+                    attachments: &[],
                 },
             )
             .await;

@@ -1336,6 +1336,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 .full-head h2 { font-size: var(--t5); text-transform: none; letter-spacing: -.01em; color: var(--ink); }
 .full-body { flex: 1; min-height: 0; background: #fffdfa; }
 .full-body iframe { display: block; width: 100%; height: 100%; border: 0; }
+/* The same full-screen dialog, reused for a tapped attachment instead of a
+   panel's iframe - a plain same-origin image needs neither a sandbox nor a
+   CSP, so there is nothing an iframe would add here. */
+.full-body img { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
 
 /* ---- merge approval ---------------------------------------------------- *
  * The land loop asks before it merges, and that is the one question in this
@@ -1432,6 +1436,21 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 }
 .turn-at { display: block; margin-top: var(--s1); font-size: var(--t1); opacity: .75; }
 
+/* Images attached to a turn, already sent - a row of squares that wraps
+   rather than one that scrolls sideways, so a narrow phone never has to pan
+   to see the third picture. `max-width: 100%` on the row plus `flex-wrap` is
+   what keeps this from ever pushing the bubble wider than `.turn` allows. */
+.turn-attachments {
+  display: flex; flex-wrap: wrap; gap: var(--s2);
+  margin-top: var(--s2); max-width: 100%;
+}
+.turn-thumb {
+  flex: none; width: 96px; height: 96px;
+  padding: 0; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  overflow: hidden; background: var(--sunk); cursor: pointer;
+}
+.turn-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
 /* The honest wait. Three dots breathing at 1.6s is slow enough to read as
    thinking rather than as a stuck spinner, and the elapsed seconds beside it
    are the proof that something is still counting. */
@@ -1471,12 +1490,81 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
      plus the label row under the glyph, which is what --s3 stands in for
      here; at 44px alone the composer's own edge crossed the dock's top rule. */
   bottom: calc(var(--tap) + var(--s3) + env(safe-area-inset-bottom));
-  display: flex; gap: var(--s2); align-items: flex-end;
+  display: flex; flex-direction: column; gap: var(--s2);
   padding: var(--s2) 0;
   background: var(--bg);
+  border-radius: var(--radius);
+  transition: background-color .15s var(--ease);
 }
-.say textarea { margin-top: 0; flex: 1; min-width: 0; }
-.say .btn { flex: none; }
+/* The file-picker / paste / drop trio all land here, so a phone with no
+   pointer for drag-and-drop still has the other two - this row is never the
+   only path to an attachment. */
+.say-row { display: flex; gap: var(--s2); align-items: flex-end; }
+.say-row textarea { margin-top: 0; flex: 1; min-width: 0; }
+.say-row .btn { flex: none; }
+
+.attach-btn {
+  width: var(--tap); height: var(--tap); flex: none;
+  display: grid; place-items: center; align-self: flex-end;
+  background: none; border: 1px solid var(--edge); border-radius: var(--radius-sm);
+  color: var(--ink-2); cursor: pointer;
+}
+.attach-btn:active { background: var(--sunk); }
+.attach-btn svg { width: 20px; height: 20px; }
+
+/* A drag entering the composer or the transcript above it - see
+   `wireAttachments` in app.js - gets a visible drop zone rather than silence
+   right up until the drop lands. */
+.say.is-drop-target, .turns.is-drop-target {
+  background: var(--tint-teal);
+  outline: 2px dashed var(--teal); outline-offset: -2px;
+  border-radius: var(--radius);
+}
+
+/* Attached-but-not-yet-sent images. A row of small squares rather than the
+   full-width `.md img` treatment: this is a queue to review before Send, not
+   the message itself. */
+.say-thumbs {
+  display: flex; gap: var(--s2); flex-wrap: wrap;
+}
+.say-thumb {
+  position: relative; flex: none;
+  width: 64px; height: 64px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  overflow: hidden; background: var(--sunk);
+}
+.say-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* A full `--tap` (44px) square would cover most of a 64px thumbnail, so the
+   visible badge stays small and legible in the corner; `padding` below is
+   what keeps the actual hit area close to that minimum without inflating
+   the badge itself over the picture. */
+.say-thumb-remove {
+  position: absolute; top: 0; right: 0;
+  width: 28px; height: 28px; padding: 4px;
+  display: grid; place-items: center;
+  background: none; border: 0; cursor: pointer;
+  color: #fff;
+}
+.say-thumb-remove::before {
+  content: ""; position: absolute; inset: 0;
+  background: rgba(20, 18, 14, .55); border-radius: 0 0 0 var(--radius-sm);
+}
+.say-thumb-remove svg { position: relative; width: 14px; height: 14px; }
+.say-thumb.is-uploading img { opacity: .4; }
+.say-thumb-spinner {
+  position: absolute; inset: 0; display: grid; place-items: center;
+}
+.say-thumb-spinner i {
+  width: 18px; height: 18px; border-radius: 50%;
+  border: 2px solid var(--line-2); border-top-color: var(--ink-2);
+  animation: spin .7s linear infinite;
+}
+.say-thumb.is-failed { border-color: var(--on-rust); }
+.say-thumb.is-failed img { opacity: .35; }
+
+.say-upload-status {
+  font-size: var(--t2); color: var(--ink-3);
+}
 
 /* Formatted is the default read of the draft; raw is the exact bytes that
    would be filed, one tap away, so the toggle sits above both and only ever

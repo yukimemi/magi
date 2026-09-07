@@ -52,6 +52,13 @@ const API = {
   talk: (id) => `/api/talks/${encodeURIComponent(id)}`,
   talkSay: (id) => `/api/talks/${encodeURIComponent(id)}/say`,
   talkClose: (id) => `/api/talks/${encodeURIComponent(id)}/close`,
+  /* One image, uploaded the moment it is picked/pasted/dropped - well before
+     Send exists to tap - and referenced by the id this route hands back.
+     `say` never carries bytes of its own. */
+  chatAttachmentPost: (id) => `/api/chats/${encodeURIComponent(id)}/attachments`,
+  chatAttachment: (id, att) => `/api/chats/${encodeURIComponent(id)}/attachments/${encodeURIComponent(att)}`,
+  talkAttachmentPost: (id) => `/api/talks/${encodeURIComponent(id)}/attachments`,
+  talkAttachment: (id, att) => `/api/talks/${encodeURIComponent(id)}/attachments/${encodeURIComponent(att)}`,
   /* Local checkouts under `[repos] roots`, for the repository pickers on the
      "start a conversation" panel and the "continue in another repository"
      action. `?refresh=1` bypasses the server's cache regardless of its TTL. */
@@ -481,6 +488,13 @@ const state = {
      so instead of silently staying empty. */
   draftDetail: { id: null, advice: null, error: null },
   chatDetail: { id: null, chat: null },
+  /* Images picked, pasted or dropped for the *next* `chat-say`, not yet
+     part of any turn. Each item is `{ localId, previewUrl, name, status,
+     serverId, mime, bytes }` with `status` one of `"uploading"` /
+     `"done"` / `"error"` - see `renderChatThumbs`. Keyed to a conversation
+     id the same way `chatProblems` is, so switching conversations does not
+     leave one's pending pictures attached to another's next message. */
+  chatAttachments: { id: null, items: [] },
   /* The id of the conversation whose turn is in flight, and the transcript
      length it started from. One turn at a time is the whole rule: a second
      one fired into the same chat would interleave with the first. */
@@ -515,6 +529,9 @@ const state = {
      turn guard. */
   talks: null,
   talkDetail: { id: null, talk: null },
+  /* See `chatAttachments`, which this mirrors for the standing chat's own
+     composer. */
+  talkAttachments: { id: null, items: [] },
   talkBusy: null,
   talkBusyTurns: 0,
   talkPending: null,
@@ -570,6 +587,19 @@ const postJson = (url, body) =>
   }).then((r) => r.json());
 
 const deleteReq = (url) => request(url, { method: "DELETE" });
+
+/* An attachment upload: the raw bytes as the body, never JSON, so a picture
+   is not paid for twice over by base64. `filename` is separate from
+   `file.name` because a pasted clipboard image usually has none. */
+const postBytes = (url, file, filename) =>
+  request(url, {
+    method: "POST",
+    headers: {
+      "content-type": file.type || "application/octet-stream",
+      "x-filename": filename || file.name || "attachment",
+    },
+    body: file,
+  }).then((r) => r.json());
 
 /* ---- alert ------------------------------------------------------------- */
 function fail(message) {
@@ -3039,10 +3069,19 @@ function closeDraftDetail() {
 function createTurnRow() {
   const who = el("span", { class: "turn-who" });
   const body = el("div", { class: "turn-body" });
+  const attachments = el("div", { class: "turn-attachments" });
   const at = el("time", { class: "turn-at" });
-  const row = el("li", { class: "turn" }, who, body, at);
-  row.refs = { who, body, at };
+  const row = el("li", { class: "turn" }, who, body, attachments, at);
+  row.refs = { who, body, attachments, at };
   return row;
+}
+
+/* Which store a turn's attachments are served from - `item.kind` is set by
+   the two callers of `syncList` (`renderChat`, `renderTalk`) below, since
+   `createTurnRow`/`updateTurnRow` are the one component both share and a
+   thumbnail's URL has to name the right route. */
+function attachmentUrl(kind, conversationId, att) {
+  return kind === "talk" ? API.talkAttachment(conversationId, att.id) : API.chatAttachment(conversationId, att.id);
 }
 
 function updateTurnRow(row, item) {
@@ -3075,10 +3114,49 @@ function updateTurnRow(row, item) {
     }
   }
 
+  /* Images already attached to this turn - distinct from the pending row the
+     composer shows before Send, and rebuilt only when the set actually
+     changes, on the same append-only reasoning the body gets above. */
+  const atts = Array.isArray(turn.attachments) ? turn.attachments : [];
+  const attKey = atts.map((a) => a.id).join(",");
+  if (r.attachments.dataset.attKey !== attKey) {
+    r.attachments.dataset.attKey = attKey;
+    clear(r.attachments);
+    for (const att of atts) {
+      const url = attachmentUrl(item.kind, item.conversationId, att);
+      const name = String(att.name || "attachment");
+      const thumb = el("button", {
+        class: "turn-thumb", type: "button",
+        "aria-label": `Open ${name} at full size`,
+        onclick: () => showAttachment(url, name),
+      }, el("img", { src: url, alt: "", loading: "lazy" }));
+      r.attachments.append(thumb);
+    }
+  }
+
   const at = when(turn.at);
   setText(r.at, at.text);
   setAttr(r.at, "datetime", turn.at || null);
   setAttr(r.at, "title", at.title);
+}
+
+/* Full size, in the same dialog shell `openPanel` uses for a question's
+   panel - a plain same-origin `<img>` here rather than a sandboxed iframe,
+   since `web::attachment_response` already serves this from a closed
+   content-type whitelist with `nosniff` and there is no agent-authored
+   markup to contain. */
+function showAttachment(url, name) {
+  const dialog = $("attachment-view");
+  const img = $("attachment-view-img");
+  setText($("attachment-view-h"), name || "Attachment");
+  img.src = url;
+  img.alt = name || "";
+  if (!dialog.open) dialog.showModal();
+}
+
+function closeAttachmentView() {
+  const dialog = $("attachment-view");
+  if (dialog.open) dialog.close();
 }
 
 function renderProblems(problems) {
@@ -3101,6 +3179,115 @@ function chatError(message) {
   const box = $("chat-error");
   setText(box, message || "");
   show(box, Boolean(message));
+}
+
+/* ---- chat composer attachments ------------------------------------------ *
+ * Three ways an image reaches the file input - the picker, a paste, or a
+ * drop, all wired in wire() below to attachChatFiles() - and one thing that
+ * happens next: every file is POSTed the moment it arrives, well before Send
+ * is even tappable, so the thumbnail row has something to key on and a slow
+ * mobile upload is visible as progress rather than as a silent wait right
+ * before the tap that would have started it. `say` later carries only the
+ * ids this minted; see `API.chatAttachmentPost` and `web::validate_attachment`
+ * for what the server actually accepts - this side repeats none of that
+ * whitelist and just shows whatever message a rejection carries.
+ */
+let nextLocalAttachmentId = 1;
+
+function chatAttachmentsBusy() {
+  return state.chatAttachments.id === state.chatDetail.id
+    && state.chatAttachments.items.some((item) => item.status === "uploading");
+}
+
+/* Unconditional: called on every navigation away from a conversation (see
+   applyRoute) as well as after a successful send, so a pending queue never
+   survives long enough to attach itself to the wrong conversation - and
+   every object URL it created is revoked, since those are only ever read
+   from this page's own memory and nothing else will free them. */
+function resetChatAttachments(id) {
+  for (const item of state.chatAttachments.items) {
+    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+  }
+  state.chatAttachments = { id, items: [] };
+}
+
+function renderChatThumbs() {
+  const box = $("chat-say-thumbs");
+  const items = state.chatAttachments.id === state.chatDetail.id ? state.chatAttachments.items : [];
+  clear(box);
+  show(box, items.length > 0);
+  for (const item of items) {
+    const thumb = el("div", { class: "say-thumb" });
+    if (item.status === "uploading") thumb.classList.add("is-uploading");
+    if (item.status === "error") thumb.classList.add("is-failed");
+    thumb.append(el("img", { src: item.previewUrl || "", alt: "" }));
+    if (item.status === "uploading") {
+      thumb.append(el("div", { class: "say-thumb-spinner" }, el("i", {})));
+    }
+    thumb.append(el("button", {
+      class: "say-thumb-remove", type: "button",
+      "aria-label": `Remove ${item.name || "image"}`,
+      onclick: () => removeChatAttachment(item.localId),
+    }, svg(
+      "svg", { viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "2.5", "stroke-linecap": "round" },
+      svg("path", { d: "M6 6l12 12M18 6L6 18" }),
+    )));
+    box.append(thumb);
+  }
+
+  const uploading = items.filter((item) => item.status === "uploading").length;
+  const status = $("chat-say-upload-status");
+  setText(status, uploading > 0 ? `Uploading ${plural(uploading, "image", "images")}…` : "");
+  show(status, uploading > 0);
+}
+
+function removeChatAttachment(localId) {
+  const items = state.chatAttachments.items;
+  const at = items.findIndex((item) => item.localId === localId);
+  if (at < 0) return;
+  const [item] = items.splice(at, 1);
+  if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+  renderChat();
+}
+
+/* `files` is anything array-like of `File`/`Blob` - a `FileList` from the
+   input or a drop, or a plain array built from clipboard items on paste. */
+async function attachChatFiles(files) {
+  const id = state.chatDetail.id;
+  if (!id) return;
+  if (state.chatAttachments.id !== id) resetChatAttachments(id);
+
+  const images = [...files].filter((file) => file.type.startsWith("image/"));
+  if (images.length === 0) return;
+
+  for (const file of images) {
+    const localId = nextLocalAttachmentId++;
+    const item = {
+      localId,
+      previewUrl: URL.createObjectURL(file),
+      name: file.name || "image",
+      status: "uploading",
+      serverId: null,
+    };
+    state.chatAttachments.items.push(item);
+    renderChat();
+
+    try {
+      const att = await postBytes(API.chatAttachmentPost(id), file, file.name);
+      item.status = "done";
+      item.serverId = att.id;
+    } catch (error) {
+      /* Dropped rather than kept around failed: there is nothing to retry on
+         this exact item (the bytes were never a `File` this page can resend
+         after a paste), and the message is what the operator needs, in the
+         same error box a failed send already uses. */
+      const at = state.chatAttachments.items.indexOf(item);
+      if (at >= 0) state.chatAttachments.items.splice(at, 1);
+      URL.revokeObjectURL(item.previewUrl);
+      chatError(`Could not attach ${item.name}: ${error.message}`);
+    }
+    renderChat();
+  }
 }
 
 /* Switches the draft panel between its formatted read and the raw bytes that
@@ -3146,6 +3333,7 @@ function renderChat() {
     show($("chat-wait"), false);
     show($("chat-problems"), false);
     show($("chat-derived-from"), false);
+    renderChatThumbs();
     return;
   }
 
@@ -3181,8 +3369,11 @@ function renderChat() {
   /* Turns are append-only, so the index is a stable key and reconciling can
      never rebuild the transcript the operator is reading. */
   const turnsMd = chatTurnsMd(chat);
-  syncList($("chat-turns"), turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i) })),
-    (item) => item.key, createTurnRow, updateTurnRow);
+  syncList(
+    $("chat-turns"),
+    turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i), kind: "chat", conversationId: chat.id })),
+    (item) => item.key, createTurnRow, updateTurnRow,
+  );
 
   /* Auto-scroll: on first open and when a new turn arrives. Not when the
      turn count is unchanged (status refresh, 10-second re-read, draft
@@ -3223,12 +3414,16 @@ function renderChat() {
   const canSay = status === "open";
   show($("chat-say"), canSay);
   show($("chat-closed"), !canSay);
+  renderChatThumbs();
   /* The guard against a second turn: the field and the button are both dead
      while one is outstanding, and the button says what it is waiting for
-     rather than just greying out. */
+     rather than just greying out. An upload in flight disables Send the same
+     way - sending the ids of pictures that have not finished uploading yet
+     is not a request `web::chat_say` can even resolve. */
+  const uploading = chatAttachmentsBusy();
   $("f-say").disabled = busy;
-  $("chat-send").disabled = busy;
-  setText($("chat-send"), busy ? "Thinking\u2026" : "Send");
+  $("chat-send").disabled = busy || uploading;
+  setText($("chat-send"), busy ? "Thinking\u2026" : uploading ? "Uploading\u2026" : "Send");
   show($("chat-wait"), busy);
 }
 
@@ -3434,13 +3629,17 @@ async function sendTurn(event) {
   const id = state.chatDetail.id;
   const box = $("f-say");
   const text = box.value;
+  const attachments = state.chatAttachments.id === id
+    ? state.chatAttachments.items.filter((item) => item.status === "done")
+    : [];
 
   /* One turn at a time, checked here as well as by the disabled button: a
      double tap can beat a re-render, and a keyboard shortcut does not care
-     that the button looks dead. */
-  if (!id || state.chatBusy !== null) return;
-  if (!text.trim()) {
-    chatError("Say something first.");
+     that the button looks dead. Same for an upload still in flight - its ids
+     do not exist yet, so there is nothing valid to send. */
+  if (!id || state.chatBusy !== null || chatAttachmentsBusy()) return;
+  if (!text.trim() && attachments.length === 0) {
+    chatError("Say something, or attach an image, first.");
     box.focus();
     return;
   }
@@ -3450,7 +3649,10 @@ async function sendTurn(event) {
   beginTurn(id, before);
 
   /* The operator's own words go up immediately, held as the pending turn
-     until the transcript on disk has grown past it. */
+     until the transcript on disk has grown past it. The attached images
+     stay in their own row until the response lands, rather than joining
+     this optimistic bubble - they are already visible there, and the send
+     itself is normally the only remaining wait. */
   state.pending = { id, body: text, at: new Date().toISOString() };
   box.value = "";
   renderChat();
@@ -3465,7 +3667,14 @@ async function sendTurn(event) {
        reply arrives the way everything else in this client arrives: the change
        stream, or the ten-second re-read in `tickWait`. `loadChat` ends the turn
        once the transcript has grown past `busyTurns`. */
-    const queued = await postJson(API.say(id), { text });
+    const queued = await postJson(API.say(id), {
+      text,
+      attachments: attachments.map((item) => item.serverId),
+    });
+    /* Only when the queue we are clearing is still the one that was sent -
+       see `resetChatAttachments`'s doc for what a race here would otherwise
+       clobber. */
+    if (state.chatAttachments.id === id) resetChatAttachments(id);
     if (state.chatDetail.id === id) {
       state.chatDetail.chat = queued;
       renderChat();
@@ -3486,7 +3695,8 @@ async function sendTurn(event) {
     /* The request itself failed, which now means it failed before the server
        recorded anything — the response no longer waits for the agent. Reload
        anyway and say so carefully: the transcript on disk is the truth, not
-       the optimistic bubble above. */
+       the optimistic bubble above. The attachments stay queued: nothing was
+       lost, so the operator can just try Send again. */
     chatError(`The message may not have been sent: ${error.message}`);
     await loadChat(id);
   }
@@ -3701,6 +3911,7 @@ function renderTalk() {
     show($("talk-say"), false);
     show($("talk-closed"), false);
     show($("talk-wait"), false);
+    renderTalkThumbs();
     return;
   }
 
@@ -3727,8 +3938,11 @@ function renderTalk() {
   setAttr($("talk-meta"), "title", `${talk.id}\nstarted ${started.title}`);
 
   const turnsMd = talkTurnsMd(talk);
-  syncList($("talk-turns"), turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i) })),
-    (item) => item.key, createTurnRow, updateTurnRow);
+  syncList(
+    $("talk-turns"),
+    turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i), kind: "talk", conversationId: talk.id })),
+    (item) => item.key, createTurnRow, updateTurnRow,
+  );
 
   renderTalkTasks(talk);
 
@@ -3736,9 +3950,11 @@ function renderTalk() {
   show($("talk-say"), canSay);
   show($("talk-closed"), !canSay);
   show($("talk-close-go"), canSay);
+  renderTalkThumbs();
+  const uploading = talkAttachmentsBusy();
   $("f-talk-say").disabled = busy;
-  $("talk-send").disabled = busy;
-  setText($("talk-send"), busy ? "Thinking…" : "Send");
+  $("talk-send").disabled = busy || uploading;
+  setText($("talk-send"), busy ? "Thinking…" : uploading ? "Uploading…" : "Send");
   show($("talk-wait"), busy);
 }
 
@@ -3785,6 +4001,99 @@ function talkError(message) {
   show(box, Boolean(message));
 }
 
+/* ---- talk composer attachments ------------------------------------------ *
+ * Mirrors the chat composer's own attachment functions immediately above
+ * `chatError` - see that block's doc, which explains the shape once for
+ * both. Kept as its own copy against a separate piece of state
+ * (`talkAttachments`, not `chatAttachments`) for the same reason `sendTurn`
+ * and `sendTalkTurn` are two functions: the two surfaces talk to different
+ * stores and must not contend for one queue.
+ */
+function talkAttachmentsBusy() {
+  return state.talkAttachments.id === state.talkDetail.id
+    && state.talkAttachments.items.some((item) => item.status === "uploading");
+}
+
+function resetTalkAttachments(id) {
+  for (const item of state.talkAttachments.items) {
+    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+  }
+  state.talkAttachments = { id, items: [] };
+}
+
+function renderTalkThumbs() {
+  const box = $("talk-say-thumbs");
+  const items = state.talkAttachments.id === state.talkDetail.id ? state.talkAttachments.items : [];
+  clear(box);
+  show(box, items.length > 0);
+  for (const item of items) {
+    const thumb = el("div", { class: "say-thumb" });
+    if (item.status === "uploading") thumb.classList.add("is-uploading");
+    if (item.status === "error") thumb.classList.add("is-failed");
+    thumb.append(el("img", { src: item.previewUrl || "", alt: "" }));
+    if (item.status === "uploading") {
+      thumb.append(el("div", { class: "say-thumb-spinner" }, el("i", {})));
+    }
+    thumb.append(el("button", {
+      class: "say-thumb-remove", type: "button",
+      "aria-label": `Remove ${item.name || "image"}`,
+      onclick: () => removeTalkAttachment(item.localId),
+    }, svg(
+      "svg", { viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "2.5", "stroke-linecap": "round" },
+      svg("path", { d: "M6 6l12 12M18 6L6 18" }),
+    )));
+    box.append(thumb);
+  }
+
+  const uploading = items.filter((item) => item.status === "uploading").length;
+  const status = $("talk-say-upload-status");
+  setText(status, uploading > 0 ? `Uploading ${plural(uploading, "image", "images")}…` : "");
+  show(status, uploading > 0);
+}
+
+function removeTalkAttachment(localId) {
+  const items = state.talkAttachments.items;
+  const at = items.findIndex((item) => item.localId === localId);
+  if (at < 0) return;
+  const [item] = items.splice(at, 1);
+  if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+  renderTalk();
+}
+
+async function attachTalkFiles(files) {
+  const id = state.talkDetail.id;
+  if (!id) return;
+  if (state.talkAttachments.id !== id) resetTalkAttachments(id);
+
+  const images = [...files].filter((file) => file.type.startsWith("image/"));
+  if (images.length === 0) return;
+
+  for (const file of images) {
+    const localId = nextLocalAttachmentId++;
+    const item = {
+      localId,
+      previewUrl: URL.createObjectURL(file),
+      name: file.name || "image",
+      status: "uploading",
+      serverId: null,
+    };
+    state.talkAttachments.items.push(item);
+    renderTalk();
+
+    try {
+      const att = await postBytes(API.talkAttachmentPost(id), file, file.name);
+      item.status = "done";
+      item.serverId = att.id;
+    } catch (error) {
+      const at = state.talkAttachments.items.indexOf(item);
+      if (at >= 0) state.talkAttachments.items.splice(at, 1);
+      URL.revokeObjectURL(item.previewUrl);
+      talkError(`Could not attach ${item.name}: ${error.message}`);
+    }
+    renderTalk();
+  }
+}
+
 /* Opening a talk takes no agent turn - see `talk::begin`'s doc - so this is
    as fast as any other write and needs none of `startChat`'s waiting state. */
 async function startTalk() {
@@ -3812,10 +4121,13 @@ async function sendTalkTurn(event) {
   const id = state.talkDetail.id;
   const box = $("f-talk-say");
   const text = box.value;
+  const attachments = state.talkAttachments.id === id
+    ? state.talkAttachments.items.filter((item) => item.status === "done")
+    : [];
 
-  if (!id || state.talkBusy !== null) return;
-  if (!text.trim()) {
-    talkError("Say something first.");
+  if (!id || state.talkBusy !== null || talkAttachmentsBusy()) return;
+  if (!text.trim() && attachments.length === 0) {
+    talkError("Say something, or attach an image, first.");
     box.focus();
     return;
   }
@@ -3835,7 +4147,11 @@ async function sendTalkTurn(event) {
        that long is not a thing to ask a phone to do. The reply arrives
        through the change stream's `talks_rev`, or the ten-second insurance
        in `tickTalkWait`. */
-    const queued = await postJson(API.talkSay(id), { text });
+    const queued = await postJson(API.talkSay(id), {
+      text,
+      attachments: attachments.map((item) => item.serverId),
+    });
+    if (state.talkAttachments.id === id) resetTalkAttachments(id);
     if (state.talkDetail.id === id) {
       state.talkDetail.talk = queued;
       renderTalk();
@@ -4940,6 +5256,9 @@ function applyRoute() {
        openingChat stays false. */
     if (changed) state.openingChat = true;
     if (state.chatDetail.id !== route.id) {
+      /* A pending picture belongs to the conversation the operator was
+         composing into, not to whichever one they navigate to next. */
+      resetChatAttachments(route.id);
       state.chatDetail = { id: route.id, chat: null };
       loadChat(route.id);
     }
@@ -4949,17 +5268,20 @@ function applyRoute() {
        path showing "Loading conversation" forever. */
     renderChat();
   } else if (state.chatDetail.id) {
+    resetChatAttachments(null);
     state.chatDetail = { id: null, chat: null };
   }
 
   /* Same rule as the chat block above, for the standing chat's own store. */
   if (route.name === "talk") {
     if (state.talkDetail.id !== route.id) {
+      resetTalkAttachments(route.id);
       state.talkDetail = { id: route.id, talk: null };
       loadTalk(route.id);
     }
     renderTalk();
   } else if (state.talkDetail.id) {
+    resetTalkAttachments(null);
     state.talkDetail = { id: null, talk: null };
   }
 
@@ -5090,6 +5412,56 @@ function applyTheme(theme) {
   }
 }
 
+/* The three ways an image reaches a composer, wired once per surface (chat,
+   talk) instead of by hand in `wire()` twice over: the file input's own
+   `change`, a paste into the textarea, and a drop on either the composer or
+   the transcript above it - "入力欄ないし会話パネル" is both, so both are
+   drop targets. `attach` is `attachChatFiles` or `attachTalkFiles`; neither
+   this function nor its caller needs to know which. */
+function wireAttachments({ fileInput, say, turns, box, attach }) {
+  const input = $(fileInput);
+  input.addEventListener("change", () => {
+    if (input.files && input.files.length) attach(input.files);
+    input.value = "";   /* so picking the same file again still fires change */
+  });
+
+  $(box).addEventListener("paste", (event) => {
+    const items = event.clipboardData && event.clipboardData.items;
+    if (!items) return;
+    const files = [...items]
+      .filter((item) => item.kind === "file")
+      .map((item) => item.getAsFile())
+      .filter(Boolean);
+    if (files.length === 0) return;
+    /* Only when there is a picture to take: an ordinary text paste must not
+       be swallowed just because this listener exists. */
+    event.preventDefault();
+    attach(files);
+  });
+
+  for (const id of [say, turns]) {
+    const zone = $(id);
+    zone.addEventListener("dragover", (event) => {
+      if (!event.dataTransfer || ![...event.dataTransfer.types].includes("Files")) return;
+      event.preventDefault();
+      zone.classList.add("is-drop-target");
+    });
+    /* `relatedTarget` is what stops this from flickering as the pointer
+       crosses a child element on the way out - a drag over `.turns` moves
+       across many `<li>`s, each of which is its own dragleave otherwise. */
+    zone.addEventListener("dragleave", (event) => {
+      if (event.relatedTarget && zone.contains(event.relatedTarget)) return;
+      zone.classList.remove("is-drop-target");
+    });
+    zone.addEventListener("drop", (event) => {
+      zone.classList.remove("is-drop-target");
+      if (!event.dataTransfer || event.dataTransfer.files.length === 0) return;
+      event.preventDefault();
+      attach(event.dataTransfer.files);
+    });
+  }
+}
+
 /* ---- boot -------------------------------------------------------------- */
 function wire() {
   for (const entry of document.querySelectorAll("[data-plan]")) {
@@ -5152,10 +5524,18 @@ function wire() {
   $("chat-say").addEventListener("submit", sendTurn);
   $("chat-file").addEventListener("click", fileDraft);
   $("chat-derive-go").addEventListener("click", deriveChat);
+  wireAttachments({
+    fileInput: "chat-file-input", say: "chat-say", turns: "chat-turns", box: "f-say",
+    attach: attachChatFiles,
+  });
 
   $("talk-start-go").addEventListener("click", startTalk);
   $("talk-say").addEventListener("submit", sendTalkTurn);
   $("talk-close-go").addEventListener("click", closeTalk);
+  wireAttachments({
+    fileInput: "talk-file-input", say: "talk-say", turns: "talk-turns", box: "f-talk-say",
+    attach: attachTalkFiles,
+  });
   /* Same accommodation `f-say` gets: Enter is a newline on a phone, Ctrl/Cmd
      with Enter sends. */
   $("f-talk-say").addEventListener("keydown", (event) => {
@@ -5191,6 +5571,14 @@ function wire() {
      close event rather than from the button: a dismissed panel must not go
      on holding a live document. */
   $("panel-full").addEventListener("close", () => clear($("panel-full-body")));
+
+  $("attachment-view-close").addEventListener("click", closeAttachmentView);
+  $("attachment-view").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeAttachmentView();
+  });
+  $("attachment-view").addEventListener("close", () => {
+    $("attachment-view-img").src = "";
+  });
 
   window.addEventListener("hashchange", applyRoute);
 

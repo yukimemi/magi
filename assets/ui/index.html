@@ -386,9 +386,23 @@
     </div>
 
     <form class="say" id="chat-say">
-      <label class="sr-only" for="f-say">Your reply</label>
-      <textarea id="f-say" rows="2" placeholder="Answer, or push back…"></textarea>
-      <button class="btn btn-gold" type="submit" id="chat-send">Send</button>
+      <div class="say-thumbs" id="chat-say-thumbs" hidden></div>
+      <p class="say-upload-status" id="chat-say-upload-status" role="status" hidden></p>
+      <div class="say-row">
+        <label class="attach-btn" for="chat-file-input" aria-label="Attach image">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M17.5 7.5 9 16a3 3 0 1 1-4.5-4L13 3.5a2 2 0 1 1 3 3L8 14.5a1 1 0 1 1-1.5-1.5L14 6"/>
+          </svg>
+        </label>
+        <!-- No `capture`: that attribute jumps straight to the camera and
+             skips the photo library. `accept="image/*"` alone is what makes
+             iOS/Android show the OS sheet with both "Photo Library" and
+             "Take Photo" as choices. -->
+        <input class="sr-only" type="file" id="chat-file-input" accept="image/*" multiple>
+        <label class="sr-only" for="f-say">Your reply</label>
+        <textarea id="f-say" rows="2" placeholder="Answer, or push back…"></textarea>
+        <button class="btn btn-gold" type="submit" id="chat-send">Send</button>
+      </div>
     </form>
     <p class="form-error" id="chat-error" role="alert" hidden></p>
     <p class="panel-note" id="chat-closed" hidden>
@@ -455,9 +469,19 @@
     </div>
 
     <form class="say" id="talk-say">
-      <label class="sr-only" for="f-talk-say">Your message</label>
-      <textarea id="f-talk-say" rows="2" placeholder="Ask, investigate, think out loud…"></textarea>
-      <button class="btn btn-gold" type="submit" id="talk-send">Send</button>
+      <div class="say-thumbs" id="talk-say-thumbs" hidden></div>
+      <p class="say-upload-status" id="talk-say-upload-status" role="status" hidden></p>
+      <div class="say-row">
+        <label class="attach-btn" for="talk-file-input" aria-label="Attach image">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M17.5 7.5 9 16a3 3 0 1 1-4.5-4L13 3.5a2 2 0 1 1 3 3L8 14.5a1 1 0 1 1-1.5-1.5L14 6"/>
+          </svg>
+        </label>
+        <input class="sr-only" type="file" id="talk-file-input" accept="image/*" multiple>
+        <label class="sr-only" for="f-talk-say">Your message</label>
+        <textarea id="f-talk-say" rows="2" placeholder="Ask, investigate, think out loud…"></textarea>
+        <button class="btn btn-gold" type="submit" id="talk-send">Send</button>
+      </div>
     </form>
     <p class="form-error" id="talk-error" role="alert" hidden></p>
     <p class="panel-note" id="talk-closed" hidden>
@@ -598,6 +622,26 @@
     </button>
   </div>
   <div class="full-body" id="panel-full-body"></div>
+</dialog>
+
+<!-- ATTACHMENT, FULL SIZE ------------------------------------------------ *
+     What a tap on any turn's thumbnail opens. A plain same-origin `<img>`,
+     not an iframe: an attachment is bytes this server stored and serves
+     back with a closed content-type whitelist plus `nosniff` (see
+     `web::attachment_response`), so it carries none of a panel's risk and
+     needs none of its sandboxing. -->
+<dialog class="full" id="attachment-view" aria-labelledby="attachment-view-h">
+  <div class="full-head">
+    <h2 id="attachment-view-h">Attachment</h2>
+    <button class="icon-btn" type="button" id="attachment-view-close" aria-label="Close">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <path d="M6 6l12 12M18 6L6 18"/>
+      </svg>
+    </button>
+  </div>
+  <div class="full-body">
+    <img id="attachment-view-img" alt="">
+  </div>
 </dialog>
 
 <p class="sr-only" id="live" aria-live="polite"></p>

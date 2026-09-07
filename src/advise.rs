@@ -317,6 +317,7 @@ async fn deliberate(
             run: ctx.id,
             node: "plan-advise",
             cache_dir: None,
+            attachments: &[],
         },
     )
     .await
@@ -431,6 +432,7 @@ async fn gather(
                     run: &run,
                     node: "plan-advise",
                     cache_dir: None,
+                    attachments: &[],
                 },
             )
             .await;
