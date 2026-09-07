@@ -2191,6 +2191,14 @@ impl Runner {
                             f.id = format!("R{round}-{}-{}", r + 1, n + 1);
                             f.title = blind::sanitize_prose(&f.title, &self.state.config.blind);
                             f.detail = blind::sanitize_prose(&f.detail, &self.state.config.blind);
+                            // `file` is agent-supplied prose too, never
+                            // checked against the real tree — the same
+                            // exposure `title`/`detail` above have, just in
+                            // a field easy to forget because it looks like a
+                            // path rather than free text.
+                            f.file = f
+                                .file
+                                .map(|file| blind::sanitize_prose(&file, &self.state.config.blind));
                             all_findings.push(f.clone());
                             record.findings.push(f);
                         }
