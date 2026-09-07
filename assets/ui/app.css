@@ -1075,6 +1075,7 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .tag[data-tone="rust"] { background: var(--tint-rust); color: var(--on-rust); }
 .tag[data-tone="ink"]  { background: var(--tint-ink);  color: var(--on-ink); }
 .tag[data-tone="gold"] { background: var(--tint-gold); color: var(--on-gold); }
+.tag[data-tone="blue"] { background: var(--tint-blue); color: var(--on-blue); }
 .round-head .head-sha { margin-left: auto; font-family: var(--mono); font-size: var(--t1); color: var(--ink-3); }
 
 .findings { display: flex; flex-direction: column; gap: var(--s2); margin-top: var(--s3); }
@@ -1518,6 +1519,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 .filed-note { font-size: var(--t3); color: var(--ink-2); }
 .filed-note .ask-seat { font-size: var(--t2); }
 .chat-ready { color: var(--on-gold); font-weight: 700; }
+/* A conversation whose turn is running - see `state.chatWaits` in app.js.
+   Blue rather than gold: it must not read as the same "come look" signal as
+   `chat-ready`, since the two are answering different questions. */
+.chat-thinking { color: var(--on-blue); font-weight: 700; }
 
 /* One `magi plan` design deliberation's raw record: one block per advisor
    seat, its proposal's fields as a plain list underneath. */

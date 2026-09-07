@@ -481,11 +481,27 @@ const state = {
      so instead of silently staying empty. */
   draftDetail: { id: null, advice: null, error: null },
   chatDetail: { id: null, chat: null },
-  /* The id of the conversation whose turn is in flight, and the transcript
-     length it started from. One turn at a time is the whole rule: a second
-     one fired into the same chat would interleave with the first. */
-  chatBusy: null,
-  busyTurns: 0,
+  /* Conversations with a turn in flight, keyed by chat id: `Map<id, {
+       since, target, pending, waitFrom, lastPoll }>`. One turn *per chat* is
+     the rule the server enforces (`Ui::begin_turn` refuses a second one on
+     the *same* chat, see `chat_say`'s doc) - nothing here refuses sending
+     into a different, idle conversation just because this one is busy.
+       - `since`: transcript length before this turn's own new turns, used
+         only to know when `pending` has been superseded by the real thing.
+       - `target`: transcript length once this turn's agent reply (or
+         failure note) has landed - always `since-of-the-turn-itself + 1`,
+         one more turn than whatever the 202 response already carried.
+       - `pending`: the operator's own text, shown as an optimistic bubble
+         until the transcript catches up to it - `null` when there is
+         nothing to show that is not already in the transcript (starting an
+         interview, or a wait rebuilt from `thinking` - see `trackIfThinking`).
+       - `waitFrom`: when the wait began, for the "Xs" counter.
+       - `lastPoll`: last time this id's ten-second insurance re-read ran.
+     An entry's presence is this browser's own belief that a turn is
+     running; `thinking` on a fetched [`ChatView`] is the server's - see
+     `trackIfThinking` for how the two are reconciled after a reload or on
+     another device. */
+  chatWaits: new Map(),
   /* Whether the current view was entered via a route change to a chat.
      Cleared after the first scroll, so a subsequent renderChat() with the
      same turn count does not re-scroll. */
@@ -497,10 +513,10 @@ const state = {
   /* Turn count from the previous renderChat() call, used to detect new
      turns arriving while the conversation is already on screen. */
   prevTurnCount: 0,
-  /* The message that turn is carrying, shown as the operator's bubble until
-     the recorded transcript has caught up with it. */
-  pending: null,
-  waitFrom: 0,
+  /* One shared ticking interval driving every entry in `chatWaits` at once -
+     the seconds counter for whichever chat is on screen, and the
+     ten-second insurance re-read for every busy chat, on screen or not.
+     Started when `chatWaits` gains its first entry, stopped when it empties. */
   waitTimer: null,
   /* Problems the server found in a draft, kept per conversation so a
      re-render does not wipe the list the operator is working through. */
@@ -2831,6 +2847,11 @@ function sortChats(list) {
 function createChatCard() {
   const chipSlot = el("span");
   const ready = el("span", { class: "tag chat-ready", "data-tone": "gold", text: "draft ready" });
+  /* A busy conversation's own badge, distinct from `ready`: the two can never
+     show at once (a chat mid-turn has not just produced a fresh draft this
+     browser has not seen), but they answer different questions, so a shared
+     slot would have to pick one to lose. */
+  const thinking = el("span", { class: "tag chat-thinking", "data-tone": "blue", text: "thinking…" });
   const whenSlot = el("time", { class: "card-when" });
   const title = el("h2", { class: "card-title" });
   const agent = el("span", { class: "repo" });
@@ -2840,11 +2861,11 @@ function createChatCard() {
   const last = el("p", { class: "card-event" });
 
   const card = el("a", { class: "card" },
-    el("div", { class: "card-top" }, chipSlot, ready, whenSlot),
+    el("div", { class: "card-top" }, chipSlot, thinking, ready, whenSlot),
     title, meta, last,
   );
   const row = el("li", {}, card);
-  row.refs = { card, chipSlot, ready, whenSlot, title, agent, turns, task, last };
+  row.refs = { card, chipSlot, thinking, ready, whenSlot, title, agent, turns, task, last };
   return row;
 }
 
@@ -2866,6 +2887,13 @@ function updateChatCard(row, chat) {
      actually the operator's turn, so it is called out on the card rather
      than found by opening each conversation. */
   show(r.ready, status === "open" && chatDraft(chat).trim() !== "");
+
+  /* `state.chatWaits`, not `chat.thinking` directly: `trackIfThinking` (run
+     over every chat in `loadChats`) is what reconciles the two, and reading
+     the map here is what makes the badge agree with the wait strip on the
+     conversation's own page - both a reload and a turn started from another
+     device land in the same place. */
+  show(r.thinking, state.chatWaits.has(chat.id));
 
   const at = when(chat.updated_at || chat.created_at);
   setText(r.whenSlot, at.text);
@@ -3132,7 +3160,8 @@ function scrollToLastTurn() {
 
 function renderChat() {
   const chat = state.chatDetail.chat;
-  const busy = state.chatBusy !== null && state.chatBusy === state.chatDetail.id;
+  const wait = chat ? state.chatWaits.get(chat.id) : undefined;
+  const busy = Boolean(wait);
 
   if (!chat) {
     setText($("chat-h"), "Loading conversation\u2026");
@@ -3155,9 +3184,8 @@ function renderChat() {
      because the ten-second re-read below replaces that chat wholesale and
      would otherwise make the message the operator just sent vanish for the
      rest of the wait. */
-  const pending = busy && state.pending && state.pending.id === chat.id
-    && chatTurns(chat).length <= state.busyTurns
-    ? [{ who: "operator", body: state.pending.body, at: state.pending.at }]
+  const pending = wait && wait.pending && chatTurns(chat).length <= wait.since
+    ? [{ who: "operator", body: wait.pending.body, at: wait.pending.at }]
     : [];
   const turns = [...chatTurns(chat), ...pending];
 
@@ -3188,9 +3216,9 @@ function renderChat() {
      turn count is unchanged (status refresh, 10-second re-read, draft
      update) and not for the pending optimistic turn the operator just sent. */
   const turnCount = turns.length;
-  const lastIsPending = busy && state.pending && state.pending.id === chat.id
+  const lastIsPending = wait && wait.pending
     && turns.length > 0 && turns[turns.length - 1].who === "operator"
-    && turns[turns.length - 1].body === state.pending.body;
+    && turns[turns.length - 1].body === wait.pending.body;
   if (state.openingChat) {
     state.openingChat = false;
     if (turnCount > 0) requestAnimationFrame(scrollToLastTurn);
@@ -3232,46 +3260,88 @@ function renderChat() {
   show($("chat-wait"), busy);
 }
 
-/* The wait, in words. The sentence in the live region changes only twice —
-   once when the turn starts and once when it has been going long enough to
-   need saying — while the seconds tick in a span that assistive technology
-   never reads, because a counter announced every second is unusable. */
-function tickWait() {
+/* The wait, in words, for whichever chat is on screen - and, regardless of
+   what is on screen, the ten-second insurance re-read for every entry in
+   state.chatWaits. Several conversations can be waiting at once now: the
+   sentence and the countdown are only ever drawn for state.chatDetail.id,
+   since there is one wait strip in the document, but every busy chat still
+   gets polled so its own turn is not left relying solely on the change
+   stream to be discovered as finished. The sentence changes only twice — once
+   when the turn starts and once when it has been going long enough to need
+   saying — while the seconds tick in a span that assistive technology never
+   reads, because a counter announced every second is unusable. */
+function tickWaits() {
+  const now = Date.now();
+  for (const [id, wait] of state.chatWaits) {
+    if (now - wait.lastPoll >= 10000) {
+      wait.lastPoll = now;
+      loadChat(id);
+    }
+  }
+
   const box = $("chat-wait");
-  if (state.chatBusy === null) {
+  const wait = state.chatDetail.id ? state.chatWaits.get(state.chatDetail.id) : undefined;
+  if (!wait) {
     show(box, false);
     return;
   }
-  const secs = Math.max(Math.round((Date.now() - state.waitFrom) / 1000), 0);
+  const secs = Math.max(Math.round((now - wait.waitFrom) / 1000), 0);
   setText(box.querySelector(".waiting-text"), secs >= 90
-    ? "The agent is still thinking. Long, but not stuck \u2014 it is allowed to take its time, and the reply will appear here."
+    ? "The agent is still thinking. Long, but not stuck — it is allowed to take its time, and the reply will appear here."
     : "The agent is thinking about your message. A turn usually takes under a minute.");
   setText(box.querySelector(".waiting-secs"), `${secs}s`);
-  show(box, state.chatBusy === state.chatDetail.id);
-
-  /* Cheap insurance for the one case the button cannot cover: the turn was
-     started somewhere else, or the stream is down, so nothing will tell this
-     page that the reply has landed. */
-  if (secs > 0 && secs % 10 === 0) loadChat(state.chatBusy);
+  show(box, true);
 }
 
-function beginTurn(id, before) {
-  state.chatBusy = id;
-  state.busyTurns = before;
-  state.waitFrom = Date.now();
-  tickWait();
-  if (!state.waitTimer) state.waitTimer = setInterval(tickWait, 1000);
+/* Start (or restart) waiting for chat id's turn.
+ *
+ * since is the transcript length the turn started from and target the length
+ * its landing will reach - always one more turn than whatever is already
+ * known, since a turn only ever appends one reply or failure note. pending,
+ * when given, is the operator's own text to show as an optimistic bubble
+ * until the transcript reaches since on its own - see renderChat. It is null
+ * for a turn this browser did not just send a message into (starting an
+ * interview, or a wait rebuilt from the server's own `thinking` - see
+ * trackIfThinking), because in both of those cases the transcript already
+ * carries everything there is to show. */
+function beginChatTurn(id, since, target, pending = null) {
+  state.chatWaits.set(id, { since, target, pending, waitFrom: Date.now(), lastPoll: Date.now() });
+  if (!state.waitTimer) state.waitTimer = setInterval(tickWaits, 1000);
+  tickWaits();
 }
 
-function endTurn(id) {
-  if (state.chatBusy !== id) return;
-  state.chatBusy = null;
-  state.pending = null;
-  if (state.waitTimer) {
+function endChatTurn(id) {
+  if (!state.chatWaits.has(id)) return;
+  state.chatWaits.delete(id);
+  if (state.chatDetail.id === id) show($("chat-wait"), false);
+  if (state.chatWaits.size === 0 && state.waitTimer) {
     clearInterval(state.waitTimer);
     state.waitTimer = null;
   }
-  show($("chat-wait"), false);
+}
+
+/* Reconcile this browser's belief about a chat with a freshly fetched
+ * ChatView - from loadChat, from loadChats, or from a POST /api/chats
+ * response, all of which carry the same shape.
+ *
+ * Ending a wait is decided from the transcript, never from `thinking`: a
+ * turn's guard (Ui::begin_turn/TurnGuard) is dropped before the CLI's answer
+ * is necessarily visible everywhere this reads from, and `thinking` going
+ * false is not the same event as the reply landing - see ChatView's doc for
+ * that field. Starting a wait *is* taken from `thinking`, because that is the
+ * only way this browser learns of a turn it did not itself send - another
+ * tab, another device, or a reload that lost the chatWaits entry the first
+ * beginChatTurn call made. */
+function trackIfThinking(chat) {
+  const wait = state.chatWaits.get(chat.id);
+  if (wait) {
+    if (chatTurns(chat).length >= wait.target) endChatTurn(chat.id);
+    return;
+  }
+  if (chat.thinking) {
+    const turns = chatTurns(chat).length;
+    beginChatTurn(chat.id, turns, turns + 1);
+  }
 }
 
 /* ---- repository picker -------------------------------------------------- *
@@ -3305,6 +3375,12 @@ async function loadChats() {
   try {
     const list = await getJson(API.chats);
     state.chats = Array.isArray(list) ? list : [];
+    /* Reconciles every conversation's wait state, not just the one on screen:
+       `thinking` is how this browser learns of a turn it did not send itself
+       (another tab, another device, or a chat started before the last
+       reload), and a turn landing while its chat is off screen still has to
+       clear the busy marker on its card. */
+    for (const chat of state.chats) trackIfThinking(chat);
     renderChats();
     ok();
   } catch (error) {
@@ -3316,8 +3392,8 @@ async function loadChats() {
    screen: that is the router's job, in `applyRoute`.
  *
  * It used to open with `state.chatDetail = { id, chat: null }`, which turned
- * every refresh into a navigation. With a turn in flight, `tickWait`'s
- * ten-second insurance calls this for the *waiting* chat no matter what the
+ * every refresh into a navigation. With a turn in flight, `tickWaits`'
+ * ten-second insurance calls this for every *waiting* chat no matter what the
  * operator is reading, so every ten seconds the transcript on screen was
  * replaced by a different conversation while the address bar went on naming
  * the one the operator had chosen. Reported as "the screen switches by itself
@@ -3329,10 +3405,10 @@ async function loadChats() {
 async function loadChat(id) {
   try {
     const chat = await getJson(API.chat(id));
-    /* The transcript having grown by the operator's turn and a reply is what
-       proves the turn finished, whoever started it and whether or not this
-       page's own request has come back yet. */
-    if (state.chatBusy === id && chatTurns(chat).length >= state.busyTurns + 2) endTurn(id);
+    /* The transcript having grown past `target` is what proves the turn
+       finished, whoever started it and whether or not this page's own
+       request has come back yet - see `trackIfThinking`. */
+    trackIfThinking(chat);
     if (state.chatDetail.id !== id) return;   /* not on screen: nothing to draw */
     state.chatDetail.chat = chat;
     renderChat();
@@ -3347,8 +3423,11 @@ async function loadChat(id) {
   }
 }
 
-/* Starting an interview runs the agent's first turn, so this is as slow as
-   any other turn and says so instead of leaving a dead button. */
+/* Starting an interview no longer waits for the agent's first turn - see
+   `chat_post`'s doc: the response carries the operator's idea and
+   `thinking: true`, and the reply arrives the way every other turn does,
+   through the change stream or `tickWaits`' insurance. The button is
+   disabled only for the round trip that records the idea, which is fast. */
 async function startChat() {
   const box = $("f-idea");
   const error = $("chat-start-error");
@@ -3365,7 +3444,6 @@ async function startChat() {
   show(error, false);
   go.disabled = true;
   setText(go, "Starting\u2026");
-  show($("chat-start-wait"), true);
 
   const repo = $("chat-start-repo").value.trim();
 
@@ -3373,6 +3451,7 @@ async function startChat() {
     const chat = await postJson(API.chats, { idea, agent: null, repo: repo || null });
     state.chats = sortChats([chat, ...(state.chats || []).filter((c) => c.id !== chat.id)]);
     state.chatDetail = { id: chat.id, chat };
+    trackIfThinking(chat);
     box.value = "";
     renderChats();
     announce("The interview has started.");
@@ -3384,7 +3463,6 @@ async function startChat() {
   } finally {
     go.disabled = false;
     setText(go, "Start the interview");
-    show($("chat-start-wait"), false);
   }
 }
 
@@ -3417,6 +3495,7 @@ async function deriveChat() {
       from: chat.id,
     });
     state.chats = sortChats([derived, ...(state.chats || []).filter((c) => c.id !== derived.id)]);
+    trackIfThinking(derived);
     renderChats();
     announce("Started a new conversation in the other repository.");
     location.hash = `#/plan/${derived.id}`;
@@ -3435,10 +3514,12 @@ async function sendTurn(event) {
   const box = $("f-say");
   const text = box.value;
 
-  /* One turn at a time, checked here as well as by the disabled button: a
-     double tap can beat a re-render, and a keyboard shortcut does not care
-     that the button looks dead. */
-  if (!id || state.chatBusy !== null) return;
+  /* One turn at a time *on this chat*, checked here as well as by the
+     disabled button: a double tap can beat a re-render, and a keyboard
+     shortcut does not care that the button looks dead. A turn running on a
+     different conversation is not a reason to refuse this one - the server
+     only refuses two turns on the same chat, see `Ui::begin_turn`. */
+  if (!id || state.chatWaits.has(id)) return;
   if (!text.trim()) {
     chatError("Say something first.");
     box.focus();
@@ -3447,11 +3528,9 @@ async function sendTurn(event) {
 
   chatError("");
   const before = chatTurns(state.chatDetail.chat).length;
-  beginTurn(id, before);
-
   /* The operator's own words go up immediately, held as the pending turn
      until the transcript on disk has grown past it. */
-  state.pending = { id, body: text, at: new Date().toISOString() };
+  beginChatTurn(id, before, before + 2, { body: text, at: new Date().toISOString() });
   box.value = "";
   renderChat();
   $("chat-wait").scrollIntoView({ block: "nearest" });
@@ -3463,8 +3542,8 @@ async function sendTurn(event) {
        lock or a network handoff dropped it, the browser said "Failed to fetch",
        and the server finished the turn anyway. So the wait stays up and the
        reply arrives the way everything else in this client arrives: the change
-       stream, or the ten-second re-read in `tickWait`. `loadChat` ends the turn
-       once the transcript has grown past `busyTurns`. */
+       stream, or the ten-second re-read in `tickWaits`. `loadChat` ends the
+       turn once the transcript has grown past this wait's `target`. */
     const queued = await postJson(API.say(id), { text });
     if (state.chatDetail.id === id) {
       state.chatDetail.chat = queued;
@@ -3482,7 +3561,7 @@ async function sendTurn(event) {
       announce("A turn is already running on this conversation. Waiting for it.");
       return;
     }
-    endTurn(id);
+    endChatTurn(id);
     /* The request itself failed, which now means it failed before the server
        recorded anything — the response no longer waits for the agent. Reload
        anyway and say so carefully: the transcript on disk is the truth, not
@@ -3532,10 +3611,11 @@ async function fileDraft() {
  * times a planning turn's budget, since the agent is expected to run
  * commands and read their output rather than answer from what it already
  * knows. The composer and the wait strip below are otherwise the same
- * pattern as Planning's `sendTurn`/`beginTurn`/`endTurn`, kept as separate
- * functions and separate state (`talkBusy`, not `chatBusy`) because the two
- * surfaces talk to two different stores and must not contend for one turn
- * guard.
+ * pattern as Planning's `sendTurn`/`beginChatTurn`/`endChatTurn`, kept as
+ * separate functions and separate state (`talkBusy`, a single slot, not
+ * `chatWaits`, a map) because the two surfaces talk to two different stores
+ * and must not contend for one turn guard - and because there is only ever
+ * one standing chat, where Planning holds many conversations at once.
  */
 const talkTurns = (talk) => (talk && Array.isArray(talk.turns) ? talk.turns : []);
 const talkTurnsMd = (talk) => (talk && Array.isArray(talk.turn_bodies_md) ? talk.turn_bodies_md : []);
