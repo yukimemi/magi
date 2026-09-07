@@ -294,6 +294,31 @@ impl Talks {
     pub fn count_open(&self) -> usize {
         self.list().iter().filter(|t| t.status.open()).count()
     }
+
+    /// Remove a conversation from disk, record and artifacts both. The
+    /// operator's way of saying "not just done, gone" - [`close`] alone
+    /// leaves the record as history.
+    ///
+    /// Takes [`Talks::guard`] for the same reason [`close`] does: a delete
+    /// racing a [`record`] or the tail of [`turn`] must not land between
+    /// their own read and write, or the file removed here would look, to
+    /// them, like a record that simply has not been written yet. The other
+    /// half of that story is on their side - both check under this same
+    /// guard that the record they are about to write is still there, and
+    /// give up without writing if it is not, which is what stops their `put`
+    /// from resurrecting a conversation this call already removed.
+    pub fn remove(&self, id: &str) -> Result<()> {
+        let _guard = self.guard();
+        let resolved = self.resolve_id(id)?;
+        let path = self.path_of(&resolved);
+        std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        let artifacts = self.artifacts_of(&resolved);
+        if artifacts.is_dir() {
+            std::fs::remove_dir_all(&artifacts)
+                .with_context(|| format!("remove {}", artifacts.display()))?;
+        }
+        Ok(())
+    }
 }
 
 /// Open a conversation. Unlike [`crate::chat::start`] this takes no agent
@@ -344,9 +369,14 @@ pub fn record(talk: &mut Talk, store: &Talks, text: &str) -> Result<String> {
     // `put`, it does not remove it. See [`Talks::guard`] and the matching
     // guard in `turn`, which this mirrors.
     let _guard = store.guard();
-    if let Ok(fresh) = store.get(&talk.id) {
-        talk.status = fresh.status;
-    }
+    // A concurrent `Talks::remove` can have landed in that same gap. `put`
+    // writes unconditionally, so trusting the stale `talk` here would recreate
+    // the file a delete just removed - the record must still be there for a
+    // turn to have anywhere to append to.
+    let Ok(fresh) = store.get(&talk.id) else {
+        bail!("talk {} was deleted", talk.short());
+    };
+    talk.status = fresh.status;
     if !talk.status.open() {
         bail!(
             "talk {} is {} and takes no more turns",
@@ -395,6 +425,24 @@ pub fn close(talk: &mut Talk, store: &Talks) -> Result<()> {
     let _guard = store.guard();
     let mut fresh = store.get(&talk.id).unwrap_or_else(|_| talk.clone());
     fresh.status = TalkStatus::Closed;
+    store.put(&mut fresh)?;
+    *talk = fresh;
+    Ok(())
+}
+
+/// Reopen a closed conversation. Idempotent for the same reason [`close`] is:
+/// reopening an already-open conversation is not an error, since the
+/// operator's intent - "I want to keep talking about this" - is already
+/// satisfied.
+///
+/// Written symmetrically with [`close`]: re-reads the record under
+/// [`Talks::guard`] rather than trusting the caller's copy of `talk`, and
+/// writes that fresh copy back rather than the one passed in, for the same
+/// reason `close`'s doc gives.
+pub fn reopen(talk: &mut Talk, store: &Talks) -> Result<()> {
+    let _guard = store.guard();
+    let mut fresh = store.get(&talk.id).unwrap_or_else(|_| talk.clone());
+    fresh.status = TalkStatus::Open;
     store.put(&mut fresh)?;
     *talk = fresh;
     Ok(())
@@ -521,9 +569,15 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // for the whole invocation above, so one talk's fifteen-minute turn does
     // not block another talk's close from proceeding.
     let _guard = store.guard();
-    if let Ok(fresh) = store.get(&talk.id) {
-        talk.status = fresh.status;
-    }
+    // A delete is the more final version of that same race: `put` writes
+    // unconditionally, so a talk removed while this turn was in flight must
+    // stay removed rather than being written back with this turn's reply
+    // appended to it. The reply is simply given up on - there is no
+    // conversation left for it to belong to.
+    let Ok(fresh) = store.get(&talk.id) else {
+        return Ok(());
+    };
+    talk.status = fresh.status;
     talk.turns.push(reply);
     store.put(talk)?;
 
@@ -938,6 +992,109 @@ mod tests {
             talks.get(&talk.id).expect("reread").status,
             TalkStatus::Closed,
             "once the guard is free, close still lands"
+        );
+        let _ = &cfg; // config kept only to build the agent above
+    }
+
+    #[test]
+    fn reopening_a_closed_talk_lets_it_take_turns_again_and_reopening_twice_is_not_an_error() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), REPLY, env("hi"));
+        let cfg = config(spec);
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        close(&mut talk, &talks).expect("close");
+        assert_eq!(talk.status, TalkStatus::Closed);
+
+        reopen(&mut talk, &talks).expect("reopen");
+        assert_eq!(talk.status, TalkStatus::Open);
+        assert_eq!(
+            talks.get(&talk.id).expect("reread").status,
+            TalkStatus::Open
+        );
+
+        // Idempotent: reopening an already-open talk is not an error.
+        reopen(&mut talk, &talks).expect("reopening an open talk is not an error");
+        assert_eq!(talk.status, TalkStatus::Open);
+
+        record(&mut talk, &talks, "one more thing").expect("a reopened talk takes turns again");
+        let _ = &cfg; // config kept only to build the agent above
+    }
+
+    #[test]
+    fn removing_a_talk_deletes_its_record_and_artifacts_and_refuses_an_unknown_id() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), REPLY, env("hi"));
+        let cfg = config(spec);
+        let talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        let artifacts = talks.artifacts_of(&talk.id);
+        std::fs::create_dir_all(&artifacts).expect("create artifacts dir");
+        std::fs::write(artifacts.join("turn-1.txt"), "hello").expect("write artifact");
+
+        talks.remove(&talk.id).expect("remove");
+        assert!(!talks.path_of(&talk.id).is_file(), "the record is gone");
+        assert!(!artifacts.is_dir(), "the artifacts directory is gone");
+        assert!(
+            talks.get(&talk.id).is_err(),
+            "a removed talk cannot be read back"
+        );
+
+        let err = talks
+            .remove("nonexistent-id")
+            .expect_err("unknown id refused");
+        assert!(err.to_string().contains("no talk matches"), "{err}");
+        let _ = &cfg; // config kept only to build the agent above
+    }
+
+    #[tokio::test]
+    async fn a_delete_that_lands_while_a_turn_is_in_flight_is_not_undone_by_the_reply() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), REPLY, env("here you go"));
+        let cfg = config(spec);
+        // The in-flight turn's own handle, loaded before the delete lands -
+        // the same shape as the matching close test above.
+        let mut in_flight = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        talks.remove(&in_flight.id).expect("remove");
+        assert!(
+            talks.get(&in_flight.id).is_err(),
+            "the delete landed on disk before the turn finished"
+        );
+
+        // The turn's own handle has no way to know the record is gone -
+        // finishing it must not write the file back into existence.
+        respond(&mut in_flight, &talks, &cfg, "one more question")
+            .await
+            .expect("the turn itself still completes rather than erroring");
+
+        assert!(
+            talks.get(&in_flight.id).is_err(),
+            "a delete must stick even when a turn that started before it finishes after it"
+        );
+    }
+
+    #[test]
+    fn a_delete_that_lands_before_record_is_called_is_not_undone_by_it() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), REPLY, env("hi"));
+        let cfg = config(spec);
+        // The handle `web::talk_say` would have read before awaiting config
+        // discovery, then carried across that await into `record`.
+        let mut stale = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        talks.remove(&stale.id).expect("remove");
+
+        // The stale handle has no way to know the record is gone - a
+        // `record` that trusted it would append a turn and write the
+        // conversation back into existence.
+        let err = record(&mut stale, &talks, "still there?")
+            .expect_err("a delete that landed first must be honored, not overwritten");
+        assert!(err.to_string().contains("deleted"), "{err}");
+
+        assert!(
+            talks.get(&stale.id).is_err(),
+            "record must not resurrect a conversation deleted while its snapshot was stale"
         );
         let _ = &cfg; // config kept only to build the agent above
     }

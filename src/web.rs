@@ -677,9 +677,10 @@ impl Ui {
             .route("/api/chats/{id}/say", post(chat_say))
             .route("/api/chats/{id}/file", post(chat_file))
             .route("/api/talks", get(talks_list).post(talk_post))
-            .route("/api/talks/{id}", get(talk_detail))
+            .route("/api/talks/{id}", get(talk_detail).delete(talk_delete))
             .route("/api/talks/{id}/say", post(talk_say))
             .route("/api/talks/{id}/close", post(talk_close))
+            .route("/api/talks/{id}/reopen", post(talk_reopen))
             .route("/api/events", get(events))
             .with_state(Arc::new(self))
     }
@@ -3599,6 +3600,38 @@ async fn talk_close(
     .await
 }
 
+/// `POST /api/talks/{id}/reopen`.
+async fn talk_reopen(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<TalkView>> {
+    blocking(move || {
+        let id = resolve_talk(&ui.talks, &id)?;
+        let mut talk = ui.talks.get(&id)?;
+        talk::reopen(&mut talk, &ui.talks)?;
+        Ok(Json(TalkView::from(talk)))
+    })
+    .await
+}
+
+/// `DELETE /api/talks/{id}`.
+///
+/// Removes the conversation's record and artifacts outright, unlike
+/// [`talk_close`] which keeps the record as history. A turn already in
+/// flight is not refused here the way [`run_delete`] refuses a live run:
+/// [`talk::record`] and the tail of [`talk::turn`] check for themselves,
+/// under [`Talks::guard`], that the record they are about to write back is
+/// still there, so a delete racing a turn is safe without this route having
+/// to know a turn is running at all.
+async fn talk_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    blocking(move || {
+        let id = resolve_talk(&ui.talks, &id)?;
+        ui.talks.remove(&id)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
 /// Expand an id or short id to exactly one talk id.
 fn resolve_talk(store: &Talks, id: &str) -> ApiResult<String> {
     pick(store.list().into_iter().map(|t| t.id).collect(), id, "talk")
@@ -5107,6 +5140,70 @@ mod tests {
         let closed_again = f.post(&format!("/api/talks/{id}/close"), None).await;
         assert_eq!(closed_again.status, 200);
         assert_eq!(closed_again.json()["status"], "closed");
+    }
+
+    #[tokio::test]
+    async fn talk_reopen_lets_a_closed_talk_take_turns_again_and_is_idempotent() {
+        let (_tmp, _repo, f) = talk_fixture().await;
+        let id = f.post("/api/talks", None).await.json()["id"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let closed = f.post(&format!("/api/talks/{id}/close"), None).await;
+        assert_eq!(closed.status, 200, "{}", closed.body);
+
+        let reopened = f.post(&format!("/api/talks/{id}/reopen"), None).await;
+        assert_eq!(reopened.status, 200, "{}", reopened.body);
+        assert_eq!(reopened.json()["status"], "open");
+
+        // Idempotent: reopening an already-open talk is not an error.
+        let reopened_again = f.post(&format!("/api/talks/{id}/reopen"), None).await;
+        assert_eq!(reopened_again.status, 200);
+        assert_eq!(reopened_again.json()["status"], "open");
+
+        let said = f
+            .post(
+                &format!("/api/talks/{id}/say"),
+                Some(r#"{"text":"still there?"}"#),
+            )
+            .await;
+        assert_eq!(
+            said.status, 202,
+            "a reopened talk accepts turns again: {}",
+            said.body
+        );
+    }
+
+    #[tokio::test]
+    async fn talk_reopen_on_an_unknown_id_is_404() {
+        let f = Fixture::start().await;
+        let res = f.post("/api/talks/nonexistent-id/reopen", None).await;
+        assert_eq!(res.status, 404, "{}", res.body);
+    }
+
+    #[tokio::test]
+    async fn talk_delete_removes_the_talk_from_disk_and_the_list() {
+        let f = Fixture::start().await;
+        let id = seed_talk(&f, "20260904-014455-ef56", "closed");
+
+        let deleted = f.delete(&format!("/api/talks/{id}")).await;
+        assert_eq!(deleted.status, 204, "{}", deleted.body);
+
+        let after = f.get(&format!("/api/talks/{id}")).await;
+        assert_eq!(after.status, 404, "{}", after.body);
+
+        let listed = f.get("/api/talks").await.json();
+        assert!(
+            listed.as_array().unwrap().iter().all(|t| t["id"] != id),
+            "a deleted talk must not linger in the list: {listed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn talk_delete_on_an_unknown_id_is_404() {
+        let f = Fixture::start().await;
+        let res = f.delete("/api/talks/nonexistent-id").await;
+        assert_eq!(res.status, 404, "{}", res.body);
     }
 
     #[tokio::test]
