@@ -3567,9 +3567,9 @@ async fn talks_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TalkView>>>
 
 /// The body of `POST /api/talks`, all of it optional: opening a talk needs no
 /// message, unlike starting a Planning interview. `repo` defaults to the
-/// server's own; `agent` to `[roles] planner`, [`talk::begin`]'s own default.
-/// Unknown fields are ignored so a newer front end still opens a talk against
-/// an older binary.
+/// server's own; `agent` to `[roles] chatter` (falling back to `[roles]
+/// planner`), [`talk::begin`]'s own default. Unknown fields are ignored so a
+/// newer front end still opens a talk against an older binary.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct NewTalk {
