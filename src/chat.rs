@@ -409,9 +409,22 @@ impl Chats {
     /// appends and for [`Invocation::attachments`]. `None` only for a mime
     /// [`put_attachment`] could never have written, which means the
     /// attachment did not come from this store.
+    ///
+    /// `self.root` (and so `attachments_dir`) is not guaranteed absolute on
+    /// its own - `run::home()` returns a bare relative `PathBuf` verbatim
+    /// when the operator sets `MAGI_HOME` to a relative path, and nothing
+    /// canonicalizes it on the way in. That is harmless for every other use
+    /// of this store, since its own I/O runs in this process against this
+    /// process's cwd - but this path is handed to a CLI invoked with `cwd:
+    /// &chat.repo`, a different directory, so a relative path here would
+    /// resolve against the wrong place once it reached the prompt.
+    /// `std::path::absolute` fixes it against *this* process's cwd before
+    /// that happens; see `disk::free_bytes_by_os` for the same function used
+    /// the same way elsewhere in this codebase.
     fn attachment_path(&self, id: &str, att: &Attachment) -> Option<PathBuf> {
         let ext = attachment_ext(&att.mime)?;
-        Some(self.attachments_dir(id).join(format!("{}.{ext}", att.id)))
+        let path = self.attachments_dir(id).join(format!("{}.{ext}", att.id));
+        std::path::absolute(&path).ok()
     }
 
     /// Write a conversation, atomically, so a process killed mid-write leaves
@@ -2184,6 +2197,34 @@ mod tests {
             "the agent must be told the attachment's absolute path: {prompt}"
         );
         assert!(prompt.contains("image/png"), "and its mime: {prompt}");
+    }
+
+    /// `run::home()` returns a bare relative `PathBuf` verbatim when the
+    /// operator sets `MAGI_HOME` to a relative path - nothing canonicalizes
+    /// it - so a `Chats` store built on top of it has a relative `root` too.
+    /// That is harmless for this store's own reads and writes, which run in
+    /// this same process against this process's cwd, but `attachment_path`
+    /// hands its result to a *different* process invoked with `cwd:
+    /// &chat.repo`: an uncorrected relative path would resolve against the
+    /// repository instead of wherever the attachment actually landed, and
+    /// the CLI would find nothing there.
+    #[test]
+    fn attachment_path_is_absolute_even_when_the_store_root_is_relative() {
+        let chats = Chats::at(PathBuf::from("relative-chats-root-for-this-test"));
+        let att = Attachment {
+            id: "0".repeat(32),
+            name: "shot.png".to_owned(),
+            mime: "image/png".to_owned(),
+            bytes: 3,
+        };
+        let path = chats
+            .attachment_path("some-chat-id", &att)
+            .expect("a supported mime always yields a path");
+        assert!(
+            path.is_absolute(),
+            "must be absolute even off a relative store root: {}",
+            path.display()
+        );
     }
 
     #[test]
