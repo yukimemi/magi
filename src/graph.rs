@@ -35,13 +35,15 @@ use crate::config::{
 use crate::git;
 use crate::land;
 use crate::proc::Quiet as _;
-use crate::prompt::{self, CandidateView, Turn};
+use crate::prompt::{self, CandidateView, Lens, ReviewReconsiderCtx, ReviewSeatReport, Turn};
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, DeliberationRound, DeliberationTurn, FixRecord, Judgement,
-    MergeOutcome, QuotaLoss, ReviewRecord, ReviewRound, RunState, RunStatus, Tally, VoteRecord,
-    tail, write_artifact,
+    MergeOutcome, QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus,
+    Tally, VoteRecord, tail, write_artifact,
 };
-use crate::verdict::{self, FinalVote, FixReport, Position, Ranking, Review, Severity};
+use crate::verdict::{
+    self, FinalVote, FixReport, Position, Ranking, Review, ReviewRevote, ReviewVote, Severity,
+};
 
 /// How much verification output is kept and fed back to the fixer.
 const OUTPUT_TAIL: usize = 8_000;
@@ -2111,6 +2113,7 @@ impl Runner {
                         // A review-only run has no rankings, so nothing
                         // competed for this patch and the reviewer is told so.
                         competed: self.state.tally.as_ref().is_some_and(|t| t.rankings > 0),
+                        lens: Lens::for_seat(r),
                         language: &language,
                     }),
                     spec,
@@ -2163,12 +2166,14 @@ impl Runner {
                     agent: agent_id,
                     summary: String::new(),
                     findings: Vec::new(),
+                    vote: None,
                     failed: None,
                     duration_ms: 0,
                 };
                 match res {
                     Ok((review, out)) => {
                         record.summary = review.summary;
+                        record.vote = Some(review.vote);
                         record.duration_ms = out.duration_ms;
                         for (n, mut f) in review.findings.into_iter().enumerate() {
                             // ids are magi's, never the agent's: the fixer's
@@ -2180,8 +2185,9 @@ impl Runner {
                         self.state.event(
                             "review",
                             format!(
-                                "round {round}: reviewer {} raised {} finding(s)",
+                                "round {round}: reviewer {} voted {} with {} finding(s)",
                                 r + 1,
+                                review.vote.label(),
                                 record.findings.len()
                             ),
                         );
@@ -2196,6 +2202,156 @@ impl Runner {
                 }
                 records.push(record);
             }
+
+            // Tally the round's votes and, if they split, spend the one
+            // round of reconsideration the split -> deliberate -> revote
+            // shape `judge`/`vote` use for the panel, sized down to what a
+            // read-only review round can afford: one round, and a revote
+            // rather than an argument, because the panel already wrote its
+            // reasoning down as findings the first time around.
+            let initial_votes: Vec<ReviewVote> = records.iter().filter_map(|r| r.vote).collect();
+            let vote_split =
+                initial_votes.len() > 1 && !initial_votes.iter().all(|v| *v == initial_votes[0]);
+            let mut reconsideration: Vec<ReviewRevoteRecord> = Vec::new();
+            if vote_split {
+                self.state.event(
+                    "review",
+                    format!(
+                        "round {round}: votes split ({}) — one round of reconsideration",
+                        initial_votes
+                            .iter()
+                            .map(|v| v.label())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+                // Seats read every seat's findings and votes, still numbered
+                // and never named — the same anonymity `review` itself keeps.
+                let panel: Vec<ReviewSeatReport<'_>> = records
+                    .iter()
+                    .filter_map(|r| {
+                        r.vote.map(|vote| ReviewSeatReport {
+                            reviewer: r.reviewer,
+                            vote,
+                            summary: &r.summary,
+                            findings: &r.findings,
+                        })
+                    })
+                    .collect();
+
+                let mut jobs = Vec::new();
+                let mut seats_at = Vec::new();
+                for (r, spec) in reviewers.iter().cloned().enumerate() {
+                    // A seat with no initial vote has nothing to reconsider
+                    // from and stays absent, the same as it stayed absent
+                    // from `panel` above.
+                    if records[r].vote.is_none() {
+                        continue;
+                    }
+                    let wt = root.join(format!("review-{}", r + 1));
+                    let seat_key = format!("review-{}", r + 1);
+                    let seat = self.seat(&seat_key, &spec.id);
+                    let prompt = prompt::review_reconsider(&ReviewReconsiderCtx {
+                        instruction: &self.state.instruction,
+                        reviewer: r + 1,
+                        lens: Lens::for_seat(r),
+                        panel: &panel,
+                        round,
+                        rounds: max_rounds,
+                        language: &language,
+                    });
+                    jobs.push(SeatJob {
+                        prompt,
+                        spec,
+                        seat,
+                        cwd: wt,
+                        timeout: Duration::from_secs(self.state.config.graph.timeout_review),
+                        allow_write: false,
+                        sessions,
+                        artifacts: artifacts.clone(),
+                        stem: format!("review-{round}-reconsider-{}", r + 1),
+                    });
+                    seats_at.push(r);
+                }
+
+                let mut recon_quota_losses = Vec::new();
+                let recon_cache = self.state.config.cache_dir();
+                let recon_ctx = WaveCtx {
+                    run: &run_id,
+                    node: "review",
+                    prompts: &prompts,
+                    cache: recon_cache.as_deref(),
+                };
+                let recon_results = ask_json_wave::<ReviewRevote>(
+                    jobs,
+                    Arc::clone(&self.sem),
+                    review_retries,
+                    &recon_ctx,
+                    &mut recon_quota_losses,
+                    &mut self.state,
+                    &|_: &ReviewRevote| Ok(()),
+                )
+                .await;
+                self.state.quota.extend(recon_quota_losses);
+
+                for (&r, (seat, res)) in seats_at.iter().zip(recon_results) {
+                    let agent_id = seat.agent.clone();
+                    self.state.seats.insert(seat.key.clone(), seat);
+                    let mut rec = ReviewRevoteRecord {
+                        reviewer: r + 1,
+                        agent: agent_id,
+                        vote: None,
+                        reason: String::new(),
+                        failed: None,
+                    };
+                    match res {
+                        Ok((rv, _)) => {
+                            rec.vote = Some(rv.vote);
+                            rec.reason =
+                                blind::sanitize_prose(&rv.reason, &self.state.config.blind);
+                            self.state.event(
+                                "review",
+                                format!(
+                                    "round {round}: reviewer {} revoted {}",
+                                    r + 1,
+                                    rv.vote.label()
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            rec.failed = Some(e.to_string());
+                            self.state.event(
+                                "review",
+                                format!("round {round}: reviewer {} did not revote: {e}", r + 1),
+                            );
+                        }
+                    }
+                    reconsideration.push(rec);
+                }
+            } else if initial_votes.len() > 1 {
+                self.state.event(
+                    "review",
+                    format!(
+                        "round {round}: votes agreed ({}) — no reconsideration",
+                        initial_votes[0].label()
+                    ),
+                );
+            }
+
+            // The final vote per seat is its revote where reconsideration
+            // ran and answered, its initial vote otherwise — the same
+            // fallback `tally` uses for a judge whose private vote failed.
+            let final_votes: Vec<ReviewVote> = records
+                .iter()
+                .filter_map(|r| {
+                    reconsideration
+                        .iter()
+                        .find(|rv| rv.reviewer == r.reviewer)
+                        .and_then(|rv| rv.vote)
+                        .or(r.vote)
+                })
+                .collect();
+            let round_verdict = ReviewVote::worst(final_votes);
 
             let mut e2e = run_commands(
                 &shell,
@@ -2269,6 +2425,9 @@ impl Runner {
                 expected,
                 clean,
                 progressed: false,
+                vote_split,
+                reconsideration,
+                verdict: round_verdict,
             };
 
             if incomplete {
@@ -3534,6 +3693,9 @@ mod tests {
             expected,
             clean,
             progressed,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         }
     }
 
@@ -3683,6 +3845,9 @@ mod tests {
             clean: true,
             verify_retried: false,
             progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         }];
         state.gate = vec![CommandOutcome {
             command: "test".to_owned(),
@@ -3760,6 +3925,7 @@ mod tests {
                 agent: "alpha".to_owned(),
                 summary: String::new(),
                 findings: vec![finding("R2-1-1", Severity::Minor, "unused import")],
+                vote: None,
                 failed: None,
                 duration_ms: 0,
             }],
@@ -3787,6 +3953,9 @@ mod tests {
             expected: 1,
             clean: false,
             progressed: true,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         };
         let state = state_with_round(round);
         let body = pr_body(&state, 'A');
@@ -3811,6 +3980,7 @@ mod tests {
                 agent: "alpha".to_owned(),
                 summary: String::new(),
                 findings: Vec::new(),
+                vote: None,
                 failed: None,
                 duration_ms: 0,
             }],
@@ -3822,6 +3992,9 @@ mod tests {
             expected: 1,
             clean: true,
             progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         };
         let state = state_with_round(round);
         let body = pr_body(&state, 'A');

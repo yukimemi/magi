@@ -563,9 +563,9 @@ upstream CRLF, not drift worth committing — normalise back to LF and
 - **Prompt phrasing is load-bearing for the tests.** `tests/common/mod.rs`
   dispatches its mock agent by grepping the generated prompt for
   `Final vote`, `deliberation round`, `independent judges`,
-  `reviewers of a patch`, `Your patch was reviewed`. Rewording a prompt heading
-  in `src/prompt.rs` breaks the end-to-end tests — which is the intended alarm,
-  but update both sides together.
+  `reviewers of a patch`, `Your patch was reviewed`, `Your revote`. Rewording a
+  prompt heading in `src/prompt.rs` breaks the end-to-end tests — which is the
+  intended alarm, but update both sides together.
 - **`blind.strip_lines` is consumed twice**: as case-insensitive substrings by
   `blind::strip_attribution`, and as generated `sed` addresses by
   `blind::commit_msg_hook`. Entries must stay plain literals, not regexes.

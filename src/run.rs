@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::SeatState;
 use crate::blind::Leak;
 use crate::config::{Config, MergeMode};
-use crate::verdict::{Finding, Rejection};
+use crate::verdict::{Finding, Rejection, ReviewVote};
 
 /// On-disk format version. Bumped when a field changes meaning, so a resumed
 /// run never half-reads a state file written by a different magi.
@@ -335,12 +335,36 @@ pub struct ReviewRecord {
     /// Findings, with magi-assigned ids.
     #[serde(default)]
     pub findings: Vec<Finding>,
+    /// This seat's initial vote. `None` on a record predating votes, exactly
+    /// like a round that genuinely had none cast — never a stand-in for a
+    /// vote that was lost.
+    #[serde(default)]
+    pub vote: Option<ReviewVote>,
     /// Why this reviewer produced nothing.
     #[serde(default)]
     pub failed: Option<String>,
     /// Wall-clock time.
     #[serde(default)]
     pub duration_ms: u64,
+}
+
+/// One seat's revote during a round's reconsideration (see
+/// [`ReviewRound::reconsideration`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewRevoteRecord {
+    /// Reviewer seat number, 1-based.
+    pub reviewer: usize,
+    /// Agent occupying the seat.
+    pub agent: String,
+    /// The revote. `None` when the seat did not answer.
+    #[serde(default)]
+    pub vote: Option<ReviewVote>,
+    /// Why.
+    #[serde(default)]
+    pub reason: String,
+    /// Why this seat produced no revote.
+    #[serde(default)]
+    pub failed: Option<String>,
 }
 
 /// The fixer's response to a round.
@@ -464,6 +488,22 @@ pub struct ReviewRound {
     /// `false` and is not consulted.
     #[serde(default)]
     pub progressed: bool,
+    /// Did the seats' initial votes ([`ReviewRecord::vote`]) disagree?
+    #[serde(default)]
+    pub vote_split: bool,
+    /// One round of revoting, run only when `vote_split`: each seat that cast
+    /// an initial vote reads every seat's findings and votes, then revotes.
+    /// Empty when the initial votes already agreed, the same as a solo
+    /// candidate leaving `deliberation` empty.
+    #[serde(default)]
+    pub reconsideration: Vec<ReviewRevoteRecord>,
+    /// The round's verdict: the most cautious vote among the seats that
+    /// answered, using each seat's revote where reconsideration ran and its
+    /// initial vote otherwise. `None` when no seat produced a usable vote —
+    /// including every record written before votes existed, which is the
+    /// truth for those rounds, not a gap in this one.
+    #[serde(default)]
+    pub verdict: Option<ReviewVote>,
 }
 
 impl ReviewRound {
@@ -1382,6 +1422,7 @@ mod tests {
                 agent: "a".to_owned(),
                 summary: String::new(),
                 findings,
+                vote: None,
                 failed: None,
                 duration_ms: 0,
             }],
@@ -1393,6 +1434,9 @@ mod tests {
             expected: 1,
             clean,
             progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
         }
     }
 

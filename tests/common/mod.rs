@@ -145,6 +145,21 @@ if grep -q "independent judges" "$p"; then
   exit 0
 fi
 
+if grep -q "Your revote" "$p"; then
+  # Reconsideration after a split vote. A matching seat holds the same
+  # `approve_with_findings` vote it cast initially; every other seat holds
+  # its `approve`. Deterministic on purpose: the fixtures that exercise this
+  # branch assert the round's recorded verdict, not a specific argument.
+  if [ -n "$MOCK_SPLIT_REVIEW_SEAT" ] && { case ",$MOCK_SPLIT_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+    printf '{"vote":"approve_with_findings","reason":"mock reconsideration: the nit stands but is not blocking"}\n'
+  elif [ -n "$MOCK_ALWAYS_FINDING" ] || { [ -n "$MOCK_FINDING" ] && [ ! -f fixed.txt ]; }; then
+    printf '{"vote":"reject","reason":"mock reconsideration: the finding still holds"}\n'
+  else
+    printf '{"vote":"approve","reason":"mock reconsideration: nothing outstanding"}\n'
+  fi
+  exit 0
+fi
+
 if grep -q "reviewers of" "$p"; then
   # Silent-seat simulation: a matching review seat produces nothing usable and
   # exits non-zero, which is exactly the record a real timeout leaves — the
@@ -162,10 +177,18 @@ if grep -q "reviewers of" "$p"; then
     echo 'not a review at all'
     exit 1
   fi
+  # Split-vote simulation: a matching seat casts the lone dissenting vote —
+  # fine to proceed, but with a finding — while every other seat below
+  # approves clean. The finding is deliberately non-blocking, so the round
+  # still gates on its own: only the vote tally disagrees.
+  if [ -n "$MOCK_SPLIT_REVIEW_SEAT" ] && { case ",$MOCK_SPLIT_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+    printf '{"summary":"mock split review","vote":"approve_with_findings","findings":[{"severity":"minor","file":"note.txt","line":1,"title":"nit: consider a comment","detail":"cosmetic only"}]}\n'
+    exit 0
+  fi
   if [ -n "$MOCK_ALWAYS_FINDING" ] || { [ -n "$MOCK_FINDING" ] && [ ! -f fixed.txt ]; }; then
-    printf '{"summary":"mock review","findings":[{"severity":"blocker","file":"note.txt","line":1,"title":"needs a fixed marker","detail":"create fixed.txt"}]}\n'
+    printf '{"summary":"mock review","vote":"reject","findings":[{"severity":"blocker","file":"note.txt","line":1,"title":"needs a fixed marker","detail":"create fixed.txt"}]}\n'
   else
-    printf '{"summary":"mock review: clean","findings":[]}\n'
+    printf '{"summary":"mock review: clean","vote":"approve","findings":[]}\n'
   fi
   exit 0
 fi
@@ -411,6 +434,25 @@ pub fn fixture_with_silent_review_seat(home: HomeGuard, silent_seats: &[&str]) -
     let value = silent_seats.join(",");
     for a in &mut fx.config.agents {
         a.env.insert("MOCK_SILENT_SEAT".to_owned(), value.clone());
+    }
+    fx
+}
+
+/// Like [`fixture`], but the given review seat casts a lone
+/// `approve_with_findings` vote (with one non-blocking finding) while every
+/// other seat approves clean — a split that never produces a blocking
+/// finding, so the round still gates clean and the only thing worth
+/// asserting is what the vote machinery itself did: `vote_split`,
+/// `reconsideration`, and `verdict` on the round record.
+///
+/// The mock's reconsideration branch has the split seat hold its vote and
+/// every other seat hold theirs, so the round's final verdict is
+/// deterministic: `approve_with_findings`, the more cautious of the two.
+pub fn fixture_with_split_review_vote(split_seat: &str) -> Fixture {
+    let mut fx = fixture(Judges::Unanimous, false);
+    for a in &mut fx.config.agents {
+        a.env
+            .insert("MOCK_SPLIT_REVIEW_SEAT".to_owned(), split_seat.to_owned());
     }
     fx
 }
