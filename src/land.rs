@@ -290,7 +290,7 @@ pub enum Step {
 /// `None` means the merge really did not happen, including when the pull
 /// request could not be read at all: an unreadable answer is not evidence of
 /// success.
-fn merged_after_all(
+pub(crate) fn merged_after_all(
     argv: &[String],
     stderr: &str,
     after: Option<PrLifecycle>,

@@ -28,6 +28,7 @@ use tokio::sync::Semaphore;
 
 use crate::agent::{self, AgentOutput, Invocation, SeatState};
 use crate::blind;
+use crate::bump;
 use crate::config::{
     AgentSpec, Config, IncompleteReviewPolicy, LeakPolicy, MergeMode, Prompts, ResolvedRoles,
 };
@@ -2756,6 +2757,19 @@ impl Runner {
                             land::PrLifecycle::Merged => RunStatus::Merged,
                             _ => RunStatus::Blocked,
                         };
+                        // Downstream of a confirmed merge only - see
+                        // `bump::should_release_bump`'s own doc for why this
+                        // one check covers all three of `land`'s success
+                        // paths. Best-effort: the run already landed, so a
+                        // failure here (the decision call, `gh`, `cargo`)
+                        // is recorded and never turns a landed run into a
+                        // failed one.
+                        if bump::should_release_bump(self.state.status)
+                            && let Err(e) = bump::after_merge(&mut self.state, &pr.url).await
+                        {
+                            self.state
+                                .event("bump", format!("release bump skipped: {e:#}"));
+                        }
                     }
                     Err(e) => {
                         self.state.status = RunStatus::Blocked;

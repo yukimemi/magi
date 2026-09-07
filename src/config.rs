@@ -520,6 +520,16 @@ pub struct Merge {
     pub base: Option<String>,
     /// Remote for `mode = "pr"`.
     pub remote: String,
+    /// After a `mode = "pr"` run lands, open a `chore/release-vX.Y.Z` pull
+    /// request sized to the change by an agent's own judgement, so a version
+    /// bump does not depend on a human remembering to cut one.
+    ///
+    /// On by default. **Turning this off means a merge landed from the phone
+    /// never becomes a release**, so `POST /api/upgrade` keeps reporting
+    /// "already on the newest release" against a `main` that has moved past
+    /// it - the same gap this feature exists to close. Only for a repository
+    /// that wants to keep cutting releases by hand.
+    pub release_bump: bool,
 }
 
 impl Default for Merge {
@@ -528,6 +538,7 @@ impl Default for Merge {
             mode: MergeMode::None,
             base: None,
             remote: "origin".to_owned(),
+            release_bump: true,
         }
     }
 }
