@@ -12,7 +12,7 @@ use magi::run::RunStatus;
 #[tokio::test]
 async fn a_parked_run_keeps_its_work_and_resumes_into_the_next_node() {
     let _home = home_lock().await;
-    let fx = fixture(Judges::Unanimous, false);
+    let fx = fixture(&_home, Judges::Unanimous, false);
     let pause = Pause::new();
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
@@ -78,7 +78,7 @@ async fn a_parked_run_keeps_its_work_and_resumes_into_the_next_node() {
 #[tokio::test]
 async fn a_resumed_run_drops_a_stale_active_marker_left_by_a_killed_process() {
     let _home = home_lock().await;
-    let fx = fixture(Judges::Unanimous, false);
+    let fx = fixture(&_home, Judges::Unanimous, false);
     let pause = Pause::new();
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
@@ -122,7 +122,7 @@ async fn a_resumed_run_drops_a_stale_active_marker_left_by_a_killed_process() {
 #[tokio::test]
 async fn a_park_asked_for_mid_walk_stops_at_the_boundary_after_it() {
     let _home = home_lock().await;
-    let fx = fixture(Judges::Unanimous, false);
+    let fx = fixture(&_home, Judges::Unanimous, false);
     let pause = Pause::new();
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await

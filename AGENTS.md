@@ -768,8 +768,19 @@ Two rules follow, and neither is optional:
 integration binary shares a magi home. Two that mint runs concurrently clobber
 each other: a park test and a resume test in one file failed with "no
 candidate produced a change" because the other test's fixture had taken the
-home. `tests/common::home_lock()` serializes them, and any test that calls
-`fixture()` has to hold it for the duration.
+home. `tests/common::home_lock()` serializes them.
+
+This used to be a convention, not something the compiler checked, and that
+gap bit twice: `graph_review_only`'s own test always took the lock and still
+failed under the full suite, because `graph_split`, `graph_unanimous` and
+`graph_uncontested` built fixtures without ever calling `home_lock`. The
+tests that forgot stayed green — they never contended for anything — and the
+one that paid for it was whichever unrelated test happened to be running
+concurrently. `tests/common::fixture` (and every `fixture_with_*` variant)
+now takes `&HomeGuard`, the value `home_lock().await` returns, as its first
+argument, so a test that never called `home_lock()` fails to compile instead
+of occasionally taking someone else's home. Do not add a `fixture*` helper
+that can be called without one.
 
 ### Autonomy is bounded, and the bound is the point
 

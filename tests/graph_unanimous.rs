@@ -7,7 +7,8 @@ use magi::run::RunStatus;
 
 #[tokio::test]
 async fn a_unanimous_run_reaches_the_gate_without_deliberating() {
-    let fx = fixture(Judges::Unanimous, false);
+    let home = common::home_lock().await;
+    let fx = fixture(&home, Judges::Unanimous, false);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");

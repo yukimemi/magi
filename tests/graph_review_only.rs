@@ -31,7 +31,7 @@ async fn a_review_only_run_reviews_an_existing_branch_without_competing() {
     // must take this lock, not just the slow one, or the two that don't will
     // still race each other underneath it.
     let _home = common::home_lock().await;
-    let fx = fixture(Judges::Unanimous, true);
+    let fx = fixture(&_home, Judges::Unanimous, true);
 
     // Hand-written work on a branch: the thing `magi run` would never produce.
     run_git(&fx.repo, &["checkout", "-q", "-b", "feat/by-hand"]);
@@ -99,7 +99,7 @@ async fn a_review_only_run_reviews_an_existing_branch_without_competing() {
 #[tokio::test]
 async fn a_reviewer_that_never_answered_is_never_reported_as_a_clean_round() {
     let _home = common::home_lock().await;
-    let mut fx = fixture_with_silent_review_seat(&["review-2"]);
+    let mut fx = fixture_with_silent_review_seat(&_home, &["review-2"]);
     // One round is enough to exercise "budget exhausted while incomplete".
     fx.config.graph.review_rounds = 1;
 
@@ -137,7 +137,7 @@ async fn a_reviewer_that_never_answered_is_never_reported_as_a_clean_round() {
 #[tokio::test]
 async fn review_refuses_the_cases_that_cannot_mean_anything() {
     let _home = common::home_lock().await;
-    let fx = fixture(Judges::Unanimous, false);
+    let fx = fixture(&_home, Judges::Unanimous, false);
 
     let missing = Runner::review(&fx.repo, "no/such/branch", fx.config.clone()).await;
     assert!(missing.is_err(), "a branch that does not exist");
