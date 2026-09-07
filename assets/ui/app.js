@@ -52,6 +52,8 @@ const API = {
   talk: (id) => `/api/talks/${encodeURIComponent(id)}`,
   talkSay: (id) => `/api/talks/${encodeURIComponent(id)}/say`,
   talkClose: (id) => `/api/talks/${encodeURIComponent(id)}/close`,
+  talkReopen: (id) => `/api/talks/${encodeURIComponent(id)}/reopen`,
+  talkDelete: (id) => `/api/talks/${encodeURIComponent(id)}`,
   /* Local checkouts under `[repos] roots`, for the repository pickers on the
      "start a conversation" panel and the "continue in another repository"
      action. `?refresh=1` bypasses the server's cache regardless of its TTL. */
@@ -3772,7 +3774,10 @@ function renderTalk() {
     show($("talk-tasks-panel"), false);
     show($("talk-say"), false);
     show($("talk-closed"), false);
+    show($("talk-close-go"), false);
+    show($("talk-reopen-go"), false);
     show($("talk-wait"), false);
+    clear($("talk-delete-box"));
     return;
   }
 
@@ -3808,10 +3813,12 @@ function renderTalk() {
   show($("talk-say"), canSay);
   show($("talk-closed"), !canSay);
   show($("talk-close-go"), canSay);
+  show($("talk-reopen-go"), !canSay);
   $("f-talk-say").disabled = busy;
   $("talk-send").disabled = busy;
   setText($("talk-send"), busy ? "Thinking…" : "Send");
   show($("talk-wait"), busy);
+  renderTalkDelete(talk);
 }
 
 function tickTalkWait() {
@@ -3942,6 +3949,95 @@ async function closeTalk() {
     fail(`Could not close the conversation: ${error.message}`);
   } finally {
     button.disabled = false;
+  }
+}
+
+async function reopenTalk() {
+  const id = state.talkDetail.id;
+  const button = $("talk-reopen-go");
+  if (!id) return;
+  button.disabled = true;
+  try {
+    const talk = await postJson(API.talkReopen(id), {});
+    state.talkDetail.talk = talk;
+    renderTalk();
+    await loadTalks();
+    announce("Conversation reopened.");
+    ok();
+  } catch (error) {
+    fail(`Could not reopen the conversation: ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/* Armed by the talk's own id, the same two-step confirm `renderRunDelete`
+   uses: comparing against `talk.id` rather than a plain boolean means
+   navigating to a different conversation resets the confirm state for free,
+   with no separate "leaving this view" hook to remember to call. */
+let armedTalkDelete = null;
+let armedTalkDeleteFocused = null;
+
+function renderTalkDelete(talk) {
+  const box = $("talk-delete-box");
+  if (!box) return;
+  clear(box);
+
+  const armed = armedTalkDelete === talk.id;
+  if (!armed) armedTalkDeleteFocused = null;
+  if (armed) {
+    const cancel = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Cancel",
+      onclick: () => {
+        armedTalkDelete = null;
+        renderTalkDelete(talk);
+      },
+    });
+    const confirm = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Yes, delete conversation",
+      onclick: () => deleteTalk(talk.id),
+    });
+    box.append(
+      el("div", { class: "stakes-confirm" },
+        el("p", { class: "stakes-warn", text: "Deleting removes the whole conversation and its artifacts. This cannot be undone." }),
+        el("div", { class: "stakes-row" }, cancel, confirm),
+      ),
+    );
+    if (armedTalkDeleteFocused !== talk.id) {
+      armedTalkDeleteFocused = talk.id;
+      requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+    }
+  } else {
+    box.append(
+      el("button", {
+        class: "btn btn-quiet",
+        type: "button",
+        text: "Delete conversation…",
+        onclick: () => {
+          armedTalkDelete = talk.id;
+          renderTalkDelete(talk);
+        },
+      }),
+    );
+  }
+}
+
+async function deleteTalk(id) {
+  try {
+    await deleteReq(API.talkDelete(id));
+    ok();
+    announce("Conversation deleted.");
+    armedTalkDelete = null;
+    await loadTalks();
+    location.hash = "#/chat";
+  } catch (error) {
+    armedTalkDelete = null;
+    fail(`Could not delete the conversation: ${error.message}`);
+    renderTalk();
   }
 }
 
@@ -5228,6 +5324,7 @@ function wire() {
   $("talk-start-go").addEventListener("click", startTalk);
   $("talk-say").addEventListener("submit", sendTalkTurn);
   $("talk-close-go").addEventListener("click", closeTalk);
+  $("talk-reopen-go").addEventListener("click", reopenTalk);
   /* Same accommodation `f-say` gets: Enter is a newline on a phone, Ctrl/Cmd
      with Enter sends. */
   $("f-talk-say").addEventListener("keydown", (event) => {
