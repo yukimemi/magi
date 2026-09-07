@@ -433,12 +433,13 @@ function roundRail(pr) {
 }
 
 /* Declared ahead of `state` below on purpose: `state`'s own initializer calls
-   loadRunsCollapsed(), which reads this — and a `const` used before its
+   loadCollapsed(), which reads these — and a `const` used before its
    declaration line throws (temporal dead zone), even from inside a function,
    the moment that function actually runs. That would have been swallowed by
-   loadRunsCollapsed()'s own try/catch and silently read back `{}` every time,
+   loadCollapsed()'s own try/catch and silently read back `{}` every time,
    which is indistinguishable from "localStorage denied" and just as wrong. */
 const RUNS_COLLAPSE_KEY = "magi-runs-sections";
+const QUEUE_COLLAPSE_KEY = "magi-queue-sections";
 
 /* ---- state ------------------------------------------------------------- */
 const state = {
@@ -461,8 +462,11 @@ const state = {
   runsFilter: { section: null, repo: null },
   /* Open/closed per Runs section, restored from localStorage so a collapse
      survives a reload; defaults to open (see isSectionOpen()). */
-  runsCollapsed: loadRunsCollapsed(),
+  runsCollapsed: loadCollapsed(RUNS_COLLAPSE_KEY),
   queue: null,
+  /* Same idea for the Backlog's sections, kept separately since the two
+     views don't share section keys or default open/closed state. */
+  queueCollapsed: loadCollapsed(QUEUE_COLLAPSE_KEY),
   detail: { id: null, run: null, report: null },
   questions: null,
   chats: null,
@@ -1272,10 +1276,10 @@ function updateRunTail(row, run, { parked, ask }) {
  * over status here on purpose \u2014 a run parked on a question is the one
  * thing that needs a human regardless of which node it stopped in. */
 const RUN_SECTIONS = [
-  { key: "waiting", label: "Waiting on you" },
-  { key: "flight", label: "In flight" },
-  { key: "landed", label: "Landed" },
-  { key: "ended", label: "Ended" },
+  { key: "waiting", label: "Waiting on you", defaultOpen: true },
+  { key: "flight", label: "In flight", defaultOpen: true },
+  { key: "landed", label: "Landed", defaultOpen: true },
+  { key: "ended", label: "Ended", defaultOpen: true },
 ];
 
 function runSection(run) {
@@ -1472,12 +1476,13 @@ function renderRunsFilterBar() {
   show(bar, true);
 }
 
-/* ---- runs: section collapse, kept in localStorage ---------------------- *
- * RUNS_COLLAPSE_KEY itself is declared up by `state`, not here — see the
- * comment there. */
-function loadRunsCollapsed() {
+/* ---- shared: section collapse, kept in localStorage --------------------- *
+ * One mechanism, two independent users (Runs, Backlog): each keeps its own
+ * storage key and its own per-section default open/closed state, since
+ * neither shares section keys with the other. */
+function loadCollapsed(storageKey) {
   try {
-    const raw = localStorage.getItem(RUNS_COLLAPSE_KEY);
+    const raw = localStorage.getItem(storageKey);
     const parsed = raw ? JSON.parse(raw) : null;
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
@@ -1485,30 +1490,69 @@ function loadRunsCollapsed() {
   }
 }
 
-function saveRunsCollapsed() {
+function saveCollapsed(storageKey, collapsed) {
   try {
-    localStorage.setItem(RUNS_COLLAPSE_KEY, JSON.stringify(state.runsCollapsed));
+    localStorage.setItem(storageKey, JSON.stringify(collapsed));
   } catch {
     /* localStorage denied in private mode; the choice just won't outlive the tab */
   }
 }
 
-const isSectionOpen = (key) => state.runsCollapsed[key] !== false;
+function isSectionOpen(collapsed, key, defaultOpen) {
+  const saved = collapsed[key];
+  return typeof saved === "boolean" ? saved : defaultOpen;
+}
 
-/* ---- runs: one section (a native <details>, for free keyboard support) - */
-function createRunSection(key, label) {
-  const count = el("span", { class: "runs-section-count" });
-  const folded = el("span", { class: "runs-section-folded" });
-  const summary = el("summary", { class: "runs-section-head" },
-    el("h2", { class: "runs-section-title", text: label }), count, folded);
+/* ---- shared: one section (a native <details>, for free keyboard support) *
+ * `def` is one entry of a *_SECTIONS array: { key, label, defaultOpen }. */
+function createSection(def, collapsed, storageKey) {
+  const count = el("span", { class: "list-section-count" });
+  const summary = el("summary", { class: "list-section-head" },
+    el("h2", { class: "list-section-title", text: def.label }), count);
   const list = el("ol", { class: "cards" });
-  const details = el("details", { class: "runs-section", open: isSectionOpen(key) }, summary, list);
+  const details = el("details", {
+    class: "list-section",
+    open: isSectionOpen(collapsed, def.key, def.defaultOpen),
+  }, summary, list);
+  details.dataset.key = def.key;
   details.addEventListener("toggle", () => {
-    state.runsCollapsed[key] = details.open;
-    saveRunsCollapsed();
+    collapsed[def.key] = details.open;
+    saveCollapsed(storageKey, collapsed);
   });
-  details.refs = { count, folded, list };
+  details.refs = { summary, count, list };
   return details;
+}
+
+/* Keyed reconcile across sections, the same shape as syncList() above but one
+   level up: a section that empties out (everything in it superseded, or
+   filtered away) is removed rather than left on screen at "0 items". */
+function syncSections(root, sectionDefs, itemsByKey, createFn, updateFn) {
+  const existing = new Map();
+  for (const child of root.children) existing.set(child.dataset.key, child);
+
+  let previous = null;
+  for (const def of sectionDefs) {
+    const items = itemsByKey.get(def.key) || [];
+    if (items.length === 0) continue;
+    let node = existing.get(def.key);
+    if (node) existing.delete(def.key);
+    else node = createFn(def);
+    updateFn(node, items);
+    const wanted = previous ? previous.nextSibling : root.firstChild;
+    if (node !== wanted) root.insertBefore(node, wanted);
+    previous = node;
+  }
+  for (const stale of existing.values()) stale.remove();
+}
+
+/* ---- runs: one section, plus the folded-attempts count Backlog has no
+   equivalent of ------------------------------------------------------- */
+function createRunSection(def) {
+  const section = createSection(def, state.runsCollapsed, RUNS_COLLAPSE_KEY);
+  const folded = el("span", { class: "runs-section-folded" });
+  section.refs.summary.append(folded);
+  section.refs.folded = folded;
+  return section;
 }
 
 function updateRunSection(node, heads, childrenOf) {
@@ -1521,29 +1565,9 @@ function updateRunSection(node, heads, childrenOf) {
     (row, run) => updateRunRow(row, run, childrenOf.get(run.id) || []));
 }
 
-/* Keyed reconcile across sections, the same shape as syncList() above but one
-   level up: a section that empties out (everything in it superseded, or
-   filtered away) is removed rather than left on screen at "0 runs". */
 function syncRunSections(root, bySection, childrenOf) {
-  const existing = new Map();
-  for (const child of root.children) existing.set(child.dataset.key, child);
-
-  let previous = null;
-  for (const { key, label } of RUN_SECTIONS) {
-    const heads = bySection.get(key);
-    if (heads.length === 0) continue;
-    let node = existing.get(key);
-    if (node) existing.delete(key);
-    else {
-      node = createRunSection(key, label);
-      node.dataset.key = key;
-    }
-    updateRunSection(node, heads, childrenOf);
-    const wanted = previous ? previous.nextSibling : root.firstChild;
-    if (node !== wanted) root.insertBefore(node, wanted);
-    previous = node;
-  }
-  for (const stale of existing.values()) stale.remove();
+  syncSections(root, RUN_SECTIONS, bySection, createRunSection,
+    (node, heads) => updateRunSection(node, heads, childrenOf));
 }
 
 /* ---- runs: one row, a card plus its folded-away earlier attempts ------- *
@@ -2019,8 +2043,53 @@ async function mutateTask(id, action, button) {
   }
 }
 
+/* ---- queue: grouping into sections ------------------------------------- *
+ * The flat, priority-then-recency list stops being readable once a few
+ * dozen tasks pile up (in practice: mostly `held`), so it is split into what
+ * an operator actually wants to see first: what's running, what's next,
+ * what's parked, what's finished. `queued` and `failed` share a section
+ * because both are `TaskStatus::runnable` in src/queue.rs - the loop could
+ * pick up either next - and the card's own chip/tone/error already tell them
+ * apart, so a second section would only duplicate that distinction. */
+const QUEUE_SECTIONS = [
+  { key: "running", label: "Running", defaultOpen: true },
+  { key: "upnext", label: "Up next", defaultOpen: true },
+  { key: "held", label: "Held", defaultOpen: false },
+  { key: "done", label: "Done", defaultOpen: false },
+];
+
+function queueSection(task) {
+  const status = String(task.status_str || task.status || "");
+  if (status === "running") return "running";
+  if (status === "queued" || status === "failed") return "upnext";
+  if (status === "held") return "held";
+  return "done";
+}
+
+/* Section order preserved from QUEUE_SECTIONS; task order within a section
+   preserved from the order tasks arrived in, which is /api/queue's own
+   priority-then-recency order. */
+function groupQueueBySection(tasks) {
+  const bySection = new Map(QUEUE_SECTIONS.map((s) => [s.key, []]));
+  for (const task of tasks) bySection.get(queueSection(task)).push(task);
+  return bySection;
+}
+
+function createQueueSection(def) {
+  return createSection(def, state.queueCollapsed, QUEUE_COLLAPSE_KEY);
+}
+
+function updateQueueSection(node, tasks) {
+  setText(node.refs.count, plural(tasks.length, "task", "tasks"));
+  syncList(node.refs.list, tasks, (t) => t.id, createTaskCard, updateTaskCard);
+}
+
+function syncQueueSections(root, bySection) {
+  syncSections(root, QUEUE_SECTIONS, bySection, createQueueSection, updateQueueSection);
+}
+
 function renderQueue() {
-  const list = $("queue-list");
+  const sectionsRoot = $("queue-sections");
   const tasks = state.queue;
 
   if (tasks === null) {
@@ -2028,15 +2097,18 @@ function renderQueue() {
     return;
   }
 
-  const waiting = tasks.filter((t) => (t.status_str || t.status) === "queued").length;
+  const runnable = tasks.filter((t) => {
+    const status = t.status_str || t.status;
+    return status === "queued" || status === "failed";
+  }).length;
   const held = tasks.filter((t) => (t.status_str || t.status) === "held").length;
   const parts = [`${plural(tasks.length, "task", "tasks")}`];
-  if (waiting) parts.push(`${waiting} runnable`);
+  if (runnable) parts.push(`${runnable} runnable`);
   if (held) parts.push(`${held} held`);
   setText($("queue-count"), tasks.length === 0 ? "Nothing waiting" : parts.join(", "));
 
   show($("queue-empty"), tasks.length === 0);
-  syncList(list, tasks, (t) => t.id, createTaskCard, updateTaskCard);
+  syncQueueSections(sectionsRoot, groupQueueBySection(tasks));
   /* The strip's wording depends on how many tasks are runnable, so it is
      re-rendered from the queue rather than only from health: "off, with two
      tasks waiting" has to appear the moment the second one is filed. */
