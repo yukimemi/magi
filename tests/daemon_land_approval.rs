@@ -90,6 +90,9 @@ fn parked_run(repo: &std::path::Path, config: &magi::config::Config) -> RunState
         clean: true,
         verify_retried: false,
         progressed: false,
+        vote_split: false,
+        reconsideration: Vec::new(),
+        verdict: None,
     }];
     state.gate = vec![CommandOutcome {
         command: "test".to_owned(),
