@@ -421,9 +421,17 @@ pub async fn respond(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -
 /// between a `record` or `turn` elsewhere reading the file and writing it
 /// back - and a close built on the older snapshot would put it right back,
 /// silently dropping whatever turn the other call had just appended.
+///
+/// If the re-read fails, this errors rather than falling back to the
+/// caller's stale copy: `talk::begin` always `put`s the record before handing
+/// out a `Talk`, so the only way a re-read can fail is a concurrent
+/// [`Talks::remove`] having deleted it, and writing the stale copy back would
+/// resurrect exactly what that delete removed.
 pub fn close(talk: &mut Talk, store: &Talks) -> Result<()> {
     let _guard = store.guard();
-    let mut fresh = store.get(&talk.id).unwrap_or_else(|_| talk.clone());
+    let mut fresh = store
+        .get(&talk.id)
+        .with_context(|| format!("talk {} was deleted", talk.short()))?;
     fresh.status = TalkStatus::Closed;
     store.put(&mut fresh)?;
     *talk = fresh;
@@ -436,12 +444,15 @@ pub fn close(talk: &mut Talk, store: &Talks) -> Result<()> {
 /// satisfied.
 ///
 /// Written symmetrically with [`close`]: re-reads the record under
-/// [`Talks::guard`] rather than trusting the caller's copy of `talk`, and
-/// writes that fresh copy back rather than the one passed in, for the same
-/// reason `close`'s doc gives.
+/// [`Talks::guard`] rather than trusting the caller's copy of `talk`, writes
+/// that fresh copy back rather than the one passed in, and errors rather than
+/// falling back to the stale copy if the re-read fails, for the same reasons
+/// `close`'s doc gives.
 pub fn reopen(talk: &mut Talk, store: &Talks) -> Result<()> {
     let _guard = store.guard();
-    let mut fresh = store.get(&talk.id).unwrap_or_else(|_| talk.clone());
+    let mut fresh = store
+        .get(&talk.id)
+        .with_context(|| format!("talk {} was deleted", talk.short()))?;
     fresh.status = TalkStatus::Open;
     store.put(&mut fresh)?;
     *talk = fresh;
@@ -1095,6 +1106,57 @@ mod tests {
         assert!(
             talks.get(&stale.id).is_err(),
             "record must not resurrect a conversation deleted while its snapshot was stale"
+        );
+        let _ = &cfg; // config kept only to build the agent above
+    }
+
+    #[test]
+    fn a_delete_that_lands_before_close_is_called_is_not_undone_by_it() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), REPLY, env("hi"));
+        let cfg = config(spec);
+        // `web::talk_close` loads `talk` and calls `close` right after - this
+        // stands in for a delete landing in that gap.
+        let mut stale = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        talks.remove(&stale.id).expect("remove");
+
+        // The stale handle has no way to know the record is gone - a `close`
+        // that fell back to it would write the conversation back into
+        // existence, closed.
+        let err = close(&mut stale, &talks)
+            .expect_err("a delete that landed first must be honored, not overwritten");
+        assert!(err.to_string().contains("deleted"), "{err}");
+
+        assert!(
+            talks.get(&stale.id).is_err(),
+            "close must not resurrect a conversation deleted while its snapshot was stale"
+        );
+        let _ = &cfg; // config kept only to build the agent above
+    }
+
+    #[test]
+    fn a_delete_that_lands_before_reopen_is_called_is_not_undone_by_it() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), REPLY, env("hi"));
+        let cfg = config(spec);
+        // `web::talk_reopen` loads `talk` and calls `reopen` right after -
+        // this stands in for a delete landing in that gap.
+        let mut stale = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        close(&mut stale, &talks).expect("close");
+
+        talks.remove(&stale.id).expect("remove");
+
+        // The stale handle has no way to know the record is gone - a
+        // `reopen` that fell back to it would write the conversation back
+        // into existence, open.
+        let err = reopen(&mut stale, &talks)
+            .expect_err("a delete that landed first must be honored, not overwritten");
+        assert!(err.to_string().contains("deleted"), "{err}");
+
+        assert!(
+            talks.get(&stale.id).is_err(),
+            "reopen must not resurrect a conversation deleted while its snapshot was stale"
         );
         let _ = &cfg; // config kept only to build the agent above
     }
