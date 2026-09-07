@@ -48,7 +48,19 @@ use crate::verdict::{Finding, Rejection};
 /// real diff — the field simply did not exist yet to say so. Without the
 /// bump, resuming an old multi-round review could spuriously trip the
 /// stagnation check on rounds that were never stagnant.
-pub const SCHEMA: u32 = 4;
+///
+/// 5: added `RunStatus::Landing`. A run inside [`crate::land`]'s post-merge
+/// loop used to carry whatever status `merge` set before calling it forward
+/// unchanged - `Merged`, even while still watching CI or waiting on the
+/// owner's approval - which is also the one status [`RunStatus::resumable`]
+/// treats as finished. A daemon that gave this run's slot back to poll
+/// something else while an approval was outstanding, or one that simply
+/// crashed mid-land, had no way to tell "still landing" from "actually
+/// merged" and would either restart the whole competition or leave the run
+/// stuck reading as done. A schema-4 record has no notion of `Landing` at
+/// all, so this is a meaning a resumed old run cannot be guessed into rather
+/// than a value it can default to - hence the bump, not a `#[serde(default)]`.
+pub const SCHEMA: u32 = 5;
 
 /// Where a run got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +80,12 @@ pub enum RunStatus {
     Reviewing,
     /// Gate commands running.
     Gating,
+    /// Inside [`crate::land`]'s post-merge loop: watching CI, running a fix
+    /// round, rebasing onto a moved base, or waiting on the owner's merge
+    /// approval. A run parked here while an approval is outstanding has
+    /// handed its daemon slot back — see [`crate::daemon`] — and resumes
+    /// through exactly this status, not a fresh competition.
+    Landing,
     /// Winner merged.
     Merged,
     /// Winner passed the gate; merge was not requested.
@@ -104,6 +122,7 @@ impl RunStatus {
             Self::Voting => "voting",
             Self::Reviewing => "reviewing",
             Self::Gating => "gating",
+            Self::Landing => "landing",
             Self::Merged => "merged",
             Self::Ready => "ready",
             Self::Stalled => "stalled",
@@ -614,7 +633,10 @@ pub struct RunState {
     pub seed: u64,
     /// Config snapshot, so a resumed run behaves like the original.
     pub config: Config,
-    /// Did magi enable `extensions.worktreeConfig`? If so, cleanup turns it off.
+    /// Did this run take a reference on `extensions.worktreeConfig` being on
+    /// (see [`crate::git::acquire_worktree_config`])? If so, cleanup releases
+    /// it - which only actually turns the setting back off once every other
+    /// run sharing this repository has released its own reference too.
     #[serde(default)]
     pub enabled_worktree_config: bool,
     /// Candidates.

@@ -168,6 +168,28 @@ pub struct Runner {
     pause: Pause,
 }
 
+/// The lock that keeps at most one run per repository inside `land`, or the
+/// push/PR-create step just before it, at a time (see [`Runner::run_land`]).
+///
+/// One entry per repository, each its own `tokio::sync::Mutex`, so two
+/// different repositories' runs never wait on each other - only two runs
+/// against the *same* repository do, which is the point now that
+/// `Config::daemon.max_concurrent_runs` can put more than one run against a
+/// repository in flight at once. The outer `std::sync::Mutex` guards only the
+/// map itself, held long enough to find or insert an entry and clone its
+/// `Arc`, never across an `.await`.
+fn repo_land_lock(repo: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<
+        std::sync::Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+    LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(repo.to_path_buf())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// The commit a run branches from: the base branch as the remote has it.
 ///
 /// Two failures this replaces. A run used to branch off `HEAD` and so refused
@@ -448,6 +470,19 @@ impl Runner {
             }
             return Ok(());
         }
+        // A run parked inside `land` - watching CI, mid fix-round, or
+        // waiting on the owner's merge approval - resumes directly into it,
+        // never back through `prep`. Everything before `merge` already
+        // concluded; that is the only way `status` reaches `Landing` in the
+        // first place. Re-walking `review_loop` first would also be actively
+        // wrong: its own status recomputation (see its doc) treats any
+        // clean round as reason to set `status` to `Gating`, which would
+        // clobber this marker before `merge` ever ran, and this run would
+        // never find its way back into `land` at all.
+        if self.state.status == RunStatus::Landing {
+            self.run_land().await?;
+            return Ok(());
+        }
         self.prep().await?;
         if self.park_here()? {
             return Ok(());
@@ -550,9 +585,15 @@ impl Runner {
             let path = hooks_dir.join("commit-msg");
             std::fs::write(&path, script).with_context(|| format!("write {}", path.display()))?;
             make_executable(&path)?;
-            if git::enable_worktree_config(&repo).await? {
-                self.state.enabled_worktree_config = true;
-            }
+            // Ref-counted rather than a plain idempotent set: with more than
+            // one run able to be in flight in the same repository at once
+            // (see `Config::daemon.max_concurrent_runs`), a bare "already
+            // true?" check cannot tell "another run of mine still needs
+            // this" from "nobody does", and the run that happens to finish
+            // first would disable the hook out from under a sibling still
+            // relying on it.
+            git::acquire_worktree_config(&repo).await?;
+            self.state.enabled_worktree_config = true;
         }
 
         for (index, (spec, label)) in self
@@ -2626,6 +2667,14 @@ impl Runner {
         // `Blocked`. `review_conclusion` is the same derivation `gate` uses,
         // so a hand-off (open findings, green verification) reaches merge
         // exactly like a genuinely clean round does.
+        //
+        // A run resumed mid-`land` never reaches here at all: `execute`
+        // recognises `RunStatus::Landing` before it even calls `prep`, and
+        // routes straight to `run_land` instead. That has to happen a level
+        // up from this function, not with a check in here, because
+        // `review_loop`'s own status recomputation (see its doc) runs
+        // *before* `merge` on every reentry and would otherwise overwrite
+        // the `Landing` marker with `Gating` before this node ever saw it.
         if self
             .state
             .base_sync
@@ -2741,41 +2790,71 @@ impl Runner {
             && mode == MergeMode::Pr
             && self.state.status == RunStatus::Merged
         {
-            let url = self
-                .state
-                .merge
-                .as_ref()
-                .map(|m| m.detail.clone())
-                .unwrap_or_default();
-            let url = url.lines().next().unwrap_or("").trim().to_owned();
-            if url.starts_with("http") {
-                // A land failure is not a lost run: the work is on a branch and
-                // the PR is open, which is exactly where a human takes over.
-                match land::land(&mut self.state, &url).await {
-                    Ok(pr) => {
-                        self.state.status = match pr.state {
-                            land::PrLifecycle::Merged => RunStatus::Merged,
-                            _ => RunStatus::Blocked,
-                        };
-                        // Downstream of a confirmed merge only - see
-                        // `bump::should_release_bump`'s own doc for why this
-                        // one check covers all three of `land`'s success
-                        // paths. Best-effort: the run already landed, so a
-                        // failure here (the decision call, `gh`, `cargo`)
-                        // is recorded and never turns a landed run into a
-                        // failed one.
-                        if bump::should_release_bump(self.state.status)
-                            && let Err(e) = bump::after_merge(&mut self.state, &pr.url).await
-                        {
-                            self.state
-                                .event("bump", format!("release bump skipped: {e:#}"));
-                        }
-                    }
-                    Err(e) => {
-                        self.state.status = RunStatus::Blocked;
-                        self.state.event("land", format!("gave up: {e}"));
-                    }
+            self.run_land().await?;
+        }
+        Ok(())
+    }
+
+    /// Enter `land`, holding the per-repository merge lock for as long as it
+    /// runs.
+    ///
+    /// Shared between a fresh run's first pass through [`Runner::merge`] and
+    /// a resumed run's re-entry, so both take the same lock the same way: two
+    /// runs against the same repository — one possible now that
+    /// `Config::daemon.max_concurrent_runs` can be more than one — must never
+    /// both be pushing, opening a pull request, or running `gh pr merge` at
+    /// once, and holding the lock across the whole of `land::land` rather
+    /// than only around the final `gh pr merge` call is what covers the push
+    /// and the rebase it can also decide to run. This does not reintroduce
+    /// the serialisation the daemon's concurrency exists to remove: `land`
+    /// itself returns promptly whenever it is waiting on something other
+    /// than this run's own work — an approval, a slow CI — so the lock is
+    /// held for actual git activity, not for a human's reaction time.
+    async fn run_land(&mut self) -> Result<()> {
+        let url = self
+            .state
+            .merge
+            .as_ref()
+            .map(|m| m.detail.clone())
+            .unwrap_or_default();
+        let url = url.lines().next().unwrap_or("").trim().to_owned();
+        if !url.starts_with("http") {
+            return Ok(());
+        }
+        let repo = self.state.repo.clone();
+        let lock = repo_land_lock(&repo);
+        let _land_slot = lock.lock().await;
+        // A land failure is not a lost run: the work is on a branch and the
+        // pull request is open, which is exactly where a human takes over.
+        match land::land(&mut self.state, &url).await {
+            Ok(pr) if self.state.parked => {
+                // `land` already saved the parked marker; nothing here
+                // overrides `status` back to a terminal value while an
+                // approval is still outstanding.
+                let _ = pr;
+            }
+            Ok(pr) => {
+                self.state.status = match pr.state {
+                    land::PrLifecycle::Merged => RunStatus::Merged,
+                    _ => RunStatus::Blocked,
+                };
+                // Downstream of a confirmed merge only - see
+                // `bump::should_release_bump`'s own doc for why this one
+                // check covers all three of `land`'s success paths.
+                // Best-effort: the run already landed, so a failure here
+                // (the decision call, `gh`, `cargo`) is recorded and never
+                // turns a landed run into a failed one.
+                if bump::should_release_bump(self.state.status)
+                    && let Err(e) = bump::after_merge(&mut self.state, &pr.url).await
+                {
+                    self.state
+                        .event("bump", format!("release bump skipped: {e:#}"));
                 }
+                self.state.save()?;
+            }
+            Err(e) => {
+                self.state.status = RunStatus::Blocked;
+                self.state.event("land", format!("gave up: {e}"));
                 self.state.save()?;
             }
         }
@@ -3424,7 +3503,10 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool) -> Result<Vec<Str
     }
 
     if state.enabled_worktree_config && drop_winner {
-        git::disable_worktree_config(&repo).await.ok();
+        // A release, not a raw disable: some sibling run in this repository
+        // may still hold its own reference (see `git::acquire_worktree_config`),
+        // and only the last release actually turns the setting back off.
+        git::release_worktree_config(&repo).await.ok();
         state.enabled_worktree_config = false;
     }
     state.save()?;
@@ -3724,6 +3806,118 @@ mod tests {
             runner.state.merge.as_ref().map(|m| m.detail.as_str()),
             Some("already concluded"),
             "merge must not run again once the node already recorded an outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_resumed_mid_landing_reenters_land_instead_of_opening_a_second_pull_request() {
+        crate::run::set_home(std::env::temp_dir().join("magi-graph-test-home"));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let mut config = Config::default();
+        config.merge.mode = MergeMode::Pr;
+        config.graph.land = true;
+        config.graph.land_approval = false;
+
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            "deadbeef".to_owned(),
+            "task".to_owned(),
+            config,
+        );
+        state.candidates = vec![Candidate {
+            index: 0,
+            label: 'A',
+            agent: "alpha".to_owned(),
+            branch: "does-not-exist".to_owned(),
+            worktree: repo.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: false,
+        }];
+        state.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 1)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("only candidate A produced a change".to_owned()),
+        });
+        state.reviews = vec![ReviewRound {
+            round: 1,
+            head: "deadbeef".to_owned(),
+            reviews: Vec::new(),
+            e2e: Vec::new(),
+            fix: None,
+            blocking: 0,
+            answered: 0,
+            expected: 0,
+            clean: true,
+            verify_retried: false,
+            progressed: false,
+        }];
+        state.gate = vec![CommandOutcome {
+            command: "test".to_owned(),
+            code: Some(0),
+            output_tail: String::new(),
+            duration_ms: 0,
+        }];
+        // A first pass through `merge` already pushed and opened this pull
+        // request; `status` is `Landing` because a previous call into `land`
+        // parked or was interrupted before it reached a terminal outcome.
+        state.status = RunStatus::Landing;
+        state.merge = Some(MergeOutcome {
+            mode: MergeMode::Pr,
+            ok: true,
+            detail: "https://example.invalid/x/y/pull/1".to_owned(),
+        });
+
+        let mut runner = Runner {
+            state,
+            roles: ResolvedRoles {
+                implementers: Vec::new(),
+                judges: Vec::new(),
+                reviewers: Vec::new(),
+                fixer: None,
+            },
+            sem: Arc::new(Semaphore::new(1)),
+            pause: Pause::new(),
+        };
+
+        // `execute`, not `merge` directly: the Landing-resume shortcut lives
+        // at the top of `execute`, not inside `merge` (see `execute`'s doc)
+        // exactly because `review_loop` would otherwise clobber the marker
+        // first.
+        runner.execute().await.expect("execute");
+
+        assert_eq!(
+            runner.state.merge.as_ref().map(|m| m.detail.as_str()),
+            Some("https://example.invalid/x/y/pull/1"),
+            "reentry must not push again or open a second pull request over the \
+             one `land` is already watching"
+        );
+        assert_ne!(
+            runner.state.status,
+            RunStatus::Landing,
+            "land could not actually reach the fake pull request, so it must \
+             have given up rather than left the run silently parked forever"
         );
     }
 
