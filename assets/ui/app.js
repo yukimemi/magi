@@ -432,6 +432,14 @@ function roundRail(pr) {
   return rail;
 }
 
+/* Declared ahead of `state` below on purpose: `state`'s own initializer calls
+   loadRunsCollapsed(), which reads this — and a `const` used before its
+   declaration line throws (temporal dead zone), even from inside a function,
+   the moment that function actually runs. That would have been swallowed by
+   loadRunsCollapsed()'s own try/catch and silently read back `{}` every time,
+   which is indistinguishable from "localStorage denied" and just as wrong. */
+const RUNS_COLLAPSE_KEY = "magi-runs-sections";
+
 /* ---- state ------------------------------------------------------------- */
 const state = {
   route: { name: "runs", id: null },
@@ -1287,22 +1295,36 @@ function runSection(run) {
    never heard of \u2014 cut off by `limit`, or unreadable \u2014 and the run
    in hand is shown as-is rather than assumed superseded by something it
    cannot point at. That is what keeps a run from disappearing when the
-   response happens to omit the attempt that replaced it. */
+   response happens to omit the attempt that replaced it.
+
+   It also has to stop on a cycle \u2014 two runs naming each other, however that
+   record came to be \u2014 without losing either one. Walking one run at a time
+   with only its own path in hand would resolve A to B and B to A: neither
+   satisfies "this run is its own head", so neither ever reaches `heads`
+   below and the pair vanishes silently. Each walk here instead remembers
+   its whole path and, on closing a loop, mints the run the loop closed on as
+   the head for every run on that path \u2014 itself included \u2014 so a cycle always
+   resolves to one real, present run rather than to none. */
 function foldRuns(runs) {
   const byShort = new Map();
   for (const run of runs) if (run.short) byShort.set(run.short, run);
+  const nextOf = (run) => (run.superseded_by && byShort.get(run.superseded_by)) || null;
 
   const headOf = new Map();
   for (const run of runs) {
-    let head = run;
-    const seen = new Set([run.id]);
-    for (;;) {
-      const next = head.superseded_by && byShort.get(head.superseded_by);
-      if (!next || seen.has(next.id)) break;
-      seen.add(next.id);
-      head = next;
+    if (headOf.has(run.id)) continue;
+    const path = [];
+    const atIndex = new Map();
+    let cur = run;
+    while (!headOf.has(cur.id) && !atIndex.has(cur.id)) {
+      atIndex.set(cur.id, path.length);
+      path.push(cur);
+      const next = nextOf(cur);
+      if (!next) break;
+      cur = next;
     }
-    headOf.set(run.id, head);
+    const head = headOf.get(cur.id) || cur;
+    for (const node of path) headOf.set(node.id, head);
   }
 
   const heads = [];
@@ -1450,9 +1472,9 @@ function renderRunsFilterBar() {
   show(bar, true);
 }
 
-/* ---- runs: section collapse, kept in localStorage ---------------------- */
-const RUNS_COLLAPSE_KEY = "magi-runs-sections";
-
+/* ---- runs: section collapse, kept in localStorage ---------------------- *
+ * RUNS_COLLAPSE_KEY itself is declared up by `state`, not here — see the
+ * comment there. */
 function loadRunsCollapsed() {
   try {
     const raw = localStorage.getItem(RUNS_COLLAPSE_KEY);
