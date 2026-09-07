@@ -121,8 +121,8 @@ fn approval_question(run: &str) -> ask::Question {
 
 #[tokio::test]
 async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task() {
-    let _home = home_lock().await;
-    let fx = fixture(Judges::Unanimous, false);
+    let home = home_lock().await;
+    let fx = fixture(home, Judges::Unanimous, false);
 
     let mut config = fx.config.clone();
     config.graph.candidates = 1;
@@ -206,8 +206,8 @@ async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task() {
 
 #[tokio::test]
 async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own() {
-    let _home = home_lock().await;
-    let fx = fixture(Judges::Unanimous, false);
+    let home = home_lock().await;
+    let fx = fixture(home, Judges::Unanimous, false);
 
     let mut config = fx.config.clone();
     config.graph.candidates = 1;
