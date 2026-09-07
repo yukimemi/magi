@@ -35,7 +35,9 @@ use crate::config::{
 use crate::git;
 use crate::land;
 use crate::proc::Quiet as _;
-use crate::prompt::{self, CandidateView, Lens, ReviewReconsiderCtx, ReviewSeatReport, Turn};
+use crate::prompt::{
+    self, CandidateView, Lens, ReviewPatch, ReviewReconsiderCtx, ReviewSeatReport, Turn,
+};
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, DeliberationRound, DeliberationTurn, FixRecord, Judgement,
     MergeOutcome, QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus,
@@ -2172,13 +2174,23 @@ impl Runner {
                 };
                 match res {
                     Ok((review, out)) => {
-                        record.summary = review.summary;
+                        // Sanitized here, at the point every other piece of
+                        // agent prose in this file is (candidate summaries,
+                        // deliberation turns, vote reasons): a reviewer's own
+                        // words are the one thing about it that could name
+                        // it, and reconsideration below broadcasts this same
+                        // summary and these same findings to every other
+                        // seat on the panel.
+                        record.summary =
+                            blind::sanitize_prose(&review.summary, &self.state.config.blind);
                         record.vote = Some(review.vote);
                         record.duration_ms = out.duration_ms;
                         for (n, mut f) in review.findings.into_iter().enumerate() {
                             // ids are magi's, never the agent's: the fixer's
                             // adoption report is keyed by them.
                             f.id = format!("R{round}-{}-{}", r + 1, n + 1);
+                            f.title = blind::sanitize_prose(&f.title, &self.state.config.blind);
+                            f.detail = blind::sanitize_prose(&f.detail, &self.state.config.blind);
                             all_findings.push(f.clone());
                             record.findings.push(f);
                         }
@@ -2251,11 +2263,26 @@ impl Runner {
                     let wt = root.join(format!("review-{}", r + 1));
                     let seat_key = format!("review-{}", r + 1);
                     let seat = self.seat(&seat_key, &spec.id);
+                    // A seat with no live session has already forgotten the
+                    // initial review's prompt — restate the patch it is
+                    // voting on, the same as `deliberate`/`vote` do for a
+                    // judge in the same position.
+                    let patch_ctx = if has_context(&spec, &seat, sessions) {
+                        None
+                    } else {
+                        Some(ReviewPatch {
+                            branch: &winner.branch,
+                            base_short: &base_short,
+                            stat: &stat,
+                            patch: &patch,
+                        })
+                    };
                     let prompt = prompt::review_reconsider(&ReviewReconsiderCtx {
                         instruction: &self.state.instruction,
                         reviewer: r + 1,
                         lens: Lens::for_seat(r),
                         panel: &panel,
+                        patch: patch_ctx,
                         round,
                         rounds: max_rounds,
                         language: &language,

@@ -487,6 +487,26 @@ pub struct ReviewCtx<'a> {
     pub language: &'a str,
 }
 
+/// The "patch under review" section, shared by [`review`] and, when a seat
+/// holds no session to remember it from, [`review_reconsider`] — a
+/// stateless reconsideration call must be as self-sufficient as the initial
+/// review was, not a bare vote tally with nothing to check it against.
+fn patch_block(branch: &str, base_short: &str, stat: &str, patch: &str) -> String {
+    format!(
+        "# Patch under review\n\n\
+         Branch `{branch}`, base {base_short}. Your working directory is a \
+         checkout of exactly this state: read it, run it, but do not modify \
+         files.\n\n\
+         Changed files:\n```\n{}\n```\n\n```diff\n{}\n```\n",
+        if stat.trim().is_empty() {
+            "(no changes)"
+        } else {
+            stat.trim()
+        },
+        truncate_patch(patch, branch)
+    )
+}
+
 /// Prompt for a reviewer of the winning patch.
 pub fn review(ctx: &ReviewCtx<'_>) -> String {
     let ReviewCtx {
@@ -525,21 +545,8 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
         lens.heading(),
         lens.brief()
     );
-    let _ = write!(
-        s,
-        "# The task\n\n{instruction}\n\n\
-         # Patch under review\n\n\
-         Branch `{branch}`, base {base_short}. Your working directory is a \
-         checkout of exactly this state: read it, run it, but do not modify \
-         files.\n\n\
-         Changed files:\n```\n{}\n```\n\n```diff\n{}\n```\n",
-        if stat.trim().is_empty() {
-            "(no changes)"
-        } else {
-            stat.trim()
-        },
-        truncate_patch(patch, branch)
-    );
+    let _ = write!(s, "# The task\n\n{instruction}\n\n");
+    s.push_str(&patch_block(branch, base_short, stat, patch));
     if let Some(out) = e2e {
         let _ = write!(
             s,
@@ -606,12 +613,33 @@ pub struct ReviewReconsiderCtx<'a> {
     /// Every seat that cast an initial vote, in seat order, including this
     /// one.
     pub panel: &'a [ReviewSeatReport<'a>],
-    /// 1-based round number.
-    pub round: usize,
+    /// The patch, restated for a seat with no session to remember it from.
+    /// `None` when the seat's own conversation still holds the initial
+    /// review's prompt — the same distinction [`crate::graph`]'s
+    /// `has_context` draws for a judge's deliberation turn or final vote.
+    /// Without this, a stateless seat would revote on the panel's claims
+    /// alone, with nothing of its own to check them against.
+    pub patch: Option<ReviewPatch<'a>>,
     /// Round budget.
     pub rounds: usize,
+    /// 1-based round number.
+    pub round: usize,
     /// Language for prose.
     pub language: &'a str,
+}
+
+/// The patch text a stateless reconsideration call restates. See
+/// [`ReviewReconsiderCtx::patch`].
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewPatch<'a> {
+    /// Branch holding the winner.
+    pub branch: &'a str,
+    /// Abbreviated base commit.
+    pub base_short: &'a str,
+    /// `git diff --stat` output.
+    pub stat: &'a str,
+    /// The patch.
+    pub patch: &'a str,
 }
 
 /// Prompt for the one round of reconsideration a split review vote earns.
@@ -627,6 +655,7 @@ pub fn review_reconsider(ctx: &ReviewReconsiderCtx<'_>) -> String {
         reviewer,
         lens,
         panel,
+        patch,
         round,
         rounds,
         language,
@@ -637,11 +666,19 @@ pub fn review_reconsider(ctx: &ReviewReconsiderCtx<'_>) -> String {
          each seat gets one chance to read what every other seat found and revote. \
          You still do not know who wrote the patch or who the other reviewers are.\n\n\
          # The task\n\n{instruction}\n\n\
-         # Your lens: {}\n\n{}\n\n\
-         # The panel's votes and findings\n",
+         # Your lens: {}\n\n{}\n\n",
         lens.heading(),
         lens.brief()
     );
+    // A seat with no live session has already forgotten the initial review's
+    // prompt by the time this call arrives — restate the patch it is voting
+    // on, the same way `graph::Runner::deliberate` restates the candidate
+    // set for a judge in the same position.
+    if let Some(p) = patch {
+        s.push_str(&patch_block(p.branch, p.base_short, p.stat, p.patch));
+        s.push('\n');
+    }
+    s.push_str("# The panel's votes and findings\n");
     for entry in panel {
         let _ = write!(
             s,
@@ -1067,6 +1104,7 @@ mod tests {
             reviewer: 2,
             lens: Lens::Regression,
             panel: &panel,
+            patch: None,
             round: 1,
             rounds: 6,
             language: "en",
@@ -1081,6 +1119,50 @@ mod tests {
             !p.contains("\"findings\""),
             "revote must not ask for new findings"
         );
+    }
+
+    #[test]
+    fn reconsideration_restates_the_patch_only_for_a_seat_with_no_session() {
+        let panel = [ReviewSeatReport {
+            reviewer: 1,
+            vote: ReviewVote::Approve,
+            summary: "clean",
+            findings: &[],
+        }];
+        let without_session = review_reconsider(&ReviewReconsiderCtx {
+            instruction: "task",
+            reviewer: 1,
+            lens: Lens::Spec,
+            panel: &panel,
+            patch: None,
+            round: 1,
+            rounds: 6,
+            language: "en",
+        });
+        assert!(
+            !without_session.contains("Patch under review"),
+            "a seat with a live session already has the patch from its own \
+             initial review: {without_session}"
+        );
+
+        let with_session = review_reconsider(&ReviewReconsiderCtx {
+            instruction: "task",
+            reviewer: 1,
+            lens: Lens::Spec,
+            panel: &panel,
+            patch: Some(ReviewPatch {
+                branch: "magi/run/A",
+                base_short: "abc1234",
+                stat: " a | 1 +",
+                patch: "diff --git a/a b/a",
+            }),
+            round: 1,
+            rounds: 6,
+            language: "en",
+        });
+        assert!(with_session.contains("Patch under review"));
+        assert!(with_session.contains("magi/run/A"));
+        assert!(with_session.contains("diff --git a/a b/a"));
     }
 
     #[test]
