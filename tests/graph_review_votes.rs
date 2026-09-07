@@ -10,7 +10,8 @@ use magi::verdict::ReviewVote;
 
 #[tokio::test]
 async fn a_split_vote_earns_one_round_of_reconsideration_and_a_recorded_verdict() {
-    let fx = fixture_with_split_review_vote("review-2");
+    let home = common::home_lock().await;
+    let fx = fixture_with_split_review_vote(home, "review-2");
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");

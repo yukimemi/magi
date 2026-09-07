@@ -448,8 +448,8 @@ pub fn fixture_with_silent_review_seat(home: HomeGuard, silent_seats: &[&str]) -
 /// The mock's reconsideration branch has the split seat hold its vote and
 /// every other seat hold theirs, so the round's final verdict is
 /// deterministic: `approve_with_findings`, the more cautious of the two.
-pub fn fixture_with_split_review_vote(split_seat: &str) -> Fixture {
-    let mut fx = fixture(Judges::Unanimous, false);
+pub fn fixture_with_split_review_vote(home: HomeGuard, split_seat: &str) -> Fixture {
+    let mut fx = fixture(home, Judges::Unanimous, false);
     for a in &mut fx.config.agents {
         a.env
             .insert("MOCK_SPLIT_REVIEW_SEAT".to_owned(), split_seat.to_owned());
