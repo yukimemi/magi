@@ -591,6 +591,8 @@ pub struct Config {
     /// Local repositories the plan surface can start or derive a conversation
     /// against.
     pub repos: Repos,
+    /// Policy for the standing conversation ([`crate::talk`]).
+    pub talk: Talk,
 }
 
 /// Where `magi plan` and the browser interview look for a repository other
@@ -698,6 +700,21 @@ pub struct Notify {
     /// Command and arguments. `{summary}`, `{run}` and `{url}` are replaced.
     /// Empty means no notification - the web UI is then the only surface.
     pub command: Vec<String>,
+}
+
+/// Policy for [`crate::talk`], the standing conversation.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Talk {
+    /// Let the conversation's agent edit files in the repository instead of
+    /// filing a task for one. **Off by default** - see
+    /// [`crate::talk`]'s module doc for why an edit made mid-conversation is
+    /// an edit no run and no review can be attributed to, which is exactly
+    /// the property a repository entered in a competition depends on. A
+    /// repository that is never judged - dotfiles, a personal config
+    /// checkout - has nothing to lose by turning this on in its own
+    /// `magi.toml`, and a one-line fix stops costing a queued task to get.
+    pub allow_write: bool,
 }
 
 /// Roles resolved to concrete agent specs for one run.
