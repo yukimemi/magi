@@ -550,11 +550,32 @@ fn build_command(
             }
             // The prompt file lives outside the worktree, so the workspace has
             // to be widened to reach it - and so does an attachment's own
-            // directory, which lives right beside it under the
-            // conversation's `artifacts_dir` (see `chat`/`talk`).
+            // directory, which usually lives right beside it under the
+            // conversation's `artifacts_dir` (see `chat`/`talk`). "Usually":
+            // a chat derived from another one (`chat::derived_background`)
+            // can carry attachment paths that live under the *source*
+            // conversation's own artifacts dir instead, so each attachment
+            // outside `inv.artifacts` gets its own `--add-dir` rather than
+            // assuming one directory covers all of `inv.attachments`.
+            let mut add_dirs: Vec<String> = Vec::new();
             if delivery == Delivery::File || !inv.attachments.is_empty() {
+                add_dirs.push(inv.artifacts.to_string_lossy().into_owned());
+            }
+            for path in inv.attachments {
+                let Some(parent) = path.parent() else {
+                    continue;
+                };
+                if parent.starts_with(inv.artifacts) {
+                    continue;
+                }
+                let dir = parent.to_string_lossy().into_owned();
+                if !add_dirs.contains(&dir) {
+                    add_dirs.push(dir);
+                }
+            }
+            for dir in add_dirs {
                 argv.push("--add-dir".to_owned());
-                argv.push(inv.artifacts.to_string_lossy().into_owned());
+                argv.push(dir);
             }
         }
         AgentKind::Codex => {
@@ -1292,6 +1313,42 @@ mod tests {
         assert!(
             with.argv.windows(2).any(|w| w == ["--add-dir", "/art"]),
             "an attachment outside cwd must widen the sandbox even off File delivery: {with:?}"
+        );
+    }
+
+    /// A chat derived from another one (`chat::derived_background`) can pass
+    /// `turn` attachment paths that live under the *source* conversation's
+    /// own artifacts dir, not this invocation's `artifacts`. A single
+    /// `--add-dir` for `inv.artifacts` alone would leave those unreadable, so
+    /// each attachment directory outside it must get its own grant.
+    #[test]
+    fn an_inherited_attachment_outside_this_conversations_artifacts_dir_gets_its_own_add_dir() {
+        let seat = SeatState::new("plan", "a", 7);
+        let atts = [
+            PathBuf::from("/art/attachments/own.png"),
+            PathBuf::from("/other-chat/attachments/inherited.png"),
+        ];
+
+        let p = build_command(
+            &spec(AgentKind::Antigravity, None),
+            &seat,
+            &Invocation {
+                attachments: &atts,
+                ..inv(Path::new("."), Path::new("/art"), true)
+            },
+            Path::new("/art/p.md"),
+        )
+        .unwrap();
+
+        assert!(
+            p.argv.windows(2).any(|w| w == ["--add-dir", "/art"]),
+            "this conversation's own artifacts dir must still be granted: {p:?}"
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--add-dir", "/other-chat/attachments"]),
+            "the inherited attachment's own directory must be granted too: {p:?}"
         );
     }
 

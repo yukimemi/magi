@@ -3537,6 +3537,16 @@ async function attachChatFiles(files) {
   if (images.length === 0) return;
 
   for (const file of images) {
+    /* The operator can navigate to a different conversation between two
+       files of the same batch - every `await` below is a point where
+       `applyRoute` can call `resetChatAttachments` and swap `state.chatAttachments`
+       out from under this loop, so only the very first iteration is
+       guaranteed to still own `id`'s own queue. Once that has happened there
+       is no longer a queue to add this file's progress to, and pushing into
+       whatever `state.chatAttachments` now is would attach an id that
+       belongs to *this* upload's conversation onto a different one's list. */
+    if (state.chatAttachments.id !== id) break;
+
     const localId = nextLocalAttachmentId++;
     const item = {
       localId,
@@ -3553,16 +3563,18 @@ async function attachChatFiles(files) {
       item.status = "done";
       item.serverId = att.id;
     } catch (error) {
-      /* Dropped rather than kept around failed: there is nothing to retry on
-         this exact item (the bytes were never a `File` this page can resend
-         after a paste), and the message is what the operator needs, in the
-         same error box a failed send already uses. */
-      const at = state.chatAttachments.items.indexOf(item);
-      if (at >= 0) state.chatAttachments.items.splice(at, 1);
-      URL.revokeObjectURL(item.previewUrl);
-      chatError(`Could not attach ${item.name}: ${error.message}`);
+      /* Kept, not dropped: "error" is what lets renderChatThumbs show the
+         failed thumbnail (its `is-failed` branch) instead of it vanishing
+         without a trace. The operator dismisses it with the same remove
+         button any other thumbnail gets - there is nothing to retry on this
+         exact item, since the bytes were never a `File` this page can resend
+         after a paste. */
+      item.status = "error";
+      if (state.chatAttachments.id === id) {
+        chatError(`Could not attach ${item.name}: ${error.message}`);
+      }
     }
-    renderChat();
+    if (state.chatAttachments.id === id) renderChat();
   }
 }
 
@@ -4489,6 +4501,10 @@ async function attachTalkFiles(files) {
   if (images.length === 0) return;
 
   for (const file of images) {
+    // See `attachChatFiles`'s own doc, which this mirrors: the operator can
+    // navigate to a different conversation between two files of one batch.
+    if (state.talkAttachments.id !== id) break;
+
     const localId = nextLocalAttachmentId++;
     const item = {
       localId,
@@ -4505,12 +4521,13 @@ async function attachTalkFiles(files) {
       item.status = "done";
       item.serverId = att.id;
     } catch (error) {
-      const at = state.talkAttachments.items.indexOf(item);
-      if (at >= 0) state.talkAttachments.items.splice(at, 1);
-      URL.revokeObjectURL(item.previewUrl);
-      talkError(`Could not attach ${item.name}: ${error.message}`);
+      // Kept, not dropped - see `attachChatFiles`'s own catch block.
+      item.status = "error";
+      if (state.talkAttachments.id === id) {
+        talkError(`Could not attach ${item.name}: ${error.message}`);
+      }
     }
-    renderTalk();
+    if (state.talkAttachments.id === id) renderTalk();
   }
 }
 

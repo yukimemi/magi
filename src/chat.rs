@@ -640,14 +640,26 @@ pub async fn first_turn(
         .map(|t| t.body.as_str())
         .unwrap_or_default();
     let mut prompt = briefing(idea, &chat.repo);
+    // The source's own attachments, resolved against *its* id - `derived_background`
+    // already names their absolute paths in the prompt text below, and those
+    // paths live under the source conversation's own artifacts dir, not this
+    // new one's, so `turn` needs them passed in separately to widen a sandbox
+    // that only ever assumes its own conversation's directory.
+    let mut inherited_attachments: Vec<PathBuf> = Vec::new();
     if let Some(source) = from {
         // Prepended, so the leader reads what it is inheriting before it
         // reads its own instructions - the same order a human handing off a
         // conversation would use.
         prompt = format!("{}\n\n{prompt}", derived_background(source, store));
+        inherited_attachments = source
+            .turns
+            .iter()
+            .flat_map(|t| t.attachments.iter())
+            .filter_map(|a| store.attachment_path(&source.id, a))
+            .collect();
     }
     prompt.push_str(&language_note(&cfg.graph.language));
-    turn(chat, store, cfg, &prompt).await
+    turn(chat, store, cfg, &prompt, &inherited_attachments).await
 }
 
 /// Open a conversation and take the first agent turn.
@@ -723,7 +735,7 @@ pub async fn say(
         bail!("nothing to say");
     }
     let text = record(chat, store, text, attachments)?;
-    turn(chat, store, cfg, &text).await
+    turn(chat, store, cfg, &text, &[]).await
 }
 
 /// Append the operator's turn and flush it, without invoking anything.
@@ -787,7 +799,7 @@ pub fn record(
 /// answers - the same string `record` returned, so the transcript and the
 /// prompt cannot disagree.
 pub async fn respond(chat: &mut Chat, store: &Chats, cfg: &Config, text: &str) -> Result<()> {
-    turn(chat, store, cfg, text).await
+    turn(chat, store, cfg, text, &[]).await
 }
 
 /// Invoke the interviewing agent once and append what it said.
@@ -801,7 +813,13 @@ pub async fn respond(chat: &mut Chat, store: &Chats, cfg: &Config, text: &str) -
 /// whole conversation on every message is the cost this design exists to avoid,
 /// and a magi-authored replay of history is also a second, divergent version of
 /// it.
-async fn turn(chat: &mut Chat, store: &Chats, cfg: &Config, prompt: &str) -> Result<()> {
+async fn turn(
+    chat: &mut Chat,
+    store: &Chats,
+    cfg: &Config,
+    prompt: &str,
+    inherited_attachments: &[PathBuf],
+) -> Result<()> {
     let spec = cfg
         .agents
         .iter()
@@ -837,12 +855,17 @@ async fn turn(chat: &mut Chat, store: &Chats, cfg: &Config, prompt: &str) -> Res
     // turn's: a resumed session gets a fresh process every turn, so a CLI
     // whose sandbox needs `--add-dir` (see `agent::build_command`) needs the
     // grant again to open an image from three turns ago, even when nothing
-    // new was attached just now.
+    // new was attached just now. Plus whatever the caller inherited from a
+    // *different* conversation - `first_turn` passes the source's own
+    // attachments here, since `derived_background` already named their paths
+    // in the prompt and a sandbox that only widens for `chat.id`'s own
+    // directory would leave those unreadable.
     let attachment_paths: Vec<PathBuf> = chat
         .turns
         .iter()
         .flat_map(|t| t.attachments.iter())
         .filter_map(|a| store.attachment_path(&chat.id, a))
+        .chain(inherited_attachments.iter().cloned())
         .collect();
 
     let artifacts = store.artifacts_of(&chat.id);
