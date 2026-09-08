@@ -12,7 +12,7 @@
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::config::MergeMode;
+use crate::config::{MergeMode, MergeStyle};
 use crate::run::{CommandOutcome, RunState, RunStatus, tail};
 use crate::stats::Stats;
 use crate::verdict::ReviewVote;
@@ -551,12 +551,21 @@ pub fn run(state: &RunState) -> String {
                     w.branch, state.base_branch
                 );
             }
+            // The squash caveat only applies to that one style: `--no-ff` and
+            // `--ff-only` never inherit a candidate's placeholder subject,
+            // since neither ever discards the pull request body `message`
+            // that `manual_merge_command` (graph.rs) already puts on the
+            // squash commit's `-m`.
             let _ = writeln!(
                 s,
-                "  rebase onto {} before merging by hand, and pass an explicit \
-                 commit message — a squash merge otherwise inherits the \
-                 candidate's placeholder subject",
-                state.base_branch
+                "  rebase onto {} before merging by hand{}",
+                state.base_branch,
+                if state.config.merge.style == MergeStyle::Squash {
+                    ", and pass an explicit commit message — a squash merge \
+                     otherwise inherits the candidate's placeholder subject"
+                } else {
+                    ""
+                }
             );
             let _ = writeln!(s, "  {}", m.detail.lines().next().unwrap_or(""));
         } else {
@@ -926,6 +935,31 @@ mod tests {
             text.contains("rebase"),
             "the report must point at the hand-landing steps: {text}"
         );
+        assert!(
+            !text.contains("placeholder subject"),
+            "the default merge style is `merge`, which never inherits a \
+             placeholder subject, so the squash caveat must not appear: {text}"
+        );
+    }
+
+    #[test]
+    fn a_mode_none_squash_merge_warns_about_the_placeholder_subject() {
+        let _guard = plain();
+        let mut s = state();
+        s.config.merge.style = MergeStyle::Squash;
+        s.merge = Some(MergeOutcome {
+            mode: crate::config::MergeMode::None,
+            ok: true,
+            detail: "git -C /repo merge --squash magi/x/A && git -C /repo commit -m \"add \
+                      retries\""
+                .to_owned(),
+        });
+        let text = run(&s);
+        assert!(
+            text.contains("placeholder subject"),
+            "a squash-style manual merge must warn about the missing message: {text}"
+        );
+        assert!(text.contains("--squash"), "{text}");
     }
 
     #[test]

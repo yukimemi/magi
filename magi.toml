@@ -48,6 +48,12 @@ mode = "none"
 # `git symbolic-ref HEAD`. Teaching magi to read the jj bookmark instead is a
 # real feature, not a workaround — tracked as its own competition.
 base = "main"
+# This repository's own GitHub ruleset on `main` requires linear history
+# ("must not contain merge commits"), so the manual-merge guidance `magi
+# show` prints must not be `git merge --no-ff` — that push is rejected for
+# anyone without bypass rights. `squash` matches what `[graph] land` already
+# runs for `mode = "pr"` (see `land.rs`'s module doc).
+style = "squash"
 
 # Project conventions appended to the node prompts, never merged into them.
 # Repository-wide context lives in AGENTS.md, which every agent already reads

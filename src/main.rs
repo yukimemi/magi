@@ -33,7 +33,8 @@ struct Cli {
 enum MergeArg {
     /// Print the merge command and stop.
     None,
-    /// `git merge --no-ff` into the base branch.
+    /// Merge into the base branch, using the merge style from configuration
+    /// (`[merge] style`; `--no-ff` by default).
     Local,
     /// Push and open a pull request with `gh`.
     Pr,
