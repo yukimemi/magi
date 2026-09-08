@@ -1431,6 +1431,15 @@ async fn janitor(repo: &Path, opts: &Opts, home: &Path, worktrees_root: &Path) {
             return;
         }
     };
+    // A run's own worktree lives under `config.graph.worktree_root` when the
+    // repository sets one - the same precedence `RunState::worktree_root`
+    // uses - and `worktrees_root` only stands in for the *default* an
+    // unconfigured repository resolves to (see this function's own
+    // parameter, or the test fixture wiring one to a fake path). Housekeeping
+    // that always swept the default regardless of this override would never
+    // see, and so never reclaim, a single worktree for a repository that
+    // relocated them elsewhere.
+    let worktrees_root = cfg.graph.worktree_root.as_deref().unwrap_or(worktrees_root);
     let out = clean::housekeep(&cfg, home, worktrees_root, repo, Timestamp::now()).await;
     // Reported whenever there is anything to say, not only when `folded > 0`:
     // the incident this exists to prevent was 90 of 93 runs skipped and 0

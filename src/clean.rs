@@ -85,7 +85,9 @@ pub async fn housekeep(
             }
             Err(e) => tracing::warn!("housekeep: fold due runs: {e:#}"),
         }
-        out.orphaned_worktrees = fold_orphaned_worktrees(&runs, worktrees_root, home, now).await;
+        out.orphaned_worktrees =
+            fold_orphaned_worktrees(&runs, worktrees_root, home, cfg.disk.fold_grace_secs, now)
+                .await;
         // Best-effort in the same sense as everything else here: a repository
         // this janitor pass has nothing to do with (or none at all, in a unit
         // test) must not turn a `warn` into a reason to skip the rest.
@@ -342,10 +344,30 @@ pub async fn fold_unreadable(runs: &Path, worktrees_root: &Path, id: &str) -> Re
 /// is looking for it. This walks the worktree bay directly instead, and
 /// removes any `<short>` directory that no run id maps to.
 ///
+/// Two things must never happen, and this checks both before ever touching a
+/// directory:
+///
+/// - **A worktree bay is never the only kind of thing under `worktrees_root`,
+///   and this must not assume it is.** A hand-placed scratch directory, or
+///   anything else an operator or another tool left in the same bay, has the
+///   same "no run claims it" shape as a genuine orphan but is not one -
+///   [`looks_like_a_worktree_bay`] is the same tag shape [`crate::run::is_run_id`]
+///   already requires of a real run's short id, and anything else is left
+///   alone regardless of what else is true about it.
+/// - **A worktree that was only just created might not have a `run.json` yet
+///   for a reason that has nothing to do with being orphaned.** `Runner::start`
+///   and `Runner::review` both create the worktree before the first
+///   `RunState::save` lands, and that gap - several `git` subprocesses wide -
+///   is invisible to [`crate::daemon::is_working_on_short`] whenever the run
+///   is not being driven through this daemon's own `poll` loop at all (a
+///   `magi review` invocation, for one). A directory whose own modification
+///   time is within `grace_secs` of `now` is left alone on that basis alone,
+///   the same margin [`fold_due`] gives a run before treating it as truly
+///   finished - long enough that no realistic gap between a `worktree add`
+///   and its `run.json` could ever be mistaken for one.
+///
 /// The one failure this must never cause is deleting the worktree of a run
-/// that is genuinely in flight but has not written its first `run.json` yet -
-/// the gap between the daemon claiming a task and `RunState::new` saving
-/// state for the first time. [`crate::daemon::is_working_on_short`] is the
+/// that is genuinely in flight. [`crate::daemon::is_working_on_short`] is the
 /// same liveness check [`fold_due`] trusts everywhere else in this module,
 /// checked by short id because there is no full id to compare here; when it
 /// cannot tell, this leaves the directory alone. Best-effort like the rest of
@@ -355,6 +377,7 @@ pub async fn fold_orphaned_worktrees(
     runs: &Path,
     worktrees_root: &Path,
     home: &Path,
+    grace_secs: u64,
     now: Timestamp,
 ) -> usize {
     let known: std::collections::HashSet<String> = std::fs::read_dir(runs)
@@ -376,10 +399,16 @@ pub async fn fold_orphaned_worktrees(
             continue;
         }
         let short = entry.file_name().to_string_lossy().into_owned();
+        if !looks_like_a_worktree_bay(&short) {
+            continue;
+        }
         if known.contains(&short) || crate::daemon::is_working_on_short(home, &short, now) {
             continue;
         }
         let wt = entry.path();
+        if !stale_enough(&wt, grace_secs, now) {
+            continue;
+        }
         crate::git::remove_worktree_from_linked(&wt).await;
         for e in std::fs::read_dir(&wt).into_iter().flatten().flatten() {
             crate::git::remove_worktree_from_linked(&e.path()).await;
@@ -393,6 +422,36 @@ pub async fn fold_orphaned_worktrees(
         }
     }
     folded
+}
+
+/// Does `name` have the shape a run's own worktree bay is named with: the
+/// same 4-character alphanumeric tag [`crate::run::is_run_id`] requires of a
+/// full id's trailing block (see [`short_of`])?
+///
+/// Anything else under `worktrees_root` is not a bay this function reclaims
+/// at all, claimed or not - answering "does a run claim this?" about a
+/// directory that was never a run's worktree in the first place is exactly
+/// the wrong question to ask before deleting it.
+fn looks_like_a_worktree_bay(name: &str) -> bool {
+    name.len() == 4 && name.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Is `dir`'s own modification time old enough, against `grace_secs` and
+/// `now`, that its emptiness of a run record can be trusted rather than
+/// caught mid-creation?
+///
+/// A directory this pass cannot stat at all - a race with its own removal, a
+/// permission error - is treated as not yet stale: unreadable metadata is not
+/// evidence of anything, and the janitor already keeps rather than deletes
+/// whenever it cannot tell (see the module docs).
+fn stale_enough(dir: &Path, grace_secs: u64, now: Timestamp) -> bool {
+    let Ok(modified) = std::fs::metadata(dir).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let Ok(ts) = Timestamp::try_from(modified) else {
+        return false;
+    };
+    due(now, ts, grace_secs)
 }
 
 /// Resolve an id or prefix against an explicit runs directory, exactly the way
@@ -682,7 +741,6 @@ mod tests {
         let runs = dir.path().join("runs");
         let wt = dir.path().join("wt");
         let home = dir.path().to_path_buf();
-        let now = ts("2026-09-05T00:00:00Z");
 
         // A run record exists for this one: its worktree is claimed, not
         // orphaned, however old the record.
@@ -704,6 +762,20 @@ mod tests {
         // task and `RunState::new` writing its first `run.json`. Must survive
         // untouched.
         std::fs::create_dir_all(wt.join("cccc")).unwrap();
+
+        // Not shaped like a run's short id at all - a scratch directory an
+        // operator or another tool left in the same bay - so it is never a
+        // reclaim target regardless of what runs claim it or not.
+        std::fs::create_dir_all(wt.join("scratch")).unwrap();
+
+        // Real wall-clock time, taken after every directory above was
+        // created, so a zero grace - the same "always due" escape hatch
+        // `due` itself documents - can stand in for "old enough" here
+        // without faking a worktree's mtime. The sleep is what keeps that
+        // ordering unambiguous on a filesystem whose mtime resolution is
+        // coarser than the gap between two back-to-back instructions.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let now = Timestamp::now();
         let mut status = crate::daemon::Status::new();
         status.current = vec![crate::daemon::Current {
             task: "20260905-000000-t111".to_owned(),
@@ -712,14 +784,43 @@ mod tests {
         status.updated_at = now;
         crate::daemon::write_status_to(&home.join("daemon.json"), &status).unwrap();
 
-        let folded = block_on(fold_orphaned_worktrees(&runs, &wt, &home, now));
+        let folded = block_on(fold_orphaned_worktrees(&runs, &wt, &home, 0, now));
         assert_eq!(
             folded, 1,
-            "only the truly orphaned, idle worktree is removed"
+            "only the truly orphaned, idle, bay-shaped worktree is removed"
         );
         assert!(wt.join("aaaa").exists(), "claimed by a run record");
         assert!(!wt.join("bbbb").exists(), "orphaned and idle: reclaimed");
         assert!(wt.join("cccc").exists(), "a run in flight is never touched");
+        assert!(
+            wt.join("scratch").exists(),
+            "not shaped like a worktree bay, so never a reclaim target"
+        );
+    }
+
+    /// The gap this closes: `Runner::review` (`magi review`) creates the
+    /// worktree with `git worktree add` before `RunState::save` ever writes a
+    /// `run.json`, and that path never runs through the daemon's own `poll`
+    /// loop at all, so `daemon::Status` never names it either. Without a
+    /// grace window, a janitor pass landing in that gap would read the
+    /// worktree as an orphan nothing is waiting on and delete a review still
+    /// being set up.
+    #[test]
+    fn fold_orphaned_worktrees_leaves_a_freshly_created_bay_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+
+        std::fs::create_dir_all(wt.join("dddd").join("under-review")).unwrap();
+
+        let now = Timestamp::now();
+        let folded = block_on(fold_orphaned_worktrees(&runs, &wt, &home, 6 * 60 * 60, now));
+        assert_eq!(
+            folded, 0,
+            "too fresh to tell apart from a run still being set up"
+        );
+        assert!(wt.join("dddd").exists());
     }
 
     /// A fresh open question on `run`, stored and handed back for assertions.
