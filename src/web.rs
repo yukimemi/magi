@@ -626,7 +626,14 @@ impl Ui {
             busy
         };
         Ok(if parking {
-            daemon::current_work(&self.home, jiff::Timestamp::now()).map(|c| c.run)
+            // More than one run can be in flight now (see
+            // `Config::daemon.max_concurrent_runs`); this answer names one of
+            // them so the operator sees a park actually happened, not every
+            // run a park now asks to stop at its next boundary.
+            daemon::current_work(&self.home, jiff::Timestamp::now())
+                .into_iter()
+                .next()
+                .map(|c| c.run)
         } else {
             None
         })
@@ -1553,7 +1560,10 @@ struct DaemonView {
     running: bool,
     idle: Option<bool>,
     pid: Option<u32>,
-    current: Option<daemon::Current>,
+    /// Every task and run currently in flight. Empty when idle; more than
+    /// one entry when `Config::daemon.max_concurrent_runs` has more than one
+    /// run going at once.
+    current: Vec<daemon::Current>,
     completed: Option<u64>,
     stale_for_secs: Option<i64>,
 }
@@ -1568,7 +1578,7 @@ impl DaemonView {
                 running: false,
                 idle: None,
                 pid: None,
-                current: None,
+                current: Vec::new(),
                 completed: None,
                 stale_for_secs: None,
             };
@@ -2318,9 +2328,10 @@ struct FoldView {
 /// phone learns the outcome from the change stream.
 ///
 /// Refused when the loop is running at all, not merely when it is on this run.
-/// magi runs one competition at a time on purpose — the scarce resource is the
-/// agent CLIs' quota — and a tap that quietly started a second graph would
-/// double the burn for no extra throughput.
+/// The scarce resource is the agent CLIs' quota, and a tap that quietly
+/// started a second graph on top of whatever the loop is already driving —
+/// one run by default, or as many as `Config::daemon.max_concurrent_runs`
+/// allows — would spend that quota twice over for no extra throughput.
 async fn run_resume(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
@@ -2341,11 +2352,17 @@ async fn run_resume(
             status_word(state.status)
         )));
     }
-    if let Some(work) = crate::daemon::current_work(&ui.home, jiff::Timestamp::now()) {
+    // Refused whenever the loop is running anything at all, not merely when
+    // it is on this run: a manual resume racing a loop-driven run over the
+    // same agent quota is the thing this guard exists to prevent, whether
+    // the loop's own concurrency is one run or several.
+    if let Some(work) = crate::daemon::current_work(&ui.home, jiff::Timestamp::now())
+        .into_iter()
+        .next()
+    {
         return Err(ApiError::conflict(format!(
-            "the loop is running run {} right now; magi runs one competition at \
-             a time so the agent quota is not spent twice over. Stop the loop \
-             first.",
+            "the loop is running run {} right now; stop it first, or wait for \
+             it to finish, before resuming a run by hand.",
             crate::run::short_of(&work.run)
         )));
     }
@@ -4115,7 +4132,7 @@ mod tests {
             "started_at": Timestamp::now().to_string(),
             "updated_at": updated_at.to_string(),
             "idle": false,
-            "current": { "task": "20260902-140501-aaaa", "run": "20260902-140502-bbbb" },
+            "current": [{ "task": "20260902-140501-aaaa", "run": "20260902-140502-bbbb" }],
             "completed": 7,
             "polls": 143,
         });
@@ -6016,7 +6033,10 @@ mod tests {
         assert_eq!(fresh["daemon"]["idle"], false);
         assert_eq!(fresh["daemon"]["pid"], 4242);
         assert_eq!(fresh["daemon"]["completed"], 7);
-        assert_eq!(fresh["daemon"]["current"]["task"], "20260902-140501-aaaa");
+        assert_eq!(
+            fresh["daemon"]["current"][0]["task"],
+            "20260902-140501-aaaa"
+        );
         assert_eq!(fresh["version"], env!("CARGO_PKG_VERSION"));
     }
 
@@ -6826,10 +6846,10 @@ mod tests {
         t2.status = TaskStatus::Running;
         q.put(&mut t2).expect("put t2");
         let mut beat = crate::daemon::Status::new();
-        beat.current = Some(crate::daemon::Current {
+        beat.current = vec![crate::daemon::Current {
             task: t2.id.clone(),
             run: "20260901-000000-r222".to_owned(),
-        });
+        }];
         beat.updated_at = jiff::Timestamp::now();
         crate::daemon::write_status_to(&fx.home.path().join("daemon.json"), &beat)
             .expect("publish a heartbeat");
@@ -6924,10 +6944,10 @@ mod tests {
         let run_running = "20260901-000000-rung";
         write_run(&runs, run_running, RunStatus::Prep);
         let mut beat = crate::daemon::Status::new();
-        beat.current = Some(crate::daemon::Current {
+        beat.current = vec![crate::daemon::Current {
             task: "20260901-000000-task".to_owned(),
             run: run_running.to_owned(),
-        });
+        }];
         beat.updated_at = jiff::Timestamp::now();
         crate::daemon::write_status_to(&fx.home.path().join("daemon.json"), &beat)
             .expect("publish a heartbeat");
@@ -7168,10 +7188,10 @@ mod tests {
         write_run(&runs, id, RunStatus::Implementing);
 
         let mut beat = crate::daemon::Status::new();
-        beat.current = Some(crate::daemon::Current {
+        beat.current = vec![crate::daemon::Current {
             task: "20260901-000000-task".to_owned(),
             run: id.to_owned(),
-        });
+        }];
         beat.updated_at = jiff::Timestamp::now();
         crate::daemon::write_status_to(&fx.home.path().join("daemon.json"), &beat)
             .expect("publish a heartbeat");
@@ -7227,13 +7247,14 @@ mod tests {
         let stalled = "20260901-000000-stal";
         write_run(&runs, stalled, RunStatus::Stalled);
 
-        // The loop is busy with a *different* run, and that is still a refusal:
-        // one competition at a time is the point, not one per run.
+        // The loop is busy with a *different* run, and that is still a
+        // refusal: a manual resume must never race whatever the loop itself
+        // is already driving, whether that is one run or several.
         let mut beat = crate::daemon::Status::new();
-        beat.current = Some(crate::daemon::Current {
+        beat.current = vec![crate::daemon::Current {
             task: "20260901-000000-task".to_owned(),
             run: "20260901-000000-othr".to_owned(),
-        });
+        }];
         beat.updated_at = jiff::Timestamp::now();
         crate::daemon::write_status_to(&fx.home.path().join("daemon.json"), &beat)
             .expect("publish a heartbeat");
@@ -7242,7 +7263,7 @@ mod tests {
         assert_eq!(res.status, 409);
         let err = res.json()["error"].as_str().unwrap().to_owned();
         assert!(err.contains("othr"), "it names what the loop is on: {err}");
-        assert!(err.contains("one competition at a time"), "{err}");
+        assert!(err.contains("stop it first"), "{err}");
     }
 
     #[test]

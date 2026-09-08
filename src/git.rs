@@ -273,6 +273,88 @@ pub async fn disable_worktree_config(repo: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How many runs currently want `extensions.worktreeConfig` on for one
+/// repository, and whether magi is the one that turned it on.
+struct WorktreeConfigRef {
+    /// Runs holding a reference, via [`acquire_worktree_config`].
+    count: usize,
+    /// Did *this process* flip the setting from off to on? If not - it was
+    /// already `true` when the first run in this process asked - nothing
+    /// here ever turns it off either; that is what [`enable_worktree_config`]
+    /// already decided for the single-run case, and the ref-counted version
+    /// must not second-guess it.
+    we_enabled: bool,
+}
+
+/// One entry per repository, each guarded by its own `tokio::sync::Mutex` so
+/// that two repositories' acquisitions never wait on each other - only two
+/// runs in the *same* repository do, which is the point.
+///
+/// A `std::sync::Mutex` guards the map itself, held only long enough to find
+/// or insert an entry and clone its `Arc`, never across an `.await`.
+static WORKTREE_CONFIG: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<WorktreeConfigRef>>>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The per-repository slot, creating it if this is the first run to ask.
+fn worktree_config_slot(repo: &Path) -> std::sync::Arc<tokio::sync::Mutex<WorktreeConfigRef>> {
+    let mut map = WORKTREE_CONFIG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.entry(repo.to_path_buf())
+        .or_insert_with(|| {
+            std::sync::Arc::new(tokio::sync::Mutex::new(WorktreeConfigRef {
+                count: 0,
+                we_enabled: false,
+            }))
+        })
+        .clone()
+}
+
+/// Take a reference on `extensions.worktreeConfig` being on for `repo`.
+///
+/// [`enable_worktree_config`] alone is only safe for one run in a repository
+/// at a time: it is a plain get-then-set, so a second run's "already true?"
+/// check can see the first run's write and conclude it owns nothing to turn
+/// back off, while the first run's own cleanup turns the setting off under
+/// the second run's feet the moment *it* finishes - the exact race that let a
+/// finished run's fold disable the hook a still-running sibling in the same
+/// repository depended on. This ref-counts instead: the setting is turned on
+/// once, by whichever caller is first, and turned off only once every caller
+/// has released it via [`release_worktree_config`].
+///
+/// The per-repository lock is held across the `git config` call for the
+/// first acquire, so a second, concurrent acquire for the same repository
+/// waits for it rather than racing it - without that, both could observe
+/// "not yet counted" and both try to flip the setting on.
+pub async fn acquire_worktree_config(repo: &Path) -> Result<()> {
+    let slot = worktree_config_slot(repo);
+    let mut entry = slot.lock().await;
+    entry.count += 1;
+    if entry.count == 1 {
+        entry.we_enabled = enable_worktree_config(repo).await?;
+    }
+    Ok(())
+}
+
+/// Release a reference taken by [`acquire_worktree_config`].
+///
+/// Only the last release for a repository actually calls
+/// [`disable_worktree_config`], and only when this process was the one that
+/// turned the setting on in the first place.
+pub async fn release_worktree_config(repo: &Path) -> Result<()> {
+    let slot = worktree_config_slot(repo);
+    let mut entry = slot.lock().await;
+    entry.count = entry.count.saturating_sub(1);
+    if entry.count == 0 && entry.we_enabled {
+        disable_worktree_config(repo).await?;
+        entry.we_enabled = false;
+    }
+    Ok(())
+}
+
 /// Point a single worktree at its own hooks directory.
 ///
 /// `core.hooksPath` is normally repo-wide; scoping it with `--worktree` keeps
@@ -642,6 +724,63 @@ mod tests {
         );
 
         disable_worktree_config(&repo).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worktree_config_stays_on_while_a_sibling_run_still_holds_it() {
+        let (_g, repo) = scratch().await;
+
+        // Two runs in the same repository, as `Config::daemon.max_concurrent_runs`
+        // now allows: both acquire before either is done.
+        acquire_worktree_config(&repo).await.unwrap();
+        acquire_worktree_config(&repo).await.unwrap();
+
+        let on = git(&repo, &["config", "--get", "extensions.worktreeConfig"])
+            .await
+            .unwrap();
+        assert_eq!(on, "true");
+
+        // The first run to finish releases its own reference. A plain
+        // `disable_worktree_config` here is exactly the bug: it would turn
+        // the setting off while the second run still depends on it.
+        release_worktree_config(&repo).await.unwrap();
+        let still_on = git(&repo, &["config", "--get", "extensions.worktreeConfig"])
+            .await
+            .unwrap();
+        assert_eq!(
+            still_on, "true",
+            "a sibling run's release must not disable the setting for the one still working"
+        );
+
+        // Only the last release actually turns it back off.
+        release_worktree_config(&repo).await.unwrap();
+        let after = git_raw(&repo, &["config", "--get", "extensions.worktreeConfig"])
+            .await
+            .unwrap();
+        assert!(
+            !after.ok(),
+            "the last release must turn the setting back off: {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_config_already_on_before_magi_touched_it_is_left_alone() {
+        let (_g, repo) = scratch().await;
+        git(&repo, &["config", "extensions.worktreeConfig", "true"])
+            .await
+            .unwrap();
+
+        // magi did not turn this on, so even after every acquire is released,
+        // it must not turn it off - that is what a bare `enable_worktree_config`
+        // already promised for the single-run case, and the ref-counted
+        // version must keep that promise.
+        acquire_worktree_config(&repo).await.unwrap();
+        release_worktree_config(&repo).await.unwrap();
+
+        let still_on = git(&repo, &["config", "--get", "extensions.worktreeConfig"])
+            .await
+            .unwrap();
+        assert_eq!(still_on, "true");
     }
 
     #[tokio::test]

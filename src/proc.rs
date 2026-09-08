@@ -67,6 +67,64 @@ impl Quiet for tokio::process::Command {
     }
 }
 
+/// Best-effort liveness check for a process id, with no dependency beyond
+/// what the platform ships.
+///
+/// There is no portable way in the standard library to ask "is this pid
+/// alive" - no `libc`, no `sysinfo`, nothing magi already depends on binds
+/// the signals API - so this shells out to whatever each platform already
+/// provides: `kill -0` on Unix, `tasklist` on Windows. Both are read-only:
+/// `kill -0` sends no signal, it only checks whether one *could* be sent.
+///
+/// Every uncertain outcome reads as alive, on purpose. This exists so
+/// [`crate::daemon::sweep_stale_claims`] can reclaim a lock faster than its
+/// age-based fallback when the owning process is verifiably gone; the risk
+/// on the other side - reclaiming a lock a live process still holds - lets a
+/// second daemon start a second run on the same task, which costs far more
+/// than leaving one lock alone a little longer. So a helper program that is
+/// missing, output that cannot be parsed, or a permission error that merely
+/// proves the pid exists under another account, all count as "alive" rather
+/// than as license to reclaim.
+#[must_use]
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        match std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+        {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                // "No such process" is the one answer that actually means the
+                // pid is gone. Anything else - most commonly "Operation not
+                // permitted" for a pid that exists under another account - is
+                // not evidence of that.
+                let stderr = String::from_utf8_lossy(&o.stderr).to_lowercase();
+                !stderr.contains("no such process")
+            }
+            Err(_) => true,
+        }
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("tasklist")
+            .quiet()
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\""))
+            }
+            _ => true,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +157,18 @@ mod tests {
         assert_eq!(built.get_program(), "git");
         let args: Vec<_> = built.get_args().collect();
         assert_eq!(args, ["status", "--short"]);
+    }
+
+    #[test]
+    fn this_process_is_alive_and_a_pid_nothing_ever_reuses_is_not() {
+        assert!(pid_alive(std::process::id()), "this test is running");
+        // Not `u32::MAX`: Windows' `tasklist` answers a pid that large with
+        // "invalid query" rather than "no such process", which this helper
+        // - correctly - cannot tell apart from a check it simply could not
+        // run, so it reads as alive. A pid past any real process table but
+        // still a value `tasklist` accepts as a query is the one this test
+        // can assert on without racing whatever else is running on the
+        // machine.
+        assert!(!pid_alive(999_999_999));
     }
 }

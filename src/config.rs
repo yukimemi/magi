@@ -610,6 +610,51 @@ pub struct Config {
     pub repos: Repos,
     /// Policy for the standing conversation ([`crate::talk`]).
     pub talk: Talk,
+    /// How many runs `magi serve`'s own loop drives at once.
+    pub daemon: Daemon,
+}
+
+/// How the daemon loop itself behaves, as opposed to what one run does.
+///
+/// Machine-layer material in the same sense [`Repos::roots`] is: how many
+/// competitions this machine's own loop is willing to babysit at once is a
+/// fact about the machine running `magi serve`, not about any one
+/// repository's task, so it belongs in `<config_dir>/magi/config.toml`
+/// rather than a repository's own `magi.toml` - though, like `Repos::roots`,
+/// nothing stops a repository from setting it too, since a scalar field
+/// takes whichever layer has the highest precedence.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Daemon {
+    /// How many runs `magi serve` may have actively in flight at once.
+    /// **One by default** - today's behaviour, one run at a time.
+    ///
+    /// This is a different knob from [`Graph::max_parallel`], and the two
+    /// must not be confused: `max_parallel` bounds how many agent *processes*
+    /// one run starts inside itself (implementers, judges, reviewers -
+    /// candidates competing on a single task); this field bounds how many
+    /// *runs* - whole competitions, each with its own `max_parallel` budget -
+    /// the loop drives side by side, possibly across different tasks and
+    /// different repositories. Raising `max_parallel` buys a bigger panel for
+    /// one task; raising this buys more tasks worked at once. A config file
+    /// that meant one and wrote the other would either starve a competition
+    /// of judges or leave the rest of the backlog waiting for no reason.
+    ///
+    /// A run parked waiting on the operator's land-merge approval - see
+    /// [`crate::land`] - does not hold one of these slots while it waits: the
+    /// whole point of parking there is to let the loop spend the slot on
+    /// something runnable instead of sitting on a decision only a human can
+    /// make. So even at the default of `1`, an approval that comes back does
+    /// not queue behind whatever else the loop happens to be running.
+    pub max_concurrent_runs: usize,
+}
+
+impl Default for Daemon {
+    fn default() -> Self {
+        Self {
+            max_concurrent_runs: 1,
+        }
+    }
 }
 
 /// Where `magi plan` and the browser interview look for a repository other

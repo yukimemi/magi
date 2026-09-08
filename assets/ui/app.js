@@ -643,9 +643,13 @@ function runnableTasks() {
   return state.queue.filter((task) => (task.status_str || task.status) === "queued").length;
 }
 
-/* The run the loop is on, as a link when there is one to point at. */
+/* The run the loop is on, as a link when there is one to point at. `current`
+   is a list — more than one entry when the loop's own concurrency (see
+   `Config::daemon.max_concurrent_runs`) has more than one run going at once
+   — and this always points at the first, which is what a caller wanting
+   one representative run to link to means. */
 function currentRunLink(daemon) {
-  const id = daemon.current && daemon.current.run;
+  const id = daemon.current && daemon.current[0] && daemon.current[0].run;
   if (!id) return null;
   return el("a", {
     class: "daemon-run",
@@ -933,15 +937,18 @@ function renderLoop() {
     return;
   }
 
-  if (daemon.current && daemon.current.run) {
+  if (daemon.current && daemon.current.length > 0) {
     setAttr(box, "data-state", "working");
+    const first = daemon.current[0];
+    const rest = daemon.current.length - 1;
     text.append(
       el("b", { text: "Working" }),
       " on ",
       currentRunLink(daemon),
-      daemon.current.task
-        ? el("span", { class: "daemon-run", text: ` \u2190 task ${shortId(daemon.current.task)}` })
+      first.task
+        ? el("span", { class: "daemon-run", text: ` \u2190 task ${shortId(first.task)}` })
         : null,
+      rest > 0 ? ` (and ${plural(rest, "other run", "other runs")})` : null,
       tail,
     );
   } else if (daemon.idle) {
@@ -971,8 +978,8 @@ function renderLoop() {
   /* Two different promises, because they are two different facts: with a run
      in flight the operator is being told they will wait for it, and with none
      they are being told there is nothing to wait for. */
-  control("stop", "Stop the loop", daemon.current && daemon.current.run
-    ? "It finishes the run it is on first, then stops claiming. Nothing in flight is abandoned."
+  control("stop", "Stop the loop", daemon.current && daemon.current.length > 0
+    ? "It finishes the run(s) it is on first, then stops claiming. Nothing in flight is abandoned."
     : "It stops claiming new tasks. Nothing is in flight, so nothing is interrupted.");
 }
 

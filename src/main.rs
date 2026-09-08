@@ -1840,7 +1840,7 @@ fn doctor_queue_and_loop(home: &Path) -> String {
                     let _ = writeln!(s, "loop       running");
                 }
             }
-            if let Some(current) = &status.current {
+            for current in &status.current {
                 let _ = writeln!(s, "  working  task {} (run {})", current.task, current.run);
             }
         }
@@ -2103,10 +2103,10 @@ mod tests {
 
         // A live daemon working on it is ordinary progress, not an orphan.
         let mut beat = daemon::Status::new();
-        beat.current = Some(daemon::Current {
+        beat.current = vec![daemon::Current {
             task: t.id.clone(),
             run: "20260903-080619-01c2".to_owned(),
-        });
+        }];
         beat.updated_at = jiff::Timestamp::now();
         daemon::write_status_to(&dir.path().join("daemon.json"), &beat).unwrap();
         let working = doctor_queue_and_loop(dir.path());
@@ -2118,10 +2118,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut status = magi::daemon::Status::new();
         status.pid = 4242;
-        status.current = Some(magi::daemon::Current {
+        status.current = vec![magi::daemon::Current {
             task: "20260902-140501-t111".to_owned(),
             run: "20260902-140502-r111".to_owned(),
-        });
+        }];
         magi::daemon::write_status_to(&dir.path().join("daemon.json"), &status).unwrap();
 
         let text = doctor_queue_and_loop(dir.path());
@@ -2138,10 +2138,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut status = magi::daemon::Status::new();
         status.updated_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(60);
-        status.current = Some(magi::daemon::Current {
+        status.current = vec![magi::daemon::Current {
             task: "20260902-140501-t111".to_owned(),
             run: "20260902-140502-r111".to_owned(),
-        });
+        }];
         magi::daemon::write_status_to(&dir.path().join("daemon.json"), &status).unwrap();
 
         let text = doctor_queue_and_loop(dir.path());
@@ -2726,10 +2726,10 @@ mod tests {
         // unfinished run with no live daemon behind it is a leftover from a
         // killed process, and deleting those is the point of the command.
         let mut beat = magi::daemon::Status::new();
-        beat.current = Some(magi::daemon::Current {
+        beat.current = vec![magi::daemon::Current {
             task: "20260901-000000-task".to_owned(),
             run: run_running.to_owned(),
-        });
+        }];
         beat.updated_at = jiff::Timestamp::now();
         magi::daemon::write_status_to(&dir.path().join("daemon.json"), &beat).unwrap();
 

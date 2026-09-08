@@ -38,9 +38,10 @@
 //! says nothing about what landed. `AGENTS.md` records the trap; this module is
 //! where it is prevented.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -479,6 +480,18 @@ pub fn approval(answer: Option<&str>) -> Approval {
         Some(a) if a.trim().eq_ignore_ascii_case(APPROVE) => Approval::Merge,
         _ => Approval::Hold,
     }
+}
+
+/// What [`approval_gate`] found on one check of the owner's merge decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalGate {
+    /// The owner said [`APPROVE`]. Merge.
+    Approved,
+    /// The owner said anything else, the question timed out, or it was
+    /// closed with no decision recorded.
+    Held,
+    /// Filed and still waiting - the caller parks rather than blocking on it.
+    Pending,
 }
 
 /// Escape text for HTML, including both quote characters.
@@ -940,65 +953,111 @@ pub fn approval_panel(
 /// The evidence is gathered from the winner's own worktree with the `git` CLI,
 /// never from the network, so a phone on a slow link gets the diff magi is
 /// looking at rather than a link it has to go and open.
-async fn request_approval(state: &mut RunState, pr: &PrState, subject: &str) -> Result<Approval> {
-    let (worktree, head) = match state.winner() {
-        Some(w) => (w.worktree.clone(), w.branch.clone()),
-        None => (state.repo.clone(), "HEAD".to_owned()),
-    };
-    let base = state.base_branch.clone();
-    let range = format!("{base}...{head}");
-    // A failed `git` must not decide the merge: the panel degrades to less
-    // evidence and the owner still chooses. Merging because the diff could not
-    // be read would be the worst of both.
-    let numstat = git::git_raw(&worktree, &["diff", "--numstat", "-M", &range])
-        .await
-        .map(|o| o.stdout)
-        .unwrap_or_default();
-    let diff = git::diff(&worktree, &base, &head).await.unwrap_or_default();
-    let commits: Vec<String> = git::git_raw(
-        &worktree,
-        &[
-            "log",
-            "--reverse",
-            "--format=%s",
-            &format!("{base}..{head}"),
-        ],
-    )
-    .await
-    .map(|o| o.stdout)
-    .unwrap_or_default()
-    .lines()
-    .filter(|l| !l.trim().is_empty())
-    .map(str::to_owned)
-    .collect();
-
-    let w = words(&state.config.graph.language);
-    let html = approval_panel(state, pr, &numstat, &diff, &commits, subject);
+///
+/// Never blocks. `land` used to sit inside [`ask::ask_and_wait`]'s poll loop
+/// for up to a day right here, which held the whole run's task claim - and
+/// the daemon's one slot with it - for exactly as long as the owner took to
+/// notice their phone. [`ApprovalGate::Pending`] is the answer that lets the
+/// caller park the run and hand the slot back instead: the question is on
+/// disk either way, so nothing about the wait itself changes, only who is
+/// blocked on it.
+///
+/// Idempotent across resumes: called again for a run already waiting on its
+/// own question, this finds that question by [`crate::ask::Questions::list`]
+/// rather than filing a second one - asking twice would double the
+/// notification for one decision, and leave the first question's panel an
+/// orphan nobody's answer ever reaches.
+async fn approval_gate(state: &mut RunState, pr: &PrState, subject: &str) -> Result<ApprovalGate> {
     let store = ask::Questions::open();
-    let mut q = ask::Question::new(
-        state.id.clone(),
-        APPROVAL_NODE.to_owned(),
-        "land".to_owned(),
-        w.approval_summary(pr.number, subject),
-        w.approval_detail(&pr.url, &base, subject),
-        vec![APPROVE.to_owned(), HOLD.to_owned()],
-    );
-    store
-        .put_panel(&mut q, &html, &[])
-        .context("write the merge approval panel")?;
-    state.event("land", format!("asking for merge approval ({})", q.short()));
-    state.save()?;
+    let existing = store
+        .list()
+        .into_iter()
+        .filter(|q| q.run == state.id && q.node == APPROVAL_NODE)
+        .max_by(|a, b| a.id.cmp(&b.id));
 
-    let timeout = Duration::from_secs(state.config.graph.answer_timeout);
-    let said = ask::ask_and_wait(&mut q, &store, &state.config.notify, timeout).await?;
-    // The merge gate does not speak `--thread`: an owner who talks back
-    // instead of choosing has not approved anything, so it is treated the
-    // same as no answer at all and the safe default (hold) stands.
-    let answer = match said {
-        ask::Wait::Answered(a) => Some(a),
-        ask::Wait::Replied(_) | ask::Wait::Abandoned => None,
+    let q = match existing {
+        Some(q) => q,
+        None => {
+            let (worktree, head) = match state.winner() {
+                Some(w) => (w.worktree.clone(), w.branch.clone()),
+                None => (state.repo.clone(), "HEAD".to_owned()),
+            };
+            let base = state.base_branch.clone();
+            let range = format!("{base}...{head}");
+            // A failed `git` must not decide the merge: the panel degrades to
+            // less evidence and the owner still chooses. Merging because the
+            // diff could not be read would be the worst of both.
+            let numstat = git::git_raw(&worktree, &["diff", "--numstat", "-M", &range])
+                .await
+                .map(|o| o.stdout)
+                .unwrap_or_default();
+            let diff = git::diff(&worktree, &base, &head).await.unwrap_or_default();
+            let commits: Vec<String> = git::git_raw(
+                &worktree,
+                &[
+                    "log",
+                    "--reverse",
+                    "--format=%s",
+                    &format!("{base}..{head}"),
+                ],
+            )
+            .await
+            .map(|o| o.stdout)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_owned)
+            .collect();
+
+            let w = words(&state.config.graph.language);
+            let html = approval_panel(state, pr, &numstat, &diff, &commits, subject);
+            let mut fresh = ask::Question::new(
+                state.id.clone(),
+                APPROVAL_NODE.to_owned(),
+                "land".to_owned(),
+                w.approval_summary(pr.number, subject),
+                w.approval_detail(&pr.url, &base, subject),
+                vec![APPROVE.to_owned(), HOLD.to_owned()],
+            );
+            store
+                .put_panel(&mut fresh, &html, &[])
+                .context("write the merge approval panel")?;
+            store
+                .put(&mut fresh)
+                .context("file the merge approval question")?;
+            state.event(
+                "land",
+                format!("asking for merge approval ({})", fresh.short()),
+            );
+            state.save()?;
+            if let Err(e) = ask::notify(&state.config.notify, &fresh).await {
+                // A broken webhook is not a reason to lose the merge: the
+                // question is already on disk and the web UI already shows
+                // it, so the operator still has a way in.
+                tracing::warn!(
+                    "could not notify about merge approval question {}: {e:#} - \
+                     the web UI is the only surface for it now",
+                    fresh.short()
+                );
+            }
+            fresh
+        }
     };
-    Ok(approval(answer.as_deref()))
+
+    Ok(match q.status {
+        ask::QuestionStatus::Open => ApprovalGate::Pending,
+        // Nobody answered before `state.config.graph.answer_timeout` passed,
+        // or the question was closed with no decision recorded underneath
+        // this run - either way there is nothing left to wait on.
+        ask::QuestionStatus::Abandoned => ApprovalGate::Held,
+        // The merge gate does not speak `--thread`: an owner who talked back
+        // instead of choosing never reaches `Answered`, so this arm only
+        // ever sees an actual decision.
+        ask::QuestionStatus::Answered => match approval(q.resolution().as_deref()) {
+            Approval::Merge => ApprovalGate::Approved,
+            Approval::Hold => ApprovalGate::Held,
+        },
+    })
 }
 
 /// Parse `gh pr view --json url,number,state,statusCheckRollup,reviews,comments`
@@ -1229,6 +1288,35 @@ fn drop_spans(s: &str, open: &str, close: &str) -> String {
     out
 }
 
+/// The lock that keeps at most one run per repository actually moving the
+/// base branch at a time: a rebase push, or `gh pr merge`.
+///
+/// Deliberately narrow. Everything else in [`land`]'s loop - watching CI,
+/// running a fix round in the winner's own worktree, waiting on the owner's
+/// approval - touches nothing a *different* run in the same repository could
+/// collide with, and holding a lock across any of that would serialise one
+/// run's CI wait (up to [`WAIT_CEILING`]) against another run's land-approval
+/// resume, which is precisely the "must not wait on another task" property
+/// the daemon's slot-freeing exists to give a resume. Only the two moments
+/// that actually write to the shared base branch need mutual exclusion, and
+/// both are brief.
+///
+/// One entry per repository, each its own `tokio::sync::Mutex`, so two
+/// different repositories' runs never wait on each other. The outer
+/// `std::sync::Mutex` guards only the map itself, held long enough to find or
+/// insert an entry and clone its `Arc`, never across an `.await`.
+fn repo_merge_lock(repo: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<
+        std::sync::Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+    LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(repo.to_path_buf())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Run the loop against a real pull request until it merges or the budget runs
 /// out.
 ///
@@ -1249,6 +1337,14 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
     // budget away on a comment the fixer already declined with an argument.
     let mut shown: BTreeSet<String> = BTreeSet::new();
 
+    // Marks the run resumable through exactly this function, not through a
+    // fresh competition: `RunStatus::resumable` excludes only `Merged`,
+    // `Ready` and `Failed`, and `merge`'s own re-entry guard looks for this
+    // status specifically to know a resumed run belongs back in `land`
+    // rather than at a second `gh pr create`. Set on every entry - fresh or
+    // resumed - because a resume that parked here again must keep reading
+    // `Landing`, not whatever a first pass through `merge` left behind.
+    state.status = RunStatus::Landing;
     state.event("land", format!("watching {pr_url}"));
     state.save()?;
 
@@ -1303,20 +1399,43 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                 let subject = merge_subject(&seen.title, &state.instruction);
                 // The owner sees the panel before the one irreversible step,
                 // and an unanswered question is a hold: silence never merges.
-                if state.config.graph.land_approval
-                    && request_approval(state, &pr, &subject).await? == Approval::Hold
-                {
-                    stop(
-                        state,
-                        &repo,
-                        &pr,
-                        "the owner did not approve the merge (held or unanswered)",
-                    )
-                    .await?;
-                    return Ok(pr);
+                if state.config.graph.land_approval {
+                    match approval_gate(state, &pr, &subject).await? {
+                        ApprovalGate::Approved => {}
+                        ApprovalGate::Held => {
+                            stop(
+                                state,
+                                &repo,
+                                &pr,
+                                "the owner did not approve the merge (held or unanswered)",
+                            )
+                            .await?;
+                            return Ok(pr);
+                        }
+                        // Filed (or still standing from an earlier visit) and
+                        // not yet answered. Park here rather than wait: the
+                        // question survives on disk, the daemon hands this
+                        // run's slot to something else, and a later resume
+                        // re-enters `land`, finds the same question, and
+                        // either merges or stops depending on what it says
+                        // by then.
+                        ApprovalGate::Pending => {
+                            state.parked = true;
+                            state.event(
+                                "land",
+                                "parked awaiting merge approval - resumes once answered",
+                            );
+                            state.save()?;
+                            return Ok(pr);
+                        }
+                    }
                 }
                 let argv = merge_argv(pr.number, &subject);
-                let out = gh(&repo, &argv).await?;
+                let out = {
+                    let merge_lock = repo_merge_lock(&repo);
+                    let _merge_slot = merge_lock.lock().await;
+                    gh(&repo, &argv).await?
+                };
                 if out.0 {
                     state.status = RunStatus::Merged;
                     state.merge = Some(MergeOutcome {
@@ -1387,7 +1506,11 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                 let onto = format!("origin/{base}");
                 match git::rebase_branch_in_temp(&repo, &scratch, &branch, &onto).await {
                     Ok(None) => {
-                        let pushed = git::push_rewritten(&repo, "origin", &branch).await?;
+                        let pushed = {
+                            let merge_lock = repo_merge_lock(&repo);
+                            let _merge_slot = merge_lock.lock().await;
+                            git::push_rewritten(&repo, "origin", &branch).await?
+                        };
                         if !pushed.ok() {
                             let why = format!(
                                 "rebased {branch} but could not push it: {}",
@@ -2877,6 +3000,35 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         );
     }
 
+    #[tokio::test]
+    async fn the_merge_lock_serialises_one_repository_but_never_a_different_one() {
+        let a = std::path::PathBuf::from("/repo/a");
+        let b = std::path::PathBuf::from("/repo/b");
+
+        let held = repo_merge_lock(&a).lock_owned().await;
+
+        // A second, concurrent land run against the *same* repository must
+        // wait - `try_lock` fails while `held` is alive.
+        assert!(
+            repo_merge_lock(&a).try_lock().is_err(),
+            "a second merge into the same repository must not proceed concurrently"
+        );
+
+        // A run against a *different* repository must not be blocked by it -
+        // this is what keeps a slow rebase or `gh pr merge` in one
+        // repository from also stalling a land-approval resume in another.
+        assert!(
+            repo_merge_lock(&b).try_lock().is_ok(),
+            "a different repository's merge lock must be independent"
+        );
+
+        drop(held);
+        assert!(
+            repo_merge_lock(&a).try_lock().is_ok(),
+            "the lock is released once the holder is done"
+        );
+    }
+
     #[test]
     fn only_the_merge_choice_merges_and_silence_holds() {
         let table = [
@@ -2894,6 +3046,119 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 "answer {answer:?} must resolve to {want:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_first_visit_to_the_merge_gate_files_a_question_and_returns_pending_at_once() {
+        crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
+        let mut state = run_state();
+        state.config.graph.land_approval = true;
+        let pr = green_pr();
+
+        let gate = approval_gate(&mut state, &pr, "feat: x").await.unwrap();
+        assert_eq!(gate, ApprovalGate::Pending, "nobody has answered yet");
+        assert!(
+            !state.parked,
+            "approval_gate itself never sets `parked`; only its caller does"
+        );
+
+        let store = ask::Questions::open();
+        let filed: Vec<_> = store
+            .list()
+            .into_iter()
+            .filter(|q| q.run == state.id)
+            .collect();
+        assert_eq!(filed.len(), 1, "exactly one question is filed");
+        assert_eq!(filed[0].node, APPROVAL_NODE);
+        assert_eq!(filed[0].choices, vec![APPROVE.to_owned(), HOLD.to_owned()]);
+        assert!(filed[0].status.open());
+
+        // A second visit - standing in for a resumed run whose slot the
+        // daemon handed to something else while nobody had answered - must
+        // find the same question rather than filing a second one.
+        let again = approval_gate(&mut state, &pr, "feat: x").await.unwrap();
+        assert_eq!(again, ApprovalGate::Pending);
+        let still_one = store
+            .list()
+            .into_iter()
+            .filter(|q| q.run == state.id)
+            .count();
+        assert_eq!(
+            still_one, 1,
+            "asking twice must not double-file the question"
+        );
+    }
+
+    #[tokio::test]
+    async fn approving_the_existing_question_is_read_back_as_approved() {
+        crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
+        let mut state = run_state();
+        state.config.graph.land_approval = true;
+        let pr = green_pr();
+        assert_eq!(
+            approval_gate(&mut state, &pr, "feat: x").await.unwrap(),
+            ApprovalGate::Pending
+        );
+
+        let store = ask::Questions::open();
+        let mut q = store
+            .list()
+            .into_iter()
+            .find(|q| q.run == state.id)
+            .expect("filed above");
+        q.answer(ask::Answer::Choice(APPROVE.to_owned())).unwrap();
+        store.put(&mut q).unwrap();
+
+        assert_eq!(
+            approval_gate(&mut state, &pr, "feat: x").await.unwrap(),
+            ApprovalGate::Approved
+        );
+    }
+
+    #[tokio::test]
+    async fn holding_or_abandoning_the_existing_question_is_read_back_as_held() {
+        crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
+        let store = ask::Questions::open();
+
+        let mut held_state = run_state();
+        held_state.config.graph.land_approval = true;
+        let pr = green_pr();
+        approval_gate(&mut held_state, &pr, "feat: x")
+            .await
+            .unwrap();
+        let mut q = store
+            .list()
+            .into_iter()
+            .find(|q| q.run == held_state.id)
+            .expect("filed above");
+        q.answer(ask::Answer::Choice(HOLD.to_owned())).unwrap();
+        store.put(&mut q).unwrap();
+        assert_eq!(
+            approval_gate(&mut held_state, &pr, "feat: x")
+                .await
+                .unwrap(),
+            ApprovalGate::Held
+        );
+
+        let mut abandoned_state = run_state();
+        abandoned_state.config.graph.land_approval = true;
+        approval_gate(&mut abandoned_state, &pr, "feat: x")
+            .await
+            .unwrap();
+        let mut q = store
+            .list()
+            .into_iter()
+            .find(|q| q.run == abandoned_state.id)
+            .expect("filed above");
+        q.abandon("no answer within the timeout");
+        store.put(&mut q).unwrap();
+        assert_eq!(
+            approval_gate(&mut abandoned_state, &pr, "feat: x")
+                .await
+                .unwrap(),
+            ApprovalGate::Held,
+            "silence must never merge"
+        );
     }
 
     #[test]
