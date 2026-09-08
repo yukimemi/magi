@@ -1,7 +1,20 @@
-//! The disk janitor: finished runs get their worktrees folded and the shared
-//! build cache is pruned to its cap. A run whose state magi cannot read is
-//! left alone here — see [`fold_due`] — and is only ever removed by an
-//! explicit operator action (`magi fold`, or the equivalent phone route).
+//! The disk janitor: finished runs get their worktrees folded, worktrees whose
+//! run record is already gone get reclaimed too, and the shared build cache is
+//! pruned to its cap.
+//!
+//! A run's state being written by an older schema is not the same thing as it
+//! being unreadable, and this module used to conflate the two: [`fold_due`]
+//! treated any `run.json` its version check rejected exactly like one that
+//! failed to parse at all, so a single schema bump silently stopped every
+//! automatic fold in the fleet the moment it shipped, and did so with no
+//! counter and no log line to say so. A record magi genuinely cannot parse —
+//! missing fields, broken JSON, a schema newer than this build has ever heard
+//! of — is still left alone here, still counted in
+//! [`Housekeeping::unreadable`], and still only ever removed by an explicit
+//! operator action (`magi fold`, or the equivalent phone route). One written
+//! by a schema this build merely disagrees with the *meaning* of is not that:
+//! as long as it still parses, folding proceeds regardless of the number in
+//! its `schema` field.
 //!
 //! Everything policy-shaped — which statuses are foldable, how long a finished
 //! run is left alone, whether the cache is over its limit — is a pure function
@@ -26,12 +39,19 @@ use crate::disk::{Prune, dir_size, prune_dir};
 pub struct Housekeeping {
     /// Runs folded (worktrees dropped).
     pub folded: usize,
-    /// Unused: automatic housekeeping never removes a run whose state it
-    /// cannot read (see [`fold_due`]), so this is always `0`. Kept on the
-    /// struct because [`crate::daemon`] already reports it and a run that
-    /// changes the shape of this type is a bigger diff than leaving a field
-    /// that is honest about counting nothing.
+    /// Runs [`fold_due`] left alone because their `run.json` genuinely could
+    /// not be read - missing, broken JSON, a schema this build has never
+    /// heard of - as opposed to one merely written by a different schema
+    /// number, which is folded like any other (see the module docs). This was
+    /// defined but never incremented for a long stretch of this module's
+    /// history, which is exactly how 90 of 93 runs sat unfolded on one
+    /// operator's machine with nothing anywhere saying why: every one of them
+    /// was misclassified as unreadable by a schema check that has since been
+    /// narrowed to only the runs that actually are.
     pub unreadable: usize,
+    /// Worktrees under the worktree bay reclaimed because no run record in
+    /// `runs/` claims them anymore (see [`fold_orphaned_worktrees`]).
+    pub orphaned_worktrees: usize,
     /// Files dropped from the shared cache.
     pub cache_files: usize,
     /// Bytes freed from the shared cache.
@@ -41,23 +61,36 @@ pub struct Housekeeping {
     pub questions_abandoned: usize,
 }
 
-/// Run the janitor: fold due runs, then prune the cache if it is over its cap.
+/// Run the janitor: fold due runs, reclaim orphaned worktrees, prune stale
+/// worktree registrations, then prune the cache if it is over its cap.
 ///
-/// Both halves are best-effort; a jammed cache lock or a run whose worktree
-/// another borrower holds must not stop the other half. Errors are reported
-/// through `tracing::warn` - this is housekeeping, and the daemon keeps
-/// serving either way.
+/// Every part is best-effort; a jammed cache lock or a run whose worktree
+/// another borrower holds must not stop the rest. Errors are reported through
+/// `tracing::warn` - this is housekeeping, and the daemon keeps serving
+/// either way.
 pub async fn housekeep(
     cfg: &crate::config::Config,
     home: &Path,
     worktrees_root: &Path,
+    repo: &Path,
     now: Timestamp,
 ) -> Housekeeping {
     let mut out = Housekeeping::default();
     if cfg.disk.auto_fold {
-        match fold_due(&home.join("runs"), home, worktrees_root, &cfg.disk, now).await {
-            Ok(folded) => out.folded = folded,
+        let runs = home.join("runs");
+        match fold_due(&runs, home, worktrees_root, &cfg.disk, now).await {
+            Ok((folded, unreadable)) => {
+                out.folded = folded;
+                out.unreadable = unreadable;
+            }
             Err(e) => tracing::warn!("housekeep: fold due runs: {e:#}"),
+        }
+        out.orphaned_worktrees = fold_orphaned_worktrees(&runs, worktrees_root, home, now).await;
+        // Best-effort in the same sense as everything else here: a repository
+        // this janitor pass has nothing to do with (or none at all, in a unit
+        // test) must not turn a `warn` into a reason to skip the rest.
+        if let Err(e) = crate::git::worktree_prune(repo).await {
+            tracing::warn!("housekeep: prune worktree registrations: {e:#}");
         }
     }
     // A cap of `0` is the operator's opt-out (see `Disk::cache_limit_bytes`);
@@ -119,16 +152,24 @@ pub fn abandon_settled_questions(store: &Questions, runs: &Path) -> usize {
 }
 
 /// Fold every run that is finished, older than the grace period, and not being
-/// worked on; count them.
+/// worked on; return `(folded, unreadable)`.
 ///
-/// A run that magi can no longer read — a state file from another schema, a
-/// half-written `run.json` — is left exactly as it is. Automatic housekeeping
-/// cannot tell a mid-write file from one that will never parse again, and
-/// `<home>/runs/<id>/` is the evidence `magi stats` and the deck read; when
-/// unsure whether it is safe to touch, the janitor keeps rather than deletes
-/// (see the module docs). Discarding a record this unreadable is an explicit
-/// operator action (`magi fold`, or the equivalent phone route), never
-/// something that happens unattended.
+/// A run whose `run.json` genuinely cannot be parsed — missing fields, broken
+/// JSON, a schema newer than this build has ever heard of — is left exactly
+/// as it is. Automatic housekeeping cannot tell a mid-write file from one that
+/// will never parse again, and `<home>/runs/<id>/` is the evidence `magi
+/// stats` and the deck read; when unsure whether it is safe to touch, the
+/// janitor keeps rather than deletes (see the module docs). Discarding a
+/// record this unreadable is an explicit operator action (`magi fold`, or the
+/// equivalent phone route), never something that happens unattended. Every
+/// such skip is counted in the returned `unreadable` and logged through
+/// `tracing::warn` with the parse failure that caused it - silence here is
+/// exactly the failure mode that let 90 of 93 runs sit unfolded with nothing
+/// to show for it.
+///
+/// A run merely written by a *different* schema number is not unreadable: as
+/// long as `run.json` still parses, it folds like any other terminal run (see
+/// the module docs for why the two are different questions).
 ///
 /// Runnable statuses and runs newer than the grace period are also left
 /// alone; folding them would throw away work that is still the answer to
@@ -140,8 +181,9 @@ pub async fn fold_due(
     _worktrees_root: &Path,
     disk: &Disk,
     now: Timestamp,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     let mut folded = 0usize;
+    let mut unreadable = 0usize;
     let mut ids: Vec<String> = std::fs::read_dir(runs)
         .into_iter()
         .flatten()
@@ -154,19 +196,40 @@ pub async fn fold_due(
         if crate::daemon::is_working_on(home, &id, now) {
             continue;
         }
-        let Ok(meta) = read_meta(runs, &id) else {
-            continue;
+        let meta = match read_meta(runs, &id) {
+            Ok(meta) => meta,
+            Err(e) => {
+                unreadable += 1;
+                tracing::warn!("housekeep: run {id} unreadable, left alone: {e:#}");
+                continue;
+            }
         };
         if meta.status.resumable() || !due(now, meta.updated_at, disk.fold_grace_secs) {
             continue;
         }
-        // `read_meta` only demands `status` and `updated_at`, which an older
-        // schema's `run.json` can still supply; the stricter schema check in
-        // `read_state` can still fail here. That must not cost every other
-        // run its turn through this loop, so it is a skip, not a `?`.
-        let Ok(mut state) = read_state(runs, &id) else {
-            continue;
+        // `read_meta` already proved the file parses; `read_state` asks for
+        // the rest of the fields `graph::fold_run` needs (worktree paths,
+        // candidates, tally). A schema mismatch alone does not fail this -
+        // see the module docs - so reaching `Err` here means the JSON itself
+        // is broken in a way `read_meta` did not exercise, which is rare but
+        // not impossible (a body truncated between the two fields it reads
+        // and the rest). That must not cost every other run its turn through
+        // this loop, so it is a skip, not a `?`.
+        let mut state = match read_state(runs, &id) {
+            Ok(state) => state,
+            Err(e) => {
+                unreadable += 1;
+                tracing::warn!("housekeep: run {id} unreadable, left alone: {e:#}");
+                continue;
+            }
         };
+        if state.schema != SCHEMA {
+            tracing::info!(
+                "housekeep: run {id} was written by schema {} (this build speaks {SCHEMA}); \
+                 folding it anyway",
+                state.schema
+            );
+        }
         let drop_winner = state.status == RunStatus::Merged;
         // One run's fold must not cost every later run its turn. A worktree
         // another borrower holds, a branch git refuses to delete, a repository
@@ -179,7 +242,7 @@ pub async fn fold_due(
             Err(e) => tracing::warn!("housekeep: fold {id}: {e:#}"),
         }
     }
-    Ok(folded)
+    Ok((folded, unreadable))
 }
 
 /// Is `updated` old enough, measured against `now`, that the run may fold?
@@ -211,24 +274,26 @@ fn read_meta(runs: &Path, id: &str) -> Result<Meta> {
     Ok(meta)
 }
 
-/// Read and version-check a whole run state from a runs directory.
+/// Read a whole run state from a runs directory, for folding only.
 ///
-/// Mirrors [`RunState::load`] but against an explicit directory rather than
-/// the process-global home.
+/// Deliberately more permissive than [`RunState::load`], which this does not
+/// call: `load` backs `--resume` and every hand-driven command, where a
+/// schema this build disagrees with the *meaning* of must refuse outright
+/// rather than resume a review round or a tally against stale semantics
+/// (`RunState::SCHEMA`'s own docs list what has changed meaning at each
+/// bump). Folding recomputes nothing - it only reads worktree paths, branch
+/// names and a tally winner off the struct to remove them - so an old
+/// schema's values are exactly as good here as a current one's; every schema
+/// bump so far has only ever added a field or a variant, never repurposed an
+/// existing one, and serde already fills an added field's default when an
+/// older record has nothing to say about it. What this cannot tolerate, and
+/// what still surfaces as an `Err`, is `run.json` failing to parse at all.
 fn read_state(runs: &Path, id: &str) -> Result<RunState> {
     let path = runs.join(id).join("run.json");
     let body =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let state: RunState =
         serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
-    if state.schema != SCHEMA {
-        bail!(
-            "run {} was written by a different magi (schema {}, this build \
-             speaks {SCHEMA})",
-            state.id,
-            state.schema
-        );
-    }
     Ok(state)
 }
 
@@ -266,6 +331,68 @@ pub async fn fold_unreadable(runs: &Path, worktrees_root: &Path, id: &str) -> Re
         removed.push(wt.to_string_lossy().into_owned());
     }
     Ok(removed)
+}
+
+/// Reclaim worktrees under `worktrees_root` that no run record in `runs`
+/// claims anymore, and return how many were removed.
+///
+/// [`fold_due`] only ever sees a worktree by walking `runs/` first, so a
+/// worktree whose run record is already gone — `magi run rm`, or a record
+/// deleted before its worktree — never enters that loop at all: nothing there
+/// is looking for it. This walks the worktree bay directly instead, and
+/// removes any `<short>` directory that no run id maps to.
+///
+/// The one failure this must never cause is deleting the worktree of a run
+/// that is genuinely in flight but has not written its first `run.json` yet -
+/// the gap between the daemon claiming a task and `RunState::new` saving
+/// state for the first time. [`crate::daemon::is_working_on_short`] is the
+/// same liveness check [`fold_due`] trusts everywhere else in this module,
+/// checked by short id because there is no full id to compare here; when it
+/// cannot tell, this leaves the directory alone. Best-effort like the rest of
+/// housekeeping: one directory git or the filesystem refuses to give up is a
+/// `tracing::warn`, not a reason to abandon the rest of the pass.
+pub async fn fold_orphaned_worktrees(
+    runs: &Path,
+    worktrees_root: &Path,
+    home: &Path,
+    now: Timestamp,
+) -> usize {
+    let known: std::collections::HashSet<String> = std::fs::read_dir(runs)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| crate::run::is_run_id(name))
+        .map(|id| short_of(&id).to_owned())
+        .collect();
+
+    let mut folded = 0usize;
+    for entry in std::fs::read_dir(worktrees_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let short = entry.file_name().to_string_lossy().into_owned();
+        if known.contains(&short) || crate::daemon::is_working_on_short(home, &short, now) {
+            continue;
+        }
+        let wt = entry.path();
+        crate::git::remove_worktree_from_linked(&wt).await;
+        for e in std::fs::read_dir(&wt).into_iter().flatten().flatten() {
+            crate::git::remove_worktree_from_linked(&e.path()).await;
+        }
+        match std::fs::remove_dir_all(&wt) {
+            Ok(()) => folded += 1,
+            Err(e) => tracing::warn!(
+                "housekeep: remove orphaned worktree {}: {e:#}",
+                wt.display()
+            ),
+        }
+    }
+    folded
 }
 
 /// Resolve an id or prefix against an explicit runs directory, exactly the way
@@ -478,14 +605,14 @@ mod tests {
     }
 
     #[test]
-    fn fold_due_skips_fresh_runnable_and_unreadable_but_folds_a_due_terminal_run() {
+    fn fold_due_folds_terminal_runs_of_any_schema_but_leaves_genuinely_unreadable_ones() {
         let dir = tempfile::tempdir().unwrap();
         let runs = dir.path().join("runs");
         let wt = dir.path().join("wt");
         let home = dir.path().to_path_buf();
         let disk = Disk::default();
         let now = ts("2026-09-05T00:00:00Z");
-        // `graph::fold_run` (invoked below for the due, readable run) saves
+        // `graph::fold_run` (invoked below for the due, readable runs) saves
         // through the process-global home; pinning it to this test's own
         // directory is what keeps that write off the operator's real one (see
         // `run::home`'s doc). Harmless if another test already pinned it
@@ -496,48 +623,103 @@ mod tests {
         let judging = "20260801-000000-0001";
         write_meta(&runs, judging, "judging", "2026-08-01T00:00:00Z");
 
-        // 2. Finished but fresh: grace not elapsed.
-        let ready_fresh = "20260904-000000-0002";
-        write_meta(&runs, ready_fresh, "ready", "2026-09-04T00:00:00Z");
+        // 2. Finished but fresh: grace not elapsed. Within the default 6h
+        //    grace of `now`, so `fold_due` must stop at the freshness check
+        //    and never even reach `read_state` - `write_meta`'s minimal JSON
+        //    would fail that full parse anyway, and this case exists to
+        //    prove freshness is why the run survives, not an accident of the
+        //    fixture being unparseable as a whole `RunState`.
+        let ready_fresh = "20260904-220000-0002";
+        write_meta(&runs, ready_fresh, "ready", "2026-09-04T22:00:00Z");
 
-        // 3. Unreadable: left alone. Automatic housekeeping never deletes a
-        //    run record it cannot parse (see `fold_due`'s docs); that is an
-        //    explicit operator action, not something a background pass does.
+        // 3. Genuinely unreadable: broken JSON, not merely an unfamiliar
+        //    schema number. Left alone and counted - this is the one case
+        //    automatic housekeeping must never touch (see `fold_due`'s docs);
+        //    discarding it is an explicit operator action, not something a
+        //    background pass does.
         let garbage = "20260901-000000-0004";
         std::fs::create_dir_all(runs.join(garbage)).unwrap();
         std::fs::write(runs.join(garbage).join("run.json"), "not json").unwrap();
         std::fs::create_dir_all(wt.join("0004")).unwrap();
 
-        // 4. Finished, well past grace, and readable: this is the one run
-        //    `fold_due` should actually act on.
-        let due_ready = "20260801-000000-ffff";
-        let mut ready_state = RunState::new(
-            PathBuf::from("/nonexistent/repo"),
-            "main".to_owned(),
-            "0000000000000000000000000000000000000000".to_owned(),
-            String::new(),
-            crate::config::Config::default(),
-        );
-        ready_state.id = due_ready.to_owned();
-        ready_state.status = RunStatus::Ready;
-        ready_state.updated_at = ts("2026-08-01T00:00:00Z");
-        std::fs::create_dir_all(runs.join(due_ready)).unwrap();
-        std::fs::write(
-            runs.join(due_ready).join("run.json"),
-            serde_json::to_string_pretty(&ready_state).unwrap(),
-        )
-        .unwrap();
+        // 4. Finished, well past grace, current schema: the ordinary case
+        //    `fold_due` has always acted on.
+        let due_ready = due_run(&runs, "20260801-000000-ffff", SCHEMA);
 
-        let folded = block_on(fold_due(&runs, &home, &wt, &disk, now)).expect("fold_due");
-        assert_eq!(folded, 1, "only the due, readable run");
+        // 5. Finished, well past grace, but written by a schema number this
+        //    build no longer matches - the defect this task exists to fix.
+        //    It still parses cleanly, so only the version number differs, and
+        //    that alone must not block folding.
+        let due_old_schema = due_run(&runs, "20260801-000000-eeee", SCHEMA - 1);
+
+        let (folded, unreadable) =
+            block_on(fold_due(&runs, &home, &wt, &disk, now)).expect("fold_due");
+        assert_eq!(
+            folded, 2,
+            "both due, parseable runs fold regardless of their schema number"
+        );
+        assert_eq!(
+            unreadable, 1,
+            "only the run with broken JSON counts as unreadable"
+        );
         assert!(runs.join(judging).exists(), "runnable never folded");
         assert!(runs.join(ready_fresh).exists(), "fresh never folded");
         assert!(runs.join(garbage).exists(), "unreadable record kept");
         assert!(wt.join("0004").exists(), "unreadable worktree kept");
         assert!(
-            runs.join(due_ready).exists(),
+            runs.join(&due_ready).exists(),
             "folding drops worktrees, not the record"
         );
+        assert!(
+            runs.join(&due_old_schema).exists(),
+            "an old-schema record survives its fold exactly like a current one"
+        );
+    }
+
+    #[test]
+    fn fold_orphaned_worktrees_removes_only_worktrees_no_run_claims_and_none_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+        let now = ts("2026-09-05T00:00:00Z");
+
+        // A run record exists for this one: its worktree is claimed, not
+        // orphaned, however old the record.
+        write_meta(
+            &runs,
+            "20260801-000000-aaaa",
+            "ready",
+            "2026-08-01T00:00:00Z",
+        );
+        std::fs::create_dir_all(wt.join("aaaa").join("cand-A")).unwrap();
+
+        // No run record at all, and nobody is working on it: this is the
+        // leftover `fold_due` can never see, because it only ever walks
+        // `runs/`.
+        std::fs::create_dir_all(wt.join("bbbb").join("cand-A")).unwrap();
+
+        // No run record either, but a live daemon status names a run with
+        // this short id - the save-timing gap between the daemon claiming a
+        // task and `RunState::new` writing its first `run.json`. Must survive
+        // untouched.
+        std::fs::create_dir_all(wt.join("cccc")).unwrap();
+        let mut status = crate::daemon::Status::new();
+        status.current = vec![crate::daemon::Current {
+            task: "20260905-000000-t111".to_owned(),
+            run: "20260905-000000-cccc".to_owned(),
+        }];
+        status.updated_at = now;
+        crate::daemon::write_status_to(&home.join("daemon.json"), &status).unwrap();
+
+        let folded = block_on(fold_orphaned_worktrees(&runs, &wt, &home, now));
+        assert_eq!(
+            folded, 1,
+            "only the truly orphaned, idle worktree is removed"
+        );
+        assert!(wt.join("aaaa").exists(), "claimed by a run record");
+        assert!(!wt.join("bbbb").exists(), "orphaned and idle: reclaimed");
+        assert!(wt.join("cccc").exists(), "a run in flight is never touched");
     }
 
     /// A fresh open question on `run`, stored and handed back for assertions.
@@ -649,5 +831,30 @@ mod tests {
             r#"{{"schema": {SCHEMA}, "id": "{id}", "repo": "/nonexistent/repo", "base_branch": "main", "base_commit": "0000000000000000000000000000000000000000", "instruction": "", "created_at": "{day}T00:00:00Z", "updated_at": "{updated_at}", "status": "{status}", "seed": 1}}"#
         );
         std::fs::write(runs.join(id).join("run.json"), body).unwrap();
+    }
+
+    /// Write a fully-formed, `Ready`, well-past-grace `run.json` tagged with
+    /// an arbitrary schema number - so a test can write one this build's own
+    /// `RunState::new` could never produce on its own. Returns the id.
+    fn due_run(runs: &Path, id: &str, schema: u32) -> String {
+        let mut state = RunState::new(
+            PathBuf::from("/nonexistent/repo"),
+            "main".to_owned(),
+            "0000000000000000000000000000000000000000".to_owned(),
+            String::new(),
+            crate::config::Config::default(),
+        );
+        state.id = id.to_owned();
+        state.status = RunStatus::Ready;
+        state.updated_at = ts("2026-08-01T00:00:00Z");
+        let mut value = serde_json::to_value(&state).unwrap();
+        value["schema"] = serde_json::json!(schema);
+        std::fs::create_dir_all(runs.join(id)).unwrap();
+        std::fs::write(
+            runs.join(id).join("run.json"),
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        id.to_owned()
     }
 }

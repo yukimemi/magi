@@ -924,6 +924,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 max_attempts,
                 once,
                 merge: merge.map(|m| m.as_str().to_owned()),
+                worktrees_root: None,
             })
             .await
         }

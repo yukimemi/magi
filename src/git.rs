@@ -168,6 +168,18 @@ pub async fn remove_worktree_from_linked(dir: &Path) {
     let _ = git_raw(dir, &["--git-dir", &common_s, "worktree", "prune"]).await;
 }
 
+/// Drop registrations for worktrees whose directory is already gone.
+///
+/// `git worktree remove` already does this for the path it just removed, but
+/// a directory deleted by hand - [`crate::clean::fold_orphaned_worktrees`], or
+/// an operator's own `rm -rf` - leaves the registration behind, and a
+/// registered path refuses a fresh `worktree add` until something prunes it.
+/// The operator's own machine had 31 such registrations sitting in one
+/// repository, all of them for directories that no longer existed.
+pub async fn worktree_prune(repo: &Path) -> Result<()> {
+    git(repo, &["worktree", "prune"]).await.map(|_| ())
+}
+
 /// Delete a branch, ignoring "not found".
 pub async fn branch_delete(repo: &Path, branch: &str) -> Result<bool> {
     Ok(git_raw(repo, &["branch", "-D", branch]).await?.ok())

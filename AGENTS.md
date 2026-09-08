@@ -975,6 +975,23 @@ Housekeeping is best-effort by construction: one run's fold failure is a
 `tracing::warn` and the pass continues (`clean::fold_due`). A `?` there stopped
 automatic folding permanently at the first run git refused to let go of.
 
+**A different schema number is not "unreadable", and conflating the two once
+stopped the janitor fleet-wide.** `clean::fold_due` used to require a full
+`RunState` to pass the same schema check `RunState::load` enforces for
+`--resume`, and treated any mismatch as unreadable - silently skipped, not
+counted, not logged. The moment magi's own `run::SCHEMA` bumped, every run
+still on disk failed that check at once: on one operator's machine this was
+90 of 93 runs, folding 0 per pass, for months, with nothing anywhere saying
+so (`Housekeeping::unreadable` was defined but never incremented). The fix
+narrows "unreadable" to what `RunState::load` cannot do at all - `run.json`
+failing to parse - because folding only ever reads worktree paths, branch
+names and a tally winner off the struct, and every schema bump so far has
+only added a field or a variant, never repurposed one; an old record's values
+are exactly as good for that purpose as a current one's. `RunState::load`
+itself keeps the strict check, because *its* callers (`--resume`, the review
+loop, the tally) do recompute against a field's current meaning and must not
+guess at a value an older schema never had a chance to mean correctly.
+
 ### Never take a port you did not check
 
 A UI verification fixture was started on **8791** in a temp directory, and that

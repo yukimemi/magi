@@ -171,6 +171,13 @@ async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task() {
         config: Some(config_path),
         once: true,
         poll: Duration::from_millis(20),
+        // `once: true` drains to idle and back out, and the idle branch runs
+        // the janitor unconditionally. Left at the default `None` this would
+        // have it reclaim worktrees under the operator's real
+        // `crate::run::default_worktree_root()` on every run of this test,
+        // exactly like `fx.config.graph.worktree_root` already keeps a run's
+        // own worktrees off that same real directory.
+        worktrees_root: Some(fx.tmp.path().join("wt")),
         ..Opts::default()
     };
     tokio::time::timeout(Duration::from_secs(60), daemon::serve(opts))
@@ -251,6 +258,13 @@ async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own() {
         config: Some(config_path),
         once: true,
         poll: Duration::from_millis(20),
+        // `once: true` drains to idle and back out, and the idle branch runs
+        // the janitor unconditionally. Left at the default `None` this would
+        // have it reclaim worktrees under the operator's real
+        // `crate::run::default_worktree_root()` on every run of this test,
+        // exactly like `fx.config.graph.worktree_root` already keeps a run's
+        // own worktrees off that same real directory.
+        worktrees_root: Some(fx.tmp.path().join("wt")),
         ..Opts::default()
     };
     tokio::time::timeout(Duration::from_secs(60), daemon::serve(opts))

@@ -438,6 +438,13 @@ impl Ui {
         let opts = daemon::Opts {
             repo: self.repo.clone(),
             merge: self.merge.clone(),
+            // Whatever this `Ui` already reports worktree sizes and folds
+            // against (see `with_worktrees_root`) is what the loop it starts
+            // must reclaim orphaned worktrees under too - two different
+            // opinions about where the worktree bay is would leave the
+            // janitor pass reclaiming a directory nothing else on this
+            // process is even looking at.
+            worktrees_root: Some(self.worktrees_root.clone()),
             ..daemon::Opts::default()
         };
         let launch = self.launch;
