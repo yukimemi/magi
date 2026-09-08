@@ -56,18 +56,19 @@ use crate::queue::{self, Queue, Source, Task};
 /// meaning without a bump here is a front end that lies silently.
 pub const SCHEMA: u32 = 1;
 
-/// Wall-clock limit for one agent turn.
+/// Wall-clock limit for one agent turn. See [`crate::config::Graph::timeout_chat`].
 ///
-/// Five minutes, and the number is borrowed rather than invented: it is `agy`'s
-/// own default `--print-timeout`, the one place a CLI vendor has published an
-/// opinion about how long a single non-interactive answer should take. It fits
-/// what a turn actually is - read a few files, ask one question - and it is far
-/// below an implementation node's budget, which is correct: nobody is watching
-/// an implementer, whereas here an operator is holding a phone with a spinner
-/// on it. A turn that has not answered in five minutes is a wedged CLI, not a
-/// thinking one, and the operator needs to be told that while they are still
-/// looking at the screen.
-const TURN_TIMEOUT: Duration = Duration::from_secs(300);
+/// An hour by default, not the five minutes this used to be. The short
+/// timeout assumed an operator holding a phone with a spinner on it, who
+/// needed to be told a turn was wedged while they were still looking at the
+/// screen. That is no longer how this gets used: the operator starts another
+/// conversation while this one thinks and comes back to it later, so the
+/// time a turn takes is no longer time spent waiting - it is only a seat
+/// held, which is cheap. What still needs a bound is a genuinely wedged CLI,
+/// and an hour is generous enough to not be that.
+fn turn_timeout(cfg: &Config) -> Duration {
+    Duration::from_secs(cfg.graph.timeout_chat)
+}
 
 /// Seat name for the interviewing agent.
 ///
@@ -874,7 +875,7 @@ async fn turn(
     let inv = Invocation {
         cwd: &chat.repo,
         prompt: &body,
-        timeout: TURN_TIMEOUT,
+        timeout: turn_timeout(cfg),
         // The interviewer writes a task file into its reply, never into the
         // repository: the competing agents do the implementation, and a
         // repository the planner has already edited makes their diffs
@@ -918,7 +919,7 @@ async fn turn(
             let why = format!(
                 "agent `{}` did not answer within {}s; your message is saved",
                 chat.agent,
-                TURN_TIMEOUT.as_secs()
+                turn_timeout(cfg).as_secs()
             );
             (note(why.clone()), Some(why))
         }
@@ -2247,6 +2248,46 @@ mod tests {
             path.is_absolute(),
             "must be absolute even off a relative store root: {}",
             path.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_past_the_configured_chat_timeout_is_reported_with_that_timeout() {
+        // `[graph] timeout_chat` must be the number this module actually
+        // waits, not a leftover hardcoded five minutes - so the mock sleeps
+        // past a deliberately tiny override and the failure note is checked
+        // against that same override, not the old default.
+        let (tmp, chats) = store();
+        let slow = mock_agent(
+            tmp.path(),
+            "#!/bin/sh\ncat >/dev/null\nsleep 2\n",
+            BTreeMap::new(),
+        );
+        let mut cfg = config(slow);
+        cfg.graph.timeout_chat = 1;
+
+        let err = start(
+            &chats,
+            &cfg,
+            tmp.path().to_owned(),
+            "add durations",
+            None,
+            None,
+        )
+        .await
+        .expect_err("a turn that never answers is an error");
+        assert!(
+            err.to_string().contains("did not answer within 1s"),
+            "{err}"
+        );
+
+        let on_disk = chats.list();
+        let chat = &on_disk[0];
+        let note = chat.turns.last().expect("a note turn was recorded");
+        assert!(
+            note.body.contains("did not answer within 1s"),
+            "the transcript must show the configured timeout: {}",
+            note.body
         );
     }
 

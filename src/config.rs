@@ -236,6 +236,27 @@ pub struct Graph {
     pub timeout_review: u64,
     /// Per-node timeouts, seconds.
     pub timeout_fix: u64,
+    /// Wall-clock limit for one turn of [`crate::chat`]'s browser interview,
+    /// seconds.
+    ///
+    /// An hour, the same order of magnitude as [`Self::timeout_implement`]:
+    /// an operator who opens this from a phone is not standing at a spinner
+    /// waiting for it to resolve the way a five-minute default once assumed.
+    /// They start another conversation and come back to this one when it has
+    /// something to say, so a long-running turn costs magi a held seat, not
+    /// a person's attention - and the seat is worth spending on a turn that
+    /// actually needs to read files and think before it can ask its next
+    /// question.
+    pub timeout_chat: u64,
+    /// Wall-clock limit for one turn of [`crate::talk`]'s standing
+    /// conversation, seconds.
+    ///
+    /// An hour, for the same reason [`Self::timeout_chat`] is: the operator
+    /// is not watching this turn resolve in real time, so the budget can
+    /// match what the work - reading files, running commands, checking their
+    /// output - actually needs rather than what a person waiting on a phone
+    /// can tolerate.
+    pub timeout_talk: u64,
     /// Retries for an agent invocation that fails or returns nothing usable.
     pub retries: usize,
     /// Root for candidate / judge worktrees. Defaults to `~/wt/magi`.
@@ -306,6 +327,8 @@ impl Default for Graph {
             timeout_judge: 1200,
             timeout_review: 1200,
             timeout_fix: 1800,
+            timeout_chat: 3600,
+            timeout_talk: 3600,
             retries: 1,
             worktree_root: None,
             land: true,
@@ -1688,6 +1711,33 @@ mod tests {
         );
         // The rendered command is where the cache path is read back from.
         assert_eq!(cfg.cache_dir(), Some(PathBuf::from("/shared/t")));
+    }
+
+    #[test]
+    fn chat_and_talk_default_to_an_hour_and_an_unwritten_config_still_gets_it() {
+        // An operator who writes no `[graph]` timeout keys at all must still
+        // land on the hour, not on the five/fifteen minutes those turns used
+        // to hardcode before they read from config.
+        let g = Graph::default();
+        assert_eq!(g.timeout_chat, 3600);
+        assert_eq!(g.timeout_talk, 3600);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        std::fs::write(&path, "[graph]\ncandidates = 2\n").unwrap();
+        let cfg = Config::load(&path).expect("must load without timeout_chat/timeout_talk set");
+        assert_eq!(cfg.graph.timeout_chat, 3600);
+        assert_eq!(cfg.graph.timeout_talk, 3600);
+    }
+
+    #[test]
+    fn an_overridden_chat_or_talk_timeout_reaches_the_loaded_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        std::fs::write(&path, "[graph]\ntimeout_chat = 60\ntimeout_talk = 120\n").unwrap();
+        let cfg = Config::load(&path).expect("must load");
+        assert_eq!(cfg.graph.timeout_chat, 60);
+        assert_eq!(cfg.graph.timeout_talk, 120);
     }
 
     #[test]
