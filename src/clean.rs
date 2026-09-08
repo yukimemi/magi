@@ -444,6 +444,16 @@ fn looks_like_a_worktree_bay(name: &str) -> bool {
 /// permission error - is treated as not yet stale: unreadable metadata is not
 /// evidence of anything, and the janitor already keeps rather than deletes
 /// whenever it cannot tell (see the module docs).
+///
+/// `grace_secs` is floored at [`MIN_ORPHAN_AGE_SECS`] regardless of what the
+/// caller passes: `0` is a documented, legitimate value for
+/// [`crate::config::Disk::fold_grace_secs`] (`due`'s own "always due" case),
+/// because that grace answers a policy question the operator owns - how long
+/// a *known, finished* run's worktree lingers before cleanup. Whether an
+/// orphan worktree is actually a race with `Runner::review`'s `git worktree
+/// add` landing before its `run.json` is not a policy question, and must not
+/// collapse to zero just because the operator turned the other grace off -
+/// that would defeat the very check meant to catch it.
 fn stale_enough(dir: &Path, grace_secs: u64, now: Timestamp) -> bool {
     let Ok(modified) = std::fs::metadata(dir).and_then(|m| m.modified()) else {
         return false;
@@ -451,8 +461,20 @@ fn stale_enough(dir: &Path, grace_secs: u64, now: Timestamp) -> bool {
     let Ok(ts) = Timestamp::try_from(modified) else {
         return false;
     };
-    due(now, ts, grace_secs)
+    due(now, ts, grace_secs.max(MIN_ORPHAN_AGE_SECS))
 }
+
+/// The floor under [`stale_enough`]'s grace, independent of
+/// [`crate::config::Disk::fold_grace_secs`].
+///
+/// Ample next to the race it guards: the gap between `Runner::start` or
+/// `Runner::review` creating a worktree and the first `RunState::save`
+/// landing is a handful of `git` subprocess calls, not minutes - but the
+/// janitor cannot tell "still mid-setup" from "orphaned" by any other signal
+/// for a run that never registers with `daemon::Status` at all (a `magi
+/// review` invocation, for one), so this is generous on purpose rather than
+/// tuned to the observed case.
+const MIN_ORPHAN_AGE_SECS: u64 = 5 * 60;
 
 /// Resolve an id or prefix against an explicit runs directory, exactly the way
 /// [`crate::run::resolve_id`] does against the global home.
@@ -768,14 +790,12 @@ mod tests {
         // reclaim target regardless of what runs claim it or not.
         std::fs::create_dir_all(wt.join("scratch")).unwrap();
 
-        // Real wall-clock time, taken after every directory above was
-        // created, so a zero grace - the same "always due" escape hatch
-        // `due` itself documents - can stand in for "old enough" here
-        // without faking a worktree's mtime. The sleep is what keeps that
-        // ordering unambiguous on a filesystem whose mtime resolution is
-        // coarser than the gap between two back-to-back instructions.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let now = Timestamp::now();
+        // `now` pushed comfortably past `MIN_ORPHAN_AGE_SECS`, so a zero
+        // grace - the same "always due" escape hatch `due` itself documents
+        // - still reclaims once a worktree is genuinely old, without faking
+        // an mtime: real directory creation just above is already in the
+        // past relative to this `now`, by design rather than by timing.
+        let now = Timestamp::now() + SignedDuration::new((MIN_ORPHAN_AGE_SECS + 1) as i64, 0);
         let mut status = crate::daemon::Status::new();
         status.current = vec![crate::daemon::Current {
             task: "20260905-000000-t111".to_owned(),
@@ -922,6 +942,40 @@ mod tests {
             store.get(&orphan.id).unwrap().status.open(),
             "a run this sweep cannot read is left exactly as it was, not guessed at"
         );
+    }
+
+    /// A grace of `0` is a legitimate, documented value for the operator's
+    /// own `Disk::fold_grace_secs` - `due`'s "always due" case - but the
+    /// freshness check this guards is not that policy, and must not collapse
+    /// to it: a `0` handed straight through would reclaim a worktree the
+    /// instant it exists, exactly the race `fold_orphaned_worktrees_leaves_a_
+    /// freshly_created_bay_alone` exists to rule out, just with the operator
+    /// having turned the other grace off instead of leaving it at its
+    /// default.
+    #[test]
+    fn fold_orphaned_worktrees_floors_a_zero_grace_at_the_race_safe_minimum() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+
+        std::fs::create_dir_all(wt.join("eeee").join("under-review")).unwrap();
+
+        // Too fresh, even with the grace argument at zero.
+        let now = Timestamp::now();
+        let folded = block_on(fold_orphaned_worktrees(&runs, &wt, &home, 0, now));
+        assert_eq!(
+            folded, 0,
+            "a zero grace must not defeat the race-safety floor"
+        );
+        assert!(wt.join("eeee").exists());
+
+        // Once genuinely past the floor, a zero grace reclaims it - the
+        // floor is a minimum, not a replacement policy that never fires.
+        let later = now + SignedDuration::new((MIN_ORPHAN_AGE_SECS + 1) as i64, 0);
+        let folded = block_on(fold_orphaned_worktrees(&runs, &wt, &home, 0, later));
+        assert_eq!(folded, 1, "old enough now, regardless of the zero grace");
+        assert!(!wt.join("eeee").exists());
     }
 
     /// Write a whole `run.json` that magi can read, over the given state.
