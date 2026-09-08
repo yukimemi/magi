@@ -1435,7 +1435,8 @@ mod tests {
         reopen(&mut talk, &talks).expect("reopening an open talk is not an error");
         assert_eq!(talk.status, TalkStatus::Open);
 
-        record(&mut talk, &talks, "one more thing").expect("a reopened talk takes turns again");
+        record(&mut talk, &talks, "one more thing", Vec::new())
+            .expect("a reopened talk takes turns again");
         let _ = &cfg; // config kept only to build the agent above
     }
 
@@ -1506,7 +1507,7 @@ mod tests {
         // The stale handle has no way to know the record is gone - a
         // `record` that trusted it would append a turn and write the
         // conversation back into existence.
-        let err = record(&mut stale, &talks, "still there?")
+        let err = record(&mut stale, &talks, "still there?", Vec::new())
             .expect_err("a delete that landed first must be honored, not overwritten");
         assert!(err.to_string().contains("deleted"), "{err}");
 

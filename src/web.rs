@@ -6285,8 +6285,25 @@ mod tests {
         let opened = f
             .post("/api/chats", Some(r#"{"idea":"rework the config loader"}"#))
             .await;
-        assert_eq!(opened.status, 201, "{}", opened.body);
+        assert_eq!(opened.status, 202, "{}", opened.body);
         let id = opened.json()["id"].as_str().expect("id").to_owned();
+
+        // The idea's own first turn runs in the background (see `chat_post`'s
+        // doc); it must land before `say` below, which would otherwise race
+        // it and get the same 409 a second turn on a busy chat gets.
+        let mut thinking = true;
+        for _ in 0..200 {
+            let detail = f.get(&format!("/api/chats/{id}")).await.json();
+            thinking = detail["thinking"].as_bool().expect("thinking is a bool");
+            if !thinking {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !thinking,
+            "the first turn must finish before this test continues"
+        );
 
         let uploaded = f
             .post_bytes(
