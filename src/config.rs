@@ -507,12 +507,52 @@ impl Default for Disk {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MergeMode {
-    /// Leave the branch alone and print the merge command.
+    /// Leave the branch alone and print the merge command matching
+    /// [`Merge::style`].
     None,
-    /// `git merge --no-ff` into the base branch in the primary worktree.
+    /// Merge into the base branch in the primary worktree, using
+    /// [`Merge::style`].
     Local,
-    /// Push the branch and open a PR with `gh pr create`.
+    /// Push the branch and open a PR with `gh pr create`. Landing this PR
+    /// (`[graph] land`) always squashes — see `land`'s module doc — so
+    /// [`Merge::style`] does not apply here.
     Pr,
+}
+
+/// How the winning branch is attached to the base branch: what
+/// `mode = "local"` runs, and what `mode = "none"`'s printed guidance tells
+/// the operator to run by hand.
+///
+/// Read from configuration rather than asked of the repository at run time
+/// (e.g. `gh api repos/{owner}/{repo}/rulesets`) for two reasons: it keeps
+/// `mode = "none"`'s guidance a pure function of `RunState`, assertable in a
+/// unit test the same way `land::decide` is kept pure (see that module's
+/// doc), and it works for a base branch that is not hosted on GitHub, or not
+/// reachable at all, at the moment the report is rendered. An operator whose
+/// base branch enforces a ruleset already knows what it allows; declaring it
+/// once here is cheaper than magi re-discovering it, with a network call, on
+/// every render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeStyle {
+    /// `git merge --no-ff`: every candidate commit lands, plus a merge
+    /// commit that records the merge as its own event in history. Rejected
+    /// by a base branch whose ruleset requires linear history or forbids
+    /// merge commits outright.
+    #[default]
+    Merge,
+    /// `git merge --squash` followed by a commit under an explicit message:
+    /// every candidate commit folds into one, and none of the candidate's
+    /// own placeholder subjects (`magi: candidate A (uncommitted work)`)
+    /// reach the base branch. No merge commit, so this satisfies a linear-
+    /// history ruleset.
+    Squash,
+    /// A fast-forward-only merge: every candidate commit lands verbatim, in
+    /// order, with no merge commit. Only succeeds because the winner was
+    /// already rebased onto the tracked base tip before this runs (see
+    /// `Runner::sync_to_base`) — equivalent to GitHub's "rebase and merge"
+    /// once that has happened.
+    Rebase,
 }
 
 /// Merge policy.
@@ -524,6 +564,9 @@ pub struct Merge {
     pub mode: MergeMode,
     /// Base branch. Defaults to the branch checked out when the run started.
     pub base: Option<String>,
+    /// How the winner is attached to `base`; see [`MergeStyle`]. Ignored by
+    /// `mode = "pr"`.
+    pub style: MergeStyle,
     /// Remote for `mode = "pr"`.
     pub remote: String,
     /// After a `mode = "pr"` run lands, open a `chore/release-vX.Y.Z` pull
@@ -543,6 +586,7 @@ impl Default for Merge {
         Self {
             mode: MergeMode::None,
             base: None,
+            style: MergeStyle::default(),
             remote: "origin".to_owned(),
             release_bump: true,
         }
@@ -1595,8 +1639,21 @@ mod tests {
         let parsed = Config::load(&path).expect("starter config must load");
         assert_eq!(parsed.graph.candidates, 3);
         assert_eq!(parsed.merge.mode, MergeMode::None);
+        assert_eq!(parsed.merge.style, MergeStyle::Merge);
         assert!(parsed.graph.sessions);
         assert_eq!(parsed.update.mode, UpdateMode::Notify);
+    }
+
+    /// A repository whose ruleset forbids merge commits declares that once,
+    /// here, rather than magi asking GitHub about it on every render (see
+    /// [`MergeStyle`]'s own doc for why).
+    #[test]
+    fn a_repository_can_declare_a_linear_history_merge_style() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        std::fs::write(&path, "[merge]\nmode = \"none\"\nstyle = \"squash\"\n").unwrap();
+        let parsed = Config::load(&path).expect("config must load");
+        assert_eq!(parsed.merge.style, MergeStyle::Squash);
     }
 
     #[test]

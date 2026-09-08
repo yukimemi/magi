@@ -30,7 +30,8 @@ use crate::agent::{self, AgentOutput, Invocation, SeatState};
 use crate::blind;
 use crate::bump;
 use crate::config::{
-    AgentSpec, Config, IncompleteReviewPolicy, LeakPolicy, MergeMode, Prompts, ResolvedRoles,
+    AgentSpec, Config, IncompleteReviewPolicy, LeakPolicy, MergeMode, MergeStyle, Prompts,
+    ResolvedRoles,
 };
 use crate::git;
 use crate::land;
@@ -2875,13 +2876,14 @@ impl Runner {
         let repo = self.state.repo.clone();
         let base = self.state.base_branch.clone();
         let mode = self.state.config.merge.mode;
+        let style = self.state.config.merge.style;
         let message = pr_body(&self.state, winner.label);
 
         let outcome = match mode {
             MergeMode::None => MergeOutcome {
                 mode,
                 ok: true,
-                detail: format!("git -C {} merge --no-ff {}", repo.display(), winner.branch),
+                detail: manual_merge_command(style, &repo, &winner.branch, &message),
             },
             MergeMode::Local => {
                 let on = git::current_branch(&repo).await?;
@@ -2902,7 +2904,15 @@ impl Runner {
                         detail: format!("{} is dirty; refusing to merge", repo.display()),
                     }
                 } else {
-                    let out = git::merge_no_ff(&repo, &winner.branch, &message).await?;
+                    let out = match style {
+                        MergeStyle::Merge => {
+                            git::merge_no_ff(&repo, &winner.branch, &message).await?
+                        }
+                        MergeStyle::Squash => {
+                            git::merge_squash(&repo, &winner.branch, &message).await?
+                        }
+                        MergeStyle::Rebase => git::merge_ff_only(&repo, &winner.branch).await?,
+                    };
                     MergeOutcome {
                         mode,
                         ok: out.ok(),
@@ -3578,6 +3588,31 @@ async fn run_commands(
     out
 }
 
+/// The shell command line `mode = "none"` prints — in `magi show`'s `merge`
+/// section (`report::run`) and in the `merge` event this node records — for
+/// the operator to run by hand.
+///
+/// Built from [`MergeStyle`] rather than always `git merge --no-ff`: a base
+/// branch whose ruleset forbids merge commits (GitHub's "must not contain
+/// merge commits", or "require linear history") rejects the push a `--no-ff`
+/// merge would produce, which is exactly the guidance this function replaces.
+/// `message`'s first line becomes the squash commit's subject, matching the
+/// note `report::run` prints alongside this command — see that function for
+/// why an explicit subject is not optional there.
+fn manual_merge_command(style: MergeStyle, repo: &Path, branch: &str, message: &str) -> String {
+    let repo = repo.display();
+    match style {
+        MergeStyle::Merge => format!("git -C {repo} merge --no-ff {branch}"),
+        MergeStyle::Squash => {
+            let subject = message.lines().next().unwrap_or(branch);
+            format!(
+                "git -C {repo} merge --squash {branch} && git -C {repo} commit -m \"{subject}\""
+            )
+        }
+        MergeStyle::Rebase => format!("git -C {repo} merge --ff-only {branch}"),
+    }
+}
+
 /// The merge commit / pull request body: the task, and — when the winning
 /// review round was not clean — the findings still open and whatever the
 /// fixer declined, so `merge = "pr"` hands the reader the same material
@@ -4202,6 +4237,25 @@ mod tests {
         let body = pr_body(&state, 'A');
         assert!(!body.contains("Open review findings"), "{body}");
         assert!(!body.contains("Declined"), "{body}");
+    }
+
+    #[test]
+    fn manual_merge_command_matches_the_configured_style() {
+        let repo = Path::new("/repo");
+        let message = "Merge magi run 0832 (candidate A)\n\nadd retries";
+
+        let merge = manual_merge_command(MergeStyle::Merge, repo, "magi/0832/A", message);
+        assert_eq!(merge, "git -C /repo merge --no-ff magi/0832/A");
+
+        let squash = manual_merge_command(MergeStyle::Squash, repo, "magi/0832/A", message);
+        assert_eq!(
+            squash,
+            "git -C /repo merge --squash magi/0832/A && git -C /repo commit -m \
+             \"Merge magi run 0832 (candidate A)\""
+        );
+
+        let rebase = manual_merge_command(MergeStyle::Rebase, repo, "magi/0832/A", message);
+        assert_eq!(rebase, "git -C /repo merge --ff-only magi/0832/A");
     }
 
     #[test]

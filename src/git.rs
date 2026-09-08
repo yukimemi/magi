@@ -390,12 +390,47 @@ pub async fn local_exclude(worktree: &Path, pattern: &str) -> Result<()> {
 }
 
 /// `git merge --no-ff` of `branch` into the currently checked-out branch.
+///
+/// One of three ways to land a branch driven by [`crate::config::MergeStyle`]
+/// — see [`merge_squash`] and [`merge_ff_only`] for the other two, and that
+/// enum's own doc for why the choice between them lives in configuration.
 pub async fn merge_no_ff(repo: &Path, branch: &str, message: &str) -> Result<GitOut> {
     git_raw(
         repo,
         &["merge", "--no-ff", "--no-edit", "-m", message, branch],
     )
     .await
+}
+
+/// `git merge --squash` of `branch`, followed by a commit under `message`.
+///
+/// Two `git` calls because `--squash` only stages the result — unlike
+/// [`merge_no_ff`] there is no merge commit for `--no-edit` to write, and
+/// skipping the second call is exactly the trap `land`'s module doc warns
+/// about: a squash that inherits `branch`'s own single-commit subject
+/// (`magi: candidate A (uncommitted work)`) instead of `message`. Returns the
+/// `--squash` step's own output, unrun `commit` included, when staging itself
+/// fails (a conflict), so a caller sees what actually went wrong rather than
+/// a `git commit` complaint about nothing being staged.
+pub async fn merge_squash(repo: &Path, branch: &str, message: &str) -> Result<GitOut> {
+    let staged = git_raw(repo, &["merge", "--squash", branch]).await?;
+    if !staged.ok() {
+        return Ok(staged);
+    }
+    git_raw(repo, &["commit", "-m", message]).await
+}
+
+/// Fast-forward `branch` into the currently checked-out branch, refusing to
+/// create a merge commit.
+///
+/// Only ever fast-forwards because the winner was already rebased onto the
+/// tracked base tip before this runs (`Runner::sync_to_base`); at that point
+/// `--ff-only` is indistinguishable from GitHub's "rebase and merge" button.
+/// If the base moved again in the meantime this fails rather than falling
+/// back to a real rebase, the same way `merge_no_ff` fails rather than
+/// resolving a conflict — landing is not the place to improvise.
+pub async fn merge_ff_only(repo: &Path, branch: &str) -> Result<GitOut> {
+    git_raw(repo, &["merge", "--ff-only", branch]).await
 }
 
 /// Push a branch to `remote`.
@@ -594,6 +629,88 @@ mod tests {
             "a failed rebase leaves the branch exactly where it was"
         );
         assert!(!scratch_tree.exists(), "and cleans up after itself");
+    }
+
+    #[tokio::test]
+    async fn merge_squash_folds_the_branch_into_one_commit_under_the_given_message() {
+        let (_g, repo) = scratch().await;
+        git(&repo, &["checkout", "-b", "side"]).await.unwrap();
+        for name in ["b.txt", "c.txt"] {
+            tokio::fs::write(repo.join(name), "side\n").await.unwrap();
+            git(&repo, &["add", "-A"]).await.unwrap();
+            git(
+                &repo,
+                &["commit", "-m", "magi: candidate A (uncommitted work)"],
+            )
+            .await
+            .unwrap();
+        }
+        git(&repo, &["checkout", "main"]).await.unwrap();
+        let before = rev_parse(&repo, "main").await.unwrap();
+
+        let out = merge_squash(&repo, "side", "an explicit subject")
+            .await
+            .unwrap();
+        assert!(out.ok(), "{}", out.stderr);
+        assert_eq!(
+            commits_ahead(&repo, &before, "main").await.unwrap(),
+            1,
+            "squash adds exactly one commit onto the tip, not one per candidate commit"
+        );
+        let subject = git(&repo, &["log", "-1", "--format=%s"]).await.unwrap();
+        assert_eq!(
+            subject, "an explicit subject",
+            "the candidate's own placeholder subject must not survive: {subject}"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_ff_only_fast_forwards_a_branch_already_rebased_onto_the_tip() {
+        let (_g, repo) = scratch().await;
+        git(&repo, &["checkout", "-b", "side"]).await.unwrap();
+        tokio::fs::write(repo.join("b.txt"), "side\n")
+            .await
+            .unwrap();
+        git(&repo, &["add", "-A"]).await.unwrap();
+        git(&repo, &["commit", "-m", "side work"]).await.unwrap();
+        git(&repo, &["checkout", "main"]).await.unwrap();
+
+        let before = rev_parse(&repo, "side").await.unwrap();
+        let out = merge_ff_only(&repo, "side").await.unwrap();
+        assert!(out.ok(), "{}", out.stderr);
+        assert_eq!(
+            rev_parse(&repo, "main").await.unwrap(),
+            before,
+            "a fast-forward moves the base tip to the branch, no merge commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_ff_only_refuses_to_write_a_merge_commit() {
+        let (_g, repo) = scratch().await;
+        git(&repo, &["checkout", "-b", "side"]).await.unwrap();
+        tokio::fs::write(repo.join("b.txt"), "side\n")
+            .await
+            .unwrap();
+        git(&repo, &["add", "-A"]).await.unwrap();
+        git(&repo, &["commit", "-m", "side work"]).await.unwrap();
+
+        // main diverges, so a fast-forward is no longer possible.
+        git(&repo, &["checkout", "main"]).await.unwrap();
+        tokio::fs::write(repo.join("c.txt"), "main\n")
+            .await
+            .unwrap();
+        git(&repo, &["add", "-A"]).await.unwrap();
+        git(&repo, &["commit", "-m", "main moved"]).await.unwrap();
+
+        let before = rev_parse(&repo, "main").await.unwrap();
+        let out = merge_ff_only(&repo, "side").await.unwrap();
+        assert!(!out.ok(), "a divergent branch cannot fast-forward");
+        assert_eq!(
+            rev_parse(&repo, "main").await.unwrap(),
+            before,
+            "a refused fast-forward must not touch main"
+        );
     }
 
     #[tokio::test]

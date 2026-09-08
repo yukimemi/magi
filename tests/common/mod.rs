@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use magi::config::{
-    AgentKind, AgentSpec, Blind, Config, Graph, Merge, MergeMode, Roles, Update, UpdateMode, Verify,
+    AgentKind, AgentSpec, Blind, Config, Graph, Merge, MergeMode, MergeStyle, Roles, Update,
+    UpdateMode, Verify,
 };
 
 /// `set_home` is a process-wide global, so scenes that share one test binary
@@ -321,6 +322,7 @@ pub fn fixture(home: HomeGuard, judges: Judges, require_fix: bool) -> Fixture {
         merge: Merge {
             mode: MergeMode::None,
             base: None,
+            style: MergeStyle::default(),
             remote: "origin".to_owned(),
             release_bump: true,
         },
