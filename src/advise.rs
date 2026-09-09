@@ -411,12 +411,30 @@ async fn deliberate(
     // `false`, which is what tells a reader (`DraftAdvisorsView` in
     // `src/web.rs`) that `<id>.md` is still the raw interview draft, not this
     // deliberation's output.
+    //
+    // Best-effort from here: the deliberation has already succeeded (`draft`
+    // is written), so a failure re-persisting the record must not turn a
+    // completed run into a reported one - the same trade-off
+    // `remove_worktrees` makes for cleanup. Worst case, `synthesized` stays
+    // `false` on disk a little longer than it should and `DraftAdvisorsView`
+    // hides a task file that is in fact done, which is a stale read, not the
+    // data loss a `?` here would risk turning this into.
     advice.synthesized = true;
-    std::fs::write(
-        &advice_path,
-        serde_json::to_string_pretty(&advice).context("serialize the advisor records")?,
-    )
-    .with_context(|| format!("write {}", advice_path.display()))?;
+    match serde_json::to_string_pretty(&advice) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&advice_path, json) {
+                tracing::warn!(
+                    "could not record deliberation {} as synthesized in {}: {e:#}",
+                    ctx.id,
+                    advice_path.display()
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            "could not serialize the advisor record for {}: {e:#}",
+            advice_path.display()
+        ),
+    }
 
     Ok(advice)
 }
