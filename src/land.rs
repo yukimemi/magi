@@ -602,6 +602,7 @@ struct Words {
     what_changed: &'static str,
     review_verdict: &'static str,
     reviewer: &'static str,
+    reviewer_no_answer: &'static str,
     checks: &'static str,
     nothing_failing: &'static str,
     files_changed: &'static str,
@@ -620,6 +621,7 @@ const EN: Words = Words {
     what_changed: "What changed",
     review_verdict: "Review verdict",
     reviewer: "Reviewer",
+    reviewer_no_answer: "produced no answer",
     checks: "Checks",
     nothing_failing: "Nothing failing.",
     files_changed: "file(s) changed",
@@ -638,6 +640,7 @@ const JA: Words = Words {
     what_changed: "変更内容",
     review_verdict: "レビューの結論",
     reviewer: "レビュアー",
+    reviewer_no_answer: "回答なし",
     checks: "チェック",
     nothing_failing: "失敗しているものはありません。",
     files_changed: "ファイル変更",
@@ -819,6 +822,16 @@ pub fn approval_panel(
             w.review_verdict
         );
         for r in &round.reviews {
+            // A seat the review loop counted as answered has real prose in
+            // `summary`; one it counted against `incomplete` (see
+            // `graph::Runner::review_loop`) never produced any and left it
+            // empty - which must not be read back as a blank verdict, since
+            // an empty box here looks like "nothing to say" rather than
+            // "never answered".
+            let body = match &r.failed {
+                Some(reason) => format!("{}: {}", w.reviewer_no_answer, esc(reason)),
+                None => esc(&r.summary),
+            };
             let _ = writeln!(
                 h,
                 "<div style=\"margin:0 0 8px;padding:8px;background:#f6f8fa;\
@@ -828,7 +841,7 @@ pub fn approval_panel(
                 w.reviewer,
                 r.reviewer,
                 esc(&r.agent),
-                esc(&r.summary),
+                body,
             );
         }
     }
@@ -3142,6 +3155,49 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert!(ja.contains("レビューの結論"), "{ja}");
         assert!(ja.contains("レビュアー"), "{ja}");
         assert!(ja.contains("race is fixed, clean"), "{ja}");
+    }
+
+    /// The `incomplete_review = "warn"` policy (see
+    /// `graph::Runner::review_loop`) can push a `clean` round to
+    /// `state.reviews` while one seat's own record still has `failed: Some`
+    /// and an empty `summary` - a seat that never answered, not one that
+    /// answered with nothing to say.
+    fn unanswered_review_record(reviewer: usize, agent: &str, reason: &str) -> ReviewRecord {
+        ReviewRecord {
+            reviewer,
+            agent: agent.to_owned(),
+            summary: String::new(),
+            findings: Vec::new(),
+            vote: None,
+            failed: Some(reason.to_owned()),
+            duration_ms: 0,
+        }
+    }
+
+    #[test]
+    fn the_approval_panel_never_shows_an_unanswered_seat_as_a_blank_verdict() {
+        let mut state = run_state();
+        state.reviews = vec![review_round(
+            1,
+            vec![
+                review_record(1, "alpha", "clean, nothing to add"),
+                unanswered_review_record(2, "beta", "timed out"),
+            ],
+        )];
+        let en = approval_panel(&state, &green_pr(), NUMSTAT, "", &[], "feat: x");
+        assert!(en.contains("clean, nothing to add"), "{en}");
+        assert!(
+            en.contains("produced no answer: timed out"),
+            "a seat that never answered must say so, not render a blank box: {en}"
+        );
+        assert!(
+            !en.contains("<div style=\"white-space:pre-wrap;font-size:13px\"></div>"),
+            "no reviewer box may be left empty: {en}"
+        );
+
+        state.config.graph.language = "ja".to_owned();
+        let ja = approval_panel(&state, &green_pr(), NUMSTAT, "", &[], "feat: x");
+        assert!(ja.contains("回答なし: timed out"), "{ja}");
     }
 
     #[test]
