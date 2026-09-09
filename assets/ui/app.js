@@ -462,6 +462,11 @@ const state = {
      starts from the unfiltered list, since a filter is a lens on what's on
      screen right now, not a saved view. */
   runsFilter: { section: null, repo: null },
+  /* Which state chip is picked above the Runs list. Lives only in memory for
+     the same reason runsFilter does — a reload always starts from "active"
+     rather than remembering "done" was picked last, since the whole point is
+     that a fresh look at the deck defaults to what still needs attention. */
+  runsStateFilter: "active",
   /* Open/closed per Runs section, restored from localStorage so a collapse
      survives a reload; defaults to open (see isSectionOpen()). */
   runsCollapsed: loadCollapsed(RUNS_COLLAPSE_KEY),
@@ -1315,6 +1320,83 @@ function runSection(run) {
   return "flight";
 }
 
+/* ---- runs: state chips -------------------------------------------------- *
+ * A second, independent lens on the same heads RUN_SECTIONS groups. The tree
+ * above (runs-tree) narrows by section/repo but is desktop-only — see the
+ * width gate on .runs-tree in app.css — so a phone, the primary way this
+ * deck gets read, has never had a way to ask for anything but the full flood
+ * of every run ever competed. These chips are that control, and unlike the
+ * tree they render everywhere.
+ *
+ * Defaulting to "active" (in flight + waiting) rather than "all" is the
+ * point: a finished run needs nobody's attention, and piling every merged,
+ * failed and superseded run above the handful still moving is exactly the
+ * "too much to read on a phone" complaint this exists to fix. "done" and
+ * "all" stay one tap away for whoever wants the history. */
+const RUN_STATE_FILTERS = [
+  { key: "active", label: "Active", countNoun: "active", match: (run) => !run.done },
+  { key: "flight", label: "In flight", countNoun: "in flight", match: (run) => !run.done && !run.waiting },
+  { key: "waiting", label: "Waiting", countNoun: "waiting", match: (run) => Boolean(run.waiting) },
+  { key: "done", label: "Done", countNoun: "done", match: (run) => Boolean(run.done) },
+  { key: "all", label: "All", countNoun: "runs", match: () => true },
+];
+
+function activeRunStateFilter() {
+  return RUN_STATE_FILTERS.find((f) => f.key === state.runsStateFilter) || RUN_STATE_FILTERS[0];
+}
+
+function matchesRunState(run) {
+  return activeRunStateFilter().match(run);
+}
+
+/* A head that still names a `superseded_by` (see foldRuns below) is one
+   whose successor fell outside the page /api/runs returned, so it could not
+   be folded under a newer card — it is genuinely an old attempt, just one
+   this client has nowhere to nest. Hiding it by default is the same
+   judgement call as hiding "done": it is not what an operator scanning for
+   what needs them wants in front of them, and "all" still shows it. */
+function isOrphanSuperseded(run) {
+  return typeof run.superseded_by === "string" && run.superseded_by !== "";
+}
+
+/* Exactly one chip is ever selected, so picking the already-selected one is
+   a no-op rather than clearing back to nothing — unlike the tree filter
+   above, there is no "no filter" state here for the default to fall back to. */
+function selectRunStateFilter(key) {
+  if (state.runsStateFilter === key) return;
+  state.runsStateFilter = key;
+  renderRuns();
+}
+
+/* Built once and then only updated in place, not rebuilt like the tree —
+   there are only five of these, but a full rebuild on every SSE tick would
+   still steal keyboard focus off whichever chip the operator just tapped. */
+function renderRunStateChips(runs) {
+  const bar = $("runs-state-chips");
+  if (!bar.childElementCount) {
+    for (const def of RUN_STATE_FILTERS) {
+      bar.append(el("button", {
+        class: "state-chip",
+        type: "button",
+        role: "radio",
+        "data-key": def.key,
+        onclick: () => selectRunStateFilter(def.key),
+      },
+        el("span", { class: "state-chip-label", text: def.label }),
+        el("span", { class: "state-chip-count" }),
+      ));
+    }
+  }
+  for (const node of bar.children) {
+    const def = RUN_STATE_FILTERS.find((f) => f.key === node.dataset.key);
+    // Counted from the full, unfiltered list on purpose — a badge that
+    // shrinks the moment its own chip is picked would make the number on it
+    // unreadable, and the point is to see what picking it will do.
+    setText(node.querySelector(".state-chip-count"), String(runs.filter(def.match).length));
+    setAttr(node, "aria-checked", state.runsStateFilter === def.key ? "true" : "false");
+  }
+}
+
 /* Which older attempts fold into which card. `superseded_by` names the
    *successor*'s short id, so a chain is walked forward from an attempt to
    whatever replaced it until nothing newer is known. The run that walk ends
@@ -1640,6 +1722,7 @@ function renderRuns() {
     setText($("runs-count"), "Loading\u2026");
     show($("runs-tree"), false);
     show($("runs-filter"), false);
+    show($("runs-state-chips"), false);
     if (!sectionsRoot.dataset.skeleton) {
       clear(sectionsRoot);
       const list = el("ol", { class: "cards" });
@@ -1661,29 +1744,56 @@ function renderRuns() {
     delete sectionsRoot.dataset.skeleton;
   }
 
-  const moving = runs.filter((r) => !r.done).length;
   const unreadable = Number(state.health && state.health.runs_unreadable) || 0;
   const unreadableNote = unreadable
     ? `${unreadable} unreadable`
     : "";
+
+  show($("runs-state-chips"), runs.length > 0);
+  if (runs.length > 0) renderRunStateChips(runs);
+
+  const { heads, childrenOf } = foldRuns(runs);
+
+  /* Two hidings, on by default, both lifted by "all": a done run and an old
+     attempt this page could not fold under its replacement (isOrphanSuperseded)
+     are both "not what needs me right now", which is the whole reason this
+     filter exists. supersededHidden exists only to keep the count honest —
+     without it, runs-count would say "3 in flight" while quietly also having
+     dropped a dozen cards the operator never asked to hide. */
+  const passingState = heads.filter(matchesRunState);
+  const stateFiltered = state.runsStateFilter === "all"
+    ? passingState
+    : passingState.filter((r) => !isOrphanSuperseded(r));
+  const supersededHidden = passingState.length - stateFiltered.length;
+
+  renderRunsTree(buildRunsTree(groupBySection(stateFiltered)));
+  renderRunsFilterBar();
+  const visible = stateFiltered.filter(matchesFilter);
+  syncRunSections(sectionsRoot, groupBySection(visible), childrenOf);
+
   const counts = runs.length === 0
     ? (unreadable ? `no readable runs, ${unreadableNote}` : "Nothing has run yet")
-    : [`${plural(runs.length, "run", "runs")}, ${moving} in flight`, unreadableNote]
-        .filter(Boolean)
-        .join(", ");
+    : (() => {
+        const countNoun = activeRunStateFilter().countNoun;
+        const headline = countNoun === "runs"
+          ? plural(visible.length, "run", "runs")
+          : `${visible.length} ${countNoun}`;
+        return [headline, supersededHidden ? `${supersededHidden} superseded hidden` : "", unreadableNote]
+          .filter(Boolean)
+          .join(", ");
+      })();
   setText($("runs-count"), counts);
 
   // An unreadable run is still a run: offer the explanation instead of the
   // "file your first task" prompt, which would be wrong and confusing.
   show($("runs-empty"), runs.length === 0 && unreadable === 0);
   show($("runs-unreadable"), runs.length === 0 && unreadable > 0);
-
-  const { heads, childrenOf } = foldRuns(runs);
-  renderRunsTree(buildRunsTree(groupBySection(heads)));
-  renderRunsFilterBar();
-  const visible = heads.filter(matchesFilter);
-  syncRunSections(sectionsRoot, groupBySection(visible), childrenOf);
-  show($("runs-filter-empty"), heads.length > 0 && Boolean(state.runsFilter.section) && visible.length === 0);
+  // Runs exist, and at least one survives the state filter's own hiding, but
+  // none of them are the state the operator picked — distinct from the tree
+  // filter's empty state below, which only fires once the state filter has
+  // already left something on the table for the tree to narrow further.
+  show($("runs-state-empty"), runs.length > 0 && stateFiltered.length === 0);
+  show($("runs-filter-empty"), stateFiltered.length > 0 && Boolean(state.runsFilter.section) && visible.length === 0);
 }
 
 /* ---- queue ------------------------------------------------------------- */

@@ -128,11 +128,19 @@
            from the tab order, so a narrow viewport never has to skip past it. -->
       <nav class="runs-tree" id="runs-tree" aria-label="Filter runs by state and repository" hidden></nav>
       <div class="runs-main">
+        <!-- The state chips, unlike the tree beside them, work on a phone too
+             (the tree is desktop-only, see .runs-tree in app.css) — this is
+             the only per-state control a phone gets, which is why it sits
+             above everything else rather than beside it. -->
+        <div class="state-chips" id="runs-state-chips" role="radiogroup" aria-label="Filter runs by state" hidden></div>
         <div class="runs-filter" id="runs-filter" hidden>
           <p id="runs-filter-text"></p>
           <button class="btn btn-quiet" type="button" id="runs-filter-clear">Clear filter</button>
         </div>
         <div id="runs-sections"></div>
+        <p class="empty" id="runs-state-empty" hidden>
+          Nothing matches this state filter. Try "All".
+        </p>
         <p class="empty" id="runs-filter-empty" hidden>
           No runs match this filter.
         </p>
