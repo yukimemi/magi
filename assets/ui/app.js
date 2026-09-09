@@ -46,6 +46,7 @@ const API = {
   chat: (id) => `/api/chats/${encodeURIComponent(id)}`,
   say: (id) => `/api/chats/${encodeURIComponent(id)}/say`,
   file: (id) => `/api/chats/${encodeURIComponent(id)}/file`,
+  chatAbandon: (id) => `/api/chats/${encodeURIComponent(id)}/abandon`,
   /* The standing chat: a separate store from Planning's, so the two never
      appear in each other's lists (see `POST /api/talks`'s doc). */
   talks: "/api/talks",
@@ -3253,6 +3254,7 @@ function renderChat() {
     show($("chat-filed-panel"), false);
     show($("chat-say"), false);
     show($("chat-closed"), false);
+    show($("chat-abandon-go"), false);
     show($("chat-wait"), false);
     show($("chat-problems"), false);
     show($("chat-derived-from"), false);
@@ -3332,6 +3334,7 @@ function renderChat() {
   const canSay = status === "open";
   show($("chat-say"), canSay);
   show($("chat-closed"), !canSay);
+  show($("chat-abandon-go"), canSay);
   /* The guard against a second turn: the field and the button are both dead
      while one is outstanding, and the button says what it is waiting for
      rather than just greying out. */
@@ -3695,6 +3698,27 @@ async function fileDraft() {
   } finally {
     button.disabled = false;
     setText(button, "File this task");
+  }
+}
+
+async function abandonChat() {
+  const id = state.chatDetail.id;
+  const button = $("chat-abandon-go");
+  if (!id) return;
+  button.disabled = true;
+  try {
+    const chat = await postJson(API.chatAbandon(id), {});
+    if (state.chatDetail.id === id) {
+      state.chatDetail.chat = chat;
+      renderChat();
+    }
+    await loadChats();
+    announce("Conversation abandoned.");
+    ok();
+  } catch (error) {
+    chatError(`Could not abandon the conversation: ${error.message}`);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -5472,6 +5496,7 @@ function wire() {
   $("chat-start-go").addEventListener("click", startChat);
   $("chat-say").addEventListener("submit", sendTurn);
   $("chat-file").addEventListener("click", fileDraft);
+  $("chat-abandon-go").addEventListener("click", abandonChat);
   $("chat-derive-go").addEventListener("click", deriveChat);
 
   $("talk-start-go").addEventListener("click", startTalk);

@@ -706,6 +706,7 @@ impl Ui {
             .route("/api/chats/{id}", get(chat_detail))
             .route("/api/chats/{id}/say", post(chat_say))
             .route("/api/chats/{id}/file", post(chat_file))
+            .route("/api/chats/{id}/abandon", post(chat_abandon))
             .route("/api/talks", get(talks_list).post(talk_post))
             .route("/api/talks/{id}", get(talk_detail).delete(talk_delete))
             .route("/api/talks/{id}/say", post(talk_say))
@@ -3625,6 +3626,27 @@ async fn chat_file(
     .await
 }
 
+/// `POST /api/chats/{id}/abandon` - give up on an interview without filing it.
+///
+/// Maps every refusal from [`chat::abandon`] to a 409: the only one it raises
+/// is a chat that is already `filed`, which is a conflict with what the
+/// operator asked for rather than a server fault - the same granularity
+/// `question_answer` and `question_say` use for a status that no longer
+/// allows what was asked.
+async fn chat_abandon(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ChatView>> {
+    blocking(move || {
+        let id = resolve_chat(&ui.chats, &id)?;
+        let mut chat = ui.chats.get(&id)?;
+        chat::abandon(&mut chat, &ui.chats).map_err(|e| ApiError::conflict(format!("{e:#}")))?;
+        let thinking = ui.is_thinking(&chat.id);
+        Ok(Json(ChatView::new(chat, thinking)))
+    })
+    .await
+}
+
 /// Expand an id or short id to exactly one chat id.
 fn resolve_chat(store: &Chats, id: &str) -> ApiResult<String> {
     pick(store.list().into_iter().map(|c| c.id).collect(), id, "chat")
@@ -4720,6 +4742,46 @@ mod tests {
         assert_eq!(after["task"], task);
         assert_eq!(after["status"], "filed");
         assert_eq!(fx.get("/api/health").await.json()["chats_open"], 0);
+    }
+
+    #[tokio::test]
+    async fn abandoning_an_open_chat_marks_it_abandoned_and_is_idempotent() {
+        let fx = Fixture::start().await;
+        let id = interview(&fx, "20260903-014455-ab12", "open", None);
+
+        let res = fx.post(&format!("/api/chats/{id}/abandon"), None).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        assert_eq!(res.json()["status"], "abandoned");
+        assert_eq!(
+            fx.chats().get(&id).expect("get").status,
+            crate::chat::ChatStatus::Abandoned
+        );
+
+        // Idempotent: abandoning an already-abandoned chat is not an error.
+        let again = fx.post(&format!("/api/chats/{id}/abandon"), None).await;
+        assert_eq!(again.status, 200, "{}", again.body);
+        assert_eq!(again.json()["status"], "abandoned");
+    }
+
+    #[tokio::test]
+    async fn abandoning_a_filed_chat_is_refused_and_leaves_it_filed() {
+        let fx = Fixture::start().await;
+        let id = interview(&fx, "20260903-014455-cd34", "filed", Some(&good_draft()));
+
+        let res = fx.post(&format!("/api/chats/{id}/abandon"), None).await;
+        assert!(
+            (400..500).contains(&res.status),
+            "expected a 4xx, got {}: {}",
+            res.status,
+            res.body
+        );
+        assert!(res.json()["error"].is_string(), "{}", res.body);
+
+        assert_eq!(
+            fx.chats().get(&id).expect("get").status,
+            crate::chat::ChatStatus::Filed,
+            "a refused abandon must not touch the on-disk status"
+        );
     }
 
     #[tokio::test]

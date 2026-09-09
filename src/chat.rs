@@ -715,6 +715,37 @@ pub fn file_draft(chat: &mut Chat, store: &Chats, queue: &Queue, priority: i32) 
     Ok(task.id)
 }
 
+/// Give up on a conversation. Idempotent: abandoning an already-abandoned
+/// conversation is not an error, since the operator's intent - "I don't want
+/// this anymore" - is already satisfied. Refuses a `Filed` conversation: that
+/// status means a task was already produced from this interview, and abandon
+/// must not roll back the terminal state that produced it.
+///
+/// Re-reads the record from disk rather than trusting the caller's copy of
+/// `chat`, and writes that fresh copy back rather than the one passed in - the
+/// same reason [`crate::talk::close`] does: a concurrent [`say`] or
+/// [`file_draft`] must not have its result overwritten by a decision made
+/// against a stale snapshot's idea of what `status` was.
+pub fn abandon(chat: &mut Chat, store: &Chats) -> Result<()> {
+    let mut fresh = store
+        .get(&chat.id)
+        .with_context(|| format!("chat {} could not be re-read", chat.short()))?;
+    match fresh.status {
+        ChatStatus::Open => {
+            fresh.status = ChatStatus::Abandoned;
+            store.put(&mut fresh)?;
+        }
+        ChatStatus::Abandoned => {}
+        ChatStatus::Filed => bail!(
+            "chat {} is {} and takes no more turns",
+            fresh.short(),
+            fresh.status.as_str()
+        ),
+    }
+    *chat = fresh;
+    Ok(())
+}
+
 /// Is this conversation's draft fileable, and if not, what is wrong with it?
 ///
 /// Every problem is returned, not the first: an operator about to ask the agent
@@ -1386,6 +1417,91 @@ mod tests {
         assert_eq!(task.instruction, good_draft());
         assert_eq!(task.priority, 5);
         assert_eq!(task.source, Source::Human);
+    }
+
+    #[test]
+    fn abandon_moves_an_open_chat_to_abandoned() {
+        let (tmp, chats) = store();
+        let mut chat = Chat {
+            schema: SCHEMA,
+            id: "20260903-014455-ab12".to_owned(),
+            repo: tmp.path().to_owned(),
+            from: None,
+            agent: "mock".to_owned(),
+            status: ChatStatus::Open,
+            turns: Vec::new(),
+            draft: None,
+            task: None,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            seat: SeatState::new(SEAT, "mock", 7),
+        };
+        chats.put(&mut chat).expect("put");
+
+        abandon(&mut chat, &chats).expect("abandon");
+
+        assert_eq!(chat.status, ChatStatus::Abandoned);
+        assert_eq!(
+            chats.get(&chat.id).expect("get").status,
+            ChatStatus::Abandoned
+        );
+    }
+
+    #[test]
+    fn abandoning_an_already_abandoned_chat_is_not_an_error() {
+        let (tmp, chats) = store();
+        let mut chat = Chat {
+            schema: SCHEMA,
+            id: "20260903-014455-ab13".to_owned(),
+            repo: tmp.path().to_owned(),
+            from: None,
+            agent: "mock".to_owned(),
+            status: ChatStatus::Abandoned,
+            turns: Vec::new(),
+            draft: None,
+            task: None,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            seat: SeatState::new(SEAT, "mock", 7),
+        };
+        chats.put(&mut chat).expect("put");
+
+        abandon(&mut chat, &chats).expect("abandoning twice is not an error");
+
+        assert_eq!(chat.status, ChatStatus::Abandoned);
+        assert_eq!(
+            chats.get(&chat.id).expect("get").status,
+            ChatStatus::Abandoned
+        );
+    }
+
+    #[test]
+    fn abandon_refuses_a_filed_chat_and_leaves_it_filed() {
+        let (tmp, chats) = store();
+        let mut chat = Chat {
+            schema: SCHEMA,
+            id: "20260903-014455-ab14".to_owned(),
+            repo: tmp.path().to_owned(),
+            from: None,
+            agent: "mock".to_owned(),
+            status: ChatStatus::Filed,
+            turns: Vec::new(),
+            draft: None,
+            task: Some("some-task-id".to_owned()),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            seat: SeatState::new(SEAT, "mock", 7),
+        };
+        chats.put(&mut chat).expect("put");
+
+        let err = abandon(&mut chat, &chats).expect_err("a filed chat refuses abandon");
+        assert!(err.to_string().contains("filed"), "{err}");
+
+        assert_eq!(
+            chats.get(&chat.id).expect("get").status,
+            ChatStatus::Filed,
+            "a refused abandon must not touch the on-disk status"
+        );
     }
 
     #[tokio::test]
