@@ -8,12 +8,14 @@
 //! injected with numbers, so nothing here has to ask the operating system to
 //! be testable. The only I/O is the removal itself.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 
+use crate::ask::Questions;
 use crate::config::Disk;
 use crate::run::{RunState, RunStatus, SCHEMA, short_of};
 
@@ -34,6 +36,9 @@ pub struct Housekeeping {
     pub cache_files: usize,
     /// Bytes freed from the shared cache.
     pub cache_freed: u64,
+    /// Open questions abandoned because the run that asked them has already
+    /// settled where nothing is coming back to read an answer.
+    pub questions_abandoned: usize,
 }
 
 /// Run the janitor: fold due runs, then prune the cache if it is over its cap.
@@ -71,7 +76,46 @@ pub async fn housekeep(
             }
         }
     }
+    // Unconditional, unlike the two passes above: this is not a disk policy
+    // with a cap or an opt-out, it is closing a gap `graph::Runner` itself
+    // cannot - a run that reached `Merged`/`Ready`/`Failed` before this
+    // cleanup existed, or whose process died between saving that status and
+    // abandoning the question it leaves behind (see `Runner::settle_questions`).
+    // Left alone, that question sits `open` forever: the owner's badge,
+    // banner and title all keep counting a decision nobody is left to read.
+    out.questions_abandoned =
+        abandon_settled_questions(&Questions::at(home.join("questions")), &home.join("runs"));
     out
+}
+
+/// Abandon every open question whose run has already settled into a status
+/// nothing comes back from, worded with what the run became - the same
+/// cleanup `graph::Runner::settle_questions` runs the moment `status` lands
+/// there, for questions that missed it.
+///
+/// Scans questions rather than runs: the open list is normally short, and a
+/// run that never asked anything costs nothing here. A run this cannot read,
+/// deleted or written by a schema this build does not speak, is left alone
+/// the same as everywhere else in this module; the question stays open
+/// rather than guessed at.
+pub fn abandon_settled_questions(store: &Questions, runs: &Path) -> usize {
+    let waiting_on: BTreeSet<String> = store
+        .list()
+        .into_iter()
+        .filter(|q| q.status.open())
+        .map(|q| q.run)
+        .collect();
+    let mut abandoned = 0;
+    for run in waiting_on {
+        let Ok(meta) = read_meta(runs, &run) else {
+            continue;
+        };
+        match store.settle_run(&run, meta.status) {
+            Ok(n) => abandoned += n,
+            Err(e) => tracing::warn!("housekeep: abandon questions for {run}: {e:#}"),
+        }
+    }
+    abandoned
 }
 
 /// Fold every run that is finished, older than the grace period, and not being
@@ -493,6 +537,107 @@ mod tests {
         assert!(
             runs.join(due_ready).exists(),
             "folding drops worktrees, not the record"
+        );
+    }
+
+    /// A fresh open question on `run`, stored and handed back for assertions.
+    fn open_question(store: &Questions, run: &str) -> crate::ask::Question {
+        let mut q = crate::ask::Question::new(
+            run.to_owned(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            "Which storage backend should the cache use?".to_owned(),
+            String::new(),
+            vec!["SQLite".to_owned(), "Redis".to_owned()],
+        );
+        store.put(&mut q).unwrap();
+        q
+    }
+
+    /// The exact ghost the phone showed: a run that already finished, with a
+    /// question its dead seat asked still sitting `open` because it reached
+    /// that status before `graph::Runner::settle_questions` existed (or
+    /// missed it in the crash window `daemon::reclaim_orphaned_running`
+    /// covers). This sweep is the second door to the same fact.
+    #[test]
+    fn a_finished_runs_open_question_is_swept_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let store = Questions::at(dir.path().join("questions"));
+
+        let failed = "20260908-205802-c9eb";
+        write_meta(&runs, failed, "failed", "2026-09-08T20:58:02Z");
+        let failed_q = open_question(&store, failed);
+
+        let merged = "20260908-205501-ca67";
+        write_meta(&runs, merged, "merged", "2026-09-08T20:55:01Z");
+        let merged_q = open_question(&store, merged);
+
+        let n = abandon_settled_questions(&store, &runs);
+        assert_eq!(n, 2, "both dead runs' questions are swept in one pass");
+
+        for (id, run) in [(&failed_q.id, failed), (&merged_q.id, merged)] {
+            let back = store.get(id).unwrap();
+            assert!(!back.status.open(), "{run} is done; nobody reads an answer");
+            assert!(back.detail.contains(run), "{}", back.detail);
+        }
+    }
+
+    #[test]
+    fn a_still_alive_runs_open_question_survives_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let store = Questions::at(dir.path().join("questions"));
+
+        // `Blocked` and `Stalled` are `RunStatus::resumable`: the run can
+        // still be picked back up, so its question may yet get a real
+        // answer. A run still mid-competition is even more obviously alive.
+        for (id, status) in [
+            ("20260908-000000-b10c", "blocked"),
+            ("20260908-000000-5ta1", "stalled"),
+            ("20260908-000000-jud6", "judging"),
+        ] {
+            write_meta(&runs, id, status, "2026-09-08T00:00:00Z");
+            let q = open_question(&store, id);
+
+            let n = abandon_settled_questions(&store, &runs);
+            assert_eq!(n, 0, "{status} run is not done; nothing to sweep");
+            assert!(
+                store.get(&q.id).unwrap().status.open(),
+                "{status} run's question must still be waiting"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sweep_leaves_an_answered_question_and_an_unreadable_run_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let store = Questions::at(dir.path().join("questions"));
+
+        // Already decided: a sweep must never revisit it, whatever the run
+        // that asked went on to become.
+        let done = "20260908-000000-answ";
+        write_meta(&runs, done, "failed", "2026-09-08T00:00:00Z");
+        let mut answered = open_question(&store, done);
+        answered
+            .answer(crate::ask::Answer::Choice("SQLite".to_owned()))
+            .unwrap();
+        store.put(&mut answered).unwrap();
+
+        // No `run.json` at all for this one - deleted, or never landed.
+        let gone = "20260908-000000-gone";
+        let orphan = open_question(&store, gone);
+
+        assert_eq!(abandon_settled_questions(&store, &runs), 0);
+        assert_eq!(
+            store.get(&answered.id).unwrap().status,
+            crate::ask::QuestionStatus::Answered,
+            "a real answer is never overwritten by a sweep"
+        );
+        assert!(
+            store.get(&orphan.id).unwrap().status.open(),
+            "a run this sweep cannot read is left exactly as it was, not guessed at"
         );
     }
 

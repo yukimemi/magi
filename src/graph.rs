@@ -27,6 +27,7 @@ use jiff::Timestamp;
 use tokio::sync::Semaphore;
 
 use crate::agent::{self, AgentOutput, Invocation, SeatState};
+use crate::ask;
 use crate::blind;
 use crate::bump;
 use crate::config::{
@@ -529,6 +530,29 @@ impl Runner {
         self.pause = pause;
     }
 
+    /// Abandon this run's own open questions, once `status` has actually
+    /// settled rather than merely paused.
+    ///
+    /// `Blocked` and `Stalled` are `RunStatus::resumable` — a human can pick
+    /// either back up with the candidates, the review round and the seat
+    /// sessions already on disk, so a question an implementer asked mid-round
+    /// may still get a real answer read by a real resume. Only the three
+    /// statuses `resumable` excludes are actually final: the run merged, or
+    /// it reached `Ready` with nothing left to do, or it failed outright with
+    /// no established point to continue from. In every one of those the seat
+    /// that asked is gone for good, exactly like the run being deleted under
+    /// `magi run rm` - so the same cleanup applies, worded for what actually
+    /// happened instead of "the run was deleted".
+    ///
+    /// Best-effort and silent on success: called from every place `status`
+    /// can land on one of those three, including ones a resumed run revisits,
+    /// so it must cost nothing when there was nothing open to begin with.
+    fn settle_questions(&mut self) {
+        if let Err(e) = ask::Questions::open().settle_run(&self.state.id, self.state.status) {
+            tracing::warn!("abandon questions for {}: {e:#}", self.state.id);
+        }
+    }
+
     /// The tail of the graph after a trustworthy tally: fold losers, review,
     /// gate, merge, and persist.
     async fn finish_after_tally(&mut self) -> Result<()> {
@@ -965,6 +989,7 @@ impl Runner {
                             .event("blind", format!("vendor text in a patch: {summary}"));
                         self.state.leaks = leaks;
                         self.state.save()?;
+                        self.settle_questions();
                         bail!(
                             "blind.on_leak = \"fail\" and vendor text reached a \
                              judged patch: {summary}"
@@ -986,6 +1011,7 @@ impl Runner {
         if self.state.viable().is_empty() {
             self.state.status = RunStatus::Failed;
             self.state.save()?;
+            self.settle_questions();
             bail!("no candidate produced a change; nothing to judge");
         }
         self.state.status = RunStatus::Judging;
@@ -2974,6 +3000,11 @@ impl Runner {
         {
             self.run_land().await?;
         }
+        // `run_land` may have left `status` at `Landing` - still waiting on
+        // CI or the owner's approval, not actually settled - so this has to
+        // read whatever `status` ended up as here, not the `Merged` this
+        // function set a few lines up.
+        self.settle_questions();
         Ok(())
     }
 
@@ -3897,6 +3928,148 @@ mod tests {
         std::fs::write(dir.join("README.md"), "# fixture\n").unwrap();
         run(&["add", "-A"]);
         run(&["commit", "-m", "init"]);
+    }
+
+    // `settle_questions` is what closes the ghost the phone showed: a run's
+    // seat asked something, the run then ended, and nothing was left to
+    // abandon the question it left `open`. `HOME` is a process-wide
+    // `OnceLock` (see `run::set_home`'s doc), so this only wins the race the
+    // first time it runs in the binary — every test below still reaches the
+    // same directory whichever call won, and each gets its own run id from
+    // `RunState::new`, so they never collide there.
+    fn ask_test_home() {
+        crate::run::set_home(std::env::temp_dir().join("magi-graph-ask-tests-home"));
+    }
+
+    /// A minimal, git-free `Runner` at a given status — `settle_questions`
+    /// reads nothing else off it.
+    fn runner_at(status: RunStatus) -> Runner {
+        let mut state = RunState::new(
+            PathBuf::from("/nonexistent/repo"),
+            "main".to_owned(),
+            "deadbeef".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        );
+        state.status = status;
+        Runner {
+            state,
+            roles: ResolvedRoles {
+                implementers: Vec::new(),
+                judges: Vec::new(),
+                reviewers: Vec::new(),
+                fixer: None,
+            },
+            sem: Arc::new(Semaphore::new(1)),
+            pause: Pause::new(),
+        }
+    }
+
+    /// A fresh open question on `run`, stored and handed back for assertions.
+    fn ask_open_question(store: &ask::Questions, run: &str) -> ask::Question {
+        let mut q = ask::Question::new(
+            run.to_owned(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            "Which storage backend should the cache use?".to_owned(),
+            String::new(),
+            vec!["SQLite".to_owned(), "Redis".to_owned()],
+        );
+        store.put(&mut q).unwrap();
+        q
+    }
+
+    #[test]
+    fn a_failed_runs_open_question_is_abandoned() {
+        ask_test_home();
+        let store = ask::Questions::open();
+        let mut runner = runner_at(RunStatus::Failed);
+        let run = runner.state.id.clone();
+        let q = ask_open_question(&store, &run);
+
+        runner.settle_questions();
+
+        let back = store.get(&q.id).unwrap();
+        assert!(
+            !back.status.open(),
+            "the seat that asked died with the run; nobody is left to read an answer"
+        );
+        assert!(
+            back.detail.contains(&run) && back.detail.contains("failed"),
+            "the reason names what the run became, not just that it is gone: {}",
+            back.detail
+        );
+    }
+
+    #[test]
+    fn a_merged_runs_open_question_is_abandoned_too() {
+        ask_test_home();
+        let store = ask::Questions::open();
+        // A run that finishes cleanly still leaves nobody to read an answer -
+        // this is not only a failure-path cleanup.
+        for status in [RunStatus::Merged, RunStatus::Ready] {
+            let mut runner = runner_at(status);
+            let run = runner.state.id.clone();
+            let q = ask_open_question(&store, &run);
+
+            runner.settle_questions();
+
+            let back = store.get(&q.id).unwrap();
+            assert!(
+                !back.status.open(),
+                "{status:?} run's question must not outlive the run"
+            );
+        }
+    }
+
+    #[test]
+    fn a_still_resumable_runs_open_question_is_left_alone() {
+        ask_test_home();
+        let store = ask::Questions::open();
+        // `Blocked` and `Stalled` can still be resumed — the candidates, the
+        // review round and the seat sessions are all still on disk — so a
+        // question asked mid-round may yet get a real answer from a real
+        // resume. Sweeping it here would be exactly the failure mode this
+        // whole feature exists to avoid on the other side.
+        for status in [RunStatus::Blocked, RunStatus::Stalled] {
+            let mut runner = runner_at(status);
+            let run = runner.state.id.clone();
+            let q = ask_open_question(&store, &run);
+
+            runner.settle_questions();
+
+            let back = store.get(&q.id).unwrap();
+            assert!(
+                back.status.open(),
+                "{status:?} is still alive; the question must still be waiting"
+            );
+        }
+    }
+
+    #[test]
+    fn settle_questions_never_touches_an_already_answered_question() {
+        ask_test_home();
+        let store = ask::Questions::open();
+        let mut runner = runner_at(RunStatus::Failed);
+        let run = runner.state.id.clone();
+        let mut q = ask_open_question(&store, &run);
+        q.answer(crate::ask::Answer::Choice("SQLite".to_owned()))
+            .unwrap();
+        store.put(&mut q).unwrap();
+
+        // Called twice, the way a crash-recovered daemon reclaim and the
+        // graph's own cleanup both can for the same run — `abandon_for_run`
+        // only ever touches what is still open, so this must be inert both
+        // times, not merely the second.
+        runner.settle_questions();
+        runner.settle_questions();
+
+        let back = store.get(&q.id).unwrap();
+        assert_eq!(
+            back.status,
+            ask::QuestionStatus::Answered,
+            "a real answer is a decision on record, never overwritten by a sweep"
+        );
     }
 
     /// `status == Ready` used to be read as "this is the harmless
