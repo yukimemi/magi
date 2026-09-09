@@ -845,10 +845,28 @@ impl Questions {
             .unwrap_or(0)
     }
 
-    /// How many questions are waiting on the owner. The badge on the phone,
-    /// and the one number that says whether magi is blocked on a human.
+    /// How many questions are open, whichever side of the conversation is
+    /// holding the ball right now. Ten turns of back and forth between the
+    /// owner and the agent are still one open question - see
+    /// [`Question::say`] - so this does not drop while a reply is in
+    /// flight. [`Self::count_needs_owner`] is the number that does.
     pub fn count_open(&self) -> usize {
         self.list().iter().filter(|q| q.status.open()).count()
+    }
+
+    /// How many open questions actually need the owner right now: open, and
+    /// not [`Question::waiting_on_agent`].
+    ///
+    /// This is the number a notification channel owes - the ask bar, the nav
+    /// badge, the document title - because those exist to say "something
+    /// needs you", and a question sitting in `magi ask --thread` limbo does
+    /// not. `count_open` stays as it is for [`Self::open_for`]'s callers,
+    /// where a round trip must not look like the run resumed.
+    pub fn count_needs_owner(&self) -> usize {
+        self.list()
+            .iter()
+            .filter(|q| q.status.open() && !q.waiting_on_agent())
+            .count()
     }
 }
 

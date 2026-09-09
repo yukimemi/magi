@@ -2154,11 +2154,23 @@ function renderQueue() {
 const openQuestions = () => (state.questions || []).filter((q) => q.status === "open");
 const openFor = (runId) => openQuestions().filter((q) => q.run === runId);
 
-/* Until /api/questions has answered, health's own count is what is known. */
-function openCount() {
+/* Of the open questions, the ones that actually need the owner right now:
+   not the ones the owner has already talked back on and is waiting on the
+   agent's `magi ask --thread` reply to. `status` cannot tell the two apart -
+   see `Question.waiting_on_agent` - which is exactly why this is a separate
+   filter from `openQuestions` rather than a tweak to it: `openQuestions` is
+   still what the Questions page counts as "blocking a run", and a round trip
+   is still blocking, just not on the owner. */
+const needsOwnerQuestions = () => openQuestions().filter((q) => q.waiting_on_agent !== true);
+
+/* Until /api/questions has answered, health's own count is what is known.
+   `questions_needs_owner` is health's version of the same filter - see
+   `ask::Questions::count_needs_owner` - so the ask bar, the nav badge and the
+   title agree with the sharper truth from the moment /api/questions lands. */
+function needsOwnerCount() {
   return state.questions === null
-    ? Number(state.health && state.health.questions_open) || 0
-    : openQuestions().length;
+    ? Number(state.health && state.health.questions_needs_owner) || 0
+    : needsOwnerQuestions().length;
 }
 
 function sortQuestions(list) {
@@ -2774,8 +2786,8 @@ function reflectQuestion(question) {
    real one appears, which is the one failure this feature cannot survive. */
 function renderAskBar() {
   const bar = $("ask-bar");
-  const count = openCount();
-  const open = openQuestions();
+  const count = needsOwnerCount();
+  const open = needsOwnerQuestions();
 
   show(bar, count > 0);
   renderIndicators(count);
@@ -2809,7 +2821,7 @@ function renderIndicators(count) {
    deck open in a background tab shows the title in the tab strip and in the
    app switcher — which is the only notification channel this UI has. */
 function renderTitle() {
-  const count = openCount();
+  const count = needsOwnerCount();
   const base = state.route.name === "queue"
     ? "Backlog \u2014 magi"
     : state.route.name === "questions"
@@ -5073,8 +5085,8 @@ async function loadHealth({ applyRevisions = false } = {}) {
        is the only thing that asks. */
     if (state.health.loop) applyLoop(state.health.loop);
     else renderLoop();
-    /* health.questions_open is the count until /api/questions has answered,
-       so the indicator is right on the very first paint. */
+    /* health.questions_needs_owner is the count until /api/questions has
+       answered, so the indicator is right on the very first paint. */
     renderAskBar();
     if (applyRevisions) await applyRevisions_(state.health);
     ok();
