@@ -1002,11 +1002,19 @@ async fn wait_loop(
     slice: Duration,
     poll: Duration,
 ) -> Result<Wait> {
-    // Turns already on the question when this wait started - which for a
-    // `--thread` reply includes the operator's own last word - so a *new*
-    // operator turn appearing mid-wait is unambiguous even though the agent's
-    // own reply just added one too.
-    let starting_turns = q.thread.len();
+    // The owner may already have spoken back before this call ever started -
+    // most often because they did so in the gap between an earlier call
+    // reporting `Wait::Pending` and this one picking the wait back up with
+    // `--wait`. That word must surface at once rather than sit unnoticed
+    // until some *later* turn happens to change something: this call never
+    // saw it get added, so nothing below would otherwise recognise it as
+    // new. `last_word_awaiting_reply` reads the question's own record of
+    // whose turn it is - see [`Question::waiting_on_agent`] - rather than a
+    // turn count this call would have to have been there to capture.
+    if let Some(said) = last_word_awaiting_reply(q) {
+        return Ok(Wait::Replied(said.to_owned()));
+    }
+
     let bounded = timeout.min(slice);
     let is_the_real_deadline = bounded >= timeout;
     let deadline = tokio::time::Instant::now() + bounded;
@@ -1043,21 +1051,15 @@ async fn wait_loop(
                     None => Wait::Abandoned,
                 });
             }
-            Ok(fresh) if fresh.thread.len() > starting_turns => {
-                *q = fresh;
-                if let Some(said) = q
-                    .thread
-                    .iter()
-                    .rev()
-                    .find(|t| t.who == Who::Operator)
-                    .map(|t| t.body.clone())
-                {
+            Ok(fresh) => {
+                if let Some(said) = last_word_awaiting_reply(&fresh) {
+                    let said = said.to_owned();
+                    *q = fresh;
                     return Ok(Wait::Replied(said));
                 }
-                // The new turn was not the owner's - nothing this wait cares
-                // about happened, so keep polling.
+                // Still open and not waiting on the agent - nothing this
+                // wait cares about happened, so keep polling.
             }
-            Ok(_) => {}
             Err(e) => {
                 // Mid-rename, or a file the operator is editing by hand.
                 // Neither is a reason to abandon a question a human may still
@@ -1066,6 +1068,22 @@ async fn wait_loop(
             }
         }
     }
+}
+
+/// The owner's own last word, if the agent has not caught up on it yet.
+///
+/// A thin wrapper over [`Question::waiting_on_agent`] that also hands back
+/// what was said: the state is on the record itself, not derived from
+/// anything this call has seen happen, so it reads correctly whether this is
+/// the process that has been polling all along or a fresh `--wait` that just
+/// loaded the question off disk for the first time. `None` on a fresh
+/// question, one the agent already replied to, or one that is no longer
+/// open.
+fn last_word_awaiting_reply(q: &Question) -> Option<&str> {
+    if !q.waiting_on_agent() {
+        return None;
+    }
+    q.thread.last().map(|t| t.body.as_str())
 }
 
 /// Run the operator's notification command, if one is configured.
@@ -1652,6 +1670,54 @@ mod tests {
             .unwrap();
         assert_eq!(second, Wait::Answered("Redis".to_owned()));
         assert_eq!(q.status, QuestionStatus::Answered);
+    }
+
+    #[tokio::test]
+    async fn a_reply_left_in_the_gap_before_a_resumed_wait_starts_is_never_missed() {
+        // The owner can speak back while nothing is running at all - between
+        // one call reporting `Wait::Pending` and the next `--wait` picking
+        // the question back up - and whoever resumes the wait loads a
+        // *fresh* copy of the question off disk, one whose thread already
+        // contains that reply. A baseline taken from that fresh copy would
+        // treat the reply as pre-existing and never notice it "arrive",
+        // leaving the agent polling in silence until `answer_timeout`
+        // eventually abandons the question - replacing the exact accident
+        // this feature exists to fix with a quieter version of itself.
+        let (dir, s) = store();
+        let mut q = choice_question();
+        s.put(&mut q).unwrap();
+
+        let first = wait_loop(
+            &mut q,
+            &s,
+            Duration::from_secs(3600),
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, Wait::Pending);
+
+        // The owner speaks back during the gap, with nobody running yet.
+        let id = q.id.clone();
+        let writer = Questions::at(dir.path().join("questions"));
+        let mut fresh = writer.get(&id).unwrap();
+        fresh.say("why not Postgres?").unwrap();
+        writer.put(&mut fresh).unwrap();
+
+        // `magi ask --wait` re-reads the question rather than reusing the
+        // stale in-memory copy the earlier call held - so the copy handed to
+        // `resume_wait` here already carries the reply, same as `fresh` above.
+        let mut resumed = s.get(&id).unwrap();
+        let second = resume_wait(&mut resumed, &s, Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert_eq!(second, Wait::Replied("why not Postgres?".to_owned()));
+        assert_eq!(
+            resumed.status,
+            QuestionStatus::Open,
+            "talking back is not a decision; the question stays open"
+        );
     }
 
     #[tokio::test]
