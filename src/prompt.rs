@@ -144,6 +144,23 @@ magi ask --summary \"Which storage backend?\" --choice SQLite --choice Redis\n\
 ```\n\n\
 It blocks and prints the owner's answer on stdout. Omit `--choice` for a \
 free-text reply.\n\n\
+**Never put this in the background.** The process blocked inside `magi ask` \
+*is* the conversation with the owner - it is the only thing that will ever \
+read their answer. Backgrounding it, or letting your own process exit while \
+it is still running, does not free you to keep working and pick the answer \
+up later: it throws the answer away. The owner still sees the question, \
+still replies, and nothing is left listening. A single call cannot block \
+forever, so instead of hanging until something kills it, it stops on its own \
+after a while and prints that nothing has happened yet - not a failure, just \
+this call's own turn running out. When you see that, call it again, in the \
+foreground, exactly as told:\n\n\
+```sh\n\
+magi ask --wait <question-id>\n\
+```\n\n\
+Keep calling `--wait` in the foreground - one blocking call after another - \
+until an answer or a reply comes back. It resumes the same wait; it does not \
+ask anything new and takes no `--summary`. Backgrounding *this* call throws \
+the answer away exactly as backgrounding the first one would.\n\n\
 You can attach a page you format yourself, which is how the owner actually \
 judges: a diff, a table of what changes, a rendered before and after.\n\n\
 ```sh\n\
@@ -1283,6 +1300,24 @@ mod tests {
         assert!(
             p.contains("Restate `--choice`"),
             "the old choices are not kept across a reply: {p}"
+        );
+    }
+    #[test]
+    fn an_implementer_is_told_never_to_background_the_wait_and_how_to_resume_it() {
+        // A seat backgrounded a blocking `magi ask`, reported it would
+        // "continue once the owner replies", and exited `completed` - the
+        // child that would have read the reply died with it, and the owner's
+        // eventual answer had nobody left listening. The prompt has to rule
+        // this out explicitly rather than trust it is obvious.
+        let p = implement("do it", "/tmp/wt", "en");
+        assert!(
+            p.contains("Never put this in the background"),
+            "the exact failure mode has to be named, not implied: {p}"
+        );
+        assert!(p.contains("magi ask --wait"), "{p}");
+        assert!(
+            p.contains("foreground"),
+            "the fix is a foreground call, not a background one: {p}"
         );
     }
     #[test]
