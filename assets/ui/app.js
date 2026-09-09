@@ -1371,7 +1371,7 @@ function selectRunStateFilter(key) {
 /* Built once and then only updated in place, not rebuilt like the tree —
    there are only five of these, but a full rebuild on every SSE tick would
    still steal keyboard focus off whichever chip the operator just tapped. */
-function renderRunStateChips(heads) {
+function renderRunStateChips(runs) {
   const bar = $("runs-state-chips");
   if (!bar.childElementCount) {
     for (const def of RUN_STATE_FILTERS) {
@@ -1389,13 +1389,15 @@ function renderRunStateChips(heads) {
   }
   for (const node of bar.children) {
     const def = RUN_STATE_FILTERS.find((f) => f.key === node.dataset.key);
-    // Counted from every head, regardless of which chip is currently
-    // picked, so a badge never shrinks the moment its own chip is tapped —
-    // but from *heads*, not the raw /api/runs list: a folded-away earlier
-    // attempt (see foldRuns) never gets its own card, only a line in its
-    // successor's disclosure, so counting it here would advertise a number
-    // that chip can never actually produce.
-    setText(node.querySelector(".state-chip-count"), String(heads.filter(def.match).length));
+    // Counted from the full, unfiltered /api/runs list, not from `heads` —
+    // a folded-away earlier attempt (see foldRuns) never gets its own card,
+    // but it is still a real done/waiting/in-flight run and belongs in the
+    // census this badge is reporting. Counting from `heads` instead would
+    // make a completed retry disappear from the "Done" badge entirely
+    // (0 where the fleet plainly has one), and it would still shift the
+    // moment the run in question got folded under a new attempt — the same
+    // unreadable-number failure mode this full-list count exists to avoid.
+    setText(node.querySelector(".state-chip-count"), String(runs.filter(def.match).length));
     setAttr(node, "aria-checked", state.runsStateFilter === def.key ? "true" : "false");
   }
 }
@@ -1755,7 +1757,7 @@ function renderRuns() {
   const { heads, childrenOf } = foldRuns(runs);
 
   show($("runs-state-chips"), runs.length > 0);
-  if (runs.length > 0) renderRunStateChips(heads);
+  if (runs.length > 0) renderRunStateChips(runs);
 
   /* Two hidings, on by default, both lifted by "all": a done run and an old
      attempt (isOrphanSuperseded, or a whole entry in childrenOf) are both
