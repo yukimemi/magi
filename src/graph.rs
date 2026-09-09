@@ -465,6 +465,11 @@ impl Runner {
         // never find its way back into `land` at all.
         if self.state.status == RunStatus::Landing {
             self.run_land().await?;
+            // `run_land` may have settled the run right here - CI came back
+            // green and the PR merged, say - without ever passing back
+            // through `merge`'s own trailing call. Whatever it left `status`
+            // as is what this has to read.
+            self.settle_questions();
             return Ok(());
         }
         self.prep().await?;
@@ -4270,6 +4275,13 @@ mod tests {
             detail: "https://example.invalid/x/y/pull/1".to_owned(),
         });
 
+        // The Landing-resume shortcut calls `run_land` directly rather than
+        // through `merge`, which is exactly the call site that used to skip
+        // `settle_questions` - see the fixture below.
+        ask_test_home();
+        let store = ask::Questions::open();
+        let q = ask_open_question(&store, &state.id);
+
         let mut runner = Runner {
             state,
             roles: ResolvedRoles {
@@ -4299,6 +4311,14 @@ mod tests {
             RunStatus::Landing,
             "land could not actually reach the fake pull request, so it must \
              have given up rather than left the run silently parked forever"
+        );
+        // `land` could not reach the fake pull request, so it gave up into
+        // `Blocked` - still resumable, so the question must not have been
+        // swept just because this branch now also calls `settle_questions`.
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert!(
+            store.get(&q.id).unwrap().status.open(),
+            "Blocked is still alive; settle_questions must have been a no-op here"
         );
     }
 
