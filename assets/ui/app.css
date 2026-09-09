@@ -1014,12 +1014,21 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .count { color: var(--ink-3); font-weight: 500; letter-spacing: 0; text-transform: none; }
 
 /* The folded Chat tasks panel (#talk-tasks-panel) prints a status breakdown
-   in its summary, not just a count, and that string grows with how many
-   distinct statuses are in play - not with how many tasks were filed, but
-   still enough to outrun "Filed from here" on a phone. .advanced summary is
-   shared with the queue card's single-line "Full instruction" disclosure, so
-   the wrap is scoped here rather than added there. */
-#talk-tasks-panel > summary { flex-wrap: wrap; }
+   in its summary, not just a count, and that string's length depends on how
+   many distinct statuses are in play - up to five - rather than on how many
+   tasks were filed. But the whole point of folding the panel is a collapsed
+   height that never grows, and on a phone even the five-status case does not
+   fit next to "Filed from here" on one line, so it is left free to shrink and
+   is clipped with an ellipsis rather than wrapped: a wrap would make the
+   summary itself, and so the folded panel, taller exactly when there is more
+   to report - the failure mode this change exists to remove. The label stays
+   unshrunk so it never contributes to the clipping. */
+#talk-tasks-panel > summary { flex-wrap: nowrap; }
+#talk-tasks-panel > summary .talk-tasks-label { flex: none; }
+#talk-tasks-panel > summary #talk-tasks-count {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 .run-status { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
 .instruction { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--t4); color: var(--ink); }
