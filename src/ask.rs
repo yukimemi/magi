@@ -40,8 +40,8 @@ use crate::config;
 use crate::proc::Quiet as _;
 
 /// On-disk format for a question. Bumped when a field's meaning changes, or -
-/// as with [`Question::thread`] - when a new field is added that a much older
-/// magi has no notion of at all.
+/// as with [`Question::thread`] and now [`Question::answer_timeout`] - when a
+/// new field is added that a much older magi has no notion of at all.
 ///
 /// The web UI is written against this shape by hand - there is no shared schema
 /// between the front end and this struct - so a field that changes meaning
@@ -53,7 +53,7 @@ use crate::proc::Quiet as _;
 /// "no conversation yet" rather than "unreadable", and a strict equality check
 /// would turn every bump into an upgrade that breaks reading yesterday's
 /// question files.
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
 
 /// How often the wait re-reads the question file.
 ///
@@ -312,6 +312,22 @@ pub struct Question {
     /// read and quietly hiding an open question from the operator.
     #[serde(default)]
     pub thread: Vec<Turn>,
+    /// The `answer_timeout`, in seconds, that was in force when this question
+    /// was first asked. `0` means unrecorded - a question written before this
+    /// field existed, or one filed by a flow (land's merge-approval gate)
+    /// that never sets it because it never resumes a sliced wait.
+    ///
+    /// [`Question::new`] cannot know this - the effective timeout (`--timeout`,
+    /// or the config default) is decided by the caller, after the question
+    /// already exists - so it starts at `0` here and whoever files a fresh
+    /// question sets it once, the same way [`Question::panel`] is set by
+    /// [`Questions::put_panel`] rather than by the constructor. It is never
+    /// touched again: `magi ask --wait` reads it as the one deadline it is
+    /// allowed to enforce, precisely so that a `--timeout` given (or omitted)
+    /// on a later call can never quietly extend or shrink the budget the
+    /// question was actually asked with.
+    #[serde(default)]
+    pub answer_timeout: u64,
 }
 
 impl Question {
@@ -341,6 +357,7 @@ impl Question {
             answered_at: None,
             answer: None,
             thread: Vec::new(),
+            answer_timeout: 0,
         }
     }
 
@@ -1316,6 +1333,7 @@ mod tests {
             keys,
             [
                 "answer",
+                "answer_timeout",
                 "answered_at",
                 "asked_at",
                 "assets",
@@ -1333,7 +1351,7 @@ mod tests {
             ],
             "the on-disk field set is a contract with the front end"
         );
-        assert_eq!(open["schema"], 2);
+        assert_eq!(open["schema"], 3);
         assert_eq!(open["thread"], serde_json::json!([]));
         assert_eq!(open["id"], "20260902-231501-ab12");
         assert_eq!(open["run"], "20260902-201256-9fb7");
@@ -2006,11 +2024,15 @@ mod tests {
         );
         assert!(q.assets.is_empty());
         // Schema 1 predates `thread` entirely - not merely predates it having
-        // any turns - and this build now speaks schema 2. Reading it must not
-        // be an error: `q.schema > SCHEMA` is false for 1 > 2, so the file is
+        // any turns - and this build now speaks schema 3. Reading it must not
+        // be an error: `q.schema > SCHEMA` is false for 1 > 3, so the file is
         // accepted and the missing field defaults to no conversation yet.
         assert_eq!(q.schema, 1);
         assert!(q.thread.is_empty());
+        assert_eq!(
+            q.answer_timeout, 0,
+            "an absent field means unrecorded, not a zero-second deadline"
+        );
         assert!(!q.waiting_on_agent());
         assert_eq!(q.summary, "Which storage backend should the cache use?");
         assert_eq!(

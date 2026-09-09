@@ -347,7 +347,11 @@ enum Command {
         choices: Vec<String>,
         /// Seconds until the question's answer_timeout is reached. Defaults
         /// to the config's answer_timeout. Each call still only blocks for one
-        /// slice of it - see the command's own doc.
+        /// slice of it - see the command's own doc. Recorded on the question
+        /// itself when it is first filed, so a later `--wait` enforces this
+        /// number regardless of what `--timeout` (or the config) says by
+        /// then; this flag only matters again for a question filed before
+        /// that recording existed.
         #[arg(long)]
         timeout: Option<u64>,
         /// An HTML page to show with the question: a diff, a table, images.
@@ -1282,6 +1286,10 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         }
         None => {
             let mut q = ask::Question::new(run, node, seat, summary, detail, choices);
+            // Recorded once, here, so a later `magi ask --wait` enforces the
+            // deadline this call actually asked with, not whatever `--timeout`
+            // or the config default happens to say when it is called.
+            q.answer_timeout = budget.as_secs();
             // The panel is attached before the question is filed: a question
             // that appears on the phone a moment before its evidence does is a
             // question the owner answers without the evidence.
@@ -1364,15 +1372,17 @@ async fn ask_wait_cmd(
     let resolved = store.resolve_id(id)?;
     let mut q = store.get(&resolved)?;
     question_belongs_to_this_run(&q, &run, "wait on")?;
-    if !q.status.open() {
-        bail!(
-            "question {} is already {}; there is nothing left to wait for",
-            q.short(),
-            q.status.as_str()
-        );
+    // The owner may have answered - or the question may have been abandoned
+    // out from under it - in the gap between an earlier call reporting
+    // `Wait::Pending` and this one being run. Either is a real outcome, not
+    // an error, and the answer must come out exactly as it would have if
+    // this call's own wait had found it.
+    if let Some(answer) = resolved_before_the_wait_even_starts(&q)? {
+        println!("{answer}");
+        return Ok(());
     }
 
-    let total = timeout.unwrap_or(cfg.graph.answer_timeout);
+    let total = answer_timeout_for_wait(&q, timeout.unwrap_or(cfg.graph.answer_timeout));
     let remaining = remaining_answer_budget(q.asked_at, total);
 
     eprintln!("resuming the wait on {} — waiting for the owner", q.short());
@@ -1442,6 +1452,52 @@ fn question_belongs_to_this_run(q: &ask::Question, run: &str, verb: &str) -> Res
 fn remaining_answer_budget(asked_at: jiff::Timestamp, answer_timeout: u64) -> std::time::Duration {
     let elapsed = (jiff::Timestamp::now().as_second() - asked_at.as_second()).max(0) as u64;
     std::time::Duration::from_secs(answer_timeout.saturating_sub(elapsed))
+}
+
+/// The `answer_timeout` a resumed wait must enforce: the value the question
+/// was actually first asked with, never whatever `--timeout` or the config
+/// happens to say at the moment `--wait` is called.
+///
+/// Without this, a question filed with an explicit `--timeout` shorter (or
+/// longer) than the config's `answer_timeout` would silently pick up the
+/// config's number the moment a later `--wait` omitted `--timeout` itself -
+/// stretching or shrinking the deadline the first ask actually set, exactly
+/// what stacking `--wait` calls must never do. `fallback` only applies to a
+/// question with nothing recorded (`answer_timeout == 0`): one written
+/// before this field existed, or filed by a flow - land's merge-approval
+/// gate - that never resumes a sliced wait and so never sets it.
+fn answer_timeout_for_wait(q: &ask::Question, fallback: u64) -> u64 {
+    if q.answer_timeout > 0 {
+        q.answer_timeout
+    } else {
+        fallback
+    }
+}
+
+/// What to do about a question that is no longer open, before a resumed wait
+/// ever polls anything: `Ok(Some(answer))` is what to print and exit on,
+/// `Ok(None)` means still open, keep going, and `Err` names why there is
+/// nothing left to wait for.
+///
+/// The owner can answer (or the question can be abandoned by something else
+/// entirely - a deleted run, most often) in the gap between one call
+/// reporting [`ask::Wait::Pending`] and the next `--wait` picking the
+/// question back up. That answer is not an error to report - it is exactly
+/// what a wait that never got interrupted would have returned - so it has to
+/// be checked before `resume_wait` ever starts polling, not folded into "the
+/// question must still be open" as a blanket refusal.
+fn resolved_before_the_wait_even_starts(q: &ask::Question) -> Result<Option<String>> {
+    if q.status.open() {
+        return Ok(None);
+    }
+    match q.resolution() {
+        Some(answer) => Ok(Some(answer)),
+        None => bail!(
+            "question {} is already {}; there is nothing left to wait for",
+            q.short(),
+            q.status.as_str()
+        ),
+    }
 }
 
 /// `magi answer`: reply or ask back from the terminal, so the phone is a
@@ -2200,6 +2256,73 @@ mod tests {
         // computing that must not panic on an underflowed duration.
         let expired = remaining_answer_budget(hour_ago, 1800);
         assert_eq!(expired, std::time::Duration::ZERO);
+    }
+
+    fn ask_question(summary: &str) -> ask::Question {
+        ask::Question::new(
+            "20260908-205802-c9eb".to_owned(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            summary.to_owned(),
+            String::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn a_wait_enforces_the_deadline_the_question_was_first_asked_with_not_a_later_default() {
+        // The bug this guards against: a question filed with `--timeout 300`
+        // outlives a `--wait` call that omits `--timeout` and would otherwise
+        // fall back to the config's answer_timeout (86400) - stretching a
+        // five-minute question's life two hundred and eighty-eight times over.
+        let mut q = ask_question("does this need a migration?");
+        q.answer_timeout = 300;
+        assert_eq!(
+            answer_timeout_for_wait(&q, 86_400),
+            300,
+            "the recorded budget wins over any fallback, larger or smaller"
+        );
+        assert_eq!(
+            answer_timeout_for_wait(&q, 60),
+            300,
+            "a smaller fallback must not cut the recorded budget short either"
+        );
+
+        // Only a question with nothing recorded - written before this field
+        // existed, or by a flow that never resumes a sliced wait - falls back
+        // to whatever the caller was given.
+        q.answer_timeout = 0;
+        assert_eq!(answer_timeout_for_wait(&q, 86_400), 86_400);
+    }
+
+    #[test]
+    fn a_wait_on_a_question_answered_in_the_gap_prints_the_answer_instead_of_erroring() {
+        // Exactly the race `magi ask --wait` has to survive: the owner
+        // answers between one call reporting `Wait::Pending` and the next
+        // `--wait` picking the question back up. That is not a failure - it
+        // is the answer a wait that never got interrupted would have printed.
+        let mut q = ask_question("which backend?");
+        q.answer(ask::Answer::Text("SQLite".to_owned())).unwrap();
+        assert_eq!(
+            resolved_before_the_wait_even_starts(&q).unwrap(),
+            Some("SQLite".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_wait_on_an_abandoned_question_is_refused_with_a_reason() {
+        let mut q = ask_question("which backend?");
+        q.abandon("timed out");
+        let e = resolved_before_the_wait_even_starts(&q)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("abandoned"), "{e}");
+    }
+
+    #[test]
+    fn a_wait_on_a_still_open_question_is_told_to_keep_going() {
+        let q = ask_question("which backend?");
+        assert_eq!(resolved_before_the_wait_even_starts(&q).unwrap(), None);
     }
 
     #[tokio::test]
