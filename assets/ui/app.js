@@ -1371,7 +1371,7 @@ function selectRunStateFilter(key) {
 /* Built once and then only updated in place, not rebuilt like the tree —
    there are only five of these, but a full rebuild on every SSE tick would
    still steal keyboard focus off whichever chip the operator just tapped. */
-function renderRunStateChips(runs) {
+function renderRunStateChips(heads) {
   const bar = $("runs-state-chips");
   if (!bar.childElementCount) {
     for (const def of RUN_STATE_FILTERS) {
@@ -1389,10 +1389,13 @@ function renderRunStateChips(runs) {
   }
   for (const node of bar.children) {
     const def = RUN_STATE_FILTERS.find((f) => f.key === node.dataset.key);
-    // Counted from the full, unfiltered list on purpose — a badge that
-    // shrinks the moment its own chip is picked would make the number on it
-    // unreadable, and the point is to see what picking it will do.
-    setText(node.querySelector(".state-chip-count"), String(runs.filter(def.match).length));
+    // Counted from every head, regardless of which chip is currently
+    // picked, so a badge never shrinks the moment its own chip is tapped —
+    // but from *heads*, not the raw /api/runs list: a folded-away earlier
+    // attempt (see foldRuns) never gets its own card, only a line in its
+    // successor's disclosure, so counting it here would advertise a number
+    // that chip can never actually produce.
+    setText(node.querySelector(".state-chip-count"), String(heads.filter(def.match).length));
     setAttr(node, "aria-checked", state.runsStateFilter === def.key ? "true" : "false");
   }
 }
@@ -1749,27 +1752,46 @@ function renderRuns() {
     ? `${unreadable} unreadable`
     : "";
 
-  show($("runs-state-chips"), runs.length > 0);
-  if (runs.length > 0) renderRunStateChips(runs);
-
   const { heads, childrenOf } = foldRuns(runs);
 
+  show($("runs-state-chips"), runs.length > 0);
+  if (runs.length > 0) renderRunStateChips(heads);
+
   /* Two hidings, on by default, both lifted by "all": a done run and an old
-     attempt this page could not fold under its replacement (isOrphanSuperseded)
-     are both "not what needs me right now", which is the whole reason this
-     filter exists. supersededHidden exists only to keep the count honest —
-     without it, runs-count would say "3 in flight" while quietly also having
+     attempt (isOrphanSuperseded, or a whole entry in childrenOf) are both
+     "not what needs me right now", which is the whole reason this filter
+     exists. supersededHidden exists only to keep the count honest — without
+     it, runs-count would say "3 in flight" while quietly also having
      dropped a dozen cards the operator never asked to hide. */
   const passingState = heads.filter(matchesRunState);
   const stateFiltered = state.runsStateFilter === "all"
     ? passingState
     : passingState.filter((r) => !isOrphanSuperseded(r));
-  const supersededHidden = passingState.length - stateFiltered.length;
+  const orphanHidden = passingState.length - stateFiltered.length;
 
-  renderRunsTree(buildRunsTree(groupBySection(stateFiltered)));
+  /* The tree stays built from every head regardless of the state chip, same
+     as it already ignored the section/repo filter it sits beside — a chip
+     that empties "Landed" out of the visible cards must not also erase the
+     tree's own way of reaching Landed, or "all"/"done" become the only way
+     back in even though the tree is the desktop's whole point. */
+  renderRunsTree(buildRunsTree(groupBySection(heads)));
   renderRunsFilterBar();
   const visible = stateFiltered.filter(matchesFilter);
-  syncRunSections(sectionsRoot, groupBySection(visible), childrenOf);
+
+  /* Every list in childrenOf exists only because foldRuns resolved a
+     superseded_by to a head on this page (see foldRuns above) — it is
+     exactly as superseded as an orphan head is, so "all" is what shows it
+     and anything else hides it, the same toggle isOrphanSuperseded answers
+     to. Passing an empty map (rather than filtering each list) reuses
+     updateRunRow's existing "nothing folded under this card" rendering
+     instead of adding a second code path for the same outcome. */
+  const foldedHidden = state.runsStateFilter === "all"
+    ? 0
+    : visible.reduce((sum, run) => sum + (childrenOf.get(run.id) || []).length, 0);
+  const childrenForRender = state.runsStateFilter === "all" ? childrenOf : new Map();
+  syncRunSections(sectionsRoot, groupBySection(visible), childrenForRender);
+
+  const supersededHidden = orphanHidden + foldedHidden;
 
   const counts = runs.length === 0
     ? (unreadable ? `no readable runs, ${unreadableNote}` : "Nothing has run yet")
