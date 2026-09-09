@@ -60,10 +60,12 @@
 //! disk unconditionally, before that check even runs, so a total failure
 //! still leaves something for the operator to read.
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use crate::agent::{self, Invocation, SeatState};
 use crate::chat;
@@ -100,6 +102,26 @@ pub struct AdvisorRecord {
 pub struct Advice {
     /// One record per advisor seat asked.
     pub records: Vec<AdvisorRecord>,
+    /// Did this deliberation reach a synthesized task file?
+    ///
+    /// [`deliberate`] writes this record to disk unconditionally, before any
+    /// of its own failure checks run (see the module doc's "The draft
+    /// survives every failure short of success") - so a total advisor
+    /// failure, a planner crash, or a synthesis `vet` rejects all leave an
+    /// `<id>.advisors.json` on disk whose `<id>.md` is still the raw,
+    /// un-synthesized interview draft, not the deliberation's output. This
+    /// field is `false` on every write except the very last one, made only
+    /// after `draft` itself has been overwritten with the synthesis - so a
+    /// reader (the web plan surface, `DraftAdvisorsView` in `src/web.rs`) can
+    /// tell those two situations apart without guessing from whether the
+    /// file happens to exist.
+    ///
+    /// `#[serde(default)]` so a record written before this field existed
+    /// deserializes as `false` - the safe reading, since a pre-existing
+    /// record's own age is exactly the information "was this ever
+    /// synthesized" would otherwise lose.
+    #[serde(default)]
+    pub synthesized: bool,
 }
 
 impl Advice {
@@ -134,7 +156,14 @@ pub async fn run(
         )
     })?;
 
-    let seats = config.advisors().context("resolving advisor seats")?;
+    let seats = config.advisors().with_context(|| {
+        format!(
+            "resolving advisor seats; the interview draft is unchanged at \
+             {0} - file it as-is with `magi task add --file {0}`, or fix \
+             `[roles] advisors` and retry `magi plan`.",
+            draft.display(),
+        )
+    })?;
     if seats.is_empty() {
         bail!(
             "`[graph] advisors` is 0, so there is nobody to deliberate with; \
@@ -253,7 +282,7 @@ async fn deliberate(
     let draft = ctx.draft;
     let artifacts = ctx.dir.join(format!("{}.advisors", ctx.id));
 
-    let advice = gather(
+    let mut advice = gather(
         seats,
         requirements,
         worktrees,
@@ -263,6 +292,7 @@ async fn deliberate(
             language: ctx.language,
             timeout: ctx.timeout,
             seed: ctx.seed,
+            max_parallel: ctx.config.graph.max_parallel.max(1),
         },
     )
     .await;
@@ -376,6 +406,18 @@ async fn deliberate(
 
     std::fs::write(draft, &synthesized).with_context(|| format!("write {}", draft.display()))?;
 
+    // Only reached once `draft` itself already holds the synthesis: every
+    // path above this line that bails leaves `synthesized` at its default
+    // `false`, which is what tells a reader (`DraftAdvisorsView` in
+    // `src/web.rs`) that `<id>.md` is still the raw interview draft, not this
+    // deliberation's output.
+    advice.synthesized = true;
+    std::fs::write(
+        &advice_path,
+        serde_json::to_string_pretty(&advice).context("serialize the advisor records")?,
+    )
+    .with_context(|| format!("write {}", advice_path.display()))?;
+
     Ok(advice)
 }
 
@@ -388,10 +430,17 @@ struct GatherCtx<'a> {
     language: &'a str,
     timeout: Duration,
     seed: u64,
+    /// `[graph] max_parallel`, at least 1. Caps how many advisor seats may be
+    /// mid-invocation at once, the same budget `graph::ask_json_wave` enforces
+    /// with its own `Semaphore` for judges and reviewers - a roster with more
+    /// advisor seats than that would otherwise start every one of them at
+    /// once, unbounded, since a bare `JoinSet` imposes no limit of its own.
+    max_parallel: usize,
 }
 
-/// Ask every seat for a design proposal, in parallel, headless and read-only,
-/// each in its own disposable worktree (`worktrees[i]` for `seats[i]`).
+/// Ask every seat for a design proposal, in parallel (bounded by
+/// `ctx.max_parallel`), headless and read-only, each in its own disposable
+/// worktree (`worktrees[i]` for `seats[i]`).
 ///
 /// Failures are per-seat, not fatal to the wave: a seat that crashes or
 /// answers unparsably still produces an [`AdvisorRecord`], so one bad seat
@@ -403,6 +452,7 @@ async fn gather(
     ctx: &GatherCtx<'_>,
 ) -> Advice {
     let n = seats.len();
+    let sem = Arc::new(Semaphore::new(ctx.max_parallel.max(1)));
     let mut set = tokio::task::JoinSet::new();
     for (i, spec) in seats.iter().cloned().enumerate() {
         let cwd = worktrees[i].clone();
@@ -412,8 +462,10 @@ async fn gather(
         let language = ctx.language.to_owned();
         let timeout = ctx.timeout;
         let seed = ctx.seed;
+        let sem = Arc::clone(&sem);
         let key = format!("advisor-{}", i + 1);
         set.spawn(async move {
+            let _permit = sem.acquire().await;
             let mut seat = SeatState::new(&key, &spec.id, seed ^ (i as u64 + 1));
             let prompt = prompt::advisor(&requirements, i + 1, n, &language);
             let started = Instant::now();
@@ -453,7 +505,10 @@ async fn gather(
     // Stable seat order for a readable record: a `JoinSet` completes in
     // whichever order the seats actually answered, not seat 1, 2, 3.
     records.sort_by(|a, b| a.seat.cmp(&b.seat));
-    Advice { records }
+    Advice {
+        records,
+        synthesized: false,
+    }
 }
 
 fn to_record(
@@ -617,6 +672,7 @@ mod tests {
                 language: "en",
                 timeout: Duration::from_secs(30),
                 seed: 7,
+                max_parallel: 4,
             },
         )
         .await;
@@ -631,6 +687,99 @@ mod tests {
         assert_eq!(ok.approach, "do X");
         assert!(advice.records[1].proposal.is_none());
         assert!(advice.records[1].error.is_some());
+    }
+
+    /// A path suitable for embedding in a `sh -c` command string on every
+    /// platform this runs on: `sh` on Windows is Git for Windows' MSYS build,
+    /// which understands drive-letter paths but not the backslashes
+    /// [`Path::display`] renders them with.
+    fn sh_path(p: &Path) -> String {
+        p.to_string_lossy().replace('\\', "/")
+    }
+
+    /// Reported: `gather` queued `seats.len()` jobs on a bare `JoinSet` with
+    /// nothing capping how many ran at once, unlike `graph::ask_json_wave`'s
+    /// `Semaphore`. Invisible at the roster's default width (3 advisors, 4
+    /// `max_parallel`) but a real budget breach for any roster wider than
+    /// that. Each seat marks itself active in a shared directory for the
+    /// length of its (fake) work, so the test can observe how many were
+    /// running at once from outside the wave.
+    #[tokio::test]
+    async fn gather_never_exceeds_max_parallel_seats_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("active");
+        std::fs::create_dir_all(&active).unwrap();
+
+        let n = 4usize;
+        let cap = 2usize;
+        let seats: Vec<AgentSpec> = (0..n)
+            .map(|i| {
+                let marker = sh_path(&active.join(format!("adv-{i}")));
+                AgentSpec {
+                    id: format!("sage-{i}"),
+                    kind: AgentKind::Command,
+                    model: None,
+                    command: vec![
+                        "sh".to_owned(),
+                        "-c".to_owned(),
+                        format!(
+                            "cat >/dev/null && touch '{marker}' && sleep 0.5 && \
+                             rm -f '{marker}' && cat <<'EOF'\n{}\nEOF",
+                            proposal_json("do X"),
+                        ),
+                    ],
+                    extra_args: Vec::new(),
+                    env: Default::default(),
+                    prompt_delivery: None,
+                }
+            })
+            .collect();
+
+        let worktrees: Vec<PathBuf> = (0..n).map(|i| dir.path().join(format!("wt-{i}"))).collect();
+        for wt in &worktrees {
+            std::fs::create_dir_all(wt).unwrap();
+        }
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_setter = Arc::clone(&done);
+        let artifacts = dir.path().join("artifacts");
+
+        let handle = tokio::spawn(async move {
+            let advice = gather(
+                &seats,
+                "the requirements",
+                &worktrees,
+                &GatherCtx {
+                    artifacts: &artifacts,
+                    run: "test-run",
+                    language: "en",
+                    timeout: Duration::from_secs(30),
+                    seed: 7,
+                    max_parallel: cap,
+                },
+            )
+            .await;
+            done_setter.store(true, std::sync::atomic::Ordering::SeqCst);
+            advice
+        });
+
+        let mut max_seen = 0usize;
+        for _ in 0..300 {
+            let count = std::fs::read_dir(&active).map(Iterator::count).unwrap_or(0);
+            max_seen = max_seen.max(count);
+            if done.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let advice = handle.await.unwrap();
+
+        assert_eq!(advice.records.len(), n);
+        assert!(
+            max_seen <= cap,
+            "at most {cap} advisor seat(s) may be mid-invocation at once when \
+             `[graph] max_parallel` is {cap}, but saw {max_seen} active at once"
+        );
     }
 
     fn config(agents: Vec<AgentSpec>, advisors: usize) -> Config {
@@ -734,6 +883,11 @@ mod tests {
         let raw = std::fs::read_to_string(&advice_path).expect("raw record on disk");
         let reread: Advice = serde_json::from_str(&raw).expect("parses back");
         assert_eq!(reread.records.len(), 2);
+        assert!(
+            reread.synthesized,
+            "a deliberation that overwrote the draft must record itself as synthesized on disk"
+        );
+        assert!(advice.synthesized);
 
         let final_draft = std::fs::read_to_string(&draft).unwrap();
         assert!(
@@ -784,7 +938,14 @@ mod tests {
         );
         // The raw attempt is still on disk, garbage and all - the operator can
         // read why every seat failed even though nothing was usable.
-        assert!(dir.join("20260906-000000-cd34.advisors.json").is_file());
+        let advice_path = dir.join("20260906-000000-cd34.advisors.json");
+        assert!(advice_path.is_file());
+        let reread: Advice =
+            serde_json::from_str(&std::fs::read_to_string(&advice_path).unwrap()).unwrap();
+        assert!(
+            !reread.synthesized,
+            "a total advisor failure must not record this deliberation as synthesized"
+        );
     }
 
     #[tokio::test]
@@ -813,6 +974,14 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains(&draft.display().to_string()), "{msg}");
         assert_eq!(std::fs::read_to_string(&draft).unwrap(), original);
+
+        let advice_path = dir.join("20260906-000000-ef56.advisors.json");
+        let reread: Advice =
+            serde_json::from_str(&std::fs::read_to_string(&advice_path).unwrap()).unwrap();
+        assert!(
+            !reread.synthesized,
+            "a planner reply with no task block must not record this deliberation as synthesized"
+        );
     }
 
     /// Reported: `chat::extract_draft` accepts an unclosed fence as whatever
@@ -851,6 +1020,14 @@ mod tests {
             original,
             "the interview draft must survive an incomplete synthesis"
         );
+
+        let advice_path = dir.join("20260906-000000-ij90.advisors.json");
+        let reread: Advice =
+            serde_json::from_str(&std::fs::read_to_string(&advice_path).unwrap()).unwrap();
+        assert!(
+            !reread.synthesized,
+            "a rejected synthesis must not record this deliberation as synthesized"
+        );
     }
 
     #[tokio::test]
@@ -883,5 +1060,46 @@ mod tests {
             .to_string();
         assert!(msg.contains("advisors` is 0"), "{msg}");
         assert!(msg.contains(&draft.display().to_string()), "{msg}");
+    }
+
+    /// Reported: `config.advisors()` failing (e.g. a `[roles] advisors` id
+    /// that is not in the roster) surfaced only "resolving advisor seats:
+    /// no agent with id `nope` in the roster", with no mention of where the
+    /// interview draft the operator still has to salvage actually lives -
+    /// every other failure path in this module names it.
+    #[tokio::test]
+    async fn an_unresolvable_advisor_seat_still_names_the_draft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drafts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let draft = dir.join("20260906-000000-jk90.md");
+        let original = good_draft();
+        std::fs::write(&draft, &original).unwrap();
+
+        let cfg = Config {
+            agents: vec![command("sage-a", &proposal_json("x"))],
+            roles: Roles {
+                advisors: vec!["nope".to_owned()],
+                planner: Some("planner".to_owned()),
+                ..Roles::default()
+            },
+            graph: Graph {
+                advisors: 1,
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+
+        let err = run(&cfg, tmp.path(), &draft, &dir, "20260906-000000-jk90")
+            .await
+            .expect_err("an advisor id absent from the roster must not resolve");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("nope"), "{msg}");
+        assert!(msg.contains(&draft.display().to_string()), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(&draft).unwrap(),
+            original,
+            "a seat-resolution failure must leave the interview draft untouched"
+        );
     }
 }
