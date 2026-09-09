@@ -1013,6 +1013,14 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .panel-note { font-size: var(--t2); color: var(--ink-3); }
 .count { color: var(--ink-3); font-weight: 500; letter-spacing: 0; text-transform: none; }
 
+/* The folded Chat tasks panel (#talk-tasks-panel) prints a status breakdown
+   in its summary, not just a count, and that string grows with how many
+   distinct statuses are in play - not with how many tasks were filed, but
+   still enough to outrun "Filed from here" on a phone. .advanced summary is
+   shared with the queue card's single-line "Full instruction" disclosure, so
+   the wrap is scoped here rather than added there. */
+#talk-tasks-panel > summary { flex-wrap: wrap; }
+
 .run-status { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
 .instruction { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--t4); color: var(--ink); }
 
