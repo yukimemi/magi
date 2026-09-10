@@ -1562,9 +1562,10 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                     Fixed::Committed => {}
                     Fixed::Declined if was_red => {
                         let why = format!(
-                            "the fixer produced no commit while {} check(s) were failing; \
-                             stopping instead of looping on an unchanged tree",
-                            pr.failing.len()
+                            "the fixer produced no commit while {} check(s) were failing \
+                             ({}); stopping instead of looping on an unchanged tree",
+                            pr.failing.len(),
+                            pr.failing.join(", ")
                         );
                         stop(state, &repo, &pr, &why).await?;
                         return Ok(pr);

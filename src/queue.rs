@@ -164,6 +164,19 @@ pub struct Task {
     /// still reads, with no reason recorded rather than a parse error.
     #[serde(default)]
     pub hold_reason: Option<String>,
+    /// Diagnostic detail excerpted from the run that led to a hold - what a
+    /// human would have found opening `artifacts/` by hand, not the one-line
+    /// reason in [`Task::last_error`]. Set only when a run's own attempts are
+    /// exhausted and the task becomes [`TaskStatus::Held`]; `daemon` computes
+    /// it from the run's own record, since this module has no notion of a
+    /// run's internals. Bounded in length by the writer - see
+    /// `daemon::diagnostic` - so a verbose run cannot make this file grow
+    /// without limit.
+    ///
+    /// `#[serde(default)]` so a queue file written before this field existed
+    /// still reads, with no diagnostic recorded rather than a parse error.
+    #[serde(default)]
+    pub diagnostic: Option<String>,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -188,6 +201,7 @@ impl Task {
             runs: Vec::new(),
             last_error: None,
             hold_reason: None,
+            diagnostic: None,
             created_at: now,
             updated_at: now,
         }
@@ -218,12 +232,22 @@ impl Task {
         self.status = TaskStatus::Done;
         self.last_error = None;
         self.hold_reason = None;
+        self.diagnostic = None;
     }
 
     /// Record a failed attempt. Out of attempts means held for a human, rather
     /// than retried until the money runs out.
+    ///
+    /// Clears [`Task::diagnostic`] unconditionally: it belongs to whatever run
+    /// produced it, and a caller that has one for *this* attempt sets it
+    /// itself right after calling this, once it knows the task actually ended
+    /// up [`TaskStatus::Held`] - see `daemon::diagnostic`. Without the clear, a
+    /// task released after a diagnosed hold and then failed again for an
+    /// unrelated, undiagnosed reason (a config error, say) would go on
+    /// showing the previous run's diagnostic as if it explained the new one.
     pub fn fail(&mut self, why: impl Into<String>, max_attempts: usize) {
         self.last_error = Some(why.into());
+        self.diagnostic = None;
         self.status = if self.attempts >= max_attempts {
             TaskStatus::Held
         } else {
@@ -242,6 +266,7 @@ impl Task {
     /// work up where it stopped.
     pub fn stall(&mut self, why: impl Into<String>) {
         self.last_error = Some(why.into());
+        self.diagnostic = None;
         self.attempts = self.attempts.saturating_sub(1);
         self.status = TaskStatus::Failed;
     }
@@ -317,6 +342,7 @@ impl Task {
     /// A pull request nobody merged is a request for a person, not a failure.
     pub fn handed_off(&mut self, why: impl Into<String>) {
         self.last_error = Some(why.into());
+        self.diagnostic = None;
         self.status = TaskStatus::Held;
     }
 
@@ -330,6 +356,7 @@ impl Task {
         // Otherwise the next person who holds this task reads a reason that
         // belonged to whatever it was waiting on last time.
         self.hold_reason = None;
+        self.diagnostic = None;
     }
 }
 
@@ -964,6 +991,66 @@ mod tests {
         let task = q.get("20260101-000000-aaaa").expect("must still read");
         assert!(task.hold_reason.is_none());
         assert_eq!(SCHEMA, 1, "this feature must not bump the schema");
+    }
+
+    #[test]
+    fn a_task_recorded_without_a_diagnostic_still_reads_as_none() {
+        let (_dir, q) = queue();
+        let path = q.path_of("20260101-000000-aaaa");
+        std::fs::create_dir_all(q.root()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": SCHEMA,
+                "id": "20260101-000000-aaaa",
+                "title": "from before diagnostics existed",
+                "instruction": "from before diagnostics existed",
+                "repo": ".",
+                "source": { "kind": "human" },
+                "status": "held",
+                "created_at": Timestamp::now().to_string(),
+                "updated_at": Timestamp::now().to_string(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let task = q.get("20260101-000000-aaaa").expect("must still read");
+        assert!(task.diagnostic.is_none());
+        assert_eq!(SCHEMA, 1, "this feature must not bump the schema");
+    }
+
+    #[test]
+    fn releasing_or_finishing_a_task_clears_its_stale_diagnostic() {
+        // A diagnostic belongs to the run that produced it. Left in place
+        // across a release, an unrelated later failure - a config error, say -
+        // would go on showing evidence for a problem that is no longer why the
+        // task is stuck.
+        let mut held = task("diagnosed");
+        held.start("run-1".to_owned());
+        held.fail("gate red", 1);
+        held.diagnostic = Some("cargo test failed: ...".to_owned());
+        assert_eq!(held.status, TaskStatus::Held);
+
+        held.release();
+        assert!(held.diagnostic.is_none());
+
+        held.diagnostic = Some("cargo test failed: ...".to_owned());
+        held.succeed();
+        assert!(held.diagnostic.is_none());
+    }
+
+    #[test]
+    fn failing_a_task_always_clears_whatever_diagnostic_it_carried() {
+        let mut t = task("retried");
+        t.start("run-1".to_owned());
+        t.diagnostic = Some("stale evidence from a previous hold".to_owned());
+        t.fail("unrelated config error", 5);
+        assert_eq!(t.status, TaskStatus::Failed);
+        assert!(
+            t.diagnostic.is_none(),
+            "fail() must not let an old diagnostic outlive the run that produced it"
+        );
     }
 
     #[test]

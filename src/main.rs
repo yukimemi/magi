@@ -1459,6 +1459,9 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             if let Some(r) = &t.hold_reason {
                 println!("held for  {r}");
             }
+            if let Some(d) = &t.diagnostic {
+                println!("\ndiagnostic\n{d}");
+            }
             println!("\n{}", t.instruction.trim_end());
             Ok(())
         }
