@@ -1323,11 +1323,22 @@ struct HealthView {
     /// the diagnosis that a run is being held for want of space has to be
     /// checkable on the same screen.
     disk: DiskView,
-    /// Questions nobody has answered yet.
-    ///
-    /// The one number here that means "nothing will happen until a human
-    /// acts": a parked run consumes nothing and progresses never.
+    /// Questions nobody has answered yet, including ones an owner talked
+    /// back on and is now waiting for the agent's reply to. A round trip
+    /// never changes [`crate::ask::QuestionStatus`], so this does not drop
+    /// while the ball is in the agent's court - see
+    /// [`crate::ask::Questions::count_open`].
     questions_open: usize,
+    /// Of those, how many actually need the owner right now: open, and not
+    /// [`crate::ask::Question::waiting_on_agent`].
+    ///
+    /// The one number that means "nothing will happen until a human acts" -
+    /// a parked run consumes nothing and progresses never - and the count the
+    /// ask bar, the nav badge and the document title fall back to before
+    /// `/api/questions` has answered, so those notification channels clear
+    /// the instant the owner asks back and reappear the instant the agent
+    /// replies, instead of sitting lit for however long the agent thinks.
+    questions_needs_owner: usize,
     /// Interviews the operator started in the browser and has not filed.
     ///
     /// Unlike `questions_open` nothing is blocked on these - a chat is the
@@ -1619,6 +1630,7 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             loop_rev,
             runs_unreadable: runs_unreadable(&ui.runs),
             questions_open: ui.questions.count_open(),
+            questions_needs_owner: ui.questions.count_needs_owner(),
             chats_open: ui.chats.count_open(),
             daemon: DaemonView::of(reading.clone()),
             looping: ui.loop_view(reading),
@@ -4900,6 +4912,50 @@ mod tests {
         assert_eq!(body["waiting_on_agent"], true);
         // Still open, still counted, still exactly one question.
         assert_eq!(fx.get("/api/health").await.json()["questions_open"], 1);
+    }
+
+    #[tokio::test]
+    async fn asking_back_clears_the_owner_count_until_the_agent_replies() {
+        let fx = Fixture::start().await;
+        let store = fx.questions();
+        let id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+        assert_eq!(
+            fx.get("/api/health").await.json()["questions_needs_owner"],
+            1
+        );
+
+        // The owner asks back instead of deciding: the ask bar, the nav badge
+        // and the title must stop naming this question, because there is
+        // nothing to decide until the agent answers - `status` alone cannot
+        // say that, which is the whole reason `questions_needs_owner` exists
+        // alongside `questions_open`.
+        let res = fx
+            .post(
+                &format!("/api/questions/{id}/say"),
+                Some(r#"{"body":"why not Postgres?"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        assert_eq!(fx.get("/api/health").await.json()["questions_open"], 1);
+        assert_eq!(
+            fx.get("/api/health").await.json()["questions_needs_owner"],
+            0,
+            "waiting on the agent is not waiting on the owner"
+        );
+
+        // `magi ask --thread` replying is what brings the owner count back -
+        // the same event that would resume the CLI call blocked in `magi
+        // ask`.
+        let mut q = store.get(&id).expect("get");
+        q.reply("because SQLite needs no server", vec!["SQLite".to_owned()])
+            .expect("reply");
+        store.put(&mut q).expect("put");
+        assert_eq!(fx.get("/api/health").await.json()["questions_open"], 1);
+        assert_eq!(
+            fx.get("/api/health").await.json()["questions_needs_owner"],
+            1,
+            "the agent's reply is what should light the banner back up"
+        );
     }
 
     #[tokio::test]
