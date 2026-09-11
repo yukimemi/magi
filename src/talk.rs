@@ -62,15 +62,20 @@ use crate::queue::{Queue, Source, Task};
 /// On-disk format for a conversation. Bumped when a field's meaning changes.
 pub const SCHEMA: u32 = 1;
 
-/// Wall-clock limit for one agent turn.
+/// Wall-clock limit for one agent turn. See [`crate::config::Graph::timeout_talk`].
 ///
-/// Fifteen minutes, three times [`crate::chat::TURN_TIMEOUT`]. A planning turn
-/// answers a question about intent; a turn here is expected to run several
-/// shell commands and read their output before answering one - "what does
-/// this function do", "is this still true", "run the tests and tell me" - and
-/// a five-minute budget cuts that off mid-investigation on exactly the
-/// conversation meant to support it.
-const TURN_TIMEOUT: Duration = Duration::from_secs(900);
+/// An hour by default. This turn is expected to run several shell commands
+/// and read their output before answering one - "what does this function
+/// do", "is this still true", "run the tests and tell me" - which used to
+/// argue for a budget several times [`crate::chat`]'s own. Both now default
+/// to the same hour, because the thing that made a short budget matter - an
+/// operator watching a spinner - is no longer how either conversation gets
+/// used: the operator moves on to something else while a turn runs and
+/// checks back later, so a long turn spends a held seat, not anyone's
+/// attention.
+fn turn_timeout(cfg: &Config) -> Duration {
+    Duration::from_secs(cfg.graph.timeout_talk)
+}
 
 /// Seat name for the conversation's agent, scoping its CLI-side session away
 /// from every other seat magi ever opens - the same rule [`crate::chat`]
@@ -687,7 +692,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     let inv = Invocation {
         cwd: &talk.repo,
         prompt: &body,
-        timeout: TURN_TIMEOUT,
+        timeout: turn_timeout(cfg),
         // Off unless this repository's own config opts in - see
         // `crate::config::Talk::allow_write` and this module's doc for why
         // the default keeps a conversational edit from landing in a checkout
@@ -733,7 +738,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             let why = format!(
                 "agent `{}` did not answer within {}s; your message is saved",
                 talk.agent,
-                TURN_TIMEOUT.as_secs()
+                turn_timeout(cfg).as_secs()
             );
             (note(why.clone()), Some(why))
         }
@@ -1273,6 +1278,39 @@ mod tests {
             path.is_absolute(),
             "must be absolute even off a relative store root: {}",
             path.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_past_the_configured_talk_timeout_is_reported_with_that_timeout() {
+        // `[graph] timeout_talk` must be the number this module actually
+        // waits, not a leftover hardcoded fifteen minutes - so the mock
+        // sleeps past a deliberately tiny override and the failure note is
+        // checked against that same override, not the old default.
+        let (tmp, talks) = store();
+        let slow = mock_agent(
+            tmp.path(),
+            "#!/bin/sh\ncat >/dev/null\nsleep 2\n",
+            BTreeMap::new(),
+        );
+        let mut cfg = config(slow);
+        cfg.graph.timeout_talk = 1;
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        let err = say(&mut talk, &talks, &cfg, "check the tests", Vec::new())
+            .await
+            .expect_err("a turn that never answers is an error");
+        assert!(
+            err.to_string().contains("did not answer within 1s"),
+            "{err}"
+        );
+
+        let on_disk = talks.get(&talk.id).expect("get");
+        let note = on_disk.turns.last().expect("a note turn was recorded");
+        assert!(
+            note.body.contains("did not answer within 1s"),
+            "the transcript must show the configured timeout: {}",
+            note.body
         );
     }
 

@@ -3916,13 +3916,13 @@ struct NewTalkTurn {
 ///
 /// The same asynchronous shape as [`chat_say`], for the same reason: this
 /// route spawns an agent CLI and a turn here can run for the whole of
-/// [`talk::TURN_TIMEOUT`] - fifteen minutes, three times a planning turn's
-/// budget, because a research turn is expected to run commands rather than
-/// answer from what it already knows. Holding an HTTP connection open that
-/// long is not a thing to ask a phone to do; the operator's message is
-/// recorded and answered for immediately, and the reply lands in the
-/// background, discovered through the change stream's `talks_rev` the same
-/// way every other update on this surface is.
+/// [`crate::config::Graph::timeout_talk`] - an hour by default - because a
+/// research turn is expected to run commands rather than answer from what it
+/// already knows. Holding an HTTP connection open that long is not a thing
+/// to ask a phone to do; the operator's message is recorded and answered for
+/// immediately, and the reply lands in the background, discovered through
+/// the change stream's `talks_rev` the same way every other update on this
+/// surface is.
 async fn talk_say(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
@@ -6074,8 +6074,8 @@ mod tests {
             turns.len(),
             1,
             "the answer reflects only what is on disk the instant it is sent, \
-             before the agent's turn - which can run for `talk::TURN_TIMEOUT` \
-             - has a chance to land: {queued}"
+             before the agent's turn - which can run for the whole of \
+             `[graph] timeout_talk` - has a chance to land: {queued}"
         );
         assert_eq!(turns[0]["who"], "operator");
         assert_eq!(turns[0]["body"], "what does the queue module do?");
