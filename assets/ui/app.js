@@ -3996,13 +3996,44 @@ async function loadTalk(id) {
   }
 }
 
+/* A standing Chat can outlive dozens of tasks filed from it, so the panel
+   defaults folded and this is what stays visible either way: not a count,
+   but the breakdown an operator actually reads it for - whether what they
+   filed is moving, stuck, or still waiting its turn. Order puts the states
+   that want a human (running, held, failed) ahead of the quiet ones, and a
+   zero count is left out rather than printed as "0 done". */
+function talkTasksSummary(tasks) {
+  const counts = { running: 0, held: 0, failed: 0, queued: 0, done: 0 };
+  for (const task of tasks) {
+    const status = String(task.status_str || task.status || "");
+    if (status in counts) counts[status] += 1;
+  }
+  const parts = [`${tasks.length} filed`];
+  for (const key of ["running", "held", "failed", "queued", "done"]) {
+    if (counts[key]) parts.push(`${counts[key]} ${key}`);
+  }
+  return parts.join(" · ");
+}
+
+const TALK_TASKS_STORAGE_KEY = "magi.talkTasksOpen";
+
 function renderTalkTasks(talk) {
   const panel = $("talk-tasks-panel");
   const tasks = Array.isArray(talk && talk.tasks) ? talk.tasks : [];
   show(panel, tasks.length > 0);
   if (tasks.length === 0) return;
-  setText($("talk-tasks-count"), String(tasks.length));
+  setText($("talk-tasks-count"), talkTasksSummary(tasks));
   syncList($("talk-tasks"), tasks, (t) => t.id, createTalkTaskRow, updateTalkTaskRow);
+
+  /* Folded is the default for any conversation the operator hasn't touched
+     this panel on before; once they open or close it here, that sticks by
+     talk id so returning to the same standing Chat keeps their choice, but
+     switching to a different one never inherits it. */
+  const talkId = String(talk.id || "");
+  if (panel.dataset.talkId !== talkId) {
+    panel.dataset.talkId = talkId;
+    panel.open = isSectionOpen(loadCollapsed(TALK_TASKS_STORAGE_KEY), talkId, false);
+  }
 }
 
 function createTalkTaskRow() {
@@ -5636,6 +5667,14 @@ function wire() {
   $("talk-say").addEventListener("submit", sendTalkTurn);
   $("talk-close-go").addEventListener("click", closeTalk);
   $("talk-reopen-go").addEventListener("click", reopenTalk);
+  $("talk-tasks-panel").addEventListener("toggle", () => {
+    const panel = $("talk-tasks-panel");
+    const talkId = panel.dataset.talkId;
+    if (!talkId) return;
+    const collapsed = loadCollapsed(TALK_TASKS_STORAGE_KEY);
+    collapsed[talkId] = panel.open;
+    saveCollapsed(TALK_TASKS_STORAGE_KEY, collapsed);
+  });
   /* Same accommodation `f-say` gets: Enter is a newline on a phone, Ctrl/Cmd
      with Enter sends. */
   $("f-talk-say").addEventListener("keydown", (event) => {
