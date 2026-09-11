@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config;
 use crate::proc::Quiet as _;
+use crate::run::RunStatus;
 
 /// On-disk format for a question. Bumped when a field's meaning changes, or -
 /// as with [`Question::thread`] - when a new field is added that a much older
@@ -806,6 +807,38 @@ impl Questions {
         Ok(abandoned)
     }
 
+    /// Abandon a run's open questions once `status` says the run is not
+    /// coming back, worded with what it actually became.
+    ///
+    /// The run-deleted case above and this one are the same fact - nobody is
+    /// left to read an answer - reached by two different doors. This is the
+    /// one for a run that finished on its own: merged, reached `Ready` with
+    /// nothing left to do, or failed outright with no established point to
+    /// resume from. Those are exactly the statuses [`RunStatus::resumable`]
+    /// excludes, and that is the line this draws too - deliberately not
+    /// [`RunStatus::done`], which also counts `Blocked` and `Stalled` as
+    /// over. Both of those can still be picked back up with the candidates,
+    /// the review round and the seat sessions already on disk, so a question
+    /// asked mid-round may yet get a real answer from a real resume, and
+    /// folding it here would be exactly the mistake this function exists to
+    /// avoid on the other side - answering back into a run that no longer
+    /// exists to read it.
+    ///
+    /// A no-op, not an error, when `status` is still resumable or when there
+    /// was nothing open to begin with - callers reach this from more than one
+    /// place a run can settle, and a second call finding nothing left to
+    /// abandon is the expected case, not a bug.
+    pub fn settle_run(&self, run: &str, status: RunStatus) -> Result<usize> {
+        if status.resumable() {
+            return Ok(0);
+        }
+        let why = format!(
+            "run {run} {}, so nothing is waiting for this answer",
+            status.as_str()
+        );
+        self.abandon_for_run(run, &why)
+    }
+
     /// Expand an id prefix to exactly one question id. The short id the phone
     /// and the reports show is a suffix, so that is accepted too.
     pub fn resolve_id(&self, prefix: &str) -> Result<String> {
@@ -1191,6 +1224,29 @@ mod tests {
             "another run's question is untouched"
         );
         assert!(store.open_for(&open_one.run).is_empty());
+    }
+
+    #[test]
+    fn settle_run_abandons_only_for_a_status_that_is_not_resumable() {
+        let (_dir, store) = store();
+        let mut q = choice_question();
+        store.put(&mut q).unwrap();
+
+        // `Blocked` can still be resumed - leave it exactly as it was.
+        let n = store.settle_run(&q.run, RunStatus::Blocked).unwrap();
+        assert_eq!(n, 0);
+        assert!(store.get(&q.id).unwrap().status.open());
+
+        // `Failed` is not - abandon it, with the run and its fate in the
+        // reason so the owner can tell what happened without a run to read.
+        let n = store.settle_run(&q.run, RunStatus::Failed).unwrap();
+        assert_eq!(n, 1);
+        let back = store.get(&q.id).unwrap();
+        assert!(!back.status.open());
+        assert!(back.detail.contains(&q.run) && back.detail.contains("failed"));
+
+        // A second call against the same, now-settled run finds nothing left.
+        assert_eq!(store.settle_run(&q.run, RunStatus::Failed).unwrap(), 0);
     }
 
     fn choice_question() -> Question {

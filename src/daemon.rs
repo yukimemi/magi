@@ -725,6 +725,20 @@ fn reclaim_orphaned_running(queue: &Queue, max_attempts: usize) -> Vec<String> {
             continue;
         }
         let last_run = task.runs.last().and_then(|id| RunState::load(id).ok());
+        // `execute` normally abandons a run's own open questions the moment
+        // `status` lands somewhere non-resumable (see `graph::Runner::settle_questions`),
+        // but a daemon that crashed *inside* that path - mid `land`'s CI wait,
+        // say - can leave a `run.json` already at `Merged`/`Ready`/`Failed`
+        // with the question still `open`, because the process died before
+        // reaching that call. `reclaim` itself stays pure on purpose (see its
+        // own doc), so the same cleanup runs here instead, against the run
+        // this reclaim is already reading. `settle_run` costs nothing when
+        // `execute` already got there first.
+        if let Some(state) = &last_run
+            && let Err(e) = ask::Questions::open().settle_run(&state.id, state.status)
+        {
+            tracing::warn!("abandon questions for {}: {e:#}", state.id);
+        }
         reclaim(&mut task, last_run, max_attempts);
         record(queue, &mut task);
         reclaimed.push(task.id.clone());
@@ -1365,6 +1379,12 @@ async fn janitor(repo: &Path, opts: &Opts, home: &Path) {
             "housekeep: pruned {} file(s) ({} bytes) from the shared cache",
             out.cache_files,
             out.cache_freed
+        );
+    }
+    if out.questions_abandoned > 0 {
+        tracing::info!(
+            "housekeep: abandoned {} question(s) left open by a finished run",
+            out.questions_abandoned
         );
     }
 }
