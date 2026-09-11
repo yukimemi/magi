@@ -598,6 +598,11 @@ fn diff_row(line: &str) -> (&'static str, &'static str, &str) {
 /// fallback is deliberate.
 struct Words {
     html_lang: &'static str,
+    task: &'static str,
+    what_changed: &'static str,
+    review_verdict: &'static str,
+    reviewer: &'static str,
+    reviewer_no_answer: &'static str,
     checks: &'static str,
     nothing_failing: &'static str,
     files_changed: &'static str,
@@ -612,6 +617,11 @@ struct Words {
 
 const EN: Words = Words {
     html_lang: "en",
+    task: "Task",
+    what_changed: "What changed",
+    review_verdict: "Review verdict",
+    reviewer: "Reviewer",
+    reviewer_no_answer: "produced no answer",
     checks: "Checks",
     nothing_failing: "Nothing failing.",
     files_changed: "file(s) changed",
@@ -626,6 +636,11 @@ const EN: Words = Words {
 
 const JA: Words = Words {
     html_lang: "ja",
+    task: "タスク",
+    what_changed: "変更内容",
+    review_verdict: "レビューの結論",
+    reviewer: "レビュアー",
+    reviewer_no_answer: "回答なし",
     checks: "チェック",
     nothing_failing: "失敗しているものはありません。",
     files_changed: "ファイル変更",
@@ -772,6 +787,64 @@ pub fn approval_panel(
         esc(&pr.url),
         esc(&pr.url),
     );
+
+    // The task, verbatim: the operator's own words for what was asked, so the
+    // panel does not make them reconstruct the request from a diffstat.
+    let _ = writeln!(
+        h,
+        "<h2 style=\"margin:16px 0 6px;font-size:15px\">{}</h2>\n\
+         <p style=\"margin:0;font-size:13px;white-space:pre-wrap\">{}</p>",
+        w.task,
+        esc(&state.instruction)
+    );
+
+    // The winner's own account of what it did and why, when there is one.
+    if let Some(summary) = state
+        .winner()
+        .map(|c| c.summary.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        let _ = writeln!(
+            h,
+            "<h2 style=\"margin:16px 0 6px;font-size:15px\">{}</h2>\n\
+             <p style=\"margin:0;font-size:13px;white-space:pre-wrap\">{}</p>",
+            w.what_changed,
+            esc(summary)
+        );
+    }
+
+    // The verdict from the round that actually cleared this for merge - the
+    // last one, since only that round's word is still standing.
+    if let Some(round) = state.reviews.last() {
+        let _ = writeln!(
+            h,
+            "<h2 style=\"margin:16px 0 6px;font-size:15px\">{}</h2>",
+            w.review_verdict
+        );
+        for r in &round.reviews {
+            // A seat the review loop counted as answered has real prose in
+            // `summary`; one it counted against `incomplete` (see
+            // `graph::Runner::review_loop`) never produced any and left it
+            // empty - which must not be read back as a blank verdict, since
+            // an empty box here looks like "nothing to say" rather than
+            // "never answered".
+            let body = match &r.failed {
+                Some(reason) => format!("{}: {}", w.reviewer_no_answer, esc(reason)),
+                None => esc(&r.summary),
+            };
+            let _ = writeln!(
+                h,
+                "<div style=\"margin:0 0 8px;padding:8px;background:#f6f8fa;\
+                 border-radius:6px\">\
+                 <div style=\"font-size:12px;color:#57606a\">{} {} · {}</div>\
+                 <div style=\"white-space:pre-wrap;font-size:13px\">{}</div></div>",
+                w.reviewer,
+                r.reviewer,
+                esc(&r.agent),
+                body,
+            );
+        }
+    }
 
     let _ = writeln!(
         h,
@@ -2126,6 +2199,7 @@ impl Default for GhUser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::{Candidate, ReviewRecord, ReviewRound, Tally};
 
     /// Real `gh pr view` output for the open pull request #10 (Renovate's apm bump), trimmed to four checks and its one comment. Every check passed or was skipped by the review workflow, and the only comment is CodeRabbit's trigger notice.
     const GREEN_OPEN: &str = r####"{
@@ -2924,6 +2998,206 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         ] {
             assert!(html.contains(needle), "the panel must state `{needle}`");
         }
+    }
+
+    /// A candidate whose label is `A` and has won, so [`RunState::winner`]
+    /// resolves to it.
+    fn winning_candidate(summary: &str) -> Candidate {
+        Candidate {
+            index: 0,
+            label: 'A',
+            agent: "opus".to_owned(),
+            branch: "magi/x/A".to_owned(),
+            worktree: PathBuf::from("/wt/A"),
+            summary: summary.to_owned(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: false,
+        }
+    }
+
+    fn uncontested_tally() -> Tally {
+        Tally {
+            first_choice: BTreeMap::from([('A', 1)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 1,
+            present: 1,
+            quorum: 1,
+            met_quorum: true,
+            uncontested: None,
+        }
+    }
+
+    fn review_record(reviewer: usize, agent: &str, summary: &str) -> ReviewRecord {
+        ReviewRecord {
+            reviewer,
+            agent: agent.to_owned(),
+            summary: summary.to_owned(),
+            findings: Vec::new(),
+            vote: None,
+            failed: None,
+            duration_ms: 0,
+        }
+    }
+
+    fn review_round(round: usize, reviews: Vec<ReviewRecord>) -> ReviewRound {
+        let answered = reviews.len();
+        ReviewRound {
+            round,
+            head: "abc1234".to_owned(),
+            reviews,
+            e2e: Vec::new(),
+            verify_retried: false,
+            fix: None,
+            blocking: 0,
+            answered,
+            expected: answered,
+            clean: true,
+            progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
+        }
+    }
+
+    #[test]
+    fn the_approval_panel_states_the_task_verbatim_in_either_language() {
+        let en = panel();
+        assert!(en.contains("Task"), "{en}");
+        assert!(en.contains("add retries to the uploader"), "{en}");
+
+        let mut state = run_state();
+        state.config.graph.language = "ja".to_owned();
+        let ja = approval_panel(&state, &green_pr(), NUMSTAT, "", &[], "feat: x");
+        assert!(ja.contains("タスク"), "{ja}");
+        assert!(
+            ja.contains("add retries to the uploader"),
+            "the task itself is not translated: {ja}"
+        );
+    }
+
+    #[test]
+    fn the_approval_panel_omits_what_changed_and_review_verdict_with_no_data() {
+        // `run_state()` has no candidates, no tally and no reviews - exactly
+        // the shape a run has before anything has judged or reviewed it, and
+        // the panel must not print an empty box for either.
+        let html = panel();
+        assert!(!html.contains("What changed"), "{html}");
+        assert!(!html.contains("Review verdict"), "{html}");
+    }
+
+    #[test]
+    fn the_approval_panel_omits_what_changed_when_the_winners_summary_is_empty() {
+        let mut state = run_state();
+        state.candidates = vec![winning_candidate("")];
+        state.tally = Some(uncontested_tally());
+        let html = approval_panel(&state, &green_pr(), NUMSTAT, "", &[], "feat: x");
+        assert!(
+            !html.contains("What changed"),
+            "an empty summary must not render an empty box: {html}"
+        );
+    }
+
+    #[test]
+    fn the_approval_panel_shows_the_winners_own_account_in_either_language() {
+        let mut state = run_state();
+        state.candidates = vec![winning_candidate(
+            "Added a retry loop around the uploader PUT call.",
+        )];
+        state.tally = Some(uncontested_tally());
+        let en = approval_panel(&state, &green_pr(), NUMSTAT, "", &[], "feat: x");
+        assert!(en.contains("What changed"), "{en}");
+        assert!(
+            en.contains("Added a retry loop around the uploader PUT call."),
+            "{en}"
+        );
+
+        state.config.graph.language = "ja".to_owned();
+        let ja = approval_panel(&state, &green_pr(), NUMSTAT, "", &[], "feat: x");
+        assert!(ja.contains("変更内容"), "{ja}");
+        assert!(
+            ja.contains("Added a retry loop around the uploader PUT call."),
+            "{ja}"
+        );
+    }
+
+    #[test]
+    fn the_approval_panel_shows_only_the_last_review_rounds_verdict() {
+        let mut state = run_state();
+        state.reviews = vec![
+            review_round(
+                1,
+                vec![review_record(1, "alpha", "found a race, sent back")],
+            ),
+            review_round(2, vec![review_record(1, "alpha", "race is fixed, clean")]),
+        ];
+        let en = approval_panel(&state, &green_pr(), NUMSTAT, "", &[], "feat: x");
+        assert!(en.contains("Review verdict"), "{en}");
+        assert!(en.contains("race is fixed, clean"), "{en}");
+        assert!(
+            !en.contains("found a race, sent back"),
+            "only the round that actually cleared the merge should show: {en}"
+        );
+
+        state.config.graph.language = "ja".to_owned();
+        let ja = approval_panel(&state, &green_pr(), NUMSTAT, "", &[], "feat: x");
+        assert!(ja.contains("レビューの結論"), "{ja}");
+        assert!(ja.contains("レビュアー"), "{ja}");
+        assert!(ja.contains("race is fixed, clean"), "{ja}");
+    }
+
+    /// The `incomplete_review = "warn"` policy (see
+    /// `graph::Runner::review_loop`) can push a `clean` round to
+    /// `state.reviews` while one seat's own record still has `failed: Some`
+    /// and an empty `summary` - a seat that never answered, not one that
+    /// answered with nothing to say.
+    fn unanswered_review_record(reviewer: usize, agent: &str, reason: &str) -> ReviewRecord {
+        ReviewRecord {
+            reviewer,
+            agent: agent.to_owned(),
+            summary: String::new(),
+            findings: Vec::new(),
+            vote: None,
+            failed: Some(reason.to_owned()),
+            duration_ms: 0,
+        }
+    }
+
+    #[test]
+    fn the_approval_panel_never_shows_an_unanswered_seat_as_a_blank_verdict() {
+        let mut state = run_state();
+        state.reviews = vec![review_round(
+            1,
+            vec![
+                review_record(1, "alpha", "clean, nothing to add"),
+                unanswered_review_record(2, "beta", "timed out"),
+            ],
+        )];
+        let en = approval_panel(&state, &green_pr(), NUMSTAT, "", &[], "feat: x");
+        assert!(en.contains("clean, nothing to add"), "{en}");
+        assert!(
+            en.contains("produced no answer: timed out"),
+            "a seat that never answered must say so, not render a blank box: {en}"
+        );
+        assert!(
+            !en.contains("<div style=\"white-space:pre-wrap;font-size:13px\"></div>"),
+            "no reviewer box may be left empty: {en}"
+        );
+
+        state.config.graph.language = "ja".to_owned();
+        let ja = approval_panel(&state, &green_pr(), NUMSTAT, "", &[], "feat: x");
+        assert!(ja.contains("回答なし: timed out"), "{ja}");
     }
 
     #[test]
