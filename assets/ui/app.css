@@ -773,6 +773,25 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 }
 #runs-filter-text { flex: 1; min-width: 0; }
 
+/* ---- runs: state chips --------------------------------------------------- *
+ * The tree above is desktop-only (see .runs-tree below), so on a phone this
+ * row is the only way to narrow the list at all. It wraps rather than
+ * scrolling — five chips is not enough to need a scroller, and a scroller
+ * hides the very chips (like "Done") a wrap keeps in view without a swipe.
+ * Selected styling reuses .runs-tree-node's own sunk/edge pair rather than a
+ * new colour, and the pill shape is .tag's, so this introduces no vocabulary
+ * the rest of the page doesn't already use. */
+.state-chips { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.state-chip {
+  display: flex; align-items: center; gap: var(--s2);
+  min-height: var(--tap); padding: 0 var(--s3);
+  background: none; border: 1px solid var(--line); border-radius: 999px;
+  font: 600 var(--t3)/1.3 var(--sans); color: var(--ink-2); cursor: pointer;
+}
+.state-chip:hover { background: var(--sunk); }
+.state-chip[aria-checked="true"] { color: var(--ink); background: var(--sunk); border-color: var(--edge); }
+.state-chip-count { font-size: var(--t1); color: var(--ink-3); }
+
 /* An older attempt at the same task, folded under the card that replaced it.
    `.advanced` (see the queue card's "Full instruction" disclosure) already
    supplies the chevron and the flex row for its <summary>; this only adds the
