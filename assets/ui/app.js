@@ -547,6 +547,14 @@ const state = {
   talkPending: null,
   talkWaitFrom: 0,
   talkWaitTimer: null,
+  /* Whether the current view was entered via a route change to the standing
+     chat. Cleared after the first scroll, so a subsequent renderTalk() with
+     the same turn count does not re-scroll. */
+  openingTalk: false,
+  /* Turn count from the previous renderTalk() call, used to detect new turns
+     arriving while the conversation is already on screen - the standing
+     chat's counterpart to prevTurnCount. */
+  prevTalkTurnCount: 0,
   rev: { queue: null, runs: null, questions: null, chats: null, talks: null, loop: null },
   streamOpen: false,
   wrap: false,
@@ -3385,9 +3393,10 @@ function applyDraftView() {
    The header (.top) uses position:sticky;top:0, so scrollIntoView would hide
    the first line behind it. We account for its height with scroll-margin-top
    set via JS on the target element, using getBoundingClientRect for a
-   reliable measurement regardless of safe-area insets or zoom level. */
-function scrollToLastTurn() {
-  const turns = $("chat-turns");
+   reliable measurement regardless of safe-area insets or zoom level. Shared
+   by both conversation views - `containerId` is "chat-turns" or "talk-turns". */
+function scrollToLastTurn(containerId) {
+  const turns = $(containerId);
   if (!turns.children.length) return;
   const last = turns.lastElementChild;
   const header = document.querySelector(".top");
@@ -3460,9 +3469,9 @@ function renderChat() {
     && turns[turns.length - 1].body === wait.pending.body;
   if (state.openingChat) {
     state.openingChat = false;
-    if (turnCount > 0) requestAnimationFrame(scrollToLastTurn);
+    if (turnCount > 0) requestAnimationFrame(() => scrollToLastTurn("chat-turns"));
   } else if (turnCount > state.prevTurnCount && !lastIsPending) {
-    requestAnimationFrame(scrollToLastTurn);
+    requestAnimationFrame(() => scrollToLastTurn("chat-turns"));
   }
   state.prevTurnCount = turnCount;
 
@@ -4097,6 +4106,22 @@ function renderTalk() {
   const turnsMd = talkTurnsMd(talk);
   syncList($("talk-turns"), turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i) })),
     (item) => item.key, createTurnRow, updateTurnRow);
+
+  /* Auto-scroll: same rule as renderChat, against this view's own busy state
+     rather than chatWaits. The one-second tickTalkWait tick makes this
+     stricter than it is for chat - turnCount must actually hold still across
+     a render that changes nothing else, or the page would yank every second. */
+  const turnCount = turns.length;
+  const lastIsPending = busy && state.talkPending
+    && turns.length > 0 && turns[turns.length - 1].who === "operator"
+    && turns[turns.length - 1].body === state.talkPending.body;
+  if (state.openingTalk) {
+    state.openingTalk = false;
+    if (turnCount > 0) requestAnimationFrame(() => scrollToLastTurn("talk-turns"));
+  } else if (turnCount > state.prevTalkTurnCount && !lastIsPending) {
+    requestAnimationFrame(() => scrollToLastTurn("talk-turns"));
+  }
+  state.prevTalkTurnCount = turnCount;
 
   renderTalkTasks(talk);
 
@@ -5464,6 +5489,7 @@ function applyRoute() {
 
   /* Same rule as the chat block above, for the standing chat's own store. */
   if (route.name === "talk") {
+    if (changed) state.openingTalk = true;
     if (state.talkDetail.id !== route.id) {
       state.talkDetail = { id: route.id, talk: null };
       loadTalk(route.id);
