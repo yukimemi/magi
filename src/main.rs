@@ -11,7 +11,7 @@ use magi::graph::{Runner, fold_run};
 use magi::proc::Quiet as _;
 use magi::queue::{self, Queue, Source, Task, TaskStatus};
 use magi::run::{RunState, RunStatus, latest_id, list_ids, resolve_id};
-use magi::{agent, ask, daemon, plan, report, repos, stats, tui, updater, web};
+use magi::{agent, ask, daemon, report, repos, stats, tui, updater, web};
 
 /// Blind multi-agent implementation competition.
 #[derive(Debug, Parser)]
@@ -274,43 +274,6 @@ enum Command {
         /// config says, and the terminal would still be required to change it.
         #[arg(long, value_enum)]
         merge: Option<MergeArg>,
-    },
-    /// Talk over an idea with a leader agent, then file the task it writes.
-    ///
-    /// magi hands your terminal to the agent's own interface for the interview
-    /// and takes it back to validate and queue the result. It does not
-    /// reimplement a chat window.
-    Plan {
-        /// A rough starting idea. Omit to start from nothing.
-        #[arg(value_name = "IDEA", trailing_var_arg = true)]
-        idea: Vec<String>,
-        /// Repository the task will be competed in: a path, or a short
-        /// `owner/repo` name resolved against `[repos] roots`.
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
-        /// Config file; defaults to <repo>/magi.toml.
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Roster agent id to interview with.
-        #[arg(long)]
-        agent: Option<String>,
-        /// Higher runs first.
-        #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
-        priority: i32,
-        /// File the draft without the confirmation prompt.
-        #[arg(long)]
-        yes: bool,
-        /// A browser-interview chat id (or unambiguous prefix/suffix) to
-        /// continue here: its transcript and repository go into this
-        /// interview's opening briefing as background.
-        #[arg(long)]
-        from: Option<String>,
-        /// Give up on a browser-interview chat (id, or unambiguous
-        /// prefix/suffix - same resolution as `--from`) without holding an
-        /// interview. No agent is started; the chat is marked abandoned and
-        /// the command exits.
-        #[arg(long)]
-        abandon: Option<String>,
     },
     /// List local repositories found under `[repos] roots`.
     Repos {
@@ -949,43 +912,6 @@ async fn dispatch(command: Command) -> Result<()> {
                 merge: merge.map(|m| m.as_str().to_owned()),
             })
             .await
-        }
-
-        Command::Plan {
-            idea,
-            repo,
-            config,
-            agent,
-            priority,
-            yes,
-            from,
-            abandon,
-        } => {
-            // `--abandon` is a separate errand entirely: close a chat the
-            // operator started in the browser and does not want to continue.
-            // No agent is started, so this returns before any of the
-            // interview's own setup - `resolve_repo`, `Config::discover`, the
-            // terminal check `plan::plan` opens with - runs at all.
-            if let Some(id) = abandon {
-                let chats = magi::chat::Chats::open();
-                let mut chat = chats.get(&id)?;
-                magi::chat::abandon(&mut chat, &chats)?;
-                println!("chat {} is now {}", chat.short(), chat.status.as_str());
-                return Ok(());
-            }
-            let idea = idea.join(" ");
-            let task = plan::plan(plan::Opts {
-                idea: (!idea.trim().is_empty()).then_some(idea),
-                repo,
-                config,
-                agent,
-                priority,
-                yes,
-                from,
-            })
-            .await?;
-            println!("filed {} {}", task.short(), task.title);
-            Ok(())
         }
 
         Command::Repos { refresh: _ } => repos_cmd(),
@@ -1973,15 +1899,15 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
                     .as_ref()
                     .map_or("the winner's own author".to_owned(), |f| f.display())
             );
-            // The interview seat, resolved the same way `plan` and the browser
-            // conversation resolve it. Shown because a setting an operator
-            // cannot confirm is a setting they have to take on faith.
+            // The chat seat, resolved the same way `talk::begin` resolves it.
+            // Shown because a setting an operator cannot confirm is a setting
+            // they have to take on faith.
             println!(
-                "  plan         {}",
-                match magi::plan::pick(
+                "  chat         {}",
+                match magi::agent::pick(
                     &cfg.agents,
-                    cfg.roles.planner.as_deref(),
-                    &magi::plan::installed,
+                    cfg.roles.chatter.as_deref(),
+                    &magi::agent::installed,
                 ) {
                     Ok(s) => s.display(),
                     Err(e) => format!("unusable: {e}"),
@@ -2622,7 +2548,7 @@ mod tests {
 
         // The making nodes keep it: an implementer that cannot find the file
         // the instruction names has a question only the operator can answer.
-        for allowed in ["implement", "fix", "plan", "land-approval", "ask"] {
+        for allowed in ["implement", "fix", "chat", "land-approval", "ask"] {
             assert!(
                 asking_is_not_this_seat_s_job(allowed).is_none(),
                 "{allowed} must still be able to ask"

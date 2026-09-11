@@ -959,6 +959,99 @@ pub fn artifacts_dir(run_dir: &Path) -> PathBuf {
     run_dir.join("artifacts")
 }
 
+/// Can this agent's CLI actually be run on this machine?
+pub fn installed(spec: &AgentSpec) -> bool {
+    // A `command` agent has no program of its own to look for - its argv is the
+    // operator's, and they are the authority on whether it runs.
+    spec.kind.program().is_none_or(crate::config::which)
+}
+
+/// Choose the agent for a seat that stands alone rather than rotating through
+/// the roster: [`crate::talk`]'s standing conversation, [`crate::bump`]'s
+/// release-bump decision, or anything else that needs one agent picked once
+/// rather than a panel filled in.
+///
+/// `available` is a parameter rather than a call to [`installed`] so the order
+/// below is assertable on a machine with none of these CLIs installed, which is
+/// every CI runner.
+///
+/// The order, and why:
+///
+/// 1. An explicit id always wins, and is an error rather than a fallback when
+///    it is unusable. Naming a seat has a reason, and silently substituting a
+///    different model would waste whatever that reason was.
+/// 2. Otherwise a [`AgentKind::Claude`] seat, ahead of the roster order: it is
+///    the only one of the three CLIs magi can address before the first turn
+///    (see this module's own doc on session mechanics), which matters most for
+///    a conversation that opens with nothing typed yet.
+/// 3. Otherwise the first runnable agent in roster order, because the roster
+///    order is the operator's own stated preference and magi has nothing
+///    better to go on.
+pub fn pick(
+    agents: &[AgentSpec],
+    want: Option<&str>,
+    available: &dyn Fn(&AgentSpec) -> bool,
+) -> Result<AgentSpec> {
+    if let Some(id) = want {
+        let spec = agents
+            .iter()
+            .find(|a| a.id == id)
+            .with_context(|| format!("no agent `{id}` in the roster; it has {}", ids(agents)))?;
+        if !available(spec) {
+            bail!(
+                "agent `{}` needs `{}` on PATH; install it or pass a different \
+                 --agent",
+                spec.id,
+                spec.kind.program().unwrap_or("its command")
+            );
+        }
+        return Ok(spec.clone());
+    }
+
+    if agents.is_empty() {
+        bail!(
+            "the agent roster is empty, so there is nobody to ask: install one \
+             of claude, opencode or agy - magi derives a roster from what is on \
+             PATH - or add an [[agents]] entry to magi.toml."
+        );
+    }
+
+    if let Some(spec) = agents
+        .iter()
+        .find(|a| a.kind == AgentKind::Claude && available(a))
+    {
+        return Ok(spec.clone());
+    }
+
+    agents
+        .iter()
+        .find(|a| available(a))
+        .cloned()
+        .with_context(|| {
+            let missing = agents
+                .iter()
+                .filter_map(|a| a.kind.program())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "no agent in the roster can be run here: install one of \
+                 {missing}, or add an [[agents]] entry to magi.toml for a CLI \
+                 you do have"
+            )
+        })
+}
+
+fn ids(agents: &[AgentSpec]) -> String {
+    if agents.is_empty() {
+        return "no agents at all".to_owned();
+    }
+    agents
+        .iter()
+        .map(|a| a.id.clone())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1750,5 +1843,103 @@ mod tests {
             missing_programs(&[s]),
             ["definitely-not-a-real-binary-xyz".to_owned()]
         );
+    }
+
+    fn pick_spec(id: &str, kind: AgentKind) -> AgentSpec {
+        AgentSpec {
+            id: id.to_owned(),
+            kind,
+            model: None,
+            command: Vec::new(),
+            extra_args: Vec::new(),
+            env: BTreeMap::new(),
+            prompt_delivery: None,
+        }
+    }
+
+    /// Availability stub: an agent is runnable unless its id was listed as
+    /// missing. Keeps the selection tests off `PATH` entirely.
+    fn without<'a>(missing: &'a [&'a str]) -> impl Fn(&AgentSpec) -> bool + 'a {
+        move |a: &AgentSpec| !missing.contains(&a.id.as_str())
+    }
+
+    #[test]
+    fn pick_prefers_the_claude_seat_even_when_it_is_not_first_in_the_roster() {
+        let agents = [
+            pick_spec("oc", AgentKind::Opencode),
+            pick_spec("opus", AgentKind::Claude),
+            pick_spec("agy", AgentKind::Antigravity),
+        ];
+        let got = pick(&agents, None, &without(&[])).expect("a pick");
+        assert_eq!(got.id, "opus");
+    }
+
+    #[test]
+    fn pick_falls_back_to_the_first_installed_agent_in_roster_order() {
+        let agents = [
+            pick_spec("opus", AgentKind::Claude),
+            pick_spec("oc", AgentKind::Opencode),
+            pick_spec("agy", AgentKind::Antigravity),
+        ];
+        let got = pick(&agents, None, &without(&["opus", "oc"])).expect("a pick");
+        assert_eq!(got.id, "agy");
+    }
+
+    #[test]
+    fn pick_on_an_empty_roster_says_what_to_install() {
+        let msg = pick(&[], None, &without(&[]))
+            .expect_err("nobody to ask")
+            .to_string();
+        assert!(msg.contains("roster is empty"), "{msg}");
+        assert!(msg.contains("claude"), "{msg}");
+        assert!(msg.contains("magi.toml"), "{msg}");
+    }
+
+    #[test]
+    fn pick_on_a_roster_with_nothing_installed_names_the_programs_that_are_missing() {
+        let agents = [
+            pick_spec("opus", AgentKind::Claude),
+            pick_spec("oc", AgentKind::Opencode),
+        ];
+        let err = pick(&agents, None, &without(&["opus", "oc"])).expect_err("nothing runnable");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("claude"), "{msg}");
+        assert!(msg.contains("opencode"), "{msg}");
+    }
+
+    #[test]
+    fn an_explicitly_named_agent_wins_over_the_claude_preference() {
+        let agents = [
+            pick_spec("opus", AgentKind::Claude),
+            pick_spec("oc", AgentKind::Opencode),
+        ];
+        let got = pick(&agents, Some("oc"), &without(&[])).expect("a pick");
+        assert_eq!(got.id, "oc");
+    }
+
+    #[test]
+    fn an_unknown_agent_id_lists_the_ids_that_do_exist() {
+        let agents = [
+            pick_spec("opus", AgentKind::Claude),
+            pick_spec("oc", AgentKind::Opencode),
+        ];
+        let msg = pick(&agents, Some("gemini"), &without(&[]))
+            .expect_err("no such agent")
+            .to_string();
+        assert!(msg.contains("gemini"), "{msg}");
+        assert!(msg.contains("opus, oc"), "{msg}");
+    }
+
+    #[test]
+    fn an_explicitly_named_agent_that_is_not_installed_is_an_error_not_a_fallback() {
+        let agents = [
+            pick_spec("opus", AgentKind::Claude),
+            pick_spec("oc", AgentKind::Opencode),
+        ];
+        let msg = pick(&agents, Some("oc"), &without(&["oc"]))
+            .expect_err("must not silently substitute another model")
+            .to_string();
+        assert!(msg.contains("opencode"), "{msg}");
+        assert!(msg.contains("--agent"), "{msg}");
     }
 }

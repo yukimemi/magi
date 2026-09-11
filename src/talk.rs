@@ -1,19 +1,16 @@
 //! The standing conversation: a place to think out loud with an agent between
 //! tasks, reachable from a phone.
 //!
-//! [`crate::chat`] is an interview with one purpose - arrive at a task file
-//! and file it - and it ends the moment that happens. This module is the other
-//! kind of conversation an operator wants: one that stays open. Ask a
-//! question, have the agent read a file or run a command to check something,
-//! talk through an idea, and when it is time to act, tell it to file the work
-//! rather than do it here. The conversation does not end; it is what the
-//! operator opens the next time something comes up.
+//! This is a conversation that stays open. Ask a question, have the agent
+//! read a file or run a command to check something, talk through an idea,
+//! and when it is time to act, tell it to file the work rather than do it
+//! here. The conversation does not end; it is what the operator opens the
+//! next time something comes up.
 //!
 //! # Talking is not implementing
 //!
-//! Every turn here runs with `allow_write: false` by default - the same
-//! restriction [`crate::chat`] puts on its own interview, for the same
-//! reason: not security, but attribution. An agent that edits a checkout
+//! Every turn here runs with `allow_write: false` by default, for a reason
+//! that is not security, but attribution. An agent that edits a checkout
 //! mid-conversation leaves a diff that belongs to no run and passed no
 //! review, and on a repository entered into magi's blind competition that
 //! makes every candidate's diff unjudgeable. That is why the default holds
@@ -41,10 +38,10 @@
 //!
 //! # Shape
 //!
-//! The same split [`crate::chat`] and [`crate::queue`] use: [`Talk`] is data
-//! plus pure helpers, [`Talks`] owns the I/O and is constructed with its root,
-//! so every test here drives a real store in a temp directory rather than the
-//! operator's own home.
+//! The same split [`crate::queue`] uses: [`Talk`] is data plus pure helpers,
+//! [`Talks`] owns the I/O and is constructed with its root, so every test
+//! here drives a real store in a temp directory rather than the operator's
+//! own home.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -56,7 +53,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, Invocation, SeatState};
 use crate::config::Config;
-use crate::plan;
 use crate::queue::{Queue, Source, Task};
 
 /// On-disk format for a conversation. Bumped when a field's meaning changes.
@@ -66,24 +62,21 @@ pub const SCHEMA: u32 = 1;
 ///
 /// An hour by default. This turn is expected to run several shell commands
 /// and read their output before answering one - "what does this function
-/// do", "is this still true", "run the tests and tell me" - which used to
-/// argue for a budget several times [`crate::chat`]'s own. Both now default
-/// to the same hour, because the thing that made a short budget matter - an
-/// operator watching a spinner - is no longer how either conversation gets
-/// used: the operator moves on to something else while a turn runs and
-/// checks back later, so a long turn spends a held seat, not anyone's
-/// attention.
+/// do", "is this still true", "run the tests and tell me" - which argues for
+/// an hour rather than the five minutes a short budget once assumed, because
+/// the thing that made a short budget matter - an operator watching a
+/// spinner - is not how this conversation gets used: the operator moves on
+/// to something else while a turn runs and checks back later, so a long turn
+/// spends a held seat, not anyone's attention.
 fn turn_timeout(cfg: &Config) -> Duration {
     Duration::from_secs(cfg.graph.timeout_talk)
 }
 
 /// Seat name for the conversation's agent, scoping its CLI-side session away
-/// from every other seat magi ever opens - the same rule [`crate::chat`]
-/// applies to its own interviewer.
+/// from every other seat magi ever opens.
 const SEAT: &str = "talk";
 
-/// Prefix on a turn magi wrote rather than an agent. See
-/// [`crate::chat::MAGI_NOTE`], which this mirrors.
+/// Prefix on a turn magi wrote rather than an agent.
 const MAGI_NOTE: &str = "magi: ";
 
 /// Who said something.
@@ -103,9 +96,7 @@ pub enum Who {
 /// [`Talks::attachments_dir`], named by `id` alone. `name` is the filename
 /// the operator's browser reported, kept only for display - it never
 /// contributes to a path, which is what keeps an upload from being able to
-/// traverse outside its own directory. Mirrors [`crate::chat::Attachment`],
-/// duplicated rather than shared - the two conversation types are meant to
-/// share no code, per this module's own doc.
+/// traverse outside its own directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Attachment {
@@ -136,9 +127,9 @@ pub struct Turn {
     pub attachments: Vec<Attachment>,
 }
 
-/// Where a conversation is in its life. Unlike [`crate::chat::ChatStatus`]
-/// there is no `filed`: this conversation can file any number of tasks
-/// without ending, so it only ever moves once, from open to closed.
+/// Where a conversation is in its life: this conversation can file any
+/// number of tasks without ending, so it only ever moves once, from open to
+/// closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TalkStatus {
@@ -185,10 +176,9 @@ pub struct Talk {
     /// Last change to this file.
     pub updated_at: Timestamp,
     /// The CLI-side conversation, so a turn after the first costs one
-    /// sentence instead of the whole transcript. Not `pub` for the same
-    /// reason [`crate::chat::Chat`]'s is not: it is magi's bookkeeping, and a
-    /// caller that edited it would detach the record from the conversation
-    /// the model actually holds.
+    /// sentence instead of the whole transcript. Not `pub`: it is magi's
+    /// bookkeeping, and a caller that edited it would detach the record from
+    /// the conversation the model actually holds.
     seat: SeatState,
 }
 
@@ -252,7 +242,7 @@ impl Talks {
     }
 
     /// Where one conversation's prompts and CLI output are kept, beside the
-    /// record rather than inside it - see [`crate::chat::Chats::artifacts_of`].
+    /// record rather than inside it.
     pub fn artifacts_of(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.artifacts"))
     }
@@ -380,9 +370,8 @@ impl Talks {
         read_path(&self.path_of(&resolved))
     }
 
-    /// Every conversation on disk: open first, then newest first - the same
-    /// ordering [`crate::chat::Chats::list`] uses, for the same reason: what
-    /// the operator is still using belongs above what they are done with.
+    /// Every conversation on disk: open first, then newest first, so what the
+    /// operator is still using belongs above what they are done with.
     pub fn list(&self) -> Vec<Talk> {
         let mut all: Vec<Talk> = std::fs::read_dir(&self.root)
             .into_iter()
@@ -421,9 +410,8 @@ impl Talks {
         }
     }
 
-    /// Change detection token, the same shape as
-    /// [`crate::chat::Chats::revision`]: the newest modification time in the
-    /// store, in milliseconds.
+    /// Change detection token: the newest modification time in the store, in
+    /// milliseconds.
     pub fn revision(&self) -> u64 {
         std::fs::read_dir(&self.root)
             .into_iter()
@@ -468,31 +456,21 @@ impl Talks {
     }
 }
 
-/// Open a conversation. Unlike [`crate::chat::start`] this takes no agent
-/// turn: there is no idea to answer yet, and a conversation the operator has
-/// not said anything into yet is a normal, valid thing to have sitting on the
-/// phone.
+/// Open a conversation. Takes no agent turn: there is no idea to answer yet,
+/// and a conversation the operator has not said anything into yet is a
+/// normal, valid thing to have sitting on the phone.
 ///
-/// `agent` beats `[roles] chatter`, which beats `[roles] planner` -
-/// [`plan::pick`] run against the same preference order [`crate::chat::start`]
-/// uses for its own resident conversation. This is a standing chat, not an
-/// interview, so `chatter` rather than `planner` is the field this
-/// conversation is actually about; `planner` remains the fallback so an
-/// operator who never set `chatter` sees no change. `chatter` exists at all
-/// because this conversation stays open far longer than a single planning
-/// interview, and opening it against the same seat as a judge is what
-/// produced the `agent ... did not answer within 300s` timeout that led to
-/// splitting the two roles apart - see `[roles] chatter`'s own doc in
-/// [`crate::config`].
+/// `agent` beats `[roles] chatter`, which beats [`agent::pick`]'s own default
+/// order (a claude seat, else the first runnable agent in roster order) when
+/// nothing names a seat at all - see `[roles] chatter`'s own doc in
+/// [`crate::config`] for why a dedicated field exists rather than reusing a
+/// judge seat.
 pub fn begin(store: &Talks, cfg: &Config, repo: PathBuf, agent: Option<&str>) -> Result<Talk> {
-    // Absolute, for the same reason `chat::start` canonicalizes: a relative
-    // path means the wrong repository once anything other than this process
-    // reads it back.
+    // Absolute: a relative path means the wrong repository once anything
+    // other than this process reads it back.
     let repo = repo.canonicalize().unwrap_or(repo);
-    let want = agent
-        .or(cfg.roles.chatter.as_deref())
-        .or(cfg.roles.planner.as_deref());
-    let spec = plan::pick(&cfg.agents, want, &plan::installed)?;
+    let want = agent.or(cfg.roles.chatter.as_deref());
+    let spec = agent::pick(&cfg.agents, want, &agent::installed)?;
 
     let now = Timestamp::now();
     let mut talk = Talk {
@@ -512,11 +490,10 @@ pub fn begin(store: &Talks, cfg: &Config, repo: PathBuf, agent: Option<&str>) ->
 
 /// Append the operator's turn and flush it, without invoking anything.
 ///
-/// Split out of [`say`] for the same reason [`crate::chat::record`] is split
-/// out of [`crate::chat::say`]: `POST /api/talks/{id}/say` answers once the
-/// message is safely on disk, and runs the agent's half in the background -
-/// see that function's doc for why holding the connection for a turn that can
-/// run fifteen minutes is the wrong shape for a phone.
+/// Split out of [`say`] so `POST /api/talks/{id}/say` can answer once the
+/// message is safely on disk, and run the agent's half in the background -
+/// holding the connection for a turn that can run fifteen minutes is the
+/// wrong shape for a phone.
 pub fn record(
     talk: &mut Talk,
     store: &Talks,
@@ -573,8 +550,7 @@ pub async fn say(
     turn(talk, store, cfg, &text).await
 }
 
-/// The agent's half of a turn: invoke, append, flush. Pairs with [`record`],
-/// the same way [`crate::chat::respond`] pairs with [`crate::chat::record`].
+/// The agent's half of a turn: invoke, append, flush. Pairs with [`record`].
 pub async fn respond(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Result<()> {
     turn(talk, store, cfg, text).await
 }
@@ -632,9 +608,8 @@ pub fn reopen(talk: &mut Talk, store: &Talks) -> Result<()> {
 ///
 /// The first turn ever taken carries the full [`briefing`], because nothing
 /// else has told the agent what this conversation is or what it may do.
-/// Every turn after that behaves like [`crate::chat`]'s: resend nothing when
-/// the CLI can resume its own session, and fall back to [`transcript`] only
-/// when it cannot.
+/// Every turn after that resends nothing when the CLI can resume its own
+/// session, and falls back to [`transcript`] only when it cannot.
 async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Result<()> {
     let spec = cfg
         .agents
@@ -793,7 +768,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
 }
 
 /// Everything said so far, as prose, for a CLI that cannot resume its own
-/// conversation. See [`crate::chat::transcript`], which this mirrors.
+/// conversation.
 fn transcript(talk: &Talk, store: &Talks) -> String {
     let mut out = String::from(
         "This conversation cannot resume on the CLI's side, so here is \
@@ -811,10 +786,9 @@ fn transcript(talk: &Talk, store: &Talks) -> String {
 }
 
 /// The section named at the end of a turn's body, listing every attachment's
-/// absolute path and mime so the agent knows exactly what to open. Mirrors
-/// [`crate::chat`]'s own helper of the same name. Empty when `attachments`
-/// is, which is every turn but the rare one carrying an image, so a turn
-/// with none changes nothing about the prompt.
+/// absolute path and mime so the agent knows exactly what to open. Empty
+/// when `attachments` is, which is every turn but the rare one carrying an
+/// image, so a turn with none changes nothing about the prompt.
 fn attachment_note(store: &Talks, talk_id: &str, attachments: &[Attachment]) -> String {
     if attachments.is_empty() {
         return String::new();
@@ -836,13 +810,12 @@ fn attachment_note(store: &Talks, talk_id: &str, attachments: &[Attachment]) -> 
 ///
 /// Pure, so the properties that matter can be asserted without an interview:
 /// it names `magi task add --solo` (the route this conversation always has to
-/// changing anything) and it does not carry
-/// [`crate::plan::TASK_FILE_SPEC`] - that spec describes a task *file*, which
-/// belongs to the planning interview and would tell this agent to write one
-/// here instead of filing through the queue. `allow_write` only ever adds an
-/// extra permission on top of that; it never removes the queue as an option,
-/// which is why both branches keep the same `# When the operator wants
-/// something done` section - `write_policy` is the only part that changes.
+/// changing anything) and it never tells the agent to write a task *file* of
+/// its own - that would compete with filing through the queue.
+/// `allow_write` only ever adds an extra permission on top of that; it never
+/// removes the queue as an option, which is why both branches keep the same
+/// `# When the operator wants something done` section - `write_policy` is
+/// the only part that changes.
 pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
     let write_policy = if allow_write {
         "This repository has set `[talk] allow_write = true`, so you may \
@@ -881,8 +854,7 @@ pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
 }
 
 /// The operator is talking, so their language matters here more than in most
-/// prompts magi sends - see [`crate::chat::language_note`], which this
-/// mirrors.
+/// prompts magi sends.
 fn language_note(language: &str) -> String {
     if language.trim().is_empty() || language.eq_ignore_ascii_case("en") {
         String::new()
@@ -1068,42 +1040,40 @@ mod tests {
         assert_eq!(on_disk.turns.len(), 0);
     }
 
-    /// `roles.chatter`, not `roles.planner`, decides who holds this
-    /// conversation - the same distinction [`crate::chat::start`] makes for
-    /// its own resident chat, and for the same reason: a Talk stays open far
-    /// longer than a `magi plan` interview, and opening it against the same
+    /// `[roles] chatter`, when set, decides who holds this conversation; unset,
+    /// it falls back to [`agent::pick`]'s own default order (a claude seat,
+    /// else the first runnable agent in roster order) rather than to any
+    /// other role - see `[roles] chatter`'s own doc in [`crate::config`] for
+    /// why a dedicated field exists at all: opening this against the same
     /// seat as a judge is what produced the `agent ... did not answer within
-    /// 300s` timeout `[roles] chatter` exists to avoid. See
-    /// `a_chat_prefers_the_chatter_role_over_the_planner_role` in
-    /// `src/chat.rs`, which this mirrors.
+    /// 300s` timeout that led to it.
     #[test]
-    fn a_talk_prefers_the_chatter_role_over_the_planner_role() {
+    fn chatter_wins_when_set_and_falls_back_to_pick_s_default_order_otherwise() {
         let (tmp, talks) = store();
-        let planner_spec = mock_agent(tmp.path(), BROKEN, BTreeMap::new());
+        let first_spec = mock_agent(tmp.path(), BROKEN, BTreeMap::new());
         let mut chatter_spec = mock_agent(tmp.path(), BROKEN, BTreeMap::new());
         chatter_spec.id = "chatter-mock".to_owned();
 
         let mut cfg = Config {
-            agents: vec![planner_spec.clone(), chatter_spec.clone()],
+            agents: vec![first_spec.clone(), chatter_spec.clone()],
             graph: Graph {
                 language: "en".to_owned(),
                 ..Graph::default()
             },
             ..Config::default()
         };
-        cfg.roles.planner = Some(planner_spec.id.clone());
         cfg.roles.chatter = Some(chatter_spec.id.clone());
 
         let talk =
             begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin with chatter set");
-        assert_eq!(talk.agent, chatter_spec.id, "chatter must win over planner");
+        assert_eq!(talk.agent, chatter_spec.id, "an explicit chatter must win");
 
         cfg.roles.chatter = None;
         let fallback =
             begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin with chatter unset");
         assert_eq!(
-            fallback.agent, planner_spec.id,
-            "unset chatter must fall back to planner, unchanged from before this role existed"
+            fallback.agent, first_spec.id,
+            "unset chatter must fall back to agent::pick's own default order"
         );
     }
 
@@ -1681,10 +1651,9 @@ mod tests {
     }
 
     #[test]
-    fn the_briefing_names_solo_task_add_and_not_the_task_file_spec() {
+    fn the_briefing_names_solo_task_add() {
         let brief = briefing(Path::new("/repo"), "en", false);
         assert!(brief.contains("magi task add --solo"));
-        assert!(!brief.contains(plan::TASK_FILE_SPEC));
         assert!(brief.contains("/repo"));
         assert!(!brief.contains("Hold this conversation in"));
     }

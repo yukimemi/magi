@@ -942,11 +942,11 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .ask-say .btn { align-self: flex-start; }
 
 /* ---- markdown ------------------------------------------------------------
- * GFM markdown - a question's detail, a chat's agent turn, a run or task
- * instruction, a chat's draft - is parsed into a node tree server-side
- * (`magi::md`) and turned into these elements by `buildMd` in app.js. Never
- * assigned as markup: a fence containing a script tag renders as the
- * characters of a script tag. */
+ * GFM markdown - a question's detail, a standing chat's agent turn, a run or
+ * task instruction - is parsed into a node tree server-side (`magi::md`) and
+ * turned into these elements by `buildMd` in app.js. Never assigned as
+ * markup: a fence containing a script tag renders as the characters of a
+ * script tag. */
 .md { display: flex; flex-direction: column; gap: var(--s2); font-size: var(--t3); color: var(--ink-2); }
 .md p { overflow-wrap: anywhere; }
 .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
@@ -1201,11 +1201,11 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 }
 .dock-glyph svg { width: 22px; height: 22px; display: block; }
 .dock-item[aria-current="page"] { color: var(--ink); border-top-color: var(--gold-line); }
-/* Plan is the only way work gets in from this UI, so the dock's Plan item is
-   gold — the colour that everywhere else means "the commit action" — and it
-   stays gold even while a different page is active. */
-.dock-item.dock-plan { color: var(--on-gold); }
-.dock-item.dock-plan .dock-glyph svg { stroke-width: 2.4; }
+/* Chat is the only conversational way work gets in from this UI, so the
+   dock's Chat item is gold — the colour that everywhere else means "the
+   commit action" — and it stays gold even while a different page is active. */
+.dock-item.dock-chat { color: var(--on-gold); }
+.dock-item.dock-chat .dock-glyph svg { stroke-width: 2.4; }
 
 /* ---- run actions fab ---------------------------------------------------- *
  * The one entry point into Resume / Fold / Delete on a run detail. Fixed so
@@ -1444,11 +1444,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
    and a real edge rather than being demoted to a text link. */
 .stakes-hold { align-self: stretch; }
 
-/* ---- planning conversation --------------------------------------------- *
- * `magi plan` gives the terminal to an agent CLI. A phone has no terminal, so
- * the same interview runs here one turn at a time. A turn takes tens of
- * seconds because a real model is thinking: everything below is built so that
- * wait reads as work rather than as a hang. */
+/* ---- conversation turns -------------------------------------------------- *
+ * The standing chat's transcript. A turn takes tens of seconds because a real
+ * model is thinking: everything below is built so that wait reads as work
+ * rather than as a hang. */
 .turns { display: flex; flex-direction: column; gap: var(--s3); }
 .turn {
   max-width: 92%; min-width: 0;
@@ -1615,59 +1614,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
   font-size: var(--t2); color: var(--ink-3);
 }
 
-/* Formatted is the default read of the draft; raw is the exact bytes that
-   would be filed, one tap away, so the toggle sits above both and only ever
-   one of the two is visible. */
-.draft-view-toggle { display: flex; justify-content: flex-end; }
-
-/* The task file, as the file it is: monospace, wrapped rather than scrolled
-   sideways, and readable at 390px. Shown when the raw view is selected. */
-.draft {
-  margin: 0; padding: var(--s3);
-  background: var(--sunk); color: var(--ink);
-  border: 1px solid var(--line); border-radius: var(--radius-sm);
-  font-family: var(--mono); font-size: var(--t2); line-height: 1.55;
-  white-space: pre-wrap; overflow-wrap: anywhere;
-  max-height: 52vh; overflow-y: auto;
-  tab-size: 2;
-}
-/* Every problem at once, because the operator wants to fix them in one pass
-   and the draft stays on screen above them. */
-.problems {
-  display: flex; flex-direction: column; gap: var(--s2);
-  padding: var(--s3);
-  background: var(--tint-rust); color: var(--on-rust);
-  border: 1px solid currentColor; border-radius: var(--radius-sm);
-  font-size: var(--t3);
-}
-.problems h3 { font-size: var(--t3); font-weight: 700; }
-.problems ul { display: flex; flex-direction: column; gap: var(--s2); }
-.problems li { position: relative; padding-left: var(--s4); font-weight: 600; overflow-wrap: anywhere; }
-.problems li::before { content: "\2715"; position: absolute; left: 2px; }
-/* On the rust tint a sunk grey code chip disappears, so the span is outlined
-   in the ink it already sits in. */
-.problems code {
-  font-family: var(--mono); font-size: .92em;
-  border: 1px solid currentColor; border-radius: 4px; padding: 0 3px;
-  overflow-wrap: anywhere;
-}
-
-.filed-note { font-size: var(--t3); color: var(--ink-2); }
-.filed-note .ask-seat { font-size: var(--t2); }
-.chat-ready { color: var(--on-gold); font-weight: 700; }
-/* A conversation whose turn is running - see `state.chatWaits` in app.js.
-   Blue rather than gold: it must not read as the same "come look" signal as
-   `chat-ready`, since the two are answering different questions. */
-.chat-thinking { color: var(--on-blue); font-weight: 700; }
-
-/* One `magi plan` design deliberation's raw record: one block per advisor
-   seat, its proposal's fields as a plain list underneath. */
-#plan-draft-detail-list { display: flex; flex-direction: column; gap: var(--s3); }
-#plan-draft-detail-list h3 { font-size: var(--t3); font-weight: 700; }
-.proposal { display: flex; flex-direction: column; gap: var(--s1); font-size: var(--t3); }
-.proposal li { overflow-wrap: anywhere; }
-.proposal .form-error { font-weight: 600; }
-
 /* ---- wide screens ------------------------------------------------------ *
  * Not a stretched phone: the dock becomes a header rail, the run list becomes
  * a grid, and the report pane sits beside the analysis instead of below it. */
@@ -1686,9 +1632,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
     font-size: var(--t3); font-weight: 650; color: var(--ink-3);
   }
   .rail-link[aria-current="page"] { color: var(--ink); background: var(--sunk); }
-  /* The rail's Plan entry is the primary action: a filled gold button, not
-     another grey link — the same gold as the dock's plan item and every
-     start-the-interview button, and the only .btn among the links. */
+  /* The rail's Chat entry is the primary action: a filled gold button, not
+     another grey link — the same gold as the dock's chat item, and the only
+     .btn among the links. */
   .rail-link.btn-gold { color: #241d05; background: var(--gold); border-color: var(--gold); }
   main { padding: var(--s5); }
   h1 { font-size: var(--t7); }
@@ -1722,14 +1668,11 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
   .stakes-arm, .stakes-hold { align-self: flex-start; }
   /* A transcript is read, so it is measured; and with the dock gone the
      composer sticks to the bottom of the viewport instead of above it. */
-  #view-chat { max-width: 780px; }
-  /* Planning's list used to cap at 780px too, on the same "measure what you
-     read" reasoning as #view-chat above and #view-questions .asks below -
-     but a list of chats is a list of cards to scan, not a document to read
-     start to finish, and the cap left it stuck at two columns at widths
-     where Queue, the same `.cards` grid, already ran to three. Dropping the
-     override here rather than adding one to Queue keeps the rule for "a
-     list of cards" in exactly one place: the shared `.cards` rule above. */
+  #view-talk { max-width: 780px; }
+  /* The talk list itself stays uncapped, unlike the transcript above: a list
+     of conversations is a list of cards to scan, not a document to read start
+     to finish, and a cap here would leave it stuck at two columns at widths
+     where Queue, the same `.cards` grid, already runs to three. */
   .say { bottom: 0; padding-bottom: var(--s4); }
   .turn { max-width: 80%; }
 }
@@ -1776,7 +1719,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 @media print {
   .top, .daemon, .ask-bar, .dock, .back, .sheet, .full, .say { display: none; }
   .frame-wrap iframe { height: 520px; }
-  .draft { max-height: none; }
   .card, .panel { box-shadow: none; break-inside: avoid; }
   .report { max-height: none; white-space: pre-wrap; }
 }

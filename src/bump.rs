@@ -30,7 +30,6 @@ use crate::agent::{self, Invocation, SeatState};
 use crate::config::AgentSpec;
 use crate::git;
 use crate::land;
-use crate::plan;
 use crate::proc::Quiet as _;
 use crate::run::{self, RunState, RunStatus};
 use crate::verdict;
@@ -792,12 +791,11 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
         .unwrap_or_default();
     let prompt = decision_prompt(&subject, &state.instruction, &stat, &files, &base_version);
 
-    let spec: AgentSpec = plan::pick(
-        &state.config.agents,
-        state.config.roles.planner.as_deref(),
-        &plan::installed,
-    )
-    .context("choose an agent for the release-bump decision")?;
+    // No dedicated role for this one-off decision: fall back straight to
+    // `agent::pick`'s own default order (a claude seat, else the first
+    // runnable agent in roster order).
+    let spec: AgentSpec = agent::pick(&state.config.agents, None, &agent::installed)
+        .context("choose an agent for the release-bump decision")?;
     let mut seat = SeatState::new("bump", &spec.id, state.seed);
     let artifacts = agent::artifacts_dir(&state.dir());
     let out = agent::invoke(

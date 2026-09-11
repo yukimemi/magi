@@ -21,12 +21,10 @@
 //! review missed. See [`stats`].
 #![deny(missing_docs)]
 
-pub mod advise;
 pub mod agent;
 pub mod ask;
 pub mod blind;
 pub mod bump;
-pub mod chat;
 pub mod clean;
 pub mod config;
 pub mod daemon;
@@ -35,7 +33,6 @@ pub mod git;
 pub mod graph;
 pub mod land;
 pub mod md;
-pub mod plan;
 pub mod proc;
 pub mod prompt;
 pub mod queue;
