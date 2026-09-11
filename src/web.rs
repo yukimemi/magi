@@ -59,13 +59,13 @@
 //! whitelist, so an agent cannot get markup rendered outside the frame by
 //! naming a file `.html`.
 //!
-//! # An interview is not a filesystem read
+//! # A conversation turn is not a filesystem read
 //!
 //! Every other route here is disk work, which is why [`blocking`] exists.
-//! `POST /api/chats/{id}/say` is the exception: it spawns an agent CLI and
+//! `POST /api/talks/{id}/say` is the exception: it spawns an agent CLI and
 //! waits tens of seconds for a sentence. It is a plain `await` holding no lock
-//! and no executor thread, and concurrent turns on one chat are refused rather
-//! than queued - see [`Ui::begin_turn`].
+//! and no executor thread, and concurrent turns on one talk are refused rather
+//! than queued - see [`Ui::begin_talk_turn`].
 //!
 //! # The loop runs here
 //!
@@ -114,16 +114,14 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::advise;
 use crate::ask::{Answer, Question, Questions};
-use crate::chat::{Chat, Chats};
 use crate::config::{Config, Update, UpdateMode};
 use crate::md;
 use crate::proc::Quiet as _;
 use crate::queue::{Queue, Task, title_from};
 use crate::run::{RunState, RunStatus};
 use crate::talk::{Talk, Talks};
-use crate::{chat, daemon, report, repos, run, talk, updater};
+use crate::{daemon, report, repos, run, talk, updater};
 
 /// Default port. Chosen high and memorable; nothing else in the fleet uses it.
 pub const DEFAULT_PORT: u16 = 7878;
@@ -180,7 +178,7 @@ const ATTACHMENT_MAX_BYTES: usize = 10 * 1024 * 1024;
 const ATTACHMENT_MIME_WHITELIST: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 /// Header carrying the operator's own filename. Free text, stored only for
-/// display - see [`chat::Attachment::name`]'s doc on why it never
+/// display - see [`talk::Attachment::name`]'s doc on why it never
 /// contributes to a path.
 const FILENAME_HEADER: &str = "x-filename";
 
@@ -291,7 +289,6 @@ impl Default for Opts {
 pub struct Ui {
     queue: Queue,
     questions: Questions,
-    chats: Chats,
     talks: Talks,
     runs: PathBuf,
     home: PathBuf,
@@ -303,29 +300,25 @@ pub struct Ui {
     /// sizes it, and sizing the operator's real `~/wt/magi` from a test would
     /// be measuring the machine instead of the server.
     worktrees_root: PathBuf,
-    /// Chats with an agent turn in flight right now.
+    /// Talks with an agent turn in flight right now.
     ///
     /// In-process and therefore not durable, which is correct: it guards
     /// against two taps on one phone and two phones on one tailnet, both of
     /// which are this process's own concurrency. A second `magi web` would not
     /// see it, and a second `magi web` on the same home is already a
     /// misconfiguration the queue's claims would catch first.
-    turns: Arc<Mutex<HashSet<String>>>,
-    /// Talks with an agent turn in flight right now. Separate from `turns`
-    /// because a talk and a chat are different stores with different ids;
-    /// sharing one set would let a chat id collide with a talk id in theory,
-    /// and there is no reason to make the two surfaces share a guard at all.
     talk_turns: Arc<Mutex<HashSet<String>>>,
     /// Runs this process is resuming right now.
     ///
-    /// Separate from `turns` because a run and a chat are different things to
-    /// hold, and a resume is far more expensive to start twice: it re-asks
-    /// agent seats. Same reasoning about scope as `turns` — this guards two
-    /// taps and two phones, which is this process's own concurrency.
+    /// Separate from `talk_turns` because a run and a talk are different
+    /// things to hold, and a resume is far more expensive to start twice: it
+    /// re-asks agent seats. Same reasoning about scope as `talk_turns` — this
+    /// guards two taps and two phones, which is this process's own
+    /// concurrency.
     resuming: Arc<Mutex<HashSet<String>>>,
     /// The last scan of `[repos] roots`, and when it happened. Shared across
-    /// requests so a phone opening the repository picker repeatedly does not
-    /// repeat the filesystem walk every time - see [`repos::Cache`].
+    /// requests so polling `GET /api/repos` repeatedly does not repeat the
+    /// filesystem walk every time - see [`repos::Cache`].
     repos_cache: repos::Cache,
     /// Merge mode override handed to the loop this process starts.
     merge: Option<String>,
@@ -350,7 +343,6 @@ impl Ui {
     pub fn new(
         queue: Queue,
         questions: Questions,
-        chats: Chats,
         talks: Talks,
         runs: PathBuf,
         home: PathBuf,
@@ -359,7 +351,6 @@ impl Ui {
         Self {
             queue,
             questions,
-            chats,
             talks,
             runs,
             home,
@@ -368,7 +359,6 @@ impl Ui {
             // builder step rather than a ninth parameter, for the reason
             // `with_merge` gives.
             worktrees_root: run::default_worktree_root(),
-            turns: Arc::default(),
             talk_turns: Arc::default(),
             resuming: Arc::default(),
             repos_cache: repos::Cache::new(),
@@ -379,12 +369,11 @@ impl Ui {
     }
 
     /// The operator's own state: `<home>/queue`, `<home>/questions`,
-    /// `<home>/chats`, `<home>/talks`, `<home>/runs`.
+    /// `<home>/talks`, `<home>/runs`.
     pub fn open(repo: PathBuf) -> Self {
         Self::new(
             Queue::open(),
             Questions::open(),
-            Chats::open(),
             Talks::open(),
             run::runs_root(),
             run::home(),
@@ -574,12 +563,12 @@ impl Ui {
         lock_or_recover(&self.looping)
     }
 
-    /// Claim the right to run one turn in a chat, or refuse.
+    /// Claim the right to run one turn in a talk, or refuse.
     ///
-    /// An interview is strictly turn-based: the interviewing agent is resumed
-    /// with the conversation it already has, so two turns running at once would
-    /// resume the same session twice and append their answers in whatever order
-    /// the two CLIs finished in. The operator would come back to a transcript
+    /// A talk is strictly turn-based: the agent is resumed with the
+    /// conversation it already has, so two turns running at once would resume
+    /// the same session twice and append their answers in whatever order the
+    /// two CLIs finished in. The operator would come back to a transcript
     /// with two half-turns interleaved, which is unreadable and, worse,
     /// unfixable - there is no undo for a persisted turn.
     ///
@@ -593,35 +582,9 @@ impl Ui {
     /// The lock is a `std::sync::Mutex` and never crosses an `await`: it is
     /// taken to test-and-insert and released before the agent is spawned. The
     /// returned guard removes the id on drop, which is what makes a panicking
-    /// handler or a phone that walks out of range leave the chat usable - axum
+    /// handler or a phone that walks out of range leave the talk usable - axum
     /// drops the handler future when the client disconnects, and without the
-    /// guard that chat would be wedged until the server restarted.
-    fn begin_turn(&self, id: &str) -> ApiResult<TurnGuard> {
-        let mut live = self
-            .turns
-            .lock()
-            .map_err(|_| ApiError::internal("the chat turn lock was poisoned"))?;
-        if !live.insert(id.to_owned()) {
-            return Err(ApiError::conflict(format!(
-                "chat {id} is already taking a turn"
-            )));
-        }
-        Ok(TurnGuard {
-            chat: id.to_owned(),
-            turns: Arc::clone(&self.turns),
-        })
-    }
-
-    /// Is this chat's turn claimed by [`Ui::begin_turn`] in this process right
-    /// now? The source of [`ChatView::thinking`] - see there for what the
-    /// answer does and does not promise.
-    fn is_thinking(&self, id: &str) -> bool {
-        self.turns.lock().is_ok_and(|live| live.contains(id))
-    }
-
-    /// [`Ui::begin_turn`]'s counterpart for a talk. Same reasoning throughout:
-    /// a talk's seat is resumed the same way a planning chat's is, so two
-    /// turns running at once would race to append to one CLI conversation.
+    /// guard that talk would be wedged until the server restarted.
     fn begin_talk_turn(&self, id: &str) -> ApiResult<TalkTurnGuard> {
         let mut live = self
             .talk_turns
@@ -669,9 +632,9 @@ impl Ui {
         })
     }
 
-    /// Claim a run for a resume, on the same reasoning as [`Ui::begin_turn`]:
-    /// a guard that releases on drop, so a disconnected phone does not wedge
-    /// the run until the server restarts.
+    /// Claim a run for a resume, on the same reasoning as
+    /// [`Ui::begin_talk_turn`]: a guard that releases on drop, so a
+    /// disconnected phone does not wedge the run until the server restarts.
     fn begin_resume(&self, id: &str) -> ApiResult<ResumeGuard> {
         let mut live = self
             .resuming
@@ -711,8 +674,6 @@ impl Ui {
             .route("/api/queue", get(queue_list))
             .route("/api/queue/{id}", delete(queue_delete))
             .route("/api/repos", get(repos_list))
-            .route("/api/drafts", get(drafts_list))
-            .route("/api/drafts/{id}/advisors", get(draft_advisors))
             .route("/api/queue/{id}/hold", post(queue_hold))
             .route("/api/queue/{id}/release", post(queue_release))
             .route("/api/queue/{id}/priority", post(queue_priority))
@@ -732,29 +693,16 @@ impl Ui {
             .route("/api/questions/{id}/panel/index.html", get(question_panel))
             .route("/api/questions/{id}/panel/{name}", get(question_asset))
             .route("/api/questions/{id}/asset/{name}", get(question_asset))
-            .route("/api/chats", get(chats_list).post(chat_post))
-            .route("/api/chats/{id}", get(chat_detail))
-            .route("/api/chats/{id}/say", post(chat_say))
-            .route("/api/chats/{id}/file", post(chat_file))
-            .route("/api/chats/{id}/abandon", post(chat_abandon))
-            // `DefaultBodyLimit` is raised only on this one route - every
-            // other route on this server answers in a few kilobytes, and
-            // widening the crate-wide default for all of them just because
-            // one accepts a picture would let any other handler be handed
-            // a multi-megabyte body it never expects.
-            .route(
-                "/api/chats/{id}/attachments",
-                post(chat_attachment_post).layer(DefaultBodyLimit::max(ATTACHMENT_MAX_BYTES + 1)),
-            )
-            .route(
-                "/api/chats/{id}/attachments/{att}",
-                get(chat_attachment_get),
-            )
             .route("/api/talks", get(talks_list).post(talk_post))
             .route("/api/talks/{id}", get(talk_detail).delete(talk_delete))
             .route("/api/talks/{id}/say", post(talk_say))
             .route("/api/talks/{id}/close", post(talk_close))
             .route("/api/talks/{id}/reopen", post(talk_reopen))
+            // `DefaultBodyLimit` is raised only on this one route - every
+            // other route on this server answers in a few kilobytes, and
+            // widening the crate-wide default for all of them just because
+            // one accepts a picture would let any other handler be handed
+            // a multi-megabyte body it never expects.
             .route(
                 "/api/talks/{id}/attachments",
                 post(talk_attachment_post).layer(DefaultBodyLimit::max(ATTACHMENT_MAX_BYTES + 1)),
@@ -768,26 +716,11 @@ impl Ui {
     }
 }
 
-/// One chat's turn slot, released on drop.
+/// One talk's turn slot, released on drop.
 ///
 /// A guard rather than a matching `remove` at the end of the handler, because
 /// the handler has several early returns and one `await` that can be cancelled
-/// out from under it. A leaked id is a chat nobody can talk to again.
-#[derive(Debug)]
-struct TurnGuard {
-    chat: String,
-    turns: Arc<Mutex<HashSet<String>>>,
-}
-
-impl Drop for TurnGuard {
-    fn drop(&mut self) {
-        if let Ok(mut live) = self.turns.lock() {
-            live.remove(&self.chat);
-        }
-    }
-}
-
-/// [`TurnGuard`]'s counterpart for a talk's turn slot.
+/// out from under it. A leaked id is a talk nobody can talk to again.
 #[derive(Debug)]
 struct TalkTurnGuard {
     talk: String,
@@ -1133,16 +1066,6 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 struct ApiError {
     status: StatusCode,
     message: String,
-    /// Every separate thing wrong with what the client sent, when there is
-    /// more than one and the client is expected to fix them all.
-    ///
-    /// Only `POST /api/chats/{id}/file` populates it, and it is skipped when
-    /// empty so every other error body stays exactly the shape the front end
-    /// already parses. The reason it exists at all is that the operator
-    /// rejecting a draft is on a phone: a task file with no acceptance
-    /// criteria and no title is one edit, and reporting it as two round trips
-    /// means asking an agent to rewrite the draft twice.
-    problems: Vec<String>,
 }
 
 impl ApiError {
@@ -1151,15 +1074,6 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
-            problems: Vec::new(),
-        }
-    }
-
-    /// The client asked for something malformed in several ways at once.
-    fn bad_request_with(message: impl Into<String>, problems: Vec<String>) -> Self {
-        Self {
-            problems,
-            ..Self::bad_request(message)
         }
     }
 
@@ -1168,7 +1082,6 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
-            problems: Vec::new(),
         }
     }
 
@@ -1190,7 +1103,6 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
-            problems: Vec::new(),
         }
     }
 
@@ -1199,7 +1111,6 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
-            problems: Vec::new(),
         }
     }
 }
@@ -1216,13 +1127,7 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let mut body = serde_json::json!({ "error": self.message });
-        if !self.problems.is_empty() {
-            // `json!` above built an object, so this cannot be `None`.
-            if let Some(map) = body.as_object_mut() {
-                map.insert("problems".to_owned(), serde_json::json!(self.problems));
-            }
-        }
+        let body = serde_json::json!({ "error": self.message });
         (self.status, Json(body)).into_response()
     }
 }
@@ -1335,24 +1240,19 @@ struct HealthView {
     home: String,
     queue_rev: u64,
     runs_rev: u64,
-    /// The same two revisions [`events`] streams for the question and chat
+    /// The same revisions [`events`] streams for the question and talk
     /// stores.
     ///
     /// Here because this route is what the front end falls back to when the
     /// change stream is not up - it re-polls health on a timer and on wake, and
-    /// takes the revisions from the answer. Without these two the fallback
+    /// takes the revisions from the answer. Without these the fallback
     /// compares `undefined` against `undefined` for both stores, decides
     /// nothing moved, and a phone with a dead stream never learns that a
-    /// question was asked or that an interview took a turn. `queue_rev` and
+    /// question was asked or that a talk took a turn. `queue_rev` and
     /// `runs_rev` above have always been here for exactly this reason; the rule
     /// is that every revision the stream carries, this route carries too.
     questions_rev: u64,
-    /// See [`HealthView::questions_rev`].
-    chats_rev: u64,
-    /// See [`HealthView::questions_rev`]. The standing chat's own store,
-    /// separate from `chats_rev`: a `/api/talks` reply moving must not be
-    /// mistaken for a `/api/chats` one, or a phone open on Planning would sit
-    /// still while a talk it has open gets a reply.
+    /// See [`HealthView::questions_rev`]. The standing chat's own store.
     talks_rev: u64,
     /// See [`HealthView::questions_rev`]. The loop's counter is the one that
     /// is not on disk anywhere, so a phone with no change stream has no other
@@ -1391,14 +1291,6 @@ struct HealthView {
     /// the instant the owner asks back and reappear the instant the agent
     /// replies, instead of sitting lit for however long the agent thinks.
     questions_needs_owner: usize,
-    /// Interviews the operator started in the browser and has not filed.
-    ///
-    /// Unlike `questions_open` nothing is blocked on these - a chat is the
-    /// operator's own half-finished thought. It is here because an interview
-    /// that never became a task is invisible everywhere else: it is not in the
-    /// queue and it is not in the run history, so without a count the phone
-    /// has no way to say "you left one open".
-    chats_open: usize,
     daemon: DaemonView,
     /// The loop in this process, exactly what `/api/loop` answers with.
     ///
@@ -1677,13 +1569,11 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             queue_rev: ui.queue.revision(),
             runs_rev: runs_revision(&ui.runs),
             questions_rev: ui.questions.revision(),
-            chats_rev: ui.chats.revision(),
             talks_rev: ui.talks.revision(),
             loop_rev,
             runs_unreadable: runs_unreadable(&ui.runs),
             questions_open: ui.questions.count_open(),
             questions_needs_owner: ui.questions.count_needs_owner(),
-            chats_open: ui.chats.count_open(),
             daemon: DaemonView::of(reading.clone()),
             looping: ui.loop_view(reading),
             disk: DiskView::of(&ui),
@@ -2388,7 +2278,7 @@ struct FoldView {
 /// implementations against work that already exists.
 ///
 /// **202, not 200.** A resume runs agents for minutes; holding the connection
-/// is the mistake `POST /api/chats/{id}/say` already made and had fixed. The
+/// is the mistake `POST /api/talks/{id}/say` already made and had fixed. The
 /// phone learns the outcome from the change stream.
 ///
 /// Refused when the loop is running at all, not merely when it is on this run.
@@ -2509,13 +2399,12 @@ struct ReposQuery {
     refresh: u8,
 }
 
-/// `GET /api/repos` - the repository picker for the plan surface's "start a
-/// conversation" panel and its "continue in another repository" action.
+/// `GET /api/repos` - local checkouts found under `[repos] roots`, the same
+/// listing `magi repos` prints at a terminal.
 ///
-/// Reads `[repos] roots` and `[repos] scan_ttl` off the same config the rest
-/// of the plan surface uses, discovered against `ui.repo` so an edit to
-/// `magi.toml` takes effect without a restart, the same reasoning
-/// [`config_for`] documents for the chat routes.
+/// Reads `[repos] roots` and `[repos] scan_ttl` discovered against `ui.repo`
+/// so an edit to `magi.toml` takes effect without a restart, the same
+/// reasoning [`config_for`] documents for the talk routes.
 async fn repos_list(
     State(ui): State<Arc<Ui>>,
     Query(q): Query<ReposQuery>,
@@ -2528,138 +2417,6 @@ async fn repos_list(
             Duration::from_secs(cfg.repos.scan_ttl),
             refresh,
         )))
-    })
-    .await
-}
-
-/// One `magi plan` draft the plan surface can point at, summarized for
-/// `GET /api/drafts`.
-#[derive(Debug, Serialize)]
-struct DraftSummary {
-    id: String,
-    title: String,
-    seats: usize,
-    proposals: usize,
-}
-
-/// `GET /api/drafts` - every draft that finished a design-deliberation stage,
-/// newest first - the plan surface's index into `draft_advisors` below.
-///
-/// `magi plan` is a terminal command; a phone that opens later has no other
-/// way to learn which draft ids exist. Listing only the ids with an
-/// `<id>.advisors.json` on disk, rather than every `<id>.md`, keeps this to
-/// what the design-deliberation stage actually produced - an interview
-/// abandoned before it wrote anything, or one filed with the stage off, has
-/// nothing here to show.
-async fn drafts_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<DraftSummary>>> {
-    blocking(move || {
-        let dir = ui.home.join("drafts");
-        let mut out = Vec::new();
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Ok(Json(out));
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".advisors.json")) else {
-                continue;
-            };
-            let Ok(raw) = std::fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            let Ok(advice) = serde_json::from_str::<advise::Advice>(&raw) else {
-                continue;
-            };
-            let title = std::fs::read_to_string(dir.join(format!("{id}.md")))
-                .ok()
-                .map(|body| title_from(&body, TITLE_MAX))
-                .unwrap_or_else(|| id.to_owned());
-            out.push(DraftSummary {
-                id: id.to_owned(),
-                title,
-                seats: advice.records.len(),
-                proposals: advice.proposals().len(),
-            });
-        }
-        // The id is a `%Y%m%d-%H%M%S-xxxx` stamp (see `plan::new_id`), so a
-        // plain string sort is already newest-first in reverse.
-        out.sort_by(|a, b| b.id.cmp(&a.id));
-        Ok(Json(out))
-    })
-    .await
-}
-
-/// The wire shape of `GET /api/drafts/{id}/advisors`: the raw advisor
-/// records, `#[serde(flatten)]`ed so `records` reads exactly as it does in
-/// `<id>.advisors.json`, plus the task file the deliberation actually
-/// produced.
-///
-/// The proposals alone answer "what did the advisors argue"; they cannot
-/// answer "which of that actually shaped the task file", which is the
-/// question the attribution [`prompt::synthesize`] asks the planner to write
-/// is supposed to let the operator check. Reading that check requires the
-/// synthesized `## Context` / `## Change` themselves, not just the inputs to
-/// them - so this carries the draft's own text alongside the record it was
-/// built from.
-#[derive(Debug, Serialize)]
-struct DraftAdvisorsView {
-    #[serde(flatten)]
-    advice: advise::Advice,
-    /// The task file the deliberation produced, or `None` when there is
-    /// nothing yet worth calling that.
-    ///
-    /// Gated on `advice.synthesized`, not on whether `<id>.md` merely exists:
-    /// [`crate::advise::run`] writes `<id>.advisors.json` unconditionally,
-    /// before any of its own checks that could still bail - an advisor
-    /// roster that produced nothing usable, a planner crash, a synthesis
-    /// `vet` rejects - and every one of those leaves `<id>.md` exactly as
-    /// the interview wrote it. Serving that text under the same key a
-    /// successful run uses would present the raw, un-synthesized interview
-    /// draft as the deliberation's output, which is not what it is - see
-    /// [`advise::Advice::synthesized`].
-    draft: Option<String>,
-    /// The same text, pre-parsed - the plan surface's other markdown views
-    /// all render a server-parsed tree rather than trusting a client-side
-    /// parser with agent-authored text.
-    draft_md: Option<Vec<md::Node>>,
-}
-
-/// `GET /api/drafts/{id}/advisors` - the raw record of `magi plan`'s headless
-/// design-deliberation stage for one draft, plus the task file it produced,
-/// when it produced one.
-///
-/// `magi plan` runs from a terminal, and a phone has none: this is the plan
-/// surface's read of what the CLI interview produced, straight off
-/// `<magi home>/drafts/<id>.advisors.json` - the file [`crate::advise::run`]
-/// writes unconditionally, before any check of its own that could still
-/// bail, and, only once that deliberation actually finished, `<id>.md`
-/// alongside it.
-async fn draft_advisors(
-    State(ui): State<Arc<Ui>>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<DraftAdvisorsView>> {
-    blocking(move || {
-        let dir = ui.home.join("drafts");
-        let id = resolve_draft(&dir, &id)?;
-        let path = dir.join(format!("{id}.advisors.json"));
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|_| ApiError::not_found(format!("no advisor record for draft `{id}`")))?;
-        let advice: advise::Advice = serde_json::from_str(&raw)
-            .map_err(|e| ApiError::internal(format!("parse {}: {e:#}", path.display())))?;
-        // Un-synthesized is the same as absent here: `<id>.md` is still the
-        // raw interview draft, not this deliberation's output, and must
-        // never be shown as if it were.
-        let draft = advice
-            .synthesized
-            .then(|| std::fs::read_to_string(dir.join(format!("{id}.md"))).ok())
-            .flatten();
-        let draft_md = draft
-            .as_deref()
-            .map(|body| md::to_nodes(body, &md::ImageBase::None));
-        Ok(Json(DraftAdvisorsView {
-            advice,
-            draft,
-            draft_md,
-        }))
     })
     .await
 }
@@ -2838,7 +2595,7 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(4);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(POLL);
-        let mut last: Option<(u64, u64, u64, u64, u64, u64)> = None;
+        let mut last: Option<(u64, u64, u64, u64, u64)> = None;
         loop {
             // The first tick completes immediately, which is what makes the
             // stream announce the current revisions on connect.
@@ -2849,7 +2606,6 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
                     state.queue.revision(),
                     runs_revision(&state.runs),
                     state.questions.revision(),
-                    state.chats.revision(),
                     state.talks.revision(),
                     // The loop's counter is in-process state rather than a
                     // file, so nothing the three stats above look at would
@@ -2867,9 +2623,8 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
                 "queue_rev": revisions.0,
                 "runs_rev": revisions.1,
                 "questions_rev": revisions.2,
-                "chats_rev": revisions.3,
-                "talks_rev": revisions.4,
-                "loop_rev": revisions.5,
+                "talks_rev": revisions.3,
+                "loop_rev": revisions.4,
             });
             // Serializing five integers cannot fail; giving up beats looping.
             let Ok(event) = Event::default().event("change").json_data(payload) else {
@@ -3117,12 +2872,13 @@ struct NewSay {
 
 /// `POST /api/questions/{id}/say` - the owner talks back without deciding.
 ///
-/// Synchronous, unlike `POST /api/chats/{id}/say`: that route spawns an agent
+/// Synchronous, unlike `POST /api/talks/{id}/say`: that route spawns an agent
 /// CLI and waits on it, this one only appends a [`ask::Turn`] and writes the
-/// file, so there is no turn to serialize against and no [`Ui::begin_turn`]
-/// guard to take. The agent waiting on this question is a *different*
-/// process - the run parked behind `magi ask` - and picks the reply up on its
-/// own poll of the very same file, same as an answer does.
+/// file, so there is no turn to serialize against and no
+/// [`Ui::begin_talk_turn`] guard to take. The agent waiting on this question
+/// is a *different* process - the run parked behind `magi ask` - and picks
+/// the reply up on its own poll of the very same file, same as an answer
+/// does.
 async fn question_say(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
@@ -3326,482 +3082,11 @@ fn panel_response(content_type: &'static str, download: bool, body: Vec<u8>) -> 
     res
 }
 
-/// A chat as the phone reads it.
-///
-/// Every field of [`Chat`] verbatim, plus the things `app.js` would otherwise
-/// have to work out itself: `turn_bodies_md`, one markdown node tree per entry
-/// of `turns` in the same order; `draft_md`, the parsed form of `draft` when
-/// there is one; and `thinking`. `turns` and `draft` are untouched - a client
-/// reading the exact bytes a chat turn holds, or the exact bytes that would
-/// be filed as a task, still can.
-#[derive(Debug, Serialize)]
-struct ChatView {
-    #[serde(flatten)]
-    chat: Chat,
-    turn_bodies_md: Vec<Vec<md::Node>>,
-    draft_md: Option<Vec<md::Node>>,
-    /// Whether this chat's agent turn is claimed by [`Ui::begin_turn`] in
-    /// *this process* right now.
-    ///
-    /// Not part of [`Chat`] and not written to `<id>.json`: it is this
-    /// process's own in-memory claim, not a fact about the conversation, so a
-    /// second `magi web` on the same home - or this one after a restart -
-    /// would otherwise report a stale answer. It is a progress hint, not a
-    /// completion signal: a turn that just finished writing to disk still
-    /// reads `thinking: true` for the instant between the write and the
-    /// guard's drop, and the front end must treat the transcript, not this
-    /// flag going false, as the source of truth for a landed reply.
-    thinking: bool,
-}
-
-impl ChatView {
-    fn new(chat: Chat, thinking: bool) -> Self {
-        let turn_bodies_md = chat
-            .turns
-            .iter()
-            .map(|turn| md::to_nodes(&turn.body, &md::ImageBase::None))
-            .collect();
-        let draft_md = chat
-            .draft
-            .as_deref()
-            .map(|draft| md::to_nodes(draft, &md::ImageBase::None));
-        Self {
-            turn_bodies_md,
-            draft_md,
-            thinking,
-            chat,
-        }
-    }
-}
-
-/// `GET /api/chats`.
-///
-/// Every interview, open ones first and newest first, which is
-/// [`Chats::list`]'s own order. The whole record including the transcript: a
-/// conversation is a few kilobytes, the phone renders it directly, and a
-/// summary here would mean a second round trip to read the only thing a chat
-/// is made of.
-async fn chats_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<ChatView>>> {
-    blocking(move || {
-        Ok(Json(
-            ui.chats
-                .list()
-                .into_iter()
-                .map(|chat| {
-                    let thinking = ui.is_thinking(&chat.id);
-                    ChatView::new(chat, thinking)
-                })
-                .collect(),
-        ))
-    })
-    .await
-}
-
-async fn chat_detail(
-    State(ui): State<Arc<Ui>>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<ChatView>> {
-    blocking(move || {
-        let id = resolve_chat(&ui.chats, &id)?;
-        let chat = ui.chats.get(&id)?;
-        let thinking = ui.is_thinking(&chat.id);
-        Ok(Json(ChatView::new(chat, thinking)))
-    })
-    .await
-}
-
-/// The body of `POST /api/chats`.
-///
-/// `agent` names a seat from the roster to do the interviewing; absent means
-/// the configured default, which is what the phone sends. `repo` is a path,
-/// not a short name - resolving `owner/repo` against `[repos] roots` is the
-/// job of whatever built the picker the operator chose from, i.e.
-/// `GET /api/repos`, so this route only ever has to trust a path. `from`
-/// derives this conversation from an existing one - see [`chat::open`].
-/// Unknown fields are ignored so a newer front end still starts an interview
-/// against an older binary.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct NewChat {
-    idea: String,
-    agent: Option<String>,
-    repo: Option<PathBuf>,
-    from: Option<String>,
-}
-
-/// `POST /api/chats`.
-///
-/// The same asynchronous shape as [`chat_say`], for the same reason: starting
-/// an interview runs the first agent turn, and holding the connection for that
-/// is the coin flip on a phone `chat_say`'s doc explains. [`chat::build`]
-/// constructs the record in memory only - fast, and everything in it is
-/// checked before anything is written - so [`Ui::begin_turn`] can claim
-/// `chat.id` *before* [`Chats::put`] makes it visible to any other request.
-/// That order matters: the id does not exist anywhere until this handler
-/// publishes it, so nothing else can resolve it, let alone claim or record
-/// into it, ahead of the claim taken here. Publishing first and claiming
-/// second would reopen exactly the race `chat_say`'s own 409 exists to
-/// close - a `say` racing this response could win `begin_turn` first and
-/// record into a seat whose first turn never ran, while this handler's own
-/// claim then fails for a chat file it already created.
-///
-/// Every failure that reaches this function before [`Ui::begin_turn`] is
-/// reported as a 4xx and creates no chat file: an empty `idea`, a bad `from`,
-/// a `repo` whose configuration will not load, or a `repo` with no runnable
-/// interviewing agent are all things the caller sent, not a server fault, and
-/// none of them are worth a conversation record nobody can answer.
-async fn chat_post(
-    State(ui): State<Arc<Ui>>,
-    body: std::result::Result<Json<NewChat>, JsonRejection>,
-) -> ApiResult<impl IntoResponse> {
-    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    if body.idea.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "an interview needs something to interview about",
-        ));
-    }
-
-    // Resolved before anything is created, so a bad `from` id is a 4xx that
-    // names it rather than a chat record nobody asked for.
-    let from = {
-        let ui = Arc::clone(&ui);
-        let from_id = body.from.clone();
-        blocking(move || match from_id {
-            None => Ok(None),
-            Some(id) => {
-                let resolved = resolve_chat(&ui.chats, &id)?;
-                Ok(Some(ui.chats.get(&resolved)?))
-            }
-        })
-        .await?
-    };
-
-    // Read the configuration for this request rather than at startup, so an
-    // edit to `magi.toml` - a new seat, a different interviewer - takes effect
-    // without restarting the server the operator reaches from their phone.
-    // `bad_request_from` rather than the usual `?`: a repo whose config will
-    // not load is the `repo` the caller named, not this server's fault.
-    let repo = body.repo.clone().unwrap_or_else(|| ui.repo.clone());
-    let cfg = {
-        let repo = repo.clone();
-        blocking(move || {
-            Config::discover(&repo, None)
-                .map(|(cfg, _)| cfg)
-                .map_err(ApiError::bad_request_from)
-        })
-        .await?
-    };
-
-    // `chat::build`'s only reachable failure here is `plan::pick` refusing the
-    // roster - the idea was already checked non-empty above - which is again
-    // the caller's `agent`/`repo` choice, not a server fault. It only
-    // constructs `chat` in memory: nothing is written yet, and nothing else
-    // can see or claim `chat.id` until this handler publishes it below.
-    let mut chat = {
-        let cfg = cfg.clone();
-        let idea = body.idea.clone();
-        let agent = body.agent.clone();
-        let from = from.clone();
-        blocking(move || {
-            chat::build(&cfg, repo, &idea, agent.as_deref(), from.as_ref())
-                .map_err(ApiError::bad_request_from)
-        })
-        .await?
-    };
-
-    // Claimed *before* the record is written to disk, not after: once
-    // `Chats::put` below makes `chat.id` visible, `GET /api/chats` can name
-    // it and `POST /api/chats/{id}/say` can resolve it. A claim taken only
-    // after that write leaves a gap where a `say` racing this handler can
-    // win `begin_turn` first, record into a seat whose first turn never ran,
-    // and hand this handler a 409 for a chat file it just created - the
-    // opposite of the `chat_say`-shaped 409 this route means to give.
-    let _turn = ui.begin_turn(&chat.id)?;
-
-    // Persist now that the id is claimed - safe to publish, because anyone
-    // who finds it will also find it already busy.
-    chat = {
-        let ui = Arc::clone(&ui);
-        blocking(move || {
-            ui.chats.put(&mut chat)?;
-            Ok(chat)
-        })
-        .await?
-    };
-    let thinking = ui.is_thinking(&chat.id);
-    let queued = ChatView::new(chat.clone(), thinking);
-
-    let chats = ui.chats.clone();
-    let id = chat.id.clone();
-    tokio::spawn(async move {
-        let _turn = _turn;
-        if let Err(e) = chat::first_turn(&mut chat, &chats, &cfg, from.as_ref()).await {
-            // `first_turn` records the failure in the transcript itself,
-            // which is what the phone reads; this line is for the operator's
-            // terminal.
-            tracing::warn!("chat {id} first turn failed: {e:#}");
-        }
-    });
-
-    // 202: the record is on disk and a turn is running. The front end learns
-    // the reply from the change stream, the same way it learns everything
-    // else - see `chat_say`.
-    Ok((StatusCode::ACCEPTED, Json(queued)))
-}
-
-/// The body of `POST /api/chats/{id}/say`.
-///
-/// `attachments` names ids `POST /api/chats/{id}/attachments` already
-/// returned - never bytes of its own - so a turn with no images just omits
-/// the field, which is what an older front end still does.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct NewTurn {
-    text: String,
-    attachments: Vec<String>,
-}
-
-/// `POST /api/chats/{id}/say` - one turn of the interview.
-///
-/// The one handler here that is not filesystem work, and therefore the one
-/// that must not go through [`blocking`]: it spawns an agent CLI and waits tens
-/// of seconds for a paragraph. Sitting on an executor thread for that long
-/// would starve the change stream of every other connected phone, which is the
-/// opposite of what `blocking` is for. It holds no lock across the `await`
-/// either - the turn slot is a set membership, not a mutex guard - so nothing
-/// else in the server is delayed by a slow interview.
-///
-/// What the operator sees while it runs: a request outstanding for the whole
-/// turn, with no partial output, because the agent CLIs magi drives return one
-/// answer at the end rather than a stream. On a phone that means the composer
-/// stays pending for up to the seat's timeout. There is deliberately no
-/// progress channel to invent one from; the SSE `chats_rev` bump is the signal
-/// that the turn landed, and it fires from the file `chat::say` wrote, so a
-/// phone whose radio slept through the reply still learns about it.
-///
-/// A failed turn is still a turn. [`chat::say`] records the operator's message
-/// and an agent turn explaining the failure before it returns an error, so this
-/// answers 200 with the conversation: that recorded explanation is the thing
-/// the operator needs to read, and a 5xx would make the front end show a
-/// generic banner and hide it. The guard against that being a lie is the turn
-/// count - if the transcript did not grow, nothing happened and the error is
-/// reported as one.
-async fn chat_say(
-    State(ui): State<Arc<Ui>>,
-    Path(id): Path<String>,
-    body: std::result::Result<Json<NewTurn>, JsonRejection>,
-) -> ApiResult<(StatusCode, Json<ChatView>)> {
-    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    if body.text.trim().is_empty() && body.attachments.is_empty() {
-        return Err(ApiError::bad_request("say something"));
-    }
-
-    let id = {
-        let ui = Arc::clone(&ui);
-        let asked = id.clone();
-        blocking(move || resolve_chat(&ui.chats, &asked)).await?
-    };
-    // Claimed before the chat is loaded, so the record this turn appends to was
-    // read after the claim and cannot be a snapshot another turn has since
-    // replaced.
-    let _turn = ui.begin_turn(&id)?;
-
-    let (chat, cfg) = {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        blocking(move || {
-            let chat = ui.chats.get(&id)?;
-            let (cfg, _) = Config::discover(&chat.repo, None)?;
-            Ok((chat, cfg))
-        })
-        .await?
-    };
-
-    // Every attachment id resolved to the metadata `chat::record` actually
-    // stores, before anything is recorded - an unknown id is a 4xx that
-    // names it rather than a turn silently missing an image.
-    let attachments = {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        let ids = body.attachments.clone();
-        blocking(move || {
-            ids.into_iter()
-                .map(|att_id| {
-                    ui.chats.attachment_meta(&id, &att_id)?.ok_or_else(|| {
-                        ApiError::bad_request(format!("unknown attachment `{att_id}`"))
-                    })
-                })
-                .collect::<ApiResult<Vec<chat::Attachment>>>()
-        })
-        .await?
-    };
-
-    // The operator's turn is recorded, the agent's turn runs in the background,
-    // and the response goes back now.
-    //
-    // This used to hold the HTTP connection for the whole turn - 23 to 90
-    // seconds against a real model. On a phone that is a coin flip: a screen
-    // lock or a network handoff drops the request and the browser reports
-    // "Failed to fetch", while the server finishes the turn and writes it to
-    // disk. The operator is then told their message failed when it did not,
-    // which is the worst of both answers. Every other moving part in magi is
-    // state on disk plus the change stream; this was the one place that
-    // depended on a connection staying up, and it did not need to.
-    //
-    // The turn guard moves into the spawned task, so a second `say` on the
-    // same chat still gets a 409 while this one is in flight.
-    let chats = ui.chats.clone();
-    let text = {
-        let mut chat = chat.clone();
-        let chats = chats.clone();
-        let said = body.text.clone();
-        blocking(move || Ok(chat::record(&mut chat, &chats, &said, attachments)?)).await?
-    };
-    // Re-read so the spawned task appends to the record that now holds the
-    // operator's turn, rather than to the snapshot taken before it.
-    let mut chat = {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        blocking(move || Ok(ui.chats.get(&id)?)).await?
-    };
-    let thinking = ui.is_thinking(&id);
-    let queued = ChatView::new(chat.clone(), thinking);
-    tokio::spawn(async move {
-        let _turn = _turn;
-        if let Err(e) = chat::respond(&mut chat, &chats, &cfg, &text).await {
-            // `respond` records the failure in the transcript itself, which is
-            // what the phone reads; this line is for the operator's terminal.
-            tracing::warn!("chat {id} turn failed: {e:#}");
-        }
-    });
-
-    // 202: the operator's message is recorded and a turn is running. The front
-    // end learns the reply from the change stream, the same way it learns
-    // everything else.
-    Ok((StatusCode::ACCEPTED, Json(queued)))
-}
-
-/// The body of `POST /api/chats/{id}/file`, which the phone sends empty.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct FileDraft {
-    priority: i32,
-}
-
-/// `POST /api/chats/{id}/file` - validate the agent's draft and queue it.
-///
-/// The 400 carries every problem [`chat::draft_problems`] found, as an array
-/// beside the usual message, because the operator fixing them is on a phone:
-/// one problem per round trip would mean asking the interviewer to rewrite the
-/// draft three times for what is one edit.
-async fn chat_file(
-    State(ui): State<Arc<Ui>>,
-    Path(id): Path<String>,
-    body: std::result::Result<Json<FileDraft>, JsonRejection>,
-) -> ApiResult<Json<serde_json::Value>> {
-    // An absent body is the normal case - the front end posts with no content
-    // type at all - and means the default priority. A body that is present and
-    // malformed is still a bad request, because silently filing at the wrong
-    // priority is worse than saying no.
-    let body = match body {
-        Ok(Json(body)) => body,
-        Err(JsonRejection::MissingJsonContentType(_)) => FileDraft::default(),
-        Err(e) => return Err(ApiError::bad_request(e.body_text())),
-    };
-
-    blocking(move || {
-        let id = resolve_chat(&ui.chats, &id)?;
-        let mut chat = ui.chats.get(&id)?;
-        // Asked before filing so the answer can be the whole list. `file_draft`
-        // applies the same rule and would refuse too, but only with a flattened
-        // string, and re-splitting an error message to rebuild the list is the
-        // kind of thing that breaks the day someone adds a comma.
-        if let Err(problems) = chat::draft_problems(&chat) {
-            return Err(ApiError::bad_request_with(
-                "the draft is not fileable yet",
-                problems,
-            ));
-        }
-        let task = chat::file_draft(&mut chat, &ui.chats, &ui.queue, body.priority)?;
-        Ok(Json(serde_json::json!({ "task": task })))
-    })
-    .await
-}
-
-/// `POST /api/chats/{id}/abandon` - give up on an interview without filing it.
-///
-/// Maps every refusal from [`chat::abandon`] to a 409: the only one it raises
-/// is a chat that is already `filed`, which is a conflict with what the
-/// operator asked for rather than a server fault - the same granularity
-/// `question_answer` and `question_say` use for a status that no longer
-/// allows what was asked.
-async fn chat_abandon(
-    State(ui): State<Arc<Ui>>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<ChatView>> {
-    blocking(move || {
-        let id = resolve_chat(&ui.chats, &id)?;
-        let mut chat = ui.chats.get(&id)?;
-        chat::abandon(&mut chat, &ui.chats).map_err(|e| ApiError::conflict(format!("{e:#}")))?;
-        let thinking = ui.is_thinking(&chat.id);
-        Ok(Json(ChatView::new(chat, thinking)))
-    })
-    .await
-}
-
-/// Expand an id or short id to exactly one chat id.
-fn resolve_chat(store: &Chats, id: &str) -> ApiResult<String> {
-    pick(store.list().into_iter().map(|c| c.id).collect(), id, "chat")
-}
-
-/// `POST /api/chats/{id}/attachments` - upload one image to attach to a
-/// future `chat-say`.
-///
-/// A dedicated route rather than a field on `say`, because the phone uploads
-/// the moment the operator picks a file - well before Send is even
-/// tappable - so the thumbnail row and the "still uploading" state on a
-/// mobile link have something to key on before any message exists. 201
-/// carries the [`chat::Attachment`] `say` later takes the `id` of.
-async fn chat_attachment_post(
-    State(ui): State<Arc<Ui>>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> ApiResult<(StatusCode, Json<chat::Attachment>)> {
-    let mime = validate_attachment(&headers, &body)?;
-    let name = filename_header(&headers);
-    let data = body.to_vec();
-    blocking(move || {
-        let id = resolve_chat(&ui.chats, &id)?;
-        let att = ui.chats.put_attachment(&id, mime, &name, &data)?;
-        Ok((StatusCode::CREATED, Json(att)))
-    })
-    .await
-}
-
-/// `GET /api/chats/{id}/attachments/{att}` - the stored image back, for a
-/// thumbnail or the full-size view a tap opens.
-async fn chat_attachment_get(
-    State(ui): State<Arc<Ui>>,
-    Path((id, att)): Path<(String, String)>,
-) -> ApiResult<Response> {
-    blocking(move || {
-        let id = resolve_chat(&ui.chats, &id)?;
-        let Some((meta, data)) = ui.chats.read_attachment(&id, &att)? else {
-            return Err(ApiError::not_found(format!(
-                "chat {id} has no attachment `{att}`"
-            )));
-        };
-        Ok(attachment_response(&meta.mime, data))
-    })
-    .await
-}
-
 /// A talk as the phone reads it.
 ///
 /// Every field of [`Talk`] verbatim, plus `turn_bodies_md` - one markdown node
-/// tree per entry of `turns`, in order - the same accommodation
-/// [`ChatView`] makes so `app.js` never parses markdown itself.
+/// tree per entry of `turns`, in order - parsed server-side so `app.js` never
+/// parses markdown itself.
 #[derive(Debug, Serialize)]
 struct TalkView {
     #[serde(flatten)]
@@ -3837,7 +3122,7 @@ struct TalkDetailView {
 /// `GET /api/talks`.
 ///
 /// Every conversation, open ones first and newest first - [`Talks::list`]'s
-/// own order, the same one [`chats_list`] reports for Planning.
+/// own order.
 async fn talks_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TalkView>>> {
     blocking(move || {
         Ok(Json(
@@ -3848,10 +3133,9 @@ async fn talks_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TalkView>>>
 }
 
 /// The body of `POST /api/talks`, all of it optional: opening a talk needs no
-/// message, unlike starting a Planning interview. `repo` defaults to the
-/// server's own; `agent` to `[roles] chatter` (falling back to `[roles]
-/// planner`), [`talk::begin`]'s own default. Unknown fields are ignored so a
-/// newer front end still opens a talk against an older binary.
+/// message. `repo` defaults to the server's own; `agent` to `[roles] chatter`,
+/// [`talk::begin`]'s own default. Unknown fields are ignored so a newer front
+/// end still opens a talk against an older binary.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct NewTalk {
@@ -3867,7 +3151,7 @@ async fn talk_post(
 ) -> ApiResult<impl IntoResponse> {
     // An absent body, or an empty one, is the normal way to open a talk - see
     // `NewTalk`'s doc - so a missing content type is treated the same as `{}`
-    // rather than refused, the same accommodation `chat_file` makes.
+    // rather than refused.
     let body = match body {
         Ok(Json(body)) => body,
         Err(JsonRejection::MissingJsonContentType(_)) => NewTalk::default(),
@@ -3903,8 +3187,11 @@ async fn talk_detail(
     .await
 }
 
-/// The body of `POST /api/talks/{id}/say`. See [`NewTurn`]'s doc on
-/// `attachments`, which this mirrors.
+/// The body of `POST /api/talks/{id}/say`.
+///
+/// `attachments` names ids `POST /api/talks/{id}/attachments` already
+/// returned - never bytes of its own - so a turn with no images just omits
+/// the field, which is what an older front end still does.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct NewTalkTurn {
@@ -3914,7 +3201,7 @@ struct NewTalkTurn {
 
 /// `POST /api/talks/{id}/say` - one turn of the conversation.
 ///
-/// The same asynchronous shape as [`chat_say`], for the same reason: this
+/// Not filesystem work, and therefore not routed through [`blocking`]: this
 /// route spawns an agent CLI and a turn here can run for the whole of
 /// [`crate::config::Graph::timeout_talk`] - an hour by default - because a
 /// research turn is expected to run commands rather than answer from what it
@@ -3940,7 +3227,7 @@ async fn talk_say(
     };
     // Claimed before the talk is loaded, so the record this turn appends to
     // was read after the claim and cannot be a snapshot another turn has
-    // since replaced - the same ordering `chat_say` relies on.
+    // since replaced.
     let _turn = ui.begin_talk_turn(&id)?;
 
     let (talk, cfg) = {
@@ -3954,7 +3241,9 @@ async fn talk_say(
         .await?
     };
 
-    // See `chat_say`'s own resolution step, which this mirrors.
+    // Every attachment id resolved to the metadata `talk::record` actually
+    // stores, before anything is recorded - an unknown id is a 4xx that
+    // names it rather than a turn silently missing an image.
     let attachments = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
@@ -4051,45 +3340,8 @@ fn resolve_talk(store: &Talks, id: &str) -> ApiResult<String> {
     pick(store.list().into_iter().map(|t| t.id).collect(), id, "talk")
 }
 
-/// Every draft id with a `<id>.advisors.json` on disk under `dir` - the same
-/// set [`drafts_list`] enumerates, and the only ids [`resolve_draft`] may
-/// hand back.
-fn draft_ids(dir: &FsPath) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .and_then(|n| n.strip_suffix(".advisors.json"))
-                .map(str::to_owned)
-        })
-        .collect()
-}
-
-/// Expand an id or short id to exactly one draft id, the same guard
-/// [`resolve_task`] and [`resolve_talk`] give every other path parameter
-/// that ends up joined into a filesystem path.
-///
-/// `draft_advisors` used to hand the URL's `id` straight to
-/// `dir.join(format!("{id}.advisors.json"))`. Axum percent-decodes a path
-/// parameter after splitting the request path on literal `/`, so an id typed
-/// as `..%2F..%2Fetc%2Fpasswd` arrives here as `../../etc/passwd` - a value
-/// `Path<String>` never rejects, since encoding the separator sidesteps the
-/// router's own segment split. Resolving against [`draft_ids`] first means
-/// the only strings this can ever return are filenames [`std::fs::read_dir`]
-/// already saw on disk under `dir`, the same as `resolve_task` and
-/// `resolve_talk` already guarantee for their own ids.
-fn resolve_draft(dir: &FsPath, id: &str) -> ApiResult<String> {
-    pick(draft_ids(dir), id, "draft")
-}
-
-/// `POST /api/talks/{id}/attachments` - the same route as
-/// [`chat_attachment_post`], for a standing conversation instead of a
-/// planning interview.
+/// `POST /api/talks/{id}/attachments` - upload one image to attach to a
+/// future `talk-say`.
 async fn talk_attachment_post(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
@@ -4107,7 +3359,8 @@ async fn talk_attachment_post(
     .await
 }
 
-/// `GET /api/talks/{id}/attachments/{att}` - see [`chat_attachment_get`].
+/// `GET /api/talks/{id}/attachments/{att}` - the stored image back, for a
+/// `<img>` tag in the transcript.
 async fn talk_attachment_get(
     State(ui): State<Arc<Ui>>,
     Path((id, att)): Path<(String, String)>,
@@ -4209,7 +3462,7 @@ fn sniffed_mime(data: &[u8]) -> Option<&'static str> {
 }
 
 /// The operator's own filename, from [`FILENAME_HEADER`], kept only for
-/// display - see [`chat::Attachment::name`]'s doc on why it never
+/// display - see [`talk::Attachment::name`]'s doc on why it never
 /// contributes to a path. A missing or blank header (curl without it, an
 /// older front end) falls back to a generic name rather than refusing the
 /// upload over a field that is cosmetic.
@@ -4330,7 +3583,6 @@ mod tests {
             let ui = Ui::new(
                 queue,
                 Questions::at(home.join("questions")),
-                Chats::at(home.join("chats")),
                 Talks::at(home.join("talks")),
                 runs,
                 home.to_path_buf(),
@@ -4354,10 +3606,6 @@ mod tests {
 
         fn questions(&self) -> Questions {
             Questions::at(self.home.path().join("questions"))
-        }
-
-        fn chats(&self) -> Chats {
-            Chats::at(self.home.path().join("chats"))
         }
 
         fn talks(&self) -> Talks {
@@ -4708,45 +3956,14 @@ mod tests {
         q.id
     }
 
-    /// An interview on disk, without talking to a model.
+    /// A talk on disk, without talking to a model.
     ///
     /// Written as JSON straight into the store the server reads, because the
-    /// only constructor `chat` offers spawns an agent CLI. The one thing this
-    /// cannot make up is the seat, so it is built with the real
-    /// `SeatState::new` and serialized - the alternative, hand-writing that
-    /// object, would make these tests fail the day the seat gains a field.
-    fn interview(fx: &Fixture, id: &str, status: &str, draft: Option<&str>) -> String {
-        let store = fx.chats();
-        std::fs::create_dir_all(store.root()).expect("chats dir");
-        let seat = serde_json::to_value(crate::agent::SeatState::new("plan", "sonnet", 7))
-            .expect("serialize a seat");
-        let body = serde_json::json!({
-            "schema": 1,
-            "id": id,
-            "repo": "/repo/magi",
-            "agent": "sonnet",
-            "status": status,
-            "turns": [
-                { "who": "operator", "body": "rework the config loader",
-                  "at": Timestamp::now().to_string() },
-                { "who": "agent", "body": "Which part is hurting?",
-                  "at": Timestamp::now().to_string() },
-            ],
-            "draft": draft,
-            "task": Value::Null,
-            "created_at": Timestamp::now().to_string(),
-            "updated_at": Timestamp::now().to_string(),
-            "seat": seat,
-        });
-        std::fs::write(store.path_of(id), body.to_string()).expect("write the chat");
-        // A chat the server cannot parse would make every assertion below a
-        // 500 that says nothing about the route under test.
-        store.get(id).expect("the seeded chat has to be readable");
-        id.to_owned()
-    }
-
-    /// A talk on disk, without talking to a model. Mirrors [`interview`] for
-    /// `talk::Talk`.
+    /// only constructor `talk::begin` offers takes no turn but still requires
+    /// a real caller-visible flow. The one thing this cannot make up is the
+    /// seat, so it is built with the real `SeatState::new` and serialized -
+    /// the alternative, hand-writing that object, would make these tests fail
+    /// the day the seat gains a field.
     fn seed_talk(fx: &Fixture, id: &str, status: &str) -> String {
         let store = fx.talks();
         std::fs::create_dir_all(store.root()).expect("talks dir");
@@ -4766,22 +3983,6 @@ mod tests {
         std::fs::write(store.path_of(id), body.to_string()).expect("write the talk");
         store.get(id).expect("the seeded talk has to be readable");
         id.to_owned()
-    }
-
-    /// A task file that satisfies `plan::review_draft`, so `POST /file` has
-    /// something to accept.
-    fn good_draft() -> String {
-        "# Rework the config loader\n\n\
-         ## Why\n\n\
-         It re-reads `magi.toml` on every lookup, so a run that asks for the \
-         roster four hundred times pays four hundred parses of the same file.\n\n\
-         ## What\n\n\
-         Load the layers once when the run starts and hand the merged value \
-         around. Nothing about the file format changes.\n\n\
-         ## Acceptance criteria\n\n\
-         - `Config::discover` is called exactly once per run.\n\
-         - `cargo test` passes with no change to any existing assertion.\n"
-            .to_owned()
     }
 
     #[tokio::test]
@@ -5027,266 +4228,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_chat_list_is_open_first_and_carries_the_whole_transcript() {
-        let fx = Fixture::start().await;
-        assert_eq!(fx.get("/api/health").await.json()["chats_open"], 0);
-
-        interview(&fx, "20260903-014455-old1", "filed", Some(&good_draft()));
-        interview(&fx, "20260903-014456-open", "open", None);
-
-        let listed = fx.get("/api/chats").await;
-        assert_eq!(listed.status, 200, "{}", listed.body);
-        let chats = listed.json();
-        assert_eq!(chats.as_array().map(Vec::len), Some(2));
-        assert_eq!(
-            chats[0]["id"], "20260903-014456-open",
-            "an unfinished interview is what the operator came back for: {chats}"
-        );
-        assert_eq!(chats[0]["status"], "open");
-        // The transcript is the only thing a chat is made of, so the list
-        // carries it rather than making the phone fetch each one.
-        assert_eq!(chats[0]["turns"][0]["who"], "operator");
-        assert_eq!(chats[0]["turns"][1]["body"], "Which part is hurting?");
-        assert_eq!(chats[1]["status"], "filed");
-
-        // The one number that says "you left an interview open"; a filed one
-        // has become a task and must not keep counting.
-        assert_eq!(fx.get("/api/health").await.json()["chats_open"], 1);
-    }
-
-    #[tokio::test]
-    async fn one_interview_is_readable_by_short_id_and_an_unknown_one_is_a_404() {
-        let fx = Fixture::start().await;
-        let id = interview(&fx, "20260903-014455-ab12", "open", None);
-
-        let full = fx.get(&format!("/api/chats/{id}")).await;
-        assert_eq!(full.status, 200, "{}", full.body);
-        assert_eq!(full.json()["id"], id);
-        assert_eq!(full.json()["repo"], "/repo/magi");
-
-        // The short id is what the operator reads off a notification.
-        let short = fx.get("/api/chats/ab12").await;
-        assert_eq!(short.status, 200, "{}", short.body);
-        assert_eq!(short.json()["id"], id);
-
-        let missing = fx.get("/api/chats/nosuchchat").await;
-        assert_eq!(missing.status, 404, "{}", missing.body);
-        assert!(
-            missing.json()["error"]
-                .as_str()
-                .is_some_and(|e| e.contains("chat")),
-            "the error names what was not found: {}",
-            missing.body
-        );
-    }
-
-    #[tokio::test]
-    async fn filing_a_bad_draft_reports_every_problem_at_once() {
-        let fx = Fixture::start().await;
-        let id = interview(&fx, "20260903-014455-ab12", "open", Some("do the thing"));
-
-        let res = fx.post(&format!("/api/chats/{id}/file"), None).await;
-
-        assert_eq!(res.status, 400, "{}", res.body);
-        let problems = res.json()["problems"].clone();
-        let problems = problems.as_array().expect("an array of problems");
-        // Every problem, not the first one. The operator is on a phone: a
-        // draft with no title and no acceptance criteria is one edit, and
-        // reporting it one problem per round trip means asking the interviewer
-        // to rewrite it twice.
-        assert!(
-            problems.len() > 1,
-            "one round trip has to be enough to fix the draft: {}",
-            res.body
-        );
-        assert!(problems.iter().all(|p| p.is_string()), "{}", res.body);
-        assert!(res.json()["error"].is_string(), "{}", res.body);
-        assert!(
-            fx.queue().list().is_empty(),
-            "a refused draft must not reach the queue"
-        );
-
-        // An interview the agent has not drafted for at all is the same shape,
-        // so the front end has one path rather than two.
-        let empty = interview(&fx, "20260903-014456-cd34", "open", None);
-        let res = fx.post(&format!("/api/chats/{empty}/file"), None).await;
-        assert_eq!(res.status, 400, "{}", res.body);
-        assert_eq!(
-            res.json()["problems"].as_array().map(Vec::len),
-            Some(1),
-            "{}",
-            res.body
-        );
-    }
-
-    #[tokio::test]
-    async fn filing_a_good_draft_queues_it_and_answers_with_the_task_id() {
-        let fx = Fixture::start().await;
-        let draft = good_draft();
-        let id = interview(&fx, "20260903-014455-ab12", "open", Some(&draft));
-
-        let res = fx.post(&format!("/api/chats/{id}/file"), None).await;
-
-        assert_eq!(res.status, 200, "{}", res.body);
-        let task = res.json()["task"]
-            .as_str()
-            .unwrap_or_else(|| panic!("a task id: {}", res.body))
-            .to_owned();
-
-        // The point of the whole browser interview: a real task in the real
-        // queue, indistinguishable from one filed at a terminal.
-        let queued = fx.queue().get(&task).expect("the task is on disk");
-        assert_eq!(
-            queued.instruction, draft,
-            "the draft reaches the graph verbatim"
-        );
-        assert_eq!(queued.repo, PathBuf::from("/repo/magi"));
-        assert_eq!(
-            fx.get("/api/queue").await.json()[0]["id"],
-            task,
-            "the filed task is the listed one"
-        );
-
-        // The interview is finished, so it stops asking to be finished.
-        let after = fx.get(&format!("/api/chats/{id}")).await.json();
-        assert_eq!(after["task"], task);
-        assert_eq!(after["status"], "filed");
-        assert_eq!(fx.get("/api/health").await.json()["chats_open"], 0);
-    }
-
-    #[tokio::test]
-    async fn abandoning_an_open_chat_marks_it_abandoned_and_is_idempotent() {
-        let fx = Fixture::start().await;
-        let id = interview(&fx, "20260903-014455-ab12", "open", None);
-
-        let res = fx.post(&format!("/api/chats/{id}/abandon"), None).await;
-        assert_eq!(res.status, 200, "{}", res.body);
-        assert_eq!(res.json()["status"], "abandoned");
-        assert_eq!(
-            fx.chats().get(&id).expect("get").status,
-            crate::chat::ChatStatus::Abandoned
-        );
-
-        // Idempotent: abandoning an already-abandoned chat is not an error.
-        let again = fx.post(&format!("/api/chats/{id}/abandon"), None).await;
-        assert_eq!(again.status, 200, "{}", again.body);
-        assert_eq!(again.json()["status"], "abandoned");
-    }
-
-    #[tokio::test]
-    async fn abandoning_a_filed_chat_is_refused_and_leaves_it_filed() {
-        let fx = Fixture::start().await;
-        let id = interview(&fx, "20260903-014455-cd34", "filed", Some(&good_draft()));
-
-        let res = fx.post(&format!("/api/chats/{id}/abandon"), None).await;
-        assert!(
-            (400..500).contains(&res.status),
-            "expected a 4xx, got {}: {}",
-            res.status,
-            res.body
-        );
-        assert!(res.json()["error"].is_string(), "{}", res.body);
-
-        assert_eq!(
-            fx.chats().get(&id).expect("get").status,
-            crate::chat::ChatStatus::Filed,
-            "a refused abandon must not touch the on-disk status"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_second_turn_on_a_busy_chat_is_refused_rather_than_interleaved() {
-        let fx = Fixture::start().await;
-        let id = interview(&fx, "20260903-014455-ab12", "open", None);
-        let ui = Ui::new(
-            fx.queue(),
-            fx.questions(),
-            fx.chats(),
-            fx.talks(),
-            fx.runs(),
-            fx.home.path().to_path_buf(),
-            PathBuf::from("/repo/magi"),
-        )
-        .with_worktrees_root(fx.home.path().join("wt"));
-
-        // The claim a running `POST /say` holds. Taken directly rather than by
-        // starting a turn, because a turn spawns an agent CLI and no test here
-        // is allowed to do that.
-        let first = ui.begin_turn(&id).expect("the first turn claims the chat");
-        let second = ui.begin_turn(&id).expect_err("the second must be refused");
-        assert_eq!(
-            second.status,
-            StatusCode::CONFLICT,
-            "a double tap on a slow link must not append two half-turns"
-        );
-
-        // Dropped rather than released by hand, which is what makes a cancelled
-        // request - a phone that walked out of range mid-turn - leave the chat
-        // usable instead of wedged until the server restarts.
-        drop(first);
-        assert!(
-            ui.begin_turn(&id).is_ok(),
-            "the slot has to come back on its own"
-        );
-    }
-
-    #[tokio::test]
-    async fn is_thinking_is_true_exactly_while_a_turn_guard_is_held() {
-        let fx = Fixture::start().await;
-        let id = interview(&fx, "20260903-014455-ab12", "open", None);
-        let ui = Ui::new(
-            fx.queue(),
-            fx.questions(),
-            fx.chats(),
-            fx.talks(),
-            fx.runs(),
-            fx.home.path().to_path_buf(),
-            PathBuf::from("/repo/magi"),
-        )
-        .with_worktrees_root(fx.home.path().join("wt"));
-
-        assert!(!ui.is_thinking(&id), "nothing has claimed a turn yet");
-
-        let guard = ui.begin_turn(&id).expect("claim the turn");
-        assert!(
-            ui.is_thinking(&id),
-            "`thinking` is exactly what `Ui::begin_turn` claims"
-        );
-        // An unrelated id must never read as thinking just because some other
-        // chat is busy.
-        assert!(!ui.is_thinking("20260903-014455-other"));
-
-        drop(guard);
-        assert!(
-            !ui.is_thinking(&id),
-            "the claim's release, not a turn landing, is what this reflects"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_turn_with_nothing_in_it_never_reaches_an_agent() {
-        let fx = Fixture::start().await;
-        let id = interview(&fx, "20260903-014455-ab12", "open", None);
-
-        // Refused on the request, before the chat is even resolved, so an
-        // accidental send costs neither a model call nor a turn in the record.
-        for body in [r#"{"text":"   \n "}"#, r#"{}"#] {
-            let res = fx.post(&format!("/api/chats/{id}/say"), Some(body)).await;
-            assert_eq!(res.status, 400, "{body}: {}", res.body);
-        }
-        let res = fx.post("/api/chats", Some(r#"{"idea":"  "}"#)).await;
-        assert_eq!(res.status, 400, "{}", res.body);
-
-        assert_eq!(
-            fx.get(&format!("/api/chats/{id}")).await.json()["turns"]
-                .as_array()
-                .map(Vec::len),
-            Some(2),
-            "nothing above may have appended a turn"
-        );
-    }
-
-    #[tokio::test]
     async fn a_run_with_an_open_question_reads_as_waiting() {
         let fx = Fixture::start().await;
         let run = "20260902-000000-beef".to_owned();
@@ -5504,14 +4445,14 @@ mod tests {
         assert!(res.json()["error"].is_string());
     }
 
-    /// Plan is the only entry for new work: an interview writes the task
-    /// file, so the compose form and its `POST /api/queue` are gone. The
-    /// three tests that covered that route's validation went with the route,
-    /// and nothing was left asserting it stays gone — so a phone still
-    /// holding the old form, or a re-added handler, would silently be back
-    /// to filing briefs no interview ever validated.
+    /// New work reaches the queue through `magi task add`, a standing talk's
+    /// `magi task add --solo`, or the CLI - never a raw `POST /api/queue` -
+    /// so the compose form and that route are gone. The tests that covered
+    /// that route's validation went with it, and nothing was left asserting
+    /// it stays gone — so a re-added handler would silently let the phone
+    /// file briefs no one validated.
     #[tokio::test]
-    async fn a_task_cannot_be_filed_directly_only_through_an_interview() {
+    async fn a_task_cannot_be_filed_over_the_phone_directly() {
         let f = Fixture::start().await;
 
         let res = f
@@ -5528,7 +4469,7 @@ mod tests {
         );
         assert!(
             f.queue().list().is_empty(),
-            "a task that skipped the interview must not reach the disk"
+            "a task filed by a route that does not exist must not reach the disk"
         );
         // The path itself is still served — the Queue view reads it — and the
         // per-task controls are untouched by the entry being removed.
@@ -5610,377 +4551,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn draft_advisors_serves_the_raw_record_a_cli_plan_run_wrote() {
-        let f = Fixture::start().await;
-        let drafts = f.home.path().join("drafts");
-        std::fs::create_dir_all(&drafts).expect("drafts dir");
-        let record = r#"{"records":[{"seat":"advisor-1","agent":"sage-a","duration_ms":1200}]}"#;
-        std::fs::write(drafts.join("20260906-000000-ab12.advisors.json"), record)
-            .expect("write advisor record");
-
-        let res = f.get("/api/drafts/20260906-000000-ab12/advisors").await;
-        assert_eq!(res.status, 200, "{}", res.body);
-        assert_eq!(res.json()["records"][0]["seat"], "advisor-1");
-        assert!(
-            res.json()["draft"].is_null(),
-            "no .md on disk must read as no draft, not as an error: {}",
-            res.body
-        );
-    }
-
-    /// Reported: the plan surface could read what each advisor argued but
-    /// never what the planner actually kept - the half of the deliberation
-    /// that answers "so what happened".
-    #[tokio::test]
-    async fn draft_advisors_includes_the_synthesized_task_file_the_deliberation_produced() {
-        let f = Fixture::start().await;
-        let drafts = f.home.path().join("drafts");
-        std::fs::create_dir_all(&drafts).expect("drafts dir");
-        std::fs::write(
-            drafts.join("20260906-000000-mn34.advisors.json"),
-            r#"{"records":[{"seat":"advisor-1","agent":"sage-a","duration_ms":1}],"synthesized":true}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            drafts.join("20260906-000000-mn34.md"),
-            "# Rework the config loader\n\n## Context\n\nadvisor-1 argued for X.\n\n## Completion criteria\n\n- [ ] it works\n",
-        )
-        .unwrap();
-
-        let res = f.get("/api/drafts/20260906-000000-mn34/advisors").await;
-        assert_eq!(res.status, 200, "{}", res.body);
-        let body = res.json();
-        assert!(
-            body["draft"]
-                .as_str()
-                .is_some_and(|d| d.contains("advisor-1 argued for X")),
-            "{body}"
-        );
-        assert!(
-            body["draft_md"].is_array(),
-            "the draft must also arrive pre-parsed, like every other markdown surface: {body}"
-        );
-    }
-
-    /// Reported: `advise::deliberate` writes `<id>.advisors.json`
-    /// unconditionally, before the checks that can still fail the stage - so
-    /// a total advisor failure, a planner crash, or a rejected synthesis all
-    /// leave an advisor record on disk next to an `<id>.md` that is still the
-    /// raw, un-synthesized interview draft. `DraftAdvisorsView` used to serve
-    /// that text under the same `draft` key a successful run uses, which
-    /// presented an abandoned interview as if it were the deliberation's
-    /// output. Gating on `synthesized` (absent here, as a pre-fix record on
-    /// disk would have it) must suppress it instead.
-    #[tokio::test]
-    async fn draft_advisors_hides_an_unsynthesized_interview_draft() {
-        let f = Fixture::start().await;
-        let drafts = f.home.path().join("drafts");
-        std::fs::create_dir_all(&drafts).expect("drafts dir");
-        std::fs::write(
-            drafts.join("20260906-000000-op56.advisors.json"),
-            r#"{"records":[{"seat":"advisor-1","agent":"sage-a","duration_ms":1,"error":"boom"}]}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            drafts.join("20260906-000000-op56.md"),
-            "# Rework the config loader\n\n## Context\n\nplaceholder from the interview.\n",
-        )
-        .unwrap();
-
-        let res = f.get("/api/drafts/20260906-000000-op56/advisors").await;
-        assert_eq!(res.status, 200, "{}", res.body);
-        let body = res.json();
-        assert!(
-            body["draft"].is_null(),
-            "an un-synthesized interview draft must never be served as the deliberation's task file: {body}"
-        );
-        assert!(body["draft_md"].is_null(), "{body}");
-    }
-
-    #[tokio::test]
-    async fn draft_advisors_404s_for_a_draft_with_no_deliberation_on_disk() {
-        let f = Fixture::start().await;
-        let res = f.get("/api/drafts/nosuchdraft/advisors").await;
-        assert_eq!(res.status, 404, "{}", res.body);
-    }
-
-    /// Reported: `draft_advisors` used to hand the URL's `id` straight to
-    /// `dir.join(format!("{id}.advisors.json"))`. Axum decodes a path
-    /// parameter after splitting the request path on literal `/`, so an id
-    /// sent as `..%2Fsecret` arrives here as `../secret` and joins to a file
-    /// one directory above `drafts` - which is exactly where this test plants
-    /// one, so the pre-fix code would have served it as draft `nosuchdraft`'s
-    /// deliberation.
-    #[tokio::test]
-    async fn draft_advisors_does_not_escape_the_drafts_directory_via_a_path_traversal_id() {
-        let f = Fixture::start().await;
-        let drafts = f.home.path().join("drafts");
-        std::fs::create_dir_all(&drafts).expect("drafts dir");
-        std::fs::write(
-            drafts.join("20260906-000000-qr78.advisors.json"),
-            r#"{"records":[]}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            f.home.path().join("secret.advisors.json"),
-            r#"{"records":[{"seat":"leak","agent":"x","duration_ms":1}]}"#,
-        )
-        .unwrap();
-
-        let res = f.get("/api/drafts/..%2Fsecret/advisors").await;
-        assert_eq!(
-            res.status, 404,
-            "a path-traversal id must not resolve to a file outside `drafts`: {}",
-            res.body
-        );
-    }
-
-    #[tokio::test]
-    async fn drafts_list_surfaces_only_drafts_that_finished_deliberation_newest_first() {
-        let f = Fixture::start().await;
-        let drafts = f.home.path().join("drafts");
-        std::fs::create_dir_all(&drafts).expect("drafts dir");
-        // Older draft, with a title and two proposals.
-        std::fs::write(
-            drafts.join("20260901-000000-aaaa.md"),
-            "# Rework the config loader\n",
-        )
-        .unwrap();
-        std::fs::write(
-            drafts.join("20260901-000000-aaaa.advisors.json"),
-            r#"{"records":[
-                {"seat":"advisor-1","agent":"a","duration_ms":1,
-                 "proposal":{"approach":"x","key_tradeoff":"y","why_not_naive":"z"}},
-                {"seat":"advisor-2","agent":"b","duration_ms":1,"error":"boom"}
-            ]}"#,
-        )
-        .unwrap();
-        // Newer draft, no title on disk (already filed and its .md removed).
-        std::fs::write(
-            drafts.join("20260902-000000-bbbb.advisors.json"),
-            r#"{"records":[]}"#,
-        )
-        .unwrap();
-        // A plain interview draft with no deliberation must not appear.
-        std::fs::write(drafts.join("20260903-000000-cccc.md"), "# no advisors\n").unwrap();
-
-        let res = f.get("/api/drafts").await;
-        assert_eq!(res.status, 200, "{}", res.body);
-        let list = res.json();
-        let rows = list.as_array().expect("an array");
-        assert_eq!(rows.len(), 2, "{list}");
-        assert_eq!(rows[0]["id"], "20260902-000000-bbbb", "newest first");
-        assert_eq!(
-            rows[0]["title"], "20260902-000000-bbbb",
-            "falls back to the id"
-        );
-        assert_eq!(rows[1]["id"], "20260901-000000-aaaa");
-        assert_eq!(rows[1]["title"], "Rework the config loader");
-        assert_eq!(rows[1]["seats"], 2);
-        assert_eq!(rows[1]["proposals"], 1);
-    }
-
-    #[tokio::test]
-    async fn posting_a_chat_with_an_unknown_from_names_the_id_in_a_4xx() {
-        let f = Fixture::start().await;
-        let res = f
-            .post(
-                "/api/chats",
-                Some(r#"{"idea":"same idea, another repo","from":"nosuchchat"}"#),
-            )
-            .await;
-        assert!(res.status >= 400 && res.status < 500, "{}", res.status);
-        assert!(
-            res.json()["error"]
-                .as_str()
-                .is_some_and(|e| e.contains("nosuchchat")),
-            "the error names the id that does not exist: {}",
-            res.body
-        );
-        assert!(
-            f.chats().list().is_empty(),
-            "a chat must not be created against an unresolvable `from`"
-        );
-    }
-
     /// A `kind = "command"` agent that ignores its prompt and answers a fixed
     /// string, declared straight in a repository's own `magi.toml` rather
     /// than the operator's real roster. No real agent CLI is spawned - `sh`
-    /// is the interpreter, the same as `chat::tests::mock_agent` uses - so
-    /// this is safe to run over a real HTTP round trip, unlike every other
-    /// `POST /api/chats` test in this module.
-    ///
-    /// `[roles] planner` is pinned here too, and not left to the built-in
-    /// "first runnable agent" fallback: an operator's own machine layer can
-    /// (and, on at least one real machine this was written and tested on,
-    /// does) already pin a `planner` naming a roster seat this file does not
-    /// have. `roles.planner` is a scalar, so restating it in this
-    /// higher-precedence repo layer is not the array conflict
-    /// `config::array_keys` refuses - it is exactly the override the layering
-    /// exists for, and it is what keeps this test's outcome independent of
-    /// whatever the machine layer happens to say.
-    const MOCK_AGENT_TOML: &str = "[roles]\nplanner = \"mock\"\n\n[[agents]]\nid = \"mock\"\nkind = \"command\"\ncommand = [\"sh\", \"-c\", \"cat >/dev/null && printf ok\"]\n";
-
-    /// As [`MOCK_AGENT_TOML`], but the mock agent takes a fraction of a second
-    /// to answer - long enough that a test can observe `thinking: true` and a
-    /// racing `say` mid-turn instead of the turn always having already landed
-    /// by the time the assertion runs.
-    const SLOW_MOCK_AGENT_TOML: &str = "[roles]\nplanner = \"mock\"\n\n[[agents]]\nid = \"mock\"\nkind = \"command\"\ncommand = [\"sh\", \"-c\", \"cat >/dev/null && sleep 0.3 && printf ok\"]\n";
-
-    #[tokio::test]
-    async fn a_posted_chat_takes_the_given_repo_and_otherwise_keeps_the_servers_own() {
-        let tmp = TempDir::new().expect("tempdir");
-        let repo = tmp.path().join("repo");
-        let other = tmp.path().join("other");
-        std::fs::create_dir_all(&repo).expect("repo dir");
-        std::fs::create_dir_all(&other).expect("other repo dir");
-        // Both need their own roster: `chat_post` re-discovers config against
-        // whichever repo the request names, and a repo with no `magi.toml` of
-        // its own would fall back to the operator's real, installed agent CLIs.
-        std::fs::write(repo.join("magi.toml"), MOCK_AGENT_TOML).expect("write magi.toml");
-        std::fs::write(other.join("magi.toml"), MOCK_AGENT_TOML).expect("write magi.toml");
-
-        let f = Fixture::with_repo(repo.clone()).await;
-
-        let default_res = f
-            .post("/api/chats", Some(r#"{"idea":"rework the config loader"}"#))
-            .await;
-        assert_eq!(default_res.status, 202, "{}", default_res.body);
-        assert_eq!(
-            default_res.json()["repo"],
-            repo.canonicalize().unwrap().display().to_string(),
-            "omitting `repo` must keep the server's own"
-        );
-
-        let body = format!(
-            r#"{{"idea":"rework the config loader","repo":{:?}}}"#,
-            other.to_string_lossy()
-        );
-        let explicit_res = f.post("/api/chats", Some(&body)).await;
-        assert_eq!(explicit_res.status, 202, "{}", explicit_res.body);
-        assert_eq!(
-            explicit_res.json()["repo"],
-            other.canonicalize().unwrap().display().to_string(),
-            "an explicit `repo` must override the server's own"
-        );
-    }
-
-    #[tokio::test]
-    async fn posting_a_chat_against_a_repo_with_a_broken_config_is_a_4xx_and_creates_no_chat() {
-        let tmp = TempDir::new().expect("tempdir");
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).expect("repo dir");
-        // Invalid TOML, not merely an unusual roster - `Config::discover` must
-        // fail outright, before `chat::open` is ever reached.
-        std::fs::write(repo.join("magi.toml"), "this is not valid toml [[[")
-            .expect("write magi.toml");
-
-        let f = Fixture::with_repo(repo).await;
-        let res = f
-            .post("/api/chats", Some(r#"{"idea":"rework the config loader"}"#))
-            .await;
-        assert!(res.status >= 400 && res.status < 500, "{}", res.body);
-        assert!(
-            f.chats().list().is_empty(),
-            "a repo whose config will not load must not leave a chat file behind"
-        );
-    }
-
-    #[tokio::test]
-    async fn posting_a_chat_with_no_runnable_agent_is_a_4xx_and_creates_no_chat() {
-        let tmp = TempDir::new().expect("tempdir");
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).expect("repo dir");
-        // Valid TOML, but `roles.planner` names a seat this roster does not
-        // have: `Config::discover` succeeds and `plan::pick` is what refuses.
-        std::fs::write(
-            repo.join("magi.toml"),
-            "[roles]\nplanner = \"nobody\"\n\n[[agents]]\nid = \"mock\"\nkind = \"command\"\ncommand = [\"sh\", \"-c\", \"printf ok\"]\n",
-        )
-        .expect("write magi.toml");
-
-        let f = Fixture::with_repo(repo).await;
-        let res = f
-            .post("/api/chats", Some(r#"{"idea":"rework the config loader"}"#))
-            .await;
-        assert!(res.status >= 400 && res.status < 500, "{}", res.body);
-        assert!(
-            res.json()["error"]
-                .as_str()
-                .is_some_and(|e| e.contains("nobody")),
-            "the error names the agent that could not be picked: {}",
-            res.body
-        );
-        assert!(
-            f.chats().list().is_empty(),
-            "a repo with no runnable interviewing agent must not leave a chat file behind"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_posted_chats_first_turn_reads_as_thinking_until_it_lands() {
-        let tmp = TempDir::new().expect("tempdir");
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).expect("repo dir");
-        std::fs::write(repo.join("magi.toml"), SLOW_MOCK_AGENT_TOML).expect("write magi.toml");
-        let f = Fixture::with_repo(repo).await;
-
-        let posted = f
-            .post("/api/chats", Some(r#"{"idea":"rework the config loader"}"#))
-            .await;
-        assert_eq!(posted.status, 202, "{}", posted.body);
-        let body = posted.json();
-        assert_eq!(
-            body["thinking"], true,
-            "the first turn is running in the background the instant this answers: {body}"
-        );
-        assert_eq!(
-            body["turns"].as_array().map(Vec::len),
-            Some(1),
-            "only the operator's idea is on disk yet: {body}"
-        );
-        let id = body["id"].as_str().expect("id").to_owned();
-
-        // The list carries the same flag, so the operator sees which
-        // conversation is busy without opening it.
-        let listed = f.get("/api/chats").await.json();
-        let row = listed
-            .as_array()
-            .expect("array")
-            .iter()
-            .find(|c| c["id"] == id)
-            .unwrap_or_else(|| panic!("{id} in {listed}"));
-        assert_eq!(row["thinking"], true, "{listed}");
-
-        // The lock the background turn holds refuses a `say` racing it - the
-        // same 409 a second `say` on an already-busy chat gets.
-        let raced = f
-            .post(
-                &format!("/api/chats/{id}/say"),
-                Some(r#"{"text":"anything"}"#),
-            )
-            .await;
-        assert_eq!(
-            raced.status, 409,
-            "the first turn's guard must still be held: {}",
-            raced.body
-        );
-
-        let mut turns_after = 1;
-        let mut thinking_after = true;
-        for _ in 0..200 {
-            let detail = f.get(&format!("/api/chats/{id}")).await.json();
-            turns_after = detail["turns"].as_array().expect("turns array").len();
-            thinking_after = detail["thinking"].as_bool().expect("thinking is a bool");
-            if turns_after == 2 && !thinking_after {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(turns_after, 2, "the agent's first reply eventually lands");
-        assert!(!thinking_after, "the guard is released once the turn ends");
-    }
+    /// is the interpreter, the same as `talk::tests::mock_agent` uses - so
+    /// this is safe to run over a real HTTP round trip.
+    const MOCK_AGENT_TOML: &str = "[[agents]]\nid = \"mock\"\nkind = \"command\"\ncommand = [\"sh\", \"-c\", \"cat >/dev/null && printf ok\"]\n";
 
     /// A repo carrying `MOCK_AGENT_TOML`, for the talk routes that need a
     /// real `Config::discover` to find an agent - `talk::begin` resolves one
@@ -6282,67 +4858,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_say_persists_an_attachment_in_the_turn_json() {
-        let tmp = TempDir::new().expect("tempdir");
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).expect("repo dir");
-        std::fs::write(repo.join("magi.toml"), MOCK_AGENT_TOML).expect("write magi.toml");
-        let f = Fixture::with_repo(repo.clone()).await;
-
-        let opened = f
-            .post("/api/chats", Some(r#"{"idea":"rework the config loader"}"#))
-            .await;
-        assert_eq!(opened.status, 202, "{}", opened.body);
-        let id = opened.json()["id"].as_str().expect("id").to_owned();
-
-        // The idea's own first turn runs in the background (see `chat_post`'s
-        // doc); it must land before `say` below, which would otherwise race
-        // it and get the same 409 a second turn on a busy chat gets.
-        let mut thinking = true;
-        for _ in 0..200 {
-            let detail = f.get(&format!("/api/chats/{id}")).await.json();
-            thinking = detail["thinking"].as_bool().expect("thinking is a bool");
-            if !thinking {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            !thinking,
-            "the first turn must finish before this test continues"
-        );
-
-        let uploaded = f
-            .post_bytes(
-                &format!("/api/chats/{id}/attachments"),
-                &[("Content-Type", "image/png")],
-                PNG_BYTES,
-            )
-            .await;
-        assert_eq!(uploaded.status, 201, "{}", uploaded.body);
-        let att_id = uploaded.json()["id"].as_str().expect("id").to_owned();
-
-        let res = f
-            .post(
-                &format!("/api/chats/{id}/say"),
-                Some(&format!(
-                    r#"{{"text":"here is a screenshot","attachments":["{att_id}"]}}"#
-                )),
-            )
-            .await;
-        assert_eq!(res.status, 202, "{}", res.body);
-
-        let on_disk = f.chats().get(&id).expect("get");
-        let operator_turn = on_disk
-            .turns
-            .iter()
-            .find(|t| t.body == "here is a screenshot")
-            .expect("the new operator turn");
-        assert_eq!(operator_turn.attachments.len(), 1);
-        assert_eq!(operator_turn.attachments[0].id, att_id);
-    }
-
-    #[tokio::test]
     async fn talk_close_makes_the_talk_refuse_further_turns() {
         let f = Fixture::start().await;
         let id = seed_talk(&f, "20260904-014455-cd34", "open");
@@ -6419,22 +4934,6 @@ mod tests {
         let f = Fixture::start().await;
         let res = f.delete("/api/talks/nonexistent-id").await;
         assert_eq!(res.status, 404, "{}", res.body);
-    }
-
-    #[tokio::test]
-    async fn talks_never_appear_in_the_planning_chat_list() {
-        let (_tmp, _repo, f) = talk_fixture().await;
-
-        let opened = f.post("/api/talks", None).await;
-        assert_eq!(opened.status, 201, "{}", opened.body);
-
-        let chats = f.get("/api/chats").await.json();
-        assert!(
-            chats.as_array().unwrap().is_empty(),
-            "a talk must never surface as a planning chat: {chats}"
-        );
-        let talks = f.get("/api/talks").await.json();
-        assert_eq!(talks.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -7113,7 +5612,6 @@ mod tests {
         let ui = Ui::new(
             Queue::at(home.path().join("queue")),
             Questions::at(home.path().join("questions")),
-            Chats::at(home.path().join("chats")),
             Talks::at(home.path().join("talks")),
             runs,
             home.path().to_path_buf(),
@@ -7390,14 +5888,13 @@ mod tests {
             payload["queue_rev"].is_u64()
                 && payload["runs_rev"].is_u64()
                 && payload["questions_rev"].is_u64()
-                && payload["chats_rev"].is_u64()
                 && payload["talks_rev"].is_u64()
                 && payload["loop_rev"].is_u64(),
             "the client needs one revision per store to know what to refetch, \
-             and `chats_rev` / `talks_rev` are the only notification a slow \
-             interview or a standing talk get - a phone whose radio slept \
-             through a turn learns about it here, as does one whose operator \
-             started the loop from another device: {payload}"
+             and `talks_rev` is the only notification a standing talk gets - a \
+             phone whose radio slept through a turn learns about it here, as \
+             does one whose operator started the loop from another device: \
+             {payload}"
         );
 
         // The front end re-polls health on a timer and on wake, and takes the
@@ -7411,7 +5908,6 @@ mod tests {
             "queue_rev",
             "runs_rev",
             "questions_rev",
-            "chats_rev",
             "talks_rev",
             "loop_rev",
         ] {
@@ -8105,7 +6601,6 @@ mod tests {
         let ui = Ui::new(
             Queue::at(home.path().join("queue")),
             Questions::at(home.path().join("questions")),
-            Chats::at(home.path().join("chats")),
             Talks::at(home.path().join("talks")),
             home.path().join("runs"),
             home.path().to_path_buf(),
@@ -8120,39 +6615,6 @@ mod tests {
             ui.begin_resume("20260901-000000-once").is_ok(),
             "and the claim is released when the attempt ends"
         );
-    }
-
-    #[test]
-    fn refreshing_a_conversation_never_navigates_to_it() {
-        // Reproduced on the deck: send a turn in one conversation, open
-        // another, and ten seconds later the transcript on screen was the
-        // first one while the address bar still named the second.
-        // `tickWaits`' insurance calls `loadChat` for every *waiting* chat, and
-        // `loadChat` opened by assigning `state.chatDetail`, so a refresh was
-        // a navigation.
-        let body = &APP_JS[APP_JS.find("async function loadChat(").expect("loadChat")
-            ..APP_JS.find("async function startChat(").expect("startChat")];
-        assert!(
-            !body.contains("state.chatDetail = {"),
-            "loadChat must not decide which conversation is on screen: {body}"
-        );
-        assert!(
-            body.contains("if (state.chatDetail.id !== id) return;"),
-            "it returns instead of drawing a chat the operator is not reading"
-        );
-
-        // The wait still has to be settled from there, and before that check,
-        // because the insurance exists for a reply that lands while the
-        // operator is elsewhere - otherwise the wait strip runs forever.
-        assert!(
-            body.find("trackIfThinking(chat)")
-                < body.find("if (state.chatDetail.id !== id) return;"),
-            "settle the wait before the on-screen check"
-        );
-
-        // Choosing the conversation on screen belongs to the router.
-        let router = &APP_JS[APP_JS.find("function applyRoute(").expect("applyRoute")..];
-        assert!(router.contains("state.chatDetail = { id: route.id, chat: null }"));
     }
 
     #[tokio::test]
@@ -8430,7 +6892,6 @@ mod tests {
         let ui = Ui::new(
             Queue::at(home.path().join("queue")),
             Questions::at(home.path().join("questions")),
-            Chats::at(home.path().join("chats")),
             Talks::at(home.path().join("talks")),
             runs,
             home.path().to_path_buf(),

@@ -51,13 +51,8 @@
   <nav class="rail" aria-label="Sections">
     <a class="rail-link" href="#/runs" data-nav="runs">Runs</a>
     <a class="rail-link" href="#/queue" data-nav="queue">Queue</a>
-    <!-- Plan is the only way work gets in from this UI: work is interviewed
-         into a task file, not typed straight into the queue. So it is the one
-         gold button in the nav and the dock, and it only ever opens the
-         planning panel. -->
-    <a class="rail-link btn btn-gold" href="#/plan" data-nav="chats" data-plan>Plan</a>
     <a class="rail-link" href="#/questions" data-nav="questions">Questions<span class="badge" id="ask-badge-rail" hidden></span></a>
-    <a class="rail-link" href="#/chat" data-nav="talks">Chat</a>
+    <a class="rail-link btn btn-gold" href="#/chat" data-nav="talks">Chat</a>
   </nav>
 
   <button class="icon-btn" type="button" id="theme-toggle" aria-label="Colour theme: follow system">
@@ -145,9 +140,9 @@
           No runs match this filter.
         </p>
         <p class="empty" id="runs-empty" hidden>
-          No competitions yet. Start from an idea and an agent will interview you
-          into a task the loop can pick up.
-          <button class="btn btn-gold" type="button" data-plan>Start from an idea</button>
+          No competitions yet. Talk an idea through in Chat, or file one with
+          <code>magi task add</code>, and the loop will pick it up.
+          <a class="btn btn-gold" href="#/chat">Open Chat</a>
         </p>
         <p class="empty" id="runs-unreadable" hidden>
           There are runs on disk, but this build cannot read their state — almost
@@ -243,9 +238,9 @@
     </div>
     <div id="queue-sections"></div>
     <p class="empty" id="queue-empty" hidden>
-      The backlog is empty. Start from an idea and an agent will interview you
-      into a task for it.
-      <button class="btn btn-gold" type="button" data-plan>Start from an idea</button>
+      The backlog is empty. Talk an idea through in Chat, or file one with
+      <code>magi task add</code>.
+      <a class="btn btn-gold" href="#/chat">Open Chat</a>
     </p>
   </section>
 
@@ -263,175 +258,10 @@
     </p>
   </section>
 
-  <!-- PLANNING: the list ------------------------------------------------ *
-       `magi plan` hands the terminal to an agent CLI, which a phone does not
-       have. The same interview runs here one turn at a time, and ends in the
-       same place: a validated task file in the queue. -->
-  <section class="view" id="view-chats" aria-labelledby="chats-h" hidden>
-    <div class="view-head">
-      <h1 id="chats-h">Planning</h1>
-      <p class="view-sub" id="chats-count">Loading…</p>
-    </div>
-
-    <div class="panel" id="chat-start">
-      <h2>Start from an idea</h2>
-      <div class="field">
-        <label for="f-idea">What do you want done?</label>
-        <p class="hint" id="f-idea-hint">Rough is fine. An agent interviews you here, then writes the task file for you to check and file.</p>
-        <textarea id="f-idea" rows="4" aria-describedby="f-idea-hint"
-                  placeholder="rework the config loader — discovery is doing too much"></textarea>
-      </div>
-      <div class="field">
-        <label for="chat-start-repo">Repository <span class="opt">optional</span></label>
-        <p class="hint" id="chat-start-repo-hint">Defaults to the repository this server was started against. Pick a known checkout, or type a path.</p>
-        <select id="chat-start-repo-select" data-placeholder="Server default" aria-describedby="chat-start-repo-hint">
-          <option value="">Server default</option>
-        </select>
-        <input id="chat-start-repo" name="repo" type="text" spellcheck="false" autocapitalize="off"
-               aria-describedby="chat-start-repo-hint" placeholder="/home/yukimemi/src/github.com/yukimemi/magi">
-        <button class="btn btn-quiet" type="button" id="chat-start-repo-refresh">Rescan repositories</button>
-      </div>
-      <p class="form-error" id="chat-start-error" role="alert" hidden></p>
-      <button class="btn btn-gold" type="button" id="chat-start-go">Start the interview</button>
-    </div>
-
-    <ol class="cards" id="chats-list"></ol>
-    <p class="empty" id="chats-empty" hidden>
-      No conversations yet. Describe an idea above and an agent will ask you
-      the questions a good task file needs answered.
-    </p>
-
-    <!-- `magi plan` (the terminal command) runs its interview and its
-         design-deliberation stage on whatever machine the operator typed it
-         on - this list is how the raw advisor record reaches the phone
-         afterwards. Unrelated to the conversations above, which are the
-         browser's own interview. -->
-    <div class="panel" id="plan-drafts-panel">
-      <div class="panel-bar">
-        <h2>Design deliberations</h2>
-        <button class="btn btn-quiet" type="button" id="plan-drafts-refresh">Refresh</button>
-      </div>
-      <p class="panel-note">
-        Raw advisor proposals from `magi plan`'s headless design-deliberation
-        stage, run at a terminal - what each seat argued, before it was folded
-        into a task file.
-      </p>
-      <ol class="cards" id="plan-drafts-list"></ol>
-      <p class="empty" id="plan-drafts-empty" hidden>
-        No completed design deliberations yet.
-      </p>
-    </div>
-
-    <div class="panel" id="plan-draft-detail-panel" hidden>
-      <div class="panel-bar">
-        <h2 id="plan-draft-detail-title">Design deliberation</h2>
-        <button class="btn btn-quiet" type="button" id="plan-draft-detail-close">Close</button>
-      </div>
-      <!-- What the planner actually kept - the proposals below are the
-           inputs, this is the answer to "so what happened". -->
-      <h3>Task file</h3>
-      <div class="md" id="plan-draft-detail-body"></div>
-      <p class="panel-note" id="plan-draft-detail-no-body" hidden>
-        The task file is no longer on disk.
-      </p>
-      <h3>Advisor proposals</h3>
-      <ol id="plan-draft-detail-list"></ol>
-    </div>
-  </section>
-
-  <!-- PLANNING: one conversation ---------------------------------------- -->
-  <section class="view" id="view-chat" aria-labelledby="chat-h" hidden>
-    <a class="back" href="#/plan">Planning</a>
-    <div class="view-head">
-      <div class="run-status" id="chat-status"></div>
-      <h1 id="chat-h">Loading conversation…</h1>
-      <p class="view-sub" id="chat-meta"></p>
-      <p class="panel-note" id="chat-derived-from" hidden>
-        Derived from <a id="chat-derived-from-link" href="#"></a>.
-      </p>
-    </div>
-
-    <ol class="turns" id="chat-turns"></ol>
-
-    <!-- A turn takes tens of seconds because a real model is thinking, so the
-         wait is stated in words with the elapsed time counting up: a silent
-         spinner and a hung server look identical. -->
-    <p class="waiting" id="chat-wait" role="status" hidden>
-      <span class="waiting-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-      <span class="waiting-text"></span>
-      <!-- The seconds are aria-hidden on purpose: a counter announced once a
-           second makes the live region useless. The sentence beside it is
-           what changes for assistive technology, and only twice. -->
-      <span class="waiting-secs" aria-hidden="true"></span>
-    </p>
-
-    <div class="panel" id="chat-draft-panel" hidden>
-      <div class="panel-bar">
-        <h2>Task file</h2>
-        <span class="tag" data-tone="gold" id="chat-draft-tag">draft</span>
-      </div>
-      <p class="panel-note">This is what gets filed. Read it before you do.</p>
-      <!-- Formatted is the default read; raw is one tap away and shows the
-           exact bytes that would be filed, unaltered - the operator must
-           always be able to check that before filing. -->
-      <div class="draft-view-toggle">
-        <button class="btn btn-quiet" type="button" id="chat-draft-raw-toggle" aria-pressed="false">Show raw</button>
-      </div>
-      <div class="md" id="chat-draft-rendered"></div>
-      <pre class="draft" id="chat-draft" tabindex="0" aria-label="Draft task file (raw)" hidden></pre>
-      <div class="problems" id="chat-problems" role="alert" hidden></div>
-      <button class="btn btn-gold" type="button" id="chat-file">File this task</button>
-    </div>
-
-    <div class="panel" id="chat-filed-panel" hidden>
-      <h2>Filed</h2>
-      <p class="filed-note" id="chat-filed-note"></p>
-      <a class="btn btn-quiet" id="chat-filed-go" href="#/queue">Open the backlog</a>
-    </div>
-
-    <form class="say" id="chat-say">
-      <div class="say-thumbs" id="chat-say-thumbs" hidden></div>
-      <p class="say-upload-status" id="chat-say-upload-status" role="status" hidden></p>
-      <div class="say-row">
-        <label class="attach-btn" for="chat-file-input" aria-label="Attach image">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M17.5 7.5 9 16a3 3 0 1 1-4.5-4L13 3.5a2 2 0 1 1 3 3L8 14.5a1 1 0 1 1-1.5-1.5L14 6"/>
-          </svg>
-        </label>
-        <!-- No `capture`: that attribute jumps straight to the camera and
-             skips the photo library. `accept="image/*"` alone is what makes
-             iOS/Android show the OS sheet with both "Photo Library" and
-             "Take Photo" as choices. -->
-        <input class="sr-only" type="file" id="chat-file-input" accept="image/*" multiple>
-        <label class="sr-only" for="f-say">Your reply</label>
-        <textarea id="f-say" rows="2" placeholder="Answer, or push back…"></textarea>
-        <button class="btn btn-gold" type="submit" id="chat-send">Send</button>
-      </div>
-    </form>
-    <p class="form-error" id="chat-error" role="alert" hidden></p>
-    <p class="panel-note" id="chat-closed" hidden>
-      This conversation is closed. Start another from Planning.
-    </p>
-    <button class="btn btn-quiet" type="button" id="chat-abandon-go">Abandon this conversation</button>
-
-    <div class="panel" id="chat-derive-panel">
-      <h2>Continue in another repository</h2>
-      <p class="panel-note">Starts a new conversation with this whole transcript as background, against a different checkout. This conversation is left exactly as it is.</p>
-      <select id="chat-derive-repo-select" data-placeholder="Choose a repository…">
-        <option value="">Choose a repository…</option>
-      </select>
-      <input id="chat-derive-repo" type="text" spellcheck="false" autocapitalize="off"
-             placeholder="/home/yukimemi/src/github.com/yukimemi/rvpm">
-      <p class="form-error" id="chat-derive-error" role="alert" hidden></p>
-      <button class="btn btn-quiet" type="button" id="chat-derive-go">Continue here</button>
-    </div>
-  </section>
-
   <!-- CHAT: the list ------------------------------------------------------ *
        A standing conversation for questions, investigation and thinking out
-       loud - distinct from Planning, which ends the moment a task file is
-       written. This one does not end: any number of tasks can be filed from
-       it with `magi task add --solo`, and the conversation stays open. -->
+       loud. It does not end: any number of tasks can be filed from it with
+       `magi task add --solo`, and the conversation stays open. -->
   <section class="view" id="view-talks" aria-labelledby="talks-h" hidden>
     <div class="view-head">
       <h1 id="talks-h">Chat</h1>
@@ -460,8 +290,8 @@
     <ol class="turns" id="talk-turns"></ol>
 
     <!-- A turn can run for `talk::TURN_TIMEOUT` while the agent investigates,
-         so the wait is stated in words with elapsed time, the same as
-         Planning's - a silent spinner and a hung server look identical. -->
+         so the wait is stated in words with elapsed time - a silent spinner
+         and a hung server look identical. -->
     <p class="waiting" id="talk-wait" role="status" hidden>
       <span class="waiting-dots" aria-hidden="true"><i></i><i></i><i></i></span>
       <span class="waiting-text"></span>
@@ -533,16 +363,6 @@
     </span>
     <span>Queue</span>
   </a>
-  <a class="dock-item dock-plan" href="#/plan" data-nav="chats" data-plan>
-    <span class="dock-glyph" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M4.5 5.5h9l6 6v7a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2z"/>
-        <path d="M13.5 5.5v6h6"/>
-        <path d="M7.5 15h7"/>
-      </svg>
-    </span>
-    <span>Plan</span>
-  </a>
   <a class="dock-item" href="#/questions" data-nav="questions">
     <span class="dock-glyph" aria-hidden="true">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -554,7 +374,7 @@
     </span>
     <span>Questions</span>
   </a>
-  <a class="dock-item" href="#/chat" data-nav="talks">
+  <a class="dock-item dock-chat" href="#/chat" data-nav="talks">
     <span class="dock-glyph" aria-hidden="true">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
         <path d="M4 5.5h16v10h-9l-4 3.5v-3.5H4z"/>
@@ -585,7 +405,7 @@
      the alternative to deleting the task and filing it again, so the id,
      when it was filed, who filed it, and its run history all stay. Refused
      by the server once a task is running or finished; the error from that
-     lands in #task-edit-error the same way a bad chat draft's does. -->
+     lands in #task-edit-error. -->
 <dialog class="sheet" id="task-edit-sheet" aria-labelledby="task-edit-h">
   <div class="sheet-head">
     <h2 id="task-edit-h">Edit task</h2>

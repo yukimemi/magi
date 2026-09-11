@@ -115,9 +115,7 @@ magi task add "port the retry logic to the uploader"
 magi task list                # the backlog `magi serve` drains
 magi task done <id>           # work that landed some other way
 magi serve                    # run the queue unattended
-magi web                      # the phone UI, over Tailscale
-magi plan "rework the config loader"   # interview, then file the task it writes
-magi plan --repo owner/repo --from <chat-id>   # a different repo, with a browser interview as background
+magi web                      # the phone UI, over Tailscale — Chat is where new work starts
 magi repos                    # local checkouts found under [repos] roots
 magi answer                   # what an agent is waiting to hear from you
 ```
@@ -241,21 +239,19 @@ and pay for a fresh implement wave every time.
 
 A task file without completion criteria produces a competition whose candidates
 cannot be compared, and you find out forty minutes and several dollars later.
-So the first step is a conversation:
+So the first step is a conversation — Chat, the standing conversation on the
+phone UI (`magi web`):
 
 ```sh
-magi plan "rework the config loader"
+magi web
 ```
 
-magi hands your terminal to a leader agent's own interface — its UI, its
-history, its keybindings — and takes it back when the interview is over to
-check the draft and queue it. It does **not** reimplement a chat window; the
-agent CLIs are better at that than magi will ever be.
-
-What magi does own is the shape of the result. A draft with no completion
-criteria is refused, with every problem listed at once, and **the draft is kept
-on disk and named in the error** — a twenty-minute interview is never lost to a
-validation failure.
+Open Chat, talk the idea through with an agent that can read the repository
+and run commands, and once the shape of the change is settled, tell it to file
+the work. The agent runs `magi task add --solo` on your behalf — the same
+command you would type yourself — and the conversation stays open, so any
+number of tasks can come out of it over time rather than ending the moment one
+does.
 
 ## Panels: the agent formats its own confirmation screen
 
@@ -312,25 +308,24 @@ in an irreversible decision.
 **Silence is a hold.** An unanswered approval never merges, and neither does
 anything other than the word `merge`.
 
-## Planning from a phone
+## Chat: a standing conversation, turn by turn
 
-`magi plan` hands your terminal to an agent CLI, which a browser cannot do. So
-the web UI runs the same interview as a **turn-based conversation**: your
-message, one headless agent turn, repeat. It is not a second implementation of
-the interview — it is the same briefing, the same `TASK_FILE_SPEC`, and the
-same validator, reached a different way, and it ends the same way: a task file
-in the queue.
+Chat runs as a **turn-based conversation**: your message, one headless agent
+turn, repeat. Each turn resumes the CLI's own conversation (`claude -p
+--resume`, `opencode run -s`, `agy --conversation`), so a turn sends only your
+new sentence rather than replaying the transcript and paying for it again.
+Your message is written to disk **before** the agent is invoked, so a quota
+window or a crash cannot lose something you typed.
 
-Each turn resumes the CLI's own conversation (`claude -p --resume`,
-`opencode run -s`, `agy --conversation`), so a turn sends only your new
-sentence rather than replaying the transcript and paying for it again. Your
-message is written to disk **before** the agent is invoked, so a quota window
-or a crash cannot lose something you typed. The interviewer runs with writes
-disabled: a planner that had already edited the repository would make the
-candidates' diffs unjudgeable.
+The conversation runs with writes disabled by default: an agent that had
+already edited the repository mid-conversation would make a later
+competition's diffs unjudgeable. `[talk] allow_write = true` lifts that for a
+repository that is never entered into one — a dotfiles or personal config
+checkout — so a one-line fix does not have to go through the queue to land.
 
-When the agent has written a draft you get it as the task file it is, with the
-problems listed if it is not usable yet, and one button to file it.
+Unlike a one-shot interview, Chat does not end when a task is filed: the agent
+runs `magi task add --solo` from inside the conversation, tells you the task
+id, and the conversation stays open for whatever comes up next.
 
 ## When an agent needs you
 
@@ -463,8 +458,7 @@ It is still one binary. The interface is three files compiled in with
 fetched at runtime. `cargo install magi-cli` gives you the phone UI too.
 
 You can watch runs, read the full report, browse the queue, hold and release
-tasks, plan new work — an agent interviews you into a task file, the way
-`magi plan` would in a terminal — and delete a task or a finished run that
+tasks, talk new work through in Chat, and delete a task or a finished run that
 is no longer wanted. Deletion is guarded rather than hidden: a task the
 daemon is holding a claim on, and a run a live daemon is working on right now,
 are refused with the reason. So is any run whose candidate worktrees have not
@@ -622,10 +616,10 @@ implementers = ["opus", "sonnet", "oc"]
 judges = ["sonnet", "oc", "opus"]
 reviewers = ["opus", "oc"]
 # fixer defaults to the winner's own author, continuing its own conversation.
-# planner is who `magi plan` and the browser interview ask; chatter is who the
-# resident chat asks and defaults to planner when unset. Split them if one
-# agent is also a judge seat — the resident chat opens far more often than
-# `magi plan` and would otherwise compete with that judge for the account.
+# chatter is who Chat asks; unset picks a claude seat, else the first
+# runnable agent in roster order. Name one explicitly if that agent is also a
+# judge seat — Chat is opened far more often than any single competition and
+# would otherwise compete with that judge for the same account.
 
 [graph]
 candidates = 3
@@ -662,11 +656,11 @@ mode = "notify"          # off | notify | install
 # interval = "24h"
 
 [repos]
-# Where `magi plan --repo owner/repo`, `magi repos`, and the web UI's
-# repository pickers look for other local checkouts. `roots` is an array, so
-# it follows the same "declare it in exactly one layer" rule as `[[agents]]` -
-# and since which checkouts exist on disk is a machine fact rather than a
-# repository one, that layer is almost always the machine config.
+# Where `magi repos` (and `GET /api/repos`) look for other local checkouts.
+# `roots` is an array, so it follows the same "declare it in exactly one
+# layer" rule as `[[agents]]` - and since which checkouts exist on disk is a
+# machine fact rather than a repository one, that layer is almost always the
+# machine config.
 roots = ["~/src/github.com"]   # scanned as <root>/<host>/<owner>/<repo>
 scan_ttl = 86400                # seconds a scan is trusted before re-scanning
 ```

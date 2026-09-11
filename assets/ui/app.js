@@ -42,13 +42,6 @@ const API = {
      `.../shot.png`, which is not where the assets are. `base-uri 'none'`
      forbids fixing that from inside the frame, which is why it is fixed here. */
   panel: (id) => `/api/questions/${encodeURIComponent(id)}/panel/index.html`,
-  chats: "/api/chats",
-  chat: (id) => `/api/chats/${encodeURIComponent(id)}`,
-  say: (id) => `/api/chats/${encodeURIComponent(id)}/say`,
-  file: (id) => `/api/chats/${encodeURIComponent(id)}/file`,
-  chatAbandon: (id) => `/api/chats/${encodeURIComponent(id)}/abandon`,
-  /* The standing chat: a separate store from Planning's, so the two never
-     appear in each other's lists (see `POST /api/talks`'s doc). */
   talks: "/api/talks",
   talk: (id) => `/api/talks/${encodeURIComponent(id)}`,
   talkSay: (id) => `/api/talks/${encodeURIComponent(id)}/say`,
@@ -58,20 +51,13 @@ const API = {
   /* One image, uploaded the moment it is picked/pasted/dropped - well before
      Send exists to tap - and referenced by the id this route hands back.
      `say` never carries bytes of its own. */
-  chatAttachmentPost: (id) => `/api/chats/${encodeURIComponent(id)}/attachments`,
-  chatAttachment: (id, att) => `/api/chats/${encodeURIComponent(id)}/attachments/${encodeURIComponent(att)}`,
   talkAttachmentPost: (id) => `/api/talks/${encodeURIComponent(id)}/attachments`,
   talkAttachment: (id, att) => `/api/talks/${encodeURIComponent(id)}/attachments/${encodeURIComponent(att)}`,
-  /* Local checkouts under `[repos] roots`, for the repository pickers on the
-     "start a conversation" panel and the "continue in another repository"
-     action. `?refresh=1` bypasses the server's cache regardless of its TTL. */
+  /* Local checkouts under `[repos] roots`, for the "start a conversation"
+     repository picker. `?refresh=1` bypasses the server's cache regardless of
+     its TTL. */
   repos: "/api/repos",
   reposRefresh: "/api/repos?refresh=1",
-  /* `magi plan`'s headless design-deliberation stage: run from a terminal, so
-     the phone's only way to learn a draft's raw advisor record is to ask for
-     the list magi itself wrote to disk. */
-  drafts: "/api/drafts",
-  draftAdvisors: (id) => `/api/drafts/${encodeURIComponent(id)}/advisors`,
   /* The loop itself: GET reports it, POST {running} starts or stops the one
      inside this server. */
   loop: "/api/loop",
@@ -154,16 +140,6 @@ const TASK_STATUS = {
 const QUESTION_STATUS = {
   open:      { glyph: "?", tone: "wait" },
   answered:  { glyph: "\u2713", tone: "teal" },
-  abandoned: { glyph: "\u2296", tone: "ink" },
-};
-
-/* A planning conversation. `filed` is the only ending that produced
-   something, so it is the only one that gets the verdict colour; an open
-   interview is not work in flight anywhere, it is waiting on the operator,
-   so it does not borrow the pulsing blue of a running run. */
-const CHAT_STATUS = {
-  open:      { glyph: "\u25cc", tone: "blue" },
-  filed:     { glyph: "\u25c6", tone: "gold" },
   abandoned: { glyph: "\u2296", tone: "ink" },
 };
 
@@ -484,81 +460,16 @@ const state = {
   queueCollapsed: loadCollapsed(QUEUE_COLLAPSE_KEY),
   detail: { id: null, run: null, report: null },
   questions: null,
-  chats: null,
-  /* Local checkouts under `[repos] roots`, shared by both repository
-     pickers - the one on the "start a conversation" panel and the one on
-     "continue in another repository". `null` before the first load. */
-  repos: null,
-  /* `magi plan` drafts that finished a design-deliberation stage, from
-     `GET /api/drafts`. `null` before the first load; fetched once on
-     arrival and again on an explicit tap, the same as `repos` above - there
-     is no revision to poll, since the CLI process that writes these files is
-     not this server. */
-  drafts: null,
-  /* The raw advisor record currently open below the drafts list, or `null`
-     when nothing is open. `error` carries a failed fetch so the panel can say
-     so instead of silently staying empty. */
-  draftDetail: { id: null, advice: null, error: null },
-  chatDetail: { id: null, chat: null },
-  /* Conversations with a turn in flight, keyed by chat id: `Map<id, {
-       since, target, pending, waitFrom, lastPoll }>`. One turn *per chat* is
-     the rule the server enforces (`Ui::begin_turn` refuses a second one on
-     the *same* chat, see `chat_say`'s doc) - nothing here refuses sending
-     into a different, idle conversation just because this one is busy.
-       - `since`: transcript length before this turn's own new turns, used
-         only to know when `pending` has been superseded by the real thing.
-       - `target`: transcript length once this turn's agent reply (or
-         failure note) has landed - always `since-of-the-turn-itself + 1`,
-         one more turn than whatever the 202 response already carried.
-       - `pending`: the operator's own text, shown as an optimistic bubble
-         until the transcript catches up to it - `null` when there is
-         nothing to show that is not already in the transcript (starting an
-         interview, or a wait rebuilt from `thinking` - see `trackIfThinking`).
-       - `waitFrom`: when the wait began, for the "Xs" counter.
-       - `lastPoll`: last time this id's ten-second insurance re-read ran.
-     An entry's presence is this browser's own belief that a turn is
-     running; `thinking` on a fetched [`ChatView`] is the server's - see
-     `trackIfThinking` for how the two are reconciled after a reload or on
-     another device. */
-  chatWaits: new Map(),
-  /* Images picked, pasted or dropped for the *next* `chat-say`, not yet
-     part of any turn. Each item is `{ localId, previewUrl, name, status,
-     serverId, mime, bytes }` with `status` one of `"uploading"` /
-     `"done"` / `"error"` - see `renderChatThumbs`. Keyed to a conversation
-     id the same way `chatProblems` is, so switching conversations does not
-     leave one's pending pictures attached to another's next message. */
-  chatAttachments: { id: null, items: [] },
-  /* Whether the current view was entered via a route change to a chat.
-     Cleared after the first scroll, so a subsequent renderChat() with the
-     same turn count does not re-scroll. */
-  openingChat: false,
-  /* Whether a Plan control asked to focus the idea box on arrival. Set by
-     openPlan() when the planning page is not showing, cleared by applyRoute
-     once the caret has landed. */
-  planFocus: false,
-  /* Turn count from the previous renderChat() call, used to detect new
-     turns arriving while the conversation is already on screen. */
-  prevTurnCount: 0,
-  /* One shared ticking interval driving every entry in `chatWaits` at once -
-     the seconds counter for whichever chat is on screen, and the
-     ten-second insurance re-read for every busy chat, on screen or not.
-     Started when `chatWaits` gains its first entry, stopped when it empties. */
-  waitTimer: null,
-  /* Problems the server found in a draft, kept per conversation so a
-     re-render does not wipe the list the operator is working through. */
-  chatProblems: { id: null, list: [] },
   /* Whether a question's panel endpoint actually answers. A sandboxed frame
      is opaque, so a 404 inside it is indistinguishable from a rendered
      panel; this is the answer to that, asked once per question. */
   panelOk: new Map(),
-  /* The standing chat - a separate store and a separate piece of state from
-     `chats`/`chatDetail`, on the same reasoning `talk::Talks` documents: two
-     conversations with different meanings must not share one list or one
-     turn guard. */
   talks: null,
   talkDetail: { id: null, talk: null },
-  /* See `chatAttachments`, which this mirrors for the standing chat's own
-     composer. */
+  /* Images picked, pasted or dropped for the *next* `talk-say`, not yet part
+     of any turn. Each item is `{ localId, previewUrl, name, status,
+     serverId, mime, bytes }` with `status` one of `"uploading"` /
+     `"done"` / `"error"` - see `renderTalkThumbs`. */
   talkAttachments: { id: null, items: [] },
   talkBusy: null,
   talkBusyTurns: 0,
@@ -570,20 +481,15 @@ const state = {
      the same turn count does not re-scroll. */
   openingTalk: false,
   /* Turn count from the previous renderTalk() call, used to detect new turns
-     arriving while the conversation is already on screen - the standing
-     chat's counterpart to prevTurnCount. */
+     arriving while the conversation is already on screen. */
   prevTalkTurnCount: 0,
-  rev: { queue: null, runs: null, questions: null, chats: null, talks: null, loop: null },
+  rev: { queue: null, runs: null, questions: null, talks: null, loop: null },
   streamOpen: false,
   wrap: false,
   /* The upgrade stage last rendered, so a transition into "done" can be told
      apart from just being on it already - the loop strip re-renders on every
      health poll, and only a transition is worth announcing. */
   lastUpgradeStage: null,
-  /* The draft panel's own view toggle: formatted by default, the exact bytes
-     that would be filed one tap away. Global rather than per-chat - there is
-     only ever one draft panel on screen at a time. */
-  draftRaw: false,
 };
 
 let fallbackTimer = null;
@@ -593,20 +499,14 @@ async function request(url, init) {
   const res = await fetch(url, init);
   if (!res.ok) {
     let message = `${res.status} ${res.statusText || "request failed"}`;
-    let problems = null;
     try {
       const body = await res.json();
       if (body && typeof body.error === "string") message = body.error;
-      /* POST /api/chats/{id}/file answers a bad draft with every problem it
-         found. They are carried on the error so one pass of fixes is
-         possible, instead of a rejection at a time. */
-      if (body && Array.isArray(body.problems) && body.problems.length) problems = body.problems;
     } catch {
       /* an error body is not guaranteed to be JSON; the status stands in */
     }
     const error = new Error(message);
     error.status = res.status;
-    if (problems) error.problems = problems;
     throw error;
   }
   return res;
@@ -2368,9 +2268,9 @@ function isWaiting(run) {
  * and only place this client turns that tree into DOM, with createElement and
  * textContent exactly as everywhere else — there is no second reader of
  * markdown syntax in this file, and no innerHTML anywhere in it. A run's
- * instruction, a chat's agent turn, a question's detail and a chat's draft
- * all go through `renderMd`; nothing here re-derives structure from the raw
- * string the way the old hand-rolled reader did. */
+ * instruction, a standing chat's agent turn and a question's detail all go
+ * through `renderMd`; nothing here re-derives structure from the raw string
+ * the way the old hand-rolled reader did. */
 
 /* One markdown node to one DOM node. The server already refused to build a
    `link`/`image` node for anything it would be unsafe to render (see
@@ -2999,17 +2899,13 @@ function renderTitle() {
     ? "Backlog \u2014 magi"
     : state.route.name === "questions"
       ? "Questions \u2014 magi"
-      : state.route.name === "chats"
-        ? "Planning \u2014 magi"
-        : state.route.name === "chat"
-          ? `Planning ${shortId(state.route.id)} \u2014 magi`
-          : state.route.name === "talks"
-            ? "Chat \u2014 magi"
-            : state.route.name === "talk"
-              ? `Chat ${shortId(state.route.id)} \u2014 magi`
-              : state.route.name === "run"
-                ? `Run ${shortId(state.route.id)} \u2014 magi`
-                : "magi \u2014 observation deck";
+      : state.route.name === "talks"
+        ? "Chat \u2014 magi"
+        : state.route.name === "talk"
+          ? `Chat ${shortId(state.route.id)} \u2014 magi`
+          : state.route.name === "run"
+            ? `Run ${shortId(state.route.id)} \u2014 magi`
+            : "magi \u2014 observation deck";
   document.title = count > 0 ? `(${count}) ${base}` : base;
 }
 
@@ -3044,39 +2940,7 @@ function focusFirstAsk() {
   });
 }
 
-/* ---- planning conversation --------------------------------------------- *
- * `magi plan` interviews the operator and writes a task file. It does that by
- * handing the terminal to an agent CLI, which is exactly the thing a phone
- * does not have. So the same interview runs here, one turn at a time, driven
- * headlessly by the server, and ends in the same place: a validated task file
- * in the queue.
- *
- * Two facts shape everything below. A turn takes tens of seconds, because a
- * real model is reading and thinking — so the wait is stated in words, with a
- * count that visibly advances, and never as a bare spinner that is
- * indistinguishable from a server that has stopped answering. And a second
- * turn fired into the same conversation while the first is in flight would
- * interleave two half-exchanges, so exactly one is allowed to be outstanding
- * and the composer says why while it is.
- */
-const chatTurns = (chat) => (chat && Array.isArray(chat.turns) ? chat.turns : []);
-
-/* Parallel to `chatTurns`: one parsed markdown tree per real turn, server-
-   built so this client never re-derives it. The synthetic "still sending"
-   turn `renderChat` appends locally has no entry and needs none - it is
-   always the operator's own text, shown as plain text. */
-const chatTurnsMd = (chat) => (chat && Array.isArray(chat.turn_bodies_md) ? chat.turn_bodies_md : []);
-
-/* What the operator opened with, which is the only thing that names a
-   conversation before it has produced a draft. */
-function chatOpener(chat) {
-  const first = chatTurns(chat).find((turn) => turn.who === "operator");
-  return first ? String(first.body || "") : "";
-}
-
-const chatDraft = (chat) => (chat && typeof chat.draft === "string" ? chat.draft : "");
-
-/* When the interviewing agent times out, fails or runs out of quota, the
+/* When the standing chat's agent times out, fails or runs out of quota, the
    server still records the exchange and writes the failure as an agent turn
    whose body begins with `magi: `. That is magi speaking, not the model, and
    it must not be read as an answer to the operator's question — so it is
@@ -3085,260 +2949,6 @@ const MAGI_PREFIX = "magi: ";
 function turnWho(turn) {
   if (turn.who === "agent" && String(turn.body || "").startsWith(MAGI_PREFIX)) return "system";
   return turn.who === "operator" ? "operator" : "agent";
-}
-
-/* Order by when a conversation STARTED, not when it was last touched.
-
-   Sorting on `updated_at` meant every agent reply lifted its conversation to
-   the top, so a list the operator was reading rearranged itself under their
-   finger — on a phone that reads as the screen switching on its own. Every
-   other list in this client is ordered by creation (runs and tasks both sort
-   on their ids, which begin with a timestamp) and none of them move; this was
-   the only one that did.
-
-   Recency still shows: the card carries its own timestamp and its unread
-   marker. Position is identity, and identity should not move because a model
-   answered. Open-before-filed stays, because a conversation only changes
-   status when the operator files it — a card moving then is a consequence of
-   something they just did. */
-function sortChats(list) {
-  return list.slice().sort((a, b) => {
-    const rank = (a.status === "open" ? 0 : 1) - (b.status === "open" ? 0 : 1);
-    const started = (chat) => Date.parse(chat.created_at) || 0;
-    return rank || started(b) - started(a);
-  });
-}
-
-/* ---- the list ---------------------------------------------------------- */
-function createChatCard() {
-  const chipSlot = el("span");
-  const ready = el("span", { class: "tag chat-ready", "data-tone": "gold", text: "draft ready" });
-  /* A busy conversation's own badge, distinct from `ready`: the two can never
-     show at once (a chat mid-turn has not just produced a fresh draft this
-     browser has not seen), but they answer different questions, so a shared
-     slot would have to pick one to lose. */
-  const thinking = el("span", { class: "tag chat-thinking", "data-tone": "blue", text: "thinking…" });
-  const whenSlot = el("time", { class: "card-when" });
-  const title = el("h2", { class: "card-title" });
-  const agent = el("span", { class: "repo" });
-  const turns = el("span");
-  const task = el("span", { class: "win" });
-  const meta = el("div", { class: "card-meta" }, agent, turns, task);
-  const last = el("p", { class: "card-event" });
-
-  const card = el("a", { class: "card" },
-    el("div", { class: "card-top" }, chipSlot, thinking, ready, whenSlot),
-    title, meta, last,
-  );
-  const row = el("li", {}, card);
-  row.refs = { card, chipSlot, thinking, ready, whenSlot, title, agent, turns, task, last };
-  return row;
-}
-
-function updateChatCard(row, chat) {
-  const r = row.refs;
-  const status = String(chat.status || "open");
-  const turns = chatTurns(chat);
-  const tone = toneOf(status, CHAT_STATUS);
-
-  r.card.setAttribute("href", `#/plan/${chat.id}`);
-  setAttr(r.card, "data-tone", tone);
-  setAttr(row, "data-tone", tone);
-
-  const next = chip(status, CHAT_STATUS);
-  if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
-  else r.chipSlot.append(next);
-
-  /* A draft waiting to be filed is the one thing in this list that is
-     actually the operator's turn, so it is called out on the card rather
-     than found by opening each conversation. */
-  show(r.ready, status === "open" && chatDraft(chat).trim() !== "");
-
-  /* `state.chatWaits`, not `chat.thinking` directly: `trackIfThinking` (run
-     over every chat in `loadChats`) is what reconciles the two, and reading
-     the map here is what makes the badge agree with the wait strip on the
-     conversation's own page - both a reload and a turn started from another
-     device land in the same place. */
-  show(r.thinking, state.chatWaits.has(chat.id));
-
-  const at = when(chat.updated_at || chat.created_at);
-  setText(r.whenSlot, at.text);
-  setAttr(r.whenSlot, "datetime", chat.updated_at || chat.created_at);
-  setAttr(r.whenSlot, "title", `updated ${at.title}`);
-
-  setText(r.title, firstLine(chatOpener(chat)) || `conversation ${shortId(chat.id)}`);
-  setText(r.agent, chat.agent || "");
-  show(r.agent, Boolean(chat.agent));
-  setText(r.turns, plural(turns.length, "turn", "turns"));
-  setText(r.task, chat.task ? `task ${shortId(chat.task)}` : "");
-  show(r.task, Boolean(chat.task));
-  separate(r.turns.parentNode);
-
-  const tail = turns.length ? turns[turns.length - 1] : null;
-  setText(r.last, tail && tail.who === "agent" ? firstLine(tail.body) : "");
-  show(r.last, Boolean(tail && tail.who === "agent"));
-}
-
-function renderChats() {
-  const list = $("chats-list");
-  const chats = state.chats;
-
-  if (chats === null) {
-    const open = Number(state.health && state.health.chats_open) || 0;
-    setText($("chats-count"), open ? `${plural(open, "conversation open", "conversations open")}` : "Loading\u2026");
-    return;
-  }
-
-  const open = chats.filter((c) => c.status === "open").length;
-  const filed = chats.filter((c) => c.status === "filed").length;
-  setText($("chats-count"), chats.length === 0
-    ? "No interviews yet"
-    : [open ? `${plural(open, "conversation open", "conversations open")}` : "nothing open",
-       filed ? `${plural(filed, "task filed from here", "tasks filed from here")}` : null]
-        .filter(Boolean).join(" \u00b7 "));
-
-  show($("chats-empty"), chats.length === 0);
-  syncList(list, sortChats(chats), (c) => c.id, createChatCard, updateChatCard);
-}
-
-/* ---- design deliberations -----------------------------------------------
- * `magi plan` runs from a terminal and gathers its three advisors headless,
- * on whatever machine the operator typed the command on - so this is the
- * only place a phone ever gets to read what they argued. There is no
- * revision to poll for these: the files are written by that CLI process, not
- * by this server, so the list is a snapshot fetched on arrival and again on
- * an explicit tap, the same contract `repos` above already has. */
-function createDraftCard() {
-  const title = el("h2", { class: "card-title" });
-  const meta = el("p", { class: "card-meta" });
-  const card = el("div", { class: "card", tabindex: "0", role: "button" }, title, meta);
-  const row = el("li", {}, card);
-  row.refs = { card, title, meta };
-  return row;
-}
-
-function updateDraftCard(row, draft) {
-  const r = row.refs;
-  setText(r.title, draft.title || draft.id);
-  setText(
-    r.meta,
-    `${plural(draft.proposals, "proposal", "proposals")} of ${plural(draft.seats, "advisor", "advisors")}`,
-  );
-  r.card.onclick = () => viewDraftAdvisors(draft.id);
-  r.card.onkeydown = (event) => {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      viewDraftAdvisors(draft.id);
-    }
-  };
-}
-
-function renderDrafts() {
-  const list = $("plan-drafts-list");
-  const drafts = state.drafts;
-  if (drafts === null) return;
-  show($("plan-drafts-empty"), drafts.length === 0);
-  syncList(list, drafts, (d) => d.id, createDraftCard, updateDraftCard);
-}
-
-async function loadDrafts() {
-  try {
-    state.drafts = await getJson(API.drafts);
-    renderDrafts();
-  } catch {
-    /* Nothing worth interrupting Planning over - the list just stays at
-       whatever it last showed, same as a failed repository scan. */
-    state.drafts = state.drafts || [];
-    renderDrafts();
-  }
-}
-
-/* A proposal's own fields, one row each - never innerHTML, since every word
-   here came from an agent the operator has not read yet. */
-function renderProposal(list, proposal) {
-  const add = (label, value) => {
-    if (!value) return;
-    list.append(el("li", {}, el("strong", { text: `${label}: ` }), el("span", { text: value })));
-  };
-  add("Approach", proposal.approach);
-  add("Key tradeoff", proposal.key_tradeoff);
-  add("Risks", (proposal.risks || []).join("; "));
-  add("Touches", (proposal.touches || []).join(", "));
-  add("Why not the naive approach", proposal.why_not_naive);
-}
-
-function renderDraftDetail() {
-  const panel = $("plan-draft-detail-panel");
-  const { id, advice, error } = state.draftDetail;
-  show(panel, Boolean(id));
-  if (!id) return;
-
-  setText($("plan-draft-detail-title"), `Design deliberation — ${shortId(id)}`);
-  const list = $("plan-draft-detail-list");
-  const bodyEl = $("plan-draft-detail-body");
-  clear(list);
-  clear(bodyEl);
-  show(bodyEl, false);
-  show($("plan-draft-detail-no-body"), false);
-
-  if (error) {
-    list.append(el("li", { class: "form-error", text: error }));
-    return;
-  }
-  if (!advice) {
-    list.append(el("li", { text: "Loading…" }));
-    return;
-  }
-
-  /* The task file the deliberation produced - what the planner actually
-     kept from the proposals below, not just what was on offer. Rendered the
-     same way every other markdown surface in this client is: a server-parsed
-     tree, never a client-side parse of agent-authored text. */
-  if (advice.draft_md) {
-    renderMd(bodyEl, advice.draft_md);
-    show(bodyEl, true);
-  } else {
-    show($("plan-draft-detail-no-body"), true);
-  }
-
-  for (const record of advice.records || []) {
-    const head = el("h3", { text: `${record.seat} (${record.agent || "—"})` });
-    const body = el("ul", { class: "proposal" });
-    if (record.proposal) renderProposal(body, record.proposal);
-    else body.append(el("li", { class: "form-error", text: record.error || "no proposal" }));
-    list.append(el("li", {}, head, body));
-  }
-  if ((advice.records || []).length === 0) {
-    list.append(el("li", { text: "No advisor records." }));
-  }
-}
-
-/* Bumped by every open and every close, and captured by each fetch before it
-   awaits. Opening B while A is still loading, or closing while either is,
-   must not let A's (or a closed request's) answer land after the fact and
-   overwrite whatever the operator is looking at now - a plain `await` here
-   has no idea a newer request (or a close) has since superseded it. */
-let draftDetailRequest = 0;
-
-async function viewDraftAdvisors(id) {
-  const requestId = ++draftDetailRequest;
-  state.draftDetail = { id, advice: null, error: null };
-  renderDraftDetail();
-  let next;
-  try {
-    next = { id, advice: await getJson(API.draftAdvisors(id)), error: null };
-  } catch (error) {
-    next = { id, advice: null, error: error.message };
-  }
-  if (requestId !== draftDetailRequest) return;
-  state.draftDetail = next;
-  renderDraftDetail();
-}
-
-function closeDraftDetail() {
-  draftDetailRequest++;
-  state.draftDetail = { id: null, advice: null, error: null };
-  renderDraftDetail();
 }
 
 /* ---- one conversation -------------------------------------------------- */
@@ -3352,12 +2962,8 @@ function createTurnRow() {
   return row;
 }
 
-/* Which store a turn's attachments are served from - `item.kind` is set by
-   the two callers of `syncList` (`renderChat`, `renderTalk`) below, since
-   `createTurnRow`/`updateTurnRow` are the one component both share and a
-   thumbnail's URL has to name the right route. */
-function attachmentUrl(kind, conversationId, att) {
-  return kind === "talk" ? API.talkAttachment(conversationId, att.id) : API.chatAttachment(conversationId, att.id);
+function attachmentUrl(conversationId, att) {
+  return API.talkAttachment(conversationId, att.id);
 }
 
 function updateTurnRow(row, item) {
@@ -3399,7 +3005,7 @@ function updateTurnRow(row, item) {
     r.attachments.dataset.attKey = attKey;
     clear(r.attachments);
     for (const att of atts) {
-      const url = attachmentUrl(item.kind, item.conversationId, att);
+      const url = attachmentUrl(item.conversationId, att);
       const name = String(att.name || "attachment");
       const thumb = el("button", {
         class: "turn-thumb", type: "button",
@@ -3435,166 +3041,16 @@ function closeAttachmentView() {
   if (dialog.open) dialog.close();
 }
 
-function renderProblems(problems) {
-  const box = $("chat-problems");
-  clear(box);
-  if (!problems || problems.length === 0) {
-    show(box, false);
-    return;
-  }
-  /* Every problem at once. The operator asked for one pass of fixes, not a
-     rejection at a time, and the draft stays on screen above this. */
-  box.append(
-    el("h3", { text: `Not fileable yet \u2014 ${plural(problems.length, "problem", "problems")}` }),
-    el("ul", {}, problems.map((problem) => el("li", { text: String(problem) }))),
-  );
-  show(box, true);
-}
-
-function chatError(message) {
-  const box = $("chat-error");
-  setText(box, message || "");
-  show(box, Boolean(message));
-}
-
-/* ---- chat composer attachments ------------------------------------------ *
- * Three ways an image reaches the file input - the picker, a paste, or a
- * drop, all wired in wire() below to attachChatFiles() - and one thing that
- * happens next: every file is POSTed the moment it arrives, well before Send
- * is even tappable, so the thumbnail row has something to key on and a slow
- * mobile upload is visible as progress rather than as a silent wait right
- * before the tap that would have started it. `say` later carries only the
- * ids this minted; see `API.chatAttachmentPost` and `web::validate_attachment`
- * for what the server actually accepts - this side repeats none of that
- * whitelist and just shows whatever message a rejection carries.
- */
+/* Shared by the talk composer's own attachment queue below - one counter is
+   enough since only one composer is ever active at a time. */
 let nextLocalAttachmentId = 1;
-
-function chatAttachmentsBusy() {
-  return state.chatAttachments.id === state.chatDetail.id
-    && state.chatAttachments.items.some((item) => item.status === "uploading");
-}
-
-/* Unconditional: called on every navigation away from a conversation (see
-   applyRoute) as well as after a successful send, so a pending queue never
-   survives long enough to attach itself to the wrong conversation - and
-   every object URL it created is revoked, since those are only ever read
-   from this page's own memory and nothing else will free them. */
-function resetChatAttachments(id) {
-  for (const item of state.chatAttachments.items) {
-    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
-  }
-  state.chatAttachments = { id, items: [] };
-}
-
-function renderChatThumbs() {
-  const box = $("chat-say-thumbs");
-  const items = state.chatAttachments.id === state.chatDetail.id ? state.chatAttachments.items : [];
-  clear(box);
-  show(box, items.length > 0);
-  for (const item of items) {
-    const thumb = el("div", { class: "say-thumb" });
-    if (item.status === "uploading") thumb.classList.add("is-uploading");
-    if (item.status === "error") thumb.classList.add("is-failed");
-    thumb.append(el("img", { src: item.previewUrl || "", alt: "" }));
-    if (item.status === "uploading") {
-      thumb.append(el("div", { class: "say-thumb-spinner" }, el("i", {})));
-    }
-    thumb.append(el("button", {
-      class: "say-thumb-remove", type: "button",
-      "aria-label": `Remove ${item.name || "image"}`,
-      onclick: () => removeChatAttachment(item.localId),
-    }, svg(
-      "svg", { viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "2.5", "stroke-linecap": "round" },
-      svg("path", { d: "M6 6l12 12M18 6L6 18" }),
-    )));
-    box.append(thumb);
-  }
-
-  const uploading = items.filter((item) => item.status === "uploading").length;
-  const status = $("chat-say-upload-status");
-  setText(status, uploading > 0 ? `Uploading ${plural(uploading, "image", "images")}…` : "");
-  show(status, uploading > 0);
-}
-
-function removeChatAttachment(localId) {
-  const items = state.chatAttachments.items;
-  const at = items.findIndex((item) => item.localId === localId);
-  if (at < 0) return;
-  const [item] = items.splice(at, 1);
-  if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
-  renderChat();
-}
-
-/* `files` is anything array-like of `File`/`Blob` - a `FileList` from the
-   input or a drop, or a plain array built from clipboard items on paste. */
-async function attachChatFiles(files) {
-  const id = state.chatDetail.id;
-  if (!id) return;
-  if (state.chatAttachments.id !== id) resetChatAttachments(id);
-
-  const images = [...files].filter((file) => file.type.startsWith("image/"));
-  if (images.length === 0) return;
-
-  for (const file of images) {
-    /* The operator can navigate to a different conversation between two
-       files of the same batch - every `await` below is a point where
-       `applyRoute` can call `resetChatAttachments` and swap `state.chatAttachments`
-       out from under this loop, so only the very first iteration is
-       guaranteed to still own `id`'s own queue. Once that has happened there
-       is no longer a queue to add this file's progress to, and pushing into
-       whatever `state.chatAttachments` now is would attach an id that
-       belongs to *this* upload's conversation onto a different one's list. */
-    if (state.chatAttachments.id !== id) break;
-
-    const localId = nextLocalAttachmentId++;
-    const item = {
-      localId,
-      previewUrl: URL.createObjectURL(file),
-      name: file.name || "image",
-      status: "uploading",
-      serverId: null,
-    };
-    state.chatAttachments.items.push(item);
-    renderChat();
-
-    try {
-      const att = await postBytes(API.chatAttachmentPost(id), file, file.name);
-      item.status = "done";
-      item.serverId = att.id;
-    } catch (error) {
-      /* Kept, not dropped: "error" is what lets renderChatThumbs show the
-         failed thumbnail (its `is-failed` branch) instead of it vanishing
-         without a trace. The operator dismisses it with the same remove
-         button any other thumbnail gets - there is nothing to retry on this
-         exact item, since the bytes were never a `File` this page can resend
-         after a paste. */
-      item.status = "error";
-      if (state.chatAttachments.id === id) {
-        chatError(`Could not attach ${item.name}: ${error.message}`);
-      }
-    }
-    if (state.chatAttachments.id === id) renderChat();
-  }
-}
-
-/* Switches the draft panel between its formatted read and the raw bytes that
-   would actually be filed. Both stay in the DOM; only `hidden` moves, so
-   toggling never re-parses or re-fetches anything. */
-function applyDraftView() {
-  const raw = state.draftRaw;
-  show($("chat-draft-rendered"), !raw);
-  show($("chat-draft"), raw);
-  setText($("chat-draft-raw-toggle"), raw ? "Show formatted" : "Show raw");
-  setAttr($("chat-draft-raw-toggle"), "aria-pressed", String(raw));
-}
 
 /* Scroll the page so the last turn's top sits just below the sticky header.
    The header (.top) uses position:sticky;top:0, so scrollIntoView would hide
    the first line behind it. We account for its height with scroll-margin-top
    set via JS on the target element, using getBoundingClientRect for a
-   reliable measurement regardless of safe-area insets or zoom level. Shared
-   by both conversation views - `containerId` is "chat-turns" or "talk-turns". */
+   reliable measurement regardless of safe-area insets or zoom level.
+   `containerId` is always "talk-turns", the standing chat's transcript. */
 function scrollToLastTurn(containerId) {
   const turns = $(containerId);
   if (!turns.children.length) return;
@@ -3606,526 +3062,12 @@ function scrollToLastTurn(containerId) {
   last.scrollIntoView({ behavior: motion ? "auto" : "smooth", block: "start" });
 }
 
-function renderChat() {
-  const chat = state.chatDetail.chat;
-  const wait = chat ? state.chatWaits.get(chat.id) : undefined;
-  const busy = Boolean(wait);
-
-  if (!chat) {
-    setText($("chat-h"), "Loading conversation\u2026");
-    setText($("chat-meta"), "");
-    clear($("chat-status"));
-    clear($("chat-turns"));
-    show($("chat-draft-panel"), false);
-    show($("chat-filed-panel"), false);
-    show($("chat-say"), false);
-    show($("chat-closed"), false);
-    show($("chat-abandon-go"), false);
-    show($("chat-wait"), false);
-    show($("chat-problems"), false);
-    show($("chat-derived-from"), false);
-    renderChatThumbs();
-    return;
-  }
-
-  const status = String(chat.status || "open");
-  /* The operator's own message, while the turn that carries it is still in
-     flight. It is composed in here rather than pushed into the loaded chat,
-     because the ten-second re-read below replaces that chat wholesale and
-     would otherwise make the message the operator just sent vanish for the
-     rest of the wait. */
-  const pending = wait && wait.pending && chatTurns(chat).length <= wait.since
-    ? [{ who: "operator", body: wait.pending.body, at: wait.pending.at }]
-    : [];
-  const turns = [...chatTurns(chat), ...pending];
-
-  const head = $("chat-status");
-  clear(head);
-  head.append(chip(status, CHAT_STATUS));
-
-  setText($("chat-h"), firstLine(chatOpener(chat)) || `Conversation ${shortId(chat.id)}`);
-  const started = when(chat.created_at);
-  setText($("chat-meta"),
-    `${shortId(chat.id)} \u00b7 ${chat.agent || "agent"} \u00b7 ${plural(turns.length, "turn", "turns")} \u00b7 started ${started.text}`);
-  setAttr($("chat-meta"), "title", `${chat.id}\nstarted ${started.title}`);
-
-  show($("chat-derived-from"), Boolean(chat.from));
-  if (chat.from) {
-    const link = $("chat-derived-from-link");
-    setText(link, shortId(chat.from));
-    setAttr(link, "href", `#/plan/${chat.from}`);
-  }
-
-  /* Turns are append-only, so the index is a stable key and reconciling can
-     never rebuild the transcript the operator is reading. */
-  const turnsMd = chatTurnsMd(chat);
-  syncList(
-    $("chat-turns"),
-    turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i), kind: "chat", conversationId: chat.id })),
-    (item) => item.key, createTurnRow, updateTurnRow,
-  );
-
-  /* Auto-scroll: on first open and when a new turn arrives. Not when the
-     turn count is unchanged (status refresh, 10-second re-read, draft
-     update) and not for the pending optimistic turn the operator just sent. */
-  const turnCount = turns.length;
-  const lastIsPending = wait && wait.pending
-    && turns.length > 0 && turns[turns.length - 1].who === "operator"
-    && turns[turns.length - 1].body === wait.pending.body;
-  if (state.openingChat) {
-    state.openingChat = false;
-    if (turnCount > 0) requestAnimationFrame(() => scrollToLastTurn("chat-turns"));
-  } else if (turnCount > state.prevTurnCount && !lastIsPending) {
-    requestAnimationFrame(() => scrollToLastTurn("chat-turns"));
-  }
-  state.prevTurnCount = turnCount;
-
-  const draft = chatDraft(chat);
-  const hasDraft = draft.trim() !== "";
-  show($("chat-draft-panel"), hasDraft);
-  if (hasDraft) {
-    setText($("chat-draft"), draft);
-    if ($("chat-draft-rendered").dataset.forDraft !== draft) {
-      $("chat-draft-rendered").dataset.forDraft = draft;
-      renderMd($("chat-draft-rendered"), chat.draft_md);
-    }
-  }
-  applyDraftView();
-  setText($("chat-draft-tag"), status === "filed" ? "filed" : "draft");
-  setAttr($("chat-draft-tag"), "data-tone", status === "filed" ? "teal" : "gold");
-  show($("chat-file"), hasDraft && status === "open");
-  renderProblems(state.chatProblems.id === chat.id ? state.chatProblems.list : []);
-
-  show($("chat-filed-panel"), status === "filed");
-  setText($("chat-filed-note"), chat.task
-    ? `Filed as task ${shortId(chat.task)}. It is in the backlog now, and the loop claims it in priority order.`
-    : "Filed into the backlog.");
-
-  const canSay = status === "open";
-  show($("chat-say"), canSay);
-  show($("chat-closed"), !canSay);
-  show($("chat-abandon-go"), canSay);
-  renderChatThumbs();
-  /* The guard against a second turn: the field and the button are both dead
-     while one is outstanding, and the button says what it is waiting for
-     rather than just greying out. An upload in flight disables Send the same
-     way - sending the ids of pictures that have not finished uploading yet
-     is not a request `web::chat_say` can even resolve. */
-  const uploading = chatAttachmentsBusy();
-  $("f-say").disabled = busy;
-  $("chat-send").disabled = busy || uploading;
-  setText($("chat-send"), busy ? "Thinking\u2026" : uploading ? "Uploading\u2026" : "Send");
-  show($("chat-wait"), busy);
-}
-
-/* The wait, in words, for whichever chat is on screen - and, regardless of
-   what is on screen, the ten-second insurance re-read for every entry in
-   state.chatWaits. Several conversations can be waiting at once now: the
-   sentence and the countdown are only ever drawn for state.chatDetail.id,
-   since there is one wait strip in the document, but every busy chat still
-   gets polled so its own turn is not left relying solely on the change
-   stream to be discovered as finished. The sentence changes only twice — once
-   when the turn starts and once when it has been going long enough to need
-   saying — while the seconds tick in a span that assistive technology never
-   reads, because a counter announced every second is unusable. */
-function tickWaits() {
-  const now = Date.now();
-  for (const [id, wait] of state.chatWaits) {
-    if (now - wait.lastPoll >= 10000) {
-      wait.lastPoll = now;
-      loadChat(id);
-    }
-  }
-
-  const box = $("chat-wait");
-  const wait = state.chatDetail.id ? state.chatWaits.get(state.chatDetail.id) : undefined;
-  if (!wait) {
-    show(box, false);
-    return;
-  }
-  const secs = Math.max(Math.round((now - wait.waitFrom) / 1000), 0);
-  setText(box.querySelector(".waiting-text"), secs >= 90
-    ? "The agent is still thinking. Long, but not stuck — it is allowed to take its time, and the reply will appear here."
-    : "The agent is thinking about your message. A turn usually takes under a minute.");
-  setText(box.querySelector(".waiting-secs"), `${secs}s`);
-  show(box, true);
-}
-
-/* Start (or restart) waiting for chat id's turn.
- *
- * since is the transcript length the turn started from and target the length
- * its landing will reach - always one more turn than whatever is already
- * known, since a turn only ever appends one reply or failure note. pending,
- * when given, is the operator's own text to show as an optimistic bubble
- * until the transcript reaches since on its own - see renderChat. It is null
- * for a turn this browser did not just send a message into (starting an
- * interview, or a wait rebuilt from the server's own `thinking` - see
- * trackIfThinking), because in both of those cases the transcript already
- * carries everything there is to show. */
-function beginChatTurn(id, since, target, pending = null) {
-  state.chatWaits.set(id, { since, target, pending, waitFrom: Date.now(), lastPoll: Date.now() });
-  if (!state.waitTimer) state.waitTimer = setInterval(tickWaits, 1000);
-  tickWaits();
-}
-
-function endChatTurn(id) {
-  if (!state.chatWaits.has(id)) return;
-  state.chatWaits.delete(id);
-  if (state.chatDetail.id === id) show($("chat-wait"), false);
-  if (state.chatWaits.size === 0 && state.waitTimer) {
-    clearInterval(state.waitTimer);
-    state.waitTimer = null;
-  }
-}
-
-/* Reconcile this browser's belief about a chat with a freshly fetched
- * ChatView - from loadChat, from loadChats, or from a POST /api/chats
- * response, all of which carry the same shape.
- *
- * Ending a wait is decided from the transcript, never from `thinking`: a
- * turn's guard (Ui::begin_turn/TurnGuard) is dropped before the CLI's answer
- * is necessarily visible everywhere this reads from, and `thinking` going
- * false is not the same event as the reply landing - see ChatView's doc for
- * that field. Starting a wait *is* taken from `thinking`, because that is the
- * only way this browser learns of a turn it did not itself send - another
- * tab, another device, or a reload that lost the chatWaits entry the first
- * beginChatTurn call made.
- *
- * A fresh reconstruction only fires when the *last recorded turn* is the
- * operator's. A turn is always exactly one operator message followed by one
- * agent reply or failure note (see chat::turn), so an agent turn already on
- * the end of the transcript means that turn already landed - `thinking` can
- * still read `true` for an instant after (chat::turn writes the reply before
- * its TurnGuard drops), and chat_say claims the guard before its own
- * chat::record write lands (so the transcript here can still end on the
- * *previous* agent turn while a new one is already in flight). Either way,
- * there is nothing this browser can safely assume the count of remaining
- * turns to be, so it waits for the next poll - typically the SSE `chats_rev`
- * bump chat::record's own write causes - rather than guess and risk building
- * a `target` that transcript growth can never reach (stuck "thinking") or one
- * a single turn satisfies too early (a busy chat reported free). */
-function trackIfThinking(chat) {
-  const wait = state.chatWaits.get(chat.id);
-  if (wait) {
-    if (chatTurns(chat).length >= wait.target) endChatTurn(chat.id);
-    return;
-  }
-  if (!chat.thinking) return;
-  const turns = chatTurns(chat);
-  const last = turns[turns.length - 1];
-  if (last && last.who === "agent") return;
-  beginChatTurn(chat.id, turns.length, turns.length + 1);
-}
-
-/* ---- repository picker -------------------------------------------------- *
- * One list, `state.repos`, feeds both selects below: the one that starts a
- * new conversation and the one that derives a conversation into a different
- * repository. Neither select is the source of truth for what gets sent -
- * the text input beside each is, so a repository outside `[repos] roots`
- * (nothing scanned, or the operator's own path) is always reachable. */
-function renderRepoOptions(select) {
-  const current = select.value;
-  clear(select);
-  select.append(el("option", { value: "", text: select.dataset.placeholder || "" }));
-  for (const repo of state.repos || []) {
-    select.append(el("option", { value: repo.path, text: repo.name }));
-  }
-  if ([...select.options].some((option) => option.value === current)) select.value = current;
-}
-
-async function loadRepos(refresh) {
-  try {
-    state.repos = await getJson(refresh ? API.reposRefresh : API.repos);
-  } catch {
-    /* The pickers just stay empty; typing a path still works. */
-    state.repos = state.repos || [];
-  }
-  renderRepoOptions($("chat-start-repo-select"));
-  renderRepoOptions($("chat-derive-repo-select"));
-}
-
-async function loadChats() {
-  try {
-    const list = await getJson(API.chats);
-    state.chats = Array.isArray(list) ? list : [];
-    /* Reconciles every conversation's wait state, not just the one on screen:
-       `thinking` is how this browser learns of a turn it did not send itself
-       (another tab, another device, or a chat started before the last
-       reload), and a turn landing while its chat is off screen still has to
-       clear the busy marker on its card. */
-    for (const chat of state.chats) trackIfThinking(chat);
-    renderChats();
-    ok();
-  } catch (error) {
-    fail(`Could not load conversations: ${error.message}`);
-  }
-}
-
-/* Refresh one conversation. This **must not** decide which conversation is on
-   screen: that is the router's job, in `applyRoute`.
- *
- * It used to open with `state.chatDetail = { id, chat: null }`, which turned
- * every refresh into a navigation. With a turn in flight, `tickWaits`'
- * ten-second insurance calls this for every *waiting* chat no matter what the
- * operator is reading, so every ten seconds the transcript on screen was
- * replaced by a different conversation while the address bar went on naming
- * the one the operator had chosen. Reported as "the screen switches by itself
- * when a plan reply arrives", and reproduced exactly that way.
- *
- * The turn is still settled from here, before the on-screen check, because
- * that is the whole point of the insurance: the reply may well land while the
- * operator is somewhere else, and the wait strip has to stop either way. */
-async function loadChat(id) {
-  try {
-    const chat = await getJson(API.chat(id));
-    /* The transcript having grown past `target` is what proves the turn
-       finished, whoever started it and whether or not this page's own
-       request has come back yet - see `trackIfThinking`. */
-    trackIfThinking(chat);
-    if (state.chatDetail.id !== id) return;   /* not on screen: nothing to draw */
-    state.chatDetail.chat = chat;
-    renderChat();
-    ok();
-  } catch (error) {
-    /* Only complain about the conversation the operator is actually reading:
-       the ten-second insurance refreshes one that may be off screen, and an
-       alert about that is noise over whatever they chose to look at. */
-    if (state.chatDetail.id === id) {
-      fail(`Could not load conversation ${shortId(id)}: ${error.message}`);
-    }
-  }
-}
-
-/* Starting an interview no longer waits for the agent's first turn - see
-   `chat_post`'s doc: the response carries the operator's idea and
-   `thinking: true`, and the reply arrives the way every other turn does,
-   through the change stream or `tickWaits`' insurance. The button is
-   disabled only for the round trip that records the idea, which is fast. */
-async function startChat() {
-  const box = $("f-idea");
-  const error = $("chat-start-error");
-  const go = $("chat-start-go");
-  const idea = box.value;
-
-  if (!idea.trim()) {
-    setText(error, "Describe the idea first \u2014 a sentence is enough.");
-    show(error, true);
-    box.focus();
-    return;
-  }
-
-  show(error, false);
-  go.disabled = true;
-  setText(go, "Starting\u2026");
-
-  const repo = $("chat-start-repo").value.trim();
-
-  try {
-    const chat = await postJson(API.chats, { idea, agent: null, repo: repo || null });
-    state.chats = sortChats([chat, ...(state.chats || []).filter((c) => c.id !== chat.id)]);
-    state.chatDetail = { id: chat.id, chat };
-    trackIfThinking(chat);
-    box.value = "";
-    renderChats();
-    announce("The interview has started.");
-    location.hash = `#/plan/${chat.id}`;
-    ok();
-  } catch (failure) {
-    setText(error, failure.message);
-    show(error, true);
-  } finally {
-    go.disabled = false;
-    setText(go, "Start the interview");
-  }
-}
-
-/* "Continue in another repository": derives a new conversation from the one
-   on screen, carrying its whole transcript and repository into the new one's
-   opening briefing as background (see `chat::derived_background` server-side).
-   The conversation on screen is left exactly as it is - this only ever
-   creates a new one. */
-async function deriveChat() {
-  const chat = state.chatDetail.chat;
-  const error = $("chat-derive-error");
-  const go = $("chat-derive-go");
-  if (!chat) return;
-
-  const repo = $("chat-derive-repo").value.trim();
-  if (!repo) {
-    setText(error, "Pick a repository, or type a path, first.");
-    show(error, true);
-    return;
-  }
-
-  show(error, false);
-  go.disabled = true;
-  setText(go, "Starting\u2026");
-
-  try {
-    const derived = await postJson(API.chats, {
-      idea: "Continue this conversation in a different repository.",
-      repo,
-      from: chat.id,
-    });
-    state.chats = sortChats([derived, ...(state.chats || []).filter((c) => c.id !== derived.id)]);
-    trackIfThinking(derived);
-    renderChats();
-    announce("Started a new conversation in the other repository.");
-    location.hash = `#/plan/${derived.id}`;
-  } catch (failure) {
-    setText(error, failure.message);
-    show(error, true);
-  } finally {
-    go.disabled = false;
-    setText(go, "Continue here");
-  }
-}
-
-async function sendTurn(event) {
-  event.preventDefault();
-  const id = state.chatDetail.id;
-  const box = $("f-say");
-  const text = box.value;
-  const attachments = state.chatAttachments.id === id
-    ? state.chatAttachments.items.filter((item) => item.status === "done")
-    : [];
-
-  /* One turn at a time *on this chat*, checked here as well as by the
-     disabled button: a double tap can beat a re-render, and a keyboard
-     shortcut does not care that the button looks dead. A turn running on a
-     different conversation is not a reason to refuse this one - the server
-     only refuses two turns on the same chat, see `Ui::begin_turn`. Same for
-     an upload still in flight on this chat - its ids do not exist yet, so
-     there is nothing valid to send. */
-  if (!id || state.chatWaits.has(id) || chatAttachmentsBusy()) return;
-  if (!text.trim() && attachments.length === 0) {
-    chatError("Say something, or attach an image, first.");
-    box.focus();
-    return;
-  }
-
-  chatError("");
-  const before = chatTurns(state.chatDetail.chat).length;
-  /* The operator's own words go up immediately, held as the pending turn
-     until the transcript on disk has grown past it. The attached images
-     stay in their own row until the response lands, rather than joining
-     this optimistic bubble - they are already visible there, and the send
-     itself is normally the only remaining wait. */
-  beginChatTurn(id, before, before + 2, { body: text, at: new Date().toISOString() });
-  box.value = "";
-  renderChat();
-  $("chat-wait").scrollIntoView({ block: "nearest" });
-
-  try {
-    /* 202: the server has recorded the message and is running the turn. It
-       does NOT wait for the agent, because holding a connection open for the
-       23-to-90 seconds a real turn takes is a coin flip on a phone — a screen
-       lock or a network handoff dropped it, the browser said "Failed to fetch",
-       and the server finished the turn anyway. So the wait stays up and the
-       reply arrives the way everything else in this client arrives: the change
-       stream, or the ten-second re-read in `tickWaits`. `loadChat` ends the
-       turn once the transcript has grown past this wait's `target`. */
-    const queued = await postJson(API.say(id), {
-      text,
-      attachments: attachments.map((item) => item.serverId),
-    });
-    /* Only when the queue we are clearing is still the one that was sent -
-       see `resetChatAttachments`'s doc for what a race here would otherwise
-       clobber. */
-    if (state.chatAttachments.id === id) resetChatAttachments(id);
-    if (state.chatDetail.id === id) {
-      state.chatDetail.chat = queued;
-      renderChat();
-      announce("Sent. The agent is answering.");
-    }
-    loadChats();
-    ok();
-  } catch (error) {
-    if (error.status === 409) {
-      /* A turn is already running on this conversation — another phone, or a
-         tap that beat the button being disabled. Nothing has gone wrong, so
-         the wait stays up: the reply lands when it lands, and the revision
-         or the ten-second re-read will bring it. */
-      announce("A turn is already running on this conversation. Waiting for it.");
-      return;
-    }
-    endChatTurn(id);
-    /* The request itself failed, which now means it failed before the server
-       recorded anything — the response no longer waits for the agent. Reload
-       anyway and say so carefully: the transcript on disk is the truth, not
-       the optimistic bubble above. The attachments stay queued: nothing was
-       lost, so the operator can just try Send again. */
-    chatError(`The message may not have been sent: ${error.message}`);
-    await loadChat(id);
-  }
-}
-
-async function fileDraft() {
-  const id = state.chatDetail.id;
-  const button = $("chat-file");
-  if (!id) return;
-
-  button.disabled = true;
-  setText(button, "Filing\u2026");
-  state.chatProblems = { id, list: [] };
-  renderProblems([]);
-  chatError("");
-
-  try {
-    const body = await postJson(API.file(id), {});
-    const task = body && typeof body.task === "string" ? body.task : null;
-    announce(task ? `Filed as task ${shortId(task)}.` : "Filed.");
-    await Promise.allSettled([loadChat(id), loadChats(), loadQueue()]);
-    ok();
-  } catch (error) {
-    const list = Array.isArray(error.problems) && error.problems.length
-      ? error.problems
-      : [error.message];
-    state.chatProblems = { id, list };
-    renderProblems(list);
-    announce(`The draft was not filed: ${plural(list.length, "problem", "problems")} to fix.`);
-    $("chat-problems").scrollIntoView({ block: "nearest" });
-  } finally {
-    button.disabled = false;
-    setText(button, "File this task");
-  }
-}
-
-async function abandonChat() {
-  const id = state.chatDetail.id;
-  const button = $("chat-abandon-go");
-  if (!id) return;
-  button.disabled = true;
-  try {
-    const chat = await postJson(API.chatAbandon(id), {});
-    if (state.chatDetail.id === id) {
-      state.chatDetail.chat = chat;
-      renderChat();
-    }
-    await loadChats();
-    announce("Conversation abandoned.");
-    ok();
-  } catch (error) {
-    chatError(`Could not abandon the conversation: ${error.message}`);
-  } finally {
-    button.disabled = false;
-  }
-}
-
 /* ---- standing chat ------------------------------------------------------ *
  * A conversation that stays open, for questions, investigation and thinking
- * out loud between tasks - as opposed to Planning above, which is a
- * one-shot interview that ends the moment a task file is written. Opening
- * one takes no agent turn, because there is nothing yet to answer (see
- * `talk::begin`'s doc); a turn here can run for `talk::TURN_TIMEOUT`, three
- * times a planning turn's budget, since the agent is expected to run
- * commands and read their output rather than answer from what it already
- * knows. The composer and the wait strip below are otherwise the same
- * pattern as Planning's `sendTurn`/`beginChatTurn`/`endChatTurn`, kept as
- * separate functions and separate state (`talkBusy`, a single slot, not
- * `chatWaits`, a map) because the two surfaces talk to two different stores
- * and must not contend for one turn guard - and because there is only ever
- * one standing chat, where Planning holds many conversations at once.
+ * out loud between tasks. Opening one takes no agent turn, because there is
+ * nothing yet to answer (see `talk::begin`'s doc); a turn here can run for
+ * `talk::TURN_TIMEOUT`, since the agent is expected to run commands and read
+ * their output rather than answer from what it already knows.
  */
 const talkTurns = (talk) => (talk && Array.isArray(talk.turns) ? talk.turns : []);
 const talkTurnsMd = (talk) => (talk && Array.isArray(talk.turn_bodies_md) ? talk.turn_bodies_md : []);
@@ -4138,12 +3080,11 @@ function talkOpener(talk) {
 }
 
 /* Open first, then newest first - the same ordering `Talks::list` uses on
-   the server, and the same reasoning `sortChats` gives for Planning: what
-   the operator is still using belongs above what they are done with. Unlike
-   Planning a talk never reorders itself out from under a filed task, since
-   filing one does not change its status - but the rule is kept anyway, so a
-   closed conversation does not jump to the top of the list the moment it is
-   closed. */
+   the server: what the operator is still using belongs above what they are
+   done with. Sorting on `updated_at` instead would lift a conversation to
+   the top on every agent reply, rearranging the list under the operator's
+   finger - so position is identity, and a closed conversation does not jump
+   to the top of the list the moment it is closed. */
 function sortTalks(list) {
   return list.slice().sort((a, b) => {
     const rank = (a.status === "open" ? 0 : 1) - (b.status === "open" ? 0 : 1);
@@ -4233,10 +3174,10 @@ async function loadTalks() {
   }
 }
 
-/* Refresh one conversation, on the same rule `loadChat` documents: this must
-   not decide which conversation is on screen, and the wait strip is settled
-   from here whether or not the reply landed while the operator was looking
-   at something else. */
+/* Refresh one conversation. This must not decide which conversation is on
+   screen - that is the router's job, in `applyRoute` - and the wait strip is
+   settled from here whether or not the reply landed while the operator was
+   looking at something else. */
 async function loadTalk(id) {
   try {
     const talk = await getJson(API.talk(id));
@@ -4331,8 +3272,7 @@ function renderTalk() {
 
   const status = String(talk.status || "open");
   /* The operator's own message, shown immediately and held until the
-     transcript on disk has grown past it - the same accommodation
-     `renderChat` makes, for the same reason: the ten-second re-read below
+     transcript on disk has grown past it - the ten-second re-read below
      replaces the whole conversation and would otherwise make the message
      the operator just sent vanish for the rest of the wait. */
   const pending = busy && state.talkPending && state.talkPending.id === talk.id
@@ -4354,14 +3294,13 @@ function renderTalk() {
   const turnsMd = talkTurnsMd(talk);
   syncList(
     $("talk-turns"),
-    turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i), kind: "talk", conversationId: talk.id })),
+    turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i), conversationId: talk.id })),
     (item) => item.key, createTurnRow, updateTurnRow,
   );
 
-  /* Auto-scroll: same rule as renderChat, against this view's own busy state
-     rather than chatWaits. The one-second tickTalkWait tick makes this
-     stricter than it is for chat - turnCount must actually hold still across
-     a render that changes nothing else, or the page would yank every second. */
+  /* Auto-scroll: the one-second tickTalkWait tick makes this stricter than a
+     one-shot render would need - turnCount must actually hold still across a
+     render that changes nothing else, or the page would yank every second. */
   const turnCount = turns.length;
   const lastIsPending = busy && state.talkPending
     && turns.length > 0 && turns[turns.length - 1].who === "operator"
@@ -4434,12 +3373,15 @@ function talkError(message) {
 }
 
 /* ---- talk composer attachments ------------------------------------------ *
- * Mirrors the chat composer's own attachment functions immediately above
- * `chatError` - see that block's doc, which explains the shape once for
- * both. Kept as its own copy against a separate piece of state
- * (`talkAttachments`, not `chatAttachments`) for the same reason `sendTurn`
- * and `sendTalkTurn` are two functions: the two surfaces talk to different
- * stores and must not contend for one queue.
+ * Three ways an image reaches the file input - the picker, a paste, or a
+ * drop, all wired in wire() below to attachTalkFiles() - and one thing that
+ * happens next: every file is POSTed the moment it arrives, well before Send
+ * is even tappable, so the thumbnail row has something to key on and a slow
+ * mobile upload is visible as progress rather than as a silent wait right
+ * before the tap that would have started it. `say` later carries only the
+ * ids this minted; see `API.talkAttachmentPost` and `web::validate_attachment`
+ * for what the server actually accepts - this side repeats none of that
+ * whitelist and just shows whatever message a rejection carries.
  */
 function talkAttachmentsBusy() {
   return state.talkAttachments.id === state.talkDetail.id
@@ -4501,8 +3443,9 @@ async function attachTalkFiles(files) {
   if (images.length === 0) return;
 
   for (const file of images) {
-    // See `attachChatFiles`'s own doc, which this mirrors: the operator can
-    // navigate to a different conversation between two files of one batch.
+    // The operator can navigate to a different conversation between two
+    // files of the same batch - every `await` below is a point where
+    // `applyRoute` can swap `state.talkAttachments` out from under this loop.
     if (state.talkAttachments.id !== id) break;
 
     const localId = nextLocalAttachmentId++;
@@ -4521,7 +3464,8 @@ async function attachTalkFiles(files) {
       item.status = "done";
       item.serverId = att.id;
     } catch (error) {
-      // Kept, not dropped - see `attachChatFiles`'s own catch block.
+      // Kept, not dropped: "error" is what lets renderTalkThumbs show the
+      // failed thumbnail instead of it vanishing without a trace.
       item.status = "error";
       if (state.talkAttachments.id === id) {
         talkError(`Could not attach ${item.name}: ${error.message}`);
@@ -4532,7 +3476,7 @@ async function attachTalkFiles(files) {
 }
 
 /* Opening a talk takes no agent turn - see `talk::begin`'s doc - so this is
-   as fast as any other write and needs none of `startChat`'s waiting state. */
+   as fast as any other write and needs no waiting state of its own. */
 async function startTalk() {
   const go = $("talk-start-go");
   go.disabled = true;
@@ -5683,7 +4627,6 @@ async function applyRevisions_(source) {
   const queueRev = source.queue_rev;
   const runsRev = source.runs_rev;
   const questionsRev = source.questions_rev;
-  const chatsRev = source.chats_rev;
   const talksRev = source.talks_rev;
   const jobs = [];
 
@@ -5702,13 +4645,6 @@ async function applyRevisions_(source) {
   }
   /* A turn landing on disk is what bumps this, so it is also how the reply
      reaches a phone whose own POST is still outstanding. */
-  if (chatsRev !== state.rev.chats) {
-    state.rev.chats = chatsRev;
-    jobs.push(loadChats());
-    if (state.route.name === "chat" && state.chatDetail.id) jobs.push(loadChat(state.chatDetail.id));
-  }
-  /* See the `chatsRev` block above: same reasoning, the standing chat's own
-     store and its own revision. */
   if (talksRev !== state.rev.talks) {
     state.rev.talks = talksRev;
     jobs.push(loadTalks());
@@ -5774,9 +4710,6 @@ function parseRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (parts[0] === "queue") return { name: "queue", id: null };
   if (parts[0] === "questions") return { name: "questions", id: null };
-  /* `plan` rather than `chats`, because that is the command it replaces. */
-  if (parts[0] === "plan" && parts[1]) return { name: "chat", id: decodeURIComponent(parts[1]) };
-  if (parts[0] === "plan") return { name: "chats", id: null };
   if (parts[0] === "chat" && parts[1]) return { name: "talk", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "chat") return { name: "talks", id: null };
   if (parts[0] === "runs" && parts[1]) return { name: "run", id: decodeURIComponent(parts[1]) };
@@ -5792,8 +4725,6 @@ function applyRoute() {
   show($("view-run"), route.name === "run");
   show($("view-queue"), route.name === "queue");
   show($("view-questions"), route.name === "questions");
-  show($("view-chats"), route.name === "chats");
-  show($("view-chat"), route.name === "chat");
   show($("view-talks"), route.name === "talks");
   show($("view-talk"), route.name === "talk");
 
@@ -5804,7 +4735,6 @@ function applyRoute() {
   if (route.name !== "run") closeRunActions();
 
   const section = route.name === "run" ? "runs"
-    : route.name === "chat" ? "chats"
     : route.name === "talk" ? "talks"
     : route.name;
   for (const link of document.querySelectorAll("[data-nav]")) {
@@ -5821,35 +4751,6 @@ function applyRoute() {
      flash the previous transcript first. The in-flight turn is deliberately
      not cancelled: it is running on the server either way, and coming back
      to the conversation re-reads it. */
-  if (route.name === "chat") {
-    /* A chat routes to the last turn's top instead of the page top. Set
-       before the renderChat() calls below — including the synchronous one a
-       few lines down — so it is already true whether the chat is fetched
-       here (loadChat's later renderChat picks it up) or was already cached
-       (e.g. startChat() sets state.chatDetail before changing the hash, so
-       the render below is the only one that runs). Arriving via a hash
-       change to the same chat (e.g. tapping the same conversation again) is
-       not a route change here, so it scrolls to top as before and
-       openingChat stays false. */
-    if (changed) state.openingChat = true;
-    if (state.chatDetail.id !== route.id) {
-      /* A pending picture belongs to the conversation the operator was
-         composing into, not to whichever one they navigate to next. */
-      resetChatAttachments(route.id);
-      state.chatDetail = { id: route.id, chat: null };
-      loadChat(route.id);
-    }
-    /* Rendered unconditionally: starting an interview sets the conversation
-       and then changes the hash, so by the time this runs the chat is already
-       loaded and the id already matches. Rendering only on a change left that
-       path showing "Loading conversation" forever. */
-    renderChat();
-  } else if (state.chatDetail.id) {
-    resetChatAttachments(null);
-    state.chatDetail = { id: null, chat: null };
-  }
-
-  /* Same rule as the chat block above, for the standing chat's own store. */
   if (route.name === "talk") {
     if (changed) state.openingTalk = true;
     if (state.talkDetail.id !== route.id) {
@@ -5867,16 +4768,6 @@ function applyRoute() {
   /* The operator arrived to answer one specific thing, so the caret goes on
      it rather than on the top of the document. */
   if (changed && route.name === "questions") focusFirstAsk();
-  /* Same for a Plan control that navigated here: the caret goes on the idea
-     box, not the top of the document. */
-  if (changed && route.name === "chats" && state.planFocus) {
-    state.planFocus = false;
-    requestAnimationFrame(() => $("f-idea").focus());
-  }
-  /* No revision to poll here (see the "design deliberations" block above),
-     so a first arrival is the trigger - same as `loadRepos` never being
-     re-fetched on its own either. */
-  if (route.name === "chats" && state.drafts === null) loadDrafts();
   renderTitle();
 }
 
@@ -5944,26 +4835,6 @@ async function saveTaskEdit() {
   }
 }
 
-/* ---- plan -------------------------------------------------------------- */
-/* Planning is the only way work gets in from this UI: an agent interviews
-   the operator into a task file, the way `magi plan` would in a terminal.
-   So every Plan control - the nav items and the empty-state buttons - lands
-   on the planning page and puts the caret in the idea box, even when that
-   page is already showing. */
-function openPlan() {
-  if (location.hash === "#/plan") {
-    /* Already there, so no hash change will unwrap a hidden view: the caret
-       can go straight in. */
-    requestAnimationFrame(() => $("f-idea").focus());
-    return;
-  }
-  /* On the way there the focus has to wait for applyRoute to unhide the
-     panel - an element inside a hidden view cannot take focus. The flag
-     rides the route change and is cleared once the caret has landed. */
-  state.planFocus = true;
-  location.hash = "#/plan";
-}
-
 /* ---- theme ------------------------------------------------------------- */
 const THEMES = ["auto", "light", "dark"];
 const THEME_LABEL = {
@@ -5990,12 +4861,11 @@ function applyTheme(theme) {
   }
 }
 
-/* The three ways an image reaches a composer, wired once per surface (chat,
-   talk) instead of by hand in `wire()` twice over: the file input's own
-   `change`, a paste into the textarea, and a drop on either the composer or
-   the transcript above it - "入力欄ないし会話パネル" is both, so both are
-   drop targets. `attach` is `attachChatFiles` or `attachTalkFiles`; neither
-   this function nor its caller needs to know which. */
+/* The three ways an image reaches a composer: the file input's own `change`,
+   a paste into the textarea, and a drop on either the composer or the
+   transcript above it - "入力欄ないし会話パネル" is both, so both are drop
+   targets. Takes `attach` as a parameter so a second composer could reuse
+   this without this function needing to know which one it is wiring. */
 function wireAttachments({ fileInput, say, turns, box, attach }) {
   const input = $(fileInput);
   input.addEventListener("change", () => {
@@ -6042,10 +4912,6 @@ function wireAttachments({ fileInput, say, turns, box, attach }) {
 
 /* ---- boot -------------------------------------------------------------- */
 function wire() {
-  for (const entry of document.querySelectorAll("[data-plan]")) {
-    entry.addEventListener("click", openPlan);
-  }
-
   $("run-actions-fab").addEventListener("click", openRunActions);
   $("run-actions-close").addEventListener("click", closeRunActions);
   /* Clicking the backdrop hits the dialog element itself, since nothing else
@@ -6083,29 +4949,12 @@ function wire() {
     $("run-report").dataset.wrap = state.wrap ? "1" : "0";
   });
 
-  $("chat-draft-raw-toggle").addEventListener("click", () => {
-    state.draftRaw = !state.draftRaw;
-    applyDraftView();
-  });
-
   $("alert-retry").addEventListener("click", () => {
     ok();
     loadHealth({ applyRevisions: true });
     loadQuestions();
-    loadChats();
     if (state.route.name === "run" && state.detail.id) loadRun(state.detail.id);
-    if (state.route.name === "chat" && state.chatDetail.id) loadChat(state.chatDetail.id);
     if (state.route.name === "talk" && state.talkDetail.id) loadTalk(state.talkDetail.id);
-  });
-
-  $("chat-start-go").addEventListener("click", startChat);
-  $("chat-say").addEventListener("submit", sendTurn);
-  $("chat-file").addEventListener("click", fileDraft);
-  $("chat-abandon-go").addEventListener("click", abandonChat);
-  $("chat-derive-go").addEventListener("click", deriveChat);
-  wireAttachments({
-    fileInput: "chat-file-input", say: "chat-say", turns: "chat-turns", box: "f-say",
-    attach: attachChatFiles,
   });
 
   $("talk-start-go").addEventListener("click", startTalk);
@@ -6130,27 +4979,6 @@ function wire() {
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
       event.preventDefault();
       $("talk-say").requestSubmit();
-    }
-  });
-
-  /* Picking a repository fills the text field beside it, which is what
-     actually gets sent - so a checkout outside `[repos] roots` stays
-     reachable by typing a path even when the picker has nothing in it. */
-  $("chat-start-repo-select").addEventListener("change", (event) => {
-    $("chat-start-repo").value = event.target.value;
-  });
-  $("chat-derive-repo-select").addEventListener("change", (event) => {
-    $("chat-derive-repo").value = event.target.value;
-  });
-  $("chat-start-repo-refresh").addEventListener("click", () => loadRepos(true));
-  $("plan-drafts-refresh").addEventListener("click", () => loadDrafts());
-  $("plan-draft-detail-close").addEventListener("click", closeDraftDetail);
-  /* Enter inserts a newline, because on a phone that is the only way to type
-     a paragraph. Ctrl or Cmd with Enter sends, for the desktop. */
-  $("f-say").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-      event.preventDefault();
-      $("chat-say").requestSubmit();
     }
   });
 
@@ -6187,13 +5015,12 @@ async function boot() {
     state.rev.queue = state.health.queue_rev;
     state.rev.runs = state.health.runs_rev;
     state.rev.questions = state.health.questions_rev;
-    state.rev.chats = state.health.chats_rev;
     state.rev.talks = state.health.talks_rev;
     state.rev.loop = state.health.loop_rev;
     if (state.health.loop) state.loop = state.health.loop;
   }
   await Promise.allSettled([
-    loadRuns(), loadQueue(), loadQuestions(), loadChats(), loadTalks(), loadRepos(false),
+    loadRuns(), loadQueue(), loadQuestions(), loadTalks(),
   ]);
 
   subscribe();

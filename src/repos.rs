@@ -1,12 +1,7 @@
-//! Local repository discovery for the plan surface's repository picker.
+//! Local repository discovery: `magi repos` and `GET /api/repos`.
 //!
-//! `magi plan` and the browser interview both start against one repository -
-//! whatever `--repo` or `magi web --repo` named at startup - and until now
-//! that was also the only repository either surface could ever reach. This
-//! module is what lets an operator name a *different* checkout without
-//! typing its full path: [`scan`] walks the roots named in `[repos] roots`
-//! for a ghq-layout checkout (`<root>/<host>/<owner>/<repo>`), and [`resolve`]
-//! turns a short name like `yukimemi/rvpm` into the one path it names.
+//! [`scan`] walks the roots named in `[repos] roots` for a ghq-layout
+//! checkout (`<root>/<host>/<owner>/<repo>`).
 //!
 //! # Read-only, and cheap enough to repeat
 //!
@@ -14,24 +9,22 @@
 //! reached over the network - the whole point is that this is a filesystem
 //! fact about the operator's own machine. [`Cache`] exists only because a scan
 //! still means walking however many roots the operator configured on every
-//! request, and a phone re-opening the "start a conversation" panel should
-//! not repeat that walk every time. It is trusted for `[repos] scan_ttl`
-//! seconds and can always be forced with an explicit refresh.
+//! request, and the web server should not repeat that walk on every poll. It
+//! is trusted for `[repos] scan_ttl` seconds and can always be forced with an
+//! explicit refresh.
 //!
 //! # One implementation, two callers
 //!
-//! [`scan`] and [`resolve`] are the whole surface, and both `magi repos` /
-//! `magi plan --repo` (see [`crate::plan`]) and `GET /api/repos` (see
-//! [`crate::web`]) call them rather than each walking the filesystem in its
-//! own way. [`Cache`] wraps [`scan`] for the web server, which asks on every
-//! request; the CLI, invoked once per command, has no cache to keep.
+//! [`scan`] is the whole surface, and both `magi repos` and `GET /api/repos`
+//! (see [`crate::web`]) call it rather than each walking the filesystem in
+//! its own way. [`Cache`] wraps [`scan`] for the web server, which asks on
+//! every request; the CLI, invoked once per command, has no cache to keep.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
 use serde::Serialize;
 
 /// One repository found under a configured root.
@@ -78,28 +71,6 @@ pub fn scan(roots: &[PathBuf]) -> Vec<Repo> {
     }
     out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
     out
-}
-
-/// Resolve a short name (`owner/repo`) to exactly one path.
-///
-/// Refuses rather than choosing when the name is ambiguous - two hosts or two
-/// roots both holding an `owner/repo` - because silently picking one would
-/// send a task to whichever checkout happened to sort first, and that is not
-/// a decision to make quietly on the operator's behalf.
-pub fn resolve(roots: &[PathBuf], name: &str) -> Result<PathBuf> {
-    let hits: Vec<Repo> = scan(roots).into_iter().filter(|r| r.name == name).collect();
-    match hits.len() {
-        1 => Ok(hits.into_iter().next().expect("exactly one hit").path),
-        0 => bail!("no repository named `{name}` found under the configured [repos] roots"),
-        _ => bail!(
-            "`{name}` matches {} repositories:\n{}",
-            hits.len(),
-            hits.iter()
-                .map(|r| format!("  {}", r.path.display()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ),
-    }
 }
 
 /// Immediate subdirectories of `dir`, or none when it cannot be read.
@@ -211,46 +182,6 @@ mod tests {
         // set up in a test.
         let repos = scan(&[root.clone(), root]);
         assert_eq!(repos.len(), 1);
-    }
-
-    #[test]
-    fn resolve_finds_the_one_match() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().to_owned();
-        let expected = make(&root, "github.com", "yukimemi", "magi", true);
-
-        let path = resolve(&[root], "yukimemi/magi").expect("must resolve");
-        assert_eq!(path, expected.canonicalize().expect("canonicalize"));
-    }
-
-    #[test]
-    fn resolve_refuses_an_ambiguous_name_and_lists_every_candidate() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().to_owned();
-        let a = make(&root, "github.com", "yukimemi", "magi", true);
-        let b = make(&root, "gitlab.com", "yukimemi", "magi", true);
-
-        let err = resolve(&[root], "yukimemi/magi")
-            .expect_err("two hosts share the name")
-            .to_string();
-        assert!(err.contains("2 repositories"), "{err}");
-        assert!(
-            err.contains(&a.canonicalize().unwrap().display().to_string()),
-            "{err}"
-        );
-        assert!(
-            err.contains(&b.canonicalize().unwrap().display().to_string()),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn resolve_names_the_missing_name_when_nothing_matches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let err = resolve(&[tmp.path().to_owned()], "nope/nope")
-            .expect_err("nothing to find")
-            .to_string();
-        assert!(err.contains("nope/nope"), "{err}");
     }
 
     #[test]
