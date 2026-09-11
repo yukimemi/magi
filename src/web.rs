@@ -317,8 +317,8 @@ pub struct Ui {
     /// concurrency.
     resuming: Arc<Mutex<HashSet<String>>>,
     /// The last scan of `[repos] roots`, and when it happened. Shared across
-    /// requests so a phone opening the repository picker repeatedly does not
-    /// repeat the filesystem walk every time - see [`repos::Cache`].
+    /// requests so polling `GET /api/repos` repeatedly does not repeat the
+    /// filesystem walk every time - see [`repos::Cache`].
     repos_cache: repos::Cache,
     /// Merge mode override handed to the loop this process starts.
     merge: Option<String>,
@@ -2399,13 +2399,12 @@ struct ReposQuery {
     refresh: u8,
 }
 
-/// `GET /api/repos` - the repository picker for the standing chat's "start a
-/// conversation" panel.
+/// `GET /api/repos` - local checkouts found under `[repos] roots`, the same
+/// listing `magi repos` prints at a terminal.
 ///
-/// Reads `[repos] roots` and `[repos] scan_ttl` off the same config the rest
-/// of that surface uses, discovered against `ui.repo` so an edit to
-/// `magi.toml` takes effect without a restart, the same reasoning
-/// [`config_for`] documents for the talk routes.
+/// Reads `[repos] roots` and `[repos] scan_ttl` discovered against `ui.repo`
+/// so an edit to `magi.toml` takes effect without a restart, the same
+/// reasoning [`config_for`] documents for the talk routes.
 async fn repos_list(
     State(ui): State<Arc<Ui>>,
     Query(q): Query<ReposQuery>,

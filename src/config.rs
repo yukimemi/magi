@@ -672,8 +672,7 @@ impl Default for Daemon {
     }
 }
 
-/// Where `magi plan` and the browser interview look for a repository other
-/// than the one they were started against.
+/// Where `magi repos` and `GET /api/repos` look for local checkouts.
 ///
 /// `roots` is one of the array keys [`array_merge_policy`] marks as
 /// append-across-layers: which checkouts exist in general is a *machine*
