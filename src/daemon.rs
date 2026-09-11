@@ -648,6 +648,25 @@ pub fn settle(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usi
     }
 }
 
+/// [`settle`], plus attaching the run's own [`diagnostic`] excerpt once the
+/// task ends up held.
+///
+/// The one place [`attempt`] (a live finish) and [`reclaim`] (recovering one a
+/// dead daemon never got back to) share this, so the two cannot drift into
+/// disagreeing about which held tasks get a diagnostic.
+fn settle_and_diagnose(
+    task: &mut Task,
+    verdict: Verdict,
+    detail: &str,
+    max_attempts: usize,
+    state: &RunState,
+) {
+    settle(task, verdict, detail, max_attempts);
+    if task.status == TaskStatus::Held {
+        task.diagnostic = diagnostic(state);
+    }
+}
+
 /// Reconcile a task left at [`TaskStatus::Running`] by a daemon that never
 /// got back to [`settle`] for it — a crash, a `SIGKILL`, or a run carried on
 /// by some other means entirely, like a manual `magi run` resume that
@@ -672,7 +691,7 @@ fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize) {
                 "recovered a `running` task whose daemon never recorded the outcome: {}",
                 describe(&state)
             );
-            settle(task, verdict, &detail, max_attempts);
+            settle_and_diagnose(task, verdict, &detail, max_attempts, &state);
         }
         None => {
             let why = "task was `running` with no live daemon and no readable \
@@ -1304,7 +1323,7 @@ async fn attempt(
         // `Stalled` quota loss; see `settle`'s doc table.
         no_viable_candidates: runner.state.viable().is_empty(),
     };
-    settle(task, verdict, &detail, opts.max_attempts);
+    settle_and_diagnose(task, verdict, &detail, opts.max_attempts, &runner.state);
     record(queue, task);
     tracing::info!(
         "task {} is {} after run {} ({})",
@@ -1558,6 +1577,82 @@ fn describe(state: &RunState) -> String {
     detail
 }
 
+/// Upper bound on [`Task::diagnostic`]'s length, in bytes.
+///
+/// The task file lives in the backlog indefinitely; a diagnostic is an
+/// excerpt of the run's own `artifacts/`, not a copy of them, so this has to
+/// stay small regardless of how much a gate command or a candidate printed.
+const DIAGNOSTIC_MAX: usize = 4_000;
+
+/// Tail kept from a single failing command's output inside a diagnostic.
+/// Smaller than [`crate::graph`]'s own `OUTPUT_TAIL` on purpose: this is a
+/// pointer for a human deciding whether to go read the full artifact by hand,
+/// not a replacement for reading it.
+const DIAGNOSTIC_OUTPUT_TAIL: usize = 800;
+
+/// Assemble a bounded diagnostic excerpt from a held task's own run, so
+/// `magi task show` says more than the one-line reason in [`describe`].
+///
+/// The one-liner answers "where did the run stop"; this answers "what would a
+/// human have found opening `artifacts/` by hand" — the point of the whole
+/// feature is the case that one-liner actively misleads on: a run held as "no
+/// candidate produced a change" can mean the implementer actually finished
+/// the task (opened a PR, merged it, tagged a release) and only left a clean
+/// local worktree behind, which reads as "nothing happened" unless someone
+/// goes and reads what the agent actually said. `None` when the run carries
+/// none of the three shapes this recognises — an ordinary run held for
+/// something not diagnosable from `RunState` alone still explains itself
+/// through `Task::last_error`.
+fn diagnostic(state: &RunState) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Gate failure: which check(s), and the tail of what each printed.
+    for o in state.gate.iter().filter(|o| !o.ok()) {
+        parts.push(format!(
+            "gate `{}` failed ({:?}):\n{}",
+            o.command,
+            o.code,
+            crate::run::tail(&o.output_tail, DIAGNOSTIC_OUTPUT_TAIL)
+        ));
+    }
+
+    // The land loop gave up because the fixer declined while checks were
+    // still red: the message already names them (see `land::run`).
+    if let Some(last) = state
+        .events
+        .iter()
+        .rev()
+        .find(|e| e.node == "land" && e.message.contains("fixer produced no commit"))
+    {
+        parts.push(last.message.clone());
+    }
+
+    // No viable candidate: every implementer's own final word, sanitized the
+    // same way a judge would have read it, so a run that actually finished
+    // the job does not read as an unexplained failure.
+    if state.viable().is_empty() {
+        for c in &state.candidates {
+            if !c.summary.trim().is_empty() {
+                parts.push(format!("candidate {}: {}", c.label, c.summary.trim()));
+            } else if let Some(why) = &c.failed {
+                parts.push(format!("candidate {}: {why}", c.label));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+    // `run::tail` prefixes an "N earlier bytes omitted" marker whose own
+    // length depends on N, so asking it for exactly `DIAGNOSTIC_MAX` can come
+    // back slightly over. Leave it enough room to always land under the
+    // limit.
+    Some(crate::run::tail(
+        &parts.join("\n\n"),
+        DIAGNOSTIC_MAX.saturating_sub(100),
+    ))
+}
+
 /// Stable lower-case name for a run status, for logs and task errors.
 /// One definition of a status's name, on the type that owns it: this table
 /// used to live here as a second copy, and a status renamed in one place would
@@ -1590,6 +1685,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use crate::queue::{Source, TaskStatus};
+    use crate::run::{Candidate, CommandOutcome};
     use pretty_assertions::assert_eq;
 
     fn task() -> Task {
@@ -2160,6 +2256,164 @@ mod tests {
         );
         state.status = status;
         state
+    }
+
+    fn candidate(label: char, summary: &str, empty: bool, failed: Option<&str>) -> Candidate {
+        Candidate {
+            index: 0,
+            label,
+            agent: "claude".to_owned(),
+            branch: format!("magi/x/{label}"),
+            worktree: PathBuf::from("/repo"),
+            summary: summary.to_owned(),
+            stat: String::new(),
+            files: 0,
+            commits: usize::from(!empty),
+            empty,
+            failed: failed.map(str::to_owned),
+            duration_ms: 0,
+            folded: false,
+        }
+    }
+
+    #[test]
+    fn diagnostic_names_the_failing_gate_checks_and_their_output() {
+        let mut state = run_state(RunStatus::Blocked);
+        state.gate = vec![
+            CommandOutcome {
+                command: "cargo make check".to_owned(),
+                code: Some(0),
+                output_tail: "ok".to_owned(),
+                duration_ms: 0,
+            },
+            CommandOutcome {
+                command: "cargo test".to_owned(),
+                code: Some(101),
+                output_tail: "thread 'x' panicked: assertion failed".to_owned(),
+                duration_ms: 0,
+            },
+        ];
+        let d = diagnostic(&state).expect("a failing gate must produce a diagnostic");
+        assert!(d.contains("cargo test"), "{d}");
+        assert!(
+            !d.contains("cargo make check"),
+            "a passing check is not a diagnostic: {d}"
+        );
+        assert!(d.contains("assertion failed"), "{d}");
+    }
+
+    #[test]
+    fn diagnostic_names_the_checks_the_fixer_gave_up_in_front_of() {
+        let mut state = run_state(RunStatus::Blocked);
+        state.event(
+            "land",
+            "stopped: the fixer produced no commit while 2 check(s) were failing \
+             (build, lint); stopping instead of looping on an unchanged tree",
+        );
+        let d = diagnostic(&state).expect("a stalled land loop must produce a diagnostic");
+        assert!(d.contains("build"), "{d}");
+        assert!(d.contains("lint"), "{d}");
+        assert!(d.contains("fixer produced no commit"), "{d}");
+    }
+
+    #[test]
+    fn diagnostic_carries_a_candidates_own_final_word_when_none_was_viable() {
+        // The whole point of the feature: a run held as "no candidate produced
+        // a change" can mean the implementer actually finished the task and
+        // only left a clean local tree behind - see AGENTS.md on this exact
+        // failure mode. The diagnostic has to carry what the agent actually
+        // said, not just the fact that nothing was there to judge.
+        let mut state = run_state(RunStatus::Failed);
+        state.candidates = vec![candidate(
+            'A',
+            "opened pull request #42, merged it, tagged v1.2.3 and published the release",
+            true,
+            None,
+        )];
+        let d = diagnostic(&state).expect("an empty candidate with a summary must be surfaced");
+        assert!(d.contains("candidate A"), "{d}");
+        assert!(d.contains("tagged v1.2.3"), "{d}");
+    }
+
+    #[test]
+    fn diagnostic_falls_back_to_a_candidates_failure_reason_when_it_has_no_summary() {
+        let mut state = run_state(RunStatus::Failed);
+        state.candidates = vec![candidate('A', "", true, Some("agent timed out"))];
+        let d = diagnostic(&state).expect("a candidate's own failure reason must be surfaced");
+        assert!(d.contains("candidate A"), "{d}");
+        assert!(d.contains("agent timed out"), "{d}");
+    }
+
+    #[test]
+    fn diagnostic_is_none_when_nothing_recognisable_explains_the_hold() {
+        // A viable candidate existed, the gate never ran, and nothing land
+        // said matches - `Task::last_error` is left to explain this one alone.
+        let mut state = run_state(RunStatus::Failed);
+        state.candidates = vec![candidate('A', "did the work", false, None)];
+        assert!(diagnostic(&state).is_none());
+    }
+
+    #[test]
+    fn diagnostic_is_bounded_however_much_a_run_printed() {
+        let mut state = run_state(RunStatus::Blocked);
+        state.gate = vec![
+            CommandOutcome {
+                command: "cargo test".to_owned(),
+                code: Some(101),
+                output_tail: "x".repeat(50_000),
+                duration_ms: 0,
+            },
+            CommandOutcome {
+                command: "cargo clippy".to_owned(),
+                code: Some(1),
+                output_tail: "y".repeat(50_000),
+                duration_ms: 0,
+            },
+        ];
+        state.candidates = vec![
+            candidate('A', &"z".repeat(50_000), true, None),
+            candidate('B', &"w".repeat(50_000), true, None),
+        ];
+        let d = diagnostic(&state).expect("plenty here to diagnose");
+        assert!(
+            d.len() <= DIAGNOSTIC_MAX,
+            "diagnostic grew to {} bytes, unbounded",
+            d.len()
+        );
+    }
+
+    #[test]
+    fn settle_and_diagnose_attaches_a_diagnostic_only_once_the_task_is_held() {
+        let mut state = run_state(RunStatus::Blocked);
+        state.gate = vec![CommandOutcome {
+            command: "cargo test".to_owned(),
+            code: Some(101),
+            output_tail: "assertion failed".to_owned(),
+            duration_ms: 0,
+        }];
+        let verdict = Verdict {
+            status: RunStatus::Blocked,
+            left_pr: false,
+            quota_hit: false,
+            parked: false,
+            no_viable_candidates: false,
+        };
+
+        // Attempt one of two still has a retry coming: no diagnostic yet, the
+        // task is going to run again and this run's evidence would go stale.
+        let mut t = task();
+        t.start("run-1".to_owned());
+        settle_and_diagnose(&mut t, verdict, "gate failed", 2, &state);
+        assert_eq!(t.status, TaskStatus::Failed);
+        assert!(t.diagnostic.is_none());
+
+        // Attempt two exhausts the budget: now it is held, and the
+        // diagnostic is what `magi task show` has to say more than one line.
+        t.start("run-2".to_owned());
+        settle_and_diagnose(&mut t, verdict, "gate failed", 2, &state);
+        assert_eq!(t.status, TaskStatus::Held);
+        let d = t.diagnostic.expect("a held task must carry its diagnostic");
+        assert!(d.contains("cargo test"), "{d}");
     }
 
     fn approval_question(run: &str) -> ask::Question {
