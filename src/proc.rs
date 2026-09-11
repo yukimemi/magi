@@ -159,6 +159,72 @@ mod tests {
         assert_eq!(args, ["status", "--short"]);
     }
 
+    /// Every `Command::new` in this crate's own sources is either quieted or
+    /// carries one of the two exemptions this module's doc explains.
+    ///
+    /// A textual scan, not a lint: nothing in `cargo clippy` knows that a
+    /// console-app child of a console-less parent gets a window, so nothing
+    /// catches a spawn that forgot `.quiet()` short of a human reading every
+    /// call site - which is exactly how `disk.rs`'s PowerShell probe and
+    /// `graph.rs`'s `gh pr create` went unquieted despite every neighbouring
+    /// spawn getting it right. Each `Command::new` is checked against the
+    /// text between it and the next one in the same file (or end of file),
+    /// which is always enough to cover its own builder chain and never
+    /// bleeds into an unrelated spawn's exemption.
+    #[test]
+    fn every_spawn_in_the_crate_is_quiet_or_documented_as_exempt() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&src_dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_owned();
+            if file_name == "tui.rs" {
+                // explorer / open / xdg-open: GUI launchers, not console
+                // children - out of scope by design (see AGENTS.md).
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source file");
+            let lines: Vec<&str> = text.lines().collect();
+            let spawn_at: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.contains("Command::new("))
+                .map(|(i, _)| i)
+                .collect();
+            for (pos, &start) in spawn_at.iter().enumerate() {
+                let end = spawn_at.get(pos + 1).copied().unwrap_or(lines.len());
+                let block = lines[start..end].join("\n");
+                if block.contains(".quiet()") {
+                    continue;
+                }
+                // `spawn_successor`'s DETACHED_PROCESS successor has no
+                // console to inherit in the first place; see its doc comment
+                // in `web.rs`.
+                if block.contains("DETACHED_PROCESS") {
+                    continue;
+                }
+                // A spawn guarded by `#[cfg(unix)]` a few lines above cannot
+                // hit the Windows console bug at all.
+                let preceding = lines[start.saturating_sub(5)..start].join("\n");
+                if preceding.contains("#[cfg(unix)]") {
+                    continue;
+                }
+                offenders.push(format!("{file_name}:{}", start + 1));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "Command::new without .quiet() and no documented exemption: {offenders:?}"
+        );
+    }
+
     #[test]
     fn this_process_is_alive_and_a_pid_nothing_ever_reuses_is_not() {
         assert!(pid_alive(std::process::id()), "this test is running");

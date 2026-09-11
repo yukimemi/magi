@@ -581,6 +581,7 @@ fn to_record(
 mod tests {
     use super::*;
     use crate::config::{AgentKind, Graph, Roles};
+    use crate::proc::Quiet as _;
 
     /// A `kind = "command"` agent that discards its prompt and prints `output`
     /// verbatim: `cat` drains stdin so `invoke`'s writer never blocks, and the
@@ -652,6 +653,7 @@ mod tests {
             let out = std::process::Command::new("git")
                 .args(args)
                 .current_dir(dir)
+                .quiet()
                 .output()
                 .expect("spawn git");
             assert!(

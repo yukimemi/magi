@@ -3688,6 +3688,7 @@ async fn gh_pr_create(cwd: &Path, base: &str, head: &str, body: &str) -> Result<
             "pr", "create", "--base", base, "--head", head, "--title", &title, "--body", body,
         ])
         .current_dir(cwd)
+        .quiet()
         .stdin(std::process::Stdio::null())
         .output()
         .await
@@ -3919,6 +3920,7 @@ mod tests {
             let out = std::process::Command::new("git")
                 .args(args)
                 .current_dir(dir)
+                .quiet()
                 .output()
                 .expect("spawn git");
             assert!(

@@ -1139,6 +1139,7 @@ async fn task_text(words: &[String], file: Option<&Path>, issue: Option<u64>) ->
                 "--template",
                 "{{.title}}\n\n{{.body}}",
             ])
+            .quiet()
             .output()
             .await
             .context("spawn gh (is the GitHub CLI installed?)")?;
@@ -1872,6 +1873,7 @@ async fn task_source(issue: Option<u64>) -> Source {
                 "-q",
                 ".nameWithOwner",
             ])
+            .quiet()
             .output()
             .await
             .ok()
