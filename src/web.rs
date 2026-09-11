@@ -2552,12 +2552,18 @@ async fn drafts_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<DraftSumma
 struct DraftAdvisorsView {
     #[serde(flatten)]
     advice: advise::Advice,
-    /// The task file's current text. `None` only if `<id>.md` is missing on
-    /// disk (removed by hand) - never because synthesis has not run yet: by
-    /// the time `<id>.advisors.json` exists at all, [`crate::advise::run`]
-    /// has already overwritten the draft with its synthesis, or the whole
-    /// stage failed and this endpoint has nothing to serve in the first
-    /// place.
+    /// The task file the deliberation produced, or `None` when there is
+    /// nothing yet worth calling that.
+    ///
+    /// Gated on `advice.synthesized`, not on whether `<id>.md` merely exists:
+    /// [`crate::advise::run`] writes `<id>.advisors.json` unconditionally,
+    /// before any of its own checks that could still bail - an advisor
+    /// roster that produced nothing usable, a planner crash, a synthesis
+    /// `vet` rejects - and every one of those leaves `<id>.md` exactly as
+    /// the interview wrote it. Serving that text under the same key a
+    /// successful run uses would present the raw, un-synthesized interview
+    /// draft as the deliberation's output, which is not what it is - see
+    /// [`advise::Advice::synthesized`].
     draft: Option<String>,
     /// The same text, pre-parsed - the plan surface's other markdown views
     /// all render a server-parsed tree rather than trusting a client-side
@@ -2566,25 +2572,34 @@ struct DraftAdvisorsView {
 }
 
 /// `GET /api/drafts/{id}/advisors` - the raw record of `magi plan`'s headless
-/// design-deliberation stage for one draft, plus the task file it produced.
+/// design-deliberation stage for one draft, plus the task file it produced,
+/// when it produced one.
 ///
 /// `magi plan` runs from a terminal, and a phone has none: this is the plan
 /// surface's read of what the CLI interview produced, straight off
 /// `<magi home>/drafts/<id>.advisors.json` - the file [`crate::advise::run`]
-/// writes unconditionally, before any check of its own that could still bail
-/// - and `<id>.md` alongside it.
+/// writes unconditionally, before any check of its own that could still
+/// bail, and, only once that deliberation actually finished, `<id>.md`
+/// alongside it.
 async fn draft_advisors(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<DraftAdvisorsView>> {
     blocking(move || {
         let dir = ui.home.join("drafts");
+        let id = resolve_draft(&dir, &id)?;
         let path = dir.join(format!("{id}.advisors.json"));
         let raw = std::fs::read_to_string(&path)
             .map_err(|_| ApiError::not_found(format!("no advisor record for draft `{id}`")))?;
         let advice: advise::Advice = serde_json::from_str(&raw)
             .map_err(|e| ApiError::internal(format!("parse {}: {e:#}", path.display())))?;
-        let draft = std::fs::read_to_string(dir.join(format!("{id}.md"))).ok();
+        // Un-synthesized is the same as absent here: `<id>.md` is still the
+        // raw interview draft, not this deliberation's output, and must
+        // never be shown as if it were.
+        let draft = advice
+            .synthesized
+            .then(|| std::fs::read_to_string(dir.join(format!("{id}.md"))).ok())
+            .flatten();
         let draft_md = draft
             .as_deref()
             .map(|body| md::to_nodes(body, &md::ImageBase::None));
@@ -3875,6 +3890,42 @@ async fn talk_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiRe
 /// Expand an id or short id to exactly one talk id.
 fn resolve_talk(store: &Talks, id: &str) -> ApiResult<String> {
     pick(store.list().into_iter().map(|t| t.id).collect(), id, "talk")
+}
+
+/// Every draft id with a `<id>.advisors.json` on disk under `dir` - the same
+/// set [`drafts_list`] enumerates, and the only ids [`resolve_draft`] may
+/// hand back.
+fn draft_ids(dir: &FsPath) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(".advisors.json"))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// Expand an id or short id to exactly one draft id, the same guard
+/// [`resolve_task`] and [`resolve_talk`] give every other path parameter
+/// that ends up joined into a filesystem path.
+///
+/// `draft_advisors` used to hand the URL's `id` straight to
+/// `dir.join(format!("{id}.advisors.json"))`. Axum percent-decodes a path
+/// parameter after splitting the request path on literal `/`, so an id typed
+/// as `..%2F..%2Fetc%2Fpasswd` arrives here as `../../etc/passwd` - a value
+/// `Path<String>` never rejects, since encoding the separator sidesteps the
+/// router's own segment split. Resolving against [`draft_ids`] first means
+/// the only strings this can ever return are filenames [`std::fs::read_dir`]
+/// already saw on disk under `dir`, the same as `resolve_task` and
+/// `resolve_talk` already guarantee for their own ids.
+fn resolve_draft(dir: &FsPath, id: &str) -> ApiResult<String> {
+    pick(draft_ids(dir), id, "draft")
 }
 
 /// The configuration for a repository, read off the disk for this request.
@@ -5179,7 +5230,7 @@ mod tests {
         std::fs::create_dir_all(&drafts).expect("drafts dir");
         std::fs::write(
             drafts.join("20260906-000000-mn34.advisors.json"),
-            r#"{"records":[{"seat":"advisor-1","agent":"sage-a","duration_ms":1}]}"#,
+            r#"{"records":[{"seat":"advisor-1","agent":"sage-a","duration_ms":1}],"synthesized":true}"#,
         )
         .unwrap();
         std::fs::write(
@@ -5203,11 +5254,77 @@ mod tests {
         );
     }
 
+    /// Reported: `advise::deliberate` writes `<id>.advisors.json`
+    /// unconditionally, before the checks that can still fail the stage - so
+    /// a total advisor failure, a planner crash, or a rejected synthesis all
+    /// leave an advisor record on disk next to an `<id>.md` that is still the
+    /// raw, un-synthesized interview draft. `DraftAdvisorsView` used to serve
+    /// that text under the same `draft` key a successful run uses, which
+    /// presented an abandoned interview as if it were the deliberation's
+    /// output. Gating on `synthesized` (absent here, as a pre-fix record on
+    /// disk would have it) must suppress it instead.
+    #[tokio::test]
+    async fn draft_advisors_hides_an_unsynthesized_interview_draft() {
+        let f = Fixture::start().await;
+        let drafts = f.home.path().join("drafts");
+        std::fs::create_dir_all(&drafts).expect("drafts dir");
+        std::fs::write(
+            drafts.join("20260906-000000-op56.advisors.json"),
+            r#"{"records":[{"seat":"advisor-1","agent":"sage-a","duration_ms":1,"error":"boom"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            drafts.join("20260906-000000-op56.md"),
+            "# Rework the config loader\n\n## Context\n\nplaceholder from the interview.\n",
+        )
+        .unwrap();
+
+        let res = f.get("/api/drafts/20260906-000000-op56/advisors").await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let body = res.json();
+        assert!(
+            body["draft"].is_null(),
+            "an un-synthesized interview draft must never be served as the deliberation's task file: {body}"
+        );
+        assert!(body["draft_md"].is_null(), "{body}");
+    }
+
     #[tokio::test]
     async fn draft_advisors_404s_for_a_draft_with_no_deliberation_on_disk() {
         let f = Fixture::start().await;
         let res = f.get("/api/drafts/nosuchdraft/advisors").await;
         assert_eq!(res.status, 404, "{}", res.body);
+    }
+
+    /// Reported: `draft_advisors` used to hand the URL's `id` straight to
+    /// `dir.join(format!("{id}.advisors.json"))`. Axum decodes a path
+    /// parameter after splitting the request path on literal `/`, so an id
+    /// sent as `..%2Fsecret` arrives here as `../secret` and joins to a file
+    /// one directory above `drafts` - which is exactly where this test plants
+    /// one, so the pre-fix code would have served it as draft `nosuchdraft`'s
+    /// deliberation.
+    #[tokio::test]
+    async fn draft_advisors_does_not_escape_the_drafts_directory_via_a_path_traversal_id() {
+        let f = Fixture::start().await;
+        let drafts = f.home.path().join("drafts");
+        std::fs::create_dir_all(&drafts).expect("drafts dir");
+        std::fs::write(
+            drafts.join("20260906-000000-qr78.advisors.json"),
+            r#"{"records":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            f.home.path().join("secret.advisors.json"),
+            r#"{"records":[{"seat":"leak","agent":"x","duration_ms":1}]}"#,
+        )
+        .unwrap();
+
+        let res = f.get("/api/drafts/..%2Fsecret/advisors").await;
+        assert_eq!(
+            res.status, 404,
+            "a path-traversal id must not resolve to a file outside `drafts`: {}",
+            res.body
+        );
     }
 
     #[tokio::test]

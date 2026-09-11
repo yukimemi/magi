@@ -3274,18 +3274,30 @@ function renderDraftDetail() {
   }
 }
 
+/* Bumped by every open and every close, and captured by each fetch before it
+   awaits. Opening B while A is still loading, or closing while either is,
+   must not let A's (or a closed request's) answer land after the fact and
+   overwrite whatever the operator is looking at now - a plain `await` here
+   has no idea a newer request (or a close) has since superseded it. */
+let draftDetailRequest = 0;
+
 async function viewDraftAdvisors(id) {
+  const requestId = ++draftDetailRequest;
   state.draftDetail = { id, advice: null, error: null };
   renderDraftDetail();
+  let next;
   try {
-    state.draftDetail = { id, advice: await getJson(API.draftAdvisors(id)), error: null };
+    next = { id, advice: await getJson(API.draftAdvisors(id)), error: null };
   } catch (error) {
-    state.draftDetail = { id, advice: null, error: error.message };
+    next = { id, advice: null, error: error.message };
   }
+  if (requestId !== draftDetailRequest) return;
+  state.draftDetail = next;
   renderDraftDetail();
 }
 
 function closeDraftDetail() {
+  draftDetailRequest++;
   state.draftDetail = { id: null, advice: null, error: null };
   renderDraftDetail();
 }
