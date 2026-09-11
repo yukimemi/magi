@@ -305,6 +305,12 @@ enum Command {
         /// interview's opening briefing as background.
         #[arg(long)]
         from: Option<String>,
+        /// Give up on a browser-interview chat (id, or unambiguous
+        /// prefix/suffix - same resolution as `--from`) without holding an
+        /// interview. No agent is started; the chat is marked abandoned and
+        /// the command exits.
+        #[arg(long)]
+        abandon: Option<String>,
     },
     /// List local repositories found under `[repos] roots`.
     Repos {
@@ -952,7 +958,20 @@ async fn dispatch(command: Command) -> Result<()> {
             priority,
             yes,
             from,
+            abandon,
         } => {
+            // `--abandon` is a separate errand entirely: close a chat the
+            // operator started in the browser and does not want to continue.
+            // No agent is started, so this returns before any of the
+            // interview's own setup - `resolve_repo`, `Config::discover`, the
+            // terminal check `plan::plan` opens with - runs at all.
+            if let Some(id) = abandon {
+                let chats = magi::chat::Chats::open();
+                let mut chat = chats.get(&id)?;
+                magi::chat::abandon(&mut chat, &chats)?;
+                println!("chat {} is now {}", chat.short(), chat.status.as_str());
+                return Ok(());
+            }
             let idea = idea.join(" ");
             let task = plan::plan(plan::Opts {
                 idea: (!idea.trim().is_empty()).then_some(idea),

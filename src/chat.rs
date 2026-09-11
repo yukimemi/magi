@@ -38,6 +38,7 @@
 //! coordination between them.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -196,6 +197,16 @@ impl Chat {
 #[derive(Debug, Clone)]
 pub struct Chats {
     root: PathBuf,
+    /// Serializes the read-modify-write cycle that reads a chat, decides
+    /// something from its `status`, and writes the whole record back.
+    /// [`abandon`], [`file_draft`] and the tail of [`turn`] all take this
+    /// before that cycle rather than after just the read: a re-read narrows
+    /// the window another writer can land in, but does not close it, since
+    /// nothing stopped that other writer's own put from landing between this
+    /// call's re-read and its own put. Shared across every clone, since every
+    /// clone is a handle onto the same files - see [`crate::talk::Talks`],
+    /// which this mirrors.
+    lock: Arc<Mutex<()>>,
 }
 
 impl Chats {
@@ -207,7 +218,63 @@ impl Chats {
     /// A store at an explicit root. Tests use this, which is why none of them
     /// need the operator's real home.
     pub fn at(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Claim the right to read-modify-write a chat's `status`. See
+    /// [`crate::talk::Talks::guard`], which this mirrors, including recovering
+    /// from poisoning rather than propagating it: one panicking caller must
+    /// not wedge every chat in the store.
+    ///
+    /// This is an in-process `Mutex` - it serializes callers inside one
+    /// `magi web`, but is invisible to `magi plan --abandon` running as its
+    /// own process with its own `Arc`. [`Chats::claim`] is what closes that
+    /// gap; the two are meant to be taken together, this one first.
+    fn guard(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Path of the claim lock for a conversation. One definition, so
+    /// [`Chats::claim`] cannot end up naming a different file than whatever
+    /// else might go looking for it.
+    fn lock_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.lock"))
+    }
+
+    /// Take cross-process exclusive ownership of one chat's record for the
+    /// read-modify-write cycle that decides its `status`.
+    ///
+    /// [`Chats::guard`] only ever sees other callers inside the same process;
+    /// `magi plan --abandon` is a separate CLI invocation with its own
+    /// `Arc<Mutex<()>>`, wired to nothing a running `magi web` holds. This is
+    /// a `create_new` file next to the record instead - atomic on every
+    /// platform magi targets, and invisible to no process that asks - the
+    /// same primitive [`crate::queue::Queue::claim`] uses to keep a CLI edit
+    /// and a running daemon off the same task file at once. The returned
+    /// guard releases on drop, including on panic.
+    fn claim(&self, id: &str) -> Result<ChatClaim> {
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("create {}", self.root.display()))?;
+        let path = self.lock_path(id);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                // Best effort: the pid is for the human looking at a stale lock.
+                let _ = writeln!(f, "{}", std::process::id());
+                Ok(ChatClaim { path })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!("chat {id} is claimed by another process right now")
+            }
+            Err(e) => Err(e).with_context(|| format!("lock {}", path.display())),
+        }
     }
 
     /// Directory holding the conversation files.
@@ -316,6 +383,20 @@ impl Chats {
     /// How many conversations are still open. The badge on the phone.
     pub fn count_open(&self) -> usize {
         self.list().iter().filter(|c| c.status.open()).count()
+    }
+}
+
+/// Cross-process exclusive ownership of one chat's record, released on drop.
+/// See [`Chats::claim`], which this is returned by, and
+/// [`crate::queue::Claim`], which it mirrors.
+#[derive(Debug)]
+struct ChatClaim {
+    path: PathBuf,
+}
+
+impl Drop for ChatClaim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -512,7 +593,21 @@ pub async fn say(chat: &mut Chat, store: &Chats, cfg: &Config, text: &str) -> Re
 /// of both answers.
 ///
 /// Returns the trimmed text, so the caller and the agent see the same string.
+///
+/// Re-reads the record under [`Chats::guard`] and [`Chats::claim`] rather
+/// than trusting the caller's copy of `chat`'s `status`: `web::chat_say`
+/// reads the chat, then awaits config discovery before calling this - a gap
+/// a concurrent `POST /api/chats/{id}/abandon`, or a `magi plan --abandon`
+/// running as its own process, can land in. Re-reading without both would
+/// only narrow that window, not close it - see [`crate::talk::record`],
+/// which this mirrors for the in-process half.
 pub fn record(chat: &mut Chat, store: &Chats, text: &str) -> Result<String> {
+    let _guard = store.guard();
+    let _claim = store.claim(&chat.id)?;
+    let fresh = store
+        .get(&chat.id)
+        .with_context(|| format!("chat {} could not be re-read", chat.short()))?;
+    chat.status = fresh.status;
     if !chat.status.open() {
         bail!(
             "chat {} is {} and takes no more turns",
@@ -651,6 +746,22 @@ async fn turn(chat: &mut Chat, store: &Chats, cfg: &Config, prompt: &str) -> Res
     if let Some(draft) = extract_draft(&reply.body) {
         chat.draft = Some(draft);
     }
+
+    // A concurrent `abandon` or `file_draft` can have landed on disk while
+    // this turn - possibly minutes long - was in flight, from inside this
+    // same `magi web` or from a separate `magi plan --abandon` process. Read
+    // `status` and `task` back here, under the same guard and claim those two
+    // take, rather than trust the snapshot this call started with: finishing
+    // the turn on that stale snapshot would silently undo whichever of them
+    // got there first. See [`crate::talk::turn`]'s tail, which this mirrors
+    // for the in-process half.
+    let _guard = store.guard();
+    let _claim = store.claim(&chat.id)?;
+    let fresh = store
+        .get(&chat.id)
+        .with_context(|| format!("chat {} could not be re-read", chat.short()))?;
+    chat.status = fresh.status;
+    chat.task = fresh.task;
     chat.turns.push(reply);
     store.put(chat)?;
 
@@ -686,14 +797,38 @@ fn transcript(chat: &Chat) -> String {
 /// Returns the queued task's id. The conversation is left on disk either way:
 /// a refused draft is a conversation to continue, not an error to recover
 /// from, and the operator's next message can ask for the missing section.
+///
+/// Re-reads the record under [`Chats::guard`] and [`Chats::claim`] rather
+/// than trusting the caller's copy of `chat`, and writes that fresh copy back
+/// rather than the one passed in - the same reason [`abandon`] does, and for
+/// the same concurrent-writer risk: without the shared guard *and* claim, an
+/// `abandon` landing between this call's own read and its `put` - whether
+/// from this same `magi web` or from a separate `magi plan --abandon`
+/// process, which the in-process guard alone cannot see - would either be
+/// clobbered by this call filing over it, or - the other order - have this
+/// call's queued task silently orphaned from the record when `abandon`
+/// writes over it. Refuses a conversation that is no longer `Open` by the
+/// time this runs, in the same style [`say`] and [`record`] already use.
 pub fn file_draft(chat: &mut Chat, store: &Chats, queue: &Queue, priority: i32) -> Result<String> {
-    if let Err(problems) = draft_problems(chat) {
+    let _guard = store.guard();
+    let _claim = store.claim(&chat.id)?;
+    let mut fresh = store
+        .get(&chat.id)
+        .with_context(|| format!("chat {} could not be re-read", chat.short()))?;
+    if !fresh.status.open() {
+        bail!(
+            "chat {} is {} and takes no more turns",
+            fresh.short(),
+            fresh.status.as_str()
+        );
+    }
+    if let Err(problems) = draft_problems(&fresh) {
         bail!(
             "this draft is not fileable yet:\n- {}",
             problems.join("\n- ")
         );
     }
-    let body = chat
+    let body = fresh
         .draft
         .clone()
         .expect("draft_problems accepted a chat with a draft");
@@ -705,14 +840,57 @@ pub fn file_draft(chat: &mut Chat, store: &Chats, queue: &Queue, priority: i32) 
     // `Human`, not `Agent`: the agent conducted the interview, but the change
     // being asked for is the operator's, and "who asked for this" is the
     // question `source` exists to answer.
-    let mut task = Task::new(title, body, chat.repo.clone(), Source::Human);
+    let mut task = Task::new(title, body, fresh.repo.clone(), Source::Human);
     task.priority = priority;
     queue.put(&mut task)?;
 
-    chat.task = Some(task.id.clone());
-    chat.status = ChatStatus::Filed;
-    store.put(chat)?;
+    fresh.task = Some(task.id.clone());
+    fresh.status = ChatStatus::Filed;
+    store.put(&mut fresh)?;
+    *chat = fresh;
     Ok(task.id)
+}
+
+/// Give up on a conversation. Idempotent: abandoning an already-abandoned
+/// conversation is not an error, since the operator's intent - "I don't want
+/// this anymore" - is already satisfied. Refuses a `Filed` conversation: that
+/// status means a task was already produced from this interview, and abandon
+/// must not roll back the terminal state that produced it.
+///
+/// Re-reads the record under [`Chats::guard`] rather than trusting the
+/// caller's copy of `chat`, and writes that fresh copy back rather than the
+/// one passed in - the same reason [`crate::talk::close`] does: a concurrent
+/// [`say`] or [`file_draft`] must not have its result overwritten by a
+/// decision made against a stale snapshot's idea of what `status` was, and the
+/// guard is what stops that snapshot from being made stale *again* between
+/// this call's own re-read and its `put`.
+///
+/// Also takes [`Chats::claim`], because unlike [`say`] and [`file_draft`] this
+/// function is reachable from `magi plan --abandon` - a separate CLI process,
+/// with its own `Arc<Mutex<()>>` that `store.guard()` shares with nothing
+/// `magi web` holds. The claim is a `create_new` file next to the record
+/// instead, which every process asking for it sees, so a chat cannot be
+/// abandoned here at the exact moment `magi web` is filing or answering it.
+pub fn abandon(chat: &mut Chat, store: &Chats) -> Result<()> {
+    let _guard = store.guard();
+    let _claim = store.claim(&chat.id)?;
+    let mut fresh = store
+        .get(&chat.id)
+        .with_context(|| format!("chat {} could not be re-read", chat.short()))?;
+    match fresh.status {
+        ChatStatus::Open => {
+            fresh.status = ChatStatus::Abandoned;
+            store.put(&mut fresh)?;
+        }
+        ChatStatus::Abandoned => {}
+        ChatStatus::Filed => bail!(
+            "chat {} is {} and takes no more turns",
+            fresh.short(),
+            fresh.status.as_str()
+        ),
+    }
+    *chat = fresh;
+    Ok(())
 }
 
 /// Is this conversation's draft fileable, and if not, what is wrong with it?
@@ -1332,6 +1510,10 @@ mod tests {
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, "mock", 7),
         };
+        // `file_draft` re-reads its record from disk (see its own doc), so a
+        // chat that only ever exists in memory in this test would fail with
+        // "no chat matches" rather than the draft error under test.
+        chats.put(&mut chat).expect("put");
 
         let problems = draft_problems(&chat).expect_err("a draft with no criteria is not fileable");
         assert!(
@@ -1370,6 +1552,9 @@ mod tests {
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, "mock", 7),
         };
+        // See the sibling test above for why this has to be on disk before
+        // `file_draft` (which re-reads it) is called.
+        chats.put(&mut chat).expect("put");
 
         let id = file_draft(&mut chat, &chats, &queue, 5).expect("file");
 
@@ -1386,6 +1571,232 @@ mod tests {
         assert_eq!(task.instruction, good_draft());
         assert_eq!(task.priority, 5);
         assert_eq!(task.source, Source::Human);
+    }
+
+    #[test]
+    fn abandon_moves_an_open_chat_to_abandoned() {
+        let (tmp, chats) = store();
+        let mut chat = Chat {
+            schema: SCHEMA,
+            id: "20260903-014455-ab12".to_owned(),
+            repo: tmp.path().to_owned(),
+            from: None,
+            agent: "mock".to_owned(),
+            status: ChatStatus::Open,
+            turns: Vec::new(),
+            draft: None,
+            task: None,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            seat: SeatState::new(SEAT, "mock", 7),
+        };
+        chats.put(&mut chat).expect("put");
+
+        abandon(&mut chat, &chats).expect("abandon");
+
+        assert_eq!(chat.status, ChatStatus::Abandoned);
+        assert_eq!(
+            chats.get(&chat.id).expect("get").status,
+            ChatStatus::Abandoned
+        );
+    }
+
+    #[test]
+    fn abandoning_an_already_abandoned_chat_is_not_an_error() {
+        let (tmp, chats) = store();
+        let mut chat = Chat {
+            schema: SCHEMA,
+            id: "20260903-014455-ab13".to_owned(),
+            repo: tmp.path().to_owned(),
+            from: None,
+            agent: "mock".to_owned(),
+            status: ChatStatus::Abandoned,
+            turns: Vec::new(),
+            draft: None,
+            task: None,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            seat: SeatState::new(SEAT, "mock", 7),
+        };
+        chats.put(&mut chat).expect("put");
+
+        abandon(&mut chat, &chats).expect("abandoning twice is not an error");
+
+        assert_eq!(chat.status, ChatStatus::Abandoned);
+        assert_eq!(
+            chats.get(&chat.id).expect("get").status,
+            ChatStatus::Abandoned
+        );
+    }
+
+    #[test]
+    fn abandon_refuses_a_filed_chat_and_leaves_it_filed() {
+        let (tmp, chats) = store();
+        let mut chat = Chat {
+            schema: SCHEMA,
+            id: "20260903-014455-ab14".to_owned(),
+            repo: tmp.path().to_owned(),
+            from: None,
+            agent: "mock".to_owned(),
+            status: ChatStatus::Filed,
+            turns: Vec::new(),
+            draft: None,
+            task: Some("some-task-id".to_owned()),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            seat: SeatState::new(SEAT, "mock", 7),
+        };
+        chats.put(&mut chat).expect("put");
+
+        let err = abandon(&mut chat, &chats).expect_err("a filed chat refuses abandon");
+        assert!(err.to_string().contains("filed"), "{err}");
+
+        assert_eq!(
+            chats.get(&chat.id).expect("get").status,
+            ChatStatus::Filed,
+            "a refused abandon must not touch the on-disk status"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abandon_that_lands_while_a_turn_is_in_flight_is_not_undone_by_the_reply() {
+        let (tmp, chats) = store();
+        let spec = mock_agent(tmp.path(), REPLY, env("here you go"));
+        let cfg = config(spec);
+        // The in-flight turn's own handle: loaded once, the way a spawned
+        // background task in `web::chat_say` holds one for the whole turn.
+        let mut in_flight = open(
+            &chats,
+            &cfg,
+            tmp.path().to_owned(),
+            "add durations",
+            None,
+            None,
+        )
+        .expect("open");
+
+        // The operator abandons the conversation through a *different* handle
+        // while the turn above is still running - exactly what an abandon
+        // typed on the phone while an agent is mid-answer looks like.
+        let mut abandoned_elsewhere = chats.get(&in_flight.id).expect("reread");
+        abandon(&mut abandoned_elsewhere, &chats).expect("abandon");
+        assert_eq!(
+            chats.get(&in_flight.id).expect("reread").status,
+            ChatStatus::Abandoned,
+            "the abandon landed on disk before the turn finished"
+        );
+
+        // The turn's own handle still says `open` - it was loaded before the
+        // abandon - and finishing it must not resurrect the conversation the
+        // operator already ended.
+        assert_eq!(in_flight.status, ChatStatus::Open);
+        first_turn(&mut in_flight, &chats, &cfg, None)
+            .await
+            .expect("the turn itself still completes");
+
+        let on_disk = chats.get(&in_flight.id).expect("reread");
+        assert_eq!(
+            on_disk.status,
+            ChatStatus::Abandoned,
+            "an abandon must stick even when a turn that started before it finishes after it"
+        );
+        // The reply is not lost either: a turn already in flight when the
+        // operator abandoned still gets its answer recorded.
+        assert!(
+            on_disk.turns.iter().any(|t| t.body == "here you go"),
+            "the in-flight turn's own reply is still recorded: {:?}",
+            on_disk.turns
+        );
+    }
+
+    #[test]
+    fn abandon_blocks_on_the_shared_guard_rather_than_interleaving_with_a_racing_writer() {
+        let (tmp, chats) = store();
+        let queue = Queue::at(tmp.path().join("queue"));
+        let mut chat = Chat {
+            schema: SCHEMA,
+            id: "20260903-014455-ee15".to_owned(),
+            repo: tmp.path().to_owned(),
+            from: None,
+            agent: "mock".to_owned(),
+            status: ChatStatus::Open,
+            turns: Vec::new(),
+            draft: Some(good_draft()),
+            task: None,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            seat: SeatState::new(SEAT, "mock", 7),
+        };
+        chats.put(&mut chat).expect("put");
+
+        // Hold the same guard `file_draft`'s read-modify-write section holds
+        // for the whole of its own read-then-write, standing in for
+        // `file_draft` being paused between its read and its `put`.
+        let held = chats.guard();
+
+        let chats2 = chats.clone();
+        let id = chat.id.clone();
+        let abandoning = std::thread::spawn(move || {
+            let mut chat = chats2.get(&id).expect("get");
+            abandon(&mut chat, &chats2).expect("abandon");
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !abandoning.is_finished(),
+            "abandon must wait for the guard, not read and write while it is held - \
+             a re-read alone narrows this window without closing it"
+        );
+
+        drop(held);
+        abandoning.join().expect("abandon thread panicked");
+
+        assert_eq!(
+            chats.get(&chat.id).expect("reread").status,
+            ChatStatus::Abandoned,
+            "once the guard is free, abandon still lands"
+        );
+        assert!(queue.list().is_empty(), "file_draft never ran in this test");
+    }
+
+    /// The gap the in-process guard cannot see: `magi plan --abandon` opens
+    /// its own `Chats`, with its own `Arc<Mutex<()>>` wired to nothing this
+    /// process holds. Holding a claim directly - rather than the guard - is
+    /// what stands in for that separate process here, since `Chats::claim` is
+    /// a `create_new` file on disk, indistinguishable to `abandon` from a
+    /// second `magi web` or a second `magi plan --abandon` already inside its
+    /// own read-modify-write section.
+    #[test]
+    fn abandon_is_refused_while_another_process_holds_the_chats_claim() {
+        let (tmp, chats) = store();
+        let mut chat = Chat {
+            schema: SCHEMA,
+            id: "20260903-014455-ee16".to_owned(),
+            repo: tmp.path().to_owned(),
+            from: None,
+            agent: "mock".to_owned(),
+            status: ChatStatus::Open,
+            turns: Vec::new(),
+            draft: None,
+            task: None,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            seat: SeatState::new(SEAT, "mock", 7),
+        };
+        chats.put(&mut chat).expect("put");
+
+        let held = chats.claim(&chat.id).expect("claim");
+        let err = abandon(&mut chat, &chats).expect_err("a claimed chat refuses abandon");
+        assert!(err.to_string().contains("claimed"), "{err}");
+        assert_eq!(
+            chats.get(&chat.id).expect("reread").status,
+            ChatStatus::Open,
+            "a refused abandon must not touch the on-disk status"
+        );
+
+        drop(held);
+        abandon(&mut chat, &chats).expect("abandon succeeds once the claim is released");
+        assert_eq!(chat.status, ChatStatus::Abandoned);
     }
 
     #[tokio::test]
