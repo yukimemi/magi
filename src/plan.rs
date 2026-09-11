@@ -480,7 +480,7 @@ fn resolve_repo(raw: &Path, explicit_config: Option<&Path>) -> Result<PathBuf> {
 fn from_background(chats: &chat::Chats, from: Option<&str>) -> Result<Option<String>> {
     match from {
         None => Ok(None),
-        Some(id) => Ok(Some(chat::derived_background(&chats.get(id)?))),
+        Some(id) => Ok(Some(chat::derived_background(&chats.get(id)?, chats))),
     }
 }
 

@@ -816,6 +816,7 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
             run: &state.id,
             node: "bump",
             cache_dir: state.config.cache_dir().as_deref(),
+            attachments: &[],
         },
     )
     .await

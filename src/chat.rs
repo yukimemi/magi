@@ -96,6 +96,27 @@ pub enum Who {
     Agent,
 }
 
+/// One image the operator attached to a turn.
+///
+/// Never carries the bytes themselves: the picture lives on disk under
+/// [`Chats::attachments_dir`], named by `id` alone. `name` is the filename
+/// the operator's browser reported, kept only for display - it never
+/// contributes to a path, which is what keeps an upload from being able to
+/// traverse outside its own directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attachment {
+    /// Server-minted id; also the file's stem under `attachments_dir`.
+    pub id: String,
+    /// The operator's own filename, for display only.
+    pub name: String,
+    /// Validated by `web` at upload time against a closed whitelist:
+    /// `image/png`, `image/jpeg`, `image/gif`, `image/webp`.
+    pub mime: String,
+    /// Size in bytes, so the phone can show it without a second request.
+    pub bytes: u64,
+}
+
 /// One message in the conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -106,6 +127,12 @@ pub struct Turn {
     pub body: String,
     /// When it was said.
     pub at: Timestamp,
+    /// Images attached to this turn. `#[serde(default)]` so a conversation
+    /// recorded before attachments existed still reads - see
+    /// `a_chat_recorded_without_a_from_field_still_reads`'s sibling test for
+    /// this field.
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 /// Where a conversation is in its life.
@@ -297,6 +324,109 @@ impl Chats {
         self.root.join(format!("{id}.artifacts"))
     }
 
+    /// Where this conversation's attached images live: a subdirectory of
+    /// `artifacts_of`, so deleting the conversation deletes its attachments
+    /// too and nothing here needs its own cleanup path.
+    pub fn attachments_dir(&self, id: &str) -> PathBuf {
+        self.artifacts_of(id).join("attachments")
+    }
+
+    /// Persist one already-validated attachment and return its metadata.
+    ///
+    /// `web::chat_attachment_post` is the only caller: it has already
+    /// checked `mime` against the whitelist and sniffed the bytes, so an
+    /// unrecognised mime reaching here is a bug in that caller, not
+    /// something an operator did. The id is minted here and never taken
+    /// from the client; `name` is stored for display only and never used to
+    /// build a path.
+    pub fn put_attachment(
+        &self,
+        id: &str,
+        mime: &str,
+        name: &str,
+        data: &[u8],
+    ) -> Result<Attachment> {
+        let dir = self.attachments_dir(id);
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let ext = attachment_ext(mime).with_context(|| format!("unsupported mime `{mime}`"))?;
+        let att = Attachment {
+            id: new_attachment_id(),
+            name: name.to_owned(),
+            mime: mime.to_owned(),
+            bytes: data.len() as u64,
+        };
+        std::fs::write(dir.join(format!("{}.{ext}", att.id)), data)
+            .with_context(|| format!("write attachment {}", att.id))?;
+        std::fs::write(
+            dir.join(format!("{}.json", att.id)),
+            serde_json::to_string(&att).context("serialize attachment")?,
+        )
+        .with_context(|| format!("write attachment metadata {}", att.id))?;
+        Ok(att)
+    }
+
+    /// Just the metadata, without reading the image bytes back off disk -
+    /// what `web::chat_say` uses to turn an id the operator referenced into
+    /// an [`Attachment`] before appending a [`Turn`], where the bytes
+    /// themselves are of no interest. `None` for an id this conversation
+    /// never stored - including one that merely looks plausible:
+    /// [`valid_attachment_id`] is checked here too, not only by the caller,
+    /// the same defence-in-depth `Questions::panel_asset` uses for its own
+    /// asset ids.
+    pub fn attachment_meta(&self, id: &str, att_id: &str) -> Result<Option<Attachment>> {
+        if !valid_attachment_id(att_id) {
+            return Ok(None);
+        }
+        let meta_path = self.attachments_dir(id).join(format!("{att_id}.json"));
+        if !meta_path.is_file() {
+            return Ok(None);
+        }
+        let att = serde_json::from_str(
+            &std::fs::read_to_string(&meta_path)
+                .with_context(|| format!("read {}", meta_path.display()))?,
+        )
+        .with_context(|| format!("parse {}", meta_path.display()))?;
+        Ok(Some(att))
+    }
+
+    /// A stored attachment's metadata and its bytes together, for serving it
+    /// back on `GET`. `None` under the same conditions as
+    /// [`Chats::attachment_meta`], which this is built on.
+    pub fn read_attachment(&self, id: &str, att_id: &str) -> Result<Option<(Attachment, Vec<u8>)>> {
+        let Some(att) = self.attachment_meta(id, att_id)? else {
+            return Ok(None);
+        };
+        let ext = attachment_ext(&att.mime).with_context(|| {
+            format!("attachment {att_id} has an unsupported mime `{}`", att.mime)
+        })?;
+        let data_path = self.attachments_dir(id).join(format!("{att_id}.{ext}"));
+        let data =
+            std::fs::read(&data_path).with_context(|| format!("read {}", data_path.display()))?;
+        Ok(Some((att, data)))
+    }
+
+    /// Absolute path of one attachment's bytes, for the prompt note [`turn`]
+    /// appends and for [`Invocation::attachments`]. `None` only for a mime
+    /// [`put_attachment`] could never have written, which means the
+    /// attachment did not come from this store.
+    ///
+    /// `self.root` (and so `attachments_dir`) is not guaranteed absolute on
+    /// its own - `run::home()` returns a bare relative `PathBuf` verbatim
+    /// when the operator sets `MAGI_HOME` to a relative path, and nothing
+    /// canonicalizes it on the way in. That is harmless for every other use
+    /// of this store, since its own I/O runs in this process against this
+    /// process's cwd - but this path is handed to a CLI invoked with `cwd:
+    /// &chat.repo`, a different directory, so a relative path here would
+    /// resolve against the wrong place once it reached the prompt.
+    /// `std::path::absolute` fixes it against *this* process's cwd before
+    /// that happens; see `disk::free_bytes_by_os` for the same function used
+    /// the same way elsewhere in this codebase.
+    fn attachment_path(&self, id: &str, att: &Attachment) -> Option<PathBuf> {
+        let ext = attachment_ext(&att.mime)?;
+        let path = self.attachments_dir(id).join(format!("{}.{ext}", att.id));
+        std::path::absolute(&path).ok()
+    }
+
     /// Write a conversation, atomically, so a process killed mid-write leaves
     /// the previous state readable rather than a truncated file that would lose
     /// the whole interview.
@@ -459,6 +589,11 @@ pub fn build(
             who: Who::Operator,
             body: idea.to_owned(),
             at: now,
+            // The idea box that opens an interview has no attachment path of
+            // its own - only the ongoing `chat-say` composer does, once a
+            // conversation (and therefore an `artifacts_of` id to hold
+            // uploads under) exists.
+            attachments: Vec::new(),
         }],
         draft: None,
         task: None,
@@ -505,14 +640,26 @@ pub async fn first_turn(
         .map(|t| t.body.as_str())
         .unwrap_or_default();
     let mut prompt = briefing(idea, &chat.repo);
+    // The source's own attachments, resolved against *its* id - `derived_background`
+    // already names their absolute paths in the prompt text below, and those
+    // paths live under the source conversation's own artifacts dir, not this
+    // new one's, so `turn` needs them passed in separately to widen a sandbox
+    // that only ever assumes its own conversation's directory.
+    let mut inherited_attachments: Vec<PathBuf> = Vec::new();
     if let Some(source) = from {
         // Prepended, so the leader reads what it is inheriting before it
         // reads its own instructions - the same order a human handing off a
         // conversation would use.
-        prompt = format!("{}\n\n{prompt}", derived_background(source));
+        prompt = format!("{}\n\n{prompt}", derived_background(source, store));
+        inherited_attachments = source
+            .turns
+            .iter()
+            .flat_map(|t| t.attachments.iter())
+            .filter_map(|a| store.attachment_path(&source.id, a))
+            .collect();
     }
     prompt.push_str(&language_note(&cfg.graph.language));
-    turn(chat, store, cfg, &prompt).await
+    turn(chat, store, cfg, &prompt, &inherited_attachments).await
 }
 
 /// Open a conversation and take the first agent turn.
@@ -542,8 +689,10 @@ pub async fn start(
 /// Built from [`transcript`] rather than a second rendering of the turns,
 /// because that is already the "everything said so far" prose this module
 /// maintains, and a briefing is exactly the audience `transcript` was written
-/// for - a CLI (here, a fresh one) with no memory of the conversation.
-pub fn derived_background(from: &Chat) -> String {
+/// for - a CLI (here, a fresh one) with no memory of the conversation. `store`
+/// is only for resolving the *source* conversation's own attachments into
+/// absolute paths - the derived chat has none of its own yet.
+pub fn derived_background(from: &Chat, store: &Chats) -> String {
     format!(
         "# Background: derived from another conversation\n\n\
          This interview continues from a conversation about a *different* \
@@ -552,7 +701,7 @@ pub fn derived_background(from: &Chat) -> String {
          have nothing to do with this one.\n\n\
          Source repository: {}\n\n{}",
         from.repo.display(),
-        transcript(from),
+        transcript(from, store),
     )
 }
 
@@ -567,7 +716,13 @@ pub fn derived_background(from: &Chat) -> String {
 /// transcript is already on disk and already explains itself, because the
 /// failure is appended as a [`MAGI_NOTE`] turn first. A caller handling the
 /// error should re-read the chat and show it, not discard it.
-pub async fn say(chat: &mut Chat, store: &Chats, cfg: &Config, text: &str) -> Result<()> {
+pub async fn say(
+    chat: &mut Chat,
+    store: &Chats,
+    cfg: &Config,
+    text: &str,
+    attachments: Vec<Attachment>,
+) -> Result<()> {
     if !chat.status.open() {
         bail!(
             "chat {} is {} and takes no more turns",
@@ -576,11 +731,11 @@ pub async fn say(chat: &mut Chat, store: &Chats, cfg: &Config, text: &str) -> Re
         );
     }
     let text = text.trim();
-    if text.is_empty() {
+    if text.is_empty() && attachments.is_empty() {
         bail!("nothing to say");
     }
-    let text = record(chat, store, text)?;
-    turn(chat, store, cfg, &text).await
+    let text = record(chat, store, text, attachments)?;
+    turn(chat, store, cfg, &text, &[]).await
 }
 
 /// Append the operator's turn and flush it, without invoking anything.
@@ -601,7 +756,16 @@ pub async fn say(chat: &mut Chat, store: &Chats, cfg: &Config, text: &str) -> Re
 /// running as its own process, can land in. Re-reading without both would
 /// only narrow that window, not close it - see [`crate::talk::record`],
 /// which this mirrors for the in-process half.
-pub fn record(chat: &mut Chat, store: &Chats, text: &str) -> Result<String> {
+///
+/// `attachments` may be non-empty while `text` is empty - a turn that is
+/// only images is a normal thing to send - but not both empty, the same rule
+/// this always enforced for text alone.
+pub fn record(
+    chat: &mut Chat,
+    store: &Chats,
+    text: &str,
+    attachments: Vec<Attachment>,
+) -> Result<String> {
     let _guard = store.guard();
     let _claim = store.claim(&chat.id)?;
     let fresh = store
@@ -616,13 +780,14 @@ pub fn record(chat: &mut Chat, store: &Chats, text: &str) -> Result<String> {
         );
     }
     let text = text.trim();
-    if text.is_empty() {
+    if text.is_empty() && attachments.is_empty() {
         bail!("nothing to say");
     }
     chat.turns.push(Turn {
         who: Who::Operator,
         body: text.to_owned(),
         at: Timestamp::now(),
+        attachments,
     });
     store.put(chat)?;
     Ok(text.to_owned())
@@ -634,7 +799,7 @@ pub fn record(chat: &mut Chat, store: &Chats, text: &str) -> Result<String> {
 /// answers - the same string `record` returned, so the transcript and the
 /// prompt cannot disagree.
 pub async fn respond(chat: &mut Chat, store: &Chats, cfg: &Config, text: &str) -> Result<()> {
-    turn(chat, store, cfg, text).await
+    turn(chat, store, cfg, text, &[]).await
 }
 
 /// Invoke the interviewing agent once and append what it said.
@@ -648,7 +813,13 @@ pub async fn respond(chat: &mut Chat, store: &Chats, cfg: &Config, text: &str) -
 /// whole conversation on every message is the cost this design exists to avoid,
 /// and a magi-authored replay of history is also a second, divergent version of
 /// it.
-async fn turn(chat: &mut Chat, store: &Chats, cfg: &Config, prompt: &str) -> Result<()> {
+async fn turn(
+    chat: &mut Chat,
+    store: &Chats,
+    cfg: &Config,
+    prompt: &str,
+    inherited_attachments: &[PathBuf],
+) -> Result<()> {
     let spec = cfg
         .agents
         .iter()
@@ -663,11 +834,39 @@ async fn turn(chat: &mut Chat, store: &Chats, cfg: &Config, prompt: &str) -> Res
         })?;
 
     let resuming = agent::has_session(spec.kind, &chat.seat, cfg.graph.sessions);
+    // The newest turn is always the operator message this call is answering
+    // - `record` (or `start`, for the very first turn) appended it before
+    // `turn` was ever called - so its own attachments are what belong at the
+    // end of *this* prompt, resuming or not.
+    let last_note = attachment_note(
+        store,
+        &chat.id,
+        chat.turns
+            .last()
+            .map_or(&[][..], |t| t.attachments.as_slice()),
+    );
     let body = if resuming {
-        prompt.to_owned()
+        format!("{prompt}{last_note}")
     } else {
-        format!("{}\n\n{prompt}", transcript(chat))
+        format!("{}\n\n{prompt}{last_note}", transcript(chat, store))
     };
+
+    // Every attachment this conversation has ever held, not only this
+    // turn's: a resumed session gets a fresh process every turn, so a CLI
+    // whose sandbox needs `--add-dir` (see `agent::build_command`) needs the
+    // grant again to open an image from three turns ago, even when nothing
+    // new was attached just now. Plus whatever the caller inherited from a
+    // *different* conversation - `first_turn` passes the source's own
+    // attachments here, since `derived_background` already named their paths
+    // in the prompt and a sandbox that only widens for `chat.id`'s own
+    // directory would leave those unreadable.
+    let attachment_paths: Vec<PathBuf> = chat
+        .turns
+        .iter()
+        .flat_map(|t| t.attachments.iter())
+        .filter_map(|a| store.attachment_path(&chat.id, a))
+        .chain(inherited_attachments.iter().cloned())
+        .collect();
 
     let artifacts = store.artifacts_of(&chat.id);
     let stem = format!("turn-{}", chat.seat.turns + 1);
@@ -687,6 +886,7 @@ async fn turn(chat: &mut Chat, store: &Chats, cfg: &Config, prompt: &str) -> Res
         run: &chat.id,
         node: "chat",
         cache_dir: cache_dir.as_deref(),
+        attachments: &attachment_paths,
     };
 
     let outcome = agent::invoke(spec, &mut chat.seat, &inv).await;
@@ -694,6 +894,7 @@ async fn turn(chat: &mut Chat, store: &Chats, cfg: &Config, prompt: &str) -> Res
         who: Who::Agent,
         body: format!("{MAGI_NOTE}{why}"),
         at: Timestamp::now(),
+        attachments: Vec::new(),
     };
     let (reply, failure) = match outcome {
         Err(e) => (
@@ -735,6 +936,7 @@ async fn turn(chat: &mut Chat, store: &Chats, cfg: &Config, prompt: &str) -> Res
                 who: Who::Agent,
                 body: out.text.trim().to_owned(),
                 at: Timestamp::now(),
+                attachments: Vec::new(),
             },
             None,
         ),
@@ -777,7 +979,7 @@ async fn turn(chat: &mut Chat, store: &Chats, cfg: &Config, prompt: &str) -> Res
 /// continued on the CLI's side. It is a fallback and not the design: it re-pays
 /// for the history on every turn and it is magi's rendering of the
 /// conversation rather than the model's own.
-fn transcript(chat: &Chat) -> String {
+fn transcript(chat: &Chat, store: &Chats) -> String {
     let mut out = String::from(
         "You are mid-interview. This CLI cannot resume its own conversation, \
          so here is everything said so far; answer only the last message.\n",
@@ -788,7 +990,30 @@ fn transcript(chat: &Chat) -> String {
             Who::Agent => "you",
         };
         out.push_str(&format!("\n## {who}\n\n{}\n", t.body.trim()));
+        out.push_str(&attachment_note(store, &chat.id, &t.attachments));
     }
+    out
+}
+
+/// The section named at the end of a turn's body, listing every attachment's
+/// absolute path and mime so the agent knows exactly what to open - see the
+/// module doc on `Invocation::attachments`. Empty when `attachments` is,
+/// which is every turn but the rare one carrying an image, so a turn with
+/// none changes nothing about the prompt.
+fn attachment_note(store: &Chats, chat_id: &str, attachments: &[Attachment]) -> String {
+    if attachments.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\nThe operator attached the image(s) below to this message. Open \
+         and look at each one before you answer.\n",
+    );
+    for att in attachments {
+        if let Some(path) = store.attachment_path(chat_id, att) {
+            out.push_str(&format!("\n- {} ({})", path.display(), att.mime));
+        }
+    }
+    out.push('\n');
     out
 }
 
@@ -1065,6 +1290,39 @@ fn new_id() -> String {
     format!("{stamp}-{:04x}", (seed ^ (seed >> 32)) & 0xffff)
 }
 
+/// Extension an attachment's bytes are stored under, from its (already
+/// validated) mime. The one place this mapping exists on the write side;
+/// `web`'s own whitelist is what actually decides which mimes are accepted
+/// in the first place.
+fn attachment_ext(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+/// Is `id` a shape [`put_attachment`](Chats::put_attachment) could have
+/// produced? 32 lowercase hex digits and nothing else, checked before an id
+/// that came from the client is ever allowed to build a path - so `..` and a
+/// path separator are never even possible.
+pub fn valid_attachment_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A fresh attachment id: 128 bits of process entropy as lowercase hex - the
+/// same "mint it, never take it from the client" rule [`new_id`] follows for
+/// conversation ids.
+fn new_attachment_id() -> String {
+    let mut r = crate::rng::SplitMix64::new(crate::rng::entropy());
+    format!("{:016x}{:016x}", r.next_u64(), r.next_u64())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1171,6 +1429,7 @@ mod tests {
                 who: Who::Operator,
                 body: "rework the config loader".to_owned(),
                 at: Timestamp::now(),
+                attachments: Vec::new(),
             }],
             draft: None,
             task: None,
@@ -1205,6 +1464,7 @@ mod tests {
         assert_eq!(v["turns"][0]["who"], "operator");
         assert_eq!(v["turns"][0]["body"], "rework the config loader");
         assert!(v["turns"][0].get("at").is_some());
+        assert!(v["turns"][0].get("attachments").is_some());
         assert!(v["draft"].is_null());
         assert!(v["task"].is_null());
         assert!(v["from"].is_null());
@@ -1247,8 +1507,43 @@ mod tests {
         assert_eq!(chat.from, None);
     }
 
+    /// A conversation recorded before attachments existed - schema 1, no
+    /// `attachments` key on any turn - must still read, the same guarantee
+    /// `a_chat_recorded_without_a_from_field_still_reads` gives `from`.
+    #[test]
+    fn a_chat_recorded_without_attachments_still_reads() {
+        let (tmp, chats) = store();
+        let path = chats.path_of("20260903-014455-ab12");
+        std::fs::create_dir_all(chats.root()).expect("chats dir");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": 1,
+                "id": "20260903-014455-ab12",
+                "repo": tmp.path(),
+                "agent": "sonnet",
+                "status": "open",
+                "turns": [
+                    { "who": "operator", "body": "rework the config loader",
+                      "at": Timestamp::now().to_string() },
+                ],
+                "draft": null,
+                "task": null,
+                "created_at": Timestamp::now().to_string(),
+                "updated_at": Timestamp::now().to_string(),
+                "seat": SeatState::new(SEAT, "sonnet", 7),
+            })
+            .to_string(),
+        )
+        .expect("write pre-attachments chat");
+
+        let chat = chats.get("20260903-014455-ab12").expect("must still read");
+        assert!(chat.turns[0].attachments.is_empty());
+    }
+
     #[test]
     fn derived_background_names_the_source_repository_and_carries_the_transcript() {
+        let (_tmp, chats) = store();
         let chat = Chat {
             schema: SCHEMA,
             id: "20260903-014455-ab12".to_owned(),
@@ -1261,11 +1556,13 @@ mod tests {
                     who: Who::Operator,
                     body: "rework the queue drain".to_owned(),
                     at: Timestamp::now(),
+                    attachments: Vec::new(),
                 },
                 Turn {
                     who: Who::Agent,
                     body: "which part of the drain?".to_owned(),
                     at: Timestamp::now(),
+                    attachments: Vec::new(),
                 },
             ],
             draft: None,
@@ -1274,7 +1571,7 @@ mod tests {
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, "sonnet", 7),
         };
-        let background = derived_background(&chat);
+        let background = derived_background(&chat, &chats);
         assert!(background.contains("/repo/other"));
         assert!(background.contains("rework the queue drain"));
         assert!(background.contains("which part of the drain?"));
@@ -1467,7 +1764,7 @@ mod tests {
         chat.draft = Some(good_draft());
         chats.put(&mut chat).expect("put");
 
-        say(&mut chat, &chats, &cfg, "the report module")
+        say(&mut chat, &chats, &cfg, "the report module", Vec::new())
             .await
             .expect("say");
 
@@ -1819,7 +2116,7 @@ mod tests {
         assert_eq!(chat.turns[0].who, Who::Operator);
         assert_eq!(chat.turns[1].who, Who::Agent);
 
-        say(&mut chat, &chats, &cfg, "the report module")
+        say(&mut chat, &chats, &cfg, "the report module", Vec::new())
             .await
             .expect("say");
 
@@ -1851,7 +2148,7 @@ mod tests {
         // actually runs: `mock_agent` rewrites the same script path, which is
         // what it looks like when that CLI stops working mid-interview.
         mock_agent(tmp.path(), BROKEN, BTreeMap::new());
-        let err = say(&mut chat, &chats, &cfg, "the report module")
+        let err = say(&mut chat, &chats, &cfg, "the report module", Vec::new())
             .await
             .expect_err("a turn with no answer is an error");
         assert!(err.to_string().contains("no answer"), "{err}");
@@ -1870,6 +2167,87 @@ mod tests {
             note.body
         );
         assert!(note.body.contains("your message is saved"));
+    }
+
+    /// An attachment lets the operator send an otherwise-empty message, and
+    /// its absolute path (never the id or the operator's own filename alone)
+    /// is what actually reaches the agent's prompt - the whole point of
+    /// `Invocation::attachments` and the note `turn` appends.
+    #[tokio::test]
+    async fn attachments_reach_the_prompt_and_an_empty_body_is_still_a_turn() {
+        let (tmp, chats) = store();
+        let spec = mock_agent(tmp.path(), REPLY, env("first reply"));
+        let cfg = config(spec);
+        let mut chat = start(
+            &chats,
+            &cfg,
+            tmp.path().to_owned(),
+            "add durations",
+            None,
+            None,
+        )
+        .await
+        .expect("start");
+
+        let att = chats
+            .put_attachment(
+                &chat.id,
+                "image/png",
+                "screenshot.png",
+                b"pretend-png-bytes",
+            )
+            .expect("put attachment");
+
+        // Overwrites the script `mock_agent` above pointed at, the same trick
+        // `starting_a_derived_chat_carries_the_source_transcript_and_leaves_it_untouched`
+        // uses: the reply becomes whatever the agent received on stdin.
+        mock_agent(tmp.path(), ECHO, BTreeMap::new());
+        say(&mut chat, &chats, &cfg, "", vec![att.clone()])
+            .await
+            .expect("an empty body with an attachment is still a turn");
+
+        let operator_turn = &chat.turns[chat.turns.len() - 2];
+        assert_eq!(operator_turn.who, Who::Operator);
+        assert_eq!(operator_turn.body, "");
+        assert_eq!(operator_turn.attachments, vec![att.clone()]);
+
+        let prompt = &chat.turns.last().expect("agent reply").body;
+        let expected_path = chats
+            .attachments_dir(&chat.id)
+            .join(format!("{}.png", att.id));
+        assert!(
+            prompt.contains(&expected_path.display().to_string()),
+            "the agent must be told the attachment's absolute path: {prompt}"
+        );
+        assert!(prompt.contains("image/png"), "and its mime: {prompt}");
+    }
+
+    /// `run::home()` returns a bare relative `PathBuf` verbatim when the
+    /// operator sets `MAGI_HOME` to a relative path - nothing canonicalizes
+    /// it - so a `Chats` store built on top of it has a relative `root` too.
+    /// That is harmless for this store's own reads and writes, which run in
+    /// this same process against this process's cwd, but `attachment_path`
+    /// hands its result to a *different* process invoked with `cwd:
+    /// &chat.repo`: an uncorrected relative path would resolve against the
+    /// repository instead of wherever the attachment actually landed, and
+    /// the CLI would find nothing there.
+    #[test]
+    fn attachment_path_is_absolute_even_when_the_store_root_is_relative() {
+        let chats = Chats::at(PathBuf::from("relative-chats-root-for-this-test"));
+        let att = Attachment {
+            id: "0".repeat(32),
+            name: "shot.png".to_owned(),
+            mime: "image/png".to_owned(),
+            bytes: 3,
+        };
+        let path = chats
+            .attachment_path("some-chat-id", &att)
+            .expect("a supported mime always yields a path");
+        assert!(
+            path.is_absolute(),
+            "must be absolute even off a relative store root: {}",
+            path.display()
+        );
     }
 
     #[test]

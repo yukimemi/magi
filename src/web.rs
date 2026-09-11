@@ -102,9 +102,10 @@ use tokio::sync::Notify;
 use anyhow::{Context, Result};
 use axum::Json;
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -160,6 +161,28 @@ const LIST_MAX: usize = 500;
 
 /// Width of a generated task title, matching what the CLI uses.
 const TITLE_MAX: usize = 72;
+
+/// Per-file cap for an attachment upload.
+///
+/// Enforced twice: axum's own body limit is raised one byte above this, only
+/// on the two attachment `POST` routes (see the router - every other route
+/// keeps the crate-wide default), so an oversize body is still read far
+/// enough to answer with our own message below rather than axum's generic
+/// one; this constant is what that message and the boundary check actually
+/// compare against.
+const ATTACHMENT_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+/// The image types an attachment upload accepts - a closed whitelist, the
+/// same posture [`asset_content_type`] takes for panel assets and for the
+/// same reason: SVG is excluded on purpose because it is active content
+/// (it may carry `<script>`) and not merely a picture, so it never appears
+/// here even though `image/svg+xml` is a real IANA type.
+const ATTACHMENT_MIME_WHITELIST: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Header carrying the operator's own filename. Free text, stored only for
+/// display - see [`chat::Attachment::name`]'s doc on why it never
+/// contributes to a path.
+const FILENAME_HEADER: &str = "x-filename";
 
 /// The header that makes serving agent-authored HTML defensible, sent by both
 /// panel routes and asserted verbatim by a test.
@@ -714,11 +737,32 @@ impl Ui {
             .route("/api/chats/{id}/say", post(chat_say))
             .route("/api/chats/{id}/file", post(chat_file))
             .route("/api/chats/{id}/abandon", post(chat_abandon))
+            // `DefaultBodyLimit` is raised only on this one route - every
+            // other route on this server answers in a few kilobytes, and
+            // widening the crate-wide default for all of them just because
+            // one accepts a picture would let any other handler be handed
+            // a multi-megabyte body it never expects.
+            .route(
+                "/api/chats/{id}/attachments",
+                post(chat_attachment_post).layer(DefaultBodyLimit::max(ATTACHMENT_MAX_BYTES + 1)),
+            )
+            .route(
+                "/api/chats/{id}/attachments/{att}",
+                get(chat_attachment_get),
+            )
             .route("/api/talks", get(talks_list).post(talk_post))
             .route("/api/talks/{id}", get(talk_detail).delete(talk_delete))
             .route("/api/talks/{id}/say", post(talk_say))
             .route("/api/talks/{id}/close", post(talk_close))
             .route("/api/talks/{id}/reopen", post(talk_reopen))
+            .route(
+                "/api/talks/{id}/attachments",
+                post(talk_attachment_post).layer(DefaultBodyLimit::max(ATTACHMENT_MAX_BYTES + 1)),
+            )
+            .route(
+                "/api/talks/{id}/attachments/{att}",
+                get(talk_attachment_get),
+            )
             .route("/api/events", get(events))
             .with_state(Arc::new(self))
     }
@@ -3506,10 +3550,15 @@ async fn chat_post(
 }
 
 /// The body of `POST /api/chats/{id}/say`.
+///
+/// `attachments` names ids `POST /api/chats/{id}/attachments` already
+/// returned - never bytes of its own - so a turn with no images just omits
+/// the field, which is what an older front end still does.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct NewTurn {
     text: String,
+    attachments: Vec<String>,
 }
 
 /// `POST /api/chats/{id}/say` - one turn of the interview.
@@ -3543,7 +3592,7 @@ async fn chat_say(
     body: std::result::Result<Json<NewTurn>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<ChatView>)> {
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    if body.text.trim().is_empty() {
+    if body.text.trim().is_empty() && body.attachments.is_empty() {
         return Err(ApiError::bad_request("say something"));
     }
 
@@ -3568,6 +3617,25 @@ async fn chat_say(
         .await?
     };
 
+    // Every attachment id resolved to the metadata `chat::record` actually
+    // stores, before anything is recorded - an unknown id is a 4xx that
+    // names it rather than a turn silently missing an image.
+    let attachments = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        let ids = body.attachments.clone();
+        blocking(move || {
+            ids.into_iter()
+                .map(|att_id| {
+                    ui.chats.attachment_meta(&id, &att_id)?.ok_or_else(|| {
+                        ApiError::bad_request(format!("unknown attachment `{att_id}`"))
+                    })
+                })
+                .collect::<ApiResult<Vec<chat::Attachment>>>()
+        })
+        .await?
+    };
+
     // The operator's turn is recorded, the agent's turn runs in the background,
     // and the response goes back now.
     //
@@ -3587,7 +3655,7 @@ async fn chat_say(
         let mut chat = chat.clone();
         let chats = chats.clone();
         let said = body.text.clone();
-        blocking(move || Ok(chat::record(&mut chat, &chats, &said)?)).await?
+        blocking(move || Ok(chat::record(&mut chat, &chats, &said, attachments)?)).await?
     };
     // Re-read so the spawned task appends to the record that now holds the
     // operator's turn, rather than to the snapshot taken before it.
@@ -3684,6 +3752,49 @@ async fn chat_abandon(
 /// Expand an id or short id to exactly one chat id.
 fn resolve_chat(store: &Chats, id: &str) -> ApiResult<String> {
     pick(store.list().into_iter().map(|c| c.id).collect(), id, "chat")
+}
+
+/// `POST /api/chats/{id}/attachments` - upload one image to attach to a
+/// future `chat-say`.
+///
+/// A dedicated route rather than a field on `say`, because the phone uploads
+/// the moment the operator picks a file - well before Send is even
+/// tappable - so the thumbnail row and the "still uploading" state on a
+/// mobile link have something to key on before any message exists. 201
+/// carries the [`chat::Attachment`] `say` later takes the `id` of.
+async fn chat_attachment_post(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<chat::Attachment>)> {
+    let mime = validate_attachment(&headers, &body)?;
+    let name = filename_header(&headers);
+    let data = body.to_vec();
+    blocking(move || {
+        let id = resolve_chat(&ui.chats, &id)?;
+        let att = ui.chats.put_attachment(&id, mime, &name, &data)?;
+        Ok((StatusCode::CREATED, Json(att)))
+    })
+    .await
+}
+
+/// `GET /api/chats/{id}/attachments/{att}` - the stored image back, for a
+/// thumbnail or the full-size view a tap opens.
+async fn chat_attachment_get(
+    State(ui): State<Arc<Ui>>,
+    Path((id, att)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    blocking(move || {
+        let id = resolve_chat(&ui.chats, &id)?;
+        let Some((meta, data)) = ui.chats.read_attachment(&id, &att)? else {
+            return Err(ApiError::not_found(format!(
+                "chat {id} has no attachment `{att}`"
+            )));
+        };
+        Ok(attachment_response(&meta.mime, data))
+    })
+    .await
 }
 
 /// A talk as the phone reads it.
@@ -3792,11 +3903,13 @@ async fn talk_detail(
     .await
 }
 
-/// The body of `POST /api/talks/{id}/say`.
+/// The body of `POST /api/talks/{id}/say`. See [`NewTurn`]'s doc on
+/// `attachments`, which this mirrors.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct NewTalkTurn {
     text: String,
+    attachments: Vec<String>,
 }
 
 /// `POST /api/talks/{id}/say` - one turn of the conversation.
@@ -3816,7 +3929,7 @@ async fn talk_say(
     body: std::result::Result<Json<NewTalkTurn>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<TalkView>)> {
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    if body.text.trim().is_empty() {
+    if body.text.trim().is_empty() && body.attachments.is_empty() {
         return Err(ApiError::bad_request("say something"));
     }
 
@@ -3841,12 +3954,29 @@ async fn talk_say(
         .await?
     };
 
+    // See `chat_say`'s own resolution step, which this mirrors.
+    let attachments = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        let ids = body.attachments.clone();
+        blocking(move || {
+            ids.into_iter()
+                .map(|att_id| {
+                    ui.talks.attachment_meta(&id, &att_id)?.ok_or_else(|| {
+                        ApiError::bad_request(format!("unknown attachment `{att_id}`"))
+                    })
+                })
+                .collect::<ApiResult<Vec<talk::Attachment>>>()
+        })
+        .await?
+    };
+
     let talks = ui.talks.clone();
     let text = {
         let mut talk = talk.clone();
         let talks = talks.clone();
         let said = body.text.clone();
-        blocking(move || Ok(talk::record(&mut talk, &talks, &said)?)).await?
+        blocking(move || Ok(talk::record(&mut talk, &talks, &said, attachments)?)).await?
     };
     // Re-read so the spawned task appends to the record that now holds the
     // operator's turn, rather than to the snapshot taken before it.
@@ -3955,6 +4085,164 @@ fn draft_ids(dir: &FsPath) -> Vec<String> {
 /// `resolve_talk` already guarantee for their own ids.
 fn resolve_draft(dir: &FsPath, id: &str) -> ApiResult<String> {
     pick(draft_ids(dir), id, "draft")
+}
+
+/// `POST /api/talks/{id}/attachments` - the same route as
+/// [`chat_attachment_post`], for a standing conversation instead of a
+/// planning interview.
+async fn talk_attachment_post(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<talk::Attachment>)> {
+    let mime = validate_attachment(&headers, &body)?;
+    let name = filename_header(&headers);
+    let data = body.to_vec();
+    blocking(move || {
+        let id = resolve_talk(&ui.talks, &id)?;
+        let att = ui.talks.put_attachment(&id, mime, &name, &data)?;
+        Ok((StatusCode::CREATED, Json(att)))
+    })
+    .await
+}
+
+/// `GET /api/talks/{id}/attachments/{att}` - see [`chat_attachment_get`].
+async fn talk_attachment_get(
+    State(ui): State<Arc<Ui>>,
+    Path((id, att)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    blocking(move || {
+        let id = resolve_talk(&ui.talks, &id)?;
+        let Some((meta, data)) = ui.talks.read_attachment(&id, &att)? else {
+            return Err(ApiError::not_found(format!(
+                "talk {id} has no attachment `{att}`"
+            )));
+        };
+        Ok(attachment_response(&meta.mime, data))
+    })
+    .await
+}
+
+/// Validate an attachment upload's declared `Content-Type` and the bytes
+/// themselves, returning the canonical mime on success.
+///
+/// Two checks, both required: the header has to name one of
+/// [`ATTACHMENT_MIME_WHITELIST`] (which is what keeps SVG out - it is
+/// simply never in the list, active content rather than a picture, the same
+/// exclusion [`asset_content_type`]'s doc explains), and the file's own
+/// magic number has to agree. The second is what stops a mislabeled upload -
+/// an HTML file sent as `Content-Type: image/png` - from ever reaching disk;
+/// a declared type is a claim, not a fact, so it is never trusted alone.
+fn validate_attachment(headers: &HeaderMap, data: &[u8]) -> ApiResult<&'static str> {
+    if data.len() > ATTACHMENT_MAX_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "attachment is {} bytes, over the {} MiB limit",
+            data.len(),
+            ATTACHMENT_MAX_BYTES / (1024 * 1024)
+        ))
+        .with_status(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+    if data.is_empty() {
+        return Err(ApiError::bad_request("attachment is empty"));
+    }
+    let declared = declared_mime(headers)?;
+    match sniffed_mime(data) {
+        Some(sniffed) if sniffed == declared => Ok(declared),
+        Some(sniffed) => Err(ApiError::bad_request(format!(
+            "Content-Type said `{declared}` but the file's own bytes look like `{sniffed}`"
+        ))),
+        None => Err(ApiError::bad_request(
+            "the file's bytes do not match any accepted image format",
+        )),
+    }
+}
+
+/// The declared `Content-Type`, checked against [`ATTACHMENT_MIME_WHITELIST`]
+/// and nothing else - parameters like `; charset=` are stripped, but the
+/// value itself is not otherwise interpreted.
+fn declared_mime(headers: &HeaderMap) -> ApiResult<&'static str> {
+    let raw = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    ATTACHMENT_MIME_WHITELIST
+        .iter()
+        .find(|&&m| m == raw)
+        .copied()
+        .ok_or_else(|| {
+            if raw == "image/svg+xml" {
+                ApiError::bad_request(
+                    "SVG is not accepted: it can carry active content (e.g. a <script>), \
+                     not just a picture",
+                )
+            } else if raw.is_empty() {
+                ApiError::bad_request("Content-Type is required for an attachment upload")
+            } else {
+                ApiError::bad_request(format!(
+                    "`{raw}` is not an accepted attachment type; use image/png, image/jpeg, \
+                     image/gif or image/webp"
+                ))
+            }
+        })
+}
+
+/// Identify an image by its magic number, independent of whatever
+/// `Content-Type` claimed.
+fn sniffed_mime(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if data.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// The operator's own filename, from [`FILENAME_HEADER`], kept only for
+/// display - see [`chat::Attachment::name`]'s doc on why it never
+/// contributes to a path. A missing or blank header (curl without it, an
+/// older front end) falls back to a generic name rather than refusing the
+/// upload over a field that is cosmetic.
+fn filename_header(headers: &HeaderMap) -> String {
+    headers
+        .get(FILENAME_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("attachment")
+        .to_owned()
+}
+
+/// Every attachment `GET` response: the mime re-validated against the same
+/// closed whitelist the upload route enforces - never the string trusted
+/// verbatim off disk - plus `X-Content-Type-Options: nosniff`, so a browser
+/// cannot decide it knows better than the type we send. Unlike a panel asset
+/// there is no [`PANEL_CSP`] here: this is a plain image the phone's own
+/// document renders inline, not agent-authored HTML in a sandboxed frame.
+fn attachment_response(mime: &str, body: Vec<u8>) -> Response {
+    let content_type = ATTACHMENT_MIME_WHITELIST
+        .iter()
+        .find(|&&m| m == mime)
+        .copied()
+        .unwrap_or("application/octet-stream");
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// The configuration for a repository, read off the disk for this request.
@@ -4103,6 +4391,11 @@ mod tests {
         async fn delete(&self, path: &str) -> Res {
             request(self.addr, "DELETE", path, None).await
         }
+
+        /// `POST` a raw body with its own headers - see [`request_bytes`].
+        async fn post_bytes(&self, path: &str, headers: &[(&str, &str)], body: &[u8]) -> Res {
+            request_bytes(self.addr, path, headers, body).await
+        }
     }
 
     struct Res {
@@ -4176,6 +4469,53 @@ mod tests {
         socket.read_to_end(&mut raw).await.expect("read response");
         // Split on the raw bytes rather than on a lossy string, so a binary
         // body survives to be compared byte for byte.
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("a header block");
+        let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+        let bytes = raw[split + 4..].to_vec();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .expect("a status line");
+        Res {
+            status,
+            headers: head.to_lowercase(),
+            head,
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+            bytes,
+        }
+    }
+
+    /// A `POST` carrying a raw binary body and its own headers, for the
+    /// attachment upload route - `request_with` only ever sends
+    /// `Content-Type: application/json`, which is wrong for an image and
+    /// would corrupt anything not valid UTF-8 by round-tripping it through
+    /// `&str` first.
+    async fn request_bytes(
+        addr: SocketAddr,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Res {
+        let mut head = format!("POST {path} HTTP/1.1\r\nHost: magi\r\nConnection: close\r\n");
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+        let mut socket = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to the test server");
+        socket
+            .write_all(head.as_bytes())
+            .await
+            .expect("write request head");
+        socket.write_all(body).await.expect("write request body");
+        let mut raw = Vec::new();
+        socket.read_to_end(&mut raw).await.expect("read response");
         let split = raw
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
@@ -5752,6 +6092,256 @@ mod tests {
         assert_eq!(turns_after, 2, "the agent's reply eventually lands");
     }
 
+    /// Bytes `sniffed_mime` recognises as `image/png` - the signature plus a
+    /// few more, since real uploads are never exactly eight bytes.
+    const PNG_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01";
+
+    #[tokio::test]
+    async fn a_png_attachment_upload_is_201_and_get_returns_it_with_nosniff() {
+        let f = Fixture::start().await;
+        let id = seed_talk(&f, "20260905-000000-a1b2", "open");
+
+        let res = f
+            .post_bytes(
+                &format!("/api/talks/{id}/attachments"),
+                &[("Content-Type", "image/png"), ("X-Filename", "shot.png")],
+                PNG_BYTES,
+            )
+            .await;
+        assert_eq!(res.status, 201, "{}", res.body);
+        let body = res.json();
+        assert_eq!(body["name"], "shot.png");
+        assert_eq!(body["mime"], "image/png");
+        assert_eq!(body["bytes"], PNG_BYTES.len());
+        let att_id = body["id"].as_str().expect("id").to_owned();
+        assert_eq!(
+            att_id.len(),
+            32,
+            "the id must never be a client-suppliable path: {att_id}"
+        );
+
+        let got = f
+            .get(&format!("/api/talks/{id}/attachments/{att_id}"))
+            .await;
+        assert_eq!(got.status, 200, "{}", got.body);
+        assert_eq!(got.header("content-type"), Some("image/png"));
+        assert_eq!(got.header("x-content-type-options"), Some("nosniff"));
+        assert_eq!(got.bytes, PNG_BYTES);
+    }
+
+    #[tokio::test]
+    async fn an_svg_a_text_file_and_an_oversized_upload_are_all_4xx() {
+        let f = Fixture::start().await;
+        let id = seed_talk(&f, "20260905-000000-c3d4", "open");
+
+        // SVG can carry a `<script>`, so it is never on the whitelist even
+        // though it is a real IANA image type.
+        let svg = f
+            .post_bytes(
+                &format!("/api/talks/{id}/attachments"),
+                &[("Content-Type", "image/svg+xml")],
+                b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+            )
+            .await;
+        assert!(
+            (400..500).contains(&svg.status),
+            "svg must be refused: {} {}",
+            svg.status,
+            svg.body
+        );
+        assert!(svg.body.contains("SVG"), "{}", svg.body);
+
+        let text = f
+            .post_bytes(
+                &format!("/api/talks/{id}/attachments"),
+                &[("Content-Type", "text/plain")],
+                b"just some text",
+            )
+            .await;
+        assert!(
+            (400..500).contains(&text.status),
+            "an unlisted type must be refused: {} {}",
+            text.status,
+            text.body
+        );
+
+        // The declared type is a real png, but the size check runs before
+        // the bytes are even looked at.
+        let oversized = vec![0u8; ATTACHMENT_MAX_BYTES + 1];
+        let big = f
+            .post_bytes(
+                &format!("/api/talks/{id}/attachments"),
+                &[("Content-Type", "image/png")],
+                &oversized,
+            )
+            .await;
+        assert_eq!(
+            big.status,
+            StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+            "{}",
+            big.body
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mislabeled_upload_is_refused_even_though_the_declared_type_is_on_the_whitelist() {
+        let f = Fixture::start().await;
+        let id = seed_talk(&f, "20260905-000000-d4e5", "open");
+
+        // A whitelisted `Content-Type`, but bytes that are not actually a
+        // png - the declared header alone is never trusted.
+        let res = f
+            .post_bytes(
+                &format!("/api/talks/{id}/attachments"),
+                &[("Content-Type", "image/png")],
+                b"<html>not a picture</html>",
+            )
+            .await;
+        assert!((400..500).contains(&res.status), "{}", res.body);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_attachment_id_is_a_404() {
+        let f = Fixture::start().await;
+        let id = seed_talk(&f, "20260905-000000-e5f6", "open");
+
+        let res = f
+            .get(&format!("/api/talks/{id}/attachments/{}", "0".repeat(32)))
+            .await;
+        assert_eq!(res.status, 404, "{}", res.body);
+    }
+
+    #[tokio::test]
+    async fn talk_say_with_only_an_attachment_and_no_body_is_accepted_and_persists() {
+        let f = Fixture::start().await;
+        let id = seed_talk(&f, "20260905-000000-f6a7", "open");
+
+        let uploaded = f
+            .post_bytes(
+                &format!("/api/talks/{id}/attachments"),
+                &[("Content-Type", "image/png"), ("X-Filename", "shot.png")],
+                PNG_BYTES,
+            )
+            .await;
+        assert_eq!(uploaded.status, 201, "{}", uploaded.body);
+        let att_id = uploaded.json()["id"].as_str().expect("id").to_owned();
+
+        let res = f
+            .post(
+                &format!("/api/talks/{id}/say"),
+                Some(&format!(r#"{{"text":"","attachments":["{att_id}"]}}"#)),
+            )
+            .await;
+        assert_eq!(res.status, 202, "{}", res.body);
+        let queued = res.json();
+        let turns = queued["turns"].as_array().expect("turns array");
+        assert_eq!(
+            turns.len(),
+            1,
+            "an empty body with an attachment is still a turn: {queued}"
+        );
+        assert_eq!(turns[0]["who"], "operator");
+        assert_eq!(turns[0]["body"], "");
+        let atts = turns[0]["attachments"]
+            .as_array()
+            .expect("attachments array");
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0]["id"], att_id);
+        assert_eq!(atts[0]["mime"], "image/png");
+
+        // Not only in the response: `record` flushes to disk before the
+        // agent's own turn is even spawned.
+        let on_disk = f.talks().get(&id).expect("get");
+        assert_eq!(on_disk.turns[0].attachments.len(), 1);
+        assert_eq!(on_disk.turns[0].attachments[0].id, att_id);
+    }
+
+    #[tokio::test]
+    async fn saying_with_an_unknown_attachment_id_is_a_4xx_and_records_nothing() {
+        let f = Fixture::start().await;
+        let id = seed_talk(&f, "20260905-000000-a7b8", "open");
+
+        let res = f
+            .post(
+                &format!("/api/talks/{id}/say"),
+                Some(&format!(
+                    r#"{{"text":"hi","attachments":["{}"]}}"#,
+                    "a".repeat(32)
+                )),
+            )
+            .await;
+        assert!((400..500).contains(&res.status), "{}", res.body);
+        assert!(res.body.contains("unknown attachment"), "{}", res.body);
+
+        let on_disk = f.talks().get(&id).expect("get");
+        assert!(
+            on_disk.turns.is_empty(),
+            "a rejected attachment id must not partially record the turn: {:?}",
+            on_disk.turns
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_say_persists_an_attachment_in_the_turn_json() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::write(repo.join("magi.toml"), MOCK_AGENT_TOML).expect("write magi.toml");
+        let f = Fixture::with_repo(repo.clone()).await;
+
+        let opened = f
+            .post("/api/chats", Some(r#"{"idea":"rework the config loader"}"#))
+            .await;
+        assert_eq!(opened.status, 202, "{}", opened.body);
+        let id = opened.json()["id"].as_str().expect("id").to_owned();
+
+        // The idea's own first turn runs in the background (see `chat_post`'s
+        // doc); it must land before `say` below, which would otherwise race
+        // it and get the same 409 a second turn on a busy chat gets.
+        let mut thinking = true;
+        for _ in 0..200 {
+            let detail = f.get(&format!("/api/chats/{id}")).await.json();
+            thinking = detail["thinking"].as_bool().expect("thinking is a bool");
+            if !thinking {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !thinking,
+            "the first turn must finish before this test continues"
+        );
+
+        let uploaded = f
+            .post_bytes(
+                &format!("/api/chats/{id}/attachments"),
+                &[("Content-Type", "image/png")],
+                PNG_BYTES,
+            )
+            .await;
+        assert_eq!(uploaded.status, 201, "{}", uploaded.body);
+        let att_id = uploaded.json()["id"].as_str().expect("id").to_owned();
+
+        let res = f
+            .post(
+                &format!("/api/chats/{id}/say"),
+                Some(&format!(
+                    r#"{{"text":"here is a screenshot","attachments":["{att_id}"]}}"#
+                )),
+            )
+            .await;
+        assert_eq!(res.status, 202, "{}", res.body);
+
+        let on_disk = f.chats().get(&id).expect("get");
+        let operator_turn = on_disk
+            .turns
+            .iter()
+            .find(|t| t.body == "here is a screenshot")
+            .expect("the new operator turn");
+        assert_eq!(operator_turn.attachments.len(), 1);
+        assert_eq!(operator_turn.attachments[0].id, att_id);
+    }
+
     #[tokio::test]
     async fn talk_close_makes_the_talk_refuse_further_turns() {
         let f = Fixture::start().await;
@@ -6846,6 +7436,7 @@ mod tests {
             who: crate::talk::Who::Operator,
             body: "a new turn".to_owned(),
             at: Timestamp::now(),
+            attachments: Vec::new(),
         });
         f.talks().put(&mut on_disk).expect("record a turn");
 

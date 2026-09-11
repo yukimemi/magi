@@ -92,6 +92,29 @@ pub enum Who {
     Agent,
 }
 
+/// One image the operator attached to a turn.
+///
+/// Never carries the bytes themselves: the picture lives on disk under
+/// [`Talks::attachments_dir`], named by `id` alone. `name` is the filename
+/// the operator's browser reported, kept only for display - it never
+/// contributes to a path, which is what keeps an upload from being able to
+/// traverse outside its own directory. Mirrors [`crate::chat::Attachment`],
+/// duplicated rather than shared - the two conversation types are meant to
+/// share no code, per this module's own doc.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attachment {
+    /// Server-minted id; also the file's stem under `attachments_dir`.
+    pub id: String,
+    /// The operator's own filename, for display only.
+    pub name: String,
+    /// Validated by `web` at upload time against a closed whitelist:
+    /// `image/png`, `image/jpeg`, `image/gif`, `image/webp`.
+    pub mime: String,
+    /// Size in bytes, so the phone can show it without a second request.
+    pub bytes: u64,
+}
+
 /// One message in the conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,6 +125,10 @@ pub struct Turn {
     pub body: String,
     /// When it was said.
     pub at: Timestamp,
+    /// Images attached to this turn. `#[serde(default)]` so a conversation
+    /// recorded before attachments existed still reads.
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 /// Where a conversation is in its life. Unlike [`crate::chat::ChatStatus`]
@@ -223,6 +250,109 @@ impl Talks {
     /// record rather than inside it - see [`crate::chat::Chats::artifacts_of`].
     pub fn artifacts_of(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.artifacts"))
+    }
+
+    /// Where this conversation's attached images live: a subdirectory of
+    /// `artifacts_of`, so deleting the conversation deletes its attachments
+    /// too and nothing here needs its own cleanup path.
+    pub fn attachments_dir(&self, id: &str) -> PathBuf {
+        self.artifacts_of(id).join("attachments")
+    }
+
+    /// Persist one already-validated attachment and return its metadata.
+    ///
+    /// `web::talk_attachment_post` is the only caller: it has already
+    /// checked `mime` against the whitelist and sniffed the bytes, so an
+    /// unrecognised mime reaching here is a bug in that caller, not
+    /// something an operator did. The id is minted here and never taken
+    /// from the client; `name` is stored for display only and never used to
+    /// build a path.
+    pub fn put_attachment(
+        &self,
+        id: &str,
+        mime: &str,
+        name: &str,
+        data: &[u8],
+    ) -> Result<Attachment> {
+        let dir = self.attachments_dir(id);
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let ext = attachment_ext(mime).with_context(|| format!("unsupported mime `{mime}`"))?;
+        let att = Attachment {
+            id: new_attachment_id(),
+            name: name.to_owned(),
+            mime: mime.to_owned(),
+            bytes: data.len() as u64,
+        };
+        std::fs::write(dir.join(format!("{}.{ext}", att.id)), data)
+            .with_context(|| format!("write attachment {}", att.id))?;
+        std::fs::write(
+            dir.join(format!("{}.json", att.id)),
+            serde_json::to_string(&att).context("serialize attachment")?,
+        )
+        .with_context(|| format!("write attachment metadata {}", att.id))?;
+        Ok(att)
+    }
+
+    /// Just the metadata, without reading the image bytes back off disk -
+    /// what `web::talk_say` uses to turn an id the operator referenced into
+    /// an [`Attachment`] before appending a [`Turn`], where the bytes
+    /// themselves are of no interest. `None` for an id this conversation
+    /// never stored - including one that merely looks plausible:
+    /// [`valid_attachment_id`] is checked here too, not only by the caller,
+    /// the same defence-in-depth `Questions::panel_asset` uses for its own
+    /// asset ids.
+    pub fn attachment_meta(&self, id: &str, att_id: &str) -> Result<Option<Attachment>> {
+        if !valid_attachment_id(att_id) {
+            return Ok(None);
+        }
+        let meta_path = self.attachments_dir(id).join(format!("{att_id}.json"));
+        if !meta_path.is_file() {
+            return Ok(None);
+        }
+        let att = serde_json::from_str(
+            &std::fs::read_to_string(&meta_path)
+                .with_context(|| format!("read {}", meta_path.display()))?,
+        )
+        .with_context(|| format!("parse {}", meta_path.display()))?;
+        Ok(Some(att))
+    }
+
+    /// A stored attachment's metadata and its bytes together, for serving it
+    /// back on `GET`. `None` under the same conditions as
+    /// [`Talks::attachment_meta`], which this is built on.
+    pub fn read_attachment(&self, id: &str, att_id: &str) -> Result<Option<(Attachment, Vec<u8>)>> {
+        let Some(att) = self.attachment_meta(id, att_id)? else {
+            return Ok(None);
+        };
+        let ext = attachment_ext(&att.mime).with_context(|| {
+            format!("attachment {att_id} has an unsupported mime `{}`", att.mime)
+        })?;
+        let data_path = self.attachments_dir(id).join(format!("{att_id}.{ext}"));
+        let data =
+            std::fs::read(&data_path).with_context(|| format!("read {}", data_path.display()))?;
+        Ok(Some((att, data)))
+    }
+
+    /// Absolute path of one attachment's bytes, for the prompt note [`turn`]
+    /// appends and for [`Invocation::attachments`]. `None` only for a mime
+    /// [`put_attachment`] could never have written, which means the
+    /// attachment did not come from this store.
+    ///
+    /// `self.root` (and so `attachments_dir`) is not guaranteed absolute on
+    /// its own - `run::home()` returns a bare relative `PathBuf` verbatim
+    /// when the operator sets `MAGI_HOME` to a relative path, and nothing
+    /// canonicalizes it on the way in. That is harmless for every other use
+    /// of this store, since its own I/O runs in this process against this
+    /// process's cwd - but this path is handed to a CLI invoked with `cwd:
+    /// &talk.repo`, a different directory, so a relative path here would
+    /// resolve against the wrong place once it reached the prompt.
+    /// `std::path::absolute` fixes it against *this* process's cwd before
+    /// that happens; see `disk::free_bytes_by_os` for the same function used
+    /// the same way elsewhere in this codebase.
+    fn attachment_path(&self, id: &str, att: &Attachment) -> Option<PathBuf> {
+        let ext = attachment_ext(&att.mime)?;
+        let path = self.attachments_dir(id).join(format!("{}.{ext}", att.id));
+        std::path::absolute(&path).ok()
     }
 
     /// Write a conversation, atomically, so a process killed mid-write leaves
@@ -382,7 +512,12 @@ pub fn begin(store: &Talks, cfg: &Config, repo: PathBuf, agent: Option<&str>) ->
 /// message is safely on disk, and runs the agent's half in the background -
 /// see that function's doc for why holding the connection for a turn that can
 /// run fifteen minutes is the wrong shape for a phone.
-pub fn record(talk: &mut Talk, store: &Talks, text: &str) -> Result<String> {
+pub fn record(
+    talk: &mut Talk,
+    store: &Talks,
+    text: &str,
+    attachments: Vec<Attachment>,
+) -> Result<String> {
     // `web::talk_say` reads the talk, then awaits config discovery before
     // calling this - a gap a concurrent `POST /api/talks/{id}/close` can land
     // in. The guard held for the rest of this function is what actually closes
@@ -407,13 +542,14 @@ pub fn record(talk: &mut Talk, store: &Talks, text: &str) -> Result<String> {
         );
     }
     let text = text.trim();
-    if text.is_empty() {
+    if text.is_empty() && attachments.is_empty() {
         bail!("nothing to say");
     }
     talk.turns.push(Turn {
         who: Who::Operator,
         body: text.to_owned(),
         at: Timestamp::now(),
+        attachments,
     });
     store.put(talk)?;
     Ok(text.to_owned())
@@ -421,8 +557,14 @@ pub fn record(talk: &mut Talk, store: &Talks, text: &str) -> Result<String> {
 
 /// One operator turn and one agent turn, appended - the synchronous form, used
 /// by tests and by anything that is fine waiting out the turn itself.
-pub async fn say(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Result<()> {
-    let text = record(talk, store, text)?;
+pub async fn say(
+    talk: &mut Talk,
+    store: &Talks,
+    cfg: &Config,
+    text: &str,
+    attachments: Vec<Attachment>,
+) -> Result<()> {
+    let text = record(talk, store, text, attachments)?;
     turn(talk, store, cfg, &text).await
 }
 
@@ -504,16 +646,38 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         })?;
 
     let resuming = agent::has_session(spec.kind, &talk.seat, cfg.graph.sessions);
+    // The newest turn is always the operator message this call is answering
+    // - `record` appended it before `turn` was ever called - so its own
+    // attachments are what belong at the end of *this* prompt.
+    let last_note = attachment_note(
+        store,
+        &talk.id,
+        talk.turns
+            .last()
+            .map_or(&[][..], |t| t.attachments.as_slice()),
+    );
     let body = if talk.seat.turns == 0 {
         format!(
-            "{}\n\n# Operator\n\n{text}",
+            "{}\n\n# Operator\n\n{text}{last_note}",
             briefing(&talk.repo, &cfg.graph.language, cfg.talk.allow_write)
         )
     } else if resuming {
-        text.to_owned()
+        format!("{text}{last_note}")
     } else {
-        format!("{}\n\n{text}", transcript(talk))
+        format!("{}\n\n{text}{last_note}", transcript(talk, store))
     };
+
+    // Every attachment this conversation has ever held, not only this
+    // turn's: a resumed session gets a fresh process every turn, so a CLI
+    // whose sandbox needs `--add-dir` (see `agent::build_command`) needs the
+    // grant again to open an image from an earlier turn, even when nothing
+    // new was attached just now.
+    let attachment_paths: Vec<PathBuf> = talk
+        .turns
+        .iter()
+        .flat_map(|t| t.attachments.iter())
+        .filter_map(|a| store.attachment_path(&talk.id, a))
+        .collect();
 
     let artifacts = store.artifacts_of(&talk.id);
     let stem = format!("turn-{}", talk.seat.turns + 1);
@@ -537,6 +701,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         run: &talk.id,
         node: "chat",
         cache_dir: cache_dir.as_deref(),
+        attachments: &attachment_paths,
     };
 
     let outcome = agent::invoke(spec, &mut talk.seat, &inv).await;
@@ -544,6 +709,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         who: Who::Agent,
         body: format!("{MAGI_NOTE}{why}"),
         at: Timestamp::now(),
+        attachments: Vec::new(),
     };
     let (reply, failure) = match outcome {
         Err(e) => (
@@ -585,6 +751,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
                 who: Who::Agent,
                 body: out.text.trim().to_owned(),
                 at: Timestamp::now(),
+                attachments: Vec::new(),
             },
             None,
         ),
@@ -622,7 +789,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
 
 /// Everything said so far, as prose, for a CLI that cannot resume its own
 /// conversation. See [`crate::chat::transcript`], which this mirrors.
-fn transcript(talk: &Talk) -> String {
+fn transcript(talk: &Talk, store: &Talks) -> String {
     let mut out = String::from(
         "This conversation cannot resume on the CLI's side, so here is \
          everything said so far; answer only the last message.\n",
@@ -633,7 +800,30 @@ fn transcript(talk: &Talk) -> String {
             Who::Agent => "you",
         };
         out.push_str(&format!("\n## {who}\n\n{}\n", t.body.trim()));
+        out.push_str(&attachment_note(store, &talk.id, &t.attachments));
     }
+    out
+}
+
+/// The section named at the end of a turn's body, listing every attachment's
+/// absolute path and mime so the agent knows exactly what to open. Mirrors
+/// [`crate::chat`]'s own helper of the same name. Empty when `attachments`
+/// is, which is every turn but the rare one carrying an image, so a turn
+/// with none changes nothing about the prompt.
+fn attachment_note(store: &Talks, talk_id: &str, attachments: &[Attachment]) -> String {
+    if attachments.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\nThe operator attached the image(s) below to this message. Open \
+         and look at each one before you answer.\n",
+    );
+    for att in attachments {
+        if let Some(path) = store.attachment_path(talk_id, att) {
+            out.push_str(&format!("\n- {} ({})", path.display(), att.mime));
+        }
+    }
+    out.push('\n');
     out
 }
 
@@ -725,6 +915,39 @@ fn new_id() -> String {
     let stamp = jiff::Zoned::now().strftime("%Y%m%d-%H%M%S");
     let seed = crate::rng::entropy();
     format!("{stamp}-{:04x}", (seed ^ (seed >> 32)) & 0xffff)
+}
+
+/// Extension an attachment's bytes are stored under, from its (already
+/// validated) mime. The one place this mapping exists on the write side;
+/// `web`'s own whitelist is what actually decides which mimes are accepted
+/// in the first place.
+fn attachment_ext(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+/// Is `id` a shape [`put_attachment`](Talks::put_attachment) could have
+/// produced? 32 lowercase hex digits and nothing else, checked before an id
+/// that came from the client is ever allowed to build a path - so `..` and a
+/// path separator are never even possible.
+pub fn valid_attachment_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A fresh attachment id: 128 bits of process entropy as lowercase hex - the
+/// same "mint it, never take it from the client" rule [`new_id`] follows for
+/// conversation ids.
+fn new_attachment_id() -> String {
+    let mut r = crate::rng::SplitMix64::new(crate::rng::entropy());
+    format!("{:016x}{:016x}", r.next_u64(), r.next_u64())
 }
 
 #[cfg(test)]
@@ -879,6 +1102,37 @@ mod tests {
         );
     }
 
+    /// A conversation recorded before attachments existed - schema 1, no
+    /// `attachments` key on any turn - must still read.
+    #[test]
+    fn a_talk_recorded_without_attachments_still_reads() {
+        let (tmp, talks) = store();
+        let path = talks.path_of("20260904-014455-ab12");
+        std::fs::create_dir_all(talks.root()).expect("talks dir");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": 1,
+                "id": "20260904-014455-ab12",
+                "repo": tmp.path(),
+                "agent": "sonnet",
+                "status": "open",
+                "turns": [
+                    { "who": "operator", "body": "still there?",
+                      "at": Timestamp::now().to_string() },
+                ],
+                "created_at": Timestamp::now().to_string(),
+                "updated_at": Timestamp::now().to_string(),
+                "seat": SeatState::new(SEAT, "sonnet", 7),
+            })
+            .to_string(),
+        )
+        .expect("write pre-attachments talk");
+
+        let talk = talks.get("20260904-014455-ab12").expect("must still read");
+        assert!(talk.turns[0].attachments.is_empty());
+    }
+
     #[tokio::test]
     async fn the_first_turn_carries_the_briefing_and_later_turns_do_not() {
         let (tmp, talks) = store();
@@ -886,14 +1140,20 @@ mod tests {
         let cfg = config(spec);
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
 
-        say(&mut talk, &talks, &cfg, "what does the queue module do?")
-            .await
-            .expect("first turn");
+        say(
+            &mut talk,
+            &talks,
+            &cfg,
+            "what does the queue module do?",
+            Vec::new(),
+        )
+        .await
+        .expect("first turn");
         let first_prompt = &talk.turns[1].body;
         assert!(first_prompt.contains("magi task add --solo"));
         assert!(first_prompt.contains("what does the queue module do?"));
 
-        say(&mut talk, &talks, &cfg, "and how is it locked?")
+        say(&mut talk, &talks, &cfg, "and how is it locked?", Vec::new())
             .await
             .expect("second turn");
         let second_prompt = &talk.turns[3].body;
@@ -911,9 +1171,15 @@ mod tests {
         let cfg = config(spec);
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
 
-        say(&mut talk, &talks, &cfg, "can I rename this function?")
-            .await
-            .expect("say");
+        say(
+            &mut talk,
+            &talks,
+            &cfg,
+            "can I rename this function?",
+            Vec::new(),
+        )
+        .await
+        .expect("say");
 
         assert_eq!(talk.turns.len(), 2);
         assert_eq!(talk.turns[0].who, Who::Operator);
@@ -930,7 +1196,7 @@ mod tests {
         let cfg = config(spec);
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
 
-        let err = say(&mut talk, &talks, &cfg, "check the tests")
+        let err = say(&mut talk, &talks, &cfg, "check the tests", Vec::new())
             .await
             .expect_err("a turn with no answer is an error");
         assert!(err.to_string().contains("no answer"), "{err}");
@@ -944,6 +1210,72 @@ mod tests {
         assert!(note.body.contains("your message is saved"));
     }
 
+    /// An attachment lets the operator send an otherwise-empty message, and
+    /// its absolute path is what actually reaches the agent's prompt - here
+    /// on the very first turn, where it has to share the briefing.
+    #[tokio::test]
+    async fn attachments_reach_the_prompt_and_an_empty_body_is_still_a_turn() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), ECHO, BTreeMap::new());
+        let cfg = config(spec);
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        let att = talks
+            .put_attachment(
+                &talk.id,
+                "image/png",
+                "screenshot.png",
+                b"pretend-png-bytes",
+            )
+            .expect("put attachment");
+
+        say(&mut talk, &talks, &cfg, "", vec![att.clone()])
+            .await
+            .expect("an empty body with an attachment is still a turn");
+
+        let operator_turn = &talk.turns[0];
+        assert_eq!(operator_turn.who, Who::Operator);
+        assert_eq!(operator_turn.body, "");
+        assert_eq!(operator_turn.attachments, vec![att.clone()]);
+
+        let prompt = &talk.turns[1].body;
+        let expected_path = talks
+            .attachments_dir(&talk.id)
+            .join(format!("{}.png", att.id));
+        assert!(
+            prompt.contains(&expected_path.display().to_string()),
+            "the agent must be told the attachment's absolute path: {prompt}"
+        );
+        assert!(prompt.contains("image/png"), "and its mime: {prompt}");
+    }
+
+    /// See `chat`'s test of the same name: `run::home()` returns a bare
+    /// relative `PathBuf` verbatim when `MAGI_HOME` is set to a relative
+    /// path, so a `Talks` store built on it has a relative `root` too. That
+    /// is fine for this store's own I/O, which runs in this process against
+    /// this process's cwd, but `attachment_path` hands its result to a
+    /// *different* process invoked with `cwd: &talk.repo` - an uncorrected
+    /// relative path would resolve against the repository instead of
+    /// wherever the attachment actually landed.
+    #[test]
+    fn attachment_path_is_absolute_even_when_the_store_root_is_relative() {
+        let talks = Talks::at(PathBuf::from("relative-talks-root-for-this-test"));
+        let att = Attachment {
+            id: "0".repeat(32),
+            name: "shot.png".to_owned(),
+            mime: "image/png".to_owned(),
+            bytes: 3,
+        };
+        let path = talks
+            .attachment_path("some-talk-id", &att)
+            .expect("a supported mime always yields a path");
+        assert!(
+            path.is_absolute(),
+            "must be absolute even off a relative store root: {}",
+            path.display()
+        );
+    }
+
     #[test]
     fn closing_is_idempotent_and_a_closed_talk_takes_no_more_turns() {
         let (tmp, talks) = store();
@@ -955,7 +1287,8 @@ mod tests {
         assert_eq!(talk.status, TalkStatus::Closed);
         close(&mut talk, &talks).expect("closing twice is not an error");
 
-        let err = record(&mut talk, &talks, "still there?").expect_err("closed talks refuse");
+        let err =
+            record(&mut talk, &talks, "still there?", Vec::new()).expect_err("closed talks refuse");
         assert!(err.to_string().contains("closed"));
         let _ = &cfg; // config kept only to build the agent above
     }
@@ -1026,7 +1359,7 @@ mod tests {
         // close - so a `record` that trusted it would append a turn and
         // write the conversation back open, undoing the close.
         assert_eq!(stale.status, TalkStatus::Open);
-        let err = record(&mut stale, &talks, "still there?")
+        let err = record(&mut stale, &talks, "still there?", Vec::new())
             .expect_err("a close that landed first must be honored, not overwritten");
         assert!(err.to_string().contains("closed"));
 
@@ -1102,7 +1435,8 @@ mod tests {
         reopen(&mut talk, &talks).expect("reopening an open talk is not an error");
         assert_eq!(talk.status, TalkStatus::Open);
 
-        record(&mut talk, &talks, "one more thing").expect("a reopened talk takes turns again");
+        record(&mut talk, &talks, "one more thing", Vec::new())
+            .expect("a reopened talk takes turns again");
         let _ = &cfg; // config kept only to build the agent above
     }
 
@@ -1173,7 +1507,7 @@ mod tests {
         // The stale handle has no way to know the record is gone - a
         // `record` that trusted it would append a turn and write the
         // conversation back into existence.
-        let err = record(&mut stale, &talks, "still there?")
+        let err = record(&mut stale, &talks, "still there?", Vec::new())
             .expect_err("a delete that landed first must be honored, not overwritten");
         assert!(err.to_string().contains("deleted"), "{err}");
 

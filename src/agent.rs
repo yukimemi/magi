@@ -120,6 +120,13 @@ pub struct Invocation<'a> {
     /// directory `verify` reads back from - one cache, one prune, and the
     /// build the agent just paid for is the build the gate reuses.
     pub cache_dir: Option<&'a Path>,
+    /// Absolute paths of images the operator attached to this conversation,
+    /// outside `cwd` - see `chat`/`talk`'s `attachments_dir`. Empty for every
+    /// invocation that is not a chat or talk turn. [`build_command`] uses
+    /// this only to decide whether a CLI's sandbox needs widening to read
+    /// them; the prompt text naming each path and its mime is built by the
+    /// caller, not here.
+    pub attachments: &'a [PathBuf],
 }
 
 /// Evidence that a CLI ran out of its rate limit / quota, distinct from an
@@ -450,6 +457,10 @@ fn build_command(
 
     match spec.kind {
         AgentKind::Claude => {
+            // Claude's own tools have no cwd-confined sandbox - the CLI can
+            // already `Read` any absolute path magi hands it, an attachment
+            // outside the repository included - so no extra flag is needed
+            // here.
             argv.push("claude".to_owned());
             argv.push("-p".to_owned());
             argv.push("--output-format".to_owned());
@@ -474,6 +485,9 @@ fn build_command(
             }
         }
         AgentKind::Opencode => {
+            // `--auto` below already bypasses every permission, reads of a
+            // path outside `--dir` included, so an attachment elsewhere
+            // needs no extra flag.
             argv.push("opencode".to_owned());
             argv.push("run".to_owned());
             argv.push("--format".to_owned());
@@ -535,13 +549,41 @@ fn build_command(
                 );
             }
             // The prompt file lives outside the worktree, so the workspace has
-            // to be widened to reach it.
-            if delivery == Delivery::File {
+            // to be widened to reach it - and so does an attachment's own
+            // directory, which usually lives right beside it under the
+            // conversation's `artifacts_dir` (see `chat`/`talk`). "Usually":
+            // a chat derived from another one (`chat::derived_background`)
+            // can carry attachment paths that live under the *source*
+            // conversation's own artifacts dir instead, so each attachment
+            // outside `inv.artifacts` gets its own `--add-dir` rather than
+            // assuming one directory covers all of `inv.attachments`.
+            let mut add_dirs: Vec<String> = Vec::new();
+            if delivery == Delivery::File || !inv.attachments.is_empty() {
+                add_dirs.push(inv.artifacts.to_string_lossy().into_owned());
+            }
+            for path in inv.attachments {
+                let Some(parent) = path.parent() else {
+                    continue;
+                };
+                if parent.starts_with(inv.artifacts) {
+                    continue;
+                }
+                let dir = parent.to_string_lossy().into_owned();
+                if !add_dirs.contains(&dir) {
+                    add_dirs.push(dir);
+                }
+            }
+            for dir in add_dirs {
                 argv.push("--add-dir".to_owned());
-                argv.push(inv.artifacts.to_string_lossy().into_owned());
+                argv.push(dir);
             }
         }
         AgentKind::Codex => {
+            // `--sandbox` below governs writes, not reads (see the module
+            // doc: it is what makes codex the one kind whose *read-only*
+            // mode is enforced, by refusing edits) - both presets can read
+            // anywhere the OS lets the process, so an attachment outside
+            // `cwd` is already reachable without an extra flag.
             argv.push("codex".to_owned());
             argv.push("exec".to_owned());
             argv.push("--json".to_owned());
@@ -586,6 +628,10 @@ fn build_command(
             }
         }
         AgentKind::Command => {
+            // The operator's own command line, not one of the roster CLIs -
+            // there is no flag this function could add on its behalf, so an
+            // attachment's path has to reach it the same way the prompt
+            // does, through the substitutions below.
             if spec.command.is_empty() {
                 bail!("agent `{}` has kind = \"command\" but no command", spec.id);
             }
@@ -941,6 +987,7 @@ mod tests {
             run: "test-run",
             node: "test",
             cache_dir: None,
+            attachments: &[],
         }
     }
 
@@ -1217,11 +1264,92 @@ mod tests {
                 run: "test-run",
                 node: "test",
                 cache_dir: None,
+                attachments: &[],
             },
             Path::new("/art/p.md"),
         )
         .unwrap();
         assert!(p.argv.windows(2).any(|w| w == ["--print-timeout", "3600s"]));
+    }
+
+    /// `--add-dir` is what lets antigravity open a file outside the
+    /// worktree at all. Today that only happens when the delivery mode is
+    /// already `File`, but an attachment can arrive on a seat whose delivery
+    /// is `Stdin` or `Argv` (an explicit `prompt_delivery` override), and the
+    /// image still lives outside `cwd` - so the flag has to widen for that
+    /// reason too, independent of how the prompt itself is delivered.
+    #[test]
+    fn attachments_widen_antigravitys_add_dir_even_off_file_delivery() {
+        let mut s = spec(AgentKind::Antigravity, None);
+        s.prompt_delivery = Some(Delivery::Argv);
+        let seat = SeatState::new("talk", "a", 7);
+        let atts = [PathBuf::from("/art/attachments/abc.png")];
+
+        let without = build_command(
+            &s,
+            &seat,
+            &Invocation {
+                attachments: &[],
+                ..inv(Path::new("."), Path::new("/art"), true)
+            },
+            Path::new("/art/p.md"),
+        )
+        .unwrap();
+        assert!(
+            !without.argv.iter().any(|a| a == "--add-dir"),
+            "no attachment, no reason to widen the sandbox: {without:?}"
+        );
+
+        let with = build_command(
+            &s,
+            &seat,
+            &Invocation {
+                attachments: &atts,
+                ..inv(Path::new("."), Path::new("/art"), true)
+            },
+            Path::new("/art/p.md"),
+        )
+        .unwrap();
+        assert!(
+            with.argv.windows(2).any(|w| w == ["--add-dir", "/art"]),
+            "an attachment outside cwd must widen the sandbox even off File delivery: {with:?}"
+        );
+    }
+
+    /// A chat derived from another one (`chat::derived_background`) can pass
+    /// `turn` attachment paths that live under the *source* conversation's
+    /// own artifacts dir, not this invocation's `artifacts`. A single
+    /// `--add-dir` for `inv.artifacts` alone would leave those unreadable, so
+    /// each attachment directory outside it must get its own grant.
+    #[test]
+    fn an_inherited_attachment_outside_this_conversations_artifacts_dir_gets_its_own_add_dir() {
+        let seat = SeatState::new("plan", "a", 7);
+        let atts = [
+            PathBuf::from("/art/attachments/own.png"),
+            PathBuf::from("/other-chat/attachments/inherited.png"),
+        ];
+
+        let p = build_command(
+            &spec(AgentKind::Antigravity, None),
+            &seat,
+            &Invocation {
+                attachments: &atts,
+                ..inv(Path::new("."), Path::new("/art"), true)
+            },
+            Path::new("/art/p.md"),
+        )
+        .unwrap();
+
+        assert!(
+            p.argv.windows(2).any(|w| w == ["--add-dir", "/art"]),
+            "this conversation's own artifacts dir must still be granted: {p:?}"
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--add-dir", "/other-chat/attachments"]),
+            "the inherited attachment's own directory must be granted too: {p:?}"
+        );
     }
 
     #[test]
@@ -1438,6 +1566,7 @@ mod tests {
                 run: "test-run",
                 node: "test",
                 cache_dir: None,
+                attachments: &[],
             },
         )
         .await
@@ -1485,6 +1614,7 @@ mod tests {
                 run: "test-run",
                 node: "test",
                 cache_dir: Some(&cache),
+                attachments: &[],
             },
         )
         .await
@@ -1520,6 +1650,7 @@ mod tests {
                 run: "test-run",
                 node: "test",
                 cache_dir: None,
+                attachments: &[],
             },
         )
         .await
@@ -1548,6 +1679,7 @@ mod tests {
                 run: "test-run",
                 node: "test",
                 cache_dir: None,
+                attachments: &[],
             },
         )
         .await
@@ -1590,6 +1722,7 @@ mod tests {
                 run: "test-run",
                 node: "test",
                 cache_dir: None,
+                attachments: &[],
             },
         )
         .await
