@@ -1386,9 +1386,12 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             let text = task_text(&instruction, file.as_deref(), issue).await?;
             let title = title.unwrap_or_else(|| queue::title_from(&text, 72));
             let source = task_source(issue).await;
-            // Store an absolute path: the daemon that runs this task has its
-            // own working directory, and `.` would mean the wrong repository.
-            let repo = repo.canonicalize().unwrap_or(repo);
+            // Checked and stored as an absolute path here, not left for
+            // `serve` to discover: the daemon that runs this task has its
+            // own working directory, so a bad `--repo` must fail while a
+            // human is still looking at the terminal, not two attempts and
+            // a `held` later as an opaque OS error from a failed git spawn.
+            let repo = resolve_repo(&repo).await?;
             let mut task = Task::new(title, text, repo, source);
             task.priority = priority;
             task.solo = solo;
@@ -1629,6 +1632,24 @@ fn asking_is_not_this_seat_s_job(node: &str) -> Option<String> {
          task itself is ambiguous, say so as a finding - that reaches the \
          operator too, without stopping the run."
     ))
+}
+
+/// Check that `repo` is a real directory and a git working tree, returning
+/// its canonical, absolute path.
+///
+/// `--repo` is taken on faith nowhere else downstream: `serve` spawns `git`
+/// directly in whatever path the task carries, so a value that is merely
+/// well-formed but wrong (a typo, a mangled Windows extended-path prefix)
+/// would otherwise only surface once the daemon burns a task's attempts and
+/// parks it `held`, as an OS-level error with no mention of `--repo` at all.
+async fn resolve_repo(repo: &Path) -> Result<PathBuf> {
+    let canonical = repo
+        .canonicalize()
+        .with_context(|| format!("--repo {} does not exist", repo.display()))?;
+    magi::git::toplevel(&canonical)
+        .await
+        .with_context(|| format!("--repo {} is not a git working tree", canonical.display()))?;
+    Ok(canonical)
 }
 
 /// Who is filing this task.
@@ -2338,6 +2359,130 @@ mod tests {
             .unwrap();
         assert!(solo.solo, "--solo must land on the queued task");
         assert!(!plain.solo, "no --solo must leave the task as false");
+    }
+
+    /// A real git working tree, for the `resolve_repo` tests below.
+    async fn scratch_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        tokio::fs::create_dir_all(&repo).await.unwrap();
+        magi::git::git(&repo, &["init", "-b", "main"])
+            .await
+            .unwrap();
+        magi::git::git(&repo, &["config", "user.name", "test"])
+            .await
+            .unwrap();
+        magi::git::git(&repo, &["config", "user.email", "test@example.com"])
+            .await
+            .unwrap();
+        (dir, repo)
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_accepts_a_real_git_working_tree() {
+        let (_dir, repo) = scratch_repo().await;
+        let resolved = resolve_repo(&repo).await.expect("a real repo resolves");
+        assert_eq!(resolved, repo.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_rejects_a_path_that_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nowhere");
+        let err = resolve_repo(&missing)
+            .await
+            .expect_err("a nonexistent path must not resolve");
+        assert!(err.to_string().contains("does not exist"), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_rejects_a_directory_that_is_not_a_git_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_repo(dir.path())
+            .await
+            .expect_err("a plain directory is not a git working tree");
+        assert!(
+            err.to_string().contains("not a git working tree"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_rejects_a_windows_extended_path_missing_a_backslash() {
+        // The extended-path prefix is `\\?\` (two leading backslashes). A
+        // caller that loses one in transit produces `\?\`, which is not a
+        // path anything exists at - exactly the mangled form that made it
+        // into the queue unchecked before this validation existed.
+        let broken = PathBuf::from("\\?\\C:\\this-drive-and-path-do-not-exist-magi-7524");
+        let err = resolve_repo(&broken)
+            .await
+            .expect_err("a malformed extended-path prefix must not resolve");
+        assert!(err.to_string().contains("does not exist"), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_accepts_a_well_formed_windows_extended_path() {
+        let (_dir, repo) = scratch_repo().await;
+        // `canonicalize` already returns the `\\?\`-prefixed form on
+        // Windows, so round-tripping it back through `resolve_repo` is
+        // exactly the "correct extended path" case that must keep working.
+        let canonical = repo.canonicalize().unwrap();
+        let resolved = resolve_repo(&canonical)
+            .await
+            .expect("a well-formed extended path resolves");
+        assert_eq!(resolved, canonical);
+    }
+
+    #[tokio::test]
+    async fn task_add_rejects_a_broken_repo_without_queuing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let missing = dir.path().join("nowhere");
+
+        let err = task_cmd_on(
+            TaskCmd::Add {
+                instruction: vec!["do".to_owned(), "it".to_owned()],
+                file: None,
+                issue: None,
+                title: None,
+                priority: 0,
+                repo: missing,
+                solo: false,
+                json: false,
+            },
+            q.clone(),
+        )
+        .await
+        .expect_err("a broken --repo must fail rather than queue a task");
+        assert!(err.to_string().contains("does not exist"), "got: {err:#}");
+        assert!(q.list().is_empty(), "no task must be left in the queue");
+    }
+
+    #[tokio::test]
+    async fn task_add_accepts_a_real_repo_and_queues_the_task() {
+        let (_repo_dir, repo) = scratch_repo().await;
+        let queue_dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(queue_dir.path().join("queue"));
+
+        task_cmd_on(
+            TaskCmd::Add {
+                instruction: vec!["do".to_owned(), "it".to_owned()],
+                file: None,
+                issue: None,
+                title: None,
+                priority: 0,
+                repo: repo.clone(),
+                solo: false,
+                json: false,
+            },
+            q.clone(),
+        )
+        .await
+        .expect("a real repo must still queue the task as before");
+
+        let tasks = q.list();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].repo, repo.canonicalize().unwrap());
     }
 
     #[test]
