@@ -878,6 +878,23 @@ first agent already knows.
   `chat::Turn` on purpose - it lets the phone render both with one component -
   but `ask::Turn` and `ask::Who` are their own types with no dependency on
   `chat`.
+- **No single `magi ask` call blocks for the whole `answer_timeout`, on
+  purpose.** `answer_timeout` defaults to a day; the shell tool an agent CLI
+  runs `magi ask` inside caps out around ten minutes, so a wait that long is
+  killed either way, taking the `magi ask` child - the only thing that would
+  have read the owner's answer - down with it. Run 20260908-205802-c9eb is
+  what that looked like: seat `impl-A` asked, the tool killed the wait, the
+  seat backgrounded the blocking call and exited `completed`, and the
+  owner's eventual answer on the web UI had nobody left to notice it. So a
+  wait is sliced to `WAIT_SLICE` (`src/ask.rs`, four minutes) and hands
+  control back with [`Wait::Pending`] - exit 0, same as `Wait::Replied` -
+  when nothing has happened yet. `magi ask --wait <id>` (`ask::resume_wait`)
+  is how the caller picks that same wait back up: no new turn, no
+  re-notification, and its budget is computed from
+  [`Question::asked_at`] plus `answer_timeout`, never re-armed to a fresh
+  window - stacking `--wait` calls can spend that deadline, never extend it.
+  `--thread` is unrelated and keeps re-arming a fresh `answer_timeout` on
+  every reply, exactly as before.
 
 ### The web UI: one binary, no authentication, and no lying empty states
 

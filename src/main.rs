@@ -324,12 +324,18 @@ enum Command {
     /// `--summary` (`--detail` too, if given) to the question's thread as
     /// this agent's own turn and waits again, rather than filing a new
     /// question the owner would have no context for.
+    ///
+    /// A single call never blocks longer than [`ask::Wait::Pending`] allows -
+    /// see that variant for why. `--wait` is how a call picks a still-open
+    /// wait back up without adding anything to it, once that slice has run
+    /// out.
     Ask {
-        /// One-line question, or - with `--thread` - this agent's reply.
-        #[arg(long)]
-        summary: String,
+        /// One-line question, or - with `--thread` - this agent's reply. Not
+        /// given with `--wait`, which has nothing new to say.
+        #[arg(long, required_unless_present = "wait", conflicts_with = "wait")]
+        summary: Option<String>,
         /// Longer explanation, markdown. Reads stdin when omitted.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "wait")]
         detail: Option<String>,
         /// An answer to offer; repeat for more. Omit for a free-text reply.
         ///
@@ -337,16 +343,22 @@ enum Command {
         /// than adding to them - asking back is usually exactly the moment the
         /// right choices change, and a caller that wants the old set kept can
         /// just repeat it.
-        #[arg(long = "choice")]
+        #[arg(long = "choice", conflicts_with = "wait")]
         choices: Vec<String>,
-        /// Seconds to wait. Defaults to the config's answer_timeout.
+        /// Seconds until the question's answer_timeout is reached. Defaults
+        /// to the config's answer_timeout. Each call still only blocks for one
+        /// slice of it - see the command's own doc. Recorded on the question
+        /// itself when it is first filed, so a later `--wait` enforces this
+        /// number regardless of what `--timeout` (or the config) says by
+        /// then; this flag only matters again for a question filed before
+        /// that recording existed.
         #[arg(long)]
         timeout: Option<u64>,
         /// An HTML page to show with the question: a diff, a table, images.
         ///
         /// Rendered in a sandbox with no JavaScript and no network access, so
         /// inline the CSS and reference assets by bare filename.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "wait")]
         panel: Option<PathBuf>,
         /// A file the panel references, copied in beside it; repeat for more.
         #[arg(long = "asset", requires = "panel")]
@@ -357,8 +369,16 @@ enum Command {
         /// Reply to an open question of this run's instead of asking a new
         /// one: id or unambiguous prefix/suffix. Refused for a question this
         /// run did not ask, or one already answered or abandoned.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "wait")]
         thread: Option<String>,
+        /// Resume waiting on an open question of this run's, id or
+        /// unambiguous prefix/suffix, without filing a reply: for picking a
+        /// wait back up once its slice has run out (see
+        /// [`ask::Wait::Pending`]), in a fresh process the tool timeout that
+        /// killed the last one has never seen. Same ownership rule as
+        /// `--thread` - refused for a question this run did not ask.
+        #[arg(long)]
+        wait: Option<String>,
     },
     /// Answer a question an agent is waiting on, or ask it back.
     Answer {
@@ -959,6 +979,7 @@ async fn dispatch(command: Command) -> Result<()> {
             assets,
             repo,
             thread,
+            wait,
         } => {
             ask_cmd(AskArgs {
                 summary,
@@ -969,6 +990,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 assets,
                 repo,
                 thread,
+                wait,
             })
             .await
         }
@@ -1164,7 +1186,7 @@ async fn task_text(words: &[String], file: Option<&Path>, issue: Option<u64>) ->
 /// Everything `magi ask` was given, kept together because clap's arms and this
 /// function would otherwise drift apart one argument at a time.
 struct AskArgs {
-    summary: String,
+    summary: Option<String>,
     detail: Option<String>,
     choices: Vec<String>,
     timeout: Option<u64>,
@@ -1172,6 +1194,7 @@ struct AskArgs {
     assets: Vec<PathBuf>,
     repo: PathBuf,
     thread: Option<String>,
+    wait: Option<String>,
 }
 
 /// The one message `--summary`/`--detail` make, whether that is a fresh
@@ -1197,7 +1220,20 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         assets,
         repo,
         thread,
+        wait,
     } = args;
+
+    let (cfg, _) = Config::discover(&repo, None).unwrap_or_default();
+    let store = ask::Questions::open();
+
+    // `--wait` resumes a still-open question with nothing new to say, so it
+    // skips every step below that files something: no summary to read, no
+    // detail to fall back to stdin for, no turn to append.
+    if let Some(id) = wait {
+        return ask_wait_cmd(&store, &cfg, timeout, &id).await;
+    }
+    let summary = summary.context("give --summary, or resume a wait with --wait <question-id>")?;
+
     let detail = match detail {
         Some(d) => d,
         // Long explanations arrive on stdin for the same reason task bodies do:
@@ -1224,10 +1260,8 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         bail!(why);
     }
 
-    let (cfg, _) = Config::discover(&repo, None).unwrap_or_default();
-    let wait = std::time::Duration::from_secs(timeout.unwrap_or(cfg.graph.answer_timeout));
+    let budget = std::time::Duration::from_secs(timeout.unwrap_or(cfg.graph.answer_timeout));
 
-    let store = ask::Questions::open();
     let mut q = match thread {
         Some(id) => {
             let resolved = store.resolve_id(&id)?;
@@ -1236,14 +1270,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
             // replying would be a stranger continuing someone else's
             // conversation, and the owner has no way to tell the two apart on
             // the card.
-            if !run.is_empty() && run != q.run {
-                bail!(
-                    "question {} belongs to run {}, not this one ({run}); only \
-                     the run that asked can reply to it",
-                    q.short(),
-                    q.run
-                );
-            }
+            question_belongs_to_this_run(&q, &run, "reply to")?;
             q.reply(thread_message(&summary, &detail), choices)?;
             // Re-attached the same way a fresh ask's panel is: before the
             // question is filed, so the owner never sees the reply a moment
@@ -1259,6 +1286,10 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         }
         None => {
             let mut q = ask::Question::new(run, node, seat, summary, detail, choices);
+            // Recorded once, here, so a later `magi ask --wait` enforces the
+            // deadline this call actually asked with, not whatever `--timeout`
+            // or the config default happens to say when it is called.
+            q.answer_timeout = budget.as_secs();
             // The panel is attached before the question is filed: a question
             // that appears on the phone a moment before its evidence does is a
             // question the owner answers without the evidence.
@@ -1273,7 +1304,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         }
     };
 
-    match ask::ask_and_wait(&mut q, &store, &cfg.notify, wait).await? {
+    match ask::ask_and_wait(&mut q, &store, &cfg.notify, budget).await? {
         ask::Wait::Answered(answer) => {
             println!("{answer}");
             Ok(())
@@ -1292,10 +1323,179 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
             );
             Ok(())
         }
+        // Also not an answer, and also not a failure: this call's own slice
+        // ran out, not the owner's patience, and the question is still open
+        // on disk. Exit zero for the same reason `Replied` does - a shell
+        // tool must not read this as a failed command - and say exactly how
+        // to pick the same wait back up.
+        ask::Wait::Pending => {
+            println!(
+                "no answer yet — this call's wait slice ran out, not the \
+                 question's answer_timeout. Pick the same wait back up with:\n  \
+                 magi ask --wait {}",
+                q.short()
+            );
+            Ok(())
+        }
         ask::Wait::Abandoned => bail!(
             "question {} went unanswered for {}s; it is recorded as abandoned",
             q.short(),
-            wait.as_secs()
+            budget.as_secs()
+        ),
+    }
+}
+
+/// `magi ask --wait <id>`: resume waiting on a question this run already
+/// asked, with nothing new to say.
+///
+/// Mirrors `--thread`'s ownership check for the same reason - the record on
+/// disk says which run may still act on this question - but files no reply
+/// and sends no notification, because nothing happened that the owner does
+/// not already know about: the previous wait's slice simply ran out.
+///
+/// The deadline enforced here is anchored on [`ask::Question::asked_at`],
+/// never on when this call happens to start - see [`ask::resume_wait`] for
+/// why stacking `--wait` calls must not be a way to buy a question a longer
+/// `answer_timeout` than the first ask set.
+async fn ask_wait_cmd(
+    store: &ask::Questions,
+    cfg: &Config,
+    timeout: Option<u64>,
+    id: &str,
+) -> Result<()> {
+    let run = std::env::var("MAGI_RUN").unwrap_or_default();
+    let node = std::env::var("MAGI_NODE").unwrap_or_else(|_| "ask".to_owned());
+    if let Some(why) = asking_is_not_this_seat_s_job(&node) {
+        bail!(why);
+    }
+
+    let resolved = store.resolve_id(id)?;
+    let mut q = store.get(&resolved)?;
+    question_belongs_to_this_run(&q, &run, "wait on")?;
+    // The owner may have answered - or the question may have been abandoned
+    // out from under it - in the gap between an earlier call reporting
+    // `Wait::Pending` and this one being run. Either is a real outcome, not
+    // an error, and the answer must come out exactly as it would have if
+    // this call's own wait had found it.
+    if let Some(answer) = resolved_before_the_wait_even_starts(&q)? {
+        println!("{answer}");
+        return Ok(());
+    }
+
+    let total = answer_timeout_for_wait(&q, timeout.unwrap_or(cfg.graph.answer_timeout));
+    let remaining = remaining_answer_budget(q.asked_at, total);
+
+    eprintln!("resuming the wait on {} — waiting for the owner", q.short());
+    match ask::resume_wait(&mut q, store, remaining).await? {
+        ask::Wait::Answered(answer) => {
+            println!("{answer}");
+            Ok(())
+        }
+        ask::Wait::Replied(said) => {
+            println!(
+                "the owner replied without deciding yet:\n\n{said}\n\n\
+                 continue the conversation with:\n  magi ask --thread {} \
+                 --summary \"...\"",
+                q.id
+            );
+            Ok(())
+        }
+        ask::Wait::Pending => {
+            println!(
+                "no answer yet — this call's wait slice ran out, not the \
+                 question's answer_timeout. Pick the same wait back up with:\n  \
+                 magi ask --wait {}",
+                q.short()
+            );
+            Ok(())
+        }
+        ask::Wait::Abandoned => bail!(
+            "question {} went unanswered for {total}s since it was first \
+             asked; it is recorded as abandoned",
+            q.short(),
+        ),
+    }
+}
+
+/// Refuse `--thread` or `--wait` on a question a different run asked.
+///
+/// A question belongs to the run that asked it: a different run replying or
+/// resuming its wait would be a stranger continuing someone else's
+/// conversation, and the owner has no way to tell the two apart on the card.
+/// An empty `run` is never refused - outside a graph node (a human at a
+/// terminal, `magi doctor`, a test) there is no run to compare against, and
+/// the check exists to protect one run's conversation from another, not to
+/// lock the terminal out.
+fn question_belongs_to_this_run(q: &ask::Question, run: &str, verb: &str) -> Result<()> {
+    if !run.is_empty() && run != q.run {
+        bail!(
+            "question {} belongs to run {}, not this one ({run}); only the \
+             run that asked can {verb} it",
+            q.short(),
+            q.run
+        );
+    }
+    Ok(())
+}
+
+/// How much of a question's `answer_timeout` is left, anchored on
+/// [`ask::Question::asked_at`] rather than on when this call happens to
+/// start.
+///
+/// This is what keeps `--wait` from being a way to extend a question's life
+/// one slice at a time: each call recomputes the remaining budget from the
+/// same fixed point, so ten stacked calls spend the same total wait as one
+/// unsliced call would have. Saturates at zero rather than going negative -
+/// a call made after the deadline already passed hands `resume_wait` a
+/// budget of nothing, which lands on the abandon path on its very first
+/// check rather than panicking on an underflowed duration.
+fn remaining_answer_budget(asked_at: jiff::Timestamp, answer_timeout: u64) -> std::time::Duration {
+    let elapsed = (jiff::Timestamp::now().as_second() - asked_at.as_second()).max(0) as u64;
+    std::time::Duration::from_secs(answer_timeout.saturating_sub(elapsed))
+}
+
+/// The `answer_timeout` a resumed wait must enforce: the value the question
+/// was actually first asked with, never whatever `--timeout` or the config
+/// happens to say at the moment `--wait` is called.
+///
+/// Without this, a question filed with an explicit `--timeout` shorter (or
+/// longer) than the config's `answer_timeout` would silently pick up the
+/// config's number the moment a later `--wait` omitted `--timeout` itself -
+/// stretching or shrinking the deadline the first ask actually set, exactly
+/// what stacking `--wait` calls must never do. `fallback` only applies to a
+/// question with nothing recorded (`answer_timeout == 0`): one written
+/// before this field existed, or filed by a flow - land's merge-approval
+/// gate - that never resumes a sliced wait and so never sets it.
+fn answer_timeout_for_wait(q: &ask::Question, fallback: u64) -> u64 {
+    if q.answer_timeout > 0 {
+        q.answer_timeout
+    } else {
+        fallback
+    }
+}
+
+/// What to do about a question that is no longer open, before a resumed wait
+/// ever polls anything: `Ok(Some(answer))` is what to print and exit on,
+/// `Ok(None)` means still open, keep going, and `Err` names why there is
+/// nothing left to wait for.
+///
+/// The owner can answer (or the question can be abandoned by something else
+/// entirely - a deleted run, most often) in the gap between one call
+/// reporting [`ask::Wait::Pending`] and the next `--wait` picking the
+/// question back up. That answer is not an error to report - it is exactly
+/// what a wait that never got interrupted would have returned - so it has to
+/// be checked before `resume_wait` ever starts polling, not folded into "the
+/// question must still be open" as a blanket refusal.
+fn resolved_before_the_wait_even_starts(q: &ask::Question) -> Result<Option<String>> {
+    if q.status.open() {
+        return Ok(None);
+    }
+    match q.resolution() {
+        Some(answer) => Ok(Some(answer)),
+        None => bail!(
+            "question {} is already {}; there is nothing left to wait for",
+            q.short(),
+            q.status.as_str()
         ),
     }
 }
@@ -1998,6 +2198,155 @@ mod tests {
         let clash_list =
             Cli::try_parse_from(["magi", "answer", "ab12", "--say", "why?", "--list"]).unwrap_err();
         assert_eq!(clash_list.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn ask_wait_parses_alone_and_needs_no_summary() {
+        // `--wait` has nothing new to say, so it is the one shape of
+        // `magi ask` that must parse without `--summary` at all.
+        let resumed = Cli::try_parse_from(["magi", "ask", "--wait", "ab12"]).unwrap();
+        match resumed.command {
+            Some(Command::Ask { summary, wait, .. }) => {
+                assert!(summary.is_none());
+                assert_eq!(wait.as_deref(), Some("ab12"));
+            }
+            other => panic!("expected Command::Ask, got {other:?}"),
+        }
+
+        // Every other shape still needs one, `--wait` absent or not.
+        assert!(Cli::try_parse_from(["magi", "ask"]).is_err());
+
+        // `--wait` is its own flow: pairing it with a reply's arguments is a
+        // caller confusing "resume" with "reply", and clap catches it before
+        // the run ever reaches the ownership check.
+        for clash in [
+            ["magi", "ask", "--wait", "ab12", "--thread", "ab12"].as_slice(),
+            ["magi", "ask", "--wait", "ab12", "--summary", "x"].as_slice(),
+        ] {
+            let e = Cli::try_parse_from(clash).unwrap_err();
+            assert_eq!(
+                e.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{clash:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wait_is_refused_on_a_question_another_run_asked_but_not_from_a_terminal() {
+        let q = ask::Question::new(
+            "20260908-205802-c9eb".to_owned(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            "does this need a migration?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+
+        let e = question_belongs_to_this_run(&q, "some-other-run", "wait on")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("belongs to run"), "{e}");
+        assert!(
+            e.contains("wait on"),
+            "the refusal names what was refused: {e}"
+        );
+
+        assert!(
+            question_belongs_to_this_run(&q, "20260908-205802-c9eb", "wait on").is_ok(),
+            "the run that asked may always wait on its own question"
+        );
+        assert!(
+            question_belongs_to_this_run(&q, "", "wait on").is_ok(),
+            "an empty run means a human at a terminal, never refused"
+        );
+        // The check reads the question but never writes it.
+        assert_eq!(q.status, ask::QuestionStatus::Open);
+    }
+
+    #[test]
+    fn the_wait_budget_is_anchored_on_when_the_question_was_first_asked() {
+        let hour_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3600);
+
+        // Half the answer_timeout has already passed; roughly the other half
+        // is left. Generous slack because the test itself takes real time.
+        let remaining = remaining_answer_budget(hour_ago, 7200);
+        assert!(
+            remaining.as_secs() > 3500 && remaining.as_secs() <= 3600,
+            "{remaining:?}"
+        );
+
+        // The whole answer_timeout already elapsed: nothing is left, and
+        // computing that must not panic on an underflowed duration.
+        let expired = remaining_answer_budget(hour_ago, 1800);
+        assert_eq!(expired, std::time::Duration::ZERO);
+    }
+
+    fn ask_question(summary: &str) -> ask::Question {
+        ask::Question::new(
+            "20260908-205802-c9eb".to_owned(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            summary.to_owned(),
+            String::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn a_wait_enforces_the_deadline_the_question_was_first_asked_with_not_a_later_default() {
+        // The bug this guards against: a question filed with `--timeout 300`
+        // outlives a `--wait` call that omits `--timeout` and would otherwise
+        // fall back to the config's answer_timeout (86400) - stretching a
+        // five-minute question's life two hundred and eighty-eight times over.
+        let mut q = ask_question("does this need a migration?");
+        q.answer_timeout = 300;
+        assert_eq!(
+            answer_timeout_for_wait(&q, 86_400),
+            300,
+            "the recorded budget wins over any fallback, larger or smaller"
+        );
+        assert_eq!(
+            answer_timeout_for_wait(&q, 60),
+            300,
+            "a smaller fallback must not cut the recorded budget short either"
+        );
+
+        // Only a question with nothing recorded - written before this field
+        // existed, or by a flow that never resumes a sliced wait - falls back
+        // to whatever the caller was given.
+        q.answer_timeout = 0;
+        assert_eq!(answer_timeout_for_wait(&q, 86_400), 86_400);
+    }
+
+    #[test]
+    fn a_wait_on_a_question_answered_in_the_gap_prints_the_answer_instead_of_erroring() {
+        // Exactly the race `magi ask --wait` has to survive: the owner
+        // answers between one call reporting `Wait::Pending` and the next
+        // `--wait` picking the question back up. That is not a failure - it
+        // is the answer a wait that never got interrupted would have printed.
+        let mut q = ask_question("which backend?");
+        q.answer(ask::Answer::Text("SQLite".to_owned())).unwrap();
+        assert_eq!(
+            resolved_before_the_wait_even_starts(&q).unwrap(),
+            Some("SQLite".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_wait_on_an_abandoned_question_is_refused_with_a_reason() {
+        let mut q = ask_question("which backend?");
+        q.abandon("timed out");
+        let e = resolved_before_the_wait_even_starts(&q)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("abandoned"), "{e}");
+    }
+
+    #[test]
+    fn a_wait_on_a_still_open_question_is_told_to_keep_going() {
+        let q = ask_question("which backend?");
+        assert_eq!(resolved_before_the_wait_even_starts(&q).unwrap(), None);
     }
 
     #[tokio::test]

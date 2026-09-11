@@ -41,8 +41,8 @@ use crate::proc::Quiet as _;
 use crate::run::RunStatus;
 
 /// On-disk format for a question. Bumped when a field's meaning changes, or -
-/// as with [`Question::thread`] - when a new field is added that a much older
-/// magi has no notion of at all.
+/// as with [`Question::thread`] and now [`Question::answer_timeout`] - when a
+/// new field is added that a much older magi has no notion of at all.
 ///
 /// The web UI is written against this shape by hand - there is no shared schema
 /// between the front end and this struct - so a field that changes meaning
@@ -54,7 +54,7 @@ use crate::run::RunStatus;
 /// "no conversation yet" rather than "unreadable", and a strict equality check
 /// would turn every bump into an upgrade that breaks reading yesterday's
 /// question files.
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
 
 /// How often the wait re-reads the question file.
 ///
@@ -84,6 +84,31 @@ const REPLY_QUIET_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// for a slow HTTP round trip and short enough that the operator still gets the
 /// question filed and the run parked in a bounded time.
 const NOTIFY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The longest a single `magi ask` invocation may block on the owner before
+/// it hands the wait back to whatever is running it, rather than to
+/// [`Question::abandon`].
+///
+/// `answer_timeout` defaults to a day, and that is a deadline for the
+/// *question*, not a budget the calling process is free to spend all at
+/// once: an agent CLI's own shell tool kills a command that runs much longer
+/// than this, and the child it kills is `magi ask` itself - the one thing
+/// that would have read the owner's answer. Run 20260908-205802-c9eb is what
+/// that looks like end to end: seat `impl-A` asked, its tool timed the wait
+/// out, and the seat's own summary said it had backgrounded the blocking
+/// `magi ask` and would "continue once the owner replies" - except nothing
+/// was left to notice the reply. The seat exited `completed`, the
+/// backgrounded child died with it, and the owner's eventual answer on the
+/// web UI had nobody left to read it.
+///
+/// So a wait is sliced instead: this call blocks for at most `WAIT_SLICE`
+/// and returns [`Wait::Pending`] if nothing happened, which is not a
+/// failure - the caller runs `magi ask --wait <id>` again, in a fresh
+/// process the tool timeout has never seen. Four minutes leaves a ten-minute
+/// tool budget room for the CLI's own startup and the notification's round
+/// trip, while staying long enough that an owner who answers within the hour
+/// is not making an agent loop through fifteen slices to hear about it.
+const WAIT_SLICE: Duration = Duration::from_secs(240);
 
 /// Environment variable naming the base URL of the web UI, for `{url}`.
 ///
@@ -288,6 +313,22 @@ pub struct Question {
     /// read and quietly hiding an open question from the operator.
     #[serde(default)]
     pub thread: Vec<Turn>,
+    /// The `answer_timeout`, in seconds, that was in force when this question
+    /// was first asked. `0` means unrecorded - a question written before this
+    /// field existed, or one filed by a flow (land's merge-approval gate)
+    /// that never sets it because it never resumes a sliced wait.
+    ///
+    /// [`Question::new`] cannot know this - the effective timeout (`--timeout`,
+    /// or the config default) is decided by the caller, after the question
+    /// already exists - so it starts at `0` here and whoever files a fresh
+    /// question sets it once, the same way [`Question::panel`] is set by
+    /// [`Questions::put_panel`] rather than by the constructor. It is never
+    /// touched again: `magi ask --wait` reads it as the one deadline it is
+    /// allowed to enforce, precisely so that a `--timeout` given (or omitted)
+    /// on a later call can never quietly extend or shrink the budget the
+    /// question was actually asked with.
+    #[serde(default)]
+    pub answer_timeout: u64,
 }
 
 impl Question {
@@ -317,6 +358,7 @@ impl Question {
             answered_at: None,
             answer: None,
             thread: Vec::new(),
+            answer_timeout: 0,
         }
     }
 
@@ -913,6 +955,13 @@ pub enum Wait {
     /// the caller's move is to hand this text to the agent and let it call
     /// `magi ask --thread` to keep talking, not to treat it as a decision.
     Replied(String),
+    /// This call's [`WAIT_SLICE`] ran out with the question still
+    /// [`QuestionStatus::Open`] and nothing having happened - not the owner
+    /// going quiet, the clock on *this process* running out. The question is
+    /// untouched; the caller's move is `magi ask --wait <id>` in a fresh
+    /// process, so the wait resumes before the shell tool that would have
+    /// killed this one gets the chance.
+    Pending,
     /// Nobody said anything before the deadline, or the question was closed
     /// out from under the wait with no decision recorded - a run deleted out
     /// from under it, most often. Either way [`QuestionStatus::Abandoned`] is
@@ -923,7 +972,9 @@ pub enum Wait {
 /// File a question and wait for the owner, polling the store.
 ///
 /// The question is updated in place from disk whenever the wait ends, so the
-/// caller can act on it without re-reading it.
+/// caller can act on it without re-reading it. `timeout` is the question's
+/// whole `answer_timeout` budget, but this call spends at most [`WAIT_SLICE`]
+/// of it - see [`Wait::Pending`] for what happens to the rest.
 pub async fn ask_and_wait(
     q: &mut Question,
     store: &Questions,
@@ -931,6 +982,24 @@ pub async fn ask_and_wait(
     timeout: Duration,
 ) -> Result<Wait> {
     wait_for_owner(q, store, notify, timeout, POLL).await
+}
+
+/// Resume a wait already filed, without adding a turn or notifying again.
+///
+/// This is `magi ask --wait <id>`'s engine: the process that owned the
+/// previous slice is dead (the tool that ran it killed it, or it simply
+/// exited after reporting [`Wait::Pending`]), but the question on disk never
+/// stopped being open, and the owner was already notified about it once. A
+/// second notification for the same unanswered question would page the
+/// owner every [`WAIT_SLICE`] for a question they have already seen - so,
+/// unlike [`ask_and_wait`], this skips straight to polling.
+///
+/// `timeout` is **not** re-armed to a fresh `answer_timeout` here - the
+/// caller computes it as what remains until [`Question::asked_at`] plus the
+/// configured `answer_timeout`, so stacking `--wait` calls can only ever use
+/// up the deadline the first ask set, never push it out further.
+pub async fn resume_wait(q: &mut Question, store: &Questions, timeout: Duration) -> Result<Wait> {
+    wait_loop(q, store, timeout, WAIT_SLICE, POLL).await
 }
 
 /// [`ask_and_wait`] with the poll interval injected.
@@ -965,16 +1034,47 @@ async fn wait_for_owner(
         q.seat,
         q.summary
     );
+    wait_loop(q, store, timeout, WAIT_SLICE, poll).await
+}
 
-    // Turns already on the question when this wait started - which for a
-    // `--thread` reply includes the operator's own last word - so a *new*
-    // operator turn appearing mid-wait is unambiguous even though the agent's
-    // own reply just added one too.
-    let starting_turns = q.thread.len();
-    let deadline = tokio::time::Instant::now() + timeout;
+/// The polling loop shared by a fresh wait and a resumed one.
+///
+/// `timeout` is the budget left before the question's `answer_timeout`
+/// truly runs out; `slice` bounds how much of that this one call spends
+/// before handing control back. Landing on `slice` while `timeout` still has
+/// budget left is [`Wait::Pending`] - the caller's move, not the owner's
+/// silence. Landing on `timeout` itself - because it was no bigger than
+/// `slice` to begin with - is the real thing, and abandons the question
+/// exactly as a single unsliced wait always did.
+async fn wait_loop(
+    q: &mut Question,
+    store: &Questions,
+    timeout: Duration,
+    slice: Duration,
+    poll: Duration,
+) -> Result<Wait> {
+    // The owner may already have spoken back before this call ever started -
+    // most often because they did so in the gap between an earlier call
+    // reporting `Wait::Pending` and this one picking the wait back up with
+    // `--wait`. That word must surface at once rather than sit unnoticed
+    // until some *later* turn happens to change something: this call never
+    // saw it get added, so nothing below would otherwise recognise it as
+    // new. `last_word_awaiting_reply` reads the question's own record of
+    // whose turn it is - see [`Question::waiting_on_agent`] - rather than a
+    // turn count this call would have to have been there to capture.
+    if let Some(said) = last_word_awaiting_reply(q) {
+        return Ok(Wait::Replied(said.to_owned()));
+    }
+
+    let bounded = timeout.min(slice);
+    let is_the_real_deadline = bounded >= timeout;
+    let deadline = tokio::time::Instant::now() + bounded;
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
+            if !is_the_real_deadline {
+                return Ok(Wait::Pending);
+            }
             q.abandon(format!(
                 "no answer within {}s of asking",
                 timeout.as_secs().max(1)
@@ -1002,21 +1102,15 @@ async fn wait_for_owner(
                     None => Wait::Abandoned,
                 });
             }
-            Ok(fresh) if fresh.thread.len() > starting_turns => {
-                *q = fresh;
-                if let Some(said) = q
-                    .thread
-                    .iter()
-                    .rev()
-                    .find(|t| t.who == Who::Operator)
-                    .map(|t| t.body.clone())
-                {
+            Ok(fresh) => {
+                if let Some(said) = last_word_awaiting_reply(&fresh) {
+                    let said = said.to_owned();
+                    *q = fresh;
                     return Ok(Wait::Replied(said));
                 }
-                // The new turn was not the owner's - nothing this wait cares
-                // about happened, so keep polling.
+                // Still open and not waiting on the agent - nothing this
+                // wait cares about happened, so keep polling.
             }
-            Ok(_) => {}
             Err(e) => {
                 // Mid-rename, or a file the operator is editing by hand.
                 // Neither is a reason to abandon a question a human may still
@@ -1025,6 +1119,22 @@ async fn wait_for_owner(
             }
         }
     }
+}
+
+/// The owner's own last word, if the agent has not caught up on it yet.
+///
+/// A thin wrapper over [`Question::waiting_on_agent`] that also hands back
+/// what was said: the state is on the record itself, not derived from
+/// anything this call has seen happen, so it reads correctly whether this is
+/// the process that has been polling all along or a fresh `--wait` that just
+/// loaded the question off disk for the first time. `None` on a fresh
+/// question, one the agent already replied to, or one that is no longer
+/// open.
+fn last_word_awaiting_reply(q: &Question) -> Option<&str> {
+    if !q.waiting_on_agent() {
+        return None;
+    }
+    q.thread.last().map(|t| t.body.as_str())
 }
 
 /// Run the operator's notification command, if one is configured.
@@ -1315,6 +1425,7 @@ mod tests {
             keys,
             [
                 "answer",
+                "answer_timeout",
                 "answered_at",
                 "asked_at",
                 "assets",
@@ -1332,7 +1443,7 @@ mod tests {
             ],
             "the on-disk field set is a contract with the front end"
         );
-        assert_eq!(open["schema"], 2);
+        assert_eq!(open["schema"], 3);
         assert_eq!(open["thread"], serde_json::json!([]));
         assert_eq!(open["id"], "20260902-231501-ab12");
         assert_eq!(open["run"], "20260902-201256-9fb7");
@@ -1557,6 +1668,130 @@ mod tests {
         );
         assert!(on_disk.resolution().is_none());
         assert_eq!(s.count_open(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_slice_running_out_leaves_the_question_open_rather_than_abandoning_it() {
+        // This is the whole point of slicing: `timeout` (the real
+        // `answer_timeout` budget) is far larger than `slice`, so the loop
+        // must land on `slice` first and hand back `Pending` - not read the
+        // silence so far as the owner having given up.
+        let (_dir, s) = store();
+        let mut q = choice_question();
+        s.put(&mut q).unwrap();
+
+        let got = wait_loop(
+            &mut q,
+            &s,
+            Duration::from_secs(3600),
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            got,
+            Wait::Pending,
+            "the clock on this call ran out, not the owner's patience"
+        );
+        assert_eq!(
+            q.status,
+            QuestionStatus::Open,
+            "a slice expiring must never abandon the question"
+        );
+        let on_disk = s.get(&q.id).expect("still on disk, still open");
+        assert_eq!(
+            on_disk.status,
+            QuestionStatus::Open,
+            "nothing about the record changed just because this call gave up"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wait_resumed_after_a_slice_sees_the_answer_the_first_slice_missed() {
+        // The shape `magi ask --wait <id>` relies on: one slice finds nothing
+        // and returns `Pending`, a second slice - a fresh call, exactly as a
+        // fresh process would make - picks the same question back up and
+        // sees an answer written in between.
+        let (dir, s) = store();
+        let mut q = choice_question();
+        s.put(&mut q).unwrap();
+
+        let first = wait_loop(
+            &mut q,
+            &s,
+            Duration::from_secs(3600),
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, Wait::Pending);
+
+        let id = q.id.clone();
+        let writer = Questions::at(dir.path().join("questions"));
+        let mut fresh = writer.get(&id).unwrap();
+        fresh.answer(Answer::Choice("Redis".to_owned())).unwrap();
+        writer.put(&mut fresh).unwrap();
+
+        // `resume_wait` uses its own production poll interval rather than a
+        // test-injected one, so the budget here only needs to be large enough
+        // to cover one real poll tick - the point is that it is `resume_wait`
+        // itself, not a helper, that finds the answer.
+        let second = resume_wait(&mut q, &s, Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert_eq!(second, Wait::Answered("Redis".to_owned()));
+        assert_eq!(q.status, QuestionStatus::Answered);
+    }
+
+    #[tokio::test]
+    async fn a_reply_left_in_the_gap_before_a_resumed_wait_starts_is_never_missed() {
+        // The owner can speak back while nothing is running at all - between
+        // one call reporting `Wait::Pending` and the next `--wait` picking
+        // the question back up - and whoever resumes the wait loads a
+        // *fresh* copy of the question off disk, one whose thread already
+        // contains that reply. A baseline taken from that fresh copy would
+        // treat the reply as pre-existing and never notice it "arrive",
+        // leaving the agent polling in silence until `answer_timeout`
+        // eventually abandons the question - replacing the exact accident
+        // this feature exists to fix with a quieter version of itself.
+        let (dir, s) = store();
+        let mut q = choice_question();
+        s.put(&mut q).unwrap();
+
+        let first = wait_loop(
+            &mut q,
+            &s,
+            Duration::from_secs(3600),
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, Wait::Pending);
+
+        // The owner speaks back during the gap, with nobody running yet.
+        let id = q.id.clone();
+        let writer = Questions::at(dir.path().join("questions"));
+        let mut fresh = writer.get(&id).unwrap();
+        fresh.say("why not Postgres?").unwrap();
+        writer.put(&mut fresh).unwrap();
+
+        // `magi ask --wait` re-reads the question rather than reusing the
+        // stale in-memory copy the earlier call held - so the copy handed to
+        // `resume_wait` here already carries the reply, same as `fresh` above.
+        let mut resumed = s.get(&id).unwrap();
+        let second = resume_wait(&mut resumed, &s, Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert_eq!(second, Wait::Replied("why not Postgres?".to_owned()));
+        assert_eq!(
+            resumed.status,
+            QuestionStatus::Open,
+            "talking back is not a decision; the question stays open"
+        );
     }
 
     #[tokio::test]
@@ -1929,11 +2164,15 @@ mod tests {
         );
         assert!(q.assets.is_empty());
         // Schema 1 predates `thread` entirely - not merely predates it having
-        // any turns - and this build now speaks schema 2. Reading it must not
-        // be an error: `q.schema > SCHEMA` is false for 1 > 2, so the file is
+        // any turns - and this build now speaks schema 3. Reading it must not
+        // be an error: `q.schema > SCHEMA` is false for 1 > 3, so the file is
         // accepted and the missing field defaults to no conversation yet.
         assert_eq!(q.schema, 1);
         assert!(q.thread.is_empty());
+        assert_eq!(
+            q.answer_timeout, 0,
+            "an absent field means unrecorded, not a zero-second deadline"
+        );
         assert!(!q.waiting_on_agent());
         assert_eq!(q.summary, "Which storage backend should the cache use?");
         assert_eq!(
