@@ -170,6 +170,15 @@ pub struct Opts {
     pub once: bool,
     /// Merge mode override (`none`, `local`, `pr`); `None` keeps the config's.
     pub merge: Option<String>,
+    /// Where the janitor's [`crate::clean::fold_orphaned_worktrees`] and
+    /// [`crate::git::worktree_prune`] look for and reclaim worktrees.
+    /// `None` resolves to [`crate::run::default_worktree_root`] - the
+    /// operator's real `~/wt/<repo>` - the same way a run with no
+    /// [`crate::config::Graph::worktree_root`] resolves its own. A caller
+    /// that does not own that directory (a test, an embedding that manages
+    /// worktrees itself) must set this, or every idle tick reclaims worktrees
+    /// out from under whoever actually does.
+    pub worktrees_root: Option<PathBuf>,
 }
 
 impl Default for Opts {
@@ -181,6 +190,7 @@ impl Default for Opts {
             max_attempts: 2,
             once: false,
             merge: None,
+            worktrees_root: None,
         }
     }
 }
@@ -468,6 +478,22 @@ pub fn current_work(home: &Path, now: Timestamp) -> Vec<Current> {
 #[must_use]
 pub fn is_working_on(home: &Path, run: &str, now: Timestamp) -> bool {
     current_work(home, now).iter().any(|c| c.run == run)
+}
+
+/// Whether a live daemon is working on a run whose short id is this one.
+///
+/// For a worktree that has no run record to compare against at all -
+/// [`crate::clean::fold_orphaned_worktrees`]'s whole reason to exist - a full
+/// id is not available to hand to [`is_working_on`]. The short id is: a run's
+/// worktree bay is named after it (see [`crate::run::RunState::worktree_root`]),
+/// and it is exactly the gap between the daemon claiming a task and
+/// `RunState::new` saving the first `run.json` that this exists to protect -
+/// a run genuinely in flight but invisible to a scan of `runs/`.
+#[must_use]
+pub fn is_working_on_short(home: &Path, short: &str, now: Timestamp) -> bool {
+    current_work(home, now)
+        .iter()
+        .any(|c| crate::run::short_of(&c.run) == short)
 }
 
 /// Whether a live daemon is working on this task at this moment.
@@ -801,11 +827,16 @@ pub async fn serve_until(opts: Opts, stop: Stop) -> Result<()> {
         })
     };
 
+    let worktrees_root = opts
+        .worktrees_root
+        .clone()
+        .unwrap_or_else(crate::run::default_worktree_root);
     let outcome = drive(
         &opts,
         &Queue::open(),
         &status_path(),
         &crate::run::home(),
+        &worktrees_root,
         &stop,
     )
     .await;
@@ -817,19 +848,24 @@ pub async fn serve_until(opts: Opts, stop: Stop) -> Result<()> {
 /// The loop proper: setup, poll, teardown, with the queue and the status file
 /// supplied rather than discovered.
 ///
-/// Both are parameters because [`crate::run::home`] is process-global and its
-/// override is a `OnceLock`, so a unit test that pinned it would fight every
-/// other test in the binary — and a loop that resolved the home itself could
-/// only be exercised against the operator's real one, publishing over a live
-/// daemon's status file and claiming tasks out of a live backlog.
+/// All three of `home`, `worktrees_root` and the queue/status paths are
+/// parameters rather than resolved here, for the same reason:
+/// [`crate::run::home`] is process-global and its override is a `OnceLock`,
+/// so a unit test that pinned it would fight every other test in the binary,
+/// and a loop that resolved its own worktree bay could only be exercised
+/// against the operator's real `~/wt/<repo>` - publishing over a live
+/// daemon's status file, claiming tasks out of a live backlog, and, since
+/// [`janitor`] runs on every idle tick, reclaiming worktrees out from under
+/// whatever the operator actually has on disk.
 async fn drive(
     opts: &Opts,
     queue: &Queue,
     status_file: &Path,
     home: &Path,
+    worktrees_root: &Path,
     stop: &Stop,
 ) -> Result<()> {
-    janitor(&opts.repo, opts, home).await;
+    janitor(&opts.repo, opts, home, worktrees_root).await;
 
     // The status file is a *snapshot*, not a stream of events: a reader only
     // ever wants the latest values, and every tick rewrites the whole file
@@ -861,7 +897,16 @@ async fn drive(
         concurrency
     );
 
-    let outcome = poll(opts, queue, &status, home, stop, concurrency).await;
+    let outcome = poll(
+        opts,
+        queue,
+        &status,
+        home,
+        worktrees_root,
+        stop,
+        concurrency,
+    )
+    .await;
 
     beat.abort();
     clear_status_at(status_file);
@@ -1002,6 +1047,7 @@ async fn poll(
     queue: &Queue,
     status: &Arc<Mutex<Status>>,
     home: &Path,
+    worktrees_root: &Path,
     stop: &Stop,
     max_concurrent: usize,
 ) -> Result<()> {
@@ -1184,7 +1230,7 @@ async fn poll(
         // building would race the very compile the prune exists to keep,
         // which concurrent runs make possible in a way the old one-at-a-time
         // loop never had to guard against.
-        janitor(&opts.repo, opts, home).await;
+        janitor(&opts.repo, opts, home, worktrees_root).await;
         lock(status).idle = true;
         if opts.once {
             break;
@@ -1366,11 +1412,18 @@ fn prepare(repo: &Path, opts: &Opts) -> Result<Config> {
 /// re-read on every call because the repository that just ran may not be the
 /// daemon's own default, and the cache directory is a repository fact.
 ///
-/// `home` is a parameter rather than [`crate::run::home`] read here, for the
-/// same reason [`drive`] takes its queue and status file rather than
-/// resolving them: a test driving the loop must not reach through to the
-/// operator's real home just because the janitor runs on every idle tick.
-async fn janitor(repo: &Path, opts: &Opts, home: &Path) {
+/// `home` and `worktrees_root` are parameters rather than [`crate::run::home`]
+/// and [`crate::run::default_worktree_root`] read here, for the same reason
+/// [`drive`] takes its queue and status file rather than resolving them: a
+/// test driving the loop must not reach through to the operator's real home
+/// or worktree bay just because the janitor runs on every idle tick.
+/// `worktrees_root` staying unread by [`clean::fold_due`] once made this easy
+/// to get wrong silently - a test's `home` was already isolated, but nothing
+/// exercised the parameter next to it, so a real worktree bay stayed wired in
+/// underneath. The moment [`clean::fold_orphaned_worktrees`] started reading
+/// it for real, every test in this file that drives the loop at all started
+/// sweeping the operator's actual `~/wt/<repo>` instead of a fixture's.
+async fn janitor(repo: &Path, opts: &Opts, home: &Path, worktrees_root: &Path) {
     let cfg = match prepare(repo, opts) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -1378,20 +1431,34 @@ async fn janitor(repo: &Path, opts: &Opts, home: &Path) {
             return;
         }
     };
-    let out = clean::housekeep(
-        &cfg,
-        home,
-        &crate::run::default_worktree_root(),
-        Timestamp::now(),
-    )
-    .await;
-    if out.folded > 0 {
-        let unreadable = if out.unreadable > 0 {
-            format!(" ({} unreadable)", out.unreadable)
-        } else {
+    // A run's own worktree lives under `config.graph.worktree_root` when the
+    // repository sets one - the same precedence `RunState::worktree_root`
+    // uses - and `worktrees_root` only stands in for the *default* an
+    // unconfigured repository resolves to (see this function's own
+    // parameter, or the test fixture wiring one to a fake path). Housekeeping
+    // that always swept the default regardless of this override would never
+    // see, and so never reclaim, a single worktree for a repository that
+    // relocated them elsewhere.
+    let worktrees_root = cfg.graph.worktree_root.as_deref().unwrap_or(worktrees_root);
+    let out = clean::housekeep(&cfg, home, worktrees_root, repo, Timestamp::now()).await;
+    // Reported whenever there is anything to say, not only when `folded > 0`:
+    // the incident this exists to prevent was 90 of 93 runs skipped and 0
+    // folded, on every single pass, for months - a report gated on `folded`
+    // would have stayed silent through every one of them.
+    if out.folded > 0 || out.unreadable > 0 || out.orphaned_worktrees > 0 {
+        let mut extra = Vec::new();
+        if out.unreadable > 0 {
+            extra.push(format!("{} unreadable", out.unreadable));
+        }
+        if out.orphaned_worktrees > 0 {
+            extra.push(format!("{} orphaned worktree(s)", out.orphaned_worktrees));
+        }
+        let detail = if extra.is_empty() {
             String::new()
+        } else {
+            format!(" ({})", extra.join(", "))
         };
-        tracing::info!("housekeep: folded {} run(s){unreadable}", out.folded);
+        tracing::info!("housekeep: folded {} run(s){detail}", out.folded);
     }
     if out.cache_files > 0 {
         tracing::info!(
@@ -2683,6 +2750,33 @@ mod tests {
     }
 
     #[test]
+    fn is_working_on_short_matches_by_the_worktree_bays_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Timestamp::now();
+
+        assert!(
+            !is_working_on_short(dir.path(), "01c2", now),
+            "no status file means nobody is working on anything"
+        );
+
+        let mut status = Status::new();
+        status.current = vec![Current {
+            task: "20260903-080340-0167".to_owned(),
+            run: "20260903-080619-01c2".to_owned(),
+        }];
+        status.updated_at = now;
+        write_status_to(&dir.path().join("daemon.json"), &status).unwrap();
+        assert!(
+            is_working_on_short(dir.path(), "01c2", now),
+            "the run's short id is the last block of its full id"
+        );
+        assert!(
+            !is_working_on_short(dir.path(), "3cbf", now),
+            "a daemon busy with one worktree bay is not working on another"
+        );
+    }
+
+    #[test]
     fn a_newer_status_file_still_yields_a_reading() {
         let dir = tempfile::tempdir().unwrap();
         // A field this build has never heard of must not turn the reading into
@@ -2873,19 +2967,38 @@ mod tests {
     /// A loop whose queue lives in a temp tree and whose poll interval is far
     /// longer than the test's patience, so anything that waits out a poll
     /// instead of noticing the stop fails rather than merely being slow.
-    fn idle_loop(dir: &Path) -> (Opts, Queue, PathBuf, PathBuf) {
+    fn idle_loop(dir: &Path) -> (Opts, Queue, PathBuf, PathBuf, PathBuf) {
         let opts = Opts {
             poll: Duration::from_secs(30),
+            // `Opts::default`'s `repo` is `"."` - the process's own working
+            // directory, which under `cargo test` is this very checkout, a
+            // real git repository with its own `magi.toml`. `drive` runs the
+            // janitor unconditionally on every call, and the janitor discovers
+            // its config from `opts.repo` and then prunes worktree
+            // registrations there - so leaving this at `"."` would have every
+            // test that drives the loop mutate this checkout's own git admin
+            // state. A directory that is not a repository at all makes that
+            // step fail closed instead (`git worktree prune` errors, caught
+            // and logged, nothing pruned).
+            repo: dir.join("repo"),
             ..Opts::default()
         };
         // The status file goes in a directory that does not exist yet, so its
-        // creation is itself evidence the loop published one.
+        // creation is itself evidence the loop published one. `worktrees`
+        // must be just as fictional: the janitor reclaims worktrees under it
+        // for real, and a test that let it fall through to
+        // `crate::run::default_worktree_root()` would have it reclaim
+        // worktrees out of the operator's real `~/wt/<repo>`, not a fixture -
+        // which is exactly what happened before this function took the
+        // parameter at all.
         let home = dir.join("home");
+        let worktrees = dir.join("wt");
         (
             opts,
             Queue::at(dir.join("queue")),
             home.join("daemon.json"),
             home,
+            worktrees,
         )
     }
 
@@ -2952,14 +3065,14 @@ mod tests {
     #[tokio::test]
     async fn a_loop_already_asked_to_stop_returns_without_waiting_out_a_poll() {
         let dir = tempfile::tempdir().unwrap();
-        let (opts, queue, status_file, home) = idle_loop(dir.path());
+        let (opts, queue, status_file, home, worktrees) = idle_loop(dir.path());
         let stop = Stop::new();
         stop.stop();
 
         let began = std::time::Instant::now();
         tokio::time::timeout(
             Duration::from_secs(2),
-            drive(&opts, &queue, &status_file, &home, &stop),
+            drive(&opts, &queue, &status_file, &home, &worktrees, &stop),
         )
         .await
         .expect("a stopped loop must return, not sit out its poll interval")
@@ -2974,7 +3087,7 @@ mod tests {
     #[tokio::test]
     async fn a_stop_while_idle_wakes_the_wait_instead_of_sleeping_it_out() {
         let dir = tempfile::tempdir().unwrap();
-        let (opts, queue, status_file, home) = idle_loop(dir.path());
+        let (opts, queue, status_file, home, worktrees) = idle_loop(dir.path());
         let stop = Stop::new();
 
         // Asked for after the loop is already parked on its empty queue, which
@@ -2990,7 +3103,7 @@ mod tests {
         let began = std::time::Instant::now();
         tokio::time::timeout(
             Duration::from_secs(2),
-            drive(&opts, &queue, &status_file, &home, &stop),
+            drive(&opts, &queue, &status_file, &home, &worktrees, &stop),
         )
         .await
         .expect("a stop asked for while idle must wake the wait")
@@ -3006,13 +3119,13 @@ mod tests {
     #[tokio::test]
     async fn a_stopped_loop_leaves_no_status_file_claiming_it_is_running() {
         let dir = tempfile::tempdir().unwrap();
-        let (opts, queue, status_file, home) = idle_loop(dir.path());
+        let (opts, queue, status_file, home, worktrees) = idle_loop(dir.path());
         let stop = Stop::new();
         stop.stop();
 
         tokio::time::timeout(
             Duration::from_secs(2),
-            drive(&opts, &queue, &status_file, &home, &stop),
+            drive(&opts, &queue, &status_file, &home, &worktrees, &stop),
         )
         .await
         .expect("a stopped loop must return")

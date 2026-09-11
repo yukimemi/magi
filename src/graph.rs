@@ -3738,6 +3738,16 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool) -> Result<Vec<Str
         removed.push(path.to_string_lossy().into_owned());
     }
 
+    // `root` (`wt/<...>/<short>/`) held nothing but this run's candidate and
+    // judge worktrees, so once the loop above has cleared all of them out,
+    // the parent is a bare directory nobody else was ever going to remove -
+    // git only ever managed what was inside it. Left alone, one of these
+    // accumulates per fully-folded run; the operator's own machine had 74.
+    // `remove_if_empty` re-checks rather than assuming: a run whose winner
+    // was kept (`!drop_winner`) leaves its directory behind on purpose, and
+    // so does anything a run never claimed that happens to share the bay.
+    remove_if_empty(&root);
+
     if state.enabled_worktree_config && drop_winner {
         // A release, not a raw disable: some sibling run in this repository
         // may still hold its own reference (see `git::acquire_worktree_config`),
@@ -3747,6 +3757,22 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool) -> Result<Vec<Str
     }
     state.save()?;
     Ok(removed)
+}
+
+/// Remove `dir` if it exists and has nothing in it.
+///
+/// Best-effort and silent by design: a directory that is not empty (a run
+/// whose winner is still parked there, a stray file some other process left)
+/// is exactly the case this must refuse, and a directory that is already gone
+/// is not a failure worth reporting either. `std::fs::remove_dir` itself
+/// already refuses a non-empty directory, so the emptiness check below is
+/// belt, not suspenders - it is what keeps this from ever attempting the
+/// removal in the case that matters, rather than trusting `remove_dir`'s
+/// error path to have no side effects if it ever changed.
+fn remove_if_empty(dir: &Path) {
+    if dir.is_dir() && std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none()) {
+        std::fs::remove_dir(dir).ok();
+    }
 }
 
 /// Severity of the worst open finding in the last review round, for reporting.
@@ -3765,6 +3791,27 @@ pub fn worst_open(state: &RunState) -> Option<Severity> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn remove_if_empty_only_ever_takes_a_bare_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let bay = dir.path().join("ffff");
+
+        // Not there yet: nothing to do, nothing to panic on.
+        remove_if_empty(&bay);
+        assert!(!bay.exists());
+
+        // Something still inside - the winner's worktree, or a stray file -
+        // keeps the directory standing.
+        std::fs::create_dir_all(bay.join("cand-A")).unwrap();
+        remove_if_empty(&bay);
+        assert!(bay.exists(), "non-empty directory must survive");
+
+        // Once the last entry is gone, so is the directory itself.
+        std::fs::remove_dir(bay.join("cand-A")).unwrap();
+        remove_if_empty(&bay);
+        assert!(!bay.exists(), "an empty bay is a leftover, not a record");
+    }
 
     // `round_is_clean` is the exact decision this task fixed: a round with a
     // seat that never answered must not read the same as a round every seat
