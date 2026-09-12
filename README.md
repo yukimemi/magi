@@ -120,6 +120,13 @@ magi repos                    # local checkouts found under [repos] roots
 magi answer                   # what an agent is waiting to hear from you
 ```
 
+`magi run --resume <run-id>` continues only work that was interrupted or
+stopped at a resumable boundary. A completed failed final gate is not retried
+by resume: magi preserves the recorded command output, reports the run as
+`blocked`, and exits unsuccessfully. Fix the cause and start the intended
+follow-up run instead; this avoids presenting an old failed command as a new
+verification attempt.
+
 `magi run` starts spending money, so an instruction whose first word names a
 subcommand is refused as a probable typo: there is no `magi run show`, and
 without the guard `magi run show 3cbf` opens worktrees and pays agents to

@@ -2860,6 +2860,17 @@ impl Runner {
             return Ok(());
         }
         if !self.state.gate.is_empty() {
+            // `review_loop` derives its conclusion from the clean review
+            // record on every reentry and therefore puts a completed run back
+            // in `Gating`. A recorded red gate is a stronger, terminal fact:
+            // retain its original command output and restore `Blocked` rather
+            // than pretending the command is still running or running it a
+            // second time. An empty list remains the only interrupted-gate
+            // shape that may need to execute a command.
+            if self.state.gate.iter().any(|outcome| !outcome.ok()) {
+                self.state.status = RunStatus::Blocked;
+                self.state.save()?;
+            }
             return Ok(());
         }
         let Some(winner) = self.state.winner().cloned() else {
