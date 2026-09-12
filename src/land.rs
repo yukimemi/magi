@@ -3058,6 +3058,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         ReviewRound {
             round,
             head: "abc1234".to_owned(),
+            verified_head: None,
             reviews,
             e2e: Vec::new(),
             verify_retried: false,

@@ -4183,6 +4183,7 @@ mod tests {
         crate::run::ReviewRound {
             round,
             head: "deadbeef".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             verify_retried: false,

@@ -474,6 +474,7 @@ mod tests {
         let round = ReviewRound {
             round: 1,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -552,6 +553,7 @@ mod tests {
         let submitted = ReviewRound {
             round: 1,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "alpha".to_owned(),
@@ -605,6 +607,7 @@ mod tests {
         let round = ReviewRound {
             round: 1,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -668,6 +671,7 @@ mod tests {
         let round = ReviewRound {
             round: 1,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -741,6 +745,7 @@ mod tests {
         let sole = ReviewRound {
             round: 1,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: vec![fail.clone()],
             verify_retried: false,
@@ -759,6 +764,7 @@ mod tests {
         let alongside = ReviewRound {
             round: 2,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: vec![fail],
             verify_retried: false,

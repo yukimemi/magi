@@ -203,6 +203,11 @@ if grep -q "Your patch was reviewed" "$p"; then
     printf '{"addressed":["%s"],"rejected":[],"notes":"claims to have fixed it"}\n' "$id"
     exit 0
   fi
+  if [ -n "$MOCK_FIXER_EMPTY_COMMIT" ]; then
+    git commit --allow-empty -q -m "address review findings" >/dev/null 2>&1
+    printf '{"addressed":["%s"],"rejected":[],"notes":"empty commit"}\n' "$id"
+    exit 0
+  fi
   # Appended with a nonce so a fixer invoked round after round always has a
   # real diff to commit — otherwise `git commit` on an unchanged `fixed.txt`
   # fails with nothing to commit, and the loop stops early on "the fixer

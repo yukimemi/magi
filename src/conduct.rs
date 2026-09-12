@@ -671,6 +671,7 @@ mod tests {
         crate::run::ReviewRound {
             round,
             head: "deadbeef".to_owned(),
+            verified_head: None,
             reviews: vec![crate::run::ReviewRecord {
                 reviewer: 1,
                 agent: "mock".to_owned(),

@@ -81,6 +81,7 @@ fn parked_run(repo: &std::path::Path, config: &magi::config::Config) -> RunState
     state.reviews = vec![ReviewRound {
         round: 1,
         head: "deadbeef".to_owned(),
+        verified_head: None,
         reviews: Vec::new(),
         e2e: Vec::new(),
         fix: None,

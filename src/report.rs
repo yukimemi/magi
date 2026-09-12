@@ -393,7 +393,13 @@ pub fn run(state: &RunState) -> String {
                 "  round {}  {} @ {}{panel}  {raised} finding(s), {} blocking, {e2e}{verdict}{}",
                 r.round,
                 status,
-                short(&r.head),
+                format!(
+                    "{}{}",
+                    short(&r.head),
+                    r.verified_head.as_ref().map_or(String::new(), |head| {
+                        format!(" (verified @ {})", short(head))
+                    })
+                ),
                 r.blocking,
                 r.fix.as_ref().map_or(String::new(), |f| {
                     let tree = if r.progressed {
@@ -1015,6 +1021,7 @@ mod tests {
         lost.reviews = vec![ReviewRound {
             round: 1,
             head: "abc1234".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             verify_retried: false,
@@ -1049,6 +1056,7 @@ mod tests {
         rejected_all.reviews = vec![ReviewRound {
             round: 1,
             head: "abc1234".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             verify_retried: false,
@@ -1089,6 +1097,7 @@ mod tests {
         s.reviews = vec![ReviewRound {
             round: 1,
             head: "abc1234".to_owned(),
+            verified_head: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -1149,6 +1158,7 @@ mod tests {
         s.reviews = vec![ReviewRound {
             round: 1,
             head: "abc1234".to_owned(),
+            verified_head: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -1209,6 +1219,7 @@ mod tests {
         s.reviews = vec![ReviewRound {
             round: 1,
             head: "abc1234".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: vec![CommandOutcome {
                 command: "cargo test".to_owned(),
@@ -1245,6 +1256,7 @@ mod tests {
         s.reviews = vec![ReviewRound {
             round: 1,
             head: "deadbee".to_owned(),
+            verified_head: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "alpha".to_owned(),

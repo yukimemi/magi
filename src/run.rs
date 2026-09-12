@@ -60,7 +60,12 @@ use crate::verdict::{Finding, Rejection, ReviewVote};
 /// stuck reading as done. A schema-4 record has no notion of `Landing` at
 /// all, so this is a meaning a resumed old run cannot be guessed into rather
 /// than a value it can default to - hence the bump, not a `#[serde(default)]`.
-pub const SCHEMA: u32 = 5;
+///
+/// 6: a deferred e2e is represented by an empty outcome list plus
+/// `ReviewRound::e2e_deferred`. Schema 5 treated that same empty list as an
+/// unconfigured, successful check, so schema-5 records are migrated with the
+/// old (not-deferred) meaning while older binaries reject schema-6 records.
+pub const SCHEMA: u32 = 6;
 
 /// Where a run got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,6 +467,11 @@ pub struct ReviewRound {
     pub round: usize,
     /// Commit the round reviewed.
     pub head: String,
+    /// Commit actually checked by a catch-up e2e, when it differs from the
+    /// reviewed commit. Kept separate so reports never attribute a command
+    /// result to a review target the command did not inspect.
+    #[serde(default)]
+    pub verified_head: Option<String>,
     /// Reviewer reports.
     pub reviews: Vec<ReviewRecord>,
     /// E2E command outcomes for this round.
@@ -952,17 +962,29 @@ impl RunState {
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let state: Self =
             serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
-        if state.schema != SCHEMA {
-            bail!(
-                "run {} was written by a different magi (schema {}, this build \
-                 speaks {SCHEMA})",
-                state.id,
-                state.schema
-            );
-        }
-        Ok(state)
+        migrate_schema(state)
     }
+}
 
+fn migrate_schema(mut state: RunState) -> Result<RunState> {
+    // Schema 5 predates deferred e2e. Its empty e2e lists therefore mean
+    // "not configured", never "deferred"; serde's field defaults retain
+    // exactly that representation while this migration permits resumes.
+    if state.schema == 5 {
+        state.schema = SCHEMA;
+    }
+    if state.schema != SCHEMA {
+        bail!(
+            "run {} was written by a different magi (schema {}, this build \
+                 speaks {SCHEMA})",
+            state.id,
+            state.schema
+        );
+    }
+    Ok(state)
+}
+
+impl RunState {
     /// The winning candidate, once the tally has run.
     pub fn winner(&self) -> Option<&Candidate> {
         let label = self.tally.as_ref()?.winner;
@@ -1490,6 +1512,7 @@ mod tests {
         ReviewRound {
             round: 1,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "a".to_owned(),
@@ -1633,6 +1656,36 @@ mod tests {
         assert!(!r.e2e_deferred);
         assert!(r.e2e_defer_reason.is_none());
         assert_eq!(r.e2e_status(), E2eStatus::NotConfigured);
+    }
+
+    #[test]
+    fn schema_five_state_migrates_old_empty_e2e_and_legacy_verify_budget() {
+        let mut value = serde_json::to_value(state()).expect("serialize state");
+        let object = value.as_object_mut().expect("state object");
+        object.insert("schema".to_owned(), serde_json::json!(5));
+        let graph = object["config"]["graph"]
+            .as_object_mut()
+            .expect("graph object");
+        graph.insert("timeout_review".to_owned(), serde_json::json!(3600));
+        graph.remove("timeout_verify");
+        let review = object["reviews"].as_array_mut().expect("reviews");
+        review.push(serde_json::json!({
+            "round": 1, "head": "old", "reviews": [], "e2e": [],
+            "verify_retried": false, "blocking": 0, "answered": 1,
+            "expected": 1, "clean": true
+        }));
+        let old: RunState = serde_json::from_value(value).expect("schema-5 shape parses");
+        let migrated = migrate_schema(old).expect("schema 5 migrates");
+        assert_eq!(migrated.schema, SCHEMA);
+        assert_eq!(migrated.config.graph.verify_timeout(), 3600);
+        assert_eq!(migrated.reviews[0].e2e_status(), E2eStatus::NotConfigured);
+    }
+
+    #[test]
+    fn schema_six_serialization_is_rejected_by_a_schema_five_reader() {
+        let body = serde_json::to_value(state()).expect("serialize state");
+        assert_eq!(body["schema"], serde_json::json!(SCHEMA));
+        assert_ne!(body["schema"], serde_json::json!(5));
     }
 
     #[test]

@@ -1955,9 +1955,10 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
         cfg.merge.mode
     );
     println!(
-        "verify timeout {}s (review seat timeout {}s — separate since [graph] \
-         timeout_verify exists; shrinking one no longer shrinks the other)",
-        cfg.graph.timeout_verify, cfg.graph.timeout_review
+        "verify timeout {}s (review seat timeout {}s — inherited when [graph] \
+         timeout_verify is omitted; an explicit timeout_verify is independent)",
+        cfg.graph.verify_timeout(),
+        cfg.graph.timeout_review
     );
     println!(
         "e2e schedule {}",

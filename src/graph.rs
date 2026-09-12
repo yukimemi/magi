@@ -2440,7 +2440,7 @@ impl Runner {
             let round_verdict = ReviewVote::worst(final_votes);
 
             let blocking = all_findings.iter().filter(|f| f.severity.blocks()).count();
-            let verify_timeout = Duration::from_secs(self.state.config.graph.timeout_verify);
+            let verify_timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
             // A round that already has a blocking finding and a round left to
             // try is going back to the fixer no matter what `verify.e2e`
             // says, so running it first only spends the loop's slowest step
@@ -2495,6 +2495,7 @@ impl Runner {
             let mut round_record = ReviewRound {
                 round,
                 head: head.clone(),
+                verified_head: None,
                 reviews: records,
                 e2e,
                 verify_retried,
@@ -2782,8 +2783,9 @@ impl Runner {
         };
         if needs_catchup_run {
             let round = self.state.reviews[round_idx].round;
-            let timeout = Duration::from_secs(self.state.config.graph.timeout_verify);
+            let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
             let commands = self.state.config.verify.e2e.clone();
+            let verified_head = git::rev_parse(worktree, "HEAD").await?;
             let (outcomes, verify_retried) = run_e2e_with_retry(
                 &mut self.state,
                 shell,
@@ -2797,6 +2799,9 @@ impl Runner {
             last.e2e = outcomes;
             last.verify_retried = verify_retried;
             last.e2e_deferred = false;
+            if verified_head != last.head {
+                last.verified_head = Some(verified_head);
+            }
         }
         let last = &self.state.reviews[round_idx];
         let red: Vec<String> = last
@@ -2866,7 +2871,7 @@ impl Runner {
             &shell,
             &self.state.config.verify.gate,
             &winner.worktree,
-            Duration::from_secs(self.state.config.graph.timeout_verify),
+            Duration::from_secs(self.state.config.graph.verify_timeout()),
         )
         .await;
         for o in &outcomes {
@@ -3983,6 +3988,7 @@ mod tests {
         ReviewRound {
             round: 1,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: vec![CommandOutcome {
                 command: "test".to_owned(),
@@ -4286,6 +4292,7 @@ mod tests {
         state.reviews = vec![ReviewRound {
             round: 1,
             head: "deadbeef".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             fix: None,
@@ -4399,6 +4406,7 @@ mod tests {
         state.reviews = vec![ReviewRound {
             round: 1,
             head: "deadbeef".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             fix: None,
@@ -4506,6 +4514,7 @@ mod tests {
         let round = ReviewRound {
             round: 2,
             head: "deadbee".to_owned(),
+            verified_head: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "alpha".to_owned(),
@@ -4563,6 +4572,7 @@ mod tests {
         let round = ReviewRound {
             round: 1,
             head: "deadbee".to_owned(),
+            verified_head: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "alpha".to_owned(),

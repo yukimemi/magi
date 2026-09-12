@@ -229,10 +229,11 @@ pub struct Graph {
     /// [`Self::timeout_review`] so shrinking a reviewer's budget cannot
     /// silently shrink a real-machine command's budget too — the two used to
     /// share `timeout_review`, and turning a slow reviewer down cut the
-    /// timeout `cargo test --all-targets` runs under along with it. Defaults
-    /// to the same 1200s `timeout_review` has always defaulted to, so a
-    /// config that never heard of this field runs exactly as before.
-    pub timeout_verify: u64,
+    /// timeout `cargo test --all-targets` runs under along with it. When
+    /// omitted, preserves legacy configurations by using
+    /// [`Self::timeout_review`]. Set an explicit value to make verification
+    /// independent of later review-seat budget changes.
+    pub timeout_verify: Option<u64>,
     /// Per-node timeouts, seconds.
     pub timeout_fix: u64,
     /// Wall-clock limit for one turn of [`crate::talk`]'s standing
@@ -314,7 +315,7 @@ impl Default for Graph {
             timeout_implement: 3600,
             timeout_judge: 1200,
             timeout_review: 1200,
-            timeout_verify: 1200,
+            timeout_verify: None,
             timeout_fix: 1800,
             timeout_talk: 3600,
             retries: 1,
@@ -326,6 +327,15 @@ impl Default for Graph {
             incomplete_review: IncompleteReviewPolicy::Block,
             e2e_every_round: false,
         }
+    }
+}
+
+impl Graph {
+    /// Effective machine-command budget. Older configuration files had only
+    /// `timeout_review`, which also governed verification, so absence is a
+    /// compatibility fallback rather than a new 1200-second default.
+    pub fn verify_timeout(&self) -> u64 {
+        self.timeout_verify.unwrap_or(self.timeout_review)
     }
 }
 
@@ -1432,16 +1442,14 @@ mod tests {
     }
 
     #[test]
-    fn timeout_verify_defaults_to_the_value_timeout_review_has_always_defaulted_to() {
+    fn timeout_verify_omitted_from_old_toml_inherits_timeout_review() {
         // `timeout_verify` used to not exist: `verify.e2e`/`verify.gate` ran
         // under `timeout_review`. A config written before this field existed
         // must run exactly as before, which means its default has to be the
         // same 1200s `timeout_review` has always defaulted to.
-        assert_eq!(
-            Graph::default().timeout_verify,
-            Graph::default().timeout_review
-        );
-        assert_eq!(Graph::default().timeout_verify, 1200);
+        let g: Graph = toml::from_str("timeout_review = 3600").expect("parse");
+        assert_eq!(g.timeout_verify, None);
+        assert_eq!(g.verify_timeout(), 3600);
     }
 
     #[test]
@@ -1453,9 +1461,13 @@ mod tests {
         let g: Graph = toml::from_str("timeout_review = 45").expect("parse");
         assert_eq!(g.timeout_review, 45);
         assert_eq!(
-            g.timeout_verify, 1200,
-            "an unrelated field must not move because timeout_review did"
+            g.verify_timeout(),
+            45,
+            "an omitted legacy value follows review"
         );
+        let explicit: Graph = toml::from_str("timeout_review = 45\ntimeout_verify = 1200")
+            .expect("parse explicit override");
+        assert_eq!(explicit.verify_timeout(), 1200);
     }
 
     #[test]
@@ -1466,7 +1478,7 @@ mod tests {
         let g: Graph =
             toml::from_str("candidates = 1\nreviewers = 3\nreview_rounds = 6\nmax_parallel = 4\n")
                 .expect("an old-shaped [graph] table must still parse");
-        assert_eq!(g.timeout_verify, Graph::default().timeout_verify);
+        assert_eq!(g.verify_timeout(), Graph::default().timeout_review);
         assert!(
             !g.e2e_every_round,
             "off by default, same as before this field existed"
