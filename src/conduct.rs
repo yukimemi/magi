@@ -324,7 +324,14 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
         if task.status == TaskStatus::Done {
             return Ok(());
         }
-        let question_id = match questions.open_for(&task.id).into_iter().next() {
+        // `Question::run` is a task id for conductor questions, but ordinary
+        // graph questions use it as a run id. A coincidental equality must
+        // not block this task on an answer meant for another node.
+        let question_id = match questions
+            .list()
+            .into_iter()
+            .find(|q| q.status.open() && q.node == NODE && q.run == task.id)
+        {
             Some(existing) => existing.id,
             None => {
                 let mut q = Question::new(
@@ -922,6 +929,44 @@ mod tests {
             [first_question_id],
             "the existing open question is reused, not replaced"
         );
+    }
+
+    #[test]
+    fn a_same_id_question_from_another_node_is_not_reused() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("must ask the conductor");
+        queue.put(&mut t).unwrap();
+
+        let mut unrelated = Question::new(
+            t.id.clone(),
+            "review".to_owned(),
+            "reviewer-1".to_owned(),
+            "An unrelated review question".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut unrelated).unwrap();
+
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![Decision {
+                    id: t.id.clone(),
+                    question: Some("Which backend?".to_owned()),
+                    ..Decision::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let blocked_by = &queue.get(&t.id).unwrap().blocked_by;
+        assert_eq!(blocked_by.len(), 1);
+        assert_ne!(blocked_by[0], unrelated.id);
+        assert!(questions.get(&unrelated.id).unwrap().status.open());
+        assert_eq!(questions.get(&blocked_by[0]).unwrap().node, NODE);
     }
 
     #[test]

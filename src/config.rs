@@ -1259,11 +1259,19 @@ impl Config {
                 .as_deref()
                 .map(|f| self.agent(f).cloned())
                 .transpose()?,
-            conductor: crate::agent::pick(
-                &self.agents,
-                self.roles.conductor.as_deref(),
-                &crate::agent::installed,
-            )?,
+            // Role resolution validates roster shape, but deliberately does
+            // not preflight a CLI. The other graph seats have always deferred
+            // that failure to invocation; doing it only for the conductor
+            // made otherwise usable graph commands and `doctor` fail as one.
+            conductor: match self.roles.conductor.as_deref() {
+                Some(id) => self.agent(id)?.clone(),
+                // Keep the normal standalone-seat preference when something
+                // is installed, but retain a roster fallback when it is not.
+                // Invocation then reports the unavailable CLI in the same
+                // place it does for every other graph role.
+                None => crate::agent::pick(&self.agents, None, &crate::agent::installed)
+                    .unwrap_or_else(|_| self.agents[0].clone()),
+            },
         })
     }
 

@@ -1441,6 +1441,10 @@ async fn poll(
         // Truly idle: nothing new to start and nothing still running.
         lock(status).idle = true;
         if opts.once {
+            // A one-shot drain must perform the same post-work cleanup as a
+            // daemon that reached a normal idle interval. The startup pass
+            // cannot see runs or cache files produced by this drain.
+            janitor(&opts.repo, opts, home, worktrees_root).await;
             break;
         }
         stop.idle(opts.poll).await;

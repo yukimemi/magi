@@ -1922,11 +1922,19 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
                     Err(e) => format!("unusable: {e}"),
                 }
             );
-            // The conductor seat, resolved the same way `conduct::Conductor`
-            // resolves it. Shown for the same reason the chat seat is: an
-            // unresolved role that only fails inside a running daemon is a
-            // setting an operator cannot confirm ahead of time.
-            println!("  conduct      {}", roles.conductor.display());
+            // Resolve this availability diagnostic independently: a missing
+            // conductor CLI must not hide the otherwise valid graph seats.
+            println!(
+                "  conduct      {}",
+                match magi::agent::pick(
+                    &cfg.agents,
+                    cfg.roles.conductor.as_deref(),
+                    &magi::agent::installed,
+                ) {
+                    Ok(s) => s.display(),
+                    Err(e) => format!("unusable: {e}"),
+                }
+            );
         }
         Err(e) => println!("\nroster     unusable: {e}"),
     }
