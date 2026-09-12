@@ -692,6 +692,40 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
     }
 }
 
+/// Retire an unanswered conductor question after its task no longer refers to
+/// it. Conductor questions use the task id in `Question::run`, so run-based
+/// cleanup cannot observe a manual release or completion.
+fn reconcile_task_questions(queue: &Queue, questions: &Questions) {
+    let tasks = queue.list();
+    let referenced: std::collections::BTreeSet<&str> = tasks
+        .iter()
+        .flat_map(|task| task.blocked_by.iter().map(String::as_str))
+        .collect();
+
+    for task in &tasks {
+        for mut question in questions.open_for(&task.id) {
+            // Keep questions a task still names, including when the
+            // reference moved to a dependent task.  A question whose `run`
+            // is not a current task id is a normal run question and never
+            // enters this loop.
+            if referenced.contains(question.id.as_str()) {
+                continue;
+            }
+            question.abandon(format!(
+                "task {} no longer waits for this answer",
+                task.short()
+            ));
+            if let Err(e) = questions.put(&mut question) {
+                tracing::warn!(
+                    "could not retire question {} for task {}: {e:#}",
+                    question.short(),
+                    task.short()
+                );
+            }
+        }
+    }
+}
+
 /// What a finished run tells the queue about the task it came from.
 ///
 /// A struct rather than a fourth and fifth boolean argument: the two flags
@@ -1006,6 +1040,10 @@ async fn drive(
         concurrency
     );
 
+    // `--once` drains an already-idle queue without reaching the idle wait,
+    // but must still perform the startup cleanup.
+    janitor(&opts.repo, opts, home, worktrees_root).await;
+
     let outcome = poll(
         opts,
         queue,
@@ -1223,6 +1261,7 @@ async fn poll(
         // Deterministic: no model, run before the conductor sees anything so
         // its input reflects the queue's current, already-resolved state.
         resolve_blockers(queue, &questions);
+        reconcile_task_questions(queue, &questions);
 
         // The conductor gets one look per cycle, right before the loop takes
         // its next task, and only when there is something new to look at -
@@ -1835,8 +1874,17 @@ fn exhausted_review_budget(state: &RunState) -> bool {
 /// `Runner::start` here (see `Recovery::Review`), once this task's next
 /// failure shows it up as `held`/`failed` with the run state unreadable.
 fn unfinished_run(runs: &[String], short: &str) -> Option<String> {
+    unfinished_run_with(runs, short, RunState::load)
+}
+
+/// [`unfinished_run`] with an injected state reader. Tests provide their
+/// fixtures directly rather than touching the process-global run home.
+fn unfinished_run_with<F>(runs: &[String], short: &str, load: F) -> Option<String>
+where
+    F: FnOnce(&str) -> Result<RunState>,
+{
     let id = runs.last()?;
-    match RunState::load(id) {
+    match load(id) {
         Ok(s) if s.status.resumable() && !exhausted_review_budget(&s) => Some(id.clone()),
         Ok(_) => None,
         Err(e) => {
@@ -3289,18 +3337,18 @@ mod tests {
     /// longer than the test's patience, so anything that waits out a poll
     /// instead of noticing the stop fails rather than merely being slow.
     fn idle_loop(dir: &Path) -> (Opts, Queue, PathBuf, PathBuf, PathBuf) {
+        let config = dir.join("magi.toml");
+        std::fs::write(
+            &config,
+            "[disk]\nmin_free_bytes = 0\nauto_fold = false\ncache_limit_bytes = 0\n",
+        )
+        .unwrap();
         let opts = Opts {
             poll: Duration::from_secs(30),
-            // `Opts::default`'s `repo` is `"."` - the process's own working
-            // directory, which under `cargo test` is this very checkout, a
-            // real git repository with its own `magi.toml`. Idle polling can
-            // run the janitor, which discovers its config from `opts.repo`
-            // and then prunes worktree
-            // registrations there - so leaving this at `"."` would have every
-            // test that drives the loop mutate this checkout's own git admin
-            // state. A directory that is not a repository at all makes that
-            // step fail closed instead (`git worktree prune` errors, caught
-            // and logged, nothing pruned).
+            config: Some(config),
+            // The explicit fixture config keeps startup cleanup from reading
+            // machine configuration. This fictional repository likewise
+            // keeps any best-effort git cleanup away from this checkout.
             repo: dir.join("repo"),
             ..Opts::default()
         };
@@ -3463,6 +3511,96 @@ mod tests {
         assert!(
             read_status(&home).is_none(),
             "a reader must see no daemon at all, not a heartbeat that merely stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn once_runs_startup_housekeeping_before_an_empty_queue_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut opts, queue, status_file, home, worktrees) = idle_loop(dir.path());
+        opts.once = true;
+
+        let mut settled = RunState::new(
+            dir.path().join("repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            "fixture".to_owned(),
+            Config::default(),
+        );
+        settled.status = RunStatus::Ready;
+        let run_dir = home.join("runs").join(&settled.id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("run.json"),
+            serde_json::to_string_pretty(&settled).unwrap(),
+        )
+        .unwrap();
+        let questions = Questions::at(home.join("questions"));
+        let mut question = ask::Question::new(
+            settled.id.clone(),
+            "review".to_owned(),
+            "reviewer-1".to_owned(),
+            "Continue?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut question).unwrap();
+
+        drive(&opts, &queue, &status_file, &home, &worktrees, &Stop::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            questions.get(&question.id).unwrap().status,
+            ask::QuestionStatus::Abandoned,
+            "an empty --once drain still performs startup question cleanup"
+        );
+    }
+
+    #[test]
+    fn task_question_reconciliation_keeps_references_and_retires_manual_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut task = task();
+        queue.put(&mut task).unwrap();
+
+        let mut task_question = ask::Question::new(
+            task.id.clone(),
+            "conductor".to_owned(),
+            "conductor".to_owned(),
+            "Which backend?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut task_question).unwrap();
+        task.block(vec![task_question.id.clone()], None);
+        queue.put(&mut task).unwrap();
+
+        let mut run_question = ask::Question::new(
+            "20260101-000000-run1".to_owned(),
+            "review".to_owned(),
+            "reviewer-1".to_owned(),
+            "Run question".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut run_question).unwrap();
+
+        reconcile_task_questions(&queue, &questions);
+        assert!(questions.get(&task_question.id).unwrap().status.open());
+        assert!(questions.get(&run_question.id).unwrap().status.open());
+
+        task.release();
+        queue.put(&mut task).unwrap();
+        reconcile_task_questions(&queue, &questions);
+        assert_eq!(
+            questions.get(&task_question.id).unwrap().status,
+            ask::QuestionStatus::Abandoned
+        );
+        assert!(
+            questions.get(&run_question.id).unwrap().status.open(),
+            "run questions remain the run janitor's responsibility"
         );
     }
 
@@ -3862,7 +4000,6 @@ mod tests {
         // review loop iterates zero times over an already-spent budget, so
         // the resumed run settles right back to `Blocked` having asked nobody
         // anything, and `Requeue`'s promised fresh competition never happens.
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
         let mut exhausted = RunState::new(
             PathBuf::from("/repo"),
             "main".to_owned(),
@@ -3873,10 +4010,9 @@ mod tests {
         exhausted.status = RunStatus::Blocked;
         exhausted.config.graph.review_rounds = 1;
         exhausted.reviews = vec![review_round(1)];
-        exhausted.save().unwrap();
 
         assert_eq!(
-            unfinished_run(&[exhausted.id.clone()], "t"),
+            unfinished_run_with(&[exhausted.id.clone()], "t", |_| Ok(exhausted.clone())),
             None,
             "an exhausted `Blocked` run must not be offered as resumable"
         );
@@ -3893,10 +4029,11 @@ mod tests {
         has_budget_left.status = RunStatus::Blocked;
         has_budget_left.config.graph.review_rounds = 3;
         has_budget_left.reviews = vec![review_round(1)];
-        has_budget_left.save().unwrap();
 
         assert_eq!(
-            unfinished_run(&[has_budget_left.id.clone()], "t"),
+            unfinished_run_with(&[has_budget_left.id.clone()], "t", |_| {
+                Ok(has_budget_left.clone())
+            }),
             Some(has_budget_left.id.clone())
         );
     }
@@ -3910,8 +4047,6 @@ mod tests {
         // on this task must mean a fresh competition — falling back to the
         // stale, superseded `Stalled` run instead would resurrect history
         // nothing asked to revisit and silently defeat the requeue.
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
-
         let mut older_stalled = RunState::new(
             PathBuf::from("/repo"),
             "main".to_owned(),
@@ -3920,7 +4055,6 @@ mod tests {
             Config::default(),
         );
         older_stalled.status = RunStatus::Stalled;
-        older_stalled.save().unwrap();
 
         let mut newest_exhausted = RunState::new(
             PathBuf::from("/repo"),
@@ -3932,12 +4066,12 @@ mod tests {
         newest_exhausted.status = RunStatus::Blocked;
         newest_exhausted.config.graph.review_rounds = 1;
         newest_exhausted.reviews = vec![review_round(1)];
-        newest_exhausted.save().unwrap();
 
         assert_eq!(
-            unfinished_run(
+            unfinished_run_with(
                 &[older_stalled.id.clone(), newest_exhausted.id.clone()],
-                "t"
+                "t",
+                |_| Ok(newest_exhausted.clone())
             ),
             None,
             "the newest run is exhausted, so nothing here is worth resuming - \
@@ -3947,9 +4081,10 @@ mod tests {
 
     #[test]
     fn unfinished_run_warns_and_skips_a_run_it_cannot_read() {
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
         assert_eq!(
-            unfinished_run(&["20260101-000000-gone".to_owned()], "t"),
+            unfinished_run_with(&["20260101-000000-gone".to_owned()], "t", |_| {
+                Err(anyhow::anyhow!("fixture is absent"))
+            }),
             None
         );
     }
