@@ -3404,6 +3404,7 @@ async function editTalkPending() {
     const next = await postJson(API.talkPendingEdit(id), { text, expected_text: expectedText, expected_attachments: expectedAttachments });
     if (state.talkDetail.id === id) {
       state.talkDetail.talk = next;
+      trackTalkThinking(next);
       renderTalk();
     }
     announce("Queued text updated. Attachments are preserved.");
