@@ -3313,7 +3313,18 @@ async fn talk_say(
             let said = body.text.clone();
             blocking(move || {
                 let mut talk = ui.talks.get(&id)?;
-                talk::queue(&mut talk, &ui.talks, &said, attachments)?;
+                if let Err(error) = talk::queue(&mut talk, &ui.talks, &said, attachments) {
+                    if let Ok(fresh) = ui.talks.get(&id) {
+                        if !fresh.status.open() {
+                            return Err(ApiError::conflict(format!(
+                                "talk {} is {} and takes no more turns",
+                                fresh.short(),
+                                fresh.status.as_str()
+                            )));
+                        }
+                    }
+                    return Err(ApiError::from(error));
+                }
                 // The turn that looked busy a moment ago can have finished,
                 // found nothing to drain and given up the slot in the gap
                 // between that check and this write landing - see
@@ -3358,7 +3369,22 @@ async fn talk_say(
         let mut talk = talk.clone();
         let talks = talks.clone();
         let said = body.text.clone();
-        blocking(move || Ok(talk::record(&mut talk, &talks, &said, attachments)?)).await?
+        blocking(move || {
+            if let Err(error) = talk::record(&mut talk, &talks, &said, attachments) {
+                if let Ok(fresh) = talks.get(&talk.id) {
+                    if !fresh.status.open() {
+                        return Err(ApiError::conflict(format!(
+                            "talk {} is {} and takes no more turns",
+                            fresh.short(),
+                            fresh.status.as_str()
+                        )));
+                    }
+                }
+                return Err(ApiError::from(error));
+            }
+            Ok(said.trim().to_owned())
+        })
+        .await?
     };
     // Re-read so the spawned task appends to the record that now holds the
     // operator's turn, rather than to the snapshot taken before it.
