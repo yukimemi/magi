@@ -52,7 +52,7 @@
     <a class="rail-link" href="#/runs" data-nav="runs">Runs</a>
     <a class="rail-link" href="#/queue" data-nav="queue">Queue</a>
     <a class="rail-link" href="#/questions" data-nav="questions">Questions<span class="badge" id="ask-badge-rail" hidden></span></a>
-    <a class="rail-link btn btn-gold" href="#/chat" data-nav="talks">Chat</a>
+    <a class="rail-link btn btn-gold" href="#/chat" data-nav="talks">Chat<span class="badge" id="talk-badge-rail" hidden></span></a>
   </nav>
 
   <button class="icon-btn" type="button" id="theme-toggle" aria-label="Colour theme: follow system">
@@ -297,6 +297,7 @@
       <span class="waiting-text"></span>
       <span class="waiting-secs" aria-hidden="true"></span>
     </p>
+    <div id="talk-pending" class="talk-pending" aria-live="polite" hidden></div>
 
     <details class="panel advanced" id="talk-tasks-panel" hidden>
       <summary><span class="talk-tasks-label">Filed from here</span> <span class="count" id="talk-tasks-count"></span></summary>
@@ -379,6 +380,7 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
         <path d="M4 5.5h16v10h-9l-4 3.5v-3.5H4z"/>
       </svg>
+      <span class="badge" id="talk-badge-dock" hidden></span>
     </span>
     <span>Chat</span>
   </a>

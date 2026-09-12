@@ -171,6 +171,13 @@ pub struct Talk {
     pub status: TalkStatus,
     /// Everything said, oldest first.
     pub turns: Vec<Turn>,
+    /// Text and attachments accepted while the single CLI turn is busy.
+    /// They are durable, but become a real turn only when [`drain`] records them.
+    #[serde(default)]
+    pub pending: String,
+    /// Attachments paired with [`Self::pending`].
+    #[serde(default)]
+    pub pending_attachments: Vec<Attachment>,
     /// When the conversation was opened.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -480,6 +487,8 @@ pub fn begin(store: &Talks, cfg: &Config, repo: PathBuf, agent: Option<&str>) ->
         agent: spec.id.clone(),
         status: TalkStatus::Open,
         turns: Vec::new(),
+        pending: String::new(),
+        pending_attachments: Vec::new(),
         created_at: now,
         updated_at: now,
         seat: SeatState::new(SEAT, &spec.id, crate::rng::entropy()),
@@ -516,6 +525,10 @@ pub fn record(
         bail!("talk {} was deleted", talk.short());
     };
     talk.status = fresh.status;
+    // Do not let this older handle overwrite a draft accepted while it was
+    // waiting for configuration discovery.
+    talk.pending = fresh.pending;
+    talk.pending_attachments = fresh.pending_attachments;
     if !talk.status.open() {
         bail!(
             "talk {} is {} and takes no more turns",
@@ -535,6 +548,65 @@ pub fn record(
     });
     store.put(talk)?;
     Ok(text.to_owned())
+}
+
+/// Add an unrecorded message to the durable draft while another turn runs.
+pub fn queue(
+    talk: &mut Talk,
+    store: &Talks,
+    text: &str,
+    attachments: Vec<Attachment>,
+) -> Result<()> {
+    let text = text.trim();
+    if text.is_empty() && attachments.is_empty() {
+        bail!("nothing to say");
+    }
+    let _guard = store.guard();
+    let mut fresh = store
+        .get(&talk.id)
+        .with_context(|| format!("talk {} was deleted", talk.short()))?;
+    if !fresh.status.open() {
+        bail!(
+            "talk {} is {} and takes no more turns",
+            fresh.short(),
+            fresh.status.as_str()
+        );
+    }
+    if !text.is_empty() {
+        if fresh.pending.is_empty() {
+            fresh.pending = text.to_owned();
+        } else {
+            fresh.pending.push_str("\n\n");
+            fresh.pending.push_str(text);
+        }
+    }
+    fresh.pending_attachments.extend(attachments);
+    store.put(&mut fresh)?;
+    *talk = fresh;
+    Ok(())
+}
+
+/// Promote the current durable draft to one operator turn.
+pub fn drain(talk: &mut Talk, store: &Talks) -> Result<Option<String>> {
+    let _guard = store.guard();
+    let mut fresh = store
+        .get(&talk.id)
+        .with_context(|| format!("talk {} was deleted", talk.short()))?;
+    if !fresh.status.open() || (fresh.pending.is_empty() && fresh.pending_attachments.is_empty()) {
+        *talk = fresh;
+        return Ok(None);
+    }
+    let text = std::mem::take(&mut fresh.pending);
+    let attachments = std::mem::take(&mut fresh.pending_attachments);
+    fresh.turns.push(Turn {
+        who: Who::Operator,
+        body: text.clone(),
+        at: Timestamp::now(),
+        attachments,
+    });
+    store.put(&mut fresh)?;
+    *talk = fresh;
+    Ok(Some(text))
 }
 
 /// One operator turn and one agent turn, appended - the synchronous form, used
@@ -578,6 +650,9 @@ pub fn close(talk: &mut Talk, store: &Talks) -> Result<()> {
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
     fresh.status = TalkStatus::Closed;
+    // A closed conversation must not replay a draft if it is reopened later.
+    fresh.pending.clear();
+    fresh.pending_attachments.clear();
     store.put(&mut fresh)?;
     *talk = fresh;
     Ok(())
@@ -602,6 +677,74 @@ pub fn reopen(talk: &mut Talk, store: &Talks) -> Result<()> {
     store.put(&mut fresh)?;
     *talk = fresh;
     Ok(())
+}
+
+/// Discard the durable draft without adding a transcript turn.
+pub fn clear_pending(talk: &mut Talk, store: &Talks) -> Result<()> {
+    let _guard = store.guard();
+    let mut fresh = store
+        .get(&talk.id)
+        .with_context(|| format!("talk {} was deleted", talk.short()))?;
+    fresh.pending.clear();
+    fresh.pending_attachments.clear();
+    store.put(&mut fresh)?;
+    *talk = fresh;
+    Ok(())
+}
+
+/// Clear a draft only when the caller still sees its complete snapshot.
+pub fn clear_pending_if_matches(
+    talk: &mut Talk,
+    store: &Talks,
+    expected_text: &str,
+    expected_attachments: &[String],
+) -> Result<bool> {
+    let _guard = store.guard();
+    let mut fresh = store
+        .get(&talk.id)
+        .with_context(|| format!("talk {} was deleted", talk.short()))?;
+    if !pending_matches(&fresh, expected_text, expected_attachments) {
+        *talk = fresh;
+        return Ok(false);
+    }
+    fresh.pending.clear();
+    fresh.pending_attachments.clear();
+    store.put(&mut fresh)?;
+    *talk = fresh;
+    Ok(true)
+}
+
+/// Replace just the text of the durable draft, but only if the caller's
+/// snapshot still identifies the entire draft. This refuses to overwrite a
+/// message another client queued or a draft the drain already promoted.
+pub fn edit_pending_text(
+    talk: &mut Talk,
+    store: &Talks,
+    text: &str,
+    expected_text: &str,
+    expected_attachments: &[String],
+) -> Result<bool> {
+    let _guard = store.guard();
+    let mut fresh = store
+        .get(&talk.id)
+        .with_context(|| format!("talk {} was deleted", talk.short()))?;
+    if !pending_matches(&fresh, expected_text, expected_attachments) {
+        *talk = fresh;
+        return Ok(false);
+    }
+    fresh.pending = text.trim().to_owned();
+    store.put(&mut fresh)?;
+    *talk = fresh;
+    Ok(true)
+}
+
+fn pending_matches(talk: &Talk, expected_text: &str, expected_attachments: &[String]) -> bool {
+    talk.pending == expected_text
+        && talk
+            .pending_attachments
+            .iter()
+            .map(|attachment| &attachment.id)
+            .eq(expected_attachments.iter())
 }
 
 /// Invoke the conversation's agent once and append what it said.
@@ -758,6 +901,11 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         return Ok(());
     };
     talk.status = fresh.status;
+    // `queue` may have accepted another operator message while the CLI was
+    // running. This handle predates that write, so preserving only `status`
+    // would overwrite the durable draft when the reply is appended below.
+    talk.pending = fresh.pending;
+    talk.pending_attachments = fresh.pending_attachments;
     talk.turns.push(reply);
     store.put(talk)?;
 
@@ -995,6 +1143,8 @@ mod tests {
             agent: "sonnet".to_owned(),
             status: TalkStatus::Open,
             turns: Vec::new(),
+            pending: String::new(),
+            pending_attachments: Vec::new(),
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, "sonnet", 7),
@@ -1106,6 +1256,106 @@ mod tests {
 
         let talk = talks.get("20260904-014455-ab12").expect("must still read");
         assert!(talk.turns[0].attachments.is_empty());
+    }
+
+    #[test]
+    fn queued_text_is_durable_combined_and_drained_as_one_operator_turn() {
+        let (tmp, talks) = store();
+        let cfg = config(mock_agent(tmp.path(), REPLY, env("reply")));
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        queue(&mut talk, &talks, "first", Vec::new()).expect("queue first");
+        queue(&mut talk, &talks, "second", Vec::new()).expect("queue second");
+        let saved = talks.get(&talk.id).expect("reload queued talk");
+        assert_eq!(saved.pending, "first\n\nsecond");
+        assert!(saved.turns.is_empty(), "a draft is not a transcript turn");
+
+        let drained = drain(&mut talk, &talks).expect("drain");
+        assert_eq!(drained.as_deref(), Some("first\n\nsecond"));
+        let saved = talks.get(&talk.id).expect("reload drained talk");
+        assert!(saved.pending.is_empty());
+        assert_eq!(saved.turns.len(), 1);
+        assert_eq!(saved.turns[0].body, "first\n\nsecond");
+    }
+
+    #[test]
+    fn editing_a_queued_draft_preserves_its_attachments_and_rejects_a_stale_snapshot() {
+        let (tmp, talks) = store();
+        let cfg = config(mock_agent(tmp.path(), REPLY, env("reply")));
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        let attachment = Attachment {
+            id: "a".repeat(32),
+            name: "shot.png".to_owned(),
+            mime: "image/png".to_owned(),
+            bytes: 3,
+        };
+
+        queue(&mut talk, &talks, "first", vec![attachment.clone()]).expect("queue");
+        assert!(
+            edit_pending_text(
+                &mut talk,
+                &talks,
+                "corrected",
+                "first",
+                std::slice::from_ref(&attachment.id),
+            )
+            .expect("edit")
+        );
+        let saved = talks.get(&talk.id).expect("reload edited draft");
+        assert_eq!(saved.pending, "corrected");
+        assert_eq!(saved.pending_attachments, vec![attachment]);
+
+        queue(&mut talk, &talks, "later", Vec::new()).expect("queue concurrent draft");
+        assert!(
+            !edit_pending_text(
+                &mut talk,
+                &talks,
+                "stale edit",
+                "corrected",
+                &["a".repeat(32)],
+            )
+            .expect("stale edit is a conflict")
+        );
+        assert_eq!(
+            talks.get(&talk.id).expect("reload after conflict").pending,
+            "corrected\n\nlater"
+        );
+        assert!(
+            !clear_pending_if_matches(&mut talk, &talks, "corrected", &["a".repeat(32)])
+                .expect("stale clear is a conflict")
+        );
+        assert_eq!(
+            talks
+                .get(&talk.id)
+                .expect("reload after stale clear")
+                .pending,
+            "corrected\n\nlater"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_save_preserves_pending_accepted_while_the_cli_runs() {
+        let (tmp, talks) = store();
+        let slow = "#!/bin/sh\ncat >/dev/null\nsleep 0.1\nprintf reply\n";
+        let cfg = config(mock_agent(tmp.path(), slow, BTreeMap::new()));
+        let mut running = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        let id = running.id.clone();
+        let first = record(&mut running, &talks, "first", Vec::new()).expect("record");
+
+        let response_talks = talks.clone();
+        let response_cfg = cfg.clone();
+        let reply = tokio::spawn(async move {
+            respond(&mut running, &response_talks, &response_cfg, &first).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let mut queued = talks.get(&id).expect("queued handle");
+        queue(&mut queued, &talks, "next", Vec::new()).expect("queue");
+        reply.await.expect("join").expect("reply");
+
+        let saved = talks.get(&id).expect("reload");
+        assert_eq!(saved.pending, "next");
+        assert_eq!(saved.turns.len(), 2, "operator message and reply remain");
     }
 
     #[tokio::test]
@@ -1588,6 +1838,8 @@ mod tests {
                 agent: "mock".to_owned(),
                 status,
                 turns: Vec::new(),
+                pending: String::new(),
+                pending_attachments: Vec::new(),
                 created_at: Timestamp::now(),
                 updated_at: Timestamp::now(),
                 seat: SeatState::new(SEAT, "mock", 7),
