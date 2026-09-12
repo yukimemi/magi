@@ -700,7 +700,7 @@ impl Ui {
             .route("/api/talks", get(talks_list).post(talk_post))
             .route("/api/talks/{id}", get(talk_detail).delete(talk_delete))
             .route("/api/talks/{id}/say", post(talk_say))
-            .route("/api/talks/{id}/pending", delete(talk_pending_delete))
+            .route("/api/talks/{id}/pending/clear", post(talk_pending_clear))
             .route("/api/talks/{id}/pending/edit", post(talk_pending_edit))
             .route("/api/talks/{id}/close", post(talk_close))
             .route("/api/talks/{id}/reopen", post(talk_reopen))
@@ -3244,6 +3244,13 @@ struct EditTalkPending {
     expected_attachments: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClearTalkPending {
+    expected_text: String,
+    expected_attachments: Vec<String>,
+}
+
 /// `POST /api/talks/{id}/say` - one turn of the conversation.
 ///
 /// Not filesystem work, and therefore not routed through [`blocking`]: this
@@ -3475,21 +3482,26 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
     }
 }
 
-/// `DELETE /api/talks/{id}/pending` - discard a queued draft without
-/// recording it.
-///
-/// There is no dedicated "edit the draft" route: the front end's way of
-/// fixing what it queued is to call this, then `POST .../say` again with the
-/// corrected text - two calls rather than a second route that would have to
-/// carry the same guard-and-reread care `talk::queue` already needs.
-async fn talk_pending_delete(
+/// Clear a queued draft only if it remains exactly the one the caller saw.
+async fn talk_pending_clear(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
+    body: std::result::Result<Json<ClearTalkPending>, JsonRejection>,
 ) -> ApiResult<Json<TalkView>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
     blocking(move || {
         let id = resolve_talk(&ui.talks, &id)?;
         let mut talk = ui.talks.get(&id)?;
-        talk::clear_pending(&mut talk, &ui.talks)?;
+        if !talk::clear_pending_if_matches(
+            &mut talk,
+            &ui.talks,
+            &body.expected_text,
+            &body.expected_attachments,
+        )? {
+            return Err(ApiError::conflict(
+                "queued message changed; reload it before clearing",
+            ));
+        }
         let thinking = ui.is_thinking(&talk.id);
         Ok(Json(TalkView::new(talk, thinking)))
     })
