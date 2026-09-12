@@ -1235,10 +1235,15 @@ async fn poll(
             .into_iter()
             .filter(|task| !stalled_ids.contains(&task.id))
             .collect();
-        if conductor.worth_a_look(queue, &stalled, &finished) {
+        let queued = queued_tasks(queue);
+        // An empty queue has nothing to arrange. In particular, do not let
+        // the conductor's initial snapshot cause synchronous config I/O
+        // between the caller's stop notification and the idle wait below.
+        if !(queued.is_empty() && stalled.is_empty() && finished.is_empty())
+            && conductor.worth_a_look(queue, &stalled, &finished)
+        {
             match prepare(&opts.repo, opts) {
                 Ok(cfg) => {
-                    let queued = queued_tasks(queue);
                     conductor
                         .maybe_run(
                             &cfg,
@@ -3781,7 +3786,7 @@ mod tests {
     fn an_explicit_release_forces_a_fresh_competition_even_with_a_resumable_run() {
         let mut released = task();
         released.start("stalled-run".to_owned());
-        released.release();
+        released.requeue();
         let unfinished = (!released.fresh_start)
             .then(|| Some("stalled-run".to_owned()))
             .flatten();
@@ -3791,6 +3796,21 @@ mod tests {
             "release keeps run history but must not resume it"
         );
         assert_eq!(released.runs, ["stalled-run"]);
+    }
+
+    #[test]
+    fn an_ordinary_release_keeps_a_resumable_run_available() {
+        let mut released = task();
+        released.start("stalled-run".to_owned());
+        released.release();
+        let unfinished = (!released.fresh_start)
+            .then(|| Some("stalled-run".to_owned()))
+            .flatten();
+        assert_eq!(
+            choose_starter(None, false, unfinished.as_deref()),
+            Starter::Resume("stalled-run".to_owned()),
+            "manual release must preserve the normal resume path"
+        );
     }
 
     #[test]

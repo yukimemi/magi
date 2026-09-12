@@ -406,6 +406,13 @@ impl Task {
         self.review_branch = Some(branch);
     }
 
+    /// Requeue after a conductor chose a new competition. Unlike an ordinary
+    /// operator release, this deliberately does not resume the old run.
+    pub fn requeue(&mut self) {
+        self.release();
+        self.fresh_start = true;
+    }
+
     /// Change how urgently this task should run next.
     ///
     /// Refused once the task is `running`: priority only feeds the sort
@@ -486,7 +493,7 @@ impl Task {
         self.blocked_by.clear();
         self.block_reason = None;
         self.review_branch = None;
-        self.fresh_start = true;
+        self.fresh_start = false;
     }
 }
 
@@ -1070,6 +1077,17 @@ mod tests {
         // An ordinary release (a human overriding the choice) drops it again.
         t.release();
         assert!(t.review_branch.is_none());
+    }
+
+    #[test]
+    fn conductor_requeue_but_not_an_ordinary_release_forces_a_fresh_start() {
+        let mut t = task("retry");
+        t.start("run-1".to_owned());
+        t.requeue();
+        assert!(t.fresh_start);
+
+        t.release();
+        assert!(!t.fresh_start);
     }
 
     #[test]

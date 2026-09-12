@@ -350,7 +350,7 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
         }
         TaskStatus::Running => match d.recovery {
             Some(Recovery::Requeue) => {
-                task.release();
+                task.requeue();
                 queue.put(&mut task)?;
             }
             Some(Recovery::Hold) => {
@@ -364,7 +364,7 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
         },
         TaskStatus::Failed | TaskStatus::Held => match d.recovery {
             Some(Recovery::Requeue) => {
-                task.release();
+                task.requeue();
                 queue.put(&mut task)?;
             }
             Some(Recovery::Hold) => {
