@@ -317,6 +317,15 @@ new sentence rather than replaying the transcript and paying for it again.
 Your message is written to disk **before** the agent is invoked, so a quota
 window or a crash cannot lose something you typed.
 
+While a reply is running, Chat accepts the next message as one durable pending
+draft instead of starting a second CLI turn. The web composer shows that draft;
+use **Clear** to discard it, or **Edit text** to clear it and put its text back
+in the composer before sending a correction. Pending attachments are cleared
+with the draft, so reattach them when correcting. A server restart cannot
+resume an in-flight CLI process, but the recorded transcript and pending draft
+remain on disk and are visible after reopening Chat; send the pending text
+again if no worker is still running to drain it.
+
 The conversation runs with writes disabled by default: an agent that had
 already edited the repository mid-conversation would make a later
 competition's diffs unjudgeable. `[talk] allow_write = true` lifts that for a

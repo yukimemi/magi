@@ -45,6 +45,7 @@ const API = {
   talks: "/api/talks",
   talk: (id) => `/api/talks/${encodeURIComponent(id)}`,
   talkSay: (id) => `/api/talks/${encodeURIComponent(id)}/say`,
+  talkPending: (id) => `/api/talks/${encodeURIComponent(id)}/pending`,
   talkClose: (id) => `/api/talks/${encodeURIComponent(id)}/close`,
   talkReopen: (id) => `/api/talks/${encodeURIComponent(id)}/reopen`,
   talkDelete: (id) => `/api/talks/${encodeURIComponent(id)}`,
@@ -3360,11 +3361,52 @@ function renderTalk() {
   show($("talk-reopen-go"), !canSay);
   renderTalkThumbs();
   const uploading = talkAttachmentsBusy();
-  $("f-talk-say").disabled = busy;
-  $("talk-send").disabled = busy || uploading;
-  setText($("talk-send"), busy ? "Thinking…" : uploading ? "Uploading…" : "Send");
+  $("f-talk-say").disabled = false;
+  $("talk-send").disabled = uploading;
+  setText($("talk-send"), uploading ? "Uploading…" : busy ? "Queue next" : "Send");
+  renderTalkPending(talk);
   show($("talk-wait"), busy);
   renderTalkDelete(talk);
+}
+
+/* Pending is server data, not an optimistic browser-only message: it survives
+   reload and shows an attachment count so an image can never disappear from
+   the operator's understanding of what will be sent next. Edit is deliberately
+   clear-then-send, matching the API's atomic clear endpoint. */
+function renderTalkPending(talk) {
+  const box = $("talk-pending");
+  const text = String(talk.pending || "");
+  const attachments = Array.isArray(talk.pending_attachments) ? talk.pending_attachments : [];
+  clear(box);
+  show(box, Boolean(text || attachments.length));
+  if (!text && attachments.length === 0) return;
+  box.append(
+    el("p", { class: "panel-note", text: "Queued for the next reply" }),
+    text ? el("pre", { class: "talk-pending-text", text }) : null,
+    attachments.length ? el("p", { class: "frame-note", text: `${plural(attachments.length, "attachment", "attachments")} queued` }) : null,
+    el("button", { class: "btn btn-quiet", type: "button", text: "Clear", onclick: () => clearTalkPending(false) }),
+    el("button", { class: "btn btn-quiet", type: "button", text: "Edit text", onclick: () => clearTalkPending(true) }),
+  );
+}
+
+async function clearTalkPending(edit) {
+  const id = state.talkDetail.id;
+  const talk = state.talkDetail.talk;
+  if (!id || !talk) return;
+  const text = String(talk.pending || "");
+  try {
+    const next = await request(API.talkPending(id), { method: "DELETE" }).then((r) => r.json());
+    if (state.talkDetail.id === id) {
+      state.talkDetail.talk = next;
+      if (edit) $("f-talk-say").value = text;
+      renderTalk();
+      if (edit) $("f-talk-say").focus();
+    }
+    announce(edit ? "Queued text cleared for editing. Attachments were cleared too." : "Queued message cleared.");
+    loadTalks();
+  } catch (error) {
+    talkError(`Could not clear the queued message: ${error.message}`);
+  }
 }
 
 /* One timer services every busy conversation: it redraws the visible wait
@@ -3584,7 +3626,7 @@ async function sendTalkTurn(event) {
   /* A double tap is still refused for this conversation, but a turn on a
      different conversation must not lock this surface. The server repeats
      the same per-conversation rule for other devices. */
-  if (!id || state.talkWaits.has(id) || (state.talkDetail.talk && state.talkDetail.talk.thinking) || talkAttachmentsBusy()) return;
+  if (!id || talkAttachmentsBusy()) return;
   if (!text.trim() && attachments.length === 0) {
     talkError("Say something, or attach an image, first.");
     box.focus();
@@ -3593,7 +3635,8 @@ async function sendTalkTurn(event) {
 
   talkError("");
   const before = talkTurns(state.talkDetail.talk).length;
-  beginTalkTurn(id, before, before + 2, { body: text, at: new Date().toISOString() });
+  const ownsTurn = !state.talkWaits.has(id) && !(state.talkDetail.talk && state.talkDetail.talk.thinking);
+  if (ownsTurn) beginTalkTurn(id, before, before + 2, { body: text, at: new Date().toISOString() });
   box.value = "";
   renderTalk();
   $("talk-wait").scrollIntoView({ block: "nearest" });
@@ -3622,11 +3665,7 @@ async function sendTalkTurn(event) {
     loadTalks();
     ok();
   } catch (error) {
-    if (error.status === 409) {
-      announce("A turn is already running on this conversation. Waiting for it.");
-      return;
-    }
-    endTalkTurn(id);
+    if (ownsTurn) endTalkTurn(id);
     talkError(`The message may not have been sent: ${error.message}`);
     await loadTalk(id);
   }
