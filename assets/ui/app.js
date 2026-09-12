@@ -1887,9 +1887,9 @@ function updateTaskCard(row, task) {
   /* A held task's note gains whatever the operator said it is waiting on,
      since the queue cannot express a dependency between two tasks and this
      is the one place that reason survives. */
-  const noteText = task.hold_reason && meta.note
+  const noteText = status === "held" && task.hold_reason && meta.note
     ? `${meta.note} Waiting on: ${task.hold_reason}`
-    : meta.note || (task.hold_reason ? `Waiting on: ${task.hold_reason}` : "");
+    : meta.note || (status === "held" && task.hold_reason ? `Waiting on: ${task.hold_reason}` : "");
   setText(r.note, noteText);
   show(r.note, Boolean(noteText));
   renderTaskBlockDetails(r.blockDetails, task, status);
@@ -3246,16 +3246,16 @@ async function loadTalk(id) {
    defaults folded and this is what stays visible either way: not a count,
    but the breakdown an operator actually reads it for - whether what they
    filed is moving, stuck, or still waiting its turn. Order puts the states
-   that want a human (running, held, failed) ahead of the quiet ones, and a
+   that want a human (running, blocked, held, failed) ahead of the quiet ones, and a
    zero count is left out rather than printed as "0 done". */
 function talkTasksSummary(tasks) {
-  const counts = { running: 0, held: 0, failed: 0, queued: 0, done: 0 };
+  const counts = { running: 0, blocked: 0, held: 0, failed: 0, queued: 0, done: 0 };
   for (const task of tasks) {
     const status = String(task.status_str || task.status || "");
     if (status in counts) counts[status] += 1;
   }
   const parts = [`${tasks.length} filed`];
-  for (const key of ["running", "held", "failed", "queued", "done"]) {
+  for (const key of ["running", "blocked", "held", "failed", "queued", "done"]) {
     if (counts[key]) parts.push(`${counts[key]} ${key}`);
   }
   return parts.join(" · ");
