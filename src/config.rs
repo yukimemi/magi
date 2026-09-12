@@ -1385,7 +1385,13 @@ impl Config {
              language = \"en\"\n\
              # One CLI conversation per seat: judges keep their own argument\n\
              # across deliberation, the fixer keeps its implementation context.\n\
-             sessions = true\n\n\
+             sessions = true\n\
+             # Reviewer-seat timeout. When timeout_verify is omitted, E2E and\n\
+             # the final gate inherit this value for compatibility.\n\
+             timeout_review = 1200\n\
+             # Optional independent E2E/final-gate timeout; uncomment to keep\n\
+             # verification independent if timeout_review changes later.\n\
+             # timeout_verify = 1200\n\n\
              [verify]\n\
              # Run once per review round in the winner's worktree; failures are\n\
              # fed back to the fixer.\n\
@@ -1636,7 +1642,17 @@ mod tests {
         assert_eq!(parsed.merge.mode, MergeMode::None);
         assert_eq!(parsed.merge.style, MergeStyle::Merge);
         assert!(parsed.graph.sessions);
+        assert_eq!(parsed.graph.timeout_review, 1200);
+        assert_eq!(parsed.graph.verify_timeout(), 1200);
         assert_eq!(parsed.update.mode, UpdateMode::Notify);
+    }
+
+    #[test]
+    fn starter_toml_explains_inherited_and_explicit_verify_timeouts() {
+        let starter = Config::starter_toml();
+        assert!(starter.contains("When timeout_verify is omitted, E2E and"));
+        assert!(starter.contains("verification independent if timeout_review changes later"));
+        assert!(starter.contains("# timeout_verify = 1200"));
     }
 
     /// A repository whose ruleset forbids merge commits declares that once,

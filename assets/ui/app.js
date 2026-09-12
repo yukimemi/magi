@@ -4304,7 +4304,10 @@ function renderReviews(run) {
         round.vote_split
           ? el("span", { class: "tag", "data-tone": "gold", text: "votes split" })
           : null,
-        round.head ? el("span", { class: "head-sha", text: String(round.head).slice(0, 7) }) : null,
+        round.head ? el("span", { class: "head-sha", title: "reviewed HEAD", text: String(round.head).slice(0, 7) }) : null,
+        round.verified_head
+          ? el("span", { class: "head-sha", title: "verified HEAD", text: `verified ${String(round.verified_head).slice(0, 7)}` })
+          : null,
       ),
     );
 
