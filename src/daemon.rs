@@ -881,7 +881,7 @@ fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize) {
             task.last_error = Some(why.to_owned());
             // The phone shows `hold_reason`, so a task held by the machine
             // says why there too and not only in `last_error`.
-            task.hold(Some(why.to_owned()));
+            task.hold_machine(Some(why.to_owned()));
         }
     }
 }
@@ -1514,7 +1514,7 @@ async fn attempt(
     // disk that may be full is how the machine ends up with 6.7 GB free.
     if let Some(reason) = disk_gate(&repo, &config) {
         task.last_error = Some(reason.clone());
-        task.hold(Some(reason.clone()));
+        task.hold_machine(Some(reason.clone()));
         record(queue, task);
         tracing::warn!("holding {} for want of disk space: {reason}", task.short());
         return Vec::new();
@@ -2573,7 +2573,7 @@ mod tests {
         let mut held = task();
         held.id = "20260909-000000-9999".to_owned();
         held.priority = 99;
-        held.hold(None);
+        held.hold_machine(None);
         queue.put(&mut held).unwrap();
 
         let order: Vec<String> = runnable(&queue).into_iter().map(|t| t.id).collect();
@@ -3908,7 +3908,7 @@ mod tests {
 
         let mut held = task();
         held.id = "20260101-000003-cccc".to_owned();
-        held.hold(None);
+        held.hold_machine(None);
         queue.put(&mut held).unwrap();
 
         let mut running = task();

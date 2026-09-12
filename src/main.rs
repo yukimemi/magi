@@ -1609,6 +1609,9 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             if let Some(r) = &t.hold_reason {
                 println!("held for  {r}");
             }
+            if let Some(source) = t.hold_source {
+                println!("hold source  {}", source.label());
+            }
             if !t.blocked_by.is_empty() {
                 println!("blocked on {}", t.blocked_by.join(", "));
                 if let Some(r) = &t.block_reason {
@@ -1626,9 +1629,13 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
         }
 
         TaskCmd::Hold { id, reason } => {
-            let mut t = q.get(&id)?;
+            let resolved = q.resolve_id(&id)?;
+            let _claim = q
+                .claim(&resolved)
+                .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
+            let mut t = q.get(&resolved)?;
             let reason = reason.join(" ");
-            t.hold((!reason.is_empty()).then_some(reason));
+            t.hold_manual((!reason.is_empty()).then_some(reason));
             q.put(&mut t)?;
             println!("held {} {}", t.short(), t.title);
             Ok(())
@@ -1678,7 +1685,11 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
         }
 
         TaskCmd::Release { id } => {
-            let mut t = q.get(&id)?;
+            let resolved = q.resolve_id(&id)?;
+            let _claim = q
+                .claim(&resolved)
+                .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
+            let mut t = q.get(&resolved)?;
             t.release();
             q.put(&mut t)?;
             println!("queued {} {}", t.short(), t.title);
@@ -3031,7 +3042,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_priority_and_edit_refuse_a_claimed_task() {
+    async fn task_priority_edit_hold_and_release_refuse_a_claimed_task() {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::at(dir.path().join("queue"));
         let mut t = magi::queue::Task::new(
@@ -3040,8 +3051,10 @@ mod tests {
             PathBuf::from("."),
             magi::queue::Source::Human,
         );
+        t.priority = 4;
+        t.runs.push("20260902-140502-history".to_owned());
         q.put(&mut t).unwrap();
-        let _claim = q.claim(&t.id).expect("stand in for a running daemon");
+        let claim = q.claim(&t.id).expect("stand in for a running daemon");
 
         let priority_err = task_cmd_on(
             TaskCmd::Priority {
@@ -3068,6 +3081,65 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(edit_err.contains("claimed"), "{edit_err}");
+
+        let hold_err = task_cmd_on(
+            TaskCmd::Hold {
+                id: t.id.clone(),
+                reason: vec!["do not change".to_owned()],
+            },
+            q.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(hold_err.contains("claimed"), "{hold_err}");
+        let unchanged = q.get(&t.id).unwrap();
+        assert_eq!(unchanged.status, TaskStatus::Queued);
+        assert_eq!(unchanged.hold_reason, None);
+        assert_eq!(unchanged.hold_source, None);
+        assert_eq!(unchanged.runs, ["20260902-140502-history"]);
+        assert_eq!(unchanged.priority, 4);
+
+        drop(claim);
+        task_cmd_on(
+            TaskCmd::Hold {
+                id: t.id.clone(),
+                reason: vec!["operator pause".to_owned()],
+            },
+            q.clone(),
+        )
+        .await
+        .expect("hold succeeds after the claim is released");
+        let held = q.get(&t.id).unwrap();
+        assert_eq!(held.status, TaskStatus::Held);
+        assert_eq!(held.hold_reason.as_deref(), Some("operator pause"));
+        assert_eq!(held.hold_source, Some(magi::queue::HoldSource::Manual));
+        assert_eq!(held.runs, ["20260902-140502-history"]);
+        assert_eq!(held.priority, 4);
+
+        let claim = q.claim(&t.id).expect("stand in for a running daemon");
+        let release_err = task_cmd_on(TaskCmd::Release { id: t.id.clone() }, q.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(release_err.contains("claimed"), "{release_err}");
+        let unchanged = q.get(&t.id).unwrap();
+        assert_eq!(unchanged.status, TaskStatus::Held);
+        assert_eq!(unchanged.hold_reason.as_deref(), Some("operator pause"));
+        assert_eq!(unchanged.hold_source, Some(magi::queue::HoldSource::Manual));
+        assert_eq!(unchanged.runs, ["20260902-140502-history"]);
+        assert_eq!(unchanged.priority, 4);
+
+        drop(claim);
+        task_cmd_on(TaskCmd::Release { id: t.id.clone() }, q.clone())
+            .await
+            .expect("release succeeds after the claim is released");
+        let released = q.get(&t.id).unwrap();
+        assert_eq!(released.status, TaskStatus::Queued);
+        assert_eq!(released.hold_reason, None);
+        assert_eq!(released.hold_source, None);
+        assert_eq!(released.runs, ["20260902-140502-history"]);
+        assert_eq!(released.priority, 4);
     }
 
     #[test]
