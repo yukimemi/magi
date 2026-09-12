@@ -846,6 +846,11 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         return Ok(());
     };
     talk.status = fresh.status;
+    // `queue` may have accepted another operator message while the CLI was
+    // running. This handle predates that write, so preserving only `status`
+    // would overwrite the durable draft when the reply is appended below.
+    talk.pending = fresh.pending;
+    talk.pending_attachments = fresh.pending_attachments;
     talk.turns.push(reply);
     store.put(talk)?;
 
@@ -1216,6 +1221,31 @@ mod tests {
         assert!(saved.pending.is_empty());
         assert_eq!(saved.turns.len(), 1);
         assert_eq!(saved.turns[0].body, "first\n\nsecond");
+    }
+
+    #[tokio::test]
+    async fn a_reply_save_preserves_pending_accepted_while_the_cli_runs() {
+        let (tmp, talks) = store();
+        let slow = "#!/bin/sh\ncat >/dev/null\nsleep 0.1\nprintf reply\n";
+        let cfg = config(mock_agent(tmp.path(), slow, BTreeMap::new()));
+        let mut running = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        let id = running.id.clone();
+        let first = record(&mut running, &talks, "first", Vec::new()).expect("record");
+
+        let response_talks = talks.clone();
+        let response_cfg = cfg.clone();
+        let reply = tokio::spawn(async move {
+            respond(&mut running, &response_talks, &response_cfg, &first).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let mut queued = talks.get(&id).expect("queued handle");
+        queue(&mut queued, &talks, "next", Vec::new()).expect("queue");
+        reply.await.expect("join").expect("reply");
+
+        let saved = talks.get(&id).expect("reload");
+        assert_eq!(saved.pending, "next");
+        assert_eq!(saved.turns.len(), 2, "operator message and reply remain");
     }
 
     #[tokio::test]
