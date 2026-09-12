@@ -701,6 +701,7 @@ impl Ui {
             .route("/api/talks/{id}", get(talk_detail).delete(talk_delete))
             .route("/api/talks/{id}/say", post(talk_say))
             .route("/api/talks/{id}/pending", delete(talk_pending_delete))
+            .route("/api/talks/{id}/pending/edit", post(talk_pending_edit))
             .route("/api/talks/{id}/close", post(talk_close))
             .route("/api/talks/{id}/reopen", post(talk_reopen))
             // `DefaultBodyLimit` is raised only on this one route - every
@@ -3235,6 +3236,14 @@ struct NewTalkTurn {
     attachments: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditTalkPending {
+    text: String,
+    expected_text: String,
+    expected_attachments: Vec<String>,
+}
+
 /// `POST /api/talks/{id}/say` - one turn of the conversation.
 ///
 /// Not filesystem work, and therefore not routed through [`blocking`]: this
@@ -3481,6 +3490,35 @@ async fn talk_pending_delete(
         let id = resolve_talk(&ui.talks, &id)?;
         let mut talk = ui.talks.get(&id)?;
         talk::clear_pending(&mut talk, &ui.talks)?;
+        let thinking = ui.is_thinking(&talk.id);
+        Ok(Json(TalkView::new(talk, thinking)))
+    })
+    .await
+}
+
+/// Atomically edit a queued draft's text while preserving its attachments.
+/// The snapshot fields make a concurrent queue or drain a conflict rather
+/// than silently discarding either message.
+async fn talk_pending_edit(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<EditTalkPending>, JsonRejection>,
+) -> ApiResult<Json<TalkView>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    blocking(move || {
+        let id = resolve_talk(&ui.talks, &id)?;
+        let mut talk = ui.talks.get(&id)?;
+        if !talk::edit_pending_text(
+            &mut talk,
+            &ui.talks,
+            &body.text,
+            &body.expected_text,
+            &body.expected_attachments,
+        )? {
+            return Err(ApiError::conflict(
+                "queued message changed; reload it before editing",
+            ));
+        }
         let thinking = ui.is_thinking(&talk.id);
         Ok(Json(TalkView::new(talk, thinking)))
     })

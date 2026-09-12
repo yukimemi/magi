@@ -692,6 +692,36 @@ pub fn clear_pending(talk: &mut Talk, store: &Talks) -> Result<()> {
     Ok(())
 }
 
+/// Replace just the text of the durable draft, but only if the caller's
+/// snapshot still identifies the entire draft. This refuses to overwrite a
+/// message another client queued or a draft the drain already promoted.
+pub fn edit_pending_text(
+    talk: &mut Talk,
+    store: &Talks,
+    text: &str,
+    expected_text: &str,
+    expected_attachments: &[String],
+) -> Result<bool> {
+    let _guard = store.guard();
+    let mut fresh = store
+        .get(&talk.id)
+        .with_context(|| format!("talk {} was deleted", talk.short()))?;
+    if fresh.pending != expected_text
+        || fresh
+            .pending_attachments
+            .iter()
+            .map(|attachment| &attachment.id)
+            .ne(expected_attachments.iter())
+    {
+        *talk = fresh;
+        return Ok(false);
+    }
+    fresh.pending = text.trim().to_owned();
+    store.put(&mut fresh)?;
+    *talk = fresh;
+    Ok(true)
+}
+
 /// Invoke the conversation's agent once and append what it said.
 ///
 /// The first turn ever taken carries the full [`briefing`], because nothing
@@ -1221,6 +1251,50 @@ mod tests {
         assert!(saved.pending.is_empty());
         assert_eq!(saved.turns.len(), 1);
         assert_eq!(saved.turns[0].body, "first\n\nsecond");
+    }
+
+    #[test]
+    fn editing_a_queued_draft_preserves_its_attachments_and_rejects_a_stale_snapshot() {
+        let (tmp, talks) = store();
+        let cfg = config(mock_agent(tmp.path(), REPLY, env("reply")));
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        let attachment = Attachment {
+            id: "a".repeat(32),
+            name: "shot.png".to_owned(),
+            mime: "image/png".to_owned(),
+            bytes: 3,
+        };
+
+        queue(&mut talk, &talks, "first", vec![attachment.clone()]).expect("queue");
+        assert!(
+            edit_pending_text(
+                &mut talk,
+                &talks,
+                "corrected",
+                "first",
+                std::slice::from_ref(&attachment.id),
+            )
+            .expect("edit")
+        );
+        let saved = talks.get(&talk.id).expect("reload edited draft");
+        assert_eq!(saved.pending, "corrected");
+        assert_eq!(saved.pending_attachments, vec![attachment]);
+
+        queue(&mut talk, &talks, "later", Vec::new()).expect("queue concurrent draft");
+        assert!(
+            !edit_pending_text(
+                &mut talk,
+                &talks,
+                "stale edit",
+                "corrected",
+                &["a".repeat(32)],
+            )
+            .expect("stale edit is a conflict")
+        );
+        assert_eq!(
+            talks.get(&talk.id).expect("reload after conflict").pending,
+            "corrected\n\nlater"
+        );
     }
 
     #[tokio::test]
