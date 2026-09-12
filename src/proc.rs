@@ -102,7 +102,17 @@ where
     match query(pid) {
         Ok(alive) => alive,
         Err(error) => {
-            tracing::debug!(%pid, %error, "process liveness query unavailable; treating pid as alive");
+            // Sweeping is a poll-loop operation, so state the environment
+            // problem at the default log level without repeating it for every
+            // protected lock on every poll.
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| {
+                tracing::warn!(
+                    %pid,
+                    %error,
+                    "process liveness query unavailable; keeping locks rather than treating processes as dead"
+                );
+            });
             true
         }
     }
