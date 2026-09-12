@@ -90,6 +90,17 @@ if [ -n "$MOCK_QUOTA_SEAT" ] && { case ",$MOCK_QUOTA_SEAT," in *",$seat,"*) true
   exit 1
 fi
 
+# Stale session replies must also persist through a nudge, whose prompt has no
+# node-specific heading. The marker lives outside the reset review worktree.
+if [ -n "$MOCK_STALE_REVIEW_SEAT" ] && { case ",$MOCK_STALE_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && [ -f "$MOCK_STALE_MARKER" ]; then
+  printf '{"vote":"reject","reason":"mock stale revote: compile error"}\n'
+  exit 0
+fi
+if [ -n "$MOCK_STALE_REVOTE_SEAT" ] && { case ",$MOCK_STALE_REVOTE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && [ -f "$MOCK_STALE_REVOTE_MARKER" ]; then
+  printf '{"summary":"mock stale review","vote":"approve","findings":[]}\n'
+  exit 0
+fi
+
 # Dropped-stream simulation: a matching implement seat's first reply is the
 # "billed work, nothing delivered" shape a CLI leaves when it hangs up on its
 # own stream mid-response (see `agent::dropped_stream`). The resumed call is
@@ -151,8 +162,8 @@ if grep -q "Your revote" "$p"; then
   # `approve_with_findings` vote it cast initially; every other seat holds
   # its `approve`. Deterministic on purpose: the fixtures that exercise this
   # branch assert the round's recorded verdict, not a specific argument.
-  if [ -n "$MOCK_STALE_REVOTE_SEAT" ] && { case ",$MOCK_STALE_REVOTE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
-    printf '{"summary":"mock stale review","vote":"approve","findings":[]}\n'
+  if [ -n "$MOCK_EMPTY_REJECT_REVOTE_SEAT" ] && { case ",$MOCK_EMPTY_REJECT_REVOTE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+    printf '{"vote":"reject","reason":" "}\n'
   elif [ -n "$MOCK_REJECT_MINOR_SEAT" ] && { case ",$MOCK_REJECT_MINOR_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     printf '{"vote":"reject","reason":"mock reconsideration: the minor concern remains"}\n'
   elif [ -n "$MOCK_STALE_REVIEW_SEAT" ] && { case ",$MOCK_STALE_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
@@ -191,12 +202,11 @@ if grep -q "reviewers of" "$p"; then
   # review contract. Keep it separate from an ordinary silent seat so the
   # graph has to reject the schema rather than an exit status.
   if [ -n "$MOCK_STALE_REVIEW_SEAT" ] && { case ",$MOCK_STALE_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
-    if [ -f "$MOCK_STALE_MARKER" ]; then
-      printf '{"vote":"reject","reason":"mock stale revote: compile error"}\n'
-      exit 0
-    fi
     printf '{"summary":"mock review: clean","vote":"approve","findings":[]}\n'
     exit 0
+  fi
+  if [ -n "$MOCK_STALE_REVOTE_SEAT" ] && { case ",$MOCK_STALE_REVOTE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+    : > "$MOCK_STALE_REVOTE_MARKER"
   fi
   if [ -n "$MOCK_REJECT_MINOR_SEAT" ] && { case ",$MOCK_REJECT_MINOR_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     printf '{"summary":"mock review: minor concern","vote":"reject","findings":[{"severity":"minor","file":"note.txt","line":1,"title":"minor concern","detail":"an operator should resolve this"}]}\n'
@@ -513,9 +523,28 @@ pub fn fixture_with_stale_review_reply(home: HomeGuard) -> Fixture {
 pub fn fixture_with_stale_revote_reply(home: HomeGuard) -> Fixture {
     let mut fx = fixture_with_split_review_vote(home, "review-2");
     fx.config.graph.review_rounds = 1;
+    let marker = fx.tmp.path().join("stale-revote-reply");
     for a in &mut fx.config.agents {
         a.env
             .insert("MOCK_STALE_REVOTE_SEAT".to_owned(), "review-2".to_owned());
+        a.env.insert(
+            "MOCK_STALE_REVOTE_MARKER".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        );
+    }
+    fx
+}
+
+/// A reject revote with no reason is malformed, even when the incomplete
+/// panel policy is `warn`.
+pub fn fixture_with_empty_reject_revote(home: HomeGuard) -> Fixture {
+    let mut fx = fixture_with_split_review_vote(home, "review-2");
+    fx.config.graph.review_rounds = 1;
+    for a in &mut fx.config.agents {
+        a.env.insert(
+            "MOCK_EMPTY_REJECT_REVOTE_SEAT".to_owned(),
+            "review-2".to_owned(),
+        );
     }
     fx
 }

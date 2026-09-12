@@ -3458,6 +3458,7 @@ fn round_is_clean(
 fn malformed_review_reply(message: &str) -> bool {
     message.contains("no JSON object")
         || message.contains("must include at least one actionable finding")
+        || message.contains("must include a reason")
 }
 
 /// The review loop's own conclusion, derived entirely from its persisted

@@ -2,8 +2,8 @@
 mod common;
 
 use common::{
-    fixture_with_rejected_minor_review, fixture_with_stale_review_reply,
-    fixture_with_stale_revote_reply,
+    fixture_with_empty_reject_revote, fixture_with_rejected_minor_review,
+    fixture_with_stale_review_reply, fixture_with_stale_revote_reply,
 };
 use magi::config::IncompleteReviewPolicy;
 use magi::graph::Runner;
@@ -94,5 +94,30 @@ async fn actionable_non_blocking_reject_is_open_not_clean() {
         round.fix.is_none(),
         "a non-blocking reject is not a fixer task"
     );
+    assert_eq!(runner.state.status, RunStatus::Blocked);
+}
+
+#[tokio::test]
+async fn empty_reason_reject_revote_is_not_clean_under_warn() {
+    let home = common::home_lock().await;
+    let mut fx = fixture_with_empty_reject_revote(home);
+    fx.config.graph.incomplete_review = IncompleteReviewPolicy::Warn;
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    let round = &runner.state.reviews[0];
+
+    assert!(round.incomplete(), "{round:#?}");
+    assert!(!round.clean, "{round:#?}");
+    assert!(
+        round.reconsideration[1]
+            .failed
+            .as_deref()
+            .is_some_and(|why| why.contains("must include a reason")),
+        "{:#?}",
+        round.reconsideration
+    );
+    assert!(runner.state.gate.is_empty());
     assert_eq!(runner.state.status, RunStatus::Blocked);
 }
