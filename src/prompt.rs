@@ -1011,6 +1011,13 @@ fn conduct_task_block(t: &ConductTask) -> String {
     if let Some(e) = &t.last_error {
         let _ = writeln!(s, "  last_error: {e}");
     }
+    if t.hold_source.is_some() || t.hold_reason.is_some() {
+        let source = t
+            .hold_source
+            .as_deref()
+            .unwrap_or("unknown (legacy record)");
+        let _ = writeln!(s, "  hold_source: {source}");
+    }
     if let Some(reason) = &t.hold_reason {
         let source = t.hold_source.as_deref().unwrap_or("legacy");
         let _ = writeln!(s, "  hold_reason ({source}): {reason}");
@@ -1712,7 +1719,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hold_reason_and_source_reach_the_conductor_prompt() {
+    fn hold_source_reaches_the_conductor_prompt_with_or_without_a_reason() {
         let mut t = conduct_task("t4");
         t.status = "held".to_owned();
         t.hold_reason = Some("manual recovery is active".to_owned());
@@ -1736,8 +1743,32 @@ mod tests {
             }],
             "en",
         );
+        assert!(body.contains("hold_source: manual"));
         assert!(body.contains("hold_reason (manual): manual recovery is active"));
         assert!(body.contains("operator-owned evidence"));
+
+        let mut reasonless_manual = conduct_task("t5");
+        reasonless_manual.status = "held".to_owned();
+        reasonless_manual.hold_source = Some("manual".to_owned());
+        let reasonless = conduct(&[reasonless_manual], &[], &[], "en");
+        assert!(reasonless.contains("hold_source: manual"), "{reasonless}");
+        assert!(
+            !reasonless.contains("hold_reason"),
+            "a reasonless hold must not invent a reason: {reasonless}"
+        );
+
+        let mut legacy = conduct_task("t6");
+        legacy.status = "held".to_owned();
+        legacy.hold_reason = Some("written before hold sources".to_owned());
+        let legacy = conduct(&[legacy], &[], &[], "en");
+        assert!(
+            legacy.contains("hold_source: unknown (legacy record)"),
+            "{legacy}"
+        );
+        assert!(
+            legacy.contains("hold_reason (legacy): written before hold sources"),
+            "{legacy}"
+        );
     }
 
     #[test]
