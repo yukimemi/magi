@@ -976,8 +976,6 @@ async fn drive(
     worktrees_root: &Path,
     stop: &Stop,
 ) -> Result<()> {
-    janitor(&opts.repo, opts, home, worktrees_root).await;
-
     // The status file is a *snapshot*, not a stream of events: a reader only
     // ever wants the latest values, and every tick rewrites the whole file
     // anyway. A shared `Mutex<Status>` therefore says exactly what is meant,
@@ -1390,18 +1388,21 @@ async fn poll(
             continue;
         }
 
-        // Truly idle: nothing new to start and nothing still running. The
-        // disk is quiet, so this is the point for the janitor - folding
-        // worktrees and pruning a cache while a sibling run is still
-        // building would race the very compile the prune exists to keep,
-        // which concurrent runs make possible in a way the old one-at-a-time
-        // loop never had to guard against.
-        janitor(&opts.repo, opts, home, worktrees_root).await;
+        // Truly idle: nothing new to start and nothing still running.
         lock(status).idle = true;
         if opts.once {
             break;
         }
         stop.idle(opts.poll).await;
+        if stop.stopped() {
+            continue;
+        }
+        // Housekeeping only after a full quiet interval. Running it before
+        // the first idle wait can block the executor while an operator's
+        // stop request is waiting to be scheduled, defeating Stop's retained
+        // wake permit. No run can start while this branch is active, so the
+        // janitor still never races an in-flight compile.
+        janitor(&opts.repo, opts, home, worktrees_root).await;
     }
 
     // Never return while a run is still in flight, whichever way the loop
@@ -3292,9 +3293,9 @@ mod tests {
             poll: Duration::from_secs(30),
             // `Opts::default`'s `repo` is `"."` - the process's own working
             // directory, which under `cargo test` is this very checkout, a
-            // real git repository with its own `magi.toml`. `drive` runs the
-            // janitor unconditionally on every call, and the janitor discovers
-            // its config from `opts.repo` and then prunes worktree
+            // real git repository with its own `magi.toml`. Idle polling can
+            // run the janitor, which discovers its config from `opts.repo`
+            // and then prunes worktree
             // registrations there - so leaving this at `"."` would have every
             // test that drives the loop mutate this checkout's own git admin
             // state. A directory that is not a repository at all makes that
