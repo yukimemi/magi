@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::collections::BTreeMap;
 
@@ -27,6 +27,75 @@ fn write_config(dir: &std::path::Path, config: &magi::config::Config) -> std::pa
     let path = dir.join("magi.toml");
     std::fs::write(&path, toml::to_string(config).expect("serialize config")).unwrap();
     path
+}
+
+/// Keep the ordinary task small while still taking the real implement,
+/// review, verification and completion path. The scheduling contract under
+/// test is between that runnable task and the parked approval; a larger panel
+/// does not add coverage, but on Windows it adds process and worktree churn
+/// while this test is holding the process-wide test home lock.
+fn daemon_config(fx: &common::Fixture) -> magi::config::Config {
+    let mut config = fx.config.clone();
+    config.graph.candidates = 1;
+    config.graph.reviewers = 1;
+    config.disk.min_free_bytes = 0;
+    // `serve --once` runs the janitor both before and after its drain. Its
+    // real housekeeping is covered elsewhere; scanning/pruning a brand-new
+    // fixture's worktree bay and cache cannot affect this scheduling decision
+    // and needlessly starts more Windows processes while the test home is
+    // intentionally serialized.
+    config.disk.auto_fold = false;
+    config.disk.cache_limit_bytes = 0;
+    config
+}
+
+/// Preserve a bounded hang guard, but make a failure identify whether the
+/// daemon was still advancing, which task/run owned its slot, and what the
+/// persisted run states said when the guard fired. The daemon status path is
+/// inside this fixture's locked, temporary home.
+async fn serve_once(opts: Opts, queue: &Queue, task_ids: &[&str], scenario: &str) {
+    const HANG_GUARD: Duration = Duration::from_secs(60);
+
+    let started = Instant::now();
+    match tokio::time::timeout(HANG_GUARD, daemon::serve(opts)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("{scenario}: daemon loop failed: {error:#}"),
+        Err(_) => {
+            let tasks: Vec<_> = task_ids
+                .iter()
+                .map(|id| {
+                    queue.get(id).map_or_else(
+                        |error| format!("{id}: {error:#}"),
+                        |task| format!("{task:?}"),
+                    )
+                })
+                .collect();
+            let runs: Vec<_> = task_ids
+                .iter()
+                .filter_map(|id| queue.get(id).ok())
+                .flat_map(|task| task.runs)
+                .map(|id| match RunState::load(&id) {
+                    Ok(run) => format!(
+                        "{id}: status={:?}, parked={}, last_event={:?}",
+                        run.status,
+                        run.parked,
+                        run.events.last()
+                    ),
+                    Err(error) => format!("{id}: {error:#}"),
+                })
+                .collect();
+            let status_path = daemon::status_path();
+            let status = std::fs::read_to_string(&status_path)
+                .unwrap_or_else(|error| format!("unreadable {}: {error}", status_path.display()));
+            panic!(
+                "{scenario}: daemon exceeded the {}s hang guard after {:?}; \
+                 status at {}: {status}; tasks: {tasks:#?}; runs: {runs:#?}",
+                HANG_GUARD.as_secs(),
+                started.elapsed(),
+                status_path.display(),
+            );
+        }
+    }
 }
 
 /// A run that already competed, reviewed and gated clean, pushed a pull
@@ -130,12 +199,7 @@ async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task() {
     let home = home_lock().await;
     let fx = fixture(home, Judges::Unanimous, false);
 
-    let mut config = fx.config.clone();
-    config.graph.candidates = 1;
-    // A single candidate makes `judge`/`deliberate`/`vote` skip their agent
-    // calls entirely (see `Graph::candidates`'s doc), so this run only ever
-    // needs the mock's implement and review branches.
-    config.disk.min_free_bytes = 0;
+    let config = daemon_config(&fx);
     let config_path = write_config(fx.tmp.path(), &config);
 
     let queue = Queue::open();
@@ -183,10 +247,13 @@ async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task() {
         worktrees_root: Some(fx.tmp.path().join("wt")),
         ..Opts::default()
     };
-    tokio::time::timeout(Duration::from_secs(60), daemon::serve(opts))
-        .await
-        .expect("the drain must not hang on the parked task")
-        .expect("the loop itself must not error");
+    serve_once(
+        opts,
+        &queue,
+        &[&task_a.id, &task_b.id],
+        "the drain must not hang on the parked task",
+    )
+    .await;
 
     let after_a = queue.get(&task_a.id).expect("task A still on disk");
     assert_eq!(
@@ -222,9 +289,7 @@ async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own() {
     let home = home_lock().await;
     let fx = fixture(home, Judges::Unanimous, false);
 
-    let mut config = fx.config.clone();
-    config.graph.candidates = 1;
-    config.disk.min_free_bytes = 0;
+    let config = daemon_config(&fx);
     let config_path = write_config(fx.tmp.path(), &config);
 
     let queue = Queue::open();
@@ -270,10 +335,13 @@ async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own() {
         worktrees_root: Some(fx.tmp.path().join("wt")),
         ..Opts::default()
     };
-    tokio::time::timeout(Duration::from_secs(60), daemon::serve(opts))
-        .await
-        .expect("the drain must not hang")
-        .expect("the loop itself must not error");
+    serve_once(
+        opts,
+        &queue,
+        &[&task.id],
+        "the answered approval must resume without hanging",
+    )
+    .await;
 
     // The run was resumed through `Runner::resume`, not recompeted: the same
     // run id is still the task's only run, and `land` was re-entered - proven

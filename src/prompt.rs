@@ -609,8 +609,8 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
          Cast exactly one: `approve` (no reservations), `approve_with_findings` \
          (fine to proceed, but the findings below are worth fixing), or `reject` \
          (do not proceed as-is). The vote is your verdict and the findings are your \
-         evidence — an empty findings list can still be `approve`, and neither should \
-         be padded or held back to make the other look justified.\n\n\
+         evidence — `approve_with_findings` and `reject` each require at least one \
+         actionable finding; an empty findings list must be `approve`.\n\n\
          # Output\n\n\
          Your reasoning first, then exactly one fenced json block, last:\n\n\
          ```json\n\

@@ -2204,7 +2204,7 @@ impl Runner {
                 &ctx,
                 &mut quota_losses,
                 &mut self.state,
-                &|_: &Review| Ok(()),
+                &Review::validate,
             )
             .await;
             self.state.quota.extend(quota_losses);
@@ -2375,7 +2375,7 @@ impl Runner {
                     &recon_ctx,
                     &mut recon_quota_losses,
                     &mut self.state,
-                    &|_: &ReviewRevote| Ok(()),
+                    &ReviewRevote::validate,
                 )
                 .await;
                 self.state.quota.extend(recon_quota_losses);
@@ -2486,11 +2486,34 @@ impl Runner {
                 .collect();
 
             let expected = records.len();
-            let answered = records.iter().filter(|r| r.failed.is_none()).count();
+            // A reconsideration replaces the initial vote for the purpose of
+            // deciding whether this review node received a complete panel.
+            // Retaining the initial vote for the verdict preserves the
+            // cautious fallback, but a lost or malformed revote cannot count
+            // as a completed answer.
+            let answered = records
+                .iter()
+                .filter(|record| {
+                    record.failed.is_none()
+                        && reconsideration
+                            .iter()
+                            .find(|revote| revote.reviewer == record.reviewer)
+                            .is_none_or(|revote| revote.vote.is_some())
+                })
+                .count();
             let incomplete = answered < expected;
             let e2e_ok = e2e.iter().all(CommandOutcome::ok);
             let policy = self.state.config.graph.incomplete_review;
-            let clean = round_is_clean(blocking, e2e_ok, answered, expected, policy);
+            let clean = !records
+                .iter()
+                .filter_map(|r| r.failed.as_deref())
+                .any(malformed_review_reply)
+                && !reconsideration
+                    .iter()
+                    .filter_map(|r| r.failed.as_deref())
+                    .any(malformed_review_reply)
+                && round_verdict != Some(ReviewVote::Reject)
+                && round_is_clean(blocking, e2e_ok, answered, expected, policy);
 
             let mut round_record = ReviewRound {
                 round,
@@ -2513,12 +2536,19 @@ impl Runner {
             };
 
             if incomplete {
-                let missing: Vec<String> = round_record
+                let mut missing: Vec<String> = round_record
                     .reviews
                     .iter()
                     .filter(|r| r.failed.is_some())
                     .map(|r| format!("review-{}", r.reviewer))
                     .collect();
+                missing.extend(
+                    round_record
+                        .reconsideration
+                        .iter()
+                        .filter(|r| r.vote.is_none())
+                        .map(|r| format!("review-{} revote", r.reviewer)),
+                );
                 self.state.event(
                     "review",
                     format!(
@@ -2549,18 +2579,26 @@ impl Runner {
             // Nothing was raised and verification passed, but not every seat
             // answered and the policy refuses to call that clean: re-review
             // rather than send the fixer after a round with nothing to fix.
-            if incomplete && blocking == 0 && e2e_ok {
+            let unresolved_reject = round_verdict == Some(ReviewVote::Reject);
+            if (incomplete || unresolved_reject) && blocking == 0 && e2e_ok {
                 self.state.reviews.push(round_record);
                 self.state.save()?;
                 if round == max_rounds {
                     self.state.status = RunStatus::Blocked;
                     self.state.event(
                         "review",
-                        format!(
-                            "{} reviewer seat(s) never answered after {max_rounds} rounds; \
-                             refusing to call it clean",
-                            expected - answered
-                        ),
+                        if unresolved_reject {
+                            format!(
+                                "a reviewer still rejected the patch after {max_rounds} round(s); \
+                                 refusing to call it clean"
+                            )
+                        } else {
+                            format!(
+                                "{} reviewer seat(s) never answered after {max_rounds} rounds; \
+                                 refusing to call it clean",
+                                expected - answered
+                            )
+                        },
                     );
                     return Ok(());
                 }
@@ -3413,6 +3451,17 @@ fn round_is_clean(
     blocking == 0 && e2e_ok && (answered == expected || policy == IncompleteReviewPolicy::Warn)
 }
 
+/// Did a reviewer return an answer-shaped payload that failed the review
+/// contract? Unlike a timeout, this is evidence the seat answered the wrong
+/// node (for example, a stale reconsideration revote), so `warn` must not
+/// promote the incomplete panel to clean.
+fn malformed_review_reply(message: &str) -> bool {
+    message.contains("no JSON object")
+        || message.contains("must include at least one actionable finding")
+        || message.contains("must include an actionable title")
+        || message.contains("must include a reason")
+}
+
 /// The review loop's own conclusion, derived entirely from its persisted
 /// round records and the round budget that produced them — never from
 /// `status`, so a reentry (or `gate`/`merge` reading it independently)
@@ -3427,6 +3476,8 @@ fn round_is_clean(
 /// - An incomplete panel that raised nothing is missing input, not a
 ///   verified tree — never a hand-off candidate, whatever verification said
 ///   (see [`ReviewRound::incomplete`], `IncompleteReviewPolicy`).
+/// - A terminal `reject` verdict is never a hand-off candidate, even when
+///   its finding is non-blocking and verification passed.
 /// - Otherwise, green e2e on the last round hands off (see
 ///   [`Runner::stop_reviewing`]); red e2e blocks.
 fn review_conclusion(reviews: &[ReviewRound], max_rounds: usize) -> Option<RunStatus> {
@@ -3438,13 +3489,15 @@ fn review_conclusion(reviews: &[ReviewRound], max_rounds: usize) -> Option<RunSt
     if reviews.len() < max_rounds && !stagnant {
         return None;
     }
-    Some(if last.incomplete() && last.blocking == 0 {
-        RunStatus::Blocked
-    } else if last.e2e.iter().all(CommandOutcome::ok) {
-        RunStatus::Gating
-    } else {
-        RunStatus::Blocked
-    })
+    Some(
+        if last.verdict == Some(ReviewVote::Reject) || (last.incomplete() && last.blocking == 0) {
+            RunStatus::Blocked
+        } else if last.e2e.iter().all(CommandOutcome::ok) {
+            RunStatus::Gating
+        } else {
+            RunStatus::Blocked
+        },
+    )
 }
 
 /// How long a re-ask may take, given the budget the first attempt had.
@@ -4028,6 +4081,13 @@ mod tests {
     }
 
     #[test]
+    fn malformed_review_reply_rejects_an_empty_finding_title() {
+        assert!(malformed_review_reply(
+            "every review finding must include an actionable title"
+        ));
+    }
+
+    #[test]
     fn review_conclusion_is_none_while_rounds_remain() {
         let rounds = vec![review_round(false, 1, 2, 2, true, true)];
         assert_eq!(review_conclusion(&rounds, 3), None);
@@ -4062,6 +4122,20 @@ mod tests {
         // Missing input, not a verified tree — never a hand-off candidate.
         let rounds = vec![review_round(false, 0, 1, 2, false, true)];
         assert_eq!(review_conclusion(&rounds, 1), Some(RunStatus::Blocked));
+    }
+
+    #[test]
+    fn review_conclusion_blocks_a_reject_even_when_e2e_is_green() {
+        let mut round = review_round(false, 0, 2, 2, false, true);
+        round.verdict = Some(ReviewVote::Reject);
+        assert_eq!(review_conclusion(&[round], 1), Some(RunStatus::Blocked));
+    }
+
+    #[test]
+    fn review_conclusion_retries_a_reject_while_rounds_remain() {
+        let mut round = review_round(false, 0, 2, 2, true, true);
+        round.verdict = Some(ReviewVote::Reject);
+        assert_eq!(review_conclusion(&[round], 2), None);
     }
 
     #[test]
