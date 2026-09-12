@@ -324,7 +324,9 @@ in the composer before sending a correction. Pending attachments are cleared
 with the draft, so reattach them when correcting. A server restart cannot
 resume an in-flight CLI process, but the recorded transcript and pending draft
 remain on disk and are visible after reopening Chat; send the pending text
-again if no worker is still running to drain it.
+again only after using **Clear** or **Edit text** to remove the old pending
+draft. **Edit text** puts its text back in the composer; reattach any images,
+then send the corrected draft once.
 
 The conversation runs with writes disabled by default: an agent that had
 already edited the repository mid-conversation would make a later
