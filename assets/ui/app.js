@@ -496,6 +496,7 @@ const state = {
 };
 
 let fallbackTimer = null;
+let nextTalkWaitGeneration = 1;
 
 /* ---- transport --------------------------------------------------------- */
 async function request(url, init) {
@@ -3185,10 +3186,17 @@ function renderTalkIndicators() {
 }
 
 async function loadTalks() {
+  /* A response started before a send cannot revoke the wait that send just
+     created. Keep the per-talk generation that was current when this read
+     began, rather than comparing a late response with today's state. */
+  const observedAt = Date.now();
+  const observed = new Map([...state.talkWaits].map(([id, wait]) => [id, {
+    generation: wait.generation, startedAt: observedAt,
+  }]));
   try {
     const list = await getJson(API.talks);
     state.talks = Array.isArray(list) ? list : [];
-    for (const talk of state.talks) trackTalkThinking(talk);
+    for (const talk of state.talks) trackTalkThinking(talk, observed.get(talk.id));
     renderTalks();
     ok();
   } catch (error) {
@@ -3201,9 +3209,11 @@ async function loadTalks() {
    settled from here whether or not the reply landed while the operator was
    looking at something else. */
 async function loadTalk(id) {
+  const wait = state.talkWaits.get(id);
+  const observed = wait && { generation: wait.generation, startedAt: Date.now() };
   try {
     const talk = await getJson(API.talk(id));
-    trackTalkThinking(talk);
+    trackTalkThinking(talk, observed);
     if (state.talkDetail.id !== id) return;
     state.talkDetail.talk = talk;
     renderTalk();
@@ -3378,7 +3388,10 @@ function tickTalkWaits() {
 }
 
 function beginTalkTurn(id, since, target, pending = null) {
-  state.talkWaits.set(id, { since, target, pending, waitFrom: Date.now(), lastPoll: Date.now() });
+  state.talkWaits.set(id, {
+    since, target, pending, waitFrom: Date.now(), lastPoll: Date.now(),
+    generation: nextTalkWaitGeneration++, confirmed: target === null, missingClaimSince: null,
+  });
   if (!state.talkWaitTimer) state.talkWaitTimer = setInterval(tickTalkWaits, 1000);
   tickTalkWaits();
 }
@@ -3396,14 +3409,28 @@ function endTalkTurn(id) {
 /* A TalkView can arrive from this browser, another device, or after reload.
    A known local target is settled by transcript growth, never merely by a
    claim disappearing: guard release and the reply write are distinct events.
-   If a subsequent full transcript read has no claim and still cannot meet
-   that target, the process must have failed or restarted before landing it;
-   release the local wait rather than leave the composer stale forever. */
-function trackTalkThinking(talk) {
+   `observed` identifies the wait a GET saw when it began, so an older false
+   response cannot release a later send. Once a matching response confirmed
+   the claim, one matching false only schedules suspicion: a second false
+   from a GET begun after that suspicion proves the process lost the claim,
+   so a restart cannot leave the composer stale forever. */
+function trackTalkThinking(talk, observed) {
   const wait = state.talkWaits.get(talk.id);
   if (wait) {
     if (wait.target !== null && talkTurns(talk).length >= wait.target) endTalkTurn(talk.id);
-    else if (!talk.thinking) endTalkTurn(talk.id);
+    else if (observed && observed.generation === wait.generation && talk.thinking) {
+      wait.confirmed = true;
+      wait.missingClaimSince = null;
+    } else if (wait.target !== null && !talk.thinking && observed
+      && observed.generation === wait.generation && wait.confirmed) {
+      if (wait.missingClaimSince !== null && observed.startedAt > wait.missingClaimSince) {
+        endTalkTurn(talk.id);
+      } else {
+        wait.missingClaimSince = Date.now();
+      }
+    } else if (wait.target === null && !talk.thinking) {
+      endTalkTurn(talk.id);
+    }
     return;
   }
   if (talk.thinking) beginTalkTurn(talk.id, talkTurns(talk).length, null);
@@ -3577,10 +3604,14 @@ async function sendTalkTurn(event) {
       text,
       attachments: attachments.map((item) => item.serverId),
     });
+    /* This 202 was received after the local wait was created, so it is the
+       matching observation that makes a later fresh false useful for
+       recovering from a process restart. */
+    const wait = state.talkWaits.get(id);
+    trackTalkThinking(queued, wait && { generation: wait.generation, startedAt: Date.now() });
     if (state.talkAttachments.id === id) resetTalkAttachments(id);
     if (state.talkDetail.id === id) {
       state.talkDetail.talk = queued;
-      trackTalkThinking(queued);
       renderTalk();
       announce("Sent. The agent is answering.");
     }
