@@ -46,6 +46,7 @@ const API = {
   talk: (id) => `/api/talks/${encodeURIComponent(id)}`,
   talkSay: (id) => `/api/talks/${encodeURIComponent(id)}/say`,
   talkPending: (id) => `/api/talks/${encodeURIComponent(id)}/pending`,
+  talkPendingResume: (id) => `/api/talks/${encodeURIComponent(id)}/pending/resume`,
   talkPendingClear: (id) => `/api/talks/${encodeURIComponent(id)}/pending/clear`,
   talkPendingEdit: (id) => `/api/talks/${encodeURIComponent(id)}/pending/edit`,
   talkClose: (id) => `/api/talks/${encodeURIComponent(id)}/close`,
@@ -3385,9 +3386,29 @@ function renderTalkPending(talk) {
     el("p", { class: "panel-note", text: "Queued for the next reply" }),
     text ? el("pre", { class: "talk-pending-text", text }) : null,
     attachments.length ? el("p", { class: "frame-note", text: `${plural(attachments.length, "attachment", "attachments")} queued` }) : null,
+    el("button", { class: "btn", type: "button", text: "Resume queued draft", onclick: resumeTalkPending }),
     el("button", { class: "btn btn-quiet", type: "button", text: "Clear", onclick: clearTalkPending }),
     el("button", { class: "btn btn-quiet", type: "button", text: "Edit text", onclick: editTalkPending }),
   ]);
+}
+
+async function resumeTalkPending() {
+  const id = state.talkDetail.id;
+  const talk = state.talkDetail.talk;
+  if (!id || !talk) return;
+  try {
+    const next = await postJson(API.talkPendingResume(id), {});
+    if (state.talkDetail.id === id) {
+      state.talkDetail.talk = next;
+      trackTalkThinking(next);
+      renderTalk();
+    }
+    announce("Queued draft resumed.");
+    loadTalks();
+  } catch (error) {
+    if (error.status === 409) await loadTalk(id);
+    talkError(`Could not resume the queued draft: ${error.message}`);
+  }
 }
 
 async function editTalkPending() {
