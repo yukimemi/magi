@@ -695,33 +695,44 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
 /// Retire an unanswered conductor question after its task no longer refers to
 /// it. Conductor questions use the task id in `Question::run`, so run-based
 /// cleanup cannot observe a manual release or completion.
+///
+/// Restricted to `Question::node == crate::conduct::NODE`: an ordinary run's
+/// own question also carries a `run`, and a run id that happens to collide
+/// with some task's id is not this loop's business — only a conductor
+/// question actually uses the task id that way. One `Questions::list()` scan
+/// is taken up front and matched against the in-memory task set, rather than
+/// calling `Questions::open_for` (a full disk scan on its own) once per task.
 fn reconcile_task_questions(queue: &Queue, questions: &Questions) {
     let tasks = queue.list();
+    let by_id: std::collections::BTreeMap<&str, &Task> =
+        tasks.iter().map(|t| (t.id.as_str(), t)).collect();
     let referenced: std::collections::BTreeSet<&str> = tasks
         .iter()
         .flat_map(|task| task.blocked_by.iter().map(String::as_str))
         .collect();
 
-    for task in &tasks {
-        for mut question in questions.open_for(&task.id) {
-            // Keep questions a task still names, including when the
-            // reference moved to a dependent task.  A question whose `run`
-            // is not a current task id is a normal run question and never
-            // enters this loop.
-            if referenced.contains(question.id.as_str()) {
-                continue;
-            }
-            question.abandon(format!(
-                "task {} no longer waits for this answer",
+    for mut question in questions.list() {
+        if !question.status.open() || question.node != crate::conduct::NODE {
+            continue;
+        }
+        // Keep questions a task still names, including when the reference
+        // moved to a dependent task.
+        if referenced.contains(question.id.as_str()) {
+            continue;
+        }
+        let Some(task) = by_id.get(question.run.as_str()) else {
+            continue;
+        };
+        question.abandon(format!(
+            "task {} no longer waits for this answer",
+            task.short()
+        ));
+        if let Err(e) = questions.put(&mut question) {
+            tracing::warn!(
+                "could not retire question {} for task {}: {e:#}",
+                question.short(),
                 task.short()
-            ));
-            if let Err(e) = questions.put(&mut question) {
-                tracing::warn!(
-                    "could not retire question {} for task {}: {e:#}",
-                    question.short(),
-                    task.short()
-                );
-            }
+            );
         }
     }
 }
@@ -1554,7 +1565,14 @@ async fn attempt(
         }
         Starter::Resume(id) => {
             tracing::info!("resuming run {id} rather than competing again");
-            Runner::resume(id)
+            Runner::resume(id).map(|mut r| {
+                if let Some(instruction) =
+                    prepare_instruction(&starter, Some(&r.state.instruction), task)
+                {
+                    r.state.instruction = instruction;
+                }
+                r
+            })
         }
         Starter::Start => {
             if let Some(branch) = &review_branch {
@@ -1564,7 +1582,9 @@ async fn attempt(
                     task.short()
                 );
             }
-            Runner::start(&repo, instruction_for(task), config).await
+            let instruction = prepare_instruction(&starter, None, task)
+                .unwrap_or_else(|| task.instruction.clone());
+            Runner::start(&repo, instruction, config).await
         }
     };
     let mut runner = match started {
@@ -1942,6 +1962,34 @@ fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
     task.repo.clone()
 }
 
+/// The header [`append_answers`] appends operator answers under. Shared with
+/// [`strip_answers_block`] so a resumed run's instruction can be refreshed
+/// rather than grown a new block on every resume.
+const ANSWERS_HEADER: &str = "\n\n# Operator answers\n\n";
+
+/// Append every answer `crate::conduct` has collected for `task` onto `base`,
+/// in the shape both [`instruction_for`] and [`resumed_instruction`] use.
+fn append_answers(base: &str, task: &Task) -> String {
+    if task.answers.is_empty() {
+        return base.to_owned();
+    }
+    let mut s = base.to_owned();
+    s.push_str(ANSWERS_HEADER);
+    for a in &task.answers {
+        s.push_str(&format!("- {}: {}\n", a.question, a.answer));
+    }
+    s
+}
+
+/// Drop a previously appended [`ANSWERS_HEADER`] block, if `instruction`
+/// carries one, leaving whatever preceded it untouched.
+fn strip_answers_block(instruction: &str) -> &str {
+    match instruction.find(ANSWERS_HEADER) {
+        Some(at) => &instruction[..at],
+        None => instruction,
+    }
+}
+
 /// The instruction handed to `Runner::start`: the task's own text, plus any
 /// operator answers `crate::conduct` collected for it (see
 /// [`Task::answers`]), so a decision the operator actually made reaches the
@@ -1950,15 +1998,47 @@ fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
 /// Appended rather than merged into [`Task::instruction`] itself, so the
 /// task's own record stays exactly what its author wrote.
 fn instruction_for(task: &Task) -> String {
-    if task.answers.is_empty() {
-        return task.instruction.clone();
+    append_answers(&task.instruction, task)
+}
+
+/// The instruction a resumed run should carry on with: whatever it already
+/// had, refreshed with the task's *current* operator answers.
+///
+/// A resumable run's own `RunState::instruction` predates any answer
+/// `crate::conduct` collects after the run parks, so resuming it unchanged —
+/// the behaviour before this function existed — silently drops the very
+/// decision the operator made to unblock it. Re-stripping any block this
+/// function appended on an earlier resume before re-appending the current
+/// list (rather than blindly appending again) is what keeps a task resumed
+/// three times over three answered questions from carrying the same answer
+/// three times.
+fn resumed_instruction(old_instruction: &str, task: &Task) -> String {
+    append_answers(strip_answers_block(old_instruction), task)
+}
+
+/// What [`attempt`] should tell a [`Starter`] about `task`'s current operator
+/// answers before handing it to `Runner` — the actual boundary between
+/// [`choose_starter`]'s routing and the graph, factored out so it is
+/// assertable without a real repository, git branch, or agent CLI.
+///
+/// `Starter::Review` deliberately answers `None`: `Runner::review` builds its
+/// instruction from the reviewed branch's own commit log because there is no
+/// task statement to speak of for hand-written work, and splicing operator
+/// answers into that text would contradict the very message it sends
+/// reviewers ("there is no task statement").
+fn prepare_instruction(
+    starter: &Starter,
+    old_instruction: Option<&str>,
+    task: &Task,
+) -> Option<String> {
+    match starter {
+        Starter::Start => Some(instruction_for(task)),
+        Starter::Resume(_) => Some(resumed_instruction(
+            old_instruction.expect("a resumed run always has a prior instruction"),
+            task,
+        )),
+        Starter::Review(_) => None,
     }
-    let mut s = task.instruction.clone();
-    s.push_str("\n\n# Operator answers\n\n");
-    for a in &task.answers {
-        s.push_str(&format!("- {}: {}\n", a.question, a.answer));
-    }
-    s
 }
 
 /// Persist a transition. A queue write failure is logged rather than fatal: the
@@ -3567,8 +3647,8 @@ mod tests {
 
         let mut task_question = ask::Question::new(
             task.id.clone(),
-            "conductor".to_owned(),
-            "conductor".to_owned(),
+            crate::conduct::NODE.to_owned(),
+            "conduct".to_owned(),
             "Which backend?".to_owned(),
             String::new(),
             Vec::new(),
@@ -3587,9 +3667,24 @@ mod tests {
         );
         questions.put(&mut run_question).unwrap();
 
+        // A question from another node whose `run` happens to equal this
+        // task's id — the same field, filled in for an unrelated reason. Only
+        // `crate::conduct::NODE` questions use `run` as a task id; this one
+        // must never be touched by this reconciliation, even after release.
+        let mut coincidental = ask::Question::new(
+            task.id.clone(),
+            "review".to_owned(),
+            "reviewer-1".to_owned(),
+            "Unrelated review question".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut coincidental).unwrap();
+
         reconcile_task_questions(&queue, &questions);
         assert!(questions.get(&task_question.id).unwrap().status.open());
         assert!(questions.get(&run_question.id).unwrap().status.open());
+        assert!(questions.get(&coincidental.id).unwrap().status.open());
 
         task.release();
         queue.put(&mut task).unwrap();
@@ -3601,6 +3696,11 @@ mod tests {
         assert!(
             questions.get(&run_question.id).unwrap().status.open(),
             "run questions remain the run janitor's responsibility"
+        );
+        assert!(
+            questions.get(&coincidental.id).unwrap().status.open(),
+            "a non-conductor question must not be abandoned just because its \
+             run id coincides with a task id"
         );
     }
 
@@ -3893,6 +3993,77 @@ mod tests {
     fn instruction_for_is_unchanged_without_any_answers() {
         let t = task();
         assert_eq!(instruction_for(&t), t.instruction);
+    }
+
+    #[test]
+    fn resumed_instruction_is_unchanged_without_any_answers() {
+        let t = task();
+        assert_eq!(resumed_instruction(&t.instruction, &t), t.instruction);
+    }
+
+    #[test]
+    fn resumed_instruction_carries_a_new_answer_onto_the_old_run() {
+        let mut t = task();
+        t.record_answer("Which backend?".to_owned(), "SQLite".to_owned());
+        // The run's own instruction on disk predates the answer: it is the
+        // plain original text `Runner::start` saved before the operator was
+        // ever asked anything.
+        let old = t.instruction.clone();
+
+        let refreshed = resumed_instruction(&old, &t);
+        assert!(refreshed.starts_with(&old), "the original text is kept");
+        assert!(refreshed.contains("Which backend?"));
+        assert!(refreshed.contains("SQLite"));
+    }
+
+    #[test]
+    fn resumed_instruction_does_not_duplicate_across_repeated_resumes() {
+        let mut t = task();
+        t.record_answer("Which backend?".to_owned(), "SQLite".to_owned());
+
+        // A first resume appends the block; a second resume of the same run,
+        // with no new answer in between, must reproduce exactly the same
+        // text rather than appending the block a second time.
+        let once = resumed_instruction(&t.instruction, &t);
+        let twice = resumed_instruction(&once, &t);
+        assert_eq!(once, twice);
+        assert_eq!(once.matches("Which backend?").count(), 1);
+
+        // A later answer replaces the block wholesale rather than growing it.
+        t.record_answer("Which cache?".to_owned(), "Redis".to_owned());
+        let refreshed = resumed_instruction(&once, &t);
+        assert_eq!(refreshed.matches(ANSWERS_HEADER).count(), 1);
+        assert!(refreshed.contains("Which backend?"));
+        assert!(refreshed.contains("Which cache?"));
+    }
+
+    #[test]
+    fn prepare_instruction_covers_all_three_starters() {
+        let mut t = task();
+        t.record_answer("Which backend?".to_owned(), "SQLite".to_owned());
+
+        // Start: a fresh run gets the task text plus every answer so far —
+        // exactly `instruction_for`.
+        assert_eq!(
+            prepare_instruction(&Starter::Start, None, &t),
+            Some(instruction_for(&t))
+        );
+
+        // Resume: the run's prior instruction is refreshed with the answer,
+        // not discarded and not left stale.
+        let old = t.instruction.clone();
+        assert_eq!(
+            prepare_instruction(&Starter::Resume("some-run".to_owned()), Some(&old), &t),
+            Some(resumed_instruction(&old, &t))
+        );
+
+        // Review: a review-only pass builds its own instruction from the
+        // branch's history in `crate::graph`, with no task statement at all -
+        // this boundary must leave it alone.
+        assert_eq!(
+            prepare_instruction(&Starter::Review("magi/eba2/A".to_owned()), Some(&old), &t),
+            None
+        );
     }
 
     #[test]
