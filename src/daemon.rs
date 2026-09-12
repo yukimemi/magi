@@ -1967,6 +1967,15 @@ fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
 /// rather than grown a new block on every resume.
 const ANSWERS_HEADER: &str = "\n\n# Operator answers\n\n";
 
+/// Render the first `count` answers in the block appended to an instruction.
+fn answers_block(task: &Task, count: usize) -> String {
+    let mut s = ANSWERS_HEADER.to_owned();
+    for a in &task.answers[..count] {
+        s.push_str(&format!("- {}: {}\n", a.question, a.answer));
+    }
+    s
+}
+
 /// Append every answer `crate::conduct` has collected for `task` onto `base`,
 /// in the shape both [`instruction_for`] and [`resumed_instruction`] use.
 fn append_answers(base: &str, task: &Task) -> String {
@@ -1974,20 +1983,21 @@ fn append_answers(base: &str, task: &Task) -> String {
         return base.to_owned();
     }
     let mut s = base.to_owned();
-    s.push_str(ANSWERS_HEADER);
-    for a in &task.answers {
-        s.push_str(&format!("- {}: {}\n", a.question, a.answer));
-    }
+    s.push_str(&answers_block(task, task.answers.len()));
     s
 }
 
-/// Drop a previously appended [`ANSWERS_HEADER`] block, if `instruction`
-/// carries one, leaving whatever preceded it untouched.
-fn strip_answers_block(instruction: &str) -> &str {
-    match instruction.find(ANSWERS_HEADER) {
-        Some(at) => &instruction[..at],
-        None => instruction,
+/// Drop the prior answer block only when it is exactly the suffix this task
+/// could have appended on an earlier resume. An `ANSWERS_HEADER` written by
+/// the task author is ordinary instruction text, not a block to remove.
+fn strip_answers_block<'a>(instruction: &'a str, task: &Task) -> &'a str {
+    for count in (1..=task.answers.len()).rev() {
+        let block = answers_block(task, count);
+        if let Some(base) = instruction.strip_suffix(&block) {
+            return base;
+        }
     }
+    instruction
 }
 
 /// The instruction handed to `Runner::start`: the task's own text, plus any
@@ -2013,7 +2023,7 @@ fn instruction_for(task: &Task) -> String {
 /// three times over three answered questions from carrying the same answer
 /// three times.
 fn resumed_instruction(old_instruction: &str, task: &Task) -> String {
-    append_answers(strip_answers_block(old_instruction), task)
+    append_answers(strip_answers_block(old_instruction, task), task)
 }
 
 /// What [`attempt`] should tell a [`Starter`] about `task`'s current operator
@@ -4014,6 +4024,29 @@ mod tests {
         assert!(refreshed.starts_with(&old), "the original text is kept");
         assert!(refreshed.contains("Which backend?"));
         assert!(refreshed.contains("SQLite"));
+    }
+
+    #[test]
+    fn resumed_instruction_keeps_an_original_answers_heading() {
+        let mut t = task();
+        t.instruction = "Context\n\n# Operator answers\n\nThis is part of the task.".to_owned();
+        t.record_answer("Which backend?".to_owned(), "SQLite".to_owned());
+
+        let refreshed = resumed_instruction(&t.instruction, &t);
+
+        assert!(
+            refreshed.starts_with(&t.instruction),
+            "an answers heading in the original instruction is not the appended block"
+        );
+        assert_eq!(refreshed.matches(ANSWERS_HEADER).count(), 2);
+        assert!(refreshed.contains("Which backend?"));
+        assert!(refreshed.contains("SQLite"));
+
+        let repeated = resumed_instruction(&refreshed, &t);
+        assert_eq!(
+            repeated, refreshed,
+            "only the final appended block is refreshed"
+        );
     }
 
     #[test]
