@@ -671,6 +671,7 @@ mod tests {
         crate::run::ReviewRound {
             round,
             head: "deadbeef".to_owned(),
+            verified_head: None,
             reviews: vec![crate::run::ReviewRecord {
                 reviewer: 1,
                 agent: "mock".to_owned(),
@@ -689,6 +690,8 @@ mod tests {
             }],
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: Some(crate::run::FixRecord {
                 agent: "mock".to_owned(),
                 addressed: addressed.iter().map(|s| (*s).to_owned()).collect(),

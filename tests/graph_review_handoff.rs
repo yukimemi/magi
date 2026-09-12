@@ -133,6 +133,31 @@ async fn a_tree_that_stops_moving_hands_off_before_the_round_budget() {
 }
 
 #[tokio::test]
+async fn catchup_e2e_records_the_actual_head_after_an_empty_fixer_commit() {
+    let _guard = common::home_lock().await;
+    let mut fx = fixture_that_never_clears(_guard, 6);
+    for agent in &mut fx.config.agents {
+        agent
+            .env
+            .insert("MOCK_FIXER_EMPTY_COMMIT".to_owned(), "1".to_owned());
+    }
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    let last = runner.state.reviews.last().expect("review round");
+    let verified = last
+        .verified_head
+        .as_ref()
+        .expect("catch-up verification head");
+    assert_ne!(
+        &last.head, verified,
+        "the fixer made an empty commit after review"
+    );
+    assert!(last.e2e.iter().all(|outcome| outcome.ok()));
+}
+
+#[tokio::test]
 async fn a_clean_round_is_unaffected_by_any_of_this() {
     let _guard = common::home_lock().await;
     // The ordinary happy path (one blocker, one fix, clean) must still behave

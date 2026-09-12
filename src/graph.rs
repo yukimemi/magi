@@ -2439,51 +2439,45 @@ impl Runner {
                 .collect();
             let round_verdict = ReviewVote::worst(final_votes);
 
-            let mut e2e = run_commands(
-                &shell,
-                &self.state.config.verify.e2e,
-                &winner.worktree,
-                Duration::from_secs(self.state.config.graph.timeout_review),
-            )
-            .await;
-            for o in &e2e {
-                self.state.event(
-                    "verify",
-                    format!("round {round}: `{}` -> {}", o.command, e2e_outcome_label(o)),
-                );
-            }
-
-            // A build/link failure is not a verdict on the patch — it is
-            // frequently a race against a shared `CARGO_TARGET_DIR` (see
-            // AGENTS.md). Give verify one retry before letting a red like
-            // that decide the round.
-            let verify_retried = e2e.iter().any(CommandOutcome::build_failed);
-            if verify_retried {
+            let blocking = all_findings.iter().filter(|f| f.severity.blocks()).count();
+            let verify_timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
+            // A round that already has a blocking finding and a round left to
+            // try is going back to the fixer no matter what `verify.e2e`
+            // says, so running it first only spends the loop's slowest step
+            // (minutes, for a Rust repo's full test suite) on a head about
+            // to be rewritten. Deferred, never skipped: `verify.e2e` still
+            // runs once a round has no blocking findings left (see
+            // `round_is_clean`, which a deferred — empty — `e2e` can never
+            // satisfy since `blocking` is nonzero whenever this branch is
+            // taken), and `stop_reviewing` forces a real run before it will
+            // ever read a deferred round as green.
+            let defer_e2e =
+                blocking > 0 && round < max_rounds && !self.state.config.graph.e2e_every_round;
+            let (e2e, verify_retried, e2e_deferred, e2e_defer_reason) = if defer_e2e {
+                let reason =
+                    format!("{blocking} blocking finding(s) already required a fix this round");
                 self.state.event(
                     "verify",
                     format!(
-                        "round {round}: verify could not build/link, not a test result — \
-                         retrying once before concluding"
+                        "round {round}: {reason} — e2e deferred to the fixer (reviewed head \
+                         {}); it will run once a round has none left",
+                        short(&head)
                     ),
                 );
-                e2e = run_commands(
+                (Vec::new(), false, true, Some(reason))
+            } else {
+                let e2e_commands = self.state.config.verify.e2e.clone();
+                let (e2e, verify_retried) = run_e2e_with_retry(
+                    &mut self.state,
                     &shell,
-                    &self.state.config.verify.e2e,
+                    &e2e_commands,
                     &winner.worktree,
-                    Duration::from_secs(self.state.config.graph.timeout_review),
+                    verify_timeout,
+                    &format!("round {round}"),
                 )
                 .await;
-                for o in &e2e {
-                    self.state.event(
-                        "verify",
-                        format!(
-                            "round {round}: retry `{}` -> {}",
-                            o.command,
-                            e2e_outcome_label(o)
-                        ),
-                    );
-                }
-            }
+                (e2e, verify_retried, false, None)
+            };
 
             let e2e_failures: String = e2e
                 .iter()
@@ -2494,7 +2488,6 @@ impl Runner {
             let expected = records.len();
             let answered = records.iter().filter(|r| r.failed.is_none()).count();
             let incomplete = answered < expected;
-            let blocking = all_findings.iter().filter(|f| f.severity.blocks()).count();
             let e2e_ok = e2e.iter().all(CommandOutcome::ok);
             let policy = self.state.config.graph.incomplete_review;
             let clean = round_is_clean(blocking, e2e_ok, answered, expected, policy);
@@ -2502,9 +2495,12 @@ impl Runner {
             let mut round_record = ReviewRound {
                 round,
                 head: head.clone(),
+                verified_head: None,
                 reviews: records,
                 e2e,
                 verify_retried,
+                e2e_deferred,
+                e2e_defer_reason,
                 fix: None,
                 blocking,
                 answered,
@@ -2574,9 +2570,15 @@ impl Runner {
 
             if round == max_rounds {
                 self.state.reviews.push(round_record);
-                return self.stop_reviewing(&format!(
-                    "{blocking} blocking finding(s) still open after {max_rounds} round(s)"
-                ));
+                return self
+                    .stop_reviewing(
+                        &format!(
+                            "{blocking} blocking finding(s) still open after {max_rounds} round(s)"
+                        ),
+                        &shell,
+                        &winner.worktree,
+                    )
+                    .await;
             }
 
             // Fix. The winner's own implementer seat continues its conversation:
@@ -2603,6 +2605,7 @@ impl Runner {
                     &self.state.instruction,
                     &blocking_findings,
                     (!e2e_failures.is_empty()).then_some(e2e_failures.as_str()),
+                    e2e_deferred,
                     round,
                     max_rounds,
                     &language,
@@ -2735,9 +2738,15 @@ impl Runner {
                 .take_while(|r| !r.progressed)
                 .count();
             if streak >= STAGNANT_LIMIT {
-                return self.stop_reviewing(&format!(
-                    "the tree has not moved against base for {streak} round(s) in a row"
-                ));
+                return self
+                    .stop_reviewing(
+                        &format!(
+                            "the tree has not moved against base for {streak} round(s) in a row"
+                        ),
+                        &shell,
+                        &winner.worktree,
+                    )
+                    .await;
             }
         }
         Ok(())
@@ -2758,12 +2767,43 @@ impl Runner {
     /// that case still blocks, with the failing command and a tail of its
     /// output recorded here rather than left in `run.json` for someone to go
     /// find.
-    fn stop_reviewing(&mut self, why: &str) -> Result<()> {
-        let last = self
-            .state
-            .reviews
-            .last()
-            .expect("a round was just recorded before this is called");
+    ///
+    /// A round that deferred its own e2e (see [`Config::graph`]'s
+    /// `e2e_every_round`) is never read as that green: its `e2e` is empty
+    /// only because nothing ran, and treating an empty list as a passing one
+    /// here is exactly the "deferred painted green" bug this function exists
+    /// to not have. When the last round deferred, this makes the real run —
+    /// on the actual worktree this loop is about to stop touching — before
+    /// deciding anything.
+    async fn stop_reviewing(&mut self, why: &str, shell: &[String], worktree: &Path) -> Result<()> {
+        let round_idx = self.state.reviews.len() - 1;
+        let needs_catchup_run = {
+            let last = &self.state.reviews[round_idx];
+            last.e2e.is_empty() && last.e2e_deferred
+        };
+        if needs_catchup_run {
+            let round = self.state.reviews[round_idx].round;
+            let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
+            let commands = self.state.config.verify.e2e.clone();
+            let verified_head = git::rev_parse(worktree, "HEAD").await?;
+            let (outcomes, verify_retried) = run_e2e_with_retry(
+                &mut self.state,
+                shell,
+                &commands,
+                worktree,
+                timeout,
+                &format!("round {round}: deferred e2e, now catching up before the final decision"),
+            )
+            .await;
+            let last = &mut self.state.reviews[round_idx];
+            last.e2e = outcomes;
+            last.verify_retried = verify_retried;
+            last.e2e_deferred = false;
+            if verified_head != last.head {
+                last.verified_head = Some(verified_head);
+            }
+        }
+        let last = &self.state.reviews[round_idx];
         let red: Vec<String> = last
             .e2e
             .iter()
@@ -2831,7 +2871,7 @@ impl Runner {
             &shell,
             &self.state.config.verify.gate,
             &winner.worktree,
-            Duration::from_secs(self.state.config.graph.timeout_review),
+            Duration::from_secs(self.state.config.graph.verify_timeout()),
         )
         .await;
         for o in &outcomes {
@@ -3254,7 +3294,7 @@ async fn wave(
         job.prompt = prompt::with_overlay(job.prompt, overlay.clone());
         if cache.is_some() {
             job.prompt.push('\n');
-            job.prompt.push_str(prompt::build_cache_note());
+            job.prompt.push_str(&prompt::build_cache_note(node));
         }
         let sem = Arc::clone(&sem);
         let run = run.to_owned();
@@ -3583,6 +3623,55 @@ fn e2e_outcome_label(o: &CommandOutcome) -> String {
     format!("{reason}\n{}", tail(&o.output_tail, EVENT_OUTPUT_TAIL))
 }
 
+/// Run `verify.e2e`, retrying once if the first attempt could not build or
+/// link — a build/link failure is frequently a race against a shared
+/// `CARGO_TARGET_DIR` (see AGENTS.md), not a verdict on the patch. Emits one
+/// `verify` event per command, tagged with `context` (normally `"round N"`)
+/// so the two call sites that need this — the ordinary per-round leg in
+/// `review_loop`, and the deferred catch-up run `stop_reviewing` makes before
+/// it will ever call a round green — read identically in the event log.
+async fn run_e2e_with_retry(
+    state: &mut RunState,
+    shell: &[String],
+    commands: &[String],
+    worktree: &Path,
+    timeout: Duration,
+    context: &str,
+) -> (Vec<CommandOutcome>, bool) {
+    let mut e2e = run_commands(shell, commands, worktree, timeout).await;
+    for o in &e2e {
+        state.event(
+            "verify",
+            format!("{context}: `{}` -> {}", o.command, e2e_outcome_label(o)),
+        );
+    }
+    // A build/link failure is not a verdict on the patch — it is frequently a
+    // race against a shared `CARGO_TARGET_DIR` (see AGENTS.md). Give verify
+    // one retry before letting a red like that decide the round.
+    let verify_retried = e2e.iter().any(CommandOutcome::build_failed);
+    if verify_retried {
+        state.event(
+            "verify",
+            format!(
+                "{context}: verify could not build/link, not a test result — retrying once \
+                 before concluding"
+            ),
+        );
+        e2e = run_commands(shell, commands, worktree, timeout).await;
+        for o in &e2e {
+            state.event(
+                "verify",
+                format!(
+                    "{context}: retry `{}` -> {}",
+                    o.command,
+                    e2e_outcome_label(o)
+                ),
+            );
+        }
+    }
+    (e2e, verify_retried)
+}
+
 /// Run configured shell commands in `cwd`, in order.
 async fn run_commands(
     shell: &[String],
@@ -3899,6 +3988,7 @@ mod tests {
         ReviewRound {
             round: 1,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: vec![CommandOutcome {
                 command: "test".to_owned(),
@@ -3907,6 +3997,8 @@ mod tests {
                 duration_ms: 0,
             }],
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: None,
             blocking,
             answered,
@@ -4200,6 +4292,7 @@ mod tests {
         state.reviews = vec![ReviewRound {
             round: 1,
             head: "deadbeef".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             fix: None,
@@ -4208,6 +4301,8 @@ mod tests {
             expected: 0,
             clean: true,
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             progressed: false,
             vote_split: false,
             reconsideration: Vec::new(),
@@ -4311,6 +4406,7 @@ mod tests {
         state.reviews = vec![ReviewRound {
             round: 1,
             head: "deadbeef".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             fix: None,
@@ -4319,6 +4415,8 @@ mod tests {
             expected: 0,
             clean: true,
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             progressed: false,
             vote_split: false,
             reconsideration: Vec::new(),
@@ -4416,6 +4514,7 @@ mod tests {
         let round = ReviewRound {
             round: 2,
             head: "deadbee".to_owned(),
+            verified_head: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "alpha".to_owned(),
@@ -4432,6 +4531,8 @@ mod tests {
                 duration_ms: 0,
             }],
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: Some(FixRecord {
                 agent: "alpha".to_owned(),
                 addressed: Vec::new(),
@@ -4471,6 +4572,7 @@ mod tests {
         let round = ReviewRound {
             round: 1,
             head: "deadbee".to_owned(),
+            verified_head: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "alpha".to_owned(),
@@ -4482,6 +4584,8 @@ mod tests {
             }],
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: None,
             blocking: 0,
             answered: 1,

@@ -216,8 +216,19 @@ noise the owner learns to ignore.",
 /// with its own `CARGO_TARGET_DIR` (or lets cargo create a fresh `target/` in
 /// the worktree) is compiling a second copy of the world that nobody prunes,
 /// on a machine that has already had that exact failure once.
-pub fn build_cache_note() -> &'static str {
-    "\
+///
+/// `node` is the graph node this is spliced into (`"review"`, `"fix"`, ...).
+/// A reviewer or fixer gets an extra paragraph saying full verification is
+/// magi's own job, not theirs to repeat — the same duplicated-full-suite cost
+/// this note's own advice (build through the shared cache) does nothing to
+/// prevent on its own, since a seat that dutifully builds through the cache
+/// can still spend the round re-running the whole thing. Phrased as a
+/// request, not a guarantee: magi has no way to stop a seat from running
+/// `cargo test --all-targets` anyway, so the note asks rather than claims it
+/// enforces anything.
+pub fn build_cache_note(node: &str) -> String {
+    let mut s = String::from(
+        "\
 # The build cache\n\n\
 This environment sets `CARGO_TARGET_DIR` to a shared build cache. Build and \
 test through it — the verify commands use the same directory, so a compile \
@@ -225,7 +236,20 @@ you pay for is a compile the gate does not redo.\n\n\
 The cache is size-capped and pruned oldest-first by magi. Never create your \
 own build directory — no `CARGO_TARGET_DIR` of your own, no local `target/` \
 in the worktree. A private target directory is exactly the multi-gigabyte \
-junk the cap exists to keep down."
+junk the cap exists to keep down.",
+    );
+    if node == "review" || node == "fix" {
+        s.push_str(
+            "\n\n\
+Full verification — the complete test suite and the final gate — is magi's \
+own job: it runs once a round has no blocking findings left, and again on \
+the tree that would actually land. Build and run focused, targeted checks \
+for what you touched rather than the full suite; magi has no way to enforce \
+which commands a seat runs, so this is a request for judgment, not a rule it \
+polices.",
+        );
+    }
+    s
 }
 
 /// Prompt for an implementer.
@@ -747,10 +771,18 @@ pub fn review_reconsider(ctx: &ReviewReconsiderCtx<'_>) -> String {
 }
 
 /// Prompt for the fixer, given a round's findings.
+///
+/// `e2e_deferred` is true when this round's `verify.e2e` was intentionally
+/// not run (blocking findings already required a fix, and a round remained
+/// to actually verify once none are left) — distinct from `e2e` being `None`
+/// because verification ran and every command passed. Telling the fixer
+/// which one happened matters: silence here would read as "nothing to worry
+/// about", and a deferred check is not a passing one.
 pub fn fix(
     instruction: &str,
     findings: &[Finding],
     e2e: Option<&str>,
+    e2e_deferred: bool,
     round: usize,
     rounds: usize,
     language: &str,
@@ -785,6 +817,13 @@ pub fn fix(
             s,
             "\n# Verification output (must end green)\n\n```\n{}\n```\n",
             out.trim()
+        );
+    } else if e2e_deferred {
+        s.push_str(
+            "\n# Verification\n\nNot run this round — the findings above already required a \
+             fix, so magi deferred the full verification run rather than spend it on a head \
+             about to change. It runs once a round has no blocking findings left; it has not \
+             passed, and it has not failed. Do not treat its absence here as a pass.\n",
         );
     }
     s.push_str(
@@ -1409,7 +1448,7 @@ mod tests {
             title: "panics".to_owned(),
             detail: "empty input".to_owned(),
         }];
-        let p = fix("task", &findings, Some("FAILED"), 2, 6, "en");
+        let p = fix("task", &findings, Some("FAILED"), false, 2, 6, "en");
         assert!(p.contains("R1-1-1"));
         assert!(p.contains("src/a.rs:9"));
         assert!(p.contains("FAILED"));
@@ -1418,9 +1457,47 @@ mod tests {
 
     #[test]
     fn fix_prompt_survives_an_empty_finding_list() {
-        let p = fix("task", &[], Some("boom"), 3, 6, "en");
+        let p = fix("task", &[], Some("boom"), false, 3, 6, "en");
         assert!(p.contains("(none"));
         assert!(p.contains("boom"));
+    }
+
+    #[test]
+    fn fix_prompt_tells_the_fixer_e2e_was_deferred_not_passed() {
+        let findings = [Finding {
+            id: "R1-1-1".to_owned(),
+            severity: Severity::Blocker,
+            file: None,
+            line: None,
+            title: "panics".to_owned(),
+            detail: "empty input".to_owned(),
+        }];
+        let p = fix("task", &findings, None, true, 1, 6, "en");
+        assert!(
+            p.contains("Not run this round"),
+            "a deferred check must say so, not read as a silent pass: {p}"
+        );
+        assert!(
+            !p.contains("must end green"),
+            "no verification output section without an actual run: {p}"
+        );
+    }
+
+    #[test]
+    fn fix_prompt_says_nothing_extra_when_e2e_simply_passed() {
+        let findings = [Finding {
+            id: "R1-1-1".to_owned(),
+            severity: Severity::Blocker,
+            file: None,
+            line: None,
+            title: "panics".to_owned(),
+            detail: "empty input".to_owned(),
+        }];
+        let p = fix("task", &findings, None, false, 1, 6, "en");
+        assert!(
+            !p.contains("Not run this round"),
+            "a round whose e2e simply had nothing to report must not read as deferred: {p}"
+        );
     }
 
     #[test]
@@ -1482,12 +1559,31 @@ mod tests {
     }
     #[test]
     fn the_build_cache_note_says_the_load_bearing_things() {
-        let note = build_cache_note();
+        let note = build_cache_note("implement");
         // The two sentences that carry the invariant: build through the shared
         // variable, and never create your own cache.
         assert!(note.contains("CARGO_TARGET_DIR` to a shared build cache"));
         assert!(note.contains("Never create your own build directory"));
         assert!(note.contains("pruned oldest-first by magi"));
+        assert!(
+            !note.contains("magi's own job"),
+            "an implementer is not told to defer to a full suite it is not asked to run: {note}"
+        );
+    }
+
+    #[test]
+    fn the_build_cache_note_tells_review_and_fix_seats_full_verification_is_not_theirs() {
+        for node in ["review", "fix"] {
+            let note = build_cache_note(node);
+            assert!(
+                note.contains("magi's own job"),
+                "{node} must be told full verification is parent-owned: {note}"
+            );
+            assert!(
+                note.contains("has no way to enforce"),
+                "{node} must not be told magi polices this: {note}"
+            );
+        }
     }
 
     #[test]

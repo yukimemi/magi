@@ -5847,6 +5847,13 @@ mod tests {
         assert_eq!(html.body, INDEX_HTML, "compiled in, never read from disk");
     }
 
+    #[test]
+    fn review_rounds_label_a_distinct_verified_head() {
+        assert!(APP_JS.contains("round.verified_head"));
+        assert!(APP_JS.contains("verified HEAD"));
+        assert!(APP_JS.contains("verified ${String(round.verified_head).slice(0, 7)}"));
+    }
+
     #[tokio::test]
     async fn the_change_stream_announces_the_current_revisions_on_connect() {
         let f = Fixture::start().await;

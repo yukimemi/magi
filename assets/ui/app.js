@@ -4295,13 +4295,19 @@ function renderReviews(run) {
         round.verify_retried
           ? el("span", { class: "tag", "data-tone": "gold", text: "verify retried" })
           : null,
+        round.e2e_deferred
+          ? el("span", { class: "tag", "data-tone": "gold", text: "e2e deferred" })
+          : null,
         round.verdict
           ? el("span", { class: "tag", "data-tone": voteTone(round.verdict), text: `verdict: ${voteLabel(round.verdict)}` })
           : null,
         round.vote_split
           ? el("span", { class: "tag", "data-tone": "gold", text: "votes split" })
           : null,
-        round.head ? el("span", { class: "head-sha", text: String(round.head).slice(0, 7) }) : null,
+        round.head ? el("span", { class: "head-sha", title: "reviewed HEAD", text: String(round.head).slice(0, 7) }) : null,
+        round.verified_head
+          ? el("span", { class: "head-sha", title: "verified HEAD", text: `verified ${String(round.verified_head).slice(0, 7)}` })
+          : null,
       ),
     );
 
@@ -4355,7 +4361,16 @@ function renderReviews(run) {
     }
 
     const e2e = Array.isArray(round.e2e) ? round.e2e : [];
-    if (e2e.length) node.append(commandList("Verification", e2e));
+    if (e2e.length) {
+      node.append(commandList("Verification", e2e));
+    } else if (round.e2e_deferred) {
+      // Empty on purpose here, never "nothing to report": an empty `e2e`
+      // also means "not configured" elsewhere, and the two must not look
+      // the same — a deferred round has not passed and has not failed.
+      node.append(el("p", { class: "card-note", text: round.e2e_defer_reason
+        ? `Verification deferred to the fixer: ${round.e2e_defer_reason}`
+        : "Verification deferred to the fixer" }));
+    }
 
     if (round.fix) {
       const fix = round.fix;

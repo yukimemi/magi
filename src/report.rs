@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::{MergeMode, MergeStyle};
-use crate::run::{CommandOutcome, RunState, RunStatus, tail};
+use crate::run::{CommandOutcome, E2eStatus, RunState, RunStatus, tail};
 use crate::stats::Stats;
 use crate::verdict::ReviewVote;
 
@@ -319,15 +319,25 @@ pub fn run(state: &RunState) -> String {
             let raised: usize = r.reviews.iter().map(|x| x.findings.len()).sum();
             // A build/link failure is not a verdict on the patch (a shared
             // `CARGO_TARGET_DIR` link race looks exactly like one), so it
-            // must not read the same as a real test failure.
-            let e2e = if r.e2e.is_empty() {
-                dim("no e2e")
-            } else if r.e2e.iter().all(|o| o.ok()) {
-                green("e2e green")
-            } else if r.e2e.iter().any(CommandOutcome::build_failed) {
-                yellow("e2e could not run (build/link failure)")
-            } else {
-                red("e2e RED")
+            // must not read the same as a real test failure. And a deferred
+            // round is not a passed one: `e2e.is_empty()` alone cannot tell
+            // "not configured" from "skipped on purpose" apart, which is
+            // exactly why `e2e_status` exists rather than reading `e2e`
+            // directly here.
+            let e2e = match r.e2e_status() {
+                E2eStatus::NotConfigured => dim("no e2e"),
+                E2eStatus::Deferred => yellow(&format!(
+                    "e2e deferred{}",
+                    r.e2e_defer_reason
+                        .as_deref()
+                        .map(|why| format!(" ({why})"))
+                        .unwrap_or_default()
+                )),
+                E2eStatus::Passed => green("e2e green"),
+                E2eStatus::Failed if r.e2e.iter().any(CommandOutcome::build_failed) => {
+                    yellow("e2e could not run (build/link failure)")
+                }
+                E2eStatus::Failed => red("e2e RED"),
             };
             let e2e = if r.verify_retried {
                 format!("{e2e}, retried once")
@@ -380,10 +390,13 @@ pub fn run(state: &RunState) -> String {
             });
             let _ = writeln!(
                 s,
-                "  round {}  {} @ {}{panel}  {raised} finding(s), {} blocking, {e2e}{verdict}{}",
+                "  round {}  {} @ {}{}{panel}  {raised} finding(s), {} blocking, {e2e}{verdict}{}",
                 r.round,
                 status,
                 short(&r.head),
+                r.verified_head.as_ref().map_or(String::new(), |head| {
+                    format!(" (verified @ {})", short(head))
+                }),
                 r.blocking,
                 r.fix.as_ref().map_or(String::new(), |f| {
                     let tree = if r.progressed {
@@ -728,16 +741,17 @@ pub fn stats(stats: &Stats) -> String {
         }
     }
 
-    if stats.e2e.rounds > 0 {
+    if stats.e2e.rounds > 0 || stats.e2e.deferred > 0 {
         let _ = writeln!(s, "\n{}", bold("verification"));
         let _ = writeln!(
             s,
             "  {} rounds ran e2e, {} failed, {} of those with a clean static \
-             review ({:.0}% sole detections)",
+             review ({:.0}% sole detections), {} round(s) deferred it to the fixer",
             stats.e2e.rounds,
             stats.e2e.failures,
             stats.e2e.sole_detections,
-            stats.e2e.sole_rate()
+            stats.e2e.sole_rate(),
+            stats.e2e.deferred
         );
     }
     s
@@ -1004,9 +1018,12 @@ mod tests {
         lost.reviews = vec![ReviewRound {
             round: 1,
             head: "abc1234".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: Some(FixRecord {
                 agent: "opus".to_owned(),
                 addressed: Vec::new(),
@@ -1036,9 +1053,12 @@ mod tests {
         rejected_all.reviews = vec![ReviewRound {
             round: 1,
             head: "abc1234".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: Some(FixRecord {
                 agent: "opus".to_owned(),
                 addressed: Vec::new(),
@@ -1074,6 +1094,7 @@ mod tests {
         s.reviews = vec![ReviewRound {
             round: 1,
             head: "abc1234".to_owned(),
+            verified_head: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -1096,6 +1117,8 @@ mod tests {
             ],
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: None,
             blocking: 0,
             answered: 2,
@@ -1132,6 +1155,7 @@ mod tests {
         s.reviews = vec![ReviewRound {
             round: 1,
             head: "abc1234".to_owned(),
+            verified_head: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -1154,6 +1178,8 @@ mod tests {
             ],
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: Some(FixRecord {
                 agent: "opus".to_owned(),
                 addressed: Vec::new(),
@@ -1190,6 +1216,7 @@ mod tests {
         s.reviews = vec![ReviewRound {
             round: 1,
             head: "abc1234".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: vec![CommandOutcome {
                 command: "cargo test".to_owned(),
@@ -1198,6 +1225,8 @@ mod tests {
                 duration_ms: 100,
             }],
             verify_retried: true,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: None,
             blocking: 0,
             answered: 0,
@@ -1224,6 +1253,7 @@ mod tests {
         s.reviews = vec![ReviewRound {
             round: 1,
             head: "deadbee".to_owned(),
+            verified_head: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "alpha".to_owned(),
@@ -1247,6 +1277,8 @@ mod tests {
                 duration_ms: 0,
             }],
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: Some(FixRecord {
                 agent: "alpha".to_owned(),
                 addressed: Vec::new(),

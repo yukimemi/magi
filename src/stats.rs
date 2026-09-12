@@ -110,6 +110,13 @@ pub struct E2eStats {
     /// Rounds where E2E failed and no reviewer had raised a blocking finding —
     /// a runtime defect that only execution found.
     pub sole_detections: usize,
+    /// Rounds where E2E was deferred rather than run: blocking findings
+    /// already required a fix, so the round went straight to the fixer
+    /// instead of spending a full verify run on a head about to change. Kept
+    /// separate from [`Self::rounds`] on purpose — a deferred round never
+    /// ran anything, so counting it there would misreport how often E2E
+    /// actually executed.
+    pub deferred: usize,
 }
 
 impl E2eStats {
@@ -308,7 +315,9 @@ pub fn collect(states: &[RunState]) -> Stats {
                 }
             }
 
-            if !round.e2e.is_empty() {
+            if round.e2e_deferred {
+                e2e.deferred += 1;
+            } else if !round.e2e.is_empty() {
                 e2e.rounds += 1;
                 if round.e2e.iter().any(|o| !o.ok()) {
                     e2e.failures += 1;
@@ -465,6 +474,7 @@ mod tests {
         let round = ReviewRound {
             round: 1,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -503,6 +513,8 @@ mod tests {
             ],
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: Some(FixRecord {
                 agent: "alpha".to_owned(),
                 addressed: vec!["R1-1-1".to_owned()],
@@ -541,6 +553,7 @@ mod tests {
         let submitted = ReviewRound {
             round: 1,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "alpha".to_owned(),
@@ -558,6 +571,8 @@ mod tests {
             }],
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             // The fixer's diff may well have landed (blocking counts do fall
             // round over round) — only its adoption report never came back.
             fix: Some(FixRecord {
@@ -592,6 +607,7 @@ mod tests {
         let round = ReviewRound {
             round: 1,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -614,6 +630,8 @@ mod tests {
             ],
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: None,
             blocking: 0,
             answered: 1,
@@ -653,6 +671,7 @@ mod tests {
         let round = ReviewRound {
             round: 1,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -681,6 +700,8 @@ mod tests {
             ],
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: Some(FixRecord {
                 agent: "alpha".to_owned(),
                 addressed: Vec::new(),
@@ -724,9 +745,12 @@ mod tests {
         let sole = ReviewRound {
             round: 1,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: vec![fail.clone()],
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: None,
             blocking: 0,
             answered: 0,
@@ -740,9 +764,12 @@ mod tests {
         let alongside = ReviewRound {
             round: 2,
             head: "h".to_owned(),
+            verified_head: None,
             reviews: Vec::new(),
             e2e: vec![fail],
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: None,
             blocking: 2,
             answered: 0,
