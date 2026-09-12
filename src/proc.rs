@@ -170,16 +170,18 @@ fn parse_unix_kill_output(success: bool, stderr: &[u8]) -> bool {
 /// フィールドを持つ行は存在しない。
 #[cfg(any(windows, test))]
 fn parse_windows_tasklist_output(pid: u32, stdout: &[u8]) -> std::io::Result<bool> {
+    if stdout.iter().all(u8::is_ascii_whitespace) {
+        return Err(std::io::Error::other("tasklist produced no output"));
+    }
     let expected = pid.to_string();
-    String::from_utf8_lossy(stdout)
+    let rows = String::from_utf8_lossy(stdout)
         .lines()
         .map(tasklist_csv_fields)
         .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| std::io::Error::other("could not parse tasklist CSV output"))
-        .map(|rows| {
-            rows.into_iter()
-                .any(|fields| fields.get(1).is_some_and(|field| field == &expected))
-        })
+        .ok_or_else(|| std::io::Error::other("could not parse tasklist CSV output"))?;
+    Ok(rows
+        .into_iter()
+        .any(|fields| fields.get(1).is_some_and(|field| field == &expected)))
 }
 
 /// `tasklist` が出す、二重引用符と `""` エスケープを持つ CSV の一行を分ける。
@@ -384,6 +386,14 @@ mod tests {
         assert!(
             parse_windows_tasklist_output(pid, b"\"magi.exe\",\"12345").is_err(),
             "壊れた CSV は死亡ではなく利用不能である"
+        );
+        assert!(
+            parse_windows_tasklist_output(pid, b"").is_err(),
+            "空出力は死亡ではなく利用不能である"
+        );
+        assert!(
+            parse_windows_tasklist_output(pid, b"\r\n").is_err(),
+            "空白だけの出力は死亡ではなく利用不能である"
         );
         assert!(
             tasklist_result(
