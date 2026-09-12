@@ -144,6 +144,8 @@ fn view(t: &Task, max_attempts: usize) -> prompt::ConductTask {
         attempts: t.attempts,
         max_attempts,
         last_error: t.last_error.clone(),
+        hold_reason: t.hold_reason.clone(),
+        hold_source: t.hold_source.map(|source| source.label().to_owned()),
         blocked_by: t.blocked_by.clone(),
         answers: t
             .answers
@@ -320,6 +322,13 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
         .with_context(|| format!("task {} is claimed elsewhere right now", d.id))?;
     let mut task = queue.get(&d.id).context("no such task")?;
 
+    // A conductor answer is never operator authorization.  In particular,
+    // do this before questions and blocking too: either would reclassify a
+    // manual hold and let a later deterministic resolver queue it.
+    if task.operator_held() {
+        return Ok(());
+    }
+
     if let Some(text) = &d.question {
         if task.status == TaskStatus::Done {
             return Ok(());
@@ -361,7 +370,7 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
                 queue.put(&mut task)?;
             }
             Some(Recovery::Hold) => {
-                task.hold(d.reason.clone());
+                task.hold_machine(d.reason.clone());
                 queue.put(&mut task)?;
             }
             // `Review` reopens a branch, which only makes sense once a run
@@ -375,7 +384,7 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
                 queue.put(&mut task)?;
             }
             Some(Recovery::Hold) => {
-                task.hold(d.reason.clone());
+                task.hold_machine(d.reason.clone());
                 queue.put(&mut task)?;
             }
             Some(Recovery::Review) => {
@@ -1056,6 +1065,149 @@ mod tests {
         let held = queue.get(&hold_me.id).unwrap();
         assert_eq!(held.status, TaskStatus::Held);
         assert_eq!(held.hold_reason.as_deref(), Some("looks broken"));
+    }
+
+    #[test]
+    fn manual_hold_rejects_hostile_or_stale_conductor_recovery() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut held = task("manual recovery");
+        held.priority = 300;
+        held.runs.push("run20260912-224242-daf5".to_owned());
+        held.hold_manual(Some(
+            "active manual recovery run20260912-224242-daf5".to_owned(),
+        ));
+        queue.put(&mut held).unwrap();
+
+        // Every field a conductor may use to alter lifecycle state is ignored:
+        // requeue/review would dispatch duplicate work, hold could overwrite
+        // evidence, and a question would turn the hold into `blocked`.
+        for decision in [
+            Decision {
+                id: held.id.clone(),
+                recovery: Some(Recovery::Requeue),
+                ..Decision::default()
+            },
+            Decision {
+                id: held.id.clone(),
+                recovery: Some(Recovery::Hold),
+                reason: Some("stale replacement reason".to_owned()),
+                ..Decision::default()
+            },
+            Decision {
+                id: held.id.clone(),
+                recovery: Some(Recovery::Review),
+                ..Decision::default()
+            },
+            Decision {
+                id: held.id.clone(),
+                blocked_by: vec!["other-task".to_owned()],
+                question: Some("retry now?".to_owned()),
+                ..Decision::default()
+            },
+        ] {
+            apply(
+                &queue,
+                &questions,
+                &Verdict {
+                    decisions: vec![decision],
+                },
+            )
+            .unwrap();
+        }
+
+        let after = queue.get(&held.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Held);
+        assert!(after.operator_held());
+        assert_eq!(after.priority, 300);
+        assert_eq!(after.runs, ["run20260912-224242-daf5"]);
+        assert_eq!(
+            after.hold_reason.as_deref(),
+            Some("active manual recovery run20260912-224242-daf5")
+        );
+        assert!(after.blocked_by.is_empty());
+        assert!(questions.list().is_empty());
+        assert!(
+            queue.next_runnable().is_none(),
+            "must not dispatch a duplicate"
+        );
+    }
+
+    #[test]
+    fn machine_holds_remain_recoverable_and_manual_release_is_authorization() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+
+        let mut automatic = task("disk gate");
+        automatic.hold_machine(Some("disk full".to_owned()));
+        queue.put(&mut automatic).unwrap();
+        let requeue = || Verdict {
+            decisions: vec![Decision {
+                id: automatic.id.clone(),
+                recovery: Some(Recovery::Requeue),
+                ..Decision::default()
+            }],
+        };
+        apply(&queue, &questions, &requeue()).unwrap();
+        assert_eq!(queue.get(&automatic.id).unwrap().status, TaskStatus::Queued);
+
+        let mut manual = task("operator gate");
+        manual.hold_manual(Some("wait for operator".to_owned()));
+        queue.put(&mut manual).unwrap();
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![Decision {
+                    id: manual.id.clone(),
+                    recovery: Some(Recovery::Requeue),
+                    ..Decision::default()
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(queue.get(&manual.id).unwrap().status, TaskStatus::Held);
+
+        // This mirrors the CLI and web release routes: only an explicit
+        // operator action clears the manual boundary.
+        let mut released = queue.get(&manual.id).unwrap();
+        released.release();
+        queue.put(&mut released).unwrap();
+        assert_eq!(queue.get(&manual.id).unwrap().status, TaskStatus::Queued);
+    }
+
+    #[test]
+    fn legacy_reasoned_hold_is_protected_without_losing_its_metadata() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut legacy = task("old explicit hold");
+        legacy.status = TaskStatus::Held;
+        legacy.hold_reason = Some("manual recovery already active".to_owned());
+        legacy.hold_source = None;
+        legacy.blocked_by = vec!["dependency".to_owned()];
+        queue.put(&mut legacy).unwrap();
+
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![Decision {
+                    id: legacy.id.clone(),
+                    recovery: Some(Recovery::Requeue),
+                    ..Decision::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let after = queue.get(&legacy.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Held);
+        assert_eq!(after.hold_source, None);
+        assert_eq!(after.hold_reason, legacy.hold_reason);
+        assert_eq!(after.blocked_by, legacy.blocked_by);
     }
 
     #[test]

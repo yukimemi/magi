@@ -2453,7 +2453,7 @@ async fn queue_hold(
     };
     let reason = body.reason.filter(|r| !r.trim().is_empty());
     mutate(ui, id, move |t| {
-        t.hold(reason.clone());
+        t.hold_manual(reason.clone());
         Ok(())
     })
     .await
@@ -5297,7 +5297,7 @@ mod tests {
             PathBuf::from("/repo/magi"),
             Source::Human,
         );
-        task.hold(Some("waiting on 3ed9".to_owned()));
+        task.hold_manual(Some("waiting on 3ed9".to_owned()));
         queue.put(&mut task).expect("file the held task");
 
         let done = f.post(&format!("/api/queue/{}/done", task.id), None).await;

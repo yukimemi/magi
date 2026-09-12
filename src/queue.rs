@@ -38,6 +38,11 @@ use serde::{Deserialize, Serialize};
 
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
 ///
+/// 3: added [`HoldSource`] so conductor recovery cannot release a hold an
+/// operator deliberately placed. Old records default to `None` and are
+/// protected as operator-held until an explicit release; the safe direction
+/// when their author was never recorded.
+///
 /// 2: added [`TaskStatus::Blocked`], [`Task::blocked_by`] and
 /// [`Task::block_reason`] (`crate::conduct`'s decisions) and
 /// [`Task::answers`] (operator answers carried forward to the next
@@ -47,7 +52,27 @@ use serde::{Deserialize, Serialize};
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
+
+/// Who placed the current hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HoldSource {
+    /// An operator used the CLI or web UI.
+    Manual,
+    /// The daemon or conductor placed the hold as part of its own recovery.
+    Machine,
+}
+
+impl HoldSource {
+    /// Short human-facing label for reports and the CLI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Machine => "machine",
+        }
+    }
+}
 
 /// Where a task came from. Recorded because "who asked for this" is the first
 /// question about an autonomous run, and the answer is not recoverable later.
@@ -173,12 +198,16 @@ pub struct Task {
     /// explain is still a valid hold. The queue has no way to express a
     /// dependency between two tasks, so on the occasions a hold really is
     /// "wait for that other task first", this is the only place that reason
-    /// survives - see [`Task::hold`] and [`Task::release`].
+    /// survives - see [`Task::hold_manual`] and [`Task::release`].
     ///
     /// `#[serde(default)]` so a queue file written before this field existed
     /// still reads, with no reason recorded rather than a parse error.
     #[serde(default)]
     pub hold_reason: Option<String>,
+    /// Who placed [`Task::hold_reason`].  `None` is a compatible old record;
+    /// see [`Task::operator_held`] for its deliberately conservative meaning.
+    #[serde(default)]
+    pub hold_source: Option<HoldSource>,
     /// Diagnostic detail excerpted from the run that led to a hold - what a
     /// human would have found opening `artifacts/` by hand, not the one-line
     /// reason in [`Task::last_error`]. Set only when a run's own attempts are
@@ -270,6 +299,7 @@ impl Task {
             runs: Vec::new(),
             last_error: None,
             hold_reason: None,
+            hold_source: None,
             diagnostic: None,
             blocked_by: Vec::new(),
             block_reason: None,
@@ -307,6 +337,7 @@ impl Task {
         self.status = TaskStatus::Done;
         self.last_error = None;
         self.hold_reason = None;
+        self.hold_source = None;
         self.diagnostic = None;
     }
 
@@ -324,6 +355,7 @@ impl Task {
         self.last_error = Some(why.into());
         self.diagnostic = None;
         self.status = if self.attempts >= max_attempts {
+            self.hold_source = Some(HoldSource::Machine);
             TaskStatus::Held
         } else {
             TaskStatus::Failed
@@ -346,17 +378,31 @@ impl Task {
         self.status = TaskStatus::Failed;
     }
 
-    /// Take this task out of the loop's reach without deleting it.
+    /// Whether this held task may only be released by an operator.
     ///
-    /// `reason` replaces whatever was recorded before when it is given.
-    /// Passing `None` - the loop's own holds do this - leaves any existing
-    /// reason alone, so a machine-initiated hold cannot erase what a human
-    /// wrote down about a previous one.
-    pub fn hold(&mut self, reason: Option<String>) {
+    /// Old files did not record a source. Preserve every such hold rather
+    /// than guessing that it was automatic and risking duplicate work. New
+    /// automatic holds record [`HoldSource::Machine`] and remain recoverable.
+    pub fn operator_held(&self) -> bool {
+        self.status == TaskStatus::Held && !matches!(self.hold_source, Some(HoldSource::Machine))
+    }
+
+    /// Take this task out of the loop's reach by an operator action.
+    pub fn hold_manual(&mut self, reason: Option<String>) {
         self.status = TaskStatus::Held;
         if reason.is_some() {
             self.hold_reason = reason;
         }
+        self.hold_source = Some(HoldSource::Manual);
+    }
+
+    /// Take this task out of the loop's reach during automatic recovery.
+    pub fn hold_machine(&mut self, reason: Option<String>) {
+        self.status = TaskStatus::Held;
+        if reason.is_some() {
+            self.hold_reason = reason;
+        }
+        self.hold_source = Some(HoldSource::Machine);
     }
 
     /// Block this task on other task ids and/or open question ids, chosen by
@@ -473,6 +519,7 @@ impl Task {
         self.last_error = Some(why.into());
         self.diagnostic = None;
         self.status = TaskStatus::Held;
+        self.hold_source = Some(HoldSource::Machine);
     }
 
     /// Put a held or finished task back in line, with its attempt count reset
@@ -485,6 +532,7 @@ impl Task {
         // Otherwise the next person who holds this task reads a reason that
         // belonged to whatever it was waiting on last time.
         self.hold_reason = None;
+        self.hold_source = None;
         self.diagnostic = None;
         // A release also un-blocks: the dependency or question `blocked_by`
         // named may still be unresolved, but a human (or `crate::conduct`)
@@ -843,7 +891,7 @@ mod tests {
 
         // Priority first...
         assert_eq!(q.next_runnable().unwrap().id, c.id);
-        c.hold(None);
+        c.hold_machine(None);
         q.put(&mut c).unwrap();
         // ...then oldest, so a burst of new work cannot starve older work.
         assert_eq!(q.next_runnable().unwrap().id, a.id);
@@ -871,7 +919,7 @@ mod tests {
         q.put(&mut t).unwrap();
         assert!(q.next_runnable().is_some());
 
-        t.hold(None);
+        t.hold_machine(None);
         q.put(&mut t).unwrap();
         assert!(
             q.next_runnable().is_none(),
@@ -958,7 +1006,7 @@ mod tests {
     #[test]
     fn a_hold_reason_survives_and_a_release_clears_it() {
         let mut t = task("waiting on something else");
-        t.hold(Some(
+        t.hold_manual(Some(
             "waiting for 20260101-000000-aaaa to land first".to_owned(),
         ));
         assert_eq!(t.status, TaskStatus::Held);
@@ -968,7 +1016,7 @@ mod tests {
         );
 
         // Holding again with no reason must not erase the one already there.
-        t.hold(None);
+        t.hold_manual(None);
         assert_eq!(
             t.hold_reason.as_deref(),
             Some("waiting for 20260101-000000-aaaa to land first"),
@@ -977,7 +1025,7 @@ mod tests {
 
         // A hold with no reason at all is still an ordinary, allowed hold.
         let mut plain = task("no reason given");
-        plain.hold(None);
+        plain.hold_manual(None);
         assert_eq!(plain.status, TaskStatus::Held);
         assert!(plain.hold_reason.is_none());
 
@@ -996,7 +1044,7 @@ mod tests {
         // task held for "waiting on 3ed9" and then closed without ever being
         // released must not still read as waiting on it afterwards.
         let mut t = task("landed by hand while held");
-        t.hold(Some("waiting on 3ed9".to_owned()));
+        t.hold_manual(Some("waiting on 3ed9".to_owned()));
         assert_eq!(t.hold_reason.as_deref(), Some("waiting on 3ed9"));
 
         t.succeed();
@@ -1201,7 +1249,7 @@ mod tests {
         let mut queued = task("waiting");
         queued.edit("x".to_owned(), "y".to_owned()).unwrap();
         let mut held = task("parked");
-        held.hold(None);
+        held.hold_machine(None);
         held.edit("x".to_owned(), "y".to_owned()).unwrap();
     }
 
@@ -1229,6 +1277,35 @@ mod tests {
 
         let task = q.get("20260101-000000-aaaa").expect("must still read");
         assert!(task.hold_reason.is_none());
+        assert!(task.operator_held());
+    }
+
+    #[test]
+    fn a_legacy_reasoned_hold_defaults_to_operator_protection() {
+        let (_dir, q) = queue();
+        let path = q.path_of("20260101-000000-bbbb");
+        std::fs::create_dir_all(q.root()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": 2,
+                "id": "20260101-000000-bbbb",
+                "title": "old manual recovery",
+                "instruction": "old manual recovery",
+                "repo": ".",
+                "source": { "kind": "human" },
+                "status": "held",
+                "hold_reason": "active manual recovery run20260912-224242-daf5",
+                "created_at": Timestamp::now().to_string(),
+                "updated_at": Timestamp::now().to_string(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let task = q.get("20260101-000000-bbbb").expect("must still read");
+        assert_eq!(task.hold_source, None);
+        assert!(task.operator_held());
     }
 
     #[test]

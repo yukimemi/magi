@@ -1609,6 +1609,9 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             if let Some(r) = &t.hold_reason {
                 println!("held for  {r}");
             }
+            if let Some(source) = t.hold_source {
+                println!("hold source  {}", source.label());
+            }
             if !t.blocked_by.is_empty() {
                 println!("blocked on {}", t.blocked_by.join(", "));
                 if let Some(r) = &t.block_reason {
@@ -1626,9 +1629,13 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
         }
 
         TaskCmd::Hold { id, reason } => {
-            let mut t = q.get(&id)?;
+            let resolved = q.resolve_id(&id)?;
+            let _claim = q
+                .claim(&resolved)
+                .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
+            let mut t = q.get(&resolved)?;
             let reason = reason.join(" ");
-            t.hold((!reason.is_empty()).then_some(reason));
+            t.hold_manual((!reason.is_empty()).then_some(reason));
             q.put(&mut t)?;
             println!("held {} {}", t.short(), t.title);
             Ok(())
@@ -1678,7 +1685,11 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
         }
 
         TaskCmd::Release { id } => {
-            let mut t = q.get(&id)?;
+            let resolved = q.resolve_id(&id)?;
+            let _claim = q
+                .claim(&resolved)
+                .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
+            let mut t = q.get(&resolved)?;
             t.release();
             q.put(&mut t)?;
             println!("queued {} {}", t.short(), t.title);

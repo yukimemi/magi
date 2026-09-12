@@ -904,6 +904,10 @@ pub struct ConductTask {
     pub max_attempts: usize,
     /// Why the last attempt did not land.
     pub last_error: Option<String>,
+    /// The reason an operator or machine placed a hold.
+    pub hold_reason: Option<String>,
+    /// `manual` or `machine` when the hold source is known.
+    pub hold_source: Option<String>,
     /// This task's current `crate::queue::Task::blocked_by`, if any.
     pub blocked_by: Vec<String>,
     /// Questions asked about this task and what the operator said back — see
@@ -1007,6 +1011,10 @@ fn conduct_task_block(t: &ConductTask) -> String {
     if let Some(e) = &t.last_error {
         let _ = writeln!(s, "  last_error: {e}");
     }
+    if let Some(reason) = &t.hold_reason {
+        let source = t.hold_source.as_deref().unwrap_or("legacy");
+        let _ = writeln!(s, "  hold_reason ({source}): {reason}");
+    }
     if !t.blocked_by.is_empty() {
         let _ = writeln!(s, "  blocked_by: {}", t.blocked_by.join(", "));
     }
@@ -1070,13 +1078,15 @@ pub fn conduct(
 
     s.push_str(
         "# Finished tasks\n\n\
-         `failed` or `held`, and nobody has decided what to do about them \
+         `failed` or machine-held, and nobody has decided what to do about them \
          yet. Each carries how its last run ended: every review round's \
          findings and how the fixer treated each one — addressed, or \
          rejected with a reason — not only the last round's. The same \
          argument raised and declined the same way in every round is a \
          settled disagreement; a finding that was never rejected and never \
          addressed is simply unfixed. Tell them apart.\n\n\
+         A `manual` (or `legacy`) hold is operator-owned evidence, not a \
+         recovery target: leave it out of your reply.\n\n\
          Choose one via `recovery`:\n\
          - `requeue` — back in line, a fresh competition from scratch.\n\
          - `hold` — leave it for a human.\n\
@@ -1660,6 +1670,8 @@ mod tests {
             attempts: 0,
             max_attempts: 2,
             last_error: None,
+            hold_reason: None,
+            hold_source: None,
             blocked_by: Vec::new(),
             answers: Vec::new(),
         }
@@ -1697,6 +1709,35 @@ mod tests {
             "an answered question's content must reach the task's own entry, \
              not only the fact that it is no longer blocking: {body}"
         );
+    }
+
+    #[test]
+    fn a_hold_reason_and_source_reach_the_conductor_prompt() {
+        let mut t = conduct_task("t4");
+        t.status = "held".to_owned();
+        t.hold_reason = Some("manual recovery is active".to_owned());
+        t.hold_source = Some("manual".to_owned());
+        let body = conduct(
+            &[],
+            &[],
+            &[ConductFinished {
+                task: t,
+                outcome: ConductOutcome {
+                    run_id: "run-1".to_owned(),
+                    unreadable: None,
+                    run_status: None,
+                    open_findings: Vec::new(),
+                    rounds_used: 0,
+                    rounds_max: 0,
+                    rounds: Vec::new(),
+                    branch: None,
+                    branch_head: None,
+                },
+            }],
+            "en",
+        );
+        assert!(body.contains("hold_reason (manual): manual recovery is active"));
+        assert!(body.contains("operator-owned evidence"));
     }
 
     #[test]
