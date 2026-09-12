@@ -428,15 +428,21 @@ mod tests {
     }
 
     #[test]
-    fn review_parses_with_optional_fields_missing() {
+    fn review_parses_with_optional_finding_fields_missing() {
         let r: Review = extract_json(
-            r#"{"vote":"reject","findings":[{"severity":"blocker","title":"panics on empty input"}]}"#,
+            r#"{"summary":"empty input panics","vote":"reject","findings":[{"severity":"blocker","title":"panics on empty input"}]}"#,
         )
         .unwrap();
         assert_eq!(r.findings.len(), 1);
         assert!(r.findings[0].file.is_none());
         assert_eq!(r.findings[0].id, "");
         assert_eq!(r.vote, ReviewVote::Reject);
+    }
+
+    #[test]
+    fn review_without_a_summary_is_rejected_rather_than_defaulted() {
+        let err = extract_json::<Review>(r#"{"vote":"approve","findings":[]}"#).unwrap_err();
+        assert!(err.to_string().contains("no JSON object"), "{err}");
     }
 
     #[test]
