@@ -807,6 +807,7 @@ mod tests {
     /// runtime into a test that does no other async work.
     fn tokio_test_block_on<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap()
             .block_on(f)
