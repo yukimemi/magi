@@ -95,6 +95,26 @@ async fn actionable_non_blocking_reject_is_open_not_clean() {
         "a non-blocking reject is not a fixer task"
     );
     assert_eq!(runner.state.status, RunStatus::Blocked);
+
+    let id = runner.state.id.clone();
+    drop(runner);
+
+    // Re-enter through the public resume path: a solo-candidate run revisits
+    // the graph before `review_loop`, so this catches a conclusion derived
+    // from findings alone rather than the persisted reject verdict.
+    let mut resumed = Runner::resume(&id).expect("resume");
+    resumed.execute().await.expect("resume execution");
+    assert_eq!(resumed.state.status, RunStatus::Blocked);
+    assert!(
+        resumed.state.gate.is_empty(),
+        "a resumed reject must not enter the gate: {:#?}",
+        resumed.state
+    );
+    assert!(
+        resumed.state.merge.is_none(),
+        "a resumed reject must not be merged: {:#?}",
+        resumed.state
+    );
 }
 
 #[tokio::test]

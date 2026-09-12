@@ -3482,6 +3482,9 @@ fn review_conclusion(reviews: &[ReviewRound], max_rounds: usize) -> Option<RunSt
         return Some(RunStatus::Gating);
     }
     let last = reviews.last()?;
+    if last.verdict == Some(ReviewVote::Reject) {
+        return Some(RunStatus::Blocked);
+    }
     let stagnant = reviews.iter().rev().take_while(|r| !r.progressed).count() >= STAGNANT_LIMIT;
     if reviews.len() < max_rounds && !stagnant {
         return None;
@@ -4110,6 +4113,13 @@ mod tests {
         // Missing input, not a verified tree — never a hand-off candidate.
         let rounds = vec![review_round(false, 0, 1, 2, false, true)];
         assert_eq!(review_conclusion(&rounds, 1), Some(RunStatus::Blocked));
+    }
+
+    #[test]
+    fn review_conclusion_blocks_a_reject_even_when_e2e_is_green() {
+        let mut round = review_round(false, 0, 2, 2, false, true);
+        round.verdict = Some(ReviewVote::Reject);
+        assert_eq!(review_conclusion(&[round], 1), Some(RunStatus::Blocked));
     }
 
     #[test]

@@ -181,12 +181,18 @@ pub struct Review {
 }
 
 impl Review {
-    /// Rejecting a patch without a finding leaves neither the fixer nor the
-    /// operator anything actionable. It is not a clean review merely because
-    /// no finding id can be assigned to it.
+    /// A reservation or rejection without a finding leaves neither the fixer
+    /// nor the operator anything actionable. It is not a clean review merely
+    /// because no finding id can be assigned to it.
     pub fn validate(&self) -> Result<()> {
-        if self.vote == ReviewVote::Reject && self.findings.is_empty() {
-            bail!("a reject review must include at least one actionable finding");
+        if matches!(
+            self.vote,
+            ReviewVote::ApproveWithFindings | ReviewVote::Reject
+        ) && self.findings.is_empty()
+        {
+            bail!(
+                "a review with findings or a reject vote must include at least one actionable finding"
+            );
         }
         Ok(())
     }
@@ -460,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_review_needs_an_actionable_finding_but_clean_approval_does_not() {
+    fn reserved_or_reject_review_needs_an_actionable_finding_but_clean_approval_does_not() {
         let clean: Review =
             extract_json(r#"{"summary":"looks good","vote":"approve","findings":[]}"#).unwrap();
         clean.validate().unwrap();
@@ -468,6 +474,12 @@ mod tests {
         let reject: Review =
             extract_json(r#"{"summary":"compile error","vote":"reject","findings":[]}"#).unwrap();
         assert!(reject.validate().is_err());
+
+        let reserved: Review = extract_json(
+            r#"{"summary":"consider a comment","vote":"approve_with_findings","findings":[]}"#,
+        )
+        .unwrap();
+        assert!(reserved.validate().is_err());
     }
 
     #[test]
