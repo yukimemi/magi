@@ -169,17 +169,21 @@ fn parse_unix_kill_output(success: bool, stderr: &[u8]) -> bool {
 /// `tasklist /FO CSV` の出力を解釈する。一致しない場合、要求した PID の
 /// フィールドを持つ行は存在しない。
 #[cfg(any(windows, test))]
-fn parse_windows_tasklist_output(pid: u32, stdout: &[u8]) -> bool {
+fn parse_windows_tasklist_output(pid: u32, stdout: &[u8]) -> std::io::Result<bool> {
     let expected = pid.to_string();
-    String::from_utf8_lossy(stdout).lines().any(|line| {
-        tasklist_csv_fields(line)
-            .is_some_and(|fields| fields.get(1).is_some_and(|field| field == &expected))
-    })
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(tasklist_csv_fields)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| std::io::Error::other("could not parse tasklist CSV output"))
+        .map(|rows| {
+            rows.into_iter()
+                .any(|fields| fields.get(1).is_some_and(|field| field == &expected))
+        })
 }
 
 /// `tasklist` が出す、二重引用符と `""` エスケープを持つ CSV の一行を分ける。
-/// 壊れた CSV は PID 不一致として扱う。コマンド失敗の利用不能判定は呼び出し側が
-/// 保持する。
+/// 壊れた CSV は呼び出し側が利用不能として保持できるよう `None` を返す。
 #[cfg(any(windows, test))]
 fn tasklist_csv_fields(line: &str) -> Option<Vec<String>> {
     let mut fields = Vec::new();
@@ -214,7 +218,7 @@ fn tasklist_result(
     status: &str,
 ) -> std::io::Result<bool> {
     if success {
-        Ok(parse_windows_tasklist_output(pid, stdout))
+        parse_windows_tasklist_output(pid, stdout)
     } else {
         Err(std::io::Error::other(format!(
             "tasklist exited {status}: {}",
@@ -356,18 +360,31 @@ mod tests {
     #[test]
     fn windows_tasklist_csv_parsing_handles_match_no_match_and_error() {
         let pid = 12345;
-        assert!(parse_windows_tasklist_output(
-            pid,
-            b"\"magi.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n"
-        ));
-        assert!(parse_windows_tasklist_output(
-            pid,
-            b"\"magi,worker.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n"
-        ));
-        assert!(!parse_windows_tasklist_output(
-            pid,
-            b"INFO: No tasks are running which match the specified criteria.\r\n"
-        ));
+        assert!(
+            parse_windows_tasklist_output(
+                pid,
+                b"\"magi.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n"
+            )
+            .expect("整形式 CSV の一致行は生存を示す")
+        );
+        assert!(
+            parse_windows_tasklist_output(
+                pid,
+                b"\"magi,worker.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n"
+            )
+            .expect("カンマ入りイメージ名でも PID 列を読む")
+        );
+        assert!(
+            !parse_windows_tasklist_output(
+                pid,
+                b"INFO: No tasks are running which match the specified criteria.\r\n"
+            )
+            .expect("tasklist の no-match 出力は整形式である")
+        );
+        assert!(
+            parse_windows_tasklist_output(pid, b"\"magi.exe\",\"12345").is_err(),
+            "壊れた CSV は死亡ではなく利用不能である"
+        );
         assert!(
             tasklist_result(
                 pid,
