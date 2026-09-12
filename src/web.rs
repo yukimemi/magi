@@ -3557,19 +3557,14 @@ async fn talk_pending_resume(
 /// call, and `talk_say`'s busy path, when it reclaims a slot the previous
 /// holder just gave up - see the comment at that call site.
 ///
-/// The release is folded into the same critical section as the last
-/// `talk::drain` call, both gated on `turn`'s own lock - the same lock
-/// [`Ui::begin_talk_turn`] takes to decide "busy or free". A plain `drain`
-/// followed by a separate drop of `turn` would leave a gap between the two:
-/// a `say` arriving in exactly that gap sees "busy", queues through
-/// `talk::queue`, and - without this - would sit unanswered until some
-/// unrelated later `say` happened to drain it, because the loop that was
-/// supposed to pick it up had already decided there was nothing left and
-/// walked away. Holding `turn`'s lock across the read makes the two
-/// decisions - "is there anything queued" and "should the slot be released"
-/// - indivisible, so any `say` that is told "busy" while this loop still
-///   holds the lock is guaranteed to have its `talk::queue` write land before
-///   the next time this loop reads `pending`.
+/// The release is folded into the final generation check under `turn`'s own
+/// lock - the same lock [`Ui::begin_talk_turn`] takes to decide "busy or
+/// free". Before its blocking `talk::drain`, this loop observes the queued
+/// generation. A `say` that sees the turn busy writes its draft, then advances
+/// that generation. Thus, if it lands while the drain is in flight, the final
+/// check observes the advance and drains again; otherwise it releases the
+/// claim while holding the same lock. This keeps the release/arrival handoff
+/// atomic without holding the global claim mutex across filesystem I/O.
 async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn: TalkTurnGuard) {
     let live_set = Arc::clone(&turn.turns);
     // `Option` rather than binding `turn` directly to a `_turn` that lives
@@ -3584,7 +3579,9 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
         // `talk::drain` takes the store lock and can write/rename the talk
         // file. Keep the turn mutex out of that synchronous work: it protects
         // every talk's in-memory claim, not this talk's disk operation.
-        let observed = lock_or_recover(&live_set)
+        let observed = live_set
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .queued
             .get(&id)
             .copied()
@@ -3600,7 +3597,11 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
         let (next_talk, result) = match drained {
             Ok(drained) => drained,
             Err(e) => {
-                tracing::warn!("talk {id} could not start queued-text drain: {e:#}");
+                tracing::warn!(
+                    status = %e.status,
+                    message = %e.message,
+                    "talk {id} could not start queued-text drain"
+                );
                 let mut live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
                 turn.take()
                     .expect("held for the whole loop until released here")
@@ -3646,6 +3647,13 @@ async fn talk_pending_clear(
     blocking(move || {
         let id = resolve_talk(&ui.talks, &id)?;
         let mut talk = ui.talks.get(&id)?;
+        if !talk.status.open() {
+            return Err(ApiError::conflict(format!(
+                "talk {} is {} and takes no more turns",
+                talk.short(),
+                talk.status.as_str()
+            )));
+        }
         if !talk::clear_pending_if_matches(
             &mut talk,
             &ui.talks,
@@ -5241,7 +5249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_talk_refuses_pending_resume_and_edit() {
+    async fn closed_talk_refuses_pending_mutations_without_changing_the_record() {
         let (_tmp, _repo, f) = talk_fixture().await;
         let id = f.post("/api/talks", None).await.json()["id"]
             .as_str()
@@ -5249,8 +5257,14 @@ mod tests {
             .to_owned();
         let closed = f.post(&format!("/api/talks/{id}/close"), None).await;
         assert_eq!(closed.status, 200, "{}", closed.body);
+        let before_clear = serde_json::to_value(f.talks().get(&id).expect("closed talk"))
+            .expect("serialize closed talk");
         for (path, body) in [
             (format!("/api/talks/{id}/pending/resume"), None),
+            (
+                format!("/api/talks/{id}/pending/clear"),
+                Some(r#"{"expected_text":"","expected_attachments":[]}"#),
+            ),
             (
                 format!("/api/talks/{id}/pending/edit"),
                 Some(r#"{"text":"x","expected_text":"","expected_attachments":[]}"#),
@@ -5260,7 +5274,12 @@ mod tests {
             let response = f.post(&path, body).await;
             assert_eq!(response.status, 409, "{}", response.body);
         }
-        assert!(f.talks().get(&id).expect("closed talk").turns.is_empty());
+        let after_clear = serde_json::to_value(f.talks().get(&id).expect("closed talk"))
+            .expect("serialize closed talk");
+        assert_eq!(
+            after_clear, before_clear,
+            "clear must not rewrite a closed talk"
+        );
     }
 
     /// Keeps both claims observable long enough to exercise the distinction
