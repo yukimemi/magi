@@ -87,6 +87,28 @@ impl Quiet for tokio::process::Command {
 /// than as license to reclaim.
 #[must_use]
 pub fn pid_alive(pid: u32) -> bool {
+    pid_alive_with(pid, platform_pid_alive)
+}
+
+/// Apply the conservative policy to one platform liveness query.
+///
+/// Kept separate from the OS command so queue and daemon tests can exercise
+/// dead, live, and unavailable answers without requiring permission to list
+/// the machine's processes.
+fn pid_alive_with<F>(pid: u32, query: F) -> bool
+where
+    F: FnOnce(u32) -> std::io::Result<bool>,
+{
+    match query(pid) {
+        Ok(alive) => alive,
+        Err(error) => {
+            tracing::debug!(%pid, %error, "process liveness query unavailable; treating pid as alive");
+            true
+        }
+    }
+}
+
+fn platform_pid_alive(pid: u32) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
         match std::process::Command::new("kill")
@@ -94,16 +116,16 @@ pub fn pid_alive(pid: u32) -> bool {
             .arg(pid.to_string())
             .output()
         {
-            Ok(o) if o.status.success() => true,
+            Ok(o) if o.status.success() => Ok(true),
             Ok(o) => {
                 // "No such process" is the one answer that actually means the
                 // pid is gone. Anything else - most commonly "Operation not
                 // permitted" for a pid that exists under another account - is
                 // not evidence of that.
                 let stderr = String::from_utf8_lossy(&o.stderr).to_lowercase();
-                !stderr.contains("no such process")
+                Ok(!stderr.contains("no such process"))
             }
-            Err(_) => true,
+            Err(error) => Err(error),
         }
     }
     #[cfg(windows)]
@@ -114,14 +136,20 @@ pub fn pid_alive(pid: u32) -> bool {
             .output();
         match out {
             Ok(o) if o.status.success() => {
-                String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\""))
+                Ok(String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
             }
-            _ => true,
+            Ok(o) => Err(std::io::Error::other(format!(
+                "tasklist exited {}: {}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim()
+            ))),
+            Err(error) => Err(error),
         }
     }
     #[cfg(not(any(unix, windows)))]
     {
-        true
+        let _ = pid;
+        Ok(true)
     }
 }
 
@@ -226,15 +254,15 @@ mod tests {
     }
 
     #[test]
-    fn this_process_is_alive_and_a_pid_nothing_ever_reuses_is_not() {
-        assert!(pid_alive(std::process::id()), "this test is running");
-        // Not `u32::MAX`: Windows' `tasklist` answers a pid that large with
-        // "invalid query" rather than "no such process", which this helper
-        // - correctly - cannot tell apart from a check it simply could not
-        // run, so it reads as alive. A pid past any real process table but
-        // still a value `tasklist` accepts as a query is the one this test
-        // can assert on without racing whatever else is running on the
-        // machine.
-        assert!(!pid_alive(999_999_999));
+    fn pid_liveness_policy_is_deterministic_without_an_os_process_query() {
+        assert!(pid_alive_with(42, |_| Ok(true)));
+        assert!(!pid_alive_with(42, |_| Ok(false)));
+    }
+
+    #[test]
+    fn an_unavailable_process_query_is_never_mistaken_for_a_dead_process() {
+        assert!(pid_alive_with(42, |_| Err(std::io::Error::other(
+            "access denied"
+        ))));
     }
 }

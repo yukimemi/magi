@@ -567,6 +567,16 @@ pub fn is_working_on_task(home: &Path, task: &str, now: Timestamp) -> bool {
 /// noticing a lock some other, now-dead, daemon left behind just as readily
 /// as one it trips over on the way up.
 pub fn sweep_stale_claims(queue: &Queue, older_than: Duration) -> Vec<String> {
+    sweep_stale_claims_with(queue, older_than, crate::proc::pid_alive)
+}
+
+/// [`sweep_stale_claims`] with its process-query boundary supplied by the
+/// caller. This keeps the lock policy testable where process listing is
+/// unavailable, while production still uses the platform query above.
+fn sweep_stale_claims_with<F>(queue: &Queue, older_than: Duration, pid_alive: F) -> Vec<String>
+where
+    F: Fn(u32) -> bool,
+{
     let this_process = std::process::id();
     let mut swept: Vec<String> = std::fs::read_dir(queue.root())
         .into_iter()
@@ -583,7 +593,7 @@ pub fn sweep_stale_claims(queue: &Queue, older_than: Duration) -> Vec<String> {
                 // now, so it is definitionally still alive - settled without
                 // spawning a helper process at all.
                 Some(pid) if pid == this_process => false,
-                Some(pid) => !crate::proc::pid_alive(pid),
+                Some(pid) => !pid_alive(pid),
                 None => p
                     .metadata()
                     .and_then(|m| m.modified())
@@ -2658,13 +2668,7 @@ mod tests {
         drop(claim);
     }
 
-    /// A pid past any real process table, but not `u32::MAX`: Windows'
-    /// `tasklist` answers that one with "invalid query" rather than "no such
-    /// process", which [`crate::proc::pid_alive`] - correctly - cannot tell
-    /// apart from a check it simply could not run, so it would read as
-    /// alive. See `proc::tests` for the same choice made for the same
-    /// reason.
-    const DEAD_PID: u32 = 999_999_999;
+    const DEAD_PID: u32 = 42;
 
     #[test]
     fn a_lock_naming_a_dead_pid_is_swept_at_once_regardless_of_age() {
@@ -2684,7 +2688,9 @@ mod tests {
         )
         .unwrap();
 
-        let swept = sweep_stale_claims(&queue, Duration::from_secs(6 * 60 * 60));
+        let swept = sweep_stale_claims_with(&queue, Duration::from_secs(6 * 60 * 60), |pid| {
+            pid != DEAD_PID
+        });
         assert_eq!(
             swept,
             vec![t.id.clone()],
@@ -2719,7 +2725,9 @@ mod tests {
         // Tick two, standing in for a poll long into this daemon's uptime:
         // the same function, called again, notices what only just appeared -
         // proving the sweep is not a one-shot startup check.
-        let swept = sweep_stale_claims(&queue, Duration::from_secs(6 * 60 * 60));
+        let swept = sweep_stale_claims_with(&queue, Duration::from_secs(6 * 60 * 60), |pid| {
+            pid != DEAD_PID
+        });
         assert_eq!(swept, vec![t.id.clone()]);
     }
 
@@ -2758,7 +2766,9 @@ mod tests {
         assert!(reclaim_orphaned_running(&queue, 2).is_empty());
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Running);
 
-        let swept = sweep_stale_claims(&queue, Duration::from_secs(6 * 60 * 60));
+        let swept = sweep_stale_claims_with(&queue, Duration::from_secs(6 * 60 * 60), |pid| {
+            pid != DEAD_PID
+        });
         assert_eq!(swept, vec![t.id.clone()]);
 
         let reclaimed = reclaim_orphaned_running(&queue, 2);
@@ -2774,6 +2784,24 @@ mod tests {
             vec!["20260904-000000-4043".to_owned()],
             "the crashed run's id is kept as evidence, not discarded"
         );
+    }
+
+    #[test]
+    fn a_lock_is_kept_when_the_process_query_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().to_path_buf());
+        let mut t = task();
+        t.id = "20260101-000000-unknown".to_owned();
+        queue.put(&mut t).unwrap();
+        std::fs::write(
+            dir.path().join(format!("{}.lock", t.id)),
+            DEAD_PID.to_string(),
+        )
+        .unwrap();
+
+        let swept = sweep_stale_claims_with(&queue, Duration::ZERO, |_| true);
+        assert!(swept.is_empty(), "an unknown pid must keep its lock");
+        assert!(queue.claim(&t.id).is_err(), "the lock remains protective");
     }
 
     fn run_state(status: RunStatus) -> RunState {
