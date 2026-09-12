@@ -3379,6 +3379,7 @@ function renderTalkPending(talk) {
   const box = $("talk-pending");
   const text = String(talk.pending || "");
   const attachments = Array.isArray(talk.pending_attachments) ? talk.pending_attachments : [];
+  const busy = Boolean(talk.thinking) || state.talkWaits.has(talk.id);
   clear(box);
   show(box, Boolean(text || attachments.length));
   if (!text && attachments.length === 0) return;
@@ -3386,7 +3387,7 @@ function renderTalkPending(talk) {
     el("p", { class: "panel-note", text: "Queued for the next reply" }),
     text ? el("pre", { class: "talk-pending-text", text }) : null,
     attachments.length ? el("p", { class: "frame-note", text: `${plural(attachments.length, "attachment", "attachments")} queued` }) : null,
-    el("button", { class: "btn", type: "button", text: "Resume queued draft", onclick: resumeTalkPending }),
+    !busy ? el("button", { class: "btn", type: "button", text: "Resume queued draft", onclick: resumeTalkPending }) : null,
     el("button", { class: "btn btn-quiet", type: "button", text: "Clear", onclick: clearTalkPending }),
     el("button", { class: "btn btn-quiet", type: "button", text: "Edit text", onclick: editTalkPending }),
   ]);
