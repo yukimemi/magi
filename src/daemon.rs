@@ -2668,7 +2668,11 @@ mod tests {
         drop(claim);
     }
 
-    const DEAD_PID: u32 = 42;
+    /// このテストプロセスにはなり得ない決定的なフィクスチャ PID。
+    /// OS 上の状態は意図的に無関係で、各利用箇所が方針問い合わせを注入する。
+    fn injected_dead_pid() -> u32 {
+        std::process::id().checked_add(1).unwrap_or(1)
+    }
 
     #[test]
     fn a_lock_naming_a_dead_pid_is_swept_at_once_regardless_of_age() {
@@ -2677,6 +2681,7 @@ mod tests {
         let mut t = task();
         t.id = "20260101-000000-dead".to_owned();
         queue.put(&mut t).unwrap();
+        let dead_pid = injected_dead_pid();
 
         // Written directly rather than through `Queue::claim`, which would
         // stamp this test process's own very much alive pid and defeat the
@@ -2684,12 +2689,12 @@ mod tests {
         // like moments after it died, not six hours later.
         std::fs::write(
             dir.path().join(format!("{}.lock", t.id)),
-            DEAD_PID.to_string(),
+            dead_pid.to_string(),
         )
         .unwrap();
 
         let swept = sweep_stale_claims_with(&queue, Duration::from_secs(6 * 60 * 60), |pid| {
-            pid != DEAD_PID
+            pid != dead_pid
         });
         assert_eq!(
             swept,
@@ -2706,6 +2711,7 @@ mod tests {
         let mut t = task();
         t.id = "20260101-000000-late".to_owned();
         queue.put(&mut t).unwrap();
+        let dead_pid = injected_dead_pid();
 
         // Tick one, standing in for the sweep `poll` already runs at
         // startup: nothing to find yet.
@@ -2718,7 +2724,7 @@ mod tests {
         // `running`, well after this loop's own startup sweep already ran.
         std::fs::write(
             dir.path().join(format!("{}.lock", t.id)),
-            DEAD_PID.to_string(),
+            dead_pid.to_string(),
         )
         .unwrap();
 
@@ -2726,7 +2732,7 @@ mod tests {
         // the same function, called again, notices what only just appeared -
         // proving the sweep is not a one-shot startup check.
         let swept = sweep_stale_claims_with(&queue, Duration::from_secs(6 * 60 * 60), |pid| {
-            pid != DEAD_PID
+            pid != dead_pid
         });
         assert_eq!(swept, vec![t.id.clone()]);
     }
@@ -2749,12 +2755,13 @@ mod tests {
         // recovery table `reclaim` already has its own tests for.
         t.runs.push("20260904-000000-4043".to_owned());
         queue.put(&mut t).unwrap();
+        let dead_pid = injected_dead_pid();
 
         // The crashed daemon's own claim, naming a pid nothing on the
         // machine holds anymore.
         std::fs::write(
             dir.path().join(format!("{}.lock", t.id)),
-            DEAD_PID.to_string(),
+            dead_pid.to_string(),
         )
         .unwrap();
 
@@ -2767,7 +2774,7 @@ mod tests {
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Running);
 
         let swept = sweep_stale_claims_with(&queue, Duration::from_secs(6 * 60 * 60), |pid| {
-            pid != DEAD_PID
+            pid != dead_pid
         });
         assert_eq!(swept, vec![t.id.clone()]);
 
@@ -2793,9 +2800,10 @@ mod tests {
         let mut t = task();
         t.id = "20260101-000000-unknown".to_owned();
         queue.put(&mut t).unwrap();
+        let dead_pid = injected_dead_pid();
         std::fs::write(
             dir.path().join(format!("{}.lock", t.id)),
-            DEAD_PID.to_string(),
+            dead_pid.to_string(),
         )
         .unwrap();
 

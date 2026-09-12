@@ -126,15 +126,7 @@ fn platform_pid_alive(pid: u32) -> std::io::Result<bool> {
             .arg(pid.to_string())
             .output()
         {
-            Ok(o) if o.status.success() => Ok(true),
-            Ok(o) => {
-                // "No such process" is the one answer that actually means the
-                // pid is gone. Anything else - most commonly "Operation not
-                // permitted" for a pid that exists under another account - is
-                // not evidence of that.
-                let stderr = String::from_utf8_lossy(&o.stderr).to_lowercase();
-                Ok(!stderr.contains("no such process"))
-            }
+            Ok(o) => Ok(parse_unix_kill_output(o.status.success(), &o.stderr)),
             Err(error) => Err(error),
         }
     }
@@ -145,14 +137,13 @@ fn platform_pid_alive(pid: u32) -> std::io::Result<bool> {
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
             .output();
         match out {
-            Ok(o) if o.status.success() => {
-                Ok(String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
-            }
-            Ok(o) => Err(std::io::Error::other(format!(
-                "tasklist exited {}: {}",
-                o.status,
-                String::from_utf8_lossy(&o.stderr).trim()
-            ))),
+            Ok(o) => tasklist_result(
+                pid,
+                o.status.success(),
+                &o.stdout,
+                &o.stderr,
+                &o.status.to_string(),
+            ),
             Err(error) => Err(error),
         }
     }
@@ -160,6 +151,49 @@ fn platform_pid_alive(pid: u32) -> std::io::Result<bool> {
     {
         let _ = pid;
         Ok(true)
+    }
+}
+
+/// 数値の PID から推測せず、`kill -0` の終了状態と診断を解釈する。
+/// 明示的な "no such process" 診断だけを死亡の証拠とする。
+#[cfg(any(unix, test))]
+fn parse_unix_kill_output(success: bool, stderr: &[u8]) -> bool {
+    if success {
+        return true;
+    }
+    !String::from_utf8_lossy(stderr)
+        .to_lowercase()
+        .contains("no such process")
+}
+
+/// `tasklist /FO CSV` の出力を解釈する。一致しない場合、要求した PID の
+/// フィールドを持つ行は存在しない。
+#[cfg(any(windows, test))]
+fn parse_windows_tasklist_output(pid: u32, stdout: &[u8]) -> bool {
+    let expected = format!("\"{pid}\"");
+    String::from_utf8_lossy(stdout).lines().any(|line| {
+        line.split(',')
+            .nth(1)
+            .is_some_and(|field| field.trim() == expected)
+    })
+}
+
+/// `tasklist` の失敗を、利用不能な問い合わせとして保持する。
+#[cfg(any(windows, test))]
+fn tasklist_result(
+    pid: u32,
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+    status: &str,
+) -> std::io::Result<bool> {
+    if success {
+        Ok(parse_windows_tasklist_output(pid, stdout))
+    } else {
+        Err(std::io::Error::other(format!(
+            "tasklist exited {status}: {}",
+            String::from_utf8_lossy(stderr).trim()
+        )))
     }
 }
 
@@ -274,6 +308,50 @@ mod tests {
         assert!(pid_alive_with(42, |_| Err(std::io::Error::other(
             "access denied"
         ))));
+    }
+
+    /// 本番パーサー用のコマンド出力フィクスチャであり、特定 PID の OS 上の
+    /// 死亡状態を主張するものではない。
+    #[test]
+    fn unix_kill_output_only_marks_no_such_process_as_dead() {
+        assert!(parse_unix_kill_output(true, b""));
+        assert!(!parse_unix_kill_output(
+            false,
+            b"kill: (12345) - No such process\n"
+        ));
+        assert!(parse_unix_kill_output(
+            false,
+            b"kill: (12345) - Operation not permitted\n"
+        ));
+    }
+
+    /// 本番パーサー用のコマンド出力フィクスチャであり、OS の生存照会ではない。
+    /// 失敗した `tasklist` は死亡ではなく利用不能のままとする。
+    #[test]
+    fn windows_tasklist_csv_parsing_handles_match_no_match_and_error() {
+        let pid = 12345;
+        assert!(parse_windows_tasklist_output(
+            pid,
+            b"\"magi.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n"
+        ));
+        assert!(!parse_windows_tasklist_output(
+            pid,
+            b"INFO: No tasks are running which match the specified criteria.\r\n"
+        ));
+        assert!(
+            tasklist_result(
+                pid,
+                true,
+                b"\"magi.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n",
+                b"",
+                "exit status: 0",
+            )
+            .expect("CSV の一致行は生存を示す")
+        );
+
+        let error = tasklist_result(pid, false, b"", b"Access is denied.\r\n", "exit status: 1")
+            .expect_err("tasklist の失敗は死亡ではなく利用不能である");
+        assert!(error.to_string().contains("Access is denied."));
     }
 
     /// このテスト自身の PID を OS に問い合わせるスモーク診断。
