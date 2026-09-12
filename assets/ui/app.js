@@ -471,10 +471,13 @@ const state = {
      serverId, mime, bytes }` with `status` one of `"uploading"` /
      `"done"` / `"error"` - see `renderTalkThumbs`. */
   talkAttachments: { id: null, items: [] },
-  talkBusy: null,
-  talkBusyTurns: 0,
-  talkPending: null,
-  talkWaitFrom: 0,
+  /* Turns in flight, keyed by conversation id. The server allows one turn
+     per conversation, not one per browser surface: an entry must never stop
+     an unrelated conversation from sending. `target` is the transcript
+     length that proves this browser's own turn landed; reconstructed waits
+     use null and are cleared after a later transcript refresh sees the
+     server's claim released. */
+  talkWaits: new Map(),
   talkWaitTimer: null,
   /* Whether the current view was entered via a route change to the standing
      chat. Cleared after the first scroll, so a subsequent renderTalk() with
@@ -493,6 +496,7 @@ const state = {
 };
 
 let fallbackTimer = null;
+let nextTalkWaitGeneration = 1;
 
 /* ---- transport --------------------------------------------------------- */
 async function request(url, init) {
@@ -3095,6 +3099,7 @@ function sortTalks(list) {
 
 function createTalkCard() {
   const chipSlot = el("span");
+  const thinking = el("span", { class: "tag", "data-tone": "blue", text: "thinking…" });
   const whenSlot = el("time", { class: "card-when" });
   const title = el("h2", { class: "card-title" });
   const agent = el("span", { class: "repo" });
@@ -3104,11 +3109,11 @@ function createTalkCard() {
   const last = el("p", { class: "card-event" });
 
   const card = el("a", { class: "card" },
-    el("div", { class: "card-top" }, chipSlot, whenSlot),
+    el("div", { class: "card-top" }, chipSlot, thinking, whenSlot),
     title, meta, last,
   );
   const row = el("li", {}, card);
-  row.refs = { card, chipSlot, whenSlot, title, agent, turns, tasks, last };
+  row.refs = { card, chipSlot, thinking, whenSlot, title, agent, turns, tasks, last };
   return row;
 }
 
@@ -3125,6 +3130,7 @@ function updateTalkCard(row, talk) {
   const next = chip(status, TALK_STATUS);
   if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
   else r.chipSlot.append(next);
+  show(r.thinking, talkIsThinking(talk));
 
   const at = when(talk.updated_at || talk.created_at);
   setText(r.whenSlot, at.text);
@@ -3148,6 +3154,7 @@ function updateTalkCard(row, talk) {
 function renderTalks() {
   const list = $("talks-list");
   const talks = state.talks;
+  renderTalkIndicators();
 
   if (talks === null) {
     setText($("talks-count"), "Loading…");
@@ -3163,10 +3170,39 @@ function renderTalks() {
   syncList(list, sortTalks(talks), (t) => t.id, createTalkCard, updateTalkCard);
 }
 
+/* The rail and dock carry the same count as Questions' badges: conversations
+   this server currently reports as thinking. The accessible name says what
+   the bare numeral means. */
+function renderTalkIndicators() {
+  const count = (state.talks || []).filter(talkIsThinking).length;
+  for (const id of ["talk-badge-rail", "talk-badge-dock"]) {
+    const badge = $(id);
+    setText(badge, count > 99 ? "99+" : String(count));
+    show(badge, count > 0);
+  }
+  for (const link of document.querySelectorAll('[data-nav="talks"]')) {
+    setAttr(link, "aria-label", count > 0 ? `Chat, ${count} conversations thinking` : "Chat");
+  }
+}
+
+/* A wait is newer than an overlapping list read. Keep its activity visible
+   until a read that observed that same wait proves the server released it. */
+function talkIsThinking(talk) {
+  return Boolean(talk && (talk.thinking || state.talkWaits.has(talk.id)));
+}
+
 async function loadTalks() {
+  /* A response started before a send cannot revoke the wait that send just
+     created. Keep the per-talk generation that was current when this read
+     began, rather than comparing a late response with today's state. */
+  const observedAt = Date.now();
+  const observed = new Map([...state.talkWaits].map(([id, wait]) => [id, {
+    generation: wait.generation, startedAt: observedAt,
+  }]));
   try {
     const list = await getJson(API.talks);
     state.talks = Array.isArray(list) ? list : [];
+    for (const talk of state.talks) trackTalkThinking(talk, observed.get(talk.id));
     renderTalks();
     ok();
   } catch (error) {
@@ -3179,9 +3215,11 @@ async function loadTalks() {
    settled from here whether or not the reply landed while the operator was
    looking at something else. */
 async function loadTalk(id) {
+  const wait = state.talkWaits.get(id);
+  const observed = wait && { generation: wait.generation, startedAt: Date.now() };
   try {
     const talk = await getJson(API.talk(id));
-    if (state.talkBusy === id && talkTurns(talk).length >= state.talkBusyTurns + 2) endTalkTurn(id);
+    trackTalkThinking(talk, observed);
     if (state.talkDetail.id !== id) return;
     state.talkDetail.talk = talk;
     renderTalk();
@@ -3252,7 +3290,8 @@ function updateTalkTaskRow(row, task) {
 
 function renderTalk() {
   const talk = state.talkDetail.talk;
-  const busy = state.talkBusy !== null && state.talkBusy === state.talkDetail.id;
+  const wait = talk ? state.talkWaits.get(talk.id) : undefined;
+  const busy = Boolean(wait) || Boolean(talk && talk.thinking);
 
   if (!talk) {
     setText($("talk-h"), "Loading conversation…");
@@ -3275,9 +3314,8 @@ function renderTalk() {
      transcript on disk has grown past it - the ten-second re-read below
      replaces the whole conversation and would otherwise make the message
      the operator just sent vanish for the rest of the wait. */
-  const pending = busy && state.talkPending && state.talkPending.id === talk.id
-    && talkTurns(talk).length <= state.talkBusyTurns
-    ? [{ who: "operator", body: state.talkPending.body, at: state.talkPending.at }]
+  const pending = wait && wait.pending && talkTurns(talk).length <= wait.since
+    ? [{ who: "operator", body: wait.pending.body, at: wait.pending.at }]
     : [];
   const turns = [...talkTurns(talk), ...pending];
 
@@ -3298,13 +3336,13 @@ function renderTalk() {
     (item) => item.key, createTurnRow, updateTurnRow,
   );
 
-  /* Auto-scroll: the one-second tickTalkWait tick makes this stricter than a
+  /* Auto-scroll: the one-second tickTalkWaits tick makes this stricter than a
      one-shot render would need - turnCount must actually hold still across a
      render that changes nothing else, or the page would yank every second. */
   const turnCount = turns.length;
-  const lastIsPending = busy && state.talkPending
+  const lastIsPending = wait && wait.pending
     && turns.length > 0 && turns[turns.length - 1].who === "operator"
-    && turns[turns.length - 1].body === state.talkPending.body;
+    && turns[turns.length - 1].body === wait.pending.body;
   if (state.openingTalk) {
     state.openingTalk = false;
     if (turnCount > 0) requestAnimationFrame(() => scrollToLastTurn("talk-turns"));
@@ -3329,41 +3367,77 @@ function renderTalk() {
   renderTalkDelete(talk);
 }
 
-function tickTalkWait() {
+/* One timer services every busy conversation: it redraws the visible wait
+   strip and refreshes all conversations every ten seconds as insurance when
+   the change stream is unavailable. */
+function tickTalkWaits() {
+  const now = Date.now();
+  for (const [id, wait] of state.talkWaits) {
+    if (now - wait.lastPoll >= 10000) {
+      wait.lastPoll = now;
+      loadTalk(id);
+    }
+  }
+
   const box = $("talk-wait");
-  if (state.talkBusy === null) {
+  const wait = state.talkDetail.id ? state.talkWaits.get(state.talkDetail.id) : undefined;
+  if (!wait) {
     show(box, false);
     return;
   }
-  const secs = Math.max(Math.round((Date.now() - state.talkWaitFrom) / 1000), 0);
+  const secs = Math.max(Math.round((now - wait.waitFrom) / 1000), 0);
   setText(box.querySelector(".waiting-text"), secs >= 90
     ? "Still working — a standing chat turn can run for several minutes while the agent investigates. Long, but not stuck."
     : "The agent is looking into it.");
   setText(box.querySelector(".waiting-secs"), `${secs}s`);
-  show(box, state.talkBusy === state.talkDetail.id);
-
-  /* Cheap insurance for the case nothing else will tell this page the reply
-     landed: the turn was started somewhere else, or the stream is down. */
-  if (secs > 0 && secs % 10 === 0) loadTalk(state.talkBusy);
+  show(box, true);
 }
 
-function beginTalkTurn(id, before) {
-  state.talkBusy = id;
-  state.talkBusyTurns = before;
-  state.talkWaitFrom = Date.now();
-  tickTalkWait();
-  if (!state.talkWaitTimer) state.talkWaitTimer = setInterval(tickTalkWait, 1000);
+function beginTalkTurn(id, since, target, pending = null) {
+  state.talkWaits.set(id, {
+    since, target, pending, waitFrom: Date.now(), lastPoll: Date.now(),
+    generation: nextTalkWaitGeneration++, confirmed: target === null, missingClaimSince: null,
+  });
+  if (!state.talkWaitTimer) state.talkWaitTimer = setInterval(tickTalkWaits, 1000);
+  tickTalkWaits();
 }
 
 function endTalkTurn(id) {
-  if (state.talkBusy !== id) return;
-  state.talkBusy = null;
-  state.talkPending = null;
-  if (state.talkWaitTimer) {
+  if (!state.talkWaits.has(id)) return;
+  state.talkWaits.delete(id);
+  if (state.talkDetail.id === id) show($("talk-wait"), false);
+  if (state.talkWaits.size === 0 && state.talkWaitTimer) {
     clearInterval(state.talkWaitTimer);
     state.talkWaitTimer = null;
   }
-  show($("talk-wait"), false);
+}
+
+/* A TalkView can arrive from this browser, another device, or after reload.
+   A known local target is settled by transcript growth, never merely by a
+   claim disappearing: guard release and the reply write are distinct events.
+   `observed` identifies the wait a GET saw when it began, so an older false
+   response cannot release a later send. Once a matching response confirmed
+   the claim, one matching false only schedules suspicion: a second false
+   from a GET begun after that suspicion proves the process lost the claim,
+   so a restart cannot leave the composer stale forever. */
+function trackTalkThinking(talk, observed) {
+  const wait = state.talkWaits.get(talk.id);
+  if (wait) {
+    if (wait.target !== null && talkTurns(talk).length >= wait.target) endTalkTurn(talk.id);
+    else if (observed && observed.generation === wait.generation && talk.thinking) {
+      wait.confirmed = true;
+      wait.missingClaimSince = null;
+    } else if (!talk.thinking && observed && observed.generation === wait.generation
+      && wait.confirmed) {
+      if (wait.missingClaimSince !== null && observed.startedAt > wait.missingClaimSince) {
+        endTalkTurn(talk.id);
+      } else {
+        wait.missingClaimSince = Date.now();
+      }
+    }
+    return;
+  }
+  if (talk.thinking) beginTalkTurn(talk.id, talkTurns(talk).length, null);
 }
 
 function talkError(message) {
@@ -3485,6 +3559,7 @@ async function startTalk() {
     const talk = await postJson(API.talks, {});
     state.talks = sortTalks([talk, ...(state.talks || []).filter((t) => t.id !== talk.id)]);
     state.talkDetail = { id: talk.id, talk };
+    trackTalkThinking(talk);
     renderTalks();
     announce("Conversation opened.");
     location.hash = `#/chat/${talk.id}`;
@@ -3506,7 +3581,10 @@ async function sendTalkTurn(event) {
     ? state.talkAttachments.items.filter((item) => item.status === "done")
     : [];
 
-  if (!id || state.talkBusy !== null || talkAttachmentsBusy()) return;
+  /* A double tap is still refused for this conversation, but a turn on a
+     different conversation must not lock this surface. The server repeats
+     the same per-conversation rule for other devices. */
+  if (!id || state.talkWaits.has(id) || (state.talkDetail.talk && state.talkDetail.talk.thinking) || talkAttachmentsBusy()) return;
   if (!text.trim() && attachments.length === 0) {
     talkError("Say something, or attach an image, first.");
     box.focus();
@@ -3515,9 +3593,7 @@ async function sendTalkTurn(event) {
 
   talkError("");
   const before = talkTurns(state.talkDetail.talk).length;
-  beginTalkTurn(id, before);
-
-  state.talkPending = { id, body: text, at: new Date().toISOString() };
+  beginTalkTurn(id, before, before + 2, { body: text, at: new Date().toISOString() });
   box.value = "";
   renderTalk();
   $("talk-wait").scrollIntoView({ block: "nearest" });
@@ -3532,6 +3608,11 @@ async function sendTalkTurn(event) {
       text,
       attachments: attachments.map((item) => item.serverId),
     });
+    /* This 202 was received after the local wait was created, so it is the
+       matching observation that makes a later fresh false useful for
+       recovering from a process restart. */
+    const wait = state.talkWaits.get(id);
+    trackTalkThinking(queued, wait && { generation: wait.generation, startedAt: Date.now() });
     if (state.talkAttachments.id === id) resetTalkAttachments(id);
     if (state.talkDetail.id === id) {
       state.talkDetail.talk = queued;
