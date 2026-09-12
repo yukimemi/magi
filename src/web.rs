@@ -307,7 +307,7 @@ pub struct Ui {
     /// which are this process's own concurrency. A second `magi web` would not
     /// see it, and a second `magi web` on the same home is already a
     /// misconfiguration the queue's claims would catch first.
-    talk_turns: Arc<Mutex<HashSet<String>>>,
+    talk_turns: Arc<Mutex<TalkTurns>>,
     /// Runs this process is resuming right now.
     ///
     /// Separate from `talk_turns` because a run and a talk are different
@@ -569,10 +569,12 @@ impl Ui {
     /// [`Ui::begin_talk_turn`]. It is not conversation data and therefore is
     /// never persisted with a [`Talk`].
     fn is_thinking(&self, id: &str) -> bool {
-        self.talk_turns.lock().is_ok_and(|turns| turns.contains(id))
+        self.talk_turns
+            .lock()
+            .is_ok_and(|turns| turns.live.contains(id))
     }
 
-    /// Claim the right to run one turn in a talk, or refuse.
+    /// Claim the right to run one turn in a talk, or report that it is busy.
     ///
     /// A talk is strictly turn-based: the agent is resumed with the
     /// conversation it already has, so two turns running at once would resume
@@ -581,12 +583,8 @@ impl Ui {
     /// with two half-turns interleaved, which is unreadable and, worse,
     /// unfixable - there is no undo for a persisted turn.
     ///
-    /// Refusing with a conflict rather than queueing behind the first turn is
-    /// the deliberate half. A turn takes tens of seconds, so a phone on a slow
-    /// link is exactly the case where the operator taps send twice; queueing
-    /// would answer the second tap with a second agent turn on text they only
-    /// meant to send once, and would do it a minute later when they have
-    /// stopped looking. An immediate 409 is a thing the front end can act on.
+    /// A busy result is queued as a durable draft by [`talk_say`], rather than
+    /// starting a second CLI invocation for the same session.
     ///
     /// The lock is a `std::sync::Mutex` and never crosses an `await`: it is
     /// taken to test-and-insert and released before the agent is spawned. The
@@ -594,20 +592,60 @@ impl Ui {
     /// handler or a phone that walks out of range leave the talk usable - axum
     /// drops the handler future when the client disconnects, and without the
     /// guard that talk would be wedged until the server restarted.
-    fn begin_talk_turn(&self, id: &str) -> ApiResult<TalkTurnGuard> {
+    fn begin_talk_turn(&self, id: &str) -> ApiResult<Option<TalkTurnGuard>> {
+        self.claim_talk_turn(id, false)
+    }
+
+    /// Claim a turn after durably queueing a draft, or notify its current
+    /// owner that a drainer must recheck before it releases the slot.
+    fn begin_queued_talk_turn(&self, id: &str) -> ApiResult<Option<TalkTurnGuard>> {
+        self.claim_talk_turn(id, true)
+    }
+
+    fn claim_talk_turn(&self, id: &str, queued: bool) -> ApiResult<Option<TalkTurnGuard>> {
         let mut live = self
             .talk_turns
             .lock()
             .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
-        if !live.insert(id.to_owned()) {
-            return Err(ApiError::conflict(format!(
-                "talk {id} is already taking a turn"
-            )));
+        if !live.live.insert(id.to_owned()) {
+            if queued {
+                // A queued write has landed before this busy check.
+                // `drain_loop` uses this generation to recheck after its
+                // off-thread disk read, so it cannot release a turn between
+                // this check and the write.
+                *live.queued.entry(id.to_owned()).or_default() += 1;
+            }
+            return Ok(None);
         }
-        Ok(TalkTurnGuard {
+        Ok(Some(TalkTurnGuard {
             talk: id.to_owned(),
             turns: Arc::clone(&self.talk_turns),
-        })
+            released: false,
+        }))
+    }
+
+    /// Decide whether a free talk may start a new immediate turn while its
+    /// claim lock is held. A persisted draft without an owner is recovery
+    /// state, not a busy turn: two simultaneous `/say` requests must both
+    /// leave it untouched rather than one of them appending to it.
+    fn begin_talk_turn_unless_pending(&self, id: &str) -> ApiResult<TalkTurnStart> {
+        let mut live = self
+            .talk_turns
+            .lock()
+            .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
+        if live.live.contains(id) {
+            return Ok(TalkTurnStart::Busy);
+        }
+        let talk = self.talks.get(id).map_err(ApiError::from)?;
+        if !talk.pending.is_empty() || !talk.pending_attachments.is_empty() {
+            return Ok(TalkTurnStart::Pending);
+        }
+        live.live.insert(id.to_owned());
+        Ok(TalkTurnStart::Claimed(TalkTurnGuard {
+            talk: id.to_owned(),
+            turns: Arc::clone(&self.talk_turns),
+            released: false,
+        }))
     }
 
     /// Park the loop for an upgrade, and report the run that is parking.
@@ -705,6 +743,9 @@ impl Ui {
             .route("/api/talks", get(talks_list).post(talk_post))
             .route("/api/talks/{id}", get(talk_detail).delete(talk_delete))
             .route("/api/talks/{id}/say", post(talk_say))
+            .route("/api/talks/{id}/pending/resume", post(talk_pending_resume))
+            .route("/api/talks/{id}/pending/clear", post(talk_pending_clear))
+            .route("/api/talks/{id}/pending/edit", post(talk_pending_edit))
             .route("/api/talks/{id}/close", post(talk_close))
             .route("/api/talks/{id}/reopen", post(talk_reopen))
             // `DefaultBodyLimit` is raised only on this one route - every
@@ -733,13 +774,48 @@ impl Ui {
 #[derive(Debug)]
 struct TalkTurnGuard {
     talk: String,
-    turns: Arc<Mutex<HashSet<String>>>,
+    turns: Arc<Mutex<TalkTurns>>,
+    released: bool,
+}
+
+/// In-memory turn ownership plus the queue generation observed by a drainer.
+///
+/// The generation changes only after a durable queued draft is written and its
+/// caller finds the turn busy. That lets the loop run filesystem work outside
+/// this mutex while still making the final empty-check/release atomic with a
+/// concurrent queue handoff.
+#[derive(Debug, Default)]
+struct TalkTurns {
+    live: HashSet<String>,
+    queued: HashMap<String, u64>,
+}
+
+/// The atomic initial-state decision made by
+/// [`Ui::begin_talk_turn_unless_pending`].
+enum TalkTurnStart {
+    Claimed(TalkTurnGuard),
+    Busy,
+    Pending,
+}
+
+impl TalkTurnGuard {
+    /// Release while the caller already holds the claim mutex, closing the
+    /// last-drain/arrival gap without letting `Drop` revoke a later claim.
+    fn release(mut self, live: &mut TalkTurns) {
+        live.live.remove(&self.talk);
+        live.queued.remove(&self.talk);
+        self.released = true;
+    }
 }
 
 impl Drop for TalkTurnGuard {
     fn drop(&mut self) {
+        if self.released {
+            return;
+        }
         if let Ok(mut live) = self.turns.lock() {
-            live.remove(&self.talk);
+            live.live.remove(&self.talk);
+            live.queued.remove(&self.talk);
         }
     }
 }
@@ -3226,6 +3302,21 @@ struct NewTalkTurn {
     attachments: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditTalkPending {
+    text: String,
+    expected_text: String,
+    expected_attachments: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClearTalkPending {
+    expected_text: String,
+    expected_attachments: Vec<String>,
+}
+
 /// `POST /api/talks/{id}/say` - one turn of the conversation.
 ///
 /// Not filesystem work, and therefore not routed through [`blocking`]: this
@@ -3252,25 +3343,30 @@ async fn talk_say(
         let asked = id.clone();
         blocking(move || resolve_talk(&ui.talks, &asked)).await?
     };
-    // Claimed before the talk is loaded, so the record this turn appends to
-    // was read after the claim and cannot be a snapshot another turn has
-    // since replaced.
-    let _turn = ui.begin_talk_turn(&id)?;
-
-    let (talk, cfg) = {
+    // A closed Talk never accepts a new immediate or queued turn. Check this
+    // before claiming a slot so its ordinary domain refusal is a 409, not an
+    // incidental failure from the later record/queue write.
+    {
         let ui = Arc::clone(&ui);
         let id = id.clone();
         blocking(move || {
             let talk = ui.talks.get(&id)?;
-            let (cfg, _) = Config::discover(&talk.repo, None)?;
-            Ok((talk, cfg))
+            if !talk.status.open() {
+                return Err(ApiError::conflict(format!(
+                    "talk {} is {} and takes no more turns",
+                    talk.short(),
+                    talk.status.as_str()
+                )));
+            }
+            Ok(())
         })
-        .await?
-    };
+        .await?;
+    }
 
-    // Every attachment id resolved to the metadata `talk::record` actually
-    // stores, before anything is recorded - an unknown id is a 4xx that
-    // names it rather than a turn silently missing an image.
+    // Every attachment id resolved to the metadata `talk::record`/`talk::queue`
+    // actually stores, before anything is written - an unknown id is a 4xx
+    // that names it rather than a turn (or a queued draft) silently missing
+    // an image.
     let attachments = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
@@ -3287,12 +3383,104 @@ async fn talk_say(
         .await?
     };
 
+    // Pending recovery and a new immediate turn are decided under the same
+    // claim lock. Without that one critical section, a second `/say` can see
+    // the first request's claim as "busy" and append itself to the recovered
+    // draft before the first request rejects it.
+    let start = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || ui.begin_talk_turn_unless_pending(&id)).await?
+    };
+    let turn_guard = match start {
+        TalkTurnStart::Claimed(turn_guard) => turn_guard,
+        TalkTurnStart::Pending => {
+            return Err(ApiError::conflict(
+                "a queued draft is waiting; resume it, edit it, or clear it before sending another message",
+            ));
+        }
+        TalkTurnStart::Busy => {
+            // A turn is already running: queue rather than refuse. See
+            // `Ui::begin_talk_turn` and `talk::queue`.
+            let (view, reclaimed) = {
+                let ui = Arc::clone(&ui);
+                let id = id.clone();
+                let said = body.text.clone();
+                blocking(move || {
+                    let mut talk = ui.talks.get(&id)?;
+                    if let Err(error) = talk::queue(&mut talk, &ui.talks, &said, attachments) {
+                        if let Ok(fresh) = ui.talks.get(&id) {
+                            if !fresh.status.open() {
+                                return Err(ApiError::conflict(format!(
+                                    "talk {} is {} and takes no more turns",
+                                    fresh.short(),
+                                    fresh.status.as_str()
+                                )));
+                            }
+                        }
+                        return Err(ApiError::from(error));
+                    }
+                    // The turn that looked busy a moment ago can have finished,
+                    // found nothing to drain and given up the slot in the gap
+                    // between that check and this write landing - see
+                    // `drain_loop`'s own doc for the other half of why that gap
+                    // would otherwise be able to open at all. Reclaiming the
+                    // slot here, rather than trusting that whoever held it is
+                    // still watching, is what stops the text just queued from
+                    // being stranded until an unrelated future `say` happens to
+                    // drain it.
+                    let claim = match ui.begin_queued_talk_turn(&id)? {
+                        Some(turn_guard) => {
+                            let (cfg, _) = Config::discover(&talk.repo, None)?;
+                            Some((talk.clone(), cfg, turn_guard))
+                        }
+                        None => None,
+                    };
+                    let thinking = ui.is_thinking(&id);
+                    Ok((TalkView::new(talk, thinking), claim))
+                })
+                .await?
+            };
+            if let Some((talk, cfg, turn_guard)) = reclaimed {
+                let talks = ui.talks.clone();
+                tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+            }
+            return Ok((StatusCode::ACCEPTED, Json(view)));
+        }
+    };
+
+    let (talk, cfg) = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || {
+            let talk = ui.talks.get(&id)?;
+            let (cfg, _) = Config::discover(&talk.repo, None)?;
+            Ok((talk, cfg))
+        })
+        .await?
+    };
+
     let talks = ui.talks.clone();
     let text = {
         let mut talk = talk.clone();
         let talks = talks.clone();
         let said = body.text.clone();
-        blocking(move || Ok(talk::record(&mut talk, &talks, &said, attachments)?)).await?
+        blocking(move || {
+            if let Err(error) = talk::record(&mut talk, &talks, &said, attachments) {
+                if let Ok(fresh) = talks.get(&talk.id) {
+                    if !fresh.status.open() {
+                        return Err(ApiError::conflict(format!(
+                            "talk {} is {} and takes no more turns",
+                            fresh.short(),
+                            fresh.status.as_str()
+                        )));
+                    }
+                }
+                return Err(ApiError::from(error));
+            }
+            Ok(said.trim().to_owned())
+        })
+        .await?
     };
     // Re-read so the spawned task appends to the record that now holds the
     // operator's turn, rather than to the snapshot taken before it.
@@ -3301,19 +3489,236 @@ async fn talk_say(
         let id = id.clone();
         blocking(move || Ok(ui.talks.get(&id)?)).await?
     };
-    let queued = TalkView::new(talk.clone(), ui.is_thinking(&id));
+    let queued = talk.clone();
+    let thinking = ui.is_thinking(&id);
     tokio::spawn(async move {
-        let _turn = _turn;
         let mut talk = talk;
         if let Err(e) = talk::respond(&mut talk, &talks, &cfg, &text).await {
             // `respond` records the failure in the transcript itself, which is
             // what the phone reads; this line is for the operator's terminal.
             tracing::warn!("talk {id} turn failed: {e:#}");
         }
+        // Anything `talk::queue` added while the turn above was running is
+        // still owed an answer - see `drain_loop`.
+        drain_loop(talk, talks, cfg, id, turn_guard).await;
     });
 
     // 202: the operator's message is recorded and a turn is running.
-    Ok((StatusCode::ACCEPTED, Json(queued)))
+    Ok((StatusCode::ACCEPTED, Json(TalkView::new(queued, thinking))))
+}
+
+/// `POST /api/talks/{id}/pending/resume` promotes a persisted draft without
+/// changing it. The turn guard is the same per-talk ownership `talk_say`
+/// holds, so duplicate recovery clicks cannot resume the CLI session twice.
+async fn talk_pending_resume(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<(StatusCode, Json<TalkView>)> {
+    let id = {
+        let ui = Arc::clone(&ui);
+        let asked = id.clone();
+        blocking(move || resolve_talk(&ui.talks, &asked)).await?
+    };
+    let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
+        return Err(ApiError::conflict(
+            "a talk turn is already running; the queued draft will be handled by it",
+        ));
+    };
+    let (talk, cfg) = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || {
+            let talk = ui.talks.get(&id)?;
+            if !talk.status.open() {
+                return Err(ApiError::conflict(format!(
+                    "talk {} is {} and takes no more turns",
+                    talk.short(),
+                    talk.status.as_str()
+                )));
+            }
+            if talk.pending.is_empty() && talk.pending_attachments.is_empty() {
+                return Err(ApiError::conflict("there is no queued draft to resume"));
+            }
+            let (cfg, _) = Config::discover(&talk.repo, None)?;
+            Ok((talk, cfg))
+        })
+        .await?
+    };
+    let view = TalkView::new(talk.clone(), true);
+    let talks = ui.talks.clone();
+    tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+    Ok((StatusCode::ACCEPTED, Json(view)))
+}
+
+/// Drain [`talk::Talk::pending`] one turn at a time until nothing is left,
+/// releasing `turn` only once a check finds it truly empty. Shared by both
+/// callers that can end up owning a talk's turn slot with something already
+/// queued for it: `talk_say`'s normal path, after its own `talk::respond`
+/// call, and `talk_say`'s busy path, when it reclaims a slot the previous
+/// holder just gave up - see the comment at that call site.
+///
+/// The release is folded into the final generation check under `turn`'s own
+/// lock - the same lock [`Ui::begin_talk_turn`] takes to decide "busy or
+/// free". Before its blocking `talk::drain`, this loop observes the queued
+/// generation. A `say` that sees the turn busy writes its draft, then advances
+/// that generation. Thus, if it lands while the drain is in flight, the final
+/// check observes the advance and drains again; otherwise it releases the
+/// claim while holding the same lock. This keeps the release/arrival handoff
+/// atomic without holding the global claim mutex across filesystem I/O.
+async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn: TalkTurnGuard) {
+    let live_set = Arc::clone(&turn.turns);
+    // `Option` rather than binding `turn` directly to a `_turn` that lives
+    // for the whole function: releasing it has to happen by calling
+    // `TalkTurnGuard::release` from inside the locked branch below, which
+    // takes `self` by value. Left as a plain drop instead, `Drop` would still
+    // remove the id - correctly, if this loop is ever left some other way -
+    // but doing it there misses the lock this loop is already holding, which
+    // is the exact gap `release` exists to close.
+    let mut turn = Some(turn);
+    loop {
+        // `talk::drain` takes the store lock and can write/rename the talk
+        // file. Keep the turn mutex out of that synchronous work: it protects
+        // every talk's in-memory claim, not this talk's disk operation.
+        let observed = live_set
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .queued
+            .get(&id)
+            .copied()
+            .unwrap_or(0);
+        let drained = blocking({
+            let talks = talks.clone();
+            move || {
+                let result = talk::drain(&mut talk, &talks);
+                Ok((talk, result))
+            }
+        })
+        .await;
+        let (next_talk, result) = match drained {
+            Ok(drained) => drained,
+            Err(e) => {
+                tracing::warn!(
+                    status = %e.status,
+                    message = %e.message,
+                    "talk {id} could not start queued-text drain"
+                );
+                let mut live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
+                turn.take()
+                    .expect("held for the whole loop until released here")
+                    .release(&mut live);
+                break;
+            }
+        };
+        talk = next_talk;
+        let drained = match result {
+            Ok(Some(drained)) => drained,
+            Ok(None) => {
+                let mut live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
+                if live.queued.get(&id).copied().unwrap_or(0) != observed {
+                    continue;
+                }
+                turn.take()
+                    .expect("held for the whole loop until released here")
+                    .release(&mut live);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("talk {id} could not drain queued text: {e:#}");
+                let mut live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
+                turn.take()
+                    .expect("held for the whole loop until released here")
+                    .release(&mut live);
+                break;
+            }
+        };
+        if let Err(e) = talk::respond(&mut talk, &talks, &cfg, &drained).await {
+            tracing::warn!("talk {id} turn failed: {e:#}");
+        }
+    }
+}
+
+/// Clear a queued draft only if it remains exactly the one the caller saw.
+async fn talk_pending_clear(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<ClearTalkPending>, JsonRejection>,
+) -> ApiResult<Json<TalkView>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    blocking(move || {
+        let id = resolve_talk(&ui.talks, &id)?;
+        let mut talk = ui.talks.get(&id)?;
+        if !talk.status.open() {
+            return Err(ApiError::conflict(format!(
+                "talk {} is {} and takes no more turns",
+                talk.short(),
+                talk.status.as_str()
+            )));
+        }
+        if !talk::clear_pending_if_matches(
+            &mut talk,
+            &ui.talks,
+            &body.expected_text,
+            &body.expected_attachments,
+        )? {
+            return Err(ApiError::conflict(
+                "queued message changed; reload it before clearing",
+            ));
+        }
+        let thinking = ui.is_thinking(&talk.id);
+        Ok(Json(TalkView::new(talk, thinking)))
+    })
+    .await
+}
+
+/// Atomically edit a queued draft's text while preserving its attachments.
+/// The snapshot fields make a concurrent queue or drain a conflict rather
+/// than silently discarding either message.
+async fn talk_pending_edit(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<EditTalkPending>, JsonRejection>,
+) -> ApiResult<Json<TalkView>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    let (view, reclaimed) = blocking({
+        let ui = Arc::clone(&ui);
+        move || {
+            let id = resolve_talk(&ui.talks, &id)?;
+            let mut talk = ui.talks.get(&id)?;
+            if !talk.status.open() {
+                return Err(ApiError::conflict(format!(
+                    "talk {} is {} and takes no more turns",
+                    talk.short(),
+                    talk.status.as_str()
+                )));
+            }
+            if !talk::edit_pending_text(
+                &mut talk,
+                &ui.talks,
+                &body.text,
+                &body.expected_text,
+                &body.expected_attachments,
+            )? {
+                return Err(ApiError::conflict(
+                    "queued message changed; reload it before editing",
+                ));
+            }
+            let claim = match ui.begin_queued_talk_turn(&id)? {
+                Some(turn_guard) => {
+                    let (cfg, _) = Config::discover(&talk.repo, None)?;
+                    Some((talk.clone(), cfg, id.clone(), turn_guard))
+                }
+                None => None,
+            };
+            let thinking = ui.is_thinking(&id);
+            Ok((TalkView::new(talk, thinking), claim))
+        }
+    })
+    .await?;
+    if let Some((talk, cfg, id, turn_guard)) = reclaimed {
+        let talks = ui.talks.clone();
+        tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+    }
+    Ok(Json(view))
 }
 
 /// `POST /api/talks/{id}/close`.
@@ -4701,12 +5106,188 @@ mod tests {
         assert_eq!(turns_after, 2, "the agent's reply eventually lands");
     }
 
+    #[tokio::test]
+    async fn editing_a_recovered_pending_draft_restarts_its_drain_once() {
+        let (_tmp, _repo, f) = talk_fixture().await;
+        let id = f.post("/api/talks", None).await.json()["id"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let store = f.talks();
+        let mut recovered = store.get(&id).expect("opened talk");
+        talk::queue(&mut recovered, &store, "saved before restart", Vec::new())
+            .expect("persist pending draft without a live turn");
+
+        let edited = f
+            .post(
+                &format!("/api/talks/{id}/pending/edit"),
+                Some(r#"{"text":"corrected","expected_text":"saved before restart","expected_attachments":[]}"#),
+            )
+            .await;
+        assert_eq!(edited.status, 200, "{}", edited.body);
+        assert!(edited.json()["thinking"].as_bool().unwrap());
+
+        let mut detail = f.get(&format!("/api/talks/{id}")).await.json();
+        for _ in 0..200 {
+            if detail["turns"].as_array().expect("turns").len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            detail = f.get(&format!("/api/talks/{id}")).await.json();
+        }
+        let turns = detail["turns"].as_array().expect("turns");
+        assert_eq!(
+            turns.len(),
+            2,
+            "the recovered draft must run once: {detail}"
+        );
+        assert_eq!(turns[0]["body"], "corrected");
+        assert_eq!(detail["pending"], "");
+    }
+
+    #[tokio::test]
+    async fn recovered_pending_requires_explicit_resume_and_duplicate_resume_runs_once() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::write(repo.join("magi.toml"), SLOW_MOCK_AGENT_TOML).expect("write config");
+        let f = Fixture::with_repo(repo).await;
+        let id = f.post("/api/talks", None).await.json()["id"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let store = f.talks();
+        let mut recovered = store.get(&id).expect("opened talk");
+        talk::queue(&mut recovered, &store, "saved before restart", Vec::new())
+            .expect("persist pending draft without a live turn");
+
+        let refused = f
+            .post(
+                &format!("/api/talks/{id}/say"),
+                Some(r#"{"text":"new message"}"#),
+            )
+            .await;
+        assert_eq!(refused.status, 409, "{}", refused.body);
+        assert!(refused.body.contains("resume"), "{}", refused.body);
+        let saved = store.get(&id).expect("draft remains after refusal");
+        assert!(saved.turns.is_empty());
+        assert_eq!(saved.pending, "saved before restart");
+
+        let say_path = format!("/api/talks/{id}/say");
+        let (first, second) = tokio::join!(
+            f.post(&say_path, Some(r#"{"text":"concurrent one"}"#)),
+            f.post(&say_path, Some(r#"{"text":"concurrent two"}"#)),
+        );
+        assert_eq!(first.status, 409, "{}", first.body);
+        assert_eq!(second.status, 409, "{}", second.body);
+        let saved = store
+            .get(&id)
+            .expect("draft remains after concurrent refusals");
+        assert!(saved.turns.is_empty());
+        assert_eq!(saved.pending, "saved before restart");
+
+        let resumed = f
+            .post(&format!("/api/talks/{id}/pending/resume"), None)
+            .await;
+        assert_eq!(resumed.status, 202, "{}", resumed.body);
+        let duplicate = f
+            .post(&format!("/api/talks/{id}/pending/resume"), None)
+            .await;
+        assert_eq!(duplicate.status, 409, "{}", duplicate.body);
+
+        for _ in 0..100 {
+            if store.get(&id).expect("talk").turns.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let finished = store.get(&id).expect("finished talk");
+        assert_eq!(finished.turns.len(), 2, "{finished:?}");
+        assert_eq!(finished.turns[0].body, "saved before restart");
+        assert!(finished.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_image_only_recovered_draft_resumes_without_text() {
+        let (_tmp, _repo, f) = talk_fixture().await;
+        let id = f.post("/api/talks", None).await.json()["id"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let uploaded = f
+            .post_bytes(
+                &format!("/api/talks/{id}/attachments"),
+                &[("Content-Type", "image/png"), ("X-Filename", "saved.png")],
+                PNG_BYTES,
+            )
+            .await;
+        assert_eq!(uploaded.status, 201, "{}", uploaded.body);
+        let attachment = f
+            .talks()
+            .attachment_meta(&id, uploaded.json()["id"].as_str().expect("attachment id"))
+            .expect("attachment metadata")
+            .expect("stored attachment");
+        let store = f.talks();
+        let mut recovered = store.get(&id).expect("opened talk");
+        talk::queue(&mut recovered, &store, "", vec![attachment]).expect("queue image only");
+
+        let resumed = f
+            .post(&format!("/api/talks/{id}/pending/resume"), None)
+            .await;
+        assert_eq!(resumed.status, 202, "{}", resumed.body);
+        for _ in 0..200 {
+            if store.get(&id).expect("talk").turns.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let finished = store.get(&id).expect("finished talk");
+        assert_eq!(finished.turns.len(), 2, "{finished:?}");
+        assert!(finished.turns[0].body.is_empty());
+        assert_eq!(finished.turns[0].attachments.len(), 1);
+        assert!(finished.pending_attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_talk_refuses_pending_mutations_without_changing_the_record() {
+        let (_tmp, _repo, f) = talk_fixture().await;
+        let id = f.post("/api/talks", None).await.json()["id"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let closed = f.post(&format!("/api/talks/{id}/close"), None).await;
+        assert_eq!(closed.status, 200, "{}", closed.body);
+        let before_clear = serde_json::to_value(f.talks().get(&id).expect("closed talk"))
+            .expect("serialize closed talk");
+        for (path, body) in [
+            (format!("/api/talks/{id}/pending/resume"), None),
+            (
+                format!("/api/talks/{id}/pending/clear"),
+                Some(r#"{"expected_text":"","expected_attachments":[]}"#),
+            ),
+            (
+                format!("/api/talks/{id}/pending/edit"),
+                Some(r#"{"text":"x","expected_text":"","expected_attachments":[]}"#),
+            ),
+            (format!("/api/talks/{id}/say"), Some(r#"{"text":"x"}"#)),
+        ] {
+            let response = f.post(&path, body).await;
+            assert_eq!(response.status, 409, "{}", response.body);
+        }
+        let after_clear = serde_json::to_value(f.talks().get(&id).expect("closed talk"))
+            .expect("serialize closed talk");
+        assert_eq!(
+            after_clear, before_clear,
+            "clear must not rewrite a closed talk"
+        );
+    }
+
     /// Keeps both claims observable long enough to exercise the distinction
     /// between one busy talk and a globally locked Chat surface.
     const SLOW_MOCK_AGENT_TOML: &str = "[[agents]]\nid = \"mock\"\nkind = \"command\"\ncommand = [\"sh\", \"-c\", \"cat >/dev/null && sleep 0.3 && printf ok\"]\n";
 
     #[tokio::test]
-    async fn talks_report_independent_thinking_claims_and_refuse_only_their_own_second_turn() {
+    async fn talks_report_independent_thinking_claims_and_queue_a_second_message() {
         let tmp = TempDir::new().expect("tempdir");
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo dir");
@@ -4748,7 +5329,8 @@ mod tests {
                 Some(r#"{"text":"again"}"#),
             )
             .await;
-        assert_eq!(repeated.status, 409, "{}", repeated.body);
+        assert_eq!(repeated.status, 202, "{}", repeated.body);
+        assert_eq!(repeated.json()["pending"], "again");
     }
 
     /// Bytes `sniffed_mime` recognises as `image/png` - the signature plus a
@@ -4953,6 +5535,14 @@ mod tests {
         let closed_again = f.post(&format!("/api/talks/{id}/close"), None).await;
         assert_eq!(closed_again.status, 200);
         assert_eq!(closed_again.json()["status"], "closed");
+
+        let said = f
+            .post(
+                &format!("/api/talks/{id}/say"),
+                Some(r#"{"text":"too late"}"#),
+            )
+            .await;
+        assert_eq!(said.status, 409, "{}", said.body);
     }
 
     #[tokio::test]

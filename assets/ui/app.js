@@ -45,6 +45,10 @@ const API = {
   talks: "/api/talks",
   talk: (id) => `/api/talks/${encodeURIComponent(id)}`,
   talkSay: (id) => `/api/talks/${encodeURIComponent(id)}/say`,
+  talkPending: (id) => `/api/talks/${encodeURIComponent(id)}/pending`,
+  talkPendingResume: (id) => `/api/talks/${encodeURIComponent(id)}/pending/resume`,
+  talkPendingClear: (id) => `/api/talks/${encodeURIComponent(id)}/pending/clear`,
+  talkPendingEdit: (id) => `/api/talks/${encodeURIComponent(id)}/pending/edit`,
   talkClose: (id) => `/api/talks/${encodeURIComponent(id)}/close`,
   talkReopen: (id) => `/api/talks/${encodeURIComponent(id)}/reopen`,
   talkDelete: (id) => `/api/talks/${encodeURIComponent(id)}`,
@@ -3360,11 +3364,99 @@ function renderTalk() {
   show($("talk-reopen-go"), !canSay);
   renderTalkThumbs();
   const uploading = talkAttachmentsBusy();
-  $("f-talk-say").disabled = busy;
-  $("talk-send").disabled = busy || uploading;
-  setText($("talk-send"), busy ? "Thinking…" : uploading ? "Uploading…" : "Send");
+  $("f-talk-say").disabled = false;
+  $("talk-send").disabled = uploading;
+  setText($("talk-send"), uploading ? "Uploading…" : busy ? "Queue next" : "Send");
+  renderTalkPending(talk);
   show($("talk-wait"), busy);
   renderTalkDelete(talk);
+}
+
+/* Pending is server data, not an optimistic browser-only message: it survives
+   reload and shows an attachment count so an image can never disappear from
+   the operator's understanding of what will be sent next. */
+function renderTalkPending(talk) {
+  const box = $("talk-pending");
+  const text = String(talk.pending || "");
+  const attachments = Array.isArray(talk.pending_attachments) ? talk.pending_attachments : [];
+  const busy = Boolean(talk.thinking) || state.talkWaits.has(talk.id);
+  clear(box);
+  show(box, Boolean(text || attachments.length));
+  if (!text && attachments.length === 0) return;
+  append(box, [
+    el("p", { class: "panel-note", text: "Queued for the next reply" }),
+    text ? el("pre", { class: "talk-pending-text", text }) : null,
+    attachments.length ? el("p", { class: "frame-note", text: `${plural(attachments.length, "attachment", "attachments")} queued` }) : null,
+    !busy ? el("button", { class: "btn", type: "button", text: "Resume queued draft", onclick: resumeTalkPending }) : null,
+    el("button", { class: "btn btn-quiet", type: "button", text: "Clear", onclick: clearTalkPending }),
+    el("button", { class: "btn btn-quiet", type: "button", text: "Edit text", onclick: editTalkPending }),
+  ]);
+}
+
+async function resumeTalkPending() {
+  const id = state.talkDetail.id;
+  const talk = state.talkDetail.talk;
+  if (!id || !talk) return;
+  try {
+    const next = await postJson(API.talkPendingResume(id), {});
+    if (state.talkDetail.id === id) {
+      state.talkDetail.talk = next;
+      trackTalkThinking(next);
+      renderTalk();
+    }
+    announce("Queued draft resumed.");
+    loadTalks();
+  } catch (error) {
+    if (error.status === 409) await loadTalk(id);
+    talkError(`Could not resume the queued draft: ${error.message}`);
+  }
+}
+
+async function editTalkPending() {
+  const id = state.talkDetail.id;
+  const talk = state.talkDetail.talk;
+  if (!id || !talk) return;
+  const expectedText = String(talk.pending || "");
+  const expectedAttachments = Array.isArray(talk.pending_attachments)
+    ? talk.pending_attachments.map((attachment) => attachment.id)
+    : [];
+  const text = window.prompt("Edit queued text", expectedText);
+  if (text === null || text === expectedText) return;
+  try {
+    const next = await postJson(API.talkPendingEdit(id), { text, expected_text: expectedText, expected_attachments: expectedAttachments });
+    if (state.talkDetail.id === id) {
+      state.talkDetail.talk = next;
+      trackTalkThinking(next);
+      renderTalk();
+    }
+    announce("Queued text updated. Attachments are preserved.");
+    loadTalks();
+  } catch (error) {
+    if (error.status === 409) await loadTalk(id);
+    talkError(`Could not edit the queued message: ${error.message}`);
+  }
+}
+
+async function clearTalkPending() {
+  const id = state.talkDetail.id;
+  const talk = state.talkDetail.talk;
+  if (!id || !talk) return;
+  const expectedText = String(talk.pending || "");
+  const expectedAttachments = Array.isArray(talk.pending_attachments)
+    ? talk.pending_attachments.map((attachment) => attachment.id)
+    : [];
+  try {
+    const next = await postJson(API.talkPendingClear(id), { expected_text: expectedText, expected_attachments: expectedAttachments });
+    if (state.talkDetail.id === id) {
+      state.talkDetail.talk = next;
+      renderTalk();
+    }
+    announce("Queued message cleared.");
+    loadTalks();
+  } catch (error) {
+    if (error.status === 409) await loadTalk(id);
+    talkError(`Could not clear the queued message: ${error.message}`);
+  }
 }
 
 /* One timer services every busy conversation: it redraws the visible wait
@@ -3467,6 +3559,34 @@ function resetTalkAttachments(id) {
     if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
   }
   state.talkAttachments = { id, items: [] };
+}
+
+/* A send owns the completed uploads present at its click. Removing just those
+   objects synchronously means a later click or attachment cannot reuse them,
+   and a delayed 202 cannot erase the later draft. */
+function takeTalkAttachments(id) {
+  if (state.talkAttachments.id !== id) return [];
+  const taken = state.talkAttachments.items.filter((item) => item.status === "done");
+  state.talkAttachments.items = state.talkAttachments.items.filter((item) => item.status !== "done");
+  return taken;
+}
+
+function releaseTalkAttachments(items) {
+  for (const item of items) {
+    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+  }
+}
+
+function restoreTalkSubmission(id, text, attachments) {
+  if (state.talkAttachments.id === id) {
+    const known = new Set(state.talkAttachments.items.map((item) => item.localId));
+    state.talkAttachments.items.unshift(...attachments.filter((item) => !known.has(item.localId)));
+  }
+  if (state.talkDetail.id !== id) return;
+  const box = $("f-talk-say");
+  if (!box.value) box.value = text;
+  else if (text && box.value !== text) box.value = `${text}\n\n${box.value}`;
+  renderTalk();
 }
 
 function renderTalkThumbs() {
@@ -3577,14 +3697,10 @@ async function sendTalkTurn(event) {
   const id = state.talkDetail.id;
   const box = $("f-talk-say");
   const text = box.value;
+  if (!id || talkAttachmentsBusy()) return;
   const attachments = state.talkAttachments.id === id
     ? state.talkAttachments.items.filter((item) => item.status === "done")
     : [];
-
-  /* A double tap is still refused for this conversation, but a turn on a
-     different conversation must not lock this surface. The server repeats
-     the same per-conversation rule for other devices. */
-  if (!id || state.talkWaits.has(id) || (state.talkDetail.talk && state.talkDetail.talk.thinking) || talkAttachmentsBusy()) return;
   if (!text.trim() && attachments.length === 0) {
     talkError("Say something, or attach an image, first.");
     box.focus();
@@ -3592,8 +3708,10 @@ async function sendTalkTurn(event) {
   }
 
   talkError("");
+  const submissionAttachments = takeTalkAttachments(id);
   const before = talkTurns(state.talkDetail.talk).length;
-  beginTalkTurn(id, before, before + 2, { body: text, at: new Date().toISOString() });
+  const ownsTurn = !state.talkWaits.has(id) && !(state.talkDetail.talk && state.talkDetail.talk.thinking);
+  if (ownsTurn) beginTalkTurn(id, before, before + 2, { body: text, at: new Date().toISOString() });
   box.value = "";
   renderTalk();
   $("talk-wait").scrollIntoView({ block: "nearest" });
@@ -3606,14 +3724,14 @@ async function sendTalkTurn(event) {
        in `tickTalkWait`. */
     const queued = await postJson(API.talkSay(id), {
       text,
-      attachments: attachments.map((item) => item.serverId),
+      attachments: submissionAttachments.map((item) => item.serverId),
     });
     /* This 202 was received after the local wait was created, so it is the
        matching observation that makes a later fresh false useful for
        recovering from a process restart. */
     const wait = state.talkWaits.get(id);
     trackTalkThinking(queued, wait && { generation: wait.generation, startedAt: Date.now() });
-    if (state.talkAttachments.id === id) resetTalkAttachments(id);
+    releaseTalkAttachments(submissionAttachments);
     if (state.talkDetail.id === id) {
       state.talkDetail.talk = queued;
       renderTalk();
@@ -3622,11 +3740,8 @@ async function sendTalkTurn(event) {
     loadTalks();
     ok();
   } catch (error) {
-    if (error.status === 409) {
-      announce("A turn is already running on this conversation. Waiting for it.");
-      return;
-    }
-    endTalkTurn(id);
+    restoreTalkSubmission(id, text, submissionAttachments);
+    if (ownsTurn) endTalkTurn(id);
     talkError(`The message may not have been sent: ${error.message}`);
     await loadTalk(id);
   }
