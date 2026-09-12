@@ -11,8 +11,21 @@ use magi::run::RunStatus;
 
 #[tokio::test]
 async fn a_cached_failed_gate_stays_blocked_and_does_not_run_again() {
+    // `set_home` pins the first fixture's directory for this whole test
+    // process. Reproduce a prior fixture explicitly so this case does not
+    // accidentally pass only when it is scheduled first.
+    let pinned_home = {
+        let prior = fixture(home_lock().await, Judges::Unanimous, false);
+        let home = magi::run::home();
+        assert!(home.ends_with("magi-home"));
+        drop(prior);
+        home
+    };
+
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
+    assert_ne!(pinned_home, fx.tmp.path().join("magi-home"));
+    assert_eq!(magi::run::home(), pinned_home);
     fx.config.verify.gate = vec!["false".to_owned()];
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
@@ -42,23 +55,26 @@ async fn a_cached_failed_gate_stays_blocked_and_does_not_run_again() {
         .count();
     drop(runner);
 
-    // Exercise the public resume path with the fixture's isolated MAGI_HOME,
-    // not merely an in-process call to `execute`.
+    // Exercise the public resume path using the home actually pinned by the
+    // parent process, not the later fixture directory whose `set_home` call
+    // was ignored by the OnceLock.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
         .args(["run", "--resume", &id])
         .current_dir(&fx.repo)
-        .env("MAGI_HOME", fx.tmp.path().join("magi-home"))
+        .env("MAGI_HOME", &pinned_home)
         .output()
         .expect("run magi --resume");
     assert!(
         !output.status.success(),
-        "a cached failed gate must remain an unsuccessful CLI result: {}",
-        String::from_utf8_lossy(&output.stdout)
+        "a cached failed gate must remain an unsuccessful CLI result:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("blocked"),
-        "the report must show the terminal state: {}",
-        String::from_utf8_lossy(&output.stdout)
+        "the report must show the terminal state:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 
     let resumed = Runner::resume(&id).expect("load resumed state");
