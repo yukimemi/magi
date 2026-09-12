@@ -170,11 +170,37 @@ fn parse_unix_kill_output(success: bool, stderr: &[u8]) -> bool {
 /// フィールドを持つ行は存在しない。
 #[cfg(any(windows, test))]
 fn parse_windows_tasklist_output(pid: u32, stdout: &[u8]) -> bool {
-    let expected = format!("\"{pid}\"");
+    let expected = pid.to_string();
     String::from_utf8_lossy(stdout).lines().any(|line| {
-        line.split(',')
-            .nth(1)
-            .is_some_and(|field| field.trim() == expected)
+        tasklist_csv_fields(line)
+            .is_some_and(|fields| fields.get(1).is_some_and(|field| field == &expected))
+    })
+}
+
+/// `tasklist` が出す、二重引用符と `""` エスケープを持つ CSV の一行を分ける。
+/// 壊れた CSV は PID 不一致として扱う。コマンド失敗の利用不能判定は呼び出し側が
+/// 保持する。
+#[cfg(any(windows, test))]
+fn tasklist_csv_fields(line: &str) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => fields.push(std::mem::take(&mut field)),
+            _ => field.push(ch),
+        }
+    }
+    (!quoted).then(|| {
+        fields.push(field);
+        fields
     })
 }
 
@@ -333,6 +359,10 @@ mod tests {
         assert!(parse_windows_tasklist_output(
             pid,
             b"\"magi.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n"
+        ));
+        assert!(parse_windows_tasklist_output(
+            pid,
+            b"\"magi,worker.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n"
         ));
         assert!(!parse_windows_tasklist_output(
             pid,
