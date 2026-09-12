@@ -3517,24 +3517,39 @@ async fn talk_pending_edit(
     body: std::result::Result<Json<EditTalkPending>, JsonRejection>,
 ) -> ApiResult<Json<TalkView>> {
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    blocking(move || {
-        let id = resolve_talk(&ui.talks, &id)?;
-        let mut talk = ui.talks.get(&id)?;
-        if !talk::edit_pending_text(
-            &mut talk,
-            &ui.talks,
-            &body.text,
-            &body.expected_text,
-            &body.expected_attachments,
-        )? {
-            return Err(ApiError::conflict(
-                "queued message changed; reload it before editing",
-            ));
+    let (view, reclaimed) = blocking({
+        let ui = Arc::clone(&ui);
+        move || {
+            let id = resolve_talk(&ui.talks, &id)?;
+            let mut talk = ui.talks.get(&id)?;
+            if !talk::edit_pending_text(
+                &mut talk,
+                &ui.talks,
+                &body.text,
+                &body.expected_text,
+                &body.expected_attachments,
+            )? {
+                return Err(ApiError::conflict(
+                    "queued message changed; reload it before editing",
+                ));
+            }
+            let claim = match ui.begin_talk_turn(&id)? {
+                Some(turn_guard) => {
+                    let (cfg, _) = Config::discover(&talk.repo, None)?;
+                    Some((talk.clone(), cfg, id.clone(), turn_guard))
+                }
+                None => None,
+            };
+            let thinking = ui.is_thinking(&id);
+            Ok((TalkView::new(talk, thinking), claim))
         }
-        let thinking = ui.is_thinking(&talk.id);
-        Ok(Json(TalkView::new(talk, thinking)))
     })
-    .await
+    .await?;
+    if let Some((talk, cfg, id, turn_guard)) = reclaimed {
+        let talks = ui.talks.clone();
+        tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+    }
+    Ok(Json(view))
 }
 
 /// `POST /api/talks/{id}/close`.
@@ -4920,6 +4935,45 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(turns_after, 2, "the agent's reply eventually lands");
+    }
+
+    #[tokio::test]
+    async fn editing_a_recovered_pending_draft_restarts_its_drain_once() {
+        let (_tmp, _repo, f) = talk_fixture().await;
+        let id = f.post("/api/talks", None).await.json()["id"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let store = f.talks();
+        let mut recovered = store.get(&id).expect("opened talk");
+        talk::queue(&mut recovered, &store, "saved before restart", Vec::new())
+            .expect("persist pending draft without a live turn");
+
+        let edited = f
+            .post(
+                &format!("/api/talks/{id}/pending/edit"),
+                Some(r#"{"text":"corrected","expected_text":"saved before restart","expected_attachments":[]}"#),
+            )
+            .await;
+        assert_eq!(edited.status, 200, "{}", edited.body);
+        assert!(edited.json()["thinking"].as_bool().unwrap());
+
+        let mut detail = f.get(&format!("/api/talks/{id}")).await.json();
+        for _ in 0..200 {
+            if detail["turns"].as_array().expect("turns").len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            detail = f.get(&format!("/api/talks/{id}")).await.json();
+        }
+        let turns = detail["turns"].as_array().expect("turns");
+        assert_eq!(
+            turns.len(),
+            2,
+            "the recovered draft must run once: {detail}"
+        );
+        assert_eq!(turns[0]["body"], "corrected");
+        assert_eq!(detail["pending"], "");
     }
 
     /// Keeps both claims observable long enough to exercise the distinction
