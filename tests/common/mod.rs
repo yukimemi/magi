@@ -100,6 +100,10 @@ if [ -n "$MOCK_STALE_REVOTE_SEAT" ] && { case ",$MOCK_STALE_REVOTE_SEAT," in *",
   printf '{"summary":"mock stale review","vote":"approve","findings":[]}\n'
   exit 0
 fi
+if [ -n "$MOCK_EMPTY_REJECT_REVOTE_SEAT" ] && { case ",$MOCK_EMPTY_REJECT_REVOTE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && [ -f "$MOCK_EMPTY_REJECT_REVOTE_MARKER" ]; then
+  printf '{"vote":"reject","reason":" "}\n'
+  exit 0
+fi
 
 # Dropped-stream simulation: a matching implement seat's first reply is the
 # "billed work, nothing delivered" shape a CLI leaves when it hangs up on its
@@ -162,9 +166,7 @@ if grep -q "Your revote" "$p"; then
   # `approve_with_findings` vote it cast initially; every other seat holds
   # its `approve`. Deterministic on purpose: the fixtures that exercise this
   # branch assert the round's recorded verdict, not a specific argument.
-  if [ -n "$MOCK_EMPTY_REJECT_REVOTE_SEAT" ] && { case ",$MOCK_EMPTY_REJECT_REVOTE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
-    printf '{"vote":"reject","reason":" "}\n'
-  elif [ -n "$MOCK_REJECT_MINOR_SEAT" ] && { case ",$MOCK_REJECT_MINOR_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+  if [ -n "$MOCK_REJECT_MINOR_SEAT" ] && { case ",$MOCK_REJECT_MINOR_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     printf '{"vote":"reject","reason":"mock reconsideration: the minor concern remains"}\n'
   elif [ -n "$MOCK_STALE_REVIEW_SEAT" ] && { case ",$MOCK_STALE_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     # The following review call deliberately receives this revote-shaped
@@ -202,11 +204,14 @@ if grep -q "reviewers of" "$p"; then
   # review contract. Keep it separate from an ordinary silent seat so the
   # graph has to reject the schema rather than an exit status.
   if [ -n "$MOCK_STALE_REVIEW_SEAT" ] && { case ",$MOCK_STALE_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
-    printf '{"summary":"mock review: clean","vote":"approve","findings":[]}\n'
+    printf '{"summary":"mock split review","vote":"approve_with_findings","findings":[{"severity":"minor","file":"note.txt","line":1,"title":"nit: consider a comment","detail":"cosmetic only"}]}\n'
     exit 0
   fi
   if [ -n "$MOCK_STALE_REVOTE_SEAT" ] && { case ",$MOCK_STALE_REVOTE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     : > "$MOCK_STALE_REVOTE_MARKER"
+  fi
+  if [ -n "$MOCK_EMPTY_REJECT_REVOTE_SEAT" ] && { case ",$MOCK_EMPTY_REJECT_REVOTE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+    : > "$MOCK_EMPTY_REJECT_REVOTE_MARKER"
   fi
   if [ -n "$MOCK_REJECT_MINOR_SEAT" ] && { case ",$MOCK_REJECT_MINOR_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     printf '{"summary":"mock review: minor concern","vote":"reject","findings":[{"severity":"minor","file":"note.txt","line":1,"title":"minor concern","detail":"an operator should resolve this"}]}\n'
@@ -540,10 +545,15 @@ pub fn fixture_with_stale_revote_reply(home: HomeGuard) -> Fixture {
 pub fn fixture_with_empty_reject_revote(home: HomeGuard) -> Fixture {
     let mut fx = fixture_with_split_review_vote(home, "review-2");
     fx.config.graph.review_rounds = 1;
+    let marker = fx.tmp.path().join("empty-reject-revote");
     for a in &mut fx.config.agents {
         a.env.insert(
             "MOCK_EMPTY_REJECT_REVOTE_SEAT".to_owned(),
             "review-2".to_owned(),
+        );
+        a.env.insert(
+            "MOCK_EMPTY_REJECT_REVOTE_MARKER".to_owned(),
+            marker.to_string_lossy().into_owned(),
         );
     }
     fx
