@@ -563,6 +563,15 @@ impl Ui {
         lock_or_recover(&self.looping)
     }
 
+    /// Whether this process currently owns the agent turn for `id`.
+    ///
+    /// This deliberately describes only the in-memory claim made by
+    /// [`Ui::begin_talk_turn`]. It is not conversation data and therefore is
+    /// never persisted with a [`Talk`].
+    fn is_thinking(&self, id: &str) -> bool {
+        lock_or_recover(&self.talk_turns).contains(id)
+    }
+
     /// Claim the right to run one turn in a talk, or refuse.
     ///
     /// A talk is strictly turn-based: the agent is resumed with the
@@ -3086,16 +3095,24 @@ fn panel_response(content_type: &'static str, download: bool, body: Vec<u8>) -> 
 ///
 /// Every field of [`Talk`] verbatim, plus `turn_bodies_md` - one markdown node
 /// tree per entry of `turns`, in order - parsed server-side so `app.js` never
-/// parses markdown itself.
+/// parses markdown itself - and the process-local `thinking` hint.
 #[derive(Debug, Serialize)]
 struct TalkView {
     #[serde(flatten)]
     talk: Talk,
     turn_bodies_md: Vec<Vec<md::Node>>,
+    /// Whether [`Ui::begin_talk_turn`] currently holds this talk's turn in
+    /// this server process.
+    ///
+    /// This is deliberately not durable: another server process cannot see
+    /// it, and a restarted server must not claim an old turn is live. It is a
+    /// progress hint rather than proof a reply landed; the transcript remains
+    /// the source of truth for that.
+    thinking: bool,
 }
 
-impl From<Talk> for TalkView {
-    fn from(talk: Talk) -> Self {
+impl TalkView {
+    fn new(talk: Talk, thinking: bool) -> Self {
         let turn_bodies_md = talk
             .turns
             .iter()
@@ -3103,6 +3120,7 @@ impl From<Talk> for TalkView {
             .collect();
         Self {
             turn_bodies_md,
+            thinking,
             talk,
         }
     }
@@ -3126,7 +3144,14 @@ struct TalkDetailView {
 async fn talks_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TalkView>>> {
     blocking(move || {
         Ok(Json(
-            ui.talks.list().into_iter().map(TalkView::from).collect(),
+            ui.talks
+                .list()
+                .into_iter()
+                .map(|talk| {
+                    let thinking = ui.is_thinking(&talk.id);
+                    TalkView::new(talk, thinking)
+                })
+                .collect(),
         ))
     })
     .await
@@ -3161,7 +3186,8 @@ async fn talk_post(
     let cfg = config_for(&repo).await?;
     let view = blocking(move || {
         let talk = talk::begin(&ui.talks, &cfg, repo, body.agent.as_deref())?;
-        Ok(TalkView::from(talk))
+        let thinking = ui.is_thinking(&talk.id);
+        Ok(TalkView::new(talk, thinking))
     })
     .await?;
     Ok((StatusCode::CREATED, Json(view)))
@@ -3175,12 +3201,13 @@ async fn talk_detail(
     blocking(move || {
         let id = resolve_talk(&ui.talks, &id)?;
         let talk = ui.talks.get(&id)?;
+        let thinking = ui.is_thinking(&talk.id);
         let tasks = talk::tasks_of(&ui.queue, &talk.id)
             .into_iter()
             .map(TaskView::from)
             .collect();
         Ok(Json(TalkDetailView {
-            view: TalkView::from(talk),
+            view: TalkView::new(talk, thinking),
             tasks,
         }))
     })
@@ -3274,7 +3301,7 @@ async fn talk_say(
         let id = id.clone();
         blocking(move || Ok(ui.talks.get(&id)?)).await?
     };
-    let queued = talk.clone();
+    let queued = TalkView::new(talk.clone(), ui.is_thinking(&id));
     tokio::spawn(async move {
         let _turn = _turn;
         let mut talk = talk;
@@ -3286,7 +3313,7 @@ async fn talk_say(
     });
 
     // 202: the operator's message is recorded and a turn is running.
-    Ok((StatusCode::ACCEPTED, Json(TalkView::from(queued))))
+    Ok((StatusCode::ACCEPTED, Json(queued)))
 }
 
 /// `POST /api/talks/{id}/close`.
@@ -3298,7 +3325,8 @@ async fn talk_close(
         let id = resolve_talk(&ui.talks, &id)?;
         let mut talk = ui.talks.get(&id)?;
         talk::close(&mut talk, &ui.talks)?;
-        Ok(Json(TalkView::from(talk)))
+        let thinking = ui.is_thinking(&talk.id);
+        Ok(Json(TalkView::new(talk, thinking)))
     })
     .await
 }
@@ -3312,7 +3340,8 @@ async fn talk_reopen(
         let id = resolve_talk(&ui.talks, &id)?;
         let mut talk = ui.talks.get(&id)?;
         talk::reopen(&mut talk, &ui.talks)?;
-        Ok(Json(TalkView::from(talk)))
+        let thinking = ui.is_thinking(&talk.id);
+        Ok(Json(TalkView::new(talk, thinking)))
     })
     .await
 }
@@ -4655,6 +4684,10 @@ mod tests {
         );
         assert_eq!(turns[0]["who"], "operator");
         assert_eq!(turns[0]["body"], "what does the queue module do?");
+        assert_eq!(
+            queued["thinking"], true,
+            "the accepted response exposes the background turn claim: {queued}"
+        );
 
         let mut turns_after = 1;
         for _ in 0..200 {
@@ -4666,6 +4699,56 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(turns_after, 2, "the agent's reply eventually lands");
+    }
+
+    /// Keeps both claims observable long enough to exercise the distinction
+    /// between one busy talk and a globally locked Chat surface.
+    const SLOW_MOCK_AGENT_TOML: &str = "[[agents]]\nid = \"mock\"\nkind = \"command\"\ncommand = [\"sh\", \"-c\", \"cat >/dev/null && sleep 0.3 && printf ok\"]\n";
+
+    #[tokio::test]
+    async fn talks_report_independent_thinking_claims_and_refuse_only_their_own_second_turn() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::write(repo.join("magi.toml"), SLOW_MOCK_AGENT_TOML).expect("write config");
+        let f = Fixture::with_repo(repo).await;
+        let id_a = f.post("/api/talks", None).await.json()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let id_b = f.post("/api/talks", None).await.json()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let a = f
+            .post(&format!("/api/talks/{id_a}/say"), Some(r#"{"text":"a"}"#))
+            .await;
+        assert_eq!(a.status, 202, "{}", a.body);
+        assert_eq!(a.json()["thinking"], true);
+        let b = f
+            .post(&format!("/api/talks/{id_b}/say"), Some(r#"{"text":"b"}"#))
+            .await;
+        assert_eq!(b.status, 202, "{}", b.body);
+        assert_eq!(b.json()["thinking"], true);
+
+        let listed = f.get("/api/talks").await.json();
+        for id in [&id_a, &id_b] {
+            let view = listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|talk| talk["id"] == *id)
+                .unwrap();
+            assert_eq!(view["thinking"], true, "{listed}");
+        }
+        let repeated = f
+            .post(
+                &format!("/api/talks/{id_a}/say"),
+                Some(r#"{"text":"again"}"#),
+            )
+            .await;
+        assert_eq!(repeated.status, 409, "{}", repeated.body);
     }
 
     /// Bytes `sniffed_mime` recognises as `image/png` - the signature plus a
@@ -6622,6 +6705,31 @@ mod tests {
             ui.begin_resume("20260901-000000-once").is_ok(),
             "and the claim is released when the attempt ends"
         );
+    }
+
+    #[test]
+    fn talk_thinking_tracks_only_its_held_turn_claim() {
+        let home = TempDir::new().expect("temp home");
+        let ui = Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            Talks::at(home.path().join("talks")),
+            home.path().join("runs"),
+            home.path().to_path_buf(),
+            PathBuf::from("/repo"),
+        )
+        .with_worktrees_root(home.path().join("wt"));
+        let id = "20260901-000000-once";
+
+        assert!(!ui.is_thinking(id), "an unclaimed talk is not thinking");
+        let turn = ui.begin_talk_turn(id).expect("claim turn");
+        assert!(ui.is_thinking(id), "the held guard is reported as thinking");
+        assert!(
+            !ui.is_thinking("20260901-000000-other"),
+            "one talk's turn does not make another talk busy"
+        );
+        drop(turn);
+        assert!(!ui.is_thinking(id), "dropping the guard releases thinking");
     }
 
     #[tokio::test]
