@@ -57,8 +57,9 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
-use crate::ask;
+use crate::ask::{self, Questions};
 use crate::clean;
+use crate::conduct::Conductor;
 use crate::config::{Config, MergeMode};
 use crate::graph::Runner;
 use crate::land;
@@ -90,6 +91,26 @@ pub const POLL: Duration = Duration::from_secs(5);
 /// this graph plausibly takes, so a sweep cannot pull a task out from under a
 /// daemon that is merely slow.
 pub const STALE_CLAIM: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// How long a task may sit [`TaskStatus::Running`] with no live daemon's
+/// heartbeat naming it before [`crate::conduct`] is shown it as stalled.
+///
+/// [`reclaim_orphaned_running`] settles most crashes immediately, on every
+/// poll, by attempting the task's own claim: a dead pid is proof enough for
+/// [`sweep_stale_claims`] to drop the lock the same tick, and the very next
+/// claim attempt succeeds. But a lock whose pid cannot be parsed at all — an
+/// empty or corrupt `.lock` file — falls back to [`STALE_CLAIM`]'s six-hour
+/// age instead, since there is nothing else to check (see
+/// [`sweep_stale_claims`]'s own doc). For as long as that lock survives, the
+/// claim keeps failing and `reclaim_orphaned_running` correctly leaves the
+/// task `running` — see
+/// `stalled_tasks_still_reaches_a_task_reclaim_could_not_claim_yet` for
+/// exactly this ordering. `stalled_tasks` is what surfaces that task to the
+/// conductor well before the mechanical six-hour sweep would, and thirty
+/// minutes is comfortably below `STALE_CLAIM` while still being generous
+/// enough that a task merely late to publish its first [`HEARTBEAT`] is
+/// never mistaken for abandoned.
+pub const STALLED_RUNNING: Duration = Duration::from_secs(30 * 60);
 
 /// What the loop is working on, for the status file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -581,6 +602,141 @@ pub fn sweep_stale_claims(queue: &Queue, older_than: Duration) -> Vec<String> {
     swept
 }
 
+/// Is `task` stalled: [`TaskStatus::Running`], past [`STALLED_RUNNING`], with
+/// no live daemon's heartbeat naming it? Deterministic — no model call, and
+/// the exact test [`stalled_tasks`] uses to decide what `crate::conduct` is
+/// shown.
+fn is_stalled(task: &Task, home: &Path, now: Timestamp) -> bool {
+    task.status == TaskStatus::Running
+        && (now.as_second() - task.updated_at.as_second()) >= STALLED_RUNNING.as_secs() as i64
+        && !is_working_on_task(home, &task.id, now)
+}
+
+/// Every task [`is_stalled`] right now — "止まったタスク" in
+/// `crate::conduct`'s vocabulary.
+fn stalled_tasks(queue: &Queue, home: &Path, now: Timestamp) -> Vec<Task> {
+    queue
+        .list()
+        .into_iter()
+        .filter(|t| is_stalled(t, home, now))
+        .collect()
+}
+
+/// Runnable tasks a dependency can still be set on — "runnable なタスク" in
+/// `crate::conduct`'s vocabulary. Deliberately `Queued` only, not
+/// `Failed`-and-so-also-runnable: a task that already attempted and lost
+/// belongs in [`finished_tasks`], where the question is a recovery, not a
+/// dependency.
+fn queued_tasks(queue: &Queue) -> Vec<Task> {
+    queue
+        .list()
+        .into_iter()
+        .filter(|t| t.status == TaskStatus::Queued)
+        .collect()
+}
+
+/// `Failed`/`Held` tasks nobody has decided a recovery for yet — "終わった
+/// タスク" in `crate::conduct`'s vocabulary.
+fn finished_tasks(queue: &Queue) -> Vec<Task> {
+    queue
+        .list()
+        .into_iter()
+        .filter(|t| matches!(t.status, TaskStatus::Failed | TaskStatus::Held))
+        .collect()
+}
+
+/// Deterministically resolve `Task::blocked_by`: a dependency task that
+/// reached `Done`, or a question that was answered, is removed — no model
+/// involved, on every poll. An answered question's content is copied onto
+/// the task ([`Task::record_answer`]) before its id is dropped, so it
+/// reaches the next `crate::conduct` prompt and the next run's instruction
+/// (see [`instruction_for`]) rather than only clearing the block.
+fn resolve_blockers(queue: &Queue, questions: &Questions) {
+    for listed in queue.list() {
+        if listed.status != TaskStatus::Blocked || listed.blocked_by.is_empty() {
+            continue;
+        }
+        let Ok(_claim) = queue.claim(&listed.id) else {
+            continue;
+        };
+        let Ok(mut task) = queue.get(&listed.id) else {
+            continue;
+        };
+        if task.status != TaskStatus::Blocked {
+            continue;
+        }
+        let mut changed = false;
+        for id in task.blocked_by.clone() {
+            if let Ok(dep) = queue.get(&id) {
+                if dep.status == TaskStatus::Done {
+                    task.unblock(&id);
+                    changed = true;
+                }
+                continue;
+            }
+            if let Ok(q) = questions.get(&id)
+                && q.status == ask::QuestionStatus::Answered
+            {
+                let answer = match &q.answer {
+                    Some(ask::Answer::Choice(c) | ask::Answer::Text(c)) => c.clone(),
+                    None => String::new(),
+                };
+                task.record_answer(q.summary.clone(), answer);
+                task.unblock(&id);
+                changed = true;
+            }
+        }
+        if changed {
+            record(queue, &mut task);
+        }
+    }
+}
+
+/// Retire an unanswered conductor question after its task no longer refers to
+/// it. Conductor questions use the task id in `Question::run`, so run-based
+/// cleanup cannot observe a manual release or completion.
+///
+/// Restricted to `Question::node == crate::conduct::NODE`: an ordinary run's
+/// own question also carries a `run`, and a run id that happens to collide
+/// with some task's id is not this loop's business — only a conductor
+/// question actually uses the task id that way. One `Questions::list()` scan
+/// is taken up front and matched against the in-memory task set, rather than
+/// calling `Questions::open_for` (a full disk scan on its own) once per task.
+fn reconcile_task_questions(queue: &Queue, questions: &Questions) {
+    let tasks = queue.list();
+    let by_id: std::collections::BTreeMap<&str, &Task> =
+        tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+    let referenced: std::collections::BTreeSet<&str> = tasks
+        .iter()
+        .flat_map(|task| task.blocked_by.iter().map(String::as_str))
+        .collect();
+
+    for mut question in questions.list() {
+        if !question.status.open() || question.node != crate::conduct::NODE {
+            continue;
+        }
+        // Keep questions a task still names, including when the reference
+        // moved to a dependent task.
+        if referenced.contains(question.id.as_str()) {
+            continue;
+        }
+        let Some(task) = by_id.get(question.run.as_str()) else {
+            continue;
+        };
+        question.abandon(format!(
+            "task {} no longer waits for this answer",
+            task.short()
+        ));
+        if let Err(e) = questions.put(&mut question) {
+            tracing::warn!(
+                "could not retire question {} for task {}: {e:#}",
+                question.short(),
+                task.short()
+            );
+        }
+    }
+}
+
 /// What a finished run tells the queue about the task it came from.
 ///
 /// A struct rather than a fourth and fifth boolean argument: the two flags
@@ -865,8 +1021,6 @@ async fn drive(
     worktrees_root: &Path,
     stop: &Stop,
 ) -> Result<()> {
-    janitor(&opts.repo, opts, home, worktrees_root).await;
-
     // The status file is a *snapshot*, not a stream of events: a reader only
     // ever wants the latest values, and every tick rewrites the whole file
     // anyway. A shared `Mutex<Status>` therefore says exactly what is meant,
@@ -896,6 +1050,10 @@ async fn drive(
         opts.max_attempts,
         concurrency
     );
+
+    // `--once` drains an already-idle queue without reaching the idle wait,
+    // but must still perform the startup cleanup.
+    janitor(&opts.repo, opts, home, worktrees_root).await;
 
     let outcome = poll(
         opts,
@@ -1064,6 +1222,7 @@ async fn poll(
     // must not sit out a quota cooldown it did not cause.
     let quota_cooldown_until: Arc<Mutex<Option<Timestamp>>> = Arc::new(Mutex::new(None));
     let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let mut conductor = Conductor::new();
 
     while !stop.stopped() {
         lock(status).polls += 1;
@@ -1086,6 +1245,14 @@ async fn poll(
                 swept.join(", ")
             );
         }
+        // Capture stalled work before reclaiming it. A dead daemon's ordinary
+        // lock is swept and reclaimed in this same poll, but the conductor
+        // must still see that it was stranded rather than only its mechanical
+        // terminal state.
+        let now = Timestamp::now();
+        let stalled = stalled_tasks(queue, home, now);
+        let stalled_ids: std::collections::BTreeSet<_> =
+            stalled.iter().map(|task| task.id.clone()).collect();
         let reclaimed = reclaim_orphaned_running(queue, opts.max_attempts);
         if !reclaimed.is_empty() {
             tracing::warn!(
@@ -1094,6 +1261,53 @@ async fn poll(
                 reclaimed.len(),
                 reclaimed.join(", ")
             );
+        }
+
+        // `home`, not `ask::Questions::open()`'s own process-global default:
+        // `poll` is handed its home explicitly precisely so a test can point
+        // it elsewhere, the same reason `Queue::at` and the status file path
+        // are parameters rather than resolved here - see `drive`'s own doc.
+        let questions = Questions::at(home.join("questions"));
+
+        // Deterministic: no model, run before the conductor sees anything so
+        // its input reflects the queue's current, already-resolved state.
+        resolve_blockers(queue, &questions);
+        reconcile_task_questions(queue, &questions);
+
+        // The conductor gets one look per cycle, right before the loop takes
+        // its next task, and only when there is something new to look at -
+        // see `Conductor::worth_a_look`'s own doc for why "stalled is
+        // non-empty" is the wrong test. Checked before `prepare` so an
+        // unchanged cycle never pays for a synchronous config load.
+        let finished: Vec<Task> = finished_tasks(queue)
+            .into_iter()
+            .filter(|task| !stalled_ids.contains(&task.id))
+            .collect();
+        let queued = queued_tasks(queue);
+        // An empty queue has nothing to arrange. In particular, do not let
+        // the conductor's initial snapshot cause synchronous config I/O
+        // between the caller's stop notification and the idle wait below.
+        if !(queued.is_empty() && stalled.is_empty() && finished.is_empty())
+            && conductor.worth_a_look(queue, &stalled, &finished)
+        {
+            match prepare(&opts.repo, opts) {
+                Ok(cfg) => {
+                    conductor
+                        .maybe_run(
+                            &cfg,
+                            &opts.repo,
+                            queue,
+                            &questions,
+                            home,
+                            &queued,
+                            &stalled,
+                            &finished,
+                            opts.max_attempts,
+                        )
+                        .await;
+                }
+                Err(e) => tracing::warn!("conductor: no config: {e:#}"),
+            }
         }
 
         let candidates: Vec<Task> = runnable(queue)
@@ -1224,18 +1438,25 @@ async fn poll(
             continue;
         }
 
-        // Truly idle: nothing new to start and nothing still running. The
-        // disk is quiet, so this is the point for the janitor - folding
-        // worktrees and pruning a cache while a sibling run is still
-        // building would race the very compile the prune exists to keep,
-        // which concurrent runs make possible in a way the old one-at-a-time
-        // loop never had to guard against.
-        janitor(&opts.repo, opts, home, worktrees_root).await;
+        // Truly idle: nothing new to start and nothing still running.
         lock(status).idle = true;
         if opts.once {
+            // A one-shot drain must perform the same post-work cleanup as a
+            // daemon that reached a normal idle interval. The startup pass
+            // cannot see runs or cache files produced by this drain.
+            janitor(&opts.repo, opts, home, worktrees_root).await;
             break;
         }
         stop.idle(opts.poll).await;
+        if stop.stopped() {
+            continue;
+        }
+        // Housekeeping only after a full quiet interval. Running it before
+        // the first idle wait can block the executor while an operator's
+        // stop request is waiting to be scheduled, defeating Stop's retained
+        // wake permit. No run can start while this branch is active, so the
+        // janitor still never races an in-flight compile.
+        janitor(&opts.repo, opts, home, worktrees_root).await;
     }
 
     // Never return while a run is still in flight, whichever way the loop
@@ -1311,22 +1532,64 @@ async fn attempt(
     // fresh implementations to reach the same panel. `RunStatus::resumable`
     // rather than `!done()` is what catches the second case: a stall is
     // terminal, and its cheap recovery re-asks only the absent seats.
-    let unfinished = task
-        .runs
-        .iter()
-        .rev()
-        .find(|id| {
-            RunState::load(id)
-                .map(|s| s.status.resumable())
-                .unwrap_or(false)
-        })
-        .cloned();
-    let started = match &unfinished {
-        Some(id) => {
-            tracing::info!("resuming run {id} rather than competing again");
-            Runner::resume(id)
+    //
+    // A load failure is warned about rather than silently read as "not
+    // resumable": the alternative is exactly what let a schema mismatch on
+    // run `eba2` fall through to a full re-competition with nobody told why.
+    // `crate::conduct` is what actually offers a better answer than
+    // `Runner::start` here (see `Recovery::Review`), once this task's next
+    // failure shows it up as `held`/`failed` with the run state unreadable.
+    let unfinished = (!task.fresh_start)
+        .then(|| unfinished_run(&task.runs, task.short()))
+        .flatten();
+    // `crate::conduct` chose `Review` for this task on an earlier cycle: its
+    // branch survived, and this reopens exactly that branch as a
+    // review-only pass rather than resuming or competing again. Consumed
+    // (cleared) here whichever way this goes, so it never outlives this one
+    // attempt - see `queue::Task::review_branch`.
+    let review_branch = task.review_branch.take();
+    let branch_exists = match &review_branch {
+        Some(branch) => crate::git::branch_exists(&repo, branch)
+            .await
+            .unwrap_or(false),
+        None => false,
+    };
+    let starter = choose_starter(
+        review_branch.as_deref(),
+        branch_exists,
+        unfinished.as_deref(),
+    );
+    let started = match &starter {
+        Starter::Review(branch) => {
+            tracing::info!(
+                "task {} reopens `{branch}` as a review-only pass",
+                task.short()
+            );
+            Runner::review(&repo, branch, config).await
         }
-        None => Runner::start(&repo, task.instruction.clone(), config).await,
+        Starter::Resume(id) => {
+            tracing::info!("resuming run {id} rather than competing again");
+            Runner::resume(id).map(|mut r| {
+                if let Some(instruction) =
+                    prepare_instruction(&starter, Some(&r.state.instruction), task)
+                {
+                    r.state.instruction = instruction;
+                }
+                r
+            })
+        }
+        Starter::Start => {
+            if let Some(branch) = &review_branch {
+                tracing::warn!(
+                    "conductor chose review for task {} but branch `{branch}` no longer \
+                     exists; requeuing as a fresh competition instead",
+                    task.short()
+                );
+            }
+            let instruction = prepare_instruction(&starter, None, task)
+                .unwrap_or_else(|| task.instruction.clone());
+            Runner::start(&repo, instruction, config).await
+        }
     };
     let mut runner = match started {
         Ok(r) => r,
@@ -1583,6 +1846,117 @@ fn parse_reset_hint(text: &str, now: Timestamp) -> Option<Timestamp> {
     Some(at)
 }
 
+/// Resuming a `Blocked` run that already spent every review round its own
+/// config allowed cannot make progress: `graph::Runner`'s review loop walks
+/// `(reviews.len()+1)..=max_rounds`, which is empty once `reviews.len()` has
+/// reached `max_rounds`, so `execute` would settle straight back to
+/// `Blocked` without asking anyone anything. Read-only against a state this
+/// build never mutates — `src/graph.rs` stays untouched — but without this
+/// check, [`unfinished_run`] would keep reporting such a run as still
+/// "unfinished", and `crate::conduct::Recovery::Requeue` (whose whole
+/// promise is a fresh competition when a design needs to change) would
+/// silently resume the exhausted run instead, spending an attempt on a
+/// cycle that cannot change anything.
+fn exhausted_review_budget(state: &RunState) -> bool {
+    state.status == RunStatus::Blocked && state.reviews.len() >= state.config.graph.review_rounds
+}
+
+/// This task's *most recent* run, if resuming it would actually make
+/// progress. `short` is only for the warning's own message.
+///
+/// Only ever `runs.last()` — never a search back through older history.
+/// `runs` accumulates one entry per fresh `Runner::start`/`Runner::review`
+/// mint, oldest first, and every entry before the last one was already
+/// superseded at the moment it was minted: the daemon only ever starts a new
+/// run when the previous one was not worth resuming (unresumable, exhausted,
+/// or unreadable), or when `crate::conduct::Recovery::Review` deliberately
+/// opens a fresh review-only run alongside an older, already-failed
+/// competition. Searching further back would let an old run that merely
+/// *looks* resumable — a `Stalled` competition an earlier `Review` pass left
+/// behind, say — get resumed instead of the fresh competition
+/// `crate::conduct::Recovery::Requeue` actually promised, reviving history
+/// nothing asked to revisit.
+///
+/// Two runs paid for the "prefer resuming over restarting" half of this
+/// lesson, which is why this still checks `runs.last()` rather than always
+/// restarting. Run 01c2 was blocked and the loop started 3cbf on the same
+/// task a moment later, duplicating two and a half hours of agent work. Then
+/// b25f stalled on a judge that timed out and one that answered with no JSON
+/// — `quota: 0`, so nothing the machine was to blame for — and 4043 started
+/// **one second** later, buying three fresh implementations to reach the
+/// same panel. `RunStatus::resumable` rather than `!done()` is what catches
+/// the second case: a stall is terminal, and its cheap recovery re-asks only
+/// the absent seats. [`exhausted_review_budget`] is the other half: a run
+/// that is technically `resumable()` but provably cannot progress must not
+/// count as "unfinished" either, or `Recovery::Requeue` becomes a silent
+/// no-op instead of the fresh competition it promises.
+///
+/// A load failure is warned about rather than silently read as "not
+/// resumable": the alternative is exactly what let a schema mismatch on run
+/// `eba2` fall through to a full re-competition with nobody told why.
+/// `crate::conduct` is what actually offers a better answer than
+/// `Runner::start` here (see `Recovery::Review`), once this task's next
+/// failure shows it up as `held`/`failed` with the run state unreadable.
+fn unfinished_run(runs: &[String], short: &str) -> Option<String> {
+    unfinished_run_with(runs, short, RunState::load)
+}
+
+/// [`unfinished_run`] with an injected state reader. Tests provide their
+/// fixtures directly rather than touching the process-global run home.
+fn unfinished_run_with<F>(runs: &[String], short: &str, load: F) -> Option<String>
+where
+    F: FnOnce(&str) -> Result<RunState>,
+{
+    let id = runs.last()?;
+    match load(id) {
+        Ok(s) if s.status.resumable() && !exhausted_review_budget(&s) => Some(id.clone()),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("could not read run {id} for task {short}: {e:#}");
+            None
+        }
+    }
+}
+
+/// Which of the three ways [`attempt`] can mint or continue a run this task
+/// should use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Starter {
+    /// `crate::graph::Runner::review` against a branch `crate::conduct` chose
+    /// and that still exists.
+    Review(String),
+    /// `crate::graph::Runner::resume` on an unfinished run of this task.
+    Resume(String),
+    /// `crate::graph::Runner::start`: a fresh competition.
+    Start,
+}
+
+/// Decide which of [`Runner::review`], [`Runner::resume`] or [`Runner::start`]
+/// this attempt should use. Pure, and separate from [`attempt`], so the
+/// routing itself is assertable without spawning a real graph or a git
+/// process: `attempt`'s own `crate::git::branch_exists` call has already
+/// happened by the time this is called.
+///
+/// `review_branch` wins whenever `branch_exists` confirms it; a `review_branch`
+/// whose branch is gone falls all the way through to [`Starter::Start`], not
+/// to [`Starter::Resume`] — `crate::conduct` chose review over resuming the
+/// old (likely `Blocked`) run in the first place, and a branch that vanished
+/// out from under that choice is not evidence resuming it would fare better.
+fn choose_starter(
+    review_branch: Option<&str>,
+    branch_exists: bool,
+    unfinished: Option<&str>,
+) -> Starter {
+    match review_branch {
+        Some(branch) if branch_exists => Starter::Review(branch.to_owned()),
+        Some(_) => Starter::Start,
+        None => match unfinished {
+            Some(id) => Starter::Resume(id.to_owned()),
+            None => Starter::Start,
+        },
+    }
+}
+
 /// Which repository a task runs in. A task that names none — the normal case
 /// for one filed from a phone — runs in the daemon's own default.
 fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
@@ -1590,6 +1964,95 @@ fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
         return fallback.to_path_buf();
     }
     task.repo.clone()
+}
+
+/// The header [`append_answers`] appends operator answers under. Shared with
+/// [`strip_answers_block`] so a resumed run's instruction can be refreshed
+/// rather than grown a new block on every resume.
+const ANSWERS_HEADER: &str = "\n\n# Operator answers\n\n";
+
+/// Render the first `count` answers in the block appended to an instruction.
+fn answers_block(task: &Task, count: usize) -> String {
+    let mut s = ANSWERS_HEADER.to_owned();
+    for a in &task.answers[..count] {
+        s.push_str(&format!("- {}: {}\n", a.question, a.answer));
+    }
+    s
+}
+
+/// Append every answer `crate::conduct` has collected for `task` onto `base`,
+/// in the shape both [`instruction_for`] and [`resumed_instruction`] use.
+fn append_answers(base: &str, task: &Task) -> String {
+    if task.answers.is_empty() {
+        return base.to_owned();
+    }
+    let mut s = base.to_owned();
+    s.push_str(&answers_block(task, task.answers.len()));
+    s
+}
+
+/// Drop the prior answer block only when it is exactly the suffix this task
+/// could have appended on an earlier resume. An `ANSWERS_HEADER` written by
+/// the task author is ordinary instruction text, not a block to remove.
+fn strip_answers_block<'a>(instruction: &'a str, task: &Task) -> &'a str {
+    for count in (1..=task.answers.len()).rev() {
+        let block = answers_block(task, count);
+        if let Some(base) = instruction.strip_suffix(&block) {
+            return base;
+        }
+    }
+    instruction
+}
+
+/// The instruction handed to `Runner::start`: the task's own text, plus any
+/// operator answers `crate::conduct` collected for it (see
+/// [`Task::answers`]), so a decision the operator actually made reaches the
+/// implementers rather than only clearing the block that was waiting on it.
+///
+/// Appended rather than merged into [`Task::instruction`] itself, so the
+/// task's own record stays exactly what its author wrote.
+fn instruction_for(task: &Task) -> String {
+    append_answers(&task.instruction, task)
+}
+
+/// The instruction a resumed run should carry on with: whatever it already
+/// had, refreshed with the task's *current* operator answers.
+///
+/// A resumable run's own `RunState::instruction` predates any answer
+/// `crate::conduct` collects after the run parks, so resuming it unchanged —
+/// the behaviour before this function existed — silently drops the very
+/// decision the operator made to unblock it. Re-stripping any block this
+/// function appended on an earlier resume before re-appending the current
+/// list (rather than blindly appending again) is what keeps a task resumed
+/// three times over three answered questions from carrying the same answer
+/// three times.
+fn resumed_instruction(old_instruction: &str, task: &Task) -> String {
+    append_answers(strip_answers_block(old_instruction, task), task)
+}
+
+/// What [`attempt`] should tell a [`Starter`] about `task`'s current operator
+/// answers before handing it to `Runner` — the actual boundary between
+/// [`choose_starter`]'s routing and the graph, factored out so it is
+/// assertable without a real repository, git branch, or agent CLI.
+///
+/// `Starter::Review` deliberately answers `None`: `Runner::review` builds its
+/// instruction from the reviewed branch's own commit log because there is no
+/// task statement to speak of for hand-written work, and splicing operator
+/// answers into that text would contradict the very message it sends
+/// reviewers ("there is no task statement").
+fn prepare_instruction(
+    starter: &Starter,
+    old_instruction: Option<&str>,
+    task: &Task,
+) -> Option<String> {
+    match starter {
+        Starter::Start => Some(instruction_for(task)),
+        Starter::Resume(_) => Some(resumed_instruction(
+            old_instruction.expect("a resumed run always has a prior instruction"),
+            task,
+        )),
+        Starter::Review(_) => None,
+    }
 }
 
 /// Persist a transition. A queue write failure is logged rather than fatal: the
@@ -2968,18 +3431,18 @@ mod tests {
     /// longer than the test's patience, so anything that waits out a poll
     /// instead of noticing the stop fails rather than merely being slow.
     fn idle_loop(dir: &Path) -> (Opts, Queue, PathBuf, PathBuf, PathBuf) {
+        let config = dir.join("magi.toml");
+        std::fs::write(
+            &config,
+            "[disk]\nmin_free_bytes = 0\nauto_fold = false\ncache_limit_bytes = 0\n",
+        )
+        .unwrap();
         let opts = Opts {
             poll: Duration::from_secs(30),
-            // `Opts::default`'s `repo` is `"."` - the process's own working
-            // directory, which under `cargo test` is this very checkout, a
-            // real git repository with its own `magi.toml`. `drive` runs the
-            // janitor unconditionally on every call, and the janitor discovers
-            // its config from `opts.repo` and then prunes worktree
-            // registrations there - so leaving this at `"."` would have every
-            // test that drives the loop mutate this checkout's own git admin
-            // state. A directory that is not a repository at all makes that
-            // step fail closed instead (`git worktree prune` errors, caught
-            // and logged, nothing pruned).
+            config: Some(config),
+            // The explicit fixture config keeps startup cleanup from reading
+            // machine configuration. This fictional repository likewise
+            // keeps any best-effort git cleanup away from this checkout.
             repo: dir.join("repo"),
             ..Opts::default()
         };
@@ -3142,6 +3605,695 @@ mod tests {
         assert!(
             read_status(&home).is_none(),
             "a reader must see no daemon at all, not a heartbeat that merely stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn once_runs_startup_housekeeping_before_an_empty_queue_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut opts, queue, status_file, home, worktrees) = idle_loop(dir.path());
+        opts.once = true;
+
+        let mut settled = RunState::new(
+            dir.path().join("repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            "fixture".to_owned(),
+            Config::default(),
+        );
+        settled.status = RunStatus::Ready;
+        let run_dir = home.join("runs").join(&settled.id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("run.json"),
+            serde_json::to_string_pretty(&settled).unwrap(),
+        )
+        .unwrap();
+        let questions = Questions::at(home.join("questions"));
+        let mut question = ask::Question::new(
+            settled.id.clone(),
+            "review".to_owned(),
+            "reviewer-1".to_owned(),
+            "Continue?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut question).unwrap();
+
+        drive(&opts, &queue, &status_file, &home, &worktrees, &Stop::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            questions.get(&question.id).unwrap().status,
+            ask::QuestionStatus::Abandoned,
+            "an empty --once drain still performs startup question cleanup"
+        );
+    }
+
+    #[test]
+    fn task_question_reconciliation_keeps_references_and_retires_manual_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut task = task();
+        queue.put(&mut task).unwrap();
+
+        let mut task_question = ask::Question::new(
+            task.id.clone(),
+            crate::conduct::NODE.to_owned(),
+            "conduct".to_owned(),
+            "Which backend?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut task_question).unwrap();
+        task.block(vec![task_question.id.clone()], None);
+        queue.put(&mut task).unwrap();
+
+        let mut run_question = ask::Question::new(
+            "20260101-000000-run1".to_owned(),
+            "review".to_owned(),
+            "reviewer-1".to_owned(),
+            "Run question".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut run_question).unwrap();
+
+        // A question from another node whose `run` happens to equal this
+        // task's id — the same field, filled in for an unrelated reason. Only
+        // `crate::conduct::NODE` questions use `run` as a task id; this one
+        // must never be touched by this reconciliation, even after release.
+        let mut coincidental = ask::Question::new(
+            task.id.clone(),
+            "review".to_owned(),
+            "reviewer-1".to_owned(),
+            "Unrelated review question".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut coincidental).unwrap();
+
+        reconcile_task_questions(&queue, &questions);
+        assert!(questions.get(&task_question.id).unwrap().status.open());
+        assert!(questions.get(&run_question.id).unwrap().status.open());
+        assert!(questions.get(&coincidental.id).unwrap().status.open());
+
+        task.release();
+        queue.put(&mut task).unwrap();
+        reconcile_task_questions(&queue, &questions);
+        assert_eq!(
+            questions.get(&task_question.id).unwrap().status,
+            ask::QuestionStatus::Abandoned
+        );
+        assert!(
+            questions.get(&run_question.id).unwrap().status.open(),
+            "run questions remain the run janitor's responsibility"
+        );
+        assert!(
+            questions.get(&coincidental.id).unwrap().status.open(),
+            "a non-conductor question must not be abandoned just because its \
+             run id coincides with a task id"
+        );
+    }
+
+    #[test]
+    fn a_freshly_started_running_task_is_never_stalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = task();
+        t.start("run-1".to_owned());
+        // `updated_at` is `Timestamp::now()`, left alone: no live daemon
+        // named in `dir`, but nowhere near `STALLED_RUNNING` yet.
+        assert!(!is_stalled(&t, dir.path(), Timestamp::now()));
+    }
+
+    #[test]
+    fn a_long_running_task_with_no_live_daemon_is_stalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = task();
+        t.start("run-1".to_owned());
+        t.updated_at = Timestamp::now()
+            - jiff::SignedDuration::from_secs(STALLED_RUNNING.as_secs() as i64 + 60);
+        assert!(is_stalled(&t, dir.path(), Timestamp::now()));
+        assert_eq!(
+            stalled_tasks(
+                &Queue::at(dir.path().join("q")),
+                dir.path(),
+                Timestamp::now()
+            )
+            .len(),
+            0,
+            "the task was never written to this queue"
+        );
+    }
+
+    #[test]
+    fn a_long_running_task_a_live_daemon_still_names_is_not_stalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = task();
+        t.id = "20260903-080340-0167".to_owned();
+        t.start("20260903-080619-01c2".to_owned());
+        t.updated_at = Timestamp::now()
+            - jiff::SignedDuration::from_secs(STALLED_RUNNING.as_secs() as i64 + 60);
+
+        let mut status = Status::new();
+        status.current = vec![Current {
+            task: t.id.clone(),
+            run: "20260903-080619-01c2".to_owned(),
+        }];
+        write_status_to(&dir.path().join("daemon.json"), &status).unwrap();
+
+        assert!(
+            !is_stalled(&t, dir.path(), Timestamp::now()),
+            "a live daemon's own heartbeat rules out stalled, however long the task has run"
+        );
+    }
+
+    /// Rewrite a task's `updated_at` on disk directly, bypassing
+    /// `Queue::put`'s own `Timestamp::now()` stamping - the only way to make
+    /// a fixture look like it has genuinely been `running` for a while.
+    fn backdate_task(queue: &Queue, id: &str, seconds_ago: i64) {
+        let path = queue.path_of(id);
+        let body = std::fs::read_to_string(&path).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let old = Timestamp::now() - jiff::SignedDuration::from_secs(seconds_ago);
+        v["updated_at"] = serde_json::Value::String(old.to_string());
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn stalled_tasks_still_reaches_a_task_reclaim_could_not_claim_yet() {
+        // The realistic `poll()` ordering, not `is_stalled` in isolation:
+        // `reclaim_orphaned_running` runs first, on every poll, and settles
+        // any `running` task whose claim it can actually take. For most
+        // crashes that is immediate - a dead pid is proof enough for
+        // `sweep_stale_claims` to drop the lock the same tick, and the very
+        // next claim attempt succeeds. But a lock whose pid cannot be parsed
+        // at all falls back to `STALE_CLAIM`'s six-hour age instead (see
+        // `sweep_stale_claims`'s own doc), so the lock - and the claim
+        // failure behind it - can legitimately outlive many polls. This is
+        // exactly the gap `stalled_tasks` exists to surface well before that
+        // six-hour sweep would: reclaim leaves the task `running`, and it
+        // must still reach the conductor as stalled.
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let home = dir.path().join("home");
+
+        let mut t = task();
+        t.id = "20260101-000001-lock".to_owned();
+        t.start("run-1".to_owned());
+        queue.put(&mut t).unwrap();
+        backdate_task(&queue, &t.id, STALLED_RUNNING.as_secs() as i64 + 60);
+        std::fs::write(
+            dir.path().join("queue").join(format!("{}.lock", t.id)),
+            "not a pid",
+        )
+        .unwrap();
+
+        let now = Timestamp::now();
+        assert!(
+            reclaim_orphaned_running(&queue, 2).is_empty(),
+            "the unparseable lock is still well within STALE_CLAIM, so the claim fails \
+             and reclaim must leave the task alone"
+        );
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Running);
+
+        let stalled = stalled_tasks(&queue, &home, now);
+        assert_eq!(
+            stalled.len(),
+            1,
+            "reclaim's inability to claim it yet must not hide it from the conductor"
+        );
+        assert_eq!(stalled[0].id, t.id);
+    }
+
+    #[test]
+    fn ordinary_dead_daemon_task_is_shown_stalled_before_reclaim_and_can_be_requeued() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::run::set_home(dir.path().join("run-home"));
+        let queue = Queue::at(dir.path().join("queue"));
+        let home = dir.path().join("home");
+        let questions = Questions::at(dir.path().join("questions"));
+
+        let mut t = task();
+        t.id = "20260101-000003-dead".to_owned();
+        t.start("missing-run".to_owned());
+        queue.put(&mut t).unwrap();
+        backdate_task(&queue, &t.id, STALLED_RUNNING.as_secs() as i64 + 60);
+
+        // This is the real poll ordering: retain the deterministic stalled
+        // input before a claim proves the owner is gone and reclaims it.
+        let stalled = stalled_tasks(&queue, &home, Timestamp::now());
+        assert_eq!(
+            stalled.iter().map(|task| &task.id).collect::<Vec<_>>(),
+            [&t.id]
+        );
+        assert_eq!(reclaim_orphaned_running(&queue, 2), [t.id.clone()]);
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+
+        // Reclaim drops its guard before conductor decisions are applied, so
+        // the decision for the captured stalled input has a real write path.
+        crate::conduct::apply(
+            &queue,
+            &questions,
+            &crate::conduct::Verdict {
+                decisions: vec![crate::conduct::Decision {
+                    id: t.id.clone(),
+                    recovery: Some(crate::conduct::Recovery::Requeue),
+                    ..crate::conduct::Decision::default()
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+    }
+
+    #[test]
+    fn stalled_tasks_reports_exactly_the_tasks_is_stalled_agrees_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let home = dir.path().join("home");
+
+        let mut fresh = task();
+        fresh.id = "20260101-000001-aaaa".to_owned();
+        fresh.start("run-1".to_owned());
+        queue.put(&mut fresh).unwrap();
+
+        let mut old = task();
+        old.id = "20260101-000002-bbbb".to_owned();
+        old.start("run-2".to_owned());
+        queue.put(&mut old).unwrap();
+        backdate_task(&queue, &old.id, STALLED_RUNNING.as_secs() as i64 + 60);
+
+        let stalled = stalled_tasks(&queue, &home, Timestamp::now());
+        assert_eq!(stalled.len(), 1);
+        assert_eq!(stalled[0].id, old.id);
+    }
+
+    #[test]
+    fn queued_and_finished_task_views_partition_by_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+
+        let mut queued = task();
+        queued.id = "20260101-000001-aaaa".to_owned();
+        queue.put(&mut queued).unwrap();
+
+        let mut failed = task();
+        failed.id = "20260101-000002-bbbb".to_owned();
+        failed.start("run-1".to_owned());
+        failed.fail("gate red", 5);
+        queue.put(&mut failed).unwrap();
+
+        let mut held = task();
+        held.id = "20260101-000003-cccc".to_owned();
+        held.hold(None);
+        queue.put(&mut held).unwrap();
+
+        let mut running = task();
+        running.id = "20260101-000004-dddd".to_owned();
+        running.start("run-2".to_owned());
+        queue.put(&mut running).unwrap();
+
+        let queued_ids: Vec<String> = queued_tasks(&queue).into_iter().map(|t| t.id).collect();
+        assert_eq!(queued_ids, [queued.id.clone()]);
+
+        let mut finished_ids: Vec<String> =
+            finished_tasks(&queue).into_iter().map(|t| t.id).collect();
+        finished_ids.sort_unstable();
+        let mut want = vec![failed.id.clone(), held.id.clone()];
+        want.sort_unstable();
+        assert_eq!(finished_ids, want);
+    }
+
+    #[test]
+    fn resolve_blockers_clears_a_done_dependency_and_keeps_an_unresolved_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = ask::Questions::at(dir.path().join("questions"));
+
+        let mut dep = task();
+        dep.id = "20260101-000001-dep0".to_owned();
+        dep.succeed();
+        queue.put(&mut dep).unwrap();
+
+        let mut still_going = task();
+        still_going.id = "20260101-000002-dep1".to_owned();
+        queue.put(&mut still_going).unwrap();
+
+        let mut blocked = task();
+        blocked.id = "20260101-000003-main".to_owned();
+        blocked.block(
+            vec![dep.id.clone(), still_going.id.clone()],
+            Some("waits on both".to_owned()),
+        );
+        queue.put(&mut blocked).unwrap();
+
+        resolve_blockers(&queue, &questions);
+
+        let after = queue.get(&blocked.id).unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::Blocked,
+            "one dependency is still outstanding"
+        );
+        assert_eq!(after.blocked_by, [still_going.id.clone()]);
+    }
+
+    #[test]
+    fn resolve_blockers_carries_an_answers_content_onto_the_task_and_unblocks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = ask::Questions::at(dir.path().join("questions"));
+
+        let mut q = crate::ask::Question::new(
+            "20260101-000001-main".to_owned(),
+            crate::conduct::NODE.to_owned(),
+            "conduct".to_owned(),
+            "Which backend?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut q).unwrap();
+        q.answer(crate::ask::Answer::Text("SQLite".to_owned()))
+            .unwrap();
+        questions.put(&mut q).unwrap();
+
+        let mut blocked = task();
+        blocked.id = "20260101-000001-main".to_owned();
+        blocked.block(vec![q.id.clone()], Some("which backend?".to_owned()));
+        queue.put(&mut blocked).unwrap();
+
+        resolve_blockers(&queue, &questions);
+
+        let after = queue.get(&blocked.id).unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::Queued,
+            "the only blocker resolved"
+        );
+        assert_eq!(after.answers.len(), 1);
+        assert_eq!(after.answers[0].question, "Which backend?");
+        assert_eq!(after.answers[0].answer, "SQLite");
+
+        // And the run this task starts next is told about it.
+        let instruction = instruction_for(&after);
+        assert!(instruction.contains("Which backend?"));
+        assert!(instruction.contains("SQLite"));
+    }
+
+    #[test]
+    fn instruction_for_is_unchanged_without_any_answers() {
+        let t = task();
+        assert_eq!(instruction_for(&t), t.instruction);
+    }
+
+    #[test]
+    fn resumed_instruction_is_unchanged_without_any_answers() {
+        let t = task();
+        assert_eq!(resumed_instruction(&t.instruction, &t), t.instruction);
+    }
+
+    #[test]
+    fn resumed_instruction_carries_a_new_answer_onto_the_old_run() {
+        let mut t = task();
+        t.record_answer("Which backend?".to_owned(), "SQLite".to_owned());
+        // The run's own instruction on disk predates the answer: it is the
+        // plain original text `Runner::start` saved before the operator was
+        // ever asked anything.
+        let old = t.instruction.clone();
+
+        let refreshed = resumed_instruction(&old, &t);
+        assert!(refreshed.starts_with(&old), "the original text is kept");
+        assert!(refreshed.contains("Which backend?"));
+        assert!(refreshed.contains("SQLite"));
+    }
+
+    #[test]
+    fn resumed_instruction_keeps_an_original_answers_heading() {
+        let mut t = task();
+        t.instruction = "Context\n\n# Operator answers\n\nThis is part of the task.".to_owned();
+        t.record_answer("Which backend?".to_owned(), "SQLite".to_owned());
+
+        let refreshed = resumed_instruction(&t.instruction, &t);
+
+        assert!(
+            refreshed.starts_with(&t.instruction),
+            "an answers heading in the original instruction is not the appended block"
+        );
+        assert_eq!(refreshed.matches(ANSWERS_HEADER).count(), 2);
+        assert!(refreshed.contains("Which backend?"));
+        assert!(refreshed.contains("SQLite"));
+
+        let repeated = resumed_instruction(&refreshed, &t);
+        assert_eq!(
+            repeated, refreshed,
+            "only the final appended block is refreshed"
+        );
+    }
+
+    #[test]
+    fn resumed_instruction_does_not_duplicate_across_repeated_resumes() {
+        let mut t = task();
+        t.record_answer("Which backend?".to_owned(), "SQLite".to_owned());
+
+        // A first resume appends the block; a second resume of the same run,
+        // with no new answer in between, must reproduce exactly the same
+        // text rather than appending the block a second time.
+        let once = resumed_instruction(&t.instruction, &t);
+        let twice = resumed_instruction(&once, &t);
+        assert_eq!(once, twice);
+        assert_eq!(once.matches("Which backend?").count(), 1);
+
+        // A later answer replaces the block wholesale rather than growing it.
+        t.record_answer("Which cache?".to_owned(), "Redis".to_owned());
+        let refreshed = resumed_instruction(&once, &t);
+        assert_eq!(refreshed.matches(ANSWERS_HEADER).count(), 1);
+        assert!(refreshed.contains("Which backend?"));
+        assert!(refreshed.contains("Which cache?"));
+    }
+
+    #[test]
+    fn prepare_instruction_covers_all_three_starters() {
+        let mut t = task();
+        t.record_answer("Which backend?".to_owned(), "SQLite".to_owned());
+
+        // Start: a fresh run gets the task text plus every answer so far —
+        // exactly `instruction_for`.
+        assert_eq!(
+            prepare_instruction(&Starter::Start, None, &t),
+            Some(instruction_for(&t))
+        );
+
+        // Resume: the run's prior instruction is refreshed with the answer,
+        // not discarded and not left stale.
+        let old = t.instruction.clone();
+        assert_eq!(
+            prepare_instruction(&Starter::Resume("some-run".to_owned()), Some(&old), &t),
+            Some(resumed_instruction(&old, &t))
+        );
+
+        // Review: a review-only pass builds its own instruction from the
+        // branch's history in `crate::graph`, with no task statement at all -
+        // this boundary must leave it alone.
+        assert_eq!(
+            prepare_instruction(&Starter::Review("magi/eba2/A".to_owned()), Some(&old), &t),
+            None
+        );
+    }
+
+    #[test]
+    fn choose_starter_prefers_review_over_resume_when_the_branch_survived() {
+        assert_eq!(
+            choose_starter(Some("magi/eba2/A"), true, Some("some-run")),
+            Starter::Review("magi/eba2/A".to_owned())
+        );
+    }
+
+    #[test]
+    fn choose_starter_falls_back_to_start_when_the_review_branch_is_gone() {
+        assert_eq!(
+            choose_starter(Some("magi/eba2/A"), false, Some("some-run")),
+            Starter::Start,
+            "a vanished review branch must not fall back to resuming the old run either"
+        );
+    }
+
+    #[test]
+    fn choose_starter_resumes_or_starts_when_there_is_no_review_choice_at_all() {
+        assert_eq!(
+            choose_starter(None, false, Some("some-run")),
+            Starter::Resume("some-run".to_owned())
+        );
+        assert_eq!(choose_starter(None, false, None), Starter::Start);
+    }
+
+    #[test]
+    fn an_explicit_release_forces_a_fresh_competition_even_with_a_resumable_run() {
+        let mut released = task();
+        released.start("stalled-run".to_owned());
+        released.requeue();
+        let unfinished = (!released.fresh_start)
+            .then(|| Some("stalled-run".to_owned()))
+            .flatten();
+        assert_eq!(
+            choose_starter(None, false, unfinished.as_deref()),
+            Starter::Start,
+            "release keeps run history but must not resume it"
+        );
+        assert_eq!(released.runs, ["stalled-run"]);
+    }
+
+    #[test]
+    fn an_ordinary_release_keeps_a_resumable_run_available() {
+        let mut released = task();
+        released.start("stalled-run".to_owned());
+        released.release();
+        let unfinished = (!released.fresh_start)
+            .then(|| Some("stalled-run".to_owned()))
+            .flatten();
+        assert_eq!(
+            choose_starter(None, false, unfinished.as_deref()),
+            Starter::Resume("stalled-run".to_owned()),
+            "manual release must preserve the normal resume path"
+        );
+    }
+
+    #[test]
+    fn a_blocked_run_that_spent_every_review_round_has_exhausted_its_budget() {
+        let mut state = run_state(RunStatus::Blocked);
+        state.config.graph.review_rounds = 3;
+        state.reviews = vec![review_round(1), review_round(2), review_round(3)];
+        assert!(exhausted_review_budget(&state));
+
+        // One round still unused: resuming can still ask a reviewer something.
+        state.reviews.pop();
+        assert!(!exhausted_review_budget(&state));
+
+        // Exhausted rounds on a non-`Blocked` status (a stall, say) do not
+        // count: only a `Blocked` run re-enters the review loop on resume.
+        let mut stalled = run_state(RunStatus::Stalled);
+        stalled.config.graph.review_rounds = 1;
+        stalled.reviews = vec![review_round(1)];
+        assert!(!exhausted_review_budget(&stalled));
+    }
+
+    fn review_round(round: usize) -> crate::run::ReviewRound {
+        crate::run::ReviewRound {
+            round,
+            head: "deadbeef".to_owned(),
+            reviews: Vec::new(),
+            e2e: Vec::new(),
+            verify_retried: false,
+            fix: None,
+            blocking: 0,
+            answered: 1,
+            expected: 1,
+            clean: false,
+            progressed: true,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
+        }
+    }
+
+    #[test]
+    fn unfinished_run_skips_a_round_exhausted_blocked_run_so_requeue_means_a_fresh_competition() {
+        // Mirrors the failure this exists to close: a task's last run ended
+        // `Blocked` with the review budget spent, `crate::conduct` chose
+        // `Recovery::Requeue` (`Task::release`, which keeps `runs` as
+        // evidence), and without this check `attempt` would go on treating
+        // that exhausted run as "unfinished" and resume it - `graph::Runner`'s
+        // review loop iterates zero times over an already-spent budget, so
+        // the resumed run settles right back to `Blocked` having asked nobody
+        // anything, and `Requeue`'s promised fresh competition never happens.
+        let mut exhausted = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234def".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        exhausted.status = RunStatus::Blocked;
+        exhausted.config.graph.review_rounds = 1;
+        exhausted.reviews = vec![review_round(1)];
+
+        assert_eq!(
+            unfinished_run_with(&[exhausted.id.clone()], "t", |_| Ok(exhausted.clone())),
+            None,
+            "an exhausted `Blocked` run must not be offered as resumable"
+        );
+
+        // A `Blocked` run with rounds still unused is genuinely worth
+        // resuming, and must still be found.
+        let mut has_budget_left = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234def".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        has_budget_left.status = RunStatus::Blocked;
+        has_budget_left.config.graph.review_rounds = 3;
+        has_budget_left.reviews = vec![review_round(1)];
+
+        assert_eq!(
+            unfinished_run_with(&[has_budget_left.id.clone()], "t", |_| {
+                Ok(has_budget_left.clone())
+            }),
+            Some(has_budget_left.id.clone())
+        );
+    }
+
+    #[test]
+    fn unfinished_run_never_falls_back_to_an_older_resumable_run() {
+        // A task whose history holds an *older* run that still looks
+        // resumable (say, a competition `Runner::review` was started
+        // alongside after that older run went `Stalled`) and a *newest* run
+        // that is `Blocked` with its review budget spent. `Recovery::Requeue`
+        // on this task must mean a fresh competition — falling back to the
+        // stale, superseded `Stalled` run instead would resurrect history
+        // nothing asked to revisit and silently defeat the requeue.
+        let mut older_stalled = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234def".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        older_stalled.status = RunStatus::Stalled;
+
+        let mut newest_exhausted = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234def".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        newest_exhausted.status = RunStatus::Blocked;
+        newest_exhausted.config.graph.review_rounds = 1;
+        newest_exhausted.reviews = vec![review_round(1)];
+
+        assert_eq!(
+            unfinished_run_with(
+                &[older_stalled.id.clone(), newest_exhausted.id.clone()],
+                "t",
+                |_| Ok(newest_exhausted.clone())
+            ),
+            None,
+            "the newest run is exhausted, so nothing here is worth resuming - \
+             least of all the older, already-superseded run"
+        );
+    }
+
+    #[test]
+    fn unfinished_run_warns_and_skips_a_run_it_cannot_read() {
+        assert_eq!(
+            unfinished_run_with(&["20260101-000000-gone".to_owned()], "t", |_| {
+                Err(anyhow::anyhow!("fixture is absent"))
+            }),
+            None
         );
     }
 }

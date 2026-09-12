@@ -147,6 +147,17 @@ pub struct Roles {
     /// turn traced to exactly this - `opus` triple-booked as chatter and judge
     /// - is what this field exists to let an operator break apart.
     pub chatter: Option<String>,
+    /// Agent that arranges the queue between polls: `crate::conduct`'s single
+    /// seat, called once per cycle to decide a runnable task's `blocked_by`
+    /// and how a stalled or finished task recovers.
+    ///
+    /// The same precedent as [`Self::chatter`] for a seat that stands alone
+    /// rather than rotating through the roster - resolved through
+    /// [`crate::agent::pick`], so unset falls back to its own default order
+    /// (a claude seat, else the first runnable agent) rather than reusing a
+    /// judge or reviewer seat that the conductor's own poll-cycle cadence
+    /// would otherwise compete with for the same account's concurrency.
+    pub conductor: Option<String>,
 }
 
 /// Graph shape and limits.
@@ -804,6 +815,8 @@ pub struct ResolvedRoles {
     pub reviewers: Vec<AgentSpec>,
     /// Explicit fixer, if configured.
     pub fixer: Option<AgentSpec>,
+    /// Queue conductor, explicitly selected or resolved by the standalone-seat fallback.
+    pub conductor: AgentSpec,
 }
 
 /// Every array-valued key in a config table, as a dotted path.
@@ -1246,6 +1259,19 @@ impl Config {
                 .as_deref()
                 .map(|f| self.agent(f).cloned())
                 .transpose()?,
+            // Role resolution validates roster shape, but deliberately does
+            // not preflight a CLI. The other graph seats have always deferred
+            // that failure to invocation; doing it only for the conductor
+            // made otherwise usable graph commands and `doctor` fail as one.
+            conductor: match self.roles.conductor.as_deref() {
+                Some(id) => self.agent(id)?.clone(),
+                // Keep the normal standalone-seat preference when something
+                // is installed, but retain a roster fallback when it is not.
+                // Invocation then reports the unavailable CLI in the same
+                // place it does for every other graph role.
+                None => crate::agent::pick(&self.agents, None, &crate::agent::installed)
+                    .unwrap_or_else(|_| self.agents[0].clone()),
+            },
         })
     }
 
@@ -1309,7 +1335,8 @@ impl Config {
              [roles]\n\
              implementers = []\n\
              judges = []\n\
-             reviewers = []\n\n\
+             reviewers = []\n\
+             # conductor = \"opus\"  # arranges the queue; unset picks a seat like chatter does\n\n\
              [graph]\n\
              candidates = 3\n\
              judges = 3\n\
@@ -1430,6 +1457,7 @@ mod tests {
         assert!(roles.implementers.iter().all(|a| a.id == "b"));
         assert!(roles.judges.iter().all(|a| a.id == "a"));
         assert_eq!(roles.fixer.unwrap().id, "a");
+        assert_eq!(roles.conductor.id, "a");
     }
 
     #[test]
@@ -1442,6 +1470,21 @@ mod tests {
             },
             ..Config::default()
         };
+        assert!(cfg.resolve_roles().is_err());
+    }
+
+    #[test]
+    fn conductor_role_is_resolved_validated_and_has_a_fallback() {
+        let mut cfg = Config {
+            agents: vec![spec("a"), spec("b")],
+            ..Config::default()
+        };
+        assert_eq!(cfg.resolve_roles().unwrap().conductor.id, "a");
+
+        cfg.roles.conductor = Some("b".to_owned());
+        assert_eq!(cfg.resolve_roles().unwrap().conductor.id, "b");
+
+        cfg.roles.conductor = Some("missing".to_owned());
         assert!(cfg.resolve_roles().is_err());
     }
 

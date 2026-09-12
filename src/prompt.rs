@@ -840,6 +840,309 @@ pub fn resume_after_drop(why: &str) -> String {
     )
 }
 
+/// A task shown to `crate::conduct`: either runnable (a dependency-blocking
+/// target), or `Running` past the stall threshold with no live daemon
+/// claiming it. `priority` is shown so the conductor can see the order the
+/// loop already runs in — never so it can change it: nothing in
+/// `crate::conduct::Decision` carries a priority back.
+#[derive(Debug, Clone)]
+pub struct ConductTask {
+    /// Task id, to be copied back verbatim in a decision.
+    pub id: String,
+    /// One line.
+    pub title: String,
+    /// The task, handed to the graph verbatim.
+    pub instruction: String,
+    /// Repository the task runs in.
+    pub repo: String,
+    /// Shown, never written back — see this type's own doc.
+    pub priority: i32,
+    /// `crate::queue::TaskStatus::as_str`.
+    pub status: String,
+    /// Claims spent so far.
+    pub attempts: usize,
+    /// Attempts before the loop holds this task for a human.
+    pub max_attempts: usize,
+    /// Why the last attempt did not land.
+    pub last_error: Option<String>,
+    /// This task's current `crate::queue::Task::blocked_by`, if any.
+    pub blocked_by: Vec<String>,
+    /// Questions asked about this task and what the operator said back — see
+    /// `crate::queue::Task::answers`.
+    pub answers: Vec<ConductAnswer>,
+}
+
+/// One answered question, for [`ConductTask::answers`] and
+/// [`ConductOutcome::answers`].
+#[derive(Debug, Clone)]
+pub struct ConductAnswer {
+    /// The question as asked.
+    pub question: String,
+    /// What the operator said back.
+    pub answer: String,
+}
+
+/// One finding, as shown to the conductor across every review round — not
+/// only the last one. See [`ConductOutcome::rounds`] for why every round
+/// matters here.
+#[derive(Debug, Clone)]
+pub struct ConductFinding {
+    /// magi-assigned id, e.g. `R1-1-2`.
+    pub id: String,
+    /// One-line summary.
+    pub title: String,
+    /// `nit` / `minor` / `major` / `blocker`.
+    pub severity: String,
+}
+
+/// One review round's findings and how the fixer treated each one, for
+/// [`ConductOutcome::rounds`].
+#[derive(Debug, Clone)]
+pub struct ConductRound {
+    /// 1-based round number.
+    pub round: usize,
+    /// Every finding raised this round, by every reviewer seat.
+    pub findings: Vec<ConductFinding>,
+    /// Finding ids the fixer acted on this round.
+    pub addressed: Vec<String>,
+    /// Finding ids the fixer declined this round, with its reason — this is
+    /// what lets the conductor tell "raised once, never rejected, simply
+    /// never fixed" apart from "raised and declined with an argument every
+    /// round it came up."
+    pub rejected: Vec<ConductRejection>,
+}
+
+/// One finding the fixer declined, and why — see [`ConductRound::rejected`].
+#[derive(Debug, Clone)]
+pub struct ConductRejection {
+    /// The declined finding's id.
+    pub id: String,
+    /// The fixer's argument for leaving it.
+    pub why: String,
+}
+
+/// How a task's last run ended, for a `Failed`/`Held` task the conductor has
+/// not yet been shown — the "終わったタスク" the whole feature exists for.
+#[derive(Debug, Clone)]
+pub struct ConductOutcome {
+    /// The run this task's last attempt produced.
+    pub run_id: String,
+    /// If the run state could not be read at all (a schema this build does
+    /// not speak, most often), the reason — never silently treated as "no
+    /// outcome to show".
+    pub unreadable: Option<String>,
+    /// `crate::run::RunStatus::as_str`, when the state could be read.
+    pub run_status: Option<String>,
+    /// Findings still open when the review loop stopped trying — the last
+    /// round's, when that round was not clean.
+    pub open_findings: Vec<ConductFinding>,
+    /// Review rounds actually used.
+    pub rounds_used: usize,
+    /// Review rounds the run's config allowed.
+    pub rounds_max: usize,
+    /// Every review round, oldest first — see [`ConductRound`].
+    pub rounds: Vec<ConductRound>,
+    /// The surviving candidate's branch, when the tally ran.
+    pub branch: Option<String>,
+    /// Short hash of `branch`'s head, when it could be read.
+    pub branch_head: Option<String>,
+}
+
+/// A `Failed`/`Held` task together with how its last run ended.
+#[derive(Debug, Clone)]
+pub struct ConductFinished {
+    /// The task itself.
+    pub task: ConductTask,
+    /// Its last run's outcome.
+    pub outcome: ConductOutcome,
+}
+
+/// Render one [`ConductTask`] entry, shared by the runnable and stalled
+/// sections.
+fn conduct_task_block(t: &ConductTask) -> String {
+    let mut s = format!(
+        "- id: {}\n  title: {}\n  status: {}\n  priority: {}\n  repo: {}\n  \
+         attempts: {}/{}\n",
+        t.id, t.title, t.status, t.priority, t.repo, t.attempts, t.max_attempts
+    );
+    if let Some(e) = &t.last_error {
+        let _ = writeln!(s, "  last_error: {e}");
+    }
+    if !t.blocked_by.is_empty() {
+        let _ = writeln!(s, "  blocked_by: {}", t.blocked_by.join(", "));
+    }
+    for a in &t.answers {
+        let _ = writeln!(s, "  answered \"{}\": {}", a.question, a.answer);
+    }
+    let _ = writeln!(
+        s,
+        "  instruction: |\n    {}",
+        t.instruction.replace('\n', "\n    ")
+    );
+    s
+}
+
+/// Prompt for `crate::conduct`'s single seat.
+///
+/// `Review` vs `Requeue` is spelled out explicitly: a branch that still
+/// exists and only needs a mergeable fix is cheaper to re-review than to
+/// re-implement, but a run whose findings say the design itself is wrong
+/// gains nothing from reviewing the same design again.
+pub fn conduct(
+    runnable: &[ConductTask],
+    stalled: &[ConductTask],
+    finished: &[ConductFinished],
+    language: &str,
+) -> String {
+    let mut s = String::from(
+        "You arrange magi's task queue between polls. You do not implement \
+         anything and you do not run `magi ask` yourself — it blocks, and \
+         this call must not. Nothing you write ever changes a task's \
+         priority: it is shown only so you know the order the loop already \
+         runs tasks in.\n\n\
+         # Runnable tasks\n\n\
+         Decide which of these should wait on another task or on a question \
+         you want to ask the operator. Leaving a task out of your reply \
+         changes nothing about it.\n\n",
+    );
+    if runnable.is_empty() {
+        s.push_str("(none)\n\n");
+    } else {
+        for t in runnable {
+            s.push_str(&conduct_task_block(t));
+            s.push('\n');
+        }
+    }
+
+    s.push_str(
+        "# Stalled tasks\n\n\
+         Left `running` well past when any live daemon could still be \
+         driving them. Choose `requeue` (put back in line, a fresh \
+         competition) or `hold` (leave for a human) via `recovery`.\n\n",
+    );
+    if stalled.is_empty() {
+        s.push_str("(none)\n\n");
+    } else {
+        for t in stalled {
+            s.push_str(&conduct_task_block(t));
+            s.push('\n');
+        }
+    }
+
+    s.push_str(
+        "# Finished tasks\n\n\
+         `failed` or `held`, and nobody has decided what to do about them \
+         yet. Each carries how its last run ended: every review round's \
+         findings and how the fixer treated each one — addressed, or \
+         rejected with a reason — not only the last round's. The same \
+         argument raised and declined the same way in every round is a \
+         settled disagreement; a finding that was never rejected and never \
+         addressed is simply unfixed. Tell them apart.\n\n\
+         Choose one via `recovery`:\n\
+         - `requeue` — back in line, a fresh competition from scratch.\n\
+         - `hold` — leave it for a human.\n\
+         - `review` — only when `branch` below is set: reopen exactly that \
+           branch through a review-only pass (review, verify, gate — no \
+           reimplementation). Choose this when the branch is fundamentally \
+           sound and what is left is a mergeable fix to its findings; choose \
+           `requeue` instead when the findings say the design itself needs \
+           to change.\n\
+         You may also `ask` the operator instead of choosing a recovery — \
+         see below.\n\n",
+    );
+    if finished.is_empty() {
+        s.push_str("(none)\n\n");
+    } else {
+        for f in finished {
+            s.push_str(&conduct_task_block(&f.task));
+            let o = &f.outcome;
+            let _ = writeln!(s, "  run: {}", o.run_id);
+            match &o.unreadable {
+                Some(why) => {
+                    let _ = writeln!(
+                        s,
+                        "  run state could not be read: {why} (no rounds, no branch \
+                         known from it — `review` is unavailable unless `branch` is \
+                         listed below anyway)"
+                    );
+                }
+                None => {
+                    if let Some(status) = &o.run_status {
+                        let _ = writeln!(s, "  run_status: {status}");
+                    }
+                    let _ = writeln!(s, "  review_rounds: {}/{}", o.rounds_used, o.rounds_max);
+                    if !o.open_findings.is_empty() {
+                        s.push_str("  still open:\n");
+                        for finding in &o.open_findings {
+                            let _ = writeln!(
+                                s,
+                                "    - {} [{}] {}",
+                                finding.id, finding.severity, finding.title
+                            );
+                        }
+                    }
+                    for round in &o.rounds {
+                        let _ = writeln!(s, "  round {}:", round.round);
+                        for finding in &round.findings {
+                            let treatment = if round.addressed.contains(&finding.id) {
+                                "addressed".to_owned()
+                            } else if let Some(r) =
+                                round.rejected.iter().find(|r| r.id == finding.id)
+                            {
+                                format!("rejected: {}", r.why)
+                            } else {
+                                "no fix attempt reached this finding".to_owned()
+                            };
+                            let _ = writeln!(
+                                s,
+                                "    - {} [{}] {} — {treatment}",
+                                finding.id, finding.severity, finding.title
+                            );
+                        }
+                    }
+                }
+            }
+            match (&o.branch, &o.branch_head) {
+                (Some(b), Some(h)) => {
+                    let _ = writeln!(s, "  branch: {b} (head {h})");
+                }
+                (Some(b), None) => {
+                    let _ = writeln!(s, "  branch: {b}");
+                }
+                (None, _) => {
+                    s.push_str("  branch: (none survived — `review` is unavailable)\n");
+                }
+            }
+            s.push('\n');
+        }
+    }
+
+    s.push_str(&ask_the_owner(language));
+    s.push_str(
+        "\nUnlike everywhere else `magi ask` is offered, you must not call it: it \
+         blocks until the operator answers, and this whole polling loop would \
+         wait behind it. Instead, put the question in `question` (and \
+         `choices`, if it is multiple choice) on a decision — magi files it \
+         without blocking and blocks that task on its id. If a task already \
+         has an unanswered question of yours, do not ask it again.\n\n",
+    );
+
+    s.push_str(
+        "# Output\n\n\
+         Your reasoning first, then exactly one fenced json block, last:\n\n\
+         ```json\n\
+         {\"decisions\":[{\"id\":\"<task id>\",\"blocked_by\":[\"<task or \
+         question id>\"],\"reason\":\"<one line>\",\"recovery\":\
+         \"requeue|hold|review\",\"question\":\"<text, optional>\",\
+         \"choices\":[\"<optional>\"]}]}\n\
+         ```\n\n\
+         Omit any field you have nothing to say for. `\"decisions\":[]` is a \
+         valid answer when nothing here needs changing.",
+    );
+    s.push_str(&lang(language));
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1248,5 +1551,122 @@ mod tests {
         // A language magi has no code for is repeated as the operator wrote it.
         let other = implement("do it", "/tmp/wt", "Brazilian Portuguese");
         assert!(other.contains("Write the question in Brazilian Portuguese."));
+    }
+
+    fn conduct_task(id: &str) -> ConductTask {
+        ConductTask {
+            id: id.to_owned(),
+            title: "a task".to_owned(),
+            instruction: "do the thing".to_owned(),
+            repo: "/repo".to_owned(),
+            priority: 7,
+            status: "queued".to_owned(),
+            attempts: 0,
+            max_attempts: 2,
+            last_error: None,
+            blocked_by: Vec::new(),
+            answers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_conduct_prompt_never_offers_a_priority_field_and_explains_review_vs_requeue() {
+        let body = conduct(&[conduct_task("t1")], &[], &[], "en");
+        assert!(
+            body.contains("priority: 7"),
+            "priority must be shown: {body}"
+        );
+        assert!(
+            !body.contains("\"priority\""),
+            "but never as an output field the model could write back: {body}"
+        );
+        assert!(body.contains("design itself needs"), "{body}");
+        assert!(body.contains("mergeable fix"), "{body}");
+        assert!(
+            body.contains("you must not call it"),
+            "the prompt must forbid calling `magi ask` itself: {body}"
+        );
+    }
+
+    #[test]
+    fn an_answered_questions_content_reaches_the_tasks_own_entry() {
+        let mut t = conduct_task("t3");
+        t.answers.push(ConductAnswer {
+            question: "Which backend?".to_owned(),
+            answer: "SQLite".to_owned(),
+        });
+        let body = conduct(&[t], &[], &[], "en");
+        assert!(
+            body.contains("Which backend?") && body.contains("SQLite"),
+            "an answered question's content must reach the task's own entry, \
+             not only the fact that it is no longer blocking: {body}"
+        );
+    }
+
+    #[test]
+    fn a_finished_task_distinguishes_a_repeatedly_rejected_finding_from_an_untouched_one() {
+        let finished = ConductFinished {
+            task: conduct_task("t2"),
+            outcome: ConductOutcome {
+                run_id: "20260906-193153-eba2".to_owned(),
+                unreadable: None,
+                run_status: Some("blocked".to_owned()),
+                open_findings: vec![ConductFinding {
+                    id: "R3-1-1".to_owned(),
+                    title: "answer content is dropped".to_owned(),
+                    severity: "major".to_owned(),
+                }],
+                rounds_used: 3,
+                rounds_max: 6,
+                rounds: vec![
+                    ConductRound {
+                        round: 1,
+                        findings: vec![
+                            ConductFinding {
+                                id: "R1-1-2".to_owned(),
+                                title: "answer content is dropped".to_owned(),
+                                severity: "major".to_owned(),
+                            },
+                            ConductFinding {
+                                id: "R1-1-1".to_owned(),
+                                title: "conductor called every cycle while stalled".to_owned(),
+                                severity: "major".to_owned(),
+                            },
+                        ],
+                        addressed: Vec::new(),
+                        rejected: vec![ConductRejection {
+                            id: "R1-1-2".to_owned(),
+                            why: "the id leaving blocked_by is enough".to_owned(),
+                        }],
+                    },
+                    ConductRound {
+                        round: 2,
+                        findings: vec![ConductFinding {
+                            id: "R2-1-3".to_owned(),
+                            title: "answer content is still dropped".to_owned(),
+                            severity: "major".to_owned(),
+                        }],
+                        addressed: Vec::new(),
+                        rejected: vec![ConductRejection {
+                            id: "R2-1-3".to_owned(),
+                            why: "same as before".to_owned(),
+                        }],
+                    },
+                ],
+                branch: Some("magi/eba2/A".to_owned()),
+                branch_head: Some("0de0077".to_owned()),
+            },
+        };
+        let body = conduct(&[], &[], &[finished], "en");
+
+        // The repeatedly-rejected line names its reason each round.
+        assert!(body.contains("rejected: the id leaving blocked_by is enough"));
+        assert!(body.contains("rejected: same as before"));
+        // The never-rejected, never-addressed finding reads differently, so
+        // the two are distinguishable rather than collapsed into one shape.
+        assert!(body.contains("R1-1-1"));
+        assert!(body.contains("no fix attempt reached this finding"));
+        assert!(body.contains("magi/eba2/A"));
+        assert!(body.contains("0de0077"));
     }
 }
