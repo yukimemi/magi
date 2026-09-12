@@ -3130,7 +3130,7 @@ function updateTalkCard(row, talk) {
   const next = chip(status, TALK_STATUS);
   if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
   else r.chipSlot.append(next);
-  show(r.thinking, Boolean(talk.thinking));
+  show(r.thinking, talkIsThinking(talk));
 
   const at = when(talk.updated_at || talk.created_at);
   setText(r.whenSlot, at.text);
@@ -3174,7 +3174,7 @@ function renderTalks() {
    this server currently reports as thinking. The accessible name says what
    the bare numeral means. */
 function renderTalkIndicators() {
-  const count = (state.talks || []).filter((talk) => talk && talk.thinking).length;
+  const count = (state.talks || []).filter(talkIsThinking).length;
   for (const id of ["talk-badge-rail", "talk-badge-dock"]) {
     const badge = $(id);
     setText(badge, count > 99 ? "99+" : String(count));
@@ -3183,6 +3183,12 @@ function renderTalkIndicators() {
   for (const link of document.querySelectorAll('[data-nav="talks"]')) {
     setAttr(link, "aria-label", count > 0 ? `Chat, ${count} conversations thinking` : "Chat");
   }
+}
+
+/* A wait is newer than an overlapping list read. Keep its activity visible
+   until a read that observed that same wait proves the server released it. */
+function talkIsThinking(talk) {
+  return Boolean(talk && (talk.thinking || state.talkWaits.has(talk.id)));
 }
 
 async function loadTalks() {
@@ -3428,7 +3434,8 @@ function trackTalkThinking(talk, observed) {
       } else {
         wait.missingClaimSince = Date.now();
       }
-    } else if (wait.target === null && !talk.thinking) {
+    } else if (wait.target === null && !talk.thinking && observed
+      && observed.generation === wait.generation) {
       endTalkTurn(talk.id);
     }
     return;
