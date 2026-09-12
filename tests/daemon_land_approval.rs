@@ -89,6 +89,8 @@ fn parked_run(repo: &std::path::Path, config: &magi::config::Config) -> RunState
         expected: 0,
         clean: true,
         verify_retried: false,
+        e2e_deferred: false,
+        e2e_defer_reason: None,
         progressed: false,
         vote_split: false,
         reconsideration: Vec::new(),

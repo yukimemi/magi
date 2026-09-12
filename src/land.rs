@@ -1774,7 +1774,7 @@ async fn fix_round(
     let mut seat = seat_of(state, &seat_key, &spec.id);
     let artifacts = agent::artifacts_dir(&state.dir());
     let prompt = if state.config.cache_dir().is_some() {
-        format!("{prompt}\n\n{}", prompt::build_cache_note())
+        format!("{prompt}\n\n{}", prompt::build_cache_note("fix"))
     } else {
         prompt
     };
@@ -3061,6 +3061,8 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             reviews,
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: None,
             blocking: 0,
             answered,

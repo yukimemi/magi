@@ -4186,6 +4186,8 @@ mod tests {
             reviews: Vec::new(),
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: None,
             blocking: 0,
             answered: 1,

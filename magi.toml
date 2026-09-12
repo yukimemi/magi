@@ -72,9 +72,13 @@ all = """
 This repository uses jj (Jujutsu) with a colocated git repo. `git commit` works \
 in a candidate worktree and is what magi expects, but never run `jj` commands \
 and never touch the main working copy.
-Verify with `RUSTUP_TOOLCHAIN=stable cargo make check`: the environment here \
-pins an older toolchain than CI uses, so a lint that fails CI is invisible \
-without it.
+Full verification is parent-owned: magi runs `cargo test --locked --all-targets` \
+and `cargo make check` itself, once a round has no blocking findings left and \
+again before landing. Do not re-run the full suite or the full gate yourself — \
+a focused `cargo check` or a targeted `cargo test <name>` for what you touched \
+is enough. Whenever you do build or test locally, set \
+`RUSTUP_TOOLCHAIN=stable`: the environment here pins an older toolchain than CI \
+uses, so a lint that fails CI is invisible without it.
 """
 review = """
 Formatting is not a finding: `cargo fmt` runs in the gate. Spend the round on \

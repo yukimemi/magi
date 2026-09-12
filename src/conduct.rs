@@ -689,6 +689,8 @@ mod tests {
             }],
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: Some(crate::run::FixRecord {
                 agent: "mock".to_owned(),
                 addressed: addressed.iter().map(|s| (*s).to_owned()).collect(),

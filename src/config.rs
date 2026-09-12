@@ -225,6 +225,14 @@ pub struct Graph {
     pub timeout_judge: u64,
     /// Per-node timeouts, seconds.
     pub timeout_review: u64,
+    /// Timeout for `verify.e2e` and `verify.gate`, seconds. Separate from
+    /// [`Self::timeout_review`] so shrinking a reviewer's budget cannot
+    /// silently shrink a real-machine command's budget too — the two used to
+    /// share `timeout_review`, and turning a slow reviewer down cut the
+    /// timeout `cargo test --all-targets` runs under along with it. Defaults
+    /// to the same 1200s `timeout_review` has always defaulted to, so a
+    /// config that never heard of this field runs exactly as before.
+    pub timeout_verify: u64,
     /// Per-node timeouts, seconds.
     pub timeout_fix: u64,
     /// Wall-clock limit for one turn of [`crate::talk`]'s standing
@@ -272,6 +280,24 @@ pub struct Graph {
     /// What a round does when one or more reviewer seats never answered
     /// (timeout, crash, unparsable output).
     pub incomplete_review: IncompleteReviewPolicy,
+    /// Run `verify.e2e` on every round, even one that already has blocking
+    /// findings and another round left to try.
+    ///
+    /// Off by default: a round with a blocking finding and rounds still left
+    /// is going back to the fixer regardless of what `verify.e2e` says, so
+    /// running it first only spends the round's slowest step (minutes, on a
+    /// Rust repo's `cargo test --all-targets`) on a head about to be
+    /// rewritten anyway. `verify.e2e` still runs once a round has no
+    /// blocking findings left (a round cannot go `clean` without it) and the
+    /// final `verify.gate` always runs on the actual tree that would land —
+    /// deferring is about *when* e2e runs mid-loop, never about skipping it.
+    ///
+    /// Set this to restore the old every-round diagnostic behaviour: e2e
+    /// output from a round that still has blocking findings is occasionally
+    /// useful on its own (a runtime failure a reviewer's panel would not
+    /// have caught by reading), and this is the way back to seeing it every
+    /// round instead of only once the panel has nothing left to flag.
+    pub e2e_every_round: bool,
 }
 
 impl Default for Graph {
@@ -288,6 +314,7 @@ impl Default for Graph {
             timeout_implement: 3600,
             timeout_judge: 1200,
             timeout_review: 1200,
+            timeout_verify: 1200,
             timeout_fix: 1800,
             timeout_talk: 3600,
             retries: 1,
@@ -297,6 +324,7 @@ impl Default for Graph {
             land_approval: true,
             answer_timeout: 86_400,
             incomplete_review: IncompleteReviewPolicy::Block,
+            e2e_every_round: false,
         }
     }
 }
@@ -1401,6 +1429,48 @@ mod tests {
             env: BTreeMap::new(),
             prompt_delivery: None,
         }
+    }
+
+    #[test]
+    fn timeout_verify_defaults_to_the_value_timeout_review_has_always_defaulted_to() {
+        // `timeout_verify` used to not exist: `verify.e2e`/`verify.gate` ran
+        // under `timeout_review`. A config written before this field existed
+        // must run exactly as before, which means its default has to be the
+        // same 1200s `timeout_review` has always defaulted to.
+        assert_eq!(
+            Graph::default().timeout_verify,
+            Graph::default().timeout_review
+        );
+        assert_eq!(Graph::default().timeout_verify, 1200);
+    }
+
+    #[test]
+    fn shrinking_timeout_review_does_not_shrink_timeout_verify() {
+        // The bug this field exists to close: `[graph] timeout_review = 45`
+        // used to shrink the real-machine `verify.e2e`/`verify.gate` budget
+        // along with the reviewer seats' own timeout, because both read the
+        // same field.
+        let g: Graph = toml::from_str("timeout_review = 45").expect("parse");
+        assert_eq!(g.timeout_review, 45);
+        assert_eq!(
+            g.timeout_verify, 1200,
+            "an unrelated field must not move because timeout_review did"
+        );
+    }
+
+    #[test]
+    fn a_toml_layer_written_before_these_fields_existed_still_parses() {
+        // `deny_unknown_fields` cuts both ways: a config from before
+        // `timeout_verify`/`e2e_every_round` existed must still parse, with
+        // both defaulted rather than refused as unknown-in-reverse.
+        let g: Graph =
+            toml::from_str("candidates = 1\nreviewers = 3\nreview_rounds = 6\nmax_parallel = 4\n")
+                .expect("an old-shaped [graph] table must still parse");
+        assert_eq!(g.timeout_verify, Graph::default().timeout_verify);
+        assert!(
+            !g.e2e_every_round,
+            "off by default, same as before this field existed"
+        );
     }
 
     #[test]

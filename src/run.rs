@@ -473,6 +473,23 @@ pub struct ReviewRound {
     /// unrelated build race.
     #[serde(default)]
     pub verify_retried: bool,
+    /// True when `e2e` was intentionally left empty this round: the round
+    /// already had blocking findings and another round was available, so
+    /// `graph::Runner::review_loop` sent the fixer straight at them instead
+    /// of spending a full verify run on a head it already knew would need
+    /// another fix. Distinct from an `e2e` that is simply empty because
+    /// `verify.e2e` has no commands configured — `e2e.is_empty()` alone
+    /// cannot tell those apart, and conflating them is exactly how a
+    /// deferred check would get painted green. A record written before this
+    /// field existed defaults to `false`, which is the truth for it: every
+    /// round used to run e2e unconditionally.
+    #[serde(default)]
+    pub e2e_deferred: bool,
+    /// Why `e2e` was deferred, set only when [`Self::e2e_deferred`] is true.
+    /// Carried to the fixer's prompt and shown in the report so "deferred"
+    /// never reads as silence.
+    #[serde(default)]
+    pub e2e_defer_reason: Option<String>,
     /// Fixer response, absent when the round was already clean.
     #[serde(default)]
     pub fix: Option<FixRecord>,
@@ -530,6 +547,40 @@ impl ReviewRound {
     pub fn incomplete(&self) -> bool {
         self.answered < self.expected
     }
+
+    /// The honest state of this round's e2e leg.
+    ///
+    /// Never derive this from `e2e.is_empty()` alone anywhere else in the
+    /// codebase — `NotConfigured` and `Deferred` both leave it empty, and
+    /// only this method (backed by [`Self::e2e_deferred`]) tells them apart.
+    pub fn e2e_status(&self) -> E2eStatus {
+        if !self.e2e.is_empty() {
+            if self.e2e.iter().all(CommandOutcome::ok) {
+                E2eStatus::Passed
+            } else {
+                E2eStatus::Failed
+            }
+        } else if self.e2e_deferred {
+            E2eStatus::Deferred
+        } else {
+            E2eStatus::NotConfigured
+        }
+    }
+}
+
+/// The honest state of a round's e2e leg. See [`ReviewRound::e2e_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum E2eStatus {
+    /// `verify.e2e` has no commands configured.
+    NotConfigured,
+    /// Skipped this round on purpose: blocking findings already required a
+    /// fix, so the round went straight to the fixer instead of spending a
+    /// full verify run on a head it already knew would need another pass.
+    Deferred,
+    /// Ran, and every command exited 0.
+    Passed,
+    /// Ran, and at least one command did not exit 0.
+    Failed,
 }
 
 /// What happened to the winning branch.
@@ -1450,6 +1501,8 @@ mod tests {
             }],
             e2e: Vec::new(),
             verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
             fix: None,
             blocking: 0,
             answered: 1,
@@ -1460,6 +1513,43 @@ mod tests {
             reconsideration: Vec::new(),
             verdict: None,
         }
+    }
+
+    #[test]
+    fn e2e_status_tells_deferred_apart_from_not_configured() {
+        let mut r = round(false, Vec::new());
+        assert_eq!(r.e2e_status(), E2eStatus::NotConfigured);
+
+        r.e2e_deferred = true;
+        assert_eq!(
+            r.e2e_status(),
+            E2eStatus::Deferred,
+            "an empty e2e must not read as unconfigured once it was deferred on purpose"
+        );
+
+        r.e2e = vec![CommandOutcome {
+            command: "test".to_owned(),
+            code: Some(0),
+            output_tail: String::new(),
+            duration_ms: 0,
+        }];
+        assert_eq!(
+            r.e2e_status(),
+            E2eStatus::Passed,
+            "a round with real outcomes is never read as deferred, even if the flag is still set"
+        );
+    }
+
+    #[test]
+    fn e2e_status_reports_a_real_failure_as_failed_not_deferred() {
+        let mut r = round(false, Vec::new());
+        r.e2e = vec![CommandOutcome {
+            command: "test".to_owned(),
+            code: Some(1),
+            output_tail: "boom".to_owned(),
+            duration_ms: 0,
+        }];
+        assert_eq!(r.e2e_status(), E2eStatus::Failed);
     }
 
     #[test]
@@ -1516,6 +1606,33 @@ mod tests {
         assert_eq!(back.id, s.id);
         assert_eq!(back.instruction, "add retries");
         assert_eq!(back.status, RunStatus::Prep);
+    }
+
+    #[test]
+    fn a_round_recorded_before_e2e_deferral_existed_still_loads() {
+        // Exactly the shape a pre-existing `run.json` has for a round: no
+        // `e2e_deferred`, no `e2e_defer_reason`. Every round used to run e2e
+        // unconditionally, so the honest reading of an old record's silence
+        // on this is "it was not deferred" — `false`/`None`, not a load
+        // failure and not a schema bump (see the `SCHEMA` doc comment: a
+        // purely additive field whose absence has one unambiguous meaning
+        // does not need one).
+        let body = r#"{
+            "round": 1,
+            "head": "deadbeef",
+            "reviews": [],
+            "e2e": [],
+            "verify_retried": false,
+            "fix": null,
+            "blocking": 0,
+            "answered": 1,
+            "expected": 1,
+            "clean": true
+        }"#;
+        let r: ReviewRound = serde_json::from_str(body).expect("an old-shaped round must load");
+        assert!(!r.e2e_deferred);
+        assert!(r.e2e_defer_reason.is_none());
+        assert_eq!(r.e2e_status(), E2eStatus::NotConfigured);
     }
 
     #[test]

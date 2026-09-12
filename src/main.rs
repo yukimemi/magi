@@ -1954,6 +1954,21 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
         ),
         cfg.merge.mode
     );
+    println!(
+        "verify timeout {}s (review seat timeout {}s — separate since [graph] \
+         timeout_verify exists; shrinking one no longer shrinks the other)",
+        cfg.graph.timeout_verify, cfg.graph.timeout_review
+    );
+    println!(
+        "e2e schedule {}",
+        if cfg.graph.e2e_every_round {
+            "every round ([graph] e2e_every_round = true)"
+        } else {
+            "deferred while blocking findings remain and a round is left \
+             (default; set [graph] e2e_every_round = true for the old \
+             every-round diagnostic behaviour)"
+        }
+    );
     println!("runs         {}", magi::run::runs_root().display());
     print!("{}", doctor_queue_and_loop(&magi::run::home()));
     Ok(())
