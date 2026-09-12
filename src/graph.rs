@@ -3475,6 +3475,8 @@ fn malformed_review_reply(message: &str) -> bool {
 /// - An incomplete panel that raised nothing is missing input, not a
 ///   verified tree — never a hand-off candidate, whatever verification said
 ///   (see [`ReviewRound::incomplete`], `IncompleteReviewPolicy`).
+/// - A terminal `reject` verdict is never a hand-off candidate, even when
+///   its finding is non-blocking and verification passed.
 /// - Otherwise, green e2e on the last round hands off (see
 ///   [`Runner::stop_reviewing`]); red e2e blocks.
 fn review_conclusion(reviews: &[ReviewRound], max_rounds: usize) -> Option<RunStatus> {
@@ -3482,20 +3484,19 @@ fn review_conclusion(reviews: &[ReviewRound], max_rounds: usize) -> Option<RunSt
         return Some(RunStatus::Gating);
     }
     let last = reviews.last()?;
-    if last.verdict == Some(ReviewVote::Reject) {
-        return Some(RunStatus::Blocked);
-    }
     let stagnant = reviews.iter().rev().take_while(|r| !r.progressed).count() >= STAGNANT_LIMIT;
     if reviews.len() < max_rounds && !stagnant {
         return None;
     }
-    Some(if last.incomplete() && last.blocking == 0 {
-        RunStatus::Blocked
-    } else if last.e2e.iter().all(CommandOutcome::ok) {
-        RunStatus::Gating
-    } else {
-        RunStatus::Blocked
-    })
+    Some(
+        if last.verdict == Some(ReviewVote::Reject) || (last.incomplete() && last.blocking == 0) {
+            RunStatus::Blocked
+        } else if last.e2e.iter().all(CommandOutcome::ok) {
+            RunStatus::Gating
+        } else {
+            RunStatus::Blocked
+        },
+    )
 }
 
 /// How long a re-ask may take, given the budget the first attempt had.
@@ -4120,6 +4121,13 @@ mod tests {
         let mut round = review_round(false, 0, 2, 2, false, true);
         round.verdict = Some(ReviewVote::Reject);
         assert_eq!(review_conclusion(&[round], 1), Some(RunStatus::Blocked));
+    }
+
+    #[test]
+    fn review_conclusion_retries_a_reject_while_rounds_remain() {
+        let mut round = review_round(false, 0, 2, 2, true, true);
+        round.verdict = Some(ReviewVote::Reject);
+        assert_eq!(review_conclusion(&[round], 2), None);
     }
 
     #[test]

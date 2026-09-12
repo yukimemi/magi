@@ -118,6 +118,37 @@ async fn actionable_non_blocking_reject_is_open_not_clean() {
 }
 
 #[tokio::test]
+async fn resumed_non_blocking_reject_uses_the_remaining_review_round() {
+    let home = common::home_lock().await;
+    let fx = fixture_with_rejected_minor_review(home);
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.execute().await.expect("first review round");
+    assert_eq!(runner.state.reviews.len(), 1);
+    assert_eq!(runner.state.reviews[0].verdict, Some(ReviewVote::Reject));
+
+    // Model an interruption after round one was persisted in a two-round
+    // review: the persisted record is identical, but resume must still spend
+    // the remaining review opportunity rather than conclude immediately.
+    runner.state.config.graph.review_rounds = 2;
+    runner.state.save().expect("save interrupted review");
+    let id = runner.state.id.clone();
+    drop(runner);
+
+    let mut resumed = Runner::resume(&id).expect("resume");
+    resumed.execute().await.expect("resume execution");
+    assert_eq!(
+        resumed.state.reviews.len(),
+        2,
+        "{:#?}",
+        resumed.state.reviews
+    );
+    assert_eq!(resumed.state.status, RunStatus::Blocked);
+    assert!(resumed.state.gate.is_empty());
+}
+
+#[tokio::test]
 async fn empty_reason_reject_revote_is_not_clean_under_warn() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_empty_reject_revote(home);
