@@ -700,6 +700,7 @@ impl Ui {
             .route("/api/talks", get(talks_list).post(talk_post))
             .route("/api/talks/{id}", get(talk_detail).delete(talk_delete))
             .route("/api/talks/{id}/say", post(talk_say))
+            .route("/api/talks/{id}/pending/resume", post(talk_pending_resume))
             .route("/api/talks/{id}/pending/clear", post(talk_pending_clear))
             .route("/api/talks/{id}/pending/edit", post(talk_pending_edit))
             .route("/api/talks/{id}/close", post(talk_close))
@@ -3380,6 +3381,16 @@ async fn talk_say(
         .await?
     };
 
+    // A stored draft with no in-memory owner is the recovery case after a
+    // server restart. Do not append this request ahead of it: that would make
+    // the old draft run later as a second, surprising turn. The draft remains
+    // intact for the explicit Resume, Edit text, or Clear actions.
+    if !talk.pending.is_empty() || !talk.pending_attachments.is_empty() {
+        return Err(ApiError::conflict(
+            "a queued draft is waiting; resume it, edit it, or clear it before sending another message",
+        ));
+    }
+
     let talks = ui.talks.clone();
     let text = {
         let mut talk = talk.clone();
@@ -3425,6 +3436,49 @@ async fn talk_say(
 
     // 202: the operator's message is recorded and a turn is running.
     Ok((StatusCode::ACCEPTED, Json(TalkView::new(queued, thinking))))
+}
+
+/// `POST /api/talks/{id}/pending/resume` promotes a persisted draft without
+/// changing it. The turn guard is the same per-talk ownership `talk_say`
+/// holds, so duplicate recovery clicks cannot resume the CLI session twice.
+async fn talk_pending_resume(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<(StatusCode, Json<TalkView>)> {
+    let id = {
+        let ui = Arc::clone(&ui);
+        let asked = id.clone();
+        blocking(move || resolve_talk(&ui.talks, &asked)).await?
+    };
+    let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
+        return Err(ApiError::conflict(
+            "a talk turn is already running; the queued draft will be handled by it",
+        ));
+    };
+    let (talk, cfg) = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || {
+            let talk = ui.talks.get(&id)?;
+            if !talk.status.open() {
+                return Err(ApiError::conflict(format!(
+                    "talk {} is {} and takes no more turns",
+                    talk.short(),
+                    talk.status.as_str()
+                )));
+            }
+            if talk.pending.is_empty() && talk.pending_attachments.is_empty() {
+                return Err(ApiError::conflict("there is no queued draft to resume"));
+            }
+            let (cfg, _) = Config::discover(&talk.repo, None)?;
+            Ok((talk, cfg))
+        })
+        .await?
+    };
+    let view = TalkView::new(talk.clone(), true);
+    let talks = ui.talks.clone();
+    tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+    Ok((StatusCode::ACCEPTED, Json(view)))
 }
 
 /// Drain [`talk::Talk::pending`] one turn at a time until nothing is left,
@@ -3522,6 +3576,13 @@ async fn talk_pending_edit(
         move || {
             let id = resolve_talk(&ui.talks, &id)?;
             let mut talk = ui.talks.get(&id)?;
+            if !talk.status.open() {
+                return Err(ApiError::conflict(format!(
+                    "talk {} is {} and takes no more turns",
+                    talk.short(),
+                    talk.status.as_str()
+                )));
+            }
             if !talk::edit_pending_text(
                 &mut talk,
                 &ui.talks,
@@ -4974,6 +5035,119 @@ mod tests {
         );
         assert_eq!(turns[0]["body"], "corrected");
         assert_eq!(detail["pending"], "");
+    }
+
+    #[tokio::test]
+    async fn recovered_pending_requires_explicit_resume_and_duplicate_resume_runs_once() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::write(repo.join("magi.toml"), SLOW_MOCK_AGENT_TOML).expect("write config");
+        let f = Fixture::with_repo(repo).await;
+        let id = f.post("/api/talks", None).await.json()["id"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let store = f.talks();
+        let mut recovered = store.get(&id).expect("opened talk");
+        talk::queue(&mut recovered, &store, "saved before restart", Vec::new())
+            .expect("persist pending draft without a live turn");
+
+        let refused = f
+            .post(
+                &format!("/api/talks/{id}/say"),
+                Some(r#"{"text":"new message"}"#),
+            )
+            .await;
+        assert_eq!(refused.status, 409, "{}", refused.body);
+        assert!(refused.body.contains("resume"), "{}", refused.body);
+        let saved = store.get(&id).expect("draft remains after refusal");
+        assert!(saved.turns.is_empty());
+        assert_eq!(saved.pending, "saved before restart");
+
+        let resumed = f
+            .post(&format!("/api/talks/{id}/pending/resume"), None)
+            .await;
+        assert_eq!(resumed.status, 202, "{}", resumed.body);
+        let duplicate = f
+            .post(&format!("/api/talks/{id}/pending/resume"), None)
+            .await;
+        assert_eq!(duplicate.status, 409, "{}", duplicate.body);
+
+        for _ in 0..100 {
+            if store.get(&id).expect("talk").turns.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let finished = store.get(&id).expect("finished talk");
+        assert_eq!(finished.turns.len(), 2, "{finished:?}");
+        assert_eq!(finished.turns[0].body, "saved before restart");
+        assert!(finished.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_image_only_recovered_draft_resumes_without_text() {
+        let (_tmp, _repo, f) = talk_fixture().await;
+        let id = f.post("/api/talks", None).await.json()["id"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let uploaded = f
+            .post_bytes(
+                &format!("/api/talks/{id}/attachments"),
+                &[("Content-Type", "image/png"), ("X-Filename", "saved.png")],
+                PNG_BYTES,
+            )
+            .await;
+        assert_eq!(uploaded.status, 201, "{}", uploaded.body);
+        let attachment = f
+            .talks()
+            .attachment_meta(&id, uploaded.json()["id"].as_str().expect("attachment id"))
+            .expect("attachment metadata")
+            .expect("stored attachment");
+        let store = f.talks();
+        let mut recovered = store.get(&id).expect("opened talk");
+        talk::queue(&mut recovered, &store, "", vec![attachment]).expect("queue image only");
+
+        let resumed = f
+            .post(&format!("/api/talks/{id}/pending/resume"), None)
+            .await;
+        assert_eq!(resumed.status, 202, "{}", resumed.body);
+        for _ in 0..200 {
+            if store.get(&id).expect("talk").turns.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let finished = store.get(&id).expect("finished talk");
+        assert_eq!(finished.turns.len(), 2, "{finished:?}");
+        assert!(finished.turns[0].body.is_empty());
+        assert_eq!(finished.turns[0].attachments.len(), 1);
+        assert!(finished.pending_attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_talk_refuses_pending_resume_and_edit() {
+        let (_tmp, _repo, f) = talk_fixture().await;
+        let id = f.post("/api/talks", None).await.json()["id"]
+            .as_str()
+            .expect("id")
+            .to_owned();
+        let closed = f.post(&format!("/api/talks/{id}/close"), None).await;
+        assert_eq!(closed.status, 200, "{}", closed.body);
+        for (path, body) in [
+            (format!("/api/talks/{id}/pending/resume"), None),
+            (
+                format!("/api/talks/{id}/pending/edit"),
+                Some(r#"{"text":"x","expected_text":"","expected_attachments":[]}"#),
+            ),
+            (format!("/api/talks/{id}/say"), Some(r#"{"text":"x"}"#)),
+        ] {
+            let response = f.post(&path, body).await;
+            assert_eq!(response.status, 409, "{}", response.body);
+        }
+        assert!(f.talks().get(&id).expect("closed talk").turns.is_empty());
     }
 
     /// Keeps both claims observable long enough to exercise the distinction
