@@ -87,6 +87,38 @@ impl Quiet for tokio::process::Command {
 /// than as license to reclaim.
 #[must_use]
 pub fn pid_alive(pid: u32) -> bool {
+    pid_alive_with(pid, platform_pid_alive)
+}
+
+/// Apply the conservative policy to one platform liveness query.
+///
+/// Kept separate from the OS command so queue and daemon tests can exercise
+/// dead, live, and unavailable answers without requiring permission to list
+/// the machine's processes.
+fn pid_alive_with<F>(pid: u32, query: F) -> bool
+where
+    F: FnOnce(u32) -> std::io::Result<bool>,
+{
+    match query(pid) {
+        Ok(alive) => alive,
+        Err(error) => {
+            // Sweeping is a poll-loop operation, so state the environment
+            // problem at the default log level without repeating it for every
+            // protected lock on every poll.
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| {
+                tracing::warn!(
+                    %pid,
+                    %error,
+                    "process liveness query unavailable; keeping locks rather than treating processes as dead"
+                );
+            });
+            true
+        }
+    }
+}
+
+fn platform_pid_alive(pid: u32) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
         match std::process::Command::new("kill")
@@ -94,16 +126,8 @@ pub fn pid_alive(pid: u32) -> bool {
             .arg(pid.to_string())
             .output()
         {
-            Ok(o) if o.status.success() => true,
-            Ok(o) => {
-                // "No such process" is the one answer that actually means the
-                // pid is gone. Anything else - most commonly "Operation not
-                // permitted" for a pid that exists under another account - is
-                // not evidence of that.
-                let stderr = String::from_utf8_lossy(&o.stderr).to_lowercase();
-                !stderr.contains("no such process")
-            }
-            Err(_) => true,
+            Ok(o) => Ok(parse_unix_kill_output(o.status.success(), &o.stderr)),
+            Err(error) => Err(error),
         }
     }
     #[cfg(windows)]
@@ -113,15 +137,95 @@ pub fn pid_alive(pid: u32) -> bool {
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
             .output();
         match out {
-            Ok(o) if o.status.success() => {
-                String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\""))
-            }
-            _ => true,
+            Ok(o) => tasklist_result(
+                pid,
+                o.status.success(),
+                &o.stdout,
+                &o.stderr,
+                &o.status.to_string(),
+            ),
+            Err(error) => Err(error),
         }
     }
     #[cfg(not(any(unix, windows)))]
     {
-        true
+        let _ = pid;
+        Ok(true)
+    }
+}
+
+/// 数値の PID から推測せず、`kill -0` の終了状態と診断を解釈する。
+/// 明示的な "no such process" 診断だけを死亡の証拠とする。
+#[cfg(any(unix, test))]
+fn parse_unix_kill_output(success: bool, stderr: &[u8]) -> bool {
+    if success {
+        return true;
+    }
+    !String::from_utf8_lossy(stderr)
+        .to_lowercase()
+        .contains("no such process")
+}
+
+/// `tasklist /FO CSV` の出力を解釈する。一致しない場合、要求した PID の
+/// フィールドを持つ行は存在しない。
+#[cfg(any(windows, test))]
+fn parse_windows_tasklist_output(pid: u32, stdout: &[u8]) -> std::io::Result<bool> {
+    if stdout.iter().all(u8::is_ascii_whitespace) {
+        return Err(std::io::Error::other("tasklist produced no output"));
+    }
+    let expected = pid.to_string();
+    let rows = String::from_utf8_lossy(stdout)
+        .lines()
+        .map(tasklist_csv_fields)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| std::io::Error::other("could not parse tasklist CSV output"))?;
+    Ok(rows
+        .into_iter()
+        .any(|fields| fields.get(1).is_some_and(|field| field == &expected)))
+}
+
+/// `tasklist` が出す、二重引用符と `""` エスケープを持つ CSV の一行を分ける。
+/// 壊れた CSV は呼び出し側が利用不能として保持できるよう `None` を返す。
+#[cfg(any(windows, test))]
+fn tasklist_csv_fields(line: &str) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => fields.push(std::mem::take(&mut field)),
+            _ => field.push(ch),
+        }
+    }
+    (!quoted).then(|| {
+        fields.push(field);
+        fields
+    })
+}
+
+/// `tasklist` の失敗を、利用不能な問い合わせとして保持する。
+#[cfg(any(windows, test))]
+fn tasklist_result(
+    pid: u32,
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+    status: &str,
+) -> std::io::Result<bool> {
+    if success {
+        parse_windows_tasklist_output(pid, stdout)
+    } else {
+        Err(std::io::Error::other(format!(
+            "tasklist exited {status}: {}",
+            String::from_utf8_lossy(stderr).trim()
+        )))
     }
 }
 
@@ -226,15 +330,107 @@ mod tests {
     }
 
     #[test]
-    fn this_process_is_alive_and_a_pid_nothing_ever_reuses_is_not() {
-        assert!(pid_alive(std::process::id()), "this test is running");
-        // Not `u32::MAX`: Windows' `tasklist` answers a pid that large with
-        // "invalid query" rather than "no such process", which this helper
-        // - correctly - cannot tell apart from a check it simply could not
-        // run, so it reads as alive. A pid past any real process table but
-        // still a value `tasklist` accepts as a query is the one this test
-        // can assert on without racing whatever else is running on the
-        // machine.
-        assert!(!pid_alive(999_999_999));
+    fn pid_liveness_policy_is_deterministic_without_an_os_process_query() {
+        assert!(pid_alive_with(42, |_| Ok(true)));
+        assert!(!pid_alive_with(42, |_| Ok(false)));
+    }
+
+    #[test]
+    fn an_unavailable_process_query_is_never_mistaken_for_a_dead_process() {
+        assert!(pid_alive_with(42, |_| Err(std::io::Error::other(
+            "access denied"
+        ))));
+    }
+
+    /// 本番パーサー用のコマンド出力フィクスチャであり、特定 PID の OS 上の
+    /// 死亡状態を主張するものではない。
+    #[test]
+    fn unix_kill_output_only_marks_no_such_process_as_dead() {
+        assert!(parse_unix_kill_output(true, b""));
+        assert!(!parse_unix_kill_output(
+            false,
+            b"kill: (12345) - No such process\n"
+        ));
+        assert!(parse_unix_kill_output(
+            false,
+            b"kill: (12345) - Operation not permitted\n"
+        ));
+    }
+
+    /// 本番パーサー用のコマンド出力フィクスチャであり、OS の生存照会ではない。
+    /// 失敗した `tasklist` は死亡ではなく利用不能のままとする。
+    #[test]
+    fn windows_tasklist_csv_parsing_handles_match_no_match_and_error() {
+        let pid = 12345;
+        assert!(
+            parse_windows_tasklist_output(
+                pid,
+                b"\"magi.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n"
+            )
+            .expect("整形式 CSV の一致行は生存を示す")
+        );
+        assert!(
+            parse_windows_tasklist_output(
+                pid,
+                b"\"magi,worker.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n"
+            )
+            .expect("カンマ入りイメージ名でも PID 列を読む")
+        );
+        assert!(
+            !parse_windows_tasklist_output(
+                pid,
+                b"INFO: No tasks are running which match the specified criteria.\r\n"
+            )
+            .expect("tasklist の no-match 出力は整形式である")
+        );
+        assert!(
+            parse_windows_tasklist_output(pid, b"\"magi.exe\",\"12345").is_err(),
+            "壊れた CSV は死亡ではなく利用不能である"
+        );
+        assert!(
+            parse_windows_tasklist_output(pid, b"").is_err(),
+            "空出力は死亡ではなく利用不能である"
+        );
+        assert!(
+            parse_windows_tasklist_output(pid, b"\r\n").is_err(),
+            "空白だけの出力は死亡ではなく利用不能である"
+        );
+        assert!(
+            tasklist_result(
+                pid,
+                true,
+                b"\"magi.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n",
+                b"",
+                "exit status: 0",
+            )
+            .expect("CSV の一致行は生存を示す")
+        );
+
+        let error = tasklist_result(pid, false, b"", b"Access is denied.\r\n", "exit status: 1")
+            .expect_err("tasklist の失敗は死亡ではなく利用不能である");
+        assert!(error.to_string().contains("Access is denied."));
+    }
+
+    /// このテスト自身の PID を OS に問い合わせるスモーク診断。
+    ///
+    /// CI では実際のコマンド実行と成功出力の解析を必須にする。制限された
+    /// 対話席で問い合わせ自体が使えない場合は、その事実を出力して成功結果や
+    /// 死んだプロセスと取り違えない。実行中の PID を dead と報告した場合と、
+    /// CI で問い合わせが利用不能な場合は失敗にする。
+    #[test]
+    fn platform_query_reports_this_running_process_as_alive_or_unavailable() {
+        let pid = std::process::id();
+        match platform_pid_alive(pid) {
+            Ok(true) => {}
+            Ok(false) => {
+                panic!("OS の PID 問い合わせが実行中のテストプロセス {pid} を dead と報告した")
+            }
+            Err(error) if std::env::var_os("CI").is_some() => {
+                panic!("CI で OS の PID 問い合わせを実行できない（テストプロセス {pid}）: {error}")
+            }
+            Err(error) => {
+                eprintln!("OS の PID 問い合わせは利用できません（テストプロセス {pid}）: {error}")
+            }
+        }
     }
 }

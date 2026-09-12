@@ -1056,6 +1056,46 @@ fn ids(agents: &[AgentSpec]) -> String {
 mod tests {
     use super::*;
 
+    const COMMAND_HELPER_MODE: &str = "MAGI_TEST_COMMAND_HELPER_MODE";
+
+    /// Test-only command agent implemented by this test binary itself. Unlike
+    /// `echo` and `sleep`, it is available wherever the Rust tests run.
+    fn command_helper(mode: &str) -> AgentSpec {
+        AgentSpec {
+            id: "helper".to_owned(),
+            kind: AgentKind::Command,
+            model: None,
+            command: vec![
+                std::env::current_exe()
+                    .expect("locate test helper")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--exact".to_owned(),
+                "agent::tests::command_agent_test_helper".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            extra_args: Vec::new(),
+            env: BTreeMap::from([(COMMAND_HELPER_MODE.to_owned(), mode.to_owned())]),
+            prompt_delivery: None,
+        }
+    }
+
+    #[test]
+    fn command_agent_test_helper() {
+        match std::env::var(COMMAND_HELPER_MODE).as_deref() {
+            Ok("reply") => println!("hello {}", std::env::var("MAGI_SEAT").unwrap()),
+            Ok("cache") => println!("{}", std::env::var("CARGO_TARGET_DIR").unwrap()),
+            Ok("ignore-stdin") => println!("done"),
+            Ok("chatty-sleep") => {
+                println!("i-said-something");
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            Ok("sleep") => std::thread::sleep(Duration::from_secs(30)),
+            Ok(other) => panic!("unknown command helper mode {other}"),
+            Err(_) => {}
+        }
+    }
+
     fn spec(kind: AgentKind, model: Option<&str>) -> AgentSpec {
         AgentSpec {
             id: "a".to_owned(),
@@ -1643,8 +1683,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let art = dir.path().join("artifacts");
         let mut seat = SeatState::new("impl-A", "a", 7);
-        let mut s = spec(AgentKind::Command, None);
-        s.command = vec!["echo".to_owned(), "hello {label}".to_owned()];
+        let s = command_helper("reply");
         let out = invoke(
             &s,
             &mut seat,
@@ -1679,20 +1718,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("magi-cache");
         let mut seat = SeatState::new("impl-A", "a", 7);
-        let mut s = spec(AgentKind::Command, None);
-        if cfg!(windows) {
-            s.command = vec![
-                "cmd".to_owned(),
-                "/C".to_owned(),
-                "echo %CARGO_TARGET_DIR%".to_owned(),
-            ];
-        } else {
-            s.command = vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                "echo $CARGO_TARGET_DIR".to_owned(),
-            ];
-        }
+        let s = command_helper("cache");
         let out = invoke(
             &s,
             &mut seat,
@@ -1713,9 +1739,8 @@ mod tests {
         .await
         .unwrap();
         assert!(out.usable(), "{out:?}");
-        assert_eq!(
-            out.text.trim(),
-            cache.to_string_lossy(),
+        assert!(
+            out.text.contains(cache.to_string_lossy().as_ref()),
             "the seat must see CARGO_TARGET_DIR = the shared cache"
         );
     }
@@ -1724,10 +1749,9 @@ mod tests {
     async fn a_prompt_larger_than_the_pipe_buffer_does_not_deadlock() {
         let dir = tempfile::tempdir().unwrap();
         let mut seat = SeatState::new("impl-A", "a", 7);
-        let mut s = spec(AgentKind::Command, None);
-        // `echo` never reads stdin, so an inline write_all would block once the
-        // OS pipe buffer filled — long before the process could be waited on.
-        s.command = vec!["echo".to_owned(), "done".to_owned()];
+        // The helper never reads stdin, so an inline write_all would block once
+        // the OS pipe buffer filled — long before the process could be waited on.
+        let s = command_helper("ignore-stdin");
         let big = "x".repeat(1_000_000);
         let out = invoke(
             &s,
@@ -1749,15 +1773,14 @@ mod tests {
         .await
         .unwrap();
         assert!(out.usable(), "{out:?}");
-        assert_eq!(out.text, "done");
+        assert!(out.text.contains("done"), "{}", out.text);
     }
 
     #[tokio::test]
     async fn timeout_is_reported_not_hung() {
         let dir = tempfile::tempdir().unwrap();
         let mut seat = SeatState::new("impl-A", "a", 7);
-        let mut s = spec(AgentKind::Command, None);
-        s.command = vec!["sleep".to_owned(), "30".to_owned()];
+        let s = command_helper("sleep");
         let out = invoke(
             &s,
             &mut seat,
@@ -1791,12 +1814,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let artifacts = dir.path().join("artifacts");
         let mut seat = SeatState::new("impl-A", "a", 7);
-        let mut s = spec(AgentKind::Command, None);
-        s.command = vec![
-            "sh".to_owned(),
-            "-c".to_owned(),
-            "echo i-said-something; sleep 30".to_owned(),
-        ];
+        let s = command_helper("chatty-sleep");
         let out = invoke(
             &s,
             &mut seat,
@@ -1804,9 +1822,9 @@ mod tests {
                 cwd: dir.path(),
                 prompt: "unused",
                 // Wide enough to cover process-spawn latency inside a loaded
-                // parallel test run, not merely the echo. At two seconds this
-                // passed alone and failed in the full suite, which is a dice
-                // roll rather than a test.
+                // parallel test run, not merely the helper's first write. At
+                // two seconds this passed alone and failed in the full suite,
+                // which is a dice roll rather than a test.
                 timeout: Duration::from_secs(10),
                 allow_write: true,
                 sessions: true,
