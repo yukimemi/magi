@@ -1926,17 +1926,7 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
             // resolves it. Shown for the same reason the chat seat is: an
             // unresolved role that only fails inside a running daemon is a
             // setting an operator cannot confirm ahead of time.
-            println!(
-                "  conduct      {}",
-                match magi::agent::pick(
-                    &cfg.agents,
-                    cfg.roles.conductor.as_deref(),
-                    &magi::agent::installed,
-                ) {
-                    Ok(s) => s.display(),
-                    Err(e) => format!("unusable: {e}"),
-                }
-            );
+            println!("  conduct      {}", roles.conductor.display());
         }
         Err(e) => println!("\nroster     unusable: {e}"),
     }

@@ -3791,7 +3791,20 @@ pub fn worst_open(state: &RunState) -> Option<Severity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::time::Duration;
+
+    fn conductor() -> AgentSpec {
+        AgentSpec {
+            id: "conductor".to_owned(),
+            kind: crate::config::AgentKind::Command,
+            model: None,
+            command: vec!["true".to_owned()],
+            extra_args: Vec::new(),
+            env: BTreeMap::new(),
+            prompt_delivery: None,
+        }
+    }
 
     #[test]
     fn remove_if_empty_only_ever_takes_a_bare_directory() {
@@ -4014,6 +4027,7 @@ mod tests {
                 judges: Vec::new(),
                 reviewers: Vec::new(),
                 fixer: None,
+                conductor: conductor(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -4223,6 +4237,7 @@ mod tests {
                 judges: Vec::new(),
                 reviewers: Vec::new(),
                 fixer: None,
+                conductor: conductor(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -4339,6 +4354,7 @@ mod tests {
                 judges: Vec::new(),
                 reviewers: Vec::new(),
                 fixer: None,
+                conductor: conductor(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),

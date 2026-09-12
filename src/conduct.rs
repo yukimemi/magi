@@ -39,7 +39,7 @@
 //! what happened here.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -284,7 +284,17 @@ async fn outcome_for(task: &Task, repo: &Path) -> prompt::ConductOutcome {
 async fn finished_view(t: &Task, repo: &Path, max_attempts: usize) -> prompt::ConductFinished {
     prompt::ConductFinished {
         task: view(t, max_attempts),
-        outcome: outcome_for(t, repo).await,
+        outcome: outcome_for(t, &repo_for(t, repo)).await,
+    }
+}
+
+/// The repository containing a task's branch. A task filed without a
+/// repository uses the daemon's repository, exactly as its later attempt does.
+fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
+    if task.repo.as_os_str().is_empty() || task.repo == Path::new(".") {
+        fallback.to_path_buf()
+    } else {
+        task.repo.clone()
     }
 }
 
@@ -494,12 +504,10 @@ impl Conductor {
             return Ok(());
         }
 
-        let spec = agent::pick(
-            &cfg.agents,
-            cfg.roles.conductor.as_deref(),
-            &agent::installed,
-        )
-        .context("resolving the conductor seat")?;
+        let spec = cfg
+            .resolve_roles()
+            .context("resolving the conductor seat")?
+            .conductor;
         let needs_new_seat = !matches!(&self.seat, Some(s) if s.agent == spec.id);
         if needs_new_seat {
             self.seat = Some(SeatState::new(SEAT, &spec.id, crate::rng::entropy()));
@@ -704,12 +712,17 @@ mod tests {
     fn outcome_for_carries_every_rounds_findings_and_the_branch_head() {
         crate::run::set_home(std::env::temp_dir().join("magi-conduct-tests-home"));
         let dir = tempdir().unwrap();
-        init_repo_with_branch(dir.path(), "magi/f00d/A");
+        let default_repo = dir.path().join("default");
+        let task_repo = dir.path().join("task");
+        std::fs::create_dir_all(&default_repo).unwrap();
+        std::fs::create_dir_all(&task_repo).unwrap();
+        init_repo_with_branch(&default_repo, "other-branch");
+        init_repo_with_branch(&task_repo, "magi/f00d/A");
 
         let mut config = Config::default();
         config.graph.review_rounds = 6;
         let mut state = crate::run::RunState::new(
-            dir.path().to_path_buf(),
+            task_repo.clone(),
             "main".to_owned(),
             "deadbeef".to_owned(),
             "task".to_owned(),
@@ -721,7 +734,7 @@ mod tests {
             label: 'A',
             agent: "mock".to_owned(),
             branch: "magi/f00d/A".to_owned(),
-            worktree: dir.path().to_path_buf(),
+            worktree: task_repo.clone(),
             summary: String::new(),
             stat: String::new(),
             files: 1,
@@ -760,9 +773,11 @@ mod tests {
         state.save().unwrap();
 
         let mut t = task("outcome test");
+        t.repo = task_repo;
         t.runs.push(state.id.clone());
 
-        let outcome = tokio_test_block_on(outcome_for(&t, dir.path()));
+        let finished = tokio_test_block_on(finished_view(&t, &default_repo, 2));
+        let outcome = finished.outcome;
 
         assert!(outcome.unreadable.is_none());
         assert_eq!(outcome.run_status.as_deref(), Some("blocked"));

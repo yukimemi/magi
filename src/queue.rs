@@ -232,6 +232,10 @@ pub struct Task {
     /// never reach here.
     #[serde(default)]
     pub review_branch: Option<String>,
+    /// A release deliberately starts a new competition instead of resuming
+    /// the prior run. History remains as evidence in `runs`.
+    #[serde(default)]
+    pub fresh_start: bool,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -271,6 +275,7 @@ impl Task {
             block_reason: None,
             answers: Vec::new(),
             review_branch: None,
+            fresh_start: false,
             created_at: now,
             updated_at: now,
         }
@@ -287,6 +292,7 @@ impl Task {
         self.attempts += 1;
         self.runs.push(run);
         self.last_error = None;
+        self.fresh_start = false;
     }
 
     /// Record a successful run.
@@ -480,6 +486,7 @@ impl Task {
         self.blocked_by.clear();
         self.block_reason = None;
         self.review_branch = None;
+        self.fresh_start = true;
     }
 }
 

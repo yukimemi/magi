@@ -1198,6 +1198,14 @@ async fn poll(
                 swept.join(", ")
             );
         }
+        // Capture stalled work before reclaiming it. A dead daemon's ordinary
+        // lock is swept and reclaimed in this same poll, but the conductor
+        // must still see that it was stranded rather than only its mechanical
+        // terminal state.
+        let now = Timestamp::now();
+        let stalled = stalled_tasks(queue, home, now);
+        let stalled_ids: std::collections::BTreeSet<_> =
+            stalled.iter().map(|task| task.id.clone()).collect();
         let reclaimed = reclaim_orphaned_running(queue, opts.max_attempts);
         if !reclaimed.is_empty() {
             tracing::warn!(
@@ -1223,9 +1231,10 @@ async fn poll(
         // see `Conductor::worth_a_look`'s own doc for why "stalled is
         // non-empty" is the wrong test. Checked before `prepare` so an
         // unchanged cycle never pays for a synchronous config load.
-        let now = Timestamp::now();
-        let stalled = stalled_tasks(queue, home, now);
-        let finished = finished_tasks(queue);
+        let finished: Vec<Task> = finished_tasks(queue)
+            .into_iter()
+            .filter(|task| !stalled_ids.contains(&task.id))
+            .collect();
         if conductor.worth_a_look(queue, &stalled, &finished) {
             match prepare(&opts.repo, opts) {
                 Ok(cfg) => {
@@ -1470,7 +1479,9 @@ async fn attempt(
     // `crate::conduct` is what actually offers a better answer than
     // `Runner::start` here (see `Recovery::Review`), once this task's next
     // failure shows it up as `held`/`failed` with the run state unreadable.
-    let unfinished = unfinished_run(&task.runs, task.short());
+    let unfinished = (!task.fresh_start)
+        .then(|| unfinished_run(&task.runs, task.short()))
+        .flatten();
     // `crate::conduct` chose `Review` for this task on an earlier cycle: its
     // branch survived, and this reopens exactly that branch as a
     // review-only pass rather than resuming or competing again. Consumed
@@ -3560,6 +3571,47 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_dead_daemon_task_is_shown_stalled_before_reclaim_and_can_be_requeued() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::run::set_home(dir.path().join("run-home"));
+        let queue = Queue::at(dir.path().join("queue"));
+        let home = dir.path().join("home");
+        let questions = Questions::at(dir.path().join("questions"));
+
+        let mut t = task();
+        t.id = "20260101-000003-dead".to_owned();
+        t.start("missing-run".to_owned());
+        queue.put(&mut t).unwrap();
+        backdate_task(&queue, &t.id, STALLED_RUNNING.as_secs() as i64 + 60);
+
+        // This is the real poll ordering: retain the deterministic stalled
+        // input before a claim proves the owner is gone and reclaims it.
+        let stalled = stalled_tasks(&queue, &home, Timestamp::now());
+        assert_eq!(
+            stalled.iter().map(|task| &task.id).collect::<Vec<_>>(),
+            [&t.id]
+        );
+        assert_eq!(reclaim_orphaned_running(&queue, 2), [t.id.clone()]);
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+
+        // Reclaim drops its guard before conductor decisions are applied, so
+        // the decision for the captured stalled input has a real write path.
+        crate::conduct::apply(
+            &queue,
+            &questions,
+            &crate::conduct::Verdict {
+                decisions: vec![crate::conduct::Decision {
+                    id: t.id.clone(),
+                    recovery: Some(crate::conduct::Recovery::Requeue),
+                    ..crate::conduct::Decision::default()
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+    }
+
+    #[test]
     fn stalled_tasks_reports_exactly_the_tasks_is_stalled_agrees_on() {
         let dir = tempfile::tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
@@ -3723,6 +3775,22 @@ mod tests {
             Starter::Resume("some-run".to_owned())
         );
         assert_eq!(choose_starter(None, false, None), Starter::Start);
+    }
+
+    #[test]
+    fn an_explicit_release_forces_a_fresh_competition_even_with_a_resumable_run() {
+        let mut released = task();
+        released.start("stalled-run".to_owned());
+        released.release();
+        let unfinished = (!released.fresh_start)
+            .then(|| Some("stalled-run".to_owned()))
+            .flatten();
+        assert_eq!(
+            choose_starter(None, false, unfinished.as_deref()),
+            Starter::Start,
+            "release keeps run history but must not resume it"
+        );
+        assert_eq!(released.runs, ["stalled-run"]);
     }
 
     #[test]

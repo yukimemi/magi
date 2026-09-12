@@ -815,6 +815,8 @@ pub struct ResolvedRoles {
     pub reviewers: Vec<AgentSpec>,
     /// Explicit fixer, if configured.
     pub fixer: Option<AgentSpec>,
+    /// Queue conductor, explicitly selected or resolved by the standalone-seat fallback.
+    pub conductor: AgentSpec,
 }
 
 /// Every array-valued key in a config table, as a dotted path.
@@ -1257,6 +1259,11 @@ impl Config {
                 .as_deref()
                 .map(|f| self.agent(f).cloned())
                 .transpose()?,
+            conductor: crate::agent::pick(
+                &self.agents,
+                self.roles.conductor.as_deref(),
+                &crate::agent::installed,
+            )?,
         })
     }
 
@@ -1442,6 +1449,7 @@ mod tests {
         assert!(roles.implementers.iter().all(|a| a.id == "b"));
         assert!(roles.judges.iter().all(|a| a.id == "a"));
         assert_eq!(roles.fixer.unwrap().id, "a");
+        assert_eq!(roles.conductor.id, "a");
     }
 
     #[test]
@@ -1454,6 +1462,21 @@ mod tests {
             },
             ..Config::default()
         };
+        assert!(cfg.resolve_roles().is_err());
+    }
+
+    #[test]
+    fn conductor_role_is_resolved_validated_and_has_a_fallback() {
+        let mut cfg = Config {
+            agents: vec![spec("a"), spec("b")],
+            ..Config::default()
+        };
+        assert_eq!(cfg.resolve_roles().unwrap().conductor.id, "a");
+
+        cfg.roles.conductor = Some("b".to_owned());
+        assert_eq!(cfg.resolve_roles().unwrap().conductor.id, "b");
+
+        cfg.roles.conductor = Some("missing".to_owned());
         assert!(cfg.resolve_roles().is_err());
     }
 
