@@ -275,4 +275,24 @@ mod tests {
             "access denied"
         ))));
     }
+
+    /// このテスト自身の PID を OS に問い合わせるスモーク診断。
+    ///
+    /// 通常の CI では実際のコマンド実行と成功出力の解析を通る。制限された
+    /// 実行環境で問い合わせ自体が使えない場合は、その事実を出力して成功結果や
+    /// 死んだプロセスと取り違えない。実行中の PID を dead と報告した場合だけは、
+    /// どの環境でも失敗にする。
+    #[test]
+    fn platform_query_reports_this_running_process_as_alive_or_unavailable() {
+        let pid = std::process::id();
+        match platform_pid_alive(pid) {
+            Ok(true) => {}
+            Ok(false) => {
+                panic!("OS の PID 問い合わせが実行中のテストプロセス {pid} を dead と報告した")
+            }
+            Err(error) => {
+                eprintln!("OS の PID 問い合わせは利用できません（テストプロセス {pid}）: {error}")
+            }
+        }
+    }
 }
