@@ -1781,21 +1781,35 @@ fn exhausted_review_budget(state: &RunState) -> bool {
     state.status == RunStatus::Blocked && state.reviews.len() >= state.config.graph.review_rounds
 }
 
-/// The most recent run of `runs` that resuming would actually make progress
-/// on, if any. `short` is only for the warning's own message.
+/// This task's *most recent* run, if resuming it would actually make
+/// progress. `short` is only for the warning's own message.
 ///
-/// Two runs paid for the "prefer resuming" half of this lesson. Run 01c2 was
-/// blocked and the loop started 3cbf on the same task a moment later,
-/// duplicating two and a half hours of agent work. Then b25f stalled on a
-/// judge that timed out and one that answered with no JSON — `quota: 0`, so
-/// nothing the machine was to blame for — and 4043 started **one second**
-/// later, buying three fresh implementations to reach the same panel.
-/// `RunStatus::resumable` rather than `!done()` is what catches the second
-/// case: a stall is terminal, and its cheap recovery re-asks only the absent
-/// seats. [`exhausted_review_budget`] is the other half: a run that is
-/// technically `resumable()` but provably cannot progress must not count as
-/// "unfinished" either, or `crate::conduct::Recovery::Requeue` — which
-/// promises a fresh competition — becomes a silent no-op instead.
+/// Only ever `runs.last()` — never a search back through older history.
+/// `runs` accumulates one entry per fresh `Runner::start`/`Runner::review`
+/// mint, oldest first, and every entry before the last one was already
+/// superseded at the moment it was minted: the daemon only ever starts a new
+/// run when the previous one was not worth resuming (unresumable, exhausted,
+/// or unreadable), or when `crate::conduct::Recovery::Review` deliberately
+/// opens a fresh review-only run alongside an older, already-failed
+/// competition. Searching further back would let an old run that merely
+/// *looks* resumable — a `Stalled` competition an earlier `Review` pass left
+/// behind, say — get resumed instead of the fresh competition
+/// `crate::conduct::Recovery::Requeue` actually promised, reviving history
+/// nothing asked to revisit.
+///
+/// Two runs paid for the "prefer resuming over restarting" half of this
+/// lesson, which is why this still checks `runs.last()` rather than always
+/// restarting. Run 01c2 was blocked and the loop started 3cbf on the same
+/// task a moment later, duplicating two and a half hours of agent work. Then
+/// b25f stalled on a judge that timed out and one that answered with no JSON
+/// — `quota: 0`, so nothing the machine was to blame for — and 4043 started
+/// **one second** later, buying three fresh implementations to reach the
+/// same panel. `RunStatus::resumable` rather than `!done()` is what catches
+/// the second case: a stall is terminal, and its cheap recovery re-asks only
+/// the absent seats. [`exhausted_review_budget`] is the other half: a run
+/// that is technically `resumable()` but provably cannot progress must not
+/// count as "unfinished" either, or `Recovery::Requeue` becomes a silent
+/// no-op instead of the fresh competition it promises.
 ///
 /// A load failure is warned about rather than silently read as "not
 /// resumable": the alternative is exactly what let a schema mismatch on run
@@ -1804,16 +1818,15 @@ fn exhausted_review_budget(state: &RunState) -> bool {
 /// `Runner::start` here (see `Recovery::Review`), once this task's next
 /// failure shows it up as `held`/`failed` with the run state unreadable.
 fn unfinished_run(runs: &[String], short: &str) -> Option<String> {
-    runs.iter()
-        .rev()
-        .find(|id| match RunState::load(id) {
-            Ok(s) => s.status.resumable() && !exhausted_review_budget(&s),
-            Err(e) => {
-                tracing::warn!("could not read run {id} for task {short}: {e:#}");
-                false
-            }
-        })
-        .cloned()
+    let id = runs.last()?;
+    match RunState::load(id) {
+        Ok(s) if s.status.resumable() && !exhausted_review_budget(&s) => Some(id.clone()),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("could not read run {id} for task {short}: {e:#}");
+            None
+        }
+    }
 }
 
 /// Which of the three ways [`attempt`] can mint or continue a run this task
@@ -3796,6 +3809,50 @@ mod tests {
         assert_eq!(
             unfinished_run(&[has_budget_left.id.clone()], "t"),
             Some(has_budget_left.id.clone())
+        );
+    }
+
+    #[test]
+    fn unfinished_run_never_falls_back_to_an_older_resumable_run() {
+        // A task whose history holds an *older* run that still looks
+        // resumable (say, a competition `Runner::review` was started
+        // alongside after that older run went `Stalled`) and a *newest* run
+        // that is `Blocked` with its review budget spent. `Recovery::Requeue`
+        // on this task must mean a fresh competition — falling back to the
+        // stale, superseded `Stalled` run instead would resurrect history
+        // nothing asked to revisit and silently defeat the requeue.
+        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+
+        let mut older_stalled = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234def".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        older_stalled.status = RunStatus::Stalled;
+        older_stalled.save().unwrap();
+
+        let mut newest_exhausted = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234def".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        newest_exhausted.status = RunStatus::Blocked;
+        newest_exhausted.config.graph.review_rounds = 1;
+        newest_exhausted.reviews = vec![review_round(1)];
+        newest_exhausted.save().unwrap();
+
+        assert_eq!(
+            unfinished_run(
+                &[older_stalled.id.clone(), newest_exhausted.id.clone()],
+                "t"
+            ),
+            None,
+            "the newest run is exhausted, so nothing here is worth resuming - \
+             least of all the older, already-superseded run"
         );
     }
 
