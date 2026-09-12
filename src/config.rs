@@ -147,6 +147,17 @@ pub struct Roles {
     /// turn traced to exactly this - `opus` triple-booked as chatter and judge
     /// - is what this field exists to let an operator break apart.
     pub chatter: Option<String>,
+    /// Agent that arranges the queue between polls: `crate::conduct`'s single
+    /// seat, called once per cycle to decide a runnable task's `blocked_by`
+    /// and how a stalled or finished task recovers.
+    ///
+    /// The same precedent as [`Self::chatter`] for a seat that stands alone
+    /// rather than rotating through the roster - resolved through
+    /// [`crate::agent::pick`], so unset falls back to its own default order
+    /// (a claude seat, else the first runnable agent) rather than reusing a
+    /// judge or reviewer seat that the conductor's own poll-cycle cadence
+    /// would otherwise compete with for the same account's concurrency.
+    pub conductor: Option<String>,
 }
 
 /// Graph shape and limits.
@@ -1309,7 +1320,8 @@ impl Config {
              [roles]\n\
              implementers = []\n\
              judges = []\n\
-             reviewers = []\n\n\
+             reviewers = []\n\
+             # conductor = \"opus\"  # arranges the queue; unset picks a seat like chatter does\n\n\
              [graph]\n\
              candidates = 3\n\
              judges = 3\n\

@@ -37,7 +37,17 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
-pub const SCHEMA: u32 = 1;
+///
+/// 2: added [`TaskStatus::Blocked`], [`Task::blocked_by`] and
+/// [`Task::block_reason`] (`crate::conduct`'s decisions) and
+/// [`Task::answers`] (operator answers carried forward to the next
+/// conductor prompt and the next run's instruction). All three are
+/// `#[serde(default)]`, so [`read_path`] accepts anything up to and
+/// including this schema rather than only an exact match — a task written
+/// by a build that only knew about schema 1 has nothing to say about
+/// blocking or answers, and defaulting those fields is exactly as good a
+/// reading as a value that build never had a chance to write.
+pub const SCHEMA: u32 = 2;
 
 /// Where a task came from. Recorded because "who asked for this" is the first
 /// question about an autonomous run, and the answer is not recoverable later.
@@ -88,6 +98,10 @@ pub enum TaskStatus {
     Failed,
     /// Out of attempts, or held by hand. The loop will not pick it up.
     Held,
+    /// Waiting on another task or an unanswered question. See
+    /// [`Task::blocked_by`]. Set and cleared by `crate::conduct` and
+    /// `crate::daemon`'s deterministic resolver, never by hand.
+    Blocked,
 }
 
 impl TaskStatus {
@@ -104,6 +118,7 @@ impl TaskStatus {
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Held => "held",
+            Self::Blocked => "blocked",
         }
     }
 }
@@ -177,10 +192,60 @@ pub struct Task {
     /// still reads, with no diagnostic recorded rather than a parse error.
     #[serde(default)]
     pub diagnostic: Option<String>,
+    /// What this task is waiting on: other task ids, unanswered
+    /// `crate::ask::Question` ids, or both. Non-empty exactly when
+    /// [`TaskStatus::Blocked`]; emptying it — see [`Task::unblock`] — is what
+    /// puts the task back at [`TaskStatus::Queued`].
+    ///
+    /// Set by `crate::conduct`'s decisions and cleared deterministically by
+    /// `crate::daemon` as each dependency resolves, never by a person. Never
+    /// `#[serde(default)]` is skipped: a queue file from before this field
+    /// existed has nothing to report here, and an empty list is exactly that.
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
+    /// One line explaining the current [`Task::blocked_by`], written by
+    /// `crate::conduct`. Cleared whenever `blocked_by` empties.
+    #[serde(default)]
+    pub block_reason: Option<String>,
+    /// Questions `crate::conduct` asked about this task that the operator has
+    /// since answered, oldest first — what was asked, and what they said.
+    ///
+    /// A blocking question's id leaves [`Task::blocked_by`] the moment
+    /// [`crate::ask::QuestionStatus::Answered`] is observed, but the id alone
+    /// tells nobody what was decided. This is what carries the answer's
+    /// *content* forward: into the next conductor prompt for this task, and
+    /// into the instruction handed to the next run — see `crate::daemon`'s
+    /// deterministic blocker resolution. Kept for the task's whole life, the
+    /// same as [`Task::runs`]: a release resets attempts, not evidence.
+    #[serde(default)]
+    pub answers: Vec<AnsweredQuestion>,
+    /// Set by `crate::conduct` when it chooses `Review` recovery for a task
+    /// whose branch survived a blocked run: the branch to reopen with
+    /// `crate::graph::Runner::review` instead of competing from scratch.
+    ///
+    /// Requeues the task the same way [`Task::release`] does, so it is
+    /// picked up by the ordinary loop; `crate::daemon` reads this field once,
+    /// when it actually starts the run, and clears it either way — consumed
+    /// on success, dropped if the branch no longer exists by then. Never set
+    /// from the conductor's own words: `crate::daemon` derives the branch
+    /// name itself from the task's last run, so a hallucinated branch can
+    /// never reach here.
+    #[serde(default)]
+    pub review_branch: Option<String>,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
     pub updated_at: Timestamp,
+}
+
+/// One question `crate::conduct` asked about a task, and what the operator
+/// said back. See [`Task::answers`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnsweredQuestion {
+    /// The question as asked, e.g. [`crate::ask::Question::summary`].
+    pub question: String,
+    /// What the operator answered.
+    pub answer: String,
 }
 
 impl Task {
@@ -202,6 +267,10 @@ impl Task {
             last_error: None,
             hold_reason: None,
             diagnostic: None,
+            blocked_by: Vec::new(),
+            block_reason: None,
+            answers: Vec::new(),
+            review_branch: None,
             created_at: now,
             updated_at: now,
         }
@@ -284,6 +353,53 @@ impl Task {
         }
     }
 
+    /// Block this task on other task ids and/or open question ids, chosen by
+    /// `crate::conduct`. Pure: the caller still owns writing it back with
+    /// [`Queue::put`].
+    pub fn block(&mut self, blocked_by: Vec<String>, reason: Option<String>) {
+        self.status = TaskStatus::Blocked;
+        self.blocked_by = blocked_by;
+        self.block_reason = reason;
+    }
+
+    /// Remove one resolved dependency (a task id that became [`TaskStatus::Done`],
+    /// or a question id that became [`crate::ask::QuestionStatus::Answered`]).
+    /// Once nothing is left in [`Task::blocked_by`], the task returns to
+    /// [`TaskStatus::Queued`] on its own - deciding *why* a task was blocked
+    /// was `crate::conduct`'s job, but noticing a dependency resolved needs no
+    /// model at all.
+    ///
+    /// A no-op, on purpose, for a task that is not [`TaskStatus::Blocked`]:
+    /// `crate::daemon`'s deterministic resolver runs over every task on every
+    /// poll, and a task that moved on for some other reason must not be
+    /// dragged back to `Queued` by a stale id it still happens to carry.
+    pub fn unblock(&mut self, resolved_id: &str) {
+        if self.status != TaskStatus::Blocked {
+            return;
+        }
+        self.blocked_by.retain(|id| id != resolved_id);
+        if self.blocked_by.is_empty() {
+            self.status = TaskStatus::Queued;
+            self.block_reason = None;
+        }
+    }
+
+    /// Record that a question `crate::conduct` asked about this task has been
+    /// answered, so the answer's content — not just the fact that the
+    /// question is gone — reaches the next conductor prompt and the next
+    /// run's instruction. See [`Task::answers`].
+    pub fn record_answer(&mut self, question: String, answer: String) {
+        self.answers.push(AnsweredQuestion { question, answer });
+    }
+
+    /// Requeue this task to reopen its last run as a review-only pass against
+    /// `branch` (`crate::graph::Runner::review`) rather than competing from
+    /// scratch. See [`Task::review_branch`].
+    pub fn request_review(&mut self, branch: String) {
+        self.release();
+        self.review_branch = Some(branch);
+    }
+
     /// Change how urgently this task should run next.
     ///
     /// Refused once the task is `running`: priority only feeds the sort
@@ -357,6 +473,13 @@ impl Task {
         // belonged to whatever it was waiting on last time.
         self.hold_reason = None;
         self.diagnostic = None;
+        // A release also un-blocks: the dependency or question `blocked_by`
+        // named may still be unresolved, but a human (or `crate::conduct`)
+        // choosing to release the task overrides that wait outright, the same
+        // as it overrides an ordinary hold.
+        self.blocked_by.clear();
+        self.block_reason = None;
+        self.review_branch = None;
     }
 }
 
@@ -616,7 +739,12 @@ fn read_path(path: &Path) -> Result<Task> {
     let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let task: Task =
         serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
-    if task.schema != SCHEMA {
+    // Greater-than, not not-equal: every field added since schema 1 carries
+    // `#[serde(default)]`, so an older task has nothing to say about it and
+    // defaulting is exactly as good a reading as a value that build never had
+    // a chance to write. Only a schema *ahead* of this build - a meaning it
+    // cannot possibly know - is refused rather than guessed at.
+    if task.schema > SCHEMA {
         bail!(
             "task {} was written by a different magi (schema {}, this build \
              speaks {SCHEMA})",
@@ -706,6 +834,20 @@ mod tests {
         // ...then oldest, so a burst of new work cannot starve older work.
         assert_eq!(q.next_runnable().unwrap().id, a.id);
         assert_eq!(q.list().len(), 3, "b is still waiting its turn");
+    }
+
+    #[test]
+    fn a_blocked_task_never_starves_another_runnable_one() {
+        let (_dir, q) = queue();
+        let mut blocked = task("blocked");
+        blocked.block(vec!["something".to_owned()], None);
+        q.put(&mut blocked).unwrap();
+
+        let mut runnable = task("free to go");
+        q.put(&mut runnable).unwrap();
+
+        let next = q.next_runnable().expect("a runnable task is still offered");
+        assert_eq!(next.id, runnable.id);
     }
 
     #[test]
@@ -852,6 +994,78 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_task_is_never_offered_to_the_loop() {
+        let mut t = task("blocked");
+        assert!(t.status.runnable());
+        t.block(
+            vec!["dep-id".to_owned()],
+            Some("waits on dep-id".to_owned()),
+        );
+        assert_eq!(t.status, TaskStatus::Blocked);
+        assert!(!t.status.runnable());
+        assert_eq!(TaskStatus::Blocked.as_str(), "blocked");
+    }
+
+    #[test]
+    fn unblocking_the_last_dependency_returns_the_task_to_queued() {
+        let mut t = task("blocked on two");
+        t.block(
+            vec!["a".to_owned(), "b".to_owned()],
+            Some("waits on a and b".to_owned()),
+        );
+
+        t.unblock("a");
+        assert_eq!(t.status, TaskStatus::Blocked, "b is still outstanding");
+        assert_eq!(t.blocked_by, ["b"]);
+
+        t.unblock("b");
+        assert_eq!(t.status, TaskStatus::Queued);
+        assert!(t.blocked_by.is_empty());
+        assert!(t.block_reason.is_none());
+    }
+
+    #[test]
+    fn unblocking_an_id_on_a_task_that_is_not_blocked_is_a_no_op() {
+        let mut t = task("never blocked");
+        t.unblock("whatever");
+        assert_eq!(t.status, TaskStatus::Queued);
+    }
+
+    #[test]
+    fn answering_a_question_is_recorded_and_survives_a_release() {
+        let mut t = task("asked something");
+        t.block(vec!["q1".to_owned()], Some("which backend?".to_owned()));
+        t.record_answer("Which backend?".to_owned(), "SQLite".to_owned());
+        t.unblock("q1");
+        assert_eq!(t.status, TaskStatus::Queued);
+        assert_eq!(t.answers.len(), 1);
+        assert_eq!(t.answers[0].answer, "SQLite");
+
+        // A release resets attempts, not evidence - the same rule
+        // `releasing_a_held_task_gives_it_a_real_second_chance` asserts for
+        // `runs`.
+        t.release();
+        assert_eq!(t.answers.len(), 1, "the answer is not lost on release");
+    }
+
+    #[test]
+    fn requesting_review_requeues_the_task_and_remembers_the_branch() {
+        let mut t = task("blocked run with a surviving branch");
+        t.start("run-1".to_owned());
+        t.fail("blocked with major findings", 5);
+        assert_eq!(t.status, TaskStatus::Failed);
+
+        t.request_review("magi/eba2/A".to_owned());
+        assert_eq!(t.status, TaskStatus::Queued);
+        assert_eq!(t.attempts, 0);
+        assert_eq!(t.review_branch.as_deref(), Some("magi/eba2/A"));
+
+        // An ordinary release (a human overriding the choice) drops it again.
+        t.release();
+        assert!(t.review_branch.is_none());
+    }
+
+    #[test]
     fn priority_can_be_changed_while_queued_but_not_while_running() {
         let mut t = task("reprioritise me");
         t.set_priority(5).unwrap();
@@ -990,7 +1204,6 @@ mod tests {
 
         let task = q.get("20260101-000000-aaaa").expect("must still read");
         assert!(task.hold_reason.is_none());
-        assert_eq!(SCHEMA, 1, "this feature must not bump the schema");
     }
 
     #[test]
@@ -1017,7 +1230,38 @@ mod tests {
 
         let task = q.get("20260101-000000-aaaa").expect("must still read");
         assert!(task.diagnostic.is_none());
-        assert_eq!(SCHEMA, 1, "this feature must not bump the schema");
+    }
+
+    #[test]
+    fn a_schema_1_task_with_no_blocking_fields_still_reads() {
+        // Written by a build that predates `blocked_by`, `block_reason`,
+        // `answers` and `review_branch` entirely - literal `"schema": 1`,
+        // not `SCHEMA`, since the whole point is a build older than this one.
+        let (_dir, q) = queue();
+        let path = q.path_of("20260101-000000-aaaa");
+        std::fs::create_dir_all(q.root()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": 1,
+                "id": "20260101-000000-aaaa",
+                "title": "from before blocking existed",
+                "instruction": "from before blocking existed",
+                "repo": ".",
+                "source": { "kind": "human" },
+                "status": "queued",
+                "created_at": Timestamp::now().to_string(),
+                "updated_at": Timestamp::now().to_string(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let task = q.get("20260101-000000-aaaa").expect("must still read");
+        assert!(task.blocked_by.is_empty());
+        assert!(task.block_reason.is_none());
+        assert!(task.answers.is_empty());
+        assert!(task.review_branch.is_none());
     }
 
     #[test]
@@ -1137,7 +1381,7 @@ mod tests {
         let path = q.path_of(&t.id);
         let body = std::fs::read_to_string(&path)
             .unwrap()
-            .replace("\"schema\": 1", "\"schema\": 99");
+            .replace(&format!("\"schema\": {SCHEMA}"), "\"schema\": 99");
         std::fs::write(&path, body).unwrap();
 
         let err = q.get(&t.id).unwrap_err().to_string();

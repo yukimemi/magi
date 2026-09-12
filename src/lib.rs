@@ -26,6 +26,7 @@ pub mod ask;
 pub mod blind;
 pub mod bump;
 pub mod clean;
+pub mod conduct;
 pub mod config;
 pub mod daemon;
 pub mod disk;

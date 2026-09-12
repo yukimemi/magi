@@ -57,8 +57,9 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
-use crate::ask;
+use crate::ask::{self, Questions};
 use crate::clean;
+use crate::conduct::Conductor;
 use crate::config::{Config, MergeMode};
 use crate::graph::Runner;
 use crate::land;
@@ -90,6 +91,23 @@ pub const POLL: Duration = Duration::from_secs(5);
 /// this graph plausibly takes, so a sweep cannot pull a task out from under a
 /// daemon that is merely slow.
 pub const STALE_CLAIM: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// How long a task may sit [`TaskStatus::Running`] with no live daemon's
+/// heartbeat naming it before [`crate::conduct`] is shown it as stalled.
+///
+/// [`reclaim_orphaned_running`] already proves abandonment immediately, on
+/// every poll, by attempting the task's own claim — a lock nothing holds
+/// succeeds at once, with no threshold at all. This constant exists only for
+/// the one race that check cannot close: [`attempt`] writes [`Task::start`]
+/// (and so `Running`) before the very first [`Status::current`] entry naming
+/// the task reaches `<home>/daemon.json`, which only happens on the next
+/// [`HEARTBEAT`] tick. A read landing in that narrow gap would see a live
+/// task with no matching heartbeat entry yet and misread it as abandoned.
+/// Thirty minutes is comfortably longer than any such gap — `HEARTBEAT` is
+/// five seconds — while staying far below [`STALE_CLAIM`]'s six hours, so a
+/// task that is genuinely stuck reaches the conductor in minutes rather than
+/// waiting for the mechanical sweep.
+pub const STALLED_RUNNING: Duration = Duration::from_secs(30 * 60);
 
 /// What the loop is working on, for the status file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -581,6 +599,96 @@ pub fn sweep_stale_claims(queue: &Queue, older_than: Duration) -> Vec<String> {
     swept
 }
 
+/// Is `task` stalled: [`TaskStatus::Running`], past [`STALLED_RUNNING`], with
+/// no live daemon's heartbeat naming it? Deterministic — no model call, and
+/// the exact test [`stalled_tasks`] uses to decide what `crate::conduct` is
+/// shown.
+fn is_stalled(task: &Task, home: &Path, now: Timestamp) -> bool {
+    task.status == TaskStatus::Running
+        && (now.as_second() - task.updated_at.as_second()) >= STALLED_RUNNING.as_secs() as i64
+        && !is_working_on_task(home, &task.id, now)
+}
+
+/// Every task [`is_stalled`] right now — "止まったタスク" in
+/// `crate::conduct`'s vocabulary.
+fn stalled_tasks(queue: &Queue, home: &Path, now: Timestamp) -> Vec<Task> {
+    queue
+        .list()
+        .into_iter()
+        .filter(|t| is_stalled(t, home, now))
+        .collect()
+}
+
+/// Runnable tasks a dependency can still be set on — "runnable なタスク" in
+/// `crate::conduct`'s vocabulary. Deliberately `Queued` only, not
+/// `Failed`-and-so-also-runnable: a task that already attempted and lost
+/// belongs in [`finished_tasks`], where the question is a recovery, not a
+/// dependency.
+fn queued_tasks(queue: &Queue) -> Vec<Task> {
+    queue
+        .list()
+        .into_iter()
+        .filter(|t| t.status == TaskStatus::Queued)
+        .collect()
+}
+
+/// `Failed`/`Held` tasks nobody has decided a recovery for yet — "終わった
+/// タスク" in `crate::conduct`'s vocabulary.
+fn finished_tasks(queue: &Queue) -> Vec<Task> {
+    queue
+        .list()
+        .into_iter()
+        .filter(|t| matches!(t.status, TaskStatus::Failed | TaskStatus::Held))
+        .collect()
+}
+
+/// Deterministically resolve `Task::blocked_by`: a dependency task that
+/// reached `Done`, or a question that was answered, is removed — no model
+/// involved, on every poll. An answered question's content is copied onto
+/// the task ([`Task::record_answer`]) before its id is dropped, so it
+/// reaches the next `crate::conduct` prompt and the next run's instruction
+/// (see [`instruction_for`]) rather than only clearing the block.
+fn resolve_blockers(queue: &Queue, questions: &Questions) {
+    for listed in queue.list() {
+        if listed.status != TaskStatus::Blocked || listed.blocked_by.is_empty() {
+            continue;
+        }
+        let Ok(_claim) = queue.claim(&listed.id) else {
+            continue;
+        };
+        let Ok(mut task) = queue.get(&listed.id) else {
+            continue;
+        };
+        if task.status != TaskStatus::Blocked {
+            continue;
+        }
+        let mut changed = false;
+        for id in task.blocked_by.clone() {
+            if let Ok(dep) = queue.get(&id) {
+                if dep.status == TaskStatus::Done {
+                    task.unblock(&id);
+                    changed = true;
+                }
+                continue;
+            }
+            if let Ok(q) = questions.get(&id)
+                && q.status == ask::QuestionStatus::Answered
+            {
+                let answer = match &q.answer {
+                    Some(ask::Answer::Choice(c) | ask::Answer::Text(c)) => c.clone(),
+                    None => String::new(),
+                };
+                task.record_answer(q.summary.clone(), answer);
+                task.unblock(&id);
+                changed = true;
+            }
+        }
+        if changed {
+            record(queue, &mut task);
+        }
+    }
+}
+
 /// What a finished run tells the queue about the task it came from.
 ///
 /// A struct rather than a fourth and fifth boolean argument: the two flags
@@ -1064,6 +1172,7 @@ async fn poll(
     // must not sit out a quota cooldown it did not cause.
     let quota_cooldown_until: Arc<Mutex<Option<Timestamp>>> = Arc::new(Mutex::new(None));
     let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let mut conductor = Conductor::new();
 
     while !stop.stopped() {
         lock(status).polls += 1;
@@ -1094,6 +1203,46 @@ async fn poll(
                 reclaimed.len(),
                 reclaimed.join(", ")
             );
+        }
+
+        // `home`, not `ask::Questions::open()`'s own process-global default:
+        // `poll` is handed its home explicitly precisely so a test can point
+        // it elsewhere, the same reason `Queue::at` and the status file path
+        // are parameters rather than resolved here - see `drive`'s own doc.
+        let questions = Questions::at(home.join("questions"));
+
+        // Deterministic: no model, run before the conductor sees anything so
+        // its input reflects the queue's current, already-resolved state.
+        resolve_blockers(queue, &questions);
+
+        // The conductor gets one look per cycle, right before the loop takes
+        // its next task, and only when there is something new to look at -
+        // see `Conductor::worth_a_look`'s own doc for why "stalled is
+        // non-empty" is the wrong test. Checked before `prepare` so an
+        // unchanged cycle never pays for a synchronous config load.
+        let now = Timestamp::now();
+        let stalled = stalled_tasks(queue, home, now);
+        let finished = finished_tasks(queue);
+        if conductor.worth_a_look(queue, &stalled, &finished) {
+            match prepare(&opts.repo, opts) {
+                Ok(cfg) => {
+                    let queued = queued_tasks(queue);
+                    conductor
+                        .maybe_run(
+                            &cfg,
+                            &opts.repo,
+                            queue,
+                            &questions,
+                            home,
+                            &queued,
+                            &stalled,
+                            &finished,
+                            opts.max_attempts,
+                        )
+                        .await;
+                }
+                Err(e) => tracing::warn!("conductor: no config: {e:#}"),
+            }
         }
 
         let candidates: Vec<Task> = runnable(queue)
@@ -1311,22 +1460,64 @@ async fn attempt(
     // fresh implementations to reach the same panel. `RunStatus::resumable`
     // rather than `!done()` is what catches the second case: a stall is
     // terminal, and its cheap recovery re-asks only the absent seats.
+    //
+    // A load failure is warned about rather than silently read as "not
+    // resumable": the alternative is exactly what let a schema mismatch on
+    // run `eba2` fall through to a full re-competition with nobody told why.
+    // `crate::conduct` is what actually offers a better answer than
+    // `Runner::start` here (see `Recovery::Review`), once this task's next
+    // failure shows it up as `held`/`failed` with the run state unreadable.
     let unfinished = task
         .runs
         .iter()
         .rev()
-        .find(|id| {
-            RunState::load(id)
-                .map(|s| s.status.resumable())
-                .unwrap_or(false)
+        .find(|id| match RunState::load(id) {
+            Ok(s) => s.status.resumable(),
+            Err(e) => {
+                tracing::warn!("could not read run {id} for task {}: {e:#}", task.short());
+                false
+            }
         })
         .cloned();
-    let started = match &unfinished {
-        Some(id) => {
+    // `crate::conduct` chose `Review` for this task on an earlier cycle: its
+    // branch survived, and this reopens exactly that branch as a
+    // review-only pass rather than resuming or competing again. Consumed
+    // (cleared) here whichever way this goes, so it never outlives this one
+    // attempt - see `queue::Task::review_branch`.
+    let review_branch = task.review_branch.take();
+    let branch_exists = match &review_branch {
+        Some(branch) => crate::git::branch_exists(&repo, branch)
+            .await
+            .unwrap_or(false),
+        None => false,
+    };
+    let starter = choose_starter(
+        review_branch.as_deref(),
+        branch_exists,
+        unfinished.as_deref(),
+    );
+    let started = match &starter {
+        Starter::Review(branch) => {
+            tracing::info!(
+                "task {} reopens `{branch}` as a review-only pass",
+                task.short()
+            );
+            Runner::review(&repo, branch, config).await
+        }
+        Starter::Resume(id) => {
             tracing::info!("resuming run {id} rather than competing again");
             Runner::resume(id)
         }
-        None => Runner::start(&repo, task.instruction.clone(), config).await,
+        Starter::Start => {
+            if let Some(branch) = &review_branch {
+                tracing::warn!(
+                    "conductor chose review for task {} but branch `{branch}` no longer \
+                     exists; requeuing as a fresh competition instead",
+                    task.short()
+                );
+            }
+            Runner::start(&repo, instruction_for(task), config).await
+        }
     };
     let mut runner = match started {
         Ok(r) => r,
@@ -1583,6 +1774,45 @@ fn parse_reset_hint(text: &str, now: Timestamp) -> Option<Timestamp> {
     Some(at)
 }
 
+/// Which of the three ways [`attempt`] can mint or continue a run this task
+/// should use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Starter {
+    /// `crate::graph::Runner::review` against a branch `crate::conduct` chose
+    /// and that still exists.
+    Review(String),
+    /// `crate::graph::Runner::resume` on an unfinished run of this task.
+    Resume(String),
+    /// `crate::graph::Runner::start`: a fresh competition.
+    Start,
+}
+
+/// Decide which of [`Runner::review`], [`Runner::resume`] or [`Runner::start`]
+/// this attempt should use. Pure, and separate from [`attempt`], so the
+/// routing itself is assertable without spawning a real graph or a git
+/// process: `attempt`'s own `crate::git::branch_exists` call has already
+/// happened by the time this is called.
+///
+/// `review_branch` wins whenever `branch_exists` confirms it; a `review_branch`
+/// whose branch is gone falls all the way through to [`Starter::Start`], not
+/// to [`Starter::Resume`] — `crate::conduct` chose review over resuming the
+/// old (likely `Blocked`) run in the first place, and a branch that vanished
+/// out from under that choice is not evidence resuming it would fare better.
+fn choose_starter(
+    review_branch: Option<&str>,
+    branch_exists: bool,
+    unfinished: Option<&str>,
+) -> Starter {
+    match review_branch {
+        Some(branch) if branch_exists => Starter::Review(branch.to_owned()),
+        Some(_) => Starter::Start,
+        None => match unfinished {
+            Some(id) => Starter::Resume(id.to_owned()),
+            None => Starter::Start,
+        },
+    }
+}
+
 /// Which repository a task runs in. A task that names none — the normal case
 /// for one filed from a phone — runs in the daemon's own default.
 fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
@@ -1590,6 +1820,25 @@ fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
         return fallback.to_path_buf();
     }
     task.repo.clone()
+}
+
+/// The instruction handed to `Runner::start`: the task's own text, plus any
+/// operator answers `crate::conduct` collected for it (see
+/// [`Task::answers`]), so a decision the operator actually made reaches the
+/// implementers rather than only clearing the block that was waiting on it.
+///
+/// Appended rather than merged into [`Task::instruction`] itself, so the
+/// task's own record stays exactly what its author wrote.
+fn instruction_for(task: &Task) -> String {
+    if task.answers.is_empty() {
+        return task.instruction.clone();
+    }
+    let mut s = task.instruction.clone();
+    s.push_str("\n\n# Operator answers\n\n");
+    for a in &task.answers {
+        s.push_str(&format!("- {}: {}\n", a.question, a.answer));
+    }
+    s
 }
 
 /// Persist a transition. A queue write failure is logged rather than fatal: the
@@ -3143,5 +3392,235 @@ mod tests {
             read_status(&home).is_none(),
             "a reader must see no daemon at all, not a heartbeat that merely stopped"
         );
+    }
+
+    #[test]
+    fn a_freshly_started_running_task_is_never_stalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = task();
+        t.start("run-1".to_owned());
+        // `updated_at` is `Timestamp::now()`, left alone: no live daemon
+        // named in `dir`, but nowhere near `STALLED_RUNNING` yet.
+        assert!(!is_stalled(&t, dir.path(), Timestamp::now()));
+    }
+
+    #[test]
+    fn a_long_running_task_with_no_live_daemon_is_stalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = task();
+        t.start("run-1".to_owned());
+        t.updated_at = Timestamp::now()
+            - jiff::SignedDuration::from_secs(STALLED_RUNNING.as_secs() as i64 + 60);
+        assert!(is_stalled(&t, dir.path(), Timestamp::now()));
+        assert_eq!(
+            stalled_tasks(
+                &Queue::at(dir.path().join("q")),
+                dir.path(),
+                Timestamp::now()
+            )
+            .len(),
+            0,
+            "the task was never written to this queue"
+        );
+    }
+
+    #[test]
+    fn a_long_running_task_a_live_daemon_still_names_is_not_stalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = task();
+        t.id = "20260903-080340-0167".to_owned();
+        t.start("20260903-080619-01c2".to_owned());
+        t.updated_at = Timestamp::now()
+            - jiff::SignedDuration::from_secs(STALLED_RUNNING.as_secs() as i64 + 60);
+
+        let mut status = Status::new();
+        status.current = vec![Current {
+            task: t.id.clone(),
+            run: "20260903-080619-01c2".to_owned(),
+        }];
+        write_status_to(&dir.path().join("daemon.json"), &status).unwrap();
+
+        assert!(
+            !is_stalled(&t, dir.path(), Timestamp::now()),
+            "a live daemon's own heartbeat rules out stalled, however long the task has run"
+        );
+    }
+
+    /// Rewrite a task's `updated_at` on disk directly, bypassing
+    /// `Queue::put`'s own `Timestamp::now()` stamping - the only way to make
+    /// a fixture look like it has genuinely been `running` for a while.
+    fn backdate_task(queue: &Queue, id: &str, seconds_ago: i64) {
+        let path = queue.path_of(id);
+        let body = std::fs::read_to_string(&path).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let old = Timestamp::now() - jiff::SignedDuration::from_secs(seconds_ago);
+        v["updated_at"] = serde_json::Value::String(old.to_string());
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn stalled_tasks_reports_exactly_the_tasks_is_stalled_agrees_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let home = dir.path().join("home");
+
+        let mut fresh = task();
+        fresh.id = "20260101-000001-aaaa".to_owned();
+        fresh.start("run-1".to_owned());
+        queue.put(&mut fresh).unwrap();
+
+        let mut old = task();
+        old.id = "20260101-000002-bbbb".to_owned();
+        old.start("run-2".to_owned());
+        queue.put(&mut old).unwrap();
+        backdate_task(&queue, &old.id, STALLED_RUNNING.as_secs() as i64 + 60);
+
+        let stalled = stalled_tasks(&queue, &home, Timestamp::now());
+        assert_eq!(stalled.len(), 1);
+        assert_eq!(stalled[0].id, old.id);
+    }
+
+    #[test]
+    fn queued_and_finished_task_views_partition_by_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+
+        let mut queued = task();
+        queued.id = "20260101-000001-aaaa".to_owned();
+        queue.put(&mut queued).unwrap();
+
+        let mut failed = task();
+        failed.id = "20260101-000002-bbbb".to_owned();
+        failed.start("run-1".to_owned());
+        failed.fail("gate red", 5);
+        queue.put(&mut failed).unwrap();
+
+        let mut held = task();
+        held.id = "20260101-000003-cccc".to_owned();
+        held.hold(None);
+        queue.put(&mut held).unwrap();
+
+        let mut running = task();
+        running.id = "20260101-000004-dddd".to_owned();
+        running.start("run-2".to_owned());
+        queue.put(&mut running).unwrap();
+
+        let queued_ids: Vec<String> = queued_tasks(&queue).into_iter().map(|t| t.id).collect();
+        assert_eq!(queued_ids, [queued.id.clone()]);
+
+        let mut finished_ids: Vec<String> =
+            finished_tasks(&queue).into_iter().map(|t| t.id).collect();
+        finished_ids.sort_unstable();
+        let mut want = vec![failed.id.clone(), held.id.clone()];
+        want.sort_unstable();
+        assert_eq!(finished_ids, want);
+    }
+
+    #[test]
+    fn resolve_blockers_clears_a_done_dependency_and_keeps_an_unresolved_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = ask::Questions::at(dir.path().join("questions"));
+
+        let mut dep = task();
+        dep.id = "20260101-000001-dep0".to_owned();
+        dep.succeed();
+        queue.put(&mut dep).unwrap();
+
+        let mut still_going = task();
+        still_going.id = "20260101-000002-dep1".to_owned();
+        queue.put(&mut still_going).unwrap();
+
+        let mut blocked = task();
+        blocked.id = "20260101-000003-main".to_owned();
+        blocked.block(
+            vec![dep.id.clone(), still_going.id.clone()],
+            Some("waits on both".to_owned()),
+        );
+        queue.put(&mut blocked).unwrap();
+
+        resolve_blockers(&queue, &questions);
+
+        let after = queue.get(&blocked.id).unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::Blocked,
+            "one dependency is still outstanding"
+        );
+        assert_eq!(after.blocked_by, [still_going.id.clone()]);
+    }
+
+    #[test]
+    fn resolve_blockers_carries_an_answers_content_onto_the_task_and_unblocks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = ask::Questions::at(dir.path().join("questions"));
+
+        let mut q = crate::ask::Question::new(
+            "20260101-000001-main".to_owned(),
+            crate::conduct::NODE.to_owned(),
+            "conduct".to_owned(),
+            "Which backend?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut q).unwrap();
+        q.answer(crate::ask::Answer::Text("SQLite".to_owned()))
+            .unwrap();
+        questions.put(&mut q).unwrap();
+
+        let mut blocked = task();
+        blocked.id = "20260101-000001-main".to_owned();
+        blocked.block(vec![q.id.clone()], Some("which backend?".to_owned()));
+        queue.put(&mut blocked).unwrap();
+
+        resolve_blockers(&queue, &questions);
+
+        let after = queue.get(&blocked.id).unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::Queued,
+            "the only blocker resolved"
+        );
+        assert_eq!(after.answers.len(), 1);
+        assert_eq!(after.answers[0].question, "Which backend?");
+        assert_eq!(after.answers[0].answer, "SQLite");
+
+        // And the run this task starts next is told about it.
+        let instruction = instruction_for(&after);
+        assert!(instruction.contains("Which backend?"));
+        assert!(instruction.contains("SQLite"));
+    }
+
+    #[test]
+    fn instruction_for_is_unchanged_without_any_answers() {
+        let t = task();
+        assert_eq!(instruction_for(&t), t.instruction);
+    }
+
+    #[test]
+    fn choose_starter_prefers_review_over_resume_when_the_branch_survived() {
+        assert_eq!(
+            choose_starter(Some("magi/eba2/A"), true, Some("some-run")),
+            Starter::Review("magi/eba2/A".to_owned())
+        );
+    }
+
+    #[test]
+    fn choose_starter_falls_back_to_start_when_the_review_branch_is_gone() {
+        assert_eq!(
+            choose_starter(Some("magi/eba2/A"), false, Some("some-run")),
+            Starter::Start,
+            "a vanished review branch must not fall back to resuming the old run either"
+        );
+    }
+
+    #[test]
+    fn choose_starter_resumes_or_starts_when_there_is_no_review_choice_at_all() {
+        assert_eq!(
+            choose_starter(None, false, Some("some-run")),
+            Starter::Resume("some-run".to_owned())
+        );
+        assert_eq!(choose_starter(None, false, None), Starter::Start);
     }
 }

@@ -1609,6 +1609,15 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             if let Some(r) = &t.hold_reason {
                 println!("held for  {r}");
             }
+            if !t.blocked_by.is_empty() {
+                println!("blocked on {}", t.blocked_by.join(", "));
+                if let Some(r) = &t.block_reason {
+                    println!("why       {r}");
+                }
+            }
+            for a in &t.answers {
+                println!("answered  {}: {}", a.question, a.answer);
+            }
             if let Some(d) = &t.diagnostic {
                 println!("\ndiagnostic\n{d}");
             }
@@ -1913,6 +1922,21 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
                     Err(e) => format!("unusable: {e}"),
                 }
             );
+            // The conductor seat, resolved the same way `conduct::Conductor`
+            // resolves it. Shown for the same reason the chat seat is: an
+            // unresolved role that only fails inside a running daemon is a
+            // setting an operator cannot confirm ahead of time.
+            println!(
+                "  conduct      {}",
+                match magi::agent::pick(
+                    &cfg.agents,
+                    cfg.roles.conductor.as_deref(),
+                    &magi::agent::installed,
+                ) {
+                    Ok(s) => s.display(),
+                    Err(e) => format!("unusable: {e}"),
+                }
+            );
         }
         Err(e) => println!("\nroster     unusable: {e}"),
     }
@@ -1951,8 +1975,8 @@ fn doctor_queue_and_loop(home: &Path) -> String {
     let mut s = String::new();
 
     let tasks = Queue::at(home.join("queue")).list();
-    let (mut queued, mut running, mut failed, mut held, mut done) =
-        (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut queued, mut running, mut failed, mut held, mut done, mut blocked) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     for t in &tasks {
         match t.status {
             TaskStatus::Queued => queued += 1,
@@ -1960,6 +1984,7 @@ fn doctor_queue_and_loop(home: &Path) -> String {
             TaskStatus::Failed => failed += 1,
             TaskStatus::Held => held += 1,
             TaskStatus::Done => done += 1,
+            TaskStatus::Blocked => blocked += 1,
         }
     }
     let _ = writeln!(
@@ -1968,7 +1993,10 @@ fn doctor_queue_and_loop(home: &Path) -> String {
         if tasks.is_empty() {
             "empty".to_owned()
         } else {
-            format!("queued {queued}, running {running}, failed {failed}, held {held}, done {done}")
+            format!(
+                "queued {queued}, running {running}, blocked {blocked}, failed {failed}, \
+                 held {held}, done {done}"
+            )
         }
     );
     if held > 0 {
@@ -2387,7 +2415,7 @@ mod tests {
         let text = doctor_queue_and_loop(dir.path());
 
         assert!(
-            text.contains("queue      queued 2, running 0, failed 0, held 1, done 0"),
+            text.contains("queue      queued 2, running 0, blocked 0, failed 0, held 1, done 0"),
             "{text}"
         );
         assert!(
