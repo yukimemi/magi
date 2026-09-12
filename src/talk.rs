@@ -692,6 +692,28 @@ pub fn clear_pending(talk: &mut Talk, store: &Talks) -> Result<()> {
     Ok(())
 }
 
+/// Clear a draft only when the caller still sees its complete snapshot.
+pub fn clear_pending_if_matches(
+    talk: &mut Talk,
+    store: &Talks,
+    expected_text: &str,
+    expected_attachments: &[String],
+) -> Result<bool> {
+    let _guard = store.guard();
+    let mut fresh = store
+        .get(&talk.id)
+        .with_context(|| format!("talk {} was deleted", talk.short()))?;
+    if !pending_matches(&fresh, expected_text, expected_attachments) {
+        *talk = fresh;
+        return Ok(false);
+    }
+    fresh.pending.clear();
+    fresh.pending_attachments.clear();
+    store.put(&mut fresh)?;
+    *talk = fresh;
+    Ok(true)
+}
+
 /// Replace just the text of the durable draft, but only if the caller's
 /// snapshot still identifies the entire draft. This refuses to overwrite a
 /// message another client queued or a draft the drain already promoted.
@@ -706,13 +728,7 @@ pub fn edit_pending_text(
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
-    if fresh.pending != expected_text
-        || fresh
-            .pending_attachments
-            .iter()
-            .map(|attachment| &attachment.id)
-            .ne(expected_attachments.iter())
-    {
+    if !pending_matches(&fresh, expected_text, expected_attachments) {
         *talk = fresh;
         return Ok(false);
     }
@@ -720,6 +736,15 @@ pub fn edit_pending_text(
     store.put(&mut fresh)?;
     *talk = fresh;
     Ok(true)
+}
+
+fn pending_matches(talk: &Talk, expected_text: &str, expected_attachments: &[String]) -> bool {
+    talk.pending == expected_text
+        && talk
+            .pending_attachments
+            .iter()
+            .map(|attachment| &attachment.id)
+            .eq(expected_attachments.iter())
 }
 
 /// Invoke the conversation's agent once and append what it said.
@@ -1293,6 +1318,17 @@ mod tests {
         );
         assert_eq!(
             talks.get(&talk.id).expect("reload after conflict").pending,
+            "corrected\n\nlater"
+        );
+        assert!(
+            !clear_pending_if_matches(&mut talk, &talks, "corrected", &["a".repeat(32)])
+                .expect("stale clear is a conflict")
+        );
+        assert_eq!(
+            talks
+                .get(&talk.id)
+                .expect("reload after stale clear")
+                .pending,
             "corrected\n\nlater"
         );
     }

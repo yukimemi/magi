@@ -46,6 +46,7 @@ const API = {
   talk: (id) => `/api/talks/${encodeURIComponent(id)}`,
   talkSay: (id) => `/api/talks/${encodeURIComponent(id)}/say`,
   talkPending: (id) => `/api/talks/${encodeURIComponent(id)}/pending`,
+  talkPendingClear: (id) => `/api/talks/${encodeURIComponent(id)}/pending/clear`,
   talkPendingEdit: (id) => `/api/talks/${encodeURIComponent(id)}/pending/edit`,
   talkClose: (id) => `/api/talks/${encodeURIComponent(id)}/close`,
   talkReopen: (id) => `/api/talks/${encodeURIComponent(id)}/reopen`,
@@ -3380,13 +3381,13 @@ function renderTalkPending(talk) {
   clear(box);
   show(box, Boolean(text || attachments.length));
   if (!text && attachments.length === 0) return;
-  append(box,
+  append(box, [
     el("p", { class: "panel-note", text: "Queued for the next reply" }),
     text ? el("pre", { class: "talk-pending-text", text }) : null,
     attachments.length ? el("p", { class: "frame-note", text: `${plural(attachments.length, "attachment", "attachments")} queued` }) : null,
     el("button", { class: "btn btn-quiet", type: "button", text: "Clear", onclick: clearTalkPending }),
     el("button", { class: "btn btn-quiet", type: "button", text: "Edit text", onclick: editTalkPending }),
-  );
+  ]);
 }
 
 async function editTalkPending() {
@@ -3417,8 +3418,12 @@ async function clearTalkPending() {
   const id = state.talkDetail.id;
   const talk = state.talkDetail.talk;
   if (!id || !talk) return;
+  const expectedText = String(talk.pending || "");
+  const expectedAttachments = Array.isArray(talk.pending_attachments)
+    ? talk.pending_attachments.map((attachment) => attachment.id)
+    : [];
   try {
-    const next = await request(API.talkPending(id), { method: "DELETE" }).then((r) => r.json());
+    const next = await postJson(API.talkPendingClear(id), { expected_text: expectedText, expected_attachments: expectedAttachments });
     if (state.talkDetail.id === id) {
       state.talkDetail.talk = next;
       renderTalk();
@@ -3426,6 +3431,7 @@ async function clearTalkPending() {
     announce("Queued message cleared.");
     loadTalks();
   } catch (error) {
+    if (error.status === 409) await loadTalk(id);
     talkError(`Could not clear the queued message: ${error.message}`);
   }
 }
@@ -3539,10 +3545,25 @@ function takeTalkAttachments(id) {
   if (state.talkAttachments.id !== id) return [];
   const taken = state.talkAttachments.items.filter((item) => item.status === "done");
   state.talkAttachments.items = state.talkAttachments.items.filter((item) => item.status !== "done");
-  for (const item of taken) {
+  return taken;
+}
+
+function releaseTalkAttachments(items) {
+  for (const item of items) {
     if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
   }
-  return taken;
+}
+
+function restoreTalkSubmission(id, text, attachments) {
+  if (state.talkAttachments.id === id) {
+    const known = new Set(state.talkAttachments.items.map((item) => item.localId));
+    state.talkAttachments.items.unshift(...attachments.filter((item) => !known.has(item.localId)));
+  }
+  if (state.talkDetail.id !== id) return;
+  const box = $("f-talk-say");
+  if (!box.value) box.value = text;
+  else if (text && box.value !== text) box.value = `${text}\n\n${box.value}`;
+  renderTalk();
 }
 
 function renderTalkThumbs() {
@@ -3687,6 +3708,7 @@ async function sendTalkTurn(event) {
        recovering from a process restart. */
     const wait = state.talkWaits.get(id);
     trackTalkThinking(queued, wait && { generation: wait.generation, startedAt: Date.now() });
+    releaseTalkAttachments(submissionAttachments);
     if (state.talkDetail.id === id) {
       state.talkDetail.talk = queued;
       renderTalk();
@@ -3695,6 +3717,7 @@ async function sendTalkTurn(event) {
     loadTalks();
     ok();
   } catch (error) {
+    restoreTalkSubmission(id, text, submissionAttachments);
     if (ownsTurn) endTalkTurn(id);
     talkError(`The message may not have been sent: ${error.message}`);
     await loadTalk(id);
