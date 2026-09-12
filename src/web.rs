@@ -605,6 +605,30 @@ impl Ui {
         }))
     }
 
+    /// Decide whether a free talk may start a new immediate turn while its
+    /// claim lock is held. A persisted draft without an owner is recovery
+    /// state, not a busy turn: two simultaneous `/say` requests must both
+    /// leave it untouched rather than one of them appending to it.
+    fn begin_talk_turn_unless_pending(&self, id: &str) -> ApiResult<TalkTurnStart> {
+        let mut live = self
+            .talk_turns
+            .lock()
+            .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
+        if live.contains(id) {
+            return Ok(TalkTurnStart::Busy);
+        }
+        let talk = self.talks.get(id).map_err(ApiError::from)?;
+        if !talk.pending.is_empty() || !talk.pending_attachments.is_empty() {
+            return Ok(TalkTurnStart::Pending);
+        }
+        live.insert(id.to_owned());
+        Ok(TalkTurnStart::Claimed(TalkTurnGuard {
+            talk: id.to_owned(),
+            turns: Arc::clone(&self.talk_turns),
+            released: false,
+        }))
+    }
+
     /// Park the loop for an upgrade, and report the run that is parking.
     ///
     /// A park rather than a stop: a stop waits out the whole competition, and
@@ -733,6 +757,14 @@ struct TalkTurnGuard {
     talk: String,
     turns: Arc<Mutex<HashSet<String>>>,
     released: bool,
+}
+
+/// The atomic initial-state decision made by
+/// [`Ui::begin_talk_turn_unless_pending`].
+enum TalkTurnStart {
+    Claimed(TalkTurnGuard),
+    Busy,
+    Pending,
 }
 
 impl TalkTurnGuard {
@@ -3318,56 +3350,70 @@ async fn talk_say(
         .await?
     };
 
-    // Claimed before the talk is loaded, so the record this turn appends to
-    // was read after the claim and cannot be a snapshot another turn has
-    // since replaced.
-    let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
-        // A turn is already running: queue rather than refuse. See
-        // `Ui::begin_talk_turn` and `talk::queue`.
-        let (view, reclaimed) = {
-            let ui = Arc::clone(&ui);
-            let id = id.clone();
-            let said = body.text.clone();
-            blocking(move || {
-                let mut talk = ui.talks.get(&id)?;
-                if let Err(error) = talk::queue(&mut talk, &ui.talks, &said, attachments) {
-                    if let Ok(fresh) = ui.talks.get(&id) {
-                        if !fresh.status.open() {
-                            return Err(ApiError::conflict(format!(
-                                "talk {} is {} and takes no more turns",
-                                fresh.short(),
-                                fresh.status.as_str()
-                            )));
-                        }
-                    }
-                    return Err(ApiError::from(error));
-                }
-                // The turn that looked busy a moment ago can have finished,
-                // found nothing to drain and given up the slot in the gap
-                // between that check and this write landing - see
-                // `drain_loop`'s own doc for the other half of why that gap
-                // would otherwise be able to open at all. Reclaiming the
-                // slot here, rather than trusting that whoever held it is
-                // still watching, is what stops the text just queued from
-                // being stranded until an unrelated future `say` happens to
-                // drain it.
-                let claim = match ui.begin_talk_turn(&id)? {
-                    Some(turn_guard) => {
-                        let (cfg, _) = Config::discover(&talk.repo, None)?;
-                        Some((talk.clone(), cfg, turn_guard))
-                    }
-                    None => None,
-                };
-                let thinking = ui.is_thinking(&id);
-                Ok((TalkView::new(talk, thinking), claim))
-            })
-            .await?
-        };
-        if let Some((talk, cfg, turn_guard)) = reclaimed {
-            let talks = ui.talks.clone();
-            tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+    // Pending recovery and a new immediate turn are decided under the same
+    // claim lock. Without that one critical section, a second `/say` can see
+    // the first request's claim as "busy" and append itself to the recovered
+    // draft before the first request rejects it.
+    let start = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || ui.begin_talk_turn_unless_pending(&id)).await?
+    };
+    let turn_guard = match start {
+        TalkTurnStart::Claimed(turn_guard) => turn_guard,
+        TalkTurnStart::Pending => {
+            return Err(ApiError::conflict(
+                "a queued draft is waiting; resume it, edit it, or clear it before sending another message",
+            ));
         }
-        return Ok((StatusCode::ACCEPTED, Json(view)));
+        TalkTurnStart::Busy => {
+            // A turn is already running: queue rather than refuse. See
+            // `Ui::begin_talk_turn` and `talk::queue`.
+            let (view, reclaimed) = {
+                let ui = Arc::clone(&ui);
+                let id = id.clone();
+                let said = body.text.clone();
+                blocking(move || {
+                    let mut talk = ui.talks.get(&id)?;
+                    if let Err(error) = talk::queue(&mut talk, &ui.talks, &said, attachments) {
+                        if let Ok(fresh) = ui.talks.get(&id) {
+                            if !fresh.status.open() {
+                                return Err(ApiError::conflict(format!(
+                                    "talk {} is {} and takes no more turns",
+                                    fresh.short(),
+                                    fresh.status.as_str()
+                                )));
+                            }
+                        }
+                        return Err(ApiError::from(error));
+                    }
+                    // The turn that looked busy a moment ago can have finished,
+                    // found nothing to drain and given up the slot in the gap
+                    // between that check and this write landing - see
+                    // `drain_loop`'s own doc for the other half of why that gap
+                    // would otherwise be able to open at all. Reclaiming the
+                    // slot here, rather than trusting that whoever held it is
+                    // still watching, is what stops the text just queued from
+                    // being stranded until an unrelated future `say` happens to
+                    // drain it.
+                    let claim = match ui.begin_talk_turn(&id)? {
+                        Some(turn_guard) => {
+                            let (cfg, _) = Config::discover(&talk.repo, None)?;
+                            Some((talk.clone(), cfg, turn_guard))
+                        }
+                        None => None,
+                    };
+                    let thinking = ui.is_thinking(&id);
+                    Ok((TalkView::new(talk, thinking), claim))
+                })
+                .await?
+            };
+            if let Some((talk, cfg, turn_guard)) = reclaimed {
+                let talks = ui.talks.clone();
+                tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+            }
+            return Ok((StatusCode::ACCEPTED, Json(view)));
+        }
     };
 
     let (talk, cfg) = {
@@ -3380,16 +3426,6 @@ async fn talk_say(
         })
         .await?
     };
-
-    // A stored draft with no in-memory owner is the recovery case after a
-    // server restart. Do not append this request ahead of it: that would make
-    // the old draft run later as a second, surprising turn. The draft remains
-    // intact for the explicit Resume, Edit text, or Clear actions.
-    if !talk.pending.is_empty() || !talk.pending_attachments.is_empty() {
-        return Err(ApiError::conflict(
-            "a queued draft is waiting; resume it, edit it, or clear it before sending another message",
-        ));
-    }
 
     let talks = ui.talks.clone();
     let text = {
@@ -5062,6 +5098,19 @@ mod tests {
         assert_eq!(refused.status, 409, "{}", refused.body);
         assert!(refused.body.contains("resume"), "{}", refused.body);
         let saved = store.get(&id).expect("draft remains after refusal");
+        assert!(saved.turns.is_empty());
+        assert_eq!(saved.pending, "saved before restart");
+
+        let say_path = format!("/api/talks/{id}/say");
+        let (first, second) = tokio::join!(
+            f.post(&say_path, Some(r#"{"text":"concurrent one"}"#)),
+            f.post(&say_path, Some(r#"{"text":"concurrent two"}"#)),
+        );
+        assert_eq!(first.status, 409, "{}", first.body);
+        assert_eq!(second.status, 409, "{}", second.body);
+        let saved = store
+            .get(&id)
+            .expect("draft remains after concurrent refusals");
         assert!(saved.turns.is_empty());
         assert_eq!(saved.pending, "saved before restart");
 
