@@ -151,7 +151,12 @@ if grep -q "Your revote" "$p"; then
   # `approve_with_findings` vote it cast initially; every other seat holds
   # its `approve`. Deterministic on purpose: the fixtures that exercise this
   # branch assert the round's recorded verdict, not a specific argument.
-  if [ -n "$MOCK_SPLIT_REVIEW_SEAT" ] && { case ",$MOCK_SPLIT_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+  if [ -n "$MOCK_STALE_REVIEW_SEAT" ] && { case ",$MOCK_STALE_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+    # The following review call deliberately receives this revote-shaped
+    # reply, as a stale session can after reconsideration.
+    : > stale-review-reply
+    printf '{"vote":"approve","reason":"mock reconsideration: nothing outstanding"}\n'
+  elif [ -n "$MOCK_SPLIT_REVIEW_SEAT" ] && { case ",$MOCK_SPLIT_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     printf '{"vote":"approve_with_findings","reason":"mock reconsideration: the nit stands but is not blocking"}\n'
   elif [ -n "$MOCK_ALWAYS_FINDING" ] || { [ -n "$MOCK_FINDING" ] && [ ! -f fixed.txt ]; }; then
     printf '{"vote":"reject","reason":"mock reconsideration: the finding still holds"}\n'
@@ -177,6 +182,17 @@ if grep -q "reviewers of" "$p"; then
   if [ -n "$MOCK_SILENT_SEAT" ] && { case ",$MOCK_SILENT_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     echo 'not a review at all'
     exit 1
+  fi
+  # A stale reconsideration response has a valid `vote` but not the complete
+  # review contract. Keep it separate from an ordinary silent seat so the
+  # graph has to reject the schema rather than an exit status.
+  if [ -n "$MOCK_STALE_REVIEW_SEAT" ] && { case ",$MOCK_STALE_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+    if [ -f stale-review-reply ]; then
+      printf '{"vote":"reject","reason":"mock stale revote: compile error"}\n'
+      exit 0
+    fi
+    printf '{"summary":"mock review: clean","vote":"approve","findings":[]}\n'
+    exit 0
   fi
   # Split-vote simulation: a matching seat casts the lone dissenting vote —
   # fine to proceed, but with a finding — while every other seat below
@@ -460,6 +476,20 @@ pub fn fixture_with_split_review_vote(home: HomeGuard, split_seat: &str) -> Fixt
     for a in &mut fx.config.agents {
         a.env
             .insert("MOCK_SPLIT_REVIEW_SEAT".to_owned(), split_seat.to_owned());
+    }
+    fx
+}
+
+/// A first split round reaches reconsideration and a fixer. On the following
+/// review, one seat replies with its earlier revote shape instead of the
+/// complete review report. The reply remains malformed through the bounded
+/// nudge, so the next round must stay visibly incomplete rather than clean.
+pub fn fixture_with_stale_review_reply(home: HomeGuard) -> Fixture {
+    let mut fx = fixture(home, Judges::Unanimous, true);
+    fx.config.graph.review_rounds = 2;
+    for a in &mut fx.config.agents {
+        a.env
+            .insert("MOCK_STALE_REVIEW_SEAT".to_owned(), "review-2".to_owned());
     }
     fx
 }

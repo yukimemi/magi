@@ -2204,7 +2204,7 @@ impl Runner {
                 &ctx,
                 &mut quota_losses,
                 &mut self.state,
-                &|_: &Review| Ok(()),
+                &Review::validate,
             )
             .await;
             self.state.quota.extend(quota_losses);
@@ -2375,7 +2375,7 @@ impl Runner {
                     &recon_ctx,
                     &mut recon_quota_losses,
                     &mut self.state,
-                    &|_: &ReviewRevote| Ok(()),
+                    &ReviewRevote::validate,
                 )
                 .await;
                 self.state.quota.extend(recon_quota_losses);
@@ -2490,7 +2490,11 @@ impl Runner {
             let incomplete = answered < expected;
             let e2e_ok = e2e.iter().all(CommandOutcome::ok);
             let policy = self.state.config.graph.incomplete_review;
-            let clean = round_is_clean(blocking, e2e_ok, answered, expected, policy);
+            let clean = !records
+                .iter()
+                .filter_map(|r| r.failed.as_deref())
+                .any(malformed_review_reply)
+                && round_is_clean(blocking, e2e_ok, answered, expected, policy);
 
             let mut round_record = ReviewRound {
                 round,
@@ -3411,6 +3415,15 @@ fn round_is_clean(
     policy: IncompleteReviewPolicy,
 ) -> bool {
     blocking == 0 && e2e_ok && (answered == expected || policy == IncompleteReviewPolicy::Warn)
+}
+
+/// Did a reviewer return an answer-shaped payload that failed the review
+/// contract? Unlike a timeout, this is evidence the seat answered the wrong
+/// node (for example, a stale reconsideration revote), so `warn` must not
+/// promote the incomplete panel to clean.
+fn malformed_review_reply(message: &str) -> bool {
+    message.contains("no JSON object")
+        || message.contains("must include at least one actionable finding")
 }
 
 /// The review loop's own conclusion, derived entirely from its persisted

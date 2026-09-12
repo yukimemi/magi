@@ -168,12 +168,11 @@ impl ReviewVote {
 
 /// A reviewer's report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Review {
     /// Findings, worst first is conventional but not required.
-    #[serde(default)]
     pub findings: Vec<Finding>,
     /// Reviewer's overall verdict prose.
-    #[serde(default)]
     pub summary: String,
     /// This seat's vote. Required, not defaulted: a reviewer that skips it
     /// is retried the same as one that skipped `severity` on a finding,
@@ -181,16 +180,40 @@ pub struct Review {
     pub vote: ReviewVote,
 }
 
+impl Review {
+    /// Rejecting a patch without a finding leaves neither the fixer nor the
+    /// operator anything actionable. It is not a clean review merely because
+    /// no finding id can be assigned to it.
+    pub fn validate(&self) -> Result<()> {
+        if self.vote == ReviewVote::Reject && self.findings.is_empty() {
+            bail!("a reject review must include at least one actionable finding");
+        }
+        Ok(())
+    }
+}
+
 /// A reviewer seat's revote after a split round, cast once it has read every
 /// seat's findings and votes (still numbered, never named — see
 /// [`crate::prompt::review_reconsider`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewRevote {
     /// The seat's revote.
     pub vote: ReviewVote,
     /// Why, one or two sentences.
-    #[serde(default)]
     pub reason: String,
+}
+
+impl ReviewRevote {
+    /// A rejecting revote needs an explicit explanation: unlike an initial
+    /// review it cannot add new findings, so its reason is the only
+    /// actionable record of why an existing finding still holds.
+    pub fn validate(&self) -> Result<()> {
+        if self.vote == ReviewVote::Reject && self.reason.trim().is_empty() {
+            bail!("a reject revote must include a reason");
+        }
+        Ok(())
+    }
 }
 
 /// The fixer's response to a round of findings.
@@ -420,6 +443,31 @@ mod tests {
     fn review_without_a_vote_is_rejected_rather_than_defaulted() {
         let err = extract_json::<Review>(r#"{"findings":[]}"#).unwrap_err();
         assert!(err.to_string().contains("no JSON object"), "{err}");
+    }
+
+    #[test]
+    fn revote_shape_is_not_a_review_report() {
+        let err =
+            extract_json::<Review>(r#"{"vote":"reject","reason":"a stale reconsideration reply"}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("no JSON object"), "{err}");
+    }
+
+    #[test]
+    fn reject_review_needs_an_actionable_finding_but_clean_approval_does_not() {
+        let clean: Review =
+            extract_json(r#"{"summary":"looks good","vote":"approve","findings":[]}"#).unwrap();
+        clean.validate().unwrap();
+
+        let reject: Review =
+            extract_json(r#"{"summary":"compile error","vote":"reject","findings":[]}"#).unwrap();
+        assert!(reject.validate().is_err());
+    }
+
+    #[test]
+    fn reject_revote_needs_a_reason() {
+        let revote: ReviewRevote = extract_json(r#"{"vote":"reject","reason":" "}"#).unwrap();
+        assert!(revote.validate().is_err());
     }
 
     #[test]
