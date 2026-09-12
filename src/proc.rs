@@ -278,10 +278,10 @@ mod tests {
 
     /// このテスト自身の PID を OS に問い合わせるスモーク診断。
     ///
-    /// 通常の CI では実際のコマンド実行と成功出力の解析を通る。制限された
-    /// 実行環境で問い合わせ自体が使えない場合は、その事実を出力して成功結果や
-    /// 死んだプロセスと取り違えない。実行中の PID を dead と報告した場合だけは、
-    /// どの環境でも失敗にする。
+    /// CI では実際のコマンド実行と成功出力の解析を必須にする。制限された
+    /// 対話席で問い合わせ自体が使えない場合は、その事実を出力して成功結果や
+    /// 死んだプロセスと取り違えない。実行中の PID を dead と報告した場合と、
+    /// CI で問い合わせが利用不能な場合は失敗にする。
     #[test]
     fn platform_query_reports_this_running_process_as_alive_or_unavailable() {
         let pid = std::process::id();
@@ -289,6 +289,9 @@ mod tests {
             Ok(true) => {}
             Ok(false) => {
                 panic!("OS の PID 問い合わせが実行中のテストプロセス {pid} を dead と報告した")
+            }
+            Err(error) if std::env::var_os("CI").is_some() => {
+                panic!("CI で OS の PID 問い合わせを実行できない（テストプロセス {pid}）: {error}")
             }
             Err(error) => {
                 eprintln!("OS の PID 問い合わせは利用できません（テストプロセス {pid}）: {error}")
