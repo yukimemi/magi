@@ -151,10 +151,14 @@ if grep -q "Your revote" "$p"; then
   # `approve_with_findings` vote it cast initially; every other seat holds
   # its `approve`. Deterministic on purpose: the fixtures that exercise this
   # branch assert the round's recorded verdict, not a specific argument.
-  if [ -n "$MOCK_STALE_REVIEW_SEAT" ] && { case ",$MOCK_STALE_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+  if [ -n "$MOCK_STALE_REVOTE_SEAT" ] && { case ",$MOCK_STALE_REVOTE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+    printf '{"summary":"mock stale review","vote":"approve","findings":[]}\n'
+  elif [ -n "$MOCK_REJECT_MINOR_SEAT" ] && { case ",$MOCK_REJECT_MINOR_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+    printf '{"vote":"reject","reason":"mock reconsideration: the minor concern remains"}\n'
+  elif [ -n "$MOCK_STALE_REVIEW_SEAT" ] && { case ",$MOCK_STALE_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     # The following review call deliberately receives this revote-shaped
     # reply, as a stale session can after reconsideration.
-    : > stale-review-reply
+    : > "$MOCK_STALE_MARKER"
     printf '{"vote":"approve","reason":"mock reconsideration: nothing outstanding"}\n'
   elif [ -n "$MOCK_SPLIT_REVIEW_SEAT" ] && { case ",$MOCK_SPLIT_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     printf '{"vote":"approve_with_findings","reason":"mock reconsideration: the nit stands but is not blocking"}\n'
@@ -187,11 +191,15 @@ if grep -q "reviewers of" "$p"; then
   # review contract. Keep it separate from an ordinary silent seat so the
   # graph has to reject the schema rather than an exit status.
   if [ -n "$MOCK_STALE_REVIEW_SEAT" ] && { case ",$MOCK_STALE_REVIEW_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
-    if [ -f stale-review-reply ]; then
+    if [ -f "$MOCK_STALE_MARKER" ]; then
       printf '{"vote":"reject","reason":"mock stale revote: compile error"}\n'
       exit 0
     fi
     printf '{"summary":"mock review: clean","vote":"approve","findings":[]}\n'
+    exit 0
+  fi
+  if [ -n "$MOCK_REJECT_MINOR_SEAT" ] && { case ",$MOCK_REJECT_MINOR_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+    printf '{"summary":"mock review: minor concern","vote":"reject","findings":[{"severity":"minor","file":"note.txt","line":1,"title":"minor concern","detail":"an operator should resolve this"}]}\n'
     exit 0
   fi
   # Split-vote simulation: a matching seat casts the lone dissenting vote —
@@ -487,9 +495,40 @@ pub fn fixture_with_split_review_vote(home: HomeGuard, split_seat: &str) -> Fixt
 pub fn fixture_with_stale_review_reply(home: HomeGuard) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, true);
     fx.config.graph.review_rounds = 2;
+    let marker = fx.tmp.path().join("stale-review-reply");
     for a in &mut fx.config.agents {
         a.env
             .insert("MOCK_STALE_REVIEW_SEAT".to_owned(), "review-2".to_owned());
+        a.env.insert(
+            "MOCK_STALE_MARKER".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        );
+    }
+    fx
+}
+
+/// The matching split-vote seat returns the obsolete initial-review schema
+/// during reconsideration. One round is enough: it must be recorded as an
+/// incomplete panel, never as a valid fallback to the initial vote.
+pub fn fixture_with_stale_revote_reply(home: HomeGuard) -> Fixture {
+    let mut fx = fixture_with_split_review_vote(home, "review-2");
+    fx.config.graph.review_rounds = 1;
+    for a in &mut fx.config.agents {
+        a.env
+            .insert("MOCK_STALE_REVOTE_SEAT".to_owned(), "review-2".to_owned());
+    }
+    fx
+}
+
+/// A reviewer may reject a patch for an actionable but non-blocking finding.
+/// The verdict still prevents calling the round clean; it is not upgraded by
+/// lowering the finding's severity.
+pub fn fixture_with_rejected_minor_review(home: HomeGuard) -> Fixture {
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    fx.config.graph.review_rounds = 1;
+    for a in &mut fx.config.agents {
+        a.env
+            .insert("MOCK_REJECT_MINOR_SEAT".to_owned(), "review-2".to_owned());
     }
     fx
 }

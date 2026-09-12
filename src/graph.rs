@@ -2486,7 +2486,21 @@ impl Runner {
                 .collect();
 
             let expected = records.len();
-            let answered = records.iter().filter(|r| r.failed.is_none()).count();
+            // A reconsideration replaces the initial vote for the purpose of
+            // deciding whether this review node received a complete panel.
+            // Retaining the initial vote for the verdict preserves the
+            // cautious fallback, but a lost or malformed revote cannot count
+            // as a completed answer.
+            let answered = records
+                .iter()
+                .filter(|record| {
+                    record.failed.is_none()
+                        && reconsideration
+                            .iter()
+                            .find(|revote| revote.reviewer == record.reviewer)
+                            .is_none_or(|revote| revote.vote.is_some())
+                })
+                .count();
             let incomplete = answered < expected;
             let e2e_ok = e2e.iter().all(CommandOutcome::ok);
             let policy = self.state.config.graph.incomplete_review;
@@ -2494,6 +2508,11 @@ impl Runner {
                 .iter()
                 .filter_map(|r| r.failed.as_deref())
                 .any(malformed_review_reply)
+                && !reconsideration
+                    .iter()
+                    .filter_map(|r| r.failed.as_deref())
+                    .any(malformed_review_reply)
+                && round_verdict != Some(ReviewVote::Reject)
                 && round_is_clean(blocking, e2e_ok, answered, expected, policy);
 
             let mut round_record = ReviewRound {
@@ -2517,12 +2536,19 @@ impl Runner {
             };
 
             if incomplete {
-                let missing: Vec<String> = round_record
+                let mut missing: Vec<String> = round_record
                     .reviews
                     .iter()
                     .filter(|r| r.failed.is_some())
                     .map(|r| format!("review-{}", r.reviewer))
                     .collect();
+                missing.extend(
+                    round_record
+                        .reconsideration
+                        .iter()
+                        .filter(|r| r.vote.is_none())
+                        .map(|r| format!("review-{} revote", r.reviewer)),
+                );
                 self.state.event(
                     "review",
                     format!(
@@ -2553,18 +2579,26 @@ impl Runner {
             // Nothing was raised and verification passed, but not every seat
             // answered and the policy refuses to call that clean: re-review
             // rather than send the fixer after a round with nothing to fix.
-            if incomplete && blocking == 0 && e2e_ok {
+            let unresolved_reject = round_verdict == Some(ReviewVote::Reject);
+            if (incomplete || unresolved_reject) && blocking == 0 && e2e_ok {
                 self.state.reviews.push(round_record);
                 self.state.save()?;
                 if round == max_rounds {
                     self.state.status = RunStatus::Blocked;
                     self.state.event(
                         "review",
-                        format!(
-                            "{} reviewer seat(s) never answered after {max_rounds} rounds; \
-                             refusing to call it clean",
-                            expected - answered
-                        ),
+                        if unresolved_reject {
+                            format!(
+                                "a reviewer still rejected the patch after {max_rounds} round(s); \
+                                 refusing to call it clean"
+                            )
+                        } else {
+                            format!(
+                                "{} reviewer seat(s) never answered after {max_rounds} rounds; \
+                                 refusing to call it clean",
+                                expected - answered
+                            )
+                        },
                     );
                     return Ok(());
                 }
