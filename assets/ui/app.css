@@ -625,6 +625,11 @@ a.card:active { background: var(--sunk); }
   overflow-wrap: anywhere;
 }
 .card-note { margin-top: var(--s2); font-size: var(--t2); color: var(--on-rust); font-weight: 600; }
+.task-block-details { margin-top: var(--s2); }
+.task-block-body { padding: 0 var(--s2) var(--s2) var(--s3); color: var(--ink-2); font-size: var(--t2); }
+.task-block-body p { margin: var(--s2) 0 0; font-weight: 650; }
+.task-block-body ul { margin: var(--s1) 0 0; padding-left: var(--s4); }
+.task-block-body li { overflow-wrap: anywhere; }
 
 .err {
   margin-top: var(--s2); padding: var(--s2) var(--s3);

@@ -131,6 +131,9 @@ const TASK_STATUS = {
   done:    { glyph: "\u25c6", tone: "gold" },
   failed:  { glyph: "\u2715", tone: "rust" },
   held:    { glyph: "\u2016", tone: "rust", note: "Held. This task will not be claimed until it is released." },
+  /* This is a conductor decision, not a manual hold and not an inference
+     from daemon health. The API only emits it while `blocked_by` is nonempty. */
+  blocked: { glyph: "\u2298", tone: "rust", note: "Blocked by the conductor until every listed dependency or question is resolved." },
 };
 
 /* An unanswered question is the only state in the product that a human, and
@@ -1776,6 +1779,9 @@ function createTaskCard() {
   const outcome = el("span");
   const meta = el("div", { class: "card-meta" }, source, repo, attempts, outcome);
   const note = el("p", { class: "card-note" });
+  const blockDetails = el("details", { class: "advanced task-block-details" },
+    el("summary", { text: "Conductor details" }),
+    el("div", { class: "task-block-body" }));
   const error = el("pre", { class: "err" });
   const instruction = el("details", { class: "advanced" },
     el("summary", { text: "Full instruction" }),
@@ -1796,14 +1802,52 @@ function createTaskCard() {
 
   const card = el("li", { class: "card" },
     el("div", { class: "card-top" }, chipSlot, priority, solo, whenSlot),
-    title, meta, note, error, instruction, actions,
+    title, meta, note, blockDetails, error, instruction, actions,
   );
   card.refs = {
     card, chipSlot, priority, solo, whenSlot, title, source, repo, attempts,
-    outcome, note, error, instruction, runLink, priorityDown, priorityUp,
+    outcome, note, blockDetails, error, instruction, runLink, priorityDown, priorityUp,
     editBtn, holdBox, doneBox, deleteBox,
   };
   return card;
+}
+
+/* `blocked_by` deliberately contains both task and question ids. They share
+   the same id shape, so classify a reference only by the records the APIs
+   actually returned; guessing from an id would turn a missing record into a
+   false claim about why the conductor parked this task. */
+function taskBlockDetails(task) {
+  const tasks = new Map((state.queue || []).map((item) => [item.id, item]));
+  const questions = new Map((state.questions || []).map((item) => [item.id, item]));
+  const blockers = (Array.isArray(task.blocked_by) ? task.blocked_by : []).map((id) => {
+    const dependency = tasks.get(id);
+    if (dependency) return `Task: ${dependency.title || dependency.id} (${shortId(id)})`;
+    const question = questions.get(id);
+    if (question) return `Question: ${question.summary || question.id} (${shortId(id)})`;
+    return `Reference: ${id}`;
+  });
+  const answers = Array.isArray(task.answers) ? task.answers.filter((answer) => answer && typeof answer === "object") : [];
+  return { blockers, answers };
+}
+
+function renderTaskBlockDetails(box, task, status) {
+  const body = box.querySelector(".task-block-body");
+  clear(body);
+  if (status !== "blocked") {
+    show(box, false);
+    return;
+  }
+
+  const { blockers, answers } = taskBlockDetails(task);
+  if (task.block_reason) body.append(el("p", { text: `Reason: ${task.block_reason}` }));
+  if (blockers.length) {
+    body.append(el("p", { text: "Waiting on:" }), el("ul", {}, blockers.map((label) => el("li", { text: label }))));
+  }
+  if (answers.length) {
+    body.append(el("p", { text: "Earlier conductor answers:" }), el("ul", {}, answers.map((item) =>
+      el("li", { text: `${item.question || "Question"}: ${item.answer || ""}` }))));
+  }
+  show(box, body.childElementCount > 0);
 }
 
 function updateTaskCard(row, task) {
@@ -1843,11 +1887,12 @@ function updateTaskCard(row, task) {
   /* A held task's note gains whatever the operator said it is waiting on,
      since the queue cannot express a dependency between two tasks and this
      is the one place that reason survives. */
-  const noteText = task.hold_reason && meta.note
+  const noteText = status === "held" && task.hold_reason && meta.note
     ? `${meta.note} Waiting on: ${task.hold_reason}`
-    : meta.note || (task.hold_reason ? `Waiting on: ${task.hold_reason}` : "");
+    : meta.note || (status === "held" && task.hold_reason ? `Waiting on: ${task.hold_reason}` : "");
   setText(r.note, noteText);
   show(r.note, Boolean(noteText));
+  renderTaskBlockDetails(r.blockDetails, task, status);
 
   setText(r.error, task.last_error || "");
   show(r.error, Boolean(task.last_error));
@@ -2152,6 +2197,7 @@ async function mutateTask(id, action, button) {
 const QUEUE_SECTIONS = [
   { key: "running", label: "Running", defaultOpen: true },
   { key: "upnext", label: "Up next", defaultOpen: true },
+  { key: "blocked", label: "Blocked", defaultOpen: true },
   { key: "held", label: "Held", defaultOpen: false },
   { key: "done", label: "Done", defaultOpen: false },
 ];
@@ -2160,6 +2206,7 @@ function queueSection(task) {
   const status = String(task.status_str || task.status || "");
   if (status === "running") return "running";
   if (status === "queued" || status === "failed") return "upnext";
+  if (status === "blocked") return "blocked";
   if (status === "held") return "held";
   return "done";
 }
@@ -2200,9 +2247,11 @@ function renderQueue() {
     return status === "queued" || status === "failed";
   }).length;
   const held = tasks.filter((t) => (t.status_str || t.status) === "held").length;
+  const blocked = tasks.filter((t) => (t.status_str || t.status) === "blocked").length;
   const parts = [`${plural(tasks.length, "task", "tasks")}`];
   if (runnable) parts.push(`${runnable} runnable`);
   if (held) parts.push(`${held} held`);
+  if (blocked) parts.push(`${blocked} blocked`);
   setText($("queue-count"), tasks.length === 0 ? "Nothing waiting" : parts.join(", "));
 
   show($("queue-empty"), tasks.length === 0);
@@ -3197,16 +3246,16 @@ async function loadTalk(id) {
    defaults folded and this is what stays visible either way: not a count,
    but the breakdown an operator actually reads it for - whether what they
    filed is moving, stuck, or still waiting its turn. Order puts the states
-   that want a human (running, held, failed) ahead of the quiet ones, and a
+   that want a human (running, blocked, held, failed) ahead of the quiet ones, and a
    zero count is left out rather than printed as "0 done". */
 function talkTasksSummary(tasks) {
-  const counts = { running: 0, held: 0, failed: 0, queued: 0, done: 0 };
+  const counts = { running: 0, blocked: 0, held: 0, failed: 0, queued: 0, done: 0 };
   for (const task of tasks) {
     const status = String(task.status_str || task.status || "");
     if (status in counts) counts[status] += 1;
   }
   const parts = [`${tasks.length} filed`];
-  for (const key of ["running", "held", "failed", "queued", "done"]) {
+  for (const key of ["running", "blocked", "held", "failed", "queued", "done"]) {
     if (counts[key]) parts.push(`${counts[key]} ${key}`);
   }
   return parts.join(" · ");
@@ -4561,6 +4610,10 @@ async function loadQuestions() {
     state.questions = sortQuestions(Array.isArray(list) ? list : []);
     renderQuestions();
     renderAskBar();
+    /* Blocked queue cards resolve `blocked_by` against this list. Repaint
+       them when questions arrive so a question is never left as an opaque
+       id merely because the queue request won the initial race. */
+    renderQueue();
     /* A run's `waiting` only means something next to the questions, so both
        views are re-rendered from the answer, not from the run revision. */
     renderRuns();
