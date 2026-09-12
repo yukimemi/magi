@@ -307,7 +307,7 @@ pub struct Ui {
     /// which are this process's own concurrency. A second `magi web` would not
     /// see it, and a second `magi web` on the same home is already a
     /// misconfiguration the queue's claims would catch first.
-    talk_turns: Arc<Mutex<HashSet<String>>>,
+    talk_turns: Arc<Mutex<TalkTurns>>,
     /// Runs this process is resuming right now.
     ///
     /// Separate from `talk_turns` because a run and a talk are different
@@ -569,7 +569,9 @@ impl Ui {
     /// [`Ui::begin_talk_turn`]. It is not conversation data and therefore is
     /// never persisted with a [`Talk`].
     fn is_thinking(&self, id: &str) -> bool {
-        self.talk_turns.lock().is_ok_and(|turns| turns.contains(id))
+        self.talk_turns
+            .lock()
+            .is_ok_and(|turns| turns.live.contains(id))
     }
 
     /// Claim the right to run one turn in a talk, or report that it is busy.
@@ -591,11 +593,28 @@ impl Ui {
     /// drops the handler future when the client disconnects, and without the
     /// guard that talk would be wedged until the server restarted.
     fn begin_talk_turn(&self, id: &str) -> ApiResult<Option<TalkTurnGuard>> {
+        self.claim_talk_turn(id, false)
+    }
+
+    /// Claim a turn after durably queueing a draft, or notify its current
+    /// owner that a drainer must recheck before it releases the slot.
+    fn begin_queued_talk_turn(&self, id: &str) -> ApiResult<Option<TalkTurnGuard>> {
+        self.claim_talk_turn(id, true)
+    }
+
+    fn claim_talk_turn(&self, id: &str, queued: bool) -> ApiResult<Option<TalkTurnGuard>> {
         let mut live = self
             .talk_turns
             .lock()
             .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
-        if !live.insert(id.to_owned()) {
+        if !live.live.insert(id.to_owned()) {
+            if queued {
+                // A queued write has landed before this busy check.
+                // `drain_loop` uses this generation to recheck after its
+                // off-thread disk read, so it cannot release a turn between
+                // this check and the write.
+                *live.queued.entry(id.to_owned()).or_default() += 1;
+            }
             return Ok(None);
         }
         Ok(Some(TalkTurnGuard {
@@ -614,14 +633,14 @@ impl Ui {
             .talk_turns
             .lock()
             .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
-        if live.contains(id) {
+        if live.live.contains(id) {
             return Ok(TalkTurnStart::Busy);
         }
         let talk = self.talks.get(id).map_err(ApiError::from)?;
         if !talk.pending.is_empty() || !talk.pending_attachments.is_empty() {
             return Ok(TalkTurnStart::Pending);
         }
-        live.insert(id.to_owned());
+        live.live.insert(id.to_owned());
         Ok(TalkTurnStart::Claimed(TalkTurnGuard {
             talk: id.to_owned(),
             turns: Arc::clone(&self.talk_turns),
@@ -755,8 +774,20 @@ impl Ui {
 #[derive(Debug)]
 struct TalkTurnGuard {
     talk: String,
-    turns: Arc<Mutex<HashSet<String>>>,
+    turns: Arc<Mutex<TalkTurns>>,
     released: bool,
+}
+
+/// In-memory turn ownership plus the queue generation observed by a drainer.
+///
+/// The generation changes only after a durable queued draft is written and its
+/// caller finds the turn busy. That lets the loop run filesystem work outside
+/// this mutex while still making the final empty-check/release atomic with a
+/// concurrent queue handoff.
+#[derive(Debug, Default)]
+struct TalkTurns {
+    live: HashSet<String>,
+    queued: HashMap<String, u64>,
 }
 
 /// The atomic initial-state decision made by
@@ -770,8 +801,9 @@ enum TalkTurnStart {
 impl TalkTurnGuard {
     /// Release while the caller already holds the claim mutex, closing the
     /// last-drain/arrival gap without letting `Drop` revoke a later claim.
-    fn release(mut self, live: &mut HashSet<String>) {
-        live.remove(&self.talk);
+    fn release(mut self, live: &mut TalkTurns) {
+        live.live.remove(&self.talk);
+        live.queued.remove(&self.talk);
         self.released = true;
     }
 }
@@ -782,7 +814,8 @@ impl Drop for TalkTurnGuard {
             return;
         }
         if let Ok(mut live) = self.turns.lock() {
-            live.remove(&self.talk);
+            live.live.remove(&self.talk);
+            live.queued.remove(&self.talk);
         }
     }
 }
@@ -3396,7 +3429,7 @@ async fn talk_say(
                     // still watching, is what stops the text just queued from
                     // being stranded until an unrelated future `say` happens to
                     // drain it.
-                    let claim = match ui.begin_talk_turn(&id)? {
+                    let claim = match ui.begin_queued_talk_turn(&id)? {
                         Some(turn_guard) => {
                             let (cfg, _) = Config::discover(&talk.repo, None)?;
                             Some((talk.clone(), cfg, turn_guard))
@@ -3548,10 +3581,41 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
     // is the exact gap `release` exists to close.
     let mut turn = Some(turn);
     loop {
-        let mut live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
-        let drained = match talk::drain(&mut talk, &talks) {
+        // `talk::drain` takes the store lock and can write/rename the talk
+        // file. Keep the turn mutex out of that synchronous work: it protects
+        // every talk's in-memory claim, not this talk's disk operation.
+        let observed = lock_or_recover(&live_set)
+            .queued
+            .get(&id)
+            .copied()
+            .unwrap_or(0);
+        let drained = blocking({
+            let talks = talks.clone();
+            move || {
+                let result = talk::drain(&mut talk, &talks);
+                Ok((talk, result))
+            }
+        })
+        .await;
+        let (next_talk, result) = match drained {
+            Ok(drained) => drained,
+            Err(e) => {
+                tracing::warn!("talk {id} could not start queued-text drain: {e:#}");
+                let mut live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
+                turn.take()
+                    .expect("held for the whole loop until released here")
+                    .release(&mut live);
+                break;
+            }
+        };
+        talk = next_talk;
+        let drained = match result {
             Ok(Some(drained)) => drained,
             Ok(None) => {
+                let mut live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
+                if live.queued.get(&id).copied().unwrap_or(0) != observed {
+                    continue;
+                }
                 turn.take()
                     .expect("held for the whole loop until released here")
                     .release(&mut live);
@@ -3559,13 +3623,13 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
             }
             Err(e) => {
                 tracing::warn!("talk {id} could not drain queued text: {e:#}");
+                let mut live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
                 turn.take()
                     .expect("held for the whole loop until released here")
                     .release(&mut live);
                 break;
             }
         };
-        drop(live);
         if let Err(e) = talk::respond(&mut talk, &talks, &cfg, &drained).await {
             tracing::warn!("talk {id} turn failed: {e:#}");
         }
@@ -3630,7 +3694,7 @@ async fn talk_pending_edit(
                     "queued message changed; reload it before editing",
                 ));
             }
-            let claim = match ui.begin_talk_turn(&id)? {
+            let claim = match ui.begin_queued_talk_turn(&id)? {
                 Some(turn_guard) => {
                     let (cfg, _) = Config::discover(&talk.repo, None)?;
                     Some((talk.clone(), cfg, id.clone(), turn_guard))
