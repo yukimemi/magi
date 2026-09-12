@@ -194,6 +194,13 @@ impl Review {
                 "a review with findings or a reject vote must include at least one actionable finding"
             );
         }
+        if self
+            .findings
+            .iter()
+            .any(|finding| finding.title.trim().is_empty())
+        {
+            bail!("every review finding must include an actionable title");
+        }
         Ok(())
     }
 }
@@ -480,6 +487,16 @@ mod tests {
         )
         .unwrap();
         assert!(reserved.validate().is_err());
+    }
+
+    #[test]
+    fn review_finding_needs_a_non_empty_title() {
+        let review: Review = extract_json(
+            r#"{"summary":"compile error","vote":"reject","findings":[{"severity":"major","title":" ","detail":""}]}"#,
+        )
+        .unwrap();
+        let err = review.validate().unwrap_err();
+        assert!(err.to_string().contains("actionable title"), "{err}");
     }
 
     #[test]

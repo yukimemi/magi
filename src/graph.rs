@@ -3458,6 +3458,7 @@ fn round_is_clean(
 fn malformed_review_reply(message: &str) -> bool {
     message.contains("no JSON object")
         || message.contains("must include at least one actionable finding")
+        || message.contains("must include an actionable title")
         || message.contains("must include a reason")
 }
 
@@ -4077,6 +4078,13 @@ mod tests {
     #[test]
     fn review_conclusion_is_none_when_nothing_has_run() {
         assert_eq!(review_conclusion(&[], 3), None);
+    }
+
+    #[test]
+    fn malformed_review_reply_rejects_an_empty_finding_title() {
+        assert!(malformed_review_reply(
+            "every review finding must include an actionable title"
+        ));
     }
 
     #[test]
