@@ -95,18 +95,21 @@ pub const STALE_CLAIM: Duration = Duration::from_secs(6 * 60 * 60);
 /// How long a task may sit [`TaskStatus::Running`] with no live daemon's
 /// heartbeat naming it before [`crate::conduct`] is shown it as stalled.
 ///
-/// [`reclaim_orphaned_running`] already proves abandonment immediately, on
-/// every poll, by attempting the task's own claim — a lock nothing holds
-/// succeeds at once, with no threshold at all. This constant exists only for
-/// the one race that check cannot close: [`attempt`] writes [`Task::start`]
-/// (and so `Running`) before the very first [`Status::current`] entry naming
-/// the task reaches `<home>/daemon.json`, which only happens on the next
-/// [`HEARTBEAT`] tick. A read landing in that narrow gap would see a live
-/// task with no matching heartbeat entry yet and misread it as abandoned.
-/// Thirty minutes is comfortably longer than any such gap — `HEARTBEAT` is
-/// five seconds — while staying far below [`STALE_CLAIM`]'s six hours, so a
-/// task that is genuinely stuck reaches the conductor in minutes rather than
-/// waiting for the mechanical sweep.
+/// [`reclaim_orphaned_running`] settles most crashes immediately, on every
+/// poll, by attempting the task's own claim: a dead pid is proof enough for
+/// [`sweep_stale_claims`] to drop the lock the same tick, and the very next
+/// claim attempt succeeds. But a lock whose pid cannot be parsed at all — an
+/// empty or corrupt `.lock` file — falls back to [`STALE_CLAIM`]'s six-hour
+/// age instead, since there is nothing else to check (see
+/// [`sweep_stale_claims`]'s own doc). For as long as that lock survives, the
+/// claim keeps failing and `reclaim_orphaned_running` correctly leaves the
+/// task `running` — see
+/// `stalled_tasks_still_reaches_a_task_reclaim_could_not_claim_yet` for
+/// exactly this ordering. `stalled_tasks` is what surfaces that task to the
+/// conductor well before the mechanical six-hour sweep would, and thirty
+/// minutes is comfortably below `STALE_CLAIM` while still being generous
+/// enough that a task merely late to publish its first [`HEARTBEAT`] is
+/// never mistaken for abandoned.
 pub const STALLED_RUNNING: Duration = Duration::from_secs(30 * 60);
 
 /// What the loop is working on, for the status file.
@@ -1467,18 +1470,7 @@ async fn attempt(
     // `crate::conduct` is what actually offers a better answer than
     // `Runner::start` here (see `Recovery::Review`), once this task's next
     // failure shows it up as `held`/`failed` with the run state unreadable.
-    let unfinished = task
-        .runs
-        .iter()
-        .rev()
-        .find(|id| match RunState::load(id) {
-            Ok(s) => s.status.resumable(),
-            Err(e) => {
-                tracing::warn!("could not read run {id} for task {}: {e:#}", task.short());
-                false
-            }
-        })
-        .cloned();
+    let unfinished = unfinished_run(&task.runs, task.short());
     // `crate::conduct` chose `Review` for this task on an earlier cycle: its
     // branch survived, and this reopens exactly that branch as a
     // review-only pass rather than resuming or competing again. Consumed
@@ -1772,6 +1764,56 @@ fn parse_reset_hint(text: &str, now: Timestamp) -> Option<Timestamp> {
         at += jiff::SignedDuration::from_hours(24);
     }
     Some(at)
+}
+
+/// Resuming a `Blocked` run that already spent every review round its own
+/// config allowed cannot make progress: `graph::Runner`'s review loop walks
+/// `(reviews.len()+1)..=max_rounds`, which is empty once `reviews.len()` has
+/// reached `max_rounds`, so `execute` would settle straight back to
+/// `Blocked` without asking anyone anything. Read-only against a state this
+/// build never mutates — `src/graph.rs` stays untouched — but without this
+/// check, [`unfinished_run`] would keep reporting such a run as still
+/// "unfinished", and `crate::conduct::Recovery::Requeue` (whose whole
+/// promise is a fresh competition when a design needs to change) would
+/// silently resume the exhausted run instead, spending an attempt on a
+/// cycle that cannot change anything.
+fn exhausted_review_budget(state: &RunState) -> bool {
+    state.status == RunStatus::Blocked && state.reviews.len() >= state.config.graph.review_rounds
+}
+
+/// The most recent run of `runs` that resuming would actually make progress
+/// on, if any. `short` is only for the warning's own message.
+///
+/// Two runs paid for the "prefer resuming" half of this lesson. Run 01c2 was
+/// blocked and the loop started 3cbf on the same task a moment later,
+/// duplicating two and a half hours of agent work. Then b25f stalled on a
+/// judge that timed out and one that answered with no JSON — `quota: 0`, so
+/// nothing the machine was to blame for — and 4043 started **one second**
+/// later, buying three fresh implementations to reach the same panel.
+/// `RunStatus::resumable` rather than `!done()` is what catches the second
+/// case: a stall is terminal, and its cheap recovery re-asks only the absent
+/// seats. [`exhausted_review_budget`] is the other half: a run that is
+/// technically `resumable()` but provably cannot progress must not count as
+/// "unfinished" either, or `crate::conduct::Recovery::Requeue` — which
+/// promises a fresh competition — becomes a silent no-op instead.
+///
+/// A load failure is warned about rather than silently read as "not
+/// resumable": the alternative is exactly what let a schema mismatch on run
+/// `eba2` fall through to a full re-competition with nobody told why.
+/// `crate::conduct` is what actually offers a better answer than
+/// `Runner::start` here (see `Recovery::Review`), once this task's next
+/// failure shows it up as `held`/`failed` with the run state unreadable.
+fn unfinished_run(runs: &[String], short: &str) -> Option<String> {
+    runs.iter()
+        .rev()
+        .find(|id| match RunState::load(id) {
+            Ok(s) => s.status.resumable() && !exhausted_review_budget(&s),
+            Err(e) => {
+                tracing::warn!("could not read run {id} for task {short}: {e:#}");
+                false
+            }
+        })
+        .cloned()
 }
 
 /// Which of the three ways [`attempt`] can mint or continue a run this task
@@ -3459,6 +3501,52 @@ mod tests {
     }
 
     #[test]
+    fn stalled_tasks_still_reaches_a_task_reclaim_could_not_claim_yet() {
+        // The realistic `poll()` ordering, not `is_stalled` in isolation:
+        // `reclaim_orphaned_running` runs first, on every poll, and settles
+        // any `running` task whose claim it can actually take. For most
+        // crashes that is immediate - a dead pid is proof enough for
+        // `sweep_stale_claims` to drop the lock the same tick, and the very
+        // next claim attempt succeeds. But a lock whose pid cannot be parsed
+        // at all falls back to `STALE_CLAIM`'s six-hour age instead (see
+        // `sweep_stale_claims`'s own doc), so the lock - and the claim
+        // failure behind it - can legitimately outlive many polls. This is
+        // exactly the gap `stalled_tasks` exists to surface well before that
+        // six-hour sweep would: reclaim leaves the task `running`, and it
+        // must still reach the conductor as stalled.
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let home = dir.path().join("home");
+
+        let mut t = task();
+        t.id = "20260101-000001-lock".to_owned();
+        t.start("run-1".to_owned());
+        queue.put(&mut t).unwrap();
+        backdate_task(&queue, &t.id, STALLED_RUNNING.as_secs() as i64 + 60);
+        std::fs::write(
+            dir.path().join("queue").join(format!("{}.lock", t.id)),
+            "not a pid",
+        )
+        .unwrap();
+
+        let now = Timestamp::now();
+        assert!(
+            reclaim_orphaned_running(&queue, 2).is_empty(),
+            "the unparseable lock is still well within STALE_CLAIM, so the claim fails \
+             and reclaim must leave the task alone"
+        );
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Running);
+
+        let stalled = stalled_tasks(&queue, &home, now);
+        assert_eq!(
+            stalled.len(),
+            1,
+            "reclaim's inability to claim it yet must not hide it from the conductor"
+        );
+        assert_eq!(stalled[0].id, t.id);
+    }
+
+    #[test]
     fn stalled_tasks_reports_exactly_the_tasks_is_stalled_agrees_on() {
         let dir = tempfile::tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
@@ -3622,5 +3710,101 @@ mod tests {
             Starter::Resume("some-run".to_owned())
         );
         assert_eq!(choose_starter(None, false, None), Starter::Start);
+    }
+
+    #[test]
+    fn a_blocked_run_that_spent_every_review_round_has_exhausted_its_budget() {
+        let mut state = run_state(RunStatus::Blocked);
+        state.config.graph.review_rounds = 3;
+        state.reviews = vec![review_round(1), review_round(2), review_round(3)];
+        assert!(exhausted_review_budget(&state));
+
+        // One round still unused: resuming can still ask a reviewer something.
+        state.reviews.pop();
+        assert!(!exhausted_review_budget(&state));
+
+        // Exhausted rounds on a non-`Blocked` status (a stall, say) do not
+        // count: only a `Blocked` run re-enters the review loop on resume.
+        let mut stalled = run_state(RunStatus::Stalled);
+        stalled.config.graph.review_rounds = 1;
+        stalled.reviews = vec![review_round(1)];
+        assert!(!exhausted_review_budget(&stalled));
+    }
+
+    fn review_round(round: usize) -> crate::run::ReviewRound {
+        crate::run::ReviewRound {
+            round,
+            head: "deadbeef".to_owned(),
+            reviews: Vec::new(),
+            e2e: Vec::new(),
+            verify_retried: false,
+            fix: None,
+            blocking: 0,
+            answered: 1,
+            expected: 1,
+            clean: false,
+            progressed: true,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
+        }
+    }
+
+    #[test]
+    fn unfinished_run_skips_a_round_exhausted_blocked_run_so_requeue_means_a_fresh_competition() {
+        // Mirrors the failure this exists to close: a task's last run ended
+        // `Blocked` with the review budget spent, `crate::conduct` chose
+        // `Recovery::Requeue` (`Task::release`, which keeps `runs` as
+        // evidence), and without this check `attempt` would go on treating
+        // that exhausted run as "unfinished" and resume it - `graph::Runner`'s
+        // review loop iterates zero times over an already-spent budget, so
+        // the resumed run settles right back to `Blocked` having asked nobody
+        // anything, and `Requeue`'s promised fresh competition never happens.
+        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        let mut exhausted = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234def".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        exhausted.status = RunStatus::Blocked;
+        exhausted.config.graph.review_rounds = 1;
+        exhausted.reviews = vec![review_round(1)];
+        exhausted.save().unwrap();
+
+        assert_eq!(
+            unfinished_run(&[exhausted.id.clone()], "t"),
+            None,
+            "an exhausted `Blocked` run must not be offered as resumable"
+        );
+
+        // A `Blocked` run with rounds still unused is genuinely worth
+        // resuming, and must still be found.
+        let mut has_budget_left = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234def".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        has_budget_left.status = RunStatus::Blocked;
+        has_budget_left.config.graph.review_rounds = 3;
+        has_budget_left.reviews = vec![review_round(1)];
+        has_budget_left.save().unwrap();
+
+        assert_eq!(
+            unfinished_run(&[has_budget_left.id.clone()], "t"),
+            Some(has_budget_left.id.clone())
+        );
+    }
+
+    #[test]
+    fn unfinished_run_warns_and_skips_a_run_it_cannot_read() {
+        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        assert_eq!(
+            unfinished_run(&["20260101-000000-gone".to_owned()], "t"),
+            None
+        );
     }
 }
