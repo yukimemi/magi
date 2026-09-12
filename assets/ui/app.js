@@ -3427,16 +3427,13 @@ function trackTalkThinking(talk, observed) {
     else if (observed && observed.generation === wait.generation && talk.thinking) {
       wait.confirmed = true;
       wait.missingClaimSince = null;
-    } else if (wait.target !== null && !talk.thinking && observed
-      && observed.generation === wait.generation && wait.confirmed) {
+    } else if (!talk.thinking && observed && observed.generation === wait.generation
+      && wait.confirmed) {
       if (wait.missingClaimSince !== null && observed.startedAt > wait.missingClaimSince) {
         endTalkTurn(talk.id);
       } else {
         wait.missingClaimSince = Date.now();
       }
-    } else if (wait.target === null && !talk.thinking && observed
-      && observed.generation === wait.generation) {
-      endTalkTurn(talk.id);
     }
     return;
   }
