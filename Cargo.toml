@@ -54,7 +54,7 @@ crossterm = { version = "0.29", features = ["events"] }
 ansi-to-tui = "8.0.1"
 jiff = { version = "0.2.35", features = ["serde"] }
 dirs = "7.0.0"
-kaishin = "0.7.1"
+kaishin = "0.7.3"
 teravars = { version = "0.2.2", features = ["merge"] }
 # Web UI. `axum` for the API and its built-in SSE, `tokio-stream` to turn the
 # change-notification channel into the stream SSE wants. No `tower-http` and no
