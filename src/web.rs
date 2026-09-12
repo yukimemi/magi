@@ -569,7 +569,7 @@ impl Ui {
     /// [`Ui::begin_talk_turn`]. It is not conversation data and therefore is
     /// never persisted with a [`Talk`].
     fn is_thinking(&self, id: &str) -> bool {
-        lock_or_recover(&self.talk_turns).contains(id)
+        self.talk_turns.lock().is_ok_and(|turns| turns.contains(id))
     }
 
     /// Claim the right to run one turn in a talk, or refuse.
