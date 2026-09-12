@@ -390,16 +390,13 @@ pub fn run(state: &RunState) -> String {
             });
             let _ = writeln!(
                 s,
-                "  round {}  {} @ {}{panel}  {raised} finding(s), {} blocking, {e2e}{verdict}{}",
+                "  round {}  {} @ {}{}{panel}  {raised} finding(s), {} blocking, {e2e}{verdict}{}",
                 r.round,
                 status,
-                format!(
-                    "{}{}",
-                    short(&r.head),
-                    r.verified_head.as_ref().map_or(String::new(), |head| {
-                        format!(" (verified @ {})", short(head))
-                    })
-                ),
+                short(&r.head),
+                r.verified_head.as_ref().map_or(String::new(), |head| {
+                    format!(" (verified @ {})", short(head))
+                }),
                 r.blocking,
                 r.fix.as_ref().map_or(String::new(), |f| {
                     let tree = if r.progressed {
