@@ -10,7 +10,7 @@ use magi::config::{Config, MergeMode};
 use magi::graph::{Runner, fold_run};
 use magi::proc::Quiet as _;
 use magi::queue::{self, Queue, Source, Task, TaskStatus};
-use magi::run::{RunState, RunStatus, latest_id, list_ids, resolve_id};
+use magi::run::{RunState, RunStatus, is_run_id, latest_id, list_ids, resolve_id};
 use magi::{agent, ask, daemon, report, repos, stats, tui, updater, web};
 
 /// Blind multi-agent implementation competition.
@@ -617,13 +617,30 @@ fn subcommand_words() -> std::collections::BTreeSet<String> {
 /// paying agents to implement the sentence "show 3cbf". That happened twice in
 /// one morning - once to an agent verifying its own change to this very
 /// argument parsing, which is how a run nobody asked for came to exist, and
-/// once to the operator.
+/// once to the operator. The same shape bit `magi task add` too: a standing
+/// talk's agent, asked something answerable by looking around, ran
+/// `magi task add --solo` with the operator's own query-like words as the
+/// instruction instead of just answering - filing `list` and
+/// `info 20260912-114326-d3b8` as tasks, each burning a full competition on
+/// a sentence that was never work to begin with.
 ///
-/// The rule is deliberately blunt: a first word that names any subcommand is a
-/// typo unless the caller wrote `--`. It costs a legitimate instruction like
-/// "add retries to the client" one extra token, and it costs a mistyped
-/// command nothing at all instead of a full competition.
+/// Two rules, both deliberately blunt:
+///
+/// - A first word that names any subcommand is a typo unless the caller wrote
+///   `--`. It costs a legitimate instruction like "add retries to the client"
+///   one extra token, and it costs a mistyped command nothing at all instead
+///   of a full competition.
+/// - An instruction no longer than two words, one of which is shaped exactly
+///   like a run or task id (`is_run_id` - the two share a generator), is the
+///   argument list of a query someone meant to run, not a task someone meant
+///   to implement: nobody hand-writes a real instruction that is just a verb
+///   and an id.
+///
+/// `command` is the literal prefix to echo back in the escape hatch
+/// (`"magi run"`, `"magi task add"`, `"magi task edit <id>"`), so the message
+/// stays copy-pasteable for whichever caller hit the guard.
 fn mistyped_command(
+    command: &str,
     instruction: &[String],
     separator: bool,
     words: &std::collections::BTreeSet<String>,
@@ -632,17 +649,25 @@ fn mistyped_command(
         return None;
     }
     let first = instruction.first()?;
-    if !words.contains(first.as_str()) {
-        return None;
+    let joined = instruction.join(" ");
+    if words.contains(first.as_str()) {
+        return Some(format!(
+            "`{first}` names a magi subcommand, so `{command} {joined}` looks \
+             like a mistyped command rather than a task, and it would end up \
+             spending real agent calls on a competition nobody meant to \
+             start. Write `{command} -- {joined}` to mean it literally."
+        ));
     }
-    Some(format!(
-        "`{first}` names a magi subcommand, so `magi run {}` looks like a \
-         mistyped command rather than a task, and starting a competition for \
-         it would cost real agent calls. Write `magi run -- {}` to mean it \
-         literally.",
-        instruction.join(" "),
-        instruction.join(" ")
-    ))
+    if instruction.len() <= 2 && instruction.iter().any(|w| is_run_id(w)) {
+        return Some(format!(
+            "`{joined}` looks like the arguments to a magi query command (a \
+             run or task id), not a task description, so `{command} {joined}` \
+             would end up spending real agent calls on a competition nobody \
+             meant to start. Write `{command} -- {joined}` to mean it \
+             literally."
+        ));
+    }
+    None
 }
 
 /// Whether the caller wrote a literal `--` separator.
@@ -708,7 +733,8 @@ async fn dispatch(command: Command) -> Result<()> {
                 }
                 None => (instruction, opts),
             };
-            if let Some(why) = mistyped_command(&instruction, had_separator(), &subcommand_words())
+            if let Some(why) =
+                mistyped_command("magi run", &instruction, had_separator(), &subcommand_words())
             {
                 bail!(why);
             }
@@ -1530,6 +1556,14 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             solo,
             json,
         } => {
+            if let Some(why) = mistyped_command(
+                "magi task add",
+                &instruction,
+                had_separator(),
+                &subcommand_words(),
+            ) {
+                bail!(why);
+            }
             let text = task_text(&instruction, file.as_deref(), issue).await?;
             let title = title.unwrap_or_else(|| queue::title_from(&text, 72));
             let source = task_source(issue).await;
@@ -1663,6 +1697,14 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             file,
             title,
         } => {
+            if let Some(why) = mistyped_command(
+                &format!("magi task edit {id}"),
+                &instruction,
+                had_separator(),
+                &subcommand_words(),
+            ) {
+                bail!(why);
+            }
             let resolved = q.resolve_id(&id)?;
             let _claim = q
                 .claim(&resolved)
@@ -2557,7 +2599,7 @@ mod tests {
         assert!(words.contains("task"));
 
         let typo: Vec<String> = ["show", "3cbf"].iter().map(|s| (*s).to_owned()).collect();
-        let why = mistyped_command(&typo, false, &words).expect("refused");
+        let why = mistyped_command("magi run", &typo, false, &words).expect("refused");
         assert!(why.contains("`show` names a magi subcommand"), "{why}");
         assert!(
             why.contains("magi run -- show 3cbf"),
@@ -2565,17 +2607,52 @@ mod tests {
         );
 
         // `--` is the way through, and it is honoured.
-        assert!(mistyped_command(&typo, true, &words).is_none());
+        assert!(mistyped_command("magi run", &typo, true, &words).is_none());
 
         // A real instruction is untouched, whatever it says about runs.
         let real: Vec<String> = "delete the runs nobody wants any more"
             .split(' ')
             .map(ToOwned::to_owned)
             .collect();
-        assert!(mistyped_command(&real, false, &words).is_none());
+        assert!(mistyped_command("magi run", &real, false, &words).is_none());
 
         // Nothing to run is not this guard's business; clap already says so.
-        assert!(mistyped_command(&[], false, &words).is_none());
+        assert!(mistyped_command("magi run", &[], false, &words).is_none());
+    }
+
+    #[test]
+    fn a_bare_query_by_id_never_becomes_a_task() {
+        // Both live incidents this guard was written for: `magi task add`
+        // filed as an instruction the exact argv of a query command someone
+        // meant to run, not a sentence anyone meant to implement.
+        let words = subcommand_words();
+
+        let list: Vec<String> = vec!["list".to_owned()];
+        let why = mistyped_command("magi task add", &list, false, &words).expect("refused");
+        assert!(why.contains("`list` names a magi subcommand"), "{why}");
+        assert!(why.contains("magi task add -- list"), "{why}");
+
+        // `info` names no subcommand at all - the guard has to catch this one
+        // by the id shape, not the first word.
+        let info: Vec<String> = vec!["info".to_owned(), "20260912-114326-d3b8".to_owned()];
+        assert!(!words.contains("info"));
+        let why = mistyped_command("magi task add", &info, false, &words).expect("refused");
+        assert!(
+            why.contains("looks like the arguments to a magi query command"),
+            "{why}"
+        );
+        assert!(why.contains("magi task add -- info 20260912-114326-d3b8"), "{why}");
+
+        // `--` is honoured here too.
+        assert!(mistyped_command("magi task add", &info, true, &words).is_none());
+
+        // A real instruction that merely mentions an id is untouched - only a
+        // bare verb-and-id instruction is short enough to trip the guard.
+        let real: Vec<String> = "backport the fix from run 20260912-114326-d3b8 onto main"
+            .split(' ')
+            .map(ToOwned::to_owned)
+            .collect();
+        assert!(mistyped_command("magi task add", &real, false, &words).is_none());
     }
 
     #[test]
@@ -2712,6 +2789,57 @@ mod tests {
             .unwrap();
         assert!(solo.solo, "--solo must land on the queued task");
         assert!(!plain.solo, "no --solo must leave the task as false");
+    }
+
+    #[tokio::test]
+    async fn task_add_refuses_a_query_that_looks_like_a_command() {
+        // The two live incidents this guard exists for: a standing talk's
+        // agent ran `magi task add --solo` with the operator's own
+        // command-shaped words as the instruction, and each filed a full
+        // competition for a sentence nobody meant to implement.
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+
+        let err = task_cmd_on(
+            TaskCmd::Add {
+                instruction: vec!["list".to_owned()],
+                file: None,
+                issue: None,
+                title: None,
+                priority: 0,
+                repo: PathBuf::from("."),
+                solo: false,
+                json: false,
+            },
+            q.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("names a magi subcommand"), "{err}");
+
+        let err = task_cmd_on(
+            TaskCmd::Add {
+                instruction: vec!["info".to_owned(), "20260912-114326-d3b8".to_owned()],
+                file: None,
+                issue: None,
+                title: None,
+                priority: 0,
+                repo: PathBuf::from("."),
+                solo: false,
+                json: false,
+            },
+            q.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("looks like the arguments to a magi query command"),
+            "{err}"
+        );
+
+        assert!(q.list().is_empty(), "neither refusal may reach the queue");
     }
 
     /// A real git working tree, for the `resolve_repo` tests below.
@@ -3039,6 +3167,43 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("running"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn task_edit_refuses_a_query_that_looks_like_a_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = magi::queue::Task::new(
+            "old title".to_owned(),
+            "old instruction".to_owned(),
+            PathBuf::from("."),
+            magi::queue::Source::Human,
+        );
+        let id = t.id.clone();
+        q.put(&mut t).unwrap();
+
+        let err = task_cmd_on(
+            TaskCmd::Edit {
+                id: id.clone(),
+                instruction: vec!["list".to_owned()],
+                file: None,
+                title: None,
+            },
+            q.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("names a magi subcommand"), "{err}");
+        assert!(
+            err.contains(&format!("magi task edit {id} -- list")),
+            "the escape hatch must name this task's own id: {err}"
+        );
+        assert_eq!(
+            q.get(&id).unwrap().instruction,
+            "old instruction",
+            "a refused edit must not touch the stored task"
+        );
     }
 
     #[tokio::test]
