@@ -624,17 +624,21 @@ fn subcommand_words() -> std::collections::BTreeSet<String> {
 /// `info 20260912-114326-d3b8` as tasks, each burning a full competition on
 /// a sentence that was never work to begin with.
 ///
-/// Two rules, both deliberately blunt:
+/// Three rules, all deliberately blunt:
 ///
 /// - A first word that names any subcommand is a typo unless the caller wrote
 ///   `--`. It costs a legitimate instruction like "add retries to the client"
 ///   one extra token, and it costs a mistyped command nothing at all instead
 ///   of a full competition.
-/// - An instruction no longer than two words, one of which is shaped exactly
-///   like a run or task id (`is_run_id` - the two share a generator), is the
-///   argument list of a query someone meant to run, not a task someone meant
-///   to implement: nobody hand-writes a real instruction that is just a verb
-///   and an id.
+/// - A leading literal `magi` is stripped before that check runs. `magi list`
+///   is exactly as mistyped as `list` alone, and clap's own subcommand tree
+///   never spells the binary's own name as one of its subcommands, so
+///   `subcommand_words()` would never catch it otherwise.
+/// - An instruction no longer than two words (after stripping a leading
+///   `magi`), one of which is shaped exactly like a run or task id
+///   (`is_run_id` - the two share a generator), is the argument list of a
+///   query someone meant to run, not a task someone meant to implement:
+///   nobody hand-writes a real instruction that is just a verb and an id.
 ///
 /// `command` is the literal prefix to echo back in the escape hatch
 /// (`"magi run"`, `"magi task add"`, `"magi task edit <id>"`), so the message
@@ -648,8 +652,13 @@ fn mistyped_command(
     if separator {
         return None;
     }
-    let first = instruction.first()?;
     let joined = instruction.join(" ");
+    let rest: &[String] = match instruction.first() {
+        Some(w) if w == "magi" => &instruction[1..],
+        Some(_) => instruction,
+        None => return None,
+    };
+    let first = rest.first()?;
     if words.contains(first.as_str()) {
         return Some(format!(
             "`{first}` names a magi subcommand, so `{command} {joined}` looks \
@@ -658,7 +667,7 @@ fn mistyped_command(
              start. Write `{command} -- {joined}` to mean it literally."
         ));
     }
-    if instruction.len() <= 2 && instruction.iter().any(|w| is_run_id(w)) {
+    if rest.len() <= 2 && rest.iter().any(|w| is_run_id(w)) {
         return Some(format!(
             "`{joined}` looks like the arguments to a magi query command (a \
              run or task id), not a task description, so `{command} {joined}` \
@@ -1565,6 +1574,22 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 bail!(why);
             }
             let text = task_text(&instruction, file.as_deref(), issue).await?;
+            if instruction.is_empty() && file.is_none() && issue.is_none() {
+                // The guard above never saw this: no positional words were
+                // given, so `task_text` fell back to stdin, and the same
+                // command-shaped mistake reaches here just as easily piped in
+                // (`echo list | magi task add --solo`) as typed on the argv.
+                let stdin_words: Vec<String> =
+                    text.split_whitespace().map(str::to_owned).collect();
+                if let Some(why) = mistyped_command(
+                    "magi task add",
+                    &stdin_words,
+                    had_separator(),
+                    &subcommand_words(),
+                ) {
+                    bail!(why);
+                }
+            }
             let title = title.unwrap_or_else(|| queue::title_from(&text, 72));
             let source = task_source(issue).await;
             // Checked and stored as an absolute path here, not left for
@@ -1711,6 +1736,21 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
             let mut t = q.get(&resolved)?;
             let text = task_text(&instruction, file.as_deref(), None).await?;
+            if instruction.is_empty() && file.is_none() {
+                // Same stdin gap as `task add`: no positional words means
+                // `task_text` read the new instruction from stdin, and the
+                // guard above never saw it.
+                let stdin_words: Vec<String> =
+                    text.split_whitespace().map(str::to_owned).collect();
+                if let Some(why) = mistyped_command(
+                    &format!("magi task edit {id}"),
+                    &stdin_words,
+                    had_separator(),
+                    &subcommand_words(),
+                ) {
+                    bail!(why);
+                }
+            }
             let title = title.unwrap_or_else(|| queue::title_from(&text, 72));
             t.edit(title, text)?;
             q.put(&mut t)?;
@@ -2656,6 +2696,37 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_literal_magi_does_not_hide_the_subcommand_behind_it() {
+        // `subcommand_words()` reads clap's own tree, which never spells the
+        // binary's own name as one of its subcommands - so "magi list" would
+        // otherwise sail past the first-word check that catches "list" alone.
+        let words = subcommand_words();
+        assert!(!words.contains("magi"));
+
+        let prefixed: Vec<String> = vec!["magi".to_owned(), "list".to_owned()];
+        let why = mistyped_command("magi task add", &prefixed, false, &words).expect("refused");
+        assert!(why.contains("`list` names a magi subcommand"), "{why}");
+
+        // The same stripping has to feed the id-shape check too.
+        let prefixed_id: Vec<String> = vec![
+            "magi".to_owned(),
+            "info".to_owned(),
+            "20260912-114326-d3b8".to_owned(),
+        ];
+        let why =
+            mistyped_command("magi task add", &prefixed_id, false, &words).expect("refused");
+        assert!(
+            why.contains("looks like the arguments to a magi query command"),
+            "{why}"
+        );
+
+        // `--` still bypasses it, and a bare "magi" alone has nothing left to
+        // check once stripped.
+        assert!(mistyped_command("magi task add", &prefixed, true, &words).is_none());
+        assert!(mistyped_command("magi task add", &["magi".to_owned()], false, &words).is_none());
+    }
+
+    #[test]
     fn only_a_seat_that_makes_something_may_ask_the_operator() {
         // The question that prompted this, verbatim from the deck:
         //   ラウンド 2 のレビュー結果を提出しますか？パッチに問題は見つかりませんでした。
@@ -2840,6 +2911,34 @@ mod tests {
         );
 
         assert!(q.list().is_empty(), "neither refusal may reach the queue");
+    }
+
+    #[tokio::test]
+    async fn task_add_from_a_file_is_never_second_guessed() {
+        // `--file` is a deliberate document, not a stray word someone typed
+        // or piped - the guard's job is catching a query's argv arriving as
+        // an instruction, not judging what an explicitly named file contains.
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let path = dir.path().join("task.md");
+        std::fs::write(&path, "list\n").unwrap();
+
+        task_cmd_on(
+            TaskCmd::Add {
+                instruction: vec![],
+                file: Some(path),
+                issue: None,
+                title: None,
+                priority: 0,
+                repo: PathBuf::from("."),
+                solo: false,
+                json: false,
+            },
+            q.clone(),
+        )
+        .await
+        .expect("a --file task is never second-guessed by this guard");
+        assert_eq!(q.list().len(), 1);
     }
 
     /// A real git working tree, for the `resolve_repo` tests below.
