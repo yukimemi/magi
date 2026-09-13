@@ -1510,24 +1510,34 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                     gh(&repo, &argv).await?
                 };
                 if out.0 {
+                    pr.state = PrLifecycle::Merged;
                     state.status = RunStatus::Merged;
                     state.merge = Some(MergeOutcome {
                         mode: MergeMode::Pr,
                         ok: true,
                         detail: format!("gh {}", argv.join(" ")),
                     });
+                    // The last `state.pr` snapshot is whatever the poll before
+                    // this merge observed - still `open` - and nothing below
+                    // refreshes it from GitHub again, so the UI's round rail
+                    // would otherwise keep animating a merged run forever.
+                    if let Some(pr_record) = state.pr.as_mut() {
+                        pr_record.state = pr.state.as_str().to_owned();
+                    }
                     state.event("land", format!("merged {} as `{subject}`", pr.url));
                     state.save()?;
-                    pr.state = PrLifecycle::Merged;
                     return Ok(pr);
                 }
                 let after = observe(&repo, pr_url).await.ok().map(|s| s.pr.state);
                 if let Some(outcome) = merged_after_all(&argv, &out.1, after) {
+                    pr.state = PrLifecycle::Merged;
                     state.status = RunStatus::Merged;
                     state.merge = Some(outcome);
+                    if let Some(pr_record) = state.pr.as_mut() {
+                        pr_record.state = pr.state.as_str().to_owned();
+                    }
                     state.event("land", format!("merged {} as `{subject}`", pr.url));
                     state.save()?;
-                    pr.state = PrLifecycle::Merged;
                     return Ok(pr);
                 }
                 stop(
