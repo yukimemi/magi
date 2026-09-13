@@ -966,11 +966,15 @@ fn attachment_note(store: &Talks, talk_id: &str, attachments: &[Attachment]) -> 
 /// the only part that changes.
 pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
     let write_policy = if allow_write {
-        "This repository has set `[talk] allow_write = true`, so you may \
-         write files here - but only a small, already-decided edit the \
-         operator names outright in this conversation, not an \
-         implementation. Once you have made it, say plainly what you \
-         edited. Anything bigger, or anything still open-ended, still goes \
+        "Write access is enabled for this conversation (`allow_write = \
+         true`), so you may write files - but only a small, \
+         already-decided edit the operator names outright in this \
+         conversation, not an implementation. This is a permission on the \
+         conversation as a whole, not a property of whichever repository \
+         it happened to start in: if the operator names a different \
+         repository for that small edit, the same allowance covers it \
+         there too. Once you have made it, say plainly what you edited. \
+         Anything bigger, or anything still open-ended, still goes \
          through the queue below rather than being done here."
     } else {
         "Do not write files. Implementing a change is not this \
