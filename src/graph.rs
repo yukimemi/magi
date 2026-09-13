@@ -3795,11 +3795,33 @@ fn manual_merge_command(style: MergeStyle, repo: &Path, branch: &str, message: &
 /// fixer declined, so `merge = "pr"` hands the reader the same material
 /// `magi show` does rather than a pull request that reads clean while
 /// `run.json` disagrees.
+///
+/// The first line doubles as the pull request title (`gh_pr_create`) and the
+/// squash/merge commit subject (`manual_merge_command`), both of which take
+/// it via `message.lines().next()` rather than as a separate argument — so it
+/// has to be the task's own opening line, not run/candidate bookkeeping.
+/// "Merge magi run ec12 (candidate B)" told a reader nothing about what
+/// landed once the run id had scrolled off the PR list. That bookkeeping
+/// still needs to be findable, just not from the title: the branch name
+/// already carries it (`RunState::branch_for`), and the footer below repeats
+/// it as plain tags for a reader holding only the merged commit or the PR
+/// body.
+///
+/// `state.instruction` can open with blank lines — a `--file` task is passed
+/// through verbatim (`task_text` only rejects a body that is blank
+/// *entirely*) — and `.lines().next()` on those reads back as `Some("")`, not
+/// `None`, so `gh_pr_create`'s `unwrap_or("magi run")` never fires and `gh pr
+/// create` would be asked for an empty `--title`. `trim_start` drops exactly
+/// those leading blank lines so the first line is the task's real opening
+/// line, and the empty-after-trim case (a whitespace-only instruction) falls
+/// back the same way `queue::title_from` does for the same situation.
 fn pr_body(state: &RunState, winner: char) -> String {
-    let mut message = format!(
-        "Merge magi run {} (candidate {winner})\n\n{}",
-        state.id, state.instruction
-    );
+    let instruction = state.instruction.trim_start();
+    let mut message = if instruction.is_empty() {
+        "(empty task)".to_owned()
+    } else {
+        instruction.to_owned()
+    };
 
     let open = state.open_findings();
     if !open.is_empty() {
@@ -3817,6 +3839,12 @@ fn pr_body(state: &RunState, winner: char) -> String {
             message.push_str(&format!("- `{}`: {}\n", r.id, r.why));
         }
     }
+
+    message.push_str(&format!(
+        "\n\n---\nmagi:run/{} magi:candidate-{}\n",
+        state.id,
+        winner.to_ascii_lowercase()
+    ));
 
     message
 }
@@ -4744,6 +4772,63 @@ mod tests {
         let body = pr_body(&state, 'A');
         assert!(!body.contains("Open review findings"), "{body}");
         assert!(!body.contains("Declined"), "{body}");
+    }
+
+    #[test]
+    fn pr_body_titles_itself_from_the_task_not_run_or_candidate() {
+        let state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        let body = pr_body(&state, 'A');
+        let title = body.lines().next().unwrap();
+
+        assert_eq!(
+            title, "add retries",
+            "the title must be the task, not run/candidate bookkeeping: {body}"
+        );
+        assert!(
+            body.contains(&format!("magi:run/{}", state.id)),
+            "the run id must still be recoverable from the footer: {body}"
+        );
+        assert!(
+            body.contains("magi:candidate-a"),
+            "the candidate must still be recoverable from the footer: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_body_never_titles_itself_off_a_blank_first_line() {
+        let leading_blank = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            "\n\n  \nadd retries\n\ndetails".to_owned(),
+            Config::default(),
+        );
+        let body = pr_body(&leading_blank, 'A');
+        assert_eq!(
+            body.lines().next(),
+            Some("add retries"),
+            "a leading blank line must not become an empty title: {body}"
+        );
+
+        let whitespace_only = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            "   \n  \n".to_owned(),
+            Config::default(),
+        );
+        let body = pr_body(&whitespace_only, 'A');
+        let title = body.lines().next().unwrap_or_default();
+        assert!(
+            !title.is_empty(),
+            "a whitespace-only instruction must still fall back to a non-empty title: {body}"
+        );
     }
 
     #[test]
