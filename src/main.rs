@@ -653,11 +653,7 @@ fn mistyped_command(
         return None;
     }
     let joined = instruction.join(" ");
-    let rest: &[String] = match instruction.first() {
-        Some(w) if w == "magi" => &instruction[1..],
-        Some(_) => instruction,
-        None => return None,
-    };
+    let rest = strip_magi_prefix(instruction);
     let first = rest.first()?;
     if words.contains(first.as_str()) {
         return Some(format!(
@@ -677,6 +673,54 @@ fn mistyped_command(
         ));
     }
     None
+}
+
+/// Strip a leading literal `magi`, if present.
+///
+/// `subcommand_words()` reads clap's own tree, which never spells the
+/// binary's own name as one of its subcommands, so a caller comparing
+/// against it has to remove a copy-pasted `magi` by hand first - otherwise
+/// `magi list` sails past a check that already catches `list` alone.
+fn strip_magi_prefix(instruction: &[String]) -> &[String] {
+    match instruction.first() {
+        Some(w) if w == "magi" => &instruction[1..],
+        _ => instruction,
+    }
+}
+
+/// Guard a task body that did not arrive as CLI positional words - the
+/// `task_text` fallback to stdin, for `magi task add`/`magi task edit` with
+/// no instruction and no `--file`/`--issue`.
+///
+/// Rule 1 of [`mistyped_command`] has no length limit of its own: a first
+/// word that names a subcommand refuses the instruction whatever comes
+/// after it, which is the right trade for text typed as CLI arguments (the
+/// fix is one more token, `--`). A body read from stdin exists for the
+/// opposite reason - `task_text` takes stdin specifically so a
+/// multi-paragraph task does not have to survive shell quoting as argv - so
+/// running that same unbounded rule against it would refuse real work the
+/// moment it opened with a word like "add", and the guard's own suggested
+/// fix ("write `{command} -- {joined}`") would then be telling the caller
+/// to redo exactly the argv quoting stdin was there to avoid. Gating the
+/// check to a body this short keeps it aimed at what it was written for -
+/// `list`, `info <id>` - where moving the words to argv really is a
+/// one-token fix, and exempts anything long enough to be an actual
+/// document.
+fn guard_free_form_text(
+    command: &str,
+    text: &str,
+    separator: bool,
+    words: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    const MAX_WORDS: usize = 2;
+    let text_words: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+    if strip_magi_prefix(&text_words).len() > MAX_WORDS {
+        return Ok(());
+    }
+    if let Some(why) = mistyped_command(command, &text_words, separator, words) {
+        bail!(why);
+    }
+    Ok(())
 }
 
 /// Whether the caller wrote a literal `--` separator.
@@ -742,9 +786,12 @@ async fn dispatch(command: Command) -> Result<()> {
                 }
                 None => (instruction, opts),
             };
-            if let Some(why) =
-                mistyped_command("magi run", &instruction, had_separator(), &subcommand_words())
-            {
+            if let Some(why) = mistyped_command(
+                "magi run",
+                &instruction,
+                had_separator(),
+                &subcommand_words(),
+            ) {
                 bail!(why);
             }
             let repo = opts.repo.unwrap_or_else(|| PathBuf::from("."));
@@ -1579,16 +1626,7 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 // given, so `task_text` fell back to stdin, and the same
                 // command-shaped mistake reaches here just as easily piped in
                 // (`echo list | magi task add --solo`) as typed on the argv.
-                let stdin_words: Vec<String> =
-                    text.split_whitespace().map(str::to_owned).collect();
-                if let Some(why) = mistyped_command(
-                    "magi task add",
-                    &stdin_words,
-                    had_separator(),
-                    &subcommand_words(),
-                ) {
-                    bail!(why);
-                }
+                guard_free_form_text("magi task add", &text, had_separator(), &subcommand_words())?;
             }
             let title = title.unwrap_or_else(|| queue::title_from(&text, 72));
             let source = task_source(issue).await;
@@ -1740,16 +1778,12 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 // Same stdin gap as `task add`: no positional words means
                 // `task_text` read the new instruction from stdin, and the
                 // guard above never saw it.
-                let stdin_words: Vec<String> =
-                    text.split_whitespace().map(str::to_owned).collect();
-                if let Some(why) = mistyped_command(
+                guard_free_form_text(
                     &format!("magi task edit {id}"),
-                    &stdin_words,
+                    &text,
                     had_separator(),
                     &subcommand_words(),
-                ) {
-                    bail!(why);
-                }
+                )?;
             }
             let title = title.unwrap_or_else(|| queue::title_from(&text, 72));
             t.edit(title, text)?;
@@ -2681,7 +2715,10 @@ mod tests {
             why.contains("looks like the arguments to a magi query command"),
             "{why}"
         );
-        assert!(why.contains("magi task add -- info 20260912-114326-d3b8"), "{why}");
+        assert!(
+            why.contains("magi task add -- info 20260912-114326-d3b8"),
+            "{why}"
+        );
 
         // `--` is honoured here too.
         assert!(mistyped_command("magi task add", &info, true, &words).is_none());
@@ -2713,8 +2750,7 @@ mod tests {
             "info".to_owned(),
             "20260912-114326-d3b8".to_owned(),
         ];
-        let why =
-            mistyped_command("magi task add", &prefixed_id, false, &words).expect("refused");
+        let why = mistyped_command("magi task add", &prefixed_id, false, &words).expect("refused");
         assert!(
             why.contains("looks like the arguments to a magi query command"),
             "{why}"
@@ -2724,6 +2760,42 @@ mod tests {
         // check once stripped.
         assert!(mistyped_command("magi task add", &prefixed, true, &words).is_none());
         assert!(mistyped_command("magi task add", &["magi".to_owned()], false, &words).is_none());
+    }
+
+    #[test]
+    fn a_long_stdin_body_is_never_second_guessed_by_the_unbounded_rule() {
+        // `task_text` reads stdin specifically so a multi-paragraph task
+        // does not have to survive shell quoting as argv - subjecting that
+        // body to rule 1's unbounded first-word check would refuse the
+        // exact case stdin exists for, and then suggest rewriting it as argv
+        // (`{command} -- {joined}`), which recreates the quoting problem.
+        let words = subcommand_words();
+        assert!(words.contains("add"), "the guard reads clap's own commands");
+
+        guard_free_form_text(
+            "magi task add",
+            "add retries to the client, with exponential backoff and a cap \
+             on attempts so a flaky endpoint cannot spin forever",
+            false,
+            &words,
+        )
+        .expect("a real multi-word document must never be refused");
+
+        // The two live incidents are still caught when they arrive this way.
+        let err = guard_free_form_text("magi task add", "list", false, &words)
+            .expect_err("a bare query verb piped in is still a mistake");
+        assert!(err.to_string().contains("names a magi subcommand"));
+
+        let err = guard_free_form_text("magi task add", "info 20260912-114326-d3b8", false, &words)
+            .expect_err("a bare id lookup piped in is still a mistake");
+        assert!(
+            err.to_string()
+                .contains("looks like the arguments to a magi query command")
+        );
+
+        // `--` on the argv side still bypasses it, body untouched.
+        guard_free_form_text("magi task add", "list", true, &words)
+            .expect("the -- escape hatch must still work for a piped body");
     }
 
     #[test]
