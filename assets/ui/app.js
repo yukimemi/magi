@@ -465,6 +465,12 @@ const state = {
   /* The Backlog's id search box. Lives only in memory, same reasoning as
      runsFilter above: a reload starts from the unfiltered backlog. */
   queueSearch: "",
+  /* `${query}\0${id}` of the single-hit jump renderQueueSearch last actually
+     performed, so a background poll that re-renders the same query without
+     a new unique hit does not yank the operator back to the card mid-read -
+     see scrollToSearchHit's own comment. Reset whenever the query is
+     cleared, so the next search starts a fresh jump. */
+  queueSearchJump: null,
   detail: { id: null, run: null, report: null },
   questions: null,
   /* Whether a question's panel endpoint actually answers. A sandboxed frame
@@ -2220,6 +2226,7 @@ function matchesTaskId(id, query) {
 
 function setQueueSearch(value) {
   state.queueSearch = value;
+  if (value.trim() === "") state.queueSearchJump = null;
   renderQueue();
 }
 
@@ -2244,8 +2251,21 @@ function renderQueueSearch(tasks, query) {
   /* A single hit is exactly the case a prefix/suffix search exists for -
      jump straight to it rather than making the operator scroll a one-item
      list. Two or more stay a list to choose from, same as the CLI's own
-     "matches N tasks" refusal, just rendered instead of erroring. */
-  if (matches.length === 1) scrollToSearchHit(results.firstElementChild);
+     "matches N tasks" refusal, just rendered instead of erroring.
+
+     Gated on jumpKey actually changing: renderQueue() re-runs on every SSE
+     revision and, without streaming, every 10s health poll, whether or not
+     this search had anything to do with the change. Re-jumping (and
+     re-flashing) on each of those would drag the view back to the card out
+     from under an operator who is mid-read - see scrollToLastTurn's own
+     rule against exactly that. */
+  if (matches.length === 1) {
+    const jumpKey = `${query}\0${matches[0].id}`;
+    if (state.queueSearchJump !== jumpKey) {
+      state.queueSearchJump = jumpKey;
+      scrollToSearchHit(results.firstElementChild);
+    }
+  }
 }
 
 /* Same sticky-header offset math as scrollToLastTurn, applied to a single
