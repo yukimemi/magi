@@ -3806,8 +3806,22 @@ fn manual_merge_command(style: MergeStyle, repo: &Path, branch: &str, message: &
 /// already carries it (`RunState::branch_for`), and the footer below repeats
 /// it as plain tags for a reader holding only the merged commit or the PR
 /// body.
+///
+/// `state.instruction` can open with blank lines — a `--file` task is passed
+/// through verbatim (`task_text` only rejects a body that is blank
+/// *entirely*) — and `.lines().next()` on those reads back as `Some("")`, not
+/// `None`, so `gh_pr_create`'s `unwrap_or("magi run")` never fires and `gh pr
+/// create` would be asked for an empty `--title`. `trim_start` drops exactly
+/// those leading blank lines so the first line is the task's real opening
+/// line, and the empty-after-trim case (a whitespace-only instruction) falls
+/// back the same way `queue::title_from` does for the same situation.
 fn pr_body(state: &RunState, winner: char) -> String {
-    let mut message = state.instruction.clone();
+    let instruction = state.instruction.trim_start();
+    let mut message = if instruction.is_empty() {
+        "(empty task)".to_owned()
+    } else {
+        instruction.to_owned()
+    };
 
     let open = state.open_findings();
     if !open.is_empty() {
@@ -4783,6 +4797,37 @@ mod tests {
         assert!(
             body.contains("magi:candidate-a"),
             "the candidate must still be recoverable from the footer: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_body_never_titles_itself_off_a_blank_first_line() {
+        let leading_blank = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            "\n\n  \nadd retries\n\ndetails".to_owned(),
+            Config::default(),
+        );
+        let body = pr_body(&leading_blank, 'A');
+        assert_eq!(
+            body.lines().next(),
+            Some("add retries"),
+            "a leading blank line must not become an empty title: {body}"
+        );
+
+        let whitespace_only = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            "   \n  \n".to_owned(),
+            Config::default(),
+        );
+        let body = pr_body(&whitespace_only, 'A');
+        let title = body.lines().next().unwrap_or_default();
+        assert!(
+            !title.is_empty(),
+            "a whitespace-only instruction must still fall back to a non-empty title: {body}"
         );
     }
 
