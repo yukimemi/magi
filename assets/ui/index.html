@@ -78,18 +78,26 @@
     <span class="daemon-text">Connecting…</span>
     <span class="daemon-why" id="loop-why" hidden></span>
   </span>
-  <!-- Which build is answering. This strip is already about this process and
-       it carries Update & restart, so after an upgrade the operator can tell
-       from the same place whether the new binary is the one serving them. -->
-  <span class="daemon-version" id="loop-version" hidden></span>
-  <button class="btn daemon-btn" type="button" id="loop-toggle" aria-describedby="loop-why" hidden></button>
-  <!-- The escalation, shown only while a stop is waiting out a run: parking
-       stops at the run's next step instead, which is what an operator waiting
-       to replace the binary actually wants. -->
-  <button class="btn btn-quiet daemon-btn" type="button" id="loop-park" aria-describedby="loop-why" hidden></button>
-  <!-- Replacing the binary ends this process, so it lives with the other
-       controls that do, and it arms on the first tap. -->
-  <button class="btn btn-quiet daemon-btn" type="button" id="loop-upgrade" aria-describedby="loop-why" hidden>Update &amp; restart</button>
+  <!-- One grid cell, always, whatever mix of the version chip and the up to
+       three buttons below happen to be visible. Letting each of those be its
+       own grid item let their count change the number of items in the row,
+       which is what put the button on a row of its own with a stray gap
+       beside it — see .daemon-controls in app.css. -->
+  <span class="daemon-controls" id="loop-controls">
+    <!-- Which build is answering. This strip is already about this process
+         and it carries Update & restart, so after an upgrade the operator
+         can tell from the same place whether the new binary is the one
+         serving them. -->
+    <span class="daemon-version" id="loop-version" hidden></span>
+    <button class="btn daemon-btn" type="button" id="loop-toggle" aria-describedby="loop-why" hidden></button>
+    <!-- The escalation, shown only while a stop is waiting out a run: parking
+         stops at the run's next step instead, which is what an operator waiting
+         to replace the binary actually wants. -->
+    <button class="btn btn-quiet daemon-btn" type="button" id="loop-park" aria-describedby="loop-why" hidden></button>
+    <!-- Replacing the binary ends this process, so it lives with the other
+         controls that do, and it arms on the first tap. -->
+    <button class="btn btn-quiet daemon-btn" type="button" id="loop-upgrade" aria-describedby="loop-why" hidden>Update &amp; restart</button>
+  </span>
 </div>
 
 <!-- An unanswered question is the only state in this product where nothing at
