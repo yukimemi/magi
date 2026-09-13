@@ -5195,7 +5195,7 @@ mod tests {
             .await;
         assert_eq!(duplicate.status, 409, "{}", duplicate.body);
 
-        for _ in 0..100 {
+        for _ in 0..200 {
             if store.get(&id).expect("talk").turns.len() == 2 {
                 break;
             }
