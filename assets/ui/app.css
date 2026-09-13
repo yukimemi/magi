@@ -616,6 +616,12 @@ a.card:active { background: var(--sunk); }
   content: "\00b7"; margin-left: var(--s2); color: var(--line-2);
 }
 .repo { font-family: var(--mono); font-size: var(--t1); }
+/* Only styled when it actually has an href - a human-filed task's source has
+   nowhere to go, and stays plain text rather than looking tappable. */
+.task-source[href] {
+  color: inherit;
+  text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 3px;
+}
 .win { font-weight: 700; color: var(--on-gold); }
 
 .card-event {
