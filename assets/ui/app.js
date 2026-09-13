@@ -1778,7 +1778,7 @@ function createTaskCard() {
   const solo = el("span", { class: "tag", "data-tone": "teal", text: "solo" });
   const whenSlot = el("time", { class: "card-when" });
   const title = el("h2", { class: "card-title" });
-  const source = el("span");
+  const source = el("a", { class: "task-source" });
   const repo = el("span", { class: "repo" });
   const attempts = el("span");
   const outcome = el("span");
@@ -1839,6 +1839,16 @@ function updateTaskCard(row, task) {
 
   setText(r.title, task.title || task.instruction || task.id);
   setText(r.source, task.source_label || "");
+  /* An agent-filed task names the run or chat that filed it right in its
+     label ("chat@a1b2", "implement@5dae") - that place still exists and is
+     one tap away, so the label becomes the link instead of leaving the
+     operator to go find it by hand. `node === "chat"` is how `Source::label`
+     spells a talk conversation; everything else agent-filed is a run node. */
+  const src = task.source || {};
+  const sourceHref = src.kind === "agent"
+    ? (src.node === "chat" ? `#/chat/${src.run}` : `#/runs/${src.run}`)
+    : null;
+  setAttr(r.source, "href", sourceHref);
   const repoName = typeof task.repo === "string" ? task.repo.split(/[\\/]/).filter(Boolean).pop() : "";
   setText(r.repo, repoName || "");
   setAttr(r.repo, "title", task.repo || "");
