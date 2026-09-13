@@ -2207,6 +2207,10 @@ impl Runner {
                 &|_: &Review| Ok(()),
             )
             .await;
+            // Counted before the move below: how many of *this* round's
+            // reviewer seats were lost to their own rate limit, as opposed to
+            // a crash, a timeout, or unparsable output — see `round_is_clean`.
+            let round_quota_missing = quota_losses.len();
             self.state.quota.extend(quota_losses);
 
             let mut records = Vec::new();
@@ -2490,7 +2494,14 @@ impl Runner {
             let incomplete = answered < expected;
             let e2e_ok = e2e.iter().all(CommandOutcome::ok);
             let policy = self.state.config.graph.incomplete_review;
-            let clean = round_is_clean(blocking, e2e_ok, answered, expected, policy);
+            let clean = round_is_clean(
+                blocking,
+                e2e_ok,
+                answered,
+                expected,
+                round_quota_missing,
+                policy,
+            );
 
             let mut round_record = ReviewRound {
                 round,
@@ -2531,10 +2542,17 @@ impl Runner {
             if clean {
                 self.state.event(
                     "review",
-                    if incomplete {
+                    if incomplete && policy == IncompleteReviewPolicy::Warn {
                         format!(
                             "round {round}: clean (warn policy, incomplete panel) — no \
                              blocking findings from the seats that answered, verification green"
+                        )
+                    } else if incomplete {
+                        format!(
+                            "round {round}: clean ({} rate-limited reviewer(s) excluded from \
+                             quorum) — no blocking findings from the seats that answered, \
+                             verification green",
+                            expected - answered
                         )
                     } else {
                         format!("round {round}: clean — no blocking findings, verification green")
@@ -2547,8 +2565,12 @@ impl Runner {
             }
 
             // Nothing was raised and verification passed, but not every seat
-            // answered and the policy refuses to call that clean: re-review
-            // rather than send the fixer after a round with nothing to fix.
+            // answered and `round_is_clean` still refused to call it clean —
+            // either a seat is missing for a reason other than its own quota
+            // (a crash, a timeout, unparsable output — worth another try), or
+            // every seat that could have answered lost its quota and nobody
+            // is left to decide on: re-review rather than send the fixer
+            // after a round with nothing to fix.
             if incomplete && blocking == 0 && e2e_ok {
                 self.state.reviews.push(round_record);
                 self.state.save()?;
@@ -3403,14 +3425,32 @@ async fn wave(
 /// policy a missing seat can never be clean; `warn` still requires the seats
 /// that *did* answer to have found nothing blocking and verification to be
 /// green.
+///
+/// `quota_missing` narrows that `block` default for exactly one cause of
+/// absence: a seat lost to its own rate limit this round. Re-reviewing hoping
+/// a session limit lifts by the very next round buys nothing — the seat is
+/// asked again with the same quota — so once every missing seat is accounted
+/// for by a quota loss (and at least one seat *did* answer, so a decision has
+/// something to rest on) the round is decided on the panel that could answer,
+/// same as `warn` would. A panel that lost every seat to quota is not
+/// decided here: `answered == 0` falls through to the existing `block`
+/// fallback so a fully collapsed panel still waits rather than landing on no
+/// review at all.
 fn round_is_clean(
     blocking: usize,
     e2e_ok: bool,
     answered: usize,
     expected: usize,
+    quota_missing: usize,
     policy: IncompleteReviewPolicy,
 ) -> bool {
-    blocking == 0 && e2e_ok && (answered == expected || policy == IncompleteReviewPolicy::Warn)
+    if blocking != 0 || !e2e_ok {
+        return false;
+    }
+    if answered == expected || policy == IncompleteReviewPolicy::Warn {
+        return true;
+    }
+    answered > 0 && expected - answered <= quota_missing
 }
 
 /// The review loop's own conclusion, derived entirely from its persisted
@@ -3937,7 +3977,14 @@ mod tests {
 
     #[test]
     fn a_full_panel_that_found_nothing_is_clean() {
-        assert!(round_is_clean(0, true, 2, 2, IncompleteReviewPolicy::Block));
+        assert!(round_is_clean(
+            0,
+            true,
+            2,
+            2,
+            0,
+            IncompleteReviewPolicy::Block
+        ));
     }
 
     #[test]
@@ -3947,18 +3994,33 @@ mod tests {
             true,
             1,
             2,
+            0,
             IncompleteReviewPolicy::Block
         ));
     }
 
     #[test]
     fn warn_policy_still_refuses_a_missing_seat_with_open_findings() {
-        assert!(!round_is_clean(1, true, 1, 2, IncompleteReviewPolicy::Warn));
+        assert!(!round_is_clean(
+            1,
+            true,
+            1,
+            2,
+            0,
+            IncompleteReviewPolicy::Warn
+        ));
     }
 
     #[test]
     fn warn_policy_gates_a_missing_seat_once_what_answered_is_clean() {
-        assert!(round_is_clean(0, true, 1, 2, IncompleteReviewPolicy::Warn));
+        assert!(round_is_clean(
+            0,
+            true,
+            1,
+            2,
+            0,
+            IncompleteReviewPolicy::Warn
+        ));
     }
 
     #[test]
@@ -3968,6 +4030,7 @@ mod tests {
             true,
             2,
             2,
+            0,
             IncompleteReviewPolicy::Block
         ));
     }
@@ -3977,6 +4040,76 @@ mod tests {
         assert!(!round_is_clean(
             0,
             false,
+            2,
+            2,
+            0,
+            IncompleteReviewPolicy::Block
+        ));
+    }
+
+    // The stall this task closes: under the default `block` policy, a seat
+    // missing only because it was rate limited must not force a wait for a
+    // session limit that will not lift by the next round. `round_is_clean`
+    // is where that quorum carve-out lives; the review loop around it never
+    // changes what a reviewer's vote or a finding's severity means.
+
+    #[test]
+    fn a_seat_missing_only_to_its_own_quota_is_clean_under_the_default_policy() {
+        // 1 of 2 answered, and the one missing was quota'd — the exact
+        // "review-2 rate limited (quota)" shape from the field report.
+        assert!(round_is_clean(
+            0,
+            true,
+            1,
+            2,
+            1,
+            IncompleteReviewPolicy::Block
+        ));
+    }
+
+    #[test]
+    fn a_seat_missing_for_a_reason_other_than_quota_still_waits() {
+        // 1 of 2 answered, but the miss was a crash/timeout/parse failure,
+        // not a quota loss (`quota_missing` stays 0) — worth another try.
+        assert!(!round_is_clean(
+            0,
+            true,
+            1,
+            2,
+            0,
+            IncompleteReviewPolicy::Block
+        ));
+    }
+
+    #[test]
+    fn a_quota_loss_does_not_excuse_an_open_finding_or_a_red_e2e() {
+        assert!(!round_is_clean(
+            1,
+            true,
+            1,
+            2,
+            1,
+            IncompleteReviewPolicy::Block
+        ));
+        assert!(!round_is_clean(
+            0,
+            false,
+            1,
+            2,
+            1,
+            IncompleteReviewPolicy::Block
+        ));
+    }
+
+    #[test]
+    fn a_panel_lost_entirely_to_quota_still_waits_rather_than_deciding_on_nobody() {
+        // Every seat quota'd, nobody answered: there is no panel to decide
+        // on, so this must fall through to the existing block-and-retry
+        // fallback rather than call an unreviewed patch clean.
+        assert!(!round_is_clean(
+            0,
+            true,
+            0,
             2,
             2,
             IncompleteReviewPolicy::Block
