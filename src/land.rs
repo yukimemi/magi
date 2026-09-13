@@ -2818,7 +2818,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
 
     #[test]
     fn a_merge_command_that_failed_after_merging_is_still_a_merge() {
-        let argv = merge_argv(28, "Merge magi run ec12 (candidate B)");
+        let argv = merge_argv(28, "fix: retry uploads on transient network errors");
         // The exact stderr from run ec12, in a jj-colocated repository.
         let jj = "could not determine current branch: failed to run git: not on any branch";
 
