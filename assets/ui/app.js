@@ -135,6 +135,10 @@ const TASK_STATUS = {
   done:    { glyph: "\u25c6", tone: "gold" },
   failed:  { glyph: "\u2715", tone: "rust" },
   held:    { glyph: "\u2016", tone: "rust", note: "Held. This task will not be claimed until it is released." },
+  /* Waiting on another task or an unanswered question - see `Task::blocked_by`.
+     Set and cleared by the daemon, never by hand, which is why there is no
+     hold-style action for it here. */
+  blocked: { glyph: "\u2298", tone: "rust", note: "Blocked. Waiting on another task or question to resolve." },
 };
 
 /* An unanswered question is the only state in the product that a human, and
@@ -1858,12 +1862,14 @@ function updateTaskCard(row, task) {
   show(r.attempts, attempts > 0);
   separate(r.attempts.parentNode);
 
-  /* A held task's note gains whatever the operator said it is waiting on,
-     since the queue cannot express a dependency between two tasks and this
-     is the one place that reason survives. */
-  const noteText = task.hold_reason && meta.note
-    ? `${meta.note} Waiting on: ${task.hold_reason}`
-    : meta.note || (task.hold_reason ? `Waiting on: ${task.hold_reason}` : "");
+  /* A held task's note gains whatever the operator said it is waiting on;
+     a blocked task's note gains `block_reason`, the daemon's own explanation
+     of the dependency (`main.rs`'s `magi task show` calls this "why"). Only
+     one of the two is ever set, since a task is either held or blocked. */
+  const waitingOn = task.hold_reason || task.block_reason;
+  const noteText = waitingOn && meta.note
+    ? `${meta.note} Waiting on: ${waitingOn}`
+    : meta.note || (waitingOn ? `Waiting on: ${waitingOn}` : "");
   setText(r.note, noteText);
   show(r.note, Boolean(noteText));
 
@@ -2225,10 +2231,190 @@ function renderQueue() {
 
   show($("queue-empty"), tasks.length === 0);
   syncQueueSections(sectionsRoot, groupQueueBySection(tasks));
+  renderDependencyGraph(tasks);
   /* The strip's wording depends on how many tasks are runnable, so it is
      re-rendered from the queue rather than only from health: "off, with two
      tasks waiting" has to appear the moment the second one is filed. */
   renderLoop();
+}
+
+/* ---- dependency graph --------------------------------------------------- *
+ * `Task::blocked_by` can name another task's id or an open question's id -
+ * see its doc in `queue.rs` - and the two id spaces look identical. This
+ * client has no way to tell them apart except by asking whether the id is
+ * one of the tasks already on this page, which is also exactly the filter
+ * that keeps a question id from being drawn as a phantom node with nothing
+ * known about it. A node is only ever built from a real `TaskView`. */
+function dependencyEdges(tasks) {
+  const byId = new Map(tasks.map((t) => [t.id, t]));
+  const edges = [];
+  for (const task of tasks) {
+    for (const dep of Array.isArray(task.blocked_by) ? task.blocked_by : []) {
+      if (dep !== task.id && byId.has(dep)) edges.push({ from: task.id, to: dep });
+    }
+  }
+  return { byId, edges };
+}
+
+/* Rank 0 is a task nothing here waits on further; a task blocked on one of
+   those is rank 1, and so on up a chain. Drawn top (highest rank, the most
+   blocked) to bottom (rank 0, next to unblock) so a glance up the arrows
+   reads the same way `magi task show`'s "blocked on" chases it one hop at a
+   time. `visiting` breaks a cycle by handing back rank 0 rather than
+   recursing forever - the queue is not supposed to produce one, but a
+   drawing must never hang on the strength of that alone. */
+function dependencyRanks(nodeIds, outEdges) {
+  const ranks = new Map();
+  function rankOf(id, visiting) {
+    if (ranks.has(id)) return ranks.get(id);
+    if (visiting.has(id)) return 0;
+    visiting.add(id);
+    const deps = outEdges.get(id) || [];
+    const r = deps.length ? 1 + Math.max(...deps.map((d) => rankOf(d, visiting))) : 0;
+    visiting.delete(id);
+    ranks.set(id, r);
+    return r;
+  }
+  for (const id of nodeIds) rankOf(id, new Set());
+  return ranks;
+}
+
+function truncateLabel(text, max) {
+  const s = String(text || "");
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+const DEP_NODE_W = 156;
+const DEP_NODE_H = 56;
+const DEP_COL_GAP = 24;
+const DEP_ROW_GAP = 48;
+
+/* One `<g>` per task, positioned by rank and by its slot within that rank's
+   row. Built fresh on every call, the same as `convergeDiagram` - the graph
+   is small enough that a full rebuild costs nothing next to the layout work
+   it would take to diff it in place. */
+function renderDependencyGraph(tasks) {
+  const panel = $("queue-graph-panel");
+  const host = $("queue-graph");
+  const { byId, edges } = dependencyEdges(tasks);
+
+  const nodeIds = new Set();
+  for (const e of edges) { nodeIds.add(e.from); nodeIds.add(e.to); }
+
+  show(panel, nodeIds.size > 0);
+  clear(host);
+  if (nodeIds.size === 0) return;
+
+  setText($("queue-graph-count"), plural(nodeIds.size, "task", "tasks"));
+
+  const outEdges = new Map();
+  for (const id of nodeIds) outEdges.set(id, []);
+  for (const e of edges) outEdges.get(e.from).push(e.to);
+
+  const ranks = dependencyRanks(nodeIds, outEdges);
+  const maxRank = Math.max(...ranks.values());
+  const rows = Array.from({ length: maxRank + 1 }, () => []);
+  for (const id of nodeIds) rows[ranks.get(id)].push(byId.get(id));
+  /* Stable, content-derived order rather than arrival order: a graph that
+     reshuffles its columns on every poll is harder to read than one that
+     shuffles its rows. */
+  for (const row of rows) row.sort((a, b) => (a.title || a.id).localeCompare(b.title || b.id));
+
+  const cols = Math.max(1, ...rows.map((row) => row.length));
+  const width = cols * (DEP_NODE_W + DEP_COL_GAP) + DEP_COL_GAP;
+  const height = (maxRank + 1) * (DEP_NODE_H + DEP_ROW_GAP) + DEP_ROW_GAP;
+
+  const pos = new Map();
+  rows.forEach((row, rank) => {
+    const y = height - DEP_ROW_GAP - DEP_NODE_H / 2 - rank * (DEP_NODE_H + DEP_ROW_GAP);
+    const slot = width / row.length;
+    row.forEach((task, i) => pos.set(task.id, { x: slot * (i + 0.5), y }));
+  });
+
+  /* No `role="img"` here, unlike `convergeDiagram` - this graph's `<g>`
+     nodes are individually focusable buttons, and an image role would tell
+     assistive tech to treat the whole thing as one flat picture and hide
+     them. `aria-label` still names the graph as a whole for anyone tabbing
+     into it. */
+  const root = svg("svg", {
+    viewBox: `0 0 ${width} ${height}`,
+    width, height,
+    class: "dep-graph",
+    "aria-label": `Dependency graph of ${plural(nodeIds.size, "task", "tasks")} and ${plural(edges.length, "dependency", "dependencies")}.`,
+  });
+
+  for (const e of edges) {
+    const a = pos.get(e.from);
+    const b = pos.get(e.to);
+    if (!a || !b) continue;
+    const midY = (a.y + b.y) / 2;
+    /* `to` is always the lower rank - closer to the bottom, since its y grows
+       with `height - rank * ...` - so the path leaves the bottom edge of
+       `from`'s box and arrives at the top edge of `to`'s box. */
+    root.append(svg("path", {
+      class: "dep-edge",
+      d: `M ${a.x} ${a.y + DEP_NODE_H / 2} C ${a.x} ${midY}, ${b.x} ${midY}, ${b.x} ${b.y - DEP_NODE_H / 2}`,
+      "marker-end": "url(#dep-arrow)",
+    }));
+  }
+  root.append(svg("defs", {}, svg("marker", {
+    id: "dep-arrow", viewBox: "0 0 10 10", refX: 8, refY: 5,
+    markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse",
+  }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: "var(--line-2)" }))));
+
+  for (const id of nodeIds) {
+    const t = byId.get(id);
+    const { x, y } = pos.get(id);
+    const status = String(t.status_str || t.status || "");
+    const label = t.title || t.instruction || t.id;
+    const g = svg("g", {
+      class: "dep-node",
+      "data-tone": toneOf(status, TASK_STATUS),
+      tabindex: "0",
+      role: "button",
+      "aria-label": `${label}, ${status}${t.block_reason ? `, waiting on: ${t.block_reason}` : ""}. Jump to this task.`,
+    },
+    svg("title", { text: t.block_reason ? `${label}\n${status}\nWaiting on: ${t.block_reason}` : `${label}\n${status}` }),
+    svg("rect", { x: x - DEP_NODE_W / 2, y: y - DEP_NODE_H / 2, width: DEP_NODE_W, height: DEP_NODE_H, rx: 10 }),
+    svg("text", { x, y: y - 8, class: "dep-node-title", "text-anchor": "middle", text: truncateLabel(label, 22) }),
+    svg("text", { x, y: y + 12, class: "dep-node-meta", "text-anchor": "middle", text: `${shortId(t.id)} · ${status}` }));
+    g.addEventListener("click", () => jumpToTask(t.id));
+    g.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      ev.preventDefault();
+      jumpToTask(t.id);
+    });
+    root.append(g);
+  }
+
+  host.append(root);
+}
+
+/* Scroll a task's own card into view and flash it, the closest thing this
+   page has to "jump to the detail" - the Queue card already carries the full
+   instruction, status, and (via the note above) why it is blocked, so
+   there is no second "task detail" screen to navigate to. Opens the card's
+   section first: a card sitting in a collapsed section cannot be scrolled
+   to at all. */
+function jumpToTask(id) {
+  const card = document.querySelector(`#queue-sections li.card[data-key="${CSS.escape(id)}"]`);
+  if (!card) return;
+  const section = card.closest("details.list-section");
+  if (section && !section.open) {
+    section.open = true;
+    state.queueCollapsed[section.dataset.key] = true;
+    saveCollapsed(QUEUE_COLLAPSE_KEY, state.queueCollapsed);
+  }
+  const header = document.querySelector(".top");
+  const gap = header ? Math.ceil(header.getBoundingClientRect().height) + 4 : 0;
+  card.style.scrollMarginTop = `${gap}px`;
+  const motion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  card.scrollIntoView({ behavior: motion ? "auto" : "smooth", block: "start" });
+  card.classList.remove("card-flash");
+  // Force a reflow so re-adding the class restarts the animation on a card
+  // that was already jumped to once this session.
+  void card.offsetWidth;
+  card.classList.add("card-flash");
 }
 
 /* ---- questions --------------------------------------------------------- *

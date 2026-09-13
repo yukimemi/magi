@@ -236,6 +236,16 @@
       <h1 id="queue-h">Backlog</h1>
       <p class="view-sub" id="queue-count">Loading…</p>
     </div>
+
+    <div class="panel" id="queue-graph-panel" hidden>
+      <h2>Blocked on <span class="count" id="queue-graph-count"></span></h2>
+      <p class="panel-note">
+        An arrow points from a blocked task to the task it is waiting on.
+        Tap a node to jump to that task below.
+      </p>
+      <div class="dep-graph-wrap" id="queue-graph"></div>
+    </div>
+
     <div id="queue-sections"></div>
     <p class="empty" id="queue-empty" hidden>
       The backlog is empty. Talk an idea through in Chat, or file one with

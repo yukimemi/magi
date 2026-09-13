@@ -591,6 +591,14 @@ main {
 .card[data-tone="wait"] { border-left-color: var(--gold-line); border-left-style: dashed; }
 a.card:active { background: var(--sunk); }
 
+/* Jumped to from the dependency graph: a brief highlight so the card that
+   scrolled into view is the one the eye lands on, not just wherever the
+   scroll happened to stop. `animation-fill-mode` is not `forwards` - it
+   reverts to normal on its own rather than leaving a permanent mark on a
+   card that gets re-jumped to later. */
+@keyframes card-flash { from { box-shadow: 0 0 0 3px var(--focus); } to { box-shadow: var(--shadow); } }
+.card-flash { animation: card-flash 1.6s var(--ease); }
+
 .card-top { display: flex; align-items: center; gap: var(--s2); }
 .card-when { margin-left: auto; font-size: var(--t1); color: var(--ink-3); white-space: nowrap; }
 .card-title {
@@ -1076,6 +1084,28 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .converge { width: 100%; }
 .converge svg { width: 100%; height: auto; display: block; }
 .converge text { font: 700 13px var(--sans); }
+
+/* dependency graph: one node per task involved in a "blocked on" chain, laid
+   out in ranks with an arrow from a blocked task to what it waits on. Fixed
+   pixel sizing rather than `width: 100%` like `.converge` above - a wide
+   graph scrolls horizontally instead of squeezing node labels unreadable on
+   a phone. */
+.dep-graph-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.dep-graph { display: block; }
+.dep-graph text {
+  font: 600 var(--t1) var(--sans); fill: var(--ink);
+  pointer-events: none; user-select: none;
+}
+.dep-node-meta { font-weight: 400; fill: var(--ink-3); }
+.dep-edge { fill: none; stroke: var(--line-2); stroke-width: 1.75; }
+.dep-node rect { fill: var(--tint-ink); stroke: var(--line-2); stroke-width: 1.5; }
+.dep-node[data-tone="blue"] rect { fill: var(--tint-blue); stroke: var(--blue); }
+.dep-node[data-tone="gold"] rect { fill: var(--tint-gold); stroke: var(--gold-line); }
+.dep-node[data-tone="rust"] rect { fill: var(--tint-rust); stroke: var(--rust); }
+.dep-node[data-tone="teal"] rect { fill: var(--tint-teal); stroke: var(--teal); }
+.dep-node { cursor: pointer; }
+.dep-node:hover rect { stroke-width: 2.5; }
+.dep-node:focus-visible rect { stroke: var(--focus); stroke-width: 2.5; }
 
 /* ---- candidates -------------------------------------------------------- */
 .cands { display: flex; flex-direction: column; gap: var(--s3); }
