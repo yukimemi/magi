@@ -2885,6 +2885,15 @@ mod tests {
         dir
     }
 
+    /// Serializes every [`NoMachineConfig`] guard against every other one:
+    /// `cargo test`'s default runner gives each test its own thread, so two
+    /// guards live at once unless something stops them, and `MAGI_CONFIG_DIR`
+    /// is process-wide state no `&mut` can protect. Without this, one guard's
+    /// `Drop` can restore the variable to `None` while a second guard's own
+    /// `Config::discover` call is still in flight, letting *that* call fall
+    /// through to the real machine config the second guard exists to hide.
+    static NO_MACHINE_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Forces `Config::discover` to see no machine config layer for the life
     /// of the guard, restoring whatever `MAGI_CONFIG_DIR` held before (even
     /// on panic) once it drops.
@@ -2900,24 +2909,34 @@ mod tests {
     /// exactly the false ambiguity that first made these tests flaky here.
     struct NoMachineConfig {
         previous: Option<String>,
+        // Held until `Drop` runs below - see `NO_MACHINE_CONFIG_LOCK`'s own
+        // doc for why one guard's lifetime must never overlap another's.
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl NoMachineConfig {
         fn set() -> Self {
+            let lock = NO_MACHINE_CONFIG_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let previous = std::env::var(Config::CONFIG_DIR_ENV).ok();
-            // SAFETY: no other test in this suite reads or writes
-            // `MAGI_CONFIG_DIR` - single-threaded as far as this variable
-            // goes, the same reasoning `web::tests::
+            // SAFETY: `NO_MACHINE_CONFIG_LOCK` guarantees this is the only
+            // guard alive right now, and nothing outside this guard touches
+            // `MAGI_CONFIG_DIR` - the same reasoning `web::tests::
             // recheck_never_spawns_when_checking_is_off_or_killed_by_env`
-            // relies on for its own env var.
+            // relies on for its own, differently-named env var.
             unsafe { std::env::set_var(Config::CONFIG_DIR_ENV, "") };
-            Self { previous }
+            Self {
+                previous,
+                _lock: lock,
+            }
         }
     }
 
     impl Drop for NoMachineConfig {
         fn drop(&mut self) {
-            // SAFETY: see `set` above.
+            // SAFETY: see `set` above - `_lock` is still held here and only
+            // releases once this whole `drop` returns.
             unsafe {
                 match &self.previous {
                     Some(v) => std::env::set_var(Config::CONFIG_DIR_ENV, v),
