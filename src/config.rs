@@ -31,6 +31,12 @@ pub enum AgentKind {
     /// read-only mode: `--sandbox read-only` is enforced by the CLI, not by
     /// the prompt.
     Codex,
+    /// oh-my-pi (`omp -p --mode=json`). Another CLI with no read-only mode of
+    /// its own - `--auto-approve` gates reads and writes together - so a
+    /// read-only seat rests on the prompt and on the worktree discipline the
+    /// other non-codex seats already rely on. It is also the roster member that
+    /// reaches DeepSeek, whose models ship in `omp`'s own catalog.
+    Omp,
     /// Arbitrary command. The escape hatch, and what the test suite drives.
     Command,
 }
@@ -43,6 +49,7 @@ impl AgentKind {
             Self::Opencode => Some("opencode"),
             Self::Antigravity => Some("agy"),
             Self::Codex => Some("codex"),
+            Self::Omp => Some("omp"),
             Self::Command => None,
         }
     }
@@ -54,6 +61,7 @@ impl AgentKind {
             Self::Opencode => "opencode",
             Self::Antigravity => "antigravity",
             Self::Codex => "codex",
+            Self::Omp => "omp",
             Self::Command => "command",
         }
     }
@@ -110,6 +118,10 @@ impl AgentSpec {
             // instruction arrives without an argv length limit and without a
             // tool round-trip to open a file.
             AgentKind::Codex => Delivery::Stdin,
+            // `omp -p` reads the prompt from stdin too, and a judging prompt
+            // carrying three patches is well past the Windows argv cap, so this
+            // is the only delivery that works for every node.
+            AgentKind::Omp => Delivery::Stdin,
             AgentKind::Opencode | AgentKind::Antigravity => Delivery::File,
         })
     }
@@ -1224,6 +1236,7 @@ impl Config {
             (AgentKind::Antigravity, "antigravity", None),
             (AgentKind::Opencode, "opencode", None),
             (AgentKind::Codex, "codex", None),
+            (AgentKind::Omp, "omp", None),
         ] {
             if kind.program().is_some_and(which) && !cfg.agents.iter().any(|a| a.id == id) {
                 cfg.agents.push(AgentSpec {
