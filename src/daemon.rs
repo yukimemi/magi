@@ -1019,6 +1019,16 @@ fn reclaim_abandoned_runs(home: &Path, now: Timestamp) -> Vec<String> {
             tracing::warn!("could not persist abandoned run {id}: {e:#}");
             continue;
         }
+        // The seat that asked is gone for good now, exactly like any other
+        // door `graph::Runner::settle_questions` closes the moment `status`
+        // lands somewhere non-resumable - see that method's own doc. Nothing
+        // else reaches this one before the next `janitor()` startup pass
+        // (`clean::abandon_settled_questions`), and a daemon that stays up
+        // for days must not leave an open question badging the operator
+        // until it happens to restart.
+        if let Err(e) = Questions::at(home.join("questions")).settle_run(&id, state.status) {
+            tracing::warn!("abandon questions for {id}: {e:#}");
+        }
         abandoned.push(id);
     }
     abandoned
@@ -3243,12 +3253,30 @@ mod tests {
         }];
         write_status_to(&home.join("daemon.json"), &status).unwrap();
 
+        // The abandoned seat left an open question behind: nobody is left to
+        // read an answer once the run is failed, and this must not wait for
+        // some later daemon startup's own sweep to notice that.
+        let questions = Questions::at(home.join("questions"));
+        let mut q = ask::Question::new(
+            dead.id.clone(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            "Which storage backend?".to_owned(),
+            String::new(),
+            vec!["SQLite".to_owned(), "Redis".to_owned()],
+        );
+        questions.put(&mut q).unwrap();
+
         let abandoned = reclaim_abandoned_runs(&home, now);
         assert_eq!(abandoned, vec![dead.id.clone()]);
 
         let reloaded = read_run_under(&home, &dead.id);
         assert_eq!(reloaded.status, RunStatus::Failed);
         assert!(reloaded.active.is_empty());
+        assert!(
+            !questions.get(&q.id).unwrap().status.open(),
+            "the failed run's own open question must be settled in the same pass"
+        );
 
         let still_alive = read_run_under(&home, &alive.id);
         assert_eq!(

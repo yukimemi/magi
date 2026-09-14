@@ -527,6 +527,16 @@ pub fn clear_abandoned_active(state: &mut RunState, home: &Path, now: Timestamp)
     }
     state.abandon("fold");
     state.save_under(home)?;
+    // The seat that asked is gone for good now - the same door
+    // `graph::Runner::settle_questions` closes the moment `status` lands
+    // somewhere non-resumable, see that method's own doc. Without this, an
+    // open question the abandoned seat left behind would keep badging the
+    // operator until the next daemon startup's `abandon_settled_questions`
+    // pass happened to notice it, or forever if nothing is running `magi
+    // serve` at all.
+    if let Err(e) = Questions::at(home.join("questions")).settle_run(&state.id, state.status) {
+        tracing::warn!("abandon questions for {}: {e:#}", state.id);
+    }
     Ok(true)
 }
 
@@ -1044,9 +1054,17 @@ mod tests {
         assert!(!fresh.active.is_empty());
         assert_eq!(fresh.status, RunStatus::Implementing);
 
+        let store = Questions::at(home.join("questions"));
+        let q = open_question(&store, &state.id);
+
         assert!(clear_abandoned_active(&mut state, &home, now).unwrap());
         assert!(state.active.is_empty());
         assert_eq!(state.status, RunStatus::Failed);
+        assert!(
+            !store.get(&q.id).unwrap().status.open(),
+            "the abandoned seat's own open question must not keep badging the \
+             operator until some later daemon startup notices it"
+        );
     }
 
     /// Write a whole `run.json` that magi can read, over the given state.
