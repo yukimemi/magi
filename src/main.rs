@@ -1812,14 +1812,67 @@ fn asking_is_not_this_seat_s_job(node: &str) -> Option<String> {
 /// well-formed but wrong (a typo, a mangled Windows extended-path prefix)
 /// would otherwise only surface once the daemon burns a task's attempts and
 /// parks it `held`, as an OS-level error with no mention of `--repo` at all.
+///
+/// A `repo` that does not canonicalize to anything on disk is not
+/// automatically a broken path, though - it is also the shape a short
+/// `owner/repo` (or bare `repo`) name takes, the kind [`crate::talk`]'s
+/// briefing now tells its agent it may use in place of a full path. That
+/// case falls through to [`resolve_repo_by_name`] rather than failing here
+/// outright; a path that *does* exist but turns out not to be a git working
+/// tree is still rejected immediately; scanning `[repos] roots` for it would
+/// only ever match a coincidence.
 async fn resolve_repo(repo: &Path) -> Result<PathBuf> {
-    let canonical = repo
-        .canonicalize()
-        .with_context(|| format!("--repo {} does not exist", repo.display()))?;
-    magi::git::toplevel(&canonical)
-        .await
-        .with_context(|| format!("--repo {} is not a git working tree", canonical.display()))?;
-    Ok(canonical)
+    match repo.canonicalize() {
+        Ok(canonical) => {
+            magi::git::toplevel(&canonical).await.with_context(|| {
+                format!("--repo {} is not a git working tree", canonical.display())
+            })?;
+            Ok(canonical)
+        }
+        Err(_) => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            // `[repos] roots` is a machine fact, most often declared in the
+            // machine config layer - see `repos_cmd`, which reads it the same
+            // way for the same reason.
+            let (cfg, _) = Config::discover(&cwd, None)
+                .with_context(|| format!("--repo {} does not exist", repo.display()))?;
+            resolve_repo_by_name(repo, &cfg.repos.roots)
+        }
+    }
+}
+
+/// Resolve a `--repo` value that is not an existing path at all against
+/// `[repos] roots`'s ghq-layout scan - the same one `magi repos` prints -
+/// letting a caller name a local checkout as `owner/repo` or a bare `repo`
+/// instead of a full path.
+///
+/// A miss or an ambiguous match is refused rather than guessed at: silently
+/// picking one of several checkouts sharing a name would file work against
+/// the wrong repository with nothing on screen to say so, and the whole
+/// point of this path is to save a round trip asking the operator, not to
+/// remove the one case that genuinely needs to ask.
+fn resolve_repo_by_name(repo: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
+    let query = repo.to_string_lossy().replace('\\', "/");
+    let hits: Vec<repos::Repo> = repos::scan(roots)
+        .into_iter()
+        .filter(|r| r.name == query || r.name.rsplit('/').next() == Some(query.as_str()))
+        .collect();
+    match hits.len() {
+        1 => Ok(hits.into_iter().next().expect("exactly one hit").path),
+        0 => bail!(
+            "--repo {} does not exist, and no checkout named `{query}` was found under \
+             [repos] roots",
+            repo.display()
+        ),
+        n => bail!(
+            "--repo `{query}` matches {n} checkouts under [repos] roots ({}); use a full path \
+             or the exact owner/repo name to disambiguate",
+            hits.iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// Who is filing this task.
@@ -2784,6 +2837,57 @@ mod tests {
             .await
             .expect("a well-formed extended path resolves");
         assert_eq!(resolved, canonical);
+    }
+
+    /// Builds `<root>/<host>/<owner>/<repo>` with a `.git` directory -
+    /// exactly what [`repos::scan`] looks for, and cheap enough that these
+    /// tests do not need a real `git init` the way [`scratch_repo`] does.
+    fn ghq_checkout(root: &Path, host: &str, owner: &str, repo: &str) -> PathBuf {
+        let dir = root.join(host).join(owner).join(repo);
+        std::fs::create_dir_all(dir.join(".git")).expect("create checkout");
+        dir
+    }
+
+    #[test]
+    fn resolve_repo_by_name_resolves_a_unique_owner_repo_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = ghq_checkout(tmp.path(), "github.com", "yukimemi", "magi");
+
+        let resolved = resolve_repo_by_name(Path::new("yukimemi/magi"), &[tmp.path().to_owned()])
+            .expect("a unique owner/repo name resolves");
+        assert_eq!(resolved, checkout.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_repo_by_name_resolves_a_unique_bare_repo_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = ghq_checkout(tmp.path(), "github.com", "yukimemi", "magi");
+
+        let resolved = resolve_repo_by_name(Path::new("magi"), &[tmp.path().to_owned()])
+            .expect("a unique bare repo name resolves");
+        assert_eq!(resolved, checkout.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_repo_by_name_refuses_a_bare_name_shared_by_two_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        ghq_checkout(tmp.path(), "github.com", "yukimemi", "magi");
+        ghq_checkout(tmp.path(), "github.com", "someone-else", "magi");
+
+        let err = resolve_repo_by_name(Path::new("magi"), &[tmp.path().to_owned()])
+            .expect_err("an ambiguous name must not pick one silently");
+        assert!(err.to_string().contains("matches 2 checkouts"), "{err:#}");
+
+        // The full owner/repo name for either checkout is unambiguous.
+        resolve_repo_by_name(Path::new("yukimemi/magi"), &[tmp.path().to_owned()])
+            .expect("the qualified name still resolves");
+    }
+
+    #[test]
+    fn resolve_repo_by_name_reports_does_not_exist_when_nothing_matches() {
+        let err = resolve_repo_by_name(Path::new("no-such-repo"), &[])
+            .expect_err("no roots and no match must fail");
+        assert!(err.to_string().contains("does not exist"), "{err:#}");
     }
 
     #[tokio::test]
