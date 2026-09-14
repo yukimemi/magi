@@ -2169,13 +2169,19 @@ async function mutateTask(id, action, button) {
  * The flat, priority-then-recency list stops being readable once a few
  * dozen tasks pile up (in practice: mostly `held`), so it is split into what
  * an operator actually wants to see first: what's running, what's next,
- * what's parked, what's finished. `queued` and `failed` share a section
- * because both are `TaskStatus::runnable` in src/queue.rs - the loop could
- * pick up either next - and the card's own chip/tone/error already tell them
- * apart, so a second section would only duplicate that distinction. */
+ * what's blocked on something else, what's parked, what's finished. `queued`
+ * and `failed` share a section because both are `TaskStatus::runnable` in
+ * src/queue.rs - the loop could pick up either next - and the card's own
+ * chip/tone/error already tell them apart, so a second section would only
+ * duplicate that distinction. */
 const QUEUE_SECTIONS = [
   { key: "running", label: "Running", defaultOpen: true },
   { key: "upnext", label: "Up next", defaultOpen: true },
+  /* Distinct from `held`: a blocked task was not taken out of the loop by
+     hand, it is waiting on another task or question and moves on its own the
+     moment `Task::unblock` clears it - see the dependency graph above the
+     list, which draws exactly this section's tasks. */
+  { key: "blocked", label: "Blocked", defaultOpen: false },
   { key: "held", label: "Held", defaultOpen: false },
   { key: "done", label: "Done", defaultOpen: false },
 ];
@@ -2184,6 +2190,7 @@ function queueSection(task) {
   const status = String(task.status_str || task.status || "");
   if (status === "running") return "running";
   if (status === "queued" || status === "failed") return "upnext";
+  if (status === "blocked") return "blocked";
   if (status === "held") return "held";
   return "done";
 }
