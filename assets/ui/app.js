@@ -3367,8 +3367,13 @@ function renderTalk() {
   }
 
   /* The conversation's real turns are on screen from here on - this is the
-     one place that counts as "the operator saw it". */
-  markTalkRead(talk);
+     one place that counts as "the operator saw it". But a hidden document is
+     not a screen: the change stream keeps this render current even while the
+     tab is backgrounded or the phone is asleep, and that refresh must not
+     silently clear an unread the operator never looked at. The
+     visibilitychange handler below re-renders once the tab is actually
+     looked at again, which is what marks it read. */
+  if (!document.hidden) markTalkRead(talk);
 
   const status = String(talk.status || "open");
   /* The operator's own message, shown immediately and held until the
@@ -5274,7 +5279,13 @@ function wire() {
   /* A phone spends most of its time with the screen off. Asking again on wake
      is what stops the operator reading a snapshot from an hour ago. */
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) loadHealth({ applyRevisions: true });
+    if (document.hidden) return;
+    loadHealth({ applyRevisions: true });
+    /* The talk on screen may already hold turns that arrived - and were
+       fetched - while this tab was hidden, in which case revisions have not
+       moved since and the load above will not touch it. Re-render it
+       directly so `renderTalk`'s now-unguarded markTalkRead sees it. */
+    if (state.route.name === "talk" && state.talkDetail.id) renderTalk();
   });
 }
 
