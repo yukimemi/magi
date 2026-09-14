@@ -2329,9 +2329,20 @@ async fn run_fold(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResul
         .await?
     };
     let removed = match state {
-        Some(mut state) => crate::graph::fold_run(&mut state, true)
-            .await
-            .map_err(|e| ApiError::internal(format!("{e:#}")))?,
+        Some(mut state) => {
+            let removed = crate::graph::fold_run(&mut state, true)
+                .await
+                .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+            // Nothing left to remove is not the same thing as nothing left to
+            // do — see `clean::clear_abandoned_active`'s own doc for the run
+            // this exists for: worktrees already gone, but a killed process
+            // left active seats nobody will ever answer for.
+            if removed.is_empty() {
+                crate::clean::clear_abandoned_active(&mut state, &ui.home, jiff::Timestamp::now())
+                    .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+            }
+            removed
+        }
         None => crate::clean::fold_unreadable(&ui.runs, &ui.worktrees_root, &id)
             .await
             .map_err(|e| ApiError::internal(format!("{e:#}")))?,

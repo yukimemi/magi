@@ -853,7 +853,27 @@ async fn dispatch(command: Command) -> Result<()> {
             // it fails. It is still occupying its run directory and worktree,
             // so fold it wholesale instead.
             let removed = match RunState::load(&id) {
-                Ok(mut state) => fold_run(&mut state, all).await?,
+                Ok(mut state) => {
+                    let removed = fold_run(&mut state, all).await?;
+                    // Nothing left for `fold_run` to remove is not the same
+                    // thing as nothing left to do: a run whose worktrees are
+                    // already gone can still be stuck `implementing` (or
+                    // whichever node) forever if a killed process left active
+                    // seats nobody will ever answer for. See
+                    // `clean::clear_abandoned_active`'s own doc.
+                    if removed.is_empty()
+                        && magi::clean::clear_abandoned_active(
+                            &mut state,
+                            &magi::run::home(),
+                            jiff::Timestamp::now(),
+                        )?
+                    {
+                        println!(
+                            "{id}: no live daemon claims this run; cleared its abandoned active seats"
+                        );
+                    }
+                    removed
+                }
                 Err(e) => {
                     println!(
                         "{id}: state unreadable ({e}); removing the run and its worktree wholesale"

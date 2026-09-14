@@ -957,6 +957,83 @@ fn reclaim_orphaned_running(queue: &Queue, max_attempts: usize) -> Vec<String> {
     reclaimed
 }
 
+/// Find every run whose `run.json` is provably dead — every seat it still
+/// lists as [`crate::run::RunState::active`] has overrun its own timeout, and
+/// no live daemon's heartbeat names the run right now — and fail it, clearing
+/// the leftover active seats so the run stops reading as `implementing` (or
+/// whichever node) forever.
+///
+/// [`reclaim_orphaned_running`] settles the *task* a dead daemon left
+/// `running`, using whatever `run.json` already says — but nothing in that
+/// path, nor in [`reclaim`], ever writes back to the run itself (`reclaim`
+/// stays pure on purpose, see its own doc), so a `run.json` a killed process
+/// never got back to sits exactly where it was left: `active` full of seats
+/// nobody will ever answer for, `status` stuck on whatever node was in
+/// flight. `magi show` already tells an operator this in prose (`no live
+/// daemon claims this run right now`); this is what makes that fact durable
+/// on disk, the same way a task's own `TaskStatus::Running` does not get to
+/// stay stuck once nothing is driving it.
+///
+/// Runs on every poll, not only at startup, for the reason
+/// [`sweep_stale_claims`] and [`reclaim_orphaned_running`] already are: a
+/// daemon up for days must keep noticing a run some other, now-dead, daemon
+/// left behind just as readily as one it trips over on the way up.
+///
+/// Walks `home.join("runs")` directly and reads each `run.json` on its own,
+/// rather than the process-global [`RunState::load`] / [`crate::run::list_ids`] —
+/// the same reason [`crate::clean`]'s housekeeping passes take an explicit
+/// `runs` directory instead: `home` here is a parameter precisely so a test
+/// can point it away from the operator's real history (see [`drive`]'s own
+/// doc), and a scan that fell through to the global home anyway would walk
+/// whichever directory some *other* process or test pinned into that
+/// `OnceLock` first — mutating runs this call was never handed.
+fn reclaim_abandoned_runs(home: &Path, now: Timestamp) -> Vec<String> {
+    let mut abandoned = Vec::new();
+    for entry in std::fs::read_dir(home.join("runs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if !crate::run::is_run_id(&id) {
+            continue;
+        }
+        // Unreadable is `clean::fold_due`'s problem, not this one's — see
+        // that module's docs for why a run this cannot parse is left alone
+        // rather than guessed at. A different schema number is not that: this
+        // touches only `status` and `active`, never a field whose meaning a
+        // schema bump changed, so an old record's values serve this exactly
+        // as well as a current one's (see `clean::read_state`'s own doc for
+        // the same reasoning applied to folding).
+        let Ok(body) = std::fs::read_to_string(entry.path().join("run.json")) else {
+            continue;
+        };
+        let Ok(mut state) = serde_json::from_str::<RunState>(&body) else {
+            continue;
+        };
+        if state.status.done() || !state.active_all_overrun(now) || is_working_on(home, &id, now) {
+            continue;
+        }
+        state.abandon("daemon");
+        if let Err(e) = state.save_under(home) {
+            tracing::warn!("could not persist abandoned run {id}: {e:#}");
+            continue;
+        }
+        // The seat that asked is gone for good now, exactly like any other
+        // door `graph::Runner::settle_questions` closes the moment `status`
+        // lands somewhere non-resumable - see that method's own doc. Nothing
+        // else reaches this one before the next `janitor()` startup pass
+        // (`clean::abandon_settled_questions`), and a daemon that stays up
+        // for days must not leave an open question badging the operator
+        // until it happens to restart.
+        if let Err(e) = Questions::at(home.join("questions")).settle_run(&id, state.status) {
+            tracing::warn!("abandon questions for {id}: {e:#}");
+        }
+        abandoned.push(id);
+    }
+    abandoned
+}
+
 /// Run the loop until Ctrl-C, or until the queue drains with [`Opts::once`].
 ///
 /// A thin wrapper over [`serve_until`] with a stop nothing but Ctrl-C ever
@@ -1270,6 +1347,15 @@ async fn poll(
                  recorded the outcome: {}",
                 reclaimed.len(),
                 reclaimed.join(", ")
+            );
+        }
+        let abandoned_runs = reclaim_abandoned_runs(home, now);
+        if !abandoned_runs.is_empty() {
+            tracing::warn!(
+                "failed {} run(s) left behind by a killed process, past every \
+                 active seat's own timeout: {}",
+                abandoned_runs.len(),
+                abandoned_runs.join(", ")
             );
         }
 
@@ -3125,6 +3211,80 @@ mod tests {
             "a live claim must protect the task it belongs to"
         );
         assert_eq!(queue.get(&queued.id).unwrap().status, TaskStatus::Queued);
+    }
+
+    /// Read a run.json back from an explicit `home`, the same way
+    /// `reclaim_abandoned_runs` itself does - never through the
+    /// process-global `RunState::load`, which this test's own `home` (an
+    /// isolated tempdir, never pinned into the shared `OnceLock`) does not
+    /// use at all.
+    fn read_run_under(home: &Path, id: &str) -> RunState {
+        let body = std::fs::read_to_string(home.join("runs").join(id).join("run.json")).unwrap();
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[test]
+    fn reclaim_abandoned_runs_fails_a_run_whose_active_seats_are_all_provably_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let now = Timestamp::now();
+        let overrun_seat = || crate::run::ActiveSeat {
+            node: "implement".to_owned(),
+            started_at: now - jiff::SignedDuration::new(21_000, 0),
+            timeout_secs: 3_600,
+            attempt: 0,
+        };
+
+        let mut dead = run_state(RunStatus::Implementing);
+        dead.id = "20260101-000000-dead".to_owned();
+        dead.active.insert("impl-A".to_owned(), overrun_seat());
+        dead.save_under(&home).unwrap();
+
+        // Same shape, but a live daemon's heartbeat names it: must be left
+        // exactly alone, however far past its own timeout the seat sits.
+        let mut alive = run_state(RunStatus::Implementing);
+        alive.id = "20260101-000000-aliv".to_owned();
+        alive.active.insert("impl-A".to_owned(), overrun_seat());
+        alive.save_under(&home).unwrap();
+        let mut status = Status::new();
+        status.current = vec![Current {
+            task: "20260101-000000-task".to_owned(),
+            run: alive.id.clone(),
+        }];
+        write_status_to(&home.join("daemon.json"), &status).unwrap();
+
+        // The abandoned seat left an open question behind: nobody is left to
+        // read an answer once the run is failed, and this must not wait for
+        // some later daemon startup's own sweep to notice that.
+        let questions = Questions::at(home.join("questions"));
+        let mut q = ask::Question::new(
+            dead.id.clone(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            "Which storage backend?".to_owned(),
+            String::new(),
+            vec!["SQLite".to_owned(), "Redis".to_owned()],
+        );
+        questions.put(&mut q).unwrap();
+
+        let abandoned = reclaim_abandoned_runs(&home, now);
+        assert_eq!(abandoned, vec![dead.id.clone()]);
+
+        let reloaded = read_run_under(&home, &dead.id);
+        assert_eq!(reloaded.status, RunStatus::Failed);
+        assert!(reloaded.active.is_empty());
+        assert!(
+            !questions.get(&q.id).unwrap().status.open(),
+            "the failed run's own open question must be settled in the same pass"
+        );
+
+        let still_alive = read_run_under(&home, &alive.id);
+        assert_eq!(
+            still_alive.status,
+            RunStatus::Implementing,
+            "a live daemon's claim protects it"
+        );
+        assert!(!still_alive.active.is_empty());
     }
 
     #[test]
