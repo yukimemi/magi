@@ -3996,8 +3996,13 @@ let armedRunDelete = null;
 let armedRunDeleteFocused = null;
 
 function runDeleteReason(run) {
-  const terminal = ["merged", "ready", "stalled", "blocked", "failed"].includes(String(run.status || ""));
-  if (!terminal) {
+  /* `run.live` is whether a daemon's heartbeat currently claims this run
+     (`daemon::is_working_on`), the same check the delete route itself gates
+     on. A non-terminal `status` alone is not proof of that: a killed process
+     leaves it stuck (`implementing`, say) forever with nobody left to answer
+     for it, and blocking delete on `status` read that dead run as still in
+     flight right alongside a genuinely running one. */
+  if (run.live) {
     return "This run is still in flight and cannot be deleted.";
   }
   if (unfolded(run)) {

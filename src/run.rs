@@ -9,7 +9,7 @@
 //! Patches and raw agent transcripts are *not* in `run.json` — they live beside
 //! it under `artifacts/`, so the state file stays small enough to read by hand.
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use jiff::{Timestamp, Zoned};
@@ -942,10 +942,69 @@ impl RunState {
         true
     }
 
-    /// Flush to `run.json`, atomically.
+    /// Does every seat this run still lists as [`Self::active`] sit past its
+    /// own [`ActiveSeat::timeout_secs`]? `false` when nothing is active at
+    /// all — an empty map is not evidence of anything overrunning.
+    ///
+    /// This alone is not proof the run is dead: a seat's own attempt can
+    /// legitimately run a little past its budget while the process driving it
+    /// is still tearing the attempt down. Every caller pairs this with its own
+    /// `!live` reading (`daemon::is_working_on`) before treating the run as
+    /// abandoned — this module cannot check that itself without depending on
+    /// `crate::daemon`, and callers already have to ask that question anyway.
+    #[must_use]
+    pub fn active_all_overrun(&self, now: Timestamp) -> bool {
+        !self.active.is_empty()
+            && self
+                .active
+                .values()
+                .all(|a| a.elapsed_secs(now) > a.timeout_secs as i64)
+    }
+
+    /// Clear every seat this run still lists as active and fail it, unless it
+    /// had already reached a terminal status some other way.
+    ///
+    /// Callers must already have proven this run is dead — [`Self::active_all_overrun`]
+    /// plus their own `!live` reading — before calling this; it does not
+    /// check either itself. Unlike [`Self::clear_active`] (dropping a resumed
+    /// run's own stale wave before repopulating it, called unconditionally at
+    /// the top of every `execute()`), this is a verdict: a run left this way
+    /// has nothing left to repopulate the wave, ever, and must stop reading as
+    /// `implementing` (or whichever node) forever.
+    pub fn abandon(&mut self, by: &str) {
+        let seats: Vec<String> = self.active.keys().cloned().collect();
+        self.clear_active();
+        if !self.status.done() {
+            self.status = RunStatus::Failed;
+        }
+        self.event(
+            by,
+            format!(
+                "abandoned: seat(s) {} left behind by a killed process, past their own \
+                 timeout with no live daemon claiming this run",
+                seats.join(", ")
+            ),
+        );
+    }
+
+    /// Flush to `run.json`, atomically, under the process-global [`home`].
     pub fn save(&mut self) -> Result<()> {
+        let home = home();
+        self.save_under(&home)
+    }
+
+    /// [`Self::save`], rooted at an explicit `home` instead of the
+    /// process-global one.
+    ///
+    /// For a caller that was already handed its own `home` explicitly — a
+    /// housekeeping pass, mainly, for the same reason `Queue::at` and the
+    /// daemon status path are parameters rather than resolved here (see
+    /// `daemon::drive`'s own doc) — falling through to the global would write
+    /// back through whichever directory some *other* process or test pinned
+    /// into that `OnceLock` first, not the one this call was actually handed.
+    pub fn save_under(&mut self, home: &Path) -> Result<()> {
         self.updated_at = Timestamp::now();
-        let dir = self.dir();
+        let dir = home.join("runs").join(&self.id);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         let body = serde_json::to_string_pretty(self).context("serialize run state")?;
         let tmp = dir.join("run.json.tmp");
@@ -1416,6 +1475,78 @@ mod tests {
         assert!(RunStatus::Merged.done());
         assert!(RunStatus::Blocked.done());
         assert!(!RunStatus::Reviewing.done());
+    }
+
+    fn overrun_seat(now: Timestamp, elapsed_secs: i64, timeout_secs: u64) -> ActiveSeat {
+        ActiveSeat {
+            node: "implement".to_owned(),
+            started_at: now - jiff::SignedDuration::new(elapsed_secs, 0),
+            timeout_secs,
+            attempt: 0,
+        }
+    }
+
+    #[test]
+    fn active_all_overrun_requires_every_seat_past_its_own_timeout() {
+        let mut s = state();
+        let now = Timestamp::now();
+        assert!(
+            !s.active_all_overrun(now),
+            "nothing active is not evidence of anything"
+        );
+
+        s.active
+            .insert("impl-A".to_owned(), overrun_seat(now, 21_000, 3_600));
+        assert!(
+            s.active_all_overrun(now),
+            "21000s elapsed against a 3600s budget"
+        );
+
+        // A seat still well within its own budget means the run is not
+        // provably dead, however far its sibling has overrun.
+        s.active
+            .insert("impl-B".to_owned(), overrun_seat(now, 0, 3_600));
+        assert!(!s.active_all_overrun(now));
+    }
+
+    #[test]
+    fn abandon_clears_active_and_fails_a_non_terminal_run() {
+        let mut s = state();
+        s.status = RunStatus::Implementing;
+        let now = Timestamp::now();
+        s.active
+            .insert("impl-A".to_owned(), overrun_seat(now, 21_000, 3_600));
+
+        s.abandon("daemon");
+
+        assert!(s.active.is_empty());
+        assert_eq!(s.status, RunStatus::Failed);
+        assert!(
+            s.events
+                .last()
+                .expect("an event was logged")
+                .message
+                .contains("impl-A"),
+            "the event names the abandoned seat"
+        );
+    }
+
+    #[test]
+    fn abandon_never_overwrites_a_status_already_terminal() {
+        let mut s = state();
+        s.status = RunStatus::Ready;
+        let now = Timestamp::now();
+        s.active
+            .insert("impl-A".to_owned(), overrun_seat(now, 21_000, 3_600));
+
+        s.abandon("daemon");
+
+        assert!(s.active.is_empty());
+        assert_eq!(
+            s.status,
+            RunStatus::Ready,
+            "a run already done must not be relabelled Failed"
+        );
     }
 
     #[test]

@@ -507,6 +507,29 @@ fn resolve_id_path(runs: &Path, prefix: &str) -> Result<String> {
     }
 }
 
+/// `magi fold`'s recovery path for a run whose worktrees are already gone —
+/// so [`crate::graph::fold_run`] removed nothing — but whose `run.json` still
+/// lists active seats nobody is left to answer for: no live daemon claims the
+/// run, and every one of those seats has overrun its own timeout (see
+/// [`RunState::active_all_overrun`]). Clearing them and failing the run is
+/// what lets it be deleted afterward — [`RunState::ensure_can_delete`] only
+/// ever checks whether a live daemon is working on the run and whether its
+/// candidates are folded, not `status`, but a run stuck `implementing`
+/// forever with an empty worktree still reads as unresolved everywhere else
+/// (`magi show`, the deck, the phone) until this runs.
+///
+/// Returns `false` without changing anything when a live daemon still claims
+/// the run, or when some active seat has not actually overrun its budget yet
+/// — a run that is merely between waves must never be guessed at.
+pub fn clear_abandoned_active(state: &mut RunState, home: &Path, now: Timestamp) -> Result<bool> {
+    if crate::daemon::is_working_on(home, &state.id, now) || !state.active_all_overrun(now) {
+        return Ok(false);
+    }
+    state.abandon("fold");
+    state.save_under(home)?;
+    Ok(true)
+}
+
 /// Delete files from the shared build cache until it fits its cap.
 ///
 /// See [`crate::disk::prune_dir`] for the oldest-first policy.
@@ -976,6 +999,54 @@ mod tests {
         let folded = block_on(fold_orphaned_worktrees(&runs, &wt, &home, 0, later));
         assert_eq!(folded, 1, "old enough now, regardless of the zero grace");
         assert!(!wt.join("eeee").exists());
+    }
+
+    #[test]
+    fn clear_abandoned_active_only_acts_once_dead_and_overrun() {
+        let dir = tempfile::tempdir().unwrap();
+        // Harmless if another test in this binary already pinned the global
+        // home first (see `run::set_home`'s own doc): this test only checks
+        // the in-memory mutation `clear_abandoned_active` makes, never a
+        // write that landed under this exact directory.
+        crate::run::set_home(dir.path().to_path_buf());
+        let home = dir.path().to_path_buf();
+        let now = ts("2026-09-14T12:00:00Z");
+        let overrun_seat = || crate::run::ActiveSeat {
+            node: "implement".to_owned(),
+            started_at: now - SignedDuration::new(21_000, 0),
+            timeout_secs: 3_600,
+            attempt: 0,
+        };
+
+        let mut state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            "fixture".to_owned(),
+            crate::config::Config::default(),
+        );
+        state.status = RunStatus::Implementing;
+        state.active.insert("impl-A".to_owned(), overrun_seat());
+
+        // A seat still within its own budget: not provably dead yet, so this
+        // must change nothing.
+        let mut fresh = state.clone();
+        fresh.active.insert(
+            "impl-B".to_owned(),
+            crate::run::ActiveSeat {
+                node: "implement".to_owned(),
+                started_at: now,
+                timeout_secs: 3_600,
+                attempt: 0,
+            },
+        );
+        assert!(!clear_abandoned_active(&mut fresh, &home, now).unwrap());
+        assert!(!fresh.active.is_empty());
+        assert_eq!(fresh.status, RunStatus::Implementing);
+
+        assert!(clear_abandoned_active(&mut state, &home, now).unwrap());
+        assert!(state.active.is_empty());
+        assert_eq!(state.status, RunStatus::Failed);
     }
 
     /// Write a whole `run.json` that magi can read, over the given state.
