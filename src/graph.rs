@@ -733,8 +733,36 @@ impl Runner {
     /// same role [`RunState::judge_skipped`] plays for `judge`: without it a
     /// resumed run whose stage failed would re-run it, and re-spend the
     /// agent calls, on every reentry before `implement`.
+    ///
+    /// Also skipped once any candidate shows implementation progress — the
+    /// exact predicate `implement` itself uses to decide a candidate is no
+    /// longer "todo" (see its own `todo` filter). `advise_attempted` alone
+    /// is not enough: a run created by an older binary that predates this
+    /// field deserializes it as `false` (`#[serde(default)]`), so resuming
+    /// an already-`Implementing`-or-later run under this build would
+    /// otherwise walk straight back through `prep` (a no-op once candidates
+    /// exist) into this node and spawn every advisor seat against worktrees
+    /// `prep` never recreated — after implementation has already started,
+    /// which is exactly the invariant this stage exists to guarantee.
     async fn advise(&mut self) -> Result<()> {
+        let implement_untouched = self
+            .state
+            .candidates
+            .iter()
+            .all(|c| c.commits == 0 && c.failed.is_none() && !c.empty);
         if !self.state.config.graph.advise || self.state.advise_attempted {
+            return Ok(());
+        }
+        if !implement_untouched {
+            self.state.event(
+                "advise",
+                "skipping the design-deliberation stage: at least one \
+                 candidate already shows implementation progress, so this \
+                 run is past the point the stage exists to run before"
+                    .to_owned(),
+            );
+            self.state.advise_attempted = true;
+            self.state.save()?;
             return Ok(());
         }
         let run_id = self.state.id.clone();

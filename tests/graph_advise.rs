@@ -185,3 +185,86 @@ async fn an_unresolvable_advisor_roster_does_not_fail_the_run_and_names_the_run_
     // not a precondition for the rest of the graph.
     assert!(state.status.done());
 }
+
+/// Reported: `advise`'s only reentry guard was `advise_attempted`, which a
+/// run written by a binary that predates the field deserializes as `false`
+/// (`#[serde(default)]`) regardless of how far the run actually got.
+/// Resuming such a run — already past `implement`, worktrees `prep` will not
+/// recreate because its own guard is "candidates non-empty" — walked
+/// straight back into `advise` and sent every advisor seat at a worktree
+/// that no longer existed, after implementation had already happened. The
+/// fix reads candidate progress directly, the same predicate `implement`
+/// itself uses to decide there is nothing left to do.
+#[tokio::test]
+async fn advise_does_not_reenter_once_implementation_has_already_progressed() {
+    let home = common::home_lock().await;
+    let mut fx = fixture_with_advise(home, 2);
+    fx.config.graph.candidates = 1;
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+    assert!(
+        state.candidates[0].commits > 0,
+        "the fixture's candidate must have actually implemented something"
+    );
+    let sketching = |events: &[magi::run::Event]| {
+        events
+            .iter()
+            .filter(|e| e.message.contains("sketching a design in parallel"))
+            .count()
+    };
+    assert_eq!(sketching(&state.events), 1, "advise ran exactly once so far");
+
+    let id = state.id.clone();
+    let run_json = state.dir().join("run.json");
+    drop(runner);
+
+    // Simulate a run written before `advice` / `advise_attempted` existed:
+    // strip both keys back out of the persisted record. `#[serde(default)]`
+    // is exactly what makes this deserialize as `false` / `None`, same as a
+    // genuinely older file would.
+    let raw = std::fs::read_to_string(&run_json).expect("read run.json");
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("parse run.json");
+    value
+        .as_object_mut()
+        .expect("run.json is an object")
+        .remove("advice");
+    value
+        .as_object_mut()
+        .expect("run.json is an object")
+        .remove("advise_attempted");
+    std::fs::write(&run_json, serde_json::to_string_pretty(&value).unwrap())
+        .expect("write run.json");
+
+    // Reenter exactly as `--resume` or the web UI's resume button would.
+    let mut again = Runner::resume(&id).expect("resume");
+    assert!(
+        !again.state.advise_attempted,
+        "the stripped field must read back as false, reproducing the bug's precondition"
+    );
+    again.execute().await.expect("re-execute");
+    let state = &again.state;
+
+    assert!(
+        state.advice.is_none(),
+        "implementation had already progressed, so advise must not run at all: {:?}",
+        state.advice
+    );
+    assert_eq!(
+        sketching(&state.events),
+        1,
+        "advise must not spawn a second advisor wave against a candidate that already implemented: {:?}",
+        state.events
+    );
+    let skipped = state.events.iter().any(|e| {
+        e.node == "advise" && e.message.contains("already shows implementation progress")
+    });
+    assert!(
+        skipped,
+        "the skip must be recorded, not silent: {:?}",
+        state.events
+    );
+}
