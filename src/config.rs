@@ -65,6 +65,22 @@ impl AgentKind {
             Self::Command => "command",
         }
     }
+
+    /// Every kind the roster can name, in display order.
+    ///
+    /// This is what `magi doctor` lists, and it has to be one list rather than
+    /// the same set typed out again wherever a kind is enumerated. The last
+    /// time it was typed out twice, `omp` was added as a roster member and the
+    /// doctor output went on saying the machine had four CLIs - which reads as
+    /// "that agent is not installed" to the person the command exists for.
+    pub const ALL: [Self; 6] = [
+        Self::Claude,
+        Self::Opencode,
+        Self::Antigravity,
+        Self::Codex,
+        Self::Omp,
+        Self::Command,
+    ];
 }
 
 /// How the prompt reaches the agent process.

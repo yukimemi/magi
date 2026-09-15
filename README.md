@@ -94,7 +94,7 @@ cargo install magi-cli
 ```
 
 magi drives *subscription CLIs*, not API keys: `claude`, `opencode`, `agy`,
-`codex`, or
+`codex`, `omp`, or
 any command you point it at. It spends your existing plan and nothing else.
 
 ## Use
