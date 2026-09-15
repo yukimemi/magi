@@ -22,8 +22,10 @@
 //! | `claude` | `--session-id <uuid>` (magi mints it) | `--resume <uuid>` |
 //! | `opencode` | `--format json` reports `sessionID` | `-s <id>` |
 //! | `agy` | `--output-format json` reports `conversation_id` | `--conversation <id>` |
+//! | `codex` | `exec --json` reports `thread.started.thread_id` | `exec … resume <id>` |
+//! | `omp` | `-p --mode=json` reports `id` on its `"type":"session"` line | `--resume <id>` |
 //!
-//! Claude is the only one magi can address before the first turn; the other two
+//! Claude is the only one magi can address before the first turn; the others
 //! report an id back, so [`SeatState::captured_session`] stays `None` until a
 //! turn has completed and [`has_session`] answers honestly instead of
 //! optimistically.
@@ -81,7 +83,7 @@ pub fn has_session(kind: AgentKind, seat: &SeatState, sessions_enabled: bool) ->
     }
     match kind {
         AgentKind::Claude => seat.claude_session.is_some(),
-        AgentKind::Opencode | AgentKind::Antigravity | AgentKind::Codex => {
+        AgentKind::Opencode | AgentKind::Antigravity | AgentKind::Codex | AgentKind::Omp => {
             seat.captured_session.is_some()
         }
         AgentKind::Command => true,
@@ -370,7 +372,7 @@ pub async fn invoke(
     if let Some(session) = extracted.session {
         match spec.kind {
             AgentKind::Claude => seat.claude_session = Some(session),
-            AgentKind::Opencode | AgentKind::Antigravity | AgentKind::Codex => {
+            AgentKind::Opencode | AgentKind::Antigravity | AgentKind::Codex | AgentKind::Omp => {
                 seat.captured_session = Some(session);
             }
             AgentKind::Command => {}
@@ -627,6 +629,41 @@ fn build_command(
                 );
             }
         }
+        AgentKind::Omp => {
+            // `omp` reads the prompt from stdin in print mode (see
+            // `AgentSpec::delivery`), so the whole instruction arrives without
+            // an argv length limit - the same reason codex gets stdin.
+            argv.push("omp".to_owned());
+            argv.push("-p".to_owned());
+            argv.push("--mode=json".to_owned());
+            // `--auto-approve` is required, and is the same trade opencode's
+            // `--auto` makes: it gates *every* permission, reads included, so
+            // without it a non-interactive seat cannot even open the prompt
+            // file magi wrote and drops out of the panel on a permission
+            // rejection. `omp` has no read-only mode of its own, so a judge or
+            // reviewer seat rests on the prompt plus the worktree discipline
+            // (judge worktrees are deleted after the tally, reviewer worktrees
+            // are reset to the commit under review every round) - never on this
+            // flag, and never on a bypass flag.
+            argv.push("--auto-approve".to_owned());
+            if let Some(m) = &spec.model {
+                argv.push("--model".to_owned());
+                argv.push(m.clone());
+            }
+            // Established by hand against omp 18.1.19: `-p --mode=json` reports
+            // the session id on its `"type":"session"` line, and
+            // `--resume <id>` continues that conversation. `--continue` is
+            // deliberately not used - it opens a *new* session rather than the
+            // stored one, which silently loses the seat's memory.
+            if resuming {
+                argv.push("--resume".to_owned());
+                argv.push(
+                    seat.captured_session
+                        .clone()
+                        .expect("has_session checked the id is present"),
+                );
+            }
+        }
         AgentKind::Command => {
             // The operator's own command line, not one of the roster CLIs -
             // there is no flag this function could add on its behalf, so an
@@ -824,6 +861,79 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 text,
                 session,
                 status,
+                quota: None,
+                dropped: None,
+            }
+        }
+        AgentKind::Omp => {
+            // A JSONL event stream. The session id arrives once, on the
+            // `"type":"session"` line that opens the run.
+            //
+            // The answer is the *last* non-empty assistant text block anywhere
+            // in the stream, and neither of the two obvious shortcuts works:
+            //
+            // 1. Do not key on `agent_end`. `omp` emits it only for a run that
+            //    quiesces on a message turn; a turn that ends on a tool call
+            //    (`stopReason: "toolUse"`) ends the run with **no `agent_end`
+            //    line at all**, and the answer is in `message_end` / `turn_end`
+            //    instead. Reading only `agent_end` silently discards a complete
+            //    review - which is exactly what the first hand-written wrapper
+            //    did, three times, before this arm existed.
+            // 2. Do not take the first assistant text. Earlier ones narrate the
+            //    tool loop (sometimes with a single `.`), so the last non-empty
+            //    block is the answer and the one before it is a progress note.
+            //
+            // Every line is parsed independently: a non-JSON line (a CLI
+            // warning, a truncated write) is skipped rather than treated as the
+            // answer, the same way the codex arm treats its tracing prefix.
+            let mut text = String::new();
+            let mut session = None;
+            for line in stdout.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                    continue;
+                };
+                if v.get("type").and_then(|t| t.as_str()) == Some("session") {
+                    session = v.get("id").and_then(|s| s.as_str()).map(str::to_owned);
+                    continue;
+                }
+                // `agent_end` carries the whole thread; `turn_end` and
+                // `message_end` each carry one message. Whichever appears, the
+                // messages are walked the same way.
+                let messages: Vec<&serde_json::Value> = match v.get("type").and_then(|t| t.as_str())
+                {
+                    Some("agent_end") => v
+                        .get("messages")
+                        .and_then(|m| m.as_array())
+                        .map(|m| m.iter().collect())
+                        .unwrap_or_default(),
+                    Some("turn_end") | Some("message_end") => {
+                        v.get("message").into_iter().collect()
+                    }
+                    _ => continue,
+                };
+                for message in messages {
+                    if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                        continue;
+                    }
+                    let Some(parts) = message.get("content").and_then(|c| c.as_array()) else {
+                        continue;
+                    };
+                    for part in parts {
+                        if part.get("type").and_then(|t| t.as_str()) != Some("text") {
+                            continue;
+                        }
+                        if let Some(t) = part.get("text").and_then(|t| t.as_str())
+                            && !t.trim().is_empty()
+                        {
+                            text = t.trim().to_owned();
+                        }
+                    }
+                }
+            }
+            Extracted {
+                text,
+                session,
+                status: None,
                 quota: None,
                 dropped: None,
             }
@@ -1279,6 +1389,137 @@ mod tests {
             "every option precedes the subcommand"
         );
         assert_eq!(resumed.argv.last().map(String::as_str), Some("-"));
+    }
+
+    /// The three things about `omp -p --mode=json` that were established by
+    /// hand against omp 18.1.19 and that a rewrite would silently get wrong.
+    #[test]
+    fn omp_reads_stdin_auto_approves_and_resumes_by_id() {
+        let mut seat = SeatState::new("review-1", "a", 7);
+
+        // 1. Print mode plus JSON, and the prompt on stdin: a judging prompt
+        //    carrying three patches is past the Windows argv cap, so argv
+        //    delivery is not an option for every node.
+        let first = plan_for(AgentKind::Omp, &seat, false);
+        assert!(first.argv.iter().any(|a| a == "-p"));
+        assert!(first.argv.iter().any(|a| a == "--mode=json"));
+        assert_eq!(first.stdin.as_deref(), Some("do the thing"));
+        assert!(
+            !first.argv.iter().any(|a| a == "do the thing"),
+            "the prompt reached argv, where Windows caps it"
+        );
+
+        // 2. `--auto-approve` is required (an unattended seat that stops to ask
+        //    blocks until its node timeout kills it), and it is the *only*
+        //    permission flag: omp has no read-only mode, so the bypass flag
+        //    that would throw away codex's one enforced guarantee must never
+        //    appear here either.
+        for allow_write in [false, true] {
+            let p = plan_for(AgentKind::Omp, &seat, allow_write);
+            assert!(
+                p.argv.iter().any(|a| a == "--auto-approve"),
+                "omp needs --auto-approve even to read (allow_write = {allow_write})"
+            );
+            assert!(
+                !p.argv
+                    .iter()
+                    .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+                "nothing ever asks for the bypass"
+            );
+        }
+
+        // 3. The id omp reports is the only resume token - magi cannot mint it
+        //    up front, so a seat resumes only once a turn has reported one.
+        seat.turns = 1;
+        assert!(!has_session(AgentKind::Omp, &seat, true));
+        assert!(
+            !plan_for(AgentKind::Omp, &seat, true)
+                .argv
+                .iter()
+                .any(|a| a == "--resume")
+        );
+        seat.captured_session = Some("01a09fe9-4e31-7226-85b3-fda6f46689d5".to_owned());
+        let resumed = plan_for(AgentKind::Omp, &seat, true);
+        assert!(
+            resumed
+                .argv
+                .windows(2)
+                .any(|w| w == ["--resume", "01a09fe9-4e31-7226-85b3-fda6f46689d5"]),
+            "a captured id is what makes the next turn a resume"
+        );
+        // `--continue` opens a *new* session instead of the stored one, which
+        // would silently drop the seat's memory.
+        assert!(!resumed.argv.iter().any(|a| a == "--continue"));
+        // stdin still carries the prompt on a resumed turn.
+        assert_eq!(resumed.stdin.as_deref(), Some("do the thing"));
+    }
+
+    /// The extraction trap that cost three complete reviews when it was done by
+    /// hand: a turn that ends on a tool call emits **no** `agent_end` line, so
+    /// keying on `agent_end` finds nothing and the seat reads as one that
+    /// produced no answer at all.
+    #[test]
+    fn omp_takes_the_answer_without_an_agent_end_line() {
+        let stream = concat!(
+            r#"{"type":"session","version":3,"id":"01a09fe9-4e31-7226-85b3-fda6f46689d5","cwd":"C:\\w"}"#,
+            "\n",
+            r#"{"type":"agent_start"}"#,
+            "\n",
+            r#"{"type":"turn_start"}"#,
+            "\n",
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"."}}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"checking"},{"type":"text","text":"."}]}}"#,
+            "\n",
+            r#"{"type":"turn_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"done"},{"type":"text","text":"{\"vote\":\"approve\"}"}]}}"#,
+            "\n",
+        );
+        let out = extract(AgentKind::Omp, stream);
+        assert_eq!(
+            out.text, "{\"vote\":\"approve\"}",
+            "the last assistant text block is the answer even with no agent_end"
+        );
+        assert_eq!(
+            out.session.as_deref(),
+            Some("01a09fe9-4e31-7226-85b3-fda6f46689d5")
+        );
+    }
+
+    /// A stream that *does* carry `agent_end` walks the whole thread, and the
+    /// last non-empty assistant text still wins over the tool-loop narration
+    /// that came before it.
+    #[test]
+    fn omp_walks_agent_end_and_ignores_tool_loop_narration() {
+        let stream = concat!(
+            r#"{"type":"session","version":3,"id":"s1"}"#,
+            "\n",
+            "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"review this\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Looking at the diff…\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"…\"},{\"type\":\"text\",\"text\":\"## 判定\\n\\n問題ありません。\"}]}]}",
+            "\n",
+        );
+        let out = extract(AgentKind::Omp, stream);
+        assert_eq!(
+            out.text, "## 判定\n\n問題ありません。",
+            "the narration is not the answer, and non-ASCII survives intact"
+        );
+        assert_eq!(out.session.as_deref(), Some("s1"));
+    }
+
+    /// A line that is not JSON - a CLI warning, a half-written line - is
+    /// skipped rather than becoming the answer.
+    #[test]
+    fn omp_skips_non_json_lines() {
+        let stream = concat!(
+            "Warning: some omp notice\n",
+            r#"{"type":"session","version":3,"id":"s2"}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"the answer"}]}}"#,
+            "\n",
+            "trailing junk",
+            "\n",
+        );
+        let out = extract(AgentKind::Omp, stream);
+        assert_eq!(out.text, "the answer");
+        assert_eq!(out.session.as_deref(), Some("s2"));
     }
 
     /// A real `codex exec --json` stream, tracing prefix included.

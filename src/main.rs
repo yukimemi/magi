@@ -1881,16 +1881,7 @@ async fn task_source(issue: Option<u64>) -> Source {
 async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
     println!("git        {}", probe("git", &["--version"]).await);
     println!("gh         {}", probe("gh", &["--version"]).await);
-    for kind in ["claude", "opencode", "agy", "codex"] {
-        println!(
-            "{kind:<10} {}",
-            if magi::config::which(kind) {
-                "found".to_owned()
-            } else {
-                "not on PATH".to_owned()
-            }
-        );
-    }
+    print!("{}", doctor_agents());
 
     let toplevel = magi::git::toplevel(repo).await;
     match &toplevel {
@@ -2006,6 +1997,41 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// The agent-CLI section of `magi doctor`: one row per kind the roster can
+/// name, saying whether its program is on `PATH`.
+///
+/// The list comes from [`magi::config::AgentKind::ALL`] rather than being typed
+/// out here, which is what keeps a newly added kind from being silently absent
+/// from the one command an operator runs to find out what is installed. A
+/// `command` seat has no fixed program - its executable is whatever the config
+/// names - so it is listed under `agent` and is never reported missing.
+fn doctor_agents() -> String {
+    let mut s = String::new();
+    for kind in magi::config::AgentKind::ALL {
+        match kind.program() {
+            Some(program) => {
+                let _ = writeln!(
+                    s,
+                    "{program:<10} {}",
+                    if magi::config::which(program) {
+                        "found"
+                    } else {
+                        "not on PATH"
+                    }
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    s,
+                    "{:<10} configured per repo (no fixed program)",
+                    kind.as_str()
+                );
+            }
+        }
+    }
+    s
+}
+
 /// The queue and loop section of `magi doctor`: how much work is backed up,
 /// whether `magi serve` is the one moving it, and how far this build's view
 /// of the runs directory can be trusted.
@@ -2108,8 +2134,8 @@ fn doctor_queue_and_loop(home: &Path) -> String {
 async fn probe(program: &str, args: &[&str]) -> String {
     match tokio::process::Command::new(program)
         .args(args)
-        // `magi doctor` probes five CLIs; unquieted that is five console
-        // windows blinking past on Windows.
+        // `magi doctor` probes every agent CLI in the roster; unquieted that is
+        // one console window per kind blinking past on Windows.
         .quiet()
         .output()
         .await
@@ -2403,6 +2429,28 @@ mod tests {
         assert!(!text.contains("held"), "nothing to release: {text}");
         assert!(text.contains("loop       not running"), "{text}");
         assert!(text.contains("unreadable 0"), "{text}");
+    }
+
+    /// Every kind the roster can name is listed by the command an operator runs
+    /// to find out what this machine has. When the list lived here as four
+    /// strings, adding `omp` to the roster left it invisible in `magi doctor` -
+    /// which reads as "not installed" to the person asking.
+    #[test]
+    fn doctor_lists_every_agent_kind_the_roster_can_name() {
+        let text = doctor_agents();
+        for kind in magi::config::AgentKind::ALL {
+            let name = kind.program().unwrap_or(kind.as_str());
+            assert!(
+                text.lines().any(|l| l.starts_with(name)),
+                "{name} is missing from the doctor roster:\n{text}"
+            );
+        }
+        // A `command` seat's program is whatever the repo config names, so it
+        // must not be reported as missing from PATH.
+        assert!(
+            text.contains("configured per repo"),
+            "a command seat has no fixed program to probe:\n{text}"
+        );
     }
 
     fn task(status: TaskStatus) -> Task {
