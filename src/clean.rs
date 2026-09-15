@@ -95,21 +95,13 @@ pub async fn housekeep(
             tracing::warn!("housekeep: prune worktree registrations: {e:#}");
         }
     }
-    // A cap of `0` is the operator's opt-out (see `Disk::cache_limit_bytes`);
-    // `prune_dir`'s `over_limit` cannot distinguish "cap of zero" from "cache
-    // must be emptied", so the opt-out is handled here, before the cache is
-    // ever measured - the same place `disk_gate` handles a zero
-    // `min_free_bytes`.
-    if cfg.disk.cache_limit_bytes > 0 {
-        if let Some(cache) = cfg.cache_dir() {
-            match prune_cache(&cache, cfg.disk.cache_limit_bytes) {
-                Ok(pruned) => {
-                    out.cache_files = pruned.files;
-                    out.cache_freed = pruned.freed;
-                }
-                Err(e) => tracing::warn!("housekeep: prune cache: {e:#}"),
-            }
+    match prune_cache_if_over_limit(cfg) {
+        Ok(Some(pruned)) => {
+            out.cache_files = pruned.files;
+            out.cache_freed = pruned.freed;
         }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("housekeep: prune cache: {e:#}"),
     }
     // Unconditional, unlike the two passes above: this is not a disk policy
     // with a cap or an opt-out, it is closing a gap `graph::Runner` itself
@@ -547,6 +539,24 @@ pub fn prune_cache(cache: &Path, limit_bytes: u64) -> Result<Prune> {
     prune_dir(cache, limit_bytes)
 }
 
+/// [`prune_cache`], but resolving the operator's opt-out and missing
+/// `CARGO_TARGET_DIR` first — the same two checks [`housekeep`]'s idle pass
+/// makes before ever measuring the cache, factored out so
+/// [`crate::daemon`]'s between-runs check (see the module's own doc for why
+/// congestion can make "idle" arrive too rarely to matter) makes them
+/// identically rather than growing its own copy that could drift. `Ok(None)`
+/// covers both a cap of `0` (see the module docs on `cache_limit_bytes`) and
+/// a config that renders no `CARGO_TARGET_DIR` to aggregate at all.
+pub fn prune_cache_if_over_limit(cfg: &crate::config::Config) -> Result<Option<Prune>> {
+    if cfg.disk.cache_limit_bytes == 0 {
+        return Ok(None);
+    }
+    let Some(cache) = cfg.cache_dir() else {
+        return Ok(None);
+    };
+    prune_cache(&cache, cfg.disk.cache_limit_bytes).map(Some)
+}
+
 /// The cache's path, size and cap, for `magi cache show` and the health view.
 /// `None` when the config declares no `CARGO_TARGET_DIR` to aggregate.
 ///
@@ -675,6 +685,43 @@ mod tests {
         assert_eq!(out.files, 1, "the big one alone gets under the cap");
         assert_eq!(out.remaining, 2);
         assert!(tied.path().join("small").exists());
+    }
+
+    #[test]
+    fn prune_cache_if_over_limit_resolves_the_opt_outs_before_ever_measuring() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("big"), vec![0u8; 10]).unwrap();
+
+        let mut cfg = crate::config::Config::default();
+        cfg.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR={} cargo make check",
+            dir.path().display()
+        )];
+
+        // A cap of `0` is the operator's opt-out: never measured, never
+        // pruned, regardless of what is actually on disk.
+        cfg.disk.cache_limit_bytes = 0;
+        assert_eq!(
+            prune_cache_if_over_limit(&cfg).unwrap(),
+            None,
+            "a zero cap must not even look at the directory"
+        );
+        assert!(dir.path().join("big").exists());
+
+        // No `CARGO_TARGET_DIR` in either verify command: nothing to
+        // aggregate, so there is nothing to prune either.
+        let mut no_cache = crate::config::Config::default();
+        no_cache.disk.cache_limit_bytes = 1;
+        assert_eq!(prune_cache_if_over_limit(&no_cache).unwrap(), None);
+
+        // Over the cap and configured: pruned exactly like `prune_cache`
+        // itself would.
+        cfg.disk.cache_limit_bytes = 1;
+        let pruned = prune_cache_if_over_limit(&cfg)
+            .unwrap()
+            .expect("a real cache dir over its cap prunes");
+        assert_eq!(pruned.files, 1);
+        assert!(!dir.path().join("big").exists());
     }
 
     /// Pin a file's mtime, so a test asserts the policy and not the runner's

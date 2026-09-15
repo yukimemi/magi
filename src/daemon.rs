@@ -1254,6 +1254,19 @@ fn land_resume_state(task: &Task) -> LandResume {
 /// fraction of a second, not within the next multi-second poll.
 const RECHECK_WHILE_BUSY: Duration = Duration::from_millis(200);
 
+/// How often [`poll`] rechecks the shared build cache against its cap at a
+/// boundary between runs (see [`maybe_prune_cache_between_runs`]), instead of
+/// waiting for the queue to run dry.
+///
+/// A queue that never empties means the `janitor` call at the bottom of this
+/// loop's fully-idle branch can go unreached for as long as the backlog
+/// lasts. Five minutes is far below a single gate's own 1200s timeout, so a
+/// cache that started the day at its 10 GiB cap cannot grow anywhere near the
+/// 81.8 GiB an idle-only check let it reach before this existed, and it is
+/// well above the cost of a `dir_size` walk over a multi-gigabyte cache, so a
+/// backlog of short tasks does not pay for that walk on every poll.
+const CACHE_CHECK_INTERVAL_SECS: u64 = 5 * 60;
+
 /// Frees one attempt's concurrency slot - `Stop`'s busy count and its entry
 /// in `Status::current` - on drop, so both are released even if the attempt
 /// panics rather than returning.
@@ -1311,6 +1324,9 @@ async fn poll(
     let quota_cooldown_until: Arc<Mutex<Option<Timestamp>>> = Arc::new(Mutex::new(None));
     let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     let mut conductor = Conductor::new();
+    // See `maybe_prune_cache_between_runs`'s own doc: this is the cache check
+    // a congested queue would otherwise starve of the fully-idle branch below.
+    let mut cache_last_checked: Option<Timestamp> = None;
 
     while !stop.stopped() {
         lock(status).polls += 1;
@@ -1338,6 +1354,15 @@ async fn poll(
         // must still see that it was stranded rather than only its mechanical
         // terminal state.
         let now = Timestamp::now();
+
+        // No run this daemon spawned is mid-compile right now, whether or
+        // not another candidate is about to start - see
+        // `maybe_prune_cache_between_runs`'s own doc for why this cannot
+        // wait for the queue to run dry.
+        if !stop.busy_now() {
+            maybe_prune_cache_between_runs(&opts.repo, opts, &mut cache_last_checked, now).await;
+        }
+
         let stalled = stalled_tasks(queue, home, now);
         let stalled_ids: std::collections::BTreeSet<_> =
             stalled.iter().map(|task| task.id.clone()).collect();
@@ -1765,6 +1790,59 @@ fn prepare(repo: &Path, opts: &Opts) -> Result<Config> {
         config.merge.mode = merge_mode(mode)?;
     }
     Ok(config)
+}
+
+/// Prune the shared build cache back under its cap at a safe boundary
+/// between runs, so a queue that never empties - and so never reaches
+/// [`poll`]'s fully-idle branch, where the ordinary [`janitor`] pass lives -
+/// does not leave the cache to grow unchecked for as long as the backlog
+/// lasts.
+///
+/// Called from [`poll`] only when `stop.busy_now()` is already `false`: the
+/// same liveness fact the idle branch's own janitor call rests on - no run
+/// this daemon spawned is still mid-compile - so pruning here races nothing.
+/// The caller must not call this while a run is in flight; there is no
+/// second check inside this function, on purpose, because there is nothing
+/// left to check that `busy_now()` has not already answered.
+///
+/// Rate-limited by [`CACHE_CHECK_INTERVAL_SECS`] rather than run on every
+/// poll: a busy loop reaches this the instant one run's `InFlightGuard` drops
+/// and the next has not yet claimed a task, which can be every few
+/// milliseconds, and re-walking a multi-gigabyte cache that often would cost
+/// more than the growth it is guarding against.
+async fn maybe_prune_cache_between_runs(
+    repo: &Path,
+    opts: &Opts,
+    last_checked: &mut Option<Timestamp>,
+    now: Timestamp,
+) {
+    if !cache_check_due(*last_checked, now, CACHE_CHECK_INTERVAL_SECS) {
+        return;
+    }
+    *last_checked = Some(now);
+    let cfg = match prepare(repo, opts) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!("cache check: no config: {e:#}");
+            return;
+        }
+    };
+    match clean::prune_cache_if_over_limit(&cfg) {
+        Ok(Some(pruned)) if pruned.files > 0 => tracing::info!(
+            "housekeep: pruned {} file(s) ({} bytes) from the shared cache between runs",
+            pruned.files,
+            pruned.freed
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("housekeep: prune cache: {e:#}"),
+    }
+}
+
+/// Whether [`maybe_prune_cache_between_runs`] should re-measure the cache
+/// now, given when it last did (if ever). Pure, so the cadence is asserted
+/// directly rather than by waiting out real minutes in a test.
+fn cache_check_due(last_checked: Option<Timestamp>, now: Timestamp, interval_secs: u64) -> bool {
+    last_checked.is_none_or(|last| clean::due(now, last, interval_secs))
 }
 
 /// The disk janitor, with its housekeeping logged rather than fatal.
@@ -3996,6 +4074,179 @@ mod tests {
             questions.get(&question.id).unwrap().status,
             ask::QuestionStatus::Abandoned,
             "an empty --once drain still performs startup question cleanup"
+        );
+    }
+
+    #[test]
+    fn cache_check_due_fires_immediately_then_waits_out_its_own_interval() {
+        let t0 = "2026-09-15T00:00:00Z".parse::<Timestamp>().unwrap();
+
+        assert!(
+            cache_check_due(None, t0, CACHE_CHECK_INTERVAL_SECS),
+            "never checked before: due at once"
+        );
+
+        let one_sec_later = t0 + jiff::SignedDuration::from_secs(1);
+        assert!(
+            !cache_check_due(Some(t0), one_sec_later, CACHE_CHECK_INTERVAL_SECS),
+            "well inside the interval: not due yet"
+        );
+
+        let at_the_edge = t0 + jiff::SignedDuration::from_secs(CACHE_CHECK_INTERVAL_SECS as i64);
+        assert!(
+            !cache_check_due(Some(t0), at_the_edge, CACHE_CHECK_INTERVAL_SECS),
+            "exactly at the edge: not yet due, same convention as `clean::due`"
+        );
+
+        let past_it = t0 + jiff::SignedDuration::from_secs(CACHE_CHECK_INTERVAL_SECS as i64 + 1);
+        assert!(
+            cache_check_due(Some(t0), past_it, CACHE_CHECK_INTERVAL_SECS),
+            "past the interval: due again"
+        );
+    }
+
+    /// A `magi.toml` whose `[verify] gate` names `cache_dir` as its shared
+    /// `CARGO_TARGET_DIR`, capped at `limit_bytes`, plus a repository path
+    /// that is never created - the fixtures [`maybe_prune_cache_between_runs`]
+    /// and the congestion test below both need, and must not drift apart.
+    fn cache_check_opts(dir: &Path, cache_dir: &Path, limit_bytes: u64) -> Opts {
+        let config = dir.join("magi.toml");
+        // A literal (single-quoted) TOML string, not a basic one: the cache
+        // path is a Windows path full of backslashes, and a basic string
+        // would have TOML try to interpret `\U` (from `\Users\...`) as a
+        // Unicode escape and fail to parse - the same trap `magi.toml`'s own
+        // `{{ vars.cache }}` rendering documents.
+        std::fs::write(
+            &config,
+            format!(
+                "[disk]\nmin_free_bytes = 0\nauto_fold = false\ncache_limit_bytes = {limit_bytes}\n\n\
+                 [verify]\ngate = ['CARGO_TARGET_DIR={} cargo make check']\n",
+                cache_dir.display()
+            ),
+        )
+        .unwrap();
+        Opts {
+            config: Some(config),
+            repo: dir.join("repo"),
+            ..Opts::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn maybe_prune_cache_between_runs_reprunes_only_once_its_own_interval_elapses() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("a"), vec![0u8; 10]).unwrap();
+        let opts = cache_check_opts(dir.path(), &cache_dir, 1);
+
+        let mut last_checked = None;
+        let t0 = "2026-09-15T00:00:00Z".parse::<Timestamp>().unwrap();
+        maybe_prune_cache_between_runs(&opts.repo, &opts, &mut last_checked, t0).await;
+        assert_eq!(
+            crate::disk::dir_size(&cache_dir),
+            0,
+            "over the cap on the first check ever: pruned at once, no idle queue required"
+        );
+        assert_eq!(last_checked, Some(t0));
+
+        // A fresh oversized file lands, but the next check is not due yet.
+        std::fs::write(cache_dir.join("b"), vec![0u8; 10]).unwrap();
+        let too_soon = t0 + jiff::SignedDuration::from_secs(1);
+        maybe_prune_cache_between_runs(&opts.repo, &opts, &mut last_checked, too_soon).await;
+        assert_eq!(
+            crate::disk::dir_size(&cache_dir),
+            10,
+            "too soon since the last check: left alone rather than rescanned every call"
+        );
+        assert_eq!(
+            last_checked,
+            Some(t0),
+            "an idle check does not reset the clock"
+        );
+
+        // Once the interval elapses, the same oversized cache is caught again.
+        let due_again = t0 + jiff::SignedDuration::from_secs(CACHE_CHECK_INTERVAL_SECS as i64 + 1);
+        maybe_prune_cache_between_runs(&opts.repo, &opts, &mut last_checked, due_again).await;
+        assert_eq!(
+            crate::disk::dir_size(&cache_dir),
+            0,
+            "due again: pruned back under the cap"
+        );
+    }
+
+    /// The regression this whole change exists for: gate timeouts on runs
+    /// 52da/2f7f/5991/0915 traced back to the shared cache sitting at 81.8
+    /// GiB against a 10 GiB cap, because the operator's queue never had a
+    /// quiet moment for `poll`'s fully-idle branch to reach the ordinary
+    /// `janitor` pass.
+    ///
+    /// Reproduced here with a task whose repository is never created:
+    /// `Runner::start` fails at `git::toplevel` in a few milliseconds,
+    /// spawning no agent CLI, so the task keeps failing and re-queuing
+    /// (`Task::fail` with attempts still under the budget leaves it
+    /// `Failed`, which `TaskStatus::runnable` still offers) for as long as
+    /// the loop keeps polling - exactly the "queue with no idle moment"
+    /// this task describes, produced without a real competition.
+    #[tokio::test]
+    async fn cache_prune_reaches_a_queue_that_never_goes_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("stale"), vec![0u8; 4096]).unwrap();
+
+        let mut opts = cache_check_opts(dir.path(), &cache_dir, 1);
+        opts.poll = Duration::from_millis(20);
+        opts.max_attempts = 1_000;
+
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut t = Task::new(
+            "x".to_owned(),
+            "x".to_owned(),
+            opts.repo.clone(),
+            Source::Human,
+        );
+        queue.put(&mut t).unwrap();
+
+        let home = dir.path().join("home");
+        let worktrees = dir.path().join("wt");
+        let status_file = home.join("daemon.json");
+        let stop = Stop::new();
+        let stopper = {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                stop.stop();
+            })
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            drive(&opts, &queue, &status_file, &home, &worktrees, &stop),
+        )
+        .await
+        .expect("the loop must not hang on a queue that keeps producing failing work")
+        .expect("the loop's own setup and teardown must not fail");
+        stopper.await.unwrap();
+
+        let after = queue.get(&t.id).unwrap();
+        assert!(
+            after.attempts >= 2,
+            "the harness must actually have retried more than once, or this is not \
+             exercising a busy queue at all (got {} attempt(s))",
+            after.attempts
+        );
+        assert!(
+            after.status.runnable(),
+            "still under its attempt budget: the queue never reached a natural idle \
+             on its own, only the external stop ended the test"
+        );
+
+        assert_eq!(
+            crate::disk::dir_size(&cache_dir),
+            0,
+            "an oversized cache must not be left to grow unboundedly just because the \
+             queue kept the loop busy the whole time"
         );
     }
 
