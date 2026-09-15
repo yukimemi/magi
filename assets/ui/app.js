@@ -3979,6 +3979,7 @@ function renderRunDetail() {
   renderAsks(run);
   renderLand(run);
   renderActive(run);
+  renderAdvise(run);
   renderVerdict(run);
   renderCandidates(run);
   renderReviews(run);
@@ -4270,6 +4271,147 @@ function firstLine(text) {
     if (trimmed) return trimmed.length > 96 ? `${trimmed.slice(0, 95)}\u2026` : trimmed;
   }
   return "";
+}
+
+/* `advise::Reflection` on the wire: "strong" | "faint" | "absent". Not the
+   three-colour vote/severity scale reused elsewhere — this is about how
+   much of a proposal survived into the synthesis, not a verdict on it, so
+   "absent" (the seat produced no proposal at all) gets the same rust as a
+   failure elsewhere, but "faint" reads as a quieter gold than a reviewer's
+   finding does. */
+function reflectionTone(reflection) {
+  switch (reflection) {
+    case "strong": return "teal";
+    case "faint": return "gold";
+    case "absent": return "rust";
+    default: return null;
+  }
+}
+
+function reflectionLabel(reflection) {
+  switch (reflection) {
+    case "strong": return "reflected in the brief";
+    case "faint": return "barely reflected";
+    case "absent": return "no proposal";
+    default: return String(reflection || "");
+  }
+}
+
+/* The design-deliberation stage's own convergence diagram. Deliberately not
+   `convergeDiagram`: that one draws a single gold diamond at the point where
+   one candidate is chosen over the others, and this stage does the opposite
+   — it blends every seat's proposal into one brief, so the merge point is a
+   plain filled circle, never a diamond, and every advisor line that produced
+   a proposal survives into it (only a failed seat's line fades to dashed). */
+function adviseConvergeDiagram(records, hasSynthesis) {
+  const width = 320;
+  const height = 132;
+  const midX = width / 2;
+  const knot = 96;
+  const count = Math.max(records.length, 1);
+
+  const labels = records.map((r) => r.seat).filter(Boolean).join(", ");
+  const root = svg("svg", {
+    viewBox: `0 0 ${width} ${height}`,
+    role: "img",
+    "aria-label": records.length
+      ? `${plural(records.length, "advisor", "advisors")} ${labels}${hasSynthesis ? "; blended into a synthesis brief" : "; no synthesis brief produced"}`
+      : "No advisor seats",
+  });
+
+  const span = Math.min(96, (width - 68) / Math.max(count - 1, 1));
+  const xs = records.map((_, i) => midX + (i - (count - 1) / 2) * span);
+
+  records.forEach((record, i) => {
+    const x = xs[i];
+    const tone = candTone(i);
+    const reflection = record.reflection || "absent";
+    const strong = reflection === "strong";
+    const absent = reflection === "absent";
+    const path = x === midX
+      ? `M ${x} 44 L ${x} ${knot}`
+      : `M ${x} 44 C ${x} ${knot - 22}, ${(x + midX) / 2} ${knot - 8}, ${midX} ${knot}`;
+
+    root.append(svg("path", {
+      d: path,
+      fill: "none",
+      stroke: tone,
+      "stroke-width": strong ? 4 : 2.5,
+      "stroke-linecap": "round",
+      "stroke-dasharray": absent ? "3 5" : null,
+      opacity: strong ? 1 : absent ? 0.35 : 0.6,
+    }));
+    root.append(svg("circle", {
+      cx: x, cy: 26, r: 13,
+      fill: absent ? "var(--sunk)" : tone,
+      stroke: tone,
+      "stroke-width": 2,
+      "stroke-dasharray": absent ? "3 3" : null,
+    }));
+    root.append(svg("text", {
+      x, y: 31,
+      "text-anchor": "middle",
+      fill: absent ? tone : "var(--surface)",
+      text: String(i + 1),
+    }));
+  });
+
+  if (hasSynthesis) {
+    root.append(svg("circle", {
+      cx: midX, cy: knot, r: 11,
+      fill: "var(--gold-line)",
+    }));
+    root.append(svg("path", {
+      d: `M ${midX} ${knot + 15} L ${midX} ${height - 8}`,
+      stroke: "var(--gold-line)", "stroke-width": 5, "stroke-linecap": "round",
+    }));
+  } else {
+    /* No brief came of it: the merge point stays hollow, same convention
+       `convergeDiagram` uses for "no verdict yet". */
+    root.append(svg("circle", {
+      cx: midX, cy: knot, r: 10,
+      fill: "none", stroke: "var(--line-2)", "stroke-width": 2, "stroke-dasharray": "3 3",
+    }));
+  }
+
+  return root;
+}
+
+function renderAdvise(run) {
+  const advice = run.advice;
+  const records = advice && Array.isArray(advice.records) ? advice.records : [];
+  show($("run-advise-panel"), records.length > 0);
+  if (records.length === 0) return;
+
+  const proposed = records.filter((r) => r.proposal).length;
+  setText($("advise-count"), `${proposed} of ${plural(records.length, "advisor", "advisors")} proposed`);
+
+  const converge = $("advise-converge");
+  clear(converge);
+  converge.append(adviseConvergeDiagram(records, Boolean(advice.synthesis)));
+
+  const synthesisEl = $("advise-synthesis");
+  show(synthesisEl, Boolean(advice.synthesis));
+  setText(synthesisEl, advice.synthesis || "");
+
+  const list = $("run-advisors");
+  clear(list);
+  records.forEach((record, i) => {
+    list.append(el("li", { class: "cand", style: `--cand-tone: ${candTone(i)}` },
+      el("div", { class: "cand-head" },
+        el("span", { class: "cand-label", text: record.seat || "?" }),
+        el("span", { class: "cand-agent", text: record.agent || "" }),
+        el("span", {
+          class: "tag",
+          "data-tone": reflectionTone(record.reflection),
+          text: reflectionLabel(record.reflection),
+        }),
+      ),
+      record.proposal
+        ? el("p", { class: "cand-summary", text: record.proposal.approach || "" })
+        : el("p", { class: "card-note", text: record.error || "No proposal." }),
+    ));
+  });
 }
 
 function renderVerdict(run) {

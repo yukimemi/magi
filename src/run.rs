@@ -812,6 +812,21 @@ pub struct RunState {
     /// winner to check.
     #[serde(default)]
     pub base_sync: Option<BaseSync>,
+    /// The design-deliberation stage's output, when `[graph] advise` ran it:
+    /// one record per advisor seat, plus the synthesis blended into the
+    /// implementer's prompt. `None` when the stage is off, has not run yet,
+    /// or could not even resolve its seats - see
+    /// [`crate::graph::Runner::advise`].
+    #[serde(default)]
+    pub advice: Option<crate::advise::Advice>,
+    /// Whether the design-deliberation stage has already been attempted this
+    /// run, whatever it produced. The idempotency marker `Runner::advise`
+    /// checks on reentry, the same role [`Self::judge_skipped`] plays for
+    /// `judge` - without it a resumed run whose stage failed (a misconfigured
+    /// `[roles] advisors`, every seat quota'd) would re-run it, and re-spend
+    /// the agent calls, on every single reentry before `implement`.
+    #[serde(default)]
+    pub advise_attempted: bool,
     /// Node log.
     #[serde(default)]
     pub events: Vec<Event>,
@@ -857,6 +872,8 @@ impl RunState {
             active: BTreeMap::new(),
             pr: None,
             base_sync: None,
+            advice: None,
+            advise_attempted: false,
             events: Vec::new(),
         }
     }

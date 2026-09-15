@@ -1077,6 +1077,21 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .converge svg { width: 100%; height: auto; display: block; }
 .converge text { font: 700 13px var(--sans); }
 
+/* The design-deliberation stage's blended brief, shown under its own
+   convergence diagram — a merge point, never the Verdict panel's gold
+   diamond, since this stage blends every seat's idea rather than picking
+   one. */
+.advise-synthesis {
+  margin-top: var(--s3);
+  padding: var(--s3);
+  background: var(--sunk);
+  border-radius: var(--radius);
+  font-size: var(--t3);
+  color: var(--ink-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* ---- candidates -------------------------------------------------------- */
 .cands { display: flex; flex-direction: column; gap: var(--s3); }
 .cand {

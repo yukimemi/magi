@@ -225,6 +225,48 @@ pub struct Position {
     pub tentative: Option<String>,
 }
 
+/// One advisor's independent design proposal, gathered by
+/// `graph::Runner::advise` before a run's implementer seats begin.
+///
+/// No patch and no plan of tool calls - a design proposal is cheap exactly
+/// because it is a few paragraphs an agent can write without touching the
+/// repository, which is what makes running several of them, on every run,
+/// affordable in a way several full implementations were not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Proposal {
+    /// What to do and how, in the advisor's own words.
+    pub approach: String,
+    /// The one tradeoff this design turns on.
+    pub key_tradeoff: String,
+    /// What could go wrong.
+    #[serde(default)]
+    pub risks: Vec<String>,
+    /// Files or modules the design touches.
+    #[serde(default)]
+    pub touches: Vec<String>,
+    /// Why this earns its complexity over the obvious first draft - the
+    /// question that keeps a proposal from being a restatement of the task.
+    pub why_not_naive: String,
+}
+
+impl Proposal {
+    /// Reject a proposal with an empty field that matters, so a malformed or
+    /// lazy answer is retried instead of silently thinning the panel down to
+    /// prose nobody can act on.
+    pub fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("approach", &self.approach),
+            ("key_tradeoff", &self.key_tradeoff),
+            ("why_not_naive", &self.why_not_naive),
+        ] {
+            if value.trim().is_empty() {
+                bail!("`{field}` is empty");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Extract the last balanced JSON object in `text` that parses as `T`.
 ///
 /// Handles fenced blocks, trailing prose, and multiple objects. Strings and
@@ -452,6 +494,31 @@ mod tests {
         .unwrap();
         assert_eq!(f.addressed, ["R1-1-1"]);
         assert_eq!(f.rejected[0].id, "R1-2-1");
+    }
+
+    #[test]
+    fn proposal_parses_with_optional_fields_missing() {
+        let p: Proposal = extract_json(
+            r#"{"approach":"do X","key_tradeoff":"simpler now, slower later","why_not_naive":"the naive version corrupts state under a retry"}"#,
+        )
+        .unwrap();
+        assert!(p.risks.is_empty());
+        assert!(p.touches.is_empty());
+        p.validate()
+            .expect("a proposal with only required fields is valid");
+    }
+
+    #[test]
+    fn proposal_validation_rejects_an_empty_required_field() {
+        let p = Proposal {
+            approach: String::new(),
+            key_tradeoff: "t".to_owned(),
+            risks: Vec::new(),
+            touches: Vec::new(),
+            why_not_naive: "w".to_owned(),
+        };
+        let err = p.validate().unwrap_err();
+        assert!(err.to_string().contains("approach"));
     }
 
     #[test]
