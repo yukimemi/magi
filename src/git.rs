@@ -93,8 +93,17 @@ pub async fn toplevel(path: &Path) -> Result<PathBuf> {
 /// what `[merge] base` exists for. So the check here is narrow on purpose —
 /// a `.jj` directory in `path` or any of its parents — and callers must
 /// consult it only after `toplevel` has already failed.
+///
+/// Walked against the *canonicalized* path, not `path` itself: `Path::parent`
+/// is a lexical operation, so for a relative path like `.` — the default
+/// `--repo` both `magi run` and `magi doctor` pass through unresolved —
+/// stripping components never reaches the real directory on disk one level
+/// up, even when that is exactly where `.jj` lives. `resolve_repo` already
+/// canonicalizes before calling this, so the fallback to `path` itself (when
+/// canonicalization fails, e.g. the path does not exist) never regresses it.
 pub fn jj_without_git_hint(path: &Path) -> Option<String> {
-    let mut dir = Some(path);
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut dir = Some(canonical.as_path());
     while let Some(p) = dir {
         if p.join(".jj").is_dir() {
             // Colocated: `.git` sits right alongside `.jj`, `toplevel` already
@@ -976,6 +985,56 @@ mod tests {
         assert!(
             jj_without_git_hint(&nested).is_some(),
             "the .jj directory a parent up still counts"
+        );
+    }
+
+    /// Serializes every test in this module that changes the process's
+    /// current directory, since it is shared by every thread `cargo test`
+    /// runs the suite on.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores the process's current directory on drop, panic included, so
+    /// a failed assertion mid-test cannot strand every other test in this
+    /// binary inside a temp directory that is about to be deleted.
+    struct CwdGuard {
+        original: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.original).ok();
+        }
+    }
+
+    #[test]
+    fn jj_without_git_hint_resolves_a_relative_path_against_the_real_filesystem() {
+        let _lock = CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+
+        // The default `--repo .` that `magi run` and `magi doctor` pass
+        // through unresolved, from one directory under the workspace root.
+        // `Path::parent` is purely lexical: `Path::new(".").parent()` is
+        // `Some("")` and `Path::new("").parent()` is `None`, so without
+        // canonicalizing first, this never walks past `sub` itself and the
+        // real `.jj` one level up on disk is invisible.
+        let _cwd = CwdGuard::enter(&sub);
+        assert!(
+            jj_without_git_hint(Path::new(".")).is_some(),
+            "a relative `.` one level under the workspace root must still \
+             find the real .jj parent on disk"
         );
     }
 
