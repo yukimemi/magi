@@ -182,8 +182,10 @@ it.** The jj-first form leaves a `.jj` directory and no `.git`, even
 when the repository it forked from is git-colocated — magi is a git
 tool throughout (every run branches, every candidate is a `git
 worktree`) and has no jj code path. `magi run` / `magi review` fail
-outright there, and `magi doctor` names the missing colocated git repo
-instead of running blind. If the change is going through magi, use
+outright there, and `magi doctor` names the missing colocated git repo on
+its `repo` line — while still printing the rest of the report, because
+everything after that line is config rather than git. If the change is
+going through magi, use
 `renri --vcs git add <branch-name> --from origin/main` instead.
 
 **Agents / non-interactive shells:** `renri remove` prints a details
