@@ -76,6 +76,7 @@ already said. magi therefore keeps one CLI conversation per seat:
 | `opencode` | `run --format json` reports `sessionID` | `run -s <id>` | id captured from the event stream |
 | `agy` (Antigravity) | `--output-format json` reports `conversation_id` | `--conversation <id>` | `--print-timeout` is raised to the node budget |
 | `codex` | `exec --json` reports `thread.started.thread_id` | `exec … resume <id>` | `resume` is a subcommand: every option precedes it. The prompt goes on stdin |
+| `omp` (oh-my-pi) | `-p --mode=json` reports `id` on its `"type":"session"` line | `-p … --resume <id>` | the answer is the last non-empty assistant text block: a turn that ends on a tool call emits **no** `agent_end` line to read it from |
 
 When a seat has no live conversation — sessions disabled, or a first turn that
 never reported an id — magi re-sends the full context instead of letting the
@@ -93,7 +94,7 @@ cargo install magi-cli
 ```
 
 magi drives *subscription CLIs*, not API keys: `claude`, `opencode`, `agy`,
-`codex`, or
+`codex`, `omp`, or
 any command you point it at. It spends your existing plan and nothing else.
 
 ## Use

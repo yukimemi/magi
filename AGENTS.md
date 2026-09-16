@@ -497,6 +497,7 @@ docs, and each is asserted in `src/agent.rs` tests:
 | `opencode` | `--format json` → `sessionID` | `-s <id>` | nothing to resume until a turn reported an id |
 | `agy` | `--output-format json` → `conversation_id` | `--conversation <id>` | print mode defaults to a **5 minute** timeout; `--print-timeout` must track the node budget. `--disable-slash-commands` silently disables `--mode`, so magi never passes it |
 | `codex` | `exec --json` → `thread.started.thread_id` | `exec … resume <id>` | `resume` is a **subcommand** and rejects every `exec` option that follows it (`unexpected argument '--sandbox'`), so magi emits all options first and the subcommand last. The prompt goes on stdin, which codex reads only when the prompt argument is `-`. The answer is the **last** `item.completed` whose item is an `agent_message`: earlier ones narrate the tool loop |
+| `omp` | `-p --mode=json` → the `id` on its `"type":"session"` line | `-p … --resume <id>` | a turn that ends on a **tool call** emits **no** `agent_end` line, so the answer has to be the last non-empty assistant text block across `agent_end` / `turn_end` / `message_end` — reading only `agent_end` silently discards a complete review. The prompt goes on stdin. `--continue` opens a *new* session, so it is never used |
 
 `agent::has_session` is the single place that decides whether a follow-up prompt
 may rely on memory. If it says no, the node re-sends full context. Never assume
@@ -525,6 +526,28 @@ fails if it appears.
 Unattended seats also pass `-c approval_policy="never"`: a seat that stops to
 ask blocks until its node timeout kills it, and there is nobody at the
 terminal during a run.
+
+### omp is opencode's shape, and its answer is not where the stream looks
+
+`kind = "omp"` reaches DeepSeek (its models ship in `omp`'s own catalog) and
+`gpt`-class models through the same CLI, but it has **no read-only mode**: like
+opencode, `--auto-approve` gates every permission, reads included, and a
+non-interactive seat without it cannot open its prompt file at all. So magi
+always passes it, and read-only-ness for those seats rests on the prompt plus
+the worktree discipline named above — never on the flag. `--dangerously-bypass-
+approvals-and-sandbox` appears nowhere, exactly as for codex.
+
+The extraction is the part that will be got wrong by anyone reading the event
+names instead of the stream. `omp -p --mode=json` emits `agent_end` **only** for
+a run that quiesces on a message turn; a turn that ends on a tool call
+(`stopReason: "toolUse"`) — which is what the review seats here routinely do —
+ends with no `agent_end` line at all, and the answer is in `message_end` /
+`turn_end` instead. A first hand-written wrapper keyed on `agent_end` and
+silently discarded three complete reviews; `omp_takes_the_answer_without_an_agent_end_line`
+exists so that cannot come back. The answer is the **last** non-empty assistant
+text block, because earlier ones narrate the tool loop (sometimes as a bare
+`.`). `--continue` opens a *new* session rather than the stored one, so resume is
+always `--resume <captured id>`.
 
 ### teravars renders the whole config file
 
