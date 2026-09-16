@@ -542,6 +542,10 @@ main {
 .chip[data-flight="1"]       { background: var(--tint-blue); color: var(--on-blue); border-style: dashed; }
 .chip[data-status="blocked"] { background: var(--tint-rust); color: var(--on-rust); }
 .chip[data-status="failed"]  { background: var(--tint-ink);  color: var(--on-ink); }
+/* unmerged: same "ready" verdict underneath, but `[merge] mode = "none"`
+   means nobody lands it — dashed like `abandoned`, so it reads as
+   deliberately left rather than as the plain `ready` teal chip next to it. */
+.chip[data-status="unmerged"] { background: var(--tint-ink); color: var(--on-ink); border-style: dashed; }
 
 /* stalled: hatched fill and a double border. The panel collapsed on quota —
    the run holds work but reached no verdict, and it must not read as success. */

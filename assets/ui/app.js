@@ -117,6 +117,13 @@ const RUN_STATUS = {
   gating:       { glyph: "\u25b8", tone: "blue", flight: true },
   merged:       { glyph: "\u25c6", tone: "gold", note: "Winner merged." },
   ready:        { glyph: "\u25c7", tone: "teal", note: "Winner passed the gate. Merge was not requested." },
+  /* Same underlying `status: "ready"` as above, but `[merge] mode = "none"`
+     left it there by design: nobody will ever land this branch for you, not
+     even the PR-polling watcher that other "ready" runs may still be headed
+     through. Shown instead of the plain `ready` chip whenever the summary's
+     `unmerged_by_design` says so \u2014 see `updateRunCard` / `renderRunDetail` \u2014
+     so the two cannot be told apart only by reading the note underneath. */
+  unmerged:     { glyph: "\u2296", tone: "ink", note: "Review and gate passed, but merge mode is \"none\": this branch is left unmerged by design and nothing will land it automatically." },
   /* Neither of these names a cause. A stall has several, and the run's own
      last line — shown for finished runs too — says which one it was; quota
      losses are counted separately above, from `losses`, so a note that
@@ -1124,7 +1131,7 @@ function updateRunCard(row, run) {
   /* `waiting` is a field of its own on the summary precisely because the
      status string still names the node the run parked in. It wins: a run
      nobody is working on must not read as one that is being worked on. */
-  const status = run.waiting ? "waiting" : String(run.status || "");
+  const status = run.waiting ? "waiting" : run.unmerged_by_design ? "unmerged" : String(run.status || "");
   const meta = RUN_STATUS[status] || {};
   const parked = isWaiting(run);
   const tone = toneOf(status, RUN_STATUS);
@@ -1261,6 +1268,10 @@ const RUN_SECTIONS = [
 
 function runSection(run) {
   if (run.waiting) return "waiting";
+  // `unmerged_by_design` is still `status: "ready"` on the wire, but nothing
+  // ever lands it, so grouping it under "Landed" would say the opposite of
+  // what happened; it belongs with the other runs that stopped for good.
+  if (run.unmerged_by_design) return "ended";
   const status = String(run.status || "");
   if (status === "merged" || status === "ready") return "landed";
   if (status === "stalled" || status === "blocked" || status === "failed") return "ended";
@@ -1655,7 +1666,7 @@ function updateRunRow(row, run, children) {
     list.append(el("li", {},
       el("a", { class: "run-folded-link", href: `#/runs/${child.id}` },
         el("span", { class: "run-folded-id", text: child.short || shortId(child.id) }),
-        el("span", { class: "run-folded-status", text: child.waiting ? "waiting" : String(child.status || "") }),
+        el("span", { class: "run-folded-status", text: child.waiting ? "waiting" : child.unmerged_by_design ? "unmerged" : String(child.status || "") }),
         el("time", { class: "run-folded-when", text: at.text, title: at.title }),
       ),
     ));
@@ -3948,7 +3959,7 @@ function renderRunDetail() {
      is the state the operator has to act on. */
   const summary = (state.runs || []).find((r) => r.id === run.id);
   const parkedNow = Boolean(summary && isWaiting(summary)) || openFor(run.id).length > 0;
-  const status = parkedNow ? "waiting" : String(run.status || "");
+  const status = parkedNow ? "waiting" : run.unmerged_by_design ? "unmerged" : String(run.status || "");
   const meta = RUN_STATUS[status] || {};
 
   const head = $("run-status");
