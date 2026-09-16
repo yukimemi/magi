@@ -222,7 +222,15 @@ async fn resolve_base(repo: &Path, base_branch: &str, remote: &str) -> Result<St
 impl Runner {
     /// Start a fresh run against `repo`.
     pub async fn start(repo: &Path, instruction: String, config: Config) -> Result<Self> {
-        let repo = git::toplevel(repo).await?;
+        let repo = match git::toplevel(repo).await {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some(hint) = git::jj_without_git_hint(repo) {
+                    bail!("{hint}");
+                }
+                return Err(e);
+            }
+        };
         let missing = agent::missing_programs(&config.agents);
         if !missing.is_empty() {
             bail!(

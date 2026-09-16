@@ -75,6 +75,46 @@ pub async fn toplevel(path: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(out))
 }
 
+/// When `path` cannot be resolved as a git working tree, say so — unless the
+/// real cause is that `path` is a **jj workspace with no colocated git**, in
+/// which case say that instead.
+///
+/// `renri add` (the fleet's worktree tool) can create a jj workspace from a
+/// git-colocated repository without colocating the workspace itself: it has a
+/// `.jj` directory and no `.git`, so `git rev-parse --show-toplevel` fails
+/// with "not a git repository" — a sentence written for a path that was never
+/// a repository at all, not for a jj workspace magi simply cannot enter. This
+/// is the one place that tells the two apart, so `resolve_repo`,
+/// [`crate::graph::Runner::start`] and `magi doctor` cannot drift into three
+/// different wordings.
+///
+/// A *colocated* jj checkout (`.git` alongside `.jj`) never reaches this
+/// function: `toplevel` already succeeds there, because that shape is exactly
+/// what `[merge] base` exists for. So the check here is narrow on purpose —
+/// a `.jj` directory in `path` or any of its parents — and callers must
+/// consult it only after `toplevel` has already failed.
+pub fn jj_without_git_hint(path: &Path) -> Option<String> {
+    let mut dir = Some(path);
+    while let Some(p) = dir {
+        if p.join(".jj").is_dir() {
+            // Colocated: `.git` sits right alongside `.jj`, `toplevel` already
+            // succeeds there, and this is not the problem.
+            if p.join(".git").exists() {
+                return None;
+            }
+            return Some(format!(
+                "{} is a jj workspace, not a git repository — magi needs a \
+                 colocated git repo here. Run `jj git init --colocate` in that \
+                 checkout, or use a git worktree instead: `renri --vcs git add \
+                 <branch> --from origin/main`.",
+                path.display()
+            ));
+        }
+        dir = p.parent();
+    }
+    None
+}
+
 /// Resolve a revision to a full object id.
 pub async fn rev_parse(repo: &Path, rev: &str) -> Result<String> {
     git(repo, &["rev-parse", rev]).await
@@ -910,6 +950,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(still_on, "true");
+    }
+
+    #[test]
+    fn jj_without_git_hint_names_jj_the_missing_git_and_the_way_out() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+
+        let hint = jj_without_git_hint(dir.path()).expect("a bare .jj workspace is detected");
+        assert!(hint.contains("jj"), "{hint}");
+        assert!(hint.contains("--colocate"), "{hint}");
+        assert!(
+            hint.to_lowercase().contains("colocated git"),
+            "must say what is missing: {hint}"
+        );
+    }
+
+    #[test]
+    fn jj_without_git_hint_finds_a_jj_directory_in_a_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        let nested = dir.path().join("sub").join("dir");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert!(
+            jj_without_git_hint(&nested).is_some(),
+            "the .jj directory a parent up still counts"
+        );
+    }
+
+    #[test]
+    fn jj_without_git_hint_stays_quiet_for_an_ordinary_non_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            jj_without_git_hint(dir.path()).is_none(),
+            "a plain directory is not a jj workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn jj_without_git_hint_does_not_fire_on_a_colocated_checkout() {
+        let (_g, repo) = scratch().await;
+        std::fs::create_dir(repo.join(".jj")).unwrap();
+
+        assert!(
+            jj_without_git_hint(&repo).is_none(),
+            "a colocated checkout has .git and works today"
+        );
+        assert!(
+            toplevel(&repo).await.is_ok(),
+            "the colocated checkout must still resolve as a git working tree"
+        );
     }
 
     #[tokio::test]

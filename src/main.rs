@@ -1836,9 +1836,13 @@ async fn resolve_repo(repo: &Path) -> Result<PathBuf> {
     let canonical = repo
         .canonicalize()
         .with_context(|| format!("--repo {} does not exist", repo.display()))?;
-    magi::git::toplevel(&canonical)
-        .await
-        .with_context(|| format!("--repo {} is not a git working tree", canonical.display()))?;
+    if let Err(e) = magi::git::toplevel(&canonical).await {
+        if let Some(hint) = magi::git::jj_without_git_hint(&canonical) {
+            bail!("{hint}");
+        }
+        return Err(e)
+            .with_context(|| format!("--repo {} is not a git working tree", canonical.display()));
+    }
     Ok(canonical)
 }
 
@@ -1884,10 +1888,7 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
     print!("{}", doctor_agents());
 
     let toplevel = magi::git::toplevel(repo).await;
-    match &toplevel {
-        Ok(p) => println!("\nrepo       {}", p.display()),
-        Err(e) => println!("\nrepo       not a git repository: {e}"),
-    }
+    println!("\n{}", doctor_repo_line(repo, &toplevel));
     if let Ok(p) = &toplevel {
         println!(
             "clean      {}",
@@ -1995,6 +1996,23 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
     println!("runs         {}", magi::run::runs_root().display());
     print!("{}", doctor_queue_and_loop(&magi::run::home()));
     Ok(())
+}
+
+/// The `repo` line of `magi doctor`: the resolved working tree, or why it
+/// could not be resolved.
+///
+/// A [`magi::git::jj_without_git_hint`] hit takes priority over the raw git
+/// error, so an operator sitting in a jj workspace with no colocated git
+/// reads what is actually wrong instead of git's generic "not a git
+/// repository" — see that function's doc for why the two are told apart.
+fn doctor_repo_line(repo: &Path, toplevel: &Result<PathBuf>) -> String {
+    match toplevel {
+        Ok(p) => format!("repo       {}", p.display()),
+        Err(e) => match magi::git::jj_without_git_hint(repo) {
+            Some(hint) => format!("repo       {hint}"),
+            None => format!("repo       not a git repository: {e}"),
+        },
+    }
 }
 
 /// The agent-CLI section of `magi doctor`: one row per kind the roster can
@@ -2421,6 +2439,37 @@ mod tests {
         assert!(task_text(&[], Some(&empty), None).await.is_err());
     }
 
+    #[tokio::test]
+    async fn doctor_repo_line_names_jj_for_a_bare_jj_workspace_and_still_lets_doctor_run() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+
+        let toplevel = magi::git::toplevel(dir.path()).await;
+        assert!(toplevel.is_err(), "no .git here, so git cannot resolve it");
+        let line = doctor_repo_line(dir.path(), &toplevel);
+        assert!(line.starts_with("repo       "), "{line}");
+        assert!(line.contains("jj"), "{line}");
+        assert!(line.contains("--colocate"), "{line}");
+
+        // `doctor` degrades gracefully here: everything after the repo line
+        // is config, not git, so a jj-only checkout must not fail the report.
+        magi::run::set_home(dir.path().join("home"));
+        assert!(
+            doctor(dir.path(), None).await.is_ok(),
+            "a jj-only path must not turn `magi doctor` into an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_repo_line_stays_generic_for_an_ordinary_non_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let toplevel = magi::git::toplevel(dir.path()).await;
+        assert!(toplevel.is_err());
+        let line = doctor_repo_line(dir.path(), &toplevel);
+        assert!(line.contains("not a git repository"), "{line}");
+        assert!(!line.contains("jj"), "must not become a catch-all: {line}");
+    }
+
     #[test]
     fn doctor_reports_an_empty_queue_and_no_loop_on_a_fresh_install() {
         let dir = tempfile::tempdir().unwrap();
@@ -2825,6 +2874,22 @@ mod tests {
         assert!(
             err.to_string().contains("not a git working tree"),
             "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_names_jj_when_the_path_is_a_bare_jj_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        let err = resolve_repo(dir.path())
+            .await
+            .expect_err("a jj workspace with no colocated git still cannot resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("jj"), "got: {msg}");
+        assert!(msg.contains("--colocate"), "got: {msg}");
+        assert!(
+            msg.to_lowercase().contains("colocated git"),
+            "must name what is missing: {msg}"
         );
     }
 
