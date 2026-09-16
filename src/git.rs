@@ -988,53 +988,37 @@ mod tests {
         );
     }
 
-    /// Serializes every test in this module that changes the process's
-    /// current directory, since it is shared by every thread `cargo test`
-    /// runs the suite on.
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Restores the process's current directory on drop, panic included, so
-    /// a failed assertion mid-test cannot strand every other test in this
-    /// binary inside a temp directory that is about to be deleted.
-    struct CwdGuard {
-        original: PathBuf,
-    }
-
-    impl CwdGuard {
-        fn enter(dir: &Path) -> Self {
-            let original = std::env::current_dir().unwrap();
-            std::env::set_current_dir(dir).unwrap();
-            Self { original }
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            std::env::set_current_dir(&self.original).ok();
-        }
-    }
-
+    // Symlink-only, mirroring `disk::tests::dir_size_is_zero_for_missing_and_counts_files_without_following_links`:
+    // creating a directory symlink on Windows needs a privilege ordinary CI
+    // runners do not grant, so this regression is unix-only rather than
+    // risking a flaky `windows-latest` job.
+    #[cfg(unix)]
     #[test]
-    fn jj_without_git_hint_resolves_a_relative_path_against_the_real_filesystem() {
-        let _lock = CWD_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn jj_without_git_hint_resolves_a_symlink_before_walking_ancestors() {
+        // `Path::parent` is a purely lexical operation: it strips the last
+        // path component and never dereferences anything, so a path reached
+        // through a symlink has a "lexical parent" that is not necessarily
+        // its real parent directory on disk. That is the same gap that let a
+        // relative `--repo .` - the default `magi run` / `magi doctor` pass
+        // through unresolved - stop one hop short of a real `.jj` up the
+        // tree; a symlink reproduces it deterministically without touching
+        // this process's current directory, which every test in this binary
+        // shares.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".jj")).unwrap();
-        let sub = dir.path().join("sub");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(workspace.join(".jj")).unwrap();
+        let sub = workspace.join("sub");
         std::fs::create_dir(&sub).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&sub, &link).expect("symlink");
 
-        // The default `--repo .` that `magi run` and `magi doctor` pass
-        // through unresolved, from one directory under the workspace root.
-        // `Path::parent` is purely lexical: `Path::new(".").parent()` is
-        // `Some("")` and `Path::new("").parent()` is `None`, so without
-        // canonicalizing first, this never walks past `sub` itself and the
-        // real `.jj` one level up on disk is invisible.
-        let _cwd = CwdGuard::enter(&sub);
+        // Lexically, `link`'s parent is `dir` itself, which has no `.jj` -
+        // only resolving the symlink to its real target (`workspace/sub`)
+        // and walking up from there reaches `workspace`, which does.
         assert!(
-            jj_without_git_hint(Path::new(".")).is_some(),
-            "a relative `.` one level under the workspace root must still \
-             find the real .jj parent on disk"
+            jj_without_git_hint(&link).is_some(),
+            "the real parent reached through the symlink has .jj"
         );
     }
 
