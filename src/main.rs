@@ -2453,7 +2453,16 @@ mod tests {
 
         // `doctor` degrades gracefully here: everything after the repo line
         // is config, not git, so a jj-only checkout must not fail the report.
-        magi::run::set_home(dir.path().join("home"));
+        //
+        // No `run::set_home` here on purpose. It is a process-global `OnceLock`
+        // (the first call in the binary wins), so a call from this test pins
+        // the home every other test in `--bin magi` then reads -
+        // `run_rm_cmd_guards_and_removes` sets its own home and would start
+        // looking for its fixtures under this temp directory instead, failing
+        // on whichever thread scheduled first. That is the exact hazard
+        // `run::set_home`'s own doc names, and it is not needed: `doctor`
+        // writes nothing, and a temp directory with no queue inside is already
+        // the fresh-install case its report is built to describe.
         assert!(
             doctor(dir.path(), None).await.is_ok(),
             "a jj-only path must not turn `magi doctor` into an error"
