@@ -1200,10 +1200,22 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 }
 .dock-item {
   flex: 1;
+  /* A flex item's automatic minimum size is its content's min-content width
+     by default, which a long label (a translation, an accessibility text-size
+     bump, a font substitution) can push past this item's equal share of a
+     390px screen - and unlike a normal block, a fixed-position row has no
+     scrollbar to fall back on, so the item that does not fit is simply
+     invisible past the screen edge instead of wrapping. `min-width: 0` lets
+     the item actually shrink to its share, and the label below truncates
+     with an ellipsis rather than forcing the row wider than the dock. */
+  min-width: 0;
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
   min-height: var(--tap); padding: var(--s2) var(--s1);
   background: none; border: 0; border-top: 2px solid transparent;
   color: var(--ink-3); font: 600 var(--t1)/1 var(--sans); cursor: pointer;
+}
+.dock-item > span:last-child {
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .dock-glyph svg { width: 22px; height: 22px; display: block; }
 .dock-item[aria-current="page"] { color: var(--ink); border-top-color: var(--gold-line); }
