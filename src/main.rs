@@ -11,7 +11,7 @@ use magi::graph::{Runner, fold_run};
 use magi::proc::Quiet as _;
 use magi::queue::{self, Queue, Source, Task, TaskStatus};
 use magi::run::{RunState, RunStatus, is_run_id, latest_id, list_ids, resolve_id};
-use magi::{agent, ask, daemon, report, repos, stats, tui, updater, web};
+use magi::{agent, ask, daemon, land, report, repos, stats, tui, updater, web};
 
 /// Blind multi-agent implementation competition.
 #[derive(Debug, Parser)]
@@ -204,6 +204,15 @@ enum Command {
         /// Also drop the winner's worktree and branch.
         #[arg(long)]
         all: bool,
+        /// Correct a run stuck on a failed automatic merge: the operator (or
+        /// an agent on their behalf) created and merged the pull request by
+        /// hand, and this is its URL. Verified against the forge before
+        /// anything is written - a URL that is not actually merged refuses
+        /// rather than guesses - and only then does `status` and the `merge`
+        /// section get rewritten to match, exactly as the automatic land loop
+        /// would have written them itself.
+        #[arg(long, value_name = "PR_URL")]
+        merged: Option<String>,
     },
     /// Inspect and shrink the shared build cache.
     ///
@@ -925,7 +934,7 @@ async fn dispatch(command: Command) -> Result<()> {
             Ok(())
         }
 
-        Command::Fold { id, all } => {
+        Command::Fold { id, all, merged } => {
             let id = match id {
                 Some(i) => resolve_id(&i)?,
                 None => latest_id().context("no runs yet")?,
@@ -933,9 +942,14 @@ async fn dispatch(command: Command) -> Result<()> {
             // A run whose state file is unreadable (missing, garbage, or an
             // unknown schema) cannot be folded through the graph path: loading
             // it fails. It is still occupying its run directory and worktree,
-            // so fold it wholesale instead.
+            // so fold it wholesale instead. `--merged` has nothing to correct
+            // in that case - there is no `status` or `merge` field to write -
+            // so it refuses instead of silently skipping the correction.
             let removed = match RunState::load(&id) {
                 Ok(mut state) => {
+                    if let Some(url) = merged {
+                        correct_manual_merge(&mut state, &url).await?;
+                    }
                     let removed = fold_run(&mut state, all).await?;
                     // Nothing left for `fold_run` to remove is not the same
                     // thing as nothing left to do: a run whose worktrees are
@@ -957,6 +971,9 @@ async fn dispatch(command: Command) -> Result<()> {
                     removed
                 }
                 Err(e) => {
+                    if merged.is_some() {
+                        bail!("{id}: state unreadable ({e}); cannot correct its merge record");
+                    }
                     println!(
                         "{id}: state unreadable ({e}); removing the run and its worktree wholesale"
                     );
@@ -1079,6 +1096,68 @@ async fn dispatch(command: Command) -> Result<()> {
             updater::run_self_update(yes, check_only, !std::io::stdin().is_terminal()).await
         }
     }
+}
+
+/// Confirm `url` is actually a merged pull request, then rewrite `state`'s
+/// `status` and `merge` exactly as the automatic land loop (`land::land`)
+/// would have written them had magi opened and merged this pull request
+/// itself.
+///
+/// This is `magi fold --merged`'s whole implementation: the operator's
+/// recovery from a merge magi could not finish on its own - a PR title too
+/// long for the GraphQL mutation, `gh pr create` unreachable, a stale token -
+/// closed by hand with a pull request magi never opened and so never
+/// recorded. Reusing `land::land` rather than writing `status`/`merge`
+/// directly keeps this one authoritative: a merged pull request decides
+/// `Step::Done { merged: true }` on the very first read, before any of
+/// `land`'s own checks/fix/rebase machinery can run, which is what makes it
+/// safe to call here even though this pull request was never magi's own.
+/// `land::lifecycle` is checked first and separately so a mistyped or still-
+/// open URL fails loudly without writing anything, rather than handing an
+/// open pull request to the full autonomous loop by accident.
+///
+/// Correcting `status` this way does not run `bump::after_merge`
+/// (`src/bump.rs`): that call is made only from `graph::Runner::run_land`,
+/// which this path never goes through. A release version bump this change
+/// might have earned is therefore not filed automatically and has to be
+/// requested by hand - recorded as an event on the run so the gap is visible
+/// to whoever reads it later, not just to this comment.
+async fn correct_manual_merge(state: &mut RunState, url: &str) -> Result<()> {
+    match land::lifecycle(&state.repo, url).await? {
+        land::PrLifecycle::Merged => {}
+        other => bail!(
+            "{url} is {}, not merged; refusing to record {} as merged on a guess",
+            other.as_str(),
+            state.id
+        ),
+    }
+    let before = state.status;
+    if let Err(e) = land::land(state, url).await {
+        // `land::land` sets `status` to `Landing` and saves before its first
+        // read of the pull request - see its own doc - so a failure here
+        // (a transient `gh` hiccup between the two forge reads this function
+        // makes) can leave the run stuck on that in-between value with
+        // nothing left driving it. Land it on the same terminal shape an
+        // automated `land` failure lands on instead of leaving it stuck.
+        state.status = RunStatus::Blocked;
+        state.event("fold", format!("manual-merge correction failed: {e:#}"));
+        state.save()?;
+        return Err(e).context(format!("confirming the merge of {url}"));
+    }
+    println!(
+        "{}: corrected status {} -> {} from {url}",
+        state.id,
+        before.as_str(),
+        state.status.as_str()
+    );
+    state.event(
+        "fold",
+        "operator recorded this pull request as a manual merge; this run never \
+         re-entered `land`, so `bump::after_merge` did not run for it - a release \
+         bump this change might warrant has to be filed by hand",
+    );
+    state.save()?;
+    Ok(())
 }
 
 /// `magi cache show` and `magi cache clear`.

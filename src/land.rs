@@ -1202,6 +1202,36 @@ pub fn parse_pr(json: &str) -> Result<PrState> {
     })
 }
 
+/// Read just a pull request's lifecycle state - open, merged, or closed -
+/// with none of the checks/reviews/comments [`land`] itself needs to decide
+/// what to do next.
+///
+/// For a caller that only ever wants one fact and must not risk anything
+/// else: `magi fold --merged` uses this to confirm a URL the operator hands
+/// it is actually a merged pull request *before* touching a run's state, so a
+/// typo or a still-open PR fails loudly instead of quietly recording a merge
+/// that never happened.
+pub async fn lifecycle(repo: &Path, pr_url: &str) -> Result<PrLifecycle> {
+    let view = gh(
+        repo,
+        &[
+            "pr".to_owned(),
+            "view".to_owned(),
+            pr_url.to_owned(),
+            "--json".to_owned(),
+            "state".to_owned(),
+        ],
+    )
+    .await?;
+    if !view.0 {
+        bail!("gh pr view {pr_url}: {}", view.1);
+    }
+    // `parse_pr` reads every other field of `GhPr` as its serde default
+    // (empty string, empty vec, zero) when this narrower `--json` selection
+    // does not carry them - harmless, since only `.state` is read back.
+    Ok(parse_pr(&view.1)?.state)
+}
+
 /// Parse `gh api repos/{owner}/{repo}/pulls/<n>/comments` into inline review
 /// comments. No I/O.
 ///
