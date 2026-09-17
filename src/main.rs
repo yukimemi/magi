@@ -11,7 +11,7 @@ use magi::graph::{Runner, fold_run};
 use magi::proc::Quiet as _;
 use magi::queue::{self, Queue, Source, Task, TaskStatus};
 use magi::run::{RunState, RunStatus, is_run_id, latest_id, list_ids, resolve_id};
-use magi::{agent, ask, daemon, land, report, repos, stats, tui, updater, web};
+use magi::{agent, ask, daemon, land, report, repos, stats, triage, tui, updater, web};
 
 /// Blind multi-agent implementation competition.
 #[derive(Debug, Parser)]
@@ -521,6 +521,19 @@ enum TaskCmd {
     Rm {
         /// Task id or unambiguous prefix/suffix.
         id: String,
+    },
+    /// Walk every held task and act on `hold_source`: a machine hold whose
+    /// cause has resolved is put back in line automatically, and anything
+    /// else - an undecidable machine hold, a legacy record with no recorded
+    /// source, or a manual hold sitting stale - gets a question filed for the
+    /// operator instead. `magi serve` already runs this on every idle poll;
+    /// this is the same pass, on demand, for a queue with no daemon watching
+    /// it right now.
+    Triage {
+        /// Config file, applied to every task's own repository. Defaults to
+        /// each task's own `magi.toml` discovery.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -1817,14 +1830,23 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 println!("queue empty");
                 return Ok(());
             }
+            // Only queried once, and only for the human-readable listing:
+            // `--json` stays a faithful dump of `Task` itself, with nothing
+            // triage-specific spliced in that is not on the task's own record.
+            let waiting_on_triage = triage::open_task_ids(&ask::Questions::open());
             for t in &tasks {
                 let attempts = if t.attempts > 0 {
                     format!(" x{}", t.attempts)
                 } else {
                     String::new()
                 };
+                let question = if waiting_on_triage.contains(&t.id) {
+                    "  [triage question open, see `magi answer --list`]"
+                } else {
+                    ""
+                };
                 println!(
-                    "{}  {:<9}{:<4} {:<14} {}",
+                    "{}  {:<9}{:<4} {:<14} {}{question}",
                     t.short(),
                     t.status.as_str(),
                     attempts,
@@ -1867,6 +1889,16 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             }
             for a in &t.answers {
                 println!("answered  {}: {}", a.question, a.answer);
+            }
+            if t.status == TaskStatus::Held
+                && let Some(question) = triage::open_question_for(&ask::Questions::open(), &t.id)
+            {
+                println!(
+                    "question  {} ({}) - {}",
+                    question.short(),
+                    question.choices.join(" / "),
+                    question.summary
+                );
             }
             if let Some(d) = &t.diagnostic {
                 println!("\ndiagnostic\n{d}");
@@ -1959,6 +1991,26 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             t.release();
             q.put(&mut t)?;
             println!("queued {} {}", t.short(), t.title);
+            Ok(())
+        }
+
+        TaskCmd::Triage { config } => {
+            let questions = ask::Questions::open();
+            let report =
+                triage::run_once(&q, &questions, config.as_deref(), jiff::Timestamp::now());
+            if report.is_empty() {
+                println!("nothing to triage");
+                return Ok(());
+            }
+            for id in &report.resumed {
+                println!("resumed  {id} (machine hold resolved)");
+            }
+            for id in &report.answered {
+                println!("applied  {id} (operator's earlier answer)");
+            }
+            for id in &report.asked {
+                println!("asked    {id} - see `magi answer --list`");
+            }
             Ok(())
         }
 
@@ -3590,6 +3642,26 @@ mod tests {
                 assert!(reason.is_empty(), "a bare hold gives no reason");
             }
             other => panic!("expected TaskCmd::Hold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_triage_parses_bare_and_with_an_explicit_config() {
+        let bare = Cli::try_parse_from(["magi", "task", "triage"]).unwrap();
+        match bare.command {
+            Some(Command::Task {
+                command: TaskCmd::Triage { config },
+            }) => assert!(config.is_none()),
+            other => panic!("expected TaskCmd::Triage, got {other:?}"),
+        }
+
+        let with_config =
+            Cli::try_parse_from(["magi", "task", "triage", "--config", "custom.toml"]).unwrap();
+        match with_config.command {
+            Some(Command::Task {
+                command: TaskCmd::Triage { config },
+            }) => assert_eq!(config, Some(PathBuf::from("custom.toml"))),
+            other => panic!("expected TaskCmd::Triage, got {other:?}"),
         }
     }
 
