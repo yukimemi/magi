@@ -1388,6 +1388,18 @@ fn thread_message(summary: &str, detail: &str) -> String {
     }
 }
 
+/// What a chat relay retried from `magi ask --wait` should show the chat, for
+/// a question that has already been asked or threaded at least once before
+/// this call - `--wait` itself carries nothing new. The asking side's own
+/// most recent word: its last `--thread` reply if it has posted one, or the
+/// original `summary`/`detail` if it never has.
+fn current_ask_message(q: &ask::Question) -> String {
+    match q.thread.last() {
+        Some(t) if t.who == ask::Who::Agent => t.body.clone(),
+        _ => thread_message(&q.summary, &q.detail),
+    }
+}
+
 async fn ask_cmd(args: AskArgs) -> Result<()> {
     let AskArgs {
         summary,
@@ -1588,6 +1600,32 @@ async fn ask_wait_cmd(
     // an error, and the answer must come out exactly as it would have if
     // this call's own wait had found it.
     if let Some(answer) = resolved_before_the_wait_even_starts(&q)? {
+        println!("{answer}");
+        return Ok(());
+    }
+
+    // The relay attempted when this question was first asked or threaded is
+    // bounded by `talk::RELAY_TIMEOUT`, well under a chat turn's own hour-long
+    // budget - a chat that has not answered by then has not necessarily
+    // failed, only not finished yet. `--wait` is a fresh process with a fresh
+    // slice of the shell tool's own kill timeout, so it gets to try the relay
+    // again rather than only ever polling the Queue panel from here on;
+    // `relay_conductor_question` itself recognises a retry of the same
+    // question and does not duplicate the conductor's turn for it.
+    let relay_message = current_ask_message(&q);
+    if let Err(e) = talk::relay_conductor_question(
+        &Queue::open(),
+        &talk::Talks::open(),
+        cfg,
+        store,
+        &mut q,
+        &relay_message,
+    )
+    .await
+    {
+        eprintln!("chat relay for question {}: {e:#}", q.short());
+    }
+    if let Some(answer) = q.resolution() {
         println!("{answer}");
         return Ok(());
     }
@@ -2678,6 +2716,25 @@ mod tests {
             String::new(),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn current_ask_message_prefers_the_asking_side_s_latest_thread_reply() {
+        // Nothing threaded yet: the original ask is still the latest word.
+        let mut q = ask_question("does this need a migration?");
+        assert_eq!(current_ask_message(&q), "does this need a migration?");
+
+        // The owner (or a chat relay standing in for them) spoke back without
+        // deciding - the ball is with the asking side now, but its own most
+        // recent word is still the original ask until it replies.
+        q.say("why do you ask?").expect("say");
+        assert_eq!(current_ask_message(&q), "does this need a migration?");
+
+        // Once the asking side has replied on the thread, that reply - not
+        // the original summary/detail - is what a retried relay should show.
+        q.reply("because the schema changed", Vec::new())
+            .expect("reply");
+        assert_eq!(current_ask_message(&q), "because the schema changed");
     }
 
     #[test]

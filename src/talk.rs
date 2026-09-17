@@ -1387,6 +1387,14 @@ fn apply_bridge(questions: &ask::Questions, question: &ask::Question, reply: &st
 /// finds nothing, and the caller's own `Question::answer`/`Question::say`
 /// path proceeds exactly as it always has, notification and Queue panel
 /// included - this is additive, never a replacement for either.
+///
+/// Meant to be called again for the same still-open question - `ask_wait_cmd`
+/// does exactly that on every `magi ask --wait` - because [`RELAY_TIMEOUT`]
+/// bounds any single attempt well under a chat turn's own hour-long budget,
+/// and a chat that has not answered yet by then has not necessarily failed,
+/// only not finished. A repeat call for the same question and message does
+/// not duplicate the conductor's turn in the transcript; see the check
+/// against the talk's last turn inside [`relay_conductor_question_inner`].
 pub async fn relay_conductor_question(
     queue: &Queue,
     talks: &Talks,
@@ -1433,7 +1441,19 @@ async fn relay_conductor_question_inner(
     }
 
     let prompt = conductor_prompt(question, message);
-    record_conductor(&mut talk, talks, &prompt)?;
+    // `magi ask --wait` retries this same relay from a fresh process every
+    // time its own slice runs out with no answer yet - see the doc on the
+    // call in `ask_wait_cmd` - so a prompt identical to the talk's own last
+    // turn means an earlier attempt already recorded this exact question and
+    // was cut off (by `RELAY_TIMEOUT` below) before the chat replied. Record
+    // it again and the transcript gains a duplicate conductor turn every few
+    // minutes for as long as the chat keeps thinking; skip straight to
+    // giving it another turn instead.
+    let already_recorded =
+        matches!(talk.turns.last(), Some(t) if t.who == Who::Conductor && t.body == prompt);
+    if !already_recorded {
+        record_conductor(&mut talk, talks, &prompt)?;
+    }
     // Bounded well under `magi ask`'s own safety margin - see
     // [`RELAY_TIMEOUT`] - rather than `respond`'s own hour-long
     // `turn_timeout`: this call has to return to `ask_cmd` in time for
@@ -2761,6 +2781,88 @@ mod tests {
             after.turns
         );
         assert_eq!(after.turns[0].who, Who::Conductor);
+    }
+
+    /// `magi ask --wait` retries the same relay from a fresh process every
+    /// time its own slice runs out - see the call in `ask_wait_cmd` - and
+    /// must not pile up a fresh conductor turn in the transcript on every
+    /// one of those retries, only ever the one turn the chat is actually
+    /// meant to answer.
+    #[tokio::test]
+    async fn a_retried_relay_does_not_duplicate_the_conductor_turn_and_can_still_succeed() {
+        let (tmp, talks) = store();
+        let questions = ask::Questions::at(tmp.path().join("questions"));
+        let queue = Queue::at(tmp.path().join("queue"));
+        let slow = mock_agent(
+            tmp.path(),
+            "#!/bin/sh\ncat >/dev/null\nsleep 0.2\nprintf 'ANSWER: Redis'\n",
+            BTreeMap::new(),
+        );
+        let cfg = config(slow);
+        let talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        let run_id = "20260904-090000-r006".to_owned();
+        let mut task = Task::new(
+            "cache backend".to_owned(),
+            "cache backend".to_owned(),
+            tmp.path().to_owned(),
+            Source::Agent {
+                run: talk.id.clone(),
+                node: "chat".to_owned(),
+            },
+        );
+        task.runs.push(run_id.clone());
+        queue.put(&mut task).expect("put task");
+
+        let mut question = choice_question(vec!["SQLite".to_owned(), "Redis".to_owned()]);
+        question.run = run_id;
+        questions.put(&mut question).expect("file question");
+
+        let message = "Which storage backend should the cache use?";
+
+        // The first attempt is cut off before the (identical, every time)
+        // mock agent finishes - standing in for a chat that needed longer
+        // than `RELAY_TIMEOUT` allowed.
+        relay_conductor_question_inner(
+            &queue,
+            &talks,
+            &cfg,
+            &questions,
+            &question,
+            message,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("first attempt times out");
+        assert_eq!(talks.get(&talk.id).expect("reload").turns.len(), 1);
+
+        // `magi ask --wait` calling this again with the exact same message -
+        // nothing new was said - must not add a second conductor turn, and
+        // this time the agent gets long enough to actually answer.
+        relay_conductor_question_inner(
+            &queue,
+            &talks,
+            &cfg,
+            &questions,
+            &question,
+            message,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("second attempt succeeds");
+
+        let after = talks.get(&talk.id).expect("reload talk");
+        assert_eq!(
+            after.turns.len(),
+            2,
+            "one conductor turn, one reply - not a duplicated conductor turn: {:?}",
+            after.turns
+        );
+        assert_eq!(after.turns[0].who, Who::Conductor);
+        assert_eq!(after.turns[1].who, Who::Agent);
+
+        let resolved = questions.get(&question.id).expect("reload question");
+        assert_eq!(resolved.resolution().as_deref(), Some("Redis"));
     }
 
     /// [`Talks::guard`] has to serialize a read-modify-write cycle across
