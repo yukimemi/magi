@@ -4236,9 +4236,20 @@ function renderAsks(run) {
 }
 
 function renderLand(run) {
-  const pr = landOf(run);
-  show($("run-land-panel"), Boolean(pr));
-  if (!pr) return;
+  const raw = landOf(run);
+  show($("run-land-panel"), Boolean(raw));
+  if (!raw) return;
+
+  // The run's own status is written the moment the land loop decides the
+  // outcome, but a merge magi performs itself can leave `pr.state` at the
+  // last polled value until observe() runs again - see land.rs's
+  // Step::Merge, and a run recorded before that was fixed stays stale on
+  // disk forever. `run.status` is the more authoritative field once it
+  // says merged, so the panel defers to it rather than repainting a
+  // finished run as still landing.
+  const pr = run.status === "merged" && raw.state !== "merged"
+    ? { ...raw, state: "merged" }
+    : raw;
 
   const box = $("run-land");
   clear(box);
