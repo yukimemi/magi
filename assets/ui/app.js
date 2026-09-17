@@ -437,6 +437,7 @@ function roundRail(pr) {
    which is indistinguishable from "localStorage denied" and just as wrong. */
 const RUNS_COLLAPSE_KEY = "magi-runs-sections";
 const QUEUE_COLLAPSE_KEY = "magi-queue-sections";
+const TALK_READS_KEY = "magi-talk-reads";
 
 /* ---- state ------------------------------------------------------------- */
 const state = {
@@ -476,6 +477,11 @@ const state = {
      panel; this is the answer to that, asked once per question. */
   panelOk: new Map(),
   talks: null,
+  /* Newest agent-turn timestamp the operator has actually seen, per
+     conversation id, kept in localStorage so unread badges survive a
+     reload. A conversation absent from this map has never been opened, so
+     every agent turn in it counts as unread. */
+  talkReads: loadCollapsed(TALK_READS_KEY),
   talkDetail: { id: null, talk: null },
   /* Images picked, pasted or dropped for the *next* `talk-say`, not yet part
      of any turn. Each item is `{ localId, previewUrl, name, status,
@@ -3161,6 +3167,33 @@ function talkOpener(talk) {
   return first ? String(first.body || "") : "";
 }
 
+/* ---- unread -------------------------------------------------------------- *
+ * `state.talkReads` holds one timestamp per conversation: the `at` of the
+ * newest agent turn the operator has actually had on screen. An agent turn
+ * newer than that is unread; a conversation never opened has no entry, so
+ * every agent turn in it counts. The operator's own turns are never
+ * "unread" - they wrote them. */
+function talkUnreadTurns(talk) {
+  const lastRead = Date.parse((talk && state.talkReads[talk.id]) || "") || 0;
+  return talkTurns(talk).filter((turn) =>
+    turn.who === "agent" && (Date.parse(turn.at) || 0) > lastRead);
+}
+
+function talkUnreadCount(talk) {
+  return talk ? talkUnreadTurns(talk).length : 0;
+}
+
+/* Called only once a conversation's real turns are on screen - never from
+   the list, which shows a preview and must not itself clear anything. */
+function markTalkRead(talk) {
+  const turns = talkTurns(talk);
+  const at = turns.length ? turns[turns.length - 1].at : new Date().toISOString();
+  if (state.talkReads[talk.id] === at) return;
+  state.talkReads[talk.id] = at;
+  saveCollapsed(TALK_READS_KEY, state.talkReads);
+  renderTalks();
+}
+
 /* Open first, then newest first - the same ordering `Talks::list` uses on
    the server: what the operator is still using belongs above what they are
    done with. Sorting on `updated_at` instead would lift a conversation to
@@ -3179,6 +3212,7 @@ function createTalkCard() {
   const chipSlot = el("span");
   const thinking = el("span", { class: "tag", "data-tone": "blue", text: "thinking…" });
   const whenSlot = el("time", { class: "card-when" });
+  const unread = el("span", { class: "badge" });
   const title = el("h2", { class: "card-title" });
   const agent = el("span", { class: "repo" });
   const turns = el("span");
@@ -3187,11 +3221,11 @@ function createTalkCard() {
   const last = el("p", { class: "card-event" });
 
   const card = el("a", { class: "card" },
-    el("div", { class: "card-top" }, chipSlot, thinking, whenSlot),
+    el("div", { class: "card-top" }, chipSlot, thinking, whenSlot, unread),
     title, meta, last,
   );
   const row = el("li", {}, card);
-  row.refs = { card, chipSlot, thinking, whenSlot, title, agent, turns, tasks, last };
+  row.refs = { card, chipSlot, thinking, whenSlot, unread, title, agent, turns, tasks, last };
   return row;
 }
 
@@ -3209,6 +3243,14 @@ function updateTalkCard(row, talk) {
   if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
   else r.chipSlot.append(next);
   show(r.thinking, talkIsThinking(talk));
+
+  /* LINE-style at-a-glance: a numbered badge plus a bolder title, both gone
+     the moment the conversation has no unseen agent turns left. */
+  const unread = talkUnreadCount(talk);
+  setText(r.unread, unread > 99 ? "99+" : String(unread));
+  setAttr(r.unread, "aria-label", unread > 0 ? `${unread} unread` : null);
+  show(r.unread, unread > 0);
+  setAttr(r.card, "data-unread", unread > 0 ? "1" : null);
 
   const at = when(talk.updated_at || talk.created_at);
   setText(r.whenSlot, at.text);
@@ -3248,18 +3290,19 @@ function renderTalks() {
   syncList(list, sortTalks(talks), (t) => t.id, createTalkCard, updateTalkCard);
 }
 
-/* The rail and dock carry the same count as Questions' badges: conversations
-   this server currently reports as thinking. The accessible name says what
-   the bare numeral means. */
+/* The rail and dock carry the total unread agent turns across every
+   conversation - not whether one is thinking, which is what the "thinking…"
+   tag on each card is for. The accessible name says what the bare numeral
+   means. */
 function renderTalkIndicators() {
-  const count = (state.talks || []).filter(talkIsThinking).length;
+  const count = (state.talks || []).reduce((sum, talk) => sum + talkUnreadCount(talk), 0);
   for (const id of ["talk-badge-rail", "talk-badge-dock"]) {
     const badge = $(id);
     setText(badge, count > 99 ? "99+" : String(count));
     show(badge, count > 0);
   }
   for (const link of document.querySelectorAll('[data-nav="talks"]')) {
-    setAttr(link, "aria-label", count > 0 ? `Chat, ${count} conversations thinking` : "Chat");
+    setAttr(link, "aria-label", count > 0 ? `Chat, ${count} unread` : "Chat");
   }
 }
 
@@ -3386,6 +3429,15 @@ function renderTalk() {
     renderTalkThumbs();
     return;
   }
+
+  /* The conversation's real turns are on screen from here on - this is the
+     one place that counts as "the operator saw it". But a hidden document is
+     not a screen: the change stream keeps this render current even while the
+     tab is backgrounded or the phone is asleep, and that refresh must not
+     silently clear an unread the operator never looked at. The
+     visibilitychange handler below re-renders once the tab is actually
+     looked at again, which is what marks it read. */
+  if (!document.hidden) markTalkRead(talk);
 
   const status = String(talk.status || "open");
   /* The operator's own message, shown immediately and held until the
@@ -5302,7 +5354,13 @@ function wire() {
   /* A phone spends most of its time with the screen off. Asking again on wake
      is what stops the operator reading a snapshot from an hour ago. */
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) loadHealth({ applyRevisions: true });
+    if (document.hidden) return;
+    loadHealth({ applyRevisions: true });
+    /* The talk on screen may already hold turns that arrived - and were
+       fetched - while this tab was hidden, in which case revisions have not
+       moved since and the load above will not touch it. Re-render it
+       directly so `renderTalk`'s now-unguarded markTalkRead sees it. */
+    if (state.route.name === "talk" && state.talkDetail.id) renderTalk();
   });
 }
 

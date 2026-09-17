@@ -610,6 +610,10 @@ a.card:active { background: var(--sunk); }
   display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--s2);
   font-size: var(--t2); color: var(--ink-2);
 }
+/* A conversation with something unseen reads heavier at a glance, the same
+   way an unread thread does anywhere else - the numbered badge next to it
+   (`.card-top .badge`) carries the count. */
+.card[data-unread] .card-title { font-weight: 800; }
 /* The separator trails its own item rather than leading the next one. When a
    meta line wraps, the dot stays at the end of the previous line instead of
    appearing as a stray bullet under the title. `data-sep` is set by the
