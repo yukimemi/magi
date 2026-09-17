@@ -992,6 +992,11 @@ pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
          # Repository\n\n{repo}\n\n\
          You may look around: read files, run shell commands, search history, \
          run tests - whatever answers the question. {write_policy}\n\n\
+         A short, command-shaped message (\"list\", \"info <id>\", \"show \
+         3cbf\") is almost always the operator asking you to look something \
+         up, not an instruction to file - answer it yourself with `magi \
+         list`, `magi show <id>`, `magi task list`, or the like, the same way \
+         you would answer any other question in this conversation.\n\n\
          # When the operator wants something done\n\n\
          Run:\n\n\
          magi task add --solo --repo {repo} <instruction>\n\n\
