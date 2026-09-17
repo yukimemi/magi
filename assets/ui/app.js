@@ -3141,6 +3141,7 @@ function focusFirstAsk() {
 const MAGI_PREFIX = "magi: ";
 function turnWho(turn) {
   if (turn.who === "agent" && String(turn.body || "").startsWith(MAGI_PREFIX)) return "system";
+  if (turn.who === "conductor") return "conductor";
   return turn.who === "operator" ? "operator" : "agent";
 }
 
@@ -3166,7 +3167,10 @@ function updateTurnRow(row, item) {
   const body = String(turn.body || "");
 
   setAttr(row, "data-who", kind);
-  setText(r.who, kind === "operator" ? "You" : kind === "system" ? "magi" : "Agent");
+  setText(r.who, kind === "operator" ? "You"
+    : kind === "system" ? "magi"
+    : kind === "conductor" ? "Conductor"
+    : "Agent");
 
   /* A turn never changes once it is on disk, so its body is built once. The
      agent's is markdown prose, already parsed server-side, and is rendered as

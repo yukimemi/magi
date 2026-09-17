@@ -1559,6 +1559,15 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
   border: 1px dashed currentColor;
   font-weight: 600;
 }
+/* A question relayed in from a run's `magi ask`, standing apart from both the
+   operator's own bubbles and the chat agent's - a third party in the
+   conversation, not a restatement of either. */
+.turn[data-who="conductor"] {
+  align-self: stretch; max-width: none;
+  background: var(--tint-gold); color: var(--on-gold);
+  border: 1px solid currentColor;
+}
+.turn[data-who="conductor"] .turn-who { color: inherit; opacity: .8; }
 .turn-at { display: block; margin-top: var(--s1); font-size: var(--t1); opacity: .75; }
 
 /* Images attached to a turn, already sent - a row of squares that wraps
