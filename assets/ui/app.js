@@ -1296,6 +1296,42 @@ function matchesRunState(run) {
   return activeRunStateFilter().match(run);
 }
 
+/* runSection() and RUN_STATE_FILTERS read two different fields of a run
+   (status/waiting vs. done/waiting) and are picked independently — the tree
+   on the left and the chips on top — but renderRuns() ANDs them together.
+   Some pairings can never both be true for any run: every "landed"/"ended"
+   run is done by construction, so pairing either with "Active" or "In
+   flight" always yields zero cards, and "flight" (not done, not waiting)
+   can never meet the "waiting" tree section. Checked against a handful of
+   representative (waiting, status) shapes rather than a hand-written table,
+   so a future field added to either side can't silently drift out of sync
+   with this check.
+   `waiting: true` does not imply `done: false`: `RunStatus::resumable()`
+   (mirrored by `ask::Questions::settle_run` on the Rust side) only abandons
+   a run's open question once it lands on Merged, Ready or Failed — Stalled
+   and Blocked are both "done" (`RunStatus::done()`) yet stay resumable, so
+   a run parked there keeps its open question and still reads `waiting:
+   true`. Those two are the only done statuses a waiting run can carry;
+   Merged/Ready/Failed always have their question swept before that status
+   is ever saved. */
+const REPRESENTATIVE_RUN_SHAPES = [
+  { waiting: true, status: "implementing" },
+  { waiting: true, status: "stalled" },
+  { waiting: true, status: "blocked" },
+  { waiting: false, status: "implementing" },
+  { waiting: false, status: "merged" },
+  { waiting: false, status: "ready" },
+  { waiting: false, status: "stalled" },
+  { waiting: false, status: "blocked" },
+  { waiting: false, status: "failed" },
+].map((shape) => ({ ...shape, done: !["implementing"].includes(shape.status) }));
+
+function sectionCompatibleWithStateFilter(sectionKey, filterKey) {
+  const filter = RUN_STATE_FILTERS.find((f) => f.key === filterKey);
+  if (!filter) return true;
+  return REPRESENTATIVE_RUN_SHAPES.some((run) => runSection(run) === sectionKey && filter.match(run));
+}
+
 /* A head that still names a `superseded_by` (see foldRuns below) is one
    whose successor fell outside the page /api/runs returned, so it could not
    be folded under a newer card — it is genuinely an old attempt, just one
@@ -1312,6 +1348,14 @@ function isOrphanSuperseded(run) {
 function selectRunStateFilter(key) {
   if (state.runsStateFilter === key) return;
   state.runsStateFilter = key;
+  /* A tree section chosen earlier can be incompatible with the newly picked
+     chip (e.g. tree on "Landed", chip switched to "In flight") — see
+     sectionCompatibleWithStateFilter. Left alone that pair always shows zero
+     cards with no way to tell why, so the now-stale tree pick is dropped
+     rather than fought over. */
+  if (state.runsFilter.section && !sectionCompatibleWithStateFilter(state.runsFilter.section, key)) {
+    state.runsFilter = { section: null, repo: null };
+  }
   renderRuns();
 }
 
@@ -1453,6 +1497,15 @@ function matchesFilter(run) {
 function selectRunsFilter(section, repo) {
   const same = state.runsFilter.section === section && state.runsFilter.repo === (repo || null);
   state.runsFilter = same ? { section: null, repo: null } : { section, repo: repo || null };
+  /* Mirrors the guard in selectRunStateFilter: a chip picked earlier (e.g.
+     "Active") can be incompatible with the newly picked section (e.g.
+     "Landed", which is done by construction). Left alone that combination
+     always renders "No runs match this filter." with the tree/chip state
+     giving no hint that the chip is why — so land on "All", the one chip
+     compatible with every section, instead. */
+  if (!same && !sectionCompatibleWithStateFilter(section, state.runsStateFilter)) {
+    state.runsStateFilter = "all";
+  }
   renderRuns();
 }
 
