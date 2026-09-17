@@ -1078,6 +1078,30 @@ code. `land::merged_after_all` is that rule for the unattended path: run ec12
 landed pull request 28 and recorded `ok: false`, and its task was held waiting
 for a merge that was already in `main`.
 
+**When magi never got as far as opening a pull request at all** - `gh pr
+create` itself failing (run 2963's title was over GitHub's 256-character
+GraphQL limit for `createPullRequest`), a dead token, `gh` unreachable - there
+is no PR for `land::merged_after_all` to recover through, because none of
+magi's own machinery ever ran against one. If a human (or an agent acting for
+one) then opens and merges a *different* pull request from the same branch by
+hand, the run's own record is stuck exactly where `merge` left it: `status`
+never becomes `Merged`, `merge` keeps recording the create failure, and the
+run sits in the web UI's "In flight" section (and the terminal deck) forever,
+usually with a `superseded_by` pointing at whatever later run actually got
+the task done. `magi task done` closes the task; it never touches the run.
+
+`magi fold --merged <pr-url>` is the fix: it reads the pull request back with
+`land::lifecycle` (refusing outright if it is not actually merged - never
+guess from a URL alone), then feeds it through `land::land` exactly as the
+automatic post-merge loop would have, which rewrites `status` and `merge` to
+match reality before the usual `fold` cleanup runs. **This path never calls
+`bump::after_merge`** (`src/bump.rs`) - that call is made only from
+`graph::Runner::run_land`, which a manually-corrected run never passes
+through - so a release version bump the change might have earned is not
+filed automatically even after the correction; request one by hand if the
+change warrants it. Fixing that gap is future work, not something this
+correction path attempts.
+
 ### Running magi on magi
 
 `magi.toml` in this repo sets `e2e = cargo test` and `gate = cargo make check`,

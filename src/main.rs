@@ -11,7 +11,7 @@ use magi::graph::{Runner, fold_run};
 use magi::proc::Quiet as _;
 use magi::queue::{self, Queue, Source, Task, TaskStatus};
 use magi::run::{RunState, RunStatus, is_run_id, latest_id, list_ids, resolve_id};
-use magi::{agent, ask, daemon, report, repos, stats, tui, updater, web};
+use magi::{agent, ask, daemon, land, report, repos, stats, tui, updater, web};
 
 /// Blind multi-agent implementation competition.
 #[derive(Debug, Parser)]
@@ -204,6 +204,15 @@ enum Command {
         /// Also drop the winner's worktree and branch.
         #[arg(long)]
         all: bool,
+        /// Correct a run stuck on a failed automatic merge: the operator (or
+        /// an agent on their behalf) created and merged the pull request by
+        /// hand, and this is its URL. Verified against the forge before
+        /// anything is written - a URL that is not actually merged refuses
+        /// rather than guesses - and only then does `status` and the `merge`
+        /// section get rewritten to match, exactly as the automatic land loop
+        /// would have written them itself.
+        #[arg(long, value_name = "PR_URL")]
+        merged: Option<String>,
     },
     /// Inspect and shrink the shared build cache.
     ///
@@ -542,8 +551,44 @@ enum CacheCmd {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// The OS default stack for a process's real main thread is small (about
+/// 1 MiB on Windows) and fixed at link time, while this binary's `async fn`
+/// call graph is not: `Runner::execute` alone walks a dozen graph nodes, and
+/// `land`'s own watch loop nests several `.await`s deeper still. In a debug
+/// build - no frame reuse across suspend points - the generator `dispatch`
+/// compiles down to is sized for the largest path through all of it, and
+/// that size sits close enough to the OS default that a change as small as
+/// one more `Option<String>` field on an unrelated `Command` variant was
+/// once enough to cross it and crash `magi run --resume` on a real run with
+/// a native stack overflow - not a panic, nothing on stdout or stderr, just
+/// gone (see `graph_cached_gate::a_cached_failed_gate_stays_blocked_and_does_not_run_again`,
+/// which exercises exactly that resume path). Rather than keep the whole
+/// call graph under whatever headroom happens to be left, the real work runs
+/// on a thread whose stack size is set explicitly.
+const STACK_SIZE: usize = 32 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(run)
+        .expect("spawn the thread this binary actually runs on")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// Build the async runtime and run the CLI on it. Kept separate from `main`
+/// so `main` itself stays the small, fixed piece of work - spawn a thread,
+/// join it - that is safe to run on the OS's own small stack; see
+/// [`STACK_SIZE`] for why that split exists at all.
+fn run() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build the tokio runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
     let interactive = std::io::stdout().is_terminal();
@@ -925,7 +970,7 @@ async fn dispatch(command: Command) -> Result<()> {
             Ok(())
         }
 
-        Command::Fold { id, all } => {
+        Command::Fold { id, all, merged } => {
             let id = match id {
                 Some(i) => resolve_id(&i)?,
                 None => latest_id().context("no runs yet")?,
@@ -933,9 +978,28 @@ async fn dispatch(command: Command) -> Result<()> {
             // A run whose state file is unreadable (missing, garbage, or an
             // unknown schema) cannot be folded through the graph path: loading
             // it fails. It is still occupying its run directory and worktree,
-            // so fold it wholesale instead.
+            // so fold it wholesale instead. `--merged` has nothing to correct
+            // in that case - there is no `status` or `merge` field to write -
+            // so it refuses instead of silently skipping the correction.
             let removed = match RunState::load(&id) {
                 Ok(mut state) => {
+                    if let Some(url) = merged {
+                        // Boxed defensively: `correct_manual_merge` calls into
+                        // `land::land`, whose own loop nests
+                        // `observe`/`approval_gate`/`fix_round` several layers
+                        // deep, and awaiting that inline would fold the whole
+                        // nested future into `dispatch`'s own generated state
+                        // machine - one `async fn` covering every branch of
+                        // this `match`, sized for whichever branch needs the
+                        // most room. (The stack overflow this was first
+                        // suspected of causing turned out to come from the
+                        // OS's small default main-thread stack instead - see
+                        // `main`'s own comment for the actual fix - but
+                        // there is no reason to keep spending an already-tight
+                        // budget when `Box::pin` moves this one to the heap
+                        // for free.)
+                        Box::pin(correct_manual_merge(&mut state, &url)).await?;
+                    }
                     let removed = fold_run(&mut state, all).await?;
                     // Nothing left for `fold_run` to remove is not the same
                     // thing as nothing left to do: a run whose worktrees are
@@ -957,6 +1021,9 @@ async fn dispatch(command: Command) -> Result<()> {
                     removed
                 }
                 Err(e) => {
+                    if merged.is_some() {
+                        bail!("{id}: state unreadable ({e}); cannot correct its merge record");
+                    }
                     println!(
                         "{id}: state unreadable ({e}); removing the run and its worktree wholesale"
                     );
@@ -1079,6 +1146,68 @@ async fn dispatch(command: Command) -> Result<()> {
             updater::run_self_update(yes, check_only, !std::io::stdin().is_terminal()).await
         }
     }
+}
+
+/// Confirm `url` is actually a merged pull request, then rewrite `state`'s
+/// `status` and `merge` exactly as the automatic land loop (`land::land`)
+/// would have written them had magi opened and merged this pull request
+/// itself.
+///
+/// This is `magi fold --merged`'s whole implementation: the operator's
+/// recovery from a merge magi could not finish on its own - a PR title too
+/// long for the GraphQL mutation, `gh pr create` unreachable, a stale token -
+/// closed by hand with a pull request magi never opened and so never
+/// recorded. Reusing `land::land` rather than writing `status`/`merge`
+/// directly keeps this one authoritative: a merged pull request decides
+/// `Step::Done { merged: true }` on the very first read, before any of
+/// `land`'s own checks/fix/rebase machinery can run, which is what makes it
+/// safe to call here even though this pull request was never magi's own.
+/// `land::lifecycle` is checked first and separately so a mistyped or still-
+/// open URL fails loudly without writing anything, rather than handing an
+/// open pull request to the full autonomous loop by accident.
+///
+/// Correcting `status` this way does not run `bump::after_merge`
+/// (`src/bump.rs`): that call is made only from `graph::Runner::run_land`,
+/// which this path never goes through. A release version bump this change
+/// might have earned is therefore not filed automatically and has to be
+/// requested by hand - recorded as an event on the run so the gap is visible
+/// to whoever reads it later, not just to this comment.
+async fn correct_manual_merge(state: &mut RunState, url: &str) -> Result<()> {
+    match land::lifecycle(&state.repo, url).await? {
+        land::PrLifecycle::Merged => {}
+        other => bail!(
+            "{url} is {}, not merged; refusing to record {} as merged on a guess",
+            other.as_str(),
+            state.id
+        ),
+    }
+    let before = state.status;
+    if let Err(e) = land::land(state, url).await {
+        // `land::land` sets `status` to `Landing` and saves before its first
+        // read of the pull request - see its own doc - so a failure here
+        // (a transient `gh` hiccup between the two forge reads this function
+        // makes) can leave the run stuck on that in-between value with
+        // nothing left driving it. Land it on the same terminal shape an
+        // automated `land` failure lands on instead of leaving it stuck.
+        state.status = RunStatus::Blocked;
+        state.event("fold", format!("manual-merge correction failed: {e:#}"));
+        state.save()?;
+        return Err(e).context(format!("confirming the merge of {url}"));
+    }
+    println!(
+        "{}: corrected status {} -> {} from {url}",
+        state.id,
+        before.as_str(),
+        state.status.as_str()
+    );
+    state.event(
+        "fold",
+        "operator recorded this pull request as a manual merge; this run never \
+         re-entered `land`, so `bump::after_merge` did not run for it - a release \
+         bump this change might warrant has to be filed by hand",
+    );
+    state.save()?;
+    Ok(())
 }
 
 /// `magi cache show` and `magi cache clear`.
