@@ -5369,7 +5369,17 @@ async function boot() {
   wire();
   applyRoute();
 
-  await loadHealth();
+  /* Health used to be awaited before the four view fetches even started,
+     paying its round trip twice on every cold load - once for health, once
+     for everything that does not actually need it. None of the four reads
+     state.health at fetch time; the one place that does (runs_unreadable in
+     renderRuns) already tolerates seeing it late, the same way needsOwnerCount
+     falls back to health's own count until /api/questions has answered. So
+     all five now share one round trip, and renderRuns runs once more after
+     to pick up whichever of health/runs landed second. */
+  await Promise.allSettled([
+    loadHealth(), loadRuns(), loadQueue(), loadQuestions(), loadTalks(),
+  ]);
   if (state.health) {
     state.rev.queue = state.health.queue_rev;
     state.rev.runs = state.health.runs_rev;
@@ -5378,9 +5388,7 @@ async function boot() {
     state.rev.loop = state.health.loop_rev;
     if (state.health.loop) state.loop = state.health.loop;
   }
-  await Promise.allSettled([
-    loadRuns(), loadQueue(), loadQuestions(), loadTalks(),
-  ]);
+  renderRuns();
 
   subscribe();
   setInterval(() => {
