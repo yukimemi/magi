@@ -470,6 +470,15 @@ const state = {
   /* Same idea for the Backlog's sections, kept separately since the two
      views don't share section keys or default open/closed state. */
   queueCollapsed: loadCollapsed(QUEUE_COLLAPSE_KEY),
+  /* The Backlog's id search box. Lives only in memory, same reasoning as
+     runsFilter above: a reload starts from the unfiltered backlog. */
+  queueSearch: "",
+  /* `${query}\0${id}` of the single-hit jump renderQueueSearch last actually
+     performed, so a background poll that re-renders the same query without
+     a new unique hit does not yank the operator back to the card mid-read -
+     see scrollToSearchHit's own comment. Reset whenever the query is
+     cleared, so the next search starts a fresh jump. */
+  queueSearchJump: null,
   detail: { id: null, run: null, report: null },
   questions: null,
   /* Whether a question's panel endpoint actually answers. A sandboxed frame
@@ -2274,6 +2283,77 @@ function syncQueueSections(root, bySection) {
   syncSections(root, QUEUE_SECTIONS, bySection, createQueueSection, updateQueueSection);
 }
 
+/* ---- queue: id search --------------------------------------------------- *
+ * Mirrors the one prefix rule shared by `Queue::resolve_id` (the CLI's
+ * `magi task show <prefix>`) and `web::pick`: a leading match on the id the
+ * loop mints in full, or a trailing match on the short form every report
+ * prints (see shortId). Case-insensitive since a phone keyboard capitalizes
+ * on autocomplete more readily than a terminal does. */
+function matchesTaskId(id, query) {
+  const idLower = String(id).toLowerCase();
+  return idLower.startsWith(query) || idLower.endsWith(query);
+}
+
+function setQueueSearch(value) {
+  state.queueSearch = value;
+  if (value.trim() === "") state.queueSearchJump = null;
+  renderQueue();
+}
+
+/* Search results are a flat list rather than the sectioned view below: a
+   section that starts collapsed (Held, Done) would otherwise hide the very
+   card the operator typed an id to find. */
+function renderQueueSearch(tasks, query) {
+  const results = $("queue-search-results");
+  const matches = tasks.filter((t) => matchesTaskId(t.id, query));
+
+  show(results, matches.length > 0);
+  show($("queue-search-empty"), matches.length === 0);
+  show($("queue-search-status"), true);
+  setText(
+    $("queue-search-status"),
+    matches.length === 0
+      ? `No task matches \u201c${query}\u201d.`
+      : `${plural(matches.length, "task matches", "tasks match")} \u201c${query}\u201d.`,
+  );
+
+  syncList(results, matches, (t) => t.id, createTaskCard, updateTaskCard);
+  /* A single hit is exactly the case a prefix/suffix search exists for -
+     jump straight to it rather than making the operator scroll a one-item
+     list. Two or more stay a list to choose from, same as the CLI's own
+     "matches N tasks" refusal, just rendered instead of erroring.
+
+     Gated on jumpKey actually changing: renderQueue() re-runs on every SSE
+     revision and, without streaming, every 10s health poll, whether or not
+     this search had anything to do with the change. Re-jumping (and
+     re-flashing) on each of those would drag the view back to the card out
+     from under an operator who is mid-read - see scrollToLastTurn's own
+     rule against exactly that. */
+  if (matches.length === 1) {
+    const jumpKey = `${query}\0${matches[0].id}`;
+    if (state.queueSearchJump !== jumpKey) {
+      state.queueSearchJump = jumpKey;
+      scrollToSearchHit(results.firstElementChild);
+    }
+  }
+}
+
+/* Same sticky-header offset math as scrollToLastTurn, applied to a single
+   card instead of a chat transcript's last turn. */
+function scrollToSearchHit(row) {
+  if (!row) return;
+  const header = document.querySelector(".top");
+  const gap = header ? Math.ceil(header.getBoundingClientRect().height) + 4 : 0;
+  row.style.scrollMarginTop = `${gap}px`;
+  const motion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  row.scrollIntoView({ behavior: motion ? "auto" : "smooth", block: "start" });
+  /* Restarts the animation even if this exact card was already flashed a
+     keystroke ago. */
+  row.classList.remove("card-hit");
+  void row.offsetWidth;
+  row.classList.add("card-hit");
+}
+
 function renderQueue() {
   const sectionsRoot = $("queue-sections");
   const tasks = state.queue;
@@ -2293,8 +2373,21 @@ function renderQueue() {
   if (held) parts.push(`${held} held`);
   setText($("queue-count"), tasks.length === 0 ? "Nothing waiting" : parts.join(", "));
 
+  show($("queue-search"), tasks.length > 0);
   show($("queue-empty"), tasks.length === 0);
-  syncQueueSections(sectionsRoot, groupQueueBySection(tasks));
+
+  const query = state.queueSearch.trim().toLowerCase();
+  show($("queue-search-clear"), query !== "");
+  if (query === "") {
+    show($("queue-search-results"), false);
+    show($("queue-search-empty"), false);
+    show($("queue-search-status"), false);
+    show(sectionsRoot, true);
+    syncQueueSections(sectionsRoot, groupQueueBySection(tasks));
+  } else {
+    show(sectionsRoot, false);
+    renderQueueSearch(tasks, query);
+  }
   /* The strip's wording depends on how many tasks are runnable, so it is
      re-rendered from the queue rather than only from health: "off, with two
      tasks waiting" has to appear the moment the second one is filed. */
@@ -5432,6 +5525,13 @@ function wire() {
   });
 
   $("runs-filter-clear").addEventListener("click", clearRunsFilter);
+
+  $("queue-search-input").addEventListener("input", (event) => setQueueSearch(event.target.value));
+  $("queue-search-clear").addEventListener("click", () => {
+    $("queue-search-input").value = "";
+    setQueueSearch("");
+    $("queue-search-input").focus({ preventScroll: true });
+  });
 
   $("theme-toggle").addEventListener("click", () => {
     const next = THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length];

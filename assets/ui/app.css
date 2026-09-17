@@ -572,6 +572,22 @@ main {
 /* The run went away before anyone answered; the question is history, not work. */
 .chip[data-status="abandoned"] { background: var(--tint-ink); color: var(--on-ink); border-style: dashed; }
 
+/* ---- queue: id search ---------------------------------------------------- *
+ * A phone's only way to find one task in a backlog of dozens; see
+ * queue-search-input in index.html. Laid out like .runs-filter's row rather
+ * than a bare <input> so it reads as a control, not a stray text field. */
+.queue-search { display: flex; align-items: center; gap: var(--s3); margin-bottom: var(--s3); }
+.queue-search input[type="search"] { flex: 1; margin-top: 0; }
+.queue-search-status { margin: calc(-1 * var(--s2)) 0 var(--s3); font-size: var(--t3); color: var(--ink-2); }
+
+/* The single-hit flash: a plain background pulse rather than color-mix(), for
+   the same reason the token list above is written out in full per theme. */
+.card.card-hit { animation: card-hit 1.6s var(--ease); }
+@keyframes card-hit {
+  0%, 35% { background: var(--sunk); box-shadow: 0 0 0 2px var(--focus); }
+  100% { background: var(--surface); box-shadow: var(--shadow); }
+}
+
 /* ---- cards (runs + queue) ---------------------------------------------- */
 .cards { display: flex; flex-direction: column; gap: var(--s3); }
 
@@ -1312,7 +1328,7 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .opt { font-weight: 400; color: var(--ink-3); }
 .hint { font-size: var(--t2); color: var(--ink-3); }
 
-textarea, input[type="text"], select {
+textarea, input[type="text"], input[type="search"], select {
   width: 100%; min-height: var(--tap);
   padding: var(--s2) var(--s3);
   margin-top: var(--s1);

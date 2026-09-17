@@ -244,6 +244,19 @@
       <h1 id="queue-h">Backlog</h1>
       <p class="view-sub" id="queue-count">Loading…</p>
     </div>
+    <!-- Resolves an id the same loose way the CLI does (`magi task show
+         <prefix>`): a leading match on the full id, or a trailing match on
+         the short form a report actually prints. A match narrows the cards
+         below instead of opening a second list, so one hit and a pile of
+         candidates both read the same way. -->
+    <div class="queue-search" id="queue-search" hidden>
+      <label class="sr-only" for="queue-search-input">Find a task by id</label>
+      <input type="search" id="queue-search-input" placeholder="Find by task id… (e.g. c71c)" autocomplete="off" spellcheck="false">
+      <button class="btn btn-quiet" type="button" id="queue-search-clear" hidden>Clear</button>
+    </div>
+    <p class="queue-search-status" id="queue-search-status" role="status" hidden></p>
+    <ol class="cards" id="queue-search-results" hidden></ol>
+    <p class="empty" id="queue-search-empty" hidden>No task matches this id.</p>
     <div id="queue-sections"></div>
     <p class="empty" id="queue-empty" hidden>
       The backlog is empty. Talk an idea through in Chat, or file one with
