@@ -52,6 +52,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, Invocation, SeatState};
+use crate::ask;
 use crate::config::Config;
 use crate::queue::{Queue, Source, Task};
 
@@ -88,6 +89,13 @@ pub enum Who {
     /// The conversation's agent - or magi itself, reporting that a turn
     /// failed. See [`MAGI_NOTE`].
     Agent,
+    /// A question relayed in from a run's `magi ask` - see
+    /// [`relay_conductor_question`]. Distinct from [`Who::Operator`] even
+    /// though the run being asked is exactly the same shape of question a
+    /// human answers, because the transcript must say plainly that this turn
+    /// came from the graph rather than from the person on the other end of
+    /// the phone.
+    Conductor,
 }
 
 /// One image the operator attached to a turn.
@@ -926,6 +934,7 @@ fn transcript(talk: &Talk, store: &Talks) -> String {
         let who = match t.who {
             Who::Operator => "operator",
             Who::Agent => "you",
+            Who::Conductor => "conductor",
         };
         out.push_str(&format!("\n## {who}\n\n{}\n", t.body.trim()));
         out.push_str(&attachment_note(store, &talk.id, &t.attachments));
@@ -1055,6 +1064,267 @@ pub fn tasks_of(queue: &Queue, talk_id: &str) -> Vec<Task> {
         .collect();
     tasks.sort_unstable_by(|a, b| a.id.cmp(&b.id));
     tasks
+}
+
+/// If `run_id` was minted for a task the standing chat filed - a task whose
+/// [`Source::Agent`] names `"chat"` as its node - return that conversation's
+/// id. `None` covers every other case: a human-filed task, a task filed by
+/// some other node (`implement`, `review`), or a `run_id` no task on disk
+/// remembers at all - and is the ordinary case, since only a task born from
+/// `magi task add --solo` run inside a live conversation ever matches.
+///
+/// `queue.list()` rather than a dedicated index: the queue is small enough
+/// that [`tasks_of`] already scans it the same way for the same reason, and
+/// this runs once per question, not once per poll.
+fn chat_origin(queue: &Queue, run_id: &str) -> Option<String> {
+    if run_id.is_empty() {
+        return None;
+    }
+    let task = queue
+        .list()
+        .into_iter()
+        .find(|t| t.runs.iter().any(|r| r == run_id))?;
+    match task.source {
+        Source::Agent { run, node } if node == "chat" => Some(run),
+        _ => None,
+    }
+}
+
+/// Append a conductor's question as a turn, the same way [`record`] appends
+/// the operator's - so a call to [`turn`] right after this answers it exactly
+/// as though the operator had asked. Not built on [`record`] itself: that
+/// function trims to "nothing to say" and hands the text back for [`say`]'s
+/// convenience, neither of which applies to a message this module built
+/// itself and knows is never empty.
+fn record_conductor(talk: &mut Talk, store: &Talks, text: &str) -> Result<()> {
+    let _guard = store.guard();
+    let Ok(fresh) = store.get(&talk.id) else {
+        bail!("talk {} was deleted", talk.short());
+    };
+    talk.status = fresh.status;
+    talk.pending = fresh.pending;
+    talk.pending_attachments = fresh.pending_attachments;
+    if !talk.status.open() {
+        bail!(
+            "talk {} is {} and takes no more turns",
+            talk.short(),
+            talk.status.as_str()
+        );
+    }
+    talk.turns.push(Turn {
+        who: Who::Conductor,
+        body: text.to_owned(),
+        at: Timestamp::now(),
+        attachments: Vec::new(),
+    });
+    store.put(talk)?;
+    Ok(())
+}
+
+/// The prompt sent to the chat's own agent when a conductor's question is
+/// relayed into its conversation.
+///
+/// The `ANSWER:`/`ASK:` markers exist because [`apply_bridge`] has to act on
+/// what comes back without a person reading it first: an agent that answers
+/// in ordinary prose leaves the caller guessing whether it decided or was
+/// only thinking out loud, and a wrong guess there would put words in the
+/// operator's mouth. Asking for the marker in English even when the rest of
+/// the reply is not is what keeps that parse independent of
+/// `[graph] language`.
+fn conductor_prompt(question: &ask::Question, message: &str) -> String {
+    let mut out = String::from(
+        "# Conductor\n\n\
+         The implementer working on a task this conversation filed has \
+         stopped and is asking something. Decide on the operator's behalf \
+         if you are confident; otherwise say so and ask the operator back \
+         instead of guessing - the run is waiting on this either way, and a \
+         wrong guess is worse than a short delay.\n\n",
+    );
+    out.push_str(message.trim());
+    out.push('\n');
+    if !question.choices.is_empty() {
+        out.push_str("\nChoices offered:\n");
+        for c in &question.choices {
+            out.push_str(&format!("- {c}\n"));
+        }
+    }
+    out.push_str(
+        "\nStart your reply with exactly one of the two literal markers \
+         below, in English even if the rest of your reply is not - this is \
+         read by a program, not a person:\n\n\
+         - `ANSWER: <text>` - resolves the question. If choices were \
+         offered, `<text>` must be one of them, verbatim; otherwise it is \
+         free text.\n\
+         - `ASK: <text>` - use this only when you are not confident. It \
+         sends `<text>` back to the implementer instead of deciding, and \
+         the implementer will follow up here once it has more to say.\n",
+    );
+    out
+}
+
+/// Which of the two markers [`conductor_prompt`] asked for came back.
+enum BridgeTag {
+    Answer,
+    Ask,
+}
+
+/// Case-insensitive `line.strip_prefix(tag)`. Safe to slice `line` at
+/// `tag.len()` on a case-insensitive match because every tag here is pure
+/// ASCII, and ASCII case-folding never changes byte length.
+fn strip_tag<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
+    // `get`, not slicing, because `line` is arbitrary model output that may
+    // not even be ASCII - a byte offset that lands mid-character would panic
+    // rather than simply fail to match.
+    let head = line.get(..tag.len())?;
+    head.eq_ignore_ascii_case(tag).then(|| &line[tag.len()..])
+}
+
+/// Pull a marker and its text out of the chat agent's reply. `None` means
+/// neither marker opened the first line - an agent that ignored the format
+/// [`conductor_prompt`] asked for - and [`apply_bridge`] leaves the question
+/// exactly as it found it in that case, falling back to the Queue panel and
+/// the operator's own hands.
+fn split_bridge_tag(reply: &str) -> Option<(BridgeTag, String)> {
+    let trimmed = reply.trim();
+    let mut lines = trimmed.lines();
+    let first = lines.next()?.trim();
+    let (tag, first_rest) = strip_tag(first, "ANSWER:")
+        .map(|rest| (BridgeTag::Answer, rest))
+        .or_else(|| strip_tag(first, "ASK:").map(|rest| (BridgeTag::Ask, rest)))?;
+    let mut text = first_rest.trim().to_owned();
+    let remainder = lines.collect::<Vec<_>>().join("\n");
+    let remainder = remainder.trim();
+    if !remainder.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(remainder);
+    }
+    Some((tag, text))
+}
+
+/// Strip one layer of matching quotes or backticks - the shape a model tends
+/// to wrap a quoted choice in - before comparing it against the choices a
+/// question actually offered.
+fn strip_wrapping(s: &str) -> &str {
+    let s = s.trim();
+    for q in ['"', '\'', '`'] {
+        if s.len() >= 2 && s.starts_with(q) && s.ends_with(q) {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+/// Turn the chat agent's structured reply into a resolution of `question`,
+/// exactly as `magi answer` would if the operator had typed it - `ANSWER:`
+/// becomes [`ask::Question::answer`], `ASK:` becomes [`ask::Question::say`],
+/// the owner's own way of asking back rather than deciding (see that
+/// function's doc for why this module is allowed to stand in for the owner
+/// here at all).
+///
+/// Does nothing - not an error - when the reply carries neither marker, is a
+/// [`MAGI_NOTE`] failure note, names a choice the question never offered, or
+/// the question was answered by someone else in the meantime. Every one of
+/// those falls back to the question sitting open for the operator to settle
+/// by hand, through the Queue panel this call never touches.
+fn apply_bridge(questions: &ask::Questions, question: &ask::Question, reply: &str) -> Result<()> {
+    if reply.trim_start().starts_with(MAGI_NOTE) {
+        return Ok(());
+    }
+    let Some((tag, text)) = split_bridge_tag(reply) else {
+        return Ok(());
+    };
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let mut fresh = questions.get(&question.id)?;
+    if !fresh.status.open() {
+        return Ok(());
+    }
+    match tag {
+        BridgeTag::Answer => {
+            let answer = if fresh.free_text() {
+                ask::Answer::Text(text)
+            } else if let Some(choice) = fresh
+                .choices
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case(strip_wrapping(&text)))
+            {
+                ask::Answer::Choice(choice.clone())
+            } else {
+                return Ok(());
+            };
+            fresh.answer(answer)?;
+        }
+        BridgeTag::Ask => fresh.say(text)?,
+    }
+    questions.put(&mut fresh)
+}
+
+/// If the run behind `question` was started for a task the standing chat
+/// filed, forward `message` into that conversation as a turn from the
+/// conductor, trigger the chat agent's own turn to answer it exactly as
+/// though the operator had spoken, and fold whatever it decided back into
+/// `question` - see [`apply_bridge`]. `question` is always left holding the
+/// current truth on disk when this returns, whatever happened above: a
+/// caller that went on to `put` a stale copy over a real answer - the chat's
+/// or a human's - would throw the answer away.
+///
+/// `cfg` is the caller's own config for the run behind `question`, reused
+/// rather than rediscovered from `talk.repo`: the two name the same
+/// repository in the shape this module expects a chat-filed task to take
+/// (`magi task add --solo --repo {repo}` inside [`briefing`], `{repo}`
+/// being the conversation's own), and rediscovering would cost a second
+/// filesystem walk for a config that has to come out identical.
+///
+/// Ordinary and silent for every task not filed from a chat: [`chat_origin`]
+/// finds nothing, and the caller's own `Question::answer`/`Question::say`
+/// path proceeds exactly as it always has, notification and Queue panel
+/// included - this is additive, never a replacement for either.
+pub async fn relay_conductor_question(
+    queue: &Queue,
+    talks: &Talks,
+    cfg: &Config,
+    questions: &ask::Questions,
+    question: &mut ask::Question,
+    message: &str,
+) -> Result<()> {
+    let result =
+        relay_conductor_question_inner(queue, talks, cfg, questions, question, message).await;
+    if let Ok(fresh) = questions.get(&question.id) {
+        *question = fresh;
+    }
+    result
+}
+
+async fn relay_conductor_question_inner(
+    queue: &Queue,
+    talks: &Talks,
+    cfg: &Config,
+    questions: &ask::Questions,
+    question: &ask::Question,
+    message: &str,
+) -> Result<()> {
+    let Some(talk_id) = chat_origin(queue, &question.run) else {
+        return Ok(());
+    };
+    let mut talk = talks.get(&talk_id)?;
+    if !talk.status.open() {
+        return Ok(());
+    }
+
+    let prompt = conductor_prompt(question, message);
+    record_conductor(&mut talk, talks, &prompt)?;
+    respond(&mut talk, talks, cfg, &prompt).await?;
+
+    let Some(reply) = talk.turns.last() else {
+        return Ok(());
+    };
+    if reply.who != Who::Agent {
+        return Ok(());
+    }
+    apply_bridge(questions, question, &reply.body)
 }
 
 fn read_path(path: &Path) -> Result<Talk> {
@@ -1973,5 +2243,303 @@ mod tests {
         // still tells the agent to report what it changed.
         assert!(writable.contains("magi task add --solo"));
         assert!(writable.contains("say plainly what you"));
+    }
+
+    #[test]
+    fn chat_origin_finds_the_talk_that_filed_the_task_and_nothing_else() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue = Queue::at(tmp.path().join("queue"));
+
+        let mut from_chat = Task::new(
+            "cache backend".to_owned(),
+            "cache backend".to_owned(),
+            tmp.path().to_owned(),
+            Source::Agent {
+                run: "20260904-014455-ab12".to_owned(),
+                node: "chat".to_owned(),
+            },
+        );
+        from_chat.runs.push("20260904-090000-r001".to_owned());
+        queue.put(&mut from_chat).expect("put from_chat");
+
+        let mut from_run = Task::new(
+            "unrelated".to_owned(),
+            "unrelated".to_owned(),
+            tmp.path().to_owned(),
+            Source::Agent {
+                run: "20260904-090000-zz99".to_owned(),
+                node: "implement".to_owned(),
+            },
+        );
+        from_run.runs.push("20260904-090000-r002".to_owned());
+        queue.put(&mut from_run).expect("put from_run");
+
+        assert_eq!(
+            chat_origin(&queue, "20260904-090000-r001"),
+            Some("20260904-014455-ab12".to_owned())
+        );
+        assert_eq!(
+            chat_origin(&queue, "20260904-090000-r002"),
+            None,
+            "filed by `implement`, not `chat`"
+        );
+        assert_eq!(chat_origin(&queue, "no-such-run"), None);
+        assert_eq!(chat_origin(&queue, ""), None);
+    }
+
+    #[test]
+    fn split_bridge_tag_reads_the_marker_case_insensitively() {
+        let (tag, text) = split_bridge_tag("answer: Redis").expect("tag");
+        assert!(matches!(tag, BridgeTag::Answer));
+        assert_eq!(text, "Redis");
+
+        let (tag, text) = split_bridge_tag("ASK: not sure").expect("tag");
+        assert!(matches!(tag, BridgeTag::Ask));
+        assert_eq!(text, "not sure");
+
+        assert!(
+            split_bridge_tag("Redis seems right").is_none(),
+            "prose with neither marker must not be read as a decision"
+        );
+    }
+
+    #[test]
+    fn split_bridge_tag_keeps_lines_after_the_marker() {
+        let (tag, text) =
+            split_bridge_tag("ANSWER: Redis\n\nWe already depend on it.").expect("tag");
+        assert!(matches!(tag, BridgeTag::Answer));
+        assert_eq!(text, "Redis\nWe already depend on it.");
+    }
+
+    fn choice_question(choices: Vec<String>) -> ask::Question {
+        ask::Question::new(
+            "20260904-090000-r001".to_owned(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            "Which storage backend should the cache use?".to_owned(),
+            String::new(),
+            choices,
+        )
+    }
+
+    #[test]
+    fn apply_bridge_answers_a_matching_choice_case_insensitively() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let questions = ask::Questions::at(tmp.path().join("questions"));
+        let mut q = choice_question(vec!["SQLite".to_owned(), "Redis".to_owned()]);
+        questions.put(&mut q).expect("file question");
+
+        apply_bridge(&questions, &q, "ANSWER: redis").expect("apply");
+
+        let after = questions.get(&q.id).expect("reload");
+        assert_eq!(
+            after.resolution().as_deref(),
+            Some("Redis"),
+            "stored verbatim from the question's own choices, not the model's casing"
+        );
+    }
+
+    #[test]
+    fn apply_bridge_ignores_a_choice_the_question_never_offered() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let questions = ask::Questions::at(tmp.path().join("questions"));
+        let mut q = choice_question(vec!["SQLite".to_owned(), "Redis".to_owned()]);
+        questions.put(&mut q).expect("file question");
+
+        apply_bridge(&questions, &q, "ANSWER: Postgres").expect("apply is a no-op, not an error");
+
+        let after = questions.get(&q.id).expect("reload");
+        assert!(
+            after.status.open(),
+            "an unrecognised choice must not be guessed into an answer"
+        );
+    }
+
+    #[test]
+    fn apply_bridge_turns_ask_into_a_say() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let questions = ask::Questions::at(tmp.path().join("questions"));
+        let mut q = choice_question(Vec::new());
+        questions.put(&mut q).expect("file question");
+
+        apply_bridge(&questions, &q, "ASK: what does the operator prefer?").expect("apply");
+
+        let after = questions.get(&q.id).expect("reload");
+        assert!(after.status.open());
+        assert!(after.waiting_on_agent());
+        assert_eq!(
+            after.thread.last().expect("a turn was appended").body,
+            "what does the operator prefer?"
+        );
+    }
+
+    #[test]
+    fn apply_bridge_ignores_a_magi_note_and_unmarked_prose() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let questions = ask::Questions::at(tmp.path().join("questions"));
+        let mut q = choice_question(Vec::new());
+        questions.put(&mut q).expect("file question");
+
+        apply_bridge(
+            &questions,
+            &q,
+            &format!("{MAGI_NOTE}could not run agent `mock`: boom"),
+        )
+        .expect("apply");
+        apply_bridge(&questions, &q, "I think Redis, but let me check").expect("apply");
+
+        let after = questions.get(&q.id).expect("reload");
+        assert!(after.status.open());
+        assert!(
+            after.thread.is_empty(),
+            "neither a failure note nor unmarked prose is a decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_conductor_question_resolves_a_confident_answer() {
+        let (tmp, talks) = store();
+        let questions = ask::Questions::at(tmp.path().join("questions"));
+        let queue = Queue::at(tmp.path().join("queue"));
+        let spec = mock_agent(tmp.path(), REPLY, env("ANSWER: Redis"));
+        let cfg = config(spec);
+        let talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        let run_id = "20260904-090000-r001".to_owned();
+        let mut task = Task::new(
+            "cache backend".to_owned(),
+            "cache backend".to_owned(),
+            tmp.path().to_owned(),
+            Source::Agent {
+                run: talk.id.clone(),
+                node: "chat".to_owned(),
+            },
+        );
+        task.runs.push(run_id.clone());
+        queue.put(&mut task).expect("put task");
+
+        let mut question = ask::Question::new(
+            run_id,
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            "Which storage backend should the cache use?".to_owned(),
+            String::new(),
+            vec!["SQLite".to_owned(), "Redis".to_owned()],
+        );
+        questions.put(&mut question).expect("file question");
+
+        relay_conductor_question(
+            &queue,
+            &talks,
+            &cfg,
+            &questions,
+            &mut question,
+            "Which storage backend should the cache use?",
+        )
+        .await
+        .expect("relay");
+
+        assert_eq!(question.resolution().as_deref(), Some("Redis"));
+
+        let after = talks.get(&talk.id).expect("reload talk");
+        assert_eq!(after.turns.len(), 2, "the question and the chat's answer");
+        assert_eq!(after.turns[0].who, Who::Conductor);
+        assert!(after.turns[0].body.contains("storage backend"));
+        assert_eq!(after.turns[1].who, Who::Agent);
+        assert_eq!(after.turns[1].body, "ANSWER: Redis");
+    }
+
+    #[tokio::test]
+    async fn relay_conductor_question_relays_an_unsure_reply_as_a_say() {
+        let (tmp, talks) = store();
+        let questions = ask::Questions::at(tmp.path().join("questions"));
+        let queue = Queue::at(tmp.path().join("queue"));
+        let spec = mock_agent(
+            tmp.path(),
+            REPLY,
+            env("ASK: not sure, please check with the operator"),
+        );
+        let cfg = config(spec);
+        let talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        let run_id = "20260904-090000-r003".to_owned();
+        let mut task = Task::new(
+            "cache backend".to_owned(),
+            "cache backend".to_owned(),
+            tmp.path().to_owned(),
+            Source::Agent {
+                run: talk.id.clone(),
+                node: "chat".to_owned(),
+            },
+        );
+        task.runs.push(run_id.clone());
+        queue.put(&mut task).expect("put task");
+
+        let mut question = choice_question(vec!["SQLite".to_owned(), "Redis".to_owned()]);
+        question.run = run_id;
+        questions.put(&mut question).expect("file question");
+
+        relay_conductor_question(
+            &queue,
+            &talks,
+            &cfg,
+            &questions,
+            &mut question,
+            "Which storage backend should the cache use?",
+        )
+        .await
+        .expect("relay");
+
+        assert!(question.status.open());
+        assert!(question.waiting_on_agent());
+        assert_eq!(
+            question.thread.last().expect("a turn was appended").body,
+            "not sure, please check with the operator"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_conductor_question_is_a_no_op_for_a_task_not_filed_from_chat() {
+        let (tmp, talks) = store();
+        let questions = ask::Questions::at(tmp.path().join("questions"));
+        let queue = Queue::at(tmp.path().join("queue"));
+        // A script that would fail loudly if it were ever run: a task not
+        // filed from a chat must never reach the talk's own agent at all.
+        let spec = mock_agent(tmp.path(), BROKEN, BTreeMap::new());
+        let cfg = config(spec);
+        let talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        let run_id = "20260904-090000-r004".to_owned();
+        let mut task = Task::new(
+            "typed by hand".to_owned(),
+            "typed by hand".to_owned(),
+            tmp.path().to_owned(),
+            Source::Human,
+        );
+        task.runs.push(run_id.clone());
+        queue.put(&mut task).expect("put task");
+
+        let mut question = choice_question(Vec::new());
+        question.run = run_id;
+        questions.put(&mut question).expect("file question");
+
+        relay_conductor_question(
+            &queue,
+            &talks,
+            &cfg,
+            &questions,
+            &mut question,
+            "what should the error message say?",
+        )
+        .await
+        .expect("relay is a no-op, not an error");
+
+        assert!(question.status.open());
+        assert!(question.thread.is_empty());
+        let after = talks.get(&talk.id).expect("reload talk");
+        assert!(
+            after.turns.is_empty(),
+            "nothing should have been said into an unrelated talk"
+        );
     }
 }

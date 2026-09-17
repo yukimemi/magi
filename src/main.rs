@@ -11,7 +11,7 @@ use magi::graph::{Runner, fold_run};
 use magi::proc::Quiet as _;
 use magi::queue::{self, Queue, Source, Task, TaskStatus};
 use magi::run::{RunState, RunStatus, is_run_id, latest_id, list_ids, resolve_id};
-use magi::{agent, ask, daemon, land, report, repos, stats, tui, updater, web};
+use magi::{agent, ask, daemon, land, report, repos, stats, talk, tui, updater, web};
 
 /// Blind multi-agent implementation competition.
 #[derive(Debug, Parser)]
@@ -1440,6 +1440,12 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
 
     let budget = std::time::Duration::from_secs(timeout.unwrap_or(cfg.graph.answer_timeout));
 
+    // Computed before `summary`/`detail` are moved into whichever arm below
+    // consumes them - this is exactly what that arm itself files, so the chat
+    // relay below sees the same words the question was actually asked or
+    // replied with.
+    let relay_message = thread_message(&summary, &detail);
+
     let mut q = match thread {
         Some(id) => {
             let resolved = store.resolve_id(&id)?;
@@ -1481,6 +1487,32 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
             q
         }
     };
+
+    // A task filed from inside a standing chat carries that conversation's id
+    // as its `Source::Agent` run - see `talk::relay_conductor_question`'s
+    // doc. Relaying is additive and best-effort: a task filed any other way
+    // finds no conversation to relay into, and a relay that errors partway
+    // through still leaves `q` holding whatever is actually on disk, so the
+    // wait below and the Queue panel proceed exactly as if this had never
+    // run.
+    if let Err(e) = talk::relay_conductor_question(
+        &Queue::open(),
+        &talk::Talks::open(),
+        &cfg,
+        &store,
+        &mut q,
+        &relay_message,
+    )
+    .await
+    {
+        eprintln!("chat relay for question {}: {e:#}", q.short());
+    }
+    if let Some(answer) = q.resolution() {
+        // The chat agent answered on the operator's behalf; there is nothing
+        // left to wait for.
+        println!("{answer}");
+        return Ok(());
+    }
 
     match ask::ask_and_wait(&mut q, &store, &cfg.notify, budget).await? {
         ask::Wait::Answered(answer) => {
