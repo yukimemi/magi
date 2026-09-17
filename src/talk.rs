@@ -1443,14 +1443,21 @@ async fn relay_conductor_question_inner(
     let prompt = conductor_prompt(question, message);
     // `magi ask --wait` retries this same relay from a fresh process every
     // time its own slice runs out with no answer yet - see the doc on the
-    // call in `ask_wait_cmd` - so a prompt identical to the talk's own last
-    // turn means an earlier attempt already recorded this exact question and
-    // was cut off (by `RELAY_TIMEOUT` below) before the chat replied. Record
-    // it again and the transcript gains a duplicate conductor turn every few
-    // minutes for as long as the chat keeps thinking; skip straight to
-    // giving it another turn instead.
-    let already_recorded =
-        matches!(talk.turns.last(), Some(t) if t.who == Who::Conductor && t.body == prompt);
+    // call in `ask_wait_cmd` - so a prompt identical to one already on the
+    // talk's transcript means an earlier attempt already asked this exact
+    // question. That earlier attempt may have been cut off before the chat
+    // replied at all (in which case this same prompt is still the *last*
+    // turn), or it may have gotten a reply with no marker the bridge could
+    // read (`apply_bridge` leaves the question open and appends nothing back
+    // here) - either way the prompt is already on the transcript, not only
+    // when it happens to be the very last turn. Recording it again in either
+    // case gains a duplicate conductor turn every time the chat keeps
+    // replying without a marker; skip straight to giving it another turn
+    // instead.
+    let already_recorded = talk
+        .turns
+        .iter()
+        .any(|t| t.who == Who::Conductor && t.body == prompt);
     if !already_recorded {
         record_conductor(&mut talk, talks, &prompt)?;
     }
@@ -2860,6 +2867,102 @@ mod tests {
         );
         assert_eq!(after.turns[0].who, Who::Conductor);
         assert_eq!(after.turns[1].who, Who::Agent);
+
+        let resolved = questions.get(&question.id).expect("reload question");
+        assert_eq!(resolved.resolution().as_deref(), Some("Redis"));
+    }
+
+    #[tokio::test]
+    async fn a_relay_retried_after_an_unmarked_reply_does_not_duplicate_the_conductor_turn() {
+        let (tmp, talks) = store();
+        let questions = ask::Questions::at(tmp.path().join("questions"));
+        let queue = Queue::at(tmp.path().join("queue"));
+        // The first invocation replies with no marker `apply_bridge` can read
+        // (see `apply_bridge_ignores_a_magi_note_and_unmarked_prose`), leaving
+        // the question open exactly as a chat that is still thinking out loud
+        // would. Every later invocation answers for real - standing in for
+        // `magi ask --wait` retrying the same relay once the chat has made up
+        // its mind.
+        let marker = tmp.path().join("answered-once");
+        let mut env = BTreeMap::new();
+        env.insert("MARKER_FILE".to_owned(), marker.display().to_string());
+        let spec = mock_agent(
+            tmp.path(),
+            "#!/bin/sh\ncat >/dev/null\n\
+             if [ -f \"$MARKER_FILE\" ]; then printf 'ANSWER: Redis'; \
+             else touch \"$MARKER_FILE\"; printf 'I think Redis, but let me check'; fi\n",
+            env,
+        );
+        let cfg = config(spec);
+        let talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        let run_id = "20260904-090000-r007".to_owned();
+        let mut task = Task::new(
+            "cache backend".to_owned(),
+            "cache backend".to_owned(),
+            tmp.path().to_owned(),
+            Source::Agent {
+                run: talk.id.clone(),
+                node: "chat".to_owned(),
+            },
+        );
+        task.runs.push(run_id.clone());
+        queue.put(&mut task).expect("put task");
+
+        let mut question = choice_question(vec!["SQLite".to_owned(), "Redis".to_owned()]);
+        question.run = run_id;
+        questions.put(&mut question).expect("file question");
+
+        let message = "Which storage backend should the cache use?";
+
+        // First attempt: the chat replies, but with nothing the bridge can
+        // read as a decision, so the question is still open afterward - the
+        // same outcome `apply_bridge_ignores_a_magi_note_and_unmarked_prose`
+        // exercises directly.
+        relay_conductor_question_inner(
+            &queue,
+            &talks,
+            &cfg,
+            &questions,
+            &question,
+            message,
+            RELAY_TIMEOUT,
+        )
+        .await
+        .expect("first attempt completes");
+        assert!(
+            questions.get(&question.id).expect("reload").status.open(),
+            "an unmarked reply must not resolve the question"
+        );
+        assert_eq!(talks.get(&talk.id).expect("reload").turns.len(), 2);
+
+        // `magi ask --wait` retries with the exact same message. The earlier
+        // attempt's conductor turn is no longer the transcript's *last* turn
+        // (the unmarked reply is), which is exactly the gap this guards
+        // against: a naive "is it the last turn" check would record the
+        // question a second time here.
+        relay_conductor_question_inner(
+            &queue,
+            &talks,
+            &cfg,
+            &questions,
+            &question,
+            message,
+            RELAY_TIMEOUT,
+        )
+        .await
+        .expect("second attempt succeeds");
+
+        let after = talks.get(&talk.id).expect("reload talk");
+        assert_eq!(
+            after.turns.len(),
+            3,
+            "one conductor turn and two agent replies - not a second conductor turn: {:?}",
+            after.turns
+        );
+        assert_eq!(after.turns[0].who, Who::Conductor);
+        assert_eq!(after.turns[1].who, Who::Agent);
+        assert_eq!(after.turns[2].who, Who::Agent);
 
         let resolved = questions.get(&question.id).expect("reload question");
         assert_eq!(resolved.resolution().as_deref(), Some("Redis"));
