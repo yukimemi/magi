@@ -41,19 +41,19 @@
 //! `conduct`: the *content* of the answer is meant for whoever reads
 //! `Task::answers` next, not for the resolver.
 //!
-//! A triage question's answer is different: "not yet" and "leave it held"
-//! (discard) do two entirely different, non-resuming things, and only
-//! "resume it" may put the task back in line. Reusing the generic
-//! blocked/unblock path would resume every answer alike, so this module
-//! never calls [`Task::block`] and never leaves a triaged task anything but
-//! `held` while its question is open. [`interpret_answer`] reads
-//! [`Question::resolution`] itself and [`run_once`] acts on it directly:
-//! [`Task::release`] for an actual "resume it" choice, [`Queue::remove`] for
-//! "leave it held" (捨ててよい really means "you may throw this away", not
-//! "leave it sitting held"), and [`Task::hold_manual`] for anything else -
-//! which both keeps the task held and reclassifies it as a hold an operator
-//! has now actually seen, one `crate::conduct` and a later triage pass leave
-//! alone.
+//! A triage question's answer is different: "not yet" and "discard it" do two
+//! entirely different, non-resuming things, and only "resume it" may put the
+//! task back in line. Reusing the generic blocked/unblock path would resume
+//! every answer alike, so this module never calls [`Task::block`] and never
+//! leaves a triaged task anything but `held` while its question is open.
+//! [`interpret_answer`] reads [`Question::resolution`] itself and
+//! [`run_once`] acts on it directly: [`Task::release`] for an actual "resume
+//! it" choice, [`Queue::remove`] for "discard it" (捨ててよい really means
+//! "you may throw this away", not "leave it sitting held" - the English
+//! wording must say the same thing, not "leave it held"), and
+//! [`Task::hold_manual`] for anything else - which both keeps the task held
+//! and reclassifies it as a hold an operator has now actually seen, one
+//! `crate::conduct` and a later triage pass leave alone.
 //!
 //! The choice is read by its **position** in [`Question::choices`]
 //! ([`Wording::choices3`]/[`Wording::choices2`] always put "resume" first and
@@ -131,7 +131,7 @@ const EN: Wording = Wording {
     lang: "en",
     resume: "resume it",
     wait: "not yet",
-    discard: "leave it held",
+    discard: "discard it",
     resume_now: "resume it",
     keep_held: "keep it held",
 };
@@ -398,8 +398,8 @@ enum AnswerAction {
     /// see [`Wording::choices3`] and [`Wording::choices2`], whose first entry
     /// is always the resume choice.
     Resume,
-    /// The third choice, present only in [`Wording::choices3`]: "leave it
-    /// held" / "捨ててよい".
+    /// The third choice, present only in [`Wording::choices3`]: "discard it"
+    /// / "捨ててよい".
     Discard,
     /// Anything else: the second choice ("not yet" / "keep it held"), or an
     /// answer that does not match any offered choice at all (should not
@@ -841,7 +841,7 @@ mod tests {
         assert_eq!(report.answered, [t.id.clone()]);
         assert!(
             q.get(&t.id).is_err(),
-            "\"leave it held\" (捨ててよい) must actually discard the task, not \
+            "\"discard it\" (捨ててよい) must actually discard the task, not \
              just leave it sitting held forever"
         );
     }
