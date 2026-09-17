@@ -551,8 +551,44 @@ enum CacheCmd {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// The OS default stack for a process's real main thread is small (about
+/// 1 MiB on Windows) and fixed at link time, while this binary's `async fn`
+/// call graph is not: `Runner::execute` alone walks a dozen graph nodes, and
+/// `land`'s own watch loop nests several `.await`s deeper still. In a debug
+/// build - no frame reuse across suspend points - the generator `dispatch`
+/// compiles down to is sized for the largest path through all of it, and
+/// that size sits close enough to the OS default that a change as small as
+/// one more `Option<String>` field on an unrelated `Command` variant was
+/// once enough to cross it and crash `magi run --resume` on a real run with
+/// a native stack overflow - not a panic, nothing on stdout or stderr, just
+/// gone (see `graph_cached_gate::a_cached_failed_gate_stays_blocked_and_does_not_run_again`,
+/// which exercises exactly that resume path). Rather than keep the whole
+/// call graph under whatever headroom happens to be left, the real work runs
+/// on a thread whose stack size is set explicitly.
+const STACK_SIZE: usize = 32 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(run)
+        .expect("spawn the thread this binary actually runs on")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// Build the async runtime and run the CLI on it. Kept separate from `main`
+/// so `main` itself stays the small, fixed piece of work - spawn a thread,
+/// join it - that is safe to run on the OS's own small stack; see
+/// [`STACK_SIZE`] for why that split exists at all.
+fn run() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build the tokio runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
     let interactive = std::io::stdout().is_terminal();
@@ -948,7 +984,21 @@ async fn dispatch(command: Command) -> Result<()> {
             let removed = match RunState::load(&id) {
                 Ok(mut state) => {
                     if let Some(url) = merged {
-                        correct_manual_merge(&mut state, &url).await?;
+                        // Boxed defensively: `correct_manual_merge` calls into
+                        // `land::land`, whose own loop nests
+                        // `observe`/`approval_gate`/`fix_round` several layers
+                        // deep, and awaiting that inline would fold the whole
+                        // nested future into `dispatch`'s own generated state
+                        // machine - one `async fn` covering every branch of
+                        // this `match`, sized for whichever branch needs the
+                        // most room. (The stack overflow this was first
+                        // suspected of causing turned out to come from the
+                        // OS's small default main-thread stack instead - see
+                        // `main`'s own comment for the actual fix - but
+                        // there is no reason to keep spending an already-tight
+                        // budget when `Box::pin` moves this one to the heap
+                        // for free.)
+                        Box::pin(correct_manual_merge(&mut state, &url)).await?;
                     }
                     let removed = fold_run(&mut state, all).await?;
                     // Nothing left for `fold_run` to remove is not the same
