@@ -1655,7 +1655,8 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             // own working directory, so a bad `--repo` must fail while a
             // human is still looking at the terminal, not two attempts and
             // a `held` later as an opaque OS error from a failed git spawn.
-            let repo = resolve_repo(&repo).await?;
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let repo = resolve_repo(&repo, &cwd).await?;
             let mut task = Task::new(title, text, repo, source);
             task.priority = priority;
             task.solo = solo;
@@ -1948,14 +1949,76 @@ fn asking_is_not_this_seat_s_job(node: &str) -> Option<String> {
 /// well-formed but wrong (a typo, a mangled Windows extended-path prefix)
 /// would otherwise only surface once the daemon burns a task's attempts and
 /// parks it `held`, as an OS-level error with no mention of `--repo` at all.
-async fn resolve_repo(repo: &Path) -> Result<PathBuf> {
-    let canonical = repo
-        .canonicalize()
-        .with_context(|| format!("--repo {} does not exist", repo.display()))?;
-    magi::git::toplevel(&canonical)
-        .await
-        .with_context(|| format!("--repo {} is not a git working tree", canonical.display()))?;
-    Ok(canonical)
+///
+/// A `repo` that does not canonicalize to anything on disk is not
+/// automatically a broken path, though - it is also the shape a short
+/// `owner/repo` (or bare `repo`) name takes, the kind [`crate::talk`]'s
+/// briefing now tells its agent it may use in place of a full path. That
+/// case falls through to [`resolve_repo_by_name`] rather than failing here
+/// outright; a path that *does* exist but turns out not to be a git working
+/// tree is still rejected immediately; scanning `[repos] roots` for it would
+/// only ever match a coincidence.
+///
+/// `cwd` is taken as a parameter rather than read from the process here, the
+/// same split `repos_cmd` keeps between reading `std::env::current_dir()` and
+/// calling `Config::discover` - it is what lets a test point this at a
+/// fixture directory instead of the real process cwd (this repository's own
+/// `magi.toml`, which has no `[repos]` section today but is not a fixture
+/// anything here should depend on).
+async fn resolve_repo(repo: &Path, cwd: &Path) -> Result<PathBuf> {
+    match repo.canonicalize() {
+        Ok(canonical) => {
+            magi::git::toplevel(&canonical).await.with_context(|| {
+                format!("--repo {} is not a git working tree", canonical.display())
+            })?;
+            Ok(canonical)
+        }
+        Err(_) => {
+            // `[repos] roots` is a machine fact, most often declared in the
+            // machine config layer - see `repos_cmd`, which reads it the same
+            // way for the same reason. A repository's own `magi.toml` may add
+            // to it too (`Config::refuse_split_arrays`'s append policy), which
+            // is what lets a test supply roots without touching the machine
+            // layer at all.
+            let (cfg, _) = Config::discover(cwd, None)
+                .with_context(|| format!("--repo {} does not exist", repo.display()))?;
+            resolve_repo_by_name(repo, &cfg.repos.roots)
+        }
+    }
+}
+
+/// Resolve a `--repo` value that is not an existing path at all against
+/// `[repos] roots`'s ghq-layout scan - the same one `magi repos` prints -
+/// letting a caller name a local checkout as `owner/repo` or a bare `repo`
+/// instead of a full path.
+///
+/// A miss or an ambiguous match is refused rather than guessed at: silently
+/// picking one of several checkouts sharing a name would file work against
+/// the wrong repository with nothing on screen to say so, and the whole
+/// point of this path is to save a round trip asking the operator, not to
+/// remove the one case that genuinely needs to ask.
+fn resolve_repo_by_name(repo: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
+    let query = repo.to_string_lossy().replace('\\', "/");
+    let hits: Vec<repos::Repo> = repos::scan(roots)
+        .into_iter()
+        .filter(|r| r.name == query || r.name.rsplit('/').next() == Some(query.as_str()))
+        .collect();
+    match hits.len() {
+        1 => Ok(hits.into_iter().next().expect("exactly one hit").path),
+        0 => bail!(
+            "--repo {} does not exist, and no checkout named `{query}` was found under \
+             [repos] roots",
+            repo.display()
+        ),
+        n => bail!(
+            "--repo `{query}` matches {n} checkouts under [repos] roots ({}); use a full path \
+             or the exact owner/repo name to disambiguate",
+            hits.iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// Who is filing this task.
@@ -3100,16 +3163,24 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_repo_accepts_a_real_git_working_tree() {
-        let (_dir, repo) = scratch_repo().await;
-        let resolved = resolve_repo(&repo).await.expect("a real repo resolves");
+        let (dir, repo) = scratch_repo().await;
+        // Hits the `Ok(canonical)` branch, which never reads `cwd` at all -
+        // any directory would do.
+        let resolved = resolve_repo(&repo, dir.path())
+            .await
+            .expect("a real repo resolves");
         assert_eq!(resolved, repo.canonicalize().unwrap());
     }
 
     #[tokio::test]
     async fn resolve_repo_rejects_a_path_that_does_not_exist() {
+        let _guard = NoMachineConfig::set();
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nowhere");
-        let err = resolve_repo(&missing)
+        // An empty fixture directory as `cwd`, so `Config::discover` finds no
+        // `magi.toml` and `[repos] roots` stays empty - the name-resolution
+        // fallback must then report the same "does not exist" it always has.
+        let err = resolve_repo(&missing, dir.path())
             .await
             .expect_err("a nonexistent path must not resolve");
         assert!(err.to_string().contains("does not exist"), "got: {err:#}");
@@ -3118,7 +3189,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_repo_rejects_a_directory_that_is_not_a_git_working_tree() {
         let dir = tempfile::tempdir().unwrap();
-        let err = resolve_repo(dir.path())
+        // Hits the `Ok(canonical)` / `toplevel` branch, not the name-resolution
+        // fallback, so `cwd` is unused here too.
+        let err = resolve_repo(dir.path(), dir.path())
             .await
             .expect_err("a plain directory is not a git working tree");
         assert!(
@@ -3129,12 +3202,14 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_repo_rejects_a_windows_extended_path_missing_a_backslash() {
+        let _guard = NoMachineConfig::set();
         // The extended-path prefix is `\\?\` (two leading backslashes). A
         // caller that loses one in transit produces `\?\`, which is not a
         // path anything exists at - exactly the mangled form that made it
         // into the queue unchecked before this validation existed.
+        let dir = tempfile::tempdir().unwrap();
         let broken = PathBuf::from("\\?\\C:\\this-drive-and-path-do-not-exist-magi-7524");
-        let err = resolve_repo(&broken)
+        let err = resolve_repo(&broken, dir.path())
             .await
             .expect_err("a malformed extended-path prefix must not resolve");
         assert!(err.to_string().contains("does not exist"), "got: {err:#}");
@@ -3142,15 +3217,173 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_repo_accepts_a_well_formed_windows_extended_path() {
-        let (_dir, repo) = scratch_repo().await;
+        let (dir, repo) = scratch_repo().await;
         // `canonicalize` already returns the `\\?\`-prefixed form on
         // Windows, so round-tripping it back through `resolve_repo` is
         // exactly the "correct extended path" case that must keep working.
+        // Hits the `Ok(canonical)` branch, so `cwd` is unused.
         let canonical = repo.canonicalize().unwrap();
-        let resolved = resolve_repo(&canonical)
+        let resolved = resolve_repo(&canonical, dir.path())
             .await
             .expect("a well-formed extended path resolves");
         assert_eq!(resolved, canonical);
+    }
+
+    /// Builds `<root>/<host>/<owner>/<repo>` with a `.git` directory -
+    /// exactly what [`repos::scan`] looks for, and cheap enough that these
+    /// tests do not need a real `git init` the way [`scratch_repo`] does.
+    fn ghq_checkout(root: &Path, host: &str, owner: &str, repo: &str) -> PathBuf {
+        let dir = root.join(host).join(owner).join(repo);
+        std::fs::create_dir_all(dir.join(".git")).expect("create checkout");
+        dir
+    }
+
+    /// A fixture `cwd` whose own `magi.toml` declares `[repos] roots`, so
+    /// `Config::discover(cwd, None)` (what `resolve_repo`'s fallback actually
+    /// calls) resolves `[repos] roots` from a file this test controls.
+    fn cwd_with_repos_roots(roots: &[PathBuf]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let quoted: Vec<String> = roots.iter().map(|r| format!("'{}'", r.display())).collect();
+        std::fs::write(
+            dir.path().join("magi.toml"),
+            format!("[repos]\nroots = [{}]\n", quoted.join(", ")),
+        )
+        .expect("write fixture magi.toml");
+        dir
+    }
+
+    /// Serializes every [`NoMachineConfig`] guard against every other one:
+    /// `cargo test`'s default runner gives each test its own thread, so two
+    /// guards live at once unless something stops them, and `MAGI_CONFIG_DIR`
+    /// is process-wide state no `&mut` can protect. Without this, one guard's
+    /// `Drop` can restore the variable to `None` while a second guard's own
+    /// `Config::discover` call is still in flight, letting *that* call fall
+    /// through to the real machine config the second guard exists to hide.
+    static NO_MACHINE_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Forces `Config::discover` to see no machine config layer for the life
+    /// of the guard, restoring whatever `MAGI_CONFIG_DIR` held before (even
+    /// on panic) once it drops.
+    ///
+    /// `Config::machine_layer`'s own `#[cfg(test)]` escape hatch only applies
+    /// when *config.rs itself* is compiled for testing - `cargo test --bin
+    /// magi` links `magi::config` as an ordinary (non-test) dependency of the
+    /// binary, so without this, `resolve_repo`'s `Config::discover` call
+    /// reads whichever `<config_dir>/magi/config.toml` genuinely exists on
+    /// the machine running the test. On an operator's own box that file can
+    /// declare real `[repos] roots`, whose checkouts can coincidentally share
+    /// a name with this fixture's ("yukimemi/magi" is this very repository) -
+    /// exactly the false ambiguity that first made these tests flaky here.
+    struct NoMachineConfig {
+        previous: Option<String>,
+        // Held until `Drop` runs below - see `NO_MACHINE_CONFIG_LOCK`'s own
+        // doc for why one guard's lifetime must never overlap another's.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl NoMachineConfig {
+        fn set() -> Self {
+            let lock = NO_MACHINE_CONFIG_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::env::var(Config::CONFIG_DIR_ENV).ok();
+            // SAFETY: `NO_MACHINE_CONFIG_LOCK` guarantees this is the only
+            // guard alive right now, and nothing outside this guard touches
+            // `MAGI_CONFIG_DIR` - the same reasoning `web::tests::
+            // recheck_never_spawns_when_checking_is_off_or_killed_by_env`
+            // relies on for its own, differently-named env var.
+            unsafe { std::env::set_var(Config::CONFIG_DIR_ENV, "") };
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for NoMachineConfig {
+        fn drop(&mut self) {
+            // SAFETY: see `set` above - `_lock` is still held here and only
+            // releases once this whole `drop` returns.
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var(Config::CONFIG_DIR_ENV, v),
+                    None => std::env::remove_var(Config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_resolves_a_short_name_through_config_discover() {
+        let _guard = NoMachineConfig::set();
+        let roots = tempfile::tempdir().unwrap();
+        let checkout = ghq_checkout(roots.path(), "github.com", "yukimemi", "magi");
+        let cwd = cwd_with_repos_roots(&[roots.path().to_owned()]);
+
+        // Not a path that exists anywhere, so this only resolves if the
+        // fallback actually ran `Config::discover(cwd, None)` and found the
+        // fixture's `[repos] roots` - the full path the completion criteria
+        // asks a test to demonstrate, not just the pure name-matching helper.
+        let resolved = resolve_repo(Path::new("yukimemi/magi"), cwd.path())
+            .await
+            .expect("a unique short name resolves without a full path");
+        assert_eq!(resolved, checkout.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_refuses_an_ambiguous_short_name_through_config_discover() {
+        let _guard = NoMachineConfig::set();
+        let roots = tempfile::tempdir().unwrap();
+        ghq_checkout(roots.path(), "github.com", "yukimemi", "magi");
+        ghq_checkout(roots.path(), "github.com", "someone-else", "magi");
+        let cwd = cwd_with_repos_roots(&[roots.path().to_owned()]);
+
+        let err = resolve_repo(Path::new("magi"), cwd.path())
+            .await
+            .expect_err("an ambiguous short name must not pick one silently");
+        assert!(err.to_string().contains("matches 2 checkouts"), "{err:#}");
+    }
+
+    #[test]
+    fn resolve_repo_by_name_resolves_a_unique_owner_repo_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = ghq_checkout(tmp.path(), "github.com", "yukimemi", "magi");
+
+        let resolved = resolve_repo_by_name(Path::new("yukimemi/magi"), &[tmp.path().to_owned()])
+            .expect("a unique owner/repo name resolves");
+        assert_eq!(resolved, checkout.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_repo_by_name_resolves_a_unique_bare_repo_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = ghq_checkout(tmp.path(), "github.com", "yukimemi", "magi");
+
+        let resolved = resolve_repo_by_name(Path::new("magi"), &[tmp.path().to_owned()])
+            .expect("a unique bare repo name resolves");
+        assert_eq!(resolved, checkout.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_repo_by_name_refuses_a_bare_name_shared_by_two_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        ghq_checkout(tmp.path(), "github.com", "yukimemi", "magi");
+        ghq_checkout(tmp.path(), "github.com", "someone-else", "magi");
+
+        let err = resolve_repo_by_name(Path::new("magi"), &[tmp.path().to_owned()])
+            .expect_err("an ambiguous name must not pick one silently");
+        assert!(err.to_string().contains("matches 2 checkouts"), "{err:#}");
+
+        // The full owner/repo name for either checkout is unambiguous.
+        resolve_repo_by_name(Path::new("yukimemi/magi"), &[tmp.path().to_owned()])
+            .expect("the qualified name still resolves");
+    }
+
+    #[test]
+    fn resolve_repo_by_name_reports_does_not_exist_when_nothing_matches() {
+        let err = resolve_repo_by_name(Path::new("no-such-repo"), &[])
+            .expect_err("no roots and no match must fail");
+        assert!(err.to_string().contains("does not exist"), "{err:#}");
     }
 
     #[tokio::test]

@@ -964,6 +964,17 @@ fn attachment_note(store: &Talks, talk_id: &str, attachments: &[Attachment]) -> 
 /// removes the queue as an option, which is why both branches keep the same
 /// `# When the operator wants something done` section - `write_policy` is
 /// the only part that changes.
+///
+/// It also tells the agent that `--repo` is not stuck naming this
+/// conversation's own directory: `resolve_repo` (`src/main.rs`) now accepts a
+/// short `owner/repo` or bare `repo` name and resolves it against
+/// `[repos] roots`, the same local checkouts `magi repos` lists. Without this
+/// line an agent asked to change some other repository has no way to know
+/// that option exists, and the only path it can see - asking the operator to
+/// dictate a full path - is exactly the friction this change exists to
+/// remove. A miss or an ambiguous name still fails the command outright, so
+/// the instruction is to ask rather than guess when that happens - the
+/// silent-decision line this task must not cross.
 pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
     let write_policy = if allow_write {
         "Write access is enabled for this conversation (`allow_write = \
@@ -1006,7 +1017,14 @@ pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
          they get. Use --solo: it runs the task through one implementer \
          straight into review instead of the usual multi-agent competition, \
          which is the right shape for a change this conversation has already \
-         settled, rather than one still worth several independent takes.\n",
+         settled, rather than one still worth several independent takes.\n\n\
+         If the operator asks for something in a different repository, \
+         --repo does not have to be a full path: --repo owner/repo (or just \
+         repo, when that is unambiguous) is resolved against local checkouts \
+         the same way `magi repos` lists them. If the command fails because \
+         nothing matches or more than one checkout shares that name, ask the \
+         operator which repository they mean (or run `magi repos` yourself \
+         to see the candidates) rather than guessing.\n",
         repo = repo.display(),
     );
     out.push_str(&language_note(language));
@@ -1920,6 +1938,20 @@ mod tests {
         assert!(brief.contains("magi task add --solo"));
         assert!(brief.contains("/repo"));
         assert!(!brief.contains("Hold this conversation in"));
+    }
+
+    /// Talk fixes `repo` at the directory the conversation was opened in, so
+    /// an agent asked to change some other checkout has no path to it unless
+    /// the briefing itself says `--repo` can take a short name - see
+    /// `resolve_repo_by_name` in `src/main.rs`, which is what actually
+    /// resolves it.
+    #[test]
+    fn the_briefing_explains_targeting_a_different_repository_by_name() {
+        let brief = briefing(Path::new("/repo"), "en", false);
+        assert!(brief.contains("--repo does not have to be a full path"));
+        assert!(brief.contains("owner/repo"));
+        assert!(brief.contains("magi repos"));
+        assert!(brief.contains("ask the operator"));
     }
 
     #[test]
