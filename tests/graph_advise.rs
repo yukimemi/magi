@@ -216,7 +216,11 @@ async fn advise_does_not_reenter_once_implementation_has_already_progressed() {
             .filter(|e| e.message.contains("sketching a design in parallel"))
             .count()
     };
-    assert_eq!(sketching(&state.events), 1, "advise ran exactly once so far");
+    assert_eq!(
+        sketching(&state.events),
+        1,
+        "advise ran exactly once so far"
+    );
 
     let id = state.id.clone();
     let run_json = state.dir().join("run.json");
@@ -259,9 +263,10 @@ async fn advise_does_not_reenter_once_implementation_has_already_progressed() {
         "advise must not spawn a second advisor wave against a candidate that already implemented: {:?}",
         state.events
     );
-    let skipped = state.events.iter().any(|e| {
-        e.node == "advise" && e.message.contains("already shows implementation progress")
-    });
+    let skipped = state
+        .events
+        .iter()
+        .any(|e| e.node == "advise" && e.message.contains("already shows implementation progress"));
     assert!(
         skipped,
         "the skip must be recorded, not silent: {:?}",
