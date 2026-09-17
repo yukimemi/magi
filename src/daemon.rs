@@ -65,6 +65,7 @@ use crate::graph::Runner;
 use crate::land;
 use crate::queue::{Queue, Task, TaskStatus};
 use crate::run::{QuotaLoss, RunState, RunStatus};
+use crate::triage;
 
 /// On-disk format for [`Status`]. Bumped when a field's meaning changes.
 pub const SCHEMA: u32 = 1;
@@ -1541,6 +1542,7 @@ async fn poll(
             // daemon that reached a normal idle interval. The startup pass
             // cannot see runs or cache files produced by this drain.
             janitor(&opts.repo, opts, home, worktrees_root).await;
+            triage_held(queue, home, opts).await;
             break;
         }
         stop.idle(opts.poll).await;
@@ -1553,6 +1555,7 @@ async fn poll(
         // wake permit. No run can start while this branch is active, so the
         // janitor still never races an in-flight compile.
         janitor(&opts.repo, opts, home, worktrees_root).await;
+        triage_held(queue, home, opts).await;
     }
 
     // Never return while a run is still in flight, whichever way the loop
@@ -1830,6 +1833,43 @@ async fn janitor(repo: &Path, opts: &Opts, home: &Path, worktrees_root: &Path) {
         tracing::info!(
             "housekeep: abandoned {} question(s) left open by a finished run",
             out.questions_abandoned
+        );
+    }
+}
+
+/// Run [`triage::run_once`] and log whatever it did, the same "only when
+/// there is something to say" rule [`janitor`] follows for its own report.
+///
+/// Called at the same idle points as [`janitor`] - once per full poll
+/// interval, never mid-attempt - for the same reason: it is not liveness
+/// critical, and a task's own `hold_reason` string is the one thing this
+/// would otherwise re-check (via [`crate::disk::free_bytes`]) on every busy
+/// tick for no benefit.
+async fn triage_held(queue: &Queue, home: &Path, opts: &Opts) {
+    let questions = Questions::at(home.join("questions"));
+    let report = triage::run_once(queue, &questions, opts.config.as_deref(), Timestamp::now());
+    if report.is_empty() {
+        return;
+    }
+    if !report.resumed.is_empty() {
+        tracing::info!(
+            "triage: resumed {} held task(s) whose machine hold had resolved: {}",
+            report.resumed.len(),
+            report.resumed.join(", ")
+        );
+    }
+    if !report.asked.is_empty() {
+        tracing::info!(
+            "triage: asked about {} held task(s): {}",
+            report.asked.len(),
+            report.asked.join(", ")
+        );
+    }
+    if !report.answered.is_empty() {
+        tracing::info!(
+            "triage: applied {} operator answer(s): {}",
+            report.answered.len(),
+            report.answered.join(", ")
         );
     }
 }
