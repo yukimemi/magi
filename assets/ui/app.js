@@ -682,6 +682,7 @@ function renderLoop() {
   const text = box.querySelector(".daemon-text");
   const why = $("loop-why");
   const button = $("loop-toggle");
+  const controls = $("loop-controls");
   /* A past upgrade failure, folded into whatever note the loop's own state
      below already shows, rather than replacing it. `Stage::Failed` is
      terminal on the server and nothing clears it automatically, so taking
@@ -698,6 +699,7 @@ function renderLoop() {
     show(why, Boolean(full));
     show(button, false);
     button.onclick = null;
+    syncControls();
   };
 
   const park = $("loop-park");
@@ -719,6 +721,14 @@ function renderLoop() {
   setAttr(versionChip, "title", version ? `magi ${version} is serving this page` : null);
   show(versionChip, Boolean(version));
 
+  /* The chip and every button live in one grid cell (.daemon-controls) so
+     that hiding or showing any one of them never changes how many items the
+     .daemon grid itself is laying out. Called from every place below that
+     touches one of their `hidden` flags, so the wrapper's own visibility
+     always tracks whether it actually has anything in it. */
+  const syncControls = () => {
+    show(controls, !versionChip.hidden || !button.hidden || !park.hidden || !upgradeBtn.hidden);
+  };
 
   const control = (kind, label, note) => {
     setText(why, [note, upgradeFailNote].filter(Boolean).join(" "));
@@ -728,6 +738,7 @@ function renderLoop() {
     show(button, true);
     button.disabled = false;
     button.onclick = () => setLoop(kind === "start");
+    syncControls();
   };
 
   /* Offered only while a stop is waiting out a run, which is the moment the
@@ -740,6 +751,7 @@ function renderLoop() {
     setAttr(park, "title", note);
     show(park, true);
     park.onclick = () => setLoop(false, true);
+    syncControls();
   };
 
   if (!state.health) {
