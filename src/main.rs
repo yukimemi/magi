@@ -1830,14 +1830,23 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 println!("queue empty");
                 return Ok(());
             }
+            // Only queried once, and only for the human-readable listing:
+            // `--json` stays a faithful dump of `Task` itself, with nothing
+            // triage-specific spliced in that is not on the task's own record.
+            let waiting_on_triage = triage::open_task_ids(&ask::Questions::open());
             for t in &tasks {
                 let attempts = if t.attempts > 0 {
                     format!(" x{}", t.attempts)
                 } else {
                     String::new()
                 };
+                let question = if waiting_on_triage.contains(&t.id) {
+                    "  [triage question open, see `magi answer --list`]"
+                } else {
+                    ""
+                };
                 println!(
-                    "{}  {:<9}{:<4} {:<14} {}",
+                    "{}  {:<9}{:<4} {:<14} {}{question}",
                     t.short(),
                     t.status.as_str(),
                     attempts,
@@ -1880,6 +1889,16 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             }
             for a in &t.answers {
                 println!("answered  {}: {}", a.question, a.answer);
+            }
+            if t.status == TaskStatus::Held
+                && let Some(question) = triage::open_question_for(&ask::Questions::open(), &t.id)
+            {
+                println!(
+                    "question  {} ({}) - {}",
+                    question.short(),
+                    question.choices.join(" / "),
+                    question.summary
+                );
             }
             if let Some(d) = &t.diagnostic {
                 println!("\ndiagnostic\n{d}");

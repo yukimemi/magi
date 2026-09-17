@@ -42,15 +42,27 @@
 //! `Task::answers` next, not for the resolver.
 //!
 //! A triage question's answer is different: "not yet" and "leave it held"
-//! must not resume the task, only "resume it" may. Reusing the generic
+//! (discard) do two entirely different, non-resuming things, and only
+//! "resume it" may put the task back in line. Reusing the generic
 //! blocked/unblock path would resume every answer alike, so this module
 //! never calls [`Task::block`] and never leaves a triaged task anything but
-//! `held` while its question is open. [`apply_answer`] reads
-//! [`Question::resolution`] itself and only calls [`Task::release`] for an
-//! actual "resume" choice; anything else calls [`Task::hold_manual`] instead,
+//! `held` while its question is open. [`interpret_answer`] reads
+//! [`Question::resolution`] itself and [`run_once`] acts on it directly:
+//! [`Task::release`] for an actual "resume it" choice, [`Queue::remove`] for
+//! "leave it held" (捨ててよい really means "you may throw this away", not
+//! "leave it sitting held"), and [`Task::hold_manual`] for anything else -
 //! which both keeps the task held and reclassifies it as a hold an operator
-//! has now actually seen - one `crate::conduct` and a later triage pass leave
+//! has now actually seen, one `crate::conduct` and a later triage pass leave
 //! alone.
+//!
+//! The choice is read by its **position** in [`Question::choices`]
+//! ([`Wording::choices3`]/[`Wording::choices2`] always put "resume" first and
+//! "discard" third), never by comparing the answer text against [`Wording`]'s
+//! own strings picked from whatever config is in force *now* - the language a
+//! question was filed in and the language a later `run_once` call happens to
+//! read back are not guaranteed to be the same call's [`Config`], and a text
+//! comparison would silently misread a real "resume" answer as "keep held"
+//! the moment they disagree.
 //!
 //! # Idempotency, without a new field
 //!
@@ -62,11 +74,13 @@
 //! [`crate::queue::Task`] nor [`crate::ask::Question`] has a field for "this
 //! answer was already applied", so [`already_applied`] reads the same
 //! [`Question::short`] id back out of [`Task::hold_reason`] that
-//! [`apply_answer`] wrote into it - the same trick [`Question::abandon`]
+//! [`keep_held_note`] appended to it - the same trick [`Question::abandon`]
 //! already uses to fold a fact into a text field that has no dedicated one.
-//! A "resume" answer needs no marker at all: [`Task::release`] moves the task
-//! out of `held` entirely, and a task that is not `held` is never looked at
-//! by this module again.
+//! Appended, not written wholesale: the reason the hold happened in the first
+//! place is still worth reading in `magi task show` after an operator says
+//! "not yet". A "resume" or "discard" answer needs no marker at all: the task
+//! either leaves `held` entirely or stops existing, and either way it is
+//! never looked at by this module again.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -172,12 +186,23 @@ impl Wording {
 
     /// The body under the summary: everything an operator needs to judge this
     /// without opening a terminal - id, title, hold reason, hold source.
+    ///
+    /// Falls back to [`Task::last_error`] when [`Task::hold_reason`] is empty:
+    /// the most common `HoldSource::Machine` hold of all - `Task::fail` once
+    /// attempts run out - only ever sets `last_error`, never `hold_reason`, so
+    /// reading `hold_reason` alone would leave the question blank for exactly
+    /// the case requirement 4 exists for.
     fn detail(&self, task: &Task, why: &str) -> String {
-        let reason = task.hold_reason.as_deref().unwrap_or(if self.lang == "ja" {
+        let none = if self.lang == "ja" {
             "（記録なし）"
         } else {
             "(none recorded)"
-        });
+        };
+        let reason = task
+            .hold_reason
+            .as_deref()
+            .or(task.last_error.as_deref())
+            .unwrap_or(none);
         format!(
             "task: {} ({})\ntitle: {}\nhold source: {}\nhold reason: {reason}\n\n{why}",
             task.id,
@@ -365,24 +390,55 @@ fn latest_triage_question(questions: &Questions, task_id: &str) -> Option<Questi
         .max_by(|a, b| a.id.cmp(&b.id))
 }
 
-/// Apply an answered triage question's decision to `task`, which must still
-/// be `held`. Only an actual "resume" choice releases it; every other answer
-/// ("not yet", "leave it held", or anything else a phone might have sent)
-/// keeps it held and reclassifies the hold as [`HoldSource::Manual`], marked
-/// so [`already_applied`] will not repeat this.
-fn apply_answer(task: &mut Task, q: &Question, w: &Wording) {
+/// What an answered triage question's choice means, independent of which
+/// language it was filed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnswerAction {
+    /// The first choice, always "resume it" / "再開してよい" / "再開する" -
+    /// see [`Wording::choices3`] and [`Wording::choices2`], whose first entry
+    /// is always the resume choice.
+    Resume,
+    /// The third choice, present only in [`Wording::choices3`]: "leave it
+    /// held" / "捨ててよい".
+    Discard,
+    /// Anything else: the second choice ("not yet" / "keep it held"), or an
+    /// answer that does not match any offered choice at all (should not
+    /// happen for a multiple-choice question, but the safe default is to
+    /// keep holding rather than guess at "resume").
+    KeepHeld,
+}
+
+/// Read `q`'s answer as an [`AnswerAction`].
+///
+/// Matched by **position in `q.choices`**, never by comparing the answer text
+/// against [`Wording`]'s own strings: [`Wording`] is picked from the task's
+/// *current* repository config, which can differ from whatever language was
+/// in force when the question was filed (a `--config` override on one `magi
+/// task triage` call and not the next, or the repository's config edited in
+/// between). Comparing text would then silently misread an actual "resume"
+/// answer as "keep held" - the choices themselves are fixed at filing time,
+/// in [`file_question`], and never change afterwards, so their position is
+/// the one thing that stays true regardless of which language reads them
+/// back.
+fn interpret_answer(q: &Question) -> AnswerAction {
     let resolution = q.resolution().unwrap_or_default();
-    if resolution == w.resume || resolution == w.resume_now {
-        task.release();
-        return;
+    match q.choices.iter().position(|c| *c == resolution) {
+        Some(0) => AnswerAction::Resume,
+        Some(2) => AnswerAction::Discard,
+        _ => AnswerAction::KeepHeld,
     }
-    let marker = marker_for(q);
-    let note = if w.lang == "ja" {
-        format!("{marker} 操作者の回答: {resolution}")
-    } else {
-        format!("{marker} operator answered: {resolution}")
-    };
-    task.hold_manual(Some(note));
+}
+
+/// The note [`already_applied`] looks for, appended to (never replacing)
+/// whatever [`Task::hold_reason`] already said - the original cause is still
+/// worth reading in `magi task show` after the operator answers "not yet",
+/// and [`Task::hold_manual`] would otherwise overwrite it outright.
+fn keep_held_note(task: &Task, q: &Question, resolution: &str) -> String {
+    let marker = format!("{} operator: {resolution}", marker_for(q));
+    match task.hold_reason.as_deref() {
+        Some(existing) if !existing.is_empty() => format!("{existing}\n{marker}"),
+        _ => marker,
+    }
 }
 
 /// File a fresh triage question for `task` and return it. The caller is
@@ -471,9 +527,26 @@ pub fn run_once(
                 continue;
             }
             if q.status == QuestionStatus::Answered && !already_applied(&task, &q) {
-                apply_answer(&mut task, &q, w);
-                if queue.put(&mut task).is_ok() {
-                    report.answered.push(task.id.clone());
+                match interpret_answer(&q) {
+                    AnswerAction::Resume => {
+                        task.release();
+                        if queue.put(&mut task).is_ok() {
+                            report.answered.push(task.id.clone());
+                        }
+                    }
+                    AnswerAction::Discard => {
+                        if queue.remove(&task.id, false).is_ok() {
+                            report.answered.push(task.id.clone());
+                        }
+                    }
+                    AnswerAction::KeepHeld => {
+                        let resolution = q.resolution().unwrap_or_default();
+                        let note = keep_held_note(&task, &q, &resolution);
+                        task.hold_manual(Some(note));
+                        if queue.put(&mut task).is_ok() {
+                            report.answered.push(task.id.clone());
+                        }
+                    }
                 }
                 continue;
             }
@@ -511,6 +584,27 @@ pub fn run_once(
         }
     }
     report
+}
+
+/// The open triage question about `task_id`, if any - what `magi task show`
+/// prints so a held task's card names the question waiting on it, not only
+/// its hold reason. `None` once it is answered or abandoned: nothing is
+/// waiting on it anymore.
+pub fn open_question_for(questions: &Questions, task_id: &str) -> Option<Question> {
+    latest_triage_question(questions, task_id).filter(|q| q.status.open())
+}
+
+/// Every task id with an open triage question right now - what `magi task
+/// list` uses to mark a held task that is already waiting on an operator
+/// decision, rather than have it read identically to one nobody has looked
+/// at yet.
+pub fn open_task_ids(questions: &Questions) -> std::collections::BTreeSet<String> {
+    questions
+        .list()
+        .into_iter()
+        .filter(|q| q.node == NODE && q.status.open())
+        .map(|q| q.run)
+        .collect()
 }
 
 #[cfg(test)]
@@ -710,6 +804,14 @@ mod tests {
         let back = q.get(&t.id).unwrap();
         assert_eq!(back.status, TaskStatus::Held);
         assert_eq!(back.hold_source, Some(HoldSource::Manual));
+        assert!(
+            back.hold_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("gate red")),
+            "the original cause must survive a \"not yet\" answer, not just the \
+             triage marker: {:?}",
+            back.hold_reason
+        );
 
         // A third pass, same instant: the manual hold is fresh (just
         // touched), so nothing more happens - in particular the already
@@ -717,5 +819,123 @@ mod tests {
         let third = run_once(&q, &questions, None, Timestamp::now());
         assert!(third.answered.is_empty());
         assert!(third.asked.is_empty());
+    }
+
+    #[test]
+    fn answering_discard_removes_the_task_entirely() {
+        let (dir, q, questions) = store();
+        let mut t = task("gate went red", dir.path().join("repo"));
+        t.hold_machine(Some("gate red".to_owned()));
+        q.put(&mut t).unwrap();
+        run_once(&q, &questions, None, Timestamp::now());
+
+        let mut asked = questions
+            .list()
+            .into_iter()
+            .find(|q| q.run == t.id)
+            .unwrap();
+        asked.answer(Answer::Choice(EN.discard.to_owned())).unwrap();
+        questions.put(&mut asked).unwrap();
+
+        let report = run_once(&q, &questions, None, Timestamp::now());
+        assert_eq!(report.answered, [t.id.clone()]);
+        assert!(
+            q.get(&t.id).is_err(),
+            "\"leave it held\" (捨ててよい) must actually discard the task, not \
+             just leave it sitting held forever"
+        );
+    }
+
+    #[test]
+    fn an_answer_is_read_by_its_position_in_choices_not_by_the_callers_current_language() {
+        // Filed while the repo's config reads Japanese...
+        let (dir, q, questions) = store();
+        let ja_config = dir.path().join("ja.toml");
+        std::fs::write(&ja_config, "[graph]\nlanguage = \"ja\"\n").unwrap();
+        let mut t = task("gate went red", dir.path().join("repo"));
+        t.hold_machine(Some("gate red".to_owned()));
+        q.put(&mut t).unwrap();
+        run_once(&q, &questions, Some(&ja_config), Timestamp::now());
+
+        let mut asked = questions
+            .list()
+            .into_iter()
+            .find(|q| q.run == t.id)
+            .unwrap();
+        assert_eq!(asked.choices[0], JA.resume, "filed in Japanese");
+        asked.answer(Answer::Choice(JA.resume.to_owned())).unwrap();
+        questions.put(&mut asked).unwrap();
+
+        // ...but applied against an English config (a later `--config`, or an
+        // edited repository config). The Japanese "再開してよい" answer must
+        // still be read as a resume, not silently misread as "keep held"
+        // because it fails a text comparison against the English wording.
+        let en_config = dir.path().join("en.toml");
+        std::fs::write(&en_config, "[graph]\nlanguage = \"en\"\n").unwrap();
+        let report = run_once(&q, &questions, Some(&en_config), Timestamp::now());
+        assert_eq!(report.answered, [t.id.clone()]);
+        let back = q.get(&t.id).unwrap();
+        assert_eq!(
+            back.status,
+            TaskStatus::Queued,
+            "a resume answer must resume the task regardless of which \
+             language it is read back in"
+        );
+    }
+
+    #[test]
+    fn a_question_falls_back_to_last_error_when_hold_reason_was_never_set() {
+        // `Task::fail` - the ordinary "out of attempts" machine hold - only
+        // ever sets `last_error`, never `hold_reason`. The question detail
+        // must still name a cause rather than reading "(none recorded)".
+        let (dir, q, questions) = store();
+        let mut t = task("kept failing the gate", dir.path().join("repo"));
+        t.start("run-1".to_owned());
+        t.fail("gate red three times running", 1);
+        assert_eq!(t.status, TaskStatus::Held);
+        assert!(t.hold_reason.is_none(), "the case this test is about");
+        q.put(&mut t).unwrap();
+
+        run_once(&q, &questions, None, Timestamp::now());
+        let asked = questions
+            .list()
+            .into_iter()
+            .find(|q| q.run == t.id)
+            .unwrap();
+        assert!(
+            asked.detail.contains("gate red three times running"),
+            "the question must surface `last_error` when there is no \
+             `hold_reason` to show instead: {}",
+            asked.detail
+        );
+    }
+
+    #[test]
+    fn open_question_for_and_open_task_ids_reflect_only_what_is_still_waiting() {
+        let (dir, q, questions) = store();
+        let mut t = task("gate went red", dir.path().join("repo"));
+        t.hold_machine(Some("gate red".to_owned()));
+        q.put(&mut t).unwrap();
+
+        assert!(open_question_for(&questions, &t.id).is_none());
+        assert!(!open_task_ids(&questions).contains(&t.id));
+
+        run_once(&q, &questions, None, Timestamp::now());
+        assert!(open_question_for(&questions, &t.id).is_some());
+        assert!(open_task_ids(&questions).contains(&t.id));
+
+        let mut asked = questions
+            .list()
+            .into_iter()
+            .find(|q| q.run == t.id)
+            .unwrap();
+        asked.answer(Answer::Choice(EN.resume.to_owned())).unwrap();
+        questions.put(&mut asked).unwrap();
+
+        assert!(
+            open_question_for(&questions, &t.id).is_none(),
+            "an answered question is no longer open"
+        );
+        assert!(!open_task_ids(&questions).contains(&t.id));
     }
 }
