@@ -55,9 +55,18 @@ fn cyan(t: &str) -> String {
 ///
 /// `Stalled` is deliberately not green: a run whose judges were taken out by a
 /// rate limit must not look like a healthy `Ready` in a one-line listing.
-fn status_word(status: RunStatus) -> String {
-    let text = format!("{status:?}").to_lowercase();
-    match status {
+///
+/// A `Ready` reached via `[merge] mode = "none"` is a second case that must
+/// not look like a plain `Ready`: that run is done for good, never picked up
+/// by the PR-polling merge watcher or anything else, while an ordinary
+/// `Ready` (a PR closed without merging, an already-concluded re-entry) may
+/// still be a live landing candidate. See [`RunState::unmerged_by_design`].
+fn status_word(state: &RunState) -> String {
+    if state.unmerged_by_design() {
+        return cyan("unmerged (no-op by design)");
+    }
+    let text = format!("{:?}", state.status).to_lowercase();
+    match state.status {
         RunStatus::Merged => bold(&green(&text)),
         RunStatus::Ready => green(&text),
         RunStatus::Stalled => bold(&yellow(&text)),
@@ -102,7 +111,7 @@ pub fn line(state: &RunState) -> String {
     format!(
         "{}  {:<20}  {:>2}c {:>2}j  win {} ({}){quorum}  {}",
         dim(&state.id),
-        status_word(state.status),
+        status_word(state),
         state.candidates.len(),
         state.judgements.len(),
         winner,
@@ -132,7 +141,7 @@ pub fn run(state: &RunState) -> String {
         "{} {}  {}",
         bold("magi run"),
         bold(&state.id),
-        status_word(state.status)
+        status_word(state)
     );
     let _ = writeln!(
         s,
@@ -974,6 +983,51 @@ mod tests {
             "a squash-style manual merge must warn about the missing message: {text}"
         );
         assert!(text.contains("--squash"), "{text}");
+    }
+
+    #[test]
+    fn a_ready_run_left_by_merge_mode_none_does_not_read_as_a_plain_ready() {
+        let _guard = plain();
+        let mut s = state();
+        s.status = RunStatus::Ready;
+        s.merge = Some(MergeOutcome {
+            mode: crate::config::MergeMode::None,
+            ok: true,
+            detail: "git -C /repo merge --no-ff magi/x/A".to_owned(),
+        });
+
+        let list = line(&s);
+        assert!(
+            !list.contains(" ready "),
+            "a mode-none run must not read as a plain ready in `magi list`: {list}"
+        );
+        assert!(list.contains("no-op by design"), "{list}");
+
+        let full = run(&s);
+        assert!(
+            !full.contains("magi run") || !full.lines().next().unwrap().contains(" ready"),
+            "the header line of `magi show` must not say plain ready either: {full}"
+        );
+        assert!(full.contains("no-op by design"), "{full}");
+    }
+
+    #[test]
+    fn an_ordinary_ready_run_still_reads_as_ready() {
+        let _guard = plain();
+        let mut s = state();
+        s.status = RunStatus::Ready;
+        // A PR closed without merging also ends at `Ready` (see `land.rs`),
+        // and unlike the honest mode-none no-op it must keep reading as a
+        // plain `ready` — the label exists to flag design, not every non-merge.
+        s.merge = Some(MergeOutcome {
+            mode: crate::config::MergeMode::Pr,
+            ok: false,
+            detail: "https://example.com/pr/1 was closed without merging".to_owned(),
+        });
+
+        let list = line(&s);
+        assert!(list.contains("ready"), "{list}");
+        assert!(!list.contains("no-op by design"), "{list}");
     }
 
     #[test]

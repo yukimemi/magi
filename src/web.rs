@@ -2081,6 +2081,12 @@ struct RunSummary {
     waiting: bool,
     /// The land loop's last look at the pull request, when there is one.
     pr: Option<crate::run::PrRecord>,
+    /// `status` is `"ready"`, but `[merge] mode = "none"` left it there by
+    /// design — never picked up by the PR-polling merge watcher, unlike an
+    /// ordinary `Ready` that may still be a live landing candidate. See
+    /// [`RunState::unmerged_by_design`]. The front end reads this rather than
+    /// re-deriving the same check from `status` and `merge.mode` itself.
+    unmerged_by_design: bool,
 }
 
 impl RunSummary {
@@ -2090,6 +2096,7 @@ impl RunSummary {
             short: state.short().to_owned(),
             status: status_word(state.status),
             done: state.status.done(),
+            unmerged_by_design: state.unmerged_by_design(),
             instruction: state.instruction.clone(),
             title: title_from(&state.instruction, TITLE_MAX),
             repo: state.repo.display().to_string(),
@@ -2205,6 +2212,11 @@ struct RunDetailView {
     /// route — see `ActiveSeat`'s own docs for why the entry alone is not
     /// proof of either.
     live: bool,
+    /// Same field and meaning as [`RunSummary::unmerged_by_design`] — kept
+    /// alongside the flattened `state` rather than inside it, since
+    /// `RunState` has no business knowing which of its own methods a caller
+    /// wants serialized.
+    unmerged_by_design: bool,
 }
 
 impl RunDetailView {
@@ -2212,6 +2224,7 @@ impl RunDetailView {
         Self {
             instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
             live,
+            unmerged_by_design: state.unmerged_by_design(),
             state,
         }
     }
@@ -6425,6 +6438,76 @@ mod tests {
         assert_eq!(detail.status, 200);
         assert_eq!(detail.json()["base_branch"], "main");
         assert_eq!(detail.json()["id"], "20260902-140501-a1b2");
+    }
+
+    /// `status: "ready"` alone cannot tell a run still headed for a landing
+    /// (a PR closed without merging, say) apart from one `[merge] mode =
+    /// "none"` left unmerged for good — the confusion the operator flagged
+    /// after the CLI report already grew a `not landed — nothing to do by
+    /// design` line for exactly this case (`report.rs`). Both the list route
+    /// and the detail route must carry a flag the phone can key on instead of
+    /// re-deriving it from `status` + `merge.mode` itself.
+    #[tokio::test]
+    async fn a_mode_none_ready_run_is_flagged_unmerged_by_design_everywhere() {
+        let f = Fixture::start().await;
+
+        let mut none_run = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "Add a web UI".to_owned(),
+            Config::default(),
+        );
+        none_run.id = "20260902-140503-none".to_owned();
+        none_run.status = RunStatus::Ready;
+        none_run.merge = Some(crate::run::MergeOutcome {
+            mode: crate::config::MergeMode::None,
+            ok: true,
+            detail: "git -C /repo merge --no-ff magi/x/A".to_owned(),
+        });
+        write_state(&f.runs(), &none_run);
+
+        let mut pr_run = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "Add a web UI".to_owned(),
+            Config::default(),
+        );
+        pr_run.id = "20260902-140504-prcl".to_owned();
+        pr_run.status = RunStatus::Ready;
+        pr_run.merge = Some(crate::run::MergeOutcome {
+            mode: crate::config::MergeMode::Pr,
+            ok: false,
+            detail: "https://example.com/pr/1 was closed without merging".to_owned(),
+        });
+        write_state(&f.runs(), &pr_run);
+
+        let summary = f.get("/api/runs").await.json();
+        let rows: std::collections::HashMap<&str, &Value> = summary
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|r| (r["id"].as_str().expect("an id"), r))
+            .collect();
+        assert_eq!(rows[none_run.id.as_str()]["status"], "ready");
+        assert_eq!(
+            rows[none_run.id.as_str()]["unmerged_by_design"],
+            true,
+            "a mode-none Ready must be flagged in the list"
+        );
+        assert_eq!(
+            rows[pr_run.id.as_str()]["unmerged_by_design"],
+            false,
+            "a Ready reached by a closed pull request is a different case"
+        );
+
+        let none_detail = f.get(&format!("/api/runs/{}", none_run.id)).await.json();
+        assert_eq!(none_detail["status"], "ready");
+        assert_eq!(none_detail["unmerged_by_design"], true);
+
+        let pr_detail = f.get(&format!("/api/runs/{}", pr_run.id)).await.json();
+        assert_eq!(pr_detail["unmerged_by_design"], false);
     }
 
     /// `RunState::active` is only ever cleared by whoever populated it, so the
