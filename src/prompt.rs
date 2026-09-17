@@ -13,7 +13,7 @@
 //!   what makes an unread patch defensible.
 use std::fmt::Write as _;
 
-use crate::verdict::{Finding, ReviewVote};
+use crate::verdict::{Finding, Proposal, ReviewVote};
 
 /// Patches above this size are truncated in the prompt; the judge is pointed at
 /// the branch instead. Agent context windows are large but not free, and a
@@ -253,12 +253,32 @@ polices.",
 }
 
 /// Prompt for an implementer.
-pub fn implement(instruction: &str, cwd: &str, language: &str) -> String {
+///
+/// `brief` is the design-deliberation stage's synthesis
+/// (`crate::advise::Advice::synthesis`), when the stage ran and at least one
+/// advisor's proposal was usable. `None` when `[graph] advise` is off, the
+/// stage found nothing usable, or the synthesis seat itself failed - the
+/// implementer then gets exactly the prompt it always did.
+pub fn implement(instruction: &str, cwd: &str, language: &str, brief: Option<&str>) -> String {
+    let brief_section = brief
+        .filter(|b| !b.trim().is_empty())
+        .map(|b| {
+            format!(
+                "# Design deliberation\n\n\
+                 Before you started, independent advisor seats each sketched a \
+                 design for this task, read-only, without seeing each other's \
+                 answer; the brief below blends what they found. Treat it as \
+                 background, not a plan handed down to follow blindly - verify \
+                 it against the repository as you go, and diverge from it when \
+                 what you find there says otherwise.\n\n{b}\n\n"
+            )
+        })
+        .unwrap_or_default();
     format!(
         "You are implementing a change in an isolated git worktree.\n\n\
          # Working directory\n\n{cwd}\n\n\
          # Task\n\n{instruction}\n\n\
-         # Rules\n\n\
+         {brief_section}# Rules\n\n\
          1. Work only inside this worktree. Nothing outside it is yours.\n\
          2. Commit your work. Anything left uncommitted is committed for you \
             under a neutral identity, so commit deliberately if the history \
@@ -877,6 +897,112 @@ pub fn resume_after_drop(why: &str) -> String {
          still in this conversation. Keep the reply short; the files are what \
          matter, not the message."
     )
+}
+
+/// Prompt for one advisor seat in the design-deliberation stage
+/// (`crate::graph::Runner::advise`), run before any implementer touches the
+/// repository.
+///
+/// Read-only and patch-free by construction: `seat` and `seats` tell the
+/// advisor it is one voice among several working at the same time, so it
+/// commits to one design rather than hedging with a menu it expects someone
+/// else to narrow down.
+pub fn advisor(instruction: &str, seat: usize, seats: usize, language: &str) -> String {
+    let mut s = format!(
+        "You are advisor {seat} of {seats}, asked to sketch a design for a \
+         change before an implementer begins. You do not implement anything \
+         and you must not modify the repository - read only.\n\n\
+         The other advisors are working independently, at the same time, \
+         without seeing your answer or you seeing theirs. Do not hedge with a \
+         menu of options for someone else to narrow down - commit to one \
+         design.\n\n\
+         # The task\n\n{instruction}\n\n\
+         # Your task\n\n\
+         Read the repository as far as you need to ground the design in what \
+         is actually there - the files it touches, the conventions already in \
+         use. Then propose one approach.\n\n\
+         # Output\n\n\
+         Exactly one fenced json block, and nothing after it:\n\n\
+         ```json\n\
+         {{\"approach\":\"what to do and how, a few sentences\",\
+         \"key_tradeoff\":\"the one tradeoff this design turns on\",\
+         \"risks\":[\"what could go wrong\"],\
+         \"touches\":[\"path/or/module\"],\
+         \"why_not_naive\":\"why this earns its complexity over the obvious \
+         first draft\"}}\n\
+         ```"
+    );
+    s.push_str(&lang(language));
+    s
+}
+
+/// Prompt for the synthesis seat that blends the advisors' proposals into a
+/// design brief carried in the implementer's prompt
+/// (`crate::prompt::implement`'s `brief` argument).
+///
+/// Deliberately titled "synthesize", not "choose": the seat is told, in so
+/// many words, not to pick a winner. `proposals` names each seat so the
+/// attribution the brief carries is the same label used here, which also
+/// grounds `crate::advise::Reflection`'s strongest signal - the brief naming
+/// a seat outright.
+pub fn synthesize_brief(
+    instruction: &str,
+    proposals: &[(&str, &Proposal)],
+    language: &str,
+) -> String {
+    let mut s = format!(
+        "You are opening a task for magi, a blind multi-agent implementation \
+         competition. The task below is already settled; independent advisors \
+         then each sketched a design for it without seeing each other's \
+         answer. Your job is not to pick a winner - it is to blend the good \
+         parts of each into one short design brief the implementer will read \
+         alongside the task, naming which advisor's idea you kept where, so \
+         it is clear where each part came from.\n\n\
+         # The task\n\n{instruction}\n\n\
+         # Advisor proposals\n"
+    );
+    for (seat, p) in proposals {
+        let _ = write!(
+            s,
+            "\n## {seat}\n\n\
+             Approach: {}\n\n\
+             Key tradeoff: {}\n\n\
+             Risks: {}\n\n\
+             Touches: {}\n\n\
+             Why not the naive approach: {}\n",
+            p.approach,
+            p.key_tradeoff,
+            if p.risks.is_empty() {
+                "(none given)".to_owned()
+            } else {
+                p.risks.join("; ")
+            },
+            if p.touches.is_empty() {
+                "(none given)".to_owned()
+            } else {
+                p.touches.join(", ")
+            },
+            p.why_not_naive,
+        );
+    }
+    let example = proposals.first().map_or("advisor-1", |(seat, _)| seat);
+    let _ = write!(
+        s,
+        "\n# What to write\n\n\
+         A few paragraphs, not a rewrite of the task: blend the advisors' \
+         thinking, naming the advisor (e.g. \"{example} argued ...\") next to \
+         the idea you kept from them. You are combining, not choosing - do \
+         not discard a proposal wholesale just because another one also had a \
+         point. If two proposals conflict, say so and explain which way you \
+         resolved it and why.\n\n\
+         # Output\n\n\
+         Your brief, ending with a `## Synthesis` heading whose content is \
+         exactly the brief and nothing else - that heading is what gets \
+         carried into the implementer's prompt, so nothing outside it should \
+         be information the implementer needs.",
+    );
+    s.push_str(&lang(language));
+    s
 }
 
 /// A task shown to `crate::conduct`: either runnable (a dependency-blocking
@@ -1538,11 +1664,79 @@ mod tests {
     }
 
     #[test]
+    fn advisor_prompt_forbids_writing_and_names_the_seat() {
+        let p = advisor("add retries", 2, 3, "en");
+        assert!(p.contains("advisor 2 of 3"), "{p}");
+        assert!(p.contains("read only"), "{p}");
+        assert!(p.contains("```json"), "{p}");
+    }
+
+    fn proposal(approach: &str) -> Proposal {
+        Proposal {
+            approach: approach.to_owned(),
+            key_tradeoff: "t".to_owned(),
+            risks: Vec::new(),
+            touches: Vec::new(),
+            why_not_naive: "w".to_owned(),
+        }
+    }
+
+    #[test]
+    fn synthesize_prompt_carries_the_task_and_attributes_every_proposal() {
+        let a = proposal("do X");
+        let b = proposal("do Y");
+        let p = synthesize_brief("add retries", &[("advisor-1", &a), ("advisor-2", &b)], "en");
+        assert!(p.contains("add retries"), "{p}");
+        assert!(p.contains("## advisor-1"), "{p}");
+        assert!(p.contains("## advisor-2"), "{p}");
+        assert!(p.contains("do X"), "{p}");
+        assert!(p.contains("do Y"), "{p}");
+        assert!(p.contains("## Synthesis"), "{p}");
+    }
+
+    #[test]
+    fn synthesize_prompt_says_none_given_for_an_advisor_with_no_risks_or_touches() {
+        let p = proposal("do X");
+        let out = synthesize_brief("t", &[("advisor-1", &p)], "en");
+        assert!(out.contains("(none given)"), "{out}");
+    }
+
+    #[test]
     fn implement_prompt_bans_attribution_and_asks_for_a_summary() {
-        let p = implement("do it", "/tmp/wt", "en");
+        let p = implement("do it", "/tmp/wt", "en", None);
         assert!(p.contains("Co-Authored-By:"));
         assert!(p.contains("## SUMMARY"));
         assert!(p.contains("/tmp/wt"));
+    }
+
+    #[test]
+    fn implement_prompt_carries_the_design_brief_when_there_is_one() {
+        let p = implement(
+            "do it",
+            "/tmp/wt",
+            "en",
+            Some("advisor-1 argued for polling; the brief adopts it."),
+        );
+        assert!(p.contains("# Design deliberation"), "{p}");
+        assert!(p.contains("advisor-1 argued for polling"), "{p}");
+        // The brief is background, never a plan the implementer must follow
+        // blindly - it can be wrong, and the repository is the ground truth.
+        assert!(p.contains("not a plan handed down"), "{p}");
+    }
+
+    #[test]
+    fn implement_prompt_omits_the_brief_section_with_no_brief() {
+        let without_brief = implement("do it", "/tmp/wt", "en", None);
+        assert!(
+            !without_brief.contains("# Design deliberation"),
+            "{without_brief}"
+        );
+
+        let blank = implement("do it", "/tmp/wt", "en", Some("   "));
+        assert!(
+            !blank.contains("# Design deliberation"),
+            "an all-whitespace brief must not add an empty section: {blank}"
+        );
     }
 
     #[test]
@@ -1583,7 +1777,7 @@ mod tests {
     }
     #[test]
     fn an_implementer_is_told_it_can_ask_and_how_the_panel_is_sandboxed() {
-        let p = implement("do it", "/tmp/wt", "en");
+        let p = implement("do it", "/tmp/wt", "en", None);
         // A capability an agent is not told about is one nobody uses.
         assert!(p.contains("magi ask"), "{p}");
         assert!(p.contains("--panel"), "{p}");
@@ -1625,7 +1819,7 @@ mod tests {
 
     #[test]
     fn an_implementer_is_told_how_to_reply_when_the_owner_asks_back() {
-        let p = implement("do it", "/tmp/wt", "en");
+        let p = implement("do it", "/tmp/wt", "en", None);
         assert!(p.contains("--thread"), "{p}");
         assert!(
             p.contains("exits 0"),
@@ -1643,7 +1837,7 @@ mod tests {
         // child that would have read the reply died with it, and the owner's
         // eventual answer had nobody left listening. The prompt has to rule
         // this out explicitly rather than trust it is obvious.
-        let p = implement("do it", "/tmp/wt", "en");
+        let p = implement("do it", "/tmp/wt", "en", None);
         assert!(
             p.contains("Never put this in the background"),
             "the exact failure mode has to be named, not implied: {p}"
@@ -1658,7 +1852,7 @@ mod tests {
     fn a_question_is_asked_in_the_operators_language_not_in_a_language_code() {
         // Reported from a real run: `language = "ja"` was set and the questions
         // still arrived in English. Two causes, both fixed here.
-        let ja = implement("do it", "/tmp/wt", "ja");
+        let ja = implement("do it", "/tmp/wt", "ja", None);
 
         // 1. The code reached the prompt verbatim - "Write all prose in ja" is
         //    an instruction a model can read as noise.
@@ -1677,12 +1871,12 @@ mod tests {
 
         // English is the default and must stay silent rather than adding a
         // paragraph telling the model to do what it was going to do anyway.
-        let en = implement("do it", "/tmp/wt", "en");
+        let en = implement("do it", "/tmp/wt", "en", None);
         assert!(!en.contains("Write the question in"), "{en}");
         assert!(!en.contains("Write all prose in"), "{en}");
 
         // A language magi has no code for is repeated as the operator wrote it.
-        let other = implement("do it", "/tmp/wt", "Brazilian Portuguese");
+        let other = implement("do it", "/tmp/wt", "Brazilian Portuguese", None);
         assert!(other.contains("Write the question in Brazilian Portuguese."));
     }
 

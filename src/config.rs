@@ -186,6 +186,17 @@ pub struct Roles {
     /// judge or reviewer seat that the conductor's own poll-cycle cadence
     /// would otherwise compete with for the same account's concurrency.
     pub conductor: Option<String>,
+    /// Seats for the design-deliberation stage `graph::Runner::advise` runs
+    /// before `implement`: independent, read-only design proposals gathered
+    /// once a run has a settled task instruction and before any implementer
+    /// touches the repository.
+    ///
+    /// Empty falls back to `judges` rather than to the whole roster: a panel
+    /// trusted to rank patches independently is exactly the panel worth
+    /// asking to sketch a design independently, and an operator who has
+    /// already thought about judge diversity gets advisor diversity for free
+    /// instead of a fourth roster to maintain.
+    pub advisors: Vec<String>,
 }
 
 /// Graph shape and limits.
@@ -327,6 +338,25 @@ pub struct Graph {
     /// have caught by reading), and this is the way back to seeing it every
     /// round instead of only once the panel has nothing left to flag.
     pub e2e_every_round: bool,
+    /// Run the design-deliberation stage before `implement`: independent
+    /// advisor seats each sketch a design, and (when at least one produced a
+    /// usable proposal) a synthesis blends them into a brief carried in the
+    /// implementer's prompt. See `graph::Runner::advise`.
+    ///
+    /// On by default. A design sketch is a few paragraphs an agent can write
+    /// without touching the repository, where a full implementation is a
+    /// tool loop that re-reads the codebase on every turn - so three
+    /// sketches, gathered once before `implement` starts, cost a fraction of
+    /// a fourth candidate and buy back a form of the same disagreement
+    /// [`Self::candidates`]'s doc describes moving away from being the
+    /// default, on every run rather than only the ones an operator remembers
+    /// to ask for with `--candidates`.
+    pub advise: bool,
+    /// How many independent design proposals the deliberation stage gathers.
+    /// **Three by default** - the same number [`Self::candidates`]'s doc
+    /// names as the point where a fourth judge's first choice stopped
+    /// changing the tally.
+    pub advisors: usize,
 }
 
 impl Default for Graph {
@@ -354,6 +384,8 @@ impl Default for Graph {
             answer_timeout: 86_400,
             incomplete_review: IncompleteReviewPolicy::Block,
             e2e_every_round: false,
+            advise: true,
+            advisors: 3,
         }
     }
 }
@@ -1342,6 +1374,41 @@ impl Config {
         })
     }
 
+    /// Advisor seats for the design-deliberation stage (see
+    /// `graph::Runner::advise`): `[roles] advisors` when set, otherwise the
+    /// judge roster - see [`Roles::advisors`] for why that fallback and not
+    /// the whole roster.
+    ///
+    /// The fallback rotates with `offset = 1`, matching the judges line in
+    /// [`Config::resolve_roles`] exactly, `ids` and offset both - not just
+    /// `roles.judges`, which is empty whenever judges themselves are
+    /// unconfigured and rotating the whole roster. Falling back with
+    /// `offset = 0` there would silently hand the advisors a *different*
+    /// agent set than the judges an unconfigured run would actually get,
+    /// which is the one thing [`Roles::advisors`]'s doc promises will not
+    /// happen.
+    ///
+    /// Called lazily from the graph node itself rather than folded into
+    /// [`Config::resolve_roles`]: unlike the other roles, a failure here must
+    /// not stop a run from starting at all - the deliberation stage is an
+    /// enrichment `[graph] advise` can turn off, not a seat later nodes
+    /// cannot proceed without - and at the point `resolve_roles` runs (before
+    /// [`crate::run::RunState`] exists, on `Runner::start`) there would be no
+    /// run yet for a resolution failure to be reported against.
+    pub fn advisors(&self) -> Result<Vec<AgentSpec>> {
+        if self.agents.is_empty() {
+            bail!(
+                "agent roster is empty: no agent CLI found on PATH and no \
+                 [[agents]] in the config. Run `magi init` to write a starter \
+                 magi.toml."
+            );
+        }
+        if !self.roles.advisors.is_empty() {
+            return self.rotate(&self.roles.advisors, self.graph.advisors, 0);
+        }
+        self.rotate(&self.roles.judges, self.graph.advisors, 1)
+    }
+
     /// Shell prefix for [`Verify`] commands.
     pub fn shell(&self) -> Vec<String> {
         if let Some(s) = &self.verify.shell {
@@ -1608,6 +1675,98 @@ mod tests {
     #[test]
     fn empty_roster_is_an_error() {
         assert!(Config::default().resolve_roles().is_err());
+    }
+
+    #[test]
+    fn advise_defaults_to_on_with_three_proposals() {
+        let g = Graph::default();
+        assert!(g.advise);
+        assert_eq!(g.advisors, 3);
+    }
+
+    #[test]
+    fn unset_advisors_falls_back_to_the_judge_roster() {
+        let cfg = Config {
+            agents: vec![spec("a"), spec("b")],
+            roles: Roles {
+                judges: vec!["b".to_owned()],
+                ..Roles::default()
+            },
+            graph: Graph {
+                advisors: 2,
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        let advisors = cfg.advisors().expect("advisors resolve");
+        assert_eq!(advisors.len(), 2);
+        assert!(
+            advisors.iter().all(|a| a.id == "b"),
+            "an unset [roles] advisors must fall back to [roles] judges: {advisors:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_advisor_roster_wins_over_the_judge_fallback() {
+        let cfg = Config {
+            agents: vec![spec("a"), spec("b")],
+            roles: Roles {
+                judges: vec!["b".to_owned()],
+                advisors: vec!["a".to_owned()],
+                ..Roles::default()
+            },
+            graph: Graph {
+                advisors: 2,
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        let advisors = cfg.advisors().expect("advisors resolve");
+        assert!(advisors.iter().all(|a| a.id == "a"));
+    }
+
+    /// Neither `[roles] advisors` nor `[roles] judges` set: an unconfigured
+    /// advisor roster must resolve to the exact same agents an unconfigured
+    /// judge panel would get - same ids, same rotation offset - or the
+    /// promise in [`Roles::advisors`]'s doc ("advisor diversity for free")
+    /// does not actually hold.
+    #[test]
+    fn an_unconfigured_advisor_and_judge_roster_resolve_to_the_same_agents() {
+        let cfg = Config {
+            agents: vec![spec("a"), spec("b"), spec("c")],
+            graph: Graph {
+                advisors: 3,
+                judges: 3,
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        let advisors = cfg.advisors().expect("advisors resolve");
+        let judges = cfg.resolve_roles().expect("roles resolve").judges;
+        let advisor_ids: Vec<&str> = advisors.iter().map(|a| a.id.as_str()).collect();
+        let judge_ids: Vec<&str> = judges.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            advisor_ids, judge_ids,
+            "an unconfigured advisor roster must be the same seats an unconfigured judge panel gets"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_advisor_seat_is_an_error_naming_the_id() {
+        let cfg = Config {
+            agents: vec![spec("a")],
+            roles: Roles {
+                advisors: vec!["nope".to_owned()],
+                ..Roles::default()
+            },
+            graph: Graph {
+                advisors: 1,
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        let err = cfg.advisors().expect_err("`nope` is not in the roster");
+        assert!(format!("{err:#}").contains("nope"));
     }
 
     #[test]
