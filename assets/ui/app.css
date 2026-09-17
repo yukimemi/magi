@@ -344,7 +344,7 @@ a { color: inherit; text-decoration: none; }
 .daemon-btn[data-kind="start"] { background: var(--gold); border-color: var(--gold); color: #241d05; }
 
 .daemon[data-state="working"] { background: var(--tint-blue); color: var(--on-blue); border-bottom-color: var(--tint-blue); }
-.daemon[data-state="working"] .daemon-dot { background: var(--on-blue); animation: pulse 1.8s var(--ease) infinite; }
+.daemon[data-state="working"] .daemon-dot { background: var(--on-blue); animation: pulse 1.8s var(--ease) infinite; box-shadow: 0 0 0 2px var(--tint-blue), 0 0 0 3px var(--on-blue); }
 .daemon[data-state="working"] .daemon-text b { color: var(--on-blue); }
 .daemon[data-state="idle"] .daemon-dot { background: var(--teal); }
 /* Off with an empty queue is a choice, not a fault: neutral, and the control
@@ -361,7 +361,7 @@ a { color: inherit; text-decoration: none; }
 /* Stopping is in flight, not finished, so it keeps the pulsing dot of work in
    progress: a run is still going. */
 .daemon[data-state="stopping"] { background: var(--tint-ink); color: var(--on-ink); border-bottom-color: var(--line-2); }
-.daemon[data-state="stopping"] .daemon-dot { background: var(--on-ink); animation: pulse 1.8s var(--ease) infinite; }
+.daemon[data-state="stopping"] .daemon-dot { background: var(--on-ink); animation: pulse 1.8s var(--ease) infinite; box-shadow: 0 0 0 2px var(--tint-ink), 0 0 0 3px var(--on-ink); }
 .daemon[data-state="stopping"] .daemon-text b { color: var(--on-ink); }
 /* A loop that died is the one state here that is a fault, so it is the only
    one in rust: the two ordinary "off" states must not be able to borrow this
@@ -375,7 +375,7 @@ a { color: inherit; text-decoration: none; }
    in progress, not a fault, and a fault colour here would make an ordinary
    restart look like an incident. */
 .daemon[data-state="upgrading"] { background: var(--tint-blue); color: var(--on-blue); border-bottom-color: var(--tint-blue); }
-.daemon[data-state="upgrading"] .daemon-dot { background: var(--on-blue); animation: pulse 1.8s var(--ease) infinite; }
+.daemon[data-state="upgrading"] .daemon-dot { background: var(--on-blue); animation: pulse 1.8s var(--ease) infinite; box-shadow: 0 0 0 2px var(--tint-blue), 0 0 0 3px var(--on-blue); }
 .daemon[data-state="upgrading"] .daemon-text b { color: var(--on-blue); }
 /* A past upgrade that did not complete, layered on the dot rather than on
    `data-state`: the loop keeps whatever state it actually has regardless of
