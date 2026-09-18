@@ -3485,47 +3485,83 @@ async fn talk_say(
     };
 
     let talks = ui.talks.clone();
-    let text = {
-        let mut talk = talk.clone();
-        let talks = talks.clone();
-        let said = body.text.clone();
-        blocking(move || {
-            if let Err(error) = talk::record(&mut talk, &talks, &said, attachments) {
-                if let Ok(fresh) = talks.get(&talk.id) {
-                    if !fresh.status.open() {
-                        return Err(ApiError::conflict(format!(
-                            "talk {} is {} and takes no more turns",
-                            fresh.short(),
-                            fresh.status.as_str()
-                        )));
-                    }
-                }
-                return Err(ApiError::from(error));
-            }
-            Ok(said.trim().to_owned())
-        })
-        .await?
-    };
-    // Re-read so the spawned task appends to the record that now holds the
-    // operator's turn, rather than to the snapshot taken before it.
-    let talk = {
+    // `record` runs *inside* the spawned task, rather than in this handler
+    // followed by a separate `tokio::spawn` for `respond` - axum drops this
+    // whole handler future outright on disconnect (see `TalkTurnGuard`'s
+    // doc), and that drop can land at any `.await` this function makes,
+    // including one that has already produced its result but not yet
+    // resumed. A message could end up recorded on disk with the handler
+    // future gone before it ever reached the `tokio::spawn` that would have
+    // started the reply. `tokio::spawn` itself is a plain, synchronous call
+    // that hands the whole future to the runtime as one unit - once made, no
+    // later drop of *this* handler's own future (that call's return value is
+    // never held onto here) can reach back in and stop it, so record and the
+    // hand-off to `respond` are unconditionally atomic from the client's
+    // point of view. The immediate response this handler owes the caller
+    // travels back over a `oneshot`, sent the moment `record` succeeds.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn({
         let ui = Arc::clone(&ui);
+        let talks = talks.clone();
         let id = id.clone();
-        blocking(move || Ok(ui.talks.get(&id)?)).await?
-    };
-    let queued = talk.clone();
-    let thinking = ui.is_thinking(&id);
-    tokio::spawn(async move {
-        let mut talk = talk;
-        if let Err(e) = talk::respond(&mut talk, &talks, &cfg, &text).await {
-            // `respond` records the failure in the transcript itself, which is
-            // what the phone reads; this line is for the operator's terminal.
-            tracing::warn!("talk {id} turn failed: {e:#}");
+        let said = body.text.clone();
+        let mut talk = talk.clone();
+        async move {
+            let recorded = blocking({
+                let talks = talks.clone();
+                move || {
+                    if let Err(error) = talk::record(&mut talk, &talks, &said, attachments) {
+                        if let Ok(fresh) = talks.get(&talk.id) {
+                            if !fresh.status.open() {
+                                return Err(ApiError::conflict(format!(
+                                    "talk {} is {} and takes no more turns",
+                                    fresh.short(),
+                                    fresh.status.as_str()
+                                )));
+                            }
+                        }
+                        return Err(ApiError::from(error));
+                    }
+                    // `record` mutates `talk` in place to the freshly persisted
+                    // state (status, pending, and the just-appended operator
+                    // turn), so returning it here is equivalent to re-reading it
+                    // from disk - without the extra round trip a re-read would
+                    // need.
+                    Ok((said.trim().to_owned(), talk))
+                }
+            })
+            .await;
+            let (text, mut talk) = match recorded {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // Nobody is listening if the handler's own future was
+                    // already dropped - that is fine, there is no response
+                    // left to carry this error to and nothing was persisted.
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+            let queued = talk.clone();
+            let thinking = ui.is_thinking(&id);
+            // If this fails, the caller is gone; the turn still runs below
+            // exactly as it would have for a caller that stayed connected.
+            let _ = tx.send(Ok((queued, thinking)));
+
+            if let Err(e) = talk::respond(&mut talk, &talks, &cfg, &text).await {
+                // `respond` records the failure in the transcript itself,
+                // which is what the phone reads; this line is for the
+                // operator's terminal.
+                tracing::warn!("talk {id} turn failed: {e:#}");
+            }
+            // Anything `talk::queue` added while the turn above was running
+            // is still owed an answer - see `drain_loop`.
+            drain_loop(talk, talks, cfg, id, turn_guard).await;
         }
-        // Anything `talk::queue` added while the turn above was running is
-        // still owed an answer - see `drain_loop`.
-        drain_loop(talk, talks, cfg, id, turn_guard).await;
     });
+
+    let (queued, thinking) = rx
+        .await
+        .map_err(|_| ApiError::internal("the talk turn task ended without answering"))??;
 
     // 202: the operator's message is recorded and a turn is running.
     Ok((StatusCode::ACCEPTED, Json(TalkView::new(queued, thinking))))
@@ -5128,6 +5164,90 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(turns_after, 2, "the agent's reply eventually lands");
+    }
+
+    /// A phone that reloads mid-request drops `talk_say`'s whole handler
+    /// future without warning - see `TalkTurnGuard`'s doc. The bug this
+    /// guards against: `talk::record` used to return, and only *then* did the
+    /// handler make a second, separate disk round trip before spawning the
+    /// agent's reply task. A future dropped in that gap left a message
+    /// recorded on disk with no reply task ever started and no way back short
+    /// of a fresh message - and the gap was not even the whole story: *any*
+    /// `.await` in this handler, including the very first one, is a point
+    /// where a drop can land after the awaited work already finished but
+    /// before this handler's own code resumes to act on it. `record` now
+    /// runs inside the task `tokio::spawn` hands to the runtime before this
+    /// handler ever awaits anything of its own again, so there is nothing
+    /// left in *this* handler's future for a disconnect to interrupt between
+    /// the message landing on disk and the reply task starting.
+    ///
+    /// A real socket disconnect cannot be relied on to land in the old gap
+    /// from a test - over loopback, `talk_say` typically finishes before the
+    /// kernel even reports the peer gone. `JoinHandle::abort` reproduces the
+    /// same failure mode directly: it drops the task's future at whatever
+    /// point it has reached, exactly what axum does to the handler future,
+    /// without needing to win a real network race. Sweeping the delay before
+    /// aborting samples a range of points the task's execution can be at,
+    /// including where the old code sat waiting on its second disk round
+    /// trip - confirmed by reverting this fix locally and watching this same
+    /// sweep catch a talk stuck with the operator's turn recorded and no
+    /// reply ever following.
+    #[tokio::test]
+    async fn a_dropped_handler_future_after_recording_still_gets_an_agent_reply() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::write(repo.join("magi.toml"), MOCK_AGENT_TOML).expect("write magi.toml");
+        let home = TempDir::new().expect("temp home");
+        let talks = Talks::at(home.path().join("talks"));
+        let ui = Arc::new(
+            Ui::new(
+                Queue::at(home.path().join("queue")),
+                Questions::at(home.path().join("questions")),
+                talks.clone(),
+                home.path().join("runs"),
+                home.path().to_path_buf(),
+                repo.clone(),
+            )
+            .with_worktrees_root(home.path().join("wt")),
+        );
+        let cfg = config_for(&repo).await.expect("discover config");
+
+        for delay in 0..40u32 {
+            let talk = talk::begin(&talks, &cfg, repo.clone(), None).expect("begin talk");
+            let id = talk.id.clone();
+
+            let handler = tokio::spawn(talk_say(
+                State(Arc::clone(&ui)),
+                Path(id.clone()),
+                Ok(Json(NewTalkTurn {
+                    text: "what does the queue module do?".to_owned(),
+                    attachments: Vec::new(),
+                })),
+            ));
+            tokio::time::sleep(Duration::from_micros(u64::from(delay) * 500)).await;
+            handler.abort();
+            // Wait out the abort so the next iteration's talk does not race
+            // this one's still-unwinding turn guard.
+            let _ = handler.await;
+
+            let mut turns = 0;
+            for _ in 0..200 {
+                if let Ok(fresh) = talks.get(&id) {
+                    turns = fresh.turns.len();
+                    if turns != 1 {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_ne!(
+                turns, 1,
+                "delay {delay}: talk {id} recorded the operator's turn but \
+                 the agent never answered - the reply task was never \
+                 started after the handler future was dropped"
+            );
+        }
     }
 
     #[tokio::test]
