@@ -26,6 +26,7 @@ use anyhow::{Context as _, Result, bail};
 use jiff::Timestamp;
 use tokio::sync::Semaphore;
 
+use crate::advise;
 use crate::agent::{self, AgentOutput, Invocation, SeatState};
 use crate::ask;
 use crate::blind;
@@ -46,7 +47,8 @@ use crate::run::{
     Tally, VoteRecord, tail, write_artifact,
 };
 use crate::verdict::{
-    self, FinalVote, FixReport, Position, Ranking, Review, ReviewRevote, ReviewVote, Severity,
+    self, FinalVote, FixReport, Position, Proposal, Ranking, Review, ReviewRevote, ReviewVote,
+    Severity,
 };
 
 /// How much verification output is kept and fed back to the fixer.
@@ -476,6 +478,10 @@ impl Runner {
         if self.park_here()? {
             return Ok(());
         }
+        self.advise().await?;
+        if self.park_here()? {
+            return Ok(());
+        }
         self.implement().await?;
         if self.park_here()? {
             return Ok(());
@@ -647,6 +653,22 @@ impl Runner {
             }
         }
 
+        // Disposable, detached checkouts for the design-deliberation stage's
+        // advisor seats — the same shape as the judges' above, at the same
+        // base commit, since advisors also only ever read. Sized off the
+        // configured count directly rather than a resolved roster: unlike
+        // `implementers`/`judges`/`reviewers`, advisor seats are resolved
+        // lazily inside `advise` itself (see `Config::advisors`'s doc), so
+        // `prep` has no `ResolvedRoles` field to read a count from here.
+        if self.state.config.graph.advise {
+            for k in 1..=self.state.config.graph.advisors {
+                let wt = root.join(format!("advisor-{k}"));
+                if !wt.exists() {
+                    git::worktree_add_detached(&repo, &wt, &base).await?;
+                }
+            }
+        }
+
         // A judge cannot tell it is looking at its own patch — the seats keep
         // separate conversations — but a panel that shares agents with the
         // field is less independent than it looks, and that is worth saying out
@@ -690,6 +712,291 @@ impl Runner {
         Ok(())
     }
 
+    // -------------------------------------------------------------- advise
+
+    /// The design-deliberation stage: independent, read-only advisor seats
+    /// each sketch a design before any implementer touches the repository,
+    /// and (when at least one produced a usable proposal) a synthesis seat
+    /// blends them into a brief `implement` carries in every candidate's
+    /// prompt.
+    ///
+    /// `[graph] advise` is the on/off switch, on by default; `[graph]
+    /// advisors` is the proposal count. Everything here is best-effort and
+    /// non-fatal to the run: a misconfigured `[roles] advisors`, a roster
+    /// that cannot reach quota, or a synthesis seat that produced nothing
+    /// usable all leave `implement` exactly as it was before this stage
+    /// existed — the task instruction alone — rather than failing the whole
+    /// competition over an enrichment stage. Every outcome is still recorded
+    /// as an event, so a run that got nothing from this stage says why.
+    ///
+    /// [`RunState::advise_attempted`] is this node's idempotency marker, the
+    /// same role [`RunState::judge_skipped`] plays for `judge`: without it a
+    /// resumed run whose stage failed would re-run it, and re-spend the
+    /// agent calls, on every reentry before `implement`.
+    ///
+    /// Also skipped once any candidate shows implementation progress — the
+    /// exact predicate `implement` itself uses to decide a candidate is no
+    /// longer "todo" (see its own `todo` filter). `advise_attempted` alone
+    /// is not enough: a run created by an older binary that predates this
+    /// field deserializes it as `false` (`#[serde(default)]`), so resuming
+    /// an already-`Implementing`-or-later run under this build would
+    /// otherwise walk straight back through `prep` (a no-op once candidates
+    /// exist) into this node and spawn every advisor seat against worktrees
+    /// `prep` never recreated — after implementation has already started,
+    /// which is exactly the invariant this stage exists to guarantee.
+    async fn advise(&mut self) -> Result<()> {
+        let implement_untouched = self
+            .state
+            .candidates
+            .iter()
+            .all(|c| c.commits == 0 && c.failed.is_none() && !c.empty);
+        if !self.state.config.graph.advise || self.state.advise_attempted {
+            return Ok(());
+        }
+        if !implement_untouched {
+            self.state.event(
+                "advise",
+                "skipping the design-deliberation stage: at least one \
+                 candidate already shows implementation progress, so this \
+                 run is past the point the stage exists to run before"
+                    .to_owned(),
+            );
+            self.state.advise_attempted = true;
+            self.state.save()?;
+            return Ok(());
+        }
+        let run_id = self.state.id.clone();
+        let prompts = self.state.config.prompts.clone();
+        let instruction = self.state.instruction.clone();
+        let language = self.state.config.graph.language.clone();
+        let root = self.state.worktree_root();
+        let n = self.state.config.graph.advisors;
+        let where_recorded = self.state.dir().join("run.json");
+
+        let seats = match self.state.config.advisors() {
+            Ok(seats) if !seats.is_empty() => seats,
+            Ok(_) => {
+                self.state.event(
+                    "advise",
+                    format!(
+                        "[graph] advisors is 0; skipping the design-deliberation \
+                         stage and continuing without a synthesis brief (see {})",
+                        where_recorded.display()
+                    ),
+                );
+                self.state.advise_attempted = true;
+                self.state.save()?;
+                return Ok(());
+            }
+            Err(e) => {
+                self.state.event(
+                    "advise",
+                    format!(
+                        "could not resolve advisor seats ({e:#}); continuing \
+                         without a design-deliberation brief (see {})",
+                        where_recorded.display()
+                    ),
+                );
+                self.state.advise_attempted = true;
+                self.state.save()?;
+                return Ok(());
+            }
+        };
+
+        let timeout = Duration::from_secs(self.state.config.graph.timeout_judge.max(1));
+        let artifacts = agent::artifacts_dir(&self.state.dir());
+        let worktrees: Vec<PathBuf> = (1..=n).map(|k| root.join(format!("advisor-{k}"))).collect();
+
+        let mut jobs = Vec::new();
+        for (i, spec) in seats.iter().cloned().enumerate() {
+            let seat_key = format!("advisor-{}", i + 1);
+            let seat = self.seat(&seat_key, &spec.id);
+            jobs.push(SeatJob {
+                prompt: prompt::advisor(&instruction, i + 1, seats.len(), &language),
+                spec,
+                seat,
+                cwd: worktrees[i % worktrees.len()].clone(),
+                timeout,
+                allow_write: false,
+                sessions: false,
+                artifacts: artifacts.clone(),
+                stem: seat_key,
+            });
+        }
+
+        self.state.event(
+            "advise",
+            format!(
+                "{} advisor seat(s) sketching a design in parallel",
+                jobs.len()
+            ),
+        );
+        let mut quota_losses = Vec::new();
+        let cache = self.state.config.cache_dir();
+        let ctx = WaveCtx {
+            run: &run_id,
+            node: "advise",
+            prompts: &prompts,
+            cache: cache.as_deref(),
+        };
+        let results = ask_json_wave::<Proposal>(
+            jobs,
+            Arc::clone(&self.sem),
+            self.state.config.graph.retries,
+            &ctx,
+            &mut quota_losses,
+            &mut self.state,
+            &|p: &Proposal| p.validate(),
+        )
+        .await;
+        self.state.quota.extend(quota_losses);
+
+        let mut records = Vec::with_capacity(results.len());
+        for (i, (seat, res)) in results.into_iter().enumerate() {
+            let agent_id = seat.agent.clone();
+            self.state.seats.insert(seat.key.clone(), seat);
+            match res {
+                Ok((proposal, out)) => {
+                    self.state
+                        .event("advise", format!("advisor-{} proposed a design", i + 1));
+                    records.push(advise::AdvisorRecord::proposed(
+                        i + 1,
+                        agent_id,
+                        proposal,
+                        out.duration_ms,
+                    ));
+                }
+                Err(e) => {
+                    self.state.event(
+                        "advise",
+                        format!("advisor-{} produced no usable proposal: {e:#}", i + 1),
+                    );
+                    records.push(advise::AdvisorRecord::failed(
+                        i + 1,
+                        agent_id,
+                        e.to_string(),
+                    ));
+                }
+            }
+        }
+
+        let mut advice = advise::Advice {
+            records,
+            synthesis: None,
+        };
+        if advice.proposals().is_empty() {
+            self.state.event(
+                "advise",
+                "no advisor produced a usable proposal; continuing without a \
+                 synthesis brief"
+                    .to_owned(),
+            );
+        } else {
+            match self
+                .synthesize_brief(
+                    &advice,
+                    &instruction,
+                    &language,
+                    &worktrees[0],
+                    &artifacts,
+                    &run_id,
+                    &prompts,
+                    cache.as_deref(),
+                )
+                .await
+            {
+                Ok(Some(text)) => {
+                    self.state.event(
+                        "advise",
+                        "synthesized a design brief for the implementer".to_owned(),
+                    );
+                    advice.synthesis = Some(text);
+                }
+                Ok(None) => {
+                    self.state.event(
+                        "advise",
+                        "the synthesis seat produced nothing usable; continuing \
+                         without a design brief"
+                            .to_owned(),
+                    );
+                }
+                Err(e) => {
+                    self.state.event(
+                        "advise",
+                        format!("could not synthesize a design brief: {e:#}"),
+                    );
+                }
+            }
+        }
+        advise::apply_reflection(&mut advice);
+
+        self.state.advice = Some(advice);
+        self.state.advise_attempted = true;
+        self.state.save()?;
+        Ok(())
+    }
+
+    /// The synthesis seat: reads every advisor's proposal and blends them
+    /// into the design brief `advise` stores on [`RunState::advice`]. Split
+    /// out of [`Runner::advise`] only for readability — it is not called
+    /// anywhere else.
+    ///
+    /// Picked the same way [`crate::talk`]'s standing conversation and
+    /// [`crate::bump`]'s release-bump decision are: [`agent::pick`] with no
+    /// explicit id, rather than a dedicated `[roles]` entry — one more role
+    /// to configure for a seat that runs once per run and, unlike the
+    /// advisors it reads, never needs more than one.
+    #[allow(clippy::too_many_arguments)]
+    async fn synthesize_brief(
+        &mut self,
+        advice: &advise::Advice,
+        instruction: &str,
+        language: &str,
+        cwd: &Path,
+        artifacts: &Path,
+        run_id: &str,
+        prompts: &Prompts,
+        cache: Option<&Path>,
+    ) -> Result<Option<String>> {
+        let spec = agent::pick(&self.state.config.agents, None, &agent::installed)?;
+        let mut seat = self.seat("advise-synthesis", &spec.id);
+        let proposals = advice.proposals();
+        let mut prompt = prompt::with_overlay(
+            prompt::synthesize_brief(instruction, &proposals, language),
+            prompts.overlay("advise"),
+        );
+        if cache.is_some() {
+            prompt.push('\n');
+            prompt.push_str(&prompt::build_cache_note("advise"));
+        }
+        let timeout = Duration::from_secs(self.state.config.graph.timeout_judge.max(1));
+        let out = agent::invoke(
+            &spec,
+            &mut seat,
+            &Invocation {
+                cwd,
+                prompt: &prompt,
+                timeout,
+                allow_write: false,
+                sessions: false,
+                artifacts,
+                stem: "advise-synthesis",
+                run: run_id,
+                node: "advise",
+                cache_dir: cache,
+                attachments: &[],
+            },
+        )
+        .await?;
+        self.state.seats.insert(seat.key.clone(), seat);
+        if !out.usable() {
+            return Ok(None);
+        }
+        let text =
+            verdict::section(&out.text, "synthesis").unwrap_or_else(|| out.text.trim().to_owned());
+        Ok((!text.trim().is_empty()).then_some(text))
+    }
+
     // ----------------------------------------------------------- implement
 
     async fn implement(&mut self) -> Result<()> {
@@ -716,6 +1023,15 @@ impl Runner {
         let timeout = Duration::from_secs(self.state.config.graph.timeout_implement);
         let sessions = self.state.config.graph.sessions;
         let artifacts = agent::artifacts_dir(&self.state.dir());
+        // The design-deliberation stage's blended brief, when `advise` found
+        // one — carried into every implementer's prompt the same way
+        // regardless of which candidate it is.
+        let brief = self
+            .state
+            .advice
+            .as_ref()
+            .and_then(|a| a.synthesis.as_deref())
+            .map(str::to_owned);
 
         let mut jobs = Vec::new();
         for &i in &todo {
@@ -730,7 +1046,12 @@ impl Runner {
             jobs.push(SeatJob {
                 spec,
                 seat,
-                prompt: prompt::implement(&instruction, &worktree.to_string_lossy(), &language),
+                prompt: prompt::implement(
+                    &instruction,
+                    &worktree.to_string_lossy(),
+                    &language,
+                    brief.as_deref(),
+                ),
                 cwd: worktree,
                 timeout,
                 allow_write: true,
@@ -1910,6 +2231,16 @@ impl Runner {
             let wt = root.join(format!("judge-{j}"));
             if wt.exists() {
                 git::worktree_remove(&repo, &wt).await.ok();
+            }
+        }
+        // The design-deliberation stage is finished by the time a tally
+        // exists — same reasoning as the judges above.
+        if self.state.config.graph.advise {
+            for k in 1..=self.state.config.graph.advisors {
+                let wt = root.join(format!("advisor-{k}"));
+                if wt.exists() {
+                    git::worktree_remove(&repo, &wt).await.ok();
+                }
             }
         }
         if !folded.is_empty() {

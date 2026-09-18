@@ -812,6 +812,21 @@ pub struct RunState {
     /// winner to check.
     #[serde(default)]
     pub base_sync: Option<BaseSync>,
+    /// The design-deliberation stage's output, when `[graph] advise` ran it:
+    /// one record per advisor seat, plus the synthesis blended into the
+    /// implementer's prompt. `None` when the stage is off, has not run yet,
+    /// or could not even resolve its seats - see
+    /// [`crate::graph::Runner::advise`].
+    #[serde(default)]
+    pub advice: Option<crate::advise::Advice>,
+    /// Whether the design-deliberation stage has already been attempted this
+    /// run, whatever it produced. The idempotency marker `Runner::advise`
+    /// checks on reentry, the same role [`Self::judge_skipped`] plays for
+    /// `judge` - without it a resumed run whose stage failed (a misconfigured
+    /// `[roles] advisors`, every seat quota'd) would re-run it, and re-spend
+    /// the agent calls, on every single reentry before `implement`.
+    #[serde(default)]
+    pub advise_attempted: bool,
     /// Node log.
     #[serde(default)]
     pub events: Vec<Event>,
@@ -857,6 +872,8 @@ impl RunState {
             active: BTreeMap::new(),
             pr: None,
             base_sync: None,
+            advice: None,
+            advise_attempted: false,
             events: Vec::new(),
         }
     }
@@ -1088,6 +1105,21 @@ impl RunState {
     pub fn handed_off_with_open_findings(&self) -> bool {
         matches!(self.status, RunStatus::Ready | RunStatus::Merged)
             && self.reviews.last().is_some_and(|r| !r.clean)
+    }
+
+    /// Reached `Ready` because `[merge] mode = "none"` left it there by
+    /// design, never to be picked up by the PR-polling merge watcher — as
+    /// opposed to a `Ready` that is still a plausible landing candidate (a
+    /// PR closed without merging, or a re-entry onto an already-concluded
+    /// node). Both leave `status` at `Ready`; only this one leaves the
+    /// winning branch permanently unwatched, which is what a caller needs to
+    /// know before labelling the run in a listing.
+    pub fn unmerged_by_design(&self) -> bool {
+        self.status == RunStatus::Ready
+            && self
+                .merge
+                .as_ref()
+                .is_some_and(|m| m.mode == MergeMode::None)
     }
 
     /// Local-time creation stamp for reports.
@@ -1749,6 +1781,52 @@ mod tests {
         assert!(
             !s.handed_off_with_open_findings(),
             "a clean last round has nothing to hand off"
+        );
+    }
+
+    #[test]
+    fn unmerged_by_design_is_only_ready_reached_via_merge_mode_none() {
+        let mut s = state();
+
+        s.status = RunStatus::Ready;
+        assert!(
+            !s.unmerged_by_design(),
+            "no merge outcome recorded at all must not be flagged"
+        );
+
+        s.merge = Some(MergeOutcome {
+            mode: MergeMode::None,
+            ok: true,
+            detail: "git merge --no-ff magi/x/A".to_owned(),
+        });
+        assert!(
+            s.unmerged_by_design(),
+            "Ready reached through mode none is the case this exists to flag"
+        );
+
+        // A PR closed without merging also leaves `status` at `Ready`, but
+        // through `mode = "pr"` — a run that may still have been landable by
+        // a person watching the PR, unlike the honest mode-none no-op.
+        s.merge = Some(MergeOutcome {
+            mode: MergeMode::Pr,
+            ok: false,
+            detail: "https://example.com/pr/1 was closed without merging".to_owned(),
+        });
+        assert!(
+            !s.unmerged_by_design(),
+            "a closed pull request is a different Ready and must not be relabelled"
+        );
+
+        // Same signal must not fire before the run actually got there.
+        s.status = RunStatus::Gating;
+        s.merge = Some(MergeOutcome {
+            mode: MergeMode::None,
+            ok: true,
+            detail: "git merge --no-ff magi/x/A".to_owned(),
+        });
+        assert!(
+            !s.unmerged_by_design(),
+            "status must actually be Ready, not merely have a stale mode-none merge record"
         );
     }
 

@@ -21,6 +21,7 @@
 //! review missed. See [`stats`].
 #![deny(missing_docs)]
 
+pub mod advise;
 pub mod agent;
 pub mod ask;
 pub mod blind;
@@ -43,6 +44,7 @@ pub mod rng;
 pub mod run;
 pub mod stats;
 pub mod talk;
+pub mod triage;
 pub mod tui;
 pub mod updater;
 pub mod verdict;

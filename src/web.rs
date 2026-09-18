@@ -2081,6 +2081,12 @@ struct RunSummary {
     waiting: bool,
     /// The land loop's last look at the pull request, when there is one.
     pr: Option<crate::run::PrRecord>,
+    /// `status` is `"ready"`, but `[merge] mode = "none"` left it there by
+    /// design — never picked up by the PR-polling merge watcher, unlike an
+    /// ordinary `Ready` that may still be a live landing candidate. See
+    /// [`RunState::unmerged_by_design`]. The front end reads this rather than
+    /// re-deriving the same check from `status` and `merge.mode` itself.
+    unmerged_by_design: bool,
 }
 
 impl RunSummary {
@@ -2090,6 +2096,7 @@ impl RunSummary {
             short: state.short().to_owned(),
             status: status_word(state.status),
             done: state.status.done(),
+            unmerged_by_design: state.unmerged_by_design(),
             instruction: state.instruction.clone(),
             title: title_from(&state.instruction, TITLE_MAX),
             repo: state.repo.display().to_string(),
@@ -2205,6 +2212,11 @@ struct RunDetailView {
     /// route — see `ActiveSeat`'s own docs for why the entry alone is not
     /// proof of either.
     live: bool,
+    /// Same field and meaning as [`RunSummary::unmerged_by_design`] — kept
+    /// alongside the flattened `state` rather than inside it, since
+    /// `RunState` has no business knowing which of its own methods a caller
+    /// wants serialized.
+    unmerged_by_design: bool,
 }
 
 impl RunDetailView {
@@ -2212,6 +2224,7 @@ impl RunDetailView {
         Self {
             instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
             live,
+            unmerged_by_design: state.unmerged_by_design(),
             state,
         }
     }
@@ -6427,6 +6440,76 @@ mod tests {
         assert_eq!(detail.json()["id"], "20260902-140501-a1b2");
     }
 
+    /// `status: "ready"` alone cannot tell a run still headed for a landing
+    /// (a PR closed without merging, say) apart from one `[merge] mode =
+    /// "none"` left unmerged for good — the confusion the operator flagged
+    /// after the CLI report already grew a `not landed — nothing to do by
+    /// design` line for exactly this case (`report.rs`). Both the list route
+    /// and the detail route must carry a flag the phone can key on instead of
+    /// re-deriving it from `status` + `merge.mode` itself.
+    #[tokio::test]
+    async fn a_mode_none_ready_run_is_flagged_unmerged_by_design_everywhere() {
+        let f = Fixture::start().await;
+
+        let mut none_run = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "Add a web UI".to_owned(),
+            Config::default(),
+        );
+        none_run.id = "20260902-140503-none".to_owned();
+        none_run.status = RunStatus::Ready;
+        none_run.merge = Some(crate::run::MergeOutcome {
+            mode: crate::config::MergeMode::None,
+            ok: true,
+            detail: "git -C /repo merge --no-ff magi/x/A".to_owned(),
+        });
+        write_state(&f.runs(), &none_run);
+
+        let mut pr_run = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "Add a web UI".to_owned(),
+            Config::default(),
+        );
+        pr_run.id = "20260902-140504-prcl".to_owned();
+        pr_run.status = RunStatus::Ready;
+        pr_run.merge = Some(crate::run::MergeOutcome {
+            mode: crate::config::MergeMode::Pr,
+            ok: false,
+            detail: "https://example.com/pr/1 was closed without merging".to_owned(),
+        });
+        write_state(&f.runs(), &pr_run);
+
+        let summary = f.get("/api/runs").await.json();
+        let rows: std::collections::HashMap<&str, &Value> = summary
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|r| (r["id"].as_str().expect("an id"), r))
+            .collect();
+        assert_eq!(rows[none_run.id.as_str()]["status"], "ready");
+        assert_eq!(
+            rows[none_run.id.as_str()]["unmerged_by_design"],
+            true,
+            "a mode-none Ready must be flagged in the list"
+        );
+        assert_eq!(
+            rows[pr_run.id.as_str()]["unmerged_by_design"],
+            false,
+            "a Ready reached by a closed pull request is a different case"
+        );
+
+        let none_detail = f.get(&format!("/api/runs/{}", none_run.id)).await.json();
+        assert_eq!(none_detail["status"], "ready");
+        assert_eq!(none_detail["unmerged_by_design"], true);
+
+        let pr_detail = f.get(&format!("/api/runs/{}", pr_run.id)).await.json();
+        assert_eq!(pr_detail["unmerged_by_design"], false);
+    }
+
     /// `RunState::active` is only ever cleared by whoever populated it, so the
     /// detail route also has to say whether a daemon is actually still
     /// driving this run right now — otherwise a seat from a killed process's
@@ -7909,5 +7992,149 @@ mod tests {
 
         // Quota keeps its own counter, fed by the number actually recorded.
         assert!(APP_JS.contains("lost to quota"));
+    }
+
+    /// The runs tree (section) and the state chips (waiting/done) are two
+    /// independent lenses ANDed together in `renderRuns`, and some pairings
+    /// can never both be true for any run - every "Landed"/"Ended" run is
+    /// done by construction, so pairing either with "Active" or "In flight"
+    /// always rendered zero cards with the filter bar still claiming
+    /// `Showing Ended`. `sectionCompatibleWithStateFilter` exists to catch
+    /// that before it happens, checked against `REPRESENTATIVE_RUN_SHAPES` -
+    /// a handful of (waiting, status) shapes standing in for the run
+    /// lifecycle, because `cargo test` cannot execute the front end.
+    ///
+    /// That stand-in list is itself the part that drifted twice in review:
+    /// once shipped with `waiting: true` paired with a done status the
+    /// lifecycle cannot produce, then over-corrected into treating every
+    /// waiting run as never done - which made "Waiting on you" look
+    /// incompatible with "Done" even for the one real, reachable shape
+    /// (Stalled/Blocked, both terminal yet still resumable) that is exactly
+    /// that combination. This test parses the shapes and the done-rule back
+    /// out of `APP_JS`, reimplements `runSection` and the five state
+    /// predicates independently in Rust, and checks the resulting
+    /// section/filter compatibility table against the lifecycle rules by
+    /// hand - so either direction of drift fails it again.
+    #[test]
+    fn runs_tree_sections_and_state_chips_agree_on_what_a_run_can_be() {
+        let shapes_marker = "const REPRESENTATIVE_RUN_SHAPES = [";
+        let shapes_body_start =
+            APP_JS.find(shapes_marker).expect("the shape list exists") + shapes_marker.len();
+        let shapes_close = APP_JS[shapes_body_start..]
+            .find("].map(")
+            .expect("the shape list is closed by its done-computing .map(...)")
+            + shapes_body_start;
+        let shapes_src = &APP_JS[shapes_body_start..shapes_close];
+
+        let mut shapes: Vec<(bool, String)> = Vec::new();
+        for entry in shapes_src.split('{').skip(1) {
+            let waiting = entry.contains("waiting: true");
+            let status_at =
+                entry.find("status: \"").expect("each shape names a status") + "status: \"".len();
+            let status_end = entry[status_at..]
+                .find('"')
+                .expect("the status string is closed")
+                + status_at;
+            shapes.push((waiting, entry[status_at..status_end].to_string()));
+        }
+        assert!(shapes.len() >= 6, "parsed shapes: {shapes:?}");
+
+        // The done rule itself (`!["implementing"].includes(shape.status)`),
+        // read out of the source rather than hardcoded, so a renamed
+        // in-flight status can't silently make every parsed shape "done".
+        let done_rule_marker = "done: !";
+        let done_rule_at = APP_JS[shapes_close..]
+            .find(done_rule_marker)
+            .expect("the done rule follows the shape list")
+            + shapes_close
+            + done_rule_marker.len();
+        let includes_at = APP_JS[done_rule_at..]
+            .find(".includes(shape.status)")
+            .expect("the done rule ends in .includes(shape.status)")
+            + done_rule_at;
+        let not_done: Vec<&str> = APP_JS[done_rule_at..includes_at]
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+            .map(|s| s.trim().trim_matches('"'))
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let shapes: Vec<(bool, String, bool)> = shapes
+            .into_iter()
+            .map(|(waiting, status)| {
+                let done = !not_done.contains(&status.as_str());
+                (waiting, status, done)
+            })
+            .collect();
+
+        // `runSection` reimplemented from assets/ui/app.js: `waiting` wins
+        // outright, then merged/ready land, stalled/blocked/failed end, and
+        // everything else is still in flight.
+        fn run_section(waiting: bool, status: &str) -> &'static str {
+            if waiting {
+                return "waiting";
+            }
+            match status {
+                "merged" | "ready" => "landed",
+                "stalled" | "blocked" | "failed" => "ended",
+                _ => "flight",
+            }
+        }
+
+        // RUN_STATE_FILTERS' five `match` functions, reimplemented the same
+        // way.
+        fn filter_matches(filter_key: &str, waiting: bool, done: bool) -> bool {
+            match filter_key {
+                "active" => !done,
+                "flight" => !done && !waiting,
+                "waiting" => waiting,
+                "done" => done,
+                "all" => true,
+                other => panic!("unknown RUN_STATE_FILTERS key: {other}"),
+            }
+        }
+
+        let compatible = |section: &str, filter_key: &str| {
+            shapes.iter().any(|(waiting, status, done)| {
+                run_section(*waiting, status) == section
+                    && filter_matches(filter_key, *waiting, *done)
+            })
+        };
+
+        // One row per RUN_SECTIONS key, in RUN_STATE_FILTERS' own order
+        // (active, flight, waiting, done, all) - hand-derived from the
+        // lifecycle, independently of whatever REPRESENTATIVE_RUN_SHAPES
+        // currently contains.
+        let expected = [
+            ("waiting", [true, false, true, true, true]),
+            ("flight", [true, true, false, false, true]),
+            ("landed", [false, false, false, true, true]),
+            ("ended", [false, false, false, true, true]),
+        ];
+        let filter_keys = ["active", "flight", "waiting", "done", "all"];
+
+        for (section, wants) in expected {
+            for (filter_key, want) in filter_keys.iter().zip(wants) {
+                assert_eq!(
+                    compatible(section, filter_key),
+                    want,
+                    "section {section:?} x filter {filter_key:?} should be compatible: {want}"
+                );
+            }
+        }
+
+        // The compatibility check exists only to be acted on: both pickers
+        // must actually consult it rather than just render its answer.
+        assert!(
+            APP_JS.contains("function sectionCompatibleWithStateFilter(sectionKey, filterKey)")
+        );
+        assert!(APP_JS.contains(
+            "if (state.runsFilter.section && !sectionCompatibleWithStateFilter(state.runsFilter.section, key))"
+        ));
+        assert!(APP_JS.contains(
+            "if (!same && !sectionCompatibleWithStateFilter(section, state.runsStateFilter))"
+        ));
     }
 }

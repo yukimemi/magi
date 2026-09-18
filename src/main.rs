@@ -10,8 +10,8 @@ use magi::config::{Config, MergeMode};
 use magi::graph::{Runner, fold_run};
 use magi::proc::Quiet as _;
 use magi::queue::{self, Queue, Source, Task, TaskStatus};
-use magi::run::{RunState, RunStatus, latest_id, list_ids, resolve_id};
-use magi::{agent, ask, daemon, report, repos, stats, tui, updater, web};
+use magi::run::{RunState, RunStatus, is_run_id, latest_id, list_ids, resolve_id};
+use magi::{agent, ask, daemon, land, report, repos, stats, triage, tui, updater, web};
 
 /// Blind multi-agent implementation competition.
 #[derive(Debug, Parser)]
@@ -204,6 +204,15 @@ enum Command {
         /// Also drop the winner's worktree and branch.
         #[arg(long)]
         all: bool,
+        /// Correct a run stuck on a failed automatic merge: the operator (or
+        /// an agent on their behalf) created and merged the pull request by
+        /// hand, and this is its URL. Verified against the forge before
+        /// anything is written - a URL that is not actually merged refuses
+        /// rather than guesses - and only then does `status` and the `merge`
+        /// section get rewritten to match, exactly as the automatic land loop
+        /// would have written them itself.
+        #[arg(long, value_name = "PR_URL")]
+        merged: Option<String>,
     },
     /// Inspect and shrink the shared build cache.
     ///
@@ -513,6 +522,19 @@ enum TaskCmd {
         /// Task id or unambiguous prefix/suffix.
         id: String,
     },
+    /// Walk every held task and act on `hold_source`: a machine hold whose
+    /// cause has resolved is put back in line automatically, and anything
+    /// else - an undecidable machine hold, a legacy record with no recorded
+    /// source, or a manual hold sitting stale - gets a question filed for the
+    /// operator instead. `magi serve` already runs this on every idle poll;
+    /// this is the same pass, on demand, for a queue with no daemon watching
+    /// it right now.
+    Triage {
+        /// Config file, applied to every task's own repository. Defaults to
+        /// each task's own `magi.toml` discovery.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 /// Operations on the shared build cache.
@@ -542,8 +564,44 @@ enum CacheCmd {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// The OS default stack for a process's real main thread is small (about
+/// 1 MiB on Windows) and fixed at link time, while this binary's `async fn`
+/// call graph is not: `Runner::execute` alone walks a dozen graph nodes, and
+/// `land`'s own watch loop nests several `.await`s deeper still. In a debug
+/// build - no frame reuse across suspend points - the generator `dispatch`
+/// compiles down to is sized for the largest path through all of it, and
+/// that size sits close enough to the OS default that a change as small as
+/// one more `Option<String>` field on an unrelated `Command` variant was
+/// once enough to cross it and crash `magi run --resume` on a real run with
+/// a native stack overflow - not a panic, nothing on stdout or stderr, just
+/// gone (see `graph_cached_gate::a_cached_failed_gate_stays_blocked_and_does_not_run_again`,
+/// which exercises exactly that resume path). Rather than keep the whole
+/// call graph under whatever headroom happens to be left, the real work runs
+/// on a thread whose stack size is set explicitly.
+const STACK_SIZE: usize = 32 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(run)
+        .expect("spawn the thread this binary actually runs on")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// Build the async runtime and run the CLI on it. Kept separate from `main`
+/// so `main` itself stays the small, fixed piece of work - spawn a thread,
+/// join it - that is safe to run on the OS's own small stack; see
+/// [`STACK_SIZE`] for why that split exists at all.
+fn run() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build the tokio runtime")?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
     let interactive = std::io::stdout().is_terminal();
@@ -617,13 +675,34 @@ fn subcommand_words() -> std::collections::BTreeSet<String> {
 /// paying agents to implement the sentence "show 3cbf". That happened twice in
 /// one morning - once to an agent verifying its own change to this very
 /// argument parsing, which is how a run nobody asked for came to exist, and
-/// once to the operator.
+/// once to the operator. The same shape bit `magi task add` too: a standing
+/// talk's agent, asked something answerable by looking around, ran
+/// `magi task add --solo` with the operator's own query-like words as the
+/// instruction instead of just answering - filing `list` and
+/// `info 20260912-114326-d3b8` as tasks, each burning a full competition on
+/// a sentence that was never work to begin with.
 ///
-/// The rule is deliberately blunt: a first word that names any subcommand is a
-/// typo unless the caller wrote `--`. It costs a legitimate instruction like
-/// "add retries to the client" one extra token, and it costs a mistyped
-/// command nothing at all instead of a full competition.
+/// Three rules, all deliberately blunt:
+///
+/// - A first word that names any subcommand is a typo unless the caller wrote
+///   `--`. It costs a legitimate instruction like "add retries to the client"
+///   one extra token, and it costs a mistyped command nothing at all instead
+///   of a full competition.
+/// - A leading literal `magi` is stripped before that check runs. `magi list`
+///   is exactly as mistyped as `list` alone, and clap's own subcommand tree
+///   never spells the binary's own name as one of its subcommands, so
+///   `subcommand_words()` would never catch it otherwise.
+/// - An instruction no longer than two words (after stripping a leading
+///   `magi`), one of which is shaped exactly like a run or task id
+///   (`is_run_id` - the two share a generator), is the argument list of a
+///   query someone meant to run, not a task someone meant to implement:
+///   nobody hand-writes a real instruction that is just a verb and an id.
+///
+/// `command` is the literal prefix to echo back in the escape hatch
+/// (`"magi run"`, `"magi task add"`, `"magi task edit <id>"`), so the message
+/// stays copy-pasteable for whichever caller hit the guard.
 fn mistyped_command(
+    command: &str,
     instruction: &[String],
     separator: bool,
     words: &std::collections::BTreeSet<String>,
@@ -631,18 +710,75 @@ fn mistyped_command(
     if separator {
         return None;
     }
-    let first = instruction.first()?;
-    if !words.contains(first.as_str()) {
-        return None;
+    let joined = instruction.join(" ");
+    let rest = strip_magi_prefix(instruction);
+    let first = rest.first()?;
+    if words.contains(first.as_str()) {
+        return Some(format!(
+            "`{first}` names a magi subcommand, so `{command} {joined}` looks \
+             like a mistyped command rather than a task, and it would end up \
+             spending real agent calls on a competition nobody meant to \
+             start. Write `{command} -- {joined}` to mean it literally."
+        ));
     }
-    Some(format!(
-        "`{first}` names a magi subcommand, so `magi run {}` looks like a \
-         mistyped command rather than a task, and starting a competition for \
-         it would cost real agent calls. Write `magi run -- {}` to mean it \
-         literally.",
-        instruction.join(" "),
-        instruction.join(" ")
-    ))
+    if rest.len() <= 2 && rest.iter().any(|w| is_run_id(w)) {
+        return Some(format!(
+            "`{joined}` looks like the arguments to a magi query command (a \
+             run or task id), not a task description, so `{command} {joined}` \
+             would end up spending real agent calls on a competition nobody \
+             meant to start. Write `{command} -- {joined}` to mean it \
+             literally."
+        ));
+    }
+    None
+}
+
+/// Strip a leading literal `magi`, if present.
+///
+/// `subcommand_words()` reads clap's own tree, which never spells the
+/// binary's own name as one of its subcommands, so a caller comparing
+/// against it has to remove a copy-pasted `magi` by hand first - otherwise
+/// `magi list` sails past a check that already catches `list` alone.
+fn strip_magi_prefix(instruction: &[String]) -> &[String] {
+    match instruction.first() {
+        Some(w) if w == "magi" => &instruction[1..],
+        _ => instruction,
+    }
+}
+
+/// Guard a task body that did not arrive as CLI positional words - the
+/// `task_text` fallback to stdin, for `magi task add`/`magi task edit` with
+/// no instruction and no `--file`/`--issue`.
+///
+/// Rule 1 of [`mistyped_command`] has no length limit of its own: a first
+/// word that names a subcommand refuses the instruction whatever comes
+/// after it, which is the right trade for text typed as CLI arguments (the
+/// fix is one more token, `--`). A body read from stdin exists for the
+/// opposite reason - `task_text` takes stdin specifically so a
+/// multi-paragraph task does not have to survive shell quoting as argv - so
+/// running that same unbounded rule against it would refuse real work the
+/// moment it opened with a word like "add", and the guard's own suggested
+/// fix ("write `{command} -- {joined}`") would then be telling the caller
+/// to redo exactly the argv quoting stdin was there to avoid. Gating the
+/// check to a body this short keeps it aimed at what it was written for -
+/// `list`, `info <id>` - where moving the words to argv really is a
+/// one-token fix, and exempts anything long enough to be an actual
+/// document.
+fn guard_free_form_text(
+    command: &str,
+    text: &str,
+    separator: bool,
+    words: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    const MAX_WORDS: usize = 2;
+    let text_words: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+    if strip_magi_prefix(&text_words).len() > MAX_WORDS {
+        return Ok(());
+    }
+    if let Some(why) = mistyped_command(command, &text_words, separator, words) {
+        bail!(why);
+    }
+    Ok(())
 }
 
 /// Whether the caller wrote a literal `--` separator.
@@ -708,8 +844,12 @@ async fn dispatch(command: Command) -> Result<()> {
                 }
                 None => (instruction, opts),
             };
-            if let Some(why) = mistyped_command(&instruction, had_separator(), &subcommand_words())
-            {
+            if let Some(why) = mistyped_command(
+                "magi run",
+                &instruction,
+                had_separator(),
+                &subcommand_words(),
+            ) {
                 bail!(why);
             }
             let repo = opts.repo.unwrap_or_else(|| PathBuf::from("."));
@@ -843,7 +983,7 @@ async fn dispatch(command: Command) -> Result<()> {
             Ok(())
         }
 
-        Command::Fold { id, all } => {
+        Command::Fold { id, all, merged } => {
             let id = match id {
                 Some(i) => resolve_id(&i)?,
                 None => latest_id().context("no runs yet")?,
@@ -851,9 +991,28 @@ async fn dispatch(command: Command) -> Result<()> {
             // A run whose state file is unreadable (missing, garbage, or an
             // unknown schema) cannot be folded through the graph path: loading
             // it fails. It is still occupying its run directory and worktree,
-            // so fold it wholesale instead.
+            // so fold it wholesale instead. `--merged` has nothing to correct
+            // in that case - there is no `status` or `merge` field to write -
+            // so it refuses instead of silently skipping the correction.
             let removed = match RunState::load(&id) {
                 Ok(mut state) => {
+                    if let Some(url) = merged {
+                        // Boxed defensively: `correct_manual_merge` calls into
+                        // `land::land`, whose own loop nests
+                        // `observe`/`approval_gate`/`fix_round` several layers
+                        // deep, and awaiting that inline would fold the whole
+                        // nested future into `dispatch`'s own generated state
+                        // machine - one `async fn` covering every branch of
+                        // this `match`, sized for whichever branch needs the
+                        // most room. (The stack overflow this was first
+                        // suspected of causing turned out to come from the
+                        // OS's small default main-thread stack instead - see
+                        // `main`'s own comment for the actual fix - but
+                        // there is no reason to keep spending an already-tight
+                        // budget when `Box::pin` moves this one to the heap
+                        // for free.)
+                        Box::pin(correct_manual_merge(&mut state, &url)).await?;
+                    }
                     let removed = fold_run(&mut state, all).await?;
                     // Nothing left for `fold_run` to remove is not the same
                     // thing as nothing left to do: a run whose worktrees are
@@ -875,6 +1034,9 @@ async fn dispatch(command: Command) -> Result<()> {
                     removed
                 }
                 Err(e) => {
+                    if merged.is_some() {
+                        bail!("{id}: state unreadable ({e}); cannot correct its merge record");
+                    }
                     println!(
                         "{id}: state unreadable ({e}); removing the run and its worktree wholesale"
                     );
@@ -997,6 +1159,68 @@ async fn dispatch(command: Command) -> Result<()> {
             updater::run_self_update(yes, check_only, !std::io::stdin().is_terminal()).await
         }
     }
+}
+
+/// Confirm `url` is actually a merged pull request, then rewrite `state`'s
+/// `status` and `merge` exactly as the automatic land loop (`land::land`)
+/// would have written them had magi opened and merged this pull request
+/// itself.
+///
+/// This is `magi fold --merged`'s whole implementation: the operator's
+/// recovery from a merge magi could not finish on its own - a PR title too
+/// long for the GraphQL mutation, `gh pr create` unreachable, a stale token -
+/// closed by hand with a pull request magi never opened and so never
+/// recorded. Reusing `land::land` rather than writing `status`/`merge`
+/// directly keeps this one authoritative: a merged pull request decides
+/// `Step::Done { merged: true }` on the very first read, before any of
+/// `land`'s own checks/fix/rebase machinery can run, which is what makes it
+/// safe to call here even though this pull request was never magi's own.
+/// `land::lifecycle` is checked first and separately so a mistyped or still-
+/// open URL fails loudly without writing anything, rather than handing an
+/// open pull request to the full autonomous loop by accident.
+///
+/// Correcting `status` this way does not run `bump::after_merge`
+/// (`src/bump.rs`): that call is made only from `graph::Runner::run_land`,
+/// which this path never goes through. A release version bump this change
+/// might have earned is therefore not filed automatically and has to be
+/// requested by hand - recorded as an event on the run so the gap is visible
+/// to whoever reads it later, not just to this comment.
+async fn correct_manual_merge(state: &mut RunState, url: &str) -> Result<()> {
+    match land::lifecycle(&state.repo, url).await? {
+        land::PrLifecycle::Merged => {}
+        other => bail!(
+            "{url} is {}, not merged; refusing to record {} as merged on a guess",
+            other.as_str(),
+            state.id
+        ),
+    }
+    let before = state.status;
+    if let Err(e) = land::land(state, url).await {
+        // `land::land` sets `status` to `Landing` and saves before its first
+        // read of the pull request - see its own doc - so a failure here
+        // (a transient `gh` hiccup between the two forge reads this function
+        // makes) can leave the run stuck on that in-between value with
+        // nothing left driving it. Land it on the same terminal shape an
+        // automated `land` failure lands on instead of leaving it stuck.
+        state.status = RunStatus::Blocked;
+        state.event("fold", format!("manual-merge correction failed: {e:#}"));
+        state.save()?;
+        return Err(e).context(format!("confirming the merge of {url}"));
+    }
+    println!(
+        "{}: corrected status {} -> {} from {url}",
+        state.id,
+        before.as_str(),
+        state.status.as_str()
+    );
+    state.event(
+        "fold",
+        "operator recorded this pull request as a manual merge; this run never \
+         re-entered `land`, so `bump::after_merge` did not run for it - a release \
+         bump this change might warrant has to be filed by hand",
+    );
+    state.save()?;
+    Ok(())
 }
 
 /// `magi cache show` and `magi cache clear`.
@@ -1550,7 +1774,22 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             solo,
             json,
         } => {
+            if let Some(why) = mistyped_command(
+                "magi task add",
+                &instruction,
+                had_separator(),
+                &subcommand_words(),
+            ) {
+                bail!(why);
+            }
             let text = task_text(&instruction, file.as_deref(), issue).await?;
+            if instruction.is_empty() && file.is_none() && issue.is_none() {
+                // The guard above never saw this: no positional words were
+                // given, so `task_text` fell back to stdin, and the same
+                // command-shaped mistake reaches here just as easily piped in
+                // (`echo list | magi task add --solo`) as typed on the argv.
+                guard_free_form_text("magi task add", &text, had_separator(), &subcommand_words())?;
+            }
             let title = title.unwrap_or_else(|| queue::title_from(&text, 72));
             let source = task_source(issue).await;
             // Checked and stored as an absolute path here, not left for
@@ -1558,7 +1797,8 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             // own working directory, so a bad `--repo` must fail while a
             // human is still looking at the terminal, not two attempts and
             // a `held` later as an opaque OS error from a failed git spawn.
-            let repo = resolve_repo(&repo).await?;
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let repo = resolve_repo(&repo, &cwd).await?;
             let mut task = Task::new(title, text, repo, source);
             task.priority = priority;
             task.solo = solo;
@@ -1590,14 +1830,23 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 println!("queue empty");
                 return Ok(());
             }
+            // Only queried once, and only for the human-readable listing:
+            // `--json` stays a faithful dump of `Task` itself, with nothing
+            // triage-specific spliced in that is not on the task's own record.
+            let waiting_on_triage = triage::open_task_ids(&ask::Questions::open());
             for t in &tasks {
                 let attempts = if t.attempts > 0 {
                     format!(" x{}", t.attempts)
                 } else {
                     String::new()
                 };
+                let question = if waiting_on_triage.contains(&t.id) {
+                    "  [triage question open, see `magi answer --list`]"
+                } else {
+                    ""
+                };
                 println!(
-                    "{}  {:<9}{:<4} {:<14} {}",
+                    "{}  {:<9}{:<4} {:<14} {}{question}",
                     t.short(),
                     t.status.as_str(),
                     attempts,
@@ -1641,6 +1890,16 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             for a in &t.answers {
                 println!("answered  {}: {}", a.question, a.answer);
             }
+            if t.status == TaskStatus::Held
+                && let Some(question) = triage::open_question_for(&ask::Questions::open(), &t.id)
+            {
+                println!(
+                    "question  {} ({}) - {}",
+                    question.short(),
+                    question.choices.join(" / "),
+                    question.summary
+                );
+            }
             if let Some(d) = &t.diagnostic {
                 println!("\ndiagnostic\n{d}");
             }
@@ -1683,12 +1942,31 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             file,
             title,
         } => {
+            if let Some(why) = mistyped_command(
+                &format!("magi task edit {id}"),
+                &instruction,
+                had_separator(),
+                &subcommand_words(),
+            ) {
+                bail!(why);
+            }
             let resolved = q.resolve_id(&id)?;
             let _claim = q
                 .claim(&resolved)
                 .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
             let mut t = q.get(&resolved)?;
             let text = task_text(&instruction, file.as_deref(), None).await?;
+            if instruction.is_empty() && file.is_none() {
+                // Same stdin gap as `task add`: no positional words means
+                // `task_text` read the new instruction from stdin, and the
+                // guard above never saw it.
+                guard_free_form_text(
+                    &format!("magi task edit {id}"),
+                    &text,
+                    had_separator(),
+                    &subcommand_words(),
+                )?;
+            }
             let title = title.unwrap_or_else(|| queue::title_from(&text, 72));
             t.edit(title, text)?;
             q.put(&mut t)?;
@@ -1713,6 +1991,26 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             t.release();
             q.put(&mut t)?;
             println!("queued {} {}", t.short(), t.title);
+            Ok(())
+        }
+
+        TaskCmd::Triage { config } => {
+            let questions = ask::Questions::open();
+            let report =
+                triage::run_once(&q, &questions, config.as_deref(), jiff::Timestamp::now());
+            if report.is_empty() {
+                println!("nothing to triage");
+                return Ok(());
+            }
+            for id in &report.resumed {
+                println!("resumed  {id} (machine hold resolved)");
+            }
+            for id in &report.answered {
+                println!("applied  {id} (operator's earlier answer)");
+            }
+            for id in &report.asked {
+                println!("asked    {id} - see `magi answer --list`");
+            }
             Ok(())
         }
 
@@ -1832,14 +2130,76 @@ fn asking_is_not_this_seat_s_job(node: &str) -> Option<String> {
 /// well-formed but wrong (a typo, a mangled Windows extended-path prefix)
 /// would otherwise only surface once the daemon burns a task's attempts and
 /// parks it `held`, as an OS-level error with no mention of `--repo` at all.
-async fn resolve_repo(repo: &Path) -> Result<PathBuf> {
-    let canonical = repo
-        .canonicalize()
-        .with_context(|| format!("--repo {} does not exist", repo.display()))?;
-    magi::git::toplevel(&canonical)
-        .await
-        .with_context(|| format!("--repo {} is not a git working tree", canonical.display()))?;
-    Ok(canonical)
+///
+/// A `repo` that does not canonicalize to anything on disk is not
+/// automatically a broken path, though - it is also the shape a short
+/// `owner/repo` (or bare `repo`) name takes, the kind [`crate::talk`]'s
+/// briefing now tells its agent it may use in place of a full path. That
+/// case falls through to [`resolve_repo_by_name`] rather than failing here
+/// outright; a path that *does* exist but turns out not to be a git working
+/// tree is still rejected immediately; scanning `[repos] roots` for it would
+/// only ever match a coincidence.
+///
+/// `cwd` is taken as a parameter rather than read from the process here, the
+/// same split `repos_cmd` keeps between reading `std::env::current_dir()` and
+/// calling `Config::discover` - it is what lets a test point this at a
+/// fixture directory instead of the real process cwd (this repository's own
+/// `magi.toml`, which has no `[repos]` section today but is not a fixture
+/// anything here should depend on).
+async fn resolve_repo(repo: &Path, cwd: &Path) -> Result<PathBuf> {
+    match repo.canonicalize() {
+        Ok(canonical) => {
+            magi::git::toplevel(&canonical).await.with_context(|| {
+                format!("--repo {} is not a git working tree", canonical.display())
+            })?;
+            Ok(canonical)
+        }
+        Err(_) => {
+            // `[repos] roots` is a machine fact, most often declared in the
+            // machine config layer - see `repos_cmd`, which reads it the same
+            // way for the same reason. A repository's own `magi.toml` may add
+            // to it too (`Config::refuse_split_arrays`'s append policy), which
+            // is what lets a test supply roots without touching the machine
+            // layer at all.
+            let (cfg, _) = Config::discover(cwd, None)
+                .with_context(|| format!("--repo {} does not exist", repo.display()))?;
+            resolve_repo_by_name(repo, &cfg.repos.roots)
+        }
+    }
+}
+
+/// Resolve a `--repo` value that is not an existing path at all against
+/// `[repos] roots`'s ghq-layout scan - the same one `magi repos` prints -
+/// letting a caller name a local checkout as `owner/repo` or a bare `repo`
+/// instead of a full path.
+///
+/// A miss or an ambiguous match is refused rather than guessed at: silently
+/// picking one of several checkouts sharing a name would file work against
+/// the wrong repository with nothing on screen to say so, and the whole
+/// point of this path is to save a round trip asking the operator, not to
+/// remove the one case that genuinely needs to ask.
+fn resolve_repo_by_name(repo: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
+    let query = repo.to_string_lossy().replace('\\', "/");
+    let hits: Vec<repos::Repo> = repos::scan(roots)
+        .into_iter()
+        .filter(|r| r.name == query || r.name.rsplit('/').next() == Some(query.as_str()))
+        .collect();
+    match hits.len() {
+        1 => Ok(hits.into_iter().next().expect("exactly one hit").path),
+        0 => bail!(
+            "--repo {} does not exist, and no checkout named `{query}` was found under \
+             [repos] roots",
+            repo.display()
+        ),
+        n => bail!(
+            "--repo `{query}` matches {n} checkouts under [repos] roots ({}); use a full path \
+             or the exact owner/repo name to disambiguate",
+            hits.iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// Who is filing this task.
@@ -1881,16 +2241,7 @@ async fn task_source(issue: Option<u64>) -> Source {
 async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
     println!("git        {}", probe("git", &["--version"]).await);
     println!("gh         {}", probe("gh", &["--version"]).await);
-    for kind in ["claude", "opencode", "agy", "codex"] {
-        println!(
-            "{kind:<10} {}",
-            if magi::config::which(kind) {
-                "found".to_owned()
-            } else {
-                "not on PATH".to_owned()
-            }
-        );
-    }
+    print!("{}", doctor_agents());
 
     let toplevel = magi::git::toplevel(repo).await;
     match &toplevel {
@@ -2006,6 +2357,41 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// The agent-CLI section of `magi doctor`: one row per kind the roster can
+/// name, saying whether its program is on `PATH`.
+///
+/// The list comes from [`magi::config::AgentKind::ALL`] rather than being typed
+/// out here, which is what keeps a newly added kind from being silently absent
+/// from the one command an operator runs to find out what is installed. A
+/// `command` seat has no fixed program - its executable is whatever the config
+/// names - so it is listed under `agent` and is never reported missing.
+fn doctor_agents() -> String {
+    let mut s = String::new();
+    for kind in magi::config::AgentKind::ALL {
+        match kind.program() {
+            Some(program) => {
+                let _ = writeln!(
+                    s,
+                    "{program:<10} {}",
+                    if magi::config::which(program) {
+                        "found"
+                    } else {
+                        "not on PATH"
+                    }
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    s,
+                    "{:<10} configured per repo (no fixed program)",
+                    kind.as_str()
+                );
+            }
+        }
+    }
+    s
+}
+
 /// The queue and loop section of `magi doctor`: how much work is backed up,
 /// whether `magi serve` is the one moving it, and how far this build's view
 /// of the runs directory can be trusted.
@@ -2108,8 +2494,8 @@ fn doctor_queue_and_loop(home: &Path) -> String {
 async fn probe(program: &str, args: &[&str]) -> String {
     match tokio::process::Command::new(program)
         .args(args)
-        // `magi doctor` probes five CLIs; unquieted that is five console
-        // windows blinking past on Windows.
+        // `magi doctor` probes every agent CLI in the roster; unquieted that is
+        // one console window per kind blinking past on Windows.
         .quiet()
         .output()
         .await
@@ -2405,6 +2791,28 @@ mod tests {
         assert!(text.contains("unreadable 0"), "{text}");
     }
 
+    /// Every kind the roster can name is listed by the command an operator runs
+    /// to find out what this machine has. When the list lived here as four
+    /// strings, adding `omp` to the roster left it invisible in `magi doctor` -
+    /// which reads as "not installed" to the person asking.
+    #[test]
+    fn doctor_lists_every_agent_kind_the_roster_can_name() {
+        let text = doctor_agents();
+        for kind in magi::config::AgentKind::ALL {
+            let name = kind.program().unwrap_or(kind.as_str());
+            assert!(
+                text.lines().any(|l| l.starts_with(name)),
+                "{name} is missing from the doctor roster:\n{text}"
+            );
+        }
+        // A `command` seat's program is whatever the repo config names, so it
+        // must not be reported as missing from PATH.
+        assert!(
+            text.contains("configured per repo"),
+            "a command seat has no fixed program to probe:\n{text}"
+        );
+    }
+
     fn task(status: TaskStatus) -> Task {
         let mut t = Task::new(
             "add retries".to_owned(),
@@ -2577,7 +2985,7 @@ mod tests {
         assert!(words.contains("task"));
 
         let typo: Vec<String> = ["show", "3cbf"].iter().map(|s| (*s).to_owned()).collect();
-        let why = mistyped_command(&typo, false, &words).expect("refused");
+        let why = mistyped_command("magi run", &typo, false, &words).expect("refused");
         assert!(why.contains("`show` names a magi subcommand"), "{why}");
         assert!(
             why.contains("magi run -- show 3cbf"),
@@ -2585,17 +2993,121 @@ mod tests {
         );
 
         // `--` is the way through, and it is honoured.
-        assert!(mistyped_command(&typo, true, &words).is_none());
+        assert!(mistyped_command("magi run", &typo, true, &words).is_none());
 
         // A real instruction is untouched, whatever it says about runs.
         let real: Vec<String> = "delete the runs nobody wants any more"
             .split(' ')
             .map(ToOwned::to_owned)
             .collect();
-        assert!(mistyped_command(&real, false, &words).is_none());
+        assert!(mistyped_command("magi run", &real, false, &words).is_none());
 
         // Nothing to run is not this guard's business; clap already says so.
-        assert!(mistyped_command(&[], false, &words).is_none());
+        assert!(mistyped_command("magi run", &[], false, &words).is_none());
+    }
+
+    #[test]
+    fn a_bare_query_by_id_never_becomes_a_task() {
+        // Both live incidents this guard was written for: `magi task add`
+        // filed as an instruction the exact argv of a query command someone
+        // meant to run, not a sentence anyone meant to implement.
+        let words = subcommand_words();
+
+        let list: Vec<String> = vec!["list".to_owned()];
+        let why = mistyped_command("magi task add", &list, false, &words).expect("refused");
+        assert!(why.contains("`list` names a magi subcommand"), "{why}");
+        assert!(why.contains("magi task add -- list"), "{why}");
+
+        // `info` names no subcommand at all - the guard has to catch this one
+        // by the id shape, not the first word.
+        let info: Vec<String> = vec!["info".to_owned(), "20260912-114326-d3b8".to_owned()];
+        assert!(!words.contains("info"));
+        let why = mistyped_command("magi task add", &info, false, &words).expect("refused");
+        assert!(
+            why.contains("looks like the arguments to a magi query command"),
+            "{why}"
+        );
+        assert!(
+            why.contains("magi task add -- info 20260912-114326-d3b8"),
+            "{why}"
+        );
+
+        // `--` is honoured here too.
+        assert!(mistyped_command("magi task add", &info, true, &words).is_none());
+
+        // A real instruction that merely mentions an id is untouched - only a
+        // bare verb-and-id instruction is short enough to trip the guard.
+        let real: Vec<String> = "backport the fix from run 20260912-114326-d3b8 onto main"
+            .split(' ')
+            .map(ToOwned::to_owned)
+            .collect();
+        assert!(mistyped_command("magi task add", &real, false, &words).is_none());
+    }
+
+    #[test]
+    fn a_leading_literal_magi_does_not_hide_the_subcommand_behind_it() {
+        // `subcommand_words()` reads clap's own tree, which never spells the
+        // binary's own name as one of its subcommands - so "magi list" would
+        // otherwise sail past the first-word check that catches "list" alone.
+        let words = subcommand_words();
+        assert!(!words.contains("magi"));
+
+        let prefixed: Vec<String> = vec!["magi".to_owned(), "list".to_owned()];
+        let why = mistyped_command("magi task add", &prefixed, false, &words).expect("refused");
+        assert!(why.contains("`list` names a magi subcommand"), "{why}");
+
+        // The same stripping has to feed the id-shape check too.
+        let prefixed_id: Vec<String> = vec![
+            "magi".to_owned(),
+            "info".to_owned(),
+            "20260912-114326-d3b8".to_owned(),
+        ];
+        let why = mistyped_command("magi task add", &prefixed_id, false, &words).expect("refused");
+        assert!(
+            why.contains("looks like the arguments to a magi query command"),
+            "{why}"
+        );
+
+        // `--` still bypasses it, and a bare "magi" alone has nothing left to
+        // check once stripped.
+        assert!(mistyped_command("magi task add", &prefixed, true, &words).is_none());
+        assert!(mistyped_command("magi task add", &["magi".to_owned()], false, &words).is_none());
+    }
+
+    #[test]
+    fn a_long_stdin_body_is_never_second_guessed_by_the_unbounded_rule() {
+        // `task_text` reads stdin specifically so a multi-paragraph task
+        // does not have to survive shell quoting as argv - subjecting that
+        // body to rule 1's unbounded first-word check would refuse the
+        // exact case stdin exists for, and then suggest rewriting it as argv
+        // (`{command} -- {joined}`), which recreates the quoting problem.
+        let words = subcommand_words();
+        assert!(words.contains("add"), "the guard reads clap's own commands");
+
+        guard_free_form_text(
+            "magi task add",
+            "add retries to the client, with exponential backoff and a cap \
+             on attempts so a flaky endpoint cannot spin forever",
+            false,
+            &words,
+        )
+        .expect("a real multi-word document must never be refused");
+
+        // The two live incidents are still caught when they arrive this way.
+        let err = guard_free_form_text("magi task add", "list", false, &words)
+            .expect_err("a bare query verb piped in is still a mistake");
+        assert!(err.to_string().contains("names a magi subcommand"));
+
+        let err = guard_free_form_text("magi task add", "info 20260912-114326-d3b8", false, &words)
+            .expect_err("a bare id lookup piped in is still a mistake");
+        assert!(
+            err.to_string()
+                .contains("looks like the arguments to a magi query command")
+        );
+
+        // `--` on the argv side still bypasses it, body untouched.
+        guard_free_form_text("magi task add", "list", true, &words)
+            .expect("the -- escape hatch must still work for a piped body");
     }
 
     #[test]
@@ -2734,6 +3246,85 @@ mod tests {
         assert!(!plain.solo, "no --solo must leave the task as false");
     }
 
+    #[tokio::test]
+    async fn task_add_refuses_a_query_that_looks_like_a_command() {
+        // The two live incidents this guard exists for: a standing talk's
+        // agent ran `magi task add --solo` with the operator's own
+        // command-shaped words as the instruction, and each filed a full
+        // competition for a sentence nobody meant to implement.
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+
+        let err = task_cmd_on(
+            TaskCmd::Add {
+                instruction: vec!["list".to_owned()],
+                file: None,
+                issue: None,
+                title: None,
+                priority: 0,
+                repo: PathBuf::from("."),
+                solo: false,
+                json: false,
+            },
+            q.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("names a magi subcommand"), "{err}");
+
+        let err = task_cmd_on(
+            TaskCmd::Add {
+                instruction: vec!["info".to_owned(), "20260912-114326-d3b8".to_owned()],
+                file: None,
+                issue: None,
+                title: None,
+                priority: 0,
+                repo: PathBuf::from("."),
+                solo: false,
+                json: false,
+            },
+            q.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("looks like the arguments to a magi query command"),
+            "{err}"
+        );
+
+        assert!(q.list().is_empty(), "neither refusal may reach the queue");
+    }
+
+    #[tokio::test]
+    async fn task_add_from_a_file_is_never_second_guessed() {
+        // `--file` is a deliberate document, not a stray word someone typed
+        // or piped - the guard's job is catching a query's argv arriving as
+        // an instruction, not judging what an explicitly named file contains.
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let path = dir.path().join("task.md");
+        std::fs::write(&path, "list\n").unwrap();
+
+        task_cmd_on(
+            TaskCmd::Add {
+                instruction: vec![],
+                file: Some(path),
+                issue: None,
+                title: None,
+                priority: 0,
+                repo: PathBuf::from("."),
+                solo: false,
+                json: false,
+            },
+            q.clone(),
+        )
+        .await
+        .expect("a --file task is never second-guessed by this guard");
+        assert_eq!(q.list().len(), 1);
+    }
+
     /// A real git working tree, for the `resolve_repo` tests below.
     async fn scratch_repo() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -2753,16 +3344,24 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_repo_accepts_a_real_git_working_tree() {
-        let (_dir, repo) = scratch_repo().await;
-        let resolved = resolve_repo(&repo).await.expect("a real repo resolves");
+        let (dir, repo) = scratch_repo().await;
+        // Hits the `Ok(canonical)` branch, which never reads `cwd` at all -
+        // any directory would do.
+        let resolved = resolve_repo(&repo, dir.path())
+            .await
+            .expect("a real repo resolves");
         assert_eq!(resolved, repo.canonicalize().unwrap());
     }
 
     #[tokio::test]
     async fn resolve_repo_rejects_a_path_that_does_not_exist() {
+        let _guard = NoMachineConfig::set();
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nowhere");
-        let err = resolve_repo(&missing)
+        // An empty fixture directory as `cwd`, so `Config::discover` finds no
+        // `magi.toml` and `[repos] roots` stays empty - the name-resolution
+        // fallback must then report the same "does not exist" it always has.
+        let err = resolve_repo(&missing, dir.path())
             .await
             .expect_err("a nonexistent path must not resolve");
         assert!(err.to_string().contains("does not exist"), "got: {err:#}");
@@ -2771,7 +3370,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_repo_rejects_a_directory_that_is_not_a_git_working_tree() {
         let dir = tempfile::tempdir().unwrap();
-        let err = resolve_repo(dir.path())
+        // Hits the `Ok(canonical)` / `toplevel` branch, not the name-resolution
+        // fallback, so `cwd` is unused here too.
+        let err = resolve_repo(dir.path(), dir.path())
             .await
             .expect_err("a plain directory is not a git working tree");
         assert!(
@@ -2782,12 +3383,14 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_repo_rejects_a_windows_extended_path_missing_a_backslash() {
+        let _guard = NoMachineConfig::set();
         // The extended-path prefix is `\\?\` (two leading backslashes). A
         // caller that loses one in transit produces `\?\`, which is not a
         // path anything exists at - exactly the mangled form that made it
         // into the queue unchecked before this validation existed.
+        let dir = tempfile::tempdir().unwrap();
         let broken = PathBuf::from("\\?\\C:\\this-drive-and-path-do-not-exist-magi-7524");
-        let err = resolve_repo(&broken)
+        let err = resolve_repo(&broken, dir.path())
             .await
             .expect_err("a malformed extended-path prefix must not resolve");
         assert!(err.to_string().contains("does not exist"), "got: {err:#}");
@@ -2795,15 +3398,173 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_repo_accepts_a_well_formed_windows_extended_path() {
-        let (_dir, repo) = scratch_repo().await;
+        let (dir, repo) = scratch_repo().await;
         // `canonicalize` already returns the `\\?\`-prefixed form on
         // Windows, so round-tripping it back through `resolve_repo` is
         // exactly the "correct extended path" case that must keep working.
+        // Hits the `Ok(canonical)` branch, so `cwd` is unused.
         let canonical = repo.canonicalize().unwrap();
-        let resolved = resolve_repo(&canonical)
+        let resolved = resolve_repo(&canonical, dir.path())
             .await
             .expect("a well-formed extended path resolves");
         assert_eq!(resolved, canonical);
+    }
+
+    /// Builds `<root>/<host>/<owner>/<repo>` with a `.git` directory -
+    /// exactly what [`repos::scan`] looks for, and cheap enough that these
+    /// tests do not need a real `git init` the way [`scratch_repo`] does.
+    fn ghq_checkout(root: &Path, host: &str, owner: &str, repo: &str) -> PathBuf {
+        let dir = root.join(host).join(owner).join(repo);
+        std::fs::create_dir_all(dir.join(".git")).expect("create checkout");
+        dir
+    }
+
+    /// A fixture `cwd` whose own `magi.toml` declares `[repos] roots`, so
+    /// `Config::discover(cwd, None)` (what `resolve_repo`'s fallback actually
+    /// calls) resolves `[repos] roots` from a file this test controls.
+    fn cwd_with_repos_roots(roots: &[PathBuf]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let quoted: Vec<String> = roots.iter().map(|r| format!("'{}'", r.display())).collect();
+        std::fs::write(
+            dir.path().join("magi.toml"),
+            format!("[repos]\nroots = [{}]\n", quoted.join(", ")),
+        )
+        .expect("write fixture magi.toml");
+        dir
+    }
+
+    /// Serializes every [`NoMachineConfig`] guard against every other one:
+    /// `cargo test`'s default runner gives each test its own thread, so two
+    /// guards live at once unless something stops them, and `MAGI_CONFIG_DIR`
+    /// is process-wide state no `&mut` can protect. Without this, one guard's
+    /// `Drop` can restore the variable to `None` while a second guard's own
+    /// `Config::discover` call is still in flight, letting *that* call fall
+    /// through to the real machine config the second guard exists to hide.
+    static NO_MACHINE_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Forces `Config::discover` to see no machine config layer for the life
+    /// of the guard, restoring whatever `MAGI_CONFIG_DIR` held before (even
+    /// on panic) once it drops.
+    ///
+    /// `Config::machine_layer`'s own `#[cfg(test)]` escape hatch only applies
+    /// when *config.rs itself* is compiled for testing - `cargo test --bin
+    /// magi` links `magi::config` as an ordinary (non-test) dependency of the
+    /// binary, so without this, `resolve_repo`'s `Config::discover` call
+    /// reads whichever `<config_dir>/magi/config.toml` genuinely exists on
+    /// the machine running the test. On an operator's own box that file can
+    /// declare real `[repos] roots`, whose checkouts can coincidentally share
+    /// a name with this fixture's ("yukimemi/magi" is this very repository) -
+    /// exactly the false ambiguity that first made these tests flaky here.
+    struct NoMachineConfig {
+        previous: Option<String>,
+        // Held until `Drop` runs below - see `NO_MACHINE_CONFIG_LOCK`'s own
+        // doc for why one guard's lifetime must never overlap another's.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl NoMachineConfig {
+        fn set() -> Self {
+            let lock = NO_MACHINE_CONFIG_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::env::var(Config::CONFIG_DIR_ENV).ok();
+            // SAFETY: `NO_MACHINE_CONFIG_LOCK` guarantees this is the only
+            // guard alive right now, and nothing outside this guard touches
+            // `MAGI_CONFIG_DIR` - the same reasoning `web::tests::
+            // recheck_never_spawns_when_checking_is_off_or_killed_by_env`
+            // relies on for its own, differently-named env var.
+            unsafe { std::env::set_var(Config::CONFIG_DIR_ENV, "") };
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for NoMachineConfig {
+        fn drop(&mut self) {
+            // SAFETY: see `set` above - `_lock` is still held here and only
+            // releases once this whole `drop` returns.
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var(Config::CONFIG_DIR_ENV, v),
+                    None => std::env::remove_var(Config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_resolves_a_short_name_through_config_discover() {
+        let _guard = NoMachineConfig::set();
+        let roots = tempfile::tempdir().unwrap();
+        let checkout = ghq_checkout(roots.path(), "github.com", "yukimemi", "magi");
+        let cwd = cwd_with_repos_roots(&[roots.path().to_owned()]);
+
+        // Not a path that exists anywhere, so this only resolves if the
+        // fallback actually ran `Config::discover(cwd, None)` and found the
+        // fixture's `[repos] roots` - the full path the completion criteria
+        // asks a test to demonstrate, not just the pure name-matching helper.
+        let resolved = resolve_repo(Path::new("yukimemi/magi"), cwd.path())
+            .await
+            .expect("a unique short name resolves without a full path");
+        assert_eq!(resolved, checkout.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_refuses_an_ambiguous_short_name_through_config_discover() {
+        let _guard = NoMachineConfig::set();
+        let roots = tempfile::tempdir().unwrap();
+        ghq_checkout(roots.path(), "github.com", "yukimemi", "magi");
+        ghq_checkout(roots.path(), "github.com", "someone-else", "magi");
+        let cwd = cwd_with_repos_roots(&[roots.path().to_owned()]);
+
+        let err = resolve_repo(Path::new("magi"), cwd.path())
+            .await
+            .expect_err("an ambiguous short name must not pick one silently");
+        assert!(err.to_string().contains("matches 2 checkouts"), "{err:#}");
+    }
+
+    #[test]
+    fn resolve_repo_by_name_resolves_a_unique_owner_repo_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = ghq_checkout(tmp.path(), "github.com", "yukimemi", "magi");
+
+        let resolved = resolve_repo_by_name(Path::new("yukimemi/magi"), &[tmp.path().to_owned()])
+            .expect("a unique owner/repo name resolves");
+        assert_eq!(resolved, checkout.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_repo_by_name_resolves_a_unique_bare_repo_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = ghq_checkout(tmp.path(), "github.com", "yukimemi", "magi");
+
+        let resolved = resolve_repo_by_name(Path::new("magi"), &[tmp.path().to_owned()])
+            .expect("a unique bare repo name resolves");
+        assert_eq!(resolved, checkout.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_repo_by_name_refuses_a_bare_name_shared_by_two_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        ghq_checkout(tmp.path(), "github.com", "yukimemi", "magi");
+        ghq_checkout(tmp.path(), "github.com", "someone-else", "magi");
+
+        let err = resolve_repo_by_name(Path::new("magi"), &[tmp.path().to_owned()])
+            .expect_err("an ambiguous name must not pick one silently");
+        assert!(err.to_string().contains("matches 2 checkouts"), "{err:#}");
+
+        // The full owner/repo name for either checkout is unambiguous.
+        resolve_repo_by_name(Path::new("yukimemi/magi"), &[tmp.path().to_owned()])
+            .expect("the qualified name still resolves");
+    }
+
+    #[test]
+    fn resolve_repo_by_name_reports_does_not_exist_when_nothing_matches() {
+        let err = resolve_repo_by_name(Path::new("no-such-repo"), &[])
+            .expect_err("no roots and no match must fail");
+        assert!(err.to_string().contains("does not exist"), "{err:#}");
     }
 
     #[tokio::test]
@@ -2881,6 +3642,26 @@ mod tests {
                 assert!(reason.is_empty(), "a bare hold gives no reason");
             }
             other => panic!("expected TaskCmd::Hold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_triage_parses_bare_and_with_an_explicit_config() {
+        let bare = Cli::try_parse_from(["magi", "task", "triage"]).unwrap();
+        match bare.command {
+            Some(Command::Task {
+                command: TaskCmd::Triage { config },
+            }) => assert!(config.is_none()),
+            other => panic!("expected TaskCmd::Triage, got {other:?}"),
+        }
+
+        let with_config =
+            Cli::try_parse_from(["magi", "task", "triage", "--config", "custom.toml"]).unwrap();
+        match with_config.command {
+            Some(Command::Task {
+                command: TaskCmd::Triage { config },
+            }) => assert_eq!(config, Some(PathBuf::from("custom.toml"))),
+            other => panic!("expected TaskCmd::Triage, got {other:?}"),
         }
     }
 
@@ -3059,6 +3840,43 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("running"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn task_edit_refuses_a_query_that_looks_like_a_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = magi::queue::Task::new(
+            "old title".to_owned(),
+            "old instruction".to_owned(),
+            PathBuf::from("."),
+            magi::queue::Source::Human,
+        );
+        let id = t.id.clone();
+        q.put(&mut t).unwrap();
+
+        let err = task_cmd_on(
+            TaskCmd::Edit {
+                id: id.clone(),
+                instruction: vec!["list".to_owned()],
+                file: None,
+                title: None,
+            },
+            q.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("names a magi subcommand"), "{err}");
+        assert!(
+            err.contains(&format!("magi task edit {id} -- list")),
+            "the escape hatch must name this task's own id: {err}"
+        );
+        assert_eq!(
+            q.get(&id).unwrap().instruction,
+            "old instruction",
+            "a refused edit must not touch the stored task"
+        );
     }
 
     #[tokio::test]

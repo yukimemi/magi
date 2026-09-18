@@ -64,6 +64,23 @@ base = "main"
 # runs for `mode = "pr"` (see `land.rs`'s module doc).
 style = "squash"
 
+[graph]
+# `cargo make check` on this repository takes ~1450s on a warm cache on this
+# machine — measured, not guessed — against a `timeout_review` default of
+# 1200s, which `timeout_verify` inherits when it is unset. That made the gate
+# fail structurally rather than because anything was wrong: run
+# 20260915-215701-c1c0 and run 20260915-225246-6805 both reached
+# `verify.gate` with two approvals and a green e2e, then timed out at 1200s.
+# The e2e leg has the same problem for a different reason: `verify.e2e` is
+# `cargo test --all-targets`, which is the same build plus the same suite.
+#
+# Stated here rather than on the machine layer on purpose: how long this
+# repository's own gate takes is a fact about this repository (a Windows box
+# building several agent worktrees at once), not about the operator's
+# preferences. 2400s is ~1.6x the measured time, which is headroom for a
+# busier machine rather than a licence to hang.
+timeout_verify = 2400
+
 # Project conventions appended to the node prompts, never merged into them.
 # Repository-wide context lives in AGENTS.md, which every agent already reads
 # from the checkout; these are the things a magi *node* needs to know.

@@ -65,6 +65,7 @@ use crate::graph::Runner;
 use crate::land;
 use crate::queue::{Queue, Task, TaskStatus};
 use crate::run::{QuotaLoss, RunState, RunStatus};
+use crate::triage;
 
 /// On-disk format for [`Status`]. Bumped when a field's meaning changes.
 pub const SCHEMA: u32 = 1;
@@ -1541,6 +1542,7 @@ async fn poll(
             // daemon that reached a normal idle interval. The startup pass
             // cannot see runs or cache files produced by this drain.
             janitor(&opts.repo, opts, home, worktrees_root).await;
+            triage_held(queue, home, opts).await;
             break;
         }
         stop.idle(opts.poll).await;
@@ -1553,6 +1555,7 @@ async fn poll(
         // wake permit. No run can start while this branch is active, so the
         // janitor still never races an in-flight compile.
         janitor(&opts.repo, opts, home, worktrees_root).await;
+        triage_held(queue, home, opts).await;
     }
 
     // Never return while a run is still in flight, whichever way the loop
@@ -1834,6 +1837,43 @@ async fn janitor(repo: &Path, opts: &Opts, home: &Path, worktrees_root: &Path) {
     }
 }
 
+/// Run [`triage::run_once`] and log whatever it did, the same "only when
+/// there is something to say" rule [`janitor`] follows for its own report.
+///
+/// Called at the same idle points as [`janitor`] - once per full poll
+/// interval, never mid-attempt - for the same reason: it is not liveness
+/// critical, and a task's own `hold_reason` string is the one thing this
+/// would otherwise re-check (via [`crate::disk::free_bytes`]) on every busy
+/// tick for no benefit.
+async fn triage_held(queue: &Queue, home: &Path, opts: &Opts) {
+    let questions = Questions::at(home.join("questions"));
+    let report = triage::run_once(queue, &questions, opts.config.as_deref(), Timestamp::now());
+    if report.is_empty() {
+        return;
+    }
+    if !report.resumed.is_empty() {
+        tracing::info!(
+            "triage: resumed {} held task(s) whose machine hold had resolved: {}",
+            report.resumed.len(),
+            report.resumed.join(", ")
+        );
+    }
+    if !report.asked.is_empty() {
+        tracing::info!(
+            "triage: asked about {} held task(s): {}",
+            report.asked.len(),
+            report.asked.join(", ")
+        );
+    }
+    if !report.answered.is_empty() {
+        tracing::info!(
+            "triage: applied {} operator answer(s): {}",
+            report.answered.len(),
+            report.answered.join(", ")
+        );
+    }
+}
+
 /// The free-space gate: what stands between this task and a new run, if
 /// anything. `Some(reason)` holds the task; `None` lets it start.
 ///
@@ -1895,19 +1935,17 @@ fn quota_wait(
 ///
 /// `reset` is deliberately free text — see [`crate::agent::Quota`], which
 /// explains why parsing it exactly "would be a bug factory" — so this only
-/// recognises the one shape actually observed in the wild, `"H:MMam/pm
-/// (Zone)"`, and returns `None` for anything else rather than guess at a
-/// format nobody has seen. A clock reading already past today is read as
-/// tomorrow's: a CLI naming a same-day reset that has already gone by means
-/// the window rolled over while nothing was watching.
+/// recognises the shapes actually observed in the wild, and returns `None`
+/// for anything else rather than guess at a format nobody has seen.
 fn parse_reset_hint(text: &str, now: Timestamp) -> Option<Timestamp> {
-    let open = text.find('(')?;
-    let close = text.rfind(')')?;
-    if close <= open {
-        return None;
-    }
-    let zone = text[open + 1..close].trim();
-    let clock = text[..open].trim().to_lowercase();
+    parse_reset_hint_zoned(text, now).or_else(|| parse_reset_hint_dated(text))
+}
+
+/// Reads a 12-hour `"H:MMam/pm"` clock reading (whitespace trimmed,
+/// case-insensitive) into a 24-hour hour and minute. Shared by every
+/// reset-hint shape below.
+fn parse_12h_clock(clock: &str) -> Option<(i8, i8)> {
+    let clock = clock.trim().to_lowercase();
     let (digits, pm) = clock
         .strip_suffix("am")
         .map(|d| (d, false))
@@ -1923,6 +1961,21 @@ fn parse_reset_hint(text: &str, now: Timestamp) -> Option<Timestamp> {
     } else if !pm && hour == 12 {
         hour = 0;
     }
+    Some((hour, minute))
+}
+
+/// The Claude CLI's shape: `"H:MMam/pm (Zone)"`, naming only a clock reading
+/// and a zone, never a date. A clock reading already past today is read as
+/// tomorrow's: a CLI naming a same-day reset that has already gone by means
+/// the window rolled over while nothing was watching.
+fn parse_reset_hint_zoned(text: &str, now: Timestamp) -> Option<Timestamp> {
+    let open = text.find('(')?;
+    let close = text.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let zone = text[open + 1..close].trim();
+    let (hour, minute) = parse_12h_clock(&text[..open])?;
     let tz = jiff::tz::TimeZone::get(zone).ok()?;
     let candidate = now
         .to_zoned(tz)
@@ -1940,6 +1993,69 @@ fn parse_reset_hint(text: &str, now: Timestamp) -> Option<Timestamp> {
         at += jiff::SignedDuration::from_hours(24);
     }
     Some(at)
+}
+
+/// The Codex CLI's shape: `"Mon DDth, YYYY H:MMam/pm"` (English month
+/// abbreviation, an ordinal day, a 4-digit year, a 12-hour clock reading),
+/// with no zone at all — unlike [`parse_reset_hint_zoned`], so there is no
+/// "already past today" correction to make: the year already disambiguates
+/// it. Scanned as a five-word window so it can be pulled out of the middle
+/// of a full sentence, e.g. Codex's actual wording: "...or try again at Sep
+/// 19th, 2026 5:10 PM." The result is read as UTC, same as this crate reads
+/// any other timestamp with no zone attached.
+fn parse_reset_hint_dated(text: &str) -> Option<Timestamp> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < 5 {
+        return None;
+    }
+    (0..=words.len() - 5)
+        .find_map(|start| parse_dated_window(&words[start..start + 5], words.get(start + 5)))
+}
+
+/// One five-word window: month, `"DDth,"`, `"YYYY"`, `"H:MM"`, `"am/pm"`. A
+/// parenthesis right after the window is refused rather than ignored — it
+/// reads as an explicit zone annotation on a shape that otherwise carries
+/// none, and guessing UTC anyway would be exactly the silent misread this
+/// module's parsing otherwise avoids.
+fn parse_dated_window(window: &[&str], trailing: Option<&&str>) -> Option<Timestamp> {
+    if trailing.is_some_and(|next| next.starts_with('(')) {
+        return None;
+    }
+    let month = month_number(window[0])?;
+    let day_token = window[1].strip_suffix(',')?.to_lowercase();
+    let day_digits = ["st", "nd", "rd", "th"]
+        .iter()
+        .find_map(|suffix| day_token.strip_suffix(*suffix))?;
+    let day: i8 = day_digits.parse().ok()?;
+    let year_token = window[2];
+    if year_token.len() != 4 || !year_token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i16 = year_token.parse().ok()?;
+    // The am/pm word carries the sentence's own trailing punctuation, e.g.
+    // the period ending "...at Sep 19th, 2026 5:10 PM." — strip it before
+    // reusing the same 12-hour clock reader the bracketed shape uses.
+    let ampm = window[4].trim_matches(|c: char| !c.is_ascii_alphabetic());
+    let (hour, minute) = parse_12h_clock(&format!("{}{}", window[3], ampm))?;
+    let date = jiff::civil::Date::new(year, month, day).ok()?;
+    let candidate = date
+        .at(hour, minute, 0, 0)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .ok()?;
+    Some(candidate.timestamp())
+}
+
+/// The 3-letter English month abbreviation [`parse_reset_hint_dated`] reads,
+/// case-insensitively, into a 1-based month number.
+fn month_number(name: &str) -> Option<i8> {
+    const NAMES: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let lower = name.to_lowercase();
+    NAMES
+        .iter()
+        .position(|n| *n == lower.as_str())
+        .map(|i| i as i8 + 1)
 }
 
 /// Resuming a `Blocked` run that already spent every review round its own
@@ -3620,6 +3736,42 @@ mod tests {
         assert!(
             parse_reset_hint("4:50am (Nowhere/Fake)", now).is_none(),
             "an unresolvable zone name is not guessed at either"
+        );
+    }
+
+    #[test]
+    fn parse_reset_hint_reads_the_codex_cli_shape_with_no_year_rollover_needed() {
+        let now = "2026-09-07T02:50:00Z".parse::<Timestamp>().unwrap();
+
+        let at = parse_reset_hint(
+            "You've hit your usage limit. Visit \
+             https://chatgpt.com/codex/settings/usage to purchase more \
+             credits or try again at Sep 19th, 2026 5:10 PM.",
+            now,
+        )
+        .expect("the codex reset wording is a recognised shape");
+        assert_eq!(at.to_string(), "2026-09-19T17:10:00Z");
+
+        // The month is explicit, so a date already earlier in the same
+        // sentence-implied year than `now` is trusted as written rather than
+        // rolled forward a year the way the bracketed shape rolls a
+        // same-day clock reading to tomorrow.
+        let earlier = parse_reset_hint("try again at Jan 2nd, 2026 1:00 AM.", now)
+            .expect("an explicit year needs no rollover");
+        assert_eq!(earlier.to_string(), "2026-01-02T01:00:00Z");
+
+        assert!(
+            parse_reset_hint("try again at Sep 19th, 26 5:10 PM.", now).is_none(),
+            "a two-digit year is not the documented shape and is not guessed at"
+        );
+        assert!(
+            parse_reset_hint("try again at Sept 19th, 2026 5:10 PM.", now).is_none(),
+            "a four-letter month name is not the documented three-letter abbreviation"
+        );
+        assert!(
+            parse_reset_hint("try again at Sep 19th, 2026 5:10 PM (UTC).", now).is_none(),
+            "an explicit zone on the dated shape is a format nobody has \
+             documented, and is refused rather than guessed at as UTC"
         );
     }
 

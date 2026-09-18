@@ -209,26 +209,26 @@ pub fn is_release_only(files: &[String]) -> bool {
     !files.is_empty() && files.iter().all(|f| f == "Cargo.toml" || f == "Cargo.lock")
 }
 
-/// Rewrite the `[package]` table's `version = "..."` line, leaving every
-/// other byte untouched.
+/// Rewrite `table`'s `version = "..."` line, leaving every other byte
+/// untouched.
 ///
-/// Scoped to the `[package]` table specifically, rather than the first line
+/// Scoped to the named table specifically, rather than the first line
 /// anywhere in the file that looks like `version = "..."`: a dependency
-/// pinned as `foo = { version = "1.2.3" }`, or - in a workspace this crate is
-/// not, but a fork might become - a `[workspace.package]` table, must not
-/// move. That scoping is what lets a version-bump-only diff stay exactly
-/// that, which [`is_release_only`] and the "no reviewer needed" exemption in
-/// `AGENTS.md` both rest on.
-pub fn rewrite_cargo_version(toml: &str, new_version: &str) -> Result<String> {
+/// pinned as `foo = { version = "1.2.3" }` must never move, and neither must
+/// the *other* of `[package]` / `[workspace.package]` when only one of them
+/// is the one being bumped. That scoping is what lets a version-bump-only
+/// diff stay exactly that, which [`is_release_only`] and the "no reviewer
+/// needed" exemption in `AGENTS.md` both rest on.
+fn rewrite_table_version(toml: &str, table: &str, new_version: &str) -> Result<String> {
     let mut out = String::with_capacity(toml.len() + 8);
-    let mut in_package = false;
+    let mut in_table = false;
     let mut done = false;
     for line in toml.split_inclusive('\n') {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            in_package = trimmed == "[package]";
+            in_table = trimmed == table;
         }
-        if !done && in_package && trimmed.split('=').next().map(str::trim) == Some("version") {
+        if !done && in_table && trimmed.split('=').next().map(str::trim) == Some("version") {
             let newline = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
             let _ = write!(out, "version = \"{new_version}\"{newline}");
             done = true;
@@ -237,32 +237,60 @@ pub fn rewrite_cargo_version(toml: &str, new_version: &str) -> Result<String> {
         out.push_str(line);
     }
     if !done {
-        bail!("no `version` field found under `[package]`");
+        bail!("no `version` field found under `{table}`");
     }
     Ok(out)
 }
 
-/// Read the `[package] version` currently on the base branch. No I/O: the
-/// caller fetches the blob (`git show <remote>/<base>:Cargo.toml`).
-fn current_version(toml: &str) -> Result<String> {
-    let mut in_package = false;
+/// Rewrite the release version, wherever this manifest actually declares it.
+///
+/// A single crate carries its version under `[package]`. A workspace root
+/// with no crate of its own - `[workspace] members = [...]` and nothing
+/// else - carries it under `[workspace.package]` instead, and `[package]`
+/// does not exist there at all. `[package]` is tried first because it is the
+/// far more common shape and the one every existing bump so far has hit;
+/// `[workspace.package]` is the fallback for the shape that never worked
+/// before this. Either way exactly one table is ever touched, so the "one
+/// version line changes" property [`rewrite_table_version`] rests on holds
+/// regardless of which table it was.
+pub fn rewrite_cargo_version(toml: &str, new_version: &str) -> Result<String> {
+    rewrite_table_version(toml, "[package]", new_version)
+        .or_else(|_| rewrite_table_version(toml, "[workspace.package]", new_version))
+        .context("no `version` field found under `[package]` or `[workspace.package]`")
+}
+
+/// Find `table`'s `version` field, if it has one. No I/O.
+fn version_in_table(toml: &str, table: &str) -> Option<String> {
+    let mut in_table = false;
     for line in toml.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            in_package = trimmed == "[package]";
+            in_table = trimmed == table;
             continue;
         }
-        if !in_package {
+        if !in_table {
             continue;
         }
         let mut parts = trimmed.splitn(2, '=');
         let key = parts.next().map(str::trim);
-        let Some(value) = parts.next() else { continue };
+        let Some(value) = parts.next() else {
+            continue;
+        };
         if key == Some("version") {
-            return Ok(value.trim().trim_matches('"').to_owned());
+            return Some(value.trim().trim_matches('"').to_owned());
         }
     }
-    bail!("no `version` field found under `[package]`")
+    None
+}
+
+/// Read the version currently on the base branch, from `[package]` if it has
+/// one, else from `[workspace.package]` - see [`rewrite_cargo_version`] for
+/// why both exist and which wins. No I/O: the caller fetches the blob (`git
+/// show <remote>/<base>:Cargo.toml`).
+fn current_version(toml: &str) -> Result<String> {
+    version_in_table(toml, "[package]")
+        .or_else(|| version_in_table(toml, "[workspace.package]"))
+        .context("no `version` field found under `[package]` or `[workspace.package]`")
 }
 
 /// Build the prompt asking an agent which digit of `major.minor.patch` a
@@ -1420,10 +1448,53 @@ foo = { version = \"1.2.3\" }\n";
         assert!(rewrite_cargo_version(toml, "1.0.0").is_err());
     }
 
+    /// The shape `kanadehq/kanade` has: a workspace root with member crates
+    /// but no crate of its own, so `[package]` never exists and the version
+    /// lives under `[workspace.package]` alone. Before this fell back,
+    /// `rewrite_cargo_version` bailed on every such repository and no bump
+    /// pull request was ever opened for it.
     #[test]
-    fn current_version_reads_only_the_package_table() {
+    fn cargo_version_rewrite_falls_back_to_workspace_package_without_a_package_table() {
+        let toml = "\
+[workspace]\n\
+members = [\"crates/a\", \"crates/b\"]\n\
+\n\
+[workspace.package]\n\
+version = \"0.45.18\"\n\
+edition = \"2024\"\n\
+\n\
+[workspace.dependencies]\n\
+foo = { version = \"1.2.3\" }\n";
+        let out = rewrite_cargo_version(toml, "0.45.19").unwrap();
+        assert!(out.contains("version = \"0.45.19\""));
+        assert!(
+            out.contains("foo = { version = \"1.2.3\" }"),
+            "a workspace dependency's own version pin must survive: {out}"
+        );
+        assert_eq!(
+            out.lines().count(),
+            toml.lines().count(),
+            "the rewrite replaces one line, it does not add or remove any"
+        );
+    }
+
+    #[test]
+    fn current_version_prefers_the_package_table_when_both_exist() {
         let toml = "[workspace.package]\nversion = \"9.9.9\"\n\n[package]\nversion = \"0.8.0\"\n";
         assert_eq!(current_version(toml).unwrap(), "0.8.0");
+    }
+
+    /// Same shape as `kanadehq/kanade`'s root `Cargo.toml`: no `[package]`
+    /// at all, only `[workspace]` and `[workspace.package]`.
+    #[test]
+    fn current_version_falls_back_to_workspace_package_without_a_package_table() {
+        let toml = "\
+[workspace]\n\
+members = [\"crates/a\", \"crates/b\"]\n\
+\n\
+[workspace.package]\n\
+version = \"0.45.18\"\n";
+        assert_eq!(current_version(toml).unwrap(), "0.45.18");
     }
 
     #[test]

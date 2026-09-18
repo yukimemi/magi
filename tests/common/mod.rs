@@ -219,6 +219,37 @@ if grep -q "Your patch was reviewed" "$p"; then
   exit 0
 fi
 
+# Design-deliberation advisor simulation: a matching seat produces nothing
+# usable and exits non-zero, exactly the record a real crash or unparsable
+# reply also leaves. Every other advisor seat proposes a design naming its
+# own seat and touching note.txt, so a synthesis that names a seat outright
+# has real, seat-specific wording to quote back.
+if grep -q "You are advisor" "$p"; then
+  if [ -n "$MOCK_ADVISOR_FAIL_SEAT" ] && { case ",$MOCK_ADVISOR_FAIL_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+    echo 'not a proposal at all'
+    exit 1
+  fi
+  printf '```json\n{"approach":"have %s add retries around note.txt","key_tradeoff":"latency versus simplicity","risks":["flaky retries"],"touches":["note.txt"],"why_not_naive":"a naive retry loop busy-waits"}\n```\n' "$seat"
+  exit 0
+fi
+
+# Design-deliberation synthesis simulation: blends the advisors, naming
+# `MOCK_SYNTH_NAMES` outright (space-separated seat keys) so the reflection
+# heuristic has an unambiguous "strong" case for those and a "faint" one for
+# any advisor left unnamed. Defaults to naming every seat that answered.
+if grep -q "opening a task for magi" "$p"; then
+  if [ -n "$MOCK_SYNTH_FAIL" ]; then
+    echo 'not a synthesis at all'
+    exit 1
+  fi
+  names="${MOCK_SYNTH_NAMES:-advisor-1}"
+  printf '## Synthesis\n\n'
+  for n in $names; do
+    printf '%s argued for adding retries around note.txt; the brief adopts that.\n\n' "$n"
+  done
+  exit 0
+fi
+
 # Anything else is the implementation node.
 echo "content from $seat" > note.txt
 git add -A >/dev/null 2>&1
@@ -304,6 +335,14 @@ pub fn fixture(home: HomeGuard, judges: Judges, require_fix: bool) -> Fixture {
             timeout_fix: 120,
             retries: 1,
             worktree_root: Some(tmp.path().join("wt")),
+            // Off: these fixtures predate the design-deliberation stage, and
+            // every scenario built on `fixture` asserts a specific sequence
+            // of mock invocations and events. Turning the stage on here would
+            // spend three more mock calls per run and add `advise` events to
+            // every one of them for no assertion that wants it — the stage
+            // gets its own fixture and mock branches in
+            // `graph_advise.rs` instead.
+            advise: false,
             // Everything else at its default. Naming every field here means a
             // new config option breaks four integration tests that do not care
             // about it, which is a cost with no matching benefit.
@@ -476,6 +515,20 @@ pub fn fixture_that_never_clears(home: HomeGuard, rounds: usize) -> Fixture {
         a.env
             .insert("MOCK_ALWAYS_FINDING".to_owned(), "1".to_owned());
     }
+    fx
+}
+
+/// Like [`fixture`], but with the design-deliberation stage turned on
+/// (`[graph] advise = true`, `[graph] advisors = advisors`) — `fixture`
+/// itself turns it off, so every scenario that wants the stage opts in here
+/// rather than the other way around. See the mock's own "Design-deliberation"
+/// branches for what an advisor seat and the synthesis seat answer, and the
+/// `MOCK_ADVISOR_FAIL_SEAT` / `MOCK_SYNTH_NAMES` / `MOCK_SYNTH_FAIL` knobs
+/// they read.
+pub fn fixture_with_advise(home: HomeGuard, advisors: usize) -> Fixture {
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    fx.config.graph.advise = true;
+    fx.config.graph.advisors = advisors;
     fx
 }
 

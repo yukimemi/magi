@@ -117,6 +117,13 @@ const RUN_STATUS = {
   gating:       { glyph: "\u25b8", tone: "blue", flight: true },
   merged:       { glyph: "\u25c6", tone: "gold", note: "Winner merged." },
   ready:        { glyph: "\u25c7", tone: "teal", note: "Winner passed the gate. Merge was not requested." },
+  /* Same underlying `status: "ready"` as above, but `[merge] mode = "none"`
+     left it there by design: nobody will ever land this branch for you, not
+     even the PR-polling watcher that other "ready" runs may still be headed
+     through. Shown instead of the plain `ready` chip whenever the summary's
+     `unmerged_by_design` says so \u2014 see `updateRunCard` / `renderRunDetail` \u2014
+     so the two cannot be told apart only by reading the note underneath. */
+  unmerged:     { glyph: "\u2296", tone: "ink", note: "Review and gate passed, but merge mode is \"none\": this branch is left unmerged by design and nothing will land it automatically." },
   /* Neither of these names a cause. A stall has several, and the run's own
      last line — shown for finished runs too — says which one it was; quota
      losses are counted separately above, from `losses`, so a note that
@@ -434,6 +441,7 @@ function roundRail(pr) {
    which is indistinguishable from "localStorage denied" and just as wrong. */
 const RUNS_COLLAPSE_KEY = "magi-runs-sections";
 const QUEUE_COLLAPSE_KEY = "magi-queue-sections";
+const TALK_READS_KEY = "magi-talk-reads";
 
 /* ---- state ------------------------------------------------------------- */
 const state = {
@@ -466,6 +474,15 @@ const state = {
   /* Same idea for the Backlog's sections, kept separately since the two
      views don't share section keys or default open/closed state. */
   queueCollapsed: loadCollapsed(QUEUE_COLLAPSE_KEY),
+  /* The Backlog's id search box. Lives only in memory, same reasoning as
+     runsFilter above: a reload starts from the unfiltered backlog. */
+  queueSearch: "",
+  /* `${query}\0${id}` of the single-hit jump renderQueueSearch last actually
+     performed, so a background poll that re-renders the same query without
+     a new unique hit does not yank the operator back to the card mid-read -
+     see scrollToSearchHit's own comment. Reset whenever the query is
+     cleared, so the next search starts a fresh jump. */
+  queueSearchJump: null,
   detail: { id: null, run: null, report: null },
   questions: null,
   /* Whether a question's panel endpoint actually answers. A sandboxed frame
@@ -473,6 +490,11 @@ const state = {
      panel; this is the answer to that, asked once per question. */
   panelOk: new Map(),
   talks: null,
+  /* Newest agent-turn timestamp the operator has actually seen, per
+     conversation id, kept in localStorage so unread badges survive a
+     reload. A conversation absent from this map has never been opened, so
+     every agent turn in it counts as unread. */
+  talkReads: loadCollapsed(TALK_READS_KEY),
   talkDetail: { id: null, talk: null },
   /* Images picked, pasted or dropped for the *next* `talk-say`, not yet part
      of any turn. Each item is `{ localId, previewUrl, name, status,
@@ -664,6 +686,7 @@ function renderLoop() {
   const text = box.querySelector(".daemon-text");
   const why = $("loop-why");
   const button = $("loop-toggle");
+  const controls = $("loop-controls");
   /* A past upgrade failure, folded into whatever note the loop's own state
      below already shows, rather than replacing it. `Stage::Failed` is
      terminal on the server and nothing clears it automatically, so taking
@@ -680,6 +703,7 @@ function renderLoop() {
     show(why, Boolean(full));
     show(button, false);
     button.onclick = null;
+    syncControls();
   };
 
   const park = $("loop-park");
@@ -701,6 +725,14 @@ function renderLoop() {
   setAttr(versionChip, "title", version ? `magi ${version} is serving this page` : null);
   show(versionChip, Boolean(version));
 
+  /* The chip and every button live in one grid cell (.daemon-controls) so
+     that hiding or showing any one of them never changes how many items the
+     .daemon grid itself is laying out. Called from every place below that
+     touches one of their `hidden` flags, so the wrapper's own visibility
+     always tracks whether it actually has anything in it. */
+  const syncControls = () => {
+    show(controls, !versionChip.hidden || !button.hidden || !park.hidden || !upgradeBtn.hidden);
+  };
 
   const control = (kind, label, note) => {
     setText(why, [note, upgradeFailNote].filter(Boolean).join(" "));
@@ -710,6 +742,7 @@ function renderLoop() {
     show(button, true);
     button.disabled = false;
     button.onclick = () => setLoop(kind === "start");
+    syncControls();
   };
 
   /* Offered only while a stop is waiting out a run, which is the moment the
@@ -722,6 +755,7 @@ function renderLoop() {
     setAttr(park, "title", note);
     show(park, true);
     park.onclick = () => setLoop(false, true);
+    syncControls();
   };
 
   if (!state.health) {
@@ -1128,7 +1162,7 @@ function updateRunCard(row, run) {
   /* `waiting` is a field of its own on the summary precisely because the
      status string still names the node the run parked in. It wins: a run
      nobody is working on must not read as one that is being worked on. */
-  const status = run.waiting ? "waiting" : String(run.status || "");
+  const status = run.waiting ? "waiting" : run.unmerged_by_design ? "unmerged" : String(run.status || "");
   const meta = RUN_STATUS[status] || {};
   const parked = isWaiting(run);
   const tone = toneOf(status, RUN_STATUS);
@@ -1265,6 +1299,10 @@ const RUN_SECTIONS = [
 
 function runSection(run) {
   if (run.waiting) return "waiting";
+  // `unmerged_by_design` is still `status: "ready"` on the wire, but nothing
+  // ever lands it, so grouping it under "Landed" would say the opposite of
+  // what happened; it belongs with the other runs that stopped for good.
+  if (run.unmerged_by_design) return "ended";
   const status = String(run.status || "");
   if (status === "merged" || status === "ready") return "landed";
   if (status === "stalled" || status === "blocked" || status === "failed") return "ended";
@@ -1300,6 +1338,42 @@ function matchesRunState(run) {
   return activeRunStateFilter().match(run);
 }
 
+/* runSection() and RUN_STATE_FILTERS read two different fields of a run
+   (status/waiting vs. done/waiting) and are picked independently — the tree
+   on the left and the chips on top — but renderRuns() ANDs them together.
+   Some pairings can never both be true for any run: every "landed"/"ended"
+   run is done by construction, so pairing either with "Active" or "In
+   flight" always yields zero cards, and "flight" (not done, not waiting)
+   can never meet the "waiting" tree section. Checked against a handful of
+   representative (waiting, status) shapes rather than a hand-written table,
+   so a future field added to either side can't silently drift out of sync
+   with this check.
+   `waiting: true` does not imply `done: false`: `RunStatus::resumable()`
+   (mirrored by `ask::Questions::settle_run` on the Rust side) only abandons
+   a run's open question once it lands on Merged, Ready or Failed — Stalled
+   and Blocked are both "done" (`RunStatus::done()`) yet stay resumable, so
+   a run parked there keeps its open question and still reads `waiting:
+   true`. Those two are the only done statuses a waiting run can carry;
+   Merged/Ready/Failed always have their question swept before that status
+   is ever saved. */
+const REPRESENTATIVE_RUN_SHAPES = [
+  { waiting: true, status: "implementing" },
+  { waiting: true, status: "stalled" },
+  { waiting: true, status: "blocked" },
+  { waiting: false, status: "implementing" },
+  { waiting: false, status: "merged" },
+  { waiting: false, status: "ready" },
+  { waiting: false, status: "stalled" },
+  { waiting: false, status: "blocked" },
+  { waiting: false, status: "failed" },
+].map((shape) => ({ ...shape, done: !["implementing"].includes(shape.status) }));
+
+function sectionCompatibleWithStateFilter(sectionKey, filterKey) {
+  const filter = RUN_STATE_FILTERS.find((f) => f.key === filterKey);
+  if (!filter) return true;
+  return REPRESENTATIVE_RUN_SHAPES.some((run) => runSection(run) === sectionKey && filter.match(run));
+}
+
 /* A head that still names a `superseded_by` (see foldRuns below) is one
    whose successor fell outside the page /api/runs returned, so it could not
    be folded under a newer card — it is genuinely an old attempt, just one
@@ -1316,6 +1390,14 @@ function isOrphanSuperseded(run) {
 function selectRunStateFilter(key) {
   if (state.runsStateFilter === key) return;
   state.runsStateFilter = key;
+  /* A tree section chosen earlier can be incompatible with the newly picked
+     chip (e.g. tree on "Landed", chip switched to "In flight") — see
+     sectionCompatibleWithStateFilter. Left alone that pair always shows zero
+     cards with no way to tell why, so the now-stale tree pick is dropped
+     rather than fought over. */
+  if (state.runsFilter.section && !sectionCompatibleWithStateFilter(state.runsFilter.section, key)) {
+    state.runsFilter = { section: null, repo: null };
+  }
   renderRuns();
 }
 
@@ -1457,6 +1539,15 @@ function matchesFilter(run) {
 function selectRunsFilter(section, repo) {
   const same = state.runsFilter.section === section && state.runsFilter.repo === (repo || null);
   state.runsFilter = same ? { section: null, repo: null } : { section, repo: repo || null };
+  /* Mirrors the guard in selectRunStateFilter: a chip picked earlier (e.g.
+     "Active") can be incompatible with the newly picked section (e.g.
+     "Landed", which is done by construction). Left alone that combination
+     always renders "No runs match this filter." with the tree/chip state
+     giving no hint that the chip is why — so land on "All", the one chip
+     compatible with every section, instead. */
+  if (!same && !sectionCompatibleWithStateFilter(section, state.runsStateFilter)) {
+    state.runsStateFilter = "all";
+  }
   renderRuns();
 }
 
@@ -1659,7 +1750,7 @@ function updateRunRow(row, run, children) {
     list.append(el("li", {},
       el("a", { class: "run-folded-link", href: `#/runs/${child.id}` },
         el("span", { class: "run-folded-id", text: child.short || shortId(child.id) }),
-        el("span", { class: "run-folded-status", text: child.waiting ? "waiting" : String(child.status || "") }),
+        el("span", { class: "run-folded-status", text: child.waiting ? "waiting" : child.unmerged_by_design ? "unmerged" : String(child.status || "") }),
         el("time", { class: "run-folded-when", text: at.text, title: at.title }),
       ),
     ));
@@ -2217,6 +2308,77 @@ function syncQueueSections(root, bySection) {
   syncSections(root, QUEUE_SECTIONS, bySection, createQueueSection, updateQueueSection);
 }
 
+/* ---- queue: id search --------------------------------------------------- *
+ * Mirrors the one prefix rule shared by `Queue::resolve_id` (the CLI's
+ * `magi task show <prefix>`) and `web::pick`: a leading match on the id the
+ * loop mints in full, or a trailing match on the short form every report
+ * prints (see shortId). Case-insensitive since a phone keyboard capitalizes
+ * on autocomplete more readily than a terminal does. */
+function matchesTaskId(id, query) {
+  const idLower = String(id).toLowerCase();
+  return idLower.startsWith(query) || idLower.endsWith(query);
+}
+
+function setQueueSearch(value) {
+  state.queueSearch = value;
+  if (value.trim() === "") state.queueSearchJump = null;
+  renderQueue();
+}
+
+/* Search results are a flat list rather than the sectioned view below: a
+   section that starts collapsed (Held, Done) would otherwise hide the very
+   card the operator typed an id to find. */
+function renderQueueSearch(tasks, query) {
+  const results = $("queue-search-results");
+  const matches = tasks.filter((t) => matchesTaskId(t.id, query));
+
+  show(results, matches.length > 0);
+  show($("queue-search-empty"), matches.length === 0);
+  show($("queue-search-status"), true);
+  setText(
+    $("queue-search-status"),
+    matches.length === 0
+      ? `No task matches \u201c${query}\u201d.`
+      : `${plural(matches.length, "task matches", "tasks match")} \u201c${query}\u201d.`,
+  );
+
+  syncList(results, matches, (t) => t.id, createTaskCard, updateTaskCard);
+  /* A single hit is exactly the case a prefix/suffix search exists for -
+     jump straight to it rather than making the operator scroll a one-item
+     list. Two or more stay a list to choose from, same as the CLI's own
+     "matches N tasks" refusal, just rendered instead of erroring.
+
+     Gated on jumpKey actually changing: renderQueue() re-runs on every SSE
+     revision and, without streaming, every 10s health poll, whether or not
+     this search had anything to do with the change. Re-jumping (and
+     re-flashing) on each of those would drag the view back to the card out
+     from under an operator who is mid-read - see scrollToLastTurn's own
+     rule against exactly that. */
+  if (matches.length === 1) {
+    const jumpKey = `${query}\0${matches[0].id}`;
+    if (state.queueSearchJump !== jumpKey) {
+      state.queueSearchJump = jumpKey;
+      scrollToSearchHit(results.firstElementChild);
+    }
+  }
+}
+
+/* Same sticky-header offset math as scrollToLastTurn, applied to a single
+   card instead of a chat transcript's last turn. */
+function scrollToSearchHit(row) {
+  if (!row) return;
+  const header = document.querySelector(".top");
+  const gap = header ? Math.ceil(header.getBoundingClientRect().height) + 4 : 0;
+  row.style.scrollMarginTop = `${gap}px`;
+  const motion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  row.scrollIntoView({ behavior: motion ? "auto" : "smooth", block: "start" });
+  /* Restarts the animation even if this exact card was already flashed a
+     keystroke ago. */
+  row.classList.remove("card-hit");
+  void row.offsetWidth;
+  row.classList.add("card-hit");
+}
+
 function renderQueue() {
   const sectionsRoot = $("queue-sections");
   const tasks = state.queue;
@@ -2236,9 +2398,21 @@ function renderQueue() {
   if (held) parts.push(`${held} held`);
   setText($("queue-count"), tasks.length === 0 ? "Nothing waiting" : parts.join(", "));
 
+  show($("queue-search"), tasks.length > 0);
   show($("queue-empty"), tasks.length === 0);
-  syncQueueSections(sectionsRoot, groupQueueBySection(tasks));
-  renderDependencyGraph(tasks);
+const query = state.queueSearch.trim().toLowerCase();
+  show($("queue-search-clear"), query !== "");
+  if (query === "") {
+    show($("queue-search-results"), false);
+    show($("queue-search-empty"), false);
+    show($("queue-search-status"), false);
+    show(sectionsRoot, true);
+    syncQueueSections(sectionsRoot, groupQueueBySection(tasks));
+    renderDependencyGraph(tasks);
+  } else {
+    show(sectionsRoot, false);
+    renderQueueSearch(tasks, query);
+  }
   /* The strip's wording depends on how many tasks are runnable, so it is
      re-rendered from the queue rather than only from health: "off, with two
      tasks waiting" has to appear the moment the second one is filed. */
@@ -3290,6 +3464,33 @@ function talkOpener(talk) {
   return first ? String(first.body || "") : "";
 }
 
+/* ---- unread -------------------------------------------------------------- *
+ * `state.talkReads` holds one timestamp per conversation: the `at` of the
+ * newest agent turn the operator has actually had on screen. An agent turn
+ * newer than that is unread; a conversation never opened has no entry, so
+ * every agent turn in it counts. The operator's own turns are never
+ * "unread" - they wrote them. */
+function talkUnreadTurns(talk) {
+  const lastRead = Date.parse((talk && state.talkReads[talk.id]) || "") || 0;
+  return talkTurns(talk).filter((turn) =>
+    turn.who === "agent" && (Date.parse(turn.at) || 0) > lastRead);
+}
+
+function talkUnreadCount(talk) {
+  return talk ? talkUnreadTurns(talk).length : 0;
+}
+
+/* Called only once a conversation's real turns are on screen - never from
+   the list, which shows a preview and must not itself clear anything. */
+function markTalkRead(talk) {
+  const turns = talkTurns(talk);
+  const at = turns.length ? turns[turns.length - 1].at : new Date().toISOString();
+  if (state.talkReads[talk.id] === at) return;
+  state.talkReads[talk.id] = at;
+  saveCollapsed(TALK_READS_KEY, state.talkReads);
+  renderTalks();
+}
+
 /* Open first, then newest first - the same ordering `Talks::list` uses on
    the server: what the operator is still using belongs above what they are
    done with. Sorting on `updated_at` instead would lift a conversation to
@@ -3308,6 +3509,7 @@ function createTalkCard() {
   const chipSlot = el("span");
   const thinking = el("span", { class: "tag", "data-tone": "blue", text: "thinking…" });
   const whenSlot = el("time", { class: "card-when" });
+  const unread = el("span", { class: "badge" });
   const title = el("h2", { class: "card-title" });
   const agent = el("span", { class: "repo" });
   const turns = el("span");
@@ -3316,11 +3518,11 @@ function createTalkCard() {
   const last = el("p", { class: "card-event" });
 
   const card = el("a", { class: "card" },
-    el("div", { class: "card-top" }, chipSlot, thinking, whenSlot),
+    el("div", { class: "card-top" }, chipSlot, thinking, whenSlot, unread),
     title, meta, last,
   );
   const row = el("li", {}, card);
-  row.refs = { card, chipSlot, thinking, whenSlot, title, agent, turns, tasks, last };
+  row.refs = { card, chipSlot, thinking, whenSlot, unread, title, agent, turns, tasks, last };
   return row;
 }
 
@@ -3338,6 +3540,14 @@ function updateTalkCard(row, talk) {
   if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
   else r.chipSlot.append(next);
   show(r.thinking, talkIsThinking(talk));
+
+  /* LINE-style at-a-glance: a numbered badge plus a bolder title, both gone
+     the moment the conversation has no unseen agent turns left. */
+  const unread = talkUnreadCount(talk);
+  setText(r.unread, unread > 99 ? "99+" : String(unread));
+  setAttr(r.unread, "aria-label", unread > 0 ? `${unread} unread` : null);
+  show(r.unread, unread > 0);
+  setAttr(r.card, "data-unread", unread > 0 ? "1" : null);
 
   const at = when(talk.updated_at || talk.created_at);
   setText(r.whenSlot, at.text);
@@ -3377,18 +3587,19 @@ function renderTalks() {
   syncList(list, sortTalks(talks), (t) => t.id, createTalkCard, updateTalkCard);
 }
 
-/* The rail and dock carry the same count as Questions' badges: conversations
-   this server currently reports as thinking. The accessible name says what
-   the bare numeral means. */
+/* The rail and dock carry the total unread agent turns across every
+   conversation - not whether one is thinking, which is what the "thinking…"
+   tag on each card is for. The accessible name says what the bare numeral
+   means. */
 function renderTalkIndicators() {
-  const count = (state.talks || []).filter(talkIsThinking).length;
+  const count = (state.talks || []).reduce((sum, talk) => sum + talkUnreadCount(talk), 0);
   for (const id of ["talk-badge-rail", "talk-badge-dock"]) {
     const badge = $(id);
     setText(badge, count > 99 ? "99+" : String(count));
     show(badge, count > 0);
   }
   for (const link of document.querySelectorAll('[data-nav="talks"]')) {
-    setAttr(link, "aria-label", count > 0 ? `Chat, ${count} conversations thinking` : "Chat");
+    setAttr(link, "aria-label", count > 0 ? `Chat, ${count} unread` : "Chat");
   }
 }
 
@@ -3515,6 +3726,15 @@ function renderTalk() {
     renderTalkThumbs();
     return;
   }
+
+  /* The conversation's real turns are on screen from here on - this is the
+     one place that counts as "the operator saw it". But a hidden document is
+     not a screen: the change stream keeps this render current even while the
+     tab is backgrounded or the phone is asleep, and that refresh must not
+     silently clear an unread the operator never looked at. The
+     visibilitychange handler below re-renders once the tab is actually
+     looked at again, which is what marks it read. */
+  if (!document.hidden) markTalkRead(talk);
 
   const status = String(talk.status || "open");
   /* The operator's own message, shown immediately and held until the
@@ -4141,7 +4361,7 @@ function renderRunDetail() {
      is the state the operator has to act on. */
   const summary = (state.runs || []).find((r) => r.id === run.id);
   const parkedNow = Boolean(summary && isWaiting(summary)) || openFor(run.id).length > 0;
-  const status = parkedNow ? "waiting" : String(run.status || "");
+  const status = parkedNow ? "waiting" : run.unmerged_by_design ? "unmerged" : String(run.status || "");
   const meta = RUN_STATUS[status] || {};
 
   const head = $("run-status");
@@ -4172,6 +4392,7 @@ function renderRunDetail() {
   renderAsks(run);
   renderLand(run);
   renderActive(run);
+  renderAdvise(run);
   renderVerdict(run);
   renderCandidates(run);
   renderReviews(run);
@@ -4429,9 +4650,20 @@ function renderAsks(run) {
 }
 
 function renderLand(run) {
-  const pr = landOf(run);
-  show($("run-land-panel"), Boolean(pr));
-  if (!pr) return;
+  const raw = landOf(run);
+  show($("run-land-panel"), Boolean(raw));
+  if (!raw) return;
+
+  // The run's own status is written the moment the land loop decides the
+  // outcome, but a merge magi performs itself can leave `pr.state` at the
+  // last polled value until observe() runs again - see land.rs's
+  // Step::Merge, and a run recorded before that was fixed stays stale on
+  // disk forever. `run.status` is the more authoritative field once it
+  // says merged, so the panel defers to it rather than repainting a
+  // finished run as still landing.
+  const pr = run.status === "merged" && raw.state !== "merged"
+    ? { ...raw, state: "merged" }
+    : raw;
 
   const box = $("run-land");
   clear(box);
@@ -4463,6 +4695,147 @@ function firstLine(text) {
     if (trimmed) return trimmed.length > 96 ? `${trimmed.slice(0, 95)}\u2026` : trimmed;
   }
   return "";
+}
+
+/* `advise::Reflection` on the wire: "strong" | "faint" | "absent". Not the
+   three-colour vote/severity scale reused elsewhere — this is about how
+   much of a proposal survived into the synthesis, not a verdict on it, so
+   "absent" (the seat produced no proposal at all) gets the same rust as a
+   failure elsewhere, but "faint" reads as a quieter gold than a reviewer's
+   finding does. */
+function reflectionTone(reflection) {
+  switch (reflection) {
+    case "strong": return "teal";
+    case "faint": return "gold";
+    case "absent": return "rust";
+    default: return null;
+  }
+}
+
+function reflectionLabel(reflection) {
+  switch (reflection) {
+    case "strong": return "reflected in the brief";
+    case "faint": return "barely reflected";
+    case "absent": return "no proposal";
+    default: return String(reflection || "");
+  }
+}
+
+/* The design-deliberation stage's own convergence diagram. Deliberately not
+   `convergeDiagram`: that one draws a single gold diamond at the point where
+   one candidate is chosen over the others, and this stage does the opposite
+   — it blends every seat's proposal into one brief, so the merge point is a
+   plain filled circle, never a diamond, and every advisor line that produced
+   a proposal survives into it (only a failed seat's line fades to dashed). */
+function adviseConvergeDiagram(records, hasSynthesis) {
+  const width = 320;
+  const height = 132;
+  const midX = width / 2;
+  const knot = 96;
+  const count = Math.max(records.length, 1);
+
+  const labels = records.map((r) => r.seat).filter(Boolean).join(", ");
+  const root = svg("svg", {
+    viewBox: `0 0 ${width} ${height}`,
+    role: "img",
+    "aria-label": records.length
+      ? `${plural(records.length, "advisor", "advisors")} ${labels}${hasSynthesis ? "; blended into a synthesis brief" : "; no synthesis brief produced"}`
+      : "No advisor seats",
+  });
+
+  const span = Math.min(96, (width - 68) / Math.max(count - 1, 1));
+  const xs = records.map((_, i) => midX + (i - (count - 1) / 2) * span);
+
+  records.forEach((record, i) => {
+    const x = xs[i];
+    const tone = candTone(i);
+    const reflection = record.reflection || "absent";
+    const strong = reflection === "strong";
+    const absent = reflection === "absent";
+    const path = x === midX
+      ? `M ${x} 44 L ${x} ${knot}`
+      : `M ${x} 44 C ${x} ${knot - 22}, ${(x + midX) / 2} ${knot - 8}, ${midX} ${knot}`;
+
+    root.append(svg("path", {
+      d: path,
+      fill: "none",
+      stroke: tone,
+      "stroke-width": strong ? 4 : 2.5,
+      "stroke-linecap": "round",
+      "stroke-dasharray": absent ? "3 5" : null,
+      opacity: strong ? 1 : absent ? 0.35 : 0.6,
+    }));
+    root.append(svg("circle", {
+      cx: x, cy: 26, r: 13,
+      fill: absent ? "var(--sunk)" : tone,
+      stroke: tone,
+      "stroke-width": 2,
+      "stroke-dasharray": absent ? "3 3" : null,
+    }));
+    root.append(svg("text", {
+      x, y: 31,
+      "text-anchor": "middle",
+      fill: absent ? tone : "var(--surface)",
+      text: String(i + 1),
+    }));
+  });
+
+  if (hasSynthesis) {
+    root.append(svg("circle", {
+      cx: midX, cy: knot, r: 11,
+      fill: "var(--gold-line)",
+    }));
+    root.append(svg("path", {
+      d: `M ${midX} ${knot + 15} L ${midX} ${height - 8}`,
+      stroke: "var(--gold-line)", "stroke-width": 5, "stroke-linecap": "round",
+    }));
+  } else {
+    /* No brief came of it: the merge point stays hollow, same convention
+       `convergeDiagram` uses for "no verdict yet". */
+    root.append(svg("circle", {
+      cx: midX, cy: knot, r: 10,
+      fill: "none", stroke: "var(--line-2)", "stroke-width": 2, "stroke-dasharray": "3 3",
+    }));
+  }
+
+  return root;
+}
+
+function renderAdvise(run) {
+  const advice = run.advice;
+  const records = advice && Array.isArray(advice.records) ? advice.records : [];
+  show($("run-advise-panel"), records.length > 0);
+  if (records.length === 0) return;
+
+  const proposed = records.filter((r) => r.proposal).length;
+  setText($("advise-count"), `${proposed} of ${plural(records.length, "advisor", "advisors")} proposed`);
+
+  const converge = $("advise-converge");
+  clear(converge);
+  converge.append(adviseConvergeDiagram(records, Boolean(advice.synthesis)));
+
+  const synthesisEl = $("advise-synthesis");
+  show(synthesisEl, Boolean(advice.synthesis));
+  setText(synthesisEl, advice.synthesis || "");
+
+  const list = $("run-advisors");
+  clear(list);
+  records.forEach((record, i) => {
+    list.append(el("li", { class: "cand", style: `--cand-tone: ${candTone(i)}` },
+      el("div", { class: "cand-head" },
+        el("span", { class: "cand-label", text: record.seat || "?" }),
+        el("span", { class: "cand-agent", text: record.agent || "" }),
+        el("span", {
+          class: "tag",
+          "data-tone": reflectionTone(record.reflection),
+          text: reflectionLabel(record.reflection),
+        }),
+      ),
+      record.proposal
+        ? el("p", { class: "cand-summary", text: record.proposal.approach || "" })
+        : el("p", { class: "card-note", text: record.error || "No proposal." }),
+    ));
+  });
 }
 
 function renderVerdict(run) {
@@ -5357,6 +5730,13 @@ function wire() {
 
   $("runs-filter-clear").addEventListener("click", clearRunsFilter);
 
+  $("queue-search-input").addEventListener("input", (event) => setQueueSearch(event.target.value));
+  $("queue-search-clear").addEventListener("click", () => {
+    $("queue-search-input").value = "";
+    setQueueSearch("");
+    $("queue-search-input").focus({ preventScroll: true });
+  });
+
   $("theme-toggle").addEventListener("click", () => {
     const next = THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length];
     applyTheme(next);
@@ -5420,7 +5800,13 @@ function wire() {
   /* A phone spends most of its time with the screen off. Asking again on wake
      is what stops the operator reading a snapshot from an hour ago. */
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) loadHealth({ applyRevisions: true });
+    if (document.hidden) return;
+    loadHealth({ applyRevisions: true });
+    /* The talk on screen may already hold turns that arrived - and were
+       fetched - while this tab was hidden, in which case revisions have not
+       moved since and the load above will not touch it. Re-render it
+       directly so `renderTalk`'s now-unguarded markTalkRead sees it. */
+    if (state.route.name === "talk" && state.talkDetail.id) renderTalk();
   });
 }
 
@@ -5429,7 +5815,17 @@ async function boot() {
   wire();
   applyRoute();
 
-  await loadHealth();
+  /* Health used to be awaited before the four view fetches even started,
+     paying its round trip twice on every cold load - once for health, once
+     for everything that does not actually need it. None of the four reads
+     state.health at fetch time; the one place that does (runs_unreadable in
+     renderRuns) already tolerates seeing it late, the same way needsOwnerCount
+     falls back to health's own count until /api/questions has answered. So
+     all five now share one round trip, and renderRuns runs once more after
+     to pick up whichever of health/runs landed second. */
+  await Promise.allSettled([
+    loadHealth(), loadRuns(), loadQueue(), loadQuestions(), loadTalks(),
+  ]);
   if (state.health) {
     state.rev.queue = state.health.queue_rev;
     state.rev.runs = state.health.runs_rev;
@@ -5438,9 +5834,7 @@ async function boot() {
     state.rev.loop = state.health.loop_rev;
     if (state.health.loop) state.loop = state.health.loop;
   }
-  await Promise.allSettled([
-    loadRuns(), loadQueue(), loadQuestions(), loadTalks(),
-  ]);
+  renderRuns();
 
   subscribe();
   setInterval(() => {

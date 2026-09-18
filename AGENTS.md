@@ -497,6 +497,7 @@ docs, and each is asserted in `src/agent.rs` tests:
 | `opencode` | `--format json` → `sessionID` | `-s <id>` | nothing to resume until a turn reported an id |
 | `agy` | `--output-format json` → `conversation_id` | `--conversation <id>` | print mode defaults to a **5 minute** timeout; `--print-timeout` must track the node budget. `--disable-slash-commands` silently disables `--mode`, so magi never passes it |
 | `codex` | `exec --json` → `thread.started.thread_id` | `exec … resume <id>` | `resume` is a **subcommand** and rejects every `exec` option that follows it (`unexpected argument '--sandbox'`), so magi emits all options first and the subcommand last. The prompt goes on stdin, which codex reads only when the prompt argument is `-`. The answer is the **last** `item.completed` whose item is an `agent_message`: earlier ones narrate the tool loop |
+| `omp` | `-p --mode=json` → the `id` on its `"type":"session"` line | `-p … --resume <id>` | a turn that ends on a **tool call** emits **no** `agent_end` line, so the answer has to be the last non-empty assistant text block across `agent_end` / `turn_end` / `message_end` — reading only `agent_end` silently discards a complete review. The prompt goes on stdin. `--continue` opens a *new* session, so it is never used |
 
 `agent::has_session` is the single place that decides whether a follow-up prompt
 may rely on memory. If it says no, the node re-sends full context. Never assume
@@ -525,6 +526,28 @@ fails if it appears.
 Unattended seats also pass `-c approval_policy="never"`: a seat that stops to
 ask blocks until its node timeout kills it, and there is nobody at the
 terminal during a run.
+
+### omp is opencode's shape, and its answer is not where the stream looks
+
+`kind = "omp"` reaches DeepSeek (its models ship in `omp`'s own catalog) and
+`gpt`-class models through the same CLI, but it has **no read-only mode**: like
+opencode, `--auto-approve` gates every permission, reads included, and a
+non-interactive seat without it cannot open its prompt file at all. So magi
+always passes it, and read-only-ness for those seats rests on the prompt plus
+the worktree discipline named above — never on the flag. `--dangerously-bypass-
+approvals-and-sandbox` appears nowhere, exactly as for codex.
+
+The extraction is the part that will be got wrong by anyone reading the event
+names instead of the stream. `omp -p --mode=json` emits `agent_end` **only** for
+a run that quiesces on a message turn; a turn that ends on a tool call
+(`stopReason: "toolUse"`) — which is what the review seats here routinely do —
+ends with no `agent_end` line at all, and the answer is in `message_end` /
+`turn_end` instead. A first hand-written wrapper keyed on `agent_end` and
+silently discarded three complete reviews; `omp_takes_the_answer_without_an_agent_end_line`
+exists so that cannot come back. The answer is the **last** non-empty assistant
+text block, because earlier ones narrate the tool loop (sometimes as a bare
+`.`). `--continue` opens a *new* session rather than the stored one, so resume is
+always `--resume <captured id>`.
 
 ### teravars renders the whole config file
 
@@ -1054,6 +1077,30 @@ concluding anything, and never re-run the merge on the strength of the exit
 code. `land::merged_after_all` is that rule for the unattended path: run ec12
 landed pull request 28 and recorded `ok: false`, and its task was held waiting
 for a merge that was already in `main`.
+
+**When magi never got as far as opening a pull request at all** - `gh pr
+create` itself failing (run 2963's title was over GitHub's 256-character
+GraphQL limit for `createPullRequest`), a dead token, `gh` unreachable - there
+is no PR for `land::merged_after_all` to recover through, because none of
+magi's own machinery ever ran against one. If a human (or an agent acting for
+one) then opens and merges a *different* pull request from the same branch by
+hand, the run's own record is stuck exactly where `merge` left it: `status`
+never becomes `Merged`, `merge` keeps recording the create failure, and the
+run sits in the web UI's "In flight" section (and the terminal deck) forever,
+usually with a `superseded_by` pointing at whatever later run actually got
+the task done. `magi task done` closes the task; it never touches the run.
+
+`magi fold --merged <pr-url>` is the fix: it reads the pull request back with
+`land::lifecycle` (refusing outright if it is not actually merged - never
+guess from a URL alone), then feeds it through `land::land` exactly as the
+automatic post-merge loop would have, which rewrites `status` and `merge` to
+match reality before the usual `fold` cleanup runs. **This path never calls
+`bump::after_merge`** (`src/bump.rs`) - that call is made only from
+`graph::Runner::run_land`, which a manually-corrected run never passes
+through - so a release version bump the change might have earned is not
+filed automatically even after the correction; request one by hand if the
+change warrants it. Fixing that gap is future work, not something this
+correction path attempts.
 
 ### Running magi on magi
 
