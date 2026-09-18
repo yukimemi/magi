@@ -359,6 +359,12 @@ impl Talks {
 
     /// Write a conversation, atomically, so a process killed mid-write leaves
     /// the previous state readable rather than a truncated file.
+    ///
+    /// The write-then-rename itself is retried a handful of times - see
+    /// [`write_atomic`] - because a reader with the destination file briefly
+    /// open is exactly the kind of failure that must not cost an agent's
+    /// whole reply; see `turn`'s own tail for what happens when even that is
+    /// not enough.
     pub fn put(&self, t: &mut Talk) -> Result<()> {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
@@ -366,9 +372,7 @@ impl Talks {
         let body = serde_json::to_string_pretty(t).context("serialize talk")?;
         let path = self.path_of(&t.id);
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
-        Ok(())
+        write_atomic(&tmp, &path, &body)
     }
 
     /// Load a conversation by id or unambiguous id prefix.
@@ -907,7 +911,46 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     talk.pending = fresh.pending;
     talk.pending_attachments = fresh.pending_attachments;
     talk.turns.push(reply);
-    store.put(talk)?;
+    if let Err(put_err) = store.put(talk) {
+        // `Talks::put` already retried the write itself - reaching here
+        // means a passing race is not what this is. An agent's answer,
+        // possibly the result of an hour-long call, must not vanish with
+        // nothing to show for it just because the very last step failed:
+        // pop it back off, stash its text beside the conversation, and
+        // replace it with a note the operator can actually see, the same
+        // mechanism the failure branches above already use for a quota or a
+        // timeout.
+        let lost = talk.turns.pop().expect("just pushed above");
+        let stash = stash_lost_turn(store, &talk.id, &stem, &lost);
+        let why = match &stash {
+            Ok(path) => format!(
+                "agent `{}` answered, but the reply could not be saved to \
+                 this conversation ({put_err:#}); the raw text was kept at \
+                 {} - your message is saved, ask again",
+                talk.agent,
+                path.display()
+            ),
+            Err(stash_err) => format!(
+                "agent `{}` answered, but the reply could not be saved to \
+                 this conversation ({put_err:#}), and it could not be kept \
+                 anywhere else either ({stash_err:#}); your message is \
+                 saved, ask again",
+                talk.agent
+            ),
+        };
+        talk.turns.push(note(why.clone()));
+        return match store.put(talk) {
+            Ok(()) => bail!("{why}"),
+            Err(note_err) => {
+                // Even the short note failed to save. Nothing left to retry
+                // in this call - undo the in-memory push so `talk` still
+                // reflects what is actually on disk, and surface both
+                // failures for whoever reads the log.
+                talk.turns.pop();
+                Err(note_err).context(why)
+            }
+        };
+    }
 
     match failure {
         Some(why) => bail!("{why}"),
@@ -1060,6 +1103,92 @@ pub fn tasks_of(queue: &Queue, talk_id: &str) -> Vec<Task> {
 fn read_path(path: &Path) -> Result<Talk> {
     let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))
+}
+
+/// How many times [`write_atomic`] retries a failed write-then-rename before
+/// giving up.
+const PUT_RETRIES: u32 = 5;
+
+/// Write `body` to `tmp` and rename it onto `path`, retrying the whole thing
+/// a handful of times with a short sleep in between.
+///
+/// The only failure this is meant to absorb is a passing one - most
+/// concretely, a reader elsewhere in this process (or another `magi`
+/// process) with `path` briefly open for `read_to_string` at the exact
+/// moment this call tries to rename over it. That clears in milliseconds
+/// once the reader lets go; a caller still failing after several short
+/// sleeps has something more durable wrong (a full disk, a permissions
+/// change) that a longer sleep would not fix either, and is left to report
+/// it.
+fn write_atomic(tmp: &Path, path: &Path, body: &str) -> Result<()> {
+    let mut last_err = None;
+    for attempt in 0..PUT_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(20 * u64::from(attempt)));
+        }
+        match try_write_atomic(tmp, path, body) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("the loop above always runs at least once"))
+}
+
+fn try_write_atomic(tmp: &Path, path: &Path, body: &str) -> Result<()> {
+    #[cfg(test)]
+    if failpoint::take_forced_put_failure() {
+        bail!("simulated write failure (test)");
+    }
+    std::fs::write(tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(tmp, path).with_context(|| format!("replace {}", path.display()))?;
+    Ok(())
+}
+
+/// Last resort when `turn`'s own `store.put` fails even after
+/// [`write_atomic`]'s retries: keep the generated text somewhere still
+/// findable rather than let the whole of an agent's answer disappear along
+/// with the write that was supposed to record it.
+fn stash_lost_turn(store: &Talks, id: &str, stem: &str, reply: &Turn) -> Result<PathBuf> {
+    let dir = store.artifacts_of(id);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(format!("{stem}-lost.txt"));
+    std::fs::write(&path, &reply.body).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
+/// A test-only seam that lets [`try_write_atomic`] simulate the kind of
+/// passing I/O race [`write_atomic`] is meant to retry through, without
+/// depending on real OS-level file-locking behaviour, which differs across
+/// the three platforms this crate ships on (and, on the one platform where a
+/// reader really does block a rename, is awkward to trigger deterministically
+/// in a unit test).
+#[cfg(test)]
+mod failpoint {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCE_PUT_FAILURES: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Arrange for the next `count` calls into [`super::try_write_atomic`] to
+    /// fail before touching the filesystem at all.
+    pub(super) fn force_put_failures(count: u32) {
+        FORCE_PUT_FAILURES.with(|c| c.set(count));
+    }
+
+    /// Consumed once per attempt inside [`super::try_write_atomic`]; `true`
+    /// means simulate this attempt failing.
+    pub(super) fn take_forced_put_failure() -> bool {
+        FORCE_PUT_FAILURES.with(|c| {
+            let n = c.get();
+            if n == 0 {
+                false
+            } else {
+                c.set(n - 1);
+                true
+            }
+        })
+    }
 }
 
 fn short(id: &str) -> &str {
@@ -1463,6 +1592,118 @@ mod tests {
         assert_eq!(note.who, Who::Agent);
         assert!(note.body.starts_with(MAGI_NOTE), "{}", note.body);
         assert!(note.body.contains("your message is saved"));
+    }
+
+    /// The failure this stands in for: a reader elsewhere briefly has the
+    /// talk file open right when `turn` tries to save the reply, and the
+    /// write-then-rename fails once or twice before the reader lets go.
+    /// `write_atomic`'s own retries must absorb that with nobody the wiser -
+    /// no gap in the transcript, no dropped turn.
+    #[tokio::test]
+    async fn a_passing_write_failure_while_saving_the_reply_does_not_lose_it() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), REPLY, env("go ahead"));
+        let cfg = config(spec);
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        let text =
+            record(&mut talk, &talks, "can I rename this function?", Vec::new()).expect("record");
+        // One fewer failure than `write_atomic` will retry through, so the
+        // very last attempt must succeed.
+        failpoint::force_put_failures(PUT_RETRIES - 1);
+        respond(&mut talk, &talks, &cfg, &text)
+            .await
+            .expect("respond must survive a write failure its own retries can outlast");
+
+        assert_eq!(talk.turns.len(), 2);
+        assert_eq!(talk.turns[1].who, Who::Agent);
+        assert_eq!(talk.turns[1].body, "go ahead");
+        let on_disk = talks.get(&talk.id).expect("get");
+        assert_eq!(
+            on_disk.turns, talk.turns,
+            "the reply must reach disk despite the early write failures"
+        );
+    }
+
+    /// When the write-then-rename never recovers - standing in for a disk
+    /// that stays unwritable rather than a reader that eventually lets go -
+    /// the reply must not disappear without a trace the way it did in the
+    /// real incident this repository saw: no error on the phone, no note in
+    /// the transcript, and the turn simply gone from `talks/<id>.json`.
+    #[tokio::test]
+    async fn a_persistent_write_failure_while_saving_the_reply_is_never_silent() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), REPLY, env("go ahead"));
+        let cfg = config(spec);
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        let text = record(&mut talk, &talks, "check the tests", Vec::new()).expect("record");
+        // Exactly enough forced failures to exhaust the reply's own retries;
+        // the shorter note that replaces it then saves cleanly, which is the
+        // common case this exercises - a large write racing something,
+        // followed by a small one that does not.
+        failpoint::force_put_failures(PUT_RETRIES);
+        let err = respond(&mut talk, &talks, &cfg, &text)
+            .await
+            .expect_err("a reply that cannot be saved must be reported, not swallowed");
+        assert!(err.to_string().contains("could not be saved"), "{err}");
+
+        let on_disk = talks.get(&talk.id).expect("get");
+        assert_eq!(
+            on_disk.turns.len(),
+            2,
+            "the operator turn plus a visible note"
+        );
+        assert_eq!(on_disk.turns[0].body, "check the tests");
+        let note = &on_disk.turns[1];
+        assert_eq!(note.who, Who::Agent);
+        assert!(note.body.starts_with(MAGI_NOTE), "{}", note.body);
+        assert!(
+            note.body.contains("could not be saved"),
+            "the operator must be told the reply is missing, not left staring \
+             at a gap with no explanation: {}",
+            note.body
+        );
+        assert_eq!(
+            talk.turns, on_disk.turns,
+            "the in-memory talk must match what actually landed on disk"
+        );
+
+        // The generated answer itself must still be recoverable, not merely
+        // reported as lost.
+        let artifacts = talks.artifacts_of(&talk.id);
+        let stash = std::fs::read_dir(&artifacts)
+            .expect("artifacts dir")
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().ends_with("-lost.txt"))
+            .expect("a stash file for the lost reply");
+        let stashed = std::fs::read_to_string(stash.path()).expect("read stash");
+        assert_eq!(stashed, "go ahead");
+    }
+
+    /// Even the note can fail to save, if the disk stays unwritable for long
+    /// enough. `respond` must still report the failure rather than pretend
+    /// the turn succeeded, and must not leave the in-memory `talk` claiming
+    /// a turn that never reached disk.
+    #[tokio::test]
+    async fn a_write_failure_that_also_loses_the_note_still_reports_it() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), REPLY, env("go ahead"));
+        let cfg = config(spec);
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        let text = record(&mut talk, &talks, "check the tests", Vec::new()).expect("record");
+        // Enough forced failures to exhaust the retries for both the reply
+        // and the note that would have replaced it.
+        failpoint::force_put_failures(PUT_RETRIES * 2);
+        let err = respond(&mut talk, &talks, &cfg, &text)
+            .await
+            .expect_err("neither the reply nor the note could be saved");
+        assert!(err.to_string().contains("could not be saved"), "{err}");
+
+        assert_eq!(talk.turns.len(), 1, "only the operator's own turn");
+        let on_disk = talks.get(&talk.id).expect("get");
+        assert_eq!(on_disk.turns.len(), 1);
     }
 
     /// An attachment lets the operator send an otherwise-empty message, and
