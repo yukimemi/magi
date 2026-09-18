@@ -939,13 +939,34 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             ),
         };
         talk.turns.push(note(why.clone()));
+        // Writing the note also carries the seat this call already advanced -
+        // `agent::invoke` incremented `turns` and, for a vendor that reports
+        // its own session id, recorded that too. That is what keeps the next
+        // turn resuming the session the CLI is already holding instead of
+        // re-opening it, so losing the reply costs the transcript a turn but
+        // not the conversation.
         return match store.put(talk) {
             Ok(()) => bail!("{why}"),
             Err(note_err) => {
-                // Even the short note failed to save. Nothing left to retry
-                // in this call - undo the in-memory push so `talk` still
-                // reflects what is actually on disk, and surface both
-                // failures for whoever reads the log.
+                // Even the short note failed to save, which means this
+                // conversation's file cannot be written at all right now -
+                // nothing is left for this call to retry or record. Pop the
+                // note so `talk.turns` matches the transcript on disk, and
+                // surface both failures for whoever reads the log.
+                //
+                // `talk.seat` is deliberately not wound back to match. The
+                // CLI really did take the turn and really did consume this
+                // seat's session id; pretending otherwise would be a second
+                // untruth on top of the unwritable file, and the handle is
+                // reloaded from disk by the next `drain` or `get` anyway -
+                // see `web::drain_loop`. What the seat cannot do is reach
+                // disk, so the record stays a turn behind the CLI until some
+                // later write lands, and a turn taken before then re-opens a
+                // session id the CLI already holds. That is the desync
+                // `20260907-011805-fb57` is about, and tolerating it belongs
+                // there rather than here: no write this branch could make
+                // would help, since a failed write is exactly what put it in
+                // this position twice over.
                 talk.turns.pop();
                 Err(note_err).context(why)
             }
@@ -1679,6 +1700,27 @@ mod tests {
             .expect("a stash file for the lost reply");
         let stashed = std::fs::read_to_string(stash.path()).expect("read stash");
         assert_eq!(stashed, "go ahead");
+
+        // Losing the reply must not also lose the seat. The CLI took a turn
+        // and consumed this seat's session id; if the note's write left the
+        // record claiming otherwise, the next turn would re-open a session
+        // the CLI is already holding - the `20260907-011805-fb57` desync -
+        // and would re-send the whole briefing besides. Both decisions read
+        // the seat straight off disk (`agent::has_session` and `turn`'s own
+        // `seat.turns == 0` branch), so this is the field that has to match.
+        assert_eq!(
+            on_disk.seat.turns, 1,
+            "the note's write must carry the turn the CLI actually took"
+        );
+        assert_eq!(
+            on_disk.seat.claude_session, talk.seat.claude_session,
+            "the session id handed to the CLI must survive the failed reply"
+        );
+        assert_eq!(on_disk.seat.captured_session, talk.seat.captured_session);
+        assert!(
+            agent::has_session(AgentKind::Command, &on_disk.seat, cfg.graph.sessions),
+            "the next turn must resume, not open the same session id twice"
+        );
     }
 
     /// Even the note can fail to save, if the disk stays unwritable for long
@@ -1704,6 +1746,28 @@ mod tests {
         assert_eq!(talk.turns.len(), 1, "only the operator's own turn");
         let on_disk = talks.get(&talk.id).expect("get");
         assert_eq!(on_disk.turns.len(), 1);
+
+        // Nothing at all reached disk, so the seat could not either: the CLI
+        // took a turn the record does not know about. That is pinned here as
+        // the known cost of a file that cannot be written twice over, not as
+        // something this branch could do better - the only way to record the
+        // seat is the write that just failed. It is also the point where
+        // this meets `20260907-011805-fb57`: a turn taken before some later
+        // write lands would re-open a session id the CLI already holds. The
+        // in-memory seat keeps the truth the CLI reported, which is why it is
+        // not wound back to match.
+        assert_eq!(
+            on_disk.seat.turns, 0,
+            "an unwritable file cannot record the turn the CLI took"
+        );
+        assert_eq!(
+            talk.seat.turns, 1,
+            "the in-memory seat still reports the turn the CLI actually took"
+        );
+        assert_eq!(
+            on_disk.seat.claude_session, talk.seat.claude_session,
+            "the session id was minted at `begin` and never changes here"
+        );
     }
 
     /// An attachment lets the operator send an otherwise-empty message, and
