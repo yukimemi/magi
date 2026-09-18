@@ -3426,49 +3426,89 @@ async fn talk_say(
         TalkTurnStart::Busy => {
             // A turn is already running: queue rather than refuse. See
             // `Ui::begin_talk_turn` and `talk::queue`.
-            let (view, reclaimed) = {
+            //
+            // The queue write and the drain it may owe live inside the task
+            // `tokio::spawn` hands to the runtime, for the same reason the
+            // immediate path below puts `record` there: a dropped handler
+            // future must not be able to land between a durable write and
+            // the task that answers it. `blocking` runs its closure on
+            // `spawn_blocking`, which finishes whether or not anyone is left
+            // to receive its result - so a disconnect at the `.await` below
+            // would otherwise leave the draft persisted and the reclaimed
+            // `TalkTurnGuard` dropped on the floor, with no `drain_loop`
+            // ever started and the queued text stranded until some later
+            // `say` happened to pick it up. The caller's 202 travels back
+            // over a `oneshot`, sent the moment the write lands.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn({
                 let ui = Arc::clone(&ui);
                 let id = id.clone();
                 let said = body.text.clone();
-                blocking(move || {
-                    let mut talk = ui.talks.get(&id)?;
-                    if let Err(error) = talk::queue(&mut talk, &ui.talks, &said, attachments) {
-                        if let Ok(fresh) = ui.talks.get(&id) {
-                            if !fresh.status.open() {
-                                return Err(ApiError::conflict(format!(
-                                    "talk {} is {} and takes no more turns",
-                                    fresh.short(),
-                                    fresh.status.as_str()
-                                )));
+                async move {
+                    let written = blocking({
+                        let ui = Arc::clone(&ui);
+                        let id = id.clone();
+                        move || {
+                            let mut talk = ui.talks.get(&id)?;
+                            if let Err(error) =
+                                talk::queue(&mut talk, &ui.talks, &said, attachments)
+                            {
+                                if let Ok(fresh) = ui.talks.get(&id) {
+                                    if !fresh.status.open() {
+                                        return Err(ApiError::conflict(format!(
+                                            "talk {} is {} and takes no more turns",
+                                            fresh.short(),
+                                            fresh.status.as_str()
+                                        )));
+                                    }
+                                }
+                                return Err(ApiError::from(error));
                             }
+                            // The turn that looked busy a moment ago can have
+                            // finished, found nothing to drain and given up the
+                            // slot in the gap between that check and this write
+                            // landing - see `drain_loop`'s own doc for the other
+                            // half of why that gap would otherwise be able to
+                            // open at all. Reclaiming the slot here, rather than
+                            // trusting that whoever held it is still watching, is
+                            // what stops the text just queued from being stranded
+                            // until an unrelated future `say` happens to drain
+                            // it.
+                            let claim = match ui.begin_queued_talk_turn(&id)? {
+                                Some(turn_guard) => {
+                                    let (cfg, _) = Config::discover(&talk.repo, None)?;
+                                    Some((talk.clone(), cfg, turn_guard))
+                                }
+                                None => None,
+                            };
+                            let thinking = ui.is_thinking(&id);
+                            Ok((TalkView::new(talk, thinking), claim))
                         }
-                        return Err(ApiError::from(error));
-                    }
-                    // The turn that looked busy a moment ago can have finished,
-                    // found nothing to drain and given up the slot in the gap
-                    // between that check and this write landing - see
-                    // `drain_loop`'s own doc for the other half of why that gap
-                    // would otherwise be able to open at all. Reclaiming the
-                    // slot here, rather than trusting that whoever held it is
-                    // still watching, is what stops the text just queued from
-                    // being stranded until an unrelated future `say` happens to
-                    // drain it.
-                    let claim = match ui.begin_queued_talk_turn(&id)? {
-                        Some(turn_guard) => {
-                            let (cfg, _) = Config::discover(&talk.repo, None)?;
-                            Some((talk.clone(), cfg, turn_guard))
+                    })
+                    .await;
+                    let (view, reclaimed) = match written {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            // Nobody is listening if the handler's own future
+                            // was already dropped - that is fine, nothing was
+                            // persisted and there is no response left to carry
+                            // this error to.
+                            let _ = tx.send(Err(e));
+                            return;
                         }
-                        None => None,
                     };
-                    let thinking = ui.is_thinking(&id);
-                    Ok((TalkView::new(talk, thinking), claim))
-                })
-                .await?
-            };
-            if let Some((talk, cfg, turn_guard)) = reclaimed {
-                let talks = ui.talks.clone();
-                tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
-            }
+                    // If this fails, the caller is gone; the drain below still
+                    // runs exactly as it would have for a caller that stayed.
+                    let _ = tx.send(Ok(view));
+                    if let Some((talk, cfg, turn_guard)) = reclaimed {
+                        let talks = ui.talks.clone();
+                        drain_loop(talk, talks, cfg, id, turn_guard).await;
+                    }
+                }
+            });
+            let view = rx
+                .await
+                .map_err(|_| ApiError::internal("the talk turn task ended without answering"))??;
             return Ok((StatusCode::ACCEPTED, Json(view)));
         }
     };
@@ -5246,6 +5286,126 @@ mod tests {
                 "delay {delay}: talk {id} recorded the operator's turn but \
                  the agent never answered - the reply task was never \
                  started after the handler future was dropped"
+            );
+        }
+    }
+
+    /// The same drop, landing on `talk_say`'s other durable write.
+    ///
+    /// When a turn is already running, the busy branch persists the
+    /// operator's text as a queued draft and then reclaims the turn slot if
+    /// the holder gave it up in the meantime - and whoever reclaims owes that
+    /// draft a `drain_loop`. `blocking` runs its closure on `spawn_blocking`,
+    /// which finishes whether or not the future awaiting it is still there,
+    /// so a handler dropped at that `.await` used to leave the draft written
+    /// to disk with the reclaimed guard dropped unread and no drainer ever
+    /// started: the message sat queued until some unrelated later `say`
+    /// happened to pick it up.
+    ///
+    /// Driving the handler future by hand reproduces that drop rather than
+    /// racing it. Polling it a fixed number of times parks it at a known
+    /// `.await`; nothing else polls it there, so the turn the test is holding
+    /// can be given up - through `drain_loop`, the protocol's other half -
+    /// before the handler is resumed for the poll that writes the draft. The
+    /// reclaim inside that write then finds the slot free, which is the case
+    /// under test, and the drop lands where axum's does: suspended on a
+    /// blocking task that is already dispatched and runs to completion
+    /// regardless of who is left waiting for it.
+    #[tokio::test]
+    async fn a_dropped_handler_future_after_queueing_still_drains_the_draft() {
+        /// Poll `fut` up to `max_polls` times, stopping early if it finishes.
+        async fn drive<F: std::future::Future>(fut: &mut std::pin::Pin<Box<F>>, max_polls: usize) {
+            if max_polls == 0 {
+                return;
+            }
+            let mut polls = 0usize;
+            std::future::poll_fn(|cx| {
+                polls += 1;
+                match fut.as_mut().poll(cx) {
+                    std::task::Poll::Ready(_) => std::task::Poll::Ready(()),
+                    std::task::Poll::Pending if polls >= max_polls => std::task::Poll::Ready(()),
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            })
+            .await;
+        }
+
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::write(repo.join("magi.toml"), MOCK_AGENT_TOML).expect("write magi.toml");
+        let home = TempDir::new().expect("temp home");
+        let talks = Talks::at(home.path().join("talks"));
+        let ui = Arc::new(
+            Ui::new(
+                Queue::at(home.path().join("queue")),
+                Questions::at(home.path().join("questions")),
+                talks.clone(),
+                home.path().join("runs"),
+                home.path().to_path_buf(),
+                repo.clone(),
+            )
+            .with_worktrees_root(home.path().join("wt")),
+        );
+        let cfg = config_for(&repo).await.expect("discover config");
+
+        for polls_after_release in 1..=3usize {
+            let talk = talk::begin(&talks, &cfg, repo.clone(), None).expect("begin talk");
+            let id = talk.id.clone();
+            // A turn is already running, which is what sends `talk_say` down
+            // the busy branch.
+            let turn_guard = ui
+                .begin_talk_turn(&id)
+                .expect("claim the turn")
+                .expect("a fresh talk owes nobody a turn");
+
+            let mut handler = Box::pin(talk_say(
+                State(Arc::clone(&ui)),
+                Path(id.clone()),
+                Ok(Json(NewTalkTurn {
+                    text: "what does the queue module do?".to_owned(),
+                    attachments: Vec::new(),
+                })),
+            ));
+            // Four awaits get the handler as far as asking for the turn:
+            // resolve, the closed-talk check, the attachment lookup, and the
+            // claim itself. Its answer - `Busy`, with the turn below still
+            // held - is waiting for a fifth poll that nothing here has made
+            // yet.
+            drive(&mut handler, 4).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // The turn that was running now finishes and gives the slot up
+            // the way a real one does - through `drain_loop`, which finds
+            // nothing queued yet and releases. The handler is parked and
+            // still believes the talk is busy, exactly the interleaving the
+            // reclaim exists for.
+            let running = talks.get(&id).expect("reload talk");
+            drain_loop(running, talks.clone(), cfg.clone(), id.clone(), turn_guard).await;
+            // Resumed, the handler writes its draft and reclaims the now-free
+            // slot - and is then dropped, the way a reloading phone drops it.
+            drive(&mut handler, polls_after_release).await;
+            drop(handler);
+
+            // A settled talk: the draft drained into an operator turn and
+            // answered. The write itself is already on its way - the blocking
+            // task carrying it outlives the dropped handler either way - so
+            // waiting for the answer is waiting for the drain the reclaim
+            // owes, not for the write.
+            let mut fresh = talks.get(&id).expect("reload talk");
+            for _ in 0..200 {
+                if fresh.pending.is_empty() && fresh.turns.len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                fresh = talks.get(&id).expect("reload talk");
+            }
+            assert!(
+                fresh.pending.is_empty() && fresh.turns.len() == 2,
+                "polls {polls_after_release}: talk {id} left the operator's \
+                 text queued with no drainer - the reclaimed turn was dropped \
+                 along with the handler future (pending {:?}, {} turns)",
+                fresh.pending,
+                fresh.turns.len()
             );
         }
     }
