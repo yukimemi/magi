@@ -1360,7 +1360,8 @@ async fn poll(
         // `maybe_prune_cache_between_runs`'s own doc for why this cannot
         // wait for the queue to run dry.
         if !stop.busy_now() {
-            maybe_prune_cache_between_runs(&opts.repo, opts, &mut cache_last_checked, now).await;
+            maybe_prune_cache_between_runs(&opts.repo, opts, stop, &mut cache_last_checked, now)
+                .await;
         }
 
         let stalled = stalled_tasks(queue, home, now);
@@ -1802,8 +1803,20 @@ fn prepare(repo: &Path, opts: &Opts) -> Result<Config> {
 /// same liveness fact the idle branch's own janitor call rests on - no run
 /// this daemon spawned is still mid-compile - so pruning here races nothing.
 /// The caller must not call this while a run is in flight; there is no
-/// second check inside this function, on purpose, because there is nothing
-/// left to check that `busy_now()` has not already answered.
+/// second `busy_now()` check inside this function, on purpose, because there
+/// is nothing left to check that `busy_now()` has not already answered.
+///
+/// A stop that has already been asked for *is* checked here, for a different
+/// reason. [`clean::prune_cache_if_over_limit`] walks the whole cache
+/// synchronously before it decides anything, so the poll loop cannot get back
+/// to its own `stopped()` test until that walk is over — and a loop already
+/// on its way out must not make the operator wait out housekeeping it is
+/// about to stop needing. This is the same call the idle branch makes when it
+/// rechecks `stop.stopped()` after its wait before reaching [`janitor`], and
+/// it matters more here: `busy_now()` is false throughout, so
+/// [`Stop::finishing`] would report a stop as already landed while the walk
+/// still held the loop. Nothing is lost by skipping — the cap is a standing
+/// policy, and the next daemon's startup pass measures the same cache.
 ///
 /// Rate-limited by [`CACHE_CHECK_INTERVAL_SECS`] rather than run on every
 /// poll: a busy loop reaches this the instant one run's `InFlightGuard` drops
@@ -1813,10 +1826,11 @@ fn prepare(repo: &Path, opts: &Opts) -> Result<Config> {
 async fn maybe_prune_cache_between_runs(
     repo: &Path,
     opts: &Opts,
+    stop: &Stop,
     last_checked: &mut Option<Timestamp>,
     now: Timestamp,
 ) {
-    if !cache_check_due(*last_checked, now, CACHE_CHECK_INTERVAL_SECS) {
+    if stop.stopped() || !cache_check_due(*last_checked, now, CACHE_CHECK_INTERVAL_SECS) {
         return;
     }
     *last_checked = Some(now);
@@ -4140,9 +4154,12 @@ mod tests {
         std::fs::write(cache_dir.join("a"), vec![0u8; 10]).unwrap();
         let opts = cache_check_opts(dir.path(), &cache_dir, 1);
 
+        // Nobody has asked this daemon to stop, which is the ordinary case;
+        // the skip that a stop buys is asserted by its own test below.
+        let running = Stop::new();
         let mut last_checked = None;
         let t0 = "2026-09-15T00:00:00Z".parse::<Timestamp>().unwrap();
-        maybe_prune_cache_between_runs(&opts.repo, &opts, &mut last_checked, t0).await;
+        maybe_prune_cache_between_runs(&opts.repo, &opts, &running, &mut last_checked, t0).await;
         assert_eq!(
             crate::disk::dir_size(&cache_dir),
             0,
@@ -4153,7 +4170,8 @@ mod tests {
         // A fresh oversized file lands, but the next check is not due yet.
         std::fs::write(cache_dir.join("b"), vec![0u8; 10]).unwrap();
         let too_soon = t0 + jiff::SignedDuration::from_secs(1);
-        maybe_prune_cache_between_runs(&opts.repo, &opts, &mut last_checked, too_soon).await;
+        maybe_prune_cache_between_runs(&opts.repo, &opts, &running, &mut last_checked, too_soon)
+            .await;
         assert_eq!(
             crate::disk::dir_size(&cache_dir),
             10,
@@ -4167,11 +4185,50 @@ mod tests {
 
         // Once the interval elapses, the same oversized cache is caught again.
         let due_again = t0 + jiff::SignedDuration::from_secs(CACHE_CHECK_INTERVAL_SECS as i64 + 1);
-        maybe_prune_cache_between_runs(&opts.repo, &opts, &mut last_checked, due_again).await;
+        maybe_prune_cache_between_runs(&opts.repo, &opts, &running, &mut last_checked, due_again)
+            .await;
         assert_eq!(
             crate::disk::dir_size(&cache_dir),
             0,
             "due again: pruned back under the cap"
+        );
+    }
+
+    /// A stop must not queue behind housekeeping. The prune below is a
+    /// synchronous walk of the whole cache with no await point in it, so a
+    /// loop that entered it could not get back to its own `stopped()` test
+    /// until the walk finished - and because no run is in flight at this
+    /// boundary, `Stop::finishing` would meanwhile tell the operator's screen
+    /// the stop had already landed. The idle branch has always made this same
+    /// check before reaching `janitor`; the between-runs path makes it too.
+    #[tokio::test]
+    async fn a_stop_already_asked_for_skips_the_between_runs_cache_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("a"), vec![0u8; 10]).unwrap();
+        let opts = cache_check_opts(dir.path(), &cache_dir, 1);
+
+        let stop = Stop::new();
+        stop.stop();
+        assert!(
+            !stop.finishing(),
+            "no run is in flight at a between-runs boundary, so nothing else \
+             would tell the operator this stop had not taken effect yet"
+        );
+
+        let mut last_checked = None;
+        let t0 = "2026-09-15T00:00:00Z".parse::<Timestamp>().unwrap();
+        maybe_prune_cache_between_runs(&opts.repo, &opts, &stop, &mut last_checked, t0).await;
+        assert_eq!(
+            crate::disk::dir_size(&cache_dir),
+            10,
+            "over its cap, and due for the first check ever, but a stop outranks \
+             it: the cap is a standing policy the next start measures again"
+        );
+        assert_eq!(
+            last_checked, None,
+            "a check that never happened must not claim the interval"
         );
     }
 
