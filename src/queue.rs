@@ -328,17 +328,20 @@ impl Task {
     /// Record a successful run.
     ///
     /// Both `magi task done` and `POST /api/queue/{id}/done` can close a held
-    /// task directly, with no release in between, so this clears
-    /// `hold_reason` the same way [`Task::release`] does. Otherwise a task
-    /// held for "waiting on 3ed9" and then closed as done without ever being
-    /// released would still read as waiting on something in `magi task show`
-    /// and on its card, after it no longer is.
+    /// *or blocked* task directly, with no release in between, so this clears
+    /// `hold_reason` and `blocked_by`/`block_reason` the same way
+    /// [`Task::release`] does. Otherwise a task held for "waiting on 3ed9", or
+    /// blocked on a dependency that never actually finished, and then closed
+    /// as done without ever being released would still read as waiting on
+    /// something in `magi task show` and on its card, after it no longer is.
     pub fn succeed(&mut self) {
         self.status = TaskStatus::Done;
         self.last_error = None;
         self.hold_reason = None;
         self.hold_source = None;
         self.diagnostic = None;
+        self.blocked_by.clear();
+        self.block_reason = None;
     }
 
     /// Record a failed attempt. Out of attempts means held for a human, rather
@@ -388,21 +391,36 @@ impl Task {
     }
 
     /// Take this task out of the loop's reach by an operator action.
+    ///
+    /// Clears `blocked_by`/`block_reason` unconditionally, the same as
+    /// [`Task::release`] and for the same reason its own comment already
+    /// gives: a human choosing to hold a *blocked* task overrides its wait
+    /// outright, the same as it overrides an ordinary hold. Without this, a
+    /// task held straight out of [`TaskStatus::Blocked`] - the web UI's "Hold"
+    /// button is reachable on a blocked task, same as "Mark done" - kept
+    /// reading as still waiting on a dependency it no longer had any claim on.
     pub fn hold_manual(&mut self, reason: Option<String>) {
         self.status = TaskStatus::Held;
         if reason.is_some() {
             self.hold_reason = reason;
         }
         self.hold_source = Some(HoldSource::Manual);
+        self.blocked_by.clear();
+        self.block_reason = None;
     }
 
     /// Take this task out of the loop's reach during automatic recovery.
+    ///
+    /// Clears `blocked_by`/`block_reason` for the same reason
+    /// [`Task::hold_manual`] does.
     pub fn hold_machine(&mut self, reason: Option<String>) {
         self.status = TaskStatus::Held;
         if reason.is_some() {
             self.hold_reason = reason;
         }
         self.hold_source = Some(HoldSource::Machine);
+        self.blocked_by.clear();
+        self.block_reason = None;
     }
 
     /// Block this task on other task ids and/or open question ids, chosen by
@@ -1053,6 +1071,43 @@ mod tests {
             t.hold_reason.is_none(),
             "a done task cannot still be waiting on something"
         );
+    }
+
+    #[test]
+    fn holding_or_closing_a_blocked_task_clears_its_dependency_too() {
+        // The web UI's "Hold" and "Mark done" buttons are both reachable on a
+        // `blocked` task, not just on `queued`/`held` ones - neither requires
+        // a release first. A task moved off `Blocked` that way must not still
+        // carry the dependency it was waiting on: a dependency graph built
+        // from `blocked_by` would otherwise keep drawing an edge for a task
+        // that is not blocked on anything any more.
+        let mut held = task("held straight out of blocked");
+        held.block(
+            vec!["20260101-000000-dead".to_owned()],
+            Some("waiting on the migration script".to_owned()),
+        );
+        assert_eq!(held.status, TaskStatus::Blocked);
+
+        held.hold_manual(None);
+        assert_eq!(held.status, TaskStatus::Held);
+        assert!(
+            held.blocked_by.is_empty(),
+            "hold overrides the wait, same as release"
+        );
+        assert!(held.block_reason.is_none());
+
+        let mut done = task("closed straight out of blocked");
+        done.block(
+            vec!["20260101-000000-dead".to_owned()],
+            Some("waiting on the migration script".to_owned()),
+        );
+        done.succeed();
+        assert_eq!(done.status, TaskStatus::Done);
+        assert!(
+            done.blocked_by.is_empty(),
+            "a done task cannot still be waiting on a dependency"
+        );
+        assert!(done.block_reason.is_none());
     }
 
     #[test]
