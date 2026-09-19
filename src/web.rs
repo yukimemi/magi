@@ -4077,6 +4077,18 @@ mod tests {
     use crate::config::Config;
     use crate::queue::{Source, TaskStatus};
 
+    /// How many 10ms steps a settle loop takes before it calls a stall a
+    /// stall - thirty seconds.
+    ///
+    /// These loops wait on real `sh` subprocesses, and the machine that runs
+    /// the gate runs several suites at once, so a two-second budget was not
+    /// waiting for the reply, it was racing the scheduler: two of these
+    /// tests failed under that load with the turn simply not landed yet.
+    /// This is a hang guard, not a latency assertion - every loop breaks the
+    /// moment its condition holds, so a generous cap costs an idle machine
+    /// nothing and still fails a genuine hang instead of hanging the suite.
+    const SETTLE_STEPS: usize = 3_000;
+
     /// A home with a queue and a runs directory, and a router serving it on
     /// loopback. `tower`'s `oneshot` is not reachable - `tower` is axum's
     /// dependency, not ours - so the tests drive a real socket, which has the
@@ -4424,11 +4436,12 @@ mod tests {
     ///
     /// Polled rather than asserted straight after the POST because stopping
     /// is deliberately not instant - that is the contract - and rather than
-    /// slept through because a fixed wait is either flaky or slow. Two
-    /// seconds is far longer than a stand-in loop needs and still finite, so
-    /// a genuine hang fails the test instead of hanging the suite.
+    /// slept through because a fixed wait is either flaky or slow.
+    /// `SETTLE_STEPS` is far longer than a stand-in loop needs and still
+    /// finite, so a genuine hang fails the test instead of hanging the
+    /// suite.
     async fn settled(fx: &Fixture, want: fn(&Value) -> bool) -> Value {
-        for _ in 0..200 {
+        for _ in 0..SETTLE_STEPS {
             let view = fx.get("/api/loop").await.json();
             if want(&view) {
                 return view;
@@ -5195,7 +5208,7 @@ mod tests {
         );
 
         let mut turns_after = 1;
-        for _ in 0..200 {
+        for _ in 0..SETTLE_STEPS {
             let detail = f.get(&format!("/api/talks/{id}")).await.json();
             turns_after = detail["turns"].as_array().expect("turns array").len();
             if turns_after == 2 {
@@ -5272,7 +5285,7 @@ mod tests {
             let _ = handler.await;
 
             let mut turns = 0;
-            for _ in 0..200 {
+            for _ in 0..SETTLE_STEPS {
                 if let Ok(fresh) = talks.get(&id) {
                     turns = fresh.turns.len();
                     if turns != 1 {
@@ -5409,7 +5422,7 @@ mod tests {
             // waiting for the answer is waiting for the drain the reclaim
             // owes, not for the write.
             let mut fresh = talks.get(&id).expect("reload talk");
-            for _ in 0..200 {
+            for _ in 0..SETTLE_STEPS {
                 if fresh.pending.is_empty() && fresh.turns.len() == 2 {
                     break;
                 }
@@ -5449,7 +5462,7 @@ mod tests {
         assert!(edited.json()["thinking"].as_bool().unwrap());
 
         let mut detail = f.get(&format!("/api/talks/{id}")).await.json();
-        for _ in 0..200 {
+        for _ in 0..SETTLE_STEPS {
             if detail["turns"].as_array().expect("turns").len() == 2 {
                 break;
             }
@@ -5516,7 +5529,7 @@ mod tests {
             .await;
         assert_eq!(duplicate.status, 409, "{}", duplicate.body);
 
-        for _ in 0..200 {
+        for _ in 0..SETTLE_STEPS {
             if store.get(&id).expect("talk").turns.len() == 2 {
                 break;
             }
@@ -5556,7 +5569,7 @@ mod tests {
             .post(&format!("/api/talks/{id}/pending/resume"), None)
             .await;
         assert_eq!(resumed.status, 202, "{}", resumed.body);
-        for _ in 0..200 {
+        for _ in 0..SETTLE_STEPS {
             if store.get(&id).expect("talk").turns.len() == 2 {
                 break;
             }
