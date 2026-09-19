@@ -163,7 +163,11 @@ async fn a_clean_round_is_unaffected_by_any_of_this() {
     // The ordinary happy path (one blocker, one fix, clean) must still behave
     // exactly as before: this guards against the round-ending refactor
     // changing what a genuinely clean run looks like.
-    let fx = fixture(_guard, Judges::Unanimous, true);
+    let mut fx = fixture(_guard, Judges::Unanimous, true);
+    // A review-loop regression guard, not a panel one — see
+    // `fixture_that_never_clears`'s doc comment for why a solo candidate is
+    // enough and cheaper.
+    fx.config.graph.candidates = 1;
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");

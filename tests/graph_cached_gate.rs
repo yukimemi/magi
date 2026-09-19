@@ -27,6 +27,9 @@ async fn a_cached_failed_gate_stays_blocked_and_does_not_run_again() {
     assert_ne!(pinned_home, fx.tmp.path().join("magi-home"));
     assert_eq!(magi::run::home(), pinned_home);
     fx.config.verify.gate = vec!["false".to_owned()];
+    // Gate-reentry behaviour does not depend on the panel; a solo candidate
+    // skips judging and is cheaper.
+    fx.config.graph.candidates = 1;
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
@@ -113,7 +116,10 @@ async fn a_cached_failed_gate_stays_blocked_and_does_not_run_again() {
 #[tokio::test]
 async fn a_cached_successful_gate_still_allows_the_interrupted_merge_step() {
     let _home = home_lock().await;
-    let fx = fixture(_home, Judges::Unanimous, false);
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    // Gate-reentry behaviour does not depend on the panel; a solo candidate
+    // skips judging and is cheaper.
+    fx.config.graph.candidates = 1;
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");
