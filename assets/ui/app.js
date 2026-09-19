@@ -3502,7 +3502,13 @@ function markAllTalksRead() {
   let changed = false;
   for (const talk of talks) {
     const turns = talkTurns(talk);
-    const at = turns.length ? turns[turns.length - 1].at : new Date().toISOString();
+    /* No turn on screen yet, unlike `markTalkRead` which is only called once
+       the operator actually has the conversation open: here nothing has been
+       viewed, so there is no "now" to anchor a read marker to, and no unread
+       agent turn to clear either - skip it rather than risk swallowing the
+       conversation's first real reply. */
+    if (!turns.length) continue;
+    const at = turns[turns.length - 1].at;
     if (state.talkReads[talk.id] === at) continue;
     state.talkReads[talk.id] = at;
     changed = true;
