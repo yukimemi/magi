@@ -508,6 +508,8 @@ main {
 .view-head { display: flex; flex-direction: column; gap: var(--s1); }
 .view-sub { font-size: var(--t2); color: var(--ink-3); }
 
+.talks-actions { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
+
 .back {
   display: inline-flex; align-items: center; gap: var(--s1);
   align-self: flex-start; min-height: var(--tap); padding-right: var(--s2);
