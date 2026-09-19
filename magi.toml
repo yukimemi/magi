@@ -81,6 +81,26 @@ style = "squash"
 # busier machine rather than a licence to hang.
 timeout_verify = 2400
 
+# `timeout_verify = 2400` above fixed `verify.gate` / `verify.e2e`, but
+# `timeout_review` (the field it was split off from, see its doc comment in
+# `src/config.rs`) was left at its 1200s default. That field is the timeout
+# for the reviewer seat itself — both the ordinary review job
+# (`src/graph.rs:2506`, stem `review-{round}-{n}`) and the reconsider-review
+# job (`src/graph.rs:2689`, stem `review-{round}-reconsider-{n}`) pass it to
+# `Duration::from_secs` directly. `timeout_verify` only bounds the real-machine
+# verification commands, so raising it did nothing for the reviewer's own
+# budget: `review-1` kept timing out every round on this machine, e.g. runs
+# 20260919-213057-71fd, 20260919-152903-01b7 and 20260919-072215-fa6e.
+#
+# Set to the same 2400s as `timeout_verify` because both seats run on the same
+# machine under the same load, not because the two fields are linked —
+# `timeout_verify` still won't follow `timeout_review` if this changes again
+# (that independence is the point of splitting them, see `src/config.rs`).
+# 1200s was failing structurally every round, so the accepted cost here is the
+# same one already paid above: up to 20 extra minutes to reclaim a reviewer
+# that has actually hung, in exchange for one that hasn't finishing normally.
+timeout_review = 2400
+
 # Project conventions appended to the node prompts, never merged into them.
 # Repository-wide context lives in AGENTS.md, which every agent already reads
 # from the checkout; these are the things a magi *node* needs to know.
