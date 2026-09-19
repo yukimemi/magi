@@ -3491,6 +3491,34 @@ function markTalkRead(talk) {
   renderTalks();
 }
 
+/* Marks every conversation currently in `state.talks` read as of the last
+   turn already on screen - never `Date.now()`, or a reply that lands after
+   this runs would be swallowed as already-read. One combined save and
+   re-render, not one per talk, so this stays a single write regardless of
+   how many conversations there are. */
+function markAllTalksRead() {
+  const talks = state.talks;
+  if (!talks) return;
+  let changed = false;
+  for (const talk of talks) {
+    const turns = talkTurns(talk);
+    /* No turn on screen yet, unlike `markTalkRead` which is only called once
+       the operator actually has the conversation open: here nothing has been
+       viewed, so there is no "now" to anchor a read marker to, and no unread
+       agent turn to clear either - skip it rather than risk swallowing the
+       conversation's first real reply. */
+    if (!turns.length) continue;
+    const at = turns[turns.length - 1].at;
+    if (state.talkReads[talk.id] === at) continue;
+    state.talkReads[talk.id] = at;
+    changed = true;
+  }
+  if (!changed) return;
+  saveCollapsed(TALK_READS_KEY, state.talkReads);
+  renderTalks();
+  announce("All conversations marked as read.");
+}
+
 /* Open first, then newest first - the same ordering `Talks::list` uses on
    the server: what the operator is still using belongs above what they are
    done with. Sorting on `updated_at` instead would lift a conversation to
@@ -3571,7 +3599,8 @@ function updateTalkCard(row, talk) {
 function renderTalks() {
   const list = $("talks-list");
   const talks = state.talks;
-  renderTalkIndicators();
+  const totalUnread = renderTalkIndicators();
+  $("talks-mark-all-read").disabled = !talks || totalUnread === 0;
 
   if (talks === null) {
     setText($("talks-count"), "Loading…");
@@ -3601,6 +3630,7 @@ function renderTalkIndicators() {
   for (const link of document.querySelectorAll('[data-nav="talks"]')) {
     setAttr(link, "aria-label", count > 0 ? `Chat, ${count} unread` : "Chat");
   }
+  return count;
 }
 
 /* A wait is newer than an overlapping list read. Keep its activity visible
@@ -5757,6 +5787,7 @@ function wire() {
   });
 
   $("talk-start-go").addEventListener("click", startTalk);
+  $("talks-mark-all-read").addEventListener("click", markAllTalksRead);
   $("talk-say").addEventListener("submit", sendTalkTurn);
   $("talk-close-go").addEventListener("click", closeTalk);
   $("talk-reopen-go").addEventListener("click", reopenTalk);
