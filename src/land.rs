@@ -1814,7 +1814,7 @@ async fn fix_round(
     let mut seat = seat_of(state, &seat_key, &spec.id);
     let artifacts = agent::artifacts_dir(&state.dir());
     let prompt = if state.config.cache_dir().is_some() {
-        format!("{prompt}\n\n{}", prompt::build_cache_note("fix"))
+        format!("{prompt}\n\n{}", prompt::build_cache_note("fix", true))
     } else {
         prompt
     };

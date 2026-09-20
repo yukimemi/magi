@@ -429,6 +429,18 @@ pub struct CommandOutcome {
     /// Wall-clock time.
     #[serde(default)]
     pub duration_ms: u64,
+    /// Set only by magi itself, never inferred from `output_tail`: the
+    /// configured command was never actually run because a resource it
+    /// needs — right now, only the shared build cache's lease or the
+    /// freshness check that must precede using it — was not available
+    /// within budget. Distinct from an ordinary failure or timeout (both of
+    /// which *did* run something and are evidence about the patch); this is
+    /// evidence about the machine, and must never be read as a verdict on
+    /// the tree it named. `#[serde(default)]` so every record written
+    /// before this field existed keeps reading as `false` — exactly what it
+    /// was.
+    #[serde(default)]
+    pub resource_blocked: bool,
 }
 
 /// Substrings that mark a Cargo/rustc/link failure: the toolchain could not
@@ -1616,6 +1628,7 @@ mod tests {
                           error: could not compile `magi-cli` (test \"graph_dirty_tree\")"
                 .to_owned(),
             duration_ms: 500,
+            resource_blocked: false,
         };
         assert!(!link_race.ok());
         assert!(link_race.build_failed());
@@ -1625,6 +1638,7 @@ mod tests {
             code: Some(101),
             output_tail: "thread 'it_works' panicked at 'assertion failed'".to_owned(),
             duration_ms: 500,
+            resource_blocked: false,
         };
         assert!(!failing_test.ok());
         assert!(
@@ -1637,6 +1651,7 @@ mod tests {
             code: Some(0),
             output_tail: String::new(),
             duration_ms: 500,
+            resource_blocked: false,
         };
         assert!(passing.ok());
         assert!(!passing.build_failed());
@@ -1718,6 +1733,7 @@ mod tests {
             code: Some(0),
             output_tail: String::new(),
             duration_ms: 0,
+            resource_blocked: false,
         }];
         assert_eq!(
             r.e2e_status(),
@@ -1734,6 +1750,7 @@ mod tests {
             code: Some(1),
             output_tail: "boom".to_owned(),
             duration_ms: 0,
+            resource_blocked: false,
         }];
         assert_eq!(r.e2e_status(), E2eStatus::Failed);
     }

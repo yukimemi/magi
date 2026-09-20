@@ -1277,6 +1277,7 @@ mod tests {
                 code: Some(1),
                 output_tail: "LINK : fatal error LNK1104: cannot open file".to_owned(),
                 duration_ms: 100,
+                resource_blocked: false,
             }],
             verify_retried: true,
             e2e_deferred: false,
@@ -1329,6 +1330,7 @@ mod tests {
                 code: Some(0),
                 output_tail: String::new(),
                 duration_ms: 0,
+                resource_blocked: false,
             }],
             verify_retried: false,
             e2e_deferred: false,
@@ -1375,6 +1377,7 @@ mod tests {
             code: Some(101),
             output_tail: "error[E0308]: mismatched types".to_owned(),
             duration_ms: 0,
+            resource_blocked: false,
         }];
 
         let text = run(&s);

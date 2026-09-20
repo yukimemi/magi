@@ -741,6 +741,7 @@ mod tests {
             code: Some(101),
             output_tail: "boom".to_owned(),
             duration_ms: 1,
+            resource_blocked: false,
         };
         let sole = ReviewRound {
             round: 1,

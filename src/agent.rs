@@ -309,6 +309,15 @@ pub async fn invoke(
         // Same directory the verify commands build into: one cache to prune,
         // and the compile the seat pays for is the compile the gate reuses.
         cmd.env("CARGO_TARGET_DIR", cache);
+    } else {
+        // `Command` inherits this process's environment by default, so
+        // simply not setting the variable here is not the same as the seat
+        // not seeing it: if the magi process itself is running under a
+        // shared `CARGO_TARGET_DIR` (the ordinary case), a read-only seat
+        // would otherwise inherit that exact path and try to build there
+        // anyway - the write refusal this is meant to prevent in the first
+        // place. Strip it explicitly.
+        cmd.env_remove("CARGO_TARGET_DIR");
     }
 
     let mut child = cmd
@@ -1195,6 +1204,10 @@ mod tests {
         match std::env::var(COMMAND_HELPER_MODE).as_deref() {
             Ok("reply") => println!("hello {}", std::env::var("MAGI_SEAT").unwrap()),
             Ok("cache") => println!("{}", std::env::var("CARGO_TARGET_DIR").unwrap()),
+            Ok("no-cache") => println!(
+                "{}",
+                std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "ABSENT".to_owned())
+            ),
             Ok("ignore-stdin") => println!("done"),
             Ok("chatty-sleep") => {
                 println!("i-said-something");
@@ -1983,6 +1996,63 @@ mod tests {
         assert!(
             out.text.contains(cache.to_string_lossy().as_ref()),
             "the seat must see CARGO_TARGET_DIR = the shared cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_dir_none_strips_a_cargo_target_dir_inherited_from_this_process() {
+        // `Command` inherits the parent's environment by default, so
+        // `cache_dir: None` alone is not the same as a seat never seeing
+        // `CARGO_TARGET_DIR` - it also has to be true when *this* process
+        // (standing in for the real magi process, which normally does have
+        // one set, from its own `[verify]` config) already has the variable
+        // set. Simulating that is the only way to exercise the inheritance
+        // path at all.
+        let previous = std::env::var("CARGO_TARGET_DIR").ok();
+        // SAFETY: this crate's tests run single-threaded
+        // (`RUST_TEST_THREADS=1`); see
+        // `updater::tests::env_kill_switch_semantics` for the same
+        // reasoning applied to another process-global env var.
+        unsafe {
+            std::env::set_var("CARGO_TARGET_DIR", "/should/never/reach/a/read-only/seat");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut seat = SeatState::new("review-1", "a", 7);
+        let s = command_helper("no-cache");
+        let result = invoke(
+            &s,
+            &mut seat,
+            &Invocation {
+                cwd: dir.path(),
+                prompt: "unused",
+                timeout: Duration::from_secs(30),
+                allow_write: false,
+                sessions: true,
+                artifacts: &dir.path().join("artifacts"),
+                stem: "no-cache",
+                run: "test-run",
+                node: "test",
+                cache_dir: None,
+                attachments: &[],
+            },
+        )
+        .await;
+        // Restored before any assertion that could panic, so a failure here
+        // never leaks a bogus `CARGO_TARGET_DIR` into whichever test runs
+        // next in this same process.
+        // SAFETY: see above.
+        unsafe {
+            match &previous {
+                Some(v) => std::env::set_var("CARGO_TARGET_DIR", v),
+                None => std::env::remove_var("CARGO_TARGET_DIR"),
+            }
+        }
+        let out = result.unwrap();
+        assert!(out.usable(), "{out:?}");
+        assert!(
+            out.text.contains("ABSENT"),
+            "a read-only seat must never inherit the process's own CARGO_TARGET_DIR: {}",
+            out.text
         );
     }
 

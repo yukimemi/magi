@@ -203,30 +203,74 @@ noise the owner learns to ignore.",
     s
 }
 
-/// What a seat that may build is told about the shared build cache.
+/// What a seat is told about the shared build cache — one of two notes,
+/// chosen by whether the seat may write at all.
 ///
-/// Spliced into every node prompt (in [`crate::graph::wave`]) when the run's
-/// config declares a `CARGO_TARGET_DIR` — which is also the directory the
-/// verify commands build into. The text is stable so tests can assert on it;
-/// the value of the variable is not spelled out because the seat reads it from
-/// its own environment, and a prompt that hardcodes a path would go stale the
+/// Spliced into every node prompt (in [`crate::graph::wave`] and
+/// [`crate::graph::Runner::synthesize_brief`]) when the run's config declares
+/// a `CARGO_TARGET_DIR` — which is also the directory the verify commands
+/// build into. The text is stable so tests can assert on it; the value of the
+/// variable is not spelled out because a write-allowed seat reads it from its
+/// own environment, and a prompt that hardcodes a path would go stale the
 /// moment the config moves the cache.
 ///
-/// The fund-transfer reality it exists to prevent: an implementer that builds
-/// with its own `CARGO_TARGET_DIR` (or lets cargo create a fresh `target/` in
-/// the worktree) is compiling a second copy of the world that nobody prunes,
-/// on a machine that has already had that exact failure once.
+/// `allow_write` must agree with whether the caller actually hands the seat
+/// `CARGO_TARGET_DIR` (see [`crate::agent::Invocation::cache_dir`]) — a
+/// read-only seat that is still told "build through it" is exactly how a
+/// sandboxed reviewer's write refusal to a directory it was never meant to
+/// touch got reported as a defect in the patch under review. So a read-only
+/// seat is told plainly that it has no shared cache and that a write refusal
+/// anywhere outside its own worktree is expected, not evidence of anything.
+///
+/// The fund-transfer reality the write-allowed note exists to prevent: an
+/// implementer that builds with its own `CARGO_TARGET_DIR` (or lets cargo
+/// create a fresh `target/` in the worktree) is compiling a second copy of
+/// the world that nobody prunes, on a machine that has already had that exact
+/// failure once. It also spells out the one thing a test name filter cannot
+/// do — `cargo test report::` still compiles every integration target in the
+/// workspace, because the filter selects which tests *run*, not which
+/// targets get *built* — so a seat asked for a narrow check knows to reach
+/// for `--lib`/`--test` instead of assuming a filter alone bounds the build.
 ///
 /// `node` is the graph node this is spliced into (`"review"`, `"fix"`, ...).
 /// A reviewer or fixer gets an extra paragraph saying full verification is
 /// magi's own job, not theirs to repeat — the same duplicated-full-suite cost
-/// this note's own advice (build through the shared cache) does nothing to
-/// prevent on its own, since a seat that dutifully builds through the cache
-/// can still spend the round re-running the whole thing. Phrased as a
-/// request, not a guarantee: magi has no way to stop a seat from running
-/// `cargo test --all-targets` anyway, so the note asks rather than claims it
-/// enforces anything.
-pub fn build_cache_note(node: &str) -> String {
+/// neither note's own advice does anything to prevent on its own, since a
+/// seat that dutifully stays inside its own worktree can still spend the
+/// round re-running the whole suite there. Phrased as a request, not a
+/// guarantee: magi has no way to stop a seat from running `cargo test
+/// --all-targets` anyway, so the note asks rather than claims it enforces
+/// anything.
+pub fn build_cache_note(node: &str, allow_write: bool) -> String {
+    let defer_to_parent = node == "review" || node == "fix";
+    if !allow_write {
+        let mut s = String::from(
+            "\
+# The build cache\n\n\
+This seat is read-only, so it is not handed the shared `CARGO_TARGET_DIR` \
+this environment otherwise uses for building — that variable is reserved for \
+seats allowed to write. A refusal to write to it, or to anywhere outside \
+this worktree, is a property of this seat, not a defect in the code under \
+review; do not report it as one.\n\n\
+Compiling is not this seat's job at all, not even into a fresh directory of \
+its own: an ad-hoc `target/` nobody prunes or accounts for is exactly what \
+this environment forbids, on a read-only seat as much as a write-allowed \
+one. Narrow reproduction here means reading the code and its existing \
+output, not building or running Cargo — a compiled check belongs to the \
+full verification magi itself runs.",
+        );
+        if defer_to_parent {
+            s.push_str(
+                "\n\n\
+Full verification — the complete test suite and the final gate — is magi's \
+own job: it runs once a round has no blocking findings left, and again on \
+the tree that would actually land. magi has no way to enforce which \
+commands a seat runs, so this is a request for judgment, not a rule it \
+polices.",
+            );
+        }
+        return s;
+    }
     let mut s = String::from(
         "\
 # The build cache\n\n\
@@ -236,9 +280,14 @@ you pay for is a compile the gate does not redo.\n\n\
 The cache is size-capped and pruned oldest-first by magi. Never create your \
 own build directory — no `CARGO_TARGET_DIR` of your own, no local `target/` \
 in the worktree. A private target directory is exactly the multi-gigabyte \
-junk the cap exists to keep down.",
+junk the cap exists to keep down.\n\n\
+A test name filter narrows which tests *run*, not which Cargo targets get \
+*built* — `cargo test report::` still compiles every integration binary in \
+the workspace before it runs a single one. For a focused unit check, use \
+`cargo test --lib <filter>`; for a focused integration check, use `cargo \
+test --test <target> [filter]`.",
     );
-    if node == "review" || node == "fix" {
+    if defer_to_parent {
         s.push_str(
             "\n\n\
 Full verification — the complete test suite and the final gate — is magi's \
@@ -1790,7 +1839,7 @@ mod tests {
     }
     #[test]
     fn the_build_cache_note_says_the_load_bearing_things() {
-        let note = build_cache_note("implement");
+        let note = build_cache_note("implement", true);
         // The two sentences that carry the invariant: build through the shared
         // variable, and never create your own cache.
         assert!(note.contains("CARGO_TARGET_DIR` to a shared build cache"));
@@ -1800,12 +1849,18 @@ mod tests {
             !note.contains("magi's own job"),
             "an implementer is not told to defer to a full suite it is not asked to run: {note}"
         );
+        // A filter alone does not bound what gets compiled.
+        assert!(note.contains("cargo test --lib <filter>"));
+        assert!(note.contains("cargo test --test <target> [filter]"));
     }
 
     #[test]
     fn the_build_cache_note_tells_review_and_fix_seats_full_verification_is_not_theirs() {
-        for node in ["review", "fix"] {
-            let note = build_cache_note(node);
+        // Production only ever pairs "review" with `allow_write = false` and
+        // "fix" with `allow_write = true` (see `graph::wave`'s per-job
+        // callers), but the deferral paragraph belongs to the node either way.
+        for (node, allow_write) in [("review", false), ("fix", true)] {
+            let note = build_cache_note(node, allow_write);
             assert!(
                 note.contains("magi's own job"),
                 "{node} must be told full verification is parent-owned: {note}"
@@ -1815,6 +1870,37 @@ mod tests {
                 "{node} must not be told magi polices this: {note}"
             );
         }
+    }
+
+    #[test]
+    fn a_read_only_seat_is_never_told_to_build_through_the_shared_cache() {
+        let note = build_cache_note("review", false);
+        assert!(
+            !note.contains("CARGO_TARGET_DIR` to a shared build cache"),
+            "a read-only seat has no shared cache to build through: {note}"
+        );
+        assert!(
+            note.contains("not a defect"),
+            "a write refusal must not be read as a source bug: {note}"
+        );
+        assert!(note.contains("read-only"));
+        // A private, unmanaged `target/` per worktree is exactly the pattern
+        // this whole mechanism exists to avoid - suggesting it as a fallback
+        // for a read-only seat is the same mistake with extra steps.
+        assert!(
+            !note.contains("own default `target/`")
+                && !note.contains("target/`, which is disposable"),
+            "must not suggest an unmanaged per-worktree build directory: {note}"
+        );
+    }
+
+    #[test]
+    fn a_write_allowed_advise_seat_gets_no_full_verification_paragraph() {
+        let note = build_cache_note("advise", false);
+        assert!(
+            !note.contains("magi's own job"),
+            "only review/fix defer to the parent's full verification: {note}"
+        );
     }
 
     #[test]

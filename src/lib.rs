@@ -26,6 +26,7 @@ pub mod agent;
 pub mod ask;
 pub mod blind;
 pub mod bump;
+pub mod cache;
 pub mod clean;
 pub mod conduct;
 pub mod config;

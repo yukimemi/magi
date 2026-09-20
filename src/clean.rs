@@ -32,7 +32,7 @@ use crate::ask::Questions;
 use crate::config::Disk;
 use crate::run::{RunState, RunStatus, SCHEMA, short_of};
 
-use crate::disk::{Prune, dir_size, prune_dir};
+use crate::disk::{Prune, dir_size};
 
 /// What one janitor pass did, for the caller's log line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -95,7 +95,7 @@ pub async fn housekeep(
             tracing::warn!("housekeep: prune worktree registrations: {e:#}");
         }
     }
-    match prune_cache_if_over_limit(cfg) {
+    match prune_cache_if_over_limit(cfg, home) {
         Ok(Some(pruned)) => {
             out.cache_files = pruned.files;
             out.cache_freed = pruned.freed;
@@ -532,11 +532,16 @@ pub fn clear_abandoned_active(state: &mut RunState, home: &Path, now: Timestamp)
     Ok(true)
 }
 
-/// Delete files from the shared build cache until it fits its cap.
-///
-/// See [`crate::disk::prune_dir`] for the oldest-first policy.
-pub fn prune_cache(cache: &Path, limit_bytes: u64) -> Result<Prune> {
-    prune_dir(cache, limit_bytes)
+/// Delete files from the shared build cache until it fits its cap — but only
+/// while nobody live is registered as using it. [`crate::cache::maintenance_prune`]
+/// takes out the same lease a build would, so a prune can never race a
+/// compile in flight (this run's own, another run's, or a human's `magi
+/// review`) into deleting a file that build still needs. `Ok(None)` when the
+/// cache is in use right now; the next pass catches it once the borrower
+/// releases it, the same way a cap of `0` or a missing `CARGO_TARGET_DIR`
+/// already meant "nothing to do this time" here.
+pub fn prune_cache(home: &Path, cache: &Path, limit_bytes: u64) -> Result<Option<Prune>> {
+    crate::cache::maintenance_prune(home, cache, limit_bytes)
 }
 
 /// [`prune_cache`], but resolving the operator's opt-out and missing
@@ -545,16 +550,20 @@ pub fn prune_cache(cache: &Path, limit_bytes: u64) -> Result<Prune> {
 /// [`crate::daemon`]'s between-runs check (see the module's own doc for why
 /// congestion can make "idle" arrive too rarely to matter) makes them
 /// identically rather than growing its own copy that could drift. `Ok(None)`
-/// covers both a cap of `0` (see the module docs on `cache_limit_bytes`) and
-/// a config that renders no `CARGO_TARGET_DIR` to aggregate at all.
-pub fn prune_cache_if_over_limit(cfg: &crate::config::Config) -> Result<Option<Prune>> {
+/// covers a cap of `0` (see the module docs on `cache_limit_bytes`), a config
+/// that renders no `CARGO_TARGET_DIR` to aggregate at all, and a cache
+/// currently in use (see [`prune_cache`]).
+pub fn prune_cache_if_over_limit(
+    cfg: &crate::config::Config,
+    home: &Path,
+) -> Result<Option<Prune>> {
     if cfg.disk.cache_limit_bytes == 0 {
         return Ok(None);
     }
     let Some(cache) = cfg.cache_dir() else {
         return Ok(None);
     };
-    prune_cache(&cache, cfg.disk.cache_limit_bytes).map(Some)
+    prune_cache(home, &cache, cfg.disk.cache_limit_bytes)
 }
 
 /// The cache's path, size and cap, for `magi cache show` and the health view.
@@ -658,6 +667,7 @@ mod tests {
 
     #[test]
     fn prune_cache_sheds_the_oldest_generation_until_it_fits() {
+        let home = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
         // Same size, different age: only the age decides, and the newest
         // generation - the one the next build reuses - is what survives.
@@ -666,7 +676,9 @@ mod tests {
         touch(&dir.path().join("old"), 1_000_000);
         touch(&dir.path().join("new"), 2_000_000);
 
-        let out = prune_cache(dir.path(), 2).expect("prune");
+        let out = prune_cache(home.path(), dir.path(), 2)
+            .expect("prune")
+            .expect("the cache is free");
         assert_eq!(out.files, 1, "one deletion is enough to reach the cap");
         assert_eq!(out.remaining, 2);
         assert!(!dir.path().join("old").exists(), "the older file went");
@@ -681,7 +693,9 @@ mod tests {
         fs::write(tied.path().join("small"), b"yy").unwrap();
         touch(&tied.path().join("big"), 1_000_000);
         touch(&tied.path().join("small"), 1_000_000);
-        let out = prune_cache(tied.path(), 2).expect("prune");
+        let out = prune_cache(home.path(), tied.path(), 2)
+            .expect("prune")
+            .expect("the cache is free");
         assert_eq!(out.files, 1, "the big one alone gets under the cap");
         assert_eq!(out.remaining, 2);
         assert!(tied.path().join("small").exists());
@@ -689,6 +703,7 @@ mod tests {
 
     #[test]
     fn prune_cache_if_over_limit_resolves_the_opt_outs_before_ever_measuring() {
+        let home = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("big"), vec![0u8; 10]).unwrap();
 
@@ -702,7 +717,7 @@ mod tests {
         // pruned, regardless of what is actually on disk.
         cfg.disk.cache_limit_bytes = 0;
         assert_eq!(
-            prune_cache_if_over_limit(&cfg).unwrap(),
+            prune_cache_if_over_limit(&cfg, home.path()).unwrap(),
             None,
             "a zero cap must not even look at the directory"
         );
@@ -712,12 +727,15 @@ mod tests {
         // aggregate, so there is nothing to prune either.
         let mut no_cache = crate::config::Config::default();
         no_cache.disk.cache_limit_bytes = 1;
-        assert_eq!(prune_cache_if_over_limit(&no_cache).unwrap(), None);
+        assert_eq!(
+            prune_cache_if_over_limit(&no_cache, home.path()).unwrap(),
+            None
+        );
 
         // Over the cap and configured: pruned exactly like `prune_cache`
         // itself would.
         cfg.disk.cache_limit_bytes = 1;
-        let pruned = prune_cache_if_over_limit(&cfg)
+        let pruned = prune_cache_if_over_limit(&cfg, home.path())
             .unwrap()
             .expect("a real cache dir over its cap prunes");
         assert_eq!(pruned.files, 1);
