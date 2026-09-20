@@ -18,8 +18,8 @@
 //! one-to-one. A moderator that never learns an author cannot leak one.
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
@@ -144,8 +144,18 @@ enum AgentOutcome {
 /// work is thrown away. Killing the process mid-node, by contrast, loses
 /// whatever the seats in flight had not yet written - which for an implement
 /// wave is an hour of paid work.
+///
+/// A [`Runner`] watches two independent handles of this type - see
+/// [`Runner::on_pause`] and [`Runner::watch_interrupt`] - never one shared
+/// between them. `magi serve`'s own shutdown (`Stop::park`) hands out one
+/// clone covering the whole daemon's lifetime and is never asked to un-park,
+/// which is correct exactly because nothing is dispatched after it fires.
+/// `magi serve`'s interrupt scheduler needs the opposite lifetime - a run
+/// that parks for an interrupted task must go on to run other tasks
+/// afterward - so it mints a fresh, unshared [`Pause`] per run instead of
+/// reusing the daemon-wide one.
 #[derive(Debug, Clone, Default)]
-pub struct Pause(Arc<AtomicBool>);
+pub struct Pause(Arc<AtomicBool>, Arc<Mutex<Option<String>>>);
 
 impl Pause {
     /// A pause nobody has asked for yet.
@@ -159,10 +169,36 @@ impl Pause {
         self.0.store(true, Ordering::SeqCst);
     }
 
+    /// Same as [`Pause::park`], but records why, for [`Runner::park_here`] to
+    /// fold into the run's own `park` event - so an operator reading the run
+    /// later knows this was a deliberate interrupt rather than a shutdown or
+    /// a binary swap. The first reason recorded wins; a park already in
+    /// flight is not relabelled by a second, unrelated request.
+    pub fn park_because(&self, reason: impl Into<String>) {
+        let mut reason_guard = self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reason_guard.is_none() {
+            *reason_guard = Some(reason.into());
+        }
+        drop(reason_guard);
+        self.park();
+    }
+
     /// Has a park been asked for?
     #[must_use]
     pub fn parked(&self) -> bool {
         self.0.load(Ordering::SeqCst)
+    }
+
+    /// Why the park was asked for, when the caller used [`Pause::park_because`].
+    #[must_use]
+    pub fn reason(&self) -> Option<String> {
+        self.1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -172,8 +208,16 @@ pub struct Runner {
     pub state: RunState,
     roles: ResolvedRoles,
     sem: Arc<Semaphore>,
-    /// Set when someone wants the run parked at its next node boundary.
+    /// Set when the daemon's own shutdown (Ctrl-C, a binary swap) wants the
+    /// run parked at its next node boundary. See [`Pause`]'s own doc for why
+    /// this is never the same handle as `interrupt`.
     pause: Pause,
+    /// Set when `magi serve`'s interrupt scheduler wants this specific run
+    /// parked at its next node boundary, to let a task marked
+    /// [`crate::queue::Task::interrupt`] run alone before this one carries
+    /// on. Unlike `pause`, a fresh, unshared handle per run - see
+    /// [`Runner::watch_interrupt`].
+    interrupt: Pause,
 }
 
 /// The commit a run branches from: the base branch as the remote has it.
@@ -261,6 +305,7 @@ impl Runner {
             roles,
             sem: Arc::new(Semaphore::new(max_parallel)),
             pause: Pause::new(),
+            interrupt: Pause::new(),
         })
     }
 
@@ -403,6 +448,7 @@ impl Runner {
             roles,
             sem: Arc::new(Semaphore::new(max_parallel)),
             pause: Pause::new(),
+            interrupt: Pause::new(),
         })
     }
 
@@ -416,6 +462,7 @@ impl Runner {
             roles,
             sem: Arc::new(Semaphore::new(max_parallel)),
             pause: Pause::new(),
+            interrupt: Pause::new(),
         })
     }
 
@@ -521,24 +568,41 @@ impl Runner {
     /// the operator's card says why a run that is neither finished nor moving
     /// is sitting where it is.
     fn park_here(&mut self) -> Result<bool> {
-        if !self.pause.parked() {
+        // Either handle asking is enough - see `Pause`'s own doc for why
+        // they are never the same one. `interrupt` is checked second so a
+        // reason it carries is preferred in the message below over a plain
+        // shutdown park racing it at the same boundary.
+        if !self.pause.parked() && !self.interrupt.parked() {
             return Ok(false);
         }
-        self.state.event(
-            "park",
-            format!(
+        let why = match self.interrupt.reason().or_else(|| self.pause.reason()) {
+            Some(reason) => format!(
+                "parked after `{}` ({reason}) — resume to carry on from here",
+                self.state.status.as_str()
+            ),
+            None => format!(
                 "parked after `{}` — resume to carry on from here",
                 self.state.status.as_str()
             ),
-        );
+        };
+        self.state.event("park", why);
         self.state.parked = true;
         self.state.save()?;
         Ok(true)
     }
 
-    /// Hand the runner a pause to watch.
+    /// Hand the runner the pause `magi serve`'s own shutdown watches.
     pub fn on_pause(&mut self, pause: Pause) {
         self.pause = pause;
+    }
+
+    /// Hand the runner a second, independent pause: `magi serve`'s interrupt
+    /// scheduler asking this one run - and no other - to park so a task
+    /// marked [`crate::queue::Task::interrupt`] can run alone. See
+    /// [`Pause`]'s own doc for why this is never [`Runner::on_pause`]'s
+    /// handle.
+    pub fn watch_interrupt(&mut self, pause: Pause) {
+        self.interrupt = pause;
     }
 
     /// Abandon this run's own open questions, once `status` has actually
@@ -4626,7 +4690,159 @@ mod tests {
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
+            interrupt: Pause::new(),
         }
+    }
+
+    /// `park_here` folding in the reason `Pause::park_because` recorded -
+    /// this is what lets an operator reading a run's events tell an
+    /// interrupt-driven park from an ordinary shutdown park.
+    #[test]
+    fn park_here_folds_the_interrupt_reason_into_the_park_event() {
+        crate::run::set_home(std::env::temp_dir().join("magi-graph-interrupt-tests-home"));
+        let mut runner = runner_at(RunStatus::Implementing);
+        let interrupt = Pause::new();
+        runner.watch_interrupt(interrupt.clone());
+
+        interrupt.park_because("task a1b2 asked to run first");
+
+        assert!(runner.park_here().expect("park_here"));
+        assert!(runner.state.parked);
+        let last = runner.state.events.last().expect("a park event");
+        assert_eq!(last.node, "park");
+        assert!(
+            last.message.contains("task a1b2 asked to run first"),
+            "expected the interrupt reason in {:?}",
+            last.message
+        );
+    }
+
+    /// `watch_interrupt` and `on_pause` are genuinely independent: an ordinary
+    /// shutdown `Pause` (what `Stop::park` hands every run, shared and never
+    /// cleared) must not make a *different* run - one only watching its own,
+    /// unshared interrupt `Pause` - see itself as parked. If a future change
+    /// ever collapsed these back into one handle, the interrupt scheduler
+    /// would park every run for the rest of the daemon's life, not just the
+    /// one it meant to interrupt.
+    #[test]
+    fn the_stop_level_pause_and_a_runs_interrupt_pause_do_not_leak_into_each_other() {
+        crate::run::set_home(std::env::temp_dir().join("magi-graph-interrupt-tests-home"));
+        let mut runner = runner_at(RunStatus::Implementing);
+        let shutdown = Pause::new();
+        runner.on_pause(shutdown.clone());
+        let interrupt = Pause::new();
+        runner.watch_interrupt(interrupt.clone());
+
+        // Nobody has asked for anything yet.
+        assert!(!runner.park_here().expect("park_here"));
+        assert!(!runner.state.parked);
+
+        // Only the interrupt handle fires; the shutdown handle stays clear.
+        interrupt.park_because("test");
+        assert!(!shutdown.parked());
+        assert!(runner.park_here().expect("park_here"));
+    }
+
+    /// The property every prior attempt at this feature failed to pin down:
+    /// asking a run to park while one of its nodes has a real, in-flight
+    /// async operation running (an agent call, in production) must not cut
+    /// that operation short. `park_here` is only ever consulted *between*
+    /// `execute`'s node calls - see its own doc - so nothing inside a node
+    /// can observe a park request until the node itself returns. This proves
+    /// that structurally, with real `tokio` concurrency and a channel
+    /// handshake (never a sleep, which would only prove "usually", not
+    /// "cannot"): the "node" below reports that it has genuinely started,
+    /// and only then is the park requested; the node still has to be told to
+    /// finish before `park_here` is ever called, exactly mirroring every
+    /// `self.some_node().await; if self.park_here()? { return Ok(()); }` pair
+    /// in `execute`.
+    #[tokio::test]
+    async fn a_park_request_made_mid_node_only_takes_effect_at_the_next_boundary() {
+        crate::run::set_home(std::env::temp_dir().join("magi-graph-interrupt-tests-home"));
+        let mut runner = runner_at(RunStatus::Implementing);
+        let interrupt = Pause::new();
+        runner.watch_interrupt(interrupt.clone());
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Stands in for one node's in-flight agent call: it proves it has
+        // genuinely started, then blocks - exactly as a spawned CLI process
+        // does - until told to finish.
+        let node = async move {
+            started_tx.send(()).expect("send started");
+            finish_rx.await.expect("recv finish");
+            "node finished"
+        };
+
+        let interrupter = async move {
+            started_rx.await.expect("recv started");
+            // The call is now genuinely in flight. Ask it to park.
+            interrupt.park_because("higher-priority task waiting");
+            // Nothing the node does can observe this yet - there is no
+            // check inside it, by construction - so let the executor run
+            // anything pending and then let the node finish on its own.
+            tokio::task::yield_now().await;
+            finish_tx.send(()).expect("send finish");
+        };
+
+        let (node_result, ()) = tokio::join!(node, interrupter);
+        assert_eq!(
+            node_result, "node finished",
+            "the in-flight call ran to completion"
+        );
+
+        // Only now, at the boundary the real `execute` would check right
+        // after this node, does the park take effect.
+        assert!(runner.park_here().expect("park_here"));
+        assert!(runner.state.parked);
+    }
+
+    /// A run parked mid-competition carries every field it had accumulated
+    /// through the exact same disk round-trip an ordinary resume uses -
+    /// `RunState::save`/`RunState::load`, which is all `Runner::resume` is.
+    /// Nothing about parking for an interrupt is a special case of that path;
+    /// this is what proves it rather than assuming it.
+    #[test]
+    fn a_run_parked_for_an_interrupt_resumes_with_nothing_lost() {
+        crate::run::set_home(std::env::temp_dir().join("magi-graph-interrupt-tests-home"));
+        let mut runner = runner_at(RunStatus::Judging);
+        // `Runner::resume` re-resolves roles from the saved config, which
+        // refuses an empty roster - give it the same minimal one `conductor`
+        // itself uses.
+        runner.state.config.agents = vec![conductor()];
+        runner.state.candidates = vec![Candidate {
+            index: 0,
+            label: 'A',
+            agent: "alpha".to_owned(),
+            branch: "magi/x/A".to_owned(),
+            worktree: PathBuf::from("/nonexistent/worktree"),
+            summary: "did the thing".to_owned(),
+            stat: "1 file changed".to_owned(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            duration_ms: 1234,
+            folded: false,
+        }];
+        let run_id = runner.state.id.clone();
+
+        let interrupt = Pause::new();
+        runner.watch_interrupt(interrupt.clone());
+        interrupt.park_because("task c3d4 asked to run first");
+        assert!(runner.park_here().expect("park_here"));
+
+        let resumed = Runner::resume(&run_id).expect("resume");
+        assert_eq!(resumed.state.candidates.len(), 1);
+        assert_eq!(resumed.state.candidates[0].summary, "did the thing");
+        assert_eq!(resumed.state.candidates[0].branch, "magi/x/A");
+        assert_eq!(resumed.state.status, runner.state.status);
+        assert!(
+            resumed.state.parked,
+            "still parked until `execute` actually walks the graph again"
+        );
+        assert!(resumed.state.events.iter().any(|e| e.node == "park"));
     }
 
     /// A fresh open question on `run`, stored and handed back for assertions.
@@ -4839,6 +5055,7 @@ mod tests {
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
+            interrupt: Pause::new(),
         };
 
         runner.merge().await.expect("merge");
@@ -4959,6 +5176,7 @@ mod tests {
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
+            interrupt: Pause::new(),
         };
 
         // `execute`, not `merge` directly: the Landing-resume shortcut lives

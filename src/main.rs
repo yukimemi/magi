@@ -487,6 +487,23 @@ enum TaskCmd {
         #[arg(allow_negative_numbers = true)]
         priority: i32,
     },
+    /// Ask `magi serve` to run this task ahead of whatever it already has in
+    /// flight, once `[daemon] pause_for_interrupts` is on in that machine's
+    /// config - off does nothing.
+    ///
+    /// Restricted to a queued or failed task, the same as `priority`: a
+    /// running task has already been claimed, and nothing else waits for the
+    /// loop's attention. The run already in flight is not killed - it is
+    /// asked to park at its next safe boundary, so its own work is never
+    /// thrown away - and resumes automatically once this task's own run
+    /// finishes.
+    Interrupt {
+        /// Task id or unambiguous prefix/suffix.
+        id: String,
+        /// Clear the mark instead of setting it.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Replace a queued or held task's title and instruction wholesale.
     ///
     /// This is the alternative to deleting the task and filing it again: the
@@ -1933,6 +1950,22 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             t.set_priority(priority)?;
             q.put(&mut t)?;
             println!("{} priority now {} - {}", t.short(), t.priority, t.title);
+            Ok(())
+        }
+
+        TaskCmd::Interrupt { id, clear } => {
+            let resolved = q.resolve_id(&id)?;
+            let _claim = q
+                .claim(&resolved)
+                .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
+            let mut t = q.get(&resolved)?;
+            t.set_interrupt(!clear)?;
+            q.put(&mut t)?;
+            if clear {
+                println!("{} no longer set to interrupt - {}", t.short(), t.title);
+            } else {
+                println!("{} marked to interrupt - {}", t.short(), t.title);
+            }
             Ok(())
         }
 
@@ -3771,6 +3804,61 @@ mod tests {
             TaskCmd::Priority {
                 id: running.id.clone(),
                 priority: 5,
+            },
+            q.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("running"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn task_interrupt_cli_marks_a_queued_task_and_refuses_a_running_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = magi::queue::Task::new(
+            "urgent fix".to_owned(),
+            "x".to_owned(),
+            PathBuf::from("."),
+            magi::queue::Source::Human,
+        );
+        q.put(&mut t).unwrap();
+
+        task_cmd_on(
+            TaskCmd::Interrupt {
+                id: t.id.clone(),
+                clear: false,
+            },
+            q.clone(),
+        )
+        .await
+        .expect("mark to interrupt");
+        assert!(q.get(&t.id).unwrap().interrupt);
+
+        task_cmd_on(
+            TaskCmd::Interrupt {
+                id: t.id.clone(),
+                clear: true,
+            },
+            q.clone(),
+        )
+        .await
+        .expect("clear the mark");
+        assert!(!q.get(&t.id).unwrap().interrupt);
+
+        let mut running = magi::queue::Task::new(
+            "in flight".to_owned(),
+            "x".to_owned(),
+            PathBuf::from("."),
+            magi::queue::Source::Human,
+        );
+        running.start("20260902-140502-bbbb".to_owned());
+        q.put(&mut running).unwrap();
+        let err = task_cmd_on(
+            TaskCmd::Interrupt {
+                id: running.id.clone(),
+                clear: false,
             },
             q.clone(),
         )
