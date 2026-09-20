@@ -579,6 +579,36 @@ enum CacheCmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// List every cache directory magi has ever leased, whether or not
+    /// anything holds it right now.
+    ///
+    /// Unlike `show`/`clear`, this does not read a repository's `magi.toml` -
+    /// it reads the durable catalog under the magi home, which is where a
+    /// cache like an old run's abandoned `Temp\magi-land6` still shows up
+    /// after its last borrower let go of it. Its own status line names why:
+    /// `active` (a live owner still holds it), `reclaimable` (nobody does,
+    /// safe to prune), or `unknown` (a lease file is present but unreadable -
+    /// never assumed safe).
+    List,
+    /// Preview or apply pruning the configured cache down to its
+    /// `[disk] cache_limit_bytes` cap.
+    Prune {
+        /// Repository, for the config that names the cache and its cap.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Config file; defaults to <repo>/magi.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Show what would be deleted without deleting it.
+        ///
+        /// A preview never takes the cache's lease - it only reads - so it
+        /// cannot make a build in flight wait on it, and it cannot conflict
+        /// with one either: a build finishing between a preview and a real
+        /// prune can change what the real prune actually removes, and the
+        /// preview says so.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// The OS default stack for a process's real main thread is small (about
@@ -1240,15 +1270,150 @@ async fn correct_manual_merge(state: &mut RunState, url: &str) -> Result<()> {
     Ok(())
 }
 
-/// `magi cache show` and `magi cache clear`.
+/// One line describing an [`magi::cache::EntryStatus`] for `magi cache list`:
+/// the three-way vocabulary the operator actually decides on (`active`,
+/// `reclaimable`, `unknown`), and a detail clause naming who or what made it
+/// so. `Stale` and `Idle` both read as `reclaimable` - a live owner is
+/// confirmed gone either way, whether the lease file said so itself or was
+/// released and only the catalog remembers - and `unknown` is never folded
+/// into either, because an unreadable lease is not evidence of anything.
+fn cache_status_line(status: &magi::cache::EntryStatus) -> (&'static str, String) {
+    use magi::cache::EntryStatus;
+    match status {
+        EntryStatus::Active(o) => (
+            "active",
+            format!(
+                "held by run {} node {} seat {} (pid {})",
+                o.run, o.node, o.seat, o.pid
+            ),
+        ),
+        EntryStatus::Stale(o) => (
+            "reclaimable",
+            format!(
+                "last held by run {} node {} seat {} (pid {}, now gone)",
+                o.run, o.node, o.seat, o.pid
+            ),
+        ),
+        EntryStatus::Idle(o) => (
+            "reclaimable",
+            format!(
+                "released; last used by run {} node {} seat {}",
+                o.run, o.node, o.seat
+            ),
+        ),
+        EntryStatus::Unknown => (
+            "unknown",
+            "an unreadable lease is present; refusing to guess who holds it".to_owned(),
+        ),
+    }
+}
+
+/// `magi cache show`, `magi cache clear`, `magi cache list`, `magi cache prune`.
 ///
-/// The cache is whatever `[verify]` renders as `CARGO_TARGET_DIR`; a config
-/// that sets none has nothing to show or clear.
+/// `show`/`clear`/`prune` are all whatever `[verify]` renders as
+/// `CARGO_TARGET_DIR` in one repository's config; a config that sets none has
+/// nothing for them to act on. `list` is different on purpose - it reads the
+/// durable catalog under the magi home instead, which is not scoped to any
+/// one repository's config at all (see [`CacheCmd::List`]'s doc).
 fn cache(command: CacheCmd) -> Result<()> {
+    if let CacheCmd::List = command {
+        let home = magi::run::home();
+        let entries = magi::cache::inventory(&home);
+        if entries.is_empty() {
+            println!("no cache directories registered under {}", home.display());
+            return Ok(());
+        }
+        for e in &entries {
+            let path = PathBuf::from(&e.cache_dir);
+            let (state, detail) = cache_status_line(&e.status);
+            println!("{}", path.display());
+            println!("  status  {state} ({detail})");
+            println!("  size    {}", bytes(magi::disk::dir_size(&path)));
+            match magi::disk::free_bytes(&path) {
+                Ok(free) => println!("  free    {} on that volume", bytes(free)),
+                Err(e) => println!("  free    could not measure ({e:#})"),
+            }
+        }
+        return Ok(());
+    }
+    if let CacheCmd::Prune {
+        repo,
+        config,
+        dry_run,
+    } = &command
+    {
+        let (cfg, _from) = Config::discover(repo, config.as_deref())?;
+        let Some(dir) = cfg.cache_dir() else {
+            println!("no shared build cache configured (no CARGO_TARGET_DIR in `[verify]`)");
+            return Ok(());
+        };
+        let limit = cfg.disk.cache_limit_bytes;
+        if limit == 0 {
+            println!(
+                "pruning is off (`[disk] cache_limit_bytes = 0`); nothing to do for {}",
+                dir.display()
+            );
+            return Ok(());
+        }
+        if *dry_run {
+            let plan = magi::disk::plan_prune(&dir, limit);
+            if plan.files.is_empty() {
+                println!(
+                    "{} is at or under its {} cap right now; nothing would be pruned",
+                    dir.display(),
+                    bytes(limit)
+                );
+            } else {
+                println!(
+                    "would free {} across {} file(s) from {} (cap {}), oldest first:",
+                    bytes(plan.freed),
+                    plan.files.len(),
+                    dir.display(),
+                    bytes(limit)
+                );
+                for (path, size) in &plan.files {
+                    println!("  {} ({})", path.display(), bytes(*size));
+                }
+                println!(
+                    "this is a preview only, read without taking the cache's lease: a build \
+                     starting before a real prune can change what it actually removes"
+                );
+            }
+        } else {
+            let home = magi::run::home();
+            let owner = magi::cache::Owner::here("(operator)", "cache-prune", "prune", &dir, "");
+            match magi::cache::try_acquire(&home, &dir, &owner)
+                .with_context(|| format!("check whether {} is in use", dir.display()))?
+            {
+                magi::cache::AcquireOutcome::Busy(busy) => {
+                    println!(
+                        "cache is in use right now, not pruning: {} ({})",
+                        dir.display(),
+                        busy.describe()
+                    );
+                }
+                magi::cache::AcquireOutcome::Acquired(guard) => {
+                    let pruned = magi::disk::prune_dir(&dir, limit);
+                    guard.release();
+                    let pruned = pruned?;
+                    println!(
+                        "pruned {} across {} file(s) from {}; {} remaining (cap {})",
+                        bytes(pruned.freed),
+                        pruned.files,
+                        dir.display(),
+                        bytes(pruned.remaining),
+                        bytes(limit)
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
     let (repo, config) = match &command {
         CacheCmd::Show { repo, config } | CacheCmd::Clear { repo, config } => {
             (repo, config.as_deref())
         }
+        CacheCmd::List | CacheCmd::Prune { .. } => unreachable!("handled above"),
     };
     let (cfg, _from) = Config::discover(repo, config)?;
     let Some(dir) = cfg.cache_dir() else {
@@ -1311,6 +1476,7 @@ fn cache(command: CacheCmd) -> Result<()> {
                 }
             }
         }
+        CacheCmd::List | CacheCmd::Prune { .. } => unreachable!("handled above"),
     }
     Ok(())
 }

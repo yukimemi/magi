@@ -2285,11 +2285,22 @@ async fn triage_held(queue: &Queue, home: &Path, opts: &Opts) {
 /// the operator opted out. A measurement failure is a gate, not a pass: both
 /// sides of "cannot tell" are served by not starting.
 fn disk_gate(repo: &Path, config: &Config) -> Option<String> {
+    disk_gate_with(repo, config, crate::disk::free_bytes)
+}
+
+/// [`disk_gate`] with its free-space measurement supplied by the caller, so a
+/// test can assert the exact wiring `attempt` runs - config's threshold in,
+/// task-holding reason out - without asking the real machine's disk anything.
+fn disk_gate_with<F: Fn(&Path) -> Result<u64>>(
+    repo: &Path,
+    config: &Config,
+    free_bytes: F,
+) -> Option<String> {
     let min = config.disk.min_free_bytes;
     if min == 0 {
         return None;
     }
-    match crate::disk::free_bytes(repo) {
+    match free_bytes(repo) {
         Ok(free) => crate::disk::gate(free, min),
         Err(e) => Some(format!(
             "could not measure free space on {} ({e}); the disk gate refuses \
@@ -2857,6 +2868,58 @@ mod tests {
         let mut t = task();
         t.id = id.to_owned();
         t
+    }
+
+    /// The exact wiring `attempt` runs before minting anything: a config's
+    /// `min_free_bytes` in, a task-holding reason naming both numbers out.
+    /// Free space is injected rather than asked of the real disk - the point
+    /// of [`disk_gate_with`] existing separately from [`disk_gate`] - so this
+    /// is deterministic on every machine this test runs on, never dependent
+    /// on how full the CI runner's own disk happens to be.
+    #[test]
+    fn disk_gate_with_holds_a_task_below_the_threshold_and_names_both_numbers() {
+        let cfg = Config::default();
+        let repo = Path::new("/any/repo/path");
+
+        let reason =
+            disk_gate_with(repo, &cfg, |_| Ok(1024)).expect("must hold below the threshold");
+        assert!(reason.contains("1024"), "{reason}");
+        assert!(
+            reason.contains(&cfg.disk.min_free_bytes.to_string()),
+            "{reason}"
+        );
+
+        assert_eq!(
+            disk_gate_with(repo, &cfg, |_| Ok(cfg.disk.min_free_bytes)),
+            None,
+            "exactly at the floor is open"
+        );
+        assert_eq!(
+            disk_gate_with(repo, &cfg, |_| Ok(cfg.disk.min_free_bytes + 1)),
+            None,
+            "comfortably above the floor is open"
+        );
+    }
+
+    #[test]
+    fn disk_gate_with_opens_unconditionally_when_the_operator_opted_out() {
+        let mut cfg = Config::default();
+        cfg.disk.min_free_bytes = 0;
+        let repo = Path::new("/any/repo/path");
+        assert_eq!(
+            disk_gate_with(repo, &cfg, |_| Ok(0)),
+            None,
+            "a zero floor never measures at all"
+        );
+    }
+
+    #[test]
+    fn disk_gate_with_closes_rather_than_starts_blind_when_it_cannot_measure() {
+        let cfg = Config::default();
+        let repo = Path::new("/any/repo/path");
+        let reason = disk_gate_with(repo, &cfg, |_| Err(anyhow::anyhow!("no df on this box")))
+            .expect("a measurement failure must close the gate, not open it");
+        assert!(reason.contains("could not measure"), "{reason}");
     }
 
     #[test]
