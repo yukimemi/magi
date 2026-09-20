@@ -248,24 +248,25 @@ pub struct PrunePlan {
     pub remaining: u64,
 }
 
-/// The selection [`prune_dir`] would act on, computed without touching disk.
+/// The selection [`prune_dir`] would act on *if every one of these deletions
+/// succeeds*, computed without touching disk.
 ///
 /// Read-only on purpose: a preview must never take the cache's lease (see
 /// `cache::maintenance_prune`'s doc) — it does not write anything, so it
 /// cannot race a build the way a real prune would, and a caller only wanting
 /// to show an operator a plan should not have to wait out contention to do
-/// it. The plan is a snapshot of what the selection looks like right now; a
-/// build finishing between the preview and a later real prune can change what
-/// actually gets deleted, and the CLI surface that shows this says so.
+/// it. This is necessarily an idealized selection, not a prediction of every
+/// file [`prune_dir`] will end up touching: a build finishing between the
+/// preview and a real prune can change what gets deleted, and so can a single
+/// locked file on the real pass, which - unlike this preview - has to keep
+/// reaching past its own plan for another (newer) file when an older one it
+/// counted on turns out to be unremovable. The CLI surface that shows this
+/// preview says so.
 #[must_use]
 pub fn plan_prune(dir: &Path, limit: u64) -> PrunePlan {
     let Some(tree) = Tree::of(dir) else {
         return PrunePlan::default();
     };
-    plan(&tree, limit)
-}
-
-fn plan(tree: &Tree, limit: u64) -> PrunePlan {
     let mut total = tree.total;
     if !over_limit(total, limit) {
         return PrunePlan {
@@ -312,20 +313,29 @@ pub fn prune_dir(dir: &Path, limit: u64) -> Result<Prune> {
             remaining: 0,
         });
     };
-    let selection = plan(&tree, limit);
-    if selection.files.is_empty() {
+    let mut total = tree.total;
+    if !over_limit(total, limit) {
         return Ok(Prune {
             freed: 0,
             files: 0,
-            remaining: selection.remaining,
+            remaining: total,
         });
     }
-    let mut total = tree.total;
     let mut freed = 0u64;
     let mut removed = 0usize;
-    for (path, size) in &selection.files {
-        // A file that is being read elsewhere (a concurrent build, a snapshot)
-        // fails on Windows; skip it and continue — the next prune gets it.
+    // Deliberately walks every file in `tree`, not a fixed plan computed up
+    // front: `total` only drops on a successful removal, so a file that is
+    // being read elsewhere (a concurrent build, a snapshot) and fails to
+    // delete on Windows costs this pass nothing but that one file - it is
+    // skipped, and the loop keeps reaching for the next-oldest file until the
+    // real, achieved total is at or below `limit` or there is nothing left to
+    // try. A version of this that instead deleted only a pre-computed
+    // selection would stop short of the cap on the first locked file, every
+    // pass, on exactly the machines where locked files are common.
+    for (_, size, path) in &tree.files {
+        if !over_limit(total, limit) {
+            break;
+        }
         if std::fs::remove_file(path).is_ok() {
             total = total.saturating_sub(*size);
             freed += *size;
@@ -593,6 +603,52 @@ mod tests {
         assert_eq!(
             plan_prune(&t.path().join("absent"), 0),
             PrunePlan::default()
+        );
+    }
+
+    /// A file `prune_dir` cannot delete - locked by a concurrent reader on
+    /// Windows, the exact scenario the function's own doc calls out - must
+    /// not make the pass stop short of the cap. The achieved total only
+    /// drops on a successful removal, so the loop has to keep reaching for
+    /// newer files until *that* total clears `limit`, not stop once a
+    /// precomputed selection runs out.
+    #[cfg(windows)]
+    #[test]
+    fn prune_keeps_reaching_past_an_undeletable_file_to_still_reach_the_cap() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let t = tempfile::TempDir::new().expect("temp");
+        let old = t.path().join("old");
+        fs::write(&old, b"yyyy").expect("write");
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        let mid = t.path().join("mid");
+        fs::write(&mid, b"zzzz").expect("write");
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        let new = t.path().join("new");
+        fs::write(&new, b"xxxxx").expect("write");
+
+        // A share mode of 0 denies every other handle, including a delete -
+        // standing in for a file a concurrent build still has open, which is
+        // exactly the case `prune_dir`'s own doc calls out.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&old)
+            .expect("lock the old file exclusively");
+
+        let pruned = prune_dir(t.path(), 8).expect("prune");
+        drop(lock);
+
+        assert!(old.exists(), "the locked file could not be deleted");
+        assert!(!mid.exists(), "the next-oldest file was tried and removed");
+        assert!(
+            !new.exists(),
+            "pruning kept reaching for newer files until the cap was actually met, \
+             not just until a fixed selection ran out"
+        );
+        assert!(
+            pruned.remaining <= 8,
+            "the achieved total must reach the cap: {pruned:?}"
         );
     }
 
