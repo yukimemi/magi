@@ -20,18 +20,66 @@ bad design. So magi does not review one implementation — it holds an election
 between several, and only then reviews.
 
 ```mermaid
-flowchart LR
-  prep[prep: worktrees + blind hook] --> impl[implement x N]
-  impl --> judge[judge x M, blind]
-  judge -->|first choices agree| vote[final vote, private]
-  judge -->|split| delib[deliberate]
-  delib --> vote
-  vote --> tally[mechanical tally]
-  tally --> fold[fold losers]
-  fold --> review[review x R + E2E + fix, bounded]
-  review --> gate[gate commands]
-  gate --> merge[merge]
+flowchart TD
+  subgraph Q["queue loop — `magi serve` (outside any one run)"]
+    direction LR
+    conductor["conductor ×1 per poll cycle\n[roles] conductor"]
+  end
+  conductor -.->|arranges blocked_by / recovery, then hands off| prep
+
+  subgraph Run["one competition — `magi run`"]
+    direction TB
+    prep["prep: worktrees + blind hook\n(no agent)"]
+    advisor["advise: advisors ×A, read-only\n[roles] advisors (falls back to judges)\n[graph] advise, advisors"]
+    synth["advise: synthesis ×1, blends the advisors\nno [roles] field — always agent::pick"]
+    impl["implement ×N\n[roles] implementers\n[graph] candidates"]
+    judge["judge ×M, blind\n[roles] judges\n[graph] judges"]
+    delib["deliberate\n[roles] judges\n[graph] deliberate_rounds"]
+    vote["final vote, private\n[roles] judges"]
+    tally["tally\n(mechanical, no agent)"]
+    fold["fold losers\n(no agent)"]
+    review["review ×R + E2E + fix, bounded\n[roles] reviewers, fixer\n[graph] reviewers, review_rounds"]
+    gate["gate commands\n[verify] gate — shell, no agent"]
+    merge["merge\n[graph] land, land_approval — no agent"]
+    land["land loop: watch CI, fix, ask to merge\n[roles] fixer, reused"]
+
+    prep --> advisor --> synth --> impl --> judge
+    judge -->|first choices agree| vote
+    judge -->|split| delib --> vote
+    vote --> tally --> fold --> review --> gate --> merge
+    merge -->|merge = pr, land = true| land
+  end
+
+  subgraph Standalone["standing chat / release bump — `magi chat`, `magi bump` (outside any run)"]
+    direction LR
+    chatter["chatter ×1 per turn\n[roles] chatter"]
+  end
+
+  classDef gap fill:#3a1414,stroke:#e05252,stroke-width:2px,color:#f5caca;
+  class synth gap;
 ```
+
+Every box above that spawns an agent has a `[roles]` field to pin it to a
+specific one — except the red one. That gap is real, not a documentation
+omission:
+
+| Seat | Runs | `[roles]` field | Other knobs | Pinnable? |
+|---|---|---|---|---|
+| conductor | once per poll cycle | `conductor` | — | yes |
+| advisors (design deliberation) | ×`advisors` (default 3) | `advisors` *(unset falls back to `judges`)* | `[graph] advise` on/off, `[graph] advisors` count | yes |
+| **advise-synthesis** (blends the advisors into one brief) | ×1 | **none** | — | **no** — always `agent::pick`'s default order |
+| implementers | ×`candidates` (default 3) | `implementers` | `[graph] candidates` | yes |
+| judges (rank / deliberate / vote) | ×`judges` (default 3) | `judges` | `[graph] judges`, `deliberate_rounds` | yes |
+| reviewers | ×`reviewers` (default 3) | `reviewers` | `[graph] reviewers`, `review_rounds` | yes |
+| fixer (review loop and land loop) | ×1, only when findings block | `fixer` *(unset falls back to the winner's own seat)* | — | yes |
+| chatter (`magi chat`, `magi bump`) | ×1 per turn | `chatter` *(unset falls back to a claude seat, else roster order)* | — | yes |
+| tally / fold / gate / merge | n/a — no agent seat | — | `[verify] gate`, `[graph] land`, `land_approval` | n/a |
+
+`advise-synthesis` is the one seat in the whole graph with no dedicated
+`[roles]` entry: it always resolves through `agent::pick`'s bare default
+order, the same fallback every other seat only reaches when its own field is
+left unset. An operator who wants the advisor-blending step pinned to a
+specific agent currently cannot do it without narrowing `[agents]` itself.
 
 ## What makes the judging blind
 
