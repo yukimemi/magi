@@ -771,12 +771,29 @@ pub struct Daemon {
     /// make. So even at the default of `1`, an approval that comes back does
     /// not queue behind whatever else the loop happens to be running.
     pub max_concurrent_runs: usize,
+    /// Let a task marked [`crate::queue::Task::interrupt`] (`magi task
+    /// interrupt`) cut ahead of whatever `magi serve` already has in flight,
+    /// instead of waiting for it to finish.
+    ///
+    /// **Off by default.** When enabled, a run that is in flight and is not
+    /// itself the interrupt candidate may be paused at its next safe node
+    /// boundary - see [`crate::graph::Runner::park_here`] - so the marked
+    /// task can run alone; the paused run resumes automatically, through the
+    /// same path any other parked run does, the moment the interrupting
+    /// task's own run reaches a terminal status. This is opt-in because it
+    /// bends the loop's own "one run at a time" principle (see this repository's
+    /// `magi serve` help) for a specific, explicit operator request, and a
+    /// repository that never files an interrupt task pays nothing for having
+    /// it on - but an operator who does not want any run of theirs preempted,
+    /// ever, should leave this `false`.
+    pub pause_for_interrupts: bool,
 }
 
 impl Default for Daemon {
     fn default() -> Self {
         Self {
             max_concurrent_runs: 1,
+            pause_for_interrupts: false,
         }
     }
 }

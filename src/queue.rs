@@ -265,6 +265,18 @@ pub struct Task {
     /// the prior run. History remains as evidence in `runs`.
     #[serde(default)]
     pub fresh_start: bool,
+    /// Marked by an operator (`magi task interrupt`) to ask `magi serve` to
+    /// run this one ahead of whatever it already has in flight, once
+    /// `[daemon] pause_for_interrupts` is on - see
+    /// `crate::daemon::advance_interrupt`. Never set by the loop itself, and
+    /// deliberately a different operation from [`Task::set_priority`]: a
+    /// priority only reorders the queue a claim has not reached yet, while
+    /// this asks a run already in flight to park at its next safe boundary
+    /// and step aside. `#[serde(default)]` so a queue file written before
+    /// this field existed still reads, as `false` - no task interrupts
+    /// anything unless asked to, exactly as before.
+    #[serde(default)]
+    pub interrupt: bool,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -306,6 +318,7 @@ impl Task {
             answers: Vec::new(),
             review_branch: None,
             fresh_start: false,
+            interrupt: false,
             created_at: now,
             updated_at: now,
         }
@@ -494,6 +507,33 @@ impl Task {
             );
         }
         self.priority = priority;
+        Ok(())
+    }
+
+    /// Mark (or unmark) this task to interrupt whatever `magi serve` already
+    /// has in flight, once `[daemon] pause_for_interrupts` is on. See
+    /// [`Task::interrupt`].
+    ///
+    /// Setting it is restricted to a task the loop could pick up on its own
+    /// right now - [`TaskStatus::runnable`] - for the same reason as
+    /// [`Task::set_priority`]: a task already `running` has been claimed, and
+    /// a task that is `done`, `held`, or `blocked` is not going to compete
+    /// for the daemon's attention regardless of this flag. Unlike priority,
+    /// this is never silently inert while `running` - it is refused outright,
+    /// because the entire feature this flag drives (`crate::daemon`'s
+    /// interrupt scheduler) is scoped to tasks still waiting to be claimed.
+    /// Clearing it back to `false` carries no such risk and is always
+    /// allowed, including on a task that moved on since it was set.
+    pub fn set_interrupt(&mut self, interrupt: bool) -> Result<()> {
+        if interrupt && !self.status.runnable() {
+            bail!(
+                "task {} is {}; only a queued or failed task can be marked \
+                 to interrupt",
+                self.short(),
+                self.status.as_str()
+            );
+        }
+        self.interrupt = interrupt;
         Ok(())
     }
 
@@ -1203,6 +1243,23 @@ mod tests {
         let err = t.set_priority(9).unwrap_err().to_string();
         assert!(err.contains("running"), "{err}");
         assert_eq!(t.priority, 5, "the rejected write must not partially apply");
+    }
+
+    #[test]
+    fn interrupt_can_be_marked_while_queued_but_not_while_running() {
+        let mut t = task("interrupt me");
+        assert!(!t.interrupt, "off unless asked, same as any other task");
+
+        t.set_interrupt(true).unwrap();
+        assert!(t.interrupt);
+
+        t.start("run-1".to_owned());
+        let err = t.set_interrupt(true).unwrap_err().to_string();
+        assert!(err.contains("running"), "{err}");
+        // Clearing is always allowed, even on a running task - there is
+        // nothing left for it to interrupt once it has been claimed.
+        t.set_interrupt(false).unwrap();
+        assert!(!t.interrupt);
     }
 
     #[test]
