@@ -986,6 +986,18 @@ async fn dispatch(command: Command) -> Result<()> {
                 cfg.merge.mode = m.into();
             }
             println!("config: {}", describe_layers(&from));
+            // The same free-space gate `magi run` and the daemon obey: a
+            // review-only run still drives worktrees and the shared verify
+            // cache through this repository, so it must not start blind on a
+            // disk that is already too full to finish it.
+            let min = cfg.disk.min_free_bytes;
+            if min > 0 {
+                let free = magi::disk::free_bytes(&repo)
+                    .with_context(|| format!("measure free space on {}", repo.display()))?;
+                if let Some(reason) = magi::disk::gate(free, min) {
+                    bail!("{reason}");
+                }
+            }
             let mut runner = Runner::review(&repo, &branch, cfg).await?;
             let result = runner.execute().await;
             print!("{}", report::run(&runner.state));
@@ -1432,14 +1444,21 @@ fn cache(command: CacheCmd) -> Result<()> {
                     );
                 }
                 magi::cache::AcquireOutcome::Acquired(guard) => {
+                    // A deleted file's own length is not necessarily what the
+                    // volume gets back (NTFS compression, sparse files, and
+                    // the like can make the two disagree) - measure the
+                    // volume's free space before and after rather than
+                    // assume they match.
+                    let free_before = magi::disk::free_bytes(&dir).ok();
                     let pruned = magi::disk::prune_dir(&dir, limit);
                     guard.release();
                     let pruned = pruned?;
+                    let free_after = magi::disk::free_bytes(&dir).ok();
                     println!(
-                        "pruned {} across {} file(s) from {}; {} remaining (cap {})",
-                        bytes(pruned.freed),
+                        "pruned {} file(s) from {}: {}; {} remaining (cap {})",
                         pruned.files,
                         dir.display(),
+                        reclaim_report(pruned.freed, free_before, free_after),
                         bytes(pruned.remaining),
                         bytes(limit)
                     );
@@ -1532,15 +1551,53 @@ fn clear_cache_dir(home: &Path, dir: &Path) -> Result<()> {
             );
         }
         magi::cache::AcquireOutcome::Acquired(guard) => {
-            let freed = magi::disk::dir_size(dir);
+            let logical = magi::disk::dir_size(dir);
+            // Same reasoning as `magi cache prune`: the sum of the files'
+            // own lengths is a description of what was deleted, not a
+            // measurement of what the volume actually got back. Measure the
+            // volume's free space on either side of the removal instead of
+            // reporting the logical size as though it were the same number
+            // - from the parent, since `dir` itself is about to stop
+            // existing and a measurement has to name a path that is there
+            // both before and after.
+            let volume_probe = dir
+                .parent()
+                .map_or_else(|| dir.to_path_buf(), Path::to_path_buf);
+            let free_before = magi::disk::free_bytes(&volume_probe).ok();
             let removed =
                 std::fs::remove_dir_all(dir).with_context(|| format!("remove {}", dir.display()));
             guard.release();
             removed?;
-            println!("removed {} ({} freed)", dir.display(), bytes(freed));
+            let free_after = magi::disk::free_bytes(&volume_probe).ok();
+            println!(
+                "removed {} ({})",
+                dir.display(),
+                reclaim_report(logical, free_before, free_after)
+            );
         }
     }
     Ok(())
+}
+
+/// Describe a deletion honestly: the logical size of what was deleted, and -
+/// when the volume's free space could be measured on both sides of the
+/// deletion - how much actually came back. The two can disagree (NTFS
+/// compression, sparse files, another process claiming space on the same
+/// volume in the meantime), so this never presents the logical count as a
+/// measurement of the volume's free space, only as what it is.
+fn reclaim_report(logical: u64, free_before: Option<u64>, free_after: Option<u64>) -> String {
+    match (free_before, free_after) {
+        (Some(before), Some(after)) => format!(
+            "{} of logical file size; {} actually returned to the volume",
+            bytes(logical),
+            bytes(after.saturating_sub(before))
+        ),
+        _ => format!(
+            "{} of logical file size (could not measure the volume's free space to confirm how \
+             much was actually returned)",
+            bytes(logical)
+        ),
+    }
 }
 
 /// A byte count as the operator reads it.
