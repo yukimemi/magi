@@ -5453,6 +5453,114 @@ mod tests {
         );
     }
 
+    /// `fold_run(&mut state, drop_winner = false)` is exactly the call
+    /// `clean::fold_due` makes for a `Ready`/`Failed` run - one that finished
+    /// without merging, whose winner is still the operator's answer to read.
+    /// Nothing previously called `fold_run` itself with a real `tally`, so
+    /// this is the first test to pin down the one distinction the whole
+    /// automatic-fold feature depends on: the winner's worktree and branch
+    /// must survive, everything else sharing the run's worktree bay - a
+    /// loser, standing in for a judge/review worktree too, since `fold_run`'s
+    /// second sweep treats every non-winner directory under the bay alike -
+    /// must not.
+    #[tokio::test]
+    async fn fold_run_keeps_only_the_winner_when_the_winner_is_not_dropped() {
+        crate::run::set_home(std::env::temp_dir().join("magi-graph-fold-run-tests-home"));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let mut config = Config::default();
+        config.graph.worktree_root = Some(tmp.path().join("wt"));
+
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            "deadbeef".to_owned(),
+            "task".to_owned(),
+            config,
+        );
+        let root = state.worktree_root();
+        let wt_a = root.join("cand-A");
+        let wt_b = root.join("cand-B");
+        git::worktree_add_branch(&repo, &wt_a, "magi/x/A", "main")
+            .await
+            .expect("worktree A");
+        git::worktree_add_branch(&repo, &wt_b, "magi/x/B", "main")
+            .await
+            .expect("worktree B");
+
+        state.candidates = vec![
+            Candidate {
+                index: 0,
+                label: 'A',
+                agent: "alpha".to_owned(),
+                branch: "magi/x/A".to_owned(),
+                worktree: wt_a.clone(),
+                summary: String::new(),
+                stat: String::new(),
+                files: 0,
+                commits: 0,
+                empty: false,
+                failed: None,
+                duration_ms: 0,
+                folded: false,
+            },
+            Candidate {
+                index: 1,
+                label: 'B',
+                agent: "beta".to_owned(),
+                branch: "magi/x/B".to_owned(),
+                worktree: wt_b.clone(),
+                summary: String::new(),
+                stat: String::new(),
+                files: 0,
+                commits: 0,
+                empty: false,
+                failed: None,
+                duration_ms: 0,
+                folded: false,
+            },
+        ];
+        state.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 1)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 1,
+            present: 1,
+            quorum: 1,
+            met_quorum: true,
+            uncontested: None,
+        });
+        state.status = RunStatus::Ready;
+
+        fold_run(&mut state, false).await.expect("fold_run");
+
+        assert!(wt_a.exists(), "the unmerged winner's worktree survives");
+        assert!(
+            git::branch_exists(&repo, "magi/x/A").await.unwrap(),
+            "the unmerged winner's branch survives"
+        );
+        assert!(
+            !state.candidates[0].folded,
+            "the winner is not marked folded"
+        );
+
+        assert!(!wt_b.exists(), "the loser's worktree is removed");
+        assert!(
+            !git::branch_exists(&repo, "magi/x/B").await.unwrap(),
+            "the loser's branch is removed"
+        );
+        assert!(state.candidates[1].folded, "the loser is marked folded");
+    }
+
     /// `status == Ready` used to be read as "this is the harmless
     /// `MergeMode::None` no-op path, nothing to guard" (graph.rs, prior to
     /// this test). But `land` sets the very same status when a `MergeMode::Pr`

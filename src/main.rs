@@ -572,12 +572,58 @@ enum CacheCmd {
     /// again - so clearing it loses nothing but the operator's next build time.
     /// Homework-sized repairs for the one thing magi already prunes on its own.
     Clear {
-        /// Repository, for the config that names the cache.
+        /// Repository, for the config that names the cache. Ignored when
+        /// `--path` is given.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Config file; defaults to <repo>/magi.toml. Ignored when `--path`
+        /// is given.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Clear a specific cache directory instead of the one the given
+        /// repository's config currently names - a path `magi cache list`
+        /// reports, for a cache no repository's `CARGO_TARGET_DIR` still
+        /// points at (an old run's abandoned cache, or one from a config
+        /// that has since changed). This is how an orphaned cache like an
+        /// old run's `Temp\magi-land6` gets cleared without a repository to
+        /// resolve it through.
+        ///
+        /// Refused unless the catalog actually registered this exact path:
+        /// acting on whatever a human names here is fine, but falling back
+        /// to guessing from a directory's name or place in `Temp` is exactly
+        /// what this whole module exists to never do.
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// List every cache directory magi has ever leased, whether or not
+    /// anything holds it right now.
+    ///
+    /// Unlike `show`/`clear`, this does not read a repository's `magi.toml` -
+    /// it reads the durable catalog under the magi home, which is where a
+    /// cache like an old run's abandoned `Temp\magi-land6` still shows up
+    /// after its last borrower let go of it. Its own status line names why:
+    /// `active` (a live owner still holds it), `reclaimable` (nobody does,
+    /// safe to prune), or `unknown` (a lease file is present but unreadable -
+    /// never assumed safe).
+    List,
+    /// Preview or apply pruning the configured cache down to its
+    /// `[disk] cache_limit_bytes` cap.
+    Prune {
+        /// Repository, for the config that names the cache and its cap.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
         /// Config file; defaults to <repo>/magi.toml.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Show what would be deleted without deleting it.
+        ///
+        /// A preview never takes the cache's lease - it only reads - so it
+        /// cannot make a build in flight wait on it, and it cannot conflict
+        /// with one either: a build finishing between a preview and a real
+        /// prune can change what the real prune actually removes, and the
+        /// preview says so.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -940,6 +986,18 @@ async fn dispatch(command: Command) -> Result<()> {
                 cfg.merge.mode = m.into();
             }
             println!("config: {}", describe_layers(&from));
+            // The same free-space gate `magi run` and the daemon obey: a
+            // review-only run still drives worktrees and the shared verify
+            // cache through this repository, so it must not start blind on a
+            // disk that is already too full to finish it.
+            let min = cfg.disk.min_free_bytes;
+            if min > 0 {
+                let free = magi::disk::free_bytes(&repo)
+                    .with_context(|| format!("measure free space on {}", repo.display()))?;
+                if let Some(reason) = magi::disk::gate(free, min) {
+                    bail!("{reason}");
+                }
+            }
             let mut runner = Runner::review(&repo, &branch, cfg).await?;
             let result = runner.execute().await;
             print!("{}", report::run(&runner.state));
@@ -1240,15 +1298,198 @@ async fn correct_manual_merge(state: &mut RunState, url: &str) -> Result<()> {
     Ok(())
 }
 
-/// `magi cache show` and `magi cache clear`.
+/// One line describing an [`magi::cache::EntryStatus`] for `magi cache list`:
+/// the three-way vocabulary the operator actually decides on (`active`,
+/// `reclaimable`, `unknown`), and a detail clause naming who or what made it
+/// so. `Stale` and `Idle` both read as `reclaimable` - a live owner is
+/// confirmed gone either way, whether the lease file said so itself or was
+/// released and only the catalog remembers - and `unknown` is never folded
+/// into either, because an unreadable lease is not evidence of anything.
+fn cache_status_line(status: &magi::cache::EntryStatus) -> (&'static str, String) {
+    use magi::cache::EntryStatus;
+    match status {
+        EntryStatus::Active(o) => (
+            "active",
+            format!(
+                "held by run {} node {} seat {} (pid {})",
+                o.run, o.node, o.seat, o.pid
+            ),
+        ),
+        EntryStatus::Stale(o) => (
+            "reclaimable",
+            format!(
+                "last held by run {} node {} seat {} (pid {}, now gone)",
+                o.run, o.node, o.seat, o.pid
+            ),
+        ),
+        EntryStatus::Idle(o) => (
+            "reclaimable",
+            format!(
+                "released; last used by run {} node {} seat {}",
+                o.run, o.node, o.seat
+            ),
+        ),
+        EntryStatus::Unknown => (
+            "unknown",
+            "an unreadable lease is present; refusing to guess who holds it".to_owned(),
+        ),
+    }
+}
+
+/// `magi cache show`, `magi cache clear`, `magi cache list`, `magi cache prune`.
 ///
-/// The cache is whatever `[verify]` renders as `CARGO_TARGET_DIR`; a config
-/// that sets none has nothing to show or clear.
+/// `show`/`clear`/`prune` are all whatever `[verify]` renders as
+/// `CARGO_TARGET_DIR` in one repository's config; a config that sets none has
+/// nothing for them to act on. `list` is different on purpose - it reads the
+/// durable catalog under the magi home instead, which is not scoped to any
+/// one repository's config at all (see [`CacheCmd::List`]'s doc).
 fn cache(command: CacheCmd) -> Result<()> {
-    let (repo, config) = match &command {
-        CacheCmd::Show { repo, config } | CacheCmd::Clear { repo, config } => {
-            (repo, config.as_deref())
+    if let CacheCmd::List = command {
+        let home = magi::run::home();
+        let entries = magi::cache::inventory(&home);
+        if entries.is_empty() {
+            println!("no cache directories registered under {}", home.display());
+            return Ok(());
         }
+        for e in &entries {
+            let path = PathBuf::from(&e.cache_dir);
+            let (state, detail) = cache_status_line(&e.status);
+            println!("{}", path.display());
+            println!("  status  {state} ({detail})");
+            println!("  size    {}", bytes(magi::disk::dir_size(&path)));
+            match magi::disk::free_bytes(&path) {
+                Ok(free) => println!("  free    {} on that volume", bytes(free)),
+                Err(e) => println!("  free    could not measure ({e:#})"),
+            }
+        }
+        return Ok(());
+    }
+    if let CacheCmd::Prune {
+        repo,
+        config,
+        dry_run,
+    } = &command
+    {
+        let (cfg, _from) = Config::discover(repo, config.as_deref())?;
+        let Some(dir) = cfg.cache_dir() else {
+            println!("no shared build cache configured (no CARGO_TARGET_DIR in `[verify]`)");
+            return Ok(());
+        };
+        let limit = cfg.disk.cache_limit_bytes;
+        if limit == 0 {
+            println!(
+                "pruning is off (`[disk] cache_limit_bytes = 0`); nothing to do for {}",
+                dir.display()
+            );
+            return Ok(());
+        }
+        let home = magi::run::home();
+        if *dry_run {
+            // A preview must not take the lease (see the flag's own doc), but
+            // showing a plan a real prune would immediately refuse as busy is
+            // its own kind of wrong answer - the whole point of a preview is
+            // to say what would actually happen. `inventory` is a read of the
+            // same registered lease state `try_acquire` itself would consult,
+            // just without taking it, so this agrees with the real path
+            // below without racing it.
+            let key = dir.display().to_string();
+            let busy = magi::cache::inventory(&home)
+                .into_iter()
+                .find(|e| e.cache_dir == key)
+                .and_then(|e| {
+                    let (state, detail) = cache_status_line(&e.status);
+                    (state != "reclaimable").then_some(detail)
+                });
+            if let Some(reason) = busy {
+                println!(
+                    "{} is in use right now, so a real prune would skip it entirely: {}",
+                    dir.display(),
+                    reason
+                );
+                return Ok(());
+            }
+            let plan = magi::disk::plan_prune(&dir, limit);
+            if plan.files.is_empty() {
+                println!(
+                    "{} is at or under its {} cap right now; nothing would be pruned",
+                    dir.display(),
+                    bytes(limit)
+                );
+            } else {
+                println!(
+                    "would free {} across {} file(s) from {} (cap {}), oldest first:",
+                    bytes(plan.freed),
+                    plan.files.len(),
+                    dir.display(),
+                    bytes(limit)
+                );
+                for (path, size) in &plan.files {
+                    println!("  {} ({})", path.display(), bytes(*size));
+                }
+                println!(
+                    "this is a preview only, read without taking the cache's lease: a build \
+                     starting before a real prune can change what it actually removes"
+                );
+            }
+        } else {
+            let owner = magi::cache::Owner::here("(operator)", "cache-prune", "prune", &dir, "");
+            match magi::cache::try_acquire(&home, &dir, &owner)
+                .with_context(|| format!("check whether {} is in use", dir.display()))?
+            {
+                magi::cache::AcquireOutcome::Busy(busy) => {
+                    println!(
+                        "cache is in use right now, not pruning: {} ({})",
+                        dir.display(),
+                        busy.describe()
+                    );
+                }
+                magi::cache::AcquireOutcome::Acquired(guard) => {
+                    // A deleted file's own length is not necessarily what the
+                    // volume gets back (NTFS compression, sparse files, and
+                    // the like can make the two disagree) - measure the
+                    // volume's free space before and after rather than
+                    // assume they match.
+                    let free_before = magi::disk::free_bytes(&dir).ok();
+                    let pruned = magi::disk::prune_dir(&dir, limit);
+                    guard.release();
+                    let pruned = pruned?;
+                    let free_after = magi::disk::free_bytes(&dir).ok();
+                    println!(
+                        "pruned {} file(s) from {}: {}; {} remaining (cap {})",
+                        pruned.files,
+                        dir.display(),
+                        reclaim_report(pruned.freed, free_before, free_after),
+                        bytes(pruned.remaining),
+                        bytes(limit)
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+    if let CacheCmd::Clear {
+        path: Some(path), ..
+    } = &command
+    {
+        let home = magi::run::home();
+        let key = path.display().to_string();
+        let registered = magi::cache::inventory(&home)
+            .iter()
+            .any(|e| e.cache_dir == key);
+        if !registered {
+            println!(
+                "{} is not a cache directory magi has ever registered; refusing to guess from \
+                 its name or location (see `magi cache list` for the paths it knows about)",
+                path.display()
+            );
+            return Ok(());
+        }
+        return clear_cache_dir(&home, path);
+    }
+    let (repo, config) = match &command {
+        CacheCmd::Show { repo, config } => (repo, config.as_deref()),
+        CacheCmd::Clear { repo, config, .. } => (repo, config.as_deref()),
+        CacheCmd::List | CacheCmd::Prune { .. } => unreachable!("handled above"),
     };
     let (cfg, _from) = Config::discover(repo, config)?;
     let Some(dir) = cfg.cache_dir() else {
@@ -1275,44 +1516,88 @@ fn cache(command: CacheCmd) -> Result<()> {
             }
         }
         CacheCmd::Clear { .. } => {
-            if !dir.exists() {
-                println!("cache not present on disk: {}", dir.display());
-                return Ok(());
-            }
-            // A live borrower - this run's own build, another run's, or a
-            // human's `magi review` sharing the same `CARGO_TARGET_DIR` -
-            // must never have its compile deleted out from under it. Taking
-            // the lease ourselves rather than only checking `cache::in_use`
-            // first closes the gap between checking and deleting: a build
-            // that starts in between would otherwise still lose its compile.
-            // An unreadable lease refuses the clear too, exactly as
-            // conservatively as it refuses the automatic janitor.
             let home = magi::run::home();
-            let owner = magi::cache::Owner::here("(operator)", "cache-clear", "clear", &dir, "");
-            match magi::cache::try_acquire(&home, &dir, &owner)
-                .with_context(|| format!("check whether {} is in use", dir.display()))?
-            {
-                magi::cache::AcquireOutcome::Busy(busy) => {
-                    println!(
-                        "cache is in use right now, not clearing: {} ({})\n\
-                         (wait for it to finish, or check `magi show` for what is still running)",
-                        dir.display(),
-                        busy.describe()
-                    );
-                    return Ok(());
-                }
-                magi::cache::AcquireOutcome::Acquired(guard) => {
-                    let freed = magi::disk::dir_size(&dir);
-                    let removed = std::fs::remove_dir_all(&dir)
-                        .with_context(|| format!("remove {}", dir.display()));
-                    guard.release();
-                    removed?;
-                    println!("removed {} ({} freed)", dir.display(), bytes(freed));
-                }
-            }
+            return clear_cache_dir(&home, &dir);
+        }
+        CacheCmd::List | CacheCmd::Prune { .. } => unreachable!("handled above"),
+    }
+    Ok(())
+}
+
+/// The shared body of `magi cache clear`, whether the directory came from a
+/// repository's config or was named directly with `--path`.
+fn clear_cache_dir(home: &Path, dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        println!("cache not present on disk: {}", dir.display());
+        return Ok(());
+    }
+    // A live borrower - this run's own build, another run's, or a human's
+    // `magi review` sharing the same `CARGO_TARGET_DIR` - must never have its
+    // compile deleted out from under it. Taking the lease ourselves rather
+    // than only checking `cache::in_use` first closes the gap between
+    // checking and deleting: a build that starts in between would otherwise
+    // still lose its compile. An unreadable lease refuses the clear too,
+    // exactly as conservatively as it refuses the automatic janitor.
+    let owner = magi::cache::Owner::here("(operator)", "cache-clear", "clear", dir, "");
+    match magi::cache::try_acquire(home, dir, &owner)
+        .with_context(|| format!("check whether {} is in use", dir.display()))?
+    {
+        magi::cache::AcquireOutcome::Busy(busy) => {
+            println!(
+                "cache is in use right now, not clearing: {} ({})\n\
+                 (wait for it to finish, or check `magi show` for what is still running)",
+                dir.display(),
+                busy.describe()
+            );
+        }
+        magi::cache::AcquireOutcome::Acquired(guard) => {
+            let logical = magi::disk::dir_size(dir);
+            // Same reasoning as `magi cache prune`: the sum of the files'
+            // own lengths is a description of what was deleted, not a
+            // measurement of what the volume actually got back. Measure the
+            // volume's free space on either side of the removal instead of
+            // reporting the logical size as though it were the same number
+            // - from the parent, since `dir` itself is about to stop
+            // existing and a measurement has to name a path that is there
+            // both before and after.
+            let volume_probe = dir
+                .parent()
+                .map_or_else(|| dir.to_path_buf(), Path::to_path_buf);
+            let free_before = magi::disk::free_bytes(&volume_probe).ok();
+            let removed =
+                std::fs::remove_dir_all(dir).with_context(|| format!("remove {}", dir.display()));
+            guard.release();
+            removed?;
+            let free_after = magi::disk::free_bytes(&volume_probe).ok();
+            println!(
+                "removed {} ({})",
+                dir.display(),
+                reclaim_report(logical, free_before, free_after)
+            );
         }
     }
     Ok(())
+}
+
+/// Describe a deletion honestly: the logical size of what was deleted, and -
+/// when the volume's free space could be measured on both sides of the
+/// deletion - how much actually came back. The two can disagree (NTFS
+/// compression, sparse files, another process claiming space on the same
+/// volume in the meantime), so this never presents the logical count as a
+/// measurement of the volume's free space, only as what it is.
+fn reclaim_report(logical: u64, free_before: Option<u64>, free_after: Option<u64>) -> String {
+    match (free_before, free_after) {
+        (Some(before), Some(after)) => format!(
+            "{} of logical file size; {} actually returned to the volume",
+            bytes(logical),
+            bytes(after.saturating_sub(before))
+        ),
+        _ => format!(
+            "{} of logical file size (could not measure the volume's free space to confirm how \
+             much was actually returned)",
+            bytes(logical)
+        ),
+    }
 }
 
 /// A byte count as the operator reads it.

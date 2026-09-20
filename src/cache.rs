@@ -225,6 +225,63 @@ fn identity_path(home: &Path, cache_dir: &Path) -> PathBuf {
     leases_dir(home).join(format!("{}.identity.json", slug(cache_dir)))
 }
 
+fn catalog_path(home: &Path, cache_dir: &Path) -> PathBuf {
+    leases_dir(home).join(format!("{}.catalog.json", slug(cache_dir)))
+}
+
+/// A cache directory magi has leased before, remembered past the point its
+/// lease file is gone.
+///
+/// A lease file's whole reason to exist is contention, and [`Guard::release`]
+/// deletes it the moment nobody holds it — correctly, since a stale lock file
+/// left lying around is exactly the bug this module exists to avoid repeating
+/// (see the module docs on the queue's own `.lock` files). But that means a
+/// cache directory nobody is actively borrowing is, from a lease file alone,
+/// indistinguishable from one magi never touched: both read as
+/// [`Status::Free`]. `magi-land6`, `magi-land7` and `magi-landtimedout` — idle
+/// Cargo caches worth tens of gigabytes each, found only by a manual sweep of
+/// `Temp` during the 2026-09-12 recovery — are exactly this: real, orphaned,
+/// magi-managed caches that [`inventory`] could not see because nothing was
+/// still holding them. This record is what closes that gap: written on every
+/// successful acquire, never deleted by [`Guard`], so a cleanup surface can
+/// still find and size a cache days after the last borrower let go of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CatalogRecord {
+    cache_dir: String,
+    last_owner: Owner,
+    last_used_at: Timestamp,
+}
+
+/// Remember `cache_dir` as one magi has leased, for [`inventory`] to find
+/// after the lease itself is gone. Best-effort: a write that fails costs a
+/// future cleanup listing one entry, never the acquire this rides along
+/// with — an operator missing an inventory row is a much smaller problem than
+/// a build that failed to get its cache.
+fn record_catalog(home: &Path, cache_dir: &Path, owner: &Owner) {
+    let path = catalog_path(home, cache_dir);
+    let record = CatalogRecord {
+        cache_dir: cache_dir.display().to_string(),
+        last_owner: owner.clone(),
+        last_used_at: Timestamp::now(),
+    };
+    let Ok(body) = serde_json::to_string_pretty(&record) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &body).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Read whatever JSON is at `path` as a [`CatalogRecord`], or `None` when it
+/// is missing or does not parse — an unreadable catalog entry costs
+/// [`inventory`] one row, not a wrong answer about who owns anything, since
+/// ownership is always decided from the lease file, never the catalog.
+fn read_catalog(path: &Path) -> Option<CatalogRecord> {
+    let body = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
 /// Read whatever JSON is at `path` as a [`LeaseFile`], or `None` when it is
 /// missing or does not parse.
 fn read_lease(path: &Path) -> Option<LeaseFile> {
@@ -327,7 +384,10 @@ fn try_acquire_with<F: Fn(u32) -> bool + Copy>(
     // reports back, not something this function spins on.
     for _ in 0..2 {
         match write_new(&path, cache_dir, owner) {
-            Ok(()) => return Ok(AcquireOutcome::Acquired(Guard::new(path))),
+            Ok(()) => {
+                record_catalog(home, cache_dir, owner);
+                return Ok(AcquireOutcome::Acquired(Guard::new(path)));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
         }
@@ -410,11 +470,21 @@ pub enum EntryStatus {
     Stale(Owner),
     /// Present, but unreadable — never assume safe to reclaim.
     Unknown,
+    /// No live lease right now — the borrower released it cleanly — but the
+    /// catalog remembers this path was leased before, by the owner named
+    /// here. Safe to reclaim: nothing holds it, and nothing has to guess that
+    /// from the lease file's mere absence, which is indistinguishable from a
+    /// path magi never touched (see [`CatalogRecord`]'s doc).
+    Idle(Owner),
 }
 
-/// Every registered lease under `home`, active or not. Free directories
-/// (nothing registered, or already reclaimed) are not entries here — there
-/// is nothing for `a0fc` to reason about in their absence.
+/// Every cache directory magi knows about under `home`, whether or not
+/// anything holds it right now. A lease file reports the current borrower;
+/// once released it is gone (by design — see [`Guard::release`]), so a
+/// directory nobody is borrowing is reported from the catalog instead,
+/// carrying its last known owner rather than nothing at all. There is
+/// nothing here for a directory this process has never leased: `inventory`
+/// answers "what has magi registered", not "what looks like a build cache".
 #[must_use]
 pub fn inventory(home: &Path) -> Vec<Entry> {
     inventory_with(home, proc::pid_alive)
@@ -430,11 +500,12 @@ fn inventory_with<F: Fn(u32) -> bool + Copy>(home: &Path, alive: F) -> Vec<Entry
     let mut out = Vec::new();
     for entry in rd.flatten() {
         let path = entry.path();
-        if path.extension().is_none_or(|e| e != "json")
-            || path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".identity.json"))
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".json")
+            || name.ends_with(".identity.json")
+            || name.ends_with(".catalog.json")
         {
             continue;
         }
@@ -453,6 +524,33 @@ fn inventory_with<F: Fn(u32) -> bool + Copy>(home: &Path, alive: F) -> Vec<Entry
             .unwrap_or_else(|| format!("(unreadable lease file: {})", path.display()));
         out.push(Entry { cache_dir, status });
     }
+
+    // Second pass: a cache directory whose lease was cleanly released is
+    // still registered, in the catalog, as long as its lease file has not
+    // been reacquired since. Skip anything the first pass already reported —
+    // a live or stale lease always outranks a catalog record, which only
+    // ever describes the *last* borrower, not the current one.
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".catalog.json") else {
+                continue;
+            };
+            if dir.join(format!("{stem}.json")).exists() {
+                continue;
+            }
+            if let Some(record) = read_catalog(&path) {
+                out.push(Entry {
+                    cache_dir: record.cache_dir,
+                    status: EntryStatus::Idle(record.last_owner),
+                });
+            }
+        }
+    }
+
     out.sort_by(|a, b| a.cache_dir.cmp(&b.cache_dir));
     out
 }
@@ -858,6 +956,52 @@ mod tests {
                 .contains(&unknown_path.display().to_string()),
             "{unknown:?}"
         );
+    }
+
+    #[test]
+    fn a_released_lease_is_reported_idle_from_the_catalog_not_dropped_entirely() {
+        let home = tempfile::TempDir::new().expect("temp");
+        let cache = home.path().join("cache");
+        let this = std::process::id();
+
+        match try_acquire(home.path(), &cache, &owner(this)).expect("acquire") {
+            AcquireOutcome::Acquired(g) => g.release(),
+            AcquireOutcome::Busy(b) => panic!("unexpectedly busy: {b:?}"),
+        }
+
+        // The lease file is gone - `in_use` reads this path as free - but the
+        // catalog written on acquire must still name it as a cache magi once
+        // leased, exactly the gap the 2026-09-12 recovery evidence found:
+        // an orphaned cache indistinguishable from one that never existed.
+        assert!(!in_use(home.path(), &cache));
+        let entries = inventory_with(home.path(), |pid| pid == this);
+        let entry = entries
+            .iter()
+            .find(|e| e.cache_dir == cache.display().to_string())
+            .unwrap_or_else(|| panic!("no entry for a released cache: {entries:?}"));
+        match &entry.status {
+            EntryStatus::Idle(o) => assert_eq!(o.run, "r1"),
+            other => panic!("expected Idle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reacquiring_a_released_cache_reports_active_not_idle() {
+        let home = tempfile::TempDir::new().expect("temp");
+        let cache = home.path().join("cache");
+        let this = std::process::id();
+        match try_acquire(home.path(), &cache, &owner(this)).expect("acquire") {
+            AcquireOutcome::Acquired(g) => g.release(),
+            AcquireOutcome::Busy(b) => panic!("unexpectedly busy: {b:?}"),
+        }
+        let _held = try_acquire(home.path(), &cache, &owner(this)).expect("reacquire");
+        let entries = inventory_with(home.path(), |pid| pid == this);
+        assert_eq!(
+            entries.len(),
+            1,
+            "the catalog row must not duplicate the live lease: {entries:?}"
+        );
+        assert!(matches!(entries[0].status, EntryStatus::Active(_)));
     }
 
     #[test]

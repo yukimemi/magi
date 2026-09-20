@@ -855,6 +855,41 @@ mod tests {
         );
     }
 
+    /// `[disk] auto_fold = false` must leave the janitor's fold-and-reclaim
+    /// passes completely inert - a due run's worktree and record both
+    /// survive exactly as if `housekeep` had never run at all. Cache pruning
+    /// is a separate opt-out (`cache_limit_bytes`) and stays disabled here
+    /// too, so this test is only ever about `auto_fold`.
+    #[tokio::test]
+    async fn housekeep_leaves_everything_alone_when_auto_fold_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+        crate::run::set_home(dir.path().to_path_buf());
+
+        let due_id = due_run(&runs, "20260801-000000-ffff", SCHEMA);
+        std::fs::create_dir_all(wt.join("orphan").join("cand-A")).unwrap();
+
+        let mut cfg = crate::config::Config::default();
+        cfg.disk.auto_fold = false;
+        cfg.disk.cache_limit_bytes = 0;
+
+        let out = housekeep(&cfg, &home, &wt, &dir.path().join("repo"), Timestamp::now()).await;
+
+        assert_eq!(out.folded, 0);
+        assert_eq!(out.unreadable, 0);
+        assert_eq!(out.orphaned_worktrees, 0);
+        assert!(
+            runs.join(&due_id).exists(),
+            "a due run's record survives untouched"
+        );
+        assert!(
+            wt.join("orphan").exists(),
+            "an orphaned worktree survives untouched: the reclaim pass never ran"
+        );
+    }
+
     #[test]
     fn fold_orphaned_worktrees_removes_only_worktrees_no_run_claims_and_none_in_flight() {
         let dir = tempfile::tempdir().unwrap();
