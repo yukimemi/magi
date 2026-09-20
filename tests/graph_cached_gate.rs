@@ -30,6 +30,12 @@ async fn a_cached_failed_gate_stays_blocked_and_does_not_run_again() {
     // Gate-reentry behaviour does not depend on the panel; a solo candidate
     // skips judging and is cheaper.
     fx.config.graph.candidates = 1;
+    // This test resumes through the real CLI binary below, which now
+    // applies the same free-space gate a fresh `magi run` does. The
+    // assertion here is about cached-gate reentry, not the host machine's
+    // free space, so opt out the same way the daemon's own disk-gate tests
+    // do.
+    fx.config.disk.min_free_bytes = 0;
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await

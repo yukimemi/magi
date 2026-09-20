@@ -221,6 +221,204 @@ pub fn dir_size(path: &Path) -> u64 {
     total
 }
 
+/// [`dir_size`]'s own walk, also tracking the most recent modification time
+/// found on any file - both in the same pass, so a caller that wants both
+/// (see [`crate::clean::classify_neighbor`]) does not pay for walking a
+/// multi-gigabyte build cache twice. Same symlink rule as `dir_size`: a
+/// linked directory counts as the link itself and is never descended into.
+pub fn dir_size_and_newest_mtime(path: &Path) -> (u64, Option<std::time::SystemTime>) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return (0, None);
+    };
+    if meta.is_file() {
+        return (meta.len(), meta.modified().ok());
+    }
+    if !meta.is_dir() {
+        return (0, None);
+    }
+    let mut total = 0u64;
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total += meta.len();
+                if let Ok(modified) = meta.modified()
+                    && newest.is_none_or(|n| modified > n)
+                {
+                    newest = Some(modified);
+                }
+            }
+        }
+    }
+    (total, newest)
+}
+
+/// Does `dir` look like the root of a Cargo build cache — the shape
+/// `CARGO_TARGET_DIR` takes — rather than something else that merely shares a
+/// parent directory with the one magi is configured to use?
+///
+/// Detected by content, never by name. The incident this backs
+/// (`Temp\magi-land6`, `Temp\magi-landtimedout`, `Temp\jtargetB`, ...) got
+/// those names from whatever a seat or an earlier config improvised for its
+/// own `CARGO_TARGET_DIR`; matching a name prefix would miss the very thing
+/// this exists to find, and could just as easily match an operator's own
+/// unrelated entry under the same parent. Cargo writes `CACHEDIR.TAG` at the
+/// target directory's own root — the same marker file the
+/// [Cache Directory Tagging Specification](https://bford.info/cachedir/)
+/// asks every cache-writing tool to leave — the first time anything ever
+/// builds into it, so its presence is the one check.
+pub fn looks_like_cargo_target(dir: &Path) -> bool {
+    dir.join("CACHEDIR.TAG").is_file()
+}
+
+/// Does `dir` hold a sign that a build is still using it right now?
+///
+/// Cargo takes a lock on `<target-dir>/.cargo-lock` for the lifetime of a
+/// build, released the moment the process exits — a live one is the one
+/// signal available here that costs nothing to check and cannot itself be
+/// stale (unlike an mtime, which a build that has been running for an hour
+/// leaves looking old). Its mere *presence* only means a lock was taken at
+/// some point, which is not proof of anything by itself, but between it and
+/// silence the safer read is the one this function gives: never claim a
+/// cache is free of it when the file is sitting right there.
+pub fn has_lock_file(dir: &Path) -> bool {
+    dir.join(".cargo-lock").is_file()
+}
+
+/// A directory found next to the configured build cache that also looks like
+/// one, per [`looks_like_cargo_target`].
+#[derive(Debug, Clone)]
+pub struct NeighborCache {
+    /// The directory itself.
+    pub path: PathBuf,
+    /// Its size, per [`dir_size`].
+    pub bytes: u64,
+    /// The most recent modification time found anywhere inside it, if any
+    /// file could be stat'd at all — see [`dir_size_and_newest_mtime`] for
+    /// why this rides along with `bytes` rather than being its own,
+    /// separate walk.
+    pub newest_mtime: Option<std::time::SystemTime>,
+}
+
+/// How many directory levels under `cache_dir`'s own parent
+/// [`scan_neighbor_caches`] looks into.
+///
+/// `1` alone would cover a flat leftover like `Temp\magi-land6`, but the
+/// incident this module answers also found per-seat scratch targets one
+/// level further down, inside a container that is not itself Cargo-shaped
+/// (`Temp\j26c7\A`, `Temp\j26c7\C` — `j26c7` is just a run id, `A` and `C`
+/// are the actual targets). `2` catches both without opening the door to a
+/// full recursive walk of `Temp`, which is the "delete things by guessing"
+/// this module exists to avoid.
+const NEIGHBOR_SCAN_DEPTH: u32 = 2;
+
+/// List directories that look like Cargo build caches next to `cache_dir`,
+/// other than `cache_dir` itself and anything under `skip`.
+///
+/// [`NEIGHBOR_SCAN_DEPTH`] levels under `cache_dir`'s own parent, never
+/// wider: the leftovers this exists to surface sat near the configured cache
+/// (typically rendered from the same `{{ vars.cache }}` template), and
+/// walking an entire `Temp` tree — or any directory the operator did not
+/// point magi at — is exactly the "delete things under `Temp` by guessing"
+/// this module is built to avoid. `skip` is for the directories this scan
+/// must never enter even if they happened to look like a match: the run
+/// worktree bay and `<home>/runs`, neither of which this function has any
+/// business touching.
+///
+/// A symlink or a junction is never followed and never counted, matching
+/// [`dir_size`]'s own rule: a reparse point next to the cache could target
+/// anywhere on the machine, and a Cargo-shaped directory reached only by
+/// following one is not a directory this scan actually found next to the
+/// cache.
+pub fn scan_neighbor_caches(cache_dir: &Path, skip: &[PathBuf]) -> Vec<NeighborCache> {
+    let Some(parent) = cache_dir.parent() else {
+        return Vec::new();
+    };
+    let cache_canon = canonical_or(cache_dir);
+    let skip_canon: Vec<PathBuf> = skip.iter().map(|p| canonical_or(p)).collect();
+    let mut out = Vec::new();
+    scan_neighbor_level(
+        parent,
+        &cache_canon,
+        &skip_canon,
+        NEIGHBOR_SCAN_DEPTH,
+        &mut out,
+    );
+    out
+}
+
+/// One level of [`scan_neighbor_caches`]'s walk, recursing into anything
+/// that is not itself Cargo-shaped until `depth` runs out. A directory that
+/// *is* Cargo-shaped is reported and never descended into — the target
+/// itself is what this scan looks for, not whatever cargo has written below
+/// it.
+fn scan_neighbor_level(
+    dir: &Path,
+    cache_canon: &Path,
+    skip_canon: &[PathBuf],
+    depth: u32,
+    out: &mut Vec<NeighborCache>,
+) {
+    let Some(next_depth) = depth.checked_sub(1) else {
+        return;
+    };
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        let canon = canonical_or(&path);
+        // Not a bare equality check: `skip` promises "anything under skip",
+        // and an operator's `{{ vars.cache }}` can legally nest the
+        // configured cache (and so this scan's own `parent`) inside the
+        // worktree bay or `<home>/runs` rather than only ever sitting beside
+        // them. `starts_with` catches both directions — a found entry
+        // sitting inside a skip root, and (should `dir` itself already be a
+        // descendant of one) a skip root sitting inside a found entry, which
+        // would otherwise still be walked into by `dir_size` and, worse,
+        // deleted whole by a caller that reclaims it.
+        if canon == *cache_canon
+            || skip_canon
+                .iter()
+                .any(|s| canon.starts_with(s) || s.starts_with(&canon))
+        {
+            continue;
+        }
+        if looks_like_cargo_target(&path) {
+            let (bytes, newest_mtime) = dir_size_and_newest_mtime(&path);
+            out.push(NeighborCache {
+                bytes,
+                newest_mtime,
+                path,
+            });
+        } else {
+            scan_neighbor_level(&path, cache_canon, skip_canon, next_depth, out);
+        }
+    }
+}
+
+/// `path`, canonicalized when possible, falling back to the path as given —
+/// so a comparison against it degrades to a plain (still useful, if less
+/// robust against `..` or symlinks) path comparison rather than failing
+/// outright when the path does not exist or is not readable.
+///
+/// `pub(crate)`: [`crate::clean`]'s neighbor-cache classifier compares a scan
+/// result against paths read back out of run records the same way, and the
+/// two must agree on what "the same directory" means.
+pub(crate) fn canonical_or(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// What a prune removed, for the report.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Prune {
@@ -449,6 +647,155 @@ mod tests {
         // (a command's environment applies once).
         let two = "CARGO_TARGET_DIR=/first and CARGO_TARGET_DIR=/second cargo x";
         assert_eq!(extract_cargo_target_dir(two), Some(PathBuf::from("/first")));
+    }
+
+    #[test]
+    fn a_cargo_target_is_recognized_by_its_tag_file_not_its_name() {
+        let t = tempfile::TempDir::new().expect("temp");
+        assert!(
+            !looks_like_cargo_target(t.path()),
+            "an empty directory is not a build cache just because it exists"
+        );
+        fs::write(t.path().join("CACHEDIR.TAG"), b"Signature: 8a477f...").expect("write");
+        assert!(looks_like_cargo_target(t.path()));
+        assert!(
+            !looks_like_cargo_target(&t.path().join("nope")),
+            "a missing directory is never mistaken for a cache"
+        );
+    }
+
+    #[test]
+    fn a_cargo_lock_file_is_the_only_thing_that_marks_use() {
+        let t = tempfile::TempDir::new().expect("temp");
+        assert!(!has_lock_file(t.path()));
+        fs::write(t.path().join(".cargo-lock"), b"").expect("write");
+        assert!(has_lock_file(t.path()));
+    }
+
+    #[test]
+    fn neighbor_scan_finds_only_cargo_shaped_siblings_outside_the_skip_list() {
+        let t = tempfile::TempDir::new().expect("temp");
+        let cache = t.path().join("magi-target");
+        fs::create_dir_all(&cache).expect("dir");
+        fs::write(cache.join("CACHEDIR.TAG"), b"tag").expect("write");
+
+        // A genuine leftover: cargo-shaped, sitting right beside the
+        // configured cache.
+        let orphan = t.path().join("magi-land6");
+        fs::create_dir_all(&orphan).expect("dir");
+        fs::write(orphan.join("CACHEDIR.TAG"), b"tag").expect("write");
+        fs::write(orphan.join("junk"), vec![0u8; 5]).expect("write");
+
+        // Same parent, but no `CACHEDIR.TAG`: an operator's own unrelated
+        // directory, never a match by name alone.
+        let unrelated = t.path().join("Downloads");
+        fs::create_dir_all(&unrelated).expect("dir");
+
+        // Explicitly excluded even though it is cargo-shaped: the worktree
+        // bay or `<home>/runs` must never be swept by this scan.
+        let excluded = t.path().join("wt");
+        fs::create_dir_all(&excluded).expect("dir");
+        fs::write(excluded.join("CACHEDIR.TAG"), b"tag").expect("write");
+
+        let found = scan_neighbor_caches(&cache, std::slice::from_ref(&excluded));
+        let paths: Vec<&Path> = found.iter().map(|n| n.path.as_path()).collect();
+        assert_eq!(found.len(), 1, "found: {paths:?}");
+        assert_eq!(found[0].path, orphan);
+        assert_eq!(found[0].bytes, 8, "the tag file itself counts too");
+    }
+
+    /// The exact shape the incident behind this module found and a
+    /// one-level scan would miss entirely: `Temp\j26c7` is just a run id, not
+    /// a build cache in its own right, but `Temp\j26c7\A` and `\C` are — a
+    /// seat's own scratch target one level further down than
+    /// `magi-land6`-style flat leftovers sit.
+    #[test]
+    fn neighbor_scan_finds_a_seat_target_nested_one_level_inside_a_run_id_container() {
+        let t = tempfile::TempDir::new().expect("temp");
+        let cache = t.path().join("magi-target");
+        fs::create_dir_all(&cache).expect("dir");
+        fs::write(cache.join("CACHEDIR.TAG"), b"tag").expect("write");
+
+        let container = t.path().join("j26c7");
+        fs::create_dir_all(&container).expect("dir");
+        let seat_a = container.join("A");
+        fs::create_dir_all(&seat_a).expect("dir");
+        fs::write(seat_a.join("CACHEDIR.TAG"), b"tag").expect("write");
+        let seat_c = container.join("C");
+        fs::create_dir_all(&seat_c).expect("dir");
+        fs::write(seat_c.join("CACHEDIR.TAG"), b"tag").expect("write");
+
+        let found = scan_neighbor_caches(&cache, &[]);
+        let mut paths: Vec<&Path> = found.iter().map(|n| n.path.as_path()).collect();
+        paths.sort();
+        assert_eq!(paths, vec![seat_a.as_path(), seat_c.as_path()], "{paths:?}");
+        // The container itself is not cargo-shaped, so it is never reported
+        // as an entry of its own - only what is actually inside it.
+        assert!(!found.iter().any(|n| n.path == container));
+    }
+
+    /// `skip` promises "anything under skip", not merely "exactly skip" — an
+    /// operator's `{{ vars.cache }}` can render `CARGO_TARGET_DIR` to a path
+    /// nested inside `<home>/runs` or the worktree bay rather than only ever
+    /// beside them. Both directions of containment have to be caught: a
+    /// found entry sitting inside a skip root, and a skip root sitting inside
+    /// a found entry.
+    #[test]
+    fn neighbor_scan_excludes_anything_under_skip_not_only_an_exact_match() {
+        let t = tempfile::TempDir::new().expect("temp");
+
+        // Direction one: the scan's own parent is already inside a skip
+        // root, so every entry it lists is too.
+        let runs = t.path().join("runs");
+        let parent = runs.join("subdir");
+        fs::create_dir_all(&parent).expect("dir");
+        let cache = parent.join("magi-target");
+        fs::create_dir_all(&cache).expect("dir");
+        let leftover = parent.join("leftover");
+        fs::create_dir_all(&leftover).expect("dir");
+        fs::write(leftover.join("CACHEDIR.TAG"), b"tag").expect("write");
+
+        let found = scan_neighbor_caches(&cache, std::slice::from_ref(&runs));
+        assert!(
+            found.is_empty(),
+            "an entry inside a skip root must never be reported: {found:?}"
+        );
+
+        // Direction two: a skip root sits inside one of the found entries -
+        // reclaiming that whole entry would take the skip root down with it.
+        let cache2 = t.path().join("magi-target2");
+        fs::create_dir_all(&cache2).expect("dir");
+        let big = t.path().join("big-cache");
+        fs::create_dir_all(&big).expect("dir");
+        fs::write(big.join("CACHEDIR.TAG"), b"tag").expect("write");
+        let nested_runs = big.join("inner-runs");
+        fs::create_dir_all(&nested_runs).expect("dir");
+
+        let found2 = scan_neighbor_caches(&cache2, std::slice::from_ref(&nested_runs));
+        assert!(
+            found2.is_empty(),
+            "an entry that would carry a skip root down with it must never be \
+             reported: {found2:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn neighbor_scan_never_follows_a_symlink_into_a_cargo_shaped_target() {
+        let t = tempfile::TempDir::new().expect("temp");
+        let cache = t.path().join("magi-target");
+        fs::create_dir_all(&cache).expect("dir");
+
+        let real = t.path().join("elsewhere");
+        fs::create_dir_all(&real).expect("dir");
+        fs::write(real.join("CACHEDIR.TAG"), b"tag").expect("write");
+        std::os::unix::fs::symlink(&real, t.path().join("link")).expect("symlink");
+
+        let found = scan_neighbor_caches(&cache, &[]);
+        assert!(
+            found.is_empty(),
+            "a symlink next to the cache is never treated as a cache of its own"
+        );
     }
 
     #[test]

@@ -2231,6 +2231,13 @@ async fn janitor(repo: &Path, opts: &Opts, home: &Path, worktrees_root: &Path) {
             out.questions_abandoned
         );
     }
+    if out.neighbor_cache_removed > 0 {
+        tracing::info!(
+            "housekeep: removed {} neighbor build cache(s) ({} bytes) no readable run still needed",
+            out.neighbor_cache_removed,
+            out.neighbor_cache_freed
+        );
+    }
 }
 
 /// Run [`triage::run_once`] and log whatever it did, the same "only when

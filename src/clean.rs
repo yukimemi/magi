@@ -59,15 +59,28 @@ pub struct Housekeeping {
     /// Open questions abandoned because the run that asked them has already
     /// settled where nothing is coming back to read an answer.
     pub questions_abandoned: usize,
+    /// Neighbor build caches removed - see [`neighbor_cache_inventory`] and
+    /// [`sweep_reclaimable`]. Only ever [`CacheStatus::Reclaimable`] entries;
+    /// `Active` and `Unknown` are never touched by this pass.
+    pub neighbor_cache_removed: usize,
+    /// Bytes freed by the removal above.
+    pub neighbor_cache_freed: u64,
 }
 
 /// Run the janitor: fold due runs, reclaim orphaned worktrees, prune stale
-/// worktree registrations, then prune the cache if it is over its cap.
+/// worktree registrations, sweep reclaimable neighbor build caches, then
+/// prune the configured cache if it is over its cap.
 ///
 /// Every part is best-effort; a jammed cache lock or a run whose worktree
 /// another borrower holds must not stop the rest. Errors are reported through
 /// `tracing::warn` - this is housekeeping, and the daemon keeps serving
 /// either way.
+///
+/// Called only once the caller has confirmed nothing is in flight (see
+/// [`crate::daemon`]'s own idle-only call site), which is also what makes the
+/// neighbor-cache sweep safe to run unattended: a cache a live verify still
+/// has open is `Active`, per [`neighbor_cache_inventory`], and this pass
+/// never removes anything else.
 pub async fn housekeep(
     cfg: &crate::config::Config,
     home: &Path,
@@ -93,6 +106,24 @@ pub async fn housekeep(
         // test) must not turn a `warn` into a reason to skip the rest.
         if let Err(e) = crate::git::worktree_prune(repo).await {
             tracing::warn!("housekeep: prune worktree registrations: {e:#}");
+        }
+        // Same knob as the worktree fold above, not `cache_limit_bytes`: that
+        // one caps a single directory's own size, while this is "does magi
+        // remove things it finds unattended" — the same question `auto_fold`
+        // already answers for a run's worktrees. Only ever `Reclaimable`
+        // entries move; see [`neighbor_cache_inventory`]'s own doc on why
+        // `Active` and `Unknown` never do, automatically or otherwise.
+        let neighbors = neighbor_cache_inventory(cfg, home, worktrees_root, repo, now);
+        for (path, bytes, result) in sweep_reclaimable(&neighbors, false) {
+            match result {
+                Ok(()) => {
+                    out.neighbor_cache_removed += 1;
+                    out.neighbor_cache_freed += bytes;
+                }
+                Err(e) => {
+                    tracing::warn!("housekeep: remove neighbor cache {}: {e:#}", path.display())
+                }
+            }
         }
     }
     match prune_cache_if_over_limit(cfg) {
@@ -576,6 +607,280 @@ pub fn cache_size(cache: &Path) -> u64 {
     dir_size(cache)
 }
 
+/// How confidently a neighbor cache's owner is known.
+///
+/// The same asymmetry the rest of this module is built around governs this
+/// too: wrongly reclaiming a cache a live run still needs costs that run its
+/// build, wrongly leaving a genuinely dead one as `Unknown` costs nothing but
+/// a report the operator reads once and a few GB they clear by hand. Every
+/// classifier that produces this is built to fail toward `Unknown`, never
+/// toward `Reclaimable`, whenever it cannot fully tell.
+///
+/// Ownership here is read-only inference from `<home>/runs`, never a new
+/// ledger of its own — a lease system and live-process visibility for a
+/// resumed child are separate concerns this deliberately leaves alone. A path
+/// this cannot attribute to any run's own record stays `Unknown` until an
+/// operator, or a future ledger, says otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheStatus {
+    /// A run that owns this path is either being worked on right now, or is
+    /// still resumable — parked, mid-review, or otherwise not finished.
+    Active,
+    /// Every run that owns this path is finished, and nothing here suggests
+    /// a build still has it open.
+    Reclaimable,
+    /// No run's record points here, or one does but something about it
+    /// withheld trust (see [`classify_neighbor`]). Never removed
+    /// automatically.
+    Unknown,
+}
+
+/// One build-cache directory found outside the single path magi's own cap
+/// and janitor already track (see [`crate::disk::scan_neighbor_caches`]),
+/// classified against the run records that might own it.
+#[derive(Debug, Clone)]
+pub struct CacheEntry {
+    /// The directory itself.
+    pub path: PathBuf,
+    /// Its size on disk.
+    pub bytes: u64,
+    /// The run id whose rendered verify command names this path, when one was
+    /// found. `None` alongside [`CacheStatus::Unknown`] means no record
+    /// claims it at all; `Some` alongside `Unknown` means a record does, but
+    /// [`classify_neighbor`] would not vouch for it being free.
+    pub owner: Option<String>,
+    /// What [`classify_neighbor`] decided.
+    pub status: CacheStatus,
+    /// Why, in words an operator reads on `magi cache status` or a sweep's
+    /// `--dry-run` preview without having to already know how
+    /// [`classify_neighbor`] works. Every `CacheStatus` variant gets one, not
+    /// only `Unknown` — "why did magi leave this alone" is exactly as much a
+    /// question for an `Active` entry, and a silent line next to `Reclaimable`
+    /// is what a PowerShell recipe already gave the operator.
+    pub reason: String,
+}
+
+/// [`classify_neighbor`]'s answer: who (if anyone) owns the path, what that
+/// makes it, and the sentence a CLI prints next to it.
+#[derive(Debug)]
+struct Classification {
+    owner: Option<String>,
+    status: CacheStatus,
+    reason: String,
+}
+
+/// Decide one neighbor cache's [`CacheStatus`] from the runs that own it.
+///
+/// `owners` is every `(run id, that run's own cache directory, is that run
+/// still active, that run's own `updated_at`)` tuple worth checking, built by
+/// the caller from `<home>/runs` — kept as a pure decision over
+/// already-extracted facts rather than reading the filesystem itself, so the
+/// policy is asserted directly. `path` and every path inside `owners` are
+/// expected already canonicalized by the caller
+/// ([`crate::disk::canonical_or`]), so this never has to guess whether two
+/// different-looking paths name the same directory. More than one run can
+/// legitimately own the same path — the configured cache is shared across a
+/// repository's whole run history — so any one active owner is enough to
+/// withhold the entry, and only when every owner found is finished does
+/// [`has_lock`] get the final say.
+///
+/// A same-repository match is still only a *history* of use, not a lease: a
+/// run finishing does not stop the directory from existing, and nothing
+/// stops an operator, a stray shell, or an entirely different tool from
+/// building into that exact path afterward — outside magi's sight, and with
+/// no `run.json` of its own to ever record it. `newest_mtime` is the one
+/// filesystem fact available short of that lease (task c23d's own charter,
+/// not this module's): if anything inside the directory was modified more
+/// recently than the matched run's own `updated_at`, something wrote there
+/// after magi's own record says the run was done, and that is reason enough
+/// to hold the entry at `Unknown` rather than call it reclaimable on the
+/// strength of a record that predates the most recent activity.
+fn classify_neighbor(
+    path: &Path,
+    owners: &[(String, PathBuf, bool, Timestamp)],
+    has_lock: bool,
+    newest_mtime: Option<Timestamp>,
+) -> Classification {
+    let matches: Vec<&(String, PathBuf, bool, Timestamp)> =
+        owners.iter().filter(|(_, p, _, _)| p == path).collect();
+    if let Some((id, _, _, _)) = matches.iter().find(|(_, _, active, _)| *active) {
+        return Classification {
+            owner: Some(id.clone()),
+            status: CacheStatus::Active,
+            reason: format!("run {id} is still resumable or being worked on"),
+        };
+    }
+    let Some((id, _, _, updated_at)) = matches.first() else {
+        return Classification {
+            owner: None,
+            status: CacheStatus::Unknown,
+            reason: "no run record claims this path".to_owned(),
+        };
+    };
+    if has_lock {
+        return Classification {
+            owner: Some(id.clone()),
+            status: CacheStatus::Unknown,
+            reason: format!(
+                "run {id} is finished, but a `.cargo-lock` file is present — \
+                 a resumed or otherwise still-running build may still hold it"
+            ),
+        };
+    }
+    if newest_mtime.is_some_and(|mtime| mtime > *updated_at) {
+        return Classification {
+            owner: Some(id.clone()),
+            status: CacheStatus::Unknown,
+            reason: format!(
+                "run {id} is finished, but this directory was modified more \
+                 recently than that run's own record — something else may \
+                 have used it since"
+            ),
+        };
+    }
+    Classification {
+        owner: Some(id.clone()),
+        status: CacheStatus::Reclaimable,
+        reason: format!("run {id} is finished and no `.cargo-lock` file is present"),
+    }
+}
+
+/// Build-cache directories outside the single path the cap and the janitor
+/// already track, classified per [`classify_neighbor`].
+///
+/// Scans one level next to the configured cache — see
+/// [`crate::disk::scan_neighbor_caches`] for why not further, and why the
+/// worktree bay and `<home>/runs` are always excluded regardless of what they
+/// look like. Ownership is read back out of every readable run record's own
+/// saved `Config`, the same field [`crate::config::Verify::cache_dir`] reads
+/// off a live one — a run's `run.json` keeps the config it actually ran
+/// with, rendered at the time, so this is exact for whichever cache a given
+/// run actually built into, even one the operator's `magi.toml` has since
+/// moved on from.
+///
+/// `<home>/runs` holds every run this machine has ever driven, for every
+/// repository magi has ever pointed at - not only `repo`'s own. Two
+/// repositories can render `CARGO_TARGET_DIR` from the same `vars.cache`
+/// root, so a path a *different* repository's finished run once used can
+/// otherwise coincide with a neighbor this scan finds next to `repo`'s own
+/// cache — and unlike a same-repo match, there is no reason to believe that
+/// other repository is done with it: it may still be building into it by
+/// hand, entirely outside magi. Only a run whose own saved `repo` matches
+/// this one is trusted to vouch for a path at all; a match against any other
+/// repository's history is worth exactly what an unclaimed path is, which is
+/// `Unknown`.
+///
+/// A run record this cannot read (mid-write, or genuinely corrupt — the same
+/// case [`fold_due`]'s own doc describes) contributes no ownership either
+/// way *if nothing is driving it right now*: there is nothing left to guess
+/// from, and the module's own rule is to keep rather than delete when unsure.
+/// But when a live daemon *is* working on such a run
+/// ([`crate::daemon::is_working_on`], which reads `daemon.json` and needs no
+/// `run.json` at all), its own `CARGO_TARGET_DIR` cannot be read back — the
+/// one piece of information this whole scan otherwise leans on — and this
+/// pass has no way to rule out that it is exactly one of the neighbor caches
+/// found below. Every entry that would otherwise be `Reclaimable` is
+/// downgraded to `Unknown` for the length of this call rather than risk
+/// deleting a build that unreadable run is mid-way through.
+pub fn neighbor_cache_inventory(
+    cfg: &crate::config::Config,
+    home: &Path,
+    worktrees_root: &Path,
+    repo: &Path,
+    now: Timestamp,
+) -> Vec<CacheEntry> {
+    let Some(configured) = cfg.cache_dir() else {
+        return Vec::new();
+    };
+    let repo_canon = crate::disk::canonical_or(repo);
+    let runs = home.join("runs");
+    let mut owners: Vec<(String, PathBuf, bool, Timestamp)> = Vec::new();
+    let mut unreadable_active = false;
+    for entry in std::fs::read_dir(&runs).into_iter().flatten().flatten() {
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if !crate::run::is_run_id(&id) {
+            continue;
+        }
+        let Ok(state) = read_state(&runs, &id) else {
+            if crate::daemon::is_working_on(home, &id, now) {
+                unreadable_active = true;
+            }
+            continue;
+        };
+        if crate::disk::canonical_or(&state.repo) != repo_canon {
+            continue;
+        }
+        let Some(path) = state.config.cache_dir() else {
+            continue;
+        };
+        let active = crate::daemon::is_working_on(home, &id, now) || state.status.resumable();
+        owners.push((
+            id,
+            crate::disk::canonical_or(&path),
+            active,
+            state.updated_at,
+        ));
+    }
+
+    let neighbors =
+        crate::disk::scan_neighbor_caches(&configured, &[worktrees_root.to_path_buf(), runs]);
+    neighbors
+        .into_iter()
+        .map(|n| {
+            let canon = crate::disk::canonical_or(&n.path);
+            let has_lock = crate::disk::has_lock_file(&n.path);
+            // `try_from` fails only outside jiff's representable range
+            // (centuries away); a mtime this cannot convert is not usable
+            // evidence either way, so it is treated the same as no mtime at
+            // all - never itself a reason to withhold `Reclaimable`.
+            let newest_mtime = n.newest_mtime.and_then(|m| Timestamp::try_from(m).ok());
+            let mut c = classify_neighbor(&canon, &owners, has_lock, newest_mtime);
+            if unreadable_active && c.status == CacheStatus::Reclaimable {
+                c.status = CacheStatus::Unknown;
+                c.reason = format!(
+                    "{} — but a run whose own record cannot be read is active \
+                     right now, and this pass cannot rule out that it is \
+                     building into this path",
+                    c.reason
+                );
+            }
+            CacheEntry {
+                path: n.path,
+                bytes: n.bytes,
+                owner: c.owner,
+                status: c.status,
+                reason: c.reason,
+            }
+        })
+        .collect()
+}
+
+/// Delete every [`CacheStatus::Reclaimable`] entry in `entries`; leave
+/// `Active` and `Unknown` alone regardless of what else is true about them.
+///
+/// `dry_run` skips the actual removal but still walks the same list, so a
+/// preview and the real sweep report identically shaped results — what
+/// `magi cache sweep --dry-run` shows is exactly what `magi cache sweep`
+/// would have done. Best-effort per entry: a directory Windows still has a
+/// file open in (see [`crate::disk::has_lock_file`]'s own doc on why that is
+/// not always caught in advance) fails its own `remove_dir_all` without
+/// costing the rest of the sweep its turn.
+pub fn sweep_reclaimable(entries: &[CacheEntry], dry_run: bool) -> Vec<(PathBuf, u64, Result<()>)> {
+    entries
+        .iter()
+        .filter(|e| e.status == CacheStatus::Reclaimable)
+        .map(|e| {
+            let result = if dry_run {
+                Ok(())
+            } else {
+                std::fs::remove_dir_all(&e.path)
+                    .with_context(|| format!("remove {}", e.path.display()))
+            };
+            (e.path.clone(), e.bytes, result)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,6 +1029,516 @@ mod tests {
         assert!(!dir.path().join("big").exists());
     }
 
+    #[test]
+    fn classify_neighbor_prefers_active_over_any_other_owner_of_the_same_path() {
+        let path = PathBuf::from("/cache/orphan");
+        let finished_at = ts("2026-08-01T00:00:00Z");
+        let owners = vec![
+            (
+                "20260801-000000-fini".to_owned(),
+                path.clone(),
+                false,
+                finished_at,
+            ),
+            (
+                "20260801-000000-live".to_owned(),
+                path.clone(),
+                true,
+                finished_at,
+            ),
+        ];
+        let c = classify_neighbor(&path, &owners, false, None);
+        assert_eq!(
+            c.owner,
+            Some("20260801-000000-live".to_owned()),
+            "one active owner is enough to withhold a path several runs share"
+        );
+        assert_eq!(c.status, CacheStatus::Active);
+        assert!(
+            c.reason.contains("20260801-000000-live"),
+            "the reason names the run that is holding it: {}",
+            c.reason
+        );
+    }
+
+    #[test]
+    fn classify_neighbor_is_reclaimable_only_once_finished_and_unlocked() {
+        let path = PathBuf::from("/cache/orphan");
+        let finished_at = ts("2026-08-01T00:00:00Z");
+        let finished = vec![(
+            "20260801-000000-fini".to_owned(),
+            path.clone(),
+            false,
+            finished_at,
+        )];
+
+        let unlocked = classify_neighbor(&path, &finished, false, None);
+        assert_eq!(unlocked.owner, Some("20260801-000000-fini".to_owned()));
+        assert_eq!(unlocked.status, CacheStatus::Reclaimable);
+
+        let locked = classify_neighbor(&path, &finished, true, None);
+        assert_eq!(locked.owner, Some("20260801-000000-fini".to_owned()));
+        assert_eq!(
+            locked.status,
+            CacheStatus::Unknown,
+            "a lock file withholds trust even once every owner is finished"
+        );
+        assert!(
+            locked.reason.contains("cargo-lock"),
+            "the reason says what withheld trust: {}",
+            locked.reason
+        );
+
+        let unowned = classify_neighbor(&path, &[], false, None);
+        assert_eq!(unowned.owner, None);
+        assert_eq!(
+            unowned.status,
+            CacheStatus::Unknown,
+            "no owner at all is unknown, never reclaimable by default"
+        );
+        assert!(unowned.reason.contains("no run record"));
+    }
+
+    /// The gap R2-1-1 found: a finished run's own record is a *history* of
+    /// use, not a lease. Nothing stops the same path from being written to
+    /// again afterward by something magi has no record of at all - an
+    /// operator's own shell, a different tool, anything. A modification
+    /// after the owning run's own `updated_at` is the one filesystem fact
+    /// available to catch that without building the lease task c23d owns.
+    #[test]
+    fn classify_neighbor_withholds_trust_when_the_directory_moved_after_the_run_finished() {
+        let path = PathBuf::from("/cache/orphan");
+        let finished_at = ts("2026-08-01T00:00:00Z");
+        let finished = vec![(
+            "20260801-000000-fini".to_owned(),
+            path.clone(),
+            false,
+            finished_at,
+        )];
+
+        // Untouched since: the run's own record is still the newest thing
+        // known about this path, so it is trusted.
+        let before = ts("2026-07-31T00:00:00Z");
+        let still_reclaimable = classify_neighbor(&path, &finished, false, Some(before));
+        assert_eq!(still_reclaimable.status, CacheStatus::Reclaimable);
+
+        // Touched after the run's own record says it was done: something
+        // else wrote there since, and that must not be waved through as
+        // this run's own leftover.
+        let after = ts("2026-08-02T00:00:00Z");
+        let withheld = classify_neighbor(&path, &finished, false, Some(after));
+        assert_eq!(withheld.owner, Some("20260801-000000-fini".to_owned()));
+        assert_eq!(
+            withheld.status,
+            CacheStatus::Unknown,
+            "modified after the owning run finished must not be reclaimable: {withheld:?}"
+        );
+        assert!(withheld.reason.contains("modified"), "{}", withheld.reason);
+
+        // No mtime evidence at all (unreadable, or genuinely empty): falls
+        // back to trusting the record the same as before this check existed.
+        let no_evidence = classify_neighbor(&path, &finished, false, None);
+        assert_eq!(no_evidence.status, CacheStatus::Reclaimable);
+    }
+
+    #[test]
+    fn neighbor_cache_inventory_attributes_by_reading_each_runs_own_saved_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+        let repo = dir.path().join("repo");
+        let now = ts("2026-09-05T00:00:00Z");
+
+        let mut cfg = crate::config::Config::default();
+        let configured_cache = dir.path().join("magi-target");
+        cfg.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR={} cargo make check",
+            configured_cache.display()
+        )];
+        fs::create_dir_all(&configured_cache).unwrap();
+
+        // A finished run whose own saved config points at a neighbor cache
+        // nothing else claims: reclaimable.
+        let dead_cache = dir.path().join("magi-land6");
+        fs::create_dir_all(&dead_cache).unwrap();
+        fs::write(dead_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
+        write_run_with_cache(
+            &runs,
+            &wt,
+            "20260801-000000-dead",
+            "ready",
+            &dead_cache,
+            &repo,
+        );
+
+        // A run still resumable, pointing at a different neighbor: active,
+        // however old its `updated_at`.
+        let live_cache = dir.path().join("magi-land7");
+        fs::create_dir_all(&live_cache).unwrap();
+        fs::write(live_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
+        write_run_with_cache(
+            &runs,
+            &wt,
+            "20260801-000000-live",
+            "blocked",
+            &live_cache,
+            &repo,
+        );
+
+        // A cargo-shaped neighbor no run record names at all: unknown.
+        let orphan_cache = dir.path().join("magi-land9");
+        fs::create_dir_all(&orphan_cache).unwrap();
+        fs::write(orphan_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
+
+        let mut entries = neighbor_cache_inventory(&cfg, &home, &wt, &repo, now);
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let by_path: std::collections::BTreeMap<_, _> =
+            entries.iter().map(|e| (e.path.clone(), e)).collect();
+
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert_eq!(by_path[&dead_cache].status, CacheStatus::Reclaimable);
+        assert_eq!(
+            by_path[&dead_cache].owner.as_deref(),
+            Some("20260801-000000-dead")
+        );
+        assert!(by_path[&dead_cache].reason.contains("20260801-000000-dead"));
+        assert_eq!(by_path[&live_cache].status, CacheStatus::Active);
+        assert_eq!(by_path[&orphan_cache].status, CacheStatus::Unknown);
+        assert_eq!(by_path[&orphan_cache].owner, None);
+        assert!(
+            by_path[&orphan_cache].reason.contains("no run record"),
+            "an entry with a plain english reason, not just a status word: {}",
+            by_path[&orphan_cache].reason
+        );
+    }
+
+    /// `<home>/runs` is shared by every repository magi has ever driven, not
+    /// only the one being scanned. Two repositories can render
+    /// `CARGO_TARGET_DIR` off the same `vars.cache` root and so end up with
+    /// numerically identical historical cache paths purely by coincidence -
+    /// a finished run's own saved path is only proof of anything for the
+    /// repository that actually ran it, never for an unrelated one that
+    /// happens to be scanning the same neighborhood.
+    #[test]
+    fn a_finished_runs_history_from_a_different_repo_does_not_make_a_path_reclaimable() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+        let this_repo = dir.path().join("this-repo");
+        let other_repo = dir.path().join("other-repo");
+        let now = ts("2026-09-05T00:00:00Z");
+
+        let mut cfg = crate::config::Config::default();
+        let configured_cache = dir.path().join("magi-target");
+        cfg.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR={} cargo make check",
+            configured_cache.display()
+        )];
+        fs::create_dir_all(&configured_cache).unwrap();
+
+        // Finished, readable, and pointing straight at the shared neighbor
+        // cache — but it is a different repository's run, so it must not be
+        // enough to call the cache reclaimable when scanning `this_repo`.
+        let shared_cache = dir.path().join("magi-land6");
+        fs::create_dir_all(&shared_cache).unwrap();
+        fs::write(shared_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
+        write_run_with_cache(
+            &runs,
+            &wt,
+            "20260801-000000-fini",
+            "ready",
+            &shared_cache,
+            &other_repo,
+        );
+
+        let entries = neighbor_cache_inventory(&cfg, &home, &wt, &this_repo, now);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0].status,
+            CacheStatus::Unknown,
+            "a different repository's finished run must not vouch for a \
+             path in this repository's scan: {:?}",
+            entries[0]
+        );
+        assert_eq!(
+            entries[0].owner, None,
+            "the other repository's run does not count as an owner here"
+        );
+    }
+
+    /// The gap R2-1-1 found: a finished, readable run `F` and an in-flight
+    /// run `U` can point at the very same neighbor cache — that is the whole
+    /// premise of `owners` allowing more than one match per path — and if
+    /// `U`'s own `run.json` happens to be unreadable (mid-write, or
+    /// genuinely corrupt) at the moment of the scan, the old code silently
+    /// dropped `U` from `owners` entirely and classified the cache as
+    /// `Reclaimable` from `F` alone. `U` being unreadable says nothing about
+    /// whether it is still building into that exact cache; only
+    /// `is_working_on` - which reads `daemon.json`, not `run.json` - can say
+    /// `U` is alive at all, and that has to be enough to withhold judgment.
+    #[test]
+    fn an_unreadable_but_active_run_withholds_reclaimable_even_when_another_run_finished_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+        let repo = dir.path().join("repo");
+        let now = ts("2026-09-05T00:00:00Z");
+
+        let mut cfg = crate::config::Config::default();
+        let configured_cache = dir.path().join("magi-target");
+        cfg.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR={} cargo make check",
+            configured_cache.display()
+        )];
+        fs::create_dir_all(&configured_cache).unwrap();
+
+        // `F`: finished, readable, and points straight at the shared
+        // neighbor cache. On its own this would make the cache reclaimable.
+        let shared_cache = dir.path().join("magi-land6");
+        fs::create_dir_all(&shared_cache).unwrap();
+        fs::write(shared_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
+        write_run_with_cache(
+            &runs,
+            &wt,
+            "20260801-000000-fini",
+            "ready",
+            &shared_cache,
+            &repo,
+        );
+
+        // `U`: a run directory a live daemon is actively driving right now,
+        // but whose `run.json` cannot be parsed at all - the exact
+        // mid-write/corrupt case `fold_due`'s own doc describes, not merely
+        // a schema this build disagrees with.
+        let unreadable_id = "20260905-000000-user";
+        std::fs::create_dir_all(runs.join(unreadable_id)).unwrap();
+        std::fs::write(runs.join(unreadable_id).join("run.json"), "not json at all").unwrap();
+        let mut status = crate::daemon::Status::new();
+        status.current = vec![crate::daemon::Current {
+            task: "20260905-000000-task".to_owned(),
+            run: unreadable_id.to_owned(),
+        }];
+        status.updated_at = now;
+        crate::daemon::write_status_to(&home.join("daemon.json"), &status).unwrap();
+
+        let entries = neighbor_cache_inventory(&cfg, &home, &wt, &repo, now);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0].status,
+            CacheStatus::Unknown,
+            "an unreadable-but-active run must withhold Reclaimable even \
+             though a different, readable run already finished with this \
+             cache: {:?}",
+            entries[0]
+        );
+        assert!(
+            entries[0].reason.contains("cannot be read"),
+            "{}",
+            entries[0].reason
+        );
+    }
+
+    /// A run this build cannot read but that *no* live daemon is working on
+    /// is the ordinary "dead leftover" case every other function in this
+    /// module already leaves alone (see `fold_due`'s own unreadable count) -
+    /// it must not, on its own, block reclaiming an unrelated cache another
+    /// run genuinely finished with.
+    #[test]
+    fn an_unreadable_but_idle_run_does_not_withhold_reclaimable() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+        let repo = dir.path().join("repo");
+        let now = ts("2026-09-05T00:00:00Z");
+
+        let mut cfg = crate::config::Config::default();
+        let configured_cache = dir.path().join("magi-target");
+        cfg.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR={} cargo make check",
+            configured_cache.display()
+        )];
+        fs::create_dir_all(&configured_cache).unwrap();
+
+        let shared_cache = dir.path().join("magi-land6");
+        fs::create_dir_all(&shared_cache).unwrap();
+        fs::write(shared_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
+        write_run_with_cache(
+            &runs,
+            &wt,
+            "20260801-000000-fini",
+            "ready",
+            &shared_cache,
+            &repo,
+        );
+
+        let unreadable_id = "20260905-000000-dead";
+        std::fs::create_dir_all(runs.join(unreadable_id)).unwrap();
+        std::fs::write(runs.join(unreadable_id).join("run.json"), "not json at all").unwrap();
+        // No `daemon.json` at all: nothing claims to be working on it.
+
+        let entries = neighbor_cache_inventory(&cfg, &home, &wt, &repo, now);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0].status,
+            CacheStatus::Reclaimable,
+            "an unreadable run nobody is working on must not, by itself, \
+             block an unrelated cache from being reclaimed: {:?}",
+            entries[0]
+        );
+    }
+
+    /// Write a minimal run whose saved `Config` renders `CARGO_TARGET_DIR` to
+    /// `cache`, so [`neighbor_cache_inventory`] can read it back exactly the
+    /// way it would a real run's own recorded config. `repo` is the run's
+    /// own saved repository — [`neighbor_cache_inventory`] only trusts a
+    /// run to vouch for a path when this matches the repo it is scanning
+    /// for, so a test asserting cross-repo behavior needs to control it.
+    fn write_run_with_cache(
+        runs: &Path,
+        wt: &Path,
+        id: &str,
+        status: &str,
+        cache: &Path,
+        repo: &Path,
+    ) {
+        let mut config = crate::config::Config::default();
+        config.graph.worktree_root = Some(wt.to_path_buf());
+        config.verify.gate = vec![format!("CARGO_TARGET_DIR={} cargo test", cache.display())];
+        let mut state = RunState::new(
+            repo.to_path_buf(),
+            "main".to_owned(),
+            "deadbeef".to_owned(),
+            String::new(),
+            config,
+        );
+        state.id = id.to_owned();
+        std::fs::create_dir_all(runs.join(id)).unwrap();
+        let mut value = serde_json::to_value(&state).unwrap();
+        value["status"] = serde_json::json!(status);
+        // Real wall-clock "now", not a fixed fictional date: every caller
+        // creates `cache`'s files moments before calling this, and
+        // `classify_neighbor`'s own mtime check (R2-1-1) would otherwise see
+        // this run as finished *before* the real filesystem timestamps on
+        // its own cache directory - failing the very fixture meant to
+        // describe it as reclaimable.
+        value["updated_at"] = serde_json::json!(Timestamp::now().to_string());
+        std::fs::write(
+            runs.join(id).join("run.json"),
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sweep_reclaimable_deletes_only_reclaimable_entries_and_a_dry_run_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("active");
+        let reclaimable = dir.path().join("reclaimable");
+        let unknown = dir.path().join("unknown");
+        for d in [&active, &reclaimable, &unknown] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let entries = vec![
+            CacheEntry {
+                path: active.clone(),
+                bytes: 1,
+                owner: Some("a".to_owned()),
+                status: CacheStatus::Active,
+                reason: "run a is still resumable or being worked on".to_owned(),
+            },
+            CacheEntry {
+                path: reclaimable.clone(),
+                bytes: 2,
+                owner: Some("b".to_owned()),
+                status: CacheStatus::Reclaimable,
+                reason: "run b is finished and no `.cargo-lock` file is present".to_owned(),
+            },
+            CacheEntry {
+                path: unknown.clone(),
+                bytes: 3,
+                owner: None,
+                status: CacheStatus::Unknown,
+                reason: "no run record claims this path".to_owned(),
+            },
+        ];
+
+        let preview = sweep_reclaimable(&entries, true);
+        assert_eq!(
+            preview.len(),
+            1,
+            "only the reclaimable entry is even a candidate"
+        );
+        assert!(reclaimable.exists(), "a dry run never removes anything");
+
+        let done = sweep_reclaimable(&entries, false);
+        assert_eq!(done.len(), 1);
+        assert!(done[0].2.is_ok());
+        assert!(
+            !reclaimable.exists(),
+            "the reclaimable entry is actually gone"
+        );
+        assert!(active.exists(), "active is never touched by this sweep");
+        assert!(unknown.exists(), "unknown is never touched by this sweep");
+    }
+
+    #[tokio::test]
+    async fn housekeep_sweeps_a_reclaimable_neighbor_cache_only_when_auto_fold_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&runs).unwrap();
+        init_repo(&repo);
+
+        let mut cfg = crate::config::Config::default();
+        let configured = dir.path().join("magi-target");
+        std::fs::create_dir_all(&configured).unwrap();
+        cfg.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR={} cargo make check",
+            configured.display()
+        )];
+        // Opting out of the size cap and the disk gate keeps this test about
+        // the neighbor sweep alone, not the other two policies `housekeep`
+        // also runs.
+        cfg.disk.cache_limit_bytes = 0;
+
+        let dead_cache = dir.path().join("magi-land6");
+        std::fs::create_dir_all(&dead_cache).unwrap();
+        std::fs::write(dead_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
+        write_run_with_cache(
+            &runs,
+            &wt,
+            "20260801-000000-dead",
+            "ready",
+            &dead_cache,
+            &repo,
+        );
+
+        // `auto_fold = false` is the operator's opt-out for every unattended
+        // removal this pass makes, worktrees and neighbor caches alike - it
+        // must leave this exactly as it found it.
+        cfg.disk.auto_fold = false;
+        let out = housekeep(&cfg, &home, &wt, &repo, Timestamp::now()).await;
+        assert_eq!(out.neighbor_cache_removed, 0);
+        assert!(dead_cache.exists(), "auto_fold = false touches nothing");
+
+        cfg.disk.auto_fold = true;
+        let out = housekeep(&cfg, &home, &wt, &repo, Timestamp::now()).await;
+        assert_eq!(out.neighbor_cache_removed, 1);
+        assert!(out.neighbor_cache_freed > 0);
+        assert!(
+            !dead_cache.exists(),
+            "a reclaimable neighbor cache is swept at the same run boundary \
+             the worktree fold already runs at"
+        );
+    }
+
     /// Pin a file's mtime, so a test asserts the policy and not the runner's
     /// timestamp granularity.
     fn touch(path: &Path, secs: u64) {
@@ -835,6 +1650,190 @@ mod tests {
             runs.join(&due_old_schema).exists(),
             "an old-schema record survives its fold exactly like a current one"
         );
+    }
+
+    /// A run parked mid-graph is neither `resumable() == false` nor `done()`
+    /// — its `status` is whatever non-terminal node it stopped at (see
+    /// `graph::Runner::park_here`) — so it already takes the same
+    /// `resumable()` exit `fold_due` gives any other in-progress run. This
+    /// pins that down explicitly for `parked`, rather than leaving it as an
+    /// inference from the ordinary "runnable" case.
+    #[test]
+    fn fold_due_leaves_a_parked_runs_worktree_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+        let disk = Disk::default();
+        let now = ts("2026-09-05T00:00:00Z");
+
+        let parked = "20260801-000000-park";
+        // Well past the default grace period, so only the park keeps it —
+        // the same shape the operator hits when an interrupt task parks a
+        // long-running competition overnight.
+        write_meta(&runs, parked, "implementing", "2026-08-01T00:00:00Z");
+        std::fs::create_dir_all(wt.join("park")).unwrap();
+
+        let (folded, unreadable) =
+            block_on(fold_due(&runs, &home, &wt, &disk, now)).expect("fold_due");
+        assert_eq!(folded, 0, "a parked run is never due, however old");
+        assert_eq!(unreadable, 0);
+        assert!(runs.join(parked).exists(), "parked run record kept");
+    }
+
+    /// `Blocked` and `Stalled` are `resumable()`, so they never even reach
+    /// this far — `fold_due` stops at the freshness check for them
+    /// regardless of age (see the "runnable" case in
+    /// `fold_due_folds_terminal_runs_of_any_schema_but_leaves_genuinely_unreadable_ones`).
+    /// `Ready` is the terminal status that actually exercises the winner-vs-
+    /// loser split unattended: `MergeMode::None` (or a pull request closed by
+    /// hand) leaves a run `Ready` with nobody having merged its winner, and
+    /// `fold_due` still folds it once its grace elapses — `drop_winner` is
+    /// only ever true for `Merged`. This is the line `magi fold`'s own
+    /// `--all` flag draws, asserted for the *unattended* path: a winner
+    /// nobody merged is the operator's own answer to look at, not junk the
+    /// janitor may sweep on its own, while the loser and a `Merged` run's
+    /// winner are both compiles of history either way.
+    #[tokio::test]
+    async fn fold_due_keeps_an_unmerged_winner_but_drops_a_merged_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+        let disk = Disk::default();
+        let now = ts("2026-09-05T00:00:00Z");
+
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let ready_id = "20260801-000000-rdy1";
+        let ready_root =
+            write_run_with_candidates(&runs, &wt, &repo, ready_id, RunStatus::Ready).await;
+        let merged_id = "20260801-000000-mrgd";
+        let merged_root =
+            write_run_with_candidates(&runs, &wt, &repo, merged_id, RunStatus::Merged).await;
+
+        let (folded, unreadable) = fold_due(&runs, &home, &wt, &disk, now)
+            .await
+            .expect("fold_due");
+        assert_eq!(folded, 2);
+        assert_eq!(unreadable, 0);
+
+        assert!(
+            ready_root.join("cand-A").exists(),
+            "a ready run finished without merging — its winner is the \
+             operator's own answer to look at, not junk to sweep"
+        );
+        assert!(
+            !ready_root.join("cand-B").exists(),
+            "the loser never had a reason to survive, merged or not"
+        );
+        assert!(
+            !merged_root.join("cand-A").exists(),
+            "once merged, the winner's worktree is a compile of history, \
+             exactly like the loser's"
+        );
+    }
+
+    /// Write a run with two real candidate worktrees (`A` wins, `B` loses)
+    /// under `wt`, well past the default fold grace, and return the run's own
+    /// worktree root.
+    async fn write_run_with_candidates(
+        runs: &Path,
+        wt: &Path,
+        repo: &Path,
+        id: &str,
+        status: RunStatus,
+    ) -> PathBuf {
+        let short = crate::run::short_of(id).to_owned();
+        let mut config = crate::config::Config::default();
+        config.graph.worktree_root = Some(wt.to_path_buf());
+        let mut state = RunState::new(
+            repo.to_path_buf(),
+            "main".to_owned(),
+            "deadbeef".to_owned(),
+            String::new(),
+            config,
+        );
+        state.id = id.to_owned();
+        state.status = status;
+
+        let root = wt.join(&short);
+        for label in ['A', 'B'] {
+            let branch = format!("magi/{short}/{label}");
+            let path = root.join(format!("cand-{label}"));
+            crate::git::worktree_add_branch(repo, &path, &branch, "main")
+                .await
+                .expect("add worktree");
+            state.candidates.push(crate::run::Candidate {
+                index: usize::from(label == 'B'),
+                label,
+                agent: "alpha".to_owned(),
+                branch,
+                worktree: path,
+                summary: String::new(),
+                stat: String::new(),
+                files: 0,
+                commits: 0,
+                empty: false,
+                failed: None,
+                duration_ms: 0,
+                folded: false,
+            });
+        }
+        state.tally = Some(crate::run::Tally {
+            first_choice: std::collections::BTreeMap::from([('A', 1)]),
+            borda: std::collections::BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            met_quorum: true,
+            quorum: 0,
+            uncontested: None,
+        });
+
+        std::fs::create_dir_all(runs.join(id)).unwrap();
+        let mut value = serde_json::to_value(&state).unwrap();
+        value["updated_at"] = serde_json::json!("2026-08-01T00:00:00Z");
+        std::fs::write(
+            runs.join(id).join("run.json"),
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        root
+    }
+
+    /// A throwaway repo with one commit on `main`, so `git worktree add`
+    /// (and, if it runs at all, `git branch -d`) have something real to work
+    /// against.
+    fn init_repo(dir: &Path) {
+        use crate::proc::Quiet as _;
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .quiet()
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.name", "magi test"]);
+        run(&["config", "user.email", "magi@example.com"]);
+        std::fs::write(dir.join("README.md"), "# fixture\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "init"]);
     }
 
     #[test]

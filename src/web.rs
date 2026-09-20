@@ -96,7 +96,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 use anyhow::{Context, Result};
@@ -320,6 +320,10 @@ pub struct Ui {
     /// requests so polling `GET /api/repos` repeatedly does not repeat the
     /// filesystem walk every time - see [`repos::Cache`].
     repos_cache: repos::Cache,
+    /// The last neighbor-cache inventory scan behind `disk.unknown_cache_bytes`,
+    /// and when it happened - the same reasoning as `repos_cache`, for the
+    /// same reason: see [`DiskCache`].
+    disk_cache: DiskCache,
     /// Merge mode override handed to the loop this process starts.
     merge: Option<String>,
     /// The loop this process is running, if it is running one.
@@ -362,6 +366,7 @@ impl Ui {
             talk_turns: Arc::default(),
             resuming: Arc::default(),
             repos_cache: repos::Cache::new(),
+            disk_cache: DiskCache::default(),
             merge: None,
             looping: Arc::default(),
             launch: launch_daemon,
@@ -1576,21 +1581,109 @@ struct DiskView {
     /// The shared build cache's size, when the config names one.
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_bytes: Option<u64>,
+    /// Bytes sitting in build-cache-shaped directories next to the
+    /// configured cache that no run record can vouch for as finished and
+    /// unclaimed — see [`crate::clean::CacheStatus::Unknown`].
+    ///
+    /// This is the figure the incident this whole module backs actually
+    /// needs on a phone: `cache_bytes` is what the cap and the janitor
+    /// already keep in check, but a leftover from a renamed
+    /// `CARGO_TARGET_DIR` or an old config revision sits entirely outside
+    /// that one path and would otherwise only ever be found by an operator
+    /// running a PowerShell recipe by hand, which is the exact failure mode
+    /// this exists to end. `0` when the count is known to be zero, not when
+    /// it could not be measured - there is nothing here worth telling apart
+    /// from "no such directories exist".
+    unknown_cache_bytes: u64,
 }
 
 impl DiskView {
-    /// Measure the three directories and re-read the config's cache.
+    /// Measure the three directories, re-read the config's cache, and
+    /// inventory anything build-cache-shaped sitting unaccounted for beside
+    /// it.
     fn of(ui: &Ui) -> Self {
-        let cache_bytes = Config::discover(&ui.repo, None)
-            .ok()
-            .and_then(|(cfg, _)| cfg.cache_dir())
+        let cfg = Config::discover(&ui.repo, None).ok().map(|(cfg, _)| cfg);
+        let cache_bytes = cfg
+            .as_ref()
+            .and_then(|cfg| cfg.cache_dir())
             .map(|dir| crate::disk::dir_size(&dir));
+        let unknown_cache_bytes = cfg
+            .as_ref()
+            .map(|cfg| {
+                ui.disk_cache
+                    .unknown_bytes(cfg, &ui.home, &ui.worktrees_root, &ui.repo)
+            })
+            .unwrap_or(0);
         Self {
             free_bytes: crate::disk::free_bytes(&ui.runs).ok(),
             runs_bytes: crate::disk::dir_size(&ui.runs),
             worktrees_bytes: crate::disk::dir_size(&ui.worktrees_root),
             cache_bytes,
+            unknown_cache_bytes,
         }
+    }
+}
+
+/// In-process cache of the last neighbor-cache inventory scan behind
+/// `unknown_cache_bytes`.
+///
+/// Mirrors [`crate::repos::Cache`]'s own pattern, for the same reason:
+/// `/api/health` is polled continuously for as long as a phone tab stays
+/// open (`assets/ui/app.js`'s own poll loop), and this is by far the most
+/// expensive figure that route computes -
+/// [`crate::clean::neighbor_cache_inventory`] parses every readable run
+/// record's own saved config and walks every build-cache-shaped directory it
+/// finds next to the configured cache file by file, `Active` and `Unknown`
+/// entries alike, not only the `Unknown` bytes this actually keeps.
+/// Recomputing that on every ten-second poll would turn a phone tab left
+/// open into a standing tax on the very disk I/O this feature exists to
+/// protect - including a cache a live verify build still has open.
+#[derive(Debug, Clone, Default)]
+struct DiskCache {
+    state: Arc<Mutex<DiskCacheState>>,
+}
+
+#[derive(Debug, Default)]
+struct DiskCacheState {
+    unknown_cache_bytes: u64,
+    scanned_at: Option<Instant>,
+}
+
+/// How long [`DiskCache`] trusts its last scan before rescanning. Long
+/// enough to matter against a ten-second poll, short enough that a sweep or
+/// a run finishing changes what the phone sees within a couple of polls
+/// rather than requiring the process to restart.
+const DISK_CACHE_TTL: Duration = Duration::from_secs(60);
+
+impl DiskCache {
+    /// The last scan's `unknown_cache_bytes`, rescanning first when the
+    /// cache has never been filled or [`DISK_CACHE_TTL`] has elapsed.
+    fn unknown_bytes(
+        &self,
+        cfg: &Config,
+        home: &std::path::Path,
+        worktrees_root: &std::path::Path,
+        repo: &std::path::Path,
+    ) -> u64 {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let stale = state
+            .scanned_at
+            .is_none_or(|at| at.elapsed() >= DISK_CACHE_TTL);
+        if stale {
+            state.unknown_cache_bytes = crate::clean::neighbor_cache_inventory(
+                cfg,
+                home,
+                worktrees_root,
+                repo,
+                Timestamp::now(),
+            )
+            .into_iter()
+            .filter(|e| e.status == crate::clean::CacheStatus::Unknown)
+            .map(|e| e.bytes)
+            .sum();
+            state.scanned_at = Some(Instant::now());
+        }
+        state.unknown_cache_bytes
     }
 }
 
@@ -6724,6 +6817,78 @@ mod tests {
         // directory full of older-schema runs looks like.
         let health = f.get("/api/health").await;
         assert_eq!(health.json()["runs_unreadable"], 1);
+    }
+
+    /// The figure the incident behind [`crate::clean::neighbor_cache_inventory`]
+    /// exists for: a build-cache-shaped directory sitting next to the
+    /// configured one, that no run record on this machine can vouch for. It
+    /// must reach the phone as `disk.unknown_cache_bytes`, not just a CLI a
+    /// human has to remember to run.
+    #[tokio::test]
+    async fn health_surfaces_an_unclaimed_neighbor_cache_as_unknown_bytes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let configured = tmp.path().join("magi-target");
+        std::fs::create_dir_all(&configured).expect("configured cache dir");
+        let gate = format!("CARGO_TARGET_DIR={} cargo test", configured.display());
+        std::fs::write(
+            repo.join("magi.toml"),
+            format!("[verify]\ngate = [{gate:?}]\n"),
+        )
+        .expect("write magi.toml");
+
+        // Cargo-shaped, right beside the configured cache, and no run record
+        // anywhere claims it — exactly the `Temp\magi-land6` leftover the
+        // task behind this route was written for.
+        let orphan = tmp.path().join("magi-land6");
+        std::fs::create_dir_all(&orphan).expect("orphan cache dir");
+        let tag = b"Signature: 8a477f...";
+        std::fs::write(orphan.join("CACHEDIR.TAG"), tag).expect("write tag file");
+        std::fs::write(orphan.join("junk"), vec![0u8; 1024]).expect("write junk");
+
+        let f = Fixture::with_repo(repo).await;
+        let health = f.get("/api/health").await;
+        assert_eq!(health.status, 200, "{}", health.body);
+        assert_eq!(
+            health.json()["disk"]["unknown_cache_bytes"],
+            1024 + tag.len() as u64
+        );
+    }
+
+    /// [`crate::clean::neighbor_cache_inventory`] parses every run record and
+    /// walks every neighbor cache byte by byte - too expensive to repeat on
+    /// every one of `app.js`'s ten-second polls. A second poll immediately
+    /// after the first must reuse that scan rather than redo it: a cache
+    /// created in between must not appear until the cache's own TTL expires.
+    #[tokio::test]
+    async fn a_second_poll_within_the_ttl_does_not_rescan_for_a_newly_created_cache() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let configured = tmp.path().join("magi-target");
+        std::fs::create_dir_all(&configured).expect("configured cache dir");
+        let gate = format!("CARGO_TARGET_DIR={} cargo test", configured.display());
+        std::fs::write(
+            repo.join("magi.toml"),
+            format!("[verify]\ngate = [{gate:?}]\n"),
+        )
+        .expect("write magi.toml");
+
+        let f = Fixture::with_repo(repo).await;
+        let first = f.get("/api/health").await;
+        assert_eq!(first.json()["disk"]["unknown_cache_bytes"], 0);
+
+        let orphan = tmp.path().join("magi-land6");
+        std::fs::create_dir_all(&orphan).expect("orphan cache dir");
+        std::fs::write(orphan.join("CACHEDIR.TAG"), b"tag").expect("write tag file");
+
+        let second = f.get("/api/health").await;
+        assert_eq!(
+            second.json()["disk"]["unknown_cache_bytes"],
+            0,
+            "a poll inside the cache's TTL must not have rescanned"
+        );
     }
 
     #[tokio::test]
