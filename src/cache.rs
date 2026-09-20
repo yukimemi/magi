@@ -145,6 +145,7 @@ impl Busy {
 /// A held lease. Releases on drop, so a panicking or early-returning caller
 /// never leaves the cache permanently marked busy — the same guarantee
 /// [`crate::queue::Claim`] gives the task queue's own lock file.
+#[derive(Debug)]
 pub struct Guard {
     path: PathBuf,
     released: bool,
@@ -246,6 +247,18 @@ fn peek_cache_dir(path: &Path) -> Option<String> {
 
 /// Classify the lease at `path`, using the real process-liveness query.
 fn classify(path: &Path) -> Status {
+    classify_with(path, proc::pid_alive)
+}
+
+/// [`classify`] with its process-liveness query supplied by the caller —
+/// mirrors [`crate::daemon::sweep_stale_claims_with`], which exists for the
+/// identical reason: a real "confirmed dead" pid cannot be produced portably
+/// from a test (an out-of-range value reads as *unavailable*, not dead, to
+/// `tasklist`/`kill -0`, and the conservative policy those already apply -
+/// correctly - treats an unavailable query as alive). Production code always
+/// goes through [`classify`]; this is what a test calls directly to assert
+/// the classification logic against an injected answer instead.
+fn classify_with<F: Fn(u32) -> bool>(path: &Path, alive: F) -> Status {
     if !path.exists() {
         return Status::Free;
     }
@@ -253,7 +266,7 @@ fn classify(path: &Path) -> Status {
         return Status::Unknown;
     };
     let this_process = std::process::id();
-    if lease.owner.pid == this_process || proc::pid_alive(lease.owner.pid) {
+    if lease.owner.pid == this_process || alive(lease.owner.pid) {
         Status::Active(lease.owner)
     } else {
         Status::Stale(lease.owner)
@@ -282,7 +295,9 @@ fn write_new(path: &Path, cache_dir: &Path, owner: &Owner) -> std::io::Result<()
 
 /// What [`try_acquire`] returned.
 pub enum AcquireOutcome {
+    /// The lease is now held by the caller.
     Acquired(Guard),
+    /// Somebody else has it, or its state could not be trusted.
     Busy(Busy),
 }
 
@@ -290,6 +305,17 @@ pub enum AcquireOutcome {
 /// stale one first. One attempt — a caller that wants to wait uses
 /// [`wait_for`], which is this in a loop bounded by a budget.
 pub fn try_acquire(home: &Path, cache_dir: &Path, owner: &Owner) -> Result<AcquireOutcome> {
+    try_acquire_with(home, cache_dir, owner, proc::pid_alive)
+}
+
+/// [`try_acquire`] with its process-liveness query supplied by the caller —
+/// see [`classify_with`] for why this split exists.
+fn try_acquire_with<F: Fn(u32) -> bool + Copy>(
+    home: &Path,
+    cache_dir: &Path,
+    owner: &Owner,
+    alive: F,
+) -> Result<AcquireOutcome> {
     let dir = leases_dir(home);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(format!("{}.json", slug(cache_dir)));
@@ -305,7 +331,7 @@ pub fn try_acquire(home: &Path, cache_dir: &Path, owner: &Owner) -> Result<Acqui
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
         }
-        match classify(&path) {
+        match classify_with(&path, alive) {
             Status::Free => {} // reclaimed between the write and the read; loop once more
             Status::Stale(_) => {
                 let _ = std::fs::remove_file(&path);
@@ -369,10 +395,13 @@ pub async fn wait_for(
 /// safely act on".
 #[derive(Debug, Clone)]
 pub struct Entry {
+    /// The literal cache path this entry describes.
     pub cache_dir: String,
+    /// What [`classify`] made of the lease registered against it.
     pub status: EntryStatus,
 }
 
+/// [`Entry::status`]'s possible values.
 #[derive(Debug, Clone)]
 pub enum EntryStatus {
     /// Held by a confirmed-live owner.
@@ -388,6 +417,12 @@ pub enum EntryStatus {
 /// is nothing for `a0fc` to reason about in their absence.
 #[must_use]
 pub fn inventory(home: &Path) -> Vec<Entry> {
+    inventory_with(home, proc::pid_alive)
+}
+
+/// [`inventory`] with its process-liveness query supplied by the caller —
+/// see [`classify_with`] for why this split exists.
+fn inventory_with<F: Fn(u32) -> bool + Copy>(home: &Path, alive: F) -> Vec<Entry> {
     let dir = leases_dir(home);
     let Ok(rd) = std::fs::read_dir(&dir) else {
         return Vec::new();
@@ -403,13 +438,19 @@ pub fn inventory(home: &Path) -> Vec<Entry> {
         {
             continue;
         }
-        let status = match classify(&path) {
+        let status = match classify_with(&path, alive) {
             Status::Free => continue,
             Status::Active(o) => EntryStatus::Active(o),
             Status::Stale(o) => EntryStatus::Stale(o),
             Status::Unknown => EntryStatus::Unknown,
         };
-        let cache_dir = peek_cache_dir(&path).unwrap_or_default();
+        // A lease so corrupted that not even its `cache_dir` field can be
+        // read still has to be findable: the lease file's own name is a
+        // one-way slug of the path it was for, so the file itself - not the
+        // path it can no longer name - is what a human or `a0fc` gets
+        // pointed at.
+        let cache_dir = peek_cache_dir(&path)
+            .unwrap_or_else(|| format!("(unreadable lease file: {})", path.display()));
         out.push(Entry { cache_dir, status });
     }
     out.sort_by(|a, b| a.cache_dir.cmp(&b.cache_dir));
@@ -452,11 +493,14 @@ pub fn maintenance_prune(
 /// only ever sees one worktree/head pair never pays a clean it does not need.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
+    /// The worktree the build ran from.
     pub worktree: String,
+    /// The commit it built.
     pub head: String,
 }
 
 impl Identity {
+    /// Build an identity from a worktree path and the commit it is at.
     #[must_use]
     pub fn new(worktree: &Path, head: &str) -> Identity {
         Identity {
@@ -493,6 +537,23 @@ pub fn record_identity(home: &Path, cache_dir: &Path, identity: &Identity) -> Re
     std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
     Ok(())
+}
+
+/// Forget the recorded source identity for `cache_dir`, so the next
+/// [`ensure_fresh`] call cannot skip its clean on the strength of a stale
+/// match.
+///
+/// For a builder that does not itself have one coherent (worktree, head) to
+/// record - an implement or fix wave, where several different worktrees
+/// deliberately share the cache concurrently - there is nothing correct to
+/// write in place of the old identity. Removing the record is still correct:
+/// it costs the next tracked caller ([`ensure_fresh`] at `e2e`/`gate`) one
+/// clean it might not have strictly needed, in exchange for never trusting a
+/// match against a write this module never observed. Best-effort: a stale
+/// record surviving a failed removal is no worse than the record this
+/// replaces.
+pub fn invalidate_identity(home: &Path, cache_dir: &Path) {
+    let _ = std::fs::remove_file(identity_path(home, cache_dir));
 }
 
 /// Parse `cargo metadata --no-deps`'s JSON for the names of packages defined
@@ -644,15 +705,23 @@ mod tests {
     fn a_lease_whose_pid_is_gone_is_stale_and_reclaimed_by_the_next_acquirer() {
         let home = tempfile::TempDir::new().expect("temp");
         let cache = home.path().join("cache");
-        // A pid essentially guaranteed not to be a running process on any
-        // platform this suite runs on.
-        let dead_owner = owner(u32::MAX - 7);
+        // Liveness is injected rather than asked of the real OS - a "known
+        // dead" pid cannot be produced portably (see `classify_with`'s doc):
+        // an out-of-range value reads as *unavailable* to `tasklist`, not
+        // dead, and the conservative policy then reports it alive, which is
+        // exactly what made this test flaky before this fix.
+        let dead_owner = owner(999_999);
         let path = lease_path(home.path(), &cache);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         write_new(&path, &cache, &dead_owner).expect("seed a stale lease");
-        assert_eq!(classify(&path), Status::Stale(dead_owner));
+        assert_eq!(
+            classify_with(&path, |_| false),
+            Status::Stale(dead_owner.clone())
+        );
 
-        match try_acquire(home.path(), &cache, &owner(std::process::id())).expect("acquire") {
+        match try_acquire_with(home.path(), &cache, &owner(std::process::id()), |_| false)
+            .expect("acquire")
+        {
             AcquireOutcome::Acquired(_) => {}
             other => panic!("stale lease should have been reclaimed: {other:?}"),
         }
@@ -739,11 +808,15 @@ mod tests {
             try_acquire(home.path(), &active_cache, &owner(std::process::id())).expect("acquire");
         let stale_path = lease_path(home.path(), &stale_cache);
         std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
-        write_new(&stale_path, &stale_cache, &owner(u32::MAX - 7)).unwrap();
+        write_new(&stale_path, &stale_cache, &owner(999_999)).unwrap();
         let unknown_path = lease_path(home.path(), &unknown_cache);
         std::fs::write(&unknown_path, b"garbage").unwrap();
 
-        let entries = inventory(home.path());
+        // Liveness injected as `false` for everyone but this test process -
+        // see `a_lease_whose_pid_is_gone_is_stale_and_reclaimed_by_the_next_acquirer`
+        // for why the real OS query cannot portably produce a "confirmed
+        // dead" answer.
+        let entries = inventory_with(home.path(), |pid| pid == std::process::id());
         assert_eq!(entries.len(), 3, "{entries:?}");
         let by_dir = |dir: &Path| {
             entries
@@ -756,10 +829,20 @@ mod tests {
             EntryStatus::Active(_)
         ));
         assert!(matches!(by_dir(&stale_cache).status, EntryStatus::Stale(_)));
-        assert!(matches!(
-            by_dir(&unknown_cache).status,
-            EntryStatus::Unknown
-        ));
+        // A lease this corrupted cannot name its own `cache_dir` - the point
+        // of this third case - so it is found by status instead of by path,
+        // and its reported path must still point somewhere a human can act
+        // on: the lease file itself.
+        let unknown = entries
+            .iter()
+            .find(|e| matches!(e.status, EntryStatus::Unknown))
+            .unwrap_or_else(|| panic!("no Unknown entry: {entries:?}"));
+        assert!(
+            unknown
+                .cache_dir
+                .contains(&unknown_path.display().to_string()),
+            "{unknown:?}"
+        );
     }
 
     #[test]
@@ -819,6 +902,32 @@ mod tests {
         assert!(needs_refresh(home.path(), &cache, &b), "different source");
         record_identity(home.path(), &cache, &b).expect("record");
         assert!(!needs_refresh(home.path(), &cache, &b));
+    }
+
+    #[test]
+    fn invalidating_forgets_a_recorded_identity_so_the_next_check_refreshes() {
+        let home = tempfile::TempDir::new().expect("temp");
+        let cache = home.path().join("cache");
+        let a = Identity {
+            worktree: "/w/a".to_owned(),
+            head: "aaaa".to_owned(),
+        };
+        record_identity(home.path(), &cache, &a).expect("record");
+        assert!(!needs_refresh(home.path(), &cache, &a));
+
+        // An untracked writer (an implement/fix wave, which shares the cache
+        // across several worktrees at once and so has no single identity of
+        // its own to record) touched the cache in between; the next tracked
+        // caller must not trust the old match anymore.
+        invalidate_identity(home.path(), &cache);
+        assert!(
+            needs_refresh(home.path(), &cache, &a),
+            "invalidation must not be skippable by asking about the same identity again"
+        );
+
+        // Invalidating a cache directory nothing ever recorded is a no-op,
+        // not an error.
+        invalidate_identity(home.path(), &home.path().join("never-recorded"));
     }
 
     #[test]

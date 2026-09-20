@@ -3806,12 +3806,14 @@ mod tests {
                 code: Some(0),
                 output_tail: "ok".to_owned(),
                 duration_ms: 0,
+                resource_blocked: false,
             },
             CommandOutcome {
                 command: "cargo test".to_owned(),
                 code: Some(101),
                 output_tail: "thread 'x' panicked: assertion failed".to_owned(),
                 duration_ms: 0,
+                resource_blocked: false,
             },
         ];
         let d = diagnostic(&state).expect("a failing gate must produce a diagnostic");
@@ -3883,12 +3885,14 @@ mod tests {
                 code: Some(101),
                 output_tail: "x".repeat(50_000),
                 duration_ms: 0,
+                resource_blocked: false,
             },
             CommandOutcome {
                 command: "cargo clippy".to_owned(),
                 code: Some(1),
                 output_tail: "y".repeat(50_000),
                 duration_ms: 0,
+                resource_blocked: false,
             },
         ];
         state.candidates = vec![
@@ -3911,6 +3915,7 @@ mod tests {
             code: Some(101),
             output_tail: "assertion failed".to_owned(),
             duration_ms: 0,
+            resource_blocked: false,
         }];
         let verdict = Verdict {
             status: RunStatus::Blocked,

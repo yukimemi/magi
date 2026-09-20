@@ -58,6 +58,20 @@ const OUTPUT_TAIL: usize = 8_000;
 /// stopped is readable from the report without opening `run.json`.
 const EVENT_OUTPUT_TAIL: usize = 2_000;
 
+/// How long [`with_cache_lease`] waits after a timed-out verify command
+/// before releasing the build cache's lease.
+///
+/// A timeout means the process tree was asked to die (`kill_on_drop`,
+/// `start_kill`), not that it already has - on Windows in particular that can
+/// take a moment, the same reason `agent`'s own `PIPE_GRACE` exists. Releasing the
+/// instant the command returns would let the very next acquirer (this run's
+/// own next round, another run's verification, the janitor's prune) start
+/// touching the same directory while a descendant might still be writing to
+/// it. This is not process-tree reaping - continuing to observe and collect
+/// a timed-out job's descendants stays a different piece of work - only a
+/// short pause before the lease changes hands.
+const LEASE_RELEASE_GRACE: Duration = Duration::from_secs(5);
+
 /// Consecutive review rounds with no tree progress (see
 /// [`crate::run::ReviewRound::progressed`]) before `review_loop` hands off
 /// instead of spending the rest of the round budget.
@@ -3378,6 +3392,19 @@ impl Runner {
                 ),
             );
         }
+        // A resource-blocked outcome means the gate command never actually
+        // ran - the shared build cache could not be acquired or confirmed
+        // fresh in time - which is evidence about the machine, not about the
+        // tree (see `CommandOutcome::resource_blocked`'s own doc). Recording
+        // it as a red gate would mark a run `Blocked` on nothing but
+        // contention magi has already logged above; leaving `self.state.gate`
+        // empty instead keeps the shape this function already treats as
+        // "still needs to run" (see the early-return above), so the next
+        // call retries the command rather than concluding anything.
+        if verify_inconclusive(&outcomes) {
+            self.state.save()?;
+            return Ok(());
+        }
         let passed = outcomes.iter().all(CommandOutcome::ok);
         self.state.gate = outcomes;
         if !passed {
@@ -3774,6 +3801,42 @@ async fn wave(
         // watching.
         tracing::warn!("could not persist in-progress seats: {e:#}");
     }
+    // Hold the shared build cache's lease for the whole batch, not per job:
+    // several candidates (an implement wave) or a fixer legitimately share
+    // one cache concurrently within this run, and that stays untouched — a
+    // single lease taken once for the whole wave and released once it is
+    // done is what stops a *different* borrower (another run's own wave, its
+    // e2e/gate, a human's `magi review`) from interleaving a build into the
+    // same directory while this one is in flight. Best-effort: a wave that
+    // cannot get the lease within its own longest job's budget proceeds
+    // without it rather than spending paid agent calls on nothing, but the
+    // identity record is still invalidated below either way, so the next
+    // tracked caller (`e2e`/`gate`) never trusts a match it cannot vouch for.
+    let jobs_had_a_writer = jobs.iter().any(|j| j.allow_write);
+    let cache_guard = if let Some(cache_dir) = cache {
+        if jobs_had_a_writer {
+            let home = crate::run::home();
+            let owner = crate::cache::Owner::here(run, node, "*", Path::new("(wave)"), "");
+            let budget = jobs
+                .iter()
+                .map(|j| j.timeout)
+                .max()
+                .unwrap_or(Duration::from_secs(60));
+            match crate::cache::wait_for(&home, cache_dir, &owner, budget, Duration::from_secs(5))
+                .await
+            {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    state.event("verify", format!("{node}: {e:#}"));
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut set = tokio::task::JoinSet::new();
     let overlay = prompts.overlay(node);
     for (i, mut job) in jobs.into_iter().enumerate() {
@@ -3870,6 +3933,20 @@ async fn wave(
         if let Err(e) = state.save() {
             tracing::warn!("could not persist the end of a wave: {e:#}");
         }
+    }
+    // Whether or not the lease above was actually held, several worktrees
+    // may just have built into the cache with nothing here able to name one
+    // coherent (worktree, head) for it - see `cache::invalidate_identity`'s
+    // own doc. Forgetting the old record costs the next `e2e`/`gate` one
+    // clean it might not have strictly needed; trusting a stale match would
+    // cost it a wrong answer.
+    if let Some(cache_dir) = cache
+        && jobs_had_a_writer
+    {
+        crate::cache::invalidate_identity(&crate::run::home(), cache_dir);
+    }
+    if let Some(guard) = cache_guard {
+        guard.release();
     }
     collected.into_iter().flatten().collect()
 }
@@ -4137,6 +4214,7 @@ where
 /// synthetic [`CommandOutcome`] (`code: None`) rather than silently skipping
 /// verification — the same shape a spawn failure already takes in
 /// [`run_commands`], so a caller need not special-case it.
+#[allow(clippy::too_many_arguments)]
 async fn with_cache_lease<'s, F, Fut>(
     state: &'s mut RunState,
     cache_dir: Option<&Path>,
@@ -4186,6 +4264,7 @@ where
                             code: None,
                             output_tail: e.to_string(),
                             duration_ms: started.elapsed().as_millis() as u64,
+                            resource_blocked: true,
                         }],
                         false,
                     );
@@ -4203,6 +4282,7 @@ where
                     code: None,
                     output_tail: e.to_string(),
                     duration_ms: started.elapsed().as_millis() as u64,
+                    resource_blocked: true,
                 }],
                 false,
             );
@@ -4210,15 +4290,56 @@ where
     };
     let identity = crate::cache::Identity::new(worktree, head);
     if let Err(e) = crate::cache::ensure_fresh(&home, cache_dir, &identity) {
-        tracing::warn!(
-            "build cache: freshness check for {} failed, building anyway: {e:#}",
-            cache_dir.display()
+        // A failed freshness check means this process cannot vouch for what
+        // is sitting in the cache right now - on Windows this is exactly the
+        // "a stale test executable is still locked, `cargo clean -p` cannot
+        // remove it" case the evidence log records. Running verify anyway
+        // and reporting whatever it says would let a result nobody can trust
+        // stand for the tree it claims to have checked; fail the step
+        // instead of the patch.
+        state.event(
+            "verify",
+            format!(
+                "{context}: could not confirm the shared build cache matches {} at {}: {e:#}",
+                worktree.display(),
+                short(head)
+            ),
+        );
+        guard.release();
+        return (
+            vec![CommandOutcome {
+                command: "(confirming the shared build cache is fresh)".to_owned(),
+                code: None,
+                output_tail: e.to_string(),
+                duration_ms: started.elapsed().as_millis() as u64,
+                resource_blocked: true,
+            }],
+            false,
         );
     }
     let remaining = budget.saturating_sub(started.elapsed());
     let result = body(state, remaining).await;
+    // `code: None` is what a timed-out command reports (see `run_commands`),
+    // and only a timeout - as opposed to an ordinary nonzero exit - means the
+    // process tree was still running when this function stopped waiting on
+    // it. See `LEASE_RELEASE_GRACE`'s own doc for why the release waits a
+    // beat in that case rather than handing the directory to the next
+    // acquirer immediately.
+    if result.0.iter().any(|o| o.code.is_none()) {
+        tokio::time::sleep(LEASE_RELEASE_GRACE).await;
+    }
     guard.release();
     result
+}
+
+/// Are any of `outcomes` [`CommandOutcome::resource_blocked`] - magi's own
+/// admission that it could not even get a verify command to run, as opposed
+/// to evidence the command actually produced? A caller that would otherwise
+/// read a resource-blocked outcome as a red command must check this first:
+/// see [`Runner::gate`], which retries rather than records `Blocked` when
+/// this is true.
+fn verify_inconclusive(outcomes: &[CommandOutcome]) -> bool {
+    outcomes.iter().any(|o| o.resource_blocked)
 }
 
 /// Describe one verify command's outcome for the event log, distinguishing a
@@ -4322,6 +4443,7 @@ async fn run_commands(
             code,
             output_tail: tail(&body, OUTPUT_TAIL),
             duration_ms: started.elapsed().as_millis() as u64,
+            resource_blocked: false,
         });
     }
     out
@@ -4706,6 +4828,31 @@ mod tests {
         ));
     }
 
+    fn outcome(code: Option<i32>, resource_blocked: bool) -> CommandOutcome {
+        CommandOutcome {
+            command: "test".to_owned(),
+            code,
+            output_tail: String::new(),
+            duration_ms: 0,
+            resource_blocked,
+        }
+    }
+
+    #[test]
+    fn verify_is_inconclusive_only_when_a_resource_blocked_outcome_is_present() {
+        assert!(!verify_inconclusive(&[outcome(Some(0), false)]));
+        assert!(
+            !verify_inconclusive(&[outcome(Some(1), false)]),
+            "an ordinary failure is still evidence about the patch"
+        );
+        assert!(verify_inconclusive(&[outcome(None, true)]));
+        assert!(
+            verify_inconclusive(&[outcome(Some(0), false), outcome(None, true)]),
+            "one inconclusive outcome taints the whole batch"
+        );
+        assert!(!verify_inconclusive(&[]));
+    }
+
     // `review_conclusion` is the exact decision the review hand-off task
     // fixed: a round budget spent (or a tree that stopped moving) must not
     // collapse into `Blocked` regardless of what verification actually
@@ -4729,6 +4876,7 @@ mod tests {
                 code: Some(if e2e_ok { 0 } else { 1 }),
                 output_tail: String::new(),
                 duration_ms: 0,
+                resource_blocked: false,
             }],
             verify_retried: false,
             e2e_deferred: false,
@@ -5199,6 +5347,7 @@ mod tests {
             code: Some(0),
             output_tail: String::new(),
             duration_ms: 0,
+            resource_blocked: false,
         }];
         // Reached its conclusion already — e.g. `land` closing the PR without
         // merging it, which (like the honest `MergeMode::None` path) leaves
@@ -5314,6 +5463,7 @@ mod tests {
             code: Some(0),
             output_tail: String::new(),
             duration_ms: 0,
+            resource_blocked: false,
         }];
         // A first pass through `merge` already pushed and opened this pull
         // request; `status` is `Landing` because a previous call into `land`
@@ -5417,6 +5567,7 @@ mod tests {
                 code: Some(0),
                 output_tail: String::new(),
                 duration_ms: 0,
+                resource_blocked: false,
             }],
             verify_retried: false,
             e2e_deferred: false,

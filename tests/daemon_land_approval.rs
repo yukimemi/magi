@@ -171,6 +171,7 @@ fn parked_run(repo: &std::path::Path, config: &magi::config::Config) -> RunState
         code: Some(0),
         output_tail: String::new(),
         duration_ms: 0,
+        resource_blocked: false,
     }];
     state.merge = Some(MergeOutcome {
         mode: MergeMode::Pr,

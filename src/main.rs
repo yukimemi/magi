@@ -1281,23 +1281,35 @@ fn cache(command: CacheCmd) -> Result<()> {
             }
             // A live borrower - this run's own build, another run's, or a
             // human's `magi review` sharing the same `CARGO_TARGET_DIR` -
-            // must never have its compile deleted out from under it. See
-            // `cache::in_use`, which is exactly as conservative here as it is
-            // for the automatic janitor: an unreadable lease refuses the
-            // clear too, rather than guessing it is safe.
+            // must never have its compile deleted out from under it. Taking
+            // the lease ourselves rather than only checking `cache::in_use`
+            // first closes the gap between checking and deleting: a build
+            // that starts in between would otherwise still lose its compile.
+            // An unreadable lease refuses the clear too, exactly as
+            // conservatively as it refuses the automatic janitor.
             let home = magi::run::home();
-            if magi::cache::in_use(&home, &dir) {
-                println!(
-                    "cache is in use right now, not clearing: {}\n\
-                     (a build is registered against it - wait for it to finish, or check \
-                     `magi show` for what is still running)",
-                    dir.display()
-                );
-                return Ok(());
+            let owner = magi::cache::Owner::here("(operator)", "cache-clear", "clear", &dir, "");
+            match magi::cache::try_acquire(&home, &dir, &owner)
+                .with_context(|| format!("check whether {} is in use", dir.display()))?
+            {
+                magi::cache::AcquireOutcome::Busy(busy) => {
+                    println!(
+                        "cache is in use right now, not clearing: {} ({})\n\
+                         (wait for it to finish, or check `magi show` for what is still running)",
+                        dir.display(),
+                        busy.describe()
+                    );
+                    return Ok(());
+                }
+                magi::cache::AcquireOutcome::Acquired(guard) => {
+                    let freed = magi::disk::dir_size(&dir);
+                    let removed = std::fs::remove_dir_all(&dir)
+                        .with_context(|| format!("remove {}", dir.display()));
+                    guard.release();
+                    removed?;
+                    println!("removed {} ({} freed)", dir.display(), bytes(freed));
+                }
             }
-            let freed = magi::disk::dir_size(&dir);
-            std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
-            println!("removed {} ({} freed)", dir.display(), bytes(freed));
         }
     }
     Ok(())

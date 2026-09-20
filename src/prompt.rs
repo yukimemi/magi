@@ -252,9 +252,12 @@ this environment otherwise uses for building — that variable is reserved for \
 seats allowed to write. A refusal to write to it, or to anywhere outside \
 this worktree, is a property of this seat, not a defect in the code under \
 review; do not report it as one.\n\n\
-If a narrow, targeted reproduction genuinely needs a compile, it lands in \
-this worktree's own default `target/`, which is disposable and is removed \
-with the worktree — never point it at a shared directory by hand.",
+Compiling is not this seat's job at all, not even into a fresh directory of \
+its own: an ad-hoc `target/` nobody prunes or accounts for is exactly what \
+this environment forbids, on a read-only seat as much as a write-allowed \
+one. Narrow reproduction here means reading the code and its existing \
+output, not building or running Cargo — a compiled check belongs to the \
+full verification magi itself runs.",
         );
         if defer_to_parent {
             s.push_str(
@@ -1881,6 +1884,14 @@ mod tests {
             "a write refusal must not be read as a source bug: {note}"
         );
         assert!(note.contains("read-only"));
+        // A private, unmanaged `target/` per worktree is exactly the pattern
+        // this whole mechanism exists to avoid - suggesting it as a fallback
+        // for a read-only seat is the same mistake with extra steps.
+        assert!(
+            !note.contains("own default `target/`")
+                && !note.contains("target/`, which is disposable"),
+            "must not suggest an unmanaged per-worktree build directory: {note}"
+        );
     }
 
     #[test]
