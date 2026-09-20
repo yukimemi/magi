@@ -651,6 +651,21 @@ pub struct CacheEntry {
     pub owner: Option<String>,
     /// What [`classify_neighbor`] decided.
     pub status: CacheStatus,
+    /// Why, in words an operator reads on `magi cache status` or a sweep's
+    /// `--dry-run` preview without having to already know how
+    /// [`classify_neighbor`] works. Every `CacheStatus` variant gets one, not
+    /// only `Unknown` — "why did magi leave this alone" is exactly as much a
+    /// question for an `Active` entry, and a silent line next to `Reclaimable`
+    /// is what a PowerShell recipe already gave the operator.
+    pub reason: String,
+}
+
+/// [`classify_neighbor`]'s answer: who (if anyone) owns the path, what that
+/// makes it, and the sentence a CLI prints next to it.
+struct Classification {
+    owner: Option<String>,
+    status: CacheStatus,
+    reason: String,
 }
 
 /// Decide one neighbor cache's [`CacheStatus`] from the runs that own it.
@@ -666,23 +681,42 @@ pub struct CacheEntry {
 /// cache is shared across a repository's whole run history — so any one
 /// active owner is enough to withhold the entry, and only when every owner
 /// found is finished does [`has_lock`] get the final say.
-pub fn classify_neighbor(
+fn classify_neighbor(
     path: &Path,
     owners: &[(String, PathBuf, bool)],
     has_lock: bool,
-) -> (Option<String>, CacheStatus) {
+) -> Classification {
     let matches: Vec<&(String, PathBuf, bool)> =
         owners.iter().filter(|(_, p, _)| p == path).collect();
     if let Some((id, _, _)) = matches.iter().find(|(_, _, active)| *active) {
-        return (Some(id.clone()), CacheStatus::Active);
+        return Classification {
+            owner: Some(id.clone()),
+            status: CacheStatus::Active,
+            reason: format!("run {id} is still resumable or being worked on"),
+        };
     }
     let Some((id, _, _)) = matches.first() else {
-        return (None, CacheStatus::Unknown);
+        return Classification {
+            owner: None,
+            status: CacheStatus::Unknown,
+            reason: "no run record claims this path".to_owned(),
+        };
     };
     if has_lock {
-        (Some(id.clone()), CacheStatus::Unknown)
+        Classification {
+            owner: Some(id.clone()),
+            status: CacheStatus::Unknown,
+            reason: format!(
+                "run {id} is finished, but a `.cargo-lock` file is present — \
+                 a resumed or otherwise still-running build may still hold it"
+            ),
+        }
     } else {
-        (Some(id.clone()), CacheStatus::Reclaimable)
+        Classification {
+            owner: Some(id.clone()),
+            status: CacheStatus::Reclaimable,
+            reason: format!("run {id} is finished and no `.cargo-lock` file is present"),
+        }
     }
 }
 
@@ -733,12 +767,13 @@ pub fn neighbor_cache_inventory(
         .map(|n| {
             let canon = crate::disk::canonical_or(&n.path);
             let has_lock = crate::disk::has_lock_file(&n.path);
-            let (owner, status) = classify_neighbor(&canon, &owners, has_lock);
+            let c = classify_neighbor(&canon, &owners, has_lock);
             CacheEntry {
                 path: n.path,
                 bytes: n.bytes,
-                owner,
-                status,
+                owner: c.owner,
+                status: c.status,
+                reason: c.reason,
             }
         })
         .collect()
@@ -925,10 +960,17 @@ mod tests {
             ("20260801-000000-fini".to_owned(), path.clone(), false),
             ("20260801-000000-live".to_owned(), path.clone(), true),
         ];
+        let c = classify_neighbor(&path, &owners, false);
         assert_eq!(
-            classify_neighbor(&path, &owners, false),
-            (Some("20260801-000000-live".to_owned()), CacheStatus::Active),
+            c.owner,
+            Some("20260801-000000-live".to_owned()),
             "one active owner is enough to withhold a path several runs share"
+        );
+        assert_eq!(c.status, CacheStatus::Active);
+        assert!(
+            c.reason.contains("20260801-000000-live"),
+            "the reason names the run that is holding it: {}",
+            c.reason
         );
     }
 
@@ -937,26 +979,31 @@ mod tests {
         let path = PathBuf::from("/cache/orphan");
         let finished = vec![("20260801-000000-fini".to_owned(), path.clone(), false)];
 
+        let unlocked = classify_neighbor(&path, &finished, false);
+        assert_eq!(unlocked.owner, Some("20260801-000000-fini".to_owned()));
+        assert_eq!(unlocked.status, CacheStatus::Reclaimable);
+
+        let locked = classify_neighbor(&path, &finished, true);
+        assert_eq!(locked.owner, Some("20260801-000000-fini".to_owned()));
         assert_eq!(
-            classify_neighbor(&path, &finished, false),
-            (
-                Some("20260801-000000-fini".to_owned()),
-                CacheStatus::Reclaimable
-            )
-        );
-        assert_eq!(
-            classify_neighbor(&path, &finished, true),
-            (
-                Some("20260801-000000-fini".to_owned()),
-                CacheStatus::Unknown
-            ),
+            locked.status,
+            CacheStatus::Unknown,
             "a lock file withholds trust even once every owner is finished"
         );
+        assert!(
+            locked.reason.contains("cargo-lock"),
+            "the reason says what withheld trust: {}",
+            locked.reason
+        );
+
+        let unowned = classify_neighbor(&path, &[], false);
+        assert_eq!(unowned.owner, None);
         assert_eq!(
-            classify_neighbor(&path, &[], false),
-            (None, CacheStatus::Unknown),
+            unowned.status,
+            CacheStatus::Unknown,
             "no owner at all is unknown, never reclaimable by default"
         );
+        assert!(unowned.reason.contains("no run record"));
     }
 
     #[test]
@@ -1005,9 +1052,15 @@ mod tests {
             by_path[&dead_cache].owner.as_deref(),
             Some("20260801-000000-dead")
         );
+        assert!(by_path[&dead_cache].reason.contains("20260801-000000-dead"));
         assert_eq!(by_path[&live_cache].status, CacheStatus::Active);
         assert_eq!(by_path[&orphan_cache].status, CacheStatus::Unknown);
         assert_eq!(by_path[&orphan_cache].owner, None);
+        assert!(
+            by_path[&orphan_cache].reason.contains("no run record"),
+            "an entry with a plain english reason, not just a status word: {}",
+            by_path[&orphan_cache].reason
+        );
     }
 
     /// Write a minimal run whose saved `Config` renders `CARGO_TARGET_DIR` to
@@ -1051,18 +1104,21 @@ mod tests {
                 bytes: 1,
                 owner: Some("a".to_owned()),
                 status: CacheStatus::Active,
+                reason: "run a is still resumable or being worked on".to_owned(),
             },
             CacheEntry {
                 path: reclaimable.clone(),
                 bytes: 2,
                 owner: Some("b".to_owned()),
                 status: CacheStatus::Reclaimable,
+                reason: "run b is finished and no `.cargo-lock` file is present".to_owned(),
             },
             CacheEntry {
                 path: unknown.clone(),
                 bytes: 3,
                 owner: None,
                 status: CacheStatus::Unknown,
+                reason: "no run record claims this path".to_owned(),
             },
         ];
 

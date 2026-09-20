@@ -295,7 +295,20 @@ pub fn scan_neighbor_caches(cache_dir: &Path, skip: &[PathBuf]) -> Vec<NeighborC
             continue;
         }
         let canon = canonical_or(&path);
-        if canon == cache_canon || skip_canon.contains(&canon) {
+        // Not a bare equality check: `skip` promises "anything under skip",
+        // and an operator's `{{ vars.cache }}` can legally nest the
+        // configured cache (and so this scan's own `parent`) inside the
+        // worktree bay or `<home>/runs` rather than only ever sitting beside
+        // them. `starts_with` catches both directions — a found entry
+        // sitting inside a skip root, and (should `parent` itself already be
+        // a descendant of one) a skip root sitting inside a found entry,
+        // which would otherwise still be walked into by `dir_size` and,
+        // worse, deleted whole by a caller that reclaims it.
+        if canon == cache_canon
+            || skip_canon
+                .iter()
+                .any(|s| canon.starts_with(s) || s.starts_with(&canon))
+        {
             continue;
         }
         if !looks_like_cargo_target(&path) {
@@ -604,6 +617,51 @@ mod tests {
         assert_eq!(found.len(), 1, "found: {paths:?}");
         assert_eq!(found[0].path, orphan);
         assert_eq!(found[0].bytes, 8, "the tag file itself counts too");
+    }
+
+    /// `skip` promises "anything under skip", not merely "exactly skip" — an
+    /// operator's `{{ vars.cache }}` can render `CARGO_TARGET_DIR` to a path
+    /// nested inside `<home>/runs` or the worktree bay rather than only ever
+    /// beside them. Both directions of containment have to be caught: a
+    /// found entry sitting inside a skip root, and a skip root sitting inside
+    /// a found entry.
+    #[test]
+    fn neighbor_scan_excludes_anything_under_skip_not_only_an_exact_match() {
+        let t = tempfile::TempDir::new().expect("temp");
+
+        // Direction one: the scan's own parent is already inside a skip
+        // root, so every entry it lists is too.
+        let runs = t.path().join("runs");
+        let parent = runs.join("subdir");
+        fs::create_dir_all(&parent).expect("dir");
+        let cache = parent.join("magi-target");
+        fs::create_dir_all(&cache).expect("dir");
+        let leftover = parent.join("leftover");
+        fs::create_dir_all(&leftover).expect("dir");
+        fs::write(leftover.join("CACHEDIR.TAG"), b"tag").expect("write");
+
+        let found = scan_neighbor_caches(&cache, std::slice::from_ref(&runs));
+        assert!(
+            found.is_empty(),
+            "an entry inside a skip root must never be reported: {found:?}"
+        );
+
+        // Direction two: a skip root sits inside one of the found entries -
+        // reclaiming that whole entry would take the skip root down with it.
+        let cache2 = t.path().join("magi-target2");
+        fs::create_dir_all(&cache2).expect("dir");
+        let big = t.path().join("big-cache");
+        fs::create_dir_all(&big).expect("dir");
+        fs::write(big.join("CACHEDIR.TAG"), b"tag").expect("write");
+        let nested_runs = big.join("inner-runs");
+        fs::create_dir_all(&nested_runs).expect("dir");
+
+        let found2 = scan_neighbor_caches(&cache2, std::slice::from_ref(&nested_runs));
+        assert!(
+            found2.is_empty(),
+            "an entry that would carry a skip root down with it must never be \
+             reported: {found2:?}"
+        );
     }
 
     #[cfg(unix)]

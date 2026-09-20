@@ -1318,6 +1318,7 @@ fn cache(command: CacheCmd) -> Result<()> {
             println!("removed {} ({} freed)", dir.display(), bytes(freed));
         }
         CacheCmd::Status { .. } => {
+            print_free_space(repo);
             let entries = neighbor_cache_entries(&cfg);
             if entries.is_empty() {
                 println!(
@@ -1327,13 +1328,13 @@ fn cache(command: CacheCmd) -> Result<()> {
                 return Ok(());
             }
             for e in &entries {
-                let owner = e.owner.as_deref().unwrap_or("no run record claims it");
                 println!(
-                    "{:<10} {:>10}  {}  ({owner})",
+                    "{:<12} {:>10}  {}",
                     status_word(e.status),
                     bytes(e.bytes),
                     e.path.display()
                 );
+                println!("             {}", e.reason);
             }
             let unknown: u64 = entries
                 .iter()
@@ -1352,24 +1353,49 @@ fn cache(command: CacheCmd) -> Result<()> {
             );
         }
         CacheCmd::Sweep { dry_run, .. } => {
+            print_free_space(repo);
             let entries = neighbor_cache_entries(&cfg);
-            let results = magi::clean::sweep_reclaimable(&entries, dry_run);
-            if results.is_empty() {
-                println!("nothing reclaimable next to {}", dir.display());
+            if entries.is_empty() {
+                println!("nothing next to {}", dir.display());
                 return Ok(());
             }
+            // Every entry gets a line, not only the reclaimable ones: an
+            // "explained preview of cleanup" means the operator can see why
+            // an `Active` or `Unknown` cache was left alone in the same
+            // place they see what actually moved, rather than only the
+            // reclaimable subset going silent about the rest.
+            let removed = magi::clean::sweep_reclaimable(&entries, dry_run);
+            let outcomes: std::collections::HashMap<PathBuf, Result<()>> = removed
+                .into_iter()
+                .map(|(path, _, outcome)| (path, outcome))
+                .collect();
             let mut freed = 0u64;
-            for (path, size, outcome) in results {
-                match outcome {
-                    Ok(()) if dry_run => {
-                        println!("would remove {} ({})", path.display(), bytes(size));
-                        freed += size;
+            for e in &entries {
+                match outcomes.get(&e.path) {
+                    Some(Ok(())) if dry_run => {
+                        println!(
+                            "would remove {} ({}) — {}",
+                            e.path.display(),
+                            bytes(e.bytes),
+                            e.reason
+                        );
+                        freed += e.bytes;
                     }
-                    Ok(()) => {
-                        println!("removed {} ({})", path.display(), bytes(size));
-                        freed += size;
+                    Some(Ok(())) => {
+                        println!(
+                            "removed {} ({}) — {}",
+                            e.path.display(),
+                            bytes(e.bytes),
+                            e.reason
+                        );
+                        freed += e.bytes;
                     }
-                    Err(e) => println!("kept {} — {e:#}", path.display()),
+                    Some(Err(err)) => {
+                        println!("kept {} — remove failed: {err:#}", e.path.display());
+                    }
+                    None => {
+                        println!("kept {} — {}", e.path.display(), e.reason);
+                    }
                 }
             }
             println!(
@@ -1397,6 +1423,18 @@ fn neighbor_cache_entries(cfg: &Config) -> Vec<magi::clean::CacheEntry> {
         &worktrees_root,
         jiff::Timestamp::now(),
     )
+}
+
+/// Print free space on the volume holding `repo`, or say why it could not be
+/// measured — the same measurement the disk gate itself trusts (see
+/// `disk::gate`'s own doc), so `magi cache status`/`sweep` never has to guess
+/// whether there is room for the next run separately from what actually
+/// gates one.
+fn print_free_space(repo: &Path) {
+    match magi::disk::free_bytes(repo) {
+        Ok(free) => println!("free space  {}\n", bytes(free)),
+        Err(e) => println!("free space  could not be measured: {e:#}\n"),
+    }
 }
 
 /// `magi cache status`'s label for one [`magi::clean::CacheStatus`].
