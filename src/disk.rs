@@ -221,6 +221,47 @@ pub fn dir_size(path: &Path) -> u64 {
     total
 }
 
+/// [`dir_size`]'s own walk, also tracking the most recent modification time
+/// found on any file - both in the same pass, so a caller that wants both
+/// (see [`crate::clean::classify_neighbor`]) does not pay for walking a
+/// multi-gigabyte build cache twice. Same symlink rule as `dir_size`: a
+/// linked directory counts as the link itself and is never descended into.
+pub fn dir_size_and_newest_mtime(path: &Path) -> (u64, Option<std::time::SystemTime>) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return (0, None);
+    };
+    if meta.is_file() {
+        return (meta.len(), meta.modified().ok());
+    }
+    if !meta.is_dir() {
+        return (0, None);
+    }
+    let mut total = 0u64;
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total += meta.len();
+                if let Ok(modified) = meta.modified()
+                    && newest.is_none_or(|n| modified > n)
+                {
+                    newest = Some(modified);
+                }
+            }
+        }
+    }
+    (total, newest)
+}
+
 /// Does `dir` look like the root of a Cargo build cache — the shape
 /// `CARGO_TARGET_DIR` takes — rather than something else that merely shares a
 /// parent directory with the one magi is configured to use?
@@ -261,6 +302,11 @@ pub struct NeighborCache {
     pub path: PathBuf,
     /// Its size, per [`dir_size`].
     pub bytes: u64,
+    /// The most recent modification time found anywhere inside it, if any
+    /// file could be stat'd at all — see [`dir_size_and_newest_mtime`] for
+    /// why this rides along with `bytes` rather than being its own,
+    /// separate walk.
+    pub newest_mtime: Option<std::time::SystemTime>,
 }
 
 /// How many directory levels under `cache_dir`'s own parent
@@ -349,8 +395,10 @@ fn scan_neighbor_level(
             continue;
         }
         if looks_like_cargo_target(&path) {
+            let (bytes, newest_mtime) = dir_size_and_newest_mtime(&path);
             out.push(NeighborCache {
-                bytes: dir_size(&path),
+                bytes,
+                newest_mtime,
                 path,
             });
         } else {

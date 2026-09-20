@@ -662,6 +662,7 @@ pub struct CacheEntry {
 
 /// [`classify_neighbor`]'s answer: who (if anyone) owns the path, what that
 /// makes it, and the sentence a CLI prints next to it.
+#[derive(Debug)]
 struct Classification {
     owner: Option<String>,
     status: CacheStatus,
@@ -671,31 +672,45 @@ struct Classification {
 /// Decide one neighbor cache's [`CacheStatus`] from the runs that own it.
 ///
 /// `owners` is every `(run id, that run's own cache directory, is that run
-/// still active)` triple worth checking, built by the caller from
-/// `<home>/runs` — kept as a pure decision over already-extracted facts
-/// rather than reading the filesystem itself, so the policy is asserted
-/// directly. `path` and every path inside `owners` are expected already
-/// canonicalized by the caller ([`crate::disk::canonical_or`]), so this never
-/// has to guess whether two different-looking paths name the same directory.
-/// More than one run can legitimately own the same path — the configured
-/// cache is shared across a repository's whole run history — so any one
-/// active owner is enough to withhold the entry, and only when every owner
-/// found is finished does [`has_lock`] get the final say.
+/// still active, that run's own `updated_at`)` tuple worth checking, built by
+/// the caller from `<home>/runs` — kept as a pure decision over
+/// already-extracted facts rather than reading the filesystem itself, so the
+/// policy is asserted directly. `path` and every path inside `owners` are
+/// expected already canonicalized by the caller
+/// ([`crate::disk::canonical_or`]), so this never has to guess whether two
+/// different-looking paths name the same directory. More than one run can
+/// legitimately own the same path — the configured cache is shared across a
+/// repository's whole run history — so any one active owner is enough to
+/// withhold the entry, and only when every owner found is finished does
+/// [`has_lock`] get the final say.
+///
+/// A same-repository match is still only a *history* of use, not a lease: a
+/// run finishing does not stop the directory from existing, and nothing
+/// stops an operator, a stray shell, or an entirely different tool from
+/// building into that exact path afterward — outside magi's sight, and with
+/// no `run.json` of its own to ever record it. `newest_mtime` is the one
+/// filesystem fact available short of that lease (task c23d's own charter,
+/// not this module's): if anything inside the directory was modified more
+/// recently than the matched run's own `updated_at`, something wrote there
+/// after magi's own record says the run was done, and that is reason enough
+/// to hold the entry at `Unknown` rather than call it reclaimable on the
+/// strength of a record that predates the most recent activity.
 fn classify_neighbor(
     path: &Path,
-    owners: &[(String, PathBuf, bool)],
+    owners: &[(String, PathBuf, bool, Timestamp)],
     has_lock: bool,
+    newest_mtime: Option<Timestamp>,
 ) -> Classification {
-    let matches: Vec<&(String, PathBuf, bool)> =
-        owners.iter().filter(|(_, p, _)| p == path).collect();
-    if let Some((id, _, _)) = matches.iter().find(|(_, _, active)| *active) {
+    let matches: Vec<&(String, PathBuf, bool, Timestamp)> =
+        owners.iter().filter(|(_, p, _, _)| p == path).collect();
+    if let Some((id, _, _, _)) = matches.iter().find(|(_, _, active, _)| *active) {
         return Classification {
             owner: Some(id.clone()),
             status: CacheStatus::Active,
             reason: format!("run {id} is still resumable or being worked on"),
         };
     }
-    let Some((id, _, _)) = matches.first() else {
+    let Some((id, _, _, updated_at)) = matches.first() else {
         return Classification {
             owner: None,
             status: CacheStatus::Unknown,
@@ -703,20 +718,30 @@ fn classify_neighbor(
         };
     };
     if has_lock {
-        Classification {
+        return Classification {
             owner: Some(id.clone()),
             status: CacheStatus::Unknown,
             reason: format!(
                 "run {id} is finished, but a `.cargo-lock` file is present — \
                  a resumed or otherwise still-running build may still hold it"
             ),
-        }
-    } else {
-        Classification {
+        };
+    }
+    if newest_mtime.is_some_and(|mtime| mtime > *updated_at) {
+        return Classification {
             owner: Some(id.clone()),
-            status: CacheStatus::Reclaimable,
-            reason: format!("run {id} is finished and no `.cargo-lock` file is present"),
-        }
+            status: CacheStatus::Unknown,
+            reason: format!(
+                "run {id} is finished, but this directory was modified more \
+                 recently than that run's own record — something else may \
+                 have used it since"
+            ),
+        };
+    }
+    Classification {
+        owner: Some(id.clone()),
+        status: CacheStatus::Reclaimable,
+        reason: format!("run {id} is finished and no `.cargo-lock` file is present"),
     }
 }
 
@@ -769,7 +794,7 @@ pub fn neighbor_cache_inventory(
     };
     let repo_canon = crate::disk::canonical_or(repo);
     let runs = home.join("runs");
-    let mut owners: Vec<(String, PathBuf, bool)> = Vec::new();
+    let mut owners: Vec<(String, PathBuf, bool, Timestamp)> = Vec::new();
     let mut unreadable_active = false;
     for entry in std::fs::read_dir(&runs).into_iter().flatten().flatten() {
         let id = entry.file_name().to_string_lossy().into_owned();
@@ -789,7 +814,12 @@ pub fn neighbor_cache_inventory(
             continue;
         };
         let active = crate::daemon::is_working_on(home, &id, now) || state.status.resumable();
-        owners.push((id, crate::disk::canonical_or(&path), active));
+        owners.push((
+            id,
+            crate::disk::canonical_or(&path),
+            active,
+            state.updated_at,
+        ));
     }
 
     let neighbors =
@@ -799,7 +829,12 @@ pub fn neighbor_cache_inventory(
         .map(|n| {
             let canon = crate::disk::canonical_or(&n.path);
             let has_lock = crate::disk::has_lock_file(&n.path);
-            let mut c = classify_neighbor(&canon, &owners, has_lock);
+            // `try_from` fails only outside jiff's representable range
+            // (centuries away); a mtime this cannot convert is not usable
+            // evidence either way, so it is treated the same as no mtime at
+            // all - never itself a reason to withhold `Reclaimable`.
+            let newest_mtime = n.newest_mtime.and_then(|m| Timestamp::try_from(m).ok());
+            let mut c = classify_neighbor(&canon, &owners, has_lock, newest_mtime);
             if unreadable_active && c.status == CacheStatus::Reclaimable {
                 c.status = CacheStatus::Unknown;
                 c.reason = format!(
@@ -997,11 +1032,22 @@ mod tests {
     #[test]
     fn classify_neighbor_prefers_active_over_any_other_owner_of_the_same_path() {
         let path = PathBuf::from("/cache/orphan");
+        let finished_at = ts("2026-08-01T00:00:00Z");
         let owners = vec![
-            ("20260801-000000-fini".to_owned(), path.clone(), false),
-            ("20260801-000000-live".to_owned(), path.clone(), true),
+            (
+                "20260801-000000-fini".to_owned(),
+                path.clone(),
+                false,
+                finished_at,
+            ),
+            (
+                "20260801-000000-live".to_owned(),
+                path.clone(),
+                true,
+                finished_at,
+            ),
         ];
-        let c = classify_neighbor(&path, &owners, false);
+        let c = classify_neighbor(&path, &owners, false, None);
         assert_eq!(
             c.owner,
             Some("20260801-000000-live".to_owned()),
@@ -1018,13 +1064,19 @@ mod tests {
     #[test]
     fn classify_neighbor_is_reclaimable_only_once_finished_and_unlocked() {
         let path = PathBuf::from("/cache/orphan");
-        let finished = vec![("20260801-000000-fini".to_owned(), path.clone(), false)];
+        let finished_at = ts("2026-08-01T00:00:00Z");
+        let finished = vec![(
+            "20260801-000000-fini".to_owned(),
+            path.clone(),
+            false,
+            finished_at,
+        )];
 
-        let unlocked = classify_neighbor(&path, &finished, false);
+        let unlocked = classify_neighbor(&path, &finished, false, None);
         assert_eq!(unlocked.owner, Some("20260801-000000-fini".to_owned()));
         assert_eq!(unlocked.status, CacheStatus::Reclaimable);
 
-        let locked = classify_neighbor(&path, &finished, true);
+        let locked = classify_neighbor(&path, &finished, true, None);
         assert_eq!(locked.owner, Some("20260801-000000-fini".to_owned()));
         assert_eq!(
             locked.status,
@@ -1037,7 +1089,7 @@ mod tests {
             locked.reason
         );
 
-        let unowned = classify_neighbor(&path, &[], false);
+        let unowned = classify_neighbor(&path, &[], false, None);
         assert_eq!(unowned.owner, None);
         assert_eq!(
             unowned.status,
@@ -1045,6 +1097,48 @@ mod tests {
             "no owner at all is unknown, never reclaimable by default"
         );
         assert!(unowned.reason.contains("no run record"));
+    }
+
+    /// The gap R2-1-1 found: a finished run's own record is a *history* of
+    /// use, not a lease. Nothing stops the same path from being written to
+    /// again afterward by something magi has no record of at all - an
+    /// operator's own shell, a different tool, anything. A modification
+    /// after the owning run's own `updated_at` is the one filesystem fact
+    /// available to catch that without building the lease task c23d owns.
+    #[test]
+    fn classify_neighbor_withholds_trust_when_the_directory_moved_after_the_run_finished() {
+        let path = PathBuf::from("/cache/orphan");
+        let finished_at = ts("2026-08-01T00:00:00Z");
+        let finished = vec![(
+            "20260801-000000-fini".to_owned(),
+            path.clone(),
+            false,
+            finished_at,
+        )];
+
+        // Untouched since: the run's own record is still the newest thing
+        // known about this path, so it is trusted.
+        let before = ts("2026-07-31T00:00:00Z");
+        let still_reclaimable = classify_neighbor(&path, &finished, false, Some(before));
+        assert_eq!(still_reclaimable.status, CacheStatus::Reclaimable);
+
+        // Touched after the run's own record says it was done: something
+        // else wrote there since, and that must not be waved through as
+        // this run's own leftover.
+        let after = ts("2026-08-02T00:00:00Z");
+        let withheld = classify_neighbor(&path, &finished, false, Some(after));
+        assert_eq!(withheld.owner, Some("20260801-000000-fini".to_owned()));
+        assert_eq!(
+            withheld.status,
+            CacheStatus::Unknown,
+            "modified after the owning run finished must not be reclaimable: {withheld:?}"
+        );
+        assert!(withheld.reason.contains("modified"), "{}", withheld.reason);
+
+        // No mtime evidence at all (unreadable, or genuinely empty): falls
+        // back to trusting the record the same as before this check existed.
+        let no_evidence = classify_neighbor(&path, &finished, false, None);
+        assert_eq!(no_evidence.status, CacheStatus::Reclaimable);
     }
 
     #[test]
@@ -1325,7 +1419,13 @@ mod tests {
         std::fs::create_dir_all(runs.join(id)).unwrap();
         let mut value = serde_json::to_value(&state).unwrap();
         value["status"] = serde_json::json!(status);
-        value["updated_at"] = serde_json::json!("2026-08-01T00:00:00Z");
+        // Real wall-clock "now", not a fixed fictional date: every caller
+        // creates `cache`'s files moments before calling this, and
+        // `classify_neighbor`'s own mtime check (R2-1-1) would otherwise see
+        // this run as finished *before* the real filesystem timestamps on
+        // its own cache directory - failing the very fixture meant to
+        // describe it as reclaimable.
+        value["updated_at"] = serde_json::json!(Timestamp::now().to_string());
         std::fs::write(
             runs.join(id).join("run.json"),
             serde_json::to_string_pretty(&value).unwrap(),
