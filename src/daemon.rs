@@ -1324,11 +1324,17 @@ impl Drop for InFlightGuard<'_> {
 enum Interrupt {
     /// No interrupt sequence in progress. Ordinary dispatch applies.
     Idle,
-    /// `interrupt_task` is runnable and something else is (or was) in
-    /// flight; `parked` names every task id that was in flight the moment
-    /// this sequence began. Dispatch is withheld from everyone, including
-    /// `interrupt_task` itself, until every id in `parked` has left flight -
-    /// only then is `interrupt_task` let through.
+    /// `interrupt_task` is runnable and exactly one other run is in flight;
+    /// `parked` names that one task's id. Dispatch is withheld from
+    /// everyone, including `interrupt_task` itself, until it has left
+    /// flight - only then is `interrupt_task` let through.
+    ///
+    /// `parked` is a `Vec` rather than a bare id for symmetry with
+    /// [`Interrupt::Running`] and [`Interrupt::Resuming`], but
+    /// [`advance_interrupt`]'s own `Idle` branch only ever starts a sequence
+    /// when exactly one run is in flight, so it is guaranteed to hold
+    /// exactly one entry in practice - see that branch's own doc for why
+    /// more than one is deliberately never attempted.
     Parking {
         parked: Vec<String>,
         interrupt_task: String,
@@ -1339,20 +1345,17 @@ enum Interrupt {
     /// [`Interrupt::Resuming`], never straight back to [`Interrupt::Idle`]:
     /// going straight to `Idle` would hand `parked` back to ordinary
     /// priority-order dispatch, where a higher-priority task filed in the
-    /// meantime - or a second slot freed by `max_concurrent_runs` - could
-    /// start ahead of it, or alongside it, which is exactly the "not
-    /// guaranteed, not exclusive" bug this state exists to close.
+    /// meantime could start ahead of it.
     Running {
         parked: Vec<String>,
         interrupt_task: String,
     },
-    /// `interrupt_task` left flight; `parked` still names whoever this
-    /// sequence owes a resume. Dispatch is withheld from everyone except a
-    /// single task drawn from `parked` - see [`interrupt_gate`] - so the
-    /// resume this feature promises is never raced by, or run alongside, an
-    /// unrelated candidate. Ends the moment any id from `parked` is seen in
-    /// flight, or - see `advance_interrupt`'s own doc on abandonment - the
-    /// moment none of them are runnable any longer.
+    /// `interrupt_task` left flight; `parked` still names the one run this
+    /// sequence owes a resume. Dispatch is withheld from everyone except
+    /// that task - see [`interrupt_gate`] - so the resume this feature
+    /// promises is never raced by, or run alongside, an unrelated candidate.
+    /// Ends the moment it is seen in flight, or - see `advance_interrupt`'s
+    /// own doc on abandonment - the moment it is no longer runnable at all.
     Resuming { parked: Vec<String> },
 }
 
@@ -1379,9 +1382,18 @@ enum Interrupt {
 fn advance_interrupt(state: Interrupt, in_flight: &[String], runnable: &[Task]) -> Interrupt {
     match state {
         Interrupt::Idle => {
-            if in_flight.is_empty() {
-                // Nothing to interrupt; an interrupt-marked task with
-                // nothing in flight is just an ordinary runnable candidate.
+            // Not just "something to interrupt": exactly one thing. More
+            // than one run in flight only happens above the default
+            // `max_concurrent_runs = 1`, and `parked` guarantees "exactly
+            // one resume, never run alongside anything else" only because
+            // it is only ever seeded with exactly one id - see
+            // `Interrupt::Resuming`'s own doc on why releasing more than one
+            // parked id back to ordinary dispatch cannot be made safe
+            // against that same setting's own extra concurrency slots.
+            // Waiting here for the herd to settle to one is the
+            // simplification this feature's own constraints ask for rather
+            // than a second concurrency model to reconcile with the first.
+            if in_flight.len() != 1 {
                 return Interrupt::Idle;
             }
             match runnable.iter().find(|t| t.interrupt) {
@@ -2874,6 +2886,29 @@ mod tests {
                 interrupt_task: "marked".to_owned(),
             }
         );
+    }
+
+    /// R1-1-2 / R2-1-2: above the default `max_concurrent_runs`, more than
+    /// one run can be in flight when a task becomes runnable and marked.
+    /// Parking all of them would mean `Resuming` later has more than one id
+    /// to release back to ordinary dispatch, which cannot be made safe
+    /// against that same setting's own extra concurrency slots letting two
+    /// of them start together - see `advance_interrupt`'s own `Idle` branch.
+    /// The simplification the task's own constraints ask for: do not begin
+    /// a sequence at all until the herd settles back to exactly one.
+    #[test]
+    fn more_than_one_run_in_flight_never_starts_an_interrupt_sequence() {
+        let marked = interrupt_task("marked");
+
+        let two = advance_interrupt(
+            Interrupt::Idle,
+            &["a".to_owned(), "b".to_owned()],
+            std::slice::from_ref(&marked),
+        );
+        assert_eq!(two, Interrupt::Idle);
+
+        let none = advance_interrupt(Interrupt::Idle, &[], std::slice::from_ref(&marked));
+        assert_eq!(none, Interrupt::Idle, "nothing to interrupt either");
     }
 
     #[test]

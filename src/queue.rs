@@ -330,12 +330,22 @@ impl Task {
     }
 
     /// Record that a run has started for this task.
+    ///
+    /// Clears [`Task::interrupt`]: a mark to run ahead of whatever else is
+    /// in flight is fulfilled the moment this task actually gets its turn,
+    /// dispatched same as any other. Without this, a task whose run fails
+    /// and requeues - still `runnable`, still carrying the mark from its
+    /// first attempt - would keep re-triggering `crate::daemon`'s interrupt
+    /// scheduler and re-parking whatever it interrupted on every later
+    /// boundary, for as long as its attempts hold out, instead of the
+    /// one-shot "let this go next" the mark is meant to be.
     pub fn start(&mut self, run: String) {
         self.status = TaskStatus::Running;
         self.attempts += 1;
         self.runs.push(run);
         self.last_error = None;
         self.fresh_start = false;
+        self.interrupt = false;
     }
 
     /// Record a successful run.
@@ -1254,12 +1264,34 @@ mod tests {
         assert!(t.interrupt);
 
         t.start("run-1".to_owned());
+        assert!(
+            !t.interrupt,
+            "the mark is one-shot: dispatching the task fulfils it, \
+             whatever the run that follows ends up doing"
+        );
         let err = t.set_interrupt(true).unwrap_err().to_string();
         assert!(err.contains("running"), "{err}");
         // Clearing is always allowed, even on a running task - there is
         // nothing left for it to interrupt once it has been claimed.
         t.set_interrupt(false).unwrap();
         assert!(!t.interrupt);
+    }
+
+    /// R2-1-1: a task whose run fails and requeues must not go on
+    /// re-triggering `crate::daemon`'s interrupt scheduler on every later
+    /// boundary, attempt after attempt, until it exhausts its budget.
+    #[test]
+    fn a_failed_run_does_not_leave_the_task_still_marked_to_interrupt() {
+        let mut t = task("interrupt me");
+        t.set_interrupt(true).unwrap();
+        t.start("run-1".to_owned());
+        t.fail("mock failure", 5);
+        assert_eq!(t.status, TaskStatus::Failed);
+        assert!(
+            !t.interrupt,
+            "one attempt already spent the mark; a retry is an ordinary \
+             requeue, not a fresh interrupt request"
+        );
     }
 
     #[test]
