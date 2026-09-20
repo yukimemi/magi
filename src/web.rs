@@ -5535,7 +5535,11 @@ mod tests {
             // reaches the gate fails the test instead of hanging it.
             tokio::time::timeout(Duration::from_secs(5), reached_rx)
                 .await
-                .unwrap_or_else(|_| panic!("attempt {attempt}: talk {id} never reached the busy branch's queue write"))
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "attempt {attempt}: talk {id} never reached the busy branch's queue write"
+                    )
+                })
                 .expect("the busy branch dropped the gate without using it");
 
             // The turn that was running now finishes and gives the slot up
