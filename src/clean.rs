@@ -113,7 +113,7 @@ pub async fn housekeep(
         // already answers for a run's worktrees. Only ever `Reclaimable`
         // entries move; see [`neighbor_cache_inventory`]'s own doc on why
         // `Active` and `Unknown` never do, automatically or otherwise.
-        let neighbors = neighbor_cache_inventory(cfg, home, worktrees_root, now);
+        let neighbors = neighbor_cache_inventory(cfg, home, worktrees_root, repo, now);
         for (path, bytes, result) in sweep_reclaimable(&neighbors, false) {
             match result {
                 Ok(()) => {
@@ -733,6 +733,18 @@ fn classify_neighbor(
 /// run actually built into, even one the operator's `magi.toml` has since
 /// moved on from.
 ///
+/// `<home>/runs` holds every run this machine has ever driven, for every
+/// repository magi has ever pointed at - not only `repo`'s own. Two
+/// repositories can render `CARGO_TARGET_DIR` from the same `vars.cache`
+/// root, so a path a *different* repository's finished run once used can
+/// otherwise coincide with a neighbor this scan finds next to `repo`'s own
+/// cache — and unlike a same-repo match, there is no reason to believe that
+/// other repository is done with it: it may still be building into it by
+/// hand, entirely outside magi. Only a run whose own saved `repo` matches
+/// this one is trusted to vouch for a path at all; a match against any other
+/// repository's history is worth exactly what an unclaimed path is, which is
+/// `Unknown`.
+///
 /// A run record this cannot read (mid-write, or genuinely corrupt — the same
 /// case [`fold_due`]'s own doc describes) contributes no ownership either
 /// way *if nothing is driving it right now*: there is nothing left to guess
@@ -749,11 +761,13 @@ pub fn neighbor_cache_inventory(
     cfg: &crate::config::Config,
     home: &Path,
     worktrees_root: &Path,
+    repo: &Path,
     now: Timestamp,
 ) -> Vec<CacheEntry> {
     let Some(configured) = cfg.cache_dir() else {
         return Vec::new();
     };
+    let repo_canon = crate::disk::canonical_or(repo);
     let runs = home.join("runs");
     let mut owners: Vec<(String, PathBuf, bool)> = Vec::new();
     let mut unreadable_active = false;
@@ -768,6 +782,9 @@ pub fn neighbor_cache_inventory(
             }
             continue;
         };
+        if crate::disk::canonical_or(&state.repo) != repo_canon {
+            continue;
+        }
         let Some(path) = state.config.cache_dir() else {
             continue;
         };
@@ -1036,6 +1053,7 @@ mod tests {
         let runs = dir.path().join("runs");
         let wt = dir.path().join("wt");
         let home = dir.path().to_path_buf();
+        let repo = dir.path().join("repo");
         let now = ts("2026-09-05T00:00:00Z");
 
         let mut cfg = crate::config::Config::default();
@@ -1051,21 +1069,35 @@ mod tests {
         let dead_cache = dir.path().join("magi-land6");
         fs::create_dir_all(&dead_cache).unwrap();
         fs::write(dead_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
-        write_run_with_cache(&runs, &wt, "20260801-000000-dead", "ready", &dead_cache);
+        write_run_with_cache(
+            &runs,
+            &wt,
+            "20260801-000000-dead",
+            "ready",
+            &dead_cache,
+            &repo,
+        );
 
         // A run still resumable, pointing at a different neighbor: active,
         // however old its `updated_at`.
         let live_cache = dir.path().join("magi-land7");
         fs::create_dir_all(&live_cache).unwrap();
         fs::write(live_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
-        write_run_with_cache(&runs, &wt, "20260801-000000-live", "blocked", &live_cache);
+        write_run_with_cache(
+            &runs,
+            &wt,
+            "20260801-000000-live",
+            "blocked",
+            &live_cache,
+            &repo,
+        );
 
         // A cargo-shaped neighbor no run record names at all: unknown.
         let orphan_cache = dir.path().join("magi-land9");
         fs::create_dir_all(&orphan_cache).unwrap();
         fs::write(orphan_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
 
-        let mut entries = neighbor_cache_inventory(&cfg, &home, &wt, now);
+        let mut entries = neighbor_cache_inventory(&cfg, &home, &wt, &repo, now);
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         let by_path: std::collections::BTreeMap<_, _> =
             entries.iter().map(|e| (e.path.clone(), e)).collect();
@@ -1087,6 +1119,61 @@ mod tests {
         );
     }
 
+    /// `<home>/runs` is shared by every repository magi has ever driven, not
+    /// only the one being scanned. Two repositories can render
+    /// `CARGO_TARGET_DIR` off the same `vars.cache` root and so end up with
+    /// numerically identical historical cache paths purely by coincidence -
+    /// a finished run's own saved path is only proof of anything for the
+    /// repository that actually ran it, never for an unrelated one that
+    /// happens to be scanning the same neighborhood.
+    #[test]
+    fn a_finished_runs_history_from_a_different_repo_does_not_make_a_path_reclaimable() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+        let this_repo = dir.path().join("this-repo");
+        let other_repo = dir.path().join("other-repo");
+        let now = ts("2026-09-05T00:00:00Z");
+
+        let mut cfg = crate::config::Config::default();
+        let configured_cache = dir.path().join("magi-target");
+        cfg.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR={} cargo make check",
+            configured_cache.display()
+        )];
+        fs::create_dir_all(&configured_cache).unwrap();
+
+        // Finished, readable, and pointing straight at the shared neighbor
+        // cache — but it is a different repository's run, so it must not be
+        // enough to call the cache reclaimable when scanning `this_repo`.
+        let shared_cache = dir.path().join("magi-land6");
+        fs::create_dir_all(&shared_cache).unwrap();
+        fs::write(shared_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
+        write_run_with_cache(
+            &runs,
+            &wt,
+            "20260801-000000-fini",
+            "ready",
+            &shared_cache,
+            &other_repo,
+        );
+
+        let entries = neighbor_cache_inventory(&cfg, &home, &wt, &this_repo, now);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0].status,
+            CacheStatus::Unknown,
+            "a different repository's finished run must not vouch for a \
+             path in this repository's scan: {:?}",
+            entries[0]
+        );
+        assert_eq!(
+            entries[0].owner, None,
+            "the other repository's run does not count as an owner here"
+        );
+    }
+
     /// The gap R2-1-1 found: a finished, readable run `F` and an in-flight
     /// run `U` can point at the very same neighbor cache — that is the whole
     /// premise of `owners` allowing more than one match per path — and if
@@ -1103,6 +1190,7 @@ mod tests {
         let runs = dir.path().join("runs");
         let wt = dir.path().join("wt");
         let home = dir.path().to_path_buf();
+        let repo = dir.path().join("repo");
         let now = ts("2026-09-05T00:00:00Z");
 
         let mut cfg = crate::config::Config::default();
@@ -1118,7 +1206,14 @@ mod tests {
         let shared_cache = dir.path().join("magi-land6");
         fs::create_dir_all(&shared_cache).unwrap();
         fs::write(shared_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
-        write_run_with_cache(&runs, &wt, "20260801-000000-fini", "ready", &shared_cache);
+        write_run_with_cache(
+            &runs,
+            &wt,
+            "20260801-000000-fini",
+            "ready",
+            &shared_cache,
+            &repo,
+        );
 
         // `U`: a run directory a live daemon is actively driving right now,
         // but whose `run.json` cannot be parsed at all - the exact
@@ -1135,7 +1230,7 @@ mod tests {
         status.updated_at = now;
         crate::daemon::write_status_to(&home.join("daemon.json"), &status).unwrap();
 
-        let entries = neighbor_cache_inventory(&cfg, &home, &wt, now);
+        let entries = neighbor_cache_inventory(&cfg, &home, &wt, &repo, now);
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(
             entries[0].status,
@@ -1163,6 +1258,7 @@ mod tests {
         let runs = dir.path().join("runs");
         let wt = dir.path().join("wt");
         let home = dir.path().to_path_buf();
+        let repo = dir.path().join("repo");
         let now = ts("2026-09-05T00:00:00Z");
 
         let mut cfg = crate::config::Config::default();
@@ -1176,14 +1272,21 @@ mod tests {
         let shared_cache = dir.path().join("magi-land6");
         fs::create_dir_all(&shared_cache).unwrap();
         fs::write(shared_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
-        write_run_with_cache(&runs, &wt, "20260801-000000-fini", "ready", &shared_cache);
+        write_run_with_cache(
+            &runs,
+            &wt,
+            "20260801-000000-fini",
+            "ready",
+            &shared_cache,
+            &repo,
+        );
 
         let unreadable_id = "20260905-000000-dead";
         std::fs::create_dir_all(runs.join(unreadable_id)).unwrap();
         std::fs::write(runs.join(unreadable_id).join("run.json"), "not json at all").unwrap();
         // No `daemon.json` at all: nothing claims to be working on it.
 
-        let entries = neighbor_cache_inventory(&cfg, &home, &wt, now);
+        let entries = neighbor_cache_inventory(&cfg, &home, &wt, &repo, now);
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(
             entries[0].status,
@@ -1196,13 +1299,23 @@ mod tests {
 
     /// Write a minimal run whose saved `Config` renders `CARGO_TARGET_DIR` to
     /// `cache`, so [`neighbor_cache_inventory`] can read it back exactly the
-    /// way it would a real run's own recorded config.
-    fn write_run_with_cache(runs: &Path, wt: &Path, id: &str, status: &str, cache: &Path) {
+    /// way it would a real run's own recorded config. `repo` is the run's
+    /// own saved repository — [`neighbor_cache_inventory`] only trusts a
+    /// run to vouch for a path when this matches the repo it is scanning
+    /// for, so a test asserting cross-repo behavior needs to control it.
+    fn write_run_with_cache(
+        runs: &Path,
+        wt: &Path,
+        id: &str,
+        status: &str,
+        cache: &Path,
+        repo: &Path,
+    ) {
         let mut config = crate::config::Config::default();
         config.graph.worktree_root = Some(wt.to_path_buf());
         config.verify.gate = vec![format!("CARGO_TARGET_DIR={} cargo test", cache.display())];
         let mut state = RunState::new(
-            PathBuf::from("/nonexistent/repo"),
+            repo.to_path_buf(),
             "main".to_owned(),
             "deadbeef".to_owned(),
             String::new(),
@@ -1298,7 +1411,14 @@ mod tests {
         let dead_cache = dir.path().join("magi-land6");
         std::fs::create_dir_all(&dead_cache).unwrap();
         std::fs::write(dead_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
-        write_run_with_cache(&runs, &wt, "20260801-000000-dead", "ready", &dead_cache);
+        write_run_with_cache(
+            &runs,
+            &wt,
+            "20260801-000000-dead",
+            "ready",
+            &dead_cache,
+            &repo,
+        );
 
         // `auto_fold = false` is the operator's opt-out for every unattended
         // removal this pass makes, worktrees and neighbor caches alike - it

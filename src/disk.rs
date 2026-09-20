@@ -263,18 +263,30 @@ pub struct NeighborCache {
     pub bytes: u64,
 }
 
+/// How many directory levels under `cache_dir`'s own parent
+/// [`scan_neighbor_caches`] looks into.
+///
+/// `1` alone would cover a flat leftover like `Temp\magi-land6`, but the
+/// incident this module answers also found per-seat scratch targets one
+/// level further down, inside a container that is not itself Cargo-shaped
+/// (`Temp\j26c7\A`, `Temp\j26c7\C` — `j26c7` is just a run id, `A` and `C`
+/// are the actual targets). `2` catches both without opening the door to a
+/// full recursive walk of `Temp`, which is the "delete things by guessing"
+/// this module exists to avoid.
+const NEIGHBOR_SCAN_DEPTH: u32 = 2;
+
 /// List directories that look like Cargo build caches next to `cache_dir`,
 /// other than `cache_dir` itself and anything under `skip`.
 ///
-/// One level under `cache_dir`'s own parent, never recursive and never wider:
-/// the leftovers this exists to surface sat directly beside the configured
-/// cache (both are typically rendered from the same `{{ vars.cache }}`
-/// template), and walking an entire `Temp` tree — or any directory the
-/// operator did not point magi at — is exactly the "delete things under
-/// `Temp` by guessing" this module is built to avoid. `skip` is for the
-/// directories this scan must never enter even if they happened to look like
-/// a match: the run worktree bay and `<home>/runs`, neither of which this
-/// function has any business touching.
+/// [`NEIGHBOR_SCAN_DEPTH`] levels under `cache_dir`'s own parent, never
+/// wider: the leftovers this exists to surface sat near the configured cache
+/// (typically rendered from the same `{{ vars.cache }}` template), and
+/// walking an entire `Temp` tree — or any directory the operator did not
+/// point magi at — is exactly the "delete things under `Temp` by guessing"
+/// this module is built to avoid. `skip` is for the directories this scan
+/// must never enter even if they happened to look like a match: the run
+/// worktree bay and `<home>/runs`, neither of which this function has any
+/// business touching.
 ///
 /// A symlink or a junction is never followed and never counted, matching
 /// [`dir_size`]'s own rule: a reparse point next to the cache could target
@@ -288,7 +300,32 @@ pub fn scan_neighbor_caches(cache_dir: &Path, skip: &[PathBuf]) -> Vec<NeighborC
     let cache_canon = canonical_or(cache_dir);
     let skip_canon: Vec<PathBuf> = skip.iter().map(|p| canonical_or(p)).collect();
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+    scan_neighbor_level(
+        parent,
+        &cache_canon,
+        &skip_canon,
+        NEIGHBOR_SCAN_DEPTH,
+        &mut out,
+    );
+    out
+}
+
+/// One level of [`scan_neighbor_caches`]'s walk, recursing into anything
+/// that is not itself Cargo-shaped until `depth` runs out. A directory that
+/// *is* Cargo-shaped is reported and never descended into — the target
+/// itself is what this scan looks for, not whatever cargo has written below
+/// it.
+fn scan_neighbor_level(
+    dir: &Path,
+    cache_canon: &Path,
+    skip_canon: &[PathBuf],
+    depth: u32,
+    out: &mut Vec<NeighborCache>,
+) {
+    let Some(next_depth) = depth.checked_sub(1) else {
+        return;
+    };
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let path = entry.path();
         let Ok(meta) = entry.metadata() else { continue };
         if meta.file_type().is_symlink() || !meta.is_dir() {
@@ -300,26 +337,26 @@ pub fn scan_neighbor_caches(cache_dir: &Path, skip: &[PathBuf]) -> Vec<NeighborC
         // configured cache (and so this scan's own `parent`) inside the
         // worktree bay or `<home>/runs` rather than only ever sitting beside
         // them. `starts_with` catches both directions — a found entry
-        // sitting inside a skip root, and (should `parent` itself already be
-        // a descendant of one) a skip root sitting inside a found entry,
-        // which would otherwise still be walked into by `dir_size` and,
-        // worse, deleted whole by a caller that reclaims it.
-        if canon == cache_canon
+        // sitting inside a skip root, and (should `dir` itself already be a
+        // descendant of one) a skip root sitting inside a found entry, which
+        // would otherwise still be walked into by `dir_size` and, worse,
+        // deleted whole by a caller that reclaims it.
+        if canon == *cache_canon
             || skip_canon
                 .iter()
                 .any(|s| canon.starts_with(s) || s.starts_with(&canon))
         {
             continue;
         }
-        if !looks_like_cargo_target(&path) {
-            continue;
+        if looks_like_cargo_target(&path) {
+            out.push(NeighborCache {
+                bytes: dir_size(&path),
+                path,
+            });
+        } else {
+            scan_neighbor_level(&path, cache_canon, skip_canon, next_depth, out);
         }
-        out.push(NeighborCache {
-            bytes: dir_size(&path),
-            path,
-        });
     }
-    out
 }
 
 /// `path`, canonicalized when possible, falling back to the path as given —
@@ -617,6 +654,36 @@ mod tests {
         assert_eq!(found.len(), 1, "found: {paths:?}");
         assert_eq!(found[0].path, orphan);
         assert_eq!(found[0].bytes, 8, "the tag file itself counts too");
+    }
+
+    /// The exact shape the incident behind this module found and a
+    /// one-level scan would miss entirely: `Temp\j26c7` is just a run id, not
+    /// a build cache in its own right, but `Temp\j26c7\A` and `\C` are — a
+    /// seat's own scratch target one level further down than
+    /// `magi-land6`-style flat leftovers sit.
+    #[test]
+    fn neighbor_scan_finds_a_seat_target_nested_one_level_inside_a_run_id_container() {
+        let t = tempfile::TempDir::new().expect("temp");
+        let cache = t.path().join("magi-target");
+        fs::create_dir_all(&cache).expect("dir");
+        fs::write(cache.join("CACHEDIR.TAG"), b"tag").expect("write");
+
+        let container = t.path().join("j26c7");
+        fs::create_dir_all(&container).expect("dir");
+        let seat_a = container.join("A");
+        fs::create_dir_all(&seat_a).expect("dir");
+        fs::write(seat_a.join("CACHEDIR.TAG"), b"tag").expect("write");
+        let seat_c = container.join("C");
+        fs::create_dir_all(&seat_c).expect("dir");
+        fs::write(seat_c.join("CACHEDIR.TAG"), b"tag").expect("write");
+
+        let found = scan_neighbor_caches(&cache, &[]);
+        let mut paths: Vec<&Path> = found.iter().map(|n| n.path.as_path()).collect();
+        paths.sort();
+        assert_eq!(paths, vec![seat_a.as_path(), seat_c.as_path()], "{paths:?}");
+        // The container itself is not cargo-shaped, so it is never reported
+        // as an entry of its own - only what is actually inside it.
+        assert!(!found.iter().any(|n| n.path == container));
     }
 
     /// `skip` promises "anything under skip", not merely "exactly skip" — an

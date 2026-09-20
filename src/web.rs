@@ -96,7 +96,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 use anyhow::{Context, Result};
@@ -320,6 +320,10 @@ pub struct Ui {
     /// requests so polling `GET /api/repos` repeatedly does not repeat the
     /// filesystem walk every time - see [`repos::Cache`].
     repos_cache: repos::Cache,
+    /// The last neighbor-cache inventory scan behind `disk.unknown_cache_bytes`,
+    /// and when it happened - the same reasoning as `repos_cache`, for the
+    /// same reason: see [`DiskCache`].
+    disk_cache: DiskCache,
     /// Merge mode override handed to the loop this process starts.
     merge: Option<String>,
     /// The loop this process is running, if it is running one.
@@ -362,6 +366,7 @@ impl Ui {
             talk_turns: Arc::default(),
             resuming: Arc::default(),
             repos_cache: repos::Cache::new(),
+            disk_cache: DiskCache::default(),
             merge: None,
             looping: Arc::default(),
             launch: launch_daemon,
@@ -1605,16 +1610,8 @@ impl DiskView {
         let unknown_cache_bytes = cfg
             .as_ref()
             .map(|cfg| {
-                crate::clean::neighbor_cache_inventory(
-                    cfg,
-                    &ui.home,
-                    &ui.worktrees_root,
-                    Timestamp::now(),
-                )
-                .into_iter()
-                .filter(|e| e.status == crate::clean::CacheStatus::Unknown)
-                .map(|e| e.bytes)
-                .sum()
+                ui.disk_cache
+                    .unknown_bytes(cfg, &ui.home, &ui.worktrees_root, &ui.repo)
             })
             .unwrap_or(0);
         Self {
@@ -1624,6 +1621,69 @@ impl DiskView {
             cache_bytes,
             unknown_cache_bytes,
         }
+    }
+}
+
+/// In-process cache of the last neighbor-cache inventory scan behind
+/// `unknown_cache_bytes`.
+///
+/// Mirrors [`crate::repos::Cache`]'s own pattern, for the same reason:
+/// `/api/health` is polled continuously for as long as a phone tab stays
+/// open (`assets/ui/app.js`'s own poll loop), and this is by far the most
+/// expensive figure that route computes -
+/// [`crate::clean::neighbor_cache_inventory`] parses every readable run
+/// record's own saved config and walks every build-cache-shaped directory it
+/// finds next to the configured cache file by file, `Active` and `Unknown`
+/// entries alike, not only the `Unknown` bytes this actually keeps.
+/// Recomputing that on every ten-second poll would turn a phone tab left
+/// open into a standing tax on the very disk I/O this feature exists to
+/// protect - including a cache a live verify build still has open.
+#[derive(Debug, Clone, Default)]
+struct DiskCache {
+    state: Arc<Mutex<DiskCacheState>>,
+}
+
+#[derive(Debug, Default)]
+struct DiskCacheState {
+    unknown_cache_bytes: u64,
+    scanned_at: Option<Instant>,
+}
+
+/// How long [`DiskCache`] trusts its last scan before rescanning. Long
+/// enough to matter against a ten-second poll, short enough that a sweep or
+/// a run finishing changes what the phone sees within a couple of polls
+/// rather than requiring the process to restart.
+const DISK_CACHE_TTL: Duration = Duration::from_secs(60);
+
+impl DiskCache {
+    /// The last scan's `unknown_cache_bytes`, rescanning first when the
+    /// cache has never been filled or [`DISK_CACHE_TTL`] has elapsed.
+    fn unknown_bytes(
+        &self,
+        cfg: &Config,
+        home: &std::path::Path,
+        worktrees_root: &std::path::Path,
+        repo: &std::path::Path,
+    ) -> u64 {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let stale = state
+            .scanned_at
+            .is_none_or(|at| at.elapsed() >= DISK_CACHE_TTL);
+        if stale {
+            state.unknown_cache_bytes = crate::clean::neighbor_cache_inventory(
+                cfg,
+                home,
+                worktrees_root,
+                repo,
+                Timestamp::now(),
+            )
+            .into_iter()
+            .filter(|e| e.status == crate::clean::CacheStatus::Unknown)
+            .map(|e| e.bytes)
+            .sum();
+            state.scanned_at = Some(Instant::now());
+        }
+        state.unknown_cache_bytes
     }
 }
 
@@ -6793,6 +6853,41 @@ mod tests {
         assert_eq!(
             health.json()["disk"]["unknown_cache_bytes"],
             1024 + tag.len() as u64
+        );
+    }
+
+    /// [`crate::clean::neighbor_cache_inventory`] parses every run record and
+    /// walks every neighbor cache byte by byte - too expensive to repeat on
+    /// every one of `app.js`'s ten-second polls. A second poll immediately
+    /// after the first must reuse that scan rather than redo it: a cache
+    /// created in between must not appear until the cache's own TTL expires.
+    #[tokio::test]
+    async fn a_second_poll_within_the_ttl_does_not_rescan_for_a_newly_created_cache() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let configured = tmp.path().join("magi-target");
+        std::fs::create_dir_all(&configured).expect("configured cache dir");
+        let gate = format!("CARGO_TARGET_DIR={} cargo test", configured.display());
+        std::fs::write(
+            repo.join("magi.toml"),
+            format!("[verify]\ngate = [{gate:?}]\n"),
+        )
+        .expect("write magi.toml");
+
+        let f = Fixture::with_repo(repo).await;
+        let first = f.get("/api/health").await;
+        assert_eq!(first.json()["disk"]["unknown_cache_bytes"], 0);
+
+        let orphan = tmp.path().join("magi-land6");
+        std::fs::create_dir_all(&orphan).expect("orphan cache dir");
+        std::fs::write(orphan.join("CACHEDIR.TAG"), b"tag").expect("write tag file");
+
+        let second = f.get("/api/health").await;
+        assert_eq!(
+            second.json()["disk"]["unknown_cache_bytes"],
+            0,
+            "a poll inside the cache's TTL must not have rescanned"
         );
     }
 

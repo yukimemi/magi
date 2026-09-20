@@ -905,6 +905,12 @@ async fn dispatch(command: Command) -> Result<()> {
             let repo = opts.repo.unwrap_or_else(|| PathBuf::from("."));
             let mut runner = if let Some(id) = resume {
                 let runner = Runner::resume(&id)?;
+                // Resuming still spends agent calls and disk the same as a
+                // fresh start does - a run picked up manually from the CLI
+                // must not skip the gate that `magi serve` already applies
+                // before it carries a resumable run on (finding R1-1-3 of
+                // run 406d).
+                disk_gate_or_bail(&runner.state.repo, &runner.state.config.disk)?;
                 println!(
                     "{}",
                     format_args!("resuming {} ({:?})", runner.state.id, runner.state.status)
@@ -929,17 +935,9 @@ async fn dispatch(command: Command) -> Result<()> {
                     cfg.blind.seed = Some(s);
                 }
                 println!("config: {}", describe_layers(&from));
-                // The same free-space gate the daemon obeys: a run that cannot
-                // finish must not start, and a held task must not spend an
-                // attempt on the way in.
-                let min = cfg.disk.min_free_bytes;
-                if min > 0 {
-                    let free = magi::disk::free_bytes(&repo)
-                        .with_context(|| format!("measure free space on {}", repo.display()))?;
-                    if let Some(reason) = magi::disk::gate(free, min) {
-                        bail!("{reason}");
-                    }
-                }
+                // A run that cannot finish must not start, and a held task
+                // must not spend an attempt on the way in.
+                disk_gate_or_bail(&repo, &cfg.disk)?;
                 Runner::start(&repo, task, cfg).await?
             };
 
@@ -973,6 +971,11 @@ async fn dispatch(command: Command) -> Result<()> {
                 cfg.merge.mode = m.into();
             }
             println!("config: {}", describe_layers(&from));
+            // Same gate as `magi run`: a review run mints candidates,
+            // verify, and worktrees the same as a fresh implementation run
+            // does, and must not start on a disk that cannot finish it
+            // (finding R1-1-3 of run 406d).
+            disk_gate_or_bail(&repo, &cfg.disk)?;
             let mut runner = Runner::review(&repo, &branch, cfg).await?;
             let result = runner.execute().await;
             print!("{}", report::run(&runner.state));
@@ -1319,7 +1322,7 @@ fn cache(command: CacheCmd) -> Result<()> {
         }
         CacheCmd::Status { .. } => {
             print_free_space(repo);
-            let entries = neighbor_cache_entries(&cfg);
+            let entries = neighbor_cache_entries(&cfg, repo);
             if entries.is_empty() {
                 println!(
                     "no build-cache-shaped directories found next to {}",
@@ -1354,7 +1357,7 @@ fn cache(command: CacheCmd) -> Result<()> {
         }
         CacheCmd::Sweep { dry_run, .. } => {
             print_free_space(repo);
-            let entries = neighbor_cache_entries(&cfg);
+            let entries = neighbor_cache_entries(&cfg, repo);
             if entries.is_empty() {
                 println!("nothing next to {}", dir.display());
                 return Ok(());
@@ -1409,9 +1412,9 @@ fn cache(command: CacheCmd) -> Result<()> {
 }
 
 /// Every build-cache-shaped directory next to `cfg`'s own cache that the
-/// cap and the janitor do not already track, classified against the run
-/// records under [`magi::run::runs_root`].
-fn neighbor_cache_entries(cfg: &Config) -> Vec<magi::clean::CacheEntry> {
+/// cap and the janitor do not already track, classified against `repo`'s own
+/// run records under [`magi::run::runs_root`].
+fn neighbor_cache_entries(cfg: &Config, repo: &Path) -> Vec<magi::clean::CacheEntry> {
     let worktrees_root = cfg
         .graph
         .worktree_root
@@ -1421,8 +1424,27 @@ fn neighbor_cache_entries(cfg: &Config) -> Vec<magi::clean::CacheEntry> {
         cfg,
         &magi::run::home(),
         &worktrees_root,
+        repo,
         jiff::Timestamp::now(),
     )
+}
+
+/// The same free-space gate the daemon obeys, for the CLI's own entry
+/// points: a run that cannot finish must not start, whether it is minted
+/// fresh, resumed, or a bare `magi review`. A volume whose free space cannot
+/// be measured closes the gate too — starting a run blind on a disk that may
+/// be full is how the machine ends up with 6.7 GB free.
+fn disk_gate_or_bail(repo: &Path, disk: &magi::config::Disk) -> Result<()> {
+    let min = disk.min_free_bytes;
+    if min == 0 {
+        return Ok(());
+    }
+    let free = magi::disk::free_bytes(repo)
+        .with_context(|| format!("measure free space on {}", repo.display()))?;
+    if let Some(reason) = magi::disk::gate(free, min) {
+        bail!("{reason}");
+    }
+    Ok(())
 }
 
 /// Print free space on the volume holding `repo`, or say why it could not be
@@ -2737,6 +2759,35 @@ mod tests {
     fn a_ready_or_merged_run_exits_zero() {
         assert!(exit_status(Ok(()), RunStatus::Ready, false).is_ok());
         assert!(exit_status(Ok(()), RunStatus::Merged, false).is_ok());
+    }
+
+    /// `magi run --resume` and `magi review` used to reach `Runner::resume`
+    /// and `Runner::review` without ever calling this — only a fresh `magi
+    /// run` did. Both now call it before minting or continuing any work
+    /// (finding R1-1-3 of run 406d); this pins the gate itself, not any one
+    /// call site.
+    #[test]
+    fn disk_gate_or_bail_refuses_a_volume_below_threshold_and_a_zero_threshold_never_measures() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // An impossibly high threshold: no volume on any machine running
+        // this test has that much free, so the gate must refuse regardless
+        // of the host's actual disk state.
+        let mut disk = magi::config::Disk {
+            min_free_bytes: u64::MAX,
+            ..Default::default()
+        };
+        let err = disk_gate_or_bail(dir.path(), &disk).expect_err("must refuse");
+        assert!(
+            format!("{err:#}").to_lowercase().contains("free"),
+            "the reason names free space: {err:#}"
+        );
+
+        // A zero threshold opts out entirely - it must not even try to
+        // measure the volume, so a path that cannot be measured (missing,
+        // or otherwise) still passes.
+        disk.min_free_bytes = 0;
+        assert!(disk_gate_or_bail(&dir.path().join("does-not-exist"), &disk).is_ok());
     }
 
     #[test]
