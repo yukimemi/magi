@@ -153,3 +153,93 @@ async fn a_park_asked_for_mid_walk_stops_at_the_boundary_after_it() {
         runner.state.status
     );
 }
+
+/// The property both prior attempts at the interrupt-scheduling feature were
+/// rejected for missing: a park requested while an agent call is genuinely
+/// in flight must not cut that call short, and must only be honoured once
+/// the node it belongs to actually finishes.
+///
+/// `impl-A`'s mock process proves it has actually started (a real file it
+/// writes, not a guessed sleep) before this test asks for a park; only then
+/// is the park released, and only after `execute` returns is the run checked
+/// for what happened. If a park were somehow observed mid-call, `impl-A`
+/// would be missing from the candidates `implement` returns, or `judge`
+/// would already have started — either failure this test would catch.
+#[tokio::test]
+async fn a_park_requested_while_a_seat_is_mid_call_does_not_cut_it_short() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+
+    let block_dir = fx.tmp.path().join("block");
+    std::fs::create_dir_all(&block_dir).expect("block dir");
+    for a in &mut fx.config.agents {
+        a.env
+            .insert("MOCK_BLOCK_SEAT".to_owned(), "impl-A".to_owned());
+        a.env.insert(
+            "MOCK_BLOCK_DIR".to_owned(),
+            block_dir.to_string_lossy().into_owned(),
+        );
+    }
+
+    let pause = Pause::new();
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.on_pause(pause.clone());
+
+    let started_marker = block_dir.join("started-impl-A");
+    let release_marker = block_dir.join("release-impl-A");
+    let interrupter = tokio::spawn({
+        let pause = pause.clone();
+        async move {
+            // A real signal that `impl-A`'s call has begun, not a guessed
+            // duration - bounded so a regression that never reaches it fails
+            // fast instead of hanging the suite.
+            let mut seen = false;
+            for _ in 0..500 {
+                if started_marker.exists() {
+                    seen = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(seen, "the mock never signalled that impl-A had started");
+
+            // The call is now genuinely in flight. Ask it to park.
+            pause.park();
+            // Nothing inside the call can observe that - only `execute`'s
+            // own boundary check, after `implement` returns, can - so
+            // letting it finish on its own is what proves the point rather
+            // than merely being lucky about timing.
+            std::fs::write(&release_marker, b"go").expect("release impl-A");
+        }
+    });
+
+    runner
+        .execute()
+        .await
+        .expect("execute parks after implement");
+    interrupter.await.expect("interrupter");
+
+    assert_eq!(
+        runner.state.candidates.len(),
+        3,
+        "all three candidates exist, including impl-A's own"
+    );
+    let a = runner
+        .state
+        .candidates
+        .iter()
+        .find(|c| c.label == 'A')
+        .expect("candidate A");
+    assert!(
+        a.commits > 0 && a.failed.is_none(),
+        "impl-A's work was not thrown away by the park request: {a:?}"
+    );
+    assert!(
+        runner.state.judgements.is_empty(),
+        "the park took effect at the boundary right after `implement`, \
+         before `judge` ever started"
+    );
+    assert!(runner.state.parked);
+}

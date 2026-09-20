@@ -1335,13 +1335,25 @@ enum Interrupt {
     },
     /// `interrupt_task` is dispatched and in flight alone. Dispatch is
     /// withheld from everyone until it leaves flight - merged, failed, held,
-    /// it makes no difference - at which point the sequence ends and
-    /// whatever was in `parked` competes for the next slot exactly like any
-    /// other runnable task.
+    /// it makes no difference - at which point the sequence moves to
+    /// [`Interrupt::Resuming`], never straight back to [`Interrupt::Idle`]:
+    /// going straight to `Idle` would hand `parked` back to ordinary
+    /// priority-order dispatch, where a higher-priority task filed in the
+    /// meantime - or a second slot freed by `max_concurrent_runs` - could
+    /// start ahead of it, or alongside it, which is exactly the "not
+    /// guaranteed, not exclusive" bug this state exists to close.
     Running {
         parked: Vec<String>,
         interrupt_task: String,
     },
+    /// `interrupt_task` left flight; `parked` still names whoever this
+    /// sequence owes a resume. Dispatch is withheld from everyone except a
+    /// single task drawn from `parked` - see [`interrupt_gate`] - so the
+    /// resume this feature promises is never raced by, or run alongside, an
+    /// unrelated candidate. Ends the moment any id from `parked` is seen in
+    /// flight, or - see `advance_interrupt`'s own doc on abandonment - the
+    /// moment none of them are runnable any longer.
+    Resuming { parked: Vec<String> },
 }
 
 /// One tick of the interrupt scheduler's own state machine. Pure: `in_flight`
@@ -1354,6 +1366,16 @@ enum Interrupt {
 /// accepted rather than a narrower type because that is what [`poll`] already
 /// has on hand from [`runnable`], and building a second, smaller list on
 /// every tick just to satisfy this signature would cost more than it proves.
+///
+/// Abandonment: [`Interrupt::Parking`] and [`Interrupt::Resuming`] both fall
+/// back to a task they are waiting on no longer being [`runnable`] - held,
+/// blocked, deleted, or finished by some other means entirely, all of which
+/// an operator can do to a task sitting in the queue with no claim on it at
+/// all, at any moment, interrupt sequence or not. Without this check the
+/// sequence would wait forever for a dispatch that can never come, and
+/// `interrupt_gate` would withhold every other task in the queue right along
+/// with it - a single `magi task hold` on the wrong id turning into a
+/// daemon that never dispatches anything again.
 fn advance_interrupt(state: Interrupt, in_flight: &[String], runnable: &[Task]) -> Interrupt {
     match state {
         Interrupt::Idle => {
@@ -1385,7 +1407,7 @@ fn advance_interrupt(state: Interrupt, in_flight: &[String], runnable: &[Task]) 
                     parked,
                     interrupt_task,
                 }
-            } else {
+            } else if runnable.iter().any(|t| t.id == interrupt_task) {
                 // The parked run(s) are gone, but the interrupt task has not
                 // been dispatched yet on this tick - `interrupt_gate` is
                 // what lets it through next.
@@ -1393,6 +1415,12 @@ fn advance_interrupt(state: Interrupt, in_flight: &[String], runnable: &[Task]) 
                     parked,
                     interrupt_task,
                 }
+            } else {
+                // The interrupt task itself is no longer runnable - see this
+                // function's own doc on abandonment. The parked run(s) still
+                // get their guaranteed resume; there is simply no interrupt
+                // to run ahead of them any longer.
+                Interrupt::Resuming { parked }
             }
         }
         Interrupt::Running {
@@ -1406,10 +1434,26 @@ fn advance_interrupt(state: Interrupt, in_flight: &[String], runnable: &[Task]) 
                 }
             } else {
                 // The interrupt task's own run reached a terminal status,
-                // whichever one - this is the *only* trigger that ends the
-                // sequence, driven straight off the same in-flight
+                // whichever one - this is the *only* trigger that moves the
+                // sequence on, driven straight off the same in-flight
                 // bookkeeping `poll` already reaps every tick, not a second,
                 // independent poll of anything.
+                Interrupt::Resuming { parked }
+            }
+        }
+        Interrupt::Resuming { parked } => {
+            if in_flight.iter().any(|id| parked.contains(id)) {
+                // One of the parked runs has been dispatched - the resume
+                // this sequence owed is fulfilled. Whatever else is left in
+                // `parked` (ordinarily nothing, at the default concurrency
+                // of one) rejoins ordinary priority-order dispatch, same as
+                // any other runnable task.
+                Interrupt::Idle
+            } else if runnable.iter().any(|t| parked.contains(&t.id)) {
+                Interrupt::Resuming { parked }
+            } else {
+                // Abandonment (see this function's own doc): nothing left in
+                // `parked` is even runnable any longer.
                 Interrupt::Idle
             }
         }
@@ -1454,6 +1498,18 @@ fn interrupt_gate(state: &Interrupt, in_flight: &[String], candidates: Vec<Task>
             }
         }
         Interrupt::Running { .. } => Vec::new(),
+        // At most one: even if `parked` names more than one id (more than
+        // one run was in flight when the sequence began, only possible
+        // above the default `max_concurrent_runs = 1`), only the first match
+        // is offered. Capping this to a single candidate - not merely to
+        // `parked`'s own ids - is what makes "exactly one resume, never two
+        // dispatched together" true regardless of how many ordinary slots
+        // happen to be free this tick.
+        Interrupt::Resuming { parked } => candidates
+            .into_iter()
+            .find(|t| parked.contains(&t.id))
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -2776,6 +2832,13 @@ mod tests {
         t
     }
 
+    /// An ordinary runnable task with an id fixed for assertions.
+    fn task_with_id(id: &str) -> Task {
+        let mut t = task();
+        t.id = id.to_owned();
+        t
+    }
+
     #[test]
     fn no_interrupt_task_leaves_the_sequence_idle_even_with_something_in_flight() {
         let ordinary = task();
@@ -2824,8 +2887,10 @@ mod tests {
         assert_eq!(still_going, state);
 
         // Left flight, but the interrupt task has not been dispatched yet on
-        // this tick - stays `Parking` so `interrupt_gate` can let it through.
-        let stopped_but_not_yet_dispatched = advance_interrupt(state.clone(), &[], &[]);
+        // this tick - stays `Parking` so `interrupt_gate` can let it through,
+        // as long as it is still runnable.
+        let stopped_but_not_yet_dispatched =
+            advance_interrupt(state.clone(), &[], &[interrupt_task("marked")]);
         assert_eq!(stopped_but_not_yet_dispatched, state);
 
         // Left flight, and the interrupt task is now in flight itself.
@@ -2840,7 +2905,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sequence_ends_the_instant_the_interrupt_tasks_own_run_leaves_flight() {
+    fn the_sequence_moves_to_resuming_the_instant_the_interrupt_tasks_own_run_leaves_flight() {
         let state = Interrupt::Running {
             parked: vec!["running".to_owned()],
             interrupt_task: "marked".to_owned(),
@@ -2850,9 +2915,68 @@ mod tests {
 
         // Whatever it ended as - merged, failed, held - is not this
         // function's concern: leaving flight is the only trigger, driven
-        // straight off the same in-flight list `poll` already reaps.
-        let ended = advance_interrupt(state, &[], &[]);
-        assert_eq!(ended, Interrupt::Idle);
+        // straight off the same in-flight list `poll` already reaps. It does
+        // not go straight to `Idle`: see `Interrupt::Running`'s own doc for
+        // why that would let an unrelated task start ahead of, or alongside,
+        // the guaranteed resume.
+        let ended = advance_interrupt(state, &[], &[task_with_id("running")]);
+        assert_eq!(
+            ended,
+            Interrupt::Resuming {
+                parked: vec!["running".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn resuming_ends_the_instant_a_parked_task_is_seen_in_flight() {
+        let state = Interrupt::Resuming {
+            parked: vec!["running".to_owned()],
+        };
+        let still_waiting = advance_interrupt(state.clone(), &[], &[task_with_id("running")]);
+        assert_eq!(still_waiting, state);
+
+        let dispatched = advance_interrupt(state, &["running".to_owned()], &[]);
+        assert_eq!(dispatched, Interrupt::Idle);
+    }
+
+    /// R1-2-1: an interrupt task that stops being runnable - held, blocked,
+    /// or otherwise moved on by an operator with no claim standing in the
+    /// way - must not wedge the sequence (and so the whole loop's dispatch,
+    /// via `interrupt_gate`) waiting forever for a dispatch that can never
+    /// come. The parked run still gets its resume.
+    #[test]
+    fn an_interrupt_task_that_stops_being_runnable_abandons_the_wait_without_losing_the_parked_run()
+    {
+        let state = Interrupt::Parking {
+            parked: vec!["running".to_owned()],
+            interrupt_task: "marked".to_owned(),
+        };
+        // `marked` has been held/blocked/deleted since the sequence began:
+        // it no longer appears in `runnable` at all.
+        let next = advance_interrupt(state, &[], &[]);
+        assert_eq!(
+            next,
+            Interrupt::Resuming {
+                parked: vec!["running".to_owned()]
+            },
+            "abandoning the interrupt must not abandon the resume it owes"
+        );
+    }
+
+    /// The same abandonment, one step later: `Resuming` itself must not wait
+    /// forever for a parked task that has since become unrunnable.
+    #[test]
+    fn resuming_abandons_a_parked_task_that_stops_being_runnable() {
+        let state = Interrupt::Resuming {
+            parked: vec!["running".to_owned()],
+        };
+        let next = advance_interrupt(state, &[], &[]);
+        assert_eq!(
+            next,
+            Interrupt::Idle,
+            "nothing is left to wait for; the loop must not stay wedged"
+        );
     }
 
     #[test]
@@ -2910,6 +3034,36 @@ mod tests {
         assert!(allowed.is_empty());
     }
 
+    /// R1-1-1 / R1-1-2: even when more than one task was in flight when the
+    /// sequence began (only reachable above the default
+    /// `max_concurrent_runs = 1`), `Resuming` offers at most one of them -
+    /// never both in the same tick, which is what "exactly one resume, no
+    /// simultaneous run" actually requires structurally rather than by
+    /// coincidence of how many ordinary slots happen to be free.
+    #[test]
+    fn the_gate_offers_at_most_one_candidate_while_resuming_even_with_two_parked() {
+        let state = Interrupt::Resuming {
+            parked: vec!["a".to_owned(), "c".to_owned()],
+        };
+        let candidates = vec![task_with_id("a"), task_with_id("c"), task_with_id("other")];
+        let allowed = interrupt_gate(&state, &[], candidates);
+        assert_eq!(
+            allowed.len(),
+            1,
+            "at most one candidate may be offered while resuming: {allowed:?}"
+        );
+        assert_eq!(allowed[0].id, "a");
+    }
+
+    #[test]
+    fn the_gate_offers_nothing_while_resuming_if_no_parked_task_is_runnable() {
+        let state = Interrupt::Resuming {
+            parked: vec!["a".to_owned()],
+        };
+        let allowed = interrupt_gate(&state, &[], vec![task_with_id("other")]);
+        assert!(allowed.is_empty());
+    }
+
     /// The invariant the completion criteria ask for by name: across a whole
     /// simulated sequence, there is never a tick where the gate would let
     /// through both the parked run's resume and the interrupt task, and
@@ -2955,14 +3109,43 @@ mod tests {
         );
 
         // Tick 4: `marked`'s run reached a terminal status and left flight.
-        state = advance_interrupt_tick(true, state, &[], std::slice::from_ref(&running));
-        assert_eq!(state, Interrupt::Idle);
-        let gated = interrupt_gate(&state, &[], vec![running.clone()]);
+        // A higher-priority ordinary task `other` is also runnable now - it
+        // must not be let through instead of, or alongside, `running`.
+        let other = task_with_id("other");
+        state = advance_interrupt_tick(true, state, &[], &[running.clone(), other.clone()]);
+        assert_eq!(
+            state,
+            Interrupt::Resuming {
+                parked: vec![running.id.clone()]
+            }
+        );
+        let gated = interrupt_gate(&state, &[], vec![other.clone(), running.clone()]);
         assert_eq!(
             gated.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
             vec![running.id.as_str()],
-            "exactly the parked run resumes, and nothing else is held back \
-             any longer"
+            "exactly the parked run resumes - not the unrelated task, even \
+             though it was offered first"
+        );
+
+        // Tick 5: `running` is now in flight (dispatched from tick 4's
+        // gate). Only now does the sequence end and ordinary dispatch fully
+        // resume.
+        state = advance_interrupt_tick(
+            true,
+            state,
+            std::slice::from_ref(&running.id),
+            std::slice::from_ref(&other),
+        );
+        assert_eq!(state, Interrupt::Idle);
+        let gated = interrupt_gate(
+            &state,
+            std::slice::from_ref(&running.id),
+            vec![other.clone()],
+        );
+        assert_eq!(
+            gated.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec![other.id.as_str()],
+            "ordinary dispatch is unrestricted again"
         );
     }
 

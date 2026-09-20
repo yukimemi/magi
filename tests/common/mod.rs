@@ -75,6 +75,22 @@ seat="$MAGI_SEAT"
 printf '%s %s %s\n' "$MAGI_RUN" "$MAGI_NODE" "$seat" \
   >> "$(dirname "$p")/attribution.log"
 
+# Handshake simulation for "is a call genuinely in flight when a park is
+# requested": a matching implement seat writes a `started-<seat>` marker,
+# proof the caller can wait on that this process has actually begun, then
+# blocks until a `release-<seat>` marker appears before falling through to
+# the ordinary implementation branch below. Bounded to five seconds of
+# polling so a test bug fails fast instead of hanging the suite; an ordinary
+# test releases it within milliseconds of seeing the marker.
+if [ -n "$MOCK_BLOCK_SEAT" ] && [ "$MAGI_NODE" = "implement" ] && { case ",$MOCK_BLOCK_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+  : > "$MOCK_BLOCK_DIR/started-$seat"
+  i=0
+  while [ ! -f "$MOCK_BLOCK_DIR/release-$seat" ] && [ "$i" -lt 500 ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+fi
+
 # Rate-limit simulation: a matching seat reports the same error shape a real
 # claude prints on quota exhaustion, and exits non-zero. The graph must read
 # this as "rate limited" — not a normal failure, not retried.
