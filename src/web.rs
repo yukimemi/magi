@@ -5314,20 +5314,31 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_handler_future_after_queueing_still_drains_the_draft() {
         /// Poll `fut` up to `max_polls` times, stopping early if it finishes.
-        async fn drive<F: std::future::Future>(fut: &mut std::pin::Pin<Box<F>>, max_polls: usize) {
+        /// Returns whether `fut` reached `Ready` — polling an `async fn`
+        /// again after that panics, so a caller driving the same `fut`
+        /// across more than one `drive` call must check this first.
+        async fn drive<F: std::future::Future>(
+            fut: &mut std::pin::Pin<Box<F>>,
+            max_polls: usize,
+        ) -> bool {
             if max_polls == 0 {
-                return;
+                return false;
             }
             let mut polls = 0usize;
+            let mut ready = false;
             std::future::poll_fn(|cx| {
                 polls += 1;
                 match fut.as_mut().poll(cx) {
-                    std::task::Poll::Ready(_) => std::task::Poll::Ready(()),
+                    std::task::Poll::Ready(_) => {
+                        ready = true;
+                        std::task::Poll::Ready(())
+                    }
                     std::task::Poll::Pending if polls >= max_polls => std::task::Poll::Ready(()),
                     std::task::Poll::Pending => std::task::Poll::Pending,
                 }
             })
             .await;
+            ready
         }
 
         let tmp = TempDir::new().expect("tempdir");
@@ -5372,7 +5383,11 @@ mod tests {
             // claim itself. Its answer - `Busy`, with the turn below still
             // held - is waiting for a fifth poll that nothing here has made
             // yet.
-            drive(&mut handler, 4).await;
+            // On a loaded machine the queueing task behind the handler's
+            // `Busy` branch can land before this ever gets to drive it
+            // again - polling an `async fn` past `Ready` panics, so that
+            // has to be checked rather than assumed away.
+            let done = drive(&mut handler, 4).await;
             tokio::time::sleep(Duration::from_millis(50)).await;
             // The turn that was running now finishes and gives the slot up
             // the way a real one does - through `drain_loop`, which finds
@@ -5383,7 +5398,9 @@ mod tests {
             drain_loop(running, talks.clone(), cfg.clone(), id.clone(), turn_guard).await;
             // Resumed, the handler writes its draft and reclaims the now-free
             // slot - and is then dropped, the way a reloading phone drops it.
-            drive(&mut handler, polls_after_release).await;
+            if !done {
+                drive(&mut handler, polls_after_release).await;
+            }
             drop(handler);
 
             // A settled talk: the draft drained into an operator turn and
