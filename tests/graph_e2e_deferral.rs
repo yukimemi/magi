@@ -82,7 +82,11 @@ async fn a_head_with_no_more_blocking_findings_runs_e2e_before_going_clean() {
     let _guard = common::home_lock().await;
     // `require_fix = true` clears its single blocking finding once the fixer
     // creates `fixed.txt`, so round 2 has nothing left to defer against.
-    let fx = fixture(_guard, Judges::Unanimous, true);
+    let mut fx = fixture(_guard, Judges::Unanimous, true);
+    // This is a review-loop scenario, not a panel one: a solo candidate skips
+    // judging entirely, dropping three implement calls and a judge/vote wave
+    // that nothing here asserts on.
+    fx.config.graph.candidates = 1;
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");

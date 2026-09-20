@@ -510,8 +510,13 @@ pub fn fixture_with_silent_review_seat(home: HomeGuard, silent_seats: &[&str]) -
 /// The mock's reconsideration branch has the split seat hold its vote and
 /// every other seat hold theirs, so the round's final verdict is
 /// deterministic: `approve_with_findings`, the more cautious of the two.
+///
+/// `candidates = 1`: this is a review-panel scenario, not an implementer
+/// panel one, so judging a solo candidate is skipped rather than spending
+/// three implement calls and a judge/vote wave nothing here asserts on.
 pub fn fixture_with_split_review_vote(home: HomeGuard, split_seat: &str) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
     for a in &mut fx.config.agents {
         a.env
             .insert("MOCK_SPLIT_REVIEW_SEAT".to_owned(), split_seat.to_owned());
@@ -524,8 +529,15 @@ pub fn fixture_with_split_review_vote(home: HomeGuard, split_seat: &str) -> Fixt
 /// fixer still runs and still commits a real, distinct change every round
 /// (see the mock script) — the point of this fixture is a round budget spent
 /// on a change that keeps moving, never a tree that stopped moving.
+///
+/// `candidates = 1` because every scenario built on this fixture is about the
+/// review loop, not the panel: judging a solo candidate is skipped entirely
+/// (see `graph::Runner::judge`), which drops three implement calls, three
+/// judge rankings and a vote wave that none of these tests assert anything
+/// about. Real subprocesses stay real; there are just fewer of them.
 pub fn fixture_that_never_clears(home: HomeGuard, rounds: usize) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
     fx.config.graph.review_rounds = rounds;
     for a in &mut fx.config.agents {
         a.env
