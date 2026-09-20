@@ -1279,6 +1279,22 @@ fn cache(command: CacheCmd) -> Result<()> {
                 println!("cache not present on disk: {}", dir.display());
                 return Ok(());
             }
+            // A live borrower - this run's own build, another run's, or a
+            // human's `magi review` sharing the same `CARGO_TARGET_DIR` -
+            // must never have its compile deleted out from under it. See
+            // `cache::in_use`, which is exactly as conservative here as it is
+            // for the automatic janitor: an unreadable lease refuses the
+            // clear too, rather than guessing it is safe.
+            let home = magi::run::home();
+            if magi::cache::in_use(&home, &dir) {
+                println!(
+                    "cache is in use right now, not clearing: {}\n\
+                     (a build is registered against it - wait for it to finish, or check \
+                     `magi show` for what is still running)",
+                    dir.display()
+                );
+                return Ok(());
+            }
             let freed = magi::disk::dir_size(&dir);
             std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
             println!("removed {} ({} freed)", dir.display(), bytes(freed));

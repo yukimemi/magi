@@ -1030,8 +1030,12 @@ impl Runner {
             prompts.overlay("advise"),
         );
         if cache.is_some() {
+            // This seat never writes, so it is never handed `CARGO_TARGET_DIR`
+            // below — see `prompt::build_cache_note`'s doc for why telling a
+            // read-only seat to build through the shared cache is exactly how
+            // a sandbox's write refusal gets misread as a defect.
             prompt.push('\n');
-            prompt.push_str(&prompt::build_cache_note("advise"));
+            prompt.push_str(&prompt::build_cache_note("advise", false));
         }
         let timeout = Duration::from_secs(self.state.config.graph.timeout_judge.max(1));
         let out = agent::invoke(
@@ -1047,7 +1051,7 @@ impl Runner {
                 stem: "advise-synthesis",
                 run: run_id,
                 node: "advise",
-                cache_dir: cache,
+                cache_dir: None,
                 attachments: &[],
             },
         )
@@ -2866,13 +2870,34 @@ impl Runner {
                 (Vec::new(), false, true, Some(reason))
             } else {
                 let e2e_commands = self.state.config.verify.e2e.clone();
-                let (e2e, verify_retried) = run_e2e_with_retry(
+                let cache_dir = self.state.config.cache_dir();
+                let context = format!("round {round}");
+                let (e2e, verify_retried) = with_cache_lease(
                     &mut self.state,
-                    &shell,
-                    &e2e_commands,
+                    cache_dir.as_deref(),
+                    "e2e",
+                    "e2e",
                     &winner.worktree,
+                    &head,
                     verify_timeout,
-                    &format!("round {round}"),
+                    &context,
+                    |state, budget| {
+                        let shell = shell.clone();
+                        let e2e_commands = e2e_commands.clone();
+                        let worktree = winner.worktree.clone();
+                        let context = context.clone();
+                        async move {
+                            run_e2e_with_retry(
+                                state,
+                                &shell,
+                                &e2e_commands,
+                                &worktree,
+                                budget,
+                                &context,
+                            )
+                            .await
+                        }
+                    },
                 )
                 .await;
                 (e2e, verify_retried, false, None)
@@ -3203,13 +3228,27 @@ impl Runner {
             let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
             let commands = self.state.config.verify.e2e.clone();
             let verified_head = git::rev_parse(worktree, "HEAD").await?;
-            let (outcomes, verify_retried) = run_e2e_with_retry(
+            let cache_dir = self.state.config.cache_dir();
+            let context =
+                format!("round {round}: deferred e2e, now catching up before the final decision");
+            let (outcomes, verify_retried) = with_cache_lease(
                 &mut self.state,
-                shell,
-                &commands,
+                cache_dir.as_deref(),
+                "e2e",
+                "e2e",
                 worktree,
+                &verified_head,
                 timeout,
-                &format!("round {round}: deferred e2e, now catching up before the final decision"),
+                &context,
+                |state, budget| {
+                    let shell = shell.to_vec();
+                    let commands = commands.clone();
+                    let context = context.clone();
+                    async move {
+                        run_e2e_with_retry(state, &shell, &commands, worktree, budget, &context)
+                            .await
+                    }
+                },
             )
             .await;
             let last = &mut self.state.reviews[round_idx];
@@ -3295,11 +3334,30 @@ impl Runner {
         };
         self.state.status = RunStatus::Gating;
         let shell = self.state.config.shell();
-        let outcomes = run_commands(
-            &shell,
-            &self.state.config.verify.gate,
+        let gate_commands = self.state.config.verify.gate.clone();
+        let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
+        let cache_dir = self.state.config.cache_dir();
+        let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+        let (outcomes, _) = with_cache_lease(
+            &mut self.state,
+            cache_dir.as_deref(),
+            "gate",
+            "gate",
             &winner.worktree,
-            Duration::from_secs(self.state.config.graph.verify_timeout()),
+            &head,
+            timeout,
+            "final gate",
+            |_state, budget| {
+                let shell = shell.clone();
+                let gate_commands = gate_commands.clone();
+                let worktree = winner.worktree.clone();
+                async move {
+                    (
+                        run_commands(&shell, &gate_commands, &worktree, budget).await,
+                        false,
+                    )
+                }
+            },
         )
         .await;
         for o in &outcomes {
@@ -3722,12 +3780,17 @@ async fn wave(
         job.prompt = prompt::with_overlay(job.prompt, overlay.clone());
         if cache.is_some() {
             job.prompt.push('\n');
-            job.prompt.push_str(&prompt::build_cache_note(node));
+            job.prompt
+                .push_str(&prompt::build_cache_note(node, job.allow_write));
         }
         let sem = Arc::clone(&sem);
         let run = run.to_owned();
         let node = node.to_owned();
-        let cache = cache.map(Path::to_path_buf);
+        // A read-only seat is never handed `CARGO_TARGET_DIR` — see
+        // `prompt::build_cache_note`'s doc for why setting it anyway is
+        // exactly how a sandboxed reviewer's write refusal got reported as a
+        // defect in the patch, not a property of its own seat.
+        let cache = cache.filter(|_| job.allow_write).map(Path::to_path_buf);
         set.spawn(async move {
             let _permit = sem.acquire().await;
             let mut seat = job.seat;
@@ -4052,6 +4115,110 @@ where
             )
         })
         .collect()
+}
+
+/// Run `body` — a verify command batch — while holding the shared build
+/// cache's lease, so this run's own full verification (`e2e`, `gate`) can
+/// never interleave with another borrower's build against the same
+/// `CARGO_TARGET_DIR`: a different run, a lingering reviewer past its
+/// timeout, or a human's own `magi review`. See the `cache` module doc for
+/// why this matters more than Cargo's own per-target locking covers — two
+/// *different* worktrees building the same package name/version into one
+/// cache directory is a staleness bug, not a lock contention one.
+///
+/// The wait for the lease is carved out of `budget`, never on top of it —
+/// `body` is handed whatever is left, so a caller's own node timeout is the
+/// only clock involved, exactly what AGENTS.md's build-cache section asks
+/// for ("never an unbounded wait"). When `cache_dir` is `None` — no shared
+/// cache configured at all — this is a pass-through: `body` runs with the
+/// full budget and nothing is leased.
+///
+/// A lease that cannot be acquired within `budget` is reported as a single
+/// synthetic [`CommandOutcome`] (`code: None`) rather than silently skipping
+/// verification — the same shape a spawn failure already takes in
+/// [`run_commands`], so a caller need not special-case it.
+async fn with_cache_lease<'s, F, Fut>(
+    state: &'s mut RunState,
+    cache_dir: Option<&Path>,
+    node: &str,
+    seat: &str,
+    worktree: &Path,
+    head: &str,
+    budget: Duration,
+    context: &str,
+    body: F,
+) -> (Vec<CommandOutcome>, bool)
+where
+    F: FnOnce(&'s mut RunState, Duration) -> Fut,
+    Fut: std::future::Future<Output = (Vec<CommandOutcome>, bool)>,
+{
+    let Some(cache_dir) = cache_dir else {
+        return body(state, budget).await;
+    };
+    let home = crate::run::home();
+    let owner = crate::cache::Owner::here(&state.id, node, seat, worktree, head);
+    let started = Instant::now();
+    // A first, non-blocking check before ever waiting: a caller stuck inside
+    // `wait_for` for the next several minutes must be visible in `magi show`
+    // *while* it waits, not only once it finally gives up. See AGENTS.md's
+    // build-cache section and the `cache` module doc for why this cannot be
+    // an unbounded wait either.
+    let guard = match crate::cache::try_acquire(&home, cache_dir, &owner) {
+        Ok(crate::cache::AcquireOutcome::Acquired(g)) => g,
+        Ok(crate::cache::AcquireOutcome::Busy(busy)) => {
+            state.event(
+                "verify",
+                format!(
+                    "{context}: waiting for the shared build cache at {} ({})",
+                    cache_dir.display(),
+                    busy.describe()
+                ),
+            );
+            match crate::cache::wait_for(&home, cache_dir, &owner, budget, Duration::from_secs(5))
+                .await
+            {
+                Ok(g) => g,
+                Err(e) => {
+                    state.event("verify", format!("{context}: {e:#}"));
+                    return (
+                        vec![CommandOutcome {
+                            command: "(waiting for the shared build cache)".to_owned(),
+                            code: None,
+                            output_tail: e.to_string(),
+                            duration_ms: started.elapsed().as_millis() as u64,
+                        }],
+                        false,
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            state.event(
+                "verify",
+                format!("{context}: could not check the shared build cache: {e:#}"),
+            );
+            return (
+                vec![CommandOutcome {
+                    command: "(waiting for the shared build cache)".to_owned(),
+                    code: None,
+                    output_tail: e.to_string(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                }],
+                false,
+            );
+        }
+    };
+    let identity = crate::cache::Identity::new(worktree, head);
+    if let Err(e) = crate::cache::ensure_fresh(&home, cache_dir, &identity) {
+        tracing::warn!(
+            "build cache: freshness check for {} failed, building anyway: {e:#}",
+            cache_dir.display()
+        );
+    }
+    let remaining = budget.saturating_sub(started.elapsed());
+    let result = body(state, remaining).await;
+    guard.release();
+    result
 }
 
 /// Describe one verify command's outcome for the event log, distinguishing a

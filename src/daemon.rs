@@ -1623,8 +1623,15 @@ async fn poll(
         // `maybe_prune_cache_between_runs`'s own doc for why this cannot
         // wait for the queue to run dry.
         if !stop.busy_now() {
-            maybe_prune_cache_between_runs(&opts.repo, opts, stop, &mut cache_last_checked, now)
-                .await;
+            maybe_prune_cache_between_runs(
+                &opts.repo,
+                opts,
+                home,
+                stop,
+                &mut cache_last_checked,
+                now,
+            )
+            .await;
         }
 
         let stalled = stalled_tasks(queue, home, now);
@@ -2130,6 +2137,7 @@ fn prepare(repo: &Path, opts: &Opts) -> Result<Config> {
 async fn maybe_prune_cache_between_runs(
     repo: &Path,
     opts: &Opts,
+    home: &Path,
     stop: &Stop,
     last_checked: &mut Option<Timestamp>,
     now: Timestamp,
@@ -2145,7 +2153,7 @@ async fn maybe_prune_cache_between_runs(
             return;
         }
     };
-    match clean::prune_cache_if_over_limit(&cfg) {
+    match clean::prune_cache_if_over_limit(&cfg, home) {
         Ok(Some(pruned)) if pruned.files > 0 => tracing::info!(
             "housekeep: pruned {} file(s) ({} bytes) from the shared cache between runs",
             pruned.files,
@@ -4802,6 +4810,7 @@ mod tests {
     #[tokio::test]
     async fn maybe_prune_cache_between_runs_reprunes_only_once_its_own_interval_elapses() {
         let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
         let cache_dir = dir.path().join("cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
         std::fs::write(cache_dir.join("a"), vec![0u8; 10]).unwrap();
@@ -4812,7 +4821,8 @@ mod tests {
         let running = Stop::new();
         let mut last_checked = None;
         let t0 = "2026-09-15T00:00:00Z".parse::<Timestamp>().unwrap();
-        maybe_prune_cache_between_runs(&opts.repo, &opts, &running, &mut last_checked, t0).await;
+        maybe_prune_cache_between_runs(&opts.repo, &opts, &home, &running, &mut last_checked, t0)
+            .await;
         assert_eq!(
             crate::disk::dir_size(&cache_dir),
             0,
@@ -4823,8 +4833,15 @@ mod tests {
         // A fresh oversized file lands, but the next check is not due yet.
         std::fs::write(cache_dir.join("b"), vec![0u8; 10]).unwrap();
         let too_soon = t0 + jiff::SignedDuration::from_secs(1);
-        maybe_prune_cache_between_runs(&opts.repo, &opts, &running, &mut last_checked, too_soon)
-            .await;
+        maybe_prune_cache_between_runs(
+            &opts.repo,
+            &opts,
+            &home,
+            &running,
+            &mut last_checked,
+            too_soon,
+        )
+        .await;
         assert_eq!(
             crate::disk::dir_size(&cache_dir),
             10,
@@ -4838,8 +4855,15 @@ mod tests {
 
         // Once the interval elapses, the same oversized cache is caught again.
         let due_again = t0 + jiff::SignedDuration::from_secs(CACHE_CHECK_INTERVAL_SECS as i64 + 1);
-        maybe_prune_cache_between_runs(&opts.repo, &opts, &running, &mut last_checked, due_again)
-            .await;
+        maybe_prune_cache_between_runs(
+            &opts.repo,
+            &opts,
+            &home,
+            &running,
+            &mut last_checked,
+            due_again,
+        )
+        .await;
         assert_eq!(
             crate::disk::dir_size(&cache_dir),
             0,
@@ -4857,6 +4881,7 @@ mod tests {
     #[tokio::test]
     async fn a_stop_already_asked_for_skips_the_between_runs_cache_walk() {
         let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
         let cache_dir = dir.path().join("cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
         std::fs::write(cache_dir.join("a"), vec![0u8; 10]).unwrap();
@@ -4872,7 +4897,8 @@ mod tests {
 
         let mut last_checked = None;
         let t0 = "2026-09-15T00:00:00Z".parse::<Timestamp>().unwrap();
-        maybe_prune_cache_between_runs(&opts.repo, &opts, &stop, &mut last_checked, t0).await;
+        maybe_prune_cache_between_runs(&opts.repo, &opts, &home, &stop, &mut last_checked, t0)
+            .await;
         assert_eq!(
             crate::disk::dir_size(&cache_dir),
             10,
