@@ -579,6 +579,39 @@ enum CacheCmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// List build-cache-shaped directories next to the configured one that
+    /// the cap and the janitor do not track, with what magi can tell about
+    /// each: its size, the run (if any) whose own saved config points at it,
+    /// and whether that makes it active, reclaimable, or unknown.
+    ///
+    /// These are the `Temp\magi-land6`-shaped leftovers a name change or an
+    /// old config revision leaves behind next to the current
+    /// `CARGO_TARGET_DIR` — outside the single path [`CacheCmd::Show`] and
+    /// [`CacheCmd::Clear`] already know about, so nothing else in magi ever
+    /// prunes or even reports them.
+    Status {
+        /// Repository, for the config that names the cache.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Config file; defaults to <repo>/magi.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Remove every neighbor cache [`CacheCmd::Status`] would report as
+    /// reclaimable. `Active` and `Unknown` entries are always left alone,
+    /// whether or not this runs with `--dry-run`.
+    Sweep {
+        /// Repository, for the config that names the cache.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Config file; defaults to <repo>/magi.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Print what would be removed, and why the rest is not, without
+        /// deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// The OS default stack for a process's real main thread is small (about
@@ -1240,15 +1273,16 @@ async fn correct_manual_merge(state: &mut RunState, url: &str) -> Result<()> {
     Ok(())
 }
 
-/// `magi cache show` and `magi cache clear`.
+/// `magi cache show`, `clear`, `status`, and `sweep`.
 ///
 /// The cache is whatever `[verify]` renders as `CARGO_TARGET_DIR`; a config
-/// that sets none has nothing to show or clear.
+/// that sets none has nothing to show, clear, inventory, or sweep.
 fn cache(command: CacheCmd) -> Result<()> {
     let (repo, config) = match &command {
-        CacheCmd::Show { repo, config } | CacheCmd::Clear { repo, config } => {
-            (repo, config.as_deref())
-        }
+        CacheCmd::Show { repo, config }
+        | CacheCmd::Clear { repo, config }
+        | CacheCmd::Status { repo, config }
+        | CacheCmd::Sweep { repo, config, .. } => (repo, config.as_deref()),
     };
     let (cfg, _from) = Config::discover(repo, config)?;
     let Some(dir) = cfg.cache_dir() else {
@@ -1283,8 +1317,95 @@ fn cache(command: CacheCmd) -> Result<()> {
             std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
             println!("removed {} ({} freed)", dir.display(), bytes(freed));
         }
+        CacheCmd::Status { .. } => {
+            let entries = neighbor_cache_entries(&cfg);
+            if entries.is_empty() {
+                println!(
+                    "no build-cache-shaped directories found next to {}",
+                    dir.display()
+                );
+                return Ok(());
+            }
+            for e in &entries {
+                let owner = e.owner.as_deref().unwrap_or("no run record claims it");
+                println!(
+                    "{:<10} {:>10}  {}  ({owner})",
+                    status_word(e.status),
+                    bytes(e.bytes),
+                    e.path.display()
+                );
+            }
+            let unknown: u64 = entries
+                .iter()
+                .filter(|e| e.status == magi::clean::CacheStatus::Unknown)
+                .map(|e| e.bytes)
+                .sum();
+            let reclaimable: u64 = entries
+                .iter()
+                .filter(|e| e.status == magi::clean::CacheStatus::Reclaimable)
+                .map(|e| e.bytes)
+                .sum();
+            println!(
+                "\n{} reclaimable (`magi cache sweep`), {} unknown (left alone; check by hand)",
+                bytes(reclaimable),
+                bytes(unknown)
+            );
+        }
+        CacheCmd::Sweep { dry_run, .. } => {
+            let entries = neighbor_cache_entries(&cfg);
+            let results = magi::clean::sweep_reclaimable(&entries, dry_run);
+            if results.is_empty() {
+                println!("nothing reclaimable next to {}", dir.display());
+                return Ok(());
+            }
+            let mut freed = 0u64;
+            for (path, size, outcome) in results {
+                match outcome {
+                    Ok(()) if dry_run => {
+                        println!("would remove {} ({})", path.display(), bytes(size));
+                        freed += size;
+                    }
+                    Ok(()) => {
+                        println!("removed {} ({})", path.display(), bytes(size));
+                        freed += size;
+                    }
+                    Err(e) => println!("kept {} — {e:#}", path.display()),
+                }
+            }
+            println!(
+                "\n{}{}",
+                if dry_run { "would free " } else { "freed " },
+                bytes(freed)
+            );
+        }
     }
     Ok(())
+}
+
+/// Every build-cache-shaped directory next to `cfg`'s own cache that the
+/// cap and the janitor do not already track, classified against the run
+/// records under [`magi::run::runs_root`].
+fn neighbor_cache_entries(cfg: &Config) -> Vec<magi::clean::CacheEntry> {
+    let worktrees_root = cfg
+        .graph
+        .worktree_root
+        .clone()
+        .unwrap_or_else(magi::run::default_worktree_root);
+    magi::clean::neighbor_cache_inventory(
+        cfg,
+        &magi::run::home(),
+        &worktrees_root,
+        jiff::Timestamp::now(),
+    )
+}
+
+/// `magi cache status`'s label for one [`magi::clean::CacheStatus`].
+fn status_word(status: magi::clean::CacheStatus) -> &'static str {
+    match status {
+        magi::clean::CacheStatus::Active => "active",
+        magi::clean::CacheStatus::Reclaimable => "reclaimable",
+        magi::clean::CacheStatus::Unknown => "unknown",
+    }
 }
 
 /// A byte count as the operator reads it.

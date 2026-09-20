@@ -1576,20 +1576,53 @@ struct DiskView {
     /// The shared build cache's size, when the config names one.
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_bytes: Option<u64>,
+    /// Bytes sitting in build-cache-shaped directories next to the
+    /// configured cache that no run record can vouch for as finished and
+    /// unclaimed — see [`crate::clean::CacheStatus::Unknown`].
+    ///
+    /// This is the figure the incident this whole module backs actually
+    /// needs on a phone: `cache_bytes` is what the cap and the janitor
+    /// already keep in check, but a leftover from a renamed
+    /// `CARGO_TARGET_DIR` or an old config revision sits entirely outside
+    /// that one path and would otherwise only ever be found by an operator
+    /// running a PowerShell recipe by hand, which is the exact failure mode
+    /// this exists to end. `0` when the count is known to be zero, not when
+    /// it could not be measured - there is nothing here worth telling apart
+    /// from "no such directories exist".
+    unknown_cache_bytes: u64,
 }
 
 impl DiskView {
-    /// Measure the three directories and re-read the config's cache.
+    /// Measure the three directories, re-read the config's cache, and
+    /// inventory anything build-cache-shaped sitting unaccounted for beside
+    /// it.
     fn of(ui: &Ui) -> Self {
-        let cache_bytes = Config::discover(&ui.repo, None)
-            .ok()
-            .and_then(|(cfg, _)| cfg.cache_dir())
+        let cfg = Config::discover(&ui.repo, None).ok().map(|(cfg, _)| cfg);
+        let cache_bytes = cfg
+            .as_ref()
+            .and_then(|cfg| cfg.cache_dir())
             .map(|dir| crate::disk::dir_size(&dir));
+        let unknown_cache_bytes = cfg
+            .as_ref()
+            .map(|cfg| {
+                crate::clean::neighbor_cache_inventory(
+                    cfg,
+                    &ui.home,
+                    &ui.worktrees_root,
+                    Timestamp::now(),
+                )
+                .into_iter()
+                .filter(|e| e.status == crate::clean::CacheStatus::Unknown)
+                .map(|e| e.bytes)
+                .sum()
+            })
+            .unwrap_or(0);
         Self {
             free_bytes: crate::disk::free_bytes(&ui.runs).ok(),
             runs_bytes: crate::disk::dir_size(&ui.runs),
             worktrees_bytes: crate::disk::dir_size(&ui.worktrees_root),
             cache_bytes,
+            unknown_cache_bytes,
         }
     }
 }
@@ -6724,6 +6757,43 @@ mod tests {
         // directory full of older-schema runs looks like.
         let health = f.get("/api/health").await;
         assert_eq!(health.json()["runs_unreadable"], 1);
+    }
+
+    /// The figure the incident behind [`crate::clean::neighbor_cache_inventory`]
+    /// exists for: a build-cache-shaped directory sitting next to the
+    /// configured one, that no run record on this machine can vouch for. It
+    /// must reach the phone as `disk.unknown_cache_bytes`, not just a CLI a
+    /// human has to remember to run.
+    #[tokio::test]
+    async fn health_surfaces_an_unclaimed_neighbor_cache_as_unknown_bytes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let configured = tmp.path().join("magi-target");
+        std::fs::create_dir_all(&configured).expect("configured cache dir");
+        let gate = format!("CARGO_TARGET_DIR={} cargo test", configured.display());
+        std::fs::write(
+            repo.join("magi.toml"),
+            format!("[verify]\ngate = [{gate:?}]\n"),
+        )
+        .expect("write magi.toml");
+
+        // Cargo-shaped, right beside the configured cache, and no run record
+        // anywhere claims it — exactly the `Temp\magi-land6` leftover the
+        // task behind this route was written for.
+        let orphan = tmp.path().join("magi-land6");
+        std::fs::create_dir_all(&orphan).expect("orphan cache dir");
+        let tag = b"Signature: 8a477f...";
+        std::fs::write(orphan.join("CACHEDIR.TAG"), tag).expect("write tag file");
+        std::fs::write(orphan.join("junk"), vec![0u8; 1024]).expect("write junk");
+
+        let f = Fixture::with_repo(repo).await;
+        let health = f.get("/api/health").await;
+        assert_eq!(health.status, 200, "{}", health.body);
+        assert_eq!(
+            health.json()["disk"]["unknown_cache_bytes"],
+            1024 + tag.len() as u64
+        );
     }
 
     #[tokio::test]

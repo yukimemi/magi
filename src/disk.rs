@@ -221,6 +221,106 @@ pub fn dir_size(path: &Path) -> u64 {
     total
 }
 
+/// Does `dir` look like the root of a Cargo build cache — the shape
+/// `CARGO_TARGET_DIR` takes — rather than something else that merely shares a
+/// parent directory with the one magi is configured to use?
+///
+/// Detected by content, never by name. The incident this backs
+/// (`Temp\magi-land6`, `Temp\magi-landtimedout`, `Temp\jtargetB`, ...) got
+/// those names from whatever a seat or an earlier config improvised for its
+/// own `CARGO_TARGET_DIR`; matching a name prefix would miss the very thing
+/// this exists to find, and could just as easily match an operator's own
+/// unrelated entry under the same parent. Cargo writes `CACHEDIR.TAG` at the
+/// target directory's own root — the same marker file the
+/// [Cache Directory Tagging Specification](https://bford.info/cachedir/)
+/// asks every cache-writing tool to leave — the first time anything ever
+/// builds into it, so its presence is the one check.
+pub fn looks_like_cargo_target(dir: &Path) -> bool {
+    dir.join("CACHEDIR.TAG").is_file()
+}
+
+/// Does `dir` hold a sign that a build is still using it right now?
+///
+/// Cargo takes a lock on `<target-dir>/.cargo-lock` for the lifetime of a
+/// build, released the moment the process exits — a live one is the one
+/// signal available here that costs nothing to check and cannot itself be
+/// stale (unlike an mtime, which a build that has been running for an hour
+/// leaves looking old). Its mere *presence* only means a lock was taken at
+/// some point, which is not proof of anything by itself, but between it and
+/// silence the safer read is the one this function gives: never claim a
+/// cache is free of it when the file is sitting right there.
+pub fn has_lock_file(dir: &Path) -> bool {
+    dir.join(".cargo-lock").is_file()
+}
+
+/// A directory found next to the configured build cache that also looks like
+/// one, per [`looks_like_cargo_target`].
+#[derive(Debug, Clone)]
+pub struct NeighborCache {
+    /// The directory itself.
+    pub path: PathBuf,
+    /// Its size, per [`dir_size`].
+    pub bytes: u64,
+}
+
+/// List directories that look like Cargo build caches next to `cache_dir`,
+/// other than `cache_dir` itself and anything under `skip`.
+///
+/// One level under `cache_dir`'s own parent, never recursive and never wider:
+/// the leftovers this exists to surface sat directly beside the configured
+/// cache (both are typically rendered from the same `{{ vars.cache }}`
+/// template), and walking an entire `Temp` tree — or any directory the
+/// operator did not point magi at — is exactly the "delete things under
+/// `Temp` by guessing" this module is built to avoid. `skip` is for the
+/// directories this scan must never enter even if they happened to look like
+/// a match: the run worktree bay and `<home>/runs`, neither of which this
+/// function has any business touching.
+///
+/// A symlink or a junction is never followed and never counted, matching
+/// [`dir_size`]'s own rule: a reparse point next to the cache could target
+/// anywhere on the machine, and a Cargo-shaped directory reached only by
+/// following one is not a directory this scan actually found next to the
+/// cache.
+pub fn scan_neighbor_caches(cache_dir: &Path, skip: &[PathBuf]) -> Vec<NeighborCache> {
+    let Some(parent) = cache_dir.parent() else {
+        return Vec::new();
+    };
+    let cache_canon = canonical_or(cache_dir);
+    let skip_canon: Vec<PathBuf> = skip.iter().map(|p| canonical_or(p)).collect();
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        let canon = canonical_or(&path);
+        if canon == cache_canon || skip_canon.contains(&canon) {
+            continue;
+        }
+        if !looks_like_cargo_target(&path) {
+            continue;
+        }
+        out.push(NeighborCache {
+            bytes: dir_size(&path),
+            path,
+        });
+    }
+    out
+}
+
+/// `path`, canonicalized when possible, falling back to the path as given —
+/// so a comparison against it degrades to a plain (still useful, if less
+/// robust against `..` or symlinks) path comparison rather than failing
+/// outright when the path does not exist or is not readable.
+///
+/// `pub(crate)`: [`crate::clean`]'s neighbor-cache classifier compares a scan
+/// result against paths read back out of run records the same way, and the
+/// two must agree on what "the same directory" means.
+pub(crate) fn canonical_or(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// What a prune removed, for the report.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Prune {
@@ -449,6 +549,80 @@ mod tests {
         // (a command's environment applies once).
         let two = "CARGO_TARGET_DIR=/first and CARGO_TARGET_DIR=/second cargo x";
         assert_eq!(extract_cargo_target_dir(two), Some(PathBuf::from("/first")));
+    }
+
+    #[test]
+    fn a_cargo_target_is_recognized_by_its_tag_file_not_its_name() {
+        let t = tempfile::TempDir::new().expect("temp");
+        assert!(
+            !looks_like_cargo_target(t.path()),
+            "an empty directory is not a build cache just because it exists"
+        );
+        fs::write(t.path().join("CACHEDIR.TAG"), b"Signature: 8a477f...").expect("write");
+        assert!(looks_like_cargo_target(t.path()));
+        assert!(
+            !looks_like_cargo_target(&t.path().join("nope")),
+            "a missing directory is never mistaken for a cache"
+        );
+    }
+
+    #[test]
+    fn a_cargo_lock_file_is_the_only_thing_that_marks_use() {
+        let t = tempfile::TempDir::new().expect("temp");
+        assert!(!has_lock_file(t.path()));
+        fs::write(t.path().join(".cargo-lock"), b"").expect("write");
+        assert!(has_lock_file(t.path()));
+    }
+
+    #[test]
+    fn neighbor_scan_finds_only_cargo_shaped_siblings_outside_the_skip_list() {
+        let t = tempfile::TempDir::new().expect("temp");
+        let cache = t.path().join("magi-target");
+        fs::create_dir_all(&cache).expect("dir");
+        fs::write(cache.join("CACHEDIR.TAG"), b"tag").expect("write");
+
+        // A genuine leftover: cargo-shaped, sitting right beside the
+        // configured cache.
+        let orphan = t.path().join("magi-land6");
+        fs::create_dir_all(&orphan).expect("dir");
+        fs::write(orphan.join("CACHEDIR.TAG"), b"tag").expect("write");
+        fs::write(orphan.join("junk"), vec![0u8; 5]).expect("write");
+
+        // Same parent, but no `CACHEDIR.TAG`: an operator's own unrelated
+        // directory, never a match by name alone.
+        let unrelated = t.path().join("Downloads");
+        fs::create_dir_all(&unrelated).expect("dir");
+
+        // Explicitly excluded even though it is cargo-shaped: the worktree
+        // bay or `<home>/runs` must never be swept by this scan.
+        let excluded = t.path().join("wt");
+        fs::create_dir_all(&excluded).expect("dir");
+        fs::write(excluded.join("CACHEDIR.TAG"), b"tag").expect("write");
+
+        let found = scan_neighbor_caches(&cache, std::slice::from_ref(&excluded));
+        let paths: Vec<&Path> = found.iter().map(|n| n.path.as_path()).collect();
+        assert_eq!(found.len(), 1, "found: {paths:?}");
+        assert_eq!(found[0].path, orphan);
+        assert_eq!(found[0].bytes, 8, "the tag file itself counts too");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn neighbor_scan_never_follows_a_symlink_into_a_cargo_shaped_target() {
+        let t = tempfile::TempDir::new().expect("temp");
+        let cache = t.path().join("magi-target");
+        fs::create_dir_all(&cache).expect("dir");
+
+        let real = t.path().join("elsewhere");
+        fs::create_dir_all(&real).expect("dir");
+        fs::write(real.join("CACHEDIR.TAG"), b"tag").expect("write");
+        std::os::unix::fs::symlink(&real, t.path().join("link")).expect("symlink");
+
+        let found = scan_neighbor_caches(&cache, &[]);
+        assert!(
+            found.is_empty(),
+            "a symlink next to the cache is never treated as a cache of its own"
+        );
     }
 
     #[test]
