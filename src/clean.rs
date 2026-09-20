@@ -731,9 +731,20 @@ fn classify_neighbor(
 /// off a live one — a run's `run.json` keeps the config it actually ran
 /// with, rendered at the time, so this is exact for whichever cache a given
 /// run actually built into, even one the operator's `magi.toml` has since
-/// moved on from. A run record this cannot read is skipped exactly like
-/// everywhere else in this module: left neither as evidence of ownership nor
-/// against it.
+/// moved on from.
+///
+/// A run record this cannot read (mid-write, or genuinely corrupt — the same
+/// case [`fold_due`]'s own doc describes) contributes no ownership either
+/// way *if nothing is driving it right now*: there is nothing left to guess
+/// from, and the module's own rule is to keep rather than delete when unsure.
+/// But when a live daemon *is* working on such a run
+/// ([`crate::daemon::is_working_on`], which reads `daemon.json` and needs no
+/// `run.json` at all), its own `CARGO_TARGET_DIR` cannot be read back — the
+/// one piece of information this whole scan otherwise leans on — and this
+/// pass has no way to rule out that it is exactly one of the neighbor caches
+/// found below. Every entry that would otherwise be `Reclaimable` is
+/// downgraded to `Unknown` for the length of this call rather than risk
+/// deleting a build that unreadable run is mid-way through.
 pub fn neighbor_cache_inventory(
     cfg: &crate::config::Config,
     home: &Path,
@@ -745,12 +756,16 @@ pub fn neighbor_cache_inventory(
     };
     let runs = home.join("runs");
     let mut owners: Vec<(String, PathBuf, bool)> = Vec::new();
+    let mut unreadable_active = false;
     for entry in std::fs::read_dir(&runs).into_iter().flatten().flatten() {
         let id = entry.file_name().to_string_lossy().into_owned();
         if !crate::run::is_run_id(&id) {
             continue;
         }
         let Ok(state) = read_state(&runs, &id) else {
+            if crate::daemon::is_working_on(home, &id, now) {
+                unreadable_active = true;
+            }
             continue;
         };
         let Some(path) = state.config.cache_dir() else {
@@ -767,7 +782,16 @@ pub fn neighbor_cache_inventory(
         .map(|n| {
             let canon = crate::disk::canonical_or(&n.path);
             let has_lock = crate::disk::has_lock_file(&n.path);
-            let c = classify_neighbor(&canon, &owners, has_lock);
+            let mut c = classify_neighbor(&canon, &owners, has_lock);
+            if unreadable_active && c.status == CacheStatus::Reclaimable {
+                c.status = CacheStatus::Unknown;
+                c.reason = format!(
+                    "{} — but a run whose own record cannot be read is active \
+                     right now, and this pass cannot rule out that it is \
+                     building into this path",
+                    c.reason
+                );
+            }
             CacheEntry {
                 path: n.path,
                 bytes: n.bytes,
@@ -1060,6 +1084,113 @@ mod tests {
             by_path[&orphan_cache].reason.contains("no run record"),
             "an entry with a plain english reason, not just a status word: {}",
             by_path[&orphan_cache].reason
+        );
+    }
+
+    /// The gap R2-1-1 found: a finished, readable run `F` and an in-flight
+    /// run `U` can point at the very same neighbor cache — that is the whole
+    /// premise of `owners` allowing more than one match per path — and if
+    /// `U`'s own `run.json` happens to be unreadable (mid-write, or
+    /// genuinely corrupt) at the moment of the scan, the old code silently
+    /// dropped `U` from `owners` entirely and classified the cache as
+    /// `Reclaimable` from `F` alone. `U` being unreadable says nothing about
+    /// whether it is still building into that exact cache; only
+    /// `is_working_on` - which reads `daemon.json`, not `run.json` - can say
+    /// `U` is alive at all, and that has to be enough to withhold judgment.
+    #[test]
+    fn an_unreadable_but_active_run_withholds_reclaimable_even_when_another_run_finished_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+        let now = ts("2026-09-05T00:00:00Z");
+
+        let mut cfg = crate::config::Config::default();
+        let configured_cache = dir.path().join("magi-target");
+        cfg.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR={} cargo make check",
+            configured_cache.display()
+        )];
+        fs::create_dir_all(&configured_cache).unwrap();
+
+        // `F`: finished, readable, and points straight at the shared
+        // neighbor cache. On its own this would make the cache reclaimable.
+        let shared_cache = dir.path().join("magi-land6");
+        fs::create_dir_all(&shared_cache).unwrap();
+        fs::write(shared_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
+        write_run_with_cache(&runs, &wt, "20260801-000000-fini", "ready", &shared_cache);
+
+        // `U`: a run directory a live daemon is actively driving right now,
+        // but whose `run.json` cannot be parsed at all - the exact
+        // mid-write/corrupt case `fold_due`'s own doc describes, not merely
+        // a schema this build disagrees with.
+        let unreadable_id = "20260905-000000-user";
+        std::fs::create_dir_all(runs.join(unreadable_id)).unwrap();
+        std::fs::write(runs.join(unreadable_id).join("run.json"), "not json at all").unwrap();
+        let mut status = crate::daemon::Status::new();
+        status.current = vec![crate::daemon::Current {
+            task: "20260905-000000-task".to_owned(),
+            run: unreadable_id.to_owned(),
+        }];
+        status.updated_at = now;
+        crate::daemon::write_status_to(&home.join("daemon.json"), &status).unwrap();
+
+        let entries = neighbor_cache_inventory(&cfg, &home, &wt, now);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0].status,
+            CacheStatus::Unknown,
+            "an unreadable-but-active run must withhold Reclaimable even \
+             though a different, readable run already finished with this \
+             cache: {:?}",
+            entries[0]
+        );
+        assert!(
+            entries[0].reason.contains("cannot be read"),
+            "{}",
+            entries[0].reason
+        );
+    }
+
+    /// A run this build cannot read but that *no* live daemon is working on
+    /// is the ordinary "dead leftover" case every other function in this
+    /// module already leaves alone (see `fold_due`'s own unreadable count) -
+    /// it must not, on its own, block reclaiming an unrelated cache another
+    /// run genuinely finished with.
+    #[test]
+    fn an_unreadable_but_idle_run_does_not_withhold_reclaimable() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+        let now = ts("2026-09-05T00:00:00Z");
+
+        let mut cfg = crate::config::Config::default();
+        let configured_cache = dir.path().join("magi-target");
+        cfg.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR={} cargo make check",
+            configured_cache.display()
+        )];
+        fs::create_dir_all(&configured_cache).unwrap();
+
+        let shared_cache = dir.path().join("magi-land6");
+        fs::create_dir_all(&shared_cache).unwrap();
+        fs::write(shared_cache.join("CACHEDIR.TAG"), b"tag").unwrap();
+        write_run_with_cache(&runs, &wt, "20260801-000000-fini", "ready", &shared_cache);
+
+        let unreadable_id = "20260905-000000-dead";
+        std::fs::create_dir_all(runs.join(unreadable_id)).unwrap();
+        std::fs::write(runs.join(unreadable_id).join("run.json"), "not json at all").unwrap();
+        // No `daemon.json` at all: nothing claims to be working on it.
+
+        let entries = neighbor_cache_inventory(&cfg, &home, &wt, now);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0].status,
+            CacheStatus::Reclaimable,
+            "an unreadable run nobody is working on must not, by itself, \
+             block an unrelated cache from being reclaimed: {:?}",
+            entries[0]
         );
     }
 
