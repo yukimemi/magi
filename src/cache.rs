@@ -599,6 +599,7 @@ fn refresh_stale_packages(worktree: &Path, cache_dir: &Path) -> Result<Vec<Strin
         );
     }
     let names = parse_workspace_package_names(&String::from_utf8_lossy(&meta.stdout));
+    let mut failed = Vec::new();
     for name in &names {
         let out = std::process::Command::new("cargo")
             .arg("clean")
@@ -611,12 +612,26 @@ fn refresh_stale_packages(worktree: &Path, cache_dir: &Path) -> Result<Vec<Strin
             .output()
             .with_context(|| format!("cargo clean -p {name}"))?;
         if !out.status.success() {
-            tracing::warn!(
-                package = %name,
-                stderr = %String::from_utf8_lossy(&out.stderr),
-                "build cache: cargo clean -p failed; leaving its artifacts as-is"
-            );
+            // A failure here — a Windows test executable still holding its
+            // own file open is the case the evidence log records — means the
+            // stale artifact this was meant to remove may still be sitting
+            // in `cache_dir`. Collecting it rather than only warning is what
+            // lets `ensure_fresh` refuse to record the new identity: the
+            // next reuse must not be told this cache is confirmed to match
+            // `identity` when a piece of the *previous* one could not be
+            // proven gone.
+            failed.push(format!(
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
         }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "cargo clean -p failed for {} package(s): {}",
+            failed.len(),
+            failed.join("; ")
+        );
     }
     Ok(names)
 }

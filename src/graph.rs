@@ -58,19 +58,27 @@ const OUTPUT_TAIL: usize = 8_000;
 /// stopped is readable from the report without opening `run.json`.
 const EVENT_OUTPUT_TAIL: usize = 2_000;
 
-/// How long [`with_cache_lease`] waits after a timed-out verify command
-/// before releasing the build cache's lease.
+/// How often [`wait_for_timed_out_children_to_die`] re-checks a timed-out
+/// command's pid before releasing the build cache's lease.
+const LEASE_RELEASE_POLL: Duration = Duration::from_secs(1);
+
+/// The most [`wait_for_timed_out_children_to_die`] will wait for a timed-out
+/// command's pid to actually exit before giving up and releasing anyway.
 ///
-/// A timeout means the process tree was asked to die (`kill_on_drop`,
-/// `start_kill`), not that it already has - on Windows in particular that can
-/// take a moment, the same reason `agent`'s own `PIPE_GRACE` exists. Releasing the
-/// instant the command returns would let the very next acquirer (this run's
-/// own next round, another run's verification, the janitor's prune) start
-/// touching the same directory while a descendant might still be writing to
-/// it. This is not process-tree reaping - continuing to observe and collect
-/// a timed-out job's descendants stays a different piece of work - only a
-/// short pause before the lease changes hands.
-const LEASE_RELEASE_GRACE: Duration = Duration::from_secs(5);
+/// A timeout means the process was asked to die (`kill_on_drop`,
+/// `start_kill`), not that it already has — on Windows in particular that can
+/// take a moment, the same reason `agent`'s own `PIPE_GRACE` exists. Releasing
+/// the instant the command returns would let the very next acquirer (this
+/// run's own next round, another run's verification, the janitor's prune)
+/// start touching the same directory while it might still be writing to it,
+/// so this polls the actual pid — real confirmation, not a fixed guess —
+/// until it is gone or this ceiling is reached. It is still not full
+/// process-tree reaping: a grandchild the timed-out process spawned and that
+/// outlives it independently is invisible to a pid check, and continuing to
+/// observe and collect *that* stays a different piece of work with its own
+/// owner. Set generously because the common case returns early the moment
+/// the pid is confirmed gone, not because every timeout pays this in full.
+const LEASE_RELEASE_MAX_WAIT: Duration = Duration::from_secs(30);
 
 /// Consecutive review rounds with no tree progress (see
 /// [`crate::run::ReviewRound::progressed`]) before `review_loop` hands off
@@ -3265,6 +3273,17 @@ impl Runner {
                 },
             )
             .await;
+            // The catch-up run never actually happened - the shared build
+            // cache could not be acquired or confirmed fresh in time (see
+            // `CommandOutcome::resource_blocked`'s own doc) - so this round's
+            // `e2e`/`e2e_deferred` are left exactly as they were:
+            // `needs_catchup_run` above still reads true the next time this
+            // is reached, and the round stays deferred rather than recording
+            // contention as a red e2e and blocking the run on it.
+            if verify_inconclusive(&outcomes) {
+                self.state.save()?;
+                return Ok(());
+            }
             let last = &mut self.state.reviews[round_idx];
             last.e2e = outcomes;
             last.verify_retried = verify_retried;
@@ -3366,10 +3385,9 @@ impl Runner {
                 let gate_commands = gate_commands.clone();
                 let worktree = winner.worktree.clone();
                 async move {
-                    (
-                        run_commands(&shell, &gate_commands, &worktree, budget).await,
-                        false,
-                    )
+                    let (outcomes, timed_out_pids) =
+                        run_commands(&shell, &gate_commands, &worktree, budget).await;
+                    (outcomes, false, timed_out_pids)
                 }
             },
         )
@@ -3439,6 +3457,13 @@ impl Runner {
             .is_some_and(|s| s.conflict.is_some())
             || review_conclusion(&self.state.reviews, self.state.config.graph.review_rounds)
                 != Some(RunStatus::Gating)
+            // Empty is not "passed" - `gate` leaves it empty both before it
+            // has ever run and when its last attempt was resource-blocked
+            // (see `Runner::gate`'s own doc), and neither is permission to
+            // merge on nothing but the review record. Only a gate that
+            // actually ran every command and saw every one of them exit 0
+            // may proceed.
+            || self.state.gate.is_empty()
             || self.state.gate.iter().any(|o| !o.ok())
         {
             return Ok(());
@@ -3807,39 +3832,45 @@ async fn wave(
     // single lease taken once for the whole wave and released once it is
     // done is what stops a *different* borrower (another run's own wave, its
     // e2e/gate, a human's `magi review`) from interleaving a build into the
-    // same directory while this one is in flight. Best-effort: a wave that
-    // cannot get the lease within its own longest job's budget proceeds
-    // without it rather than spending paid agent calls on nothing, but the
-    // identity record is still invalidated below either way, so the next
-    // tracked caller (`e2e`/`gate`) never trusts a match it cannot vouch for.
+    // same directory while this one is in flight. Best-effort, not
+    // all-or-nothing: a wave that cannot get the lease within its own
+    // longest job's budget still runs — an hour of paid implementer calls is
+    // not thrown away over cache contention — but every write-allowed seat
+    // then goes without `CARGO_TARGET_DIR` for this wave too (see the filter
+    // below), the same fallback a read-only seat always gets, rather than
+    // building into a directory this run was never granted. The identity
+    // record is still invalidated below either way, so the next tracked
+    // caller (`e2e`/`gate`) never trusts a match it cannot vouch for.
     let jobs_had_a_writer = jobs.iter().any(|j| j.allow_write);
+    let wait_started = Instant::now();
     let cache_guard = if let Some(cache_dir) = cache {
         if jobs_had_a_writer {
-            let home = crate::run::home();
             let owner = crate::cache::Owner::here(run, node, "*", Path::new("(wave)"), "");
             let budget = jobs
                 .iter()
                 .map(|j| j.timeout)
                 .max()
                 .unwrap_or(Duration::from_secs(60));
-            match crate::cache::wait_for(&home, cache_dir, &owner, budget, Duration::from_secs(5))
+            acquire_cache_lease(state, cache_dir, &owner, budget, node)
                 .await
-            {
-                Ok(g) => Some(g),
-                Err(e) => {
-                    state.event("verify", format!("{node}: {e:#}"));
-                    None
-                }
-            }
+                .ok()
         } else {
             None
         }
     } else {
         None
     };
+    // Carved out of each job's own budget, not added on top of it: a seat
+    // that waited behind the lease must not also get its full timeout
+    // afterward, or a run contended on the cache could double the time it
+    // spends per wave. `saturating_sub` floors at zero rather than
+    // wrapping - a job whose whole budget was spent waiting starts with
+    // none left, which is the honest number, not a free minimum.
+    let waited_for_lease = wait_started.elapsed();
     let mut set = tokio::task::JoinSet::new();
     let overlay = prompts.overlay(node);
     for (i, mut job) in jobs.into_iter().enumerate() {
+        job.timeout = job.timeout.saturating_sub(waited_for_lease);
         job.prompt = prompt::with_overlay(job.prompt, overlay.clone());
         if cache.is_some() {
             job.prompt.push('\n');
@@ -3852,8 +3883,16 @@ async fn wave(
         // A read-only seat is never handed `CARGO_TARGET_DIR` — see
         // `prompt::build_cache_note`'s doc for why setting it anyway is
         // exactly how a sandboxed reviewer's write refusal got reported as a
-        // defect in the patch, not a property of its own seat.
-        let cache = cache.filter(|_| job.allow_write).map(Path::to_path_buf);
+        // defect in the patch, not a property of its own seat. And a
+        // write-allowed one is handed it only when the lease above was
+        // actually acquired: a wave that could not get it (`cache_guard` is
+        // `None`, see its own comment) must not send seats to build into a
+        // directory this run does not hold - that is the exact concurrent,
+        // unmanaged-write race this module exists to prevent, not something
+        // "proceeding anyway" is allowed to reintroduce.
+        let cache = cache
+            .filter(|_| job.allow_write && cache_guard.is_some())
+            .map(Path::to_path_buf);
         set.spawn(async move {
             let _permit = sem.acquire().await;
             let mut seat = job.seat;
@@ -4194,6 +4233,65 @@ where
         .collect()
 }
 
+/// Acquire the shared build cache's lease, waiting out contention within
+/// `budget` (never past it — see AGENTS.md's build-cache section on why an
+/// unbounded wait is never acceptable).
+///
+/// A first, non-blocking check happens before ever waiting; if it finds the
+/// lease busy, that fact is logged as a `verify` event *and* flushed with
+/// [`RunState::save`] immediately — not only once the wait finally succeeds
+/// or gives up — so a `magi show` run by a different process while this one
+/// is still waiting reads a `run.json` that says so, rather than whatever it
+/// looked like before the wait started. The same applies to the terminal
+/// failure: logged and saved before this returns `Err`, so a caller that
+/// could not get the lease at all still leaves a legible record of why.
+async fn acquire_cache_lease(
+    state: &mut RunState,
+    cache_dir: &Path,
+    owner: &crate::cache::Owner,
+    budget: Duration,
+    context: &str,
+) -> Result<crate::cache::Guard> {
+    let home = crate::run::home();
+    let started = Instant::now();
+    let busy = match crate::cache::try_acquire(&home, cache_dir, owner) {
+        Ok(crate::cache::AcquireOutcome::Acquired(g)) => return Ok(g),
+        Ok(crate::cache::AcquireOutcome::Busy(busy)) => busy,
+        Err(e) => {
+            state.event(
+                "verify",
+                format!("{context}: could not check the shared build cache: {e:#}"),
+            );
+            if let Err(e2) = state.save() {
+                tracing::warn!("could not persist a cache-check failure: {e2:#}");
+            }
+            return Err(e);
+        }
+    };
+    state.event(
+        "verify",
+        format!(
+            "{context}: waiting for the shared build cache at {} ({})",
+            cache_dir.display(),
+            busy.describe()
+        ),
+    );
+    if let Err(e) = state.save() {
+        tracing::warn!("could not persist a cache wait: {e:#}");
+    }
+    let remaining = budget.saturating_sub(started.elapsed());
+    match crate::cache::wait_for(&home, cache_dir, owner, remaining, Duration::from_secs(5)).await {
+        Ok(g) => Ok(g),
+        Err(e) => {
+            state.event("verify", format!("{context}: {e:#}"));
+            if let Err(e2) = state.save() {
+                tracing::warn!("could not persist a cache wait timeout: {e2:#}");
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Run `body` — a verify command batch — while holding the shared build
 /// cache's lease, so this run's own full verification (`e2e`, `gate`) can
 /// never interleave with another borrower's build against the same
@@ -4228,54 +4326,18 @@ async fn with_cache_lease<'s, F, Fut>(
 ) -> (Vec<CommandOutcome>, bool)
 where
     F: FnOnce(&'s mut RunState, Duration) -> Fut,
-    Fut: std::future::Future<Output = (Vec<CommandOutcome>, bool)>,
+    Fut: std::future::Future<Output = (Vec<CommandOutcome>, bool, Vec<u32>)>,
 {
     let Some(cache_dir) = cache_dir else {
-        return body(state, budget).await;
+        let (outcomes, retried, _timed_out_pids) = body(state, budget).await;
+        return (outcomes, retried);
     };
     let home = crate::run::home();
     let owner = crate::cache::Owner::here(&state.id, node, seat, worktree, head);
     let started = Instant::now();
-    // A first, non-blocking check before ever waiting: a caller stuck inside
-    // `wait_for` for the next several minutes must be visible in `magi show`
-    // *while* it waits, not only once it finally gives up. See AGENTS.md's
-    // build-cache section and the `cache` module doc for why this cannot be
-    // an unbounded wait either.
-    let guard = match crate::cache::try_acquire(&home, cache_dir, &owner) {
-        Ok(crate::cache::AcquireOutcome::Acquired(g)) => g,
-        Ok(crate::cache::AcquireOutcome::Busy(busy)) => {
-            state.event(
-                "verify",
-                format!(
-                    "{context}: waiting for the shared build cache at {} ({})",
-                    cache_dir.display(),
-                    busy.describe()
-                ),
-            );
-            match crate::cache::wait_for(&home, cache_dir, &owner, budget, Duration::from_secs(5))
-                .await
-            {
-                Ok(g) => g,
-                Err(e) => {
-                    state.event("verify", format!("{context}: {e:#}"));
-                    return (
-                        vec![CommandOutcome {
-                            command: "(waiting for the shared build cache)".to_owned(),
-                            code: None,
-                            output_tail: e.to_string(),
-                            duration_ms: started.elapsed().as_millis() as u64,
-                            resource_blocked: true,
-                        }],
-                        false,
-                    );
-                }
-            }
-        }
+    let guard = match acquire_cache_lease(state, cache_dir, &owner, budget, context).await {
+        Ok(g) => g,
         Err(e) => {
-            state.event(
-                "verify",
-                format!("{context}: could not check the shared build cache: {e:#}"),
-            );
             return (
                 vec![CommandOutcome {
                     command: "(waiting for the shared build cache)".to_owned(),
@@ -4318,18 +4380,60 @@ where
         );
     }
     let remaining = budget.saturating_sub(started.elapsed());
-    let result = body(state, remaining).await;
-    // `code: None` is what a timed-out command reports (see `run_commands`),
-    // and only a timeout - as opposed to an ordinary nonzero exit - means the
-    // process tree was still running when this function stopped waiting on
-    // it. See `LEASE_RELEASE_GRACE`'s own doc for why the release waits a
-    // beat in that case rather than handing the directory to the next
-    // acquirer immediately.
-    if result.0.iter().any(|o| o.code.is_none()) {
-        tokio::time::sleep(LEASE_RELEASE_GRACE).await;
+    let (outcomes, retried, timed_out_pids) = body(state, remaining).await;
+    // A timed-out command's process was only *asked* to die (`kill_on_drop`,
+    // `start_kill`); confirm it actually has before handing the directory to
+    // the next acquirer. See `wait_for_timed_out_children_to_die`'s own doc
+    // for what this can and cannot see.
+    if !timed_out_pids.is_empty() {
+        wait_for_timed_out_children_to_die(&timed_out_pids).await;
     }
     guard.release();
-    result
+    (outcomes, retried)
+}
+
+/// Poll `pids` — commands [`run_commands`] reports as still running when its
+/// own timeout elapsed — until every one is confirmed gone, or
+/// [`LEASE_RELEASE_MAX_WAIT`] passes, whichever comes first.
+///
+/// Real confirmation where confirmation is possible, not a substitute for
+/// full process-tree observation: a grandchild the timed-out process spawned
+/// and that survives independently of it is invisible to a pid check the
+/// same way it always was, and continuing to observe and collect *that*
+/// stays a different piece of work with its own owner. This only narrows a
+/// fixed blind wait into an actual check of the pids this process does know
+/// about.
+async fn wait_for_timed_out_children_to_die(pids: &[u32]) {
+    wait_for_pids_with(
+        pids,
+        crate::proc::pid_alive,
+        LEASE_RELEASE_POLL,
+        LEASE_RELEASE_MAX_WAIT,
+    )
+    .await;
+}
+
+/// [`wait_for_timed_out_children_to_die`] with its liveness query, poll
+/// interval and ceiling supplied by the caller, so the polling *logic* -
+/// returns as soon as every pid reports dead, gives up at the ceiling
+/// otherwise - is testable on millisecond durations without asking the real
+/// OS about a pid at all.
+async fn wait_for_pids_with<F: Fn(u32) -> bool>(
+    pids: &[u32],
+    alive: F,
+    poll: Duration,
+    max_wait: Duration,
+) {
+    let deadline = Instant::now() + max_wait;
+    loop {
+        if pids.iter().all(|&pid| !alive(pid)) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 /// Are any of `outcomes` [`CommandOutcome::resource_blocked`] - magi's own
@@ -4371,8 +4475,8 @@ async fn run_e2e_with_retry(
     worktree: &Path,
     timeout: Duration,
     context: &str,
-) -> (Vec<CommandOutcome>, bool) {
-    let mut e2e = run_commands(shell, commands, worktree, timeout).await;
+) -> (Vec<CommandOutcome>, bool, Vec<u32>) {
+    let (mut e2e, mut timed_out_pids) = run_commands(shell, commands, worktree, timeout).await;
     for o in &e2e {
         state.event(
             "verify",
@@ -4391,7 +4495,11 @@ async fn run_e2e_with_retry(
                  before concluding"
             ),
         );
-        e2e = run_commands(shell, commands, worktree, timeout).await;
+        let retried = run_commands(shell, commands, worktree, timeout).await;
+        e2e = retried.0;
+        // Both attempts' timeouts matter, not just the last one: the first
+        // attempt's descendants may still be alive alongside the retry's.
+        timed_out_pids.extend(retried.1);
         for o in &e2e {
             state.event(
                 "verify",
@@ -4403,17 +4511,22 @@ async fn run_e2e_with_retry(
             );
         }
     }
-    (e2e, verify_retried)
+    (e2e, verify_retried, timed_out_pids)
 }
 
-/// Run configured shell commands in `cwd`, in order.
+/// Run configured shell commands in `cwd`, in order. The second element is
+/// the pid of every command that hit `timeout` and was still running when
+/// this stopped waiting on it (best-effort: `None` when the platform did not
+/// hand one back) — see [`with_cache_lease`]'s use of it for why a caller
+/// that releases a shared resource afterward needs to know.
 async fn run_commands(
     shell: &[String],
     commands: &[String],
     cwd: &Path,
     timeout: Duration,
-) -> Vec<CommandOutcome> {
+) -> (Vec<CommandOutcome>, Vec<u32>) {
     let mut out = Vec::new();
+    let mut timed_out_pids = Vec::new();
     for command in commands {
         let started = Instant::now();
         let mut cmd = tokio::process::Command::new(&shell[0]);
@@ -4427,15 +4540,27 @@ async fn run_commands(
             .kill_on_drop(true);
         let spawned = cmd.spawn();
         let (code, body) = match spawned {
-            Ok(child) => match tokio::time::timeout(timeout, child.wait_with_output()).await {
-                Ok(Ok(o)) => {
-                    let mut body = String::from_utf8_lossy(&o.stdout).into_owned();
-                    body.push_str(&String::from_utf8_lossy(&o.stderr));
-                    (o.status.code(), body)
+            Ok(child) => {
+                // Captured before the child is consumed below: `kill_on_drop`
+                // only *asks* the process to die when the timeout branch
+                // drops it, and the pid is the only way anyone downstream can
+                // later check whether that request actually took.
+                let pid = child.id();
+                match tokio::time::timeout(timeout, child.wait_with_output()).await {
+                    Ok(Ok(o)) => {
+                        let mut body = String::from_utf8_lossy(&o.stdout).into_owned();
+                        body.push_str(&String::from_utf8_lossy(&o.stderr));
+                        (o.status.code(), body)
+                    }
+                    Ok(Err(e)) => (None, format!("failed to run: {e}")),
+                    Err(_) => {
+                        if let Some(pid) = pid {
+                            timed_out_pids.push(pid);
+                        }
+                        (None, format!("timed out after {}s", timeout.as_secs()))
+                    }
                 }
-                Ok(Err(e)) => (None, format!("failed to run: {e}")),
-                Err(_) => (None, format!("timed out after {}s", timeout.as_secs())),
-            },
+            }
             Err(e) => (None, format!("failed to spawn `{}`: {e}", shell[0])),
         };
         out.push(CommandOutcome {
@@ -4446,7 +4571,7 @@ async fn run_commands(
             resource_blocked: false,
         });
     }
-    out
+    (out, timed_out_pids)
 }
 
 /// The shell command line `mode = "none"` prints — in `magi show`'s `merge`
@@ -4851,6 +4976,67 @@ mod tests {
             "one inconclusive outcome taints the whole batch"
         );
         assert!(!verify_inconclusive(&[]));
+    }
+
+    #[tokio::test]
+    async fn timed_out_pid_waiting_returns_as_soon_as_every_pid_is_confirmed_dead() {
+        // Alive for the first two checks, then dead - confirms the loop
+        // actually re-polls rather than deciding once and sleeping out the
+        // ceiling regardless.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let started = Instant::now();
+        wait_for_pids_with(
+            &[123],
+            |_| calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2,
+            Duration::from_millis(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "must keep checking rather than deciding on the first answer"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must return the moment it is confirmed dead, not wait out the ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_pid_waiting_gives_up_at_its_ceiling_if_never_confirmed_dead() {
+        let started = Instant::now();
+        wait_for_pids_with(
+            &[123],
+            |_| true, // never reports dead
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(30),
+            "must not give up before its own ceiling: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "must not wait past its own ceiling either: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_pid_waiting_is_a_no_op_when_nothing_was_still_running() {
+        let started = Instant::now();
+        wait_for_pids_with(
+            &[],
+            |_| true,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "an empty pid list has nothing to confirm"
+        );
     }
 
     // `review_conclusion` is the exact decision the review hand-off task
@@ -5385,6 +5571,109 @@ mod tests {
             runner.state.merge.as_ref().map(|m| m.detail.as_str()),
             Some("already concluded"),
             "merge must not run again once the node already recorded an outcome"
+        );
+    }
+
+    /// `gate` leaves `state.gate` empty both before it has ever run and when
+    /// its last attempt was resource-blocked (the shared build cache could
+    /// not be acquired or confirmed fresh in time - see
+    /// `CommandOutcome::resource_blocked`'s own doc). An empty `Vec` trivially
+    /// satisfies `.iter().any(|o| !o.ok())` being false, which used to read
+    /// as "nothing failed" and let a run merge a tree the gate never actually
+    /// checked - exactly the case a contended cache produces on every retry
+    /// until it clears. `merge` must refuse until `gate` has recorded a real,
+    /// fully-passing attempt.
+    #[tokio::test]
+    async fn merge_refuses_a_gate_that_has_not_actually_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let mut config = Config::default();
+        config.merge.mode = MergeMode::Local;
+
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            "deadbeef".to_owned(),
+            "task".to_owned(),
+            config,
+        );
+        state.candidates = vec![Candidate {
+            index: 0,
+            label: 'A',
+            agent: "alpha".to_owned(),
+            branch: "does-not-exist".to_owned(),
+            worktree: repo.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: false,
+        }];
+        state.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 1)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("only candidate A produced a change".to_owned()),
+        });
+        state.reviews = vec![ReviewRound {
+            round: 1,
+            head: "deadbeef".to_owned(),
+            verified_head: None,
+            reviews: Vec::new(),
+            e2e: Vec::new(),
+            fix: None,
+            blocking: 0,
+            answered: 0,
+            expected: 0,
+            clean: true,
+            verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
+            progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
+        }];
+        // The point: `gate` has not recorded anything yet.
+        state.gate = Vec::new();
+        state.status = RunStatus::Gating;
+
+        let mut runner = Runner {
+            state,
+            roles: ResolvedRoles {
+                implementers: Vec::new(),
+                judges: Vec::new(),
+                reviewers: Vec::new(),
+                fixer: None,
+                conductor: conductor(),
+            },
+            sem: Arc::new(Semaphore::new(1)),
+            pause: Pause::new(),
+            interrupt: Pause::new(),
+        };
+
+        runner.merge().await.expect("merge");
+
+        assert!(
+            runner.state.merge.is_none(),
+            "an empty gate must never be read as a passing one: {:?}",
+            runner.state.merge
         );
     }
 
