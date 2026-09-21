@@ -43,9 +43,9 @@ use crate::prompt::{
 };
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
-    DeliberationRound, DeliberationTurn, FixRecord, Judgement, MergeOutcome, QuotaLoss,
-    ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, Tally, VoteRecord, tail,
-    write_artifact,
+    DeliberationRound, DeliberationTurn, FixRecord, JobRecord, JobStatus, Judgement, MergeOutcome,
+    QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, Tally,
+    VoteRecord, tail, write_artifact,
 };
 use crate::verdict::{
     self, FinalVote, FixReport, Position, Proposal, Ranking, Review, ReviewRevote, ReviewVote,
@@ -4181,6 +4181,7 @@ async fn wave(
             }
         };
         state.seat_finished(&seat.key);
+        record_jobs(state, node, &seat.key, &out);
         if let Err(e) = state.save() {
             tracing::warn!("could not persist a seat's completion: {e:#}");
         }
@@ -4221,6 +4222,41 @@ async fn wave(
         guard.release();
     }
     collected.into_iter().flatten().collect()
+}
+
+/// Fold one seat's [`agent::CommandEvidence`] (if its outcome carries any)
+/// into the run's [`JobRecord`] log — every node, every seat, uniformly:
+/// this is data collection, not the fix-specific completion contract in
+/// [`Runner::continue_fix_report`], and applies regardless of which node
+/// asked.
+///
+/// Only `AgentOutcome::Ok`/`Quota`/`Dropped` carry an [`AgentOutput`] to read
+/// evidence from; `Failed` does not, and correctly contributes nothing — a
+/// timeout or crash is not itself evidence about a command the seat may have
+/// started.
+fn record_jobs(state: &mut RunState, node: &str, seat: &str, out: &AgentOutcome) {
+    let commands: &[agent::CommandEvidence] = match out {
+        AgentOutcome::Ok(o) | AgentOutcome::Quota(o) | AgentOutcome::Dropped(o) => &o.commands,
+        AgentOutcome::Failed(_) => &[],
+    };
+    let checked_at = Timestamp::now();
+    for c in commands {
+        state.jobs.push(JobRecord {
+            node: node.to_owned(),
+            seat: seat.to_owned(),
+            id: c.id.clone(),
+            description: c.description.clone(),
+            checked_at,
+            status: match c.exit_code {
+                Some(0) => JobStatus::Completed,
+                Some(_) => JobStatus::Failed,
+                None => JobStatus::Unknown,
+            },
+            exit_code: c.exit_code,
+            result_summary: c.result_summary.clone(),
+            source: c.source.clone(),
+        });
+    }
 }
 
 /// Is a review round clean, given how many reviewer seats answered against

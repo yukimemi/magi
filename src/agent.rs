@@ -159,6 +159,33 @@ pub struct Dropped {
     pub output_tokens: u64,
 }
 
+/// One command a CLI's own structured event stream reported running, with
+/// the result it reported for it.
+///
+/// This is evidence the CLI chose to report about its own tool loop — never
+/// something magi polled, supervised, or inferred from a process list. Only
+/// the Codex arm of [`extract`] currently populates it (its `item.completed`
+/// / `command_execution` events name `id`, `command`, `exit_code` and
+/// `aggregated_output` directly); every other backend's CLI does not expose
+/// this in what magi currently captures, so its seats simply never produce
+/// any. A command a CLI never reported finishing (still running when the
+/// turn ended, or the event stream never named it) has no entry here either
+/// — there is no event to build one from, and this type must never be used
+/// to *guess* that a command is still in flight.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandEvidence {
+    /// The CLI's own id for this command.
+    pub id: String,
+    /// The command itself, as the CLI reported it.
+    pub description: String,
+    /// Exit code the CLI reported for it.
+    pub exit_code: Option<i32>,
+    /// Tail of the command's own output, when the CLI reported one.
+    pub result_summary: String,
+    /// Which CLI/event stream this came from, e.g. `"codex"`.
+    pub source: String,
+}
+
 /// Result of an agent invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentOutput {
@@ -182,6 +209,11 @@ pub struct AgentOutput {
     /// [`dropped_stream`].
     #[serde(default)]
     pub dropped: Option<Dropped>,
+    /// Commands the CLI's own event stream reported running, see
+    /// [`CommandEvidence`]. Always empty for a backend this crate does not
+    /// currently read structured job events from.
+    #[serde(default)]
+    pub commands: Vec<CommandEvidence>,
 }
 
 impl AgentOutput {
@@ -416,6 +448,7 @@ pub async fn invoke(
         ],
         quota: extracted.quota,
         dropped: extracted.dropped,
+        commands: extracted.commands,
     })
 }
 
@@ -732,6 +765,7 @@ struct Extracted {
     status: Option<String>,
     quota: Option<Quota>,
     dropped: Option<Dropped>,
+    commands: Vec<CommandEvidence>,
 }
 
 /// Pull the agent's message (and any session id) out of a CLI's stdout.
@@ -765,6 +799,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 // Claude reports a truncated stream as an ordinary error; the
                 // shape `dropped_stream` keys on is agy's.
                 dropped: None,
+                commands: Vec::new(),
             }
         }
         AgentKind::Opencode => {
@@ -797,6 +832,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 status: None,
                 quota: None,
                 dropped: None,
+                commands: Vec::new(),
             }
         }
         AgentKind::Antigravity => {
@@ -826,6 +862,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 status: v.get("status").and_then(|s| s.as_str()).map(str::to_owned),
                 quota: None,
                 dropped: dropped_stream(&v),
+                commands: Vec::new(),
             }
         }
         AgentKind::Codex => {
@@ -839,9 +876,21 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
             // the model narrating its way through the tool loop, and taking
             // the first would hand the caller a progress note instead of a
             // verdict.
+            //
+            // A `command_execution` item is different evidence entirely: the
+            // CLI's own record that it ran a command and what that command
+            // reported back, kept as `CommandEvidence` — see run
+            // 20260912-214939-b3bb's artifacts, where these very fields
+            // (`id`/`command`/`exit_code`/`aggregated_output`) were what
+            // caught a paired test result magi's own agent prose had missed.
+            // Only what `item.completed` actually reports: a command still
+            // running when the turn ended emits no such event at all, and is
+            // not something this can detect — see [`CommandEvidence`]'s own
+            // doc for why that must not be guessed at instead.
             let mut text = String::new();
             let mut session = None;
             let mut status = None;
+            let mut commands = Vec::new();
             for line in stdout.lines() {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
                     continue;
@@ -855,10 +904,16 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                     }
                     Some("item.completed") => {
                         let item = v.get("item").unwrap_or(&serde_json::Value::Null);
-                        if item.get("type").and_then(|t| t.as_str()) == Some("agent_message")
-                            && let Some(t) = item.get("text").and_then(|t| t.as_str())
-                        {
-                            text = t.trim().to_owned();
+                        match item.get("type").and_then(|t| t.as_str()) {
+                            Some("agent_message") => {
+                                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                                    text = t.trim().to_owned();
+                                }
+                            }
+                            Some("command_execution") => {
+                                commands.push(command_evidence(item));
+                            }
+                            _ => {}
                         }
                     }
                     Some("turn.completed") => status = Some("success".to_owned()),
@@ -872,6 +927,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 status,
                 quota: None,
                 dropped: None,
+                commands,
             }
         }
         AgentKind::Omp => {
@@ -945,6 +1001,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 status: None,
                 quota: None,
                 dropped: None,
+                commands: Vec::new(),
             }
         }
         AgentKind::Command => {
@@ -963,9 +1020,56 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 status: None,
                 quota,
                 dropped,
+                commands: Vec::new(),
             }
         }
     }
+}
+
+/// Build one [`CommandEvidence`] from a Codex `command_execution` item.
+///
+/// `command` arrives either as a single string or as an argv array,
+/// depending on how the CLI shaped the call; both are read rather than
+/// assuming one. Missing fields are left at their honest defaults (an empty
+/// id/description, `exit_code: None`) rather than guessed at.
+fn command_evidence(item: &serde_json::Value) -> CommandEvidence {
+    let description = match item.get("command") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    let result_summary = item
+        .get("aggregated_output")
+        .and_then(|o| o.as_str())
+        .map(|s| tail_chars(s.trim(), 400))
+        .unwrap_or_default();
+    CommandEvidence {
+        id: item
+            .get("id")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        description,
+        exit_code: item
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .map(|e| e as i32),
+        result_summary,
+        source: "codex".to_owned(),
+    }
+}
+
+/// The last `max` characters of `s`, cut on a char boundary.
+fn tail_chars(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_owned();
+    }
+    s.chars().skip(count - max).collect()
 }
 
 /// Recognise claude's rate-limit error shape, when it is present.
@@ -1794,6 +1898,52 @@ mod tests {
         assert!(success.quota.is_none());
     }
 
+    /// Minimal, anonymised shape of run 20260912-214939-b3bb's
+    /// artifacts/impl-A.out: `command_execution` items reporting a paired
+    /// test run as `1 passed, 1 failed` twice, while the final
+    /// `agent_message` nevertheless claimed the target passed. The point of
+    /// `CommandEvidence` is that this claim and the CLI's own structured
+    /// record of what actually ran are now two separate things a caller can
+    /// compare, rather than the prose being the only account available.
+    #[test]
+    fn codex_command_execution_events_are_captured_alongside_the_final_message() {
+        let stream = concat!(
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item49","type":"command_execution","command":["bash","-lc","cargo test --test graph_cached_gate"],"exit_code":1,"aggregated_output":"test result: 1 passed; 1 failed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item52","type":"command_execution","command":["bash","-lc","cargo test --test graph_cached_gate a_single_test"],"exit_code":0,"aggregated_output":"test result: 1 passed; 0 failed"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item99","type":"agent_message","text":"Both tests in the target pass."}}"#,
+            "\n",
+            r#"{"type":"turn.completed"}"#,
+            "\n",
+        );
+        let out = extract(AgentKind::Codex, stream);
+        assert_eq!(out.text, "Both tests in the target pass.");
+        assert_eq!(out.commands.len(), 2, "{:?}", out.commands);
+
+        let paired = &out.commands[0];
+        assert_eq!(paired.id, "item49");
+        assert_eq!(paired.exit_code, Some(1));
+        assert!(paired.description.contains("graph_cached_gate"));
+        assert!(paired.result_summary.contains("1 failed"));
+
+        let solo = &out.commands[1];
+        assert_eq!(solo.exit_code, Some(0));
+
+        // The structured evidence disagrees with the final prose - exactly
+        // what a caller must be able to see instead of trusting the message
+        // alone: the full target never passed in one command.
+        assert!(
+            out.commands
+                .iter()
+                .any(|c| c.exit_code != Some(0) && c.description.contains("graph_cached_gate")),
+            "a failed run of the actual target must still be visible: {:?}",
+            out.commands
+        );
+    }
+
     #[test]
     fn command_agent_can_carry_the_claude_quota_shape() {
         let out = extract(
@@ -1847,6 +1997,7 @@ mod tests {
             artifacts: Vec::new(),
             quota: out.quota,
             dropped: out.dropped,
+            commands: out.commands,
         };
         assert!(
             agent_out.usable(),
@@ -1958,6 +2109,7 @@ mod tests {
                 why: "subscriber fell behind updates".to_owned(),
                 output_tokens: 14267,
             }),
+            commands: Vec::new(),
         };
         assert!(!out.usable());
         assert!(out.work_undelivered());
