@@ -307,6 +307,52 @@ async fn resolve_base(repo: &Path, base_branch: &str, remote: &str) -> Result<St
     })
 }
 
+/// Exclusive claim on one run's `magi fix` step, released on drop — including
+/// on an early return or a panic.
+///
+/// `daemon::is_working_on` only sees a heartbeat-publishing daemon; two
+/// manual `magi fix` invocations against the same run are otherwise
+/// invisible to each other and would race to remove and recreate the same
+/// worktree (see [`Runner::fix_selected`]). Deliberately the same minimal
+/// shape as `queue::Claim` — a `create_new` lock file, no staleness reclaim —
+/// since a `magi fix` step is short-lived and bounded by its own timeouts,
+/// the same reasoning that lets `queue::Claim` skip it too.
+struct FixClaim {
+    path: PathBuf,
+}
+
+impl FixClaim {
+    fn acquire(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let path = dir.join("fix.lock");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                // Best effort: the pid is for a human looking at a stale lock.
+                let _ = writeln!(f, "{}", std::process::id());
+                Ok(Self { path })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!(
+                    "another `magi fix` is already running for this run ({} exists)",
+                    path.display()
+                )
+            }
+            Err(e) => Err(e).with_context(|| format!("lock {}", path.display())),
+        }
+    }
+}
+
+impl Drop for FixClaim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 impl Runner {
     /// Start a fresh run against `repo`.
     pub async fn start(repo: &Path, instruction: String, config: Config) -> Result<Self> {
@@ -2874,6 +2920,12 @@ impl Runner {
                 self.state.id
             );
         }
+        // Held for the rest of this call, including the follow-up review
+        // below: two `magi fix` invocations against the same run must not
+        // both reach the worktree manipulation further down, which would
+        // otherwise race to remove and recreate the same directory — see
+        // [`FixClaim`]'s own doc.
+        let _claim = FixClaim::acquire(&self.state.dir())?;
 
         // Resolve every id before spending anything — an unknown id refuses
         // the whole request rather than silently dropping it — and dedup
@@ -2959,10 +3011,22 @@ impl Runner {
         // own worktree in place: that one may already be gone (folded away),
         // and reusing it in place would leave the branch checked out there
         // when the follow-up review below tries to check it out again. Freed
-        // immediately after, either way.
-        git::worktree_remove(&self.state.repo, &winner.worktree)
-            .await
-            .ok();
+        // immediately after, either way — but only once confirmed clean:
+        // `worktree_remove` is a `git worktree remove --force`, which would
+        // otherwise discard uncommitted work left there by the operator or
+        // another process before this had a chance to even look at it.
+        if winner.worktree.exists() {
+            if !git::is_clean(&winner.worktree).await? {
+                bail!(
+                    "`{}` has uncommitted changes; refusing to touch it — commit or \
+                     discard them first",
+                    winner.worktree.display()
+                );
+            }
+            git::worktree_remove(&self.state.repo, &winner.worktree)
+                .await
+                .ok();
+        }
         let fix_worktree = self.state.worktree_root().join("operator-fix");
         let fix_worktree_s = fix_worktree.to_string_lossy().to_string();
         git::git(
@@ -3183,6 +3247,15 @@ impl Runner {
         }
         request.fix = Some(fix);
 
+        // Recorded now, before the follow-up review even starts: the
+        // operator's own request and the fixer's outcome are already final
+        // at this point, and a crash partway through the follow-up review
+        // below must not lose them. Only `follow_up_review_run` is still
+        // pending — filled in and saved again once it is known.
+        self.state.operator_fixes.push(request);
+        self.state.save()?;
+        let request_index = self.state.operator_fixes.len() - 1;
+
         if committed {
             self.state.event(
                 "fix",
@@ -3198,7 +3271,7 @@ impl Runner {
                         format!(
                             "requested by an operator fix on run {} for finding(s) {}",
                             self.state.id,
-                            request
+                            self.state.operator_fixes[request_index]
                                 .findings
                                 .iter()
                                 .map(|f| f.id.as_str())
@@ -3216,7 +3289,8 @@ impl Runner {
                             ),
                         );
                     }
-                    request.follow_up_review_run = Some(follow_up_id);
+                    self.state.operator_fixes[request_index].follow_up_review_run =
+                        Some(follow_up_id);
                 }
                 Err(e) => {
                     self.state.event(
@@ -3225,10 +3299,9 @@ impl Runner {
                     );
                 }
             }
+            self.state.save()?;
         }
 
-        self.state.operator_fixes.push(request);
-        self.state.save()?;
         Ok(())
     }
 

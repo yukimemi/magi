@@ -1043,7 +1043,37 @@ async fn dispatch(command: Command) -> Result<()> {
             let mut runner = Runner::resume(&run)?;
             runner.fix_selected(&finding, &reason, allow_stale).await?;
             print!("{}", report::run(&runner.state));
-            Ok(())
+            // `fix_selected` returning `Ok` only means the operator-fix step
+            // itself ran to completion, exactly like `execute()` returning
+            // `Ok` for a run that ended `Blocked` — it says nothing about
+            // whether the follow-up review it opened actually came out
+            // clean. A caller scripting on exit code alone must not read
+            // this as success just because nothing panicked, so the
+            // follow-up run's own outcome is checked here, the same as
+            // `exit_status` already does for `Command::Run`/`Command::Review`.
+            let follow_up = runner
+                .state
+                .operator_fixes
+                .last()
+                .and_then(|r| r.follow_up_review_run.clone());
+            match follow_up {
+                Some(id) => {
+                    let follow_up_state = RunState::load(&id)
+                        .with_context(|| format!("load follow-up review run {id}"))?;
+                    if !follow_up_state.status.done() {
+                        bail!(
+                            "the fix committed, but the follow-up review run {id} did not \
+                             finish cleanly (status `{}`); see `magi show {id}`",
+                            follow_up_state.status.as_str()
+                        );
+                    }
+                    exit_status(Ok(()), follow_up_state.status, follow_up_state.pr.is_some())
+                        .with_context(|| {
+                            format!("see `magi show {id}` for what the follow-up review found")
+                        })
+                }
+                None => Ok(()),
+            }
         }
 
         Command::List { limit } => {
