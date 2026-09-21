@@ -41,6 +41,7 @@ use crate::proc::Quiet as _;
 use crate::prompt::{
     self, CandidateView, Lens, ReviewPatch, ReviewReconsiderCtx, ReviewSeatReport, Turn,
 };
+use crate::queue;
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
     DeliberationRound, DeliberationTurn, FixRecord, JobRecord, JobStatus, Judgement, MergeOutcome,
@@ -5051,25 +5052,25 @@ fn manual_merge_command(style: MergeStyle, repo: &Path, branch: &str, message: &
 /// `magi show` does rather than a pull request that reads clean while
 /// `run.json` disagrees.
 ///
-/// The first line doubles as the pull request title (`gh_pr_create`) and the
-/// squash/merge commit subject (`manual_merge_command`), both of which take
-/// it via `message.lines().next()` rather than as a separate argument — so it
-/// has to be the task's own opening line, not run/candidate bookkeeping.
-/// "Merge magi run ec12 (candidate B)" told a reader nothing about what
-/// landed once the run id had scrolled off the PR list. That bookkeeping
-/// still needs to be findable, just not from the title: the branch name
-/// already carries it (`RunState::branch_for`), and the footer below repeats
-/// it as plain tags for a reader holding only the merged commit or the PR
-/// body.
+/// The first line doubles as the squash/merge commit subject
+/// (`manual_merge_command`), which takes it via `message.lines().next()`
+/// verbatim — so it has to be the task's own opening line, not run/candidate
+/// bookkeeping. The pull request title (`gh_pr_create`) starts from the same
+/// line but is further reshaped and truncated by `pr_title` to stay inside
+/// GitHub's limit; see that function for why. "Merge magi run ec12 (candidate
+/// B)" told a reader nothing about what landed once the run id had scrolled
+/// off the PR list. That bookkeeping still needs to be findable, just not
+/// from the title: the branch name already carries it
+/// (`RunState::branch_for`), and the footer below repeats it as plain tags
+/// for a reader holding only the merged commit or the PR body.
 ///
 /// `state.instruction` can open with blank lines — a `--file` task is passed
 /// through verbatim (`task_text` only rejects a body that is blank
 /// *entirely*) — and `.lines().next()` on those reads back as `Some("")`, not
-/// `None`, so `gh_pr_create`'s `unwrap_or("magi run")` never fires and `gh pr
-/// create` would be asked for an empty `--title`. `trim_start` drops exactly
-/// those leading blank lines so the first line is the task's real opening
-/// line, and the empty-after-trim case (a whitespace-only instruction) falls
-/// back the same way `queue::title_from` does for the same situation.
+/// `None`. `trim_start` drops exactly those leading blank lines so the first
+/// line is the task's real opening line, and the empty-after-trim case (a
+/// whitespace-only instruction) falls back the same way `queue::title_from`
+/// does for the same situation.
 fn pr_body(state: &RunState, winner: char) -> String {
     let instruction = state.instruction.trim_start();
     let mut message = if instruction.is_empty() {
@@ -5104,9 +5105,28 @@ fn pr_body(state: &RunState, winner: char) -> String {
     message
 }
 
+/// GitHub's `createPullRequest` GraphQL mutation, which `gh pr create` calls
+/// under the hood, rejects a `title` over 256 characters and the whole
+/// command fails — no PR at all, for a run whose body was otherwise fine
+/// (this is what happened to run 2963; see AGENTS.md). 240 leaves room below
+/// that limit: `title_from` counts `chars()` (Unicode scalars), which is not
+/// always how GitHub counts, plus one character for the trailing ellipsis
+/// `title_from` may add. It is a margin, not a guarantee — a title packed
+/// with multi-unit characters could still in principle land close to the
+/// edge, but a real task title's occasional emoji or accented letter fits
+/// comfortably inside it.
+const PR_TITLE_MAX: usize = 240;
+
+/// The pull request title: the PR body's first line, reshaped and truncated
+/// by [`queue::title_from`] the same way `magi show`'s task list titles are,
+/// so it stays inside GitHub's limit on `--title` (see [`PR_TITLE_MAX`]).
+fn pr_title(body: &str) -> String {
+    queue::title_from(body, PR_TITLE_MAX)
+}
+
 /// `gh pr create`, returning the PR url.
 async fn gh_pr_create(cwd: &Path, base: &str, head: &str, body: &str) -> Result<String> {
-    let title = body.lines().next().unwrap_or("magi run").to_owned();
+    let title = pr_title(body);
     let out = tokio::process::Command::new("gh")
         .args([
             "pr", "create", "--base", base, "--head", head, "--title", &title, "--body", body,
@@ -6780,6 +6800,60 @@ mod tests {
         assert!(
             !title.is_empty(),
             "a whitespace-only instruction must still fall back to a non-empty title: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_title_truncates_a_first_line_over_githubs_limit() {
+        // A run 2963-shaped instruction: a single first line well past
+        // GitHub's 256-character createPullRequest limit, with a multi-byte
+        // character mixed in so the truncation is exercised on `chars()`
+        // counting rather than bytes.
+        let long_line = format!("fix the thing 🎉 {}", "x".repeat(400));
+        let title = pr_title(&long_line);
+
+        assert!(
+            title.chars().count() <= PR_TITLE_MAX,
+            "title must stay within PR_TITLE_MAX: {title:?} ({} chars)",
+            title.chars().count()
+        );
+        assert!(
+            title.chars().count() < 256,
+            "title must stay within GitHub's 256-character limit: {title:?}"
+        );
+        assert!(
+            title.ends_with('…'),
+            "a truncated title must say so: {title:?}"
+        );
+    }
+
+    #[test]
+    fn pr_title_leaves_a_short_title_untouched() {
+        let title = pr_title("add retries\n\nmore detail below");
+        assert_eq!(title, "add retries");
+    }
+
+    #[test]
+    fn pr_title_strips_markdown_heading_markers() {
+        let title = pr_title("# Rework the config loader\n\ndetails");
+        assert_eq!(title, "Rework the config loader");
+    }
+
+    #[test]
+    fn pr_title_of_pr_body_stays_within_githubs_limit() {
+        let state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            format!("fix the thing 🎉 {}", "x".repeat(400)),
+            Config::default(),
+        );
+        let body = pr_body(&state, 'A');
+        let title = pr_title(&body);
+
+        assert!(
+            title.chars().count() < 256,
+            "the title gh_pr_create sends must stay within GitHub's limit: {title:?}"
         );
     }
 
