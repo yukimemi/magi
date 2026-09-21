@@ -5105,6 +5105,9 @@ function renderReviews(run) {
         round.e2e_deferred
           ? el("span", { class: "tag", "data-tone": "gold", text: "e2e deferred" })
           : null,
+        Array.isArray(round.e2e) && round.e2e.some((o) => o && o.resource_blocked)
+          ? el("span", { class: "tag", "data-tone": "gold", text: "e2e could not run (cache unavailable)" })
+          : null,
         round.verdict
           ? el("span", { class: "tag", "data-tone": voteTone(round.verdict), text: `verdict: ${voteLabel(round.verdict)}` })
           : null,
@@ -5114,6 +5117,15 @@ function renderReviews(run) {
         round.head ? el("span", { class: "head-sha", title: "reviewed HEAD", text: String(round.head).slice(0, 7) }) : null,
         round.verified_head
           ? el("span", { class: "head-sha", title: "verified HEAD", text: `verified ${String(round.verified_head).slice(0, 7)}` })
+          : null,
+        // Fresh means the exact commit reviewers are looking at was itself
+        // checked; a round that checked an earlier commit is a reference,
+        // not proof about this one - never shown the same way.
+        round.verified_head && round.verified_head !== round.head
+          ? el("span", { class: "tag", "data-tone": "gold", text: "verified an earlier head" })
+          : null,
+        round.verified_at
+          ? el("span", { class: "head-sha", title: "when the verification ran", text: String(round.verified_at) })
           : null,
       ),
     );
@@ -5218,13 +5230,17 @@ function commandList(heading, commands) {
   return el("div", { class: "reviewer" },
     el("p", {}, el("span", { class: "reviewer-name", text: heading })),
     el("div", { class: "findings" }, commands.map((command) => {
-      /* CommandOutcome::ok is a method; the wire has the exit code. */
-      const passed = command.code === 0;
-      return el("div", { class: "finding", "data-sev": passed ? null : "blocker" },
+      /* CommandOutcome::ok is a method; the wire has the exit code.
+         resource_blocked means magi never got the command to run at all
+         (shared build cache contention) - evidence about the machine, not
+         about the patch, so it must never read the same as an actual fail. */
+      const blocked = !!command.resource_blocked;
+      const passed = !blocked && command.code === 0;
+      return el("div", { class: "finding", "data-sev": blocked ? "major" : passed ? null : "blocker" },
         el("div", { class: "finding-top" },
-          el("span", { class: "tag", "data-tone": passed ? "teal" : "rust", text: passed ? "pass" : "fail" }),
+          el("span", { class: "tag", "data-tone": blocked ? "gold" : passed ? "teal" : "rust", text: blocked ? "could not run" : passed ? "pass" : "fail" }),
           el("span", { class: "finding-where", text: command.command || "" }),
-          el("span", { class: "finding-id", text: command.code === null || command.code === undefined ? "timeout" : `exit ${command.code}` }),
+          blocked ? null : el("span", { class: "finding-id", text: command.code === null || command.code === undefined ? "timeout" : `exit ${command.code}` }),
         ),
         !passed && command.output_tail
           ? el("pre", { class: "stat", text: command.output_tail })

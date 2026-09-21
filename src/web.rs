@@ -6979,6 +6979,24 @@ mod tests {
         assert!(APP_JS.contains("verified ${String(round.verified_head).slice(0, 7)}"));
     }
 
+    #[test]
+    fn review_rounds_tell_a_stale_verification_and_a_resource_block_apart_from_a_real_result() {
+        assert!(
+            APP_JS.contains("round.verified_head !== round.head"),
+            "a round that verified an earlier commit must be visibly distinct from one that \
+             verified the head reviewers are looking at now"
+        );
+        assert!(
+            APP_JS.contains("round.verified_at"),
+            "when a check ran must be on the wire, not just which commit"
+        );
+        assert!(
+            APP_JS.contains("resource_blocked"),
+            "a command magi never got to run (shared build cache contention) must not render \
+             the same as a command that ran and failed"
+        );
+    }
+
     #[tokio::test]
     async fn the_change_stream_announces_the_current_revisions_on_connect() {
         let f = Fixture::start().await;
