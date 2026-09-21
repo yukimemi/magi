@@ -1451,7 +1451,19 @@ function renderRunStateChips(heads) {
    below and the pair vanishes silently. Each walk here instead remembers
    its whole path and, on closing a loop, mints the run the loop closed on as
    the head for every run on that path \u2014 itself included \u2014 so a cycle always
-   resolves to one real, present run rather than to none. */
+   resolves to one real, present run rather than to none.
+
+   And it stops the instant it lands on a run that is not done. A task only
+   ever gets a next attempt once its current one has concluded \u2014 that is
+   what makes an earlier attempt's `superseded_by` trustworthy \u2014 but a
+   still-open run naming one anyway (a `fresh_start` abandoning a live run
+   for a new competition, say) is exactly the case that invariant was
+   supposed to rule out. Walking through it regardless would fold a run the
+   operator can still act on underneath whatever it points to, disappearing
+   it from every non-"all" tab with no card of its own to show for it \u2014
+   worse than the unreadable-number problem the badge count separately
+   guards against, since here the run itself goes missing, not just a
+   number. Stopping here instead leaves it as its own head. */
 function foldRuns(runs) {
   const byShort = new Map();
   for (const run of runs) if (run.short) byShort.set(run.short, run);
@@ -1466,6 +1478,7 @@ function foldRuns(runs) {
     while (!headOf.has(cur.id) && !atIndex.has(cur.id)) {
       atIndex.set(cur.id, path.length);
       path.push(cur);
+      if (!cur.done) break;
       const next = nextOf(cur);
       if (!next) break;
       cur = next;

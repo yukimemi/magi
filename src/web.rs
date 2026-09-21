@@ -8383,6 +8383,25 @@ mod tests {
         assert!(APP_JS.contains("if (runs.length > 0) renderRunStateChips(heads);"));
     }
 
+    /// Unifying the badge and the card list on `heads` (above) only helps if
+    /// `heads` itself still has one entry per genuinely in-flight run. A
+    /// task's earlier attempt is only trustworthy to fold away once it is
+    /// done - that is the whole premise `superseded_by` folding rests on -
+    /// so `foldRuns` must refuse to walk a `superseded_by` chain through a
+    /// run that is not done, even if one is recorded (e.g. a fresh start
+    /// abandoning a still-running attempt): such a run has to surface as its
+    /// own head, or nine still-open runs would collapse into one card no
+    /// matter what the badge counts.
+    #[test]
+    fn folding_never_hides_a_run_that_is_not_done() {
+        assert!(
+            APP_JS.contains("if (!cur.done) break;"),
+            "foldRuns must stop walking forward the moment it lands on a run \
+             that is not done, rather than folding it under whatever it \
+             (possibly wrongly) names as its successor"
+        );
+    }
+
     /// The runs tree (section) and the state chips (waiting/done) are two
     /// independent lenses ANDed together in `renderRuns`, and some pairings
     /// can never both be true for any run - every "Landed"/"Ended" run is
