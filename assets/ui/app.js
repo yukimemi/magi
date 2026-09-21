@@ -1374,16 +1374,6 @@ function sectionCompatibleWithStateFilter(sectionKey, filterKey) {
   return REPRESENTATIVE_RUN_SHAPES.some((run) => runSection(run) === sectionKey && filter.match(run));
 }
 
-/* A head that still names a `superseded_by` (see foldRuns below) is one
-   whose successor fell outside the page /api/runs returned, so it could not
-   be folded under a newer card — it is genuinely an old attempt, just one
-   this client has nowhere to nest. Hiding it by default is the same
-   judgement call as hiding "done": it is not what an operator scanning for
-   what needs them wants in front of them, and "all" still shows it. */
-function isOrphanSuperseded(run) {
-  return typeof run.superseded_by === "string" && run.superseded_by !== "";
-}
-
 /* Exactly one chip is ever selected, so picking the already-selected one is
    a no-op rather than clearing back to nothing — unlike the tree filter
    above, there is no "no filter" state here for the default to fall back to. */
@@ -1453,7 +1443,16 @@ function renderRunStateChips(runs) {
    below and the pair vanishes silently. Each walk here instead remembers
    its whole path and, on closing a loop, mints the run the loop closed on as
    the head for every run on that path \u2014 itself included \u2014 so a cycle always
-   resolves to one real, present run rather than to none. */
+   resolves to one real, present run rather than to none.
+
+   `superseded_by` is set the moment a later attempt at the same task exists
+   (see `superseded_runs` on the server), whether or not the earlier one is
+   done \u2014 two candidates competing for the same task both get it, and only
+   one of them is "the earlier attempt" in the sense this fold is for. A walk
+   never advances past a run that is not done: that run is left as the head
+   of its own path (even though it names a successor) instead of being
+   folded away, since folding it would hide a card that is still doing
+   something behind whatever it nominally "supersedes". */
 function foldRuns(runs) {
   const byShort = new Map();
   for (const run of runs) if (run.short) byShort.set(run.short, run);
@@ -1468,6 +1467,7 @@ function foldRuns(runs) {
     while (!headOf.has(cur.id) && !atIndex.has(cur.id)) {
       atIndex.set(cur.id, path.length);
       path.push(cur);
+      if (!cur.done) break;
       const next = nextOf(cur);
       if (!next) break;
       cur = next;
@@ -1503,10 +1503,12 @@ const repoLabel = (run) => run.repo_name || run.repo || "Unknown repository";
 
 /* The wide-screen tree: section, then repo, each carrying the count of cards
    \u2014 cards, not raw runs, so this number always means the same thing as
-   the section heading it rolls up to. Built from the *unfiltered* heads, so
-   picking a node never shrinks the tree out from under the tap that picked
-   it. Sections and repos with nothing in them are left out rather than shown
-   at zero: an empty branch is not something to file into. */
+   the section heading it rolls up to. renderRuns() passes whichever list is
+   currently unfolded into standalone cards (heads for "all", the raw list
+   for every other chip \u2014 see foldRuns), never narrowed by the chip's own
+   match, so picking a node never shrinks the tree out from under the tap
+   that picked it. Sections and repos with nothing in them are left out
+   rather than shown at zero: an empty branch is not something to file into. */
 function buildRunsTree(bySection) {
   const sections = [];
   for (const { key, label } of RUN_SECTIONS) {
@@ -1797,45 +1799,35 @@ function renderRuns() {
     : "";
 
   const { heads, childrenOf } = foldRuns(runs);
+  const isAllState = state.runsStateFilter === "all";
 
   show($("runs-state-chips"), runs.length > 0);
   if (runs.length > 0) renderRunStateChips(runs);
 
-  /* Two hidings, on by default, both lifted by "all": a done run and an old
-     attempt (isOrphanSuperseded, or a whole entry in childrenOf) are both
-     "not what needs me right now", which is the whole reason this filter
-     exists. supersededHidden exists only to keep the count honest — without
-     it, runs-count would say "3 in flight" while quietly also having
-     dropped a dozen cards the operator never asked to hide. */
-  const passingState = heads.filter(matchesRunState);
-  const stateFiltered = state.runsStateFilter === "all"
-    ? passingState
-    : passingState.filter((r) => !isOrphanSuperseded(r));
-  const orphanHidden = passingState.length - stateFiltered.length;
+  /* "all" is the one chip that folds: a head's earlier attempts nest inside
+     its own card (see foldRuns/updateRunRow) instead of getting rows of
+     their own. Every other chip instead filters the very list
+     renderRunStateChips just counted, run by run — no folding, and no
+     second predicate — so a run counted into a chip's badge is always one
+     of the cards below it. Building this from `heads` instead, the way "all"
+     does, used to also filter out any run `foldRuns` had folded under a
+     card outside the current chip's matches; a run still in flight can be
+     folded that way (see foldRuns) and disappeared as a whole card despite
+     the chip's own count including it. */
+  const stateFiltered = isAllState ? heads : runs.filter(matchesRunState);
 
-  /* The tree stays built from every head regardless of the state chip, same
-     as it already ignored the section/repo filter it sits beside — a chip
-     that empties "Landed" out of the visible cards must not also erase the
-     tree's own way of reaching Landed, or "all"/"done" become the only way
-     back in even though the tree is the desktop's whole point. */
-  renderRunsTree(buildRunsTree(groupBySection(heads)));
+  renderRunsTree(buildRunsTree(groupBySection(isAllState ? heads : runs)));
   renderRunsFilterBar();
   const visible = stateFiltered.filter(matchesFilter);
 
   /* Every list in childrenOf exists only because foldRuns resolved a
-     superseded_by to a head on this page (see foldRuns above) — it is
-     exactly as superseded as an orphan head is, so "all" is what shows it
-     and anything else hides it, the same toggle isOrphanSuperseded answers
-     to. Passing an empty map (rather than filtering each list) reuses
-     updateRunRow's existing "nothing folded under this card" rendering
-     instead of adding a second code path for the same outcome. */
-  const foldedHidden = state.runsStateFilter === "all"
-    ? 0
-    : visible.reduce((sum, run) => sum + (childrenOf.get(run.id) || []).length, 0);
-  const childrenForRender = state.runsStateFilter === "all" ? childrenOf : new Map();
+     superseded_by to a head on this page (see foldRuns above); "all" is the
+     only chip that folds, so it is the only one that renders those lists —
+     passing an empty map for every other chip reuses updateRunRow's
+     existing "nothing folded under this card" rendering instead of adding a
+     second code path for the same outcome. */
+  const childrenForRender = isAllState ? childrenOf : new Map();
   syncRunSections(sectionsRoot, groupBySection(visible), childrenForRender);
-
-  const supersededHidden = orphanHidden + foldedHidden;
 
   const counts = runs.length === 0
     ? (unreadable ? `no readable runs, ${unreadableNote}` : "Nothing has run yet")
@@ -1844,9 +1836,7 @@ function renderRuns() {
         const headline = countNoun === "runs"
           ? plural(visible.length, "run", "runs")
           : `${visible.length} ${countNoun}`;
-        return [headline, supersededHidden ? `${supersededHidden} superseded hidden` : "", unreadableNote]
-          .filter(Boolean)
-          .join(", ");
+        return [headline, unreadableNote].filter(Boolean).join(", ");
       })();
   setText($("runs-count"), counts);
 

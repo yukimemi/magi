@@ -8447,4 +8447,28 @@ mod tests {
             "if (!same && !sectionCompatibleWithStateFilter(section, state.runsStateFilter))"
         ));
     }
+
+    /// The "In flight" chip once badged 9 while the list below it rendered a
+    /// single card: the badge counted every run, but the list built its
+    /// cards from `foldRuns`'s folded `heads` instead, so a run `foldRuns`
+    /// folded under some other card - reachable and true, but not what the
+    /// badge's own count meant - never got a card of its own. Pin the
+    /// identifiers that keep the two in lock-step rather than the surrounding
+    /// prose, so a refactor of either is free to reword without failing this
+    /// test, and only fails it if it reintroduces a second source or a second
+    /// predicate for the two.
+    #[test]
+    fn runs_badge_and_list_share_one_source_and_one_predicate() {
+        // The badge counts the raw, unfolded list with each chip's own match.
+        assert!(APP_JS.contains("runs.filter(def.match)"));
+        // Every chip but "all" builds its cards from that same raw list with
+        // that same predicate - not from `heads`, which folds some runs away
+        // from under a card the badge still counted.
+        assert!(APP_JS.contains("runs.filter(matchesRunState)"));
+        // And a run still in flight is never one of the folded ones to begin
+        // with: `foldRuns` only advances its walk past a run that is done, so
+        // a run that is not done always ends up the head of its own card
+        // instead of hiding behind whatever it nominally "supersedes".
+        assert!(APP_JS.contains("if (!cur.done) break;"));
+    }
 }
