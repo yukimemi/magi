@@ -1374,16 +1374,6 @@ function sectionCompatibleWithStateFilter(sectionKey, filterKey) {
   return REPRESENTATIVE_RUN_SHAPES.some((run) => runSection(run) === sectionKey && filter.match(run));
 }
 
-/* A head that still names a `superseded_by` (see foldRuns below) is one
-   whose successor fell outside the page /api/runs returned, so it could not
-   be folded under a newer card — it is genuinely an old attempt, just one
-   this client has nowhere to nest. Hiding it by default is the same
-   judgement call as hiding "done": it is not what an operator scanning for
-   what needs them wants in front of them, and "all" still shows it. */
-function isOrphanSuperseded(run) {
-  return typeof run.superseded_by === "string" && run.superseded_by !== "";
-}
-
 /* Exactly one chip is ever selected, so picking the already-selected one is
    a no-op rather than clearing back to nothing — unlike the tree filter
    above, there is no "no filter" state here for the default to fall back to. */
@@ -1801,17 +1791,24 @@ function renderRuns() {
   show($("runs-state-chips"), runs.length > 0);
   if (runs.length > 0) renderRunStateChips(runs);
 
-  /* Two hidings, on by default, both lifted by "all": a done run and an old
-     attempt (isOrphanSuperseded, or a whole entry in childrenOf) are both
-     "not what needs me right now", which is the whole reason this filter
-     exists. supersededHidden exists only to keep the count honest — without
-     it, runs-count would say "3 in flight" while quietly also having
-     dropped a dozen cards the operator never asked to hide. */
-  const passingState = heads.filter(matchesRunState);
+  /* renderRunStateChips just counted matchesRunState over the full, raw
+     `runs` array (see its own comment on why: a folded-away earlier attempt
+     is still a real run). The card list has to walk the same array through
+     the same predicate, or the badge and the cards underneath it are simply
+     answering two different questions — which is how "In flight: 9" ends up
+     over a list with one card: folding first and counting matches second
+     throws away the eight runs that got folded under some other head before
+     matchesRunState ever saw them.
+     "all" is the one tab that still folds: it nests every earlier attempt
+     under its head via childrenForRender below, so nothing is lost, just
+     redrawn one level down — the same reasoning the tree already relies on
+     (see its own comment). Every other tab shows heads and folded-away
+     attempts alike as their own top-level cards, which is also why each
+     card already renders its own "Superseded by …" note (updateRunCard)
+     regardless of whether it happens to be a head. */
   const stateFiltered = state.runsStateFilter === "all"
-    ? passingState
-    : passingState.filter((r) => !isOrphanSuperseded(r));
-  const orphanHidden = passingState.length - stateFiltered.length;
+    ? heads
+    : runs.filter(matchesRunState);
 
   /* The tree stays built from every head regardless of the state chip, same
      as it already ignored the section/repo filter it sits beside — a chip
@@ -1822,20 +1819,13 @@ function renderRuns() {
   renderRunsFilterBar();
   const visible = stateFiltered.filter(matchesFilter);
 
-  /* Every list in childrenOf exists only because foldRuns resolved a
-     superseded_by to a head on this page (see foldRuns above) — it is
-     exactly as superseded as an orphan head is, so "all" is what shows it
-     and anything else hides it, the same toggle isOrphanSuperseded answers
-     to. Passing an empty map (rather than filtering each list) reuses
-     updateRunRow's existing "nothing folded under this card" rendering
-     instead of adding a second code path for the same outcome. */
-  const foldedHidden = state.runsStateFilter === "all"
-    ? 0
-    : visible.reduce((sum, run) => sum + (childrenOf.get(run.id) || []).length, 0);
+  /* Only the "all" tab still has anything folded under a card to show;
+     everywhere else stateFiltered already put every run at the top level,
+     so an empty map reuses updateRunRow's existing "nothing folded under
+     this card" rendering instead of a second code path for the same
+     outcome. */
   const childrenForRender = state.runsStateFilter === "all" ? childrenOf : new Map();
   syncRunSections(sectionsRoot, groupBySection(visible), childrenForRender);
-
-  const supersededHidden = orphanHidden + foldedHidden;
 
   const counts = runs.length === 0
     ? (unreadable ? `no readable runs, ${unreadableNote}` : "Nothing has run yet")
@@ -1844,9 +1834,7 @@ function renderRuns() {
         const headline = countNoun === "runs"
           ? plural(visible.length, "run", "runs")
           : `${visible.length} ${countNoun}`;
-        return [headline, supersededHidden ? `${supersededHidden} superseded hidden` : "", unreadableNote]
-          .filter(Boolean)
-          .join(", ");
+        return [headline, unreadableNote].filter(Boolean).join(", ");
       })();
   setText($("runs-count"), counts);
 

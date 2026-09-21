@@ -8496,6 +8496,39 @@ mod tests {
         ));
     }
 
+    /// The "In flight" chip once read 9 while the list under it rendered a
+    /// single card: `renderRunStateChips` counted `matchesRunState` over the
+    /// raw `/api/runs` array, but `renderRuns` built the card list from
+    /// `foldRuns(runs).heads` first and only then applied the same
+    /// predicate — so any run folded under a different head as an earlier
+    /// attempt was counted in the badge and dropped from the list before
+    /// `matchesRunState` ever saw it.
+    ///
+    /// `cargo test` cannot execute the front end, so this pins the fix at
+    /// the source level: outside the "all" tab, the badge and the card list
+    /// must both walk the same array (`runs`, not `heads`) through the same
+    /// predicate (`matchesRunState`/`def.match`, both reading
+    /// `state.runsStateFilter`) — so either regressing back to counting one
+    /// array while rendering the other fails this test.
+    #[test]
+    fn runs_state_chip_badge_and_card_list_share_source_and_predicate() {
+        assert!(
+            APP_JS.contains("setText(node.querySelector(\".state-chip-count\"), String(runs.filter(def.match).length));"),
+            "the badge counts matches over the full, raw runs array"
+        );
+        assert!(
+            APP_JS.contains(
+                "const stateFiltered = state.runsStateFilter === \"all\"\n    ? heads\n    : runs.filter(matchesRunState);"
+            ),
+            "the card list, outside \"all\", filters that same raw array by the same predicate rather than folding first"
+        );
+        // `isOrphanSuperseded` used to hide a folded-away run from every tab
+        // but "all" after the fact; now that non-"all" tabs never fold in
+        // the first place, that second hiding pass would be dead code left
+        // to rot, so it must be gone rather than merely unreachable.
+        assert!(!APP_JS.contains("isOrphanSuperseded"));
+    }
+
     #[tokio::test]
     async fn normalize_default_repo_leaves_an_explicit_path_untouched() {
         // An operator-named directory - git checkout or not - is never
