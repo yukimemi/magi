@@ -414,6 +414,59 @@ pub struct FixRecord {
     /// Wall-clock time.
     #[serde(default)]
     pub duration_ms: u64,
+    /// How the fixer's own seat was made to answer when its CLI turn ended
+    /// cleanly but without an addressed/rejected report — see
+    /// [`graph::Runner::continue_fix_report`]. `None` for a record written
+    /// before this existed, which must read as "unknown", not as
+    /// [`ContinuationOutcome::NotNeeded`]: an old run really may have hit
+    /// this exact gap and simply had no mechanism to say so.
+    #[serde(default)]
+    pub continuation: Option<ContinuationRecord>,
+}
+
+/// How a node recovered — or failed to recover — a structured report after
+/// the CLI's own turn ended cleanly (a usable, non-empty, exit-0 reply)
+/// without it. A clean CLI turn is not the same fact as the node's own work
+/// being done — see the `fix` node's `continue_fix_report`, which is what
+/// produces this.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ContinuationOutcome {
+    /// The first reply already carried the report; nothing was resumed.
+    NotNeeded,
+    /// A follow-up call in the same session recovered the report.
+    Resumed,
+    /// The continuation budget was spent without ever recovering it.
+    Exhausted,
+    /// A continuation attempt hit the CLI's rate limit; not retried further
+    /// — a quota fails the same way again immediately.
+    QuotaLost,
+    /// No session was left to resume into, so nothing was attempted.
+    NoSession,
+}
+
+/// Cost and outcome of one node's attempt to recover a missing report by
+/// resuming its own seat.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ContinuationRecord {
+    /// Follow-up calls made to the same seat. `0` when the outcome is
+    /// [`ContinuationOutcome::NotNeeded`] or [`ContinuationOutcome::NoSession`].
+    pub attempts: usize,
+    /// Wall-clock time spent on those follow-up calls, summed — not counting
+    /// the original call whose reply this is recovering from.
+    pub cumulative_wait_ms: u64,
+    /// What ended the loop.
+    pub outcome: ContinuationOutcome,
+}
+
+impl ContinuationRecord {
+    /// The report was already there on the first try.
+    pub fn not_needed() -> Self {
+        Self {
+            attempts: 0,
+            cumulative_wait_ms: 0,
+            outcome: ContinuationOutcome::NotNeeded,
+        }
+    }
 }
 
 /// Outcome of one shell command.

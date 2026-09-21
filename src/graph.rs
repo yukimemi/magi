@@ -42,9 +42,10 @@ use crate::prompt::{
     self, CandidateView, Lens, ReviewPatch, ReviewReconsiderCtx, ReviewSeatReport, Turn,
 };
 use crate::run::{
-    BaseSync, Candidate, CommandOutcome, DeliberationRound, DeliberationTurn, FixRecord, Judgement,
-    MergeOutcome, QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus,
-    Tally, VoteRecord, tail, write_artifact,
+    BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
+    DeliberationRound, DeliberationTurn, FixRecord, Judgement, MergeOutcome, QuotaLoss,
+    ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, Tally, VoteRecord, tail,
+    write_artifact,
 };
 use crate::verdict::{
     self, FinalVote, FixReport, Position, Proposal, Ranking, Review, ReviewRevote, ReviewVote,
@@ -108,6 +109,23 @@ pub(crate) const STAGNANT_LIMIT: usize = 2;
 /// (once before review, once before the gate), because either one finding
 /// the base still moving is the same signal.
 const BASE_SYNC_ROUNDS: usize = 4;
+
+/// How many times [`Runner::continue_fix_report`] will resume the fixer's own
+/// seat when its CLI turn ended cleanly — usable, non-empty, exit 0 — but the
+/// reply held no [`FixReport`].
+///
+/// The shape this recovers: run 20260912-114326-d3b8's fix-2 came back
+/// `subtype=success`/`is_error=false`/`stop_reason=end_turn` with the reply
+/// "I'll pause here until the `cargo make check` background run reports
+/// back." — a CLI turn that ended cleanly while the fixer's own job had not.
+/// No `FixReport` was ever collected from that seat, and the run moved on to
+/// the next review round regardless.
+///
+/// Bounded independently of `review_rounds` and `graph.retries`: this
+/// recovers one seat's missing report mid-round, not a new round of review or
+/// an ordinary parse retry, and must not itself become the unbounded wait the
+/// rest of this module exists to avoid.
+const MAX_FIX_CONTINUATIONS: usize = 2;
 
 /// One queued agent invocation.
 ///
@@ -1372,6 +1390,183 @@ impl Runner {
                 run_one(retry, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
             *seat = resumed_seat;
             *out = resumed;
+        }
+    }
+
+    /// Ask the fixer's own seat again, up to [`MAX_FIX_CONTINUATIONS`] times,
+    /// when its CLI turn ended cleanly (`AgentOutcome::Ok`) but the reply held
+    /// no [`FixReport`] — see [`MAX_FIX_CONTINUATIONS`]'s own doc for the run
+    /// that motivated this.
+    ///
+    /// Not the same gap as an unparsable *shape*, which [`ask_json_wave`]'s
+    /// own nudge loop already covers for judge/review/vote seats, and not a
+    /// dropped stream, which [`Runner::resume_undelivered`] covers for
+    /// implement seats: here the CLI turn genuinely finished while the node's
+    /// own work — the fixer's account of what it did — had not. Gated purely
+    /// on `extract_json::<FixReport>` having failed on an otherwise-usable
+    /// reply, never on any wording in it, so a fixer whose valid, first-try
+    /// `FixReport` happens to mention having waited on a background test is
+    /// never resumed — the `Ok(report)` branch at the call site returns
+    /// before this is ever invoked.
+    ///
+    /// Same discipline as `resume_undelivered`: a nudge-sized timeout per
+    /// attempt ([`retry_budget`]), nothing attempted once the session is
+    /// gone, and a quota hit ends the loop immediately rather than retrying a
+    /// rate limit that fails the same way again.
+    async fn continue_fix_report(
+        &mut self,
+        mut seat: SeatState,
+        parse_err: String,
+        job: &SeatJob,
+        prompts: &Prompts,
+        run_id: &str,
+        round: usize,
+    ) -> (
+        SeatState,
+        Option<FixReport>,
+        Option<String>,
+        ContinuationRecord,
+    ) {
+        let mut last_err = parse_err;
+        let mut cumulative_wait_ms = 0u64;
+        let mut attempts = 0usize;
+        loop {
+            if !has_context(&job.spec, &seat, job.sessions) {
+                self.state.event(
+                    "fix",
+                    format!(
+                        "round {round}: fixer's reply had no adoption report ({last_err}); no \
+                         session left to resume into"
+                    ),
+                );
+                let outcome = if attempts == 0 {
+                    ContinuationOutcome::NoSession
+                } else {
+                    ContinuationOutcome::Exhausted
+                };
+                return (
+                    seat,
+                    None,
+                    Some(format!("unparsable fix report: {last_err}")),
+                    ContinuationRecord {
+                        attempts,
+                        cumulative_wait_ms,
+                        outcome,
+                    },
+                );
+            }
+            if attempts >= MAX_FIX_CONTINUATIONS {
+                self.state.event(
+                    "fix",
+                    format!(
+                        "round {round}: fixer's reply still had no adoption report after \
+                         {attempts} continuation(s) ({last_err}); giving up"
+                    ),
+                );
+                return (
+                    seat,
+                    None,
+                    Some(format!(
+                        "unparsable fix report after {attempts} continuation(s): {last_err}"
+                    )),
+                    ContinuationRecord {
+                        attempts,
+                        cumulative_wait_ms,
+                        outcome: ContinuationOutcome::Exhausted,
+                    },
+                );
+            }
+            attempts += 1;
+            self.state.event(
+                "fix",
+                format!(
+                    "round {round}: fixer's reply had no adoption report ({last_err}); resuming \
+                     the conversation (attempt {attempts}/{MAX_FIX_CONTINUATIONS})"
+                ),
+            );
+            let mut retry = job.clone();
+            retry.seat = seat.clone();
+            retry.prompt = prompt::resume_incomplete(&last_err);
+            retry.timeout = retry_budget(job.timeout, true);
+            retry.stem = format!("{}-continue{attempts}", job.stem);
+            let cache = self.state.config.cache_dir();
+            let ctx = WaveCtx {
+                run: run_id,
+                node: "fix",
+                prompts,
+                cache: cache.as_deref(),
+            };
+            let (resumed_seat, resumed_out) = run_one(
+                retry,
+                Arc::clone(&self.sem),
+                &ctx,
+                &mut self.state,
+                attempts,
+            )
+            .await;
+            seat = resumed_seat;
+            match resumed_out {
+                AgentOutcome::Ok(o) => {
+                    cumulative_wait_ms += o.duration_ms;
+                    match verdict::extract_json::<FixReport>(&o.text) {
+                        Ok(report) => {
+                            self.state.event(
+                                "fix",
+                                format!(
+                                    "round {round}: fixer's adoption report recovered after \
+                                     {attempts} continuation(s)"
+                                ),
+                            );
+                            return (
+                                seat,
+                                Some(report),
+                                None,
+                                ContinuationRecord {
+                                    attempts,
+                                    cumulative_wait_ms,
+                                    outcome: ContinuationOutcome::Resumed,
+                                },
+                            );
+                        }
+                        Err(e) => last_err = e.to_string(),
+                    }
+                }
+                AgentOutcome::Quota(o) => {
+                    cumulative_wait_ms += o.duration_ms;
+                    self.state.quota.push(QuotaLoss {
+                        seat: seat.key.clone(),
+                        node: "fix".to_owned(),
+                        at: Timestamp::now(),
+                        reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
+                    });
+                    self.state.event(
+                        "fix",
+                        format!(
+                            "round {round}: continuation rate limited (quota); not retrying now"
+                        ),
+                    );
+                    return (
+                        seat,
+                        None,
+                        Some("rate limited (quota) while recovering the fix report".to_owned()),
+                        ContinuationRecord {
+                            attempts,
+                            cumulative_wait_ms,
+                            outcome: ContinuationOutcome::QuotaLost,
+                        },
+                    );
+                }
+                AgentOutcome::Dropped(o) => {
+                    cumulative_wait_ms += o.duration_ms;
+                    let why = o
+                        .dropped
+                        .as_ref()
+                        .map(|d| d.why.as_str())
+                        .unwrap_or("the CLI ended the stream without delivering its answer");
+                    last_err = format!("the CLI dropped the stream ({why})");
+                }
+                AgentOutcome::Failed(e) => last_err = e,
+            }
         }
     }
 
@@ -3091,10 +3286,9 @@ impl Runner {
                 prompts: &prompts,
                 cache: cache.as_deref(),
             };
-            let (seat, out) = run_one(job, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
+            let (seat, out) =
+                run_one(job.clone(), Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
             let agent_id = seat.agent.clone();
-            let seat_key = seat.key.clone();
-            self.state.seats.insert(seat.key.clone(), seat);
 
             let mut fix = FixRecord {
                 agent: agent_id,
@@ -3104,7 +3298,10 @@ impl Runner {
                 committed: false,
                 failed: None,
                 duration_ms: 0,
+                continuation: None,
             };
+            let mut continuation = ContinuationRecord::not_needed();
+            let mut final_seat = seat.clone();
             match out {
                 AgentOutcome::Ok(o) => {
                     fix.duration_ms = o.duration_ms;
@@ -3115,7 +3312,32 @@ impl Runner {
                             fix.notes =
                                 blind::sanitize_prose(&report.notes, &self.state.config.blind);
                         }
-                        Err(e) => fix.failed = Some(format!("unparsable fix report: {e}")),
+                        Err(e) => {
+                            let (resumed_seat, resolved, failure, cont) = self
+                                .continue_fix_report(
+                                    seat,
+                                    e.to_string(),
+                                    &job,
+                                    &prompts,
+                                    &run_id,
+                                    round,
+                                )
+                                .await;
+                            fix.duration_ms += cont.cumulative_wait_ms;
+                            continuation = cont;
+                            final_seat = resumed_seat;
+                            match resolved {
+                                Some(report) => {
+                                    fix.addressed = report.addressed;
+                                    fix.rejected = report.rejected;
+                                    fix.notes = blind::sanitize_prose(
+                                        &report.notes,
+                                        &self.state.config.blind,
+                                    );
+                                }
+                                None => fix.failed = failure,
+                            }
+                        }
                     }
                 }
                 // The CLI's raw error JSON is not a fix report to parse.
@@ -3130,7 +3352,7 @@ impl Runner {
                 }
                 AgentOutcome::Quota(o) => {
                     self.state.quota.push(QuotaLoss {
-                        seat: seat_key,
+                        seat: final_seat.key.clone(),
                         node: "fix".to_owned(),
                         at: Timestamp::now(),
                         reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
@@ -3139,6 +3361,8 @@ impl Runner {
                 }
                 AgentOutcome::Failed(e) => fix.failed = Some(e),
             }
+            fix.continuation = Some(continuation);
+            self.state.seats.insert(final_seat.key.clone(), final_seat);
             git::commit_all(
                 &winner.worktree,
                 &format!("magi: review round {round} fixes (uncommitted work)"),
@@ -3181,9 +3405,18 @@ impl Runner {
                         )
                     }
                     None => format!(
-                        "round {round}: {} addressed, {} rejected, {commit_note}, tree {tree_note}",
+                        "round {round}: {} addressed, {} rejected, {commit_note}, tree \
+                         {tree_note}{}",
                         fix.addressed.len(),
                         fix.rejected.len(),
+                        if continuation.outcome == ContinuationOutcome::Resumed {
+                            format!(
+                                " (adoption report recovered after {} continuation(s))",
+                                continuation.attempts
+                            )
+                        } else {
+                            String::new()
+                        },
                     ),
                 },
             );
@@ -5980,6 +6213,7 @@ mod tests {
                 committed: true,
                 failed: None,
                 duration_ms: 0,
+                continuation: None,
             }),
             blocking: 0,
             answered: 1,

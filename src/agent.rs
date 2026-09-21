@@ -1817,6 +1817,47 @@ mod tests {
         assert_eq!(out.status.as_deref(), Some("success"));
     }
 
+    /// The shape behind fix-2 in run 20260912-114326-d3b8, minimal and
+    /// anonymised: a Claude CLI turn that ended `subtype: success`,
+    /// `is_error: false`, `terminal_reason: completed`, `stop_reason:
+    /// end_turn` — every signal this crate reads as a clean CLI turn — while
+    /// `result` is a progress update, not the report the fixer node needed,
+    /// and no `FixReport` JSON is anywhere in it.
+    ///
+    /// `AgentOutput::usable()` (a CLI fact: exit 0, not timed out, non-empty
+    /// text) must stay true here — that is the honest reading of what the
+    /// CLI reported — while `verdict::extract_json` on the same text must
+    /// fail. Conflating the two is exactly the bug this fixture reproduces:
+    /// `run.json` recorded `fix.failed = "unparsable fix report: the reply
+    /// contained no JSON object"` and moved straight to the next review round
+    /// with no report ever recovered from that seat.
+    #[test]
+    fn a_clean_cli_turn_is_not_the_same_fact_as_the_nodes_own_work_being_done() {
+        let stdout = r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","stop_reason":"end_turn","result":"I'll pause here until the `cargo make check` background run reports back.","session_id":"11111111-1111-1111-1111-111111111111"}"#;
+        let out = extract(AgentKind::Claude, stdout);
+        assert_eq!(out.status.as_deref(), Some("success"));
+        assert!(out.quota.is_none());
+        assert!(!out.text.trim().is_empty());
+
+        let agent_out = AgentOutput {
+            text: out.text.clone(),
+            exit_code: Some(0),
+            timed_out: false,
+            duration_ms: 500,
+            artifacts: Vec::new(),
+            quota: out.quota,
+            dropped: out.dropped,
+        };
+        assert!(
+            agent_out.usable(),
+            "the CLI turn itself ended cleanly and must read as usable"
+        );
+        assert!(
+            crate::verdict::extract_json::<crate::verdict::FixReport>(&agent_out.text).is_err(),
+            "a clean CLI turn is not proof the node's own report ever arrived"
+        );
+    }
+
     #[test]
     fn opencode_event_stream_is_concatenated() {
         let stream = concat!(

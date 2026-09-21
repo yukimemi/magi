@@ -715,6 +715,7 @@ mod tests {
                 committed: false,
                 failed: None,
                 duration_ms: 0,
+                continuation: None,
             }),
             blocking: 1,
             answered: 1,

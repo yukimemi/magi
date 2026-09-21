@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::{MergeMode, MergeStyle};
-use crate::run::{CommandOutcome, E2eStatus, RunState, RunStatus, tail};
+use crate::run::{CommandOutcome, ContinuationOutcome, E2eStatus, RunState, RunStatus, tail};
 use crate::stats::Stats;
 use crate::verdict::ReviewVote;
 
@@ -131,6 +131,20 @@ fn first_line(text: &str) -> String {
 
 fn short(commit: &str) -> String {
     commit.chars().take(7).collect()
+}
+
+/// A short badge for a [`crate::run::ContinuationRecord`], distinguishing
+/// "the seat's own report needed to be resumed" from "there was nothing to
+/// address" — a fixer that has never needed this stays silent here, exactly
+/// as a record predating the feature (`continuation: None`) does too.
+fn continuation_note(c: &crate::run::ContinuationRecord) -> String {
+    match c.outcome {
+        ContinuationOutcome::NotNeeded => String::new(),
+        ContinuationOutcome::Resumed => format!(" [resumed x{}]", c.attempts),
+        ContinuationOutcome::Exhausted => format!(" [continuation exhausted x{}]", c.attempts),
+        ContinuationOutcome::QuotaLost => " [continuation: quota]".to_owned(),
+        ContinuationOutcome::NoSession => " [no session to resume]".to_owned(),
+    }
 }
 
 /// Full report for one run.
@@ -413,13 +427,17 @@ pub fn run(state: &RunState) -> String {
                     } else {
                         yellow("unchanged")
                     };
+                    let cont = f
+                        .continuation
+                        .as_ref()
+                        .map_or(String::new(), continuation_note);
                     match &f.failed {
                         // Never the same shape as "N addressed / M rejected": the
                         // fixer's diff may well have landed (see the `fix` node's
                         // own event), but whether it addressed anything is
                         // unknown, not zero.
                         Some(reason) => format!(
-                            "  fix: {}, tree {tree}{}",
+                            "  fix: {}, tree {tree}{}{cont}",
                             yellow(&format!("adoption report lost ({reason})")),
                             if f.committed {
                                 String::new()
@@ -428,7 +446,7 @@ pub fn run(state: &RunState) -> String {
                             }
                         ),
                         None => format!(
-                            "  fix: {} addressed / {} rejected, tree {tree}{}",
+                            "  fix: {} addressed / {} rejected, tree {tree}{}{cont}",
                             f.addressed.len(),
                             f.rejected.len(),
                             if f.committed {
@@ -1086,6 +1104,7 @@ mod tests {
                 committed: true,
                 failed: Some("timed out".to_owned()),
                 duration_ms: 0,
+                continuation: None,
             }),
             blocking: 3,
             answered: 0,
@@ -1121,6 +1140,7 @@ mod tests {
                 committed: true,
                 failed: None,
                 duration_ms: 0,
+                continuation: None,
             }),
             blocking: 3,
             answered: 0,
@@ -1242,6 +1262,7 @@ mod tests {
                 committed: true,
                 failed: Some("timed out".to_owned()),
                 duration_ms: 0,
+                continuation: None,
             }),
             blocking: 0,
             answered: 1,
@@ -1346,6 +1367,7 @@ mod tests {
                 committed: true,
                 failed: None,
                 duration_ms: 0,
+                continuation: None,
             }),
             blocking: 1,
             answered: 1,
