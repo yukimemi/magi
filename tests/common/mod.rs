@@ -210,6 +210,24 @@ if grep -q "reviewers of" "$p"; then
   exit 0
 fi
 
+# Fixer-report-recovery simulation: the resumed call `graph::Runner::
+# continue_fix_report` sends after a fixer's clean CLI turn held no
+# FixReport (see `prompt::resume_incomplete` — its wording, never the
+# original prompt's, is what this greps for). `MOCK_FIX_ALWAYS_INCOMPLETE_SEAT`
+# never recovers, for exhaustion coverage; every other matching seat recovers
+# on this, its first resumed call.
+if grep -q "the report this step requires" "$p"; then
+  if [ -n "$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT" ] && { case ",$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+    printf "Still waiting on the background test run; I will report back once it finishes.\n"
+    exit 0
+  fi
+  echo "fixed $$" >> fixed.txt
+  git add -A >/dev/null 2>&1
+  git commit -q -m "address review findings (recovered)" >/dev/null 2>&1
+  printf '{"addressed":[],"rejected":[],"notes":"created fixed.txt after confirming the background run finished"}\n'
+  exit 0
+fi
+
 if grep -q "Your patch was reviewed" "$p"; then
   id=$(grep -o 'R[0-9]*-[0-9]*-[0-9]*' "$p" | head -1)
   # A fixer that claims to have addressed the finding but never touches the
@@ -222,6 +240,30 @@ if grep -q "Your patch was reviewed" "$p"; then
   if [ -n "$MOCK_FIXER_EMPTY_COMMIT" ]; then
     git commit --allow-empty -q -m "address review findings" >/dev/null 2>&1
     printf '{"addressed":["%s"],"rejected":[],"notes":"empty commit"}\n' "$id"
+    exit 0
+  fi
+  # The CLI's turn ends cleanly (exit 0, non-empty text) but the reply is a
+  # progress update, not a report — the shape behind fix-1 and fix-2 in run
+  # 20260912-114326-d3b8, which ended "I'll pause here until the `cargo make
+  # check` background run reports back." instead of a FixReport. A matching
+  # seat answers this way on every *original* call (never on a resumed one —
+  # that prompt does not contain "Your patch was reviewed" at all, see the
+  # branch above); `MOCK_FIX_ALWAYS_INCOMPLETE_SEAT` also never recovers on
+  # resume, `MOCK_FIX_INCOMPLETE_SEAT` does.
+  if { [ -n "$MOCK_FIX_INCOMPLETE_SEAT" ] && { case ",$MOCK_FIX_INCOMPLETE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; } \
+    || { [ -n "$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT" ] && { case ",$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; }; then
+    printf "I'll pause here until the background test run reports back. I will continue once it completes.\n"
+    exit 0
+  fi
+  # A fixer whose *first-try*, valid FixReport happens to mention having
+  # waited on something must never be resumed — the completion contract is
+  # purely structural (did `extract_json::<FixReport>` succeed), never a
+  # keyword match on the reply's prose.
+  if [ -n "$MOCK_FIXER_MENTIONS_WAITING" ]; then
+    echo "fixed $$" >> fixed.txt
+    git add -A >/dev/null 2>&1
+    git commit -q -m "address review findings" >/dev/null 2>&1
+    printf '{"addressed":["%s"],"rejected":[],"notes":"addressed after waiting for the background build to finish"}\n' "$id"
     exit 0
   fi
   # Appended with a nonce so a fixer invoked round after round always has a
@@ -438,6 +480,51 @@ pub fn fixture_with_dropped_stream(home: HomeGuard, seats: &[&str]) -> Fixture {
     let value = seats.join(",");
     for a in &mut fx.config.agents {
         a.env.insert("MOCK_DROPPED_SEAT".to_owned(), value.clone());
+    }
+    fx
+}
+
+/// `require_fix = true`, so reviewers raise a blocking finding until
+/// `fixed.txt` exists, and the given fixer seats' first reply to it is the
+/// "clean CLI turn, no FixReport" shape — a prose reply ending on a promise
+/// to check back once a background run finishes, never a parsable
+/// `FixReport`. See `graph::MAX_FIX_CONTINUATIONS`'s own doc for the run
+/// this reproduces. The seat recovers on `graph::Runner::continue_fix_report`'s
+/// resumed call, which always succeeds, so a run built on this fixture still
+/// reaches a clean review round.
+pub fn fixture_with_fix_report_lost(home: HomeGuard, seats: &[&str]) -> Fixture {
+    let mut fx = fixture(home, Judges::Unanimous, true);
+    let value = seats.join(",");
+    for a in &mut fx.config.agents {
+        a.env
+            .insert("MOCK_FIX_INCOMPLETE_SEAT".to_owned(), value.clone());
+    }
+    fx
+}
+
+/// Like [`fixture_with_fix_report_lost`], but the given fixer seats never
+/// recover: every call, original or resumed, answers with the same
+/// no-FixReport shape, so `continue_fix_report`'s budget genuinely runs out.
+pub fn fixture_with_fix_report_always_lost(home: HomeGuard, seats: &[&str]) -> Fixture {
+    let mut fx = fixture(home, Judges::Unanimous, true);
+    let value = seats.join(",");
+    for a in &mut fx.config.agents {
+        a.env
+            .insert("MOCK_FIX_ALWAYS_INCOMPLETE_SEAT".to_owned(), value.clone());
+    }
+    fx
+}
+
+/// Like [`fixture_with_fix_report_lost`], but every fixer seat's *first-try*
+/// reply already carries a valid `FixReport` — the notes just happen to
+/// mention having waited on a background build. The completion contract must
+/// never trigger a continuation on that wording; only a failed
+/// `extract_json::<FixReport>` does.
+pub fn fixture_with_fixer_mentioning_waiting(home: HomeGuard) -> Fixture {
+    let mut fx = fixture(home, Judges::Unanimous, true);
+    for a in &mut fx.config.agents {
+        a.env
+            .insert("MOCK_FIXER_MENTIONS_WAITING".to_owned(), "1".to_owned());
     }
     fx
 }

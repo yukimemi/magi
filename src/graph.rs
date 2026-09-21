@@ -42,9 +42,10 @@ use crate::prompt::{
     self, CandidateView, Lens, ReviewPatch, ReviewReconsiderCtx, ReviewSeatReport, Turn,
 };
 use crate::run::{
-    BaseSync, Candidate, CommandOutcome, DeliberationRound, DeliberationTurn, FixRecord, Judgement,
-    MergeOutcome, QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus,
-    Tally, VoteRecord, tail, write_artifact,
+    BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
+    DeliberationRound, DeliberationTurn, FixRecord, JobRecord, JobStatus, Judgement, MergeOutcome,
+    QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, Tally,
+    VoteRecord, tail, write_artifact,
 };
 use crate::verdict::{
     self, FinalVote, FixReport, Position, Proposal, Ranking, Review, ReviewRevote, ReviewVote,
@@ -108,6 +109,23 @@ pub(crate) const STAGNANT_LIMIT: usize = 2;
 /// (once before review, once before the gate), because either one finding
 /// the base still moving is the same signal.
 const BASE_SYNC_ROUNDS: usize = 4;
+
+/// How many times [`Runner::continue_fix_report`] will resume the fixer's own
+/// seat when its CLI turn ended cleanly — usable, non-empty, exit 0 — but the
+/// reply held no [`FixReport`].
+///
+/// The shape this recovers: run 20260912-114326-d3b8's fix-2 came back
+/// `subtype=success`/`is_error=false`/`stop_reason=end_turn` with the reply
+/// "I'll pause here until the `cargo make check` background run reports
+/// back." — a CLI turn that ended cleanly while the fixer's own job had not.
+/// No `FixReport` was ever collected from that seat, and the run moved on to
+/// the next review round regardless.
+///
+/// Bounded independently of `review_rounds` and `graph.retries`: this
+/// recovers one seat's missing report mid-round, not a new round of review or
+/// an ordinary parse retry, and must not itself become the unbounded wait the
+/// rest of this module exists to avoid.
+const MAX_FIX_CONTINUATIONS: usize = 2;
 
 /// One queued agent invocation.
 ///
@@ -1168,6 +1186,8 @@ impl Runner {
         let mut results = wave(jobs, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
         self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
             .await;
+        self.resume_unconfirmed_commands(&mut results, &sent, &prompts, &run_id)
+            .await;
 
         for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
             let seat_key = seat.key.clone();
@@ -1372,6 +1392,273 @@ impl Runner {
                 run_one(retry, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
             *seat = resumed_seat;
             *out = resumed;
+        }
+    }
+
+    /// Ask an implement seat's own CLI to confirm what it started, once, when
+    /// its reply reported a command whose completion status it never
+    /// confirmed — see [`has_unconfirmed_command`]'s own doc for exactly what
+    /// that does and does not mean.
+    ///
+    /// The completion contract this task asks for, extended to `implement`
+    /// with the same signal `continue_fix_report` reads for the fixer,
+    /// rather than a keyword search over the reply or a hard requirement on
+    /// `## SUMMARY`'s presence — the shape behind fb35, 9566 and e185, where
+    /// a candidate's CLI turn ended cleanly while a test run it had started
+    /// had not. A short, ordinary reply with no `## SUMMARY` and no commands
+    /// named in it at all is untouched by this: `commands` is empty, so
+    /// there is nothing to be unconfirmed.
+    ///
+    /// Unlike `resume_undelivered`, not gated on the tree being untouched:
+    /// this is not about recovering edits that might already be on disk, it
+    /// is about a result the seat itself never vouched for, which resuming
+    /// asks for regardless of what the tree already holds. Bounded to one
+    /// attempt for the same reason `resume_undelivered` is — this is the
+    /// most expensive node in the graph — and a seat that still cannot
+    /// confirm on that attempt is left as whatever its (possibly still
+    /// unconfirmed) reply says; this does not invent a new "failed" reason
+    /// for a candidate that otherwise produced a real, committed change.
+    async fn resume_unconfirmed_commands(
+        &mut self,
+        results: &mut [(usize, SeatState, AgentOutcome)],
+        sent: &[SeatJob],
+        prompts: &Prompts,
+        run_id: &str,
+    ) {
+        for (wi, seat, out) in results.iter_mut() {
+            let AgentOutcome::Ok(o) = &*out else {
+                continue;
+            };
+            if !has_unconfirmed_command(&o.commands) {
+                continue;
+            }
+            let Some(job) = sent.get(*wi) else { continue };
+            if !has_context(&job.spec, seat, job.sessions) {
+                self.state.event(
+                    "implement",
+                    format!(
+                        "{}: the reply named a command whose own CLI never confirmed the exit \
+                         status of, but there is no session left to resume",
+                        seat.key
+                    ),
+                );
+                continue;
+            }
+            self.state.event(
+                "implement",
+                format!(
+                    "{}: the reply named a command whose own CLI never confirmed the exit \
+                     status of; resuming the conversation",
+                    seat.key
+                ),
+            );
+            let mut retry = job.clone();
+            retry.seat = seat.clone();
+            retry.prompt = prompt::resume_incomplete(
+                "a command in your last reply had no confirmed exit status",
+            );
+            retry.timeout = retry_budget(job.timeout, true);
+            retry.stem = format!("{}-confirm", job.stem);
+            let cache = self.state.config.cache_dir();
+            let ctx = WaveCtx {
+                run: run_id,
+                node: "implement",
+                prompts,
+                cache: cache.as_deref(),
+            };
+            let (resumed_seat, resumed) =
+                run_one(retry, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
+            *seat = resumed_seat;
+            *out = resumed;
+        }
+    }
+
+    /// Ask the fixer's own seat again, up to [`MAX_FIX_CONTINUATIONS`] times,
+    /// when its CLI turn ended cleanly (`AgentOutcome::Ok`) but the reply held
+    /// no [`FixReport`] — see [`MAX_FIX_CONTINUATIONS`]'s own doc for the run
+    /// that motivated this.
+    ///
+    /// Not the same gap as an unparsable *shape*, which [`ask_json_wave`]'s
+    /// own nudge loop already covers for judge/review/vote seats, and not a
+    /// dropped stream, which [`Runner::resume_undelivered`] covers for
+    /// implement seats: here the CLI turn genuinely finished while the node's
+    /// own work — the fixer's account of what it did — had not. Gated purely
+    /// on `extract_json::<FixReport>` having failed on an otherwise-usable
+    /// reply, never on any wording in it, so a fixer whose valid, first-try
+    /// `FixReport` happens to mention having waited on a background test is
+    /// never resumed — the `Ok(report)` branch at the call site returns
+    /// before this is ever invoked.
+    ///
+    /// Same discipline as `resume_undelivered`: a nudge-sized timeout per
+    /// attempt ([`retry_budget`]), nothing attempted once the session is
+    /// gone, and a quota hit ends the loop immediately rather than retrying a
+    /// rate limit that fails the same way again.
+    async fn continue_fix_report(
+        &mut self,
+        mut seat: SeatState,
+        parse_err: String,
+        job: &SeatJob,
+        prompts: &Prompts,
+        run_id: &str,
+        round: usize,
+    ) -> (
+        SeatState,
+        Option<FixReport>,
+        Option<String>,
+        ContinuationRecord,
+    ) {
+        let mut last_err = parse_err;
+        let mut cumulative_wait_ms = 0u64;
+        let mut attempts = 0usize;
+        loop {
+            if !has_context(&job.spec, &seat, job.sessions) {
+                self.state.event(
+                    "fix",
+                    format!(
+                        "round {round}: fixer's reply had no adoption report ({last_err}); no \
+                         session left to resume into"
+                    ),
+                );
+                let outcome = if attempts == 0 {
+                    ContinuationOutcome::NoSession
+                } else {
+                    ContinuationOutcome::Exhausted
+                };
+                return (
+                    seat,
+                    None,
+                    Some(format!("unparsable fix report: {last_err}")),
+                    ContinuationRecord {
+                        attempts,
+                        cumulative_wait_ms,
+                        outcome,
+                    },
+                );
+            }
+            if attempts >= MAX_FIX_CONTINUATIONS {
+                self.state.event(
+                    "fix",
+                    format!(
+                        "round {round}: fixer's reply still had no adoption report after \
+                         {attempts} continuation(s) ({last_err}); giving up"
+                    ),
+                );
+                return (
+                    seat,
+                    None,
+                    Some(format!(
+                        "unparsable fix report after {attempts} continuation(s): {last_err}"
+                    )),
+                    ContinuationRecord {
+                        attempts,
+                        cumulative_wait_ms,
+                        outcome: ContinuationOutcome::Exhausted,
+                    },
+                );
+            }
+            attempts += 1;
+            self.state.event(
+                "fix",
+                format!(
+                    "round {round}: fixer's reply had no adoption report ({last_err}); resuming \
+                     the conversation (attempt {attempts}/{MAX_FIX_CONTINUATIONS})"
+                ),
+            );
+            let mut retry = job.clone();
+            retry.seat = seat.clone();
+            retry.prompt = prompt::resume_incomplete(&last_err);
+            retry.timeout = retry_budget(job.timeout, true);
+            retry.stem = format!("{}-continue{attempts}", job.stem);
+            let cache = self.state.config.cache_dir();
+            let ctx = WaveCtx {
+                run: run_id,
+                node: "fix",
+                prompts,
+                cache: cache.as_deref(),
+            };
+            let (resumed_seat, resumed_out) = run_one(
+                retry,
+                Arc::clone(&self.sem),
+                &ctx,
+                &mut self.state,
+                attempts,
+            )
+            .await;
+            seat = resumed_seat;
+            match resumed_out {
+                AgentOutcome::Ok(o) => {
+                    cumulative_wait_ms += o.duration_ms;
+                    match verdict::extract_json::<FixReport>(&o.text) {
+                        Ok(report) if !has_unconfirmed_command(&o.commands) => {
+                            self.state.event(
+                                "fix",
+                                format!(
+                                    "round {round}: fixer's adoption report recovered after \
+                                     {attempts} continuation(s)"
+                                ),
+                            );
+                            return (
+                                seat,
+                                Some(report),
+                                None,
+                                ContinuationRecord {
+                                    attempts,
+                                    cumulative_wait_ms,
+                                    outcome: ContinuationOutcome::Resumed,
+                                },
+                            );
+                        }
+                        // The report parsed, but this same reply's own
+                        // CommandEvidence — the identical record `state.jobs`
+                        // renders — names a command whose CLI never
+                        // confirmed an exit status. Read together, that is
+                        // not a resolved answer: keep nudging rather than
+                        // accept a report standing next to a command the
+                        // seat's own CLI cannot vouch for.
+                        Ok(_) => {
+                            last_err = "the reply parsed, but it reported a command whose own CLI \
+                                 never confirmed an exit status"
+                                .to_owned();
+                        }
+                        Err(e) => last_err = e.to_string(),
+                    }
+                }
+                AgentOutcome::Quota(o) => {
+                    cumulative_wait_ms += o.duration_ms;
+                    self.state.quota.push(QuotaLoss {
+                        seat: seat.key.clone(),
+                        node: "fix".to_owned(),
+                        at: Timestamp::now(),
+                        reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
+                    });
+                    self.state.event(
+                        "fix",
+                        format!(
+                            "round {round}: continuation rate limited (quota); not retrying now"
+                        ),
+                    );
+                    return (
+                        seat,
+                        None,
+                        Some("rate limited (quota) while recovering the fix report".to_owned()),
+                        ContinuationRecord {
+                            attempts,
+                            cumulative_wait_ms,
+                            outcome: ContinuationOutcome::QuotaLost,
+                        },
+                    );
+                }
+                AgentOutcome::Dropped(o) => {
+                    cumulative_wait_ms += o.duration_ms;
+                    let why = o
+                        .dropped
+                        .as_ref()
+                        .map(|d| d.why.as_str())
+                        .unwrap_or("the CLI ended the stream without delivering its answer");
+                    last_err = format!("the CLI dropped the stream ({why})");
+                }
+                AgentOutcome::Failed(e) => last_err = e,
+            }
         }
     }
 
@@ -3091,10 +3378,9 @@ impl Runner {
                 prompts: &prompts,
                 cache: cache.as_deref(),
             };
-            let (seat, out) = run_one(job, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
+            let (seat, out) =
+                run_one(job.clone(), Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
             let agent_id = seat.agent.clone();
-            let seat_key = seat.key.clone();
-            self.state.seats.insert(seat.key.clone(), seat);
 
             let mut fix = FixRecord {
                 agent: agent_id,
@@ -3104,18 +3390,56 @@ impl Runner {
                 committed: false,
                 failed: None,
                 duration_ms: 0,
+                continuation: None,
             };
+            let mut continuation = ContinuationRecord::not_needed();
+            let mut final_seat = seat.clone();
             match out {
                 AgentOutcome::Ok(o) => {
                     fix.duration_ms = o.duration_ms;
-                    match verdict::extract_json::<FixReport>(&o.text) {
-                        Ok(report) => {
+                    let parsed = verdict::extract_json::<FixReport>(&o.text);
+                    // A parsed report standing next to a command this same
+                    // reply's own CLI never confirmed the exit status of is
+                    // not a resolved answer — the identical `CommandEvidence`
+                    // `state.jobs` renders, read here instead of only on
+                    // display, per the completion judgment and the shown
+                    // record needing to agree.
+                    let incomplete_reason = match &parsed {
+                        Ok(_) if has_unconfirmed_command(&o.commands) => Some(
+                            "the reply parsed, but it reported a command whose own CLI never \
+                             confirmed an exit status"
+                                .to_owned(),
+                        ),
+                        Ok(_) => None,
+                        Err(e) => Some(e.to_string()),
+                    };
+                    match incomplete_reason {
+                        None => {
+                            let report = parsed.expect("checked Ok above");
                             fix.addressed = report.addressed;
                             fix.rejected = report.rejected;
                             fix.notes =
                                 blind::sanitize_prose(&report.notes, &self.state.config.blind);
                         }
-                        Err(e) => fix.failed = Some(format!("unparsable fix report: {e}")),
+                        Some(reason) => {
+                            let (resumed_seat, resolved, failure, cont) = self
+                                .continue_fix_report(seat, reason, &job, &prompts, &run_id, round)
+                                .await;
+                            fix.duration_ms += cont.cumulative_wait_ms;
+                            continuation = cont;
+                            final_seat = resumed_seat;
+                            match resolved {
+                                Some(report) => {
+                                    fix.addressed = report.addressed;
+                                    fix.rejected = report.rejected;
+                                    fix.notes = blind::sanitize_prose(
+                                        &report.notes,
+                                        &self.state.config.blind,
+                                    );
+                                }
+                                None => fix.failed = failure,
+                            }
+                        }
                     }
                 }
                 // The CLI's raw error JSON is not a fix report to parse.
@@ -3130,7 +3454,7 @@ impl Runner {
                 }
                 AgentOutcome::Quota(o) => {
                     self.state.quota.push(QuotaLoss {
-                        seat: seat_key,
+                        seat: final_seat.key.clone(),
                         node: "fix".to_owned(),
                         at: Timestamp::now(),
                         reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
@@ -3139,6 +3463,8 @@ impl Runner {
                 }
                 AgentOutcome::Failed(e) => fix.failed = Some(e),
             }
+            fix.continuation = Some(continuation);
+            self.state.seats.insert(final_seat.key.clone(), final_seat);
             git::commit_all(
                 &winner.worktree,
                 &format!("magi: review round {round} fixes (uncommitted work)"),
@@ -3181,9 +3507,18 @@ impl Runner {
                         )
                     }
                     None => format!(
-                        "round {round}: {} addressed, {} rejected, {commit_note}, tree {tree_note}",
+                        "round {round}: {} addressed, {} rejected, {commit_note}, tree \
+                         {tree_note}{}",
                         fix.addressed.len(),
                         fix.rejected.len(),
+                        if continuation.outcome == ContinuationOutcome::Resumed {
+                            format!(
+                                " (adoption report recovered after {} continuation(s))",
+                                continuation.attempts
+                            )
+                        } else {
+                            String::new()
+                        },
                     ),
                 },
             );
@@ -3191,6 +3526,35 @@ impl Runner {
             round_record.progressed = progressed;
             self.state.reviews.push(round_record);
             self.state.save()?;
+
+            // The fixer's own report never came back this round, even after
+            // `continue_fix_report`'s own budget was spent on it — not an
+            // ordinary "no report" (dropped stream, quota, plain failure),
+            // which already reads that way and is left to the existing round
+            // budget. Stopping here, rather than opening another round, is
+            // what keeps a next reviewer/fixer wave from ever being
+            // dispatched onto `winner.worktree` while whatever the seat's
+            // last call may still have running there is unaccounted for: no
+            // process liveness check exists (and none is being added — see
+            // AGENTS.md/this task's own scope), so the only way to honour
+            // "nothing starts before a valid report returns" is to not start
+            // anything further on this worktree from this run at all.
+            if matches!(
+                continuation.outcome,
+                ContinuationOutcome::Exhausted
+                    | ContinuationOutcome::QuotaLost
+                    | ContinuationOutcome::NoSession
+            ) {
+                return self
+                    .stop_reviewing(
+                        "the fixer's adoption report never came back, even after resuming its \
+                         own seat; refusing to start another round against the same worktree \
+                         while that is unresolved",
+                        &shell,
+                        &winner.worktree,
+                    )
+                    .await;
+            }
 
             prev_e2e = (!e2e_failures.is_empty()).then_some(e2e_failures);
 
@@ -3747,6 +4111,23 @@ fn has_context(spec: &AgentSpec, seat: &SeatState, sessions: bool) -> bool {
     agent::has_session(spec.kind, seat, sessions)
 }
 
+/// Did this reply report running a command whose own CLI never confirmed an
+/// exit status?
+///
+/// An [`agent::CommandEvidence`] only ever exists when the CLI reported the
+/// command *finished* (see that type's own doc), so this can only be `true`
+/// for a command whose completion event carried no readable exit code — not
+/// for one that simply is not mentioned at all. That is the one signal this
+/// crate can read, from the same record `state.jobs` renders, about a reply
+/// standing next to work its own CLI cannot vouch for finishing; it is
+/// deliberately not a check on the exit code's *value* (a fixer legitimately
+/// runs a command that fails mid-iteration before it succeeds) and not a
+/// guess at a command still running in the background (which emits no event
+/// at all, and so leaves no evidence here to find).
+fn has_unconfirmed_command(commands: &[agent::CommandEvidence]) -> bool {
+    commands.iter().any(|c| c.exit_code.is_none())
+}
+
 fn short(commit: &str) -> String {
     commit.chars().take(7).collect()
 }
@@ -3948,6 +4329,7 @@ async fn wave(
             }
         };
         state.seat_finished(&seat.key);
+        record_jobs(state, node, &seat.key, &out);
         if let Err(e) = state.save() {
             tracing::warn!("could not persist a seat's completion: {e:#}");
         }
@@ -3988,6 +4370,41 @@ async fn wave(
         guard.release();
     }
     collected.into_iter().flatten().collect()
+}
+
+/// Fold one seat's [`agent::CommandEvidence`] (if its outcome carries any)
+/// into the run's [`JobRecord`] log — every node, every seat, uniformly:
+/// this is data collection, not the fix-specific completion contract in
+/// [`Runner::continue_fix_report`], and applies regardless of which node
+/// asked.
+///
+/// Only `AgentOutcome::Ok`/`Quota`/`Dropped` carry an [`AgentOutput`] to read
+/// evidence from; `Failed` does not, and correctly contributes nothing — a
+/// timeout or crash is not itself evidence about a command the seat may have
+/// started.
+fn record_jobs(state: &mut RunState, node: &str, seat: &str, out: &AgentOutcome) {
+    let commands: &[agent::CommandEvidence] = match out {
+        AgentOutcome::Ok(o) | AgentOutcome::Quota(o) | AgentOutcome::Dropped(o) => &o.commands,
+        AgentOutcome::Failed(_) => &[],
+    };
+    let checked_at = Timestamp::now();
+    for c in commands {
+        state.jobs.push(JobRecord {
+            node: node.to_owned(),
+            seat: seat.to_owned(),
+            id: c.id.clone(),
+            description: c.description.clone(),
+            checked_at,
+            status: match c.exit_code {
+                Some(0) => JobStatus::Completed,
+                Some(_) => JobStatus::Failed,
+                None => JobStatus::Unknown,
+            },
+            exit_code: c.exit_code,
+            result_summary: c.result_summary.clone(),
+            source: c.source.clone(),
+        });
+    }
 }
 
 /// Is a review round clean, given how many reviewer seats answered against
@@ -5980,6 +6397,7 @@ mod tests {
                 committed: true,
                 failed: None,
                 duration_ms: 0,
+                continuation: None,
             }),
             blocking: 0,
             answered: 1,
@@ -6137,5 +6555,44 @@ mod tests {
         assert_eq!(retry_budget(secs(60), true), secs(60));
         assert_eq!(retry_budget(secs(480), true), secs(120));
         assert_eq!(retry_budget(secs(0), true), secs(0));
+    }
+
+    fn evidence(exit_code: Option<i32>) -> agent::CommandEvidence {
+        agent::CommandEvidence {
+            id: "item1".to_owned(),
+            description: "cargo test".to_owned(),
+            exit_code,
+            result_summary: String::new(),
+            source: "codex".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_reply_with_no_commands_at_all_is_not_unconfirmed() {
+        // No evidence is not the same fact as unconfirmed evidence: a
+        // backend with no adapter, or a reply that ran no commands at all,
+        // must not be misread as carrying a dangling job.
+        assert!(!has_unconfirmed_command(&[]));
+    }
+
+    #[test]
+    fn a_command_with_a_real_exit_code_is_confirmed_whatever_its_value() {
+        // Deliberately not a check on the exit code's *value*: a fixer
+        // legitimately runs something that fails mid-iteration before it
+        // succeeds, and that must never by itself reopen a valid report.
+        assert!(!has_unconfirmed_command(&[evidence(Some(0))]));
+        assert!(!has_unconfirmed_command(&[evidence(Some(1))]));
+        assert!(!has_unconfirmed_command(&[
+            evidence(Some(0)),
+            evidence(Some(101))
+        ]));
+    }
+
+    #[test]
+    fn one_command_with_no_readable_exit_code_is_enough_to_flag_the_reply() {
+        assert!(has_unconfirmed_command(&[
+            evidence(Some(0)),
+            evidence(None)
+        ]));
     }
 }

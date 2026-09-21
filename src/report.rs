@@ -13,7 +13,9 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::{MergeMode, MergeStyle};
-use crate::run::{CommandOutcome, E2eStatus, RunState, RunStatus, tail};
+use crate::run::{
+    CommandOutcome, ContinuationOutcome, E2eStatus, JobStatus, RunState, RunStatus, tail,
+};
 use crate::stats::Stats;
 use crate::verdict::ReviewVote;
 
@@ -131,6 +133,117 @@ fn first_line(text: &str) -> String {
 
 fn short(commit: &str) -> String {
     commit.chars().take(7).collect()
+}
+
+/// A short badge for a [`crate::run::ContinuationRecord`], distinguishing
+/// "the seat's own report needed to be resumed" from "there was nothing to
+/// address" — a fixer that has never needed this stays silent here, exactly
+/// as a record predating the feature (`continuation: None`) does too.
+fn continuation_note(c: &crate::run::ContinuationRecord) -> String {
+    match c.outcome {
+        ContinuationOutcome::NotNeeded => String::new(),
+        ContinuationOutcome::Resumed => format!(" [resumed x{}]", c.attempts),
+        ContinuationOutcome::Exhausted => format!(" [continuation exhausted x{}]", c.attempts),
+        ContinuationOutcome::QuotaLost => " [continuation: quota]".to_owned(),
+        ContinuationOutcome::NoSession => " [no session to resume]".to_owned(),
+    }
+}
+
+/// Commands seats' own CLIs reported running, across every node — see
+/// [`crate::run::JobRecord`]. Read-only: renders whatever `run.json` already
+/// holds, does not query anything live and does not spawn an agent.
+///
+/// A CLI this crate has no adapter for (every backend but Codex, as of this
+/// writing) never appears here at all — silence is "no evidence", not "no
+/// jobs ran", which the trailing coverage line exists to say once rather
+/// than per seat.
+///
+/// There is deliberately no "running" state anywhere in this. A command a
+/// CLI never reported finishing has no way to be told apart from one that
+/// never started at all: the CLI that would report it has, by construction,
+/// already stopped talking (killed by a timeout, or a park) by the time that
+/// question matters, so no event — real or guessed at — could ever answer
+/// it. Guessing at an unconfirmed event shape to manufacture a "running"
+/// entry is exactly the fabrication this feature must not do; recording that
+/// limit instead is what the task asks for here. `magi show`'s own
+/// seat-completion state ([`active_seats`]) still answers a related but
+/// different question honestly — "has this seat's own turn answered yet" —
+/// and stays the right place to look for that.
+fn jobs_section(state: &RunState) -> String {
+    let mut s = String::new();
+    if state.jobs.is_empty() {
+        // Not silent when it would matter: a run whose roster can actually
+        // report this (Codex, today) but has not yet says so explicitly, so
+        // "no adapter for this backend" and "nothing reported yet" are never
+        // the same blank space to a reader.
+        if state
+            .config
+            .agents
+            .iter()
+            .any(|a| a.kind == crate::config::AgentKind::Codex)
+        {
+            let _ = writeln!(
+                s,
+                "\n{}",
+                dim(
+                    "background jobs: no completed command evidence yet for this run (see \
+                     active seats above for what is still mid-turn)"
+                )
+            );
+        }
+        return s;
+    }
+    let _ = writeln!(
+        s,
+        "\n{}",
+        bold("background jobs (from each seat's own CLI)")
+    );
+    let mut by_seat: std::collections::BTreeMap<(&str, &str), Vec<&crate::run::JobRecord>> =
+        std::collections::BTreeMap::new();
+    for j in &state.jobs {
+        by_seat
+            .entry((j.node.as_str(), j.seat.as_str()))
+            .or_default()
+            .push(j);
+    }
+    for ((node, seat), records) in by_seat {
+        let _ = writeln!(s, "  {node}/{seat}");
+        for j in records {
+            let status = match j.status {
+                JobStatus::Completed => green("completed"),
+                JobStatus::Failed => red("failed"),
+                JobStatus::Unknown => yellow("unknown"),
+            };
+            let _ = writeln!(
+                s,
+                "    {} {}{}  checked {}",
+                dim(&j.id),
+                status,
+                j.exit_code
+                    .map_or(String::new(), |c| format!(" (exit {c})")),
+                j.checked_at
+                    .to_zoned(jiff::tz::TimeZone::system())
+                    .strftime("%Y-%m-%d %H:%M:%S")
+            );
+            let desc = first_line(&j.description);
+            if !desc.trim().is_empty() {
+                let _ = writeln!(s, "      $ {desc}");
+            }
+            let summary = first_line(&j.result_summary);
+            if !summary.trim().is_empty() {
+                let _ = writeln!(s, "      {}", dim(&summary));
+            }
+        }
+    }
+    let _ = writeln!(
+        s,
+        "  {}",
+        dim(
+            "(adapter coverage: codex only today; other backends, and a command a CLI never \
+             reported finishing, leave no entry here — that is unknown, never \"nothing ran\")"
+        )
+    );
+    s
 }
 
 /// Full report for one run.
@@ -413,13 +526,17 @@ pub fn run(state: &RunState) -> String {
                     } else {
                         yellow("unchanged")
                     };
+                    let cont = f
+                        .continuation
+                        .as_ref()
+                        .map_or(String::new(), continuation_note);
                     match &f.failed {
                         // Never the same shape as "N addressed / M rejected": the
                         // fixer's diff may well have landed (see the `fix` node's
                         // own event), but whether it addressed anything is
                         // unknown, not zero.
                         Some(reason) => format!(
-                            "  fix: {}, tree {tree}{}",
+                            "  fix: {}, tree {tree}{}{cont}",
                             yellow(&format!("adoption report lost ({reason})")),
                             if f.committed {
                                 String::new()
@@ -428,7 +545,7 @@ pub fn run(state: &RunState) -> String {
                             }
                         ),
                         None => format!(
-                            "  fix: {} addressed / {} rejected, tree {tree}{}",
+                            "  fix: {} addressed / {} rejected, tree {tree}{}{cont}",
                             f.addressed.len(),
                             f.rejected.len(),
                             if f.committed {
@@ -623,6 +740,7 @@ pub fn run(state: &RunState) -> String {
             w.branch
         );
     }
+    s.push_str(&jobs_section(state));
     s
 }
 
@@ -1086,6 +1204,7 @@ mod tests {
                 committed: true,
                 failed: Some("timed out".to_owned()),
                 duration_ms: 0,
+                continuation: None,
             }),
             blocking: 3,
             answered: 0,
@@ -1121,6 +1240,7 @@ mod tests {
                 committed: true,
                 failed: None,
                 duration_ms: 0,
+                continuation: None,
             }),
             blocking: 3,
             answered: 0,
@@ -1242,6 +1362,7 @@ mod tests {
                 committed: true,
                 failed: Some("timed out".to_owned()),
                 duration_ms: 0,
+                continuation: None,
             }),
             blocking: 0,
             answered: 1,
@@ -1346,6 +1467,7 @@ mod tests {
                 committed: true,
                 failed: None,
                 duration_ms: 0,
+                continuation: None,
             }),
             blocking: 1,
             answered: 1,
@@ -1412,6 +1534,90 @@ mod tests {
     fn active_seats_is_empty_when_nothing_is_running() {
         let _guard = plain();
         assert_eq!(active_seats(&state(), true), "");
+    }
+
+    #[test]
+    fn no_jobs_section_appears_when_nothing_was_ever_collected() {
+        let _guard = plain();
+        // The common case today (every backend but codex): silence, not a
+        // clutter line repeated on every single `magi show`.
+        assert!(!run(&state()).contains("background jobs"));
+    }
+
+    #[test]
+    fn a_codex_roster_with_no_completed_jobs_yet_says_so_instead_of_staying_silent() {
+        let _guard = plain();
+        let mut s = state();
+        s.config.agents.push(crate::config::AgentSpec {
+            id: "codex-one".to_owned(),
+            kind: crate::config::AgentKind::Codex,
+            model: None,
+            command: vec!["codex".to_owned()],
+            extra_args: Vec::new(),
+            env: BTreeMap::new(),
+            prompt_delivery: None,
+        });
+        let text = run(&s);
+        assert!(
+            text.contains("background jobs"),
+            "a run that could report this must not read the same as one that never could: \
+             {text}"
+        );
+        assert!(text.contains("no completed command evidence yet"));
+    }
+
+    #[test]
+    fn recovered_running_and_unreadable_jobs_are_told_apart() {
+        let _guard = plain();
+        let mut s = state();
+        s.jobs = vec![
+            crate::run::JobRecord {
+                node: "implement".to_owned(),
+                seat: "impl-A".to_owned(),
+                id: "item49".to_owned(),
+                description: "cargo test --test graph_cached_gate".to_owned(),
+                checked_at: jiff::Timestamp::now(),
+                status: crate::run::JobStatus::Completed,
+                exit_code: Some(0),
+                result_summary: "test result: 2 passed; 0 failed".to_owned(),
+                source: "codex".to_owned(),
+            },
+            crate::run::JobRecord {
+                node: "fix".to_owned(),
+                seat: "impl-A".to_owned(),
+                id: "item52".to_owned(),
+                description: "cargo test --test graph_split".to_owned(),
+                checked_at: jiff::Timestamp::now(),
+                status: crate::run::JobStatus::Failed,
+                exit_code: Some(101),
+                result_summary: "test result: 1 passed; 1 failed".to_owned(),
+                source: "codex".to_owned(),
+            },
+            crate::run::JobRecord {
+                node: "fix".to_owned(),
+                seat: "impl-A".to_owned(),
+                id: "item60".to_owned(),
+                description: "cargo build".to_owned(),
+                checked_at: jiff::Timestamp::now(),
+                status: crate::run::JobStatus::Unknown,
+                exit_code: None,
+                result_summary: String::new(),
+                source: "codex".to_owned(),
+            },
+        ];
+        let text = run(&s);
+        assert!(text.contains("background jobs"));
+        assert!(text.contains("item49"));
+        assert!(text.contains("item52"));
+        assert!(text.contains("item60"));
+        // The three states this run actually has evidence for must read
+        // differently from one another — never collapsed into a single
+        // "ran" or "did not run".
+        assert!(text.contains("completed"));
+        assert!(text.contains("failed"));
+        assert!(text.contains("unknown"));
+        // Coverage limit stated once, not fabricated per seat.
+        assert!(text.contains("adapter coverage"));
     }
 
     #[test]

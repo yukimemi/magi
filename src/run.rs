@@ -414,6 +414,105 @@ pub struct FixRecord {
     /// Wall-clock time.
     #[serde(default)]
     pub duration_ms: u64,
+    /// How the fixer's own seat was made to answer when its CLI turn ended
+    /// cleanly but without an addressed/rejected report — see
+    /// [`graph::Runner::continue_fix_report`]. `None` for a record written
+    /// before this existed, which must read as "unknown", not as
+    /// [`ContinuationOutcome::NotNeeded`]: an old run really may have hit
+    /// this exact gap and simply had no mechanism to say so.
+    #[serde(default)]
+    pub continuation: Option<ContinuationRecord>,
+}
+
+/// How a node recovered — or failed to recover — a structured report after
+/// the CLI's own turn ended cleanly (a usable, non-empty, exit-0 reply)
+/// without it. A clean CLI turn is not the same fact as the node's own work
+/// being done — see the `fix` node's `continue_fix_report`, which is what
+/// produces this.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ContinuationOutcome {
+    /// The first reply already carried the report; nothing was resumed.
+    NotNeeded,
+    /// A follow-up call in the same session recovered the report.
+    Resumed,
+    /// The continuation budget was spent without ever recovering it.
+    Exhausted,
+    /// A continuation attempt hit the CLI's rate limit; not retried further
+    /// — a quota fails the same way again immediately.
+    QuotaLost,
+    /// No session was left to resume into, so nothing was attempted.
+    NoSession,
+}
+
+/// Cost and outcome of one node's attempt to recover a missing report by
+/// resuming its own seat.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ContinuationRecord {
+    /// Follow-up calls made to the same seat. `0` when the outcome is
+    /// [`ContinuationOutcome::NotNeeded`] or [`ContinuationOutcome::NoSession`].
+    pub attempts: usize,
+    /// Wall-clock time spent on those follow-up calls, summed — not counting
+    /// the original call whose reply this is recovering from.
+    pub cumulative_wait_ms: u64,
+    /// What ended the loop.
+    pub outcome: ContinuationOutcome,
+}
+
+impl ContinuationRecord {
+    /// The report was already there on the first try.
+    pub fn not_needed() -> Self {
+        Self {
+            attempts: 0,
+            cumulative_wait_ms: 0,
+            outcome: ContinuationOutcome::NotNeeded,
+        }
+    }
+}
+
+/// A command a seat's own CLI reported running, kept for `magi show` and for
+/// telling "this seat's turn ended" apart from "the process it started is
+/// done" — see `agent::CommandEvidence`, which is the only source this is
+/// ever built from. Never something magi polled or supervised; a command the
+/// CLI never reported finishing (or a CLI this crate has no adapter for at
+/// all) simply has no entry here, which must read as "unknown", not as
+/// "nothing ran".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRecord {
+    /// Graph node the seat belongs to, e.g. `"implement"`, `"fix"`.
+    pub node: String,
+    /// Seat key, e.g. `"impl-A"`.
+    pub seat: String,
+    /// The CLI's own id for this command.
+    pub id: String,
+    /// The command itself, as the CLI reported it.
+    pub description: String,
+    /// When this evidence was captured — the moment this seat's reply
+    /// carrying it was read, not the command's own start time, which no
+    /// adapter here currently has. A lower bound on staleness only.
+    pub checked_at: Timestamp,
+    /// What the CLI reported for it.
+    pub status: JobStatus,
+    /// Exit code the CLI reported.
+    pub exit_code: Option<i32>,
+    /// Tail of the command's own output, when reported.
+    #[serde(default)]
+    pub result_summary: String,
+    /// Which CLI/event stream this came from, e.g. `"codex"`.
+    pub source: String,
+}
+
+/// What a [`JobRecord`]'s own CLI reported for it. There is no `Running`
+/// variant: nothing here is ever polled live, so "still running" and
+/// "finished but never reported" are the same absence of evidence, not a
+/// state this type can name — see [`JobRecord`]'s own doc.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum JobStatus {
+    /// The command's own reported exit code was `0`.
+    Completed,
+    /// The command's own reported exit code was non-zero.
+    Failed,
+    /// The CLI reported this command but not a readable exit code.
+    Unknown,
 }
 
 /// Outcome of one shell command.
@@ -842,6 +941,15 @@ pub struct RunState {
     /// Node log.
     #[serde(default)]
     pub events: Vec<Event>,
+    /// Commands seats' own CLIs reported running, across every node — see
+    /// [`JobRecord`]. Populated in [`crate::graph::wave`] as each seat
+    /// answers, so a resumed run keeps what earlier waves already collected
+    /// rather than losing it to a reentry. Empty on a record written before
+    /// this existed, or wherever no adapter reads structured job events for
+    /// the backend a seat used — both read as "no evidence", not "nothing
+    /// ran".
+    #[serde(default)]
+    pub jobs: Vec<JobRecord>,
 }
 
 impl RunState {
@@ -887,6 +995,7 @@ impl RunState {
             advice: None,
             advise_attempted: false,
             events: Vec::new(),
+            jobs: Vec::new(),
         }
     }
 
@@ -2023,6 +2132,20 @@ mod tests {
         value.as_object_mut().unwrap().remove("active");
         let back: RunState = serde_json::from_value(value).unwrap();
         assert!(back.active.is_empty());
+        assert_eq!(back.schema, SCHEMA);
+    }
+
+    #[test]
+    fn an_old_run_json_without_jobs_still_loads() {
+        // No schema bump for this field either, for the same reason: an
+        // empty `jobs` list on an old record means exactly what it always
+        // meant for that record — no adapter existed yet to report one —
+        // and `#[serde(default)]` fills it in rather than failing the read.
+        let s = state();
+        let mut value = serde_json::to_value(&s).unwrap();
+        value.as_object_mut().unwrap().remove("jobs");
+        let back: RunState = serde_json::from_value(value).unwrap();
+        assert!(back.jobs.is_empty());
         assert_eq!(back.schema, SCHEMA);
     }
 

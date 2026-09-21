@@ -340,7 +340,12 @@ pub fn implement(instruction: &str, cwd: &str, language: &str, brief: Option<&st
          5. Do not run repository-wide formatters or lint fixes over untouched \
             files.\n\
          6. If the task is ambiguous, take the interpretation that changes the \
-            least, and state the assumption in your summary.\n\n\
+            least, and state the assumption in your summary.\n\
+         7. If you start something in the background (a test run, a build), \
+            do not end your reply while it is still pending. Confirm it \
+            finished and report on its actual result. \"I'll wait\" or \
+            \"continuing once it completes\" is never the final line of this \
+            reply.\n\n\
          # Reply format\n\n\
          End your reply with, exactly:\n\n\
          ## SUMMARY\n\
@@ -902,7 +907,12 @@ pub fn fix(
             code to satisfy it. A rejected finding with a checkable reason is a \
             correct outcome; a change made to appease a reviewer is not.\n\
          3. Do not restructure beyond the findings.\n\
-         4. Never name yourself, your vendor, or your model, anywhere.\n\n\
+         4. Never name yourself, your vendor, or your model, anywhere.\n\
+         5. If you start something in the background (a test run, a build), \
+            do not end your reply while it is still pending. Confirm it \
+            finished and report on its actual result. \"I'll wait\" or \
+            \"continuing once it completes\" is never the final line of this \
+            reply.\n\n\
          # Output\n\n\
          Your reasoning first, then exactly one fenced json block, last:\n\n\
          ```json\n\
@@ -923,6 +933,34 @@ pub fn nudge(err: &str) -> String {
          Reply again with exactly one fenced ```json block in the shape asked \
          for, and nothing after it. Do not change your conclusion to make it \
          parse — restate the same conclusion in the required shape."
+    )
+}
+
+/// Follow-up when the CLI's own turn ended cleanly — a usable, non-empty,
+/// exit-0 reply — but held none of the structured report this step reads
+/// back.
+///
+/// Deliberately not [`nudge`]: nothing here is known to be a shape problem,
+/// and the likely cause is different — the reply is a progress update
+/// ("I'll continue once the test run finishes") rather than a final answer.
+/// Also not [`resume_after_drop`]: the stream was not lost, and nothing here
+/// should be read as "start over" — the seat still holds the conversation
+/// and, if it started something in the background, still holds whatever
+/// means it has to check on that itself.
+pub fn resume_incomplete(why: &str) -> String {
+    format!(
+        "Your last reply ended the turn without the report this step requires \
+         ({why}).\n\n\
+         If you started something in the background — a test run, a build, \
+         anything you were waiting on — do not start it again: check whether \
+         it has actually finished, using whatever you have for that (an \
+         internal task/output check, if one is available to you), rather than \
+         guessing. Wait for it only if it is genuinely still running, and only \
+         within the time you have left for this step; if it looks like it \
+         would run past that, say so instead of guessing at its result.\n\n\
+         Then reply with your real, final report in the exact shape already \
+         asked for — not another progress update. Ending your turn on \"I'll \
+         wait\" or \"continuing once it finishes\" is not a final answer."
     )
 }
 
