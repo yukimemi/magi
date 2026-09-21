@@ -65,7 +65,20 @@ use crate::verdict::{Finding, Rejection, ReviewVote};
 /// `ReviewRound::e2e_deferred`. Schema 5 treated that same empty list as an
 /// unconfigured, successful check, so schema-5 records are migrated with the
 /// old (not-deferred) meaning while older binaries reject schema-6 records.
-pub const SCHEMA: u32 = 6;
+///
+/// 7: added `RunState::gate_ran`. An empty `RunState::gate` used to carry two
+/// meanings at once — "never attempted, or the last attempt was
+/// resource-blocked" (`graph::Runner::gate`'s retry case) and "attempted,
+/// zero commands configured, vacuously passed" (a repo with no
+/// `verify.gate`) — and nothing told them apart. `graph::Runner::merge`
+/// therefore read the second case as the first and refused forever: a
+/// review-only run with no gate commands configured reached `Gating` and
+/// then could never leave it. A schema-6 record's non-empty `gate` is
+/// migrated to `gate_ran = true` (a recorded attempt, real or historical,
+/// should not be spent again); an empty one migrates to `gate_ran = false`
+/// and is simply re-attempted by the next `gate()` call, which self-heals
+/// instantly for the zero-commands case.
+pub const SCHEMA: u32 = 7;
 
 /// Where a run got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +96,11 @@ pub enum RunStatus {
     Voting,
     /// Winner in the review + verification loop.
     Reviewing,
-    /// Gate commands running.
+    /// Gate commands running. Transient: `graph::Runner::gate` and
+    /// `graph::Runner::merge` always move a run on from here, whether or not
+    /// any gate commands are configured — see [`RunState::gate_status`] and
+    /// `SCHEMA`'s doc for schema 7, which fixed a repo with an empty
+    /// `verify.gate` stranding a review-only run in `Gating` forever.
     Gating,
     /// Inside [`crate::land`]'s post-merge loop: watching CI, running a fix
     /// round, rebasing onto a moved base, or waiting on the owner's merge
@@ -704,6 +721,29 @@ pub enum E2eStatus {
     Failed,
 }
 
+/// The honest state of a run's final gate. See [`RunState::gate_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateStatus {
+    /// Never attempted, or the last attempt was resource-blocked (the shared
+    /// build cache could not be acquired or confirmed fresh in time) and
+    /// needs a retry.
+    NotRun,
+    /// Ran with zero commands configured (`verify.gate` is empty) and
+    /// therefore vacuously passed — there was nothing to check.
+    PassedWithNoCommands,
+    /// Ran one or more commands, and every one of them exited 0.
+    Passed,
+    /// Ran one or more commands, and at least one did not exit 0.
+    Failed,
+}
+
+impl GateStatus {
+    /// May a run in this state proceed to merge?
+    pub fn ok(self) -> bool {
+        matches!(self, Self::PassedWithNoCommands | Self::Passed)
+    }
+}
+
 /// What happened to the winning branch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeOutcome {
@@ -879,8 +919,30 @@ pub struct RunState {
     #[serde(default)]
     pub reviews: Vec<ReviewRound>,
     /// Final gate.
+    ///
+    /// Never derive whether the gate has run from `gate.is_empty()` alone —
+    /// use [`Self::gate_status`] instead. An empty list is ambiguous on its
+    /// own: it is what an unattempted gate looks like, what a
+    /// resource-blocked attempt leaves behind (see `graph::Runner::gate`'s
+    /// own doc), and also what a repo with no `verify.gate` commands
+    /// configured produces once it *has* run. [`Self::gate_ran`] is what
+    /// tells the third case apart from the first two.
     #[serde(default)]
     pub gate: Vec<CommandOutcome>,
+    /// Did `gate()` actually record an attempt — zero commands configured
+    /// and vacuously passed, or one or more commands that ran to
+    /// completion — as opposed to never having run, or having last hit a
+    /// resource-blocked retry?
+    ///
+    /// `gate.is_empty()` cannot tell those apart by itself: a repo with no
+    /// `verify.gate` commands leaves `gate` empty exactly like an
+    /// unattempted or resource-blocked one does, and reading that empty list
+    /// as "not yet run" is what stranded a review-only run in
+    /// `RunStatus::Gating` forever on such a repo — see `SCHEMA`'s doc for
+    /// schema 7. A record written before this field existed defaults to
+    /// `false` and is migrated in [`migrate_schema`].
+    #[serde(default)]
+    pub gate_ran: bool,
     /// Merge outcome.
     #[serde(default)]
     pub merge: Option<MergeOutcome>,
@@ -984,6 +1046,7 @@ impl RunState {
             tally: None,
             reviews: Vec::new(),
             gate: Vec::new(),
+            gate_ran: false,
             merge: None,
             leaks: Vec::new(),
             quota: Vec::new(),
@@ -1033,6 +1096,25 @@ impl RunState {
             node: node.to_owned(),
             message,
         });
+    }
+
+    /// The honest state of the final gate.
+    ///
+    /// Never derive this from `gate.is_empty()` alone anywhere else in the
+    /// codebase — `NotRun` and `PassedWithNoCommands` both leave `gate`
+    /// empty, and only this method (backed by [`Self::gate_ran`]) tells them
+    /// apart. See `SCHEMA`'s doc for schema 7 for what conflating them used
+    /// to do.
+    pub fn gate_status(&self) -> GateStatus {
+        if !self.gate_ran {
+            GateStatus::NotRun
+        } else if self.gate.is_empty() {
+            GateStatus::PassedWithNoCommands
+        } else if self.gate.iter().all(CommandOutcome::ok) {
+            GateStatus::Passed
+        } else {
+            GateStatus::Failed
+        }
     }
 
     /// Record that `seat` was just sent a prompt for `node`, with the given
@@ -1168,6 +1250,17 @@ fn migrate_schema(mut state: RunState) -> Result<RunState> {
     // "not configured", never "deferred"; serde's field defaults retain
     // exactly that representation while this migration permits resumes.
     if state.schema == 5 {
+        state.schema = 6;
+    }
+    // Schema 6 predates `gate_ran` and could not tell "never attempted or
+    // resource-blocked" apart from "ran with zero commands configured" — see
+    // `SCHEMA`'s doc for schema 7. A non-empty `gate` is a real recorded
+    // attempt either way, so it is trusted as `gate_ran = true` rather than
+    // spent again; an empty one is simply handed back to the next `gate()`
+    // call, which re-attempts it and, for the zero-commands case, resolves
+    // instantly.
+    if state.schema == 6 {
+        state.gate_ran = !state.gate.is_empty();
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {
@@ -1865,6 +1958,38 @@ mod tests {
     }
 
     #[test]
+    fn gate_status_tells_not_run_apart_from_passed_with_no_commands() {
+        let mut s = state();
+        assert_eq!(s.gate_status(), GateStatus::NotRun);
+
+        s.gate_ran = true;
+        assert_eq!(
+            s.gate_status(),
+            GateStatus::PassedWithNoCommands,
+            "an empty gate must read as a real pass once gate_ran says it actually ran"
+        );
+
+        s.gate = vec![CommandOutcome {
+            command: "cargo make check".to_owned(),
+            code: Some(0),
+            output_tail: String::new(),
+            duration_ms: 0,
+            resource_blocked: false,
+        }];
+        assert_eq!(s.gate_status(), GateStatus::Passed);
+
+        s.gate[0].code = Some(1);
+        assert_eq!(s.gate_status(), GateStatus::Failed);
+
+        s.gate_ran = false;
+        assert_eq!(
+            s.gate_status(),
+            GateStatus::NotRun,
+            "gate_ran false must win even over a non-empty gate left from a stale record"
+        );
+    }
+
+    #[test]
     fn open_findings_is_empty_when_the_last_round_was_clean() {
         let mut s = state();
         s.reviews = vec![round(
@@ -2014,6 +2139,52 @@ mod tests {
         assert_eq!(migrated.schema, SCHEMA);
         assert_eq!(migrated.config.graph.verify_timeout(), 3600);
         assert_eq!(migrated.reviews[0].e2e_status(), E2eStatus::NotConfigured);
+    }
+
+    #[test]
+    fn schema_six_state_with_a_recorded_gate_migrates_to_gate_ran_true() {
+        let mut value = serde_json::to_value(state()).expect("serialize state");
+        let object = value.as_object_mut().expect("state object");
+        object.insert("schema".to_owned(), serde_json::json!(6));
+        object.insert(
+            "gate".to_owned(),
+            serde_json::json!([{
+                "command": "cargo make check",
+                "code": 0,
+                "output_tail": "",
+                "duration_ms": 0,
+                "resource_blocked": false
+            }]),
+        );
+        let old: RunState = serde_json::from_value(value).expect("schema-6 shape parses");
+        let migrated = migrate_schema(old).expect("schema 6 migrates");
+        assert_eq!(migrated.schema, SCHEMA);
+        assert!(
+            migrated.gate_ran,
+            "a non-empty recorded gate is a real attempt, not an unrun one"
+        );
+        assert_eq!(migrated.gate_status(), GateStatus::Passed);
+    }
+
+    #[test]
+    fn schema_six_state_with_an_empty_gate_migrates_to_gate_ran_false_and_is_retried() {
+        // The exact shape of the stuck `shoka` run this schema bump fixes:
+        // `verify.gate` empty, `gate` empty, schema 6. It must come back as
+        // "not yet run" so the next `gate()` call re-attempts it — and for a
+        // repo with no gate commands configured, that resolves instantly to
+        // `PassedWithNoCommands` instead of staying stuck forever.
+        let mut value = serde_json::to_value(state()).expect("serialize state");
+        let object = value.as_object_mut().expect("state object");
+        object.insert("schema".to_owned(), serde_json::json!(6));
+        object.insert("gate".to_owned(), serde_json::json!([]));
+        let old: RunState = serde_json::from_value(value).expect("schema-6 shape parses");
+        let migrated = migrate_schema(old).expect("schema 6 migrates");
+        assert_eq!(migrated.schema, SCHEMA);
+        assert!(
+            !migrated.gate_ran,
+            "an empty gate on schema 6 is ambiguous and must be treated as unrun"
+        );
+        assert_eq!(migrated.gate_status(), GateStatus::NotRun);
     }
 
     #[test]

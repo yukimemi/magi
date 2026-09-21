@@ -3712,14 +3712,17 @@ impl Runner {
         {
             return Ok(());
         }
-        if !self.state.gate.is_empty() {
+        if self.state.gate_ran {
             // `review_loop` derives its conclusion from the clean review
             // record on every reentry and therefore puts a completed run back
-            // in `Gating`. A recorded red gate is a stronger, terminal fact:
-            // retain its original command output and restore `Blocked` rather
-            // than pretending the command is still running or running it a
-            // second time. An empty list remains the only interrupted-gate
-            // shape that may need to execute a command.
+            // in `Gating`. A recorded gate is a stronger, terminal fact:
+            // retain its original command output (or lack of any, for a repo
+            // with no `verify.gate` commands — see `RunState::gate_ran`'s own
+            // doc) and restore `Blocked` on a real failure rather than
+            // pretending the command is still running or running it a second
+            // time. `gate_ran == false` remains the only shape — unattempted,
+            // or a resource-blocked retry — that may still need to execute a
+            // command.
             if self.state.gate.iter().any(|outcome| !outcome.ok()) {
                 self.state.status = RunStatus::Blocked;
                 self.state.save()?;
@@ -3756,6 +3759,16 @@ impl Runner {
             },
         )
         .await;
+        if outcomes.is_empty() {
+            // Nothing configured to check — distinct from every other
+            // silence in this run's event log, since an empty `gate` alone
+            // no longer says whether the gate ran at all (see
+            // `RunState::gate_ran`'s own doc).
+            self.state.event(
+                "gate",
+                "no gate commands configured; nothing to check, passing",
+            );
+        }
         for o in &outcomes {
             self.state.event(
                 "gate",
@@ -3780,15 +3793,17 @@ impl Runner {
         // tree (see `CommandOutcome::resource_blocked`'s own doc). Recording
         // it as a red gate would mark a run `Blocked` on nothing but
         // contention magi has already logged above; leaving `self.state.gate`
-        // empty instead keeps the shape this function already treats as
-        // "still needs to run" (see the early-return above), so the next
-        // call retries the command rather than concluding anything.
+        // empty and `self.state.gate_ran` false instead keeps the shape this
+        // function already treats as "still needs to run" (see the
+        // early-return above), so the next call retries the command rather
+        // than concluding anything.
         if verify_inconclusive(&outcomes) {
             self.state.save()?;
             return Ok(());
         }
         let passed = outcomes.iter().all(CommandOutcome::ok);
         self.state.gate = outcomes;
+        self.state.gate_ran = true;
         if !passed {
             self.state.status = RunStatus::Blocked;
             self.state.event("gate", "gate failed; not merging");
@@ -3821,14 +3836,15 @@ impl Runner {
             .is_some_and(|s| s.conflict.is_some())
             || review_conclusion(&self.state.reviews, self.state.config.graph.review_rounds)
                 != Some(RunStatus::Gating)
-            // Empty is not "passed" - `gate` leaves it empty both before it
-            // has ever run and when its last attempt was resource-blocked
-            // (see `Runner::gate`'s own doc), and neither is permission to
-            // merge on nothing but the review record. Only a gate that
-            // actually ran every command and saw every one of them exit 0
-            // may proceed.
-            || self.state.gate.is_empty()
-            || self.state.gate.iter().any(|o| !o.ok())
+            // `gate_ran == false` is not "passed" - `gate` leaves it false
+            // both before it has ever run and when its last attempt was
+            // resource-blocked (see `Runner::gate`'s own doc), and neither is
+            // permission to merge on nothing but the review record. Only a
+            // gate that actually ran - zero commands configured and
+            // vacuously passed, or one or more that all exited 0 - may
+            // proceed; `RunState::gate_status` is the single place that
+            // reading is computed.
+            || !self.state.gate_status().ok()
         {
             return Ok(());
         }
@@ -5185,6 +5201,7 @@ pub fn worst_open(state: &RunState) -> Option<Severity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::GateStatus;
     use std::collections::BTreeMap;
     use std::time::Duration;
 
@@ -6060,6 +6077,7 @@ mod tests {
             duration_ms: 0,
             resource_blocked: false,
         }];
+        state.gate_ran = true;
         // Reached its conclusion already — e.g. `land` closing the PR without
         // merging it, which (like the honest `MergeMode::None` path) leaves
         // `status` at `Ready`. The recorded outcome is what actually marks
@@ -6099,15 +6117,14 @@ mod tests {
         );
     }
 
-    /// `gate` leaves `state.gate` empty both before it has ever run and when
-    /// its last attempt was resource-blocked (the shared build cache could
-    /// not be acquired or confirmed fresh in time - see
-    /// `CommandOutcome::resource_blocked`'s own doc). An empty `Vec` trivially
-    /// satisfies `.iter().any(|o| !o.ok())` being false, which used to read
-    /// as "nothing failed" and let a run merge a tree the gate never actually
-    /// checked - exactly the case a contended cache produces on every retry
-    /// until it clears. `merge` must refuse until `gate` has recorded a real,
-    /// fully-passing attempt.
+    /// `gate` leaves `state.gate_ran` false both before it has ever run and
+    /// when its last attempt was resource-blocked (the shared build cache
+    /// could not be acquired or confirmed fresh in time - see
+    /// `CommandOutcome::resource_blocked`'s own doc). Trusting the empty
+    /// `Vec` this also leaves behind used to read as "nothing failed" and let
+    /// a run merge a tree the gate never actually checked - exactly the case
+    /// a contended cache produces on every retry until it clears. `merge`
+    /// must refuse until `gate` has actually recorded an attempt.
     #[tokio::test]
     async fn merge_refuses_a_gate_that_has_not_actually_run() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -6177,6 +6194,7 @@ mod tests {
         }];
         // The point: `gate` has not recorded anything yet.
         state.gate = Vec::new();
+        state.gate_ran = false;
         state.status = RunStatus::Gating;
 
         let mut runner = Runner {
@@ -6199,6 +6217,115 @@ mod tests {
             runner.state.merge.is_none(),
             "an empty gate must never be read as a passing one: {:?}",
             runner.state.merge
+        );
+    }
+
+    /// The `shoka` repro this schema bump exists for: `verify.gate` has no
+    /// commands configured and `merge.mode` is `none` (a review-only run).
+    /// `gate` must still record a real attempt — zero commands, vacuously
+    /// passed — rather than leaving `state.gate` empty in a way `merge`
+    /// cannot tell apart from "never ran"; otherwise the run reaches
+    /// `Gating` and can never leave it. See `RunState::gate_ran`'s own doc.
+    #[tokio::test]
+    async fn gate_and_merge_reach_ready_when_no_gate_commands_are_configured() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        // Default config: `verify.gate` empty, `merge.mode` is `none`.
+        let config = Config::default();
+
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            "deadbeef".to_owned(),
+            "task".to_owned(),
+            config,
+        );
+        state.candidates = vec![Candidate {
+            index: 0,
+            label: 'A',
+            agent: "alpha".to_owned(),
+            branch: "does-not-exist".to_owned(),
+            worktree: repo.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: false,
+        }];
+        state.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 1)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("only candidate A produced a change".to_owned()),
+        });
+        state.reviews = vec![ReviewRound {
+            round: 1,
+            head: "deadbeef".to_owned(),
+            verified_head: None,
+            reviews: Vec::new(),
+            e2e: Vec::new(),
+            fix: None,
+            blocking: 0,
+            answered: 0,
+            expected: 0,
+            clean: true,
+            verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
+            progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
+        }];
+
+        let mut runner = Runner {
+            state,
+            roles: ResolvedRoles {
+                implementers: Vec::new(),
+                judges: Vec::new(),
+                reviewers: Vec::new(),
+                fixer: None,
+                conductor: conductor(),
+            },
+            sem: Arc::new(Semaphore::new(1)),
+            pause: Pause::new(),
+            interrupt: Pause::new(),
+        };
+
+        runner.gate().await.expect("gate");
+        assert!(
+            runner.state.gate_ran,
+            "zero configured commands is still a real attempt, not an unrun gate"
+        );
+        assert!(runner.state.gate.is_empty());
+        assert_eq!(runner.state.gate_status(), GateStatus::PassedWithNoCommands);
+        assert_ne!(
+            runner.state.status,
+            RunStatus::Blocked,
+            "a gate with nothing to check must not read as failed"
+        );
+
+        runner.merge().await.expect("merge");
+        assert_eq!(
+            runner.state.status,
+            RunStatus::Ready,
+            "a clean review-only run with no gate commands must reach Ready, not stay stuck in Gating"
         );
     }
 
@@ -6279,6 +6406,7 @@ mod tests {
             duration_ms: 0,
             resource_blocked: false,
         }];
+        state.gate_ran = true;
         // A first pass through `merge` already pushed and opened this pull
         // request; `status` is `Landing` because a previous call into `land`
         // parked or was interrupted before it reached a terminal outcome.
