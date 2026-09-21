@@ -1051,11 +1051,8 @@ async fn dispatch(command: Command) -> Result<()> {
             // this as success just because nothing panicked, so the
             // follow-up run's own outcome is checked here, the same as
             // `exit_status` already does for `Command::Run`/`Command::Review`.
-            let follow_up = runner
-                .state
-                .operator_fixes
-                .last()
-                .and_then(|r| r.follow_up_review_run.clone());
+            let last = runner.state.operator_fixes.last();
+            let follow_up = last.and_then(|r| r.follow_up_review_run.clone());
             match follow_up {
                 Some(id) => {
                     let follow_up_state = RunState::load(&id)
@@ -1071,6 +1068,21 @@ async fn dispatch(command: Command) -> Result<()> {
                         .with_context(|| {
                             format!("see `magi show {id}` for what the follow-up review found")
                         })
+                }
+                // `result_head` is only set once the fixer actually
+                // committed something (see `fix_selected`), so a `None`
+                // here has two different meanings that must not collapse
+                // into one exit code: nothing changed, so there was
+                // nothing to re-verify (fine) — or something changed and
+                // `Runner::review` itself could not even be opened for it
+                // (a real, unverified change sitting on the branch, not
+                // fine).
+                None if last.is_some_and(|r| r.result_head.is_some()) => {
+                    let id = &runner.state.id;
+                    bail!(
+                        "the fix committed a real change, but the follow-up review could not \
+                         be opened; the change is on the branch, unverified — see `magi show {id}`"
+                    );
                 }
                 None => Ok(()),
             }

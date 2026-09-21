@@ -313,10 +313,16 @@ async fn resolve_base(repo: &Path, base_branch: &str, remote: &str) -> Result<St
 /// `daemon::is_working_on` only sees a heartbeat-publishing daemon; two
 /// manual `magi fix` invocations against the same run are otherwise
 /// invisible to each other and would race to remove and recreate the same
-/// worktree (see [`Runner::fix_selected`]). Deliberately the same minimal
-/// shape as `queue::Claim` — a `create_new` lock file, no staleness reclaim —
-/// since a `magi fix` step is short-lived and bounded by its own timeouts,
-/// the same reasoning that lets `queue::Claim` skip it too.
+/// worktree (see [`Runner::fix_selected`]). The lock file itself is the same
+/// `create_new` shape as `queue::Claim`, but unlike a queued task's lock —
+/// which is only ever reclaimed later, out of band, by
+/// `daemon::sweep_stale_claims` running inside `magi serve`/`magi web` — a
+/// `magi fix` invocation is not necessarily running under either of those, so
+/// nothing would ever sweep a lock a killed or crashed process left behind.
+/// [`Self::acquire`] therefore reclaims a stale lock itself, on the same
+/// conservative PID-liveness policy `sweep_stale_claims` and `cache`'s own
+/// lease use: an unreadable or unparsable pid, or a liveness query the
+/// platform cannot answer, reads as alive and the lock is left in place.
 struct FixClaim {
     path: PathBuf,
 }
@@ -325,25 +331,44 @@ impl FixClaim {
     fn acquire(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let path = dir.join("fix.lock");
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut f) => {
-                use std::io::Write as _;
-                // Best effort: the pid is for a human looking at a stale lock.
-                let _ = writeln!(f, "{}", std::process::id());
-                Ok(Self { path })
-            }
+        match Self::create(&path) {
+            Ok(claim) => Ok(claim),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                bail!(
-                    "another `magi fix` is already running for this run ({} exists)",
-                    path.display()
-                )
+                if Self::reclaim_if_dead(&path) {
+                    Self::create(&path).with_context(|| format!("lock {}", path.display()))
+                } else {
+                    bail!(
+                        "another `magi fix` is already running for this run ({} exists)",
+                        path.display()
+                    )
+                }
             }
             Err(e) => Err(e).with_context(|| format!("lock {}", path.display())),
         }
+    }
+
+    fn create(path: &Path) -> std::io::Result<Self> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        use std::io::Write as _;
+        // Read back by `reclaim_if_dead` on a later, stuck invocation.
+        writeln!(f, "{}", std::process::id())?;
+        Ok(Self {
+            path: path.to_owned(),
+        })
+    }
+
+    /// True if the lock named a process confirmed dead, in which case it was
+    /// also removed. Never true on an unreadable file, an unparsable pid, or
+    /// a liveness query the platform cannot answer — see this type's own doc.
+    fn reclaim_if_dead(path: &Path) -> bool {
+        let dead = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|body| body.trim().parse::<u32>().ok())
+            .is_some_and(|pid| !crate::proc::pid_alive(pid));
+        dead && std::fs::remove_file(path).is_ok()
     }
 }
 
@@ -2982,7 +3007,7 @@ impl Runner {
             );
         }
 
-        let mut request = OperatorFixRequest {
+        let request = OperatorFixRequest {
             requested_at: Timestamp::now(),
             reason: reason.to_owned(),
             findings,
@@ -3006,6 +3031,15 @@ impl Runner {
                     .join(", "),
             ),
         );
+        // Recorded now, before any worktree work or the fixer call itself —
+        // and re-saved at each checkpoint below: a crash at any point after
+        // this (mid fixer call, mid follow-up review) must not lose the fact
+        // that this was requested, for which findings, and why. Everything
+        // past this point reads and writes through `request_index` rather
+        // than a local variable, since `request` itself is moved here.
+        self.state.operator_fixes.push(request);
+        self.state.save()?;
+        let request_index = self.state.operator_fixes.len() - 1;
 
         // A fresh, dedicated worktree for this one call, never the winner's
         // own worktree in place: that one may already be gone (folded away),
@@ -3062,7 +3096,7 @@ impl Runner {
             ),
         };
         let seat = self.seat(&fix_seat_key, &fix_spec.id);
-        let finding_list: Vec<Finding> = request
+        let finding_list: Vec<Finding> = self.state.operator_fixes[request_index]
             .findings
             .iter()
             .map(|f| Finding {
@@ -3183,7 +3217,7 @@ impl Runner {
             &fix_worktree,
             &format!(
                 "magi: operator-selected fix ({}) (uncommitted work)",
-                request
+                self.state.operator_fixes[request_index]
                     .findings
                     .iter()
                     .map(|f| f.id.as_str())
@@ -3229,7 +3263,7 @@ impl Runner {
         // quota, a dropped stream, or an exhausted continuation are gaps in
         // the report, not evidence about the finding itself (see [`SCHEMA`]'s
         // doc for schema 9 and [`OperatorFixOutcome::Unreported`]).
-        for f in &mut request.findings {
+        for f in &mut self.state.operator_fixes[request_index].findings {
             f.outcome = if fix.failed.is_some() {
                 OperatorFixOutcome::Unreported
             } else if fix.addressed.contains(&f.id) {
@@ -3243,18 +3277,12 @@ impl Runner {
 
         let committed = fix.committed;
         if committed {
-            request.result_head = Some(after.clone());
+            self.state.operator_fixes[request_index].result_head = Some(after.clone());
         }
-        request.fix = Some(fix);
-
-        // Recorded now, before the follow-up review even starts: the
-        // operator's own request and the fixer's outcome are already final
-        // at this point, and a crash partway through the follow-up review
-        // below must not lose them. Only `follow_up_review_run` is still
-        // pending — filled in and saved again once it is known.
-        self.state.operator_fixes.push(request);
+        self.state.operator_fixes[request_index].fix = Some(fix);
+        // Saved again now that the fixer's own outcome is final, on top of
+        // the save right after the request was first pushed above.
         self.state.save()?;
-        let request_index = self.state.operator_fixes.len() - 1;
 
         if committed {
             self.state.event(
