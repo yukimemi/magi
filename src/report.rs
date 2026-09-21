@@ -574,6 +574,25 @@ pub fn run(state: &RunState) -> String {
                     }
                 })
             );
+            // The aggregate label above (`e2e`) says the round's overall
+            // verdict; it never named the commands themselves, so a round
+            // with more than one `verify.e2e` command left no way to tell
+            // which one actually failed or was blocked without opening
+            // `run.json` by hand — the same gap `gate`'s own per-command
+            // listing above already closes for the final gate.
+            for o in &r.e2e {
+                let label = if o.resource_blocked {
+                    yellow("blocked")
+                } else if o.ok() {
+                    green("pass")
+                } else {
+                    red("FAIL")
+                };
+                let _ = writeln!(s, "    {label}  {}", o.command);
+                if !o.ok() {
+                    let _ = writeln!(s, "{}", dim(&tail(&o.output_tail, 2_000)));
+                }
+            }
             for rec in &r.reviews {
                 if let Some(vote) = rec.vote {
                     let _ = writeln!(s, "      review-{} vote {}", rec.reviewer, vote_tag(vote));
@@ -1485,6 +1504,55 @@ mod tests {
         assert!(text.contains("shared build cache unavailable"), "{text}");
         assert!(!text.contains("e2e RED"), "{text}");
         assert!(!text.contains("build/link failure"), "{text}");
+    }
+
+    #[test]
+    fn a_round_with_more_than_one_e2e_command_names_each_one() {
+        // The aggregate `e2e RED` label says the round's overall verdict,
+        // never which of several `verify.e2e` commands actually failed —
+        // `magi show` must list each command by name, the same way it
+        // already does for `gate`.
+        let _guard = plain();
+        let mut s = state();
+        s.reviews = vec![ReviewRound {
+            round: 1,
+            head: "abc1234".to_owned(),
+            verified_head: Some("abc1234".to_owned()),
+            verified_at: Some(jiff::Timestamp::now()),
+            reviews: Vec::new(),
+            e2e: vec![
+                CommandOutcome {
+                    command: "cargo test --locked --all-targets".to_owned(),
+                    code: Some(0),
+                    output_tail: String::new(),
+                    duration_ms: 0,
+                    resource_blocked: false,
+                },
+                CommandOutcome {
+                    command: "cargo make check".to_owned(),
+                    code: Some(1),
+                    output_tail: "clippy: unused import".to_owned(),
+                    duration_ms: 0,
+                    resource_blocked: false,
+                },
+            ],
+            verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
+            fix: None,
+            blocking: 0,
+            answered: 0,
+            expected: 0,
+            clean: false,
+            progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
+        }];
+        let text = run(&s);
+        assert!(text.contains("cargo test --locked --all-targets"), "{text}");
+        assert!(text.contains("cargo make check"), "{text}");
+        assert!(text.contains("clippy: unused import"), "{text}");
     }
 
     #[test]

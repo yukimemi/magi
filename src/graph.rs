@@ -2841,6 +2841,39 @@ impl Runner {
             return Ok(());
         }
         self.state.status = RunStatus::Reviewing;
+        // `review_conclusion` returns `None` for a last round stuck at
+        // `ResourceBlocked` exactly when it would otherwise have had to
+        // guess a verdict (round budget spent, or the tree stagnant) — the
+        // same gate it uses to decide whether to decide at all. The loop
+        // below has nothing left to do in that shape: its range is empty
+        // once the budget is spent, and a stagnant tree should not start a
+        // fresh round on top of one whose own check never resolved either.
+        // Retry that check directly instead of leaving the run parked in
+        // `Reviewing` forever.
+        let stagnant = self
+            .state
+            .reviews
+            .iter()
+            .rev()
+            .take_while(|r| !r.progressed)
+            .count()
+            >= STAGNANT_LIMIT;
+        if (self.state.reviews.len() >= max_rounds || stagnant)
+            && self
+                .state
+                .reviews
+                .last()
+                .is_some_and(|r| r.e2e_status() == E2eStatus::ResourceBlocked)
+        {
+            let shell = self.state.config.shell();
+            return self
+                .stop_reviewing(
+                    "the last round's own verification never resolved",
+                    &shell,
+                    &winner.worktree,
+                )
+                .await;
+        }
 
         let repo = self.state.repo.clone();
         let root = self.state.worktree_root();
@@ -3271,13 +3304,19 @@ impl Runner {
                 reconsideration,
                 verdict: round_verdict,
             };
-            // Only a real attempt vouches for the commit it names — see
-            // `ReviewRound::verified_head`'s own doc. A resource-blocked
-            // attempt checked nothing, and a deferred/unconfigured round
-            // never ran at all.
-            if matches!(
+            // Which commit and when magi actually attempted to check —
+            // known the moment a command was dispatched against `head`,
+            // whether or not it finished: a resource-blocked attempt still
+            // targeted a specific commit at a specific time, and leaving
+            // that unrecorded is exactly what made `verification_summary`
+            // report a fresh attempt as "commit unknown ... recorded before
+            // this was tracked", indistinguishable from a genuinely old,
+            // untracked record. Only a deferred or unconfigured round never
+            // ran at all and has nothing to record — see
+            // `ReviewRound::verified_head`'s own doc.
+            if !matches!(
                 round_record.e2e_status(),
-                E2eStatus::Passed | E2eStatus::Failed
+                E2eStatus::Deferred | E2eStatus::NotConfigured
             ) {
                 round_record.verified_head = Some(head.clone());
                 round_record.verified_at = Some(Timestamp::now());
@@ -3629,30 +3668,44 @@ impl Runner {
     /// `e2e_every_round`) is never read as that green: its `e2e` is empty
     /// only because nothing ran, and treating an empty list as a passing one
     /// here is exactly the "deferred painted green" bug this function exists
-    /// to not have. When the last round deferred, this makes the real run —
-    /// on the actual worktree this loop is about to stop touching — before
-    /// deciding anything.
+    /// to not have. When the last round's own verification never resolved —
+    /// deferred on purpose, or a real attempt the shared build cache blocked
+    /// — this makes (or retries) the real run, on the actual worktree this
+    /// loop is about to stop touching, before deciding anything. A
+    /// resource-blocked attempt is likewise never read as either green or
+    /// red: it is evidence about the machine, not the patch (see
+    /// [`CommandOutcome::resource_blocked`]'s own doc), so a persistently
+    /// blocked cache leaves this call without deciding rather than guessing
+    /// — the caller retries on a later reentry.
     async fn stop_reviewing(&mut self, why: &str, shell: &[String], worktree: &Path) -> Result<()> {
         let round_idx = self.state.reviews.len() - 1;
-        let needs_catchup_run = {
-            let last = &self.state.reviews[round_idx];
-            last.e2e.is_empty() && last.e2e_deferred
-        };
+        // A deferred round and a resource-blocked one are the same shape
+        // here: neither has a real result yet, and both get one more
+        // attempt. Read off `e2e_status` — the single source for this —
+        // rather than `e2e.is_empty()` alone, so a resource-blocked attempt
+        // (whose `e2e` is *not* empty; see `CommandOutcome::resource_blocked`)
+        // still retries instead of being read as a settled result the
+        // instant it stops being empty.
+        let needs_catchup_run = matches!(
+            self.state.reviews[round_idx].e2e_status(),
+            E2eStatus::Deferred | E2eStatus::ResourceBlocked
+        );
         if needs_catchup_run {
             let round = self.state.reviews[round_idx].round;
             let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
             let commands = self.state.config.verify.e2e.clone();
-            let verified_head = git::rev_parse(worktree, "HEAD").await?;
+            let attempted_head = git::rev_parse(worktree, "HEAD").await?;
             let cache_dir = self.state.config.cache_dir();
-            let context =
-                format!("round {round}: deferred e2e, now catching up before the final decision");
+            let context = format!(
+                "round {round}: verification unresolved, catching up before the final decision"
+            );
             let (outcomes, verify_retried) = with_cache_lease(
                 &mut self.state,
                 cache_dir.as_deref(),
                 "e2e",
                 "e2e",
                 worktree,
-                &verified_head,
+                &attempted_head,
                 timeout,
                 &context,
                 |state, budget| {
@@ -3666,54 +3719,71 @@ impl Runner {
                 },
             )
             .await;
-            // The catch-up run never actually happened - the shared build
-            // cache could not be acquired or confirmed fresh in time (see
-            // `CommandOutcome::resource_blocked`'s own doc) - so this round's
-            // `e2e`/`e2e_deferred` are left exactly as they were:
-            // `needs_catchup_run` above still reads true the next time this
-            // is reached, and the round stays deferred rather than recording
-            // contention as a red e2e and blocking the run on it.
-            if verify_inconclusive(&outcomes) {
-                self.state.save()?;
-                return Ok(());
-            }
             let last = &mut self.state.reviews[round_idx];
             last.e2e = outcomes;
             last.verify_retried = verify_retried;
-            last.e2e_deferred = false;
-            // Always the commit this attempt actually checked, whether or
-            // not it happens to equal the reviewed `head` — see
-            // `ReviewRound::verified_head`'s own doc for why the field no
-            // longer stays `None` on the common case.
-            last.verified_head = Some(verified_head);
+            // Always the commit and time this attempt actually targeted,
+            // whether or not it happens to equal the reviewed `head` and
+            // whether or not a command finished — see
+            // `ReviewRound::verified_head`'s own doc. A still-inconclusive
+            // attempt is recorded too, so a later reader sees "attempted
+            // again at T2" rather than silence.
+            last.verified_head = Some(attempted_head);
             last.verified_at = Some(Timestamp::now());
+            if verify_inconclusive(&last.e2e) {
+                // Still not a real result: `e2e_deferred` is left exactly
+                // as it was, so `needs_catchup_run` above reads
+                // `ResourceBlocked` (via `e2e_status`, which checks
+                // `resource_blocked` before `e2e_deferred`) and retries
+                // again on the next reentry, rather than recording
+                // contention as a red e2e and blocking the run on it.
+                self.state.save()?;
+                return Ok(());
+            }
+            last.e2e_deferred = false;
         }
         let last = &self.state.reviews[round_idx];
-        let red: Vec<String> = last
-            .e2e
-            .iter()
-            .filter(|o| !o.ok())
-            .map(|o| {
-                format!(
-                    "`{}` -> {:?}\n{}",
-                    o.command,
-                    o.code,
-                    tail(&o.output_tail, EVENT_OUTPUT_TAIL)
-                )
-            })
-            .collect();
         let open: usize = last.reviews.iter().map(|r| r.findings.len()).sum();
 
-        if red.is_empty() {
-            self.state.event(
-                "review",
-                format!("{why}; e2e is green — handing off with {open} finding(s) still open"),
-            );
-            self.state.status = RunStatus::Gating;
-        } else {
-            self.state
-                .event("review", format!("{why}; e2e failed:\n{}", red.join("\n")));
-            self.state.status = RunStatus::Blocked;
+        match last.e2e_status() {
+            E2eStatus::Failed => {
+                let red: Vec<String> = last
+                    .e2e
+                    .iter()
+                    .filter(|o| !o.ok())
+                    .map(|o| {
+                        format!(
+                            "`{}` -> {:?}\n{}",
+                            o.command,
+                            o.code,
+                            tail(&o.output_tail, EVENT_OUTPUT_TAIL)
+                        )
+                    })
+                    .collect();
+                self.state
+                    .event("review", format!("{why}; e2e failed:\n{}", red.join("\n")));
+                self.state.status = RunStatus::Blocked;
+            }
+            // `needs_catchup_run` above already retried once this call; if
+            // it is still blocked, this is magi's own admission it could
+            // not get a command to run, never a verdict on the patch — the
+            // run is left exactly where a later reentry can retry again.
+            E2eStatus::ResourceBlocked => {
+                self.state.event(
+                    "review",
+                    format!(
+                        "{why}; e2e could not run (shared build cache unavailable); not \
+                         deciding yet"
+                    ),
+                );
+            }
+            E2eStatus::Passed | E2eStatus::Deferred | E2eStatus::NotConfigured => {
+                self.state.event(
+                    "review",
+                    format!("{why}; e2e is green — handing off with {open} finding(s) still open"),
+                );
+                self.state.status = RunStatus::Gating;
+            }
         }
         self.state.save()?;
         Ok(())
@@ -4532,6 +4602,13 @@ fn round_is_clean(
 ///   (see [`ReviewRound::incomplete`], `IncompleteReviewPolicy`).
 /// - Otherwise, green e2e on the last round hands off (see
 ///   [`Runner::stop_reviewing`]); red e2e blocks.
+///
+/// A last round whose own verification is still `ResourceBlocked` — magi
+/// itself never got a command to run, not evidence the patch is broken —
+/// is neither: this returns `None` for it too, the same as "more rounds
+/// remain", so a reentry retries the check (see `Runner::review_loop`'s own
+/// handling of that shape) instead of this cheap recomputation guessing a
+/// verdict a real attempt never produced.
 fn review_conclusion(reviews: &[ReviewRound], max_rounds: usize) -> Option<RunStatus> {
     if max_rounds == 0 || reviews.iter().any(|r| r.clean) {
         return Some(RunStatus::Gating);
@@ -4541,9 +4618,13 @@ fn review_conclusion(reviews: &[ReviewRound], max_rounds: usize) -> Option<RunSt
     if reviews.len() < max_rounds && !stagnant {
         return None;
     }
-    Some(if last.incomplete() && last.blocking == 0 {
-        RunStatus::Blocked
-    } else if last.e2e.iter().all(CommandOutcome::ok) {
+    if last.incomplete() && last.blocking == 0 {
+        return Some(RunStatus::Blocked);
+    }
+    if last.e2e_status() == E2eStatus::ResourceBlocked {
+        return None;
+    }
+    Some(if last.e2e.iter().all(CommandOutcome::ok) {
         RunStatus::Gating
     } else {
         RunStatus::Blocked
@@ -5625,6 +5706,20 @@ mod tests {
     }
 
     #[test]
+    fn review_conclusion_stays_none_when_the_budget_is_spent_but_the_last_round_could_not_run() {
+        // Magi never got a command to run against this round's own head — a
+        // resource-blocked attempt, not a red one — so this must never
+        // settle on `Blocked` the way a genuine e2e failure would. `None`
+        // here is what tells `Runner::review_loop` to retry the check
+        // itself rather than trust this cheap recomputation with a verdict
+        // it cannot actually produce.
+        let mut blocked = review_round(false, 1, 2, 2, true, false);
+        blocked.e2e[0].resource_blocked = true;
+        let rounds = vec![review_round(false, 1, 2, 2, true, true), blocked];
+        assert_eq!(review_conclusion(&rounds, 2), None);
+    }
+
+    #[test]
     fn review_conclusion_blocks_an_incomplete_panel_that_raised_nothing_even_with_green_e2e() {
         // Missing input, not a verified tree — never a hand-off candidate.
         let rounds = vec![review_round(false, 0, 1, 2, false, true)];
@@ -6536,6 +6631,355 @@ mod tests {
             RunStatus::Blocked,
             "must not read as resource-blocked on a lease it never asked for"
         );
+    }
+
+    /// The shape the incident this whole fix responds to actually had: the
+    /// round budget spent, the last round's own e2e blocked on the shared
+    /// build cache (held here by a live pid — this test process — exactly
+    /// `cache`'s own unit tests' pattern for "another owner, still alive"
+    /// without forking a process). `stop_reviewing` must retry it — not
+    /// silently leave the round looking untouched (the catch-up-only half of
+    /// the bug), and not read the contention as a red `e2e` and block the
+    /// run on it (the other half). Called directly, the same way
+    /// `gate_never_asks_for_the_cache_lease_when_it_has_no_commands_to_run`
+    /// above exercises `gate`, so this never needs a real cargo build to
+    /// reach: the lease is never released, so `with_cache_lease` never gets
+    /// past acquiring it into anything that would need a real workspace.
+    #[tokio::test]
+    async fn stop_reviewing_retries_a_resource_blocked_e2e_instead_of_reading_it_as_red() {
+        crate::run::set_home(std::env::temp_dir().join("magi-graph-test-home"));
+        let home = crate::run::home();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let head = crate::git::rev_parse(&repo, "HEAD")
+            .await
+            .expect("rev-parse");
+        // Unique to this test, so holding its lease cannot collide with
+        // another test sharing the same process-wide `home`.
+        let cache_dir = tmp.path().join("target");
+
+        let mut config = Config::default();
+        config.verify.e2e = vec![format!(
+            "CARGO_TARGET_DIR='{}' test -f README.md",
+            cache_dir.display()
+        )];
+        config.graph.review_rounds = 1;
+        // Bounded so a regression that does start waiting fails the test in
+        // seconds, not hangs it.
+        config.graph.timeout_verify = Some(2);
+
+        let other = crate::cache::Owner::here("other-run", "e2e", "e2e", &repo, "deadbeef");
+        let held = match crate::cache::try_acquire(&home, &cache_dir, &other)
+            .expect("no io error acquiring directly")
+        {
+            crate::cache::AcquireOutcome::Acquired(g) => g,
+            crate::cache::AcquireOutcome::Busy(b) => {
+                panic!("expected the direct acquire to win the lease first: {b:?}")
+            }
+        };
+
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            head.clone(),
+            "task".to_owned(),
+            config,
+        );
+        state.candidates = vec![Candidate {
+            index: 0,
+            label: 'A',
+            agent: "alpha".to_owned(),
+            branch: "does-not-exist".to_owned(),
+            worktree: repo.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: false,
+        }];
+        state.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 1)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("only candidate A produced a change".to_owned()),
+        });
+        // The round budget's last round, deferred: `needs_catchup_run`'s
+        // other trigger. `stop_reviewing`'s retry machinery must treat this
+        // exactly like a resource-blocked attempt once it actually runs.
+        state.reviews = vec![ReviewRound {
+            round: 1,
+            head: head.clone(),
+            verified_head: None,
+            verified_at: None,
+            reviews: Vec::new(),
+            e2e: Vec::new(),
+            fix: None,
+            blocking: 1,
+            answered: 1,
+            expected: 1,
+            clean: false,
+            verify_retried: false,
+            e2e_deferred: true,
+            e2e_defer_reason: Some("1 blocking finding(s) already required a fix".to_owned()),
+            progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
+        }];
+
+        let mut runner = Runner {
+            state,
+            roles: ResolvedRoles {
+                implementers: Vec::new(),
+                judges: Vec::new(),
+                reviewers: Vec::new(),
+                fixer: None,
+                conductor: conductor(),
+            },
+            sem: Arc::new(Semaphore::new(1)),
+            pause: Pause::new(),
+            interrupt: Pause::new(),
+        };
+
+        let shell = runner.state.config.shell();
+        runner
+            .stop_reviewing("round budget spent", &shell, &repo)
+            .await
+            .expect("stop_reviewing");
+
+        let last = runner.state.reviews.last().expect("round record");
+        assert_eq!(
+            last.e2e_status(),
+            E2eStatus::ResourceBlocked,
+            "the shared cache is still held; the attempt must read as blocked, not deferred or \
+             failed: {last:?}"
+        );
+        assert_eq!(
+            last.verified_head.as_deref(),
+            Some(head.as_str()),
+            "which commit this attempt targeted is known even though nothing finished checking \
+             it"
+        );
+        let first_attempt_at = last
+            .verified_at
+            .expect("when this attempt ran is known too");
+        assert_ne!(
+            runner.state.status,
+            RunStatus::Blocked,
+            "contention is evidence about the machine, not the patch — it must not settle the \
+             run as blocked: {:?}",
+            runner.state.status
+        );
+        assert!(
+            !runner
+                .state
+                .events
+                .iter()
+                .any(|e| e.node == "review" && e.message.contains("e2e failed")),
+            "a resource-blocked attempt must never be logged as a failed e2e: {:?}",
+            runner.state.events
+        );
+
+        // The cache is still held: a later reentry must retry the same
+        // round's verification again — not leave it looking exactly as
+        // untouched as the first blocked attempt, which is indistinguishable
+        // from never having tried again at all.
+        runner
+            .stop_reviewing("round budget spent", &shell, &repo)
+            .await
+            .expect("stop_reviewing retry");
+        assert_eq!(
+            runner.state.reviews.len(),
+            1,
+            "no new round was started: {:?}",
+            runner.state.reviews
+        );
+        let last = runner.state.reviews.last().expect("round record");
+        assert_eq!(last.e2e_status(), E2eStatus::ResourceBlocked, "{last:?}");
+        assert!(
+            last.verified_at.expect("still known") > first_attempt_at,
+            "a second reentry must be a fresh attempt, not a stale copy of the first"
+        );
+        assert_ne!(runner.state.status, RunStatus::Blocked);
+
+        held.release();
+    }
+
+    /// A resumed run — a fresh `Runner`, `self.state.reviews` already
+    /// holding the round `stop_reviewing` left `ResourceBlocked` from a
+    /// prior process — must not sit at `Reviewing` forever: `review_loop`'s
+    /// own top-of-function fast path (`review_conclusion`) correctly reads
+    /// this shape as `None` rather than guessing `Blocked`, and the loop's
+    /// own `for` range is empty once the round budget is spent, so
+    /// `review_loop` must retry the check itself rather than silently doing
+    /// nothing. Reaches the exact same retry `stop_reviewing_retries_a_*`
+    /// above exercises directly, but through `review_loop`'s own entry point
+    /// this time, proving the wiring between the two rather than just the
+    /// retry logic in isolation.
+    #[tokio::test]
+    async fn a_resumed_review_loop_retries_a_last_round_left_resource_blocked() {
+        crate::run::set_home(std::env::temp_dir().join("magi-graph-test-home"));
+        let home = crate::run::home();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let head = crate::git::rev_parse(&repo, "HEAD")
+            .await
+            .expect("rev-parse");
+        let cache_dir = tmp.path().join("target");
+
+        let mut config = Config::default();
+        config.verify.e2e = vec![format!(
+            "CARGO_TARGET_DIR='{}' test -f README.md",
+            cache_dir.display()
+        )];
+        config.graph.review_rounds = 1;
+        config.graph.timeout_verify = Some(2);
+
+        let other = crate::cache::Owner::here("other-run", "e2e", "e2e", &repo, "deadbeef");
+        let held = match crate::cache::try_acquire(&home, &cache_dir, &other)
+            .expect("no io error acquiring directly")
+        {
+            crate::cache::AcquireOutcome::Acquired(g) => g,
+            crate::cache::AcquireOutcome::Busy(b) => {
+                panic!("expected the direct acquire to win the lease first: {b:?}")
+            }
+        };
+
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            head.clone(),
+            "task".to_owned(),
+            config,
+        );
+        state.candidates = vec![Candidate {
+            index: 0,
+            label: 'A',
+            agent: "alpha".to_owned(),
+            branch: "does-not-exist".to_owned(),
+            worktree: repo.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: false,
+        }];
+        state.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 1)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("only candidate A produced a change".to_owned()),
+        });
+        // The exact shape a prior process's `stop_reviewing` would have left
+        // on disk: the round budget's last round, a real attempt already
+        // made and already resource-blocked.
+        state.reviews = vec![ReviewRound {
+            round: 1,
+            head: head.clone(),
+            verified_head: Some(head.clone()),
+            verified_at: Some(jiff::Timestamp::now()),
+            reviews: Vec::new(),
+            e2e: vec![CommandOutcome {
+                command: format!(
+                    "CARGO_TARGET_DIR='{}' test -f README.md",
+                    cache_dir.display()
+                ),
+                code: None,
+                output_tail: "waiting for the shared build cache".to_owned(),
+                duration_ms: 0,
+                resource_blocked: true,
+            }],
+            fix: None,
+            blocking: 1,
+            answered: 1,
+            expected: 1,
+            clean: false,
+            verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
+            progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
+        }];
+
+        let first_attempt_at = state.reviews[0].verified_at.expect("set above");
+        let mut runner = Runner {
+            state,
+            roles: ResolvedRoles {
+                implementers: Vec::new(),
+                judges: Vec::new(),
+                reviewers: Vec::new(),
+                fixer: None,
+                conductor: conductor(),
+            },
+            sem: Arc::new(Semaphore::new(1)),
+            pause: Pause::new(),
+            interrupt: Pause::new(),
+        };
+
+        // The lease is still held throughout, so this reentry's own retry is
+        // also contended — proving `review_loop` actually tried again (not
+        // that it happened to succeed) is what the timestamp comparison
+        // below is for.
+        runner.review_loop().await.expect("review_loop");
+
+        assert_eq!(
+            runner.state.reviews.len(),
+            1,
+            "no new round was started on top of the unresolved one: {:?}",
+            runner.state.reviews
+        );
+        let last = &runner.state.reviews[0];
+        assert_eq!(
+            last.e2e_status(),
+            E2eStatus::ResourceBlocked,
+            "still contended: {last:?}"
+        );
+        assert!(
+            last.verified_at.expect("still known") > first_attempt_at,
+            "review_loop must have actually retried the check, not left it exactly as found"
+        );
+        assert_ne!(
+            runner.state.status,
+            RunStatus::Blocked,
+            "a resumed run must not read leftover contention as a verdict on the patch: {:?}",
+            runner.state.status
+        );
+
+        held.release();
     }
 
     #[tokio::test]

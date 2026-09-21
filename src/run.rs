@@ -624,19 +624,23 @@ pub struct ReviewRound {
     pub round: usize,
     /// Commit the round reviewed.
     pub head: String,
-    /// The commit `e2e` is actually evidence about. Set whenever `e2e` holds
-    /// a real attempt (`e2e_status()` reads `Passed` or `Failed`), naming
-    /// that commit even when it equals `head` — never left implicit, because
-    /// an implicit "must have been `head`" is exactly what let a later round
-    /// quote an earlier round's result without saying which commit it came
-    /// from. `None` when nothing actually ran (`NotConfigured`, `Deferred`,
-    /// `ResourceBlocked`): magi never vouches for a commit no command
-    /// finished checking. See `SCHEMA`'s doc for schema 8 for why this
-    /// broadened from only the catch-up-on-a-different-commit case.
+    /// The commit `e2e` was actually attempted against. Set whenever an
+    /// attempt was dispatched (`e2e_status()` reads `Passed`, `Failed`, or
+    /// `ResourceBlocked`), naming that commit even when it equals `head` —
+    /// never left implicit, because an implicit "must have been `head`" is
+    /// exactly what let a later round quote an earlier round's result
+    /// without saying which commit it came from. A resource-blocked attempt
+    /// still targeted a specific commit even though no command finished, and
+    /// leaving that unrecorded is exactly what made a *fresh* blocked
+    /// attempt read the same as an untracked one from before schema 8.
+    /// `None` only when nothing was attempted at all (`NotConfigured`,
+    /// `Deferred`). See `SCHEMA`'s doc for schema 8 for why this broadened
+    /// from only the catch-up-on-a-different-commit case.
     #[serde(default)]
     pub verified_head: Option<String>,
-    /// When the check behind `verified_head` actually ran. `None` on every
-    /// record written before schema 8, and on a round where nothing ran —
+    /// When the attempt behind `verified_head` actually ran. `None` on
+    /// every record written before schema 8, and on a round where nothing
+    /// ran —
     /// both read as "unknown", not as "now" or "never asked".
     #[serde(default)]
     pub verified_at: Option<Timestamp>,
