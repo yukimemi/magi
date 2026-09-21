@@ -78,7 +78,27 @@ use crate::verdict::{Finding, Rejection, ReviewVote};
 /// should not be spent again); an empty one migrates to `gate_ran = false`
 /// and is simply re-attempted by the next `gate()` call, which self-heals
 /// instantly for the zero-commands case.
-pub const SCHEMA: u32 = 7;
+///
+/// 8: `ReviewRound::verified_head` used to be `None` for the overwhelming
+/// majority of rounds — every ordinary round that ran e2e against its own
+/// `head` in the main review loop never set it at all, leaving only the
+/// rare catch-up-on-a-different-commit case populated. A reader (a review
+/// prompt, `magi show`, the web UI) had no field to ask "which commit did
+/// this round's `e2e` actually check" and fell back to assuming it was
+/// always `head`, which is also what let a stale round's red output get
+/// quoted to a later round's reviewers as if it were about their patch, not
+/// an earlier one (see `ReviewRound::verification_summary`, which now exists
+/// so nowhere else has to guess). `verified_head` is now set whenever `e2e`
+/// held a real attempt (`E2eStatus::Passed`/`Failed`), always naming the
+/// commit actually checked instead of only the divergent case, and
+/// `ReviewRound::verified_at` is new alongside it. A schema-7 round's own
+/// unconditional main-loop check was always against `head` whether or not
+/// this field said so, so a `None` with a non-empty `e2e` migrates to
+/// `Some(head)` — a reconstruction of a fact that was always true, not a
+/// guess. `verified_at` has no historical value to reconstruct and stays
+/// `None`, which reads through `verification_summary` as "checked at:
+/// unknown" — an honest gap, not a fabricated time.
+pub const SCHEMA: u32 = 8;
 
 /// Where a run got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,6 +517,15 @@ impl ContinuationRecord {
 pub struct JobRecord {
     /// Graph node the seat belongs to, e.g. `"implement"`, `"fix"`.
     pub node: String,
+    /// Review round this job belongs to, for a `"review"`/`"fix"` node —
+    /// `None` for every other node, where rounds do not apply, and for every
+    /// record written before this was tracked. Lets a reader ask "what did
+    /// this seat itself actually run this round", distinct from and never
+    /// substituted for magi's own recorded `ReviewRound::e2e` — an absent
+    /// entry here means unobserved, not that nothing ran (see this type's
+    /// own doc).
+    #[serde(default)]
+    pub round: Option<usize>,
     /// Seat key, e.g. `"impl-A"`.
     pub seat: String,
     /// The CLI's own id for this command.
@@ -595,11 +624,22 @@ pub struct ReviewRound {
     pub round: usize,
     /// Commit the round reviewed.
     pub head: String,
-    /// Commit actually checked by a catch-up e2e, when it differs from the
-    /// reviewed commit. Kept separate so reports never attribute a command
-    /// result to a review target the command did not inspect.
+    /// The commit `e2e` is actually evidence about. Set whenever `e2e` holds
+    /// a real attempt (`e2e_status()` reads `Passed` or `Failed`), naming
+    /// that commit even when it equals `head` — never left implicit, because
+    /// an implicit "must have been `head`" is exactly what let a later round
+    /// quote an earlier round's result without saying which commit it came
+    /// from. `None` when nothing actually ran (`NotConfigured`, `Deferred`,
+    /// `ResourceBlocked`): magi never vouches for a commit no command
+    /// finished checking. See `SCHEMA`'s doc for schema 8 for why this
+    /// broadened from only the catch-up-on-a-different-commit case.
     #[serde(default)]
     pub verified_head: Option<String>,
+    /// When the check behind `verified_head` actually ran. `None` on every
+    /// record written before schema 8, and on a round where nothing ran —
+    /// both read as "unknown", not as "now" or "never asked".
+    #[serde(default)]
+    pub verified_at: Option<Timestamp>,
     /// Reviewer reports.
     pub reviews: Vec<ReviewRecord>,
     /// E2E command outcomes for this round.
@@ -691,8 +731,15 @@ impl ReviewRound {
     /// Never derive this from `e2e.is_empty()` alone anywhere else in the
     /// codebase — `NotConfigured` and `Deferred` both leave it empty, and
     /// only this method (backed by [`Self::e2e_deferred`]) tells them apart.
+    /// A resource-blocked attempt is checked first and ahead of both: `e2e`
+    /// is non-empty for it too, but `CommandOutcome::resource_blocked` says
+    /// no command actually ran, and reading that as `Failed` is exactly how
+    /// shared build-cache contention gets misreported as a verdict on the
+    /// patch (see `CommandOutcome::resource_blocked`'s own doc).
     pub fn e2e_status(&self) -> E2eStatus {
-        if !self.e2e.is_empty() {
+        if self.e2e.iter().any(|o| o.resource_blocked) {
+            E2eStatus::ResourceBlocked
+        } else if !self.e2e.is_empty() {
             if self.e2e.iter().all(CommandOutcome::ok) {
                 E2eStatus::Passed
             } else {
@@ -703,6 +750,65 @@ impl ReviewRound {
         } else {
             E2eStatus::NotConfigured
         }
+    }
+
+    /// Facts about this round's verification leg, judged against
+    /// `current_head` — the commit whoever is asking is actually looking at
+    /// right now. `None` when there is nothing worth surfacing: no
+    /// `verify.e2e` configured, or the round's own check came back green (a
+    /// passing result needs no skepticism attached to it, and an unread
+    /// `None` is exactly what keeps a quiet round quiet instead of padding
+    /// every prompt with "everything was fine").
+    ///
+    /// This is the single place that turns `e2e`/`e2e_deferred`/
+    /// `verified_head`/`verified_at` into text. Every prompt and report that
+    /// shows a round's verification result must build its wording from this,
+    /// not re-derive its own summary at the call site — a hand-rolled
+    /// version at one more place is exactly how "an old red read as today's
+    /// answer" comes back through a different door (see the incident this
+    /// type exists to prevent, recorded alongside `SCHEMA`'s doc for schema
+    /// 8).
+    pub fn verification_summary(&self, current_head: &str) -> Option<VerificationSummary> {
+        let status = self.e2e_status();
+        if matches!(status, E2eStatus::NotConfigured | E2eStatus::Passed) {
+            return None;
+        }
+        let commit = match &self.verified_head {
+            Some(h) if h == current_head => {
+                format!("commit {} (this is the head being looked at now)", short(h))
+            }
+            Some(h) => format!("commit {} (an earlier head, since superseded)", short(h)),
+            None => "commit unknown (no command finished checking one)".to_owned(),
+        };
+        let checked_at = match self.verified_at {
+            Some(t) => format!("checked at {t}"),
+            None => "checked at: unknown (recorded before this was tracked)".to_owned(),
+        };
+        let result = match status {
+            E2eStatus::NotConfigured | E2eStatus::Passed => unreachable!("checked above"),
+            E2eStatus::Failed => "result: FAILED".to_owned(),
+            E2eStatus::Deferred => format!(
+                "result: not run this round yet — deferred to the fixer{}. Not passed, not \
+                 failed.",
+                self.e2e_defer_reason
+                    .as_deref()
+                    .map(|why| format!(" ({why})"))
+                    .unwrap_or_default()
+            ),
+            E2eStatus::ResourceBlocked => "result: could not run — the shared build cache was \
+                                            not available. This is evidence about the machine, \
+                                            not about the patch."
+                .to_owned(),
+        };
+        let label = format!("round {}, {commit}, {checked_at}\n{result}", self.round);
+        let tail = (status == E2eStatus::Failed).then(|| {
+            self.e2e
+                .iter()
+                .filter(|o| !o.ok())
+                .map(|o| format!("$ {}\n{}\n", o.command, o.output_tail))
+                .collect::<String>()
+        });
+        Some(VerificationSummary { label, tail })
     }
 }
 
@@ -719,6 +825,24 @@ pub enum E2eStatus {
     Passed,
     /// Ran, and at least one command did not exit 0.
     Failed,
+    /// Magi could not even get a command to run — the shared build cache's
+    /// lease or freshness check was not available within budget. Evidence
+    /// about the machine, never a verdict on the tree it named; must not be
+    /// shown or counted the same as [`Self::Failed`].
+    ResourceBlocked,
+}
+
+/// [`ReviewRound::verification_summary`]'s output: the facts, pre-worded, for
+/// a prompt or report to place under its own heading. Kept as two pieces
+/// rather than one pre-joined string so a caller that wants to insert its own
+/// note between the label and the raw command tail (see `prompt::review`) can
+/// do so without re-parsing text back apart.
+#[derive(Debug, Clone)]
+pub struct VerificationSummary {
+    /// Round, commit, freshness and result — always present.
+    pub label: String,
+    /// Raw `$ command` / output tail, present only when `result: FAILED`.
+    pub tail: Option<String>,
 }
 
 /// The honest state of a run's final gate. See [`RunState::gate_status`].
@@ -1261,6 +1385,22 @@ fn migrate_schema(mut state: RunState) -> Result<RunState> {
     // instantly.
     if state.schema == 6 {
         state.gate_ran = !state.gate.is_empty();
+        state.schema = 7;
+    }
+    // Schema 7's main review loop always checked `e2e` against the round's
+    // own `head`, it just never wrote that fact into `verified_head` unless
+    // a catch-up run had checked a *different* commit — see `SCHEMA`'s doc
+    // for schema 8. Reconstructing `Some(head)` for a round whose `e2e` held
+    // a real attempt restores a fact that was always true; `verified_at` has
+    // no historical value to recover and stays `None`.
+    if state.schema == 7 {
+        for round in &mut state.reviews {
+            if round.verified_head.is_none()
+                && matches!(round.e2e_status(), E2eStatus::Passed | E2eStatus::Failed)
+            {
+                round.verified_head = Some(round.head.clone());
+            }
+        }
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {
@@ -1375,6 +1515,11 @@ impl RunState {
         }
         Ok(())
     }
+}
+
+/// The short form of a commit, for a label a human or an LLM reads.
+fn short(commit: &str) -> String {
+    commit.chars().take(7).collect()
 }
 
 /// The short form of a run id: the trailing block after the last `-`.
@@ -1893,6 +2038,7 @@ mod tests {
             round: 1,
             head: "h".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "a".to_owned(),
@@ -1955,6 +2101,123 @@ mod tests {
             resource_blocked: false,
         }];
         assert_eq!(r.e2e_status(), E2eStatus::Failed);
+    }
+
+    #[test]
+    fn e2e_status_never_reads_a_resource_block_as_a_failure() {
+        // The exact shape of contention on the shared build cache: `e2e`
+        // holds one outcome, and it is `resource_blocked`, never a command
+        // that actually ran and produced a red exit code.
+        let mut r = round(false, Vec::new());
+        r.e2e = vec![CommandOutcome {
+            command: "(waiting for the shared build cache)".to_owned(),
+            code: None,
+            output_tail: "contended".to_owned(),
+            duration_ms: 0,
+            resource_blocked: true,
+        }];
+        assert_eq!(
+            r.e2e_status(),
+            E2eStatus::ResourceBlocked,
+            "magi's own inability to get a command to run must not read as a verdict on the \
+             patch"
+        );
+    }
+
+    #[test]
+    fn verification_summary_is_silent_when_there_is_nothing_worth_saying() {
+        let mut r = round(true, Vec::new());
+        assert!(
+            r.verification_summary("h").is_none(),
+            "no verify.e2e configured: nothing to surface"
+        );
+        r.e2e = vec![CommandOutcome {
+            command: "test".to_owned(),
+            code: Some(0),
+            output_tail: String::new(),
+            duration_ms: 0,
+            resource_blocked: false,
+        }];
+        assert!(
+            r.verification_summary("h").is_none(),
+            "a green result needs no skepticism attached to it"
+        );
+    }
+
+    #[test]
+    fn verification_summary_tells_the_current_head_apart_from_an_earlier_one() {
+        let mut r = round(false, Vec::new());
+        r.head = "h1".to_owned();
+        r.e2e = vec![CommandOutcome {
+            command: "test".to_owned(),
+            code: Some(1),
+            output_tail: "boom".to_owned(),
+            duration_ms: 0,
+            resource_blocked: false,
+        }];
+        r.verified_head = Some("h1".to_owned());
+        r.verified_at = Some(Timestamp::now());
+
+        let fresh = r.verification_summary("h1").expect("a failure is surfaced");
+        assert!(
+            fresh.label.contains("this is the head being looked at now"),
+            "{}",
+            fresh.label
+        );
+        assert_eq!(fresh.tail.as_deref(), Some("$ test\nboom\n"));
+
+        let stale = r.verification_summary("h2").expect("still surfaced");
+        assert!(
+            stale.label.contains("an earlier head, since superseded"),
+            "a result about a different commit than the one being looked at now must say so, \
+             not read as current: {}",
+            stale.label
+        );
+    }
+
+    #[test]
+    fn verification_summary_marks_a_resource_block_and_a_deferral_distinctly_from_a_failure() {
+        let mut r = round(false, Vec::new());
+        r.e2e = vec![CommandOutcome {
+            command: "(waiting for the shared build cache)".to_owned(),
+            code: None,
+            output_tail: "contended".to_owned(),
+            duration_ms: 0,
+            resource_blocked: true,
+        }];
+        let blocked = r
+            .verification_summary("h")
+            .expect("a resource block is still surfaced, never silent");
+        assert!(blocked.label.contains("could not run"));
+        assert!(
+            blocked.tail.is_none(),
+            "no command actually ran; there is no output to quote"
+        );
+
+        let mut d = round(false, Vec::new());
+        d.e2e_deferred = true;
+        d.e2e_defer_reason = Some("2 blocking finding(s) already required a fix".to_owned());
+        let deferred = d.verification_summary("h").expect("deferred is surfaced");
+        assert!(deferred.label.contains("deferred to the fixer"));
+        assert!(deferred.label.contains("2 blocking finding(s)"));
+        assert!(deferred.tail.is_none());
+    }
+
+    #[test]
+    fn verification_summary_says_unknown_rather_than_guessing_a_time_or_a_commit() {
+        let mut r = round(false, Vec::new());
+        r.e2e = vec![CommandOutcome {
+            command: "test".to_owned(),
+            code: Some(1),
+            output_tail: "boom".to_owned(),
+            duration_ms: 0,
+            resource_blocked: false,
+        }];
+        // verified_head/verified_at left at their default `None` — exactly
+        // the shape a schema-7 round with no reconstructable timestamp has.
+        let summary = r.verification_summary("h").expect("a failure is surfaced");
+        assert!(summary.label.contains("commit unknown"));
+        assert!(summary.label.contains("checked at: unknown"));
     }
 
     #[test]
@@ -2185,6 +2448,62 @@ mod tests {
             "an empty gate on schema 6 is ambiguous and must be treated as unrun"
         );
         assert_eq!(migrated.gate_status(), GateStatus::NotRun);
+    }
+
+    #[test]
+    fn schema_seven_state_reconstructs_verified_head_for_a_round_that_actually_ran_e2e() {
+        // Schema 7's main review loop always checked `e2e` against the
+        // round's own `head` — it just never wrote that into `verified_head`
+        // unless a catch-up run had checked a *different* commit. Migrating
+        // to schema 8 restores that always-true fact instead of leaving a
+        // reader to assume it.
+        let mut value = serde_json::to_value(state()).expect("serialize state");
+        let object = value.as_object_mut().expect("state object");
+        object.insert("schema".to_owned(), serde_json::json!(7));
+        let reviews = object["reviews"].as_array_mut().expect("reviews");
+        reviews.push(serde_json::json!({
+            "round": 1, "head": "deadbeef", "reviews": [],
+            "e2e": [{
+                "command": "cargo test", "code": 0, "output_tail": "",
+                "duration_ms": 0, "resource_blocked": false
+            }],
+            "verify_retried": false, "blocking": 0, "answered": 1,
+            "expected": 1, "clean": true
+        }));
+        let old: RunState = serde_json::from_value(value).expect("schema-7 shape parses");
+        let migrated = migrate_schema(old).expect("schema 7 migrates");
+        assert_eq!(migrated.schema, SCHEMA);
+        assert_eq!(
+            migrated.reviews[0].verified_head.as_deref(),
+            Some("deadbeef"),
+            "a schema-7 round's main-loop e2e was always against its own head, even though the \
+             field never said so"
+        );
+        assert!(
+            migrated.reviews[0].verified_at.is_none(),
+            "no historical timestamp exists to reconstruct; unknown stays unknown, not a \
+             guessed 'now'"
+        );
+    }
+
+    #[test]
+    fn schema_seven_state_leaves_a_deferred_round_with_no_verified_head() {
+        let mut value = serde_json::to_value(state()).expect("serialize state");
+        let object = value.as_object_mut().expect("state object");
+        object.insert("schema".to_owned(), serde_json::json!(7));
+        let reviews = object["reviews"].as_array_mut().expect("reviews");
+        reviews.push(serde_json::json!({
+            "round": 1, "head": "deadbeef", "reviews": [],
+            "e2e": [], "e2e_deferred": true,
+            "verify_retried": false, "blocking": 1, "answered": 1,
+            "expected": 1, "clean": false
+        }));
+        let old: RunState = serde_json::from_value(value).expect("schema-7 shape parses");
+        let migrated = migrate_schema(old).expect("schema 7 migrates");
+        assert!(
+            migrated.reviews[0].verified_head.is_none(),
+            "a deferred round never ran e2e; there is nothing to reconstruct"
+        );
     }
 
     #[test]

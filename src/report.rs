@@ -217,11 +217,12 @@ fn jobs_section(state: &RunState) -> String {
             };
             let _ = writeln!(
                 s,
-                "    {} {}{}  checked {}",
+                "    {} {}{}{}  checked {}",
                 dim(&j.id),
                 status,
                 j.exit_code
                     .map_or(String::new(), |c| format!(" (exit {c})")),
+                j.round.map_or(String::new(), |r| format!("  round {r}")),
                 j.checked_at
                     .to_zoned(jiff::tz::TimeZone::system())
                     .strftime("%Y-%m-%d %H:%M:%S")
@@ -461,6 +462,13 @@ pub fn run(state: &RunState) -> String {
                     yellow("e2e could not run (build/link failure)")
                 }
                 E2eStatus::Failed => red("e2e RED"),
+                // Magi's own admission it could not get a command to run —
+                // never the same yellow/red a real attempt earns, since
+                // nothing here is evidence about the patch (see
+                // `E2eStatus::ResourceBlocked`'s own doc).
+                E2eStatus::ResourceBlocked => {
+                    yellow("e2e could not run (shared build cache unavailable)")
+                }
             };
             let e2e = if r.verify_retried {
                 format!("{e2e}, retried once")
@@ -518,7 +526,15 @@ pub fn run(state: &RunState) -> String {
                 status,
                 short(&r.head),
                 r.verified_head.as_ref().map_or(String::new(), |head| {
-                    format!(" (verified @ {})", short(head))
+                    format!(
+                        " (verified @ {}{})",
+                        short(head),
+                        r.verified_at.map_or(String::new(), |t| format!(
+                            " on {}",
+                            t.to_zoned(jiff::tz::TimeZone::system())
+                                .strftime("%Y-%m-%d %H:%M:%S")
+                        ))
+                    )
                 }),
                 r.blocking,
                 r.fix.as_ref().map_or(String::new(), |f| {
@@ -1202,6 +1218,7 @@ mod tests {
             round: 1,
             head: "abc1234".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             verify_retried: false,
@@ -1238,6 +1255,7 @@ mod tests {
             round: 1,
             head: "abc1234".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             verify_retried: false,
@@ -1280,6 +1298,7 @@ mod tests {
             round: 1,
             head: "abc1234".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -1341,6 +1360,7 @@ mod tests {
             round: 1,
             head: "abc1234".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -1403,6 +1423,7 @@ mod tests {
             round: 1,
             head: "abc1234".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: Vec::new(),
             e2e: vec![CommandOutcome {
                 command: "cargo test".to_owned(),
@@ -1431,6 +1452,42 @@ mod tests {
     }
 
     #[test]
+    fn a_resource_blocked_e2e_never_reads_as_red_or_as_a_build_failure() {
+        let _guard = plain();
+        let mut s = state();
+        s.reviews = vec![ReviewRound {
+            round: 1,
+            head: "abc1234".to_owned(),
+            verified_head: None,
+            verified_at: None,
+            reviews: Vec::new(),
+            e2e: vec![CommandOutcome {
+                command: "(waiting for the shared build cache)".to_owned(),
+                code: None,
+                output_tail: "held by run x node e2e seat e2e".to_owned(),
+                duration_ms: 100,
+                resource_blocked: true,
+            }],
+            verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
+            fix: None,
+            blocking: 0,
+            answered: 0,
+            expected: 0,
+            clean: false,
+            progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
+        }];
+        let text = run(&s);
+        assert!(text.contains("shared build cache unavailable"), "{text}");
+        assert!(!text.contains("e2e RED"), "{text}");
+        assert!(!text.contains("build/link failure"), "{text}");
+    }
+
+    #[test]
     fn a_declined_finding_shows_its_reason() {
         use crate::verdict::{Finding, Rejection, Severity};
 
@@ -1441,6 +1498,7 @@ mod tests {
             round: 1,
             head: "deadbee".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "alpha".to_owned(),
@@ -1614,6 +1672,7 @@ mod tests {
         s.jobs = vec![
             crate::run::JobRecord {
                 node: "implement".to_owned(),
+                round: None,
                 seat: "impl-A".to_owned(),
                 id: "item49".to_owned(),
                 description: "cargo test --test graph_cached_gate".to_owned(),
@@ -1625,6 +1684,7 @@ mod tests {
             },
             crate::run::JobRecord {
                 node: "fix".to_owned(),
+                round: None,
                 seat: "impl-A".to_owned(),
                 id: "item52".to_owned(),
                 description: "cargo test --test graph_split".to_owned(),
@@ -1636,6 +1696,7 @@ mod tests {
             },
             crate::run::JobRecord {
                 node: "fix".to_owned(),
+                round: None,
                 seat: "impl-A".to_owned(),
                 id: "item60".to_owned(),
                 description: "cargo build".to_owned(),
@@ -1659,6 +1720,30 @@ mod tests {
         assert!(text.contains("unknown"));
         // Coverage limit stated once, not fabricated per seat.
         assert!(text.contains("adapter coverage"));
+    }
+
+    #[test]
+    fn a_jobs_own_round_is_shown_when_known() {
+        let _guard = plain();
+        let mut s = state();
+        s.jobs = vec![crate::run::JobRecord {
+            node: "review".to_owned(),
+            round: Some(2),
+            seat: "review-1".to_owned(),
+            id: "item9".to_owned(),
+            description: "cargo test --test graph_cached_gate".to_owned(),
+            checked_at: jiff::Timestamp::now(),
+            status: crate::run::JobStatus::Completed,
+            exit_code: Some(0),
+            result_summary: "test result: 2 passed; 0 failed".to_owned(),
+            source: "codex".to_owned(),
+        }];
+        let text = run(&s);
+        assert!(
+            text.contains("round 2"),
+            "the round this seat's own command ran in must be visible, distinct from magi's \
+             own recorded verify: {text}"
+        );
     }
 
     #[test]

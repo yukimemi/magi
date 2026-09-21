@@ -5587,6 +5587,7 @@ mod tests {
             round,
             head: "deadbeef".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             verify_retried: false,

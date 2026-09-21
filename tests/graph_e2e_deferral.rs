@@ -221,3 +221,71 @@ async fn exhausted_rounds_catch_up_on_a_deferred_e2e_before_deciding_the_gate() 
     assert_eq!(state.status, RunStatus::Ready);
     assert!(state.handed_off_with_open_findings());
 }
+
+/// A round's own `e2e` must stay pinned to that round's own commit — never
+/// borrowed to answer for a later round's patch. Round 1's e2e runs (for
+/// real, thanks to `e2e_every_round`) against a tree that does not have the
+/// fixer's marker file yet and fails; the fixer then creates it, and round
+/// 2's e2e runs again, against a different commit, and passes. This is the
+/// mock shape of the incident `ReviewRound::verification_summary` exists to
+/// stop repeating: an earlier round's red must never be read as proof about
+/// a later round's green patch.
+#[tokio::test]
+async fn each_rounds_verified_head_and_time_stay_pinned_to_that_rounds_own_commit() {
+    let _guard = common::home_lock().await;
+    let mut fx = fixture(_guard, Judges::Unanimous, true);
+    fx.config.graph.candidates = 1;
+    fx.config.graph.e2e_every_round = true;
+    // Distinct from the marker the fixer always leaves (`fixed.txt` is
+    // created for every scenario the fixer runs in): round 1's e2e must fail
+    // before the fixer runs and pass once it has, so round 2's reviewers are
+    // shown a genuinely earlier, now-superseded result rather than a made-up
+    // one.
+    fx.config.verify.e2e = vec!["test -f fixed.txt".to_owned()];
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    assert_eq!(state.reviews.len(), 2, "{:?}", state.reviews);
+    let r1 = &state.reviews[0];
+    let r2 = &state.reviews[1];
+
+    assert!(
+        !r1.e2e.is_empty(),
+        "round 1 must have actually run e2e under e2e_every_round: {r1:?}"
+    );
+    assert_eq!(r1.e2e_status(), magi::run::E2eStatus::Failed);
+    assert_eq!(
+        r1.verified_head.as_deref(),
+        Some(r1.head.as_str()),
+        "round 1's own e2e checked round 1's own head, not some other round's"
+    );
+    assert!(r1.verified_at.is_some(), "round 1's check has a real time");
+
+    assert!(r2.clean, "round 2 has nothing left to fix");
+    assert_eq!(r2.e2e_status(), magi::run::E2eStatus::Passed);
+    assert_ne!(
+        r1.head, r2.head,
+        "the fixer must have committed between round 1 and round 2"
+    );
+    assert_eq!(
+        r2.verified_head.as_deref(),
+        Some(r2.head.as_str()),
+        "round 2's clean e2e is its own, never round 1's carried forward"
+    );
+
+    // A clean round's e2e_status is Passed, and `verification_summary`
+    // deliberately says nothing about a green check — round 2 has nothing
+    // here to show a fixer or a later round's reviewer.
+    assert!(r2.verification_summary(&r2.head).is_none());
+    // Round 1's failure, judged against round 2's own head, must read as an
+    // earlier, superseded commit — exactly the summary `prompt::review`
+    // shows round 2's reviewers, and exactly the fact that keeps it from
+    // being misread as today's answer.
+    let carried_forward = r1
+        .verification_summary(&r2.head)
+        .expect("round 1's failure is still worth surfacing");
+    assert!(carried_forward.label.contains("since superseded"));
+}

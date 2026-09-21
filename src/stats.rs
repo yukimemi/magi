@@ -475,6 +475,7 @@ mod tests {
             round: 1,
             head: "h".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -555,6 +556,7 @@ mod tests {
             round: 1,
             head: "h".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "alpha".to_owned(),
@@ -610,6 +612,7 @@ mod tests {
             round: 1,
             head: "h".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -674,6 +677,7 @@ mod tests {
             round: 1,
             head: "h".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: vec![
                 ReviewRecord {
                     reviewer: 1,
@@ -750,6 +754,7 @@ mod tests {
             round: 1,
             head: "h".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: Vec::new(),
             e2e: vec![fail.clone()],
             verify_retried: false,
@@ -769,6 +774,7 @@ mod tests {
             round: 2,
             head: "h".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: Vec::new(),
             e2e: vec![fail],
             verify_retried: false,

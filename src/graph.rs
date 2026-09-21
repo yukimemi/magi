@@ -44,9 +44,9 @@ use crate::prompt::{
 use crate::queue;
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
-    DeliberationRound, DeliberationTurn, FixRecord, JobRecord, JobStatus, Judgement, MergeOutcome,
-    QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, Tally,
-    VoteRecord, tail, write_artifact,
+    DeliberationRound, DeliberationTurn, E2eStatus, FixRecord, JobRecord, JobStatus, Judgement,
+    MergeOutcome, QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus,
+    Tally, VoteRecord, tail, write_artifact,
 };
 use crate::verdict::{
     self, FinalVote, FixReport, Position, Proposal, Ranking, Review, ReviewRevote, ReviewVote,
@@ -943,6 +943,7 @@ impl Runner {
             node: "advise",
             prompts: &prompts,
             cache: cache.as_deref(),
+            round: None,
         };
         let results = ask_json_wave::<Proposal>(
             jobs,
@@ -1183,6 +1184,7 @@ impl Runner {
             node: "implement",
             prompts: &prompts,
             cache: cache.as_deref(),
+            round: None,
         };
         let mut results = wave(jobs, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
         self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
@@ -1388,6 +1390,7 @@ impl Runner {
                 node: "implement",
                 prompts,
                 cache: cache.as_deref(),
+                round: None,
             };
             let (resumed_seat, resumed) =
                 run_one(retry, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
@@ -1466,6 +1469,7 @@ impl Runner {
                 node: "implement",
                 prompts,
                 cache: cache.as_deref(),
+                round: None,
             };
             let (resumed_seat, resumed) =
                 run_one(retry, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
@@ -1576,6 +1580,7 @@ impl Runner {
                 node: "fix",
                 prompts,
                 cache: cache.as_deref(),
+                round: Some(round),
             };
             let (resumed_seat, resumed_out) = run_one(
                 retry,
@@ -1807,6 +1812,7 @@ impl Runner {
             node: "judge",
             prompts: &prompts,
             cache: cache.as_deref(),
+            round: None,
         };
         let results = ask_json_wave::<Ranking>(
             jobs,
@@ -1951,6 +1957,7 @@ impl Runner {
                     node: "deliberate",
                     prompts: &prompts,
                     cache: cache.as_deref(),
+                    round: None,
                 };
                 let (updated, out) =
                     run_one(job, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
@@ -2103,6 +2110,7 @@ impl Runner {
             node: "vote",
             prompts: &prompts,
             cache: cache.as_deref(),
+            round: None,
         };
         let results = ask_json_wave::<FinalVote>(
             jobs,
@@ -2443,6 +2451,7 @@ impl Runner {
             node: "judge",
             prompts: &prompts,
             cache: cache.as_deref(),
+            round: None,
         };
         let results = ask_json_wave::<Ranking>(
             judge_jobs,
@@ -2517,6 +2526,7 @@ impl Runner {
             node: "vote",
             prompts: &prompts,
             cache: vote_cache.as_deref(),
+            round: None,
         };
         let votes = ask_json_wave::<FinalVote>(
             vote_jobs,
@@ -2842,11 +2852,23 @@ impl Runner {
         let reviewers = self.roles.reviewers.clone();
         let shell = self.state.config.shell();
 
-        let mut prev_e2e: Option<String> = None;
         for round in (self.state.reviews.len() + 1)..=max_rounds {
             let head = git::rev_parse(&winner.worktree, "HEAD").await?;
             let patch = git::diff(&winner.worktree, &base, "HEAD").await?;
             let stat = git::diff_stat(&winner.worktree, &base, "HEAD").await?;
+            // The prior round's own record, already persisted — never a
+            // hand-carried variable of just its failing output: that is
+            // exactly what let a round's e2e result drift out of sync with
+            // which commit it was actually about (see `SCHEMA`'s doc for
+            // schema 8). Judged against `head`, the commit reviewers are
+            // about to look at now, so the summary always reads as "an
+            // earlier head" here — this round's own patch has not been
+            // checked yet.
+            let prev_verification = self
+                .state
+                .reviews
+                .last()
+                .and_then(|r| r.verification_summary(&head));
 
             // Each reviewer gets its own detached checkout of exactly this
             // commit: nobody can perturb the winner's tree, and the fixer can
@@ -2868,7 +2890,7 @@ impl Runner {
                         base_short: &base_short,
                         stat: &stat,
                         patch: &patch,
-                        e2e: prev_e2e.as_deref(),
+                        verification: prev_verification.as_ref(),
                         reviewers: reviewers.len(),
                         round,
                         rounds: max_rounds,
@@ -2905,6 +2927,7 @@ impl Runner {
                 node: "review",
                 prompts: &prompts,
                 cache: review_cache.as_deref(),
+                round: Some(round),
             };
             let results = ask_json_wave::<Review>(
                 jobs,
@@ -3080,6 +3103,7 @@ impl Runner {
                     node: "review",
                     prompts: &prompts,
                     cache: recon_cache.as_deref(),
+                    round: Some(round),
                 };
                 let recon_results = ask_json_wave::<ReviewRevote>(
                     jobs,
@@ -3213,12 +3237,6 @@ impl Runner {
                 (e2e, verify_retried, false, None)
             };
 
-            let e2e_failures: String = e2e
-                .iter()
-                .filter(|o| !o.ok())
-                .map(|o| format!("$ {}\n{}\n", o.command, o.output_tail))
-                .collect();
-
             let expected = records.len();
             let answered = records.iter().filter(|r| r.failed.is_none()).count();
             let incomplete = answered < expected;
@@ -3237,6 +3255,7 @@ impl Runner {
                 round,
                 head: head.clone(),
                 verified_head: None,
+                verified_at: None,
                 reviews: records,
                 e2e,
                 verify_retried,
@@ -3252,6 +3271,18 @@ impl Runner {
                 reconsideration,
                 verdict: round_verdict,
             };
+            // Only a real attempt vouches for the commit it names — see
+            // `ReviewRound::verified_head`'s own doc. A resource-blocked
+            // attempt checked nothing, and a deferred/unconfigured round
+            // never ran at all.
+            if matches!(
+                round_record.e2e_status(),
+                E2eStatus::Passed | E2eStatus::Failed
+            ) {
+                round_record.verified_head = Some(head.clone());
+                round_record.verified_at = Some(Timestamp::now());
+            }
+            let this_round_verification = round_record.verification_summary(&head);
 
             if incomplete {
                 let missing: Vec<String> = round_record
@@ -3316,7 +3347,6 @@ impl Runner {
                     );
                     return Ok(());
                 }
-                prev_e2e = None;
                 continue;
             }
 
@@ -3356,8 +3386,7 @@ impl Runner {
                 prompt: prompt::fix(
                     &self.state.instruction,
                     &blocking_findings,
-                    (!e2e_failures.is_empty()).then_some(e2e_failures.as_str()),
-                    e2e_deferred,
+                    this_round_verification.as_ref(),
                     round,
                     max_rounds,
                     &language,
@@ -3378,6 +3407,7 @@ impl Runner {
                 node: "fix",
                 prompts: &prompts,
                 cache: cache.as_deref(),
+                round: Some(round),
             };
             let (seat, out) =
                 run_one(job.clone(), Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
@@ -3557,8 +3587,6 @@ impl Runner {
                     .await;
             }
 
-            prev_e2e = (!e2e_failures.is_empty()).then_some(e2e_failures);
-
             let streak = self
                 .state
                 .reviews
@@ -3653,9 +3681,12 @@ impl Runner {
             last.e2e = outcomes;
             last.verify_retried = verify_retried;
             last.e2e_deferred = false;
-            if verified_head != last.head {
-                last.verified_head = Some(verified_head);
-            }
+            // Always the commit this attempt actually checked, whether or
+            // not it happens to equal the reviewed `head` — see
+            // `ReviewRound::verified_head`'s own doc for why the field no
+            // longer stays `None` on the common case.
+            last.verified_head = Some(verified_head);
+            last.verified_at = Some(Timestamp::now());
         }
         let last = &self.state.reviews[round_idx];
         let red: Vec<String> = last
@@ -4192,6 +4223,9 @@ struct WaveCtx<'a> {
     prompts: &'a Prompts,
     /// The shared `CARGO_TARGET_DIR`, when the config declares one.
     cache: Option<&'a Path>,
+    /// The review round this wave belongs to, for `"review"`/`"fix"` — see
+    /// `JobRecord::round`. `None` for every other node.
+    round: Option<usize>,
 }
 
 /// Run one job, honouring the parallelism budget.
@@ -4226,6 +4260,7 @@ async fn wave(
         node,
         prompts,
         cache,
+        round,
     } = *ctx;
     for job in &jobs {
         state.seat_started(node, &job.seat.key, job.timeout, attempt);
@@ -4359,7 +4394,7 @@ async fn wave(
             }
         };
         state.seat_finished(&seat.key);
-        record_jobs(state, node, &seat.key, &out);
+        record_jobs(state, node, round, &seat.key, &out);
         if let Err(e) = state.save() {
             tracing::warn!("could not persist a seat's completion: {e:#}");
         }
@@ -4412,7 +4447,13 @@ async fn wave(
 /// evidence from; `Failed` does not, and correctly contributes nothing — a
 /// timeout or crash is not itself evidence about a command the seat may have
 /// started.
-fn record_jobs(state: &mut RunState, node: &str, seat: &str, out: &AgentOutcome) {
+fn record_jobs(
+    state: &mut RunState,
+    node: &str,
+    round: Option<usize>,
+    seat: &str,
+    out: &AgentOutcome,
+) {
     let commands: &[agent::CommandEvidence] = match out {
         AgentOutcome::Ok(o) | AgentOutcome::Quota(o) | AgentOutcome::Dropped(o) => &o.commands,
         AgentOutcome::Failed(_) => &[],
@@ -4421,6 +4462,7 @@ fn record_jobs(state: &mut RunState, node: &str, seat: &str, out: &AgentOutcome)
     for c in commands {
         state.jobs.push(JobRecord {
             node: node.to_owned(),
+            round,
             seat: seat.to_owned(),
             id: c.id.clone(),
             description: c.description.clone(),
@@ -5523,6 +5565,7 @@ mod tests {
             round: 1,
             head: "h".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: Vec::new(),
             e2e: vec![CommandOutcome {
                 command: "test".to_owned(),
@@ -6088,6 +6131,7 @@ mod tests {
             round: 1,
             head: "deadbeef".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             fix: None,
@@ -6210,6 +6254,7 @@ mod tests {
             round: 1,
             head: "deadbeef".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             fix: None,
@@ -6311,6 +6356,7 @@ mod tests {
             round: 1,
             head: "deadbeef".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             fix: None,
@@ -6443,6 +6489,7 @@ mod tests {
             round: 1,
             head: "deadbeef".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             fix: None,
@@ -6546,6 +6593,7 @@ mod tests {
             round: 1,
             head: "deadbeef".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: Vec::new(),
             e2e: Vec::new(),
             fix: None,
@@ -6657,6 +6705,7 @@ mod tests {
             round: 2,
             head: "deadbee".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "alpha".to_owned(),
@@ -6717,6 +6766,7 @@ mod tests {
             round: 1,
             head: "deadbee".to_owned(),
             verified_head: None,
+            verified_at: None,
             reviews: vec![ReviewRecord {
                 reviewer: 1,
                 agent: "alpha".to_owned(),

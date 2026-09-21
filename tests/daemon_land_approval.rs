@@ -151,6 +151,7 @@ fn parked_run(repo: &std::path::Path, config: &magi::config::Config) -> RunState
         round: 1,
         head: "deadbeef".to_owned(),
         verified_head: None,
+        verified_at: None,
         reviews: Vec::new(),
         e2e: Vec::new(),
         fix: None,

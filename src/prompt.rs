@@ -583,8 +583,13 @@ pub struct ReviewCtx<'a> {
     pub stat: &'a str,
     /// The patch.
     pub patch: &'a str,
-    /// Verification output from the previous round, when there was one.
-    pub e2e: Option<&'a str>,
+    /// The prior round's verification, pre-labeled by
+    /// [`crate::run::ReviewRound::verification_summary`] against the head
+    /// this round is reviewing — `None` when there is nothing worth
+    /// surfacing. Always about a commit that came *before* this one: see
+    /// [`review`], which spells that out so a red result from a fix that has
+    /// since landed is never read as today's answer.
+    pub verification: Option<&'a crate::run::VerificationSummary>,
     /// How many reviewers are in this round.
     pub reviewers: usize,
     /// 1-based round number.
@@ -629,7 +634,7 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
         base_short,
         stat,
         patch,
-        e2e,
+        verification,
         reviewers,
         round,
         rounds,
@@ -661,12 +666,20 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
     );
     let _ = write!(s, "# The task\n\n{instruction}\n\n");
     s.push_str(&patch_block(branch, base_short, stat, patch));
-    if let Some(out) = e2e {
+    if let Some(v) = verification {
         let _ = write!(
             s,
-            "\n# Verification output from the previous round\n\n```\n{}\n```\n",
-            out.trim()
+            "\n# Verification from an earlier round\n\n{}\n\n\
+             This is not something you measured yourself: it is a result from a commit \
+             that came before the one above, carried forward as a hint about whether an \
+             earlier fix landed — not as proof it still holds for the patch you are \
+             reviewing now. You may still raise a concern from reading the code even if \
+             nothing here confirms or denies it.\n",
+            v.label
         );
+        if let Some(tail) = &v.tail {
+            let _ = write!(s, "\n```\n{}\n```\n", tail.trim());
+        }
     }
     s.push_str(
         "\n# What to report\n\n\
@@ -846,17 +859,17 @@ pub fn review_reconsider(ctx: &ReviewReconsiderCtx<'_>) -> String {
 
 /// Prompt for the fixer, given a round's findings.
 ///
-/// `e2e_deferred` is true when this round's `verify.e2e` was intentionally
-/// not run (blocking findings already required a fix, and a round remained
-/// to actually verify once none are left) — distinct from `e2e` being `None`
-/// because verification ran and every command passed. Telling the fixer
-/// which one happened matters: silence here would read as "nothing to worry
-/// about", and a deferred check is not a passing one.
+/// `verification` is this same round's own verification, pre-labeled by
+/// [`crate::run::ReviewRound::verification_summary`] — `None` when the round
+/// simply passed or had nothing configured, in which case silence is
+/// correct: there is nothing here to worry about. A deferred check is
+/// carried through the same `Some`, spelled out as not yet run rather than
+/// left silent, because silence here would read as "nothing to worry about"
+/// and a deferred check is not a passing one.
 pub fn fix(
     instruction: &str,
     findings: &[Finding],
-    e2e: Option<&str>,
-    e2e_deferred: bool,
+    verification: Option<&crate::run::VerificationSummary>,
     round: usize,
     rounds: usize,
     language: &str,
@@ -886,19 +899,15 @@ pub fn fix(
             f.detail.trim()
         );
     }
-    if let Some(out) = e2e {
-        let _ = write!(
-            s,
-            "\n# Verification output (must end green)\n\n```\n{}\n```\n",
-            out.trim()
-        );
-    } else if e2e_deferred {
-        s.push_str(
-            "\n# Verification\n\nNot run this round — the findings above already required a \
-             fix, so magi deferred the full verification run rather than spend it on a head \
-             about to change. It runs once a round has no blocking findings left; it has not \
-             passed, and it has not failed. Do not treat its absence here as a pass.\n",
-        );
+    if let Some(v) = verification {
+        let _ = write!(s, "\n# Verification\n\n{}\n", v.label);
+        if let Some(tail) = &v.tail {
+            let _ = write!(
+                s,
+                "\nMust end green before this is done.\n\n```\n{}\n```\n",
+                tail.trim()
+            );
+        }
     }
     s.push_str(
         "\n# Rules\n\n\
@@ -1536,7 +1545,7 @@ mod tests {
             base_short: "abc1234",
             stat: " a | 1 +",
             patch: "diff",
-            e2e: None,
+            verification: None,
             reviewers: 2,
             round: 1,
             rounds: 6,
@@ -1552,6 +1561,38 @@ mod tests {
         assert!(p.contains("An empty review is a valid review"));
         assert!(p.contains("do not modify"));
         assert!(p.contains("\"vote\""));
+    }
+
+    #[test]
+    fn review_prompt_marks_a_prior_round_result_as_not_the_reviewers_own_measurement() {
+        let summary = crate::run::VerificationSummary {
+            label: "round 1, commit abc1234 (an earlier head, since superseded), checked at \
+                     2026-01-01T00:00:00Z\nresult: FAILED"
+                .to_owned(),
+            tail: Some("$ cargo test\nFAILED".to_owned()),
+        };
+        let mut ctx = review_ctx(true);
+        ctx.verification = Some(&summary);
+        let p = review(&ctx);
+        assert!(p.contains("commit abc1234"));
+        assert!(
+            p.contains("not something you measured yourself"),
+            "a carried-forward result must be explicitly disclaimed, not read as today's \
+             answer: {p}"
+        );
+        assert!(p.contains("$ cargo test"));
+        // The disclaimer sits between the label and the raw tail, not after
+        // both — a reader must see the caveat before the evidence that could
+        // otherwise read as a fresh red.
+        let disclaimer_at = p.find("not something you measured yourself").unwrap();
+        let tail_at = p.find("$ cargo test").unwrap();
+        assert!(disclaimer_at < tail_at);
+    }
+
+    #[test]
+    fn review_prompt_says_nothing_when_there_is_no_prior_verification_to_show() {
+        let p = review(&review_ctx(true));
+        assert!(!p.contains("Verification from an earlier round"));
     }
 
     #[test]
@@ -1698,7 +1739,13 @@ mod tests {
             title: "panics".to_owned(),
             detail: "empty input".to_owned(),
         }];
-        let p = fix("task", &findings, Some("FAILED"), false, 2, 6, "en");
+        let v = crate::run::VerificationSummary {
+            label: "round 2, commit abc1234 (this is the head being looked at now), checked at \
+                     2026-01-01T00:00:00Z\nresult: FAILED"
+                .to_owned(),
+            tail: Some("FAILED".to_owned()),
+        };
+        let p = fix("task", &findings, Some(&v), 2, 6, "en");
         assert!(p.contains("R1-1-1"));
         assert!(p.contains("src/a.rs:9"));
         assert!(p.contains("FAILED"));
@@ -1707,7 +1754,11 @@ mod tests {
 
     #[test]
     fn fix_prompt_survives_an_empty_finding_list() {
-        let p = fix("task", &[], Some("boom"), false, 3, 6, "en");
+        let v = crate::run::VerificationSummary {
+            label: "boom".to_owned(),
+            tail: None,
+        };
+        let p = fix("task", &[], Some(&v), 3, 6, "en");
         assert!(p.contains("(none"));
         assert!(p.contains("boom"));
     }
@@ -1722,14 +1773,21 @@ mod tests {
             title: "panics".to_owned(),
             detail: "empty input".to_owned(),
         }];
-        let p = fix("task", &findings, None, true, 1, 6, "en");
+        let v = crate::run::VerificationSummary {
+            label: "round 1, commit unknown (no command finished checking one), checked at: \
+                     unknown (recorded before this was tracked)\nresult: not run this round \
+                     yet — deferred to the fixer. Not passed, not failed."
+                .to_owned(),
+            tail: None,
+        };
+        let p = fix("task", &findings, Some(&v), 1, 6, "en");
         assert!(
-            p.contains("Not run this round"),
+            p.contains("not run this round"),
             "a deferred check must say so, not read as a silent pass: {p}"
         );
         assert!(
-            !p.contains("must end green"),
-            "no verification output section without an actual run: {p}"
+            !p.contains("Must end green"),
+            "no red output section without an actual run: {p}"
         );
     }
 
@@ -1743,11 +1801,12 @@ mod tests {
             title: "panics".to_owned(),
             detail: "empty input".to_owned(),
         }];
-        let p = fix("task", &findings, None, false, 1, 6, "en");
+        let p = fix("task", &findings, None, 1, 6, "en");
         assert!(
-            !p.contains("Not run this round"),
+            !p.contains("not run this round"),
             "a round whose e2e simply had nothing to report must not read as deferred: {p}"
         );
+        assert!(!p.contains("# Verification"));
     }
 
     #[test]
