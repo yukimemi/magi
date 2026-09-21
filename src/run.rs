@@ -805,7 +805,13 @@ impl ReviewRound {
                 .to_owned(),
         };
         let label = format!("round {}, {commit}, {checked_at}\n{result}", self.round);
-        let tail = (status == E2eStatus::Failed).then(|| {
+        // `Failed` names the command that actually ran and failed;
+        // `ResourceBlocked` names the operation magi was waiting on (or the
+        // freshness check it could not confirm) — `command` still says what
+        // was attempted even though nothing finished, and leaving it out is
+        // exactly how a reviewer or fixer lost the one thing this leg *can*
+        // still tell them: what was being checked, not whether it passed.
+        let tail = matches!(status, E2eStatus::Failed | E2eStatus::ResourceBlocked).then(|| {
             self.e2e
                 .iter()
                 .filter(|o| !o.ok())
@@ -845,7 +851,10 @@ pub enum E2eStatus {
 pub struct VerificationSummary {
     /// Round, commit, freshness and result — always present.
     pub label: String,
-    /// Raw `$ command` / output tail, present only when `result: FAILED`.
+    /// Raw `$ command` / output tail, present for `result: FAILED` and for
+    /// a resource-blocked attempt (naming the operation magi was waiting on,
+    /// even though nothing finished) — absent for every other result, which
+    /// has nothing to add past the label.
     pub tail: Option<String>,
 }
 
@@ -2193,10 +2202,13 @@ mod tests {
             .verification_summary("h")
             .expect("a resource block is still surfaced, never silent");
         assert!(blocked.label.contains("could not run"));
-        assert!(
-            blocked.tail.is_none(),
-            "no command actually ran; there is no output to quote"
-        );
+        // No command actually ran, but which operation was attempted is
+        // still a fact worth showing — never silent past the label either.
+        let tail = blocked
+            .tail
+            .expect("the attempted operation is still named");
+        assert!(tail.contains("(waiting for the shared build cache)"));
+        assert!(tail.contains("contended"));
 
         let mut d = round(false, Vec::new());
         d.e2e_deferred = true;

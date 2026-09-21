@@ -1810,6 +1810,36 @@ mod tests {
     }
 
     #[test]
+    fn fix_prompt_names_the_operation_a_resource_block_never_finished_running() {
+        // Nothing ran, so there is no test output to quote — but which
+        // command/operation magi was waiting on is still a known fact, and
+        // must reach the fixer alongside the findings it does have real work
+        // to do on.
+        let findings = [Finding {
+            id: "R1-1-1".to_owned(),
+            severity: Severity::Blocker,
+            file: None,
+            line: None,
+            title: "panics".to_owned(),
+            detail: "empty input".to_owned(),
+        }];
+        let v = crate::run::VerificationSummary {
+            label: "round 1, commit abc1234 (this is the head being looked at now), checked at \
+                     2026-01-01T00:00:00Z\nresult: could not run — the shared build cache was \
+                     not available."
+                .to_owned(),
+            tail: Some("$ (waiting for the shared build cache)\nheld by run x\n".to_owned()),
+        };
+        let p = fix("task", &findings, Some(&v), 1, 6, "en");
+        assert!(p.contains("could not run"));
+        assert!(
+            p.contains("(waiting for the shared build cache)"),
+            "the operation magi was waiting on must reach the fixer even though nothing \
+             finished checking it: {p}"
+        );
+    }
+
+    #[test]
     fn advisor_prompt_forbids_writing_and_names_the_seat() {
         let p = advisor("add retries", 2, 3, "en");
         assert!(p.contains("advisor 2 of 3"), "{p}");

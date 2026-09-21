@@ -2841,29 +2841,20 @@ impl Runner {
             return Ok(());
         }
         self.state.status = RunStatus::Reviewing;
-        // `review_conclusion` returns `None` for a last round stuck at
-        // `ResourceBlocked` exactly when it would otherwise have had to
-        // guess a verdict (round budget spent, or the tree stagnant) — the
-        // same gate it uses to decide whether to decide at all. The loop
-        // below has nothing left to do in that shape: its range is empty
-        // once the budget is spent, and a stagnant tree should not start a
-        // fresh round on top of one whose own check never resolved either.
-        // Retry that check directly instead of leaving the run parked in
-        // `Reviewing` forever.
-        let stagnant = self
+        // A last recorded round whose own verification never resolved
+        // (`ResourceBlocked` — the shared build cache, not the patch) is
+        // never a concluded round, whatever the round budget says: starting
+        // a fresh round on top of it would spend a whole new reviewer wave
+        // re-reading an unchanged patch instead of just retrying the one
+        // check that actually needs it, and once the budget is spent the
+        // loop below has nothing left to do at all (its range is empty).
+        // Retry that check directly instead, exactly the same retry
+        // `stop_reviewing` already does for its own catch-up case.
+        if self
             .state
             .reviews
-            .iter()
-            .rev()
-            .take_while(|r| !r.progressed)
-            .count()
-            >= STAGNANT_LIMIT;
-        if (self.state.reviews.len() >= max_rounds || stagnant)
-            && self
-                .state
-                .reviews
-                .last()
-                .is_some_and(|r| r.e2e_status() == E2eStatus::ResourceBlocked)
+            .last()
+            .is_some_and(|r| r.e2e_status() == E2eStatus::ResourceBlocked)
         {
             let shell = self.state.config.shell();
             return self
@@ -3387,6 +3378,28 @@ impl Runner {
                     return Ok(());
                 }
                 continue;
+            }
+
+            // Nothing for the fixer to act on (`blocking == 0`) and the only
+            // reason this round is not clean is that magi itself never got
+            // a command to run — the shared build cache, not the patch (see
+            // `CommandOutcome::resource_blocked`'s own doc). Sending that to
+            // the fixer would invite a change to appease contention that has
+            // nothing to do with the diff, and would leave this attempt
+            // sitting in the next round's prompt as if it were about an
+            // earlier, superseded commit rather than what it actually is:
+            // the same head, still waiting to be checked. Wait for it the
+            // same way the final round's own contention is already handled,
+            // whatever round this happens to be.
+            if blocking == 0 && round_record.e2e_status() == E2eStatus::ResourceBlocked {
+                self.state.reviews.push(round_record);
+                return self
+                    .stop_reviewing(
+                        "the round's own verification could not run",
+                        &shell,
+                        &winner.worktree,
+                    )
+                    .await;
             }
 
             if round == max_rounds {
