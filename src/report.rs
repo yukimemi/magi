@@ -156,15 +156,41 @@ fn continuation_note(c: &crate::run::ContinuationRecord) -> String {
 /// A CLI this crate has no adapter for (every backend but Codex, as of this
 /// writing) never appears here at all — silence is "no evidence", not "no
 /// jobs ran", which the trailing coverage line exists to say once rather
-/// than per seat. A command a CLI never reported finishing (still running
-/// when its turn ended) is the same absence: nothing here claims to
-/// distinguish "still running" from "never started", because no adapter
-/// currently has the evidence to. `magi show`'s own seat-completion state
-/// ([`active_seats`]) already answers "is the seat itself still mid-turn";
-/// this only ever speaks to commands a *finished* turn reported.
+/// than per seat.
+///
+/// There is deliberately no "running" state anywhere in this. A command a
+/// CLI never reported finishing has no way to be told apart from one that
+/// never started at all: the CLI that would report it has, by construction,
+/// already stopped talking (killed by a timeout, or a park) by the time that
+/// question matters, so no event — real or guessed at — could ever answer
+/// it. Guessing at an unconfirmed event shape to manufacture a "running"
+/// entry is exactly the fabrication this feature must not do; recording that
+/// limit instead is what the task asks for here. `magi show`'s own
+/// seat-completion state ([`active_seats`]) still answers a related but
+/// different question honestly — "has this seat's own turn answered yet" —
+/// and stays the right place to look for that.
 fn jobs_section(state: &RunState) -> String {
     let mut s = String::new();
     if state.jobs.is_empty() {
+        // Not silent when it would matter: a run whose roster can actually
+        // report this (Codex, today) but has not yet says so explicitly, so
+        // "no adapter for this backend" and "nothing reported yet" are never
+        // the same blank space to a reader.
+        if state
+            .config
+            .agents
+            .iter()
+            .any(|a| a.kind == crate::config::AgentKind::Codex)
+        {
+            let _ = writeln!(
+                s,
+                "\n{}",
+                dim(
+                    "background jobs: no completed command evidence yet for this run (see \
+                     active seats above for what is still mid-turn)"
+                )
+            );
+        }
         return s;
     }
     let _ = writeln!(
@@ -1516,6 +1542,28 @@ mod tests {
         // The common case today (every backend but codex): silence, not a
         // clutter line repeated on every single `magi show`.
         assert!(!run(&state()).contains("background jobs"));
+    }
+
+    #[test]
+    fn a_codex_roster_with_no_completed_jobs_yet_says_so_instead_of_staying_silent() {
+        let _guard = plain();
+        let mut s = state();
+        s.config.agents.push(crate::config::AgentSpec {
+            id: "codex-one".to_owned(),
+            kind: crate::config::AgentKind::Codex,
+            model: None,
+            command: vec!["codex".to_owned()],
+            extra_args: Vec::new(),
+            env: BTreeMap::new(),
+            prompt_delivery: None,
+        });
+        let text = run(&s);
+        assert!(
+            text.contains("background jobs"),
+            "a run that could report this must not read the same as one that never could: \
+             {text}"
+        );
+        assert!(text.contains("no completed command evidence yet"));
     }
 
     #[test]

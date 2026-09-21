@@ -86,9 +86,17 @@ async fn a_fix_report_that_never_recovers_gives_up_within_the_continuation_budge
     runner.execute().await.expect("execute");
     let state = &runner.state;
 
-    assert!(
-        !state.reviews.is_empty(),
-        "at least one round must have run"
+    // Exhaustion stops the review loop outright rather than opening another
+    // round: a second round would dispatch a fresh reviewer wave and, if
+    // this round's blocking finding is still open, a fresh fix call — both
+    // against the very worktree the exhausted continuation's CLI was just
+    // in, with no way to confirm nothing it started is still running there.
+    // See `Runner::review_loop`'s own check on `ContinuationOutcome`.
+    assert_eq!(
+        state.reviews.len(),
+        1,
+        "an exhausted continuation must end the loop, not open a second round: {:?}",
+        state.reviews
     );
     for round in &state.reviews {
         let Some(fix) = &round.fix else { continue };
@@ -125,6 +133,11 @@ async fn a_fix_report_that_never_recovers_gives_up_within_the_continuation_budge
             "round {round}: the budget is exactly two, never a third call"
         );
     }
+    assert!(
+        !art.join("fix-2.out").exists() && !art.join("review-1-round2.out").exists(),
+        "no second-round fix or reviewer call may ever run against a worktree an exhausted \
+         continuation left unconfirmed"
+    );
 
     // A run this stuck must never read like a clean pass: no fixer report
     // ever landed, so nothing here is "0 findings" dressed up as success.
