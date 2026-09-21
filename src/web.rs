@@ -1019,7 +1019,7 @@ pub async fn serve(opts: Opts) -> Result<()> {
 
 /// `opts.repo`, or - when it is still `--repo`'s own default (`.`) and the
 /// process's own working directory is not a git checkout at all - the
-/// checkout [`repos::discover`] finds instead.
+/// checkout [`repos::discover_verified`] finds instead.
 ///
 /// Only the unmodified default is ever replaced: an operator who named a
 /// directory outright, git checkout or not, gets exactly that directory
@@ -1028,8 +1028,15 @@ pub async fn serve(opts: Opts) -> Result<()> {
 /// real repository is) that has always told them so - substituting a guess
 /// for an explicit answer would be a second, silent opinion about what they
 /// meant. There is no instruction or task text yet to match against this
-/// early, so only [`repos::discover`]'s own-repository tier can ever settle
-/// this - the hint tier never fires here.
+/// early, so only [`repos::discover_verified`]'s own-repository tier can
+/// ever settle this - the hint tier never fires here.
+///
+/// [`repos::discover_verified`], not [`repos::discover`]: a candidate this
+/// found by filesystem shape alone is not yet trustworthy - a stale `.git`,
+/// or a git installation that is broken in exactly the way that made the
+/// original `canonical` check above fail too - so it is re-checked with
+/// `git::toplevel` before it is ever used in place of the operator's own
+/// directory.
 async fn normalize_default_repo(repo: PathBuf) -> PathBuf {
     if repo != FsPath::new(".") {
         return repo;
@@ -1043,7 +1050,7 @@ async fn normalize_default_repo(repo: PathBuf) -> PathBuf {
     let Some(home) = dirs::home_dir() else {
         return repo;
     };
-    match repos::discover(&home, &[], None, updater::repo_name()) {
+    match repos::discover_verified(&home, &[], None, updater::repo_name()).await {
         Some(found) => {
             tracing::info!(
                 "the default --repo `.` ({}) is not a git checkout; using {} instead - {}",

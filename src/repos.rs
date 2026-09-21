@@ -11,7 +11,11 @@
 //! still means walking however many roots the operator configured on every
 //! request, and the web server should not repeat that walk on every poll. It
 //! is trusted for `[repos] scan_ttl` seconds and can always be forced with an
-//! explicit refresh.
+//! explicit refresh. [`discover_verified`] is the one exception: it spawns
+//! `git` to confirm a candidate [`discover`] found by filesystem shape alone
+//! actually works, because a caller substituting it for an unresolved
+//! `--repo .` needs more than a plausible path before using it silently -
+//! see its own doc.
 //!
 //! # One implementation, two callers
 //!
@@ -298,6 +302,33 @@ pub fn discover(
     }
 }
 
+/// [`discover`], but verified: a checkout is only returned once
+/// `crate::git::toplevel` confirms it actually works there. A directory that
+/// merely *has* a `.git` - a stale entry, a `git init` interrupted before it
+/// wrote anything past the directory itself, a linked worktree whose main
+/// checkout was since deleted - is not a confident match, and neither is a
+/// checkout found while the local git installation itself is broken: either
+/// way the caller must fall back to asking the operator exactly like a miss,
+/// not silently accept a path this module only ever inspected as bytes on
+/// disk.
+///
+/// The one function in this module that spawns anything - everything else
+/// here is the filesystem walk described in the module doc - because a
+/// plausible path is not the same claim as a working repository, and the
+/// callers this exists for (a default `--repo .` that already failed its
+/// own `git::toplevel` check) exist precisely because that distinction
+/// matters.
+pub async fn discover_verified(
+    home: &Path,
+    extra_roots: &[PathBuf],
+    hint: Option<&str>,
+    self_name: &str,
+) -> Option<Found> {
+    let found = discover(home, extra_roots, hint, self_name)?;
+    crate::git::toplevel(&found.path).await.ok()?;
+    Some(found)
+}
+
 /// In-process cache of the last scan.
 ///
 /// `Arc<Mutex<..>>` inside rather than deriving over a bare `Mutex`, so
@@ -572,5 +603,41 @@ mod tests {
 
         let found = discover(home, &[], None, "magi").expect("self-name match via worktree");
         assert_eq!(found.path, main.canonicalize().expect("canonicalize main"));
+    }
+
+    #[tokio::test]
+    async fn discover_verified_refuses_a_directory_whose_git_dir_is_not_a_real_checkout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        // `discover` alone is satisfied by a directory that merely has a
+        // `.git` - a stale entry, or a `git init` that never got past making
+        // the directory. `discover_verified` must catch what the bare
+        // filesystem shape cannot: `git` itself refuses to treat this as a
+        // working tree.
+        std::fs::create_dir_all(home.join("repos").join("widget").join(".git"))
+            .expect("create a .git directory with nothing real inside it");
+
+        assert!(
+            discover_verified(home, &[], None, "widget").await.is_none(),
+            "a `.git` directory that is not an actual checkout must not be returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_verified_accepts_a_real_checkout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let repo = home.join("repos").join("widget");
+        tokio::fs::create_dir_all(&repo)
+            .await
+            .expect("create repo dir");
+        crate::git::git(&repo, &["init", "-b", "main"])
+            .await
+            .expect("git init");
+
+        let found = discover_verified(home, &[], None, "widget")
+            .await
+            .expect("a real checkout resolves");
+        assert_eq!(found.path, repo.canonicalize().expect("canonicalize repo"));
     }
 }

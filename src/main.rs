@@ -2498,9 +2498,17 @@ fn asking_is_not_this_seat_s_job(node: &str) -> Option<String> {
 /// `magi.toml`, which has no `[repos]` section today but is not a fixture
 /// anything here should depend on).
 ///
-/// `hint` is free-form text - a task instruction, typically - [`repos::discover`]
-/// can match a repository's name against when the default falls through to
-/// it; `None` when the caller has no such text (most callers).
+/// `hint` is free-form text - a task instruction, typically -
+/// [`repos::discover_verified`] can match a repository's name against when
+/// the default falls through to it; `None` when the caller has no such text
+/// (most callers).
+///
+/// The fallback calls [`repos::discover_verified`], not `repos::discover`:
+/// a candidate found by filesystem shape alone (a plausible-looking `.git`)
+/// is not yet a confident match - a stale entry, or a git installation
+/// broken in exactly the way that made the `git::toplevel` check just below
+/// fail in the first place - so it is re-checked with `git::toplevel`
+/// before ever replacing the operator's own directory.
 async fn resolve_repo(repo: &Path, cwd: &Path, hint: Option<&str>) -> Result<PathBuf> {
     match repo.canonicalize() {
         Ok(canonical) => {
@@ -2508,7 +2516,8 @@ async fn resolve_repo(repo: &Path, cwd: &Path, hint: Option<&str>) -> Result<Pat
                 if repo == Path::new(".") {
                     if let Some(home) = dirs::home_dir() {
                         if let Some(found) =
-                            repos::discover(&home, &[], hint, magi::updater::repo_name())
+                            repos::discover_verified(&home, &[], hint, magi::updater::repo_name())
+                                .await
                         {
                             eprintln!(
                                 "the default --repo `.` ({}) is not a git checkout; using {} \
