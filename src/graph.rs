@@ -45,12 +45,13 @@ use crate::queue;
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
     DeliberationRound, DeliberationTurn, E2eStatus, FixRecord, JobRecord, JobStatus, Judgement,
-    MergeOutcome, QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus,
-    Tally, VoteRecord, tail, write_artifact,
+    MergeOutcome, OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest, QuotaLoss,
+    ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, Tally, VoteRecord, tail,
+    write_artifact,
 };
 use crate::verdict::{
-    self, FinalVote, FixReport, Position, Proposal, Ranking, Review, ReviewRevote, ReviewVote,
-    Severity,
+    self, FinalVote, Finding, FixReport, Position, Proposal, Ranking, Review, ReviewRevote,
+    ReviewVote, Severity,
 };
 
 /// How much verification output is kept and fed back to the fixer.
@@ -304,6 +305,77 @@ async fn resolve_base(repo: &Path, base_branch: &str, remote: &str) -> Result<St
              branch that exists"
         )
     })
+}
+
+/// Exclusive claim on one run's `magi fix` step, released on drop — including
+/// on an early return or a panic.
+///
+/// `daemon::is_working_on` only sees a heartbeat-publishing daemon; two
+/// manual `magi fix` invocations against the same run are otherwise
+/// invisible to each other and would race to remove and recreate the same
+/// worktree (see [`Runner::fix_selected`]). The lock file itself is the same
+/// `create_new` shape as `queue::Claim`, but unlike a queued task's lock —
+/// which is only ever reclaimed later, out of band, by
+/// `daemon::sweep_stale_claims` running inside `magi serve`/`magi web` — a
+/// `magi fix` invocation is not necessarily running under either of those, so
+/// nothing would ever sweep a lock a killed or crashed process left behind.
+/// [`Self::acquire`] therefore reclaims a stale lock itself, on the same
+/// conservative PID-liveness policy `sweep_stale_claims` and `cache`'s own
+/// lease use: an unreadable or unparsable pid, or a liveness query the
+/// platform cannot answer, reads as alive and the lock is left in place.
+struct FixClaim {
+    path: PathBuf,
+}
+
+impl FixClaim {
+    fn acquire(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let path = dir.join("fix.lock");
+        match Self::create(&path) {
+            Ok(claim) => Ok(claim),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if Self::reclaim_if_dead(&path) {
+                    Self::create(&path).with_context(|| format!("lock {}", path.display()))
+                } else {
+                    bail!(
+                        "another `magi fix` is already running for this run ({} exists)",
+                        path.display()
+                    )
+                }
+            }
+            Err(e) => Err(e).with_context(|| format!("lock {}", path.display())),
+        }
+    }
+
+    fn create(path: &Path) -> std::io::Result<Self> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        use std::io::Write as _;
+        // Read back by `reclaim_if_dead` on a later, stuck invocation.
+        writeln!(f, "{}", std::process::id())?;
+        Ok(Self {
+            path: path.to_owned(),
+        })
+    }
+
+    /// True if the lock named a process confirmed dead, in which case it was
+    /// also removed. Never true on an unreadable file, an unparsable pid, or
+    /// a liveness query the platform cannot answer — see this type's own doc.
+    fn reclaim_if_dead(path: &Path) -> bool {
+        let dead = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|body| body.trim().parse::<u32>().ok())
+            .is_some_and(|pid| !crate::proc::pid_alive(pid));
+        dead && std::fs::remove_file(path).is_ok()
+    }
+}
+
+impl Drop for FixClaim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl Runner {
@@ -2799,6 +2871,466 @@ impl Runner {
             .base_sync
             .as_ref()
             .map_or_else(|| self.state.base_commit.clone(), |s| s.tip.clone())
+    }
+
+    // ------------------------------------------------------- operator fix
+
+    /// Route specific, already-recorded review findings to a fixer for a
+    /// targeted, out-of-band fix on the winning branch — `magi fix`'s own
+    /// entry point.
+    ///
+    /// Distinct from `review_loop`'s own fix step in three ways: it never
+    /// runs a reviewer wave, it never spends review-round budget, and what
+    /// happened is recorded as an [`OperatorFixRequest`] appended to
+    /// [`RunState::operator_fixes`], never folded into a [`ReviewRound`] —
+    /// see `run::SCHEMA`'s doc for schema 9 on why a reviewer's own severity
+    /// and vote must never be rewritten to look like a manufactured blocking
+    /// verdict.
+    ///
+    /// Only meaningful once review has actually concluded: `Ready` (handed
+    /// off with findings still open, or simply concluded clean while minor
+    /// findings sat unaddressed) or `Blocked` (round budget spent, or the
+    /// gate failed). Everything else is refused: a run still in progress
+    /// should simply be resumed, and a `Merged` run's branch has already
+    /// landed — reopening *this* run's own record cannot change that, so the
+    /// answer there is a fresh `magi review <branch>`.
+    ///
+    /// A real commit here re-verifies through a fresh, ordinary review-only
+    /// run on the same branch ([`Self::review`]) rather than reopening this
+    /// run's own `review_loop`: once any round in this run's history went
+    /// clean, `review_conclusion` treats that as permanent by design (the
+    /// same purity `gate`/`merge` rely on for safe reentry), so there is no
+    /// way to force one more genuine reviewer wave out of *this* run without
+    /// either rewriting history or weakening that guarantee for every other
+    /// caller. A review-only run costs nothing extra — no implementation, no
+    /// judging, no vote — and exercises the exact same review → verify →
+    /// gate → (human) merge path, unmodified.
+    pub async fn fix_selected(
+        &mut self,
+        ids: &[String],
+        reason: &str,
+        allow_stale: bool,
+    ) -> Result<()> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            bail!("a fix request needs a reason — that is the operator's own record of why");
+        }
+        if ids.is_empty() {
+            bail!("no finding id given");
+        }
+        if !matches!(self.state.status, RunStatus::Ready | RunStatus::Blocked) {
+            bail!(
+                "run {} is `{}`; only a `ready` or `blocked` run — one whose review \
+                 has already concluded — can be given a targeted fix. A run still \
+                 in progress should simply be resumed; a `merged` run's branch has \
+                 already landed, so its answer is a fresh `magi review <branch>`, \
+                 not reopening this run's own record",
+                self.state.id,
+                self.state.status.as_str()
+            );
+        }
+        let Some(winner) = self.state.winner().cloned() else {
+            bail!("run {} has no winning candidate to fix", self.state.id);
+        };
+        if !git::branch_exists(&self.state.repo, &winner.branch).await? {
+            bail!(
+                "branch `{}` no longer exists; this run cannot be extended",
+                winner.branch
+            );
+        }
+        let home = crate::run::home();
+        if crate::daemon::is_working_on(&home, &self.state.id, Timestamp::now()) {
+            bail!(
+                "run {} is currently being worked on by another magi process",
+                self.state.id
+            );
+        }
+        // Held for the rest of this call, including the follow-up review
+        // below: two `magi fix` invocations against the same run must not
+        // both reach the worktree manipulation further down, which would
+        // otherwise race to remove and recreate the same directory — see
+        // [`FixClaim`]'s own doc.
+        let _claim = FixClaim::acquire(&self.state.dir())?;
+
+        // Resolve every id before spending anything — an unknown id refuses
+        // the whole request rather than silently dropping it — and dedup
+        // while keeping the operator's own order.
+        let mut seen = BTreeSet::new();
+        let mut findings = Vec::new();
+        let mut missing = Vec::new();
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            match self.state.finding(id) {
+                Some((round, rec, f)) => findings.push(OperatorFixFinding {
+                    id: f.id.clone(),
+                    severity: f.severity,
+                    reviewer_vote: rec.vote,
+                    round: round.round,
+                    round_head: round.head.clone(),
+                    reviewer: rec.reviewer,
+                    agent: rec.agent.clone(),
+                    file: f.file.clone(),
+                    line: f.line,
+                    title: f.title.clone(),
+                    detail: f.detail.clone(),
+                    outcome: OperatorFixOutcome::Pending,
+                }),
+                None => missing.push(id.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            bail!(
+                "unknown finding id(s): {}; nothing was changed",
+                missing.join(", ")
+            );
+        }
+
+        let head_at_request = git::rev_parse(&self.state.repo, &winner.branch).await?;
+        let stale_details: Vec<(String, String)> = findings
+            .iter()
+            .filter(|f| f.round_head != head_at_request)
+            .map(|f| (f.id.clone(), f.round_head.clone()))
+            .collect();
+        let stale = !stale_details.is_empty();
+        if stale && !allow_stale {
+            bail!(
+                "the branch has moved since some finding(s) were raised — {} — now \
+                 at {}; pass --allow-stale to fix anyway, or re-run review first",
+                stale_details
+                    .iter()
+                    .map(|(id, head)| format!("{id} (raised against {})", short(head)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                short(&head_at_request)
+            );
+        }
+
+        let request = OperatorFixRequest {
+            requested_at: Timestamp::now(),
+            reason: reason.to_owned(),
+            findings,
+            head_at_request: head_at_request.clone(),
+            allow_stale,
+            stale,
+            fix: None,
+            result_head: None,
+            follow_up_review_run: None,
+        };
+        self.state.event(
+            "fix",
+            format!(
+                "operator requested a targeted fix on {} finding(s) ({}): {reason}",
+                request.findings.len(),
+                request
+                    .findings
+                    .iter()
+                    .map(|f| f.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        );
+        // Recorded now, before any worktree work or the fixer call itself —
+        // and re-saved at each checkpoint below: a crash at any point after
+        // this (mid fixer call, mid follow-up review) must not lose the fact
+        // that this was requested, for which findings, and why. Everything
+        // past this point reads and writes through `request_index` rather
+        // than a local variable, since `request` itself is moved here.
+        self.state.operator_fixes.push(request);
+        self.state.save()?;
+        let request_index = self.state.operator_fixes.len() - 1;
+
+        // A fresh, dedicated worktree for this one call, never the winner's
+        // own worktree in place: that one may already be gone (folded away),
+        // and reusing it in place would leave the branch checked out there
+        // when the follow-up review below tries to check it out again. Freed
+        // immediately after, either way — but only once confirmed clean:
+        // `worktree_remove` is a `git worktree remove --force`, which would
+        // otherwise discard uncommitted work left there by the operator or
+        // another process before this had a chance to even look at it.
+        if winner.worktree.exists() {
+            if !git::is_clean(&winner.worktree).await? {
+                bail!(
+                    "`{}` has uncommitted changes; refusing to touch it — commit or \
+                     discard them first",
+                    winner.worktree.display()
+                );
+            }
+            git::worktree_remove(&self.state.repo, &winner.worktree)
+                .await
+                .ok();
+        }
+        let fix_worktree = self.state.worktree_root().join("operator-fix");
+        let fix_worktree_s = fix_worktree.to_string_lossy().to_string();
+        git::git(
+            &self.state.repo,
+            &["worktree", "add", &fix_worktree_s, winner.branch.as_str()],
+        )
+        .await
+        .with_context(|| format!("checking out `{}` for the fix", winner.branch))?;
+        if !git::is_clean(&fix_worktree).await? {
+            git::worktree_remove(&self.state.repo, &fix_worktree)
+                .await
+                .ok();
+            bail!(
+                "`{}` has uncommitted changes; refusing to start a fix on a dirty tree",
+                winner.branch
+            );
+        }
+
+        let run_id = self.state.id.clone();
+        let prompts = self.state.config.prompts.clone();
+        let language = self.state.config.graph.language.clone();
+        let sessions = self.state.config.graph.sessions;
+        let artifacts = agent::artifacts_dir(&self.state.dir());
+        let (fix_spec, fix_seat_key) = match &self.roles.fixer {
+            Some(f) if f.id != winner.agent => (f.clone(), "fix".to_owned()),
+            _ => (
+                self.state
+                    .config
+                    .agent(&winner.agent)
+                    .cloned()
+                    .unwrap_or_else(|_| self.roles.implementers[winner.index].clone()),
+                format!("impl-{}", winner.label),
+            ),
+        };
+        let seat = self.seat(&fix_seat_key, &fix_spec.id);
+        let finding_list: Vec<Finding> = self.state.operator_fixes[request_index]
+            .findings
+            .iter()
+            .map(|f| Finding {
+                id: f.id.clone(),
+                severity: f.severity,
+                file: f.file.clone(),
+                line: f.line,
+                title: f.title.clone(),
+                detail: f.detail.clone(),
+            })
+            .collect();
+        let job = SeatJob {
+            prompt: prompt::operator_fix(
+                &self.state.instruction,
+                &finding_list,
+                reason,
+                &stale_details,
+                &head_at_request,
+                &language,
+            ),
+            spec: fix_spec.clone(),
+            seat,
+            cwd: fix_worktree.clone(),
+            timeout: Duration::from_secs(self.state.config.graph.timeout_fix),
+            allow_write: true,
+            sessions,
+            artifacts: artifacts.clone(),
+            stem: "operator-fix".to_owned(),
+        };
+        let cache = self.state.config.cache_dir();
+        let ctx = WaveCtx {
+            run: &run_id,
+            node: "fix",
+            prompts: &prompts,
+            cache: cache.as_deref(),
+            round: None,
+        };
+        let (seat, out) =
+            run_one(job.clone(), Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
+        let agent_id = seat.agent.clone();
+
+        let mut fix = FixRecord {
+            agent: agent_id,
+            addressed: Vec::new(),
+            rejected: Vec::new(),
+            notes: String::new(),
+            committed: false,
+            failed: None,
+            duration_ms: 0,
+            continuation: None,
+        };
+        let mut final_seat = seat.clone();
+        match out {
+            AgentOutcome::Ok(o) => {
+                fix.duration_ms = o.duration_ms;
+                let parsed = verdict::extract_json::<FixReport>(&o.text);
+                let incomplete_reason = match &parsed {
+                    Ok(_) if has_unconfirmed_command(&o.commands) => Some(
+                        "the reply parsed, but it reported a command whose own CLI \
+                         never confirmed an exit status"
+                            .to_owned(),
+                    ),
+                    Ok(_) => None,
+                    Err(e) => Some(e.to_string()),
+                };
+                match incomplete_reason {
+                    None => {
+                        let report = parsed.expect("checked Ok above");
+                        fix.addressed = report.addressed;
+                        fix.rejected = report.rejected;
+                        fix.notes = blind::sanitize_prose(&report.notes, &self.state.config.blind);
+                    }
+                    Some(reason) => {
+                        let (resumed_seat, resolved, failure, cont) = self
+                            .continue_fix_report(seat, reason, &job, &prompts, &run_id, 0)
+                            .await;
+                        fix.duration_ms += cont.cumulative_wait_ms;
+                        fix.continuation = Some(cont);
+                        final_seat = resumed_seat;
+                        match resolved {
+                            Some(report) => {
+                                fix.addressed = report.addressed;
+                                fix.rejected = report.rejected;
+                                fix.notes =
+                                    blind::sanitize_prose(&report.notes, &self.state.config.blind);
+                            }
+                            None => fix.failed = failure,
+                        }
+                    }
+                }
+            }
+            AgentOutcome::Dropped(o) => {
+                fix.duration_ms = o.duration_ms;
+                let why = o
+                    .dropped
+                    .as_ref()
+                    .map(|d| d.why.as_str())
+                    .unwrap_or("the CLI ended the stream without delivering its answer");
+                fix.failed = Some(format!("the CLI dropped the stream ({why})"));
+            }
+            AgentOutcome::Quota(o) => {
+                self.state.quota.push(QuotaLoss {
+                    seat: final_seat.key.clone(),
+                    node: "fix".to_owned(),
+                    at: Timestamp::now(),
+                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
+                });
+                fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
+            }
+            AgentOutcome::Failed(e) => fix.failed = Some(e),
+        }
+        if fix.continuation.is_none() {
+            fix.continuation = Some(ContinuationRecord::not_needed());
+        }
+        self.state.seats.insert(final_seat.key.clone(), final_seat);
+
+        git::commit_all(
+            &fix_worktree,
+            &format!(
+                "magi: operator-selected fix ({}) (uncommitted work)",
+                self.state.operator_fixes[request_index]
+                    .findings
+                    .iter()
+                    .map(|f| f.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+        .await
+        .ok();
+        let after = git::rev_parse(&fix_worktree, "HEAD").await?;
+        fix.committed = after != head_at_request;
+        git::worktree_remove(&self.state.repo, &fix_worktree)
+            .await
+            .ok();
+
+        self.state.event(
+            "fix",
+            match &fix.failed {
+                Some(reason) => format!(
+                    "operator fix: adoption report was lost ({reason}); {}",
+                    if fix.committed {
+                        "committed"
+                    } else {
+                        "NO new commit"
+                    }
+                ),
+                None => format!(
+                    "operator fix: {} addressed, {} rejected, {}",
+                    fix.addressed.len(),
+                    fix.rejected.len(),
+                    if fix.committed {
+                        "committed"
+                    } else {
+                        "NO new commit"
+                    }
+                ),
+            },
+        );
+
+        // Every selected finding gets an outcome — never left `Pending` once
+        // the fixer's own turn is over. A report that never came back at all
+        // marks every one of them `Unreported`, not silently "not addressed":
+        // quota, a dropped stream, or an exhausted continuation are gaps in
+        // the report, not evidence about the finding itself (see [`SCHEMA`]'s
+        // doc for schema 9 and [`OperatorFixOutcome::Unreported`]).
+        for f in &mut self.state.operator_fixes[request_index].findings {
+            f.outcome = if fix.failed.is_some() {
+                OperatorFixOutcome::Unreported
+            } else if fix.addressed.contains(&f.id) {
+                OperatorFixOutcome::Addressed
+            } else if let Some(r) = fix.rejected.iter().find(|r| r.id == f.id) {
+                OperatorFixOutcome::Rejected { why: r.why.clone() }
+            } else {
+                OperatorFixOutcome::Unreported
+            };
+        }
+
+        let committed = fix.committed;
+        if committed {
+            self.state.operator_fixes[request_index].result_head = Some(after.clone());
+        }
+        self.state.operator_fixes[request_index].fix = Some(fix);
+        // Saved again now that the fixer's own outcome is final, on top of
+        // the save right after the request was first pushed above.
+        self.state.save()?;
+
+        if committed {
+            self.state.event(
+                "fix",
+                format!(
+                    "operator fix committed {}; opening a follow-up review-only run",
+                    short(&after)
+                ),
+            );
+            match Self::review(&self.state.repo, &winner.branch, self.state.config.clone()).await {
+                Ok(mut follow_up) => {
+                    follow_up.state.event(
+                        "start",
+                        format!(
+                            "requested by an operator fix on run {} for finding(s) {}",
+                            self.state.id,
+                            self.state.operator_fixes[request_index]
+                                .findings
+                                .iter()
+                                .map(|f| f.id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ),
+                    );
+                    follow_up.state.save()?;
+                    let follow_up_id = follow_up.state.id.clone();
+                    if let Err(e) = follow_up.execute().await {
+                        self.state.event(
+                            "fix",
+                            format!(
+                                "follow-up review {follow_up_id} did not complete cleanly: {e:#}"
+                            ),
+                        );
+                    }
+                    self.state.operator_fixes[request_index].follow_up_review_run =
+                        Some(follow_up_id);
+                }
+                Err(e) => {
+                    self.state.event(
+                        "fix",
+                        format!("committed the fix but could not open a follow-up review: {e:#}"),
+                    );
+                }
+            }
+            self.state.save()?;
+        }
+
+        Ok(())
     }
 
     // --------------------------------------------------------------- review

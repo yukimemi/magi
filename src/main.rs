@@ -178,6 +178,36 @@ enum Command {
         #[arg(long, value_enum)]
         merge: Option<MergeArg>,
     },
+    /// Route specific, already-recorded review findings from a saved run to
+    /// a fixer, for a targeted fix on the same branch — never a re-review or
+    /// a new competition. Only meaningful on a `ready` or `blocked` run
+    /// whose review has already concluded; a run still in progress should
+    /// simply be resumed with `magi run --resume`.
+    ///
+    /// A committed fix opens a fresh, cheap review-only run on the same
+    /// branch to re-verify it (the same machinery `magi review` uses), gated
+    /// by the same human merge approval as any other run — this never
+    /// bypasses it. Findings not named here are left untouched; a reviewer's
+    /// recorded severity and vote are never rewritten, only added to.
+    Fix {
+        /// Run id or unambiguous prefix/suffix whose saved review holds the
+        /// findings.
+        run: String,
+        /// Finding id to route to the fixer, e.g. `R2-1-3`; repeat for more
+        /// than one.
+        #[arg(short = 'f', long = "finding", required = true)]
+        finding: Vec<String>,
+        /// Why this fix is being requested now — kept as part of the
+        /// permanent record, alongside each finding's original severity,
+        /// vote, and round.
+        #[arg(long)]
+        reason: String,
+        /// Proceed even though the branch has moved since a selected
+        /// finding's own round — the fixer is told which findings are stale
+        /// and against which commit.
+        #[arg(long)]
+        allow_stale: bool,
+    },
     /// List recorded runs.
     List {
         /// How many to show.
@@ -1002,6 +1032,60 @@ async fn dispatch(command: Command) -> Result<()> {
             let result = runner.execute().await;
             print!("{}", report::run(&runner.state));
             exit_status(result, runner.state.status, runner.state.pr.is_some())
+        }
+
+        Command::Fix {
+            run,
+            finding,
+            reason,
+            allow_stale,
+        } => {
+            let mut runner = Runner::resume(&run)?;
+            runner.fix_selected(&finding, &reason, allow_stale).await?;
+            print!("{}", report::run(&runner.state));
+            // `fix_selected` returning `Ok` only means the operator-fix step
+            // itself ran to completion, exactly like `execute()` returning
+            // `Ok` for a run that ended `Blocked` — it says nothing about
+            // whether the follow-up review it opened actually came out
+            // clean. A caller scripting on exit code alone must not read
+            // this as success just because nothing panicked, so the
+            // follow-up run's own outcome is checked here, the same as
+            // `exit_status` already does for `Command::Run`/`Command::Review`.
+            let last = runner.state.operator_fixes.last();
+            let follow_up = last.and_then(|r| r.follow_up_review_run.clone());
+            match follow_up {
+                Some(id) => {
+                    let follow_up_state = RunState::load(&id)
+                        .with_context(|| format!("load follow-up review run {id}"))?;
+                    if !follow_up_state.status.done() {
+                        bail!(
+                            "the fix committed, but the follow-up review run {id} did not \
+                             finish cleanly (status `{}`); see `magi show {id}`",
+                            follow_up_state.status.as_str()
+                        );
+                    }
+                    exit_status(Ok(()), follow_up_state.status, follow_up_state.pr.is_some())
+                        .with_context(|| {
+                            format!("see `magi show {id}` for what the follow-up review found")
+                        })
+                }
+                // `result_head` is only set once the fixer actually
+                // committed something (see `fix_selected`), so a `None`
+                // here has two different meanings that must not collapse
+                // into one exit code: nothing changed, so there was
+                // nothing to re-verify (fine) — or something changed and
+                // `Runner::review` itself could not even be opened for it
+                // (a real, unverified change sitting on the branch, not
+                // fine).
+                None if last.is_some_and(|r| r.result_head.is_some()) => {
+                    let id = &runner.state.id;
+                    bail!(
+                        "the fix committed a real change, but the follow-up review could not \
+                         be opened; the change is on the branch, unverified — see `magi show {id}`"
+                    );
+                }
+                None => Ok(()),
+            }
         }
 
         Command::List { limit } => {
@@ -4523,6 +4607,58 @@ mod tests {
                 assert_eq!(merged.seed, Some(7));
             }
             other => panic!("expected RunCmd::Rm with flags on both sides, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_fix_cli_argument_parsing() {
+        // A top-level command, not nested under `RunCmd`: `magi run fix ...`
+        // would collide with the extremely common task instruction "fix ..."
+        // (see test 3 in `run_rm_cli_argument_parsing`, which pins that
+        // exact instruction still parsing as prose), so this lives beside
+        // `Command::Review`/`Command::Fold` instead.
+        let parsed = Cli::try_parse_from([
+            "magi",
+            "fix",
+            "20260922-061620-a238",
+            "-f",
+            "R1-1-1",
+            "--finding",
+            "R1-2-3",
+            "--reason",
+            "worth fixing before release",
+            "--allow-stale",
+        ])
+        .unwrap();
+        match parsed.command {
+            Some(Command::Fix {
+                run,
+                finding,
+                reason,
+                allow_stale,
+            }) => {
+                assert_eq!(run, "20260922-061620-a238");
+                assert_eq!(finding, vec!["R1-1-1", "R1-2-3"]);
+                assert_eq!(reason, "worth fixing before release");
+                assert!(allow_stale);
+            }
+            other => panic!("expected Command::Fix, got {other:?}"),
+        }
+
+        // --finding and --reason are both required; --allow-stale defaults
+        // to false and is never required.
+        let err = Cli::try_parse_from(["magi", "fix", "some-run", "--reason", "why"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let err = Cli::try_parse_from(["magi", "fix", "some-run", "-f", "R1-1-1"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let parsed_no_stale =
+            Cli::try_parse_from(["magi", "fix", "some-run", "-f", "R1-1-1", "--reason", "why"])
+                .unwrap();
+        match parsed_no_stale.command {
+            Some(Command::Fix { allow_stale, .. }) => assert!(!allow_stale),
+            other => panic!("expected Command::Fix, got {other:?}"),
         }
     }
 
