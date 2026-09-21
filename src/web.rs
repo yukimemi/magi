@@ -8402,6 +8402,24 @@ mod tests {
         );
     }
 
+    /// `foldRuns`' refusal to walk a not-done run into someone else's
+    /// children (above) leaves it standing as its own head, but that alone
+    /// was not enough: `isOrphanSuperseded` used to answer `true` for any
+    /// head naming a `superseded_by`, done or not, so `stateFilteredHeads`
+    /// hid that same still-open head right back out of every non-"all" tab
+    /// by a different path. Since `visibleRunsFor` (the badge) and
+    /// `renderRuns`' card list both run through `stateFilteredHeads`, the
+    /// badge and the cards agreed - just on zero, with the run itself never
+    /// shown anywhere outside "all".
+    #[test]
+    fn a_not_done_head_is_never_treated_as_an_orphan_to_hide() {
+        assert!(
+            APP_JS.contains("return run.done && typeof run.superseded_by === \"string\" && run.superseded_by !== \"\";"),
+            "isOrphanSuperseded must require the run to be done before a \
+             superseded_by on it hides the run from non-\"all\" tabs"
+        );
+    }
+
     /// The runs tree (section) and the state chips (waiting/done) are two
     /// independent lenses ANDed together in `renderRuns`, and some pairings
     /// can never both be true for any run - every "Landed"/"Ended" run is

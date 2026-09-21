@@ -1379,9 +1379,18 @@ function sectionCompatibleWithStateFilter(sectionKey, filterKey) {
    be folded under a newer card — it is genuinely an old attempt, just one
    this client has nowhere to nest. Hiding it by default is the same
    judgement call as hiding "done": it is not what an operator scanning for
-   what needs them wants in front of them, and "all" still shows it. */
+   what needs them wants in front of them, and "all" still shows it.
+
+   That reasoning only holds once the run itself is done, though: a head
+   that is not done but still names a `superseded_by` (foldRuns' own guard
+   against walking through one — see its doc there — leaves exactly this
+   case standing as its own head) is not an old attempt with nowhere to
+   nest, it is live work that has not been folded away at all. Hiding it
+   here too would undo that guard by a different path, so this only ever
+   answers `true` for a run whose own current state agrees it has
+   concluded. */
 function isOrphanSuperseded(run) {
-  return typeof run.superseded_by === "string" && run.superseded_by !== "";
+  return run.done && typeof run.superseded_by === "string" && run.superseded_by !== "";
 }
 
 /* Exactly one chip is ever selected, so picking the already-selected one is
