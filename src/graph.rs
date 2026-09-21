@@ -3735,30 +3735,43 @@ impl Runner {
         self.state.status = RunStatus::Gating;
         let shell = self.state.config.shell();
         let gate_commands = self.state.config.verify.gate.clone();
-        let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
-        let cache_dir = self.state.config.cache_dir();
-        let head = git::rev_parse(&winner.worktree, "HEAD").await?;
-        let (outcomes, _) = with_cache_lease(
-            &mut self.state,
-            cache_dir.as_deref(),
-            "gate",
-            "gate",
-            &winner.worktree,
-            &head,
-            timeout,
-            "final gate",
-            |_state, budget| {
-                let shell = shell.clone();
-                let gate_commands = gate_commands.clone();
-                let worktree = winner.worktree.clone();
-                async move {
-                    let (outcomes, timed_out_pids) =
-                        run_commands(&shell, &gate_commands, &worktree, budget).await;
-                    (outcomes, false, timed_out_pids)
-                }
-            },
-        )
-        .await;
+        // Zero commands has nothing to run and nothing that could touch the
+        // shared build cache, so it never needs a lease: `Config::cache_dir`
+        // is derived from `verify.e2e` too, so a repo with no `verify.gate`
+        // commands but a `CARGO_TARGET_DIR`-using `verify.e2e` would
+        // otherwise queue behind an unrelated run's lease and come back
+        // resource-blocked - `gate_ran` would stay false on nothing but
+        // cache contention, for a step that had nothing to check in the
+        // first place.
+        let outcomes = if gate_commands.is_empty() {
+            Vec::new()
+        } else {
+            let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
+            let cache_dir = self.state.config.cache_dir();
+            let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+            let (outcomes, _) = with_cache_lease(
+                &mut self.state,
+                cache_dir.as_deref(),
+                "gate",
+                "gate",
+                &winner.worktree,
+                &head,
+                timeout,
+                "final gate",
+                |_state, budget| {
+                    let shell = shell.clone();
+                    let gate_commands = gate_commands.clone();
+                    let worktree = winner.worktree.clone();
+                    async move {
+                        let (outcomes, timed_out_pids) =
+                            run_commands(&shell, &gate_commands, &worktree, budget).await;
+                        (outcomes, false, timed_out_pids)
+                    }
+                },
+            )
+            .await;
+            outcomes
+        };
         if outcomes.is_empty() {
             // Nothing configured to check — distinct from every other
             // silence in this run's event log, since an empty `gate` alone
@@ -6326,6 +6339,135 @@ mod tests {
             runner.state.status,
             RunStatus::Ready,
             "a clean review-only run with no gate commands must reach Ready, not stay stuck in Gating"
+        );
+    }
+
+    /// `Config::cache_dir` is derived from `verify.e2e` as well as
+    /// `verify.gate` (so the e2e leg and the final gate never build against
+    /// different directories). With zero `verify.gate` commands but a
+    /// `CARGO_TARGET_DIR`-using `verify.e2e`, `gate` used to still queue for
+    /// that lease before discovering it had nothing to run - so a repo with
+    /// no gate commands could come back `resource_blocked` (and therefore
+    /// still `gate_ran == false`) on nothing but an unrelated run holding the
+    /// cache, exactly the contention this run's own zero commands could
+    /// never have touched. `gate` must recognise there is nothing to check
+    /// before it ever asks for the lease.
+    #[tokio::test]
+    async fn gate_never_asks_for_the_cache_lease_when_it_has_no_commands_to_run() {
+        crate::run::set_home(std::env::temp_dir().join("magi-graph-test-home"));
+        let home = crate::run::home();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        // Unique to this test, so holding its lease cannot collide with
+        // another test sharing the same process-wide `home`.
+        let cache_dir = tmp.path().join("target");
+
+        let mut config = Config::default();
+        config.verify.e2e = vec![format!("CARGO_TARGET_DIR='{}' true", cache_dir.display())];
+        // `verify.gate` stays empty (the default). Bounded so a regression
+        // that does start waiting fails the test in seconds, not hangs it.
+        config.graph.timeout_verify = Some(2);
+
+        let other = crate::cache::Owner::here("other-run", "e2e", "e2e", &repo, "deadbeef");
+        let _held = match crate::cache::try_acquire(&home, &cache_dir, &other)
+            .expect("no io error acquiring directly")
+        {
+            crate::cache::AcquireOutcome::Acquired(g) => g,
+            crate::cache::AcquireOutcome::Busy(b) => {
+                panic!("expected the direct acquire to win the lease first: {b:?}")
+            }
+        };
+
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            "deadbeef".to_owned(),
+            "task".to_owned(),
+            config,
+        );
+        state.candidates = vec![Candidate {
+            index: 0,
+            label: 'A',
+            agent: "alpha".to_owned(),
+            branch: "does-not-exist".to_owned(),
+            worktree: repo.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            duration_ms: 0,
+            folded: false,
+        }];
+        state.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 1)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("only candidate A produced a change".to_owned()),
+        });
+        state.reviews = vec![ReviewRound {
+            round: 1,
+            head: "deadbeef".to_owned(),
+            verified_head: None,
+            reviews: Vec::new(),
+            e2e: Vec::new(),
+            fix: None,
+            blocking: 0,
+            answered: 0,
+            expected: 0,
+            clean: true,
+            verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
+            progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
+        }];
+
+        let mut runner = Runner {
+            state,
+            roles: ResolvedRoles {
+                implementers: Vec::new(),
+                judges: Vec::new(),
+                reviewers: Vec::new(),
+                fixer: None,
+                conductor: conductor(),
+            },
+            sem: Arc::new(Semaphore::new(1)),
+            pause: Pause::new(),
+            interrupt: Pause::new(),
+        };
+
+        let started = std::time::Instant::now();
+        runner.gate().await.expect("gate");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a gate with nothing to run must never wait on a lease it never needed"
+        );
+        assert!(
+            runner.state.gate_ran,
+            "zero commands is still a real, immediate attempt"
+        );
+        assert!(runner.state.gate.is_empty());
+        assert_ne!(
+            runner.state.status,
+            RunStatus::Blocked,
+            "must not read as resource-blocked on a lease it never asked for"
         );
     }
 
