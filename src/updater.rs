@@ -70,6 +70,13 @@ const BIN: &str = "magi";
 /// Published package name, for kaishin's `cargo install` fallback.
 const CRATE: &str = "magi-cli";
 
+/// This binary's own repository name, for `--repo .` auto-discovery
+/// (`web::serve`, `main::resolve_repo`) to match a checkout against without
+/// a second, driftable copy of [`REPO`] anywhere else.
+pub fn repo_name() -> &'static str {
+    REPO
+}
+
 /// kaishin options.
 ///
 /// All four names are spelled out because three of them differ from
