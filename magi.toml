@@ -85,8 +85,8 @@ timeout_verify = 2400
 # `timeout_review` (the field it was split off from, see its doc comment in
 # `src/config.rs`) was left at its 1200s default. That field is the timeout
 # for the reviewer seat itself — both the ordinary review job
-# (`src/graph.rs:2506`, stem `review-{round}-{n}`) and the reconsider-review
-# job (`src/graph.rs:2689`, stem `review-{round}-reconsider-{n}`) pass it to
+# (`src/graph.rs:2883`, stem `review-{round}-{n}`) and the reconsider-review
+# job (`src/graph.rs:3066`, stem `review-{round}-reconsider-{n}`) pass it to
 # `Duration::from_secs` directly. `timeout_verify` only bounds the real-machine
 # verification commands, so raising it did nothing for the reviewer's own
 # budget: `review-1` kept timing out every round on this machine, e.g. runs
