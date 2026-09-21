@@ -8352,6 +8352,37 @@ mod tests {
         assert!(APP_JS.contains("lost to quota"));
     }
 
+    /// A state chip's count and the cards drawn under it used to come from
+    /// two different populations: the badge counted the full, unfolded
+    /// `/api/runs` list, while the cards went through `foldRuns` and (outside
+    /// "all") an orphan hide the badge never applied. A badge could read "9"
+    /// with a single card on screen to show for it. Both now run through
+    /// `visibleRunsFor`, so this locks that they stay one function apart
+    /// rather than drifting back into two hand-rolled counts.
+    #[test]
+    fn run_state_badge_and_cards_share_one_filter() {
+        assert!(APP_JS.contains(
+            "function stateFilteredHeads(heads, filterKey)"
+        ));
+        assert!(APP_JS.contains("function visibleRunsFor(heads, filterKey)"));
+        assert!(APP_JS.contains(
+            "return stateFilteredHeads(heads, filterKey).filter(matchesFilter);"
+        ));
+        // The chip badges: each one counts through visibleRunsFor.
+        assert!(APP_JS.contains(
+            "setText(node.querySelector(\".state-chip-count\"), String(visibleRunsFor(heads, def.key).length));"
+        ));
+        // The card list: the selected chip's cards come from the very same
+        // stateFilteredHeads() step the badges use, then the same
+        // matchesFilter() the shared helper applies.
+        assert!(APP_JS.contains(
+            "const stateFiltered = stateFilteredHeads(heads, state.runsStateFilter);"
+        ));
+        assert!(APP_JS.contains("const visible = stateFiltered.filter(matchesFilter);"));
+        // Both are fed `heads` (post-fold), never the raw, unfolded list.
+        assert!(APP_JS.contains("if (runs.length > 0) renderRunStateChips(heads);"));
+    }
+
     /// The runs tree (section) and the state chips (waiting/done) are two
     /// independent lenses ANDed together in `renderRuns`, and some pairings
     /// can never both be true for any run - every "Landed"/"Ended" run is
