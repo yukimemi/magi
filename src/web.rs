@@ -8497,36 +8497,35 @@ mod tests {
     }
 
     /// The "In flight" chip once read 9 while the list under it rendered a
-    /// single card: `renderRunStateChips` counted `matchesRunState` over the
-    /// raw `/api/runs` array, but `renderRuns` built the card list from
-    /// `foldRuns(runs).heads` first and only then applied the same
-    /// predicate — so any run folded under a different head as an earlier
-    /// attempt was counted in the badge and dropped from the list before
-    /// `matchesRunState` ever saw it.
+    /// single card. The server marks every consecutive pair in a task's run
+    /// history as `superseded_by` (`task.runs.windows(2)`, see
+    /// `superseded_runs`), which a still-open competition populates with
+    /// several attempts racing at once — none of them finished. The client's
+    /// `foldRuns` walked that chain the same way it walks a finished retry
+    /// history, so all but the last-started of those still-running rivals
+    /// got folded under a single head and vanished from every tab but "all",
+    /// even though `renderRunStateChips`'s badge counted them from the raw,
+    /// unfolded `/api/runs` array and so never dropped them.
     ///
     /// `cargo test` cannot execute the front end, so this pins the fix at
-    /// the source level: outside the "all" tab, the badge and the card list
-    /// must both walk the same array (`runs`, not `heads`) through the same
-    /// predicate (`matchesRunState`/`def.match`, both reading
-    /// `state.runsStateFilter`) — so either regressing back to counting one
-    /// array while rendering the other fails this test.
+    /// the source level: `foldRuns`'s walk must stop at a run that is not
+    /// done rather than following `superseded_by` past it, so a run still
+    /// in progress is always its own head; and `isOrphanSuperseded`, the
+    /// second hiding pass for a head whose successor fell off the page,
+    /// must require `run.done` so it can never hide a head that is only
+    /// unresolved because it is still running.
     #[test]
-    fn runs_state_chip_badge_and_card_list_share_source_and_predicate() {
+    fn fold_runs_never_folds_away_a_run_that_is_not_done() {
         assert!(
-            APP_JS.contains("setText(node.querySelector(\".state-chip-count\"), String(runs.filter(def.match).length));"),
-            "the badge counts matches over the full, raw runs array"
+            APP_JS.contains("      atIndex.set(cur.id, path.length);\n      path.push(cur);\n      if (!cur.done) break;\n      const next = nextOf(cur);"),
+            "foldRuns' chain walk stops at a not-done run before following its superseded_by further"
         );
         assert!(
             APP_JS.contains(
-                "const stateFiltered = state.runsStateFilter === \"all\"\n    ? heads\n    : runs.filter(matchesRunState);"
+                "function isOrphanSuperseded(run) {\n  return run.done && typeof run.superseded_by === \"string\" && run.superseded_by !== \"\";\n}"
             ),
-            "the card list, outside \"all\", filters that same raw array by the same predicate rather than folding first"
+            "isOrphanSuperseded only ever hides a head that is done, never one that is merely still running"
         );
-        // `isOrphanSuperseded` used to hide a folded-away run from every tab
-        // but "all" after the fact; now that non-"all" tabs never fold in
-        // the first place, that second hiding pass would be dead code left
-        // to rot, so it must be gone rather than merely unreachable.
-        assert!(!APP_JS.contains("isOrphanSuperseded"));
     }
 
     #[tokio::test]
