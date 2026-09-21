@@ -2128,7 +2128,7 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             // human is still looking at the terminal, not two attempts and
             // a `held` later as an opaque OS error from a failed git spawn.
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let repo = resolve_repo(&repo, &cwd).await?;
+            let repo = resolve_repo(&repo, &cwd, Some(&text)).await?;
             let mut task = Task::new(title, text, repo, source);
             task.priority = priority;
             task.solo = solo;
@@ -2483,8 +2483,13 @@ fn asking_is_not_this_seat_s_job(node: &str) -> Option<String> {
 /// briefing now tells its agent it may use in place of a full path. That
 /// case falls through to [`resolve_repo_by_name`] rather than failing here
 /// outright; a path that *does* exist but turns out not to be a git working
-/// tree is still rejected immediately; scanning `[repos] roots` for it would
-/// only ever match a coincidence.
+/// tree is rejected immediately unless it is `--repo`'s own unmodified
+/// default (`.`), in which case [`magi::repos::discover`] gets one try at
+/// finding what the operator meant before this gives up and errors the same
+/// way it always has - an operator who named a directory outright, git
+/// checkout or not, still gets exactly that directory back, never a silent
+/// substitute; scanning `[repos] roots` for a path that resolved would only
+/// ever match a coincidence in that case regardless.
 ///
 /// `cwd` is taken as a parameter rather than read from the process here, the
 /// same split `repos_cmd` keeps between reading `std::env::current_dir()` and
@@ -2492,12 +2497,43 @@ fn asking_is_not_this_seat_s_job(node: &str) -> Option<String> {
 /// fixture directory instead of the real process cwd (this repository's own
 /// `magi.toml`, which has no `[repos]` section today but is not a fixture
 /// anything here should depend on).
-async fn resolve_repo(repo: &Path, cwd: &Path) -> Result<PathBuf> {
+///
+/// `hint` is free-form text - a task instruction, typically -
+/// [`repos::discover_verified`] can match a repository's name against when
+/// the default falls through to it; `None` when the caller has no such text
+/// (most callers).
+///
+/// The fallback calls [`repos::discover_verified`], not `repos::discover`:
+/// a candidate found by filesystem shape alone (a plausible-looking `.git`)
+/// is not yet a confident match - a stale entry, or a git installation
+/// broken in exactly the way that made the `git::toplevel` check just below
+/// fail in the first place - so it is re-checked with `git::toplevel`
+/// before ever replacing the operator's own directory.
+async fn resolve_repo(repo: &Path, cwd: &Path, hint: Option<&str>) -> Result<PathBuf> {
     match repo.canonicalize() {
         Ok(canonical) => {
-            magi::git::toplevel(&canonical).await.with_context(|| {
-                format!("--repo {} is not a git working tree", canonical.display())
-            })?;
+            if let Err(e) = magi::git::toplevel(&canonical).await {
+                if repo == Path::new(".") {
+                    if let Some(home) = dirs::home_dir() {
+                        if let Some(found) =
+                            repos::discover_verified(&home, &[], hint, magi::updater::repo_name())
+                                .await
+                        {
+                            eprintln!(
+                                "the default --repo `.` ({}) is not a git checkout; using {} \
+                                 instead - {}",
+                                canonical.display(),
+                                found.path.display(),
+                                found.reason,
+                            );
+                            return Ok(found.path);
+                        }
+                    }
+                }
+                return Err(e).with_context(|| {
+                    format!("--repo {} is not a git working tree", canonical.display())
+                });
+            }
             Ok(canonical)
         }
         Err(_) => {
@@ -3693,7 +3729,7 @@ mod tests {
         let (dir, repo) = scratch_repo().await;
         // Hits the `Ok(canonical)` branch, which never reads `cwd` at all -
         // any directory would do.
-        let resolved = resolve_repo(&repo, dir.path())
+        let resolved = resolve_repo(&repo, dir.path(), None)
             .await
             .expect("a real repo resolves");
         assert_eq!(resolved, repo.canonicalize().unwrap());
@@ -3707,7 +3743,7 @@ mod tests {
         // An empty fixture directory as `cwd`, so `Config::discover` finds no
         // `magi.toml` and `[repos] roots` stays empty - the name-resolution
         // fallback must then report the same "does not exist" it always has.
-        let err = resolve_repo(&missing, dir.path())
+        let err = resolve_repo(&missing, dir.path(), None)
             .await
             .expect_err("a nonexistent path must not resolve");
         assert!(err.to_string().contains("does not exist"), "got: {err:#}");
@@ -3718,7 +3754,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Hits the `Ok(canonical)` / `toplevel` branch, not the name-resolution
         // fallback, so `cwd` is unused here too.
-        let err = resolve_repo(dir.path(), dir.path())
+        let err = resolve_repo(dir.path(), dir.path(), None)
             .await
             .expect_err("a plain directory is not a git working tree");
         assert!(
@@ -3736,7 +3772,7 @@ mod tests {
         // into the queue unchecked before this validation existed.
         let dir = tempfile::tempdir().unwrap();
         let broken = PathBuf::from("\\?\\C:\\this-drive-and-path-do-not-exist-magi-7524");
-        let err = resolve_repo(&broken, dir.path())
+        let err = resolve_repo(&broken, dir.path(), None)
             .await
             .expect_err("a malformed extended-path prefix must not resolve");
         assert!(err.to_string().contains("does not exist"), "got: {err:#}");
@@ -3750,7 +3786,7 @@ mod tests {
         // exactly the "correct extended path" case that must keep working.
         // Hits the `Ok(canonical)` branch, so `cwd` is unused.
         let canonical = repo.canonicalize().unwrap();
-        let resolved = resolve_repo(&canonical, dir.path())
+        let resolved = resolve_repo(&canonical, dir.path(), None)
             .await
             .expect("a well-formed extended path resolves");
         assert_eq!(resolved, canonical);
@@ -3851,7 +3887,7 @@ mod tests {
         // fallback actually ran `Config::discover(cwd, None)` and found the
         // fixture's `[repos] roots` - the full path the completion criteria
         // asks a test to demonstrate, not just the pure name-matching helper.
-        let resolved = resolve_repo(Path::new("yukimemi/magi"), cwd.path())
+        let resolved = resolve_repo(Path::new("yukimemi/magi"), cwd.path(), None)
             .await
             .expect("a unique short name resolves without a full path");
         assert_eq!(resolved, checkout.canonicalize().unwrap());
@@ -3865,7 +3901,7 @@ mod tests {
         ghq_checkout(roots.path(), "github.com", "someone-else", "magi");
         let cwd = cwd_with_repos_roots(&[roots.path().to_owned()]);
 
-        let err = resolve_repo(Path::new("magi"), cwd.path())
+        let err = resolve_repo(Path::new("magi"), cwd.path(), None)
             .await
             .expect_err("an ambiguous short name must not pick one silently");
         assert!(err.to_string().contains("matches 2 checkouts"), "{err:#}");

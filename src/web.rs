@@ -121,7 +121,7 @@ use crate::proc::Quiet as _;
 use crate::queue::{Queue, Task, title_from};
 use crate::run::{RunState, RunStatus};
 use crate::talk::{Talk, Talks};
-use crate::{daemon, report, repos, run, talk, updater};
+use crate::{daemon, git, report, repos, run, talk, updater};
 
 /// Default port. Chosen high and memorable; nothing else in the fleet uses it.
 pub const DEFAULT_PORT: u16 = 7878;
@@ -944,7 +944,8 @@ pub async fn serve(opts: Opts) -> Result<()> {
     // change. Nothing in the server turns colour back on.
     report::set_color(false);
 
-    let ui = Ui::open(opts.repo).with_merge(opts.merge);
+    let repo = normalize_default_repo(opts.repo).await;
+    let ui = Ui::open(repo).with_merge(opts.merge);
     // Cloned before `ui.router()` consumes `ui` below: `hand_over` needs the
     // home to bracket the parking and restarting stages, and `run_update_recheck`
     // needs both it and the repo, and by then there is no `ui` left to read
@@ -1013,6 +1014,53 @@ pub async fn serve(opts: Opts) -> Result<()> {
             tracing::info!("upgraded - handing this address to the successor");
             hand_over(&home, &looping, served, spawn_successor).await
         }
+    }
+}
+
+/// `opts.repo`, or - when it is still `--repo`'s own default (`.`) and the
+/// process's own working directory is not a git checkout at all - the
+/// checkout [`repos::discover_verified`] finds instead.
+///
+/// Only the unmodified default is ever replaced: an operator who named a
+/// directory outright, git checkout or not, gets exactly that directory
+/// back, and the same story downstream (a talk whose briefing embeds a
+/// non-git directory, and an agent that has to ask the operator where the
+/// real repository is) that has always told them so - substituting a guess
+/// for an explicit answer would be a second, silent opinion about what they
+/// meant. There is no instruction or task text yet to match against this
+/// early, so only [`repos::discover_verified`]'s own-repository tier can
+/// ever settle this - the hint tier never fires here.
+///
+/// [`repos::discover_verified`], not [`repos::discover`]: a candidate this
+/// found by filesystem shape alone is not yet trustworthy - a stale `.git`,
+/// or a git installation that is broken in exactly the way that made the
+/// original `canonical` check above fail too - so it is re-checked with
+/// `git::toplevel` before it is ever used in place of the operator's own
+/// directory.
+async fn normalize_default_repo(repo: PathBuf) -> PathBuf {
+    if repo != FsPath::new(".") {
+        return repo;
+    }
+    let Ok(canonical) = repo.canonicalize() else {
+        return repo;
+    };
+    if git::toplevel(&canonical).await.is_ok() {
+        return repo;
+    }
+    let Some(home) = dirs::home_dir() else {
+        return repo;
+    };
+    match repos::discover_verified(&home, &[], None, updater::repo_name()).await {
+        Some(found) => {
+            tracing::info!(
+                "the default --repo `.` ({}) is not a git checkout; using {} instead - {}",
+                canonical.display(),
+                found.path.display(),
+                found.reason,
+            );
+            found.path
+        }
+        None => repo,
     }
 }
 
@@ -8446,5 +8494,19 @@ mod tests {
         assert!(APP_JS.contains(
             "if (!same && !sectionCompatibleWithStateFilter(section, state.runsStateFilter))"
         ));
+    }
+
+    #[tokio::test]
+    async fn normalize_default_repo_leaves_an_explicit_path_untouched() {
+        // An operator-named directory - git checkout or not - is never
+        // second-guessed, even when it does not exist at all: only the
+        // flag's own unmodified `.` default is ever eligible for discovery.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let explicit = dir.path().join("not-a-checkout");
+        std::fs::create_dir_all(&explicit).expect("create dir");
+        assert_eq!(normalize_default_repo(explicit.clone()).await, explicit);
+
+        let missing = dir.path().join("does-not-exist-at-all");
+        assert_eq!(normalize_default_repo(missing.clone()).await, missing);
     }
 }
