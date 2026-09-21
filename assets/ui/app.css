@@ -1120,6 +1120,14 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .run-status { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
 .instruction { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--t4); color: var(--ink); }
 
+/* One question/answer pair per row, the question dimmed like a label and the
+   answer full-weight like the settled fact it is - see the Queue card's
+   "Resolved questions" disclosure. */
+.task-answers { margin: 0; }
+.task-answers dt { color: var(--ink-3); font-size: var(--t4); margin-top: var(--s3); }
+.task-answers dt:first-child { margin-top: 0; }
+.task-answers dd { margin: 0; color: var(--ink); font-size: var(--t4); white-space: pre-wrap; overflow-wrap: anywhere; }
+
 .facts { display: grid; grid-template-columns: auto 1fr; gap: var(--s2) var(--s4); margin: 0; font-size: var(--t3); }
 .facts dt { color: var(--ink-3); }
 .facts dd { margin: 0; color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
@@ -1164,6 +1172,11 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .dep-node[data-tone="gold"] rect { fill: var(--tint-gold); stroke: var(--gold-line); }
 .dep-node[data-tone="rust"] rect { fill: var(--tint-rust); stroke: var(--rust); }
 .dep-node[data-tone="teal"] rect { fill: var(--tint-teal); stroke: var(--teal); }
+/* An unanswered question waited on by a task - dashed the same way a
+   waiting run's card border is dashed elsewhere, so a leaf that is a
+   question reads as a different kind of node from a task at rank 0, not
+   just a different color. */
+.dep-node[data-tone="wait"] rect { fill: var(--tint-gold); stroke: var(--gold-line); stroke-dasharray: 4 3; }
 .dep-node { cursor: pointer; }
 .dep-node:hover rect { stroke-width: 2.5; }
 .dep-node:focus-visible rect { stroke: var(--focus); stroke-width: 2.5; }
