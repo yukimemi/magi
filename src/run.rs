@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::SeatState;
 use crate::blind::Leak;
 use crate::config::{Config, MergeMode};
-use crate::verdict::{Finding, Rejection, ReviewVote};
+use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 
 /// On-disk format version. Bumped when a field changes meaning, so a resumed
 /// run never half-reads a state file written by a different magi.
@@ -98,7 +98,17 @@ use crate::verdict::{Finding, Rejection, ReviewVote};
 /// guess. `verified_at` has no historical value to reconstruct and stays
 /// `None`, which reads through `verification_summary` as "checked at:
 /// unknown" — an honest gap, not a fabricated time.
-pub const SCHEMA: u32 = 8;
+/// 9: added [`RunState::operator_fixes`] — one record per `magi fix`
+/// invocation, routing specific, already-recorded findings to a fixer as a
+/// targeted, out-of-band fix outside the normal round sequence. Kept in a
+/// channel of its own rather than folded into [`ReviewRound`], because a
+/// reviewer's own severity and vote (copied verbatim onto
+/// [`OperatorFixFinding`]) must never be rewritten to look like the operator
+/// manufactured a blocking verdict — see `graph::Runner::fix_selected`. A
+/// schema-8 record has no operator-fix history at all, and
+/// `#[serde(default)]` reads an empty list as exactly that: "none happened",
+/// not an unknown gap. Nothing about an existing field's meaning changes.
+pub const SCHEMA: u32 = 9;
 
 /// Where a run got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,6 +514,111 @@ impl ContinuationRecord {
             outcome: ContinuationOutcome::NotNeeded,
         }
     }
+}
+
+/// What happened to one operator-selected finding after the fixer ran, as
+/// part of an [`OperatorFixRequest`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorFixOutcome {
+    /// The request has not run yet, or never got far enough to report.
+    #[default]
+    Pending,
+    /// The fixer's adoption report named this finding as addressed.
+    Addressed,
+    /// The fixer's adoption report declined it, with an argument.
+    Rejected {
+        /// The fixer's own reason.
+        why: String,
+    },
+    /// The fixer never delivered a usable adoption report at all — a
+    /// dropped stream, a quota hit, or a continuation budget spent without
+    /// recovering one (see `graph::Runner::continue_fix_report`). Distinct
+    /// from `Rejected`, which needs an argument this never produced, and
+    /// never written back as "addressed" or silently left `Pending` — a
+    /// gap in the report is its own outcome, not evidence either way about
+    /// the finding.
+    Unreported,
+}
+
+/// One finding an operator selected for [`OperatorFixRequest`], with the
+/// provenance a reviewer originally gave it, copied here verbatim.
+///
+/// Severity and vote are snapshots, never recomputed and never treated as
+/// blocking just because an operator picked the finding — only
+/// [`Severity::blocks`] on the original [`ReviewRecord`] decides that. This
+/// type exists so an operator's selection is an auditable *addition* to the
+/// record, not a rewrite of what a reviewer actually said.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorFixFinding {
+    /// Finding id, e.g. `R2-1-3`.
+    pub id: String,
+    /// Severity as the reviewer recorded it.
+    pub severity: Severity,
+    /// The reviewer seat's overall vote for the round this finding came
+    /// from, if one was cast.
+    #[serde(default)]
+    pub reviewer_vote: Option<ReviewVote>,
+    /// Review round the finding was raised in.
+    pub round: usize,
+    /// That round's own head — the commit the finding was actually raised
+    /// against, used for the freshness check against the branch's current
+    /// head at request time.
+    pub round_head: String,
+    /// Reviewer seat number, 1-based.
+    pub reviewer: usize,
+    /// Agent occupying that seat.
+    pub agent: String,
+    /// File the finding concerns.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Line the finding concerns.
+    #[serde(default)]
+    pub line: Option<u32>,
+    /// One-line summary.
+    pub title: String,
+    /// The argument.
+    #[serde(default)]
+    pub detail: String,
+    /// What happened to this finding after the fixer ran.
+    #[serde(default)]
+    pub outcome: OperatorFixOutcome,
+}
+
+/// One `magi fix` invocation: the operator's own record of which
+/// already-recorded findings they routed to a fixer, why, and what came
+/// back. See [`SCHEMA`]'s doc for schema 9 on why this is a channel of its
+/// own rather than a field on [`ReviewRound`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorFixRequest {
+    /// When `magi fix` was invoked.
+    pub requested_at: Timestamp,
+    /// The operator's own reasoning. Required and never empty at the CLI —
+    /// the audit trail this feature exists for.
+    pub reason: String,
+    /// The findings selected, each with its own provenance and outcome.
+    pub findings: Vec<OperatorFixFinding>,
+    /// The branch's head at the moment this request started executing.
+    pub head_at_request: String,
+    /// Did the operator pass `--allow-stale`?
+    pub allow_stale: bool,
+    /// Did any selected finding's own `round_head` differ from
+    /// `head_at_request`? Kept distinct from `allow_stale` — flipping that
+    /// flag does not retroactively make a request that was actually fresh
+    /// read as stale, or the reverse.
+    pub stale: bool,
+    /// The fixer's own attempt, once dispatched.
+    #[serde(default)]
+    pub fix: Option<FixRecord>,
+    /// Head after the fixer's commit, when it produced one.
+    #[serde(default)]
+    pub result_head: Option<String>,
+    /// The review-only run opened to re-verify the change, when one was
+    /// actually committed. `None` when nothing changed, so there was
+    /// nothing new to re-review — never left implicit as "not gotten to
+    /// yet".
+    #[serde(default)]
+    pub follow_up_review_run: Option<String>,
 }
 
 /// A command a seat's own CLI reported running, kept for `magi show` and for
@@ -1149,6 +1264,12 @@ pub struct RunState {
     /// ran".
     #[serde(default)]
     pub jobs: Vec<JobRecord>,
+    /// Operator-triggered targeted fixes — see [`OperatorFixRequest`] and
+    /// `SCHEMA`'s doc for schema 9. Empty on every record written before
+    /// this existed, which reads correctly as "no operator fix ever
+    /// requested".
+    #[serde(default)]
+    pub operator_fixes: Vec<OperatorFixRequest>,
 }
 
 impl RunState {
@@ -1196,6 +1317,7 @@ impl RunState {
             advise_attempted: false,
             events: Vec::new(),
             jobs: Vec::new(),
+            operator_fixes: Vec::new(),
         }
     }
 
@@ -1414,6 +1536,13 @@ fn migrate_schema(mut state: RunState) -> Result<RunState> {
                 round.verified_head = Some(round.head.clone());
             }
         }
+        state.schema = 8;
+    }
+    // Schema 8 predates `operator_fixes`. There is nothing to reconstruct —
+    // an old run simply never had one requested — so `#[serde(default)]`
+    // already left it as the correct empty `Vec`; this only advances the
+    // version number.
+    if state.schema == 8 {
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {
@@ -1459,6 +1588,35 @@ impl RunState {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    /// Every finding raised in the most recent review round, regardless of
+    /// that round's own severity mix — unlike [`Self::open_findings`], not
+    /// filtered to a round that was not clean. This is the pool `magi fix`
+    /// reports as available to pick from: a round can conclude clean (no
+    /// finding blocked merge) while still carrying minor findings nobody
+    /// has acted on.
+    pub fn last_round_findings(&self) -> Vec<&Finding> {
+        self.reviews
+            .last()
+            .into_iter()
+            .flat_map(|r| r.reviews.iter())
+            .flat_map(|rec| rec.findings.iter())
+            .collect()
+    }
+
+    /// Look up a finding by id anywhere in this run's review history,
+    /// together with the round and reviewer record that raised it — the
+    /// provenance `magi fix` snapshots onto [`OperatorFixFinding`].
+    pub fn finding(&self, id: &str) -> Option<(&ReviewRound, &ReviewRecord, &Finding)> {
+        self.reviews.iter().find_map(|round| {
+            round.reviews.iter().find_map(|rec| {
+                rec.findings
+                    .iter()
+                    .find(|f| f.id == id)
+                    .map(|f| (round, rec, f))
+            })
+        })
     }
 
     /// Did this run reach a mergeable status (`Ready` or `Merged`) with

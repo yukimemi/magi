@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::{MergeMode, MergeStyle};
 use crate::run::{
-    CommandOutcome, ContinuationOutcome, E2eStatus, GateStatus, JobStatus, RunState, RunStatus,
-    tail,
+    CommandOutcome, ContinuationOutcome, E2eStatus, GateStatus, JobStatus, OperatorFixOutcome,
+    RunState, RunStatus, tail,
 };
 use crate::stats::Stats;
 use crate::verdict::ReviewVote;
@@ -668,6 +668,59 @@ pub fn run(state: &RunState) -> String {
                     state.open_findings().len()
                 ))
             );
+        }
+    }
+
+    if !state.operator_fixes.is_empty() {
+        let _ = writeln!(s, "\n{}", bold("operator fix(es)"));
+        for (i, req) in state.operator_fixes.iter().enumerate() {
+            let _ = writeln!(
+                s,
+                "  [{}] {} finding(s) at {}{}",
+                i + 1,
+                req.findings.len(),
+                req.requested_at
+                    .to_zoned(jiff::tz::TimeZone::system())
+                    .strftime("%Y-%m-%d %H:%M:%S"),
+                if req.stale {
+                    yellow("  stale head, --allow-stale used")
+                } else {
+                    String::new()
+                }
+            );
+            let _ = writeln!(s, "      reason: {}", req.reason);
+            for f in &req.findings {
+                let outcome = match &f.outcome {
+                    OperatorFixOutcome::Pending => yellow("pending"),
+                    OperatorFixOutcome::Addressed => green("addressed"),
+                    OperatorFixOutcome::Rejected { why } => red(&format!("rejected: {why}")),
+                    OperatorFixOutcome::Unreported => {
+                        red("unreported — no adoption report came back")
+                    }
+                };
+                let _ = writeln!(
+                    s,
+                    "      {} [{:?}] {}  {outcome}",
+                    dim(&f.id),
+                    f.severity,
+                    f.title
+                );
+            }
+            match &req.follow_up_review_run {
+                Some(id) => {
+                    let _ = writeln!(s, "      re-verified by run {id}");
+                }
+                None if req.fix.as_ref().is_some_and(|fx| fx.committed) => {
+                    let _ = writeln!(
+                        s,
+                        "      {}",
+                        red("committed, but the follow-up review could not be opened")
+                    );
+                }
+                None => {
+                    let _ = writeln!(s, "      no change committed; nothing to re-verify");
+                }
+            }
         }
     }
 
