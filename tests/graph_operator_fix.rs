@@ -156,6 +156,31 @@ async fn a_run_that_has_not_concluded_review_refuses_a_targeted_fix() {
 }
 
 #[tokio::test]
+async fn a_run_already_being_worked_on_by_another_process_refuses_a_targeted_fix() {
+    let home = common::home_lock().await;
+    let (_fx, mut runner) = ready_run_with_two_minor_findings(home).await;
+    let id = runner.state.last_round_findings()[0].id.clone();
+
+    let mut beat = magi::daemon::Status::new();
+    beat.current = vec![magi::daemon::Current {
+        task: "some-task".to_owned(),
+        run: runner.state.id.clone(),
+    }];
+    magi::daemon::write_status_to(&magi::run::home().join("daemon.json"), &beat)
+        .expect("publish a heartbeat");
+
+    let err = runner
+        .fix_selected(std::slice::from_ref(&id), "racing the daemon", false)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("currently being worked on"),
+        "{err}"
+    );
+    assert!(runner.state.operator_fixes.is_empty());
+}
+
+#[tokio::test]
 async fn a_stale_finding_is_refused_unless_the_operator_allows_it() {
     let home = common::home_lock().await;
     let (_fx, mut runner) = ready_run_with_two_minor_findings(home).await;
