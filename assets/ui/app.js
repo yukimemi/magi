@@ -1380,15 +1380,16 @@ function sectionCompatibleWithStateFilter(sectionKey, filterKey) {
    this client has nowhere to nest. Hiding it by default is the same
    judgement call as hiding "done": it is not what an operator scanning for
    what needs them wants in front of them, and "all" still shows it.
-   `run.done` guards it because foldRuns() now refuses to fold a run that
-   is not done under anything (see its own comment) — such a run can still
-   carry a `superseded_by` (task.runs records competing attempts as a
-   sequence, and a still-running one can sit next to a rival that hasn't
-   finished either), but it is not an old attempt with nowhere to nest, it
-   is a card still doing its work, and hiding it would undercut the very
-   fix that stops it from being folded away in the first place. */
+   `run.done && !run.waiting` mirrors foldRuns()'s own guard against folding
+   such a run under anything (see its own comment) — a run that has not
+   finished, or that is done but still waiting on an answer, can still carry
+   a `superseded_by` (task.runs records competing attempts as a sequence,
+   and a still-open one can sit next to a rival that has moved on), but it
+   is not an old attempt with nowhere to nest, it is either still doing its
+   own work or still waiting on the operator, and hiding it would undercut
+   the very fix that stops it from being folded away in the first place. */
 function isOrphanSuperseded(run) {
-  return run.done && typeof run.superseded_by === "string" && run.superseded_by !== "";
+  return run.done && !run.waiting && typeof run.superseded_by === "string" && run.superseded_by !== "";
 }
 
 /* Exactly one chip is ever selected, so picking the already-selected one is
@@ -1473,7 +1474,17 @@ function renderRunStateChips(runs) {
    went on to render one. A run that has not finished is never "replaced" in
    the sense this fold cares about \u2014 it is still doing its own work \u2014 so it
    always stays a head of its own, and only a genuinely finished attempt
-   folds forward into whatever comes after it. */
+   folds forward into whatever comes after it.
+
+   The same is true of a run that is done but still waiting: `RunStatus::
+   resumable()` leaves Stalled and Blocked runs both done and waiting (see
+   REPRESENTATIVE_RUN_SHAPES above), so a stalled or blocked run with an open
+   question the operator has not yet answered can sit right where the walk
+   would otherwise fold it under whatever the conductor requeued next. Its
+   open question is exactly what the Waiting tab exists to surface, so it
+   stays a head of its own too, the same as a run still moving \u2014 only a run
+   that is both done and no longer waiting on anyone is an old attempt with
+   nothing left to nest for. */
 function foldRuns(runs) {
   const byShort = new Map();
   for (const run of runs) if (run.short) byShort.set(run.short, run);
@@ -1488,7 +1499,7 @@ function foldRuns(runs) {
     while (!headOf.has(cur.id) && !atIndex.has(cur.id)) {
       atIndex.set(cur.id, path.length);
       path.push(cur);
-      if (!cur.done) break;
+      if (!cur.done || cur.waiting) break;
       const next = nextOf(cur);
       if (!next) break;
       cur = next;
@@ -1830,12 +1841,14 @@ function renderRuns() {
      dropped a dozen cards the operator never asked to hide.
      This is also why matchesRunState is applied to `heads`, not the raw
      `runs` array, and why that is still correct: foldRuns() (see its own
-     comment) never folds a run that is not done under anything, so every
-     run this state filter can actually match — in flight, waiting, or
-     otherwise not done — is already its own head here. Only a finished
-     attempt can be missing from `heads`, folded instead under whatever
-     replaced it, which is exactly the case this filter (and isOrphanSuperseded
-     below) means to hide outside of "all". */
+     comment) never folds a run under anything unless it is both done and no
+     longer waiting, so every run any state filter can actually match — in
+     flight, waiting (including a done-but-waiting Stalled/Blocked run), or
+     otherwise not fully resolved — is already its own head here. Only a
+     finished attempt with no open question left can be missing from
+     `heads`, folded instead under whatever replaced it, which is exactly
+     the case this filter (and isOrphanSuperseded below) means to hide
+     outside of "all". */
   const passingState = heads.filter(matchesRunState);
   const stateFiltered = state.runsStateFilter === "all"
     ? passingState

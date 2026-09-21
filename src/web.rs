@@ -8507,24 +8507,34 @@ mod tests {
     /// even though `renderRunStateChips`'s badge counted them from the raw,
     /// unfolded `/api/runs` array and so never dropped them.
     ///
+    /// A run can also be done and still waiting: `RunStatus::resumable()`
+    /// leaves Stalled and Blocked both done and waiting on an unanswered
+    /// question (see REPRESENTATIVE_RUN_SHAPES). Guarding the fold on
+    /// `!done` alone still let a requeued Stalled/Blocked run fold away the
+    /// moment the conductor recorded its replacement, dropping it from the
+    /// Waiting tab's list while the badge — still reading the raw array —
+    /// kept counting it.
+    ///
     /// `cargo test` cannot execute the front end, so this pins the fix at
     /// the source level: `foldRuns`'s walk must stop at a run that is not
-    /// done rather than following `superseded_by` past it, so a run still
-    /// in progress is always its own head; and `isOrphanSuperseded`, the
-    /// second hiding pass for a head whose successor fell off the page,
-    /// must require `run.done` so it can never hide a head that is only
-    /// unresolved because it is still running.
+    /// done, or that is done but still waiting, rather than following
+    /// `superseded_by` past it — so a run still in progress, or still
+    /// waiting on an answer, is always its own head; and
+    /// `isOrphanSuperseded`, the second hiding pass for a head whose
+    /// successor fell off the page, must require both `run.done` and
+    /// `!run.waiting` so it can never hide a head that is only unresolved
+    /// because it is still running or still waiting.
     #[test]
-    fn fold_runs_never_folds_away_a_run_that_is_not_done() {
+    fn fold_runs_never_folds_away_a_run_that_is_not_done_or_still_waiting() {
         assert!(
-            APP_JS.contains("      atIndex.set(cur.id, path.length);\n      path.push(cur);\n      if (!cur.done) break;\n      const next = nextOf(cur);"),
-            "foldRuns' chain walk stops at a not-done run before following its superseded_by further"
+            APP_JS.contains("      atIndex.set(cur.id, path.length);\n      path.push(cur);\n      if (!cur.done || cur.waiting) break;\n      const next = nextOf(cur);"),
+            "foldRuns' chain walk stops at a not-done or still-waiting run before following its superseded_by further"
         );
         assert!(
             APP_JS.contains(
-                "function isOrphanSuperseded(run) {\n  return run.done && typeof run.superseded_by === \"string\" && run.superseded_by !== \"\";\n}"
+                "function isOrphanSuperseded(run) {\n  return run.done && !run.waiting && typeof run.superseded_by === \"string\" && run.superseded_by !== \"\";\n}"
             ),
-            "isOrphanSuperseded only ever hides a head that is done, never one that is merely still running"
+            "isOrphanSuperseded only ever hides a head that is done and no longer waiting"
         );
     }
 
