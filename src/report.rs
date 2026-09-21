@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::{MergeMode, MergeStyle};
 use crate::run::{
-    CommandOutcome, ContinuationOutcome, E2eStatus, JobStatus, RunState, RunStatus, tail,
+    CommandOutcome, ContinuationOutcome, E2eStatus, GateStatus, JobStatus, RunState, RunStatus,
+    tail,
 };
 use crate::stats::Stats;
 use crate::verdict::ReviewVote;
@@ -657,17 +658,27 @@ pub fn run(state: &RunState) -> String {
         );
     }
 
-    if !state.gate.is_empty() {
-        let _ = writeln!(s, "\n{}", bold("gate"));
-        for o in &state.gate {
-            let _ = writeln!(
-                s,
-                "  {}  {}",
-                if o.ok() { green("pass") } else { red("FAIL") },
-                o.command
-            );
-            if !o.ok() {
-                let _ = writeln!(s, "{}", dim(&tail(&o.output_tail, 2_000)));
+    // `state.gate.is_empty()` alone cannot tell "never ran" apart from "ran
+    // with nothing configured" — see `RunState::gate_status`'s own doc — so
+    // this reads the accessor rather than the raw list.
+    match state.gate_status() {
+        GateStatus::NotRun => {}
+        GateStatus::PassedWithNoCommands => {
+            let _ = writeln!(s, "\n{}", bold("gate"));
+            let _ = writeln!(s, "  {}  no gate commands configured", green("pass"));
+        }
+        GateStatus::Passed | GateStatus::Failed => {
+            let _ = writeln!(s, "\n{}", bold("gate"));
+            for o in &state.gate {
+                let _ = writeln!(
+                    s,
+                    "  {}  {}",
+                    if o.ok() { green("pass") } else { red("FAIL") },
+                    o.command
+                );
+                if !o.ok() {
+                    let _ = writeln!(s, "{}", dim(&tail(&o.output_tail, 2_000)));
+                }
             }
         }
     }
@@ -1501,9 +1512,39 @@ mod tests {
             duration_ms: 0,
             resource_blocked: false,
         }];
+        s.gate_ran = true;
 
         let text = run(&s);
         assert!(text.contains("mismatched types"), "{text}");
+    }
+
+    #[test]
+    fn a_gate_with_no_commands_configured_shows_a_pass_not_silence() {
+        let _guard = plain();
+        let mut s = state();
+        s.status = RunStatus::Ready;
+        s.gate_ran = true;
+        assert!(s.gate.is_empty());
+
+        let text = run(&s);
+        assert!(
+            text.contains("gate") && text.contains("no gate commands configured"),
+            "a run gated on nothing must say so, not read as if the gate never ran: {text}"
+        );
+    }
+
+    #[test]
+    fn a_gate_that_has_not_run_yet_shows_nothing() {
+        let _guard = plain();
+        let s = state();
+        assert!(!s.gate_ran);
+        assert!(s.gate.is_empty());
+
+        let text = run(&s);
+        assert!(
+            !text.contains("no gate commands configured"),
+            "an unattempted gate must not be shown as a pass: {text}"
+        );
     }
 
     #[test]
