@@ -119,6 +119,41 @@ async fn a_resumed_run_drops_a_stale_active_marker_left_by_a_killed_process() {
     );
 }
 
+/// `driver_pid` is what `RunState::liveness` checks when no daemon claims a
+/// run — a plain `magi run` / `magi review` claims nothing there. `execute`
+/// must write this process's own pid every time it runs, including on a
+/// resume, so a stale pid from whatever process drove an earlier attempt
+/// (possibly dead by the time this one starts) never survives into a fresh
+/// process's own report.
+#[tokio::test]
+async fn execute_records_its_own_pid_as_the_driver_on_every_entry() {
+    let _home = home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, false);
+    let pause = Pause::new();
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.on_pause(pause.clone());
+    pause.park();
+    runner.execute().await.expect("execute parks cleanly");
+    assert_eq!(runner.state.driver_pid, Some(std::process::id()));
+
+    // Pretend an earlier, now-dead process drove this run — exactly what a
+    // resume after a kill finds on disk.
+    runner.state.driver_pid = Some(999_999_999);
+    runner.state.save().expect("save");
+    let id = runner.state.id.clone();
+    drop(runner);
+
+    let mut resumed = Runner::resume(&id).expect("resume");
+    resumed.execute().await.expect("execute to a verdict");
+    assert_eq!(
+        resumed.state.driver_pid,
+        Some(std::process::id()),
+        "the resuming process's own pid replaces whatever a dead one left behind"
+    );
+}
+
 #[tokio::test]
 async fn a_park_asked_for_mid_walk_stops_at_the_boundary_after_it() {
     let _home = home_lock().await;

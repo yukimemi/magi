@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::{MergeMode, MergeStyle};
 use crate::run::{
-    CommandOutcome, ContinuationOutcome, E2eStatus, GateStatus, JobStatus, OperatorFixOutcome,
-    RunState, RunStatus, tail,
+    CommandOutcome, ContinuationOutcome, E2eStatus, GateStatus, JobStatus, Liveness,
+    OperatorFixOutcome, RunState, RunStatus, tail,
 };
 use crate::stats::Stats;
 use crate::verdict::ReviewVote;
@@ -873,28 +873,51 @@ pub fn run(state: &RunState) -> String {
 /// the web UI's raw-report route — needs this, and both already know how to
 /// ask whether a daemon is currently driving it.
 ///
-/// `live` is whether a daemon's heartbeat currently names this run
-/// (`daemon::is_working_on`). An [`ActiveSeat`](crate::run::ActiveSeat) left
-/// behind by a killed process is not lied about as running just because
-/// nobody has cleared it from disk yet — see that type's own docs for why an
-/// entry alone is not proof of anything.
-pub fn active_seats(state: &RunState, live: bool) -> String {
+/// `live` is [`RunState::liveness`]: whether a daemon's heartbeat currently
+/// names this run, or — absent that claim — whether `driver_pid` still
+/// answers alive. An [`ActiveSeat`](crate::run::ActiveSeat) left behind by a
+/// killed process is not lied about as running just because nobody has
+/// cleared it from disk yet — see that type's own docs for why an entry
+/// alone is not proof of anything.
+pub fn active_seats(state: &RunState, live: Liveness) -> String {
     if state.active.is_empty() {
         return String::new();
     }
     let mut s = String::new();
     let _ = writeln!(s, "\n{}", bold("running now"));
-    if !live {
-        let _ = writeln!(
-            s,
-            "  {}",
-            yellow(
-                "no live daemon claims this run right now — likely left behind by a killed process"
-            )
-        );
-    }
     let now = jiff::Timestamp::now();
-    for (seat, a) in &state.active {
+    match live {
+        Liveness::Live => {}
+        Liveness::Dead => {
+            let _ = writeln!(
+                s,
+                "  {}",
+                yellow(
+                    "no live daemon claims this run right now — likely left behind by a killed process"
+                )
+            );
+        }
+        Liveness::Unknown => {
+            // `active_all_overrun` is never treated as proof of death here —
+            // only ever mentioned alongside "could not confirm", since a
+            // seat legitimately overrunning its budget while the process
+            // driving it tears the attempt down looks identical on disk (see
+            // `RunState::active_all_overrun`'s own doc).
+            let overrun = if state.active_all_overrun(now) {
+                " — every active seat has already run past its own timeout budget"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                s,
+                "  {}",
+                yellow(&format!(
+                    "whether a process is still driving this run could not be confirmed{overrun}"
+                ))
+            );
+        }
+    }
+    for (seat, a) in state.seats_active() {
         let retry = if a.attempt > 0 {
             format!(" retry {}", a.attempt)
         } else {
@@ -909,6 +932,29 @@ pub fn active_seats(state: &RunState, live: bool) -> String {
             a.remaining_secs(now),
             a.timeout_secs
         );
+    }
+    for (task, a) in state.tasks_active() {
+        let retry = if a.attempt > 0 {
+            format!(" retry {}", a.attempt)
+        } else {
+            String::new()
+        };
+        let progress = match (a.index, a.total) {
+            (Some(i), Some(t)) => format!(" ({i}/{t})"),
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            s,
+            "  {:<12} {:<12}{retry}{progress}  {}s elapsed, {}s left of {}s",
+            task,
+            a.node,
+            a.elapsed_secs(now),
+            a.remaining_secs(now),
+            a.timeout_secs
+        );
+        if let Some(command) = &a.command {
+            let _ = writeln!(s, "               {command}");
+        }
     }
     s
 }
@@ -1454,6 +1500,7 @@ mod tests {
             verified_at: None,
             reviews: vec![
                 ReviewRecord {
+                    attempts: 0,
                     reviewer: 1,
                     agent: "alpha".to_owned(),
                     summary: String::new(),
@@ -1463,6 +1510,7 @@ mod tests {
                     duration_ms: 0,
                 },
                 ReviewRecord {
+                    attempts: 0,
                     reviewer: 2,
                     agent: "beta".to_owned(),
                     summary: String::new(),
@@ -1516,6 +1564,7 @@ mod tests {
             verified_at: None,
             reviews: vec![
                 ReviewRecord {
+                    attempts: 0,
                     reviewer: 1,
                     agent: "alpha".to_owned(),
                     summary: String::new(),
@@ -1525,6 +1574,7 @@ mod tests {
                     duration_ms: 0,
                 },
                 ReviewRecord {
+                    attempts: 0,
                     reviewer: 2,
                     agent: "beta".to_owned(),
                     summary: String::new(),
@@ -1702,6 +1752,7 @@ mod tests {
             verified_head: None,
             verified_at: None,
             reviews: vec![ReviewRecord {
+                attempts: 0,
                 reviewer: 1,
                 agent: "alpha".to_owned(),
                 summary: String::new(),
@@ -1812,11 +1863,12 @@ mod tests {
         let _guard = plain();
         let mut s = state();
         s.seat_started("judge", "judge-2", std::time::Duration::from_secs(120), 0);
-        let text = active_seats(&s, true);
+        let text = active_seats(&s, Liveness::Live);
         assert!(text.contains("running now"));
         assert!(text.contains("judge-2"));
         assert!(text.contains("judge"));
         assert!(!text.contains("no live daemon"), "{text}");
+        assert!(!text.contains("could not be confirmed"), "{text}");
     }
 
     #[test]
@@ -1824,17 +1876,58 @@ mod tests {
         let _guard = plain();
         let mut s = state();
         s.seat_started("implement", "impl-B", std::time::Duration::from_secs(60), 0);
-        let text = active_seats(&s, false);
+        let text = active_seats(&s, Liveness::Dead);
         assert!(
             text.contains("no live daemon"),
             "a stale entry must not read as running: {text}"
         );
     }
 
+    /// A manual `magi run` / `magi review` claims no daemon, but its
+    /// `driver_pid` still answers — this is `Unknown`, never `Dead`: see
+    /// `RunState::liveness`'s own doc for why an unconfirmed process is never
+    /// folded into "confirmed dead".
+    #[test]
+    fn active_seats_reports_uncertainty_without_claiming_death() {
+        let _guard = plain();
+        let mut s = state();
+        s.seat_started("review", "review-1", std::time::Duration::from_secs(60), 0);
+        let text = active_seats(&s, Liveness::Unknown);
+        assert!(
+            text.contains("could not be confirmed"),
+            "an unproven state must read as uncertain, not dead: {text}"
+        );
+        assert!(!text.contains("no live daemon"), "{text}");
+    }
+
     #[test]
     fn active_seats_is_empty_when_nothing_is_running() {
         let _guard = plain();
-        assert_eq!(active_seats(&state(), true), "");
+        assert_eq!(active_seats(&state(), Liveness::Live), "");
+    }
+
+    /// A running `verify.e2e` / `verify.gate` task is shown alongside seats,
+    /// with which command is currently running and how far through the list
+    /// it is — the gap the addendum's second item names: a review-only run
+    /// that spends minutes inside `cargo test` between reviewer answers and
+    /// the fix's own commit had nothing at all to show for it before this.
+    #[test]
+    fn active_seats_shows_a_running_verify_task_and_its_command() {
+        let _guard = plain();
+        let mut s = state();
+        s.task_command(
+            "e2e",
+            "verify",
+            0,
+            "cargo test",
+            2,
+            3,
+            std::time::Duration::from_secs(600),
+        );
+        let text = active_seats(&s, Liveness::Live);
+        assert!(text.contains("e2e"), "{text}");
+        assert!(text.contains("(2/3)"), "{text}");
+        assert!(text.contains("cargo test"), "{text}");
     }
 
     #[test]

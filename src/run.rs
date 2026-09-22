@@ -548,6 +548,17 @@ pub struct ReviewRecord {
     /// Wall-clock time.
     #[serde(default)]
     pub duration_ms: u64,
+    /// How many times this seat was asked before it settled — 0 for a first
+    /// answer, N after N nudges (`ask_json_wave`'s retry loop). Read this
+    /// together with [`Self::failed`], never `failed` alone: `failed: Some(_)`
+    /// with `attempts == 0` is a seat that never answered at all, while
+    /// `failed: None` with `attempts > 0` is one that only came back after a
+    /// nudge — recovered, not silent — and the two must not look the same in
+    /// history. A record written before this field existed defaults to `0`,
+    /// which under-reports a pre-existing retry rather than inventing one;
+    /// see `ask_json_wave`'s own doc for where this is filled in.
+    #[serde(default)]
+    pub attempts: usize,
 }
 
 /// One seat's revote during a round's reconsideration (see
@@ -1155,17 +1166,55 @@ pub struct MergeOutcome {
 /// agent, for exactly this reason), and this struct has no way to tell which
 /// kind of seat it describes. The seat key alone — already in the map this
 /// lives under — is what every caller needs to say which seat is running.
+///
+/// The same map also carries entries for shell-command work that runs
+/// outside any seat — `verify.e2e`, `verify.gate` — keyed by the task's own
+/// name (`"e2e"`, `"gate"`) rather than a seat key. [`Self::task`] is `Some`
+/// only for those; it is how a reader tells the two kinds of entry apart
+/// without a second map, a second route, or a second SSE reason to poll for
+/// — see [`RunState::seats_active`] / [`RunState::tasks_active`] for the
+/// accessors that split them back apart. A task entry is exactly as blind as
+/// a seat entry: no agent runs it, so there is nothing to leak, and
+/// [`Self::command`] carries only the shell command being run, never
+/// anything about who is running it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveSeat {
     /// Node the seat is answering for, e.g. `implement`, `judge`, `review`.
+    /// For a task entry, the node the command list runs under (`verify`,
+    /// `gate`).
     pub node: String,
-    /// When this attempt was sent.
+    /// When this attempt — or, for a task entry, this one command — was
+    /// started. A task entry's timer resets at every command boundary,
+    /// because `verify.e2e` / `verify.gate` apply their timeout per command,
+    /// not once across the whole list — see [`RunState::task_command`].
     pub started_at: Timestamp,
-    /// The CLI's wall-clock budget for this attempt.
+    /// The wall-clock budget for this attempt (a seat) or this one command
+    /// (a task entry).
     pub timeout_secs: u64,
-    /// 0 for the first ask, N for the Nth nudge or resume.
+    /// 0 for the first ask, N for the Nth nudge or resume. For a task entry,
+    /// 0 for the first pass over the command list, N for the Nth retry (see
+    /// `run_e2e_with_retry`'s build/link retry).
     #[serde(default)]
     pub attempt: usize,
+    /// `None` for a seat; `Some("e2e")` / `Some("gate")` for a running
+    /// command-list task. This is the type tag that lets both kinds of entry
+    /// share one map without a task ever being mistaken for a (blind) seat —
+    /// see this struct's own doc. Omitted from JSON when absent (the common,
+    /// seat case), rather than written out as a literal `null` on every one
+    /// of a run's seat entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// The command currently running, task entries only. Never set on a
+    /// seat entry — a seat has no command, only a prompt, and a prompt is
+    /// not safe to show mid-run (see this struct's blindness note).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// 1-based position of [`Self::command`] within the task's command list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
+    /// Number of commands in the task's list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
 }
 
 impl ActiveSeat {
@@ -1181,6 +1230,27 @@ impl ActiveSeat {
     pub fn remaining_secs(&self, now: Timestamp) -> i64 {
         (self.timeout_secs as i64 - self.elapsed_secs(now)).max(0)
     }
+}
+
+/// Whether a process is provably still driving a run, provably not, or
+/// neither — see [`RunState::liveness`]. Serialized as a lowercase string
+/// (`"live"` / `"dead"` / `"unknown"`) rather than a bool: a bool has no room
+/// for "could not tell", and folding that case into either `true` or `false`
+/// is exactly the wrong call for a display an operator uses to decide
+/// whether to wait or to act — see the schema-10 field doc on
+/// [`RunState::driver_pid`] for the report it used to produce instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Liveness {
+    /// Proven: a daemon's heartbeat claims the run, or `driver_pid` answers
+    /// alive.
+    Live,
+    /// Proven: no daemon claim, and `driver_pid` answers dead.
+    Dead,
+    /// Neither proven — no daemon claim, and either no `driver_pid` to ask or
+    /// the platform could not answer for the one recorded. Never treated as
+    /// `Dead`: see [`RunState::liveness_with`].
+    Unknown,
 }
 
 /// A timestamped note about a node.
@@ -1355,6 +1425,20 @@ pub struct RunState {
     /// before trusting one of these as "running" rather than "abandoned".
     #[serde(default)]
     pub active: BTreeMap<String, ActiveSeat>,
+    /// Process id of whichever `execute()` call last drove this run —
+    /// written at the very top of that method, the same place
+    /// [`Self::clear_active`] runs, so a fresh reentry always overwrites the
+    /// pid a previous, possibly-dead process left behind.
+    ///
+    /// A daemon-claimed run already has a stronger signal
+    /// (`daemon::is_working_on`), but a `magi run` / `magi review` typed
+    /// straight into a terminal claims nothing there — before this field
+    /// existed, [`report::active_seats`] had no way to tell that run apart
+    /// from one a killed process abandoned, and printed the same "no live
+    /// daemon claims this run" warning over a run that was, in fact, still
+    /// answering. See [`Liveness`] for how this and the daemon claim combine.
+    #[serde(default)]
+    pub driver_pid: Option<u32>,
     /// Last observation of the winner's pull request, when a land loop ran.
     ///
     /// Persisted rather than derived from the event log because the phone asks
@@ -1442,6 +1526,7 @@ impl RunState {
             parked: false,
             seats: BTreeMap::new(),
             active: BTreeMap::new(),
+            driver_pid: None,
             pr: None,
             base_sync: None,
             advice: None,
@@ -1525,6 +1610,10 @@ impl RunState {
                 started_at: Timestamp::now(),
                 timeout_secs: timeout.as_secs(),
                 attempt,
+                task: None,
+                command: None,
+                index: None,
+                total: None,
             },
         );
     }
@@ -1532,6 +1621,60 @@ impl RunState {
     /// Record that `seat` has answered, whatever the answer was.
     pub fn seat_finished(&mut self, seat: &str) {
         self.active.remove(seat);
+    }
+
+    /// Record that `task` (`"e2e"` or `"gate"` — a shell-command list run
+    /// outside any seat) has just started `command`, the `index`-th of
+    /// `total`. Called at every command boundary, not once for the whole
+    /// list: `verify.e2e` / `verify.gate` apply `timeout` per command, so
+    /// this is the only way a reader can tell "how long is left" for
+    /// whichever command is actually running right now, rather than a stale
+    /// budget left over from the first one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn task_command(
+        &mut self,
+        task: &str,
+        node: &str,
+        attempt: usize,
+        command: &str,
+        index: usize,
+        total: usize,
+        timeout: std::time::Duration,
+    ) {
+        self.active.insert(
+            task.to_owned(),
+            ActiveSeat {
+                node: node.to_owned(),
+                started_at: Timestamp::now(),
+                timeout_secs: timeout.as_secs(),
+                attempt,
+                task: Some(task.to_owned()),
+                command: Some(command.to_owned()),
+                index: Some(index),
+                total: Some(total),
+            },
+        );
+    }
+
+    /// Record that `task` has finished its whole command list for this
+    /// attempt.
+    pub fn task_finished(&mut self, task: &str) {
+        self.active.remove(task);
+    }
+
+    /// The seats — never task entries — currently mid-answer. What
+    /// `report::active_seats` and the phone's "who has not answered yet"
+    /// note need: a seat's identifier is safe to show ([`ActiveSeat`]'s doc),
+    /// so nothing here filters anything out beyond the type tag itself.
+    pub fn seats_active(&self) -> impl Iterator<Item = (&String, &ActiveSeat)> {
+        self.active.iter().filter(|(_, a)| a.task.is_none())
+    }
+
+    /// The command-list tasks — never seat entries — currently running.
+    /// Counterpart to [`Self::seats_active`]; see [`ActiveSeat::task`] for
+    /// the tag both read.
+    pub fn tasks_active(&self) -> impl Iterator<Item = (&String, &ActiveSeat)> {
+        self.active.iter().filter(|(_, a)| a.task.is_some())
     }
 
     /// Drop every seat this state still lists as answering, reporting whether
@@ -1569,6 +1712,48 @@ impl RunState {
                 .active
                 .values()
                 .all(|a| a.elapsed_secs(now) > a.timeout_secs as i64)
+    }
+
+    /// Whether a process is actually still driving this run, given whether a
+    /// daemon's heartbeat claims it and a process-liveness query for
+    /// [`Self::driver_pid`].
+    ///
+    /// A daemon claim wins outright when present — it is the stronger,
+    /// independently-heartbeating signal. Absent that (every manual `magi
+    /// run` / `magi review`, and every daemon-driven run whose daemon has
+    /// since exited cleanly), `driver_pid` is asked directly. `query` never
+    /// collapses an unavailable answer to either extreme: no `driver_pid` at
+    /// all (an old run, or a schema older than this field), a pid this build
+    /// cannot query, or a query that comes back inconclusive, all read as
+    /// [`Liveness::Unknown`] — never [`Liveness::Dead`]. A display that
+    /// guessed "dead" out of missing information would be exactly the
+    /// mtime-and-task-manager guessing this type exists to replace.
+    ///
+    /// Kept generic over `query` so a test can inject an answer without
+    /// spawning a real process query — production code goes through
+    /// [`Self::liveness`], which supplies [`crate::proc::pid_status`].
+    #[must_use]
+    pub fn liveness_with<F>(&self, daemon_claims: bool, query: F) -> Liveness
+    where
+        F: FnOnce(u32) -> Option<bool>,
+    {
+        if daemon_claims {
+            return Liveness::Live;
+        }
+        match self.driver_pid {
+            None => Liveness::Unknown,
+            Some(pid) => match query(pid) {
+                Some(true) => Liveness::Live,
+                Some(false) => Liveness::Dead,
+                None => Liveness::Unknown,
+            },
+        }
+    }
+
+    /// [`Self::liveness_with`], backed by the real process-liveness query.
+    #[must_use]
+    pub fn liveness(&self, daemon_claims: bool) -> Liveness {
+        self.liveness_with(daemon_claims, crate::proc::pid_status)
     }
 
     /// Clear every seat this run still lists as active and fail it, unless it
@@ -2202,6 +2387,10 @@ mod tests {
             started_at: now - jiff::SignedDuration::new(elapsed_secs, 0),
             timeout_secs,
             attempt: 0,
+            task: None,
+            command: None,
+            index: None,
+            total: None,
         }
     }
 
@@ -2226,6 +2415,64 @@ mod tests {
         s.active
             .insert("impl-B".to_owned(), overrun_seat(now, 0, 3_600));
         assert!(!s.active_all_overrun(now));
+    }
+
+    /// A daemon claim wins outright, whatever `driver_pid` or the query says
+    /// — the stronger, independently-heartbeating signal.
+    #[test]
+    fn liveness_reads_live_from_a_daemon_claim_alone() {
+        let mut s = state();
+        s.driver_pid = None;
+        assert_eq!(
+            s.liveness_with(true, |_| None),
+            Liveness::Live,
+            "a daemon claim needs no pid to back it up"
+        );
+    }
+
+    /// The gap `driver_pid` closes: no daemon claim (every manual `magi run`
+    /// / `magi review`), but the recorded pid answers alive.
+    #[test]
+    fn liveness_reads_live_from_a_confirmed_pid_without_a_daemon_claim() {
+        let mut s = state();
+        s.driver_pid = Some(4242);
+        assert_eq!(
+            s.liveness_with(false, |pid| {
+                assert_eq!(pid, 4242);
+                Some(true)
+            }),
+            Liveness::Live
+        );
+    }
+
+    /// No daemon claim and the recorded pid confirmed gone: the only case
+    /// that reads as provably dead.
+    #[test]
+    fn liveness_reads_dead_only_from_a_confirmed_dead_pid() {
+        let mut s = state();
+        s.driver_pid = Some(4242);
+        assert_eq!(s.liveness_with(false, |_| Some(false)), Liveness::Dead);
+    }
+
+    /// Missing information never collapses to `Dead`: an old run with no
+    /// `driver_pid` at all, and a `driver_pid` this build could not query,
+    /// both read as `Unknown` — never a guess.
+    #[test]
+    fn liveness_never_guesses_dead_out_of_missing_information() {
+        let mut s = state();
+        s.driver_pid = None;
+        assert_eq!(
+            s.liveness_with(false, |_| panic!("no pid to query")),
+            Liveness::Unknown,
+            "no driver_pid recorded at all — an old run predating this field"
+        );
+
+        s.driver_pid = Some(4242);
+        assert_eq!(
+            s.liveness_with(false, |_| None),
+            Liveness::Unknown,
+            "a pid to ask, but the platform could not answer for it"
+        );
     }
 
     #[test]
@@ -2369,6 +2616,7 @@ mod tests {
             verified_head: None,
             verified_at: None,
             reviews: vec![ReviewRecord {
+                attempts: 0,
                 reviewer: 1,
                 agent: "a".to_owned(),
                 summary: String::new(),
@@ -2860,6 +3108,62 @@ mod tests {
         );
     }
 
+    /// `seats_active` / `tasks_active` are the accessors report/web read
+    /// instead of `active` directly, so neither ever counts the other kind of
+    /// entry as a seat — a `verify.e2e` task must never inflate a quorum or
+    /// seat count, and a seat must never show up in a task listing.
+    #[test]
+    fn seats_active_and_tasks_active_never_cross_over() {
+        let mut s = state();
+        s.seat_started("judge", "judge-1", std::time::Duration::from_secs(60), 0);
+        s.task_command(
+            "e2e",
+            "verify",
+            0,
+            "cargo test",
+            1,
+            2,
+            std::time::Duration::from_secs(600),
+        );
+
+        assert_eq!(
+            s.seats_active()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>(),
+            vec!["judge-1"]
+        );
+        assert_eq!(
+            s.tasks_active()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e2e"]
+        );
+
+        // A command boundary updates the same entry in place — still one
+        // task, never a second one accumulating alongside it.
+        s.task_command(
+            "e2e",
+            "verify",
+            0,
+            "cargo clippy",
+            2,
+            2,
+            std::time::Duration::from_secs(600),
+        );
+        assert_eq!(s.tasks_active().count(), 1);
+        assert_eq!(s.active["e2e"].command.as_deref(), Some("cargo clippy"));
+
+        s.task_finished("e2e");
+        assert!(s.tasks_active().next().is_none());
+        assert_eq!(
+            s.seats_active()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>(),
+            vec!["judge-1"],
+            "clearing the task must not touch the seat entry"
+        );
+    }
+
     #[test]
     fn a_retry_is_recorded_as_a_later_attempt_on_the_same_seat() {
         let mut s = state();
@@ -2880,6 +3184,10 @@ mod tests {
             started_at: started,
             timeout_secs: 100,
             attempt: 0,
+            task: None,
+            command: None,
+            index: None,
+            total: None,
         };
         assert_eq!(seat.elapsed_secs(now), 30);
         assert_eq!(seat.remaining_secs(now), 70);
@@ -2896,6 +3204,10 @@ mod tests {
             started_at: started,
             timeout_secs: 100,
             attempt: 1,
+            task: None,
+            command: None,
+            index: None,
+            total: None,
         };
         assert_eq!(seat.remaining_secs(now), 0);
     }
@@ -2928,6 +3240,10 @@ mod tests {
             started_at: Timestamp::now(),
             timeout_secs: 60,
             attempt: 0,
+            task: None,
+            command: None,
+            index: None,
+            total: None,
         };
         let value = serde_json::to_value(&seat).unwrap();
         let keys: std::collections::BTreeSet<String> =
@@ -2940,7 +3256,44 @@ mod tests {
                 "timeout_secs".to_owned(),
                 "attempt".to_owned(),
             ]),
-            "a byte count here would be a lever to declare a silent-but-healthy seat dead"
+            "a byte count here would be a lever to declare a silent-but-healthy seat dead, and \
+             the task-only fields must stay absent (not null) on an ordinary seat entry"
+        );
+    }
+
+    /// The same guarantee as
+    /// [`active_seat_carries_nothing_that_could_be_read_as_output_bytes`],
+    /// extended to a task entry: `verify.e2e` / `verify.gate` are exactly as
+    /// silent as `agy` between commands, so a running command-list task must
+    /// never carry anything a reader could mistake for output-byte evidence
+    /// either.
+    #[test]
+    fn task_active_seat_carries_nothing_that_could_be_read_as_output_bytes() {
+        let seat = ActiveSeat {
+            node: "verify".to_owned(),
+            started_at: Timestamp::now(),
+            timeout_secs: 600,
+            attempt: 0,
+            task: Some("e2e".to_owned()),
+            command: Some("cargo test".to_owned()),
+            index: Some(1),
+            total: Some(3),
+        };
+        let value = serde_json::to_value(&seat).unwrap();
+        let keys: std::collections::BTreeSet<String> =
+            value.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "node".to_owned(),
+                "started_at".to_owned(),
+                "timeout_secs".to_owned(),
+                "attempt".to_owned(),
+                "task".to_owned(),
+                "command".to_owned(),
+                "index".to_owned(),
+                "total".to_owned(),
+            ]),
         );
     }
 

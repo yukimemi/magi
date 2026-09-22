@@ -118,6 +118,28 @@ where
     }
 }
 
+/// A three-valued liveness read, for a caller that *displays* whether a
+/// process is running rather than deciding whether it is safe to reclaim a
+/// lock. [`pid_alive`]'s Err-means-alive policy exists to protect a lock a
+/// live process still holds — the wrong bias for a report that must never
+/// tell an operator a process is confirmed dead just because this build
+/// could not ask the platform. `None` here is the honest "could not tell",
+/// left for the caller to render as its own "unknown" rather than folded
+/// into either `Some` answer.
+#[must_use]
+pub fn pid_status(pid: u32) -> Option<bool> {
+    pid_status_with(pid, platform_pid_alive)
+}
+
+/// [`pid_status`] with its process-liveness query supplied by the caller —
+/// see [`pid_alive_with`] for why this split exists.
+fn pid_status_with<F>(pid: u32, query: F) -> Option<bool>
+where
+    F: FnOnce(u32) -> std::io::Result<bool>,
+{
+    query(pid).ok()
+}
+
 fn platform_pid_alive(pid: u32) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
@@ -340,6 +362,20 @@ mod tests {
         assert!(pid_alive_with(42, |_| Err(std::io::Error::other(
             "access denied"
         ))));
+    }
+
+    /// Unlike [`pid_alive_with`]'s Err-means-alive bias, the three-valued read
+    /// leaves an unavailable query as `None` rather than inventing either
+    /// answer — a display that guessed "dead" here would be exactly the wrong
+    /// kind of confidence this exists to avoid.
+    #[test]
+    fn pid_status_reports_alive_dead_and_unknown_as_three_distinct_answers() {
+        assert_eq!(pid_status_with(42, |_| Ok(true)), Some(true));
+        assert_eq!(pid_status_with(42, |_| Ok(false)), Some(false));
+        assert_eq!(
+            pid_status_with(42, |_| Err(std::io::Error::other("access denied"))),
+            None
+        );
     }
 
     /// 本番パーサー用のコマンド出力フィクスチャであり、特定 PID の OS 上の

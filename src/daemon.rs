@@ -4260,6 +4260,10 @@ mod tests {
             started_at: now - jiff::SignedDuration::new(21_000, 0),
             timeout_secs: 3_600,
             attempt: 0,
+            task: None,
+            command: None,
+            index: None,
+            total: None,
         };
 
         let mut dead = run_state(RunStatus::Implementing);
