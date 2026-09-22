@@ -128,6 +128,7 @@ fn parked_run(repo: &std::path::Path, config: &magi::config::Config) -> RunState
         commits: 1,
         empty: false,
         failed: None,
+        verified_noop: None,
         duration_ms: 0,
         folded: false,
     }];

@@ -7497,6 +7497,7 @@ mod tests {
             commits: 1,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: true,
         });
@@ -7564,6 +7565,7 @@ mod tests {
             commits: 1,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         });
@@ -8543,15 +8545,15 @@ mod tests {
             .collect();
 
         // `runSection` reimplemented from assets/ui/app.js: `waiting` wins
-        // outright, then merged/ready land, stalled/blocked/failed end, and
-        // everything else is still in flight.
+        // outright, then merged/ready land, stalled/blocked/failed/
+        // verified_noop end, and everything else is still in flight.
         fn run_section(waiting: bool, status: &str) -> &'static str {
             if waiting {
                 return "waiting";
             }
             match status {
                 "merged" | "ready" => "landed",
-                "stalled" | "blocked" | "failed" => "ended",
+                "stalled" | "blocked" | "failed" | "verified_noop" => "ended",
                 _ => "flight",
             }
         }

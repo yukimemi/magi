@@ -352,7 +352,15 @@ pub fn implement(instruction: &str, cwd: &str, language: &str, brief: Option<&st
          - what you changed (max 10 bullets)\n\
          - why, where it is not obvious\n\
          - risks a reviewer should check\n\
-         - how to verify by hand\n\n{}{}",
+         - how to verify by hand\n\n\
+         If, after investigating, you conclude the task's request is already \
+         satisfied elsewhere and no change belongs in this worktree, write no \
+         bullets. Instead start SUMMARY with a line reading exactly \
+         `NO CHANGE NEEDED:` followed by the evidence you verified it with — \
+         the commit SHA(s) you checked, the existing test name(s) that already \
+         cover it, the exact command you ran and its output, or the path you \
+         read. An empty or unsupported claim reads as an ordinary candidate \
+         that wrote nothing, not a verified one.\n\n{}{}",
         ask_the_owner(language),
         lang(language)
     )
@@ -1930,6 +1938,13 @@ mod tests {
         assert!(p.contains("Co-Authored-By:"));
         assert!(p.contains("## SUMMARY"));
         assert!(p.contains("/tmp/wt"));
+    }
+
+    #[test]
+    fn implement_prompt_documents_the_no_change_needed_marker() {
+        let p = implement("do it", "/tmp/wt", "en", None);
+        assert!(p.contains("NO CHANGE NEEDED:"), "{p}");
+        assert!(p.contains("already satisfied elsewhere"), "{p}");
     }
 
     #[test]

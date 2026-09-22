@@ -3057,6 +3057,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             commits: 1,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }

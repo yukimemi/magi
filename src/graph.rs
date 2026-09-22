@@ -525,6 +525,7 @@ impl Runner {
             commits,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         });
@@ -646,6 +647,12 @@ impl Runner {
         if self.park_here()? {
             return Ok(());
         }
+        // `after_implement` already saved the state and settled any open
+        // questions when it set this; nothing later in the graph has
+        // anything to judge.
+        if self.state.status == RunStatus::VerifiedNoop {
+            return Ok(());
+        }
         self.judge().await?;
         if self.park_here()? {
             return Ok(());
@@ -724,13 +731,15 @@ impl Runner {
     /// `Blocked` and `Stalled` are `RunStatus::resumable` — a human can pick
     /// either back up with the candidates, the review round and the seat
     /// sessions already on disk, so a question an implementer asked mid-round
-    /// may still get a real answer read by a real resume. Only the three
-    /// statuses `resumable` excludes are actually final: the run merged, or
-    /// it reached `Ready` with nothing left to do, or it failed outright with
-    /// no established point to continue from. In every one of those the seat
-    /// that asked is gone for good, exactly like the run being deleted under
-    /// `magi run rm` - so the same cleanup applies, worded for what actually
-    /// happened instead of "the run was deleted".
+    /// may still get a real answer read by a real resume. Only the statuses
+    /// `resumable` excludes are actually final: the run merged, it reached
+    /// `Ready` with nothing left to do, it failed outright with no
+    /// established point to continue from, or every candidate agreed, with
+    /// evidence, that nothing belonged in the worktree (`VerifiedNoop`). In
+    /// every one of those the seat that asked is gone for good, exactly like
+    /// the run being deleted under `magi run rm` - so the same cleanup
+    /// applies, worded for what actually happened instead of "the run was
+    /// deleted".
     ///
     /// Best-effort and silent on success: called from every place `status`
     /// can land on one of those three, including ones a resumed run revisits,
@@ -818,6 +827,7 @@ impl Runner {
                 commits: 0,
                 empty: false,
                 failed: None,
+                verified_noop: None,
                 duration_ms: 0,
                 folded: false,
             });
@@ -1273,7 +1283,7 @@ impl Runner {
             let worktree = self.state.candidates[i].worktree.clone();
             let base = self.state.base_commit.clone();
 
-            let (summary, duration, failed) = match out {
+            let (summary, duration, failed, verified_claim) = match out {
                 AgentOutcome::Ok(o) => {
                     let text = verdict::section(&o.text, "summary").unwrap_or(o.text.clone());
                     let failed = (!o.usable()).then(|| {
@@ -1283,7 +1293,8 @@ impl Runner {
                             format!("agent exited with {:?}", o.exit_code)
                         }
                     });
-                    (text, o.duration_ms, failed)
+                    let verified_claim = verified_noop_claim(failed.is_none(), &o.commands, &text);
+                    (text, o.duration_ms, failed, verified_claim)
                 }
                 // Left un-resumed by `resume_undelivered` (a dirty tree
                 // already rescues the work, or there was no session left to
@@ -1300,6 +1311,7 @@ impl Runner {
                         String::new(),
                         o.duration_ms,
                         Some(format!("the CLI dropped the stream ({why})")),
+                        None,
                     )
                 }
                 AgentOutcome::Quota(o) => {
@@ -1313,9 +1325,10 @@ impl Runner {
                         String::new(),
                         o.duration_ms,
                         Some("rate limited (quota); produced no change".to_owned()),
+                        None,
                     )
                 }
-                AgentOutcome::Failed(e) => (String::new(), 0, Some(e)),
+                AgentOutcome::Failed(e) => (String::new(), 0, Some(e), None),
             };
 
             // Rescue anything the agent edited but never committed: an
@@ -1354,15 +1367,23 @@ impl Runner {
                 Some(_) if c.empty => failed,
                 _ => None,
             };
-            let note = match (&c.failed, c.empty, rescued) {
-                (Some(e), _, _) => format!("candidate {label}: {e}"),
-                (None, true, _) => format!("candidate {label}: no change produced"),
-                (None, false, true) => {
+            // Only an empty candidate can be a verified no-op: a claim next
+            // to a real patch is not what the marker is for, and `c.failed`
+            // being `Some` here already implies `verified_claim` was never
+            // set (see the guard above the match that produced it).
+            c.verified_noop = if c.empty { verified_claim } else { None };
+            let note = match (&c.failed, c.empty, &c.verified_noop, rescued) {
+                (Some(e), _, _, _) => format!("candidate {label}: {e}"),
+                (None, true, Some(_), _) => {
+                    format!("candidate {label}: no change produced (agent-verified no-op)")
+                }
+                (None, true, None, _) => format!("candidate {label}: no change produced"),
+                (None, false, _, true) => {
                     format!(
                         "candidate {label}: {files} files, {commits} commits (rescued an uncommitted tree)"
                     )
                 }
-                (None, false, false) => {
+                (None, false, _, false) => {
                     format!("candidate {label}: {files} files, {commits} commits")
                 }
             };
@@ -1792,6 +1813,22 @@ impl Runner {
         }
 
         if self.state.viable().is_empty() {
+            if self.state.all_candidates_verified_noop() {
+                // Every candidate agreed, with evidence the adoption guard
+                // accepted, that nothing belongs in this worktree. That is
+                // not the same fact as a candidate that simply failed to
+                // write anything, and settling it as an ordinary `Failed`
+                // (see `SCHEMA`'s doc for schema 10) is what let two of
+                // task 391f's attempts burn a retry each re-discovering the
+                // same already-landed fix. Terminal either way, so `judge`
+                // must never run over an empty candidate set — unlike the
+                // `Failed` branch below this returns `Ok`, not an error:
+                // nothing here failed.
+                self.state.status = RunStatus::VerifiedNoop;
+                self.state.save()?;
+                self.settle_questions();
+                return Ok(());
+            }
             self.state.status = RunStatus::Failed;
             self.state.save()?;
             self.settle_questions();
@@ -4806,6 +4843,28 @@ fn has_unconfirmed_command(commands: &[agent::CommandEvidence]) -> bool {
     commands.iter().any(|c| c.exit_code.is_none())
 }
 
+/// Whether a `NO CHANGE NEEDED` marker in an implementer's reply should be
+/// trusted as a verified no-op — the adoption guard's own text-level half.
+///
+/// `usable` is the caller's `AgentOutput::usable()` (a clean CLI exit, not
+/// timed out): a marker only earns the benefit of the doubt from a turn the
+/// CLI itself vouches for finishing properly, the same house style
+/// `resume_unconfirmed_commands` and `continue_fix_report` already hold a
+/// *fix* report to for `commands`. A candidate that timed out, exited
+/// non-zero, or left a command unconfirmed is read as the ordinary loss it
+/// is, whatever prose it wrote — this returns `None` before it ever looks at
+/// `text`. The remaining guards (the tree really is empty, the evidence is
+/// non-empty) are the caller's: this only reads what the reply *claimed*.
+fn verified_noop_claim(
+    usable: bool,
+    commands: &[agent::CommandEvidence],
+    text: &str,
+) -> Option<String> {
+    (usable && !has_unconfirmed_command(commands))
+        .then(|| verdict::verified_noop(text))
+        .flatten()
+}
+
 fn short(commit: &str) -> String {
     commit.chars().take(7).collect()
 }
@@ -6476,6 +6535,7 @@ mod tests {
             commits: 1,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 1234,
             folded: false,
         }];
@@ -6656,6 +6716,7 @@ mod tests {
                 commits: 0,
                 empty: false,
                 failed: None,
+                verified_noop: None,
                 duration_ms: 0,
                 folded: false,
             },
@@ -6671,6 +6732,7 @@ mod tests {
                 commits: 0,
                 empty: false,
                 failed: None,
+                verified_noop: None,
                 duration_ms: 0,
                 folded: false,
             },
@@ -6750,6 +6812,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -6873,6 +6936,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -6975,6 +7039,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -7108,6 +7173,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -7247,6 +7313,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -7430,6 +7497,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -7561,6 +7629,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -7979,5 +8048,119 @@ mod tests {
             evidence(Some(0)),
             evidence(None)
         ]));
+    }
+
+    #[test]
+    fn a_clean_usable_reply_with_the_marker_is_a_verified_claim() {
+        let text = "NO CHANGE NEEDED: already fixed by b32cfc4, on main.";
+        assert_eq!(
+            verified_noop_claim(true, &[], text).as_deref(),
+            Some("already fixed by b32cfc4, on main.")
+        );
+    }
+
+    #[test]
+    fn an_unusable_reply_never_earns_the_benefit_of_the_doubt() {
+        // A timeout or a bad exit code reads as the ordinary loss it is,
+        // whatever the reply's own prose claims.
+        let text = "NO CHANGE NEEDED: already fixed by b32cfc4, on main.";
+        assert!(verified_noop_claim(false, &[], text).is_none());
+    }
+
+    #[test]
+    fn an_unconfirmed_command_disqualifies_the_claim_even_on_a_usable_reply() {
+        let text = "NO CHANGE NEEDED: already fixed by b32cfc4, on main.";
+        assert!(verified_noop_claim(true, &[evidence(None)], text).is_none());
+        // A confirmed command alongside the marker is fine.
+        assert!(verified_noop_claim(true, &[evidence(Some(0))], text).is_some());
+    }
+
+    #[test]
+    fn an_ordinary_reply_with_no_marker_is_never_a_claim() {
+        assert!(verified_noop_claim(true, &[], "- did the thing\n- tested it").is_none());
+    }
+
+    /// Sets `runner.state.candidates` to one candidate per `(empty, verified)`
+    /// pair, in order, labelled A, B, C, ...
+    fn set_candidates(runner: &mut Runner, shape: &[(bool, Option<&str>)]) {
+        runner.state.candidates = shape
+            .iter()
+            .enumerate()
+            .map(|(i, &(empty, verified))| Candidate {
+                index: i,
+                label: (b'A' + i as u8) as char,
+                agent: "sonnet".to_owned(),
+                branch: format!("magi/x/{}", (b'A' + i as u8) as char),
+                worktree: PathBuf::from(format!("/wt/{i}")),
+                summary: String::new(),
+                stat: String::new(),
+                files: 0,
+                commits: 0,
+                empty,
+                failed: None,
+                verified_noop: verified.map(str::to_owned),
+                duration_ms: 0,
+                folded: false,
+            })
+            .collect();
+    }
+
+    #[test]
+    fn after_implement_reads_all_candidates_verified_as_a_noop_not_a_failure() {
+        ask_test_home();
+        let mut runner = runner_at(RunStatus::Implementing);
+        set_candidates(
+            &mut runner,
+            &[
+                (true, Some("already on main at b32cfc4")),
+                (true, Some("same fix, see the existing test")),
+            ],
+        );
+
+        runner
+            .after_implement()
+            .expect("a verified no-op is not an error");
+
+        assert_eq!(runner.state.status, RunStatus::VerifiedNoop);
+    }
+
+    #[test]
+    fn after_implement_does_not_accept_one_candidates_claim_next_to_an_ordinary_loss() {
+        ask_test_home();
+        let mut runner = runner_at(RunStatus::Implementing);
+        // Candidate A declares a verified no-op; candidate B simply wrote
+        // nothing and said nothing about why. One candidate's claim is not
+        // the whole run's agreement.
+        set_candidates(
+            &mut runner,
+            &[(true, Some("already on main at b32cfc4")), (true, None)],
+        );
+
+        let err = runner
+            .after_implement()
+            .expect_err("an unverified empty candidate must still fail the run");
+
+        assert!(
+            err.to_string().contains("no candidate produced a change"),
+            "{err}"
+        );
+        assert_eq!(runner.state.status, RunStatus::Failed);
+    }
+
+    #[test]
+    fn after_implement_still_fails_an_ordinary_all_empty_run() {
+        ask_test_home();
+        let mut runner = runner_at(RunStatus::Implementing);
+        set_candidates(&mut runner, &[(true, None), (true, None)]);
+
+        let err = runner
+            .after_implement()
+            .expect_err("no candidate declared anything; this is an ordinary failure");
+
+        assert!(
+            err.to_string().contains("no candidate produced a change"),
+            "{err}"
+        );
+        assert_eq!(runner.state.status, RunStatus::Failed);
     }
 }

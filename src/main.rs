@@ -899,12 +899,20 @@ fn had_separator() -> bool {
 /// `Blocked if left_pr => handed_off` row. Treating that as an error would
 /// contradict the very distinction this repo relies on elsewhere between a
 /// stopped-but-delivered PR and a run that never converged.
+///
+/// `VerifiedNoop` is exempted the same way, and for the same reason: it also
+/// settles through `Task::handed_off`, not `Task::fail` — see that status's
+/// own doc. It falls into the wildcard below rather than `Blocked`'s error
+/// arm, which is correct on its own, but is named explicitly here so a
+/// reader does not have to rediscover that this status was deliberately
+/// excluded from the error path rather than merely never added to it.
 fn exit_status(result: Result<()>, status: RunStatus, left_pr: bool) -> Result<()> {
     result.and_then(|()| match status {
         RunStatus::Blocked if left_pr => Ok(()),
         RunStatus::Blocked | RunStatus::Stalled => {
             bail!("run ended {} — see the report above", status.as_str())
         }
+        RunStatus::VerifiedNoop => Ok(()),
         _ => Ok(()),
     })
 }
@@ -3014,6 +3022,15 @@ mod tests {
     }
 
     #[test]
+    fn a_verified_noop_run_exits_zero() {
+        // Settles through `Task::handed_off`, the same hand-off-to-a-human
+        // shape as `Blocked` with a PR open, not `Task::fail` — the exit
+        // code must agree that this is not the error `Blocked`/`Stalled`
+        // are.
+        assert!(exit_status(Ok(()), RunStatus::VerifiedNoop, false).is_ok());
+    }
+
+    #[test]
     fn an_earlier_error_is_never_swallowed_by_the_status_check() {
         let err = exit_status(Err(anyhow::anyhow!("boom")), RunStatus::Ready, false);
         assert_eq!(err.unwrap_err().to_string(), "boom");
@@ -4733,6 +4750,7 @@ mod tests {
             commits: 1,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         });
