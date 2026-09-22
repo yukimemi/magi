@@ -123,6 +123,51 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// `#[serde(default)]` for the status. `Candidate::verified_noop` alone
 /// *does* default-read as `None` on an old record, which is the honest
 /// reading: a run written before this schema never made the claim.
+///
+/// The report task 391f itself was raised from also named `6c5e`, `8df3` and
+/// `e9ce` as three more tasks whose implement wave ended the same
+/// diff-zero way, and the investigation traced all three — they do not
+/// share one cause.
+///
+/// `6c5e` and `8df3` are the same already-landed pattern as `391f`, not a
+/// coincidence: all three were re-queued together by a same-day audit of
+/// `done`-but-unlanded magi tasks (queue talk `20260912-115153-7216`,
+/// 2026-09-12 02:51–04:24), which found 17 magi tasks marked `done` with no
+/// merge to show for it and re-queued 16 of them, `6c5e` (a fix for the
+/// owner's `magi ask --thread` back-and-forth) and `8df3` (release
+/// automation) included. A second, same-day audit (talk
+/// `20260912-222053-07fe`, 13:20–13:36) then found 12 of those re-queued
+/// tasks — `391f`, `6c5e` and `8df3` among them — already merged by another
+/// route, and the owner had them deleted (`magi task rm`); `391f` alone
+/// survived because a daemon still held its run at the moment of deletion,
+/// which is the only reason any record of this group still exists to audit.
+/// `git log` independently confirms both fixes: the ask-back feature `6c5e`
+/// wanted landed as `f0df474` ("let the owner ask back on a question...",
+/// #93) on 2026-09-06, and the release-bump automation `8df3` wanted landed
+/// as `61005dd`/`bedd925` (open a release-bump PR on merge) on 2026-09-07
+/// and `116fcdc` (proportional version bump, #108) on 2026-09-08 — all
+/// before the 09-12 requeue. No run record survives the deletion for either
+/// task, so this schema's evidence is the audit transcript plus the
+/// independently re-checked `git log`, not a `run.json`.
+///
+/// `e9ce` is not that pattern at all, and is the reason the adoption guard
+/// below is all-or-nothing rather than "any candidate said so": its task
+/// asked an implementer to merge the real repository's `main` and cut a
+/// GitHub release — a destructive, out-of-worktree operation `AGENTS.md`
+/// names explicitly as not something to hand to an unattended candidate.
+/// Both of its runs (`20260912-053352-49ad`, `20260912-062629-bab1`)
+/// correctly refused, filed `magi ask` (questions `6196`, `6c9a`), and ended
+/// with an empty diff only because no answer arrived before the implement
+/// node's timeout — `49ad` looped `magi ask --wait` in the foreground for
+/// roughly 50 minutes as instructed before the timeout cut it off; `bab1`
+/// ended its turn moments after filing its question without ever actually
+/// blocking on the wait, a separate protocol slip this schema change does
+/// not attempt to fix. Neither candidate's reply carries the
+/// `NO CHANGE NEEDED` marker below, so both runs correctly stay `Failed`
+/// under this schema, not `VerifiedNoop`: a run blocked on an unanswered
+/// authorization question is not a verified no-op, and reading the two
+/// alike is exactly the misclassification the guard's per-candidate and
+/// whole-run conditions exist to refuse.
 pub const SCHEMA: u32 = 10;
 
 /// Where a run got to.

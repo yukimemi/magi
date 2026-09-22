@@ -2728,6 +2728,14 @@ fn runnable(queue: &Queue) -> Vec<Task> {
 /// A stalled run names the seats the quota took out: "out of quota" is not
 /// actionable, while "judge-2, judge-3 hit a limit" tells the operator which
 /// agent to replace or which plan to top up.
+///
+/// Uses [`RunStatus::display_label`] rather than [`label`]/`as_str` on
+/// purpose: unlike `label`'s other callers (an internal log line, an
+/// already-a-bug fallback message), this string becomes `Task::last_error`
+/// verbatim, which the phone renders in the same alarm-styled box an
+/// ordinary failure gets — see `web::tests` and `assets/ui/app.js`'s
+/// `.err` styling. A bare `verified_noop` there would read exactly like the
+/// failure this whole feature exists to tell apart from one.
 fn describe(state: &RunState) -> String {
     let mut detail = if state.status == RunStatus::Stalled {
         let mut seats: Vec<&str> = state.quota.iter().map(|q| q.seat.as_str()).collect();
@@ -2742,7 +2750,7 @@ fn describe(state: &RunState) -> String {
             )
         }
     } else {
-        format!("run ended {}", label(state.status))
+        format!("run ended {}", state.status.display_label())
     };
     if let Some(last) = state.events.last() {
         detail.push_str(&format!(" ({}: {})", last.node, last.message));
@@ -2835,9 +2843,12 @@ fn diagnostic(state: &RunState) -> Option<String> {
     ))
 }
 
-/// Stable lower-case name for a run status, for logs and task errors.
-/// One definition of a status's name, on the type that owns it: this table
-/// used to live here as a second copy, and a status renamed in one place would
+/// Stable lower-case name for a run status, for an internal log line and the
+/// "graph stopped without reaching a terminal status" bug message in
+/// [`settle`] — never for [`Task::last_error`] itself; see [`describe`]'s own
+/// doc for why that one reads [`RunStatus::display_label`] instead. One
+/// definition of a status's name, on the type that owns it: this table used
+/// to live here as a second copy, and a status renamed in one place would
 /// have gone on reading correctly in the other.
 fn label(status: RunStatus) -> &'static str {
     status.as_str()
@@ -3964,6 +3975,21 @@ mod tests {
         assert!(d.contains("build"), "{d}");
         assert!(d.contains("lint"), "{d}");
         assert!(d.contains("fixer produced no commit"), "{d}");
+    }
+
+    #[test]
+    fn describe_never_leaves_a_verified_noop_reading_as_a_bare_status_code() {
+        // `describe`'s output becomes `Task::last_error` verbatim, and the
+        // phone renders that in the same alarm-styled box an ordinary
+        // failure gets. A bare `verified_noop` there would read exactly like
+        // the failure this status exists to be told apart from.
+        let state = run_state(RunStatus::VerifiedNoop);
+        let d = describe(&state);
+        assert!(
+            d.contains("agent-verified no-op"),
+            "expected the display label, not the wire spelling: {d}"
+        );
+        assert!(!d.contains("verified_noop"), "{d}");
     }
 
     #[test]
