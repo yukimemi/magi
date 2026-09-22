@@ -456,6 +456,33 @@ pub fn fixture_with_quota(home: HomeGuard, quota_seats: &[&str]) -> Fixture {
     fx
 }
 
+/// Like [`fixture_with_quota`], but the rate limit is scoped to specific
+/// *agents* rather than shared by the whole roster — the shape needed to
+/// exercise the implement node's per-seat quota fallback
+/// (`graph::Runner::resume_quota_losses`), where the same seat key must
+/// quota on one agent's turn and succeed once a different agent takes over.
+///
+/// Forces `candidates = 1`: a solo run is the motivating case for the
+/// fallback, since `Config::resolve_roles` only ever gives a solo seat one
+/// implementer slot, and judging a single candidate is skipped, so a test
+/// built on this fixture only pays for the implement calls it is actually
+/// about.
+pub fn fixture_with_quota_on_agents(
+    home: HomeGuard,
+    quota_agents: &[&str],
+    seats: &[&str],
+) -> Fixture {
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    let value = seats.join(",");
+    for a in &mut fx.config.agents {
+        if quota_agents.contains(&a.id.as_str()) {
+            a.env.insert("MOCK_QUOTA_SEAT".to_owned(), value.clone());
+        }
+    }
+    fx
+}
+
 /// Like [`fixture`], but the given judge seats fail with a *plain* error (no
 /// usable output) at their initial ranking — the non-quota counterpart to
 /// [`fixture_with_quota`]. Enough of these collapse the quorum the same way a

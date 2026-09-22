@@ -1273,11 +1273,18 @@ impl Runner {
         let mut results = wave(jobs, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
         self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
             .await;
+        self.resume_quota_losses(&mut results, &sent, &prompts, &run_id)
+            .await;
         self.resume_unconfirmed_commands(&mut results, &sent, &prompts, &run_id)
             .await;
 
         for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
             let seat_key = seat.key.clone();
+            // A quota fallback (`resume_quota_losses`) may have handed this
+            // seat to a different agent than the one `prep` recorded on the
+            // candidate; the stats tables and any later fixer-defaults-to-
+            // winner's-author lookup must credit whoever actually answered.
+            let agent = seat.agent.clone();
             self.state.seats.insert(seat.key.clone(), seat);
             let label = self.state.candidates[i].label;
             let worktree = self.state.candidates[i].worktree.clone();
@@ -1355,6 +1362,7 @@ impl Runner {
             write_artifact(&self.state, &format!("cand-{label}.patch"), &patch)?;
 
             let c = &mut self.state.candidates[i];
+            c.agent = agent;
             c.summary = blind::sanitize_prose(&summary, &self.state.config.blind);
             c.stat = stat;
             c.files = files;
@@ -1491,6 +1499,133 @@ impl Runner {
                 run_one(retry, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
             *seat = resumed_seat;
             *out = resumed;
+        }
+    }
+
+    /// Fall an implement seat through to the next untried agent in the
+    /// implementer roster when it lost to quota, instead of leaving the
+    /// seat's loss final the moment one agent's account runs dry.
+    ///
+    /// Solo runs (`graph.candidates = 1`, `daemon::apply_solo`'s forced shape)
+    /// are the motivating case: `Config::resolve_roles`'s `implementers`
+    /// truncates to the single slot rotation picked, so a solo task whose one
+    /// implementer hits quota mid-run used to have nothing else to try. This
+    /// walks [`ResolvedRoles::implementer_roster`] instead — the untruncated,
+    /// unrotated roster — which is the only place the *other* candidates in
+    /// the machine's roster still exist once `implementers` has been cut down
+    /// to size.
+    ///
+    /// Tried by `spec.id`, never the whole [`AgentSpec`]: a roster with the
+    /// same id named twice must not let this retry that id forever. The loop
+    /// keeps falling through — sonnet, then cx, then oc, then agy — until an
+    /// attempt lands something other than `Quota` or the roster runs out of
+    /// untried ids, at which point the seat is left exactly as `implement`'s
+    /// own `AgentOutcome::Quota` arm already handles it: one `QuotaLoss`
+    /// recorded, the candidate failed/empty.
+    ///
+    /// Every fallback gets a fresh [`SeatState`], never the quota'd seat's own
+    /// — `self.seat` only reuses state when the agent id is unchanged, so
+    /// handing it a different id already gets this for free. Reusing the old
+    /// seat would resume a different CLI's session as if it were a
+    /// continuation of this one.
+    ///
+    /// Unlike [`Runner::resume_undelivered`], not gated on a clean worktree:
+    /// a quota loss cuts an agent off mid-turn, so anything already in the
+    /// tree is unfinished work, not a completed candidate a re-ask would pay
+    /// for twice. A dirty tree is rescued into a commit first (the same
+    /// neutral-identity rescue `implement`'s own outcome loop gives every
+    /// candidate) so the next agent starts clean.
+    ///
+    /// The new agent gets the implementer's full prompt and full
+    /// `timeout_implement` budget, not `resume_after_drop`'s nudge-sized one:
+    /// it has no session and no context, and is implementing the task from
+    /// nothing, unlike a resumed drop which is only restating work already
+    /// done.
+    ///
+    /// Every intermediate `Quota` this loop absorbs is folded into a plain
+    /// `implement` event, never into `self.state.quota` — that is what
+    /// `daemon.rs`'s own backoff reads to decide a run's task attempt should
+    /// go unspent, and a seat that ultimately recovered on its second or
+    /// third agent is not the stalled panel that check exists to catch. Only
+    /// the final, unrecovered `Quota` (once the roster runs out) ever reaches
+    /// `self.state.quota`, via the ordinary `AgentOutcome::Quota` arm the
+    /// outcome loop already has — this helper never pushes to it itself.
+    async fn resume_quota_losses(
+        &mut self,
+        results: &mut [(usize, SeatState, AgentOutcome)],
+        sent: &[SeatJob],
+        prompts: &Prompts,
+        run_id: &str,
+    ) {
+        let instruction = self.state.instruction.clone();
+        let language = self.state.config.graph.language.clone();
+        let brief = self
+            .state
+            .advice
+            .as_ref()
+            .and_then(|a| a.synthesis.as_deref())
+            .map(str::to_owned);
+        for (wi, seat, out) in results.iter_mut() {
+            let Some(job) = sent.get(*wi) else { continue };
+            let mut tried: BTreeSet<String> = BTreeSet::from([job.spec.id.clone()]);
+            let mut fallback_attempt = 0usize;
+            while matches!(&*out, AgentOutcome::Quota(_)) {
+                let Some(next) =
+                    next_untried_implementer(&self.roles.implementer_roster, &tried).cloned()
+                else {
+                    break;
+                };
+                tried.insert(next.id.clone());
+                fallback_attempt += 1;
+
+                git::commit_all(
+                    &job.cwd,
+                    &format!(
+                        "magi: candidate {} (uncommitted work before quota fallback)",
+                        seat.key
+                    ),
+                )
+                .await
+                .ok();
+
+                self.state.event(
+                    "implement",
+                    format!(
+                        "{}: rate limited (quota) on {}; retrying with {}",
+                        seat.key, seat.agent, next.id
+                    ),
+                );
+
+                let new_seat = self.seat(&seat.key, &next.id);
+                let mut retry = job.clone();
+                retry.spec = next.clone();
+                retry.seat = new_seat;
+                retry.prompt = prompt::implement(
+                    &instruction,
+                    &job.cwd.to_string_lossy(),
+                    &language,
+                    brief.as_deref(),
+                );
+                retry.stem = format!("{}-quota-{}", job.stem, next.id);
+                let cache = self.state.config.cache_dir();
+                let ctx = WaveCtx {
+                    run: run_id,
+                    node: "implement",
+                    prompts,
+                    cache: cache.as_deref(),
+                    round: None,
+                };
+                let (fallback_seat, fallback_out) = run_one(
+                    retry,
+                    Arc::clone(&self.sem),
+                    &ctx,
+                    &mut self.state,
+                    fallback_attempt,
+                )
+                .await;
+                *seat = fallback_seat;
+                *out = fallback_out;
+            }
         }
     }
 
@@ -4826,6 +4961,20 @@ fn has_context(spec: &AgentSpec, seat: &SeatState, sessions: bool) -> bool {
     agent::has_session(spec.kind, seat, sessions)
 }
 
+/// The first entry in `roster` whose id is not in `tried` yet.
+///
+/// Matched by [`AgentSpec::id`], never the whole spec: a roster that names
+/// the same id twice (an operator's `roles.implementers` typo, or a `[[agents]]`
+/// list reused across roles) must not let [`Runner::resume_quota_losses`]
+/// retry that id forever — the loop it feeds stops precisely when this
+/// returns `None`.
+fn next_untried_implementer<'a>(
+    roster: &'a [AgentSpec],
+    tried: &BTreeSet<String>,
+) -> Option<&'a AgentSpec> {
+    roster.iter().find(|s| !tried.contains(&s.id))
+}
+
 /// Did this reply report running a command whose own CLI never confirmed an
 /// exit status?
 ///
@@ -5979,6 +6128,46 @@ mod tests {
         }
     }
 
+    fn spec(id: &str) -> AgentSpec {
+        AgentSpec {
+            id: id.to_owned(),
+            kind: crate::config::AgentKind::Command,
+            model: None,
+            command: vec!["true".to_owned()],
+            extra_args: Vec::new(),
+            env: BTreeMap::new(),
+            prompt_delivery: None,
+        }
+    }
+
+    // `next_untried_implementer` is the property `resume_quota_losses`'s own
+    // fallback loop depends on to terminate: it must walk forward through the
+    // roster, and it must never hand back an id already tried, however many
+    // times that id happens to appear.
+
+    #[test]
+    fn next_untried_implementer_skips_ids_already_tried_even_when_duplicated() {
+        let roster = vec![spec("a"), spec("a"), spec("b")];
+        let tried = BTreeSet::from(["a".to_owned()]);
+        let next = next_untried_implementer(&roster, &tried);
+        assert_eq!(next.map(|s| s.id.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn next_untried_implementer_returns_none_once_every_id_is_tried() {
+        let roster = vec![spec("a"), spec("b")];
+        let tried = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
+        assert!(next_untried_implementer(&roster, &tried).is_none());
+    }
+
+    #[test]
+    fn next_untried_implementer_walks_forward_in_roster_order() {
+        let roster = vec![spec("a"), spec("b"), spec("c")];
+        let tried = BTreeSet::from(["a".to_owned()]);
+        let next = next_untried_implementer(&roster, &tried);
+        assert_eq!(next.map(|s| s.id.as_str()), Some("b"), "not c: b is first");
+    }
+
     #[test]
     fn remove_if_empty_only_ever_takes_a_bare_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -6399,6 +6588,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -6879,6 +7069,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -6989,6 +7180,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -7088,6 +7280,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -7222,6 +7415,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -7365,6 +7559,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -7559,6 +7754,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -7702,6 +7898,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
