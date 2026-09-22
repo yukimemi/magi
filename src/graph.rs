@@ -6083,7 +6083,14 @@ async fn gh_pr_create(cwd: &Path, base: &str, head: &str, body: &str) -> Result<
 }
 
 /// Tear a run's worktrees and branches down.
-pub async fn fold_run(state: &mut RunState, drop_winner: bool) -> Result<Vec<String>> {
+///
+/// `home` is where the updated `run.json` is saved (via
+/// [`RunState::save_under`]), never the process-global [`crate::run::home`]:
+/// a housekeeping pass already has its own honest `home` handed to it, and
+/// falling through to the global here would write back through whichever
+/// directory some other process or test pinned into that `OnceLock` first,
+/// not the one the caller actually resolved its `runs` and `state` from.
+pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> Result<Vec<String>> {
     let repo = state.repo.clone();
     let root = state.worktree_root();
     let winner = state.tally.as_ref().map(|t| t.winner);
@@ -6137,7 +6144,7 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool) -> Result<Vec<Str
         git::release_worktree_config(&repo).await.ok();
         state.enabled_worktree_config = false;
     }
-    state.save()?;
+    state.save_under(home)?;
     Ok(removed)
 }
 
@@ -7028,7 +7035,9 @@ mod tests {
         });
         state.status = RunStatus::Ready;
 
-        fold_run(&mut state, false).await.expect("fold_run");
+        fold_run(&mut state, false, &crate::run::home())
+            .await
+            .expect("fold_run");
 
         assert!(wt_a.exists(), "the unmerged winner's worktree survives");
         assert!(
