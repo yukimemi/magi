@@ -301,13 +301,21 @@ pub struct Report {
     pub asked: Vec<String>,
     /// An operator's answer to an earlier triage question was applied.
     pub answered: Vec<String>,
+    /// A `blocked` task whose `blocked_by` named an id that no longer exists
+    /// was moved to a machine hold this pass - see
+    /// [`quarantine_orphaned_blocked`]. Distinct from `asked`: the question
+    /// about it, if any, is filed in the same pass and only counted there.
+    pub quarantined: Vec<String>,
 }
 
 impl Report {
     /// Is there nothing to report? Callers use this to skip logging an empty
     /// pass rather than repeating "triaged 0 held task(s)" on every idle tick.
     pub fn is_empty(&self) -> bool {
-        self.resumed.is_empty() && self.asked.is_empty() && self.answered.is_empty()
+        self.resumed.is_empty()
+            && self.asked.is_empty()
+            && self.answered.is_empty()
+            && self.quarantined.is_empty()
     }
 }
 
@@ -479,6 +487,53 @@ fn file_question(
     Some(q)
 }
 
+/// Move every `blocked` task whose `blocked_by` names a task or question id
+/// that no longer exists to a machine hold, before the per-`held` walk
+/// [`run_once`] does gets a look at it.
+///
+/// `crate::daemon::resolve_blockers` already catches the same situation on
+/// every idle poll, and [`Queue::remove`] already catches it the moment a
+/// dependency is deleted through `magi task rm` - both call the same
+/// [`crate::queue::missing_blockers`]/[`crate::queue::missing_blocker_hold_reason`]
+/// this does. This third copy exists because a dependency can also be deleted
+/// by hand (the file just removed from disk, not through either of those
+/// paths), and because a queue can carry a `blocked` task with a
+/// long-since-deleted dependency from *before* either catch above ever
+/// existed - and such a task is `blocked`, never `held`, so it is invisible
+/// to the rest of this module without this pass. Running it here, first, is
+/// also what makes `magi task triage` alone - with no daemon running at all -
+/// enough to fix one: the task lands `held` in this same call, and the
+/// ordinary loop below files its question in the very same pass.
+fn quarantine_orphaned_blocked(queue: &Queue, questions: &Questions) -> Vec<String> {
+    let mut quarantined = Vec::new();
+    for listed in queue.list() {
+        if listed.status != TaskStatus::Blocked || listed.blocked_by.is_empty() {
+            continue;
+        }
+        let Ok(_claim) = queue.claim(&listed.id) else {
+            continue;
+        };
+        let Ok(mut task) = queue.get(&listed.id) else {
+            continue;
+        };
+        if task.status != TaskStatus::Blocked {
+            continue;
+        }
+        let missing = crate::queue::missing_blockers(queue, questions, &task.blocked_by);
+        if missing.is_empty() {
+            continue;
+        }
+        task.hold_machine(Some(crate::queue::missing_blocker_hold_reason(
+            &task.blocked_by,
+            &missing,
+        )));
+        if queue.put(&mut task).is_ok() {
+            quarantined.push(task.id.clone());
+        }
+    }
+    quarantined
+}
+
 /// Run one deterministic triage pass over every `held` task in `queue`. No
 /// model call anywhere in this function - see this module's own doc for what
 /// each `HoldSource` gets instead.
@@ -492,13 +547,20 @@ fn file_question(
 /// a task already answered and applied is left alone (see
 /// [`already_applied`]), and a task with an open question is left alone too,
 /// so repeated calls with nothing new to say do nothing.
+///
+/// Also runs [`quarantine_orphaned_blocked`] first, so a `blocked` task whose
+/// dependency no longer exists is caught and turned into a fresh `held`
+/// question in this same pass, not left for a later call to notice.
 pub fn run_once(
     queue: &Queue,
     questions: &Questions,
     config_override: Option<&Path>,
     now: Timestamp,
 ) -> Report {
-    let mut report = Report::default();
+    let mut report = Report {
+        quarantined: quarantine_orphaned_blocked(queue, questions),
+        ..Report::default()
+    };
     for listed in queue.list() {
         if listed.status != TaskStatus::Held {
             continue;
@@ -535,7 +597,7 @@ pub fn run_once(
                         }
                     }
                     AnswerAction::Discard => {
-                        if queue.remove(&task.id, false).is_ok() {
+                        if queue.remove(&task.id, false, questions).is_ok() {
                             report.answered.push(task.id.clone());
                         }
                     }
@@ -753,6 +815,54 @@ mod tests {
         assert_eq!(back.status, TaskStatus::Held);
         assert_eq!(back.hold_source, Some(HoldSource::Manual));
         assert!(questions.list().is_empty());
+    }
+
+    #[test]
+    fn a_blocked_task_on_a_deleted_dependency_is_held_and_asked_about_in_one_pass() {
+        // The five real tasks this whole change exists for are `blocked`, not
+        // `held`, and no daemon has to be running for `magi task triage` alone
+        // to reach them - `run_once` must both quarantine and ask in the same
+        // call.
+        let (dir, q, questions) = store();
+        let mut still_going = task("still valid", dir.path().join("repo"));
+        q.put(&mut still_going).unwrap();
+
+        let mut t = task("orphaned", dir.path().join("repo"));
+        t.block(
+            vec!["20260101-000000-gone".to_owned(), still_going.id.clone()],
+            Some("waits on both".to_owned()),
+        );
+        q.put(&mut t).unwrap();
+
+        let report = run_once(&q, &questions, None, Timestamp::now());
+        assert_eq!(report.quarantined, [t.id.clone()]);
+        assert_eq!(
+            report.asked,
+            [t.id.clone()],
+            "the fresh machine hold must earn a question in the same pass"
+        );
+
+        let after = q.get(&t.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Held);
+        assert_eq!(after.hold_source, Some(HoldSource::Machine));
+        assert!(after.blocked_by.is_empty());
+
+        // The reason is not disk-pressure wording, so this must not be read
+        // as a disk hold and silently auto-resumed.
+        assert!(!is_disk_hold(&after));
+
+        let open: Vec<_> = questions
+            .list()
+            .into_iter()
+            .filter(|q| q.status.open())
+            .collect();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].run, t.id);
+
+        // A second pass with nothing new files no second question.
+        let second = run_once(&q, &questions, None, Timestamp::now());
+        assert!(second.quarantined.is_empty());
+        assert!(second.asked.is_empty());
     }
 
     #[test]

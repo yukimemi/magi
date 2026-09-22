@@ -36,6 +36,8 @@ use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
+use crate::ask::Questions;
+
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
 ///
 /// 4: added [`Task::blocked_from`], the status a task had the moment it
@@ -735,7 +737,21 @@ impl Queue {
     /// still there once no live daemon claims the task is by definition stale,
     /// and leaving it would make a deleted task look claimed to
     /// [`Queue::claim`] and to whoever reads the directory.
-    pub fn remove(&self, id: &str, in_flight: bool) -> Result<String> {
+    ///
+    /// Anything still `blocked` on the id just deleted is quarantined to a
+    /// machine hold in the same call - see [`Removal::quarantined`] - rather
+    /// than left to wait on a dependency that no longer exists. Best-effort:
+    /// a dependent claimed by something else right now, or one whose write
+    /// fails, is simply left for `crate::daemon::resolve_blockers`'s own poll
+    /// (or `crate::triage::run_once`) to catch on its own next pass, and does
+    /// not fail this removal.
+    ///
+    /// `questions` is the store [`missing_blockers`] checks a `blocked_by` id
+    /// against before calling it gone - the same store the caller already
+    /// resolves `id`'s own home from, passed in rather than reopened here so
+    /// a test queue at an explicit root is never quarantined against the
+    /// operator's real questions directory.
+    pub fn remove(&self, id: &str, in_flight: bool, questions: &Questions) -> Result<Removal> {
         let resolved = self.resolve_id(id)?;
         if in_flight {
             bail!("task {resolved} is being run by a live daemon right now");
@@ -748,7 +764,45 @@ impl Queue {
                 return Err(e).with_context(|| format!("remove {}", lock.display()));
             }
         }
-        Ok(resolved)
+        let quarantined = self.quarantine_dependents_of(&resolved, questions);
+        Ok(Removal {
+            id: resolved,
+            quarantined,
+        })
+    }
+
+    /// Move every `blocked` task naming `dependency` in its own `blocked_by`
+    /// to a machine hold, now that `dependency`'s own file is gone. See
+    /// [`Queue::remove`]'s own doc for why this is best-effort.
+    fn quarantine_dependents_of(&self, dependency: &str, questions: &Questions) -> Vec<String> {
+        let mut quarantined = Vec::new();
+        for listed in self.list() {
+            if listed.status != TaskStatus::Blocked
+                || !listed.blocked_by.iter().any(|b| b == dependency)
+            {
+                continue;
+            }
+            let Ok(_claim) = self.claim(&listed.id) else {
+                continue;
+            };
+            let Ok(mut task) = self.get(&listed.id) else {
+                continue;
+            };
+            if task.status != TaskStatus::Blocked
+                || !task.blocked_by.iter().any(|b| b == dependency)
+            {
+                continue;
+            }
+            let missing = missing_blockers(self, questions, &task.blocked_by);
+            task.hold_machine(Some(missing_blocker_hold_reason(
+                &task.blocked_by,
+                &missing,
+            )));
+            if self.put(&mut task).is_ok() {
+                quarantined.push(task.id.clone());
+            }
+        }
+        quarantined
     }
 
     /// Path of the claim lock for a task. One definition, so `claim` and
@@ -889,6 +943,17 @@ impl Queue {
     }
 }
 
+/// What [`Queue::remove`] did, beyond deleting the named task's own file.
+#[derive(Debug, Clone)]
+pub struct Removal {
+    /// The id actually removed - `id` expanded from a prefix, if it was one.
+    pub id: String,
+    /// Every `blocked` task that named [`Removal::id`] in its own
+    /// `blocked_by` and was moved to a machine hold as a result, rather than
+    /// left waiting on a dependency this call just erased.
+    pub quarantined: Vec<String>,
+}
+
 /// Exclusive ownership of a task, released on drop.
 #[derive(Debug)]
 pub struct Claim {
@@ -944,6 +1009,50 @@ fn read_path(path: &Path) -> Result<Task> {
         );
     }
     Ok(task)
+}
+
+/// Ids inside a `blocked_by` list that name neither an existing task file nor
+/// an existing question file - a dependency deleted (`magi task rm`, or by
+/// hand) while something was still waiting on it.
+///
+/// Existence is decided by [`Queue::path_of`]/[`Questions::path_of`]
+/// `is_file()` alone, never by [`Queue::get`]/[`Questions::get`] succeeding:
+/// those also fail on a merely unreadable file - mid-write, corrupt, or from
+/// a schema ahead of this build (see [`read_path`]) - and misreading "cannot
+/// read it right now" as "it was deleted" would quarantine a task over a
+/// transient failure. `blocked_by` always carries a full id, written by
+/// `crate::conduct` or `crate::triage` from a real task's or question's own
+/// `id`/`short`, never a prefix a caller typed - so the exact-path check is
+/// complete on its own, with no [`Queue::resolve_id`] fallback needed.
+pub fn missing_blockers(
+    queue: &Queue,
+    questions: &Questions,
+    blocked_by: &[String],
+) -> Vec<String> {
+    blocked_by
+        .iter()
+        .filter(|id| !queue.path_of(id).is_file() && !questions.path_of(id).is_file())
+        .cloned()
+        .collect()
+}
+
+/// The `hold_reason` text for a task quarantined because one or more of its
+/// `blocked_by` ids no longer exist. Shared by `crate::daemon::resolve_blockers`,
+/// `crate::triage::run_once`, and [`Queue::remove`]'s own dependent
+/// quarantine, so the three call sites read as the same event to an operator
+/// looking at `magi task show` rather than three different wordings for it.
+///
+/// Names the full original `blocked_by` list, not just `missing` - a task
+/// quarantined here can also have named a dependency that was still
+/// perfectly valid, and [`Task::hold_machine`] clears `blocked_by` on the way
+/// in, so this text is the only place that information survives for an
+/// operator deciding whether to release the task outright.
+pub fn missing_blocker_hold_reason(blocked_by: &[String], missing: &[String]) -> String {
+    format!(
+        "blocked on {} but {} no longer exist(s) on disk - see `magi task triage`",
+        blocked_by.join(", "),
+        missing.join(", "),
+    )
 }
 
 fn short(id: &str) -> &str {
@@ -1801,7 +1910,8 @@ mod tests {
 
     #[test]
     fn revision_moves_when_deleting_an_older_task() {
-        let (_dir, q) = queue();
+        let (dir, q) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
         let mut t1 = task("older");
         q.put(&mut t1).unwrap();
         // Ensure mtime ticks forward.
@@ -1810,7 +1920,7 @@ mod tests {
         q.put(&mut t2).unwrap();
 
         let rev_before = q.revision();
-        q.remove(&t1.id, false).unwrap();
+        q.remove(&t1.id, false, &questions).unwrap();
         let rev_after = q.revision();
 
         assert_ne!(
@@ -1821,21 +1931,24 @@ mod tests {
 
     #[test]
     fn removing_a_task_takes_it_out_of_the_listing() {
-        let (_dir, q) = queue();
+        let (dir, q) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
         let mut t = task("delete me");
         q.put(&mut t).unwrap();
-        let removed = q.remove(t.short(), false).unwrap();
-        assert_eq!(removed, t.id, "a prefix resolves before deleting");
+        let removed = q.remove(t.short(), false, &questions).unwrap();
+        assert_eq!(removed.id, t.id, "a prefix resolves before deleting");
+        assert!(removed.quarantined.is_empty(), "nothing was blocked on it");
         assert!(q.list().is_empty());
         assert!(
-            q.remove(&t.id, false).is_err(),
+            q.remove(&t.id, false, &questions).is_err(),
             "removing twice is an error"
         );
     }
 
     #[test]
     fn removing_a_task_takes_its_stale_lock_with_it() {
-        let (_dir, q) = queue();
+        let (dir, q) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
         let mut t = task("interrupted");
         q.put(&mut t).unwrap();
 
@@ -1849,12 +1962,12 @@ mod tests {
         );
 
         // A live daemon on this task is refused, whatever the lock says.
-        let err = q.remove(&t.id, true).unwrap_err().to_string();
+        let err = q.remove(&t.id, true, &questions).unwrap_err().to_string();
         assert!(err.contains("live daemon"), "{err}");
         assert!(q.get(&t.id).is_ok(), "a refused delete keeps the task");
 
         // With no daemon behind it, the lock is stale and goes with the task.
-        q.remove(&t.id, false).unwrap();
+        q.remove(&t.id, false, &questions).unwrap();
         assert!(q.list().is_empty());
         let mut again = task("interrupted");
         again.id = t.id.clone();
@@ -1862,6 +1975,39 @@ mod tests {
         assert!(
             q.claim(&t.id).is_ok(),
             "a task that comes back must be claimable, which a left-behind lock would prevent"
+        );
+    }
+
+    #[test]
+    fn removing_a_task_quarantines_what_was_blocked_on_it() {
+        let (dir, q) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
+
+        let mut dep = task("dependency");
+        q.put(&mut dep).unwrap();
+
+        let mut still_valid = task("still valid");
+        q.put(&mut still_valid).unwrap();
+
+        let mut blocked = task("waiting");
+        blocked.block(
+            vec![dep.id.clone(), still_valid.id.clone()],
+            Some("waits on both".to_owned()),
+        );
+        q.put(&mut blocked).unwrap();
+
+        let removed = q.remove(&dep.id, false, &questions).unwrap();
+        assert_eq!(removed.quarantined, [blocked.id.clone()]);
+
+        let after = q.get(&blocked.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Held);
+        assert_eq!(after.hold_source, Some(HoldSource::Machine));
+        assert!(after.blocked_by.is_empty());
+        let reason = after.hold_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains(&dep.id), "{reason}");
+        assert!(
+            reason.contains(&still_valid.id),
+            "the still-valid dependency must survive in the reason text: {reason}"
         );
     }
 }

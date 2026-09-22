@@ -2774,7 +2774,7 @@ async fn queue_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiR
         let id = resolve_task(&ui.queue, &id)?;
         let in_flight = crate::daemon::is_working_on_task(&ui.home, &id, jiff::Timestamp::now());
         ui.queue
-            .remove(&id, in_flight)
+            .remove(&id, in_flight, &ui.questions)
             .map_err(|e| ApiError::conflict(format!("{e:#}")))?;
         Ok(StatusCode::NO_CONTENT)
     })
