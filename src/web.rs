@@ -2391,7 +2391,7 @@ async fn run_fold(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResul
     };
     let removed = match state {
         Some(mut state) => {
-            let removed = crate::graph::fold_run(&mut state, true)
+            let removed = crate::graph::fold_run(&mut state, true, &ui.home)
                 .await
                 .map_err(|e| ApiError::internal(format!("{e:#}")))?;
             // Nothing left to remove is not the same thing as nothing left to

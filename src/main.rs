@@ -1172,7 +1172,7 @@ async fn dispatch(command: Command) -> Result<()> {
                         // for free.)
                         Box::pin(correct_manual_merge(&mut state, &url)).await?;
                     }
-                    let removed = fold_run(&mut state, all).await?;
+                    let removed = fold_run(&mut state, all, &magi::run::home()).await?;
                     // Nothing left for `fold_run` to remove is not the same
                     // thing as nothing left to do: a run whose worktrees are
                     // already gone can still be stuck `implementing` (or
