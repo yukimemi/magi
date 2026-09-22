@@ -662,6 +662,16 @@ fn finished_tasks(queue: &Queue) -> Vec<Task> {
 /// the task ([`Task::record_answer`]) before its id is dropped, so it
 /// reaches the next `crate::conduct` prompt and the next run's instruction
 /// (see [`instruction_for`]) rather than only clearing the block.
+///
+/// A `blocked_by` id that names neither an existing task nor an existing
+/// question - `magi task rm` (or an operator by hand) deleted it while this
+/// task was still waiting - is caught before any of that: it can never
+/// become `Done` or `Answered`, so the ordinary loop below would otherwise
+/// leave the task `blocked` forever with nothing to notice. Such a task is
+/// quarantined to a machine hold instead ([`crate::queue::missing_blocker_hold_reason`]),
+/// which puts it in front of `crate::triage::run_once`'s own walk the next
+/// time it runs - see that module's doc for why the choice is "ask a human",
+/// never "assume the missing dependency was satisfied and unblock anyway".
 fn resolve_blockers(queue: &Queue, questions: &Questions) {
     for listed in queue.list() {
         if listed.status != TaskStatus::Blocked || listed.blocked_by.is_empty() {
@@ -674,6 +684,15 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
             continue;
         };
         if task.status != TaskStatus::Blocked {
+            continue;
+        }
+        let missing = crate::queue::missing_blockers(queue, questions, &task.blocked_by);
+        if !missing.is_empty() {
+            task.hold_machine(Some(crate::queue::missing_blocker_hold_reason(
+                &task.blocked_by,
+                &missing,
+            )));
+            record(queue, &mut task);
             continue;
         }
         let mut changed = false;
@@ -2310,6 +2329,14 @@ async fn triage_held(queue: &Queue, home: &Path, opts: &Opts) {
     let report = triage::run_once(queue, &questions, opts.config.as_deref(), Timestamp::now());
     if report.is_empty() {
         return;
+    }
+    if !report.quarantined.is_empty() {
+        tracing::info!(
+            "triage: held {} blocked task(s) whose blocked-on task or \
+             question no longer exists: {}",
+            report.quarantined.len(),
+            report.quarantined.join(", ")
+        );
     }
     if !report.resumed.is_empty() {
         tracing::info!(
@@ -5646,6 +5673,50 @@ mod tests {
         assert_eq!(
             after.answers[0].answer,
             "leave it held, a human will look at it later"
+        );
+    }
+
+    #[test]
+    fn resolve_blockers_holds_a_task_whose_dependency_was_deleted() {
+        // Reproduces the reported bug: a task blocked on a task id that was
+        // removed (`magi task rm`, or deleted by hand) can never see that id
+        // reach `Done`, so the ordinary per-id loop has nothing to notice and
+        // would otherwise leave the task `blocked` forever with no way for an
+        // operator to find out why.
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = ask::Questions::at(dir.path().join("questions"));
+
+        let mut still_going = task();
+        still_going.id = "20260101-000002-dep1".to_owned();
+        queue.put(&mut still_going).unwrap();
+
+        let mut blocked = task();
+        blocked.id = "20260101-000003-main".to_owned();
+        blocked.block(
+            vec!["20260101-000001-gone".to_owned(), still_going.id.clone()],
+            Some("waits on both".to_owned()),
+        );
+        queue.put(&mut blocked).unwrap();
+
+        resolve_blockers(&queue, &questions);
+
+        let after = queue.get(&blocked.id).unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::Held,
+            "a missing dependency must not leave the task blocked forever"
+        );
+        assert_eq!(after.hold_source, Some(crate::queue::HoldSource::Machine));
+        assert!(after.blocked_by.is_empty());
+        let reason = after.hold_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("20260101-000001-gone"),
+            "the missing id must be named so an operator can tell what happened: {reason}"
+        );
+        assert!(
+            reason.contains(&still_going.id),
+            "the still-valid dependency must not silently vanish from the record: {reason}"
         );
     }
 

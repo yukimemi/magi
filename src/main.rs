@@ -2315,7 +2315,20 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 println!("hold source  {}", source.label());
             }
             if !t.blocked_by.is_empty() {
-                println!("blocked on {}", t.blocked_by.join(", "));
+                let questions_store = ask::Questions::open();
+                let missing = queue::missing_blockers(&q, &questions_store, &t.blocked_by);
+                let annotated: Vec<String> = t
+                    .blocked_by
+                    .iter()
+                    .map(|id| {
+                        if missing.contains(id) {
+                            format!("{id} (no longer exists)")
+                        } else {
+                            id.clone()
+                        }
+                    })
+                    .collect();
+                println!("blocked on {}", annotated.join(", "));
                 if let Some(r) = &t.block_reason {
                     println!("why       {r}");
                 }
@@ -2451,6 +2464,9 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 println!("nothing to triage");
                 return Ok(());
             }
+            for id in &report.quarantined {
+                println!("held     {id} (blocked on a task or question that no longer exists)");
+            }
             for id in &report.resumed {
                 println!("resumed  {id} (machine hold resolved)");
             }
@@ -2470,8 +2486,15 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 &resolved,
                 jiff::Timestamp::now(),
             );
-            let removed = q.remove(&resolved, in_flight)?;
-            println!("removed {removed}");
+            let removed = q.remove(&resolved, in_flight, &ask::Questions::open())?;
+            println!("removed {}", removed.id);
+            if !removed.quarantined.is_empty() {
+                println!(
+                    "held {} task(s) that were blocked on it, no longer able to resolve: {}",
+                    removed.quarantined.len(),
+                    removed.quarantined.join(", ")
+                );
+            }
             Ok(())
         }
     }
