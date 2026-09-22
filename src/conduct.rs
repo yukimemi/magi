@@ -212,6 +212,43 @@ fn surviving_branch(task: &Task) -> Option<String> {
     state.winner().map(|c| c.branch.clone())
 }
 
+/// The reason to record when the conductor holds a `failed`/`held` task via
+/// [`Recovery::Hold`]. Always `Some`, never a bare `d.reason.clone()`.
+///
+/// [`Task::hold_machine`] only overwrites [`Task::hold_reason`] when given
+/// one, precisely so a stalled task's existing diagnosis survives a
+/// decision that has nothing new to add. That is the right default when the
+/// task was not already `held` - but a task that *is* already `held`, and
+/// is being held again here, is a different case: its current
+/// `hold_reason` may still read as a cause `crate::triage` knows how to
+/// re-check on its own (a disk-pressure message, say - see
+/// `triage::machine_cause_resolved`), and if the model gives no reason,
+/// leaving that text untouched would make this decision - the conductor
+/// choosing, informed by the operator's own answer, to keep the task held
+/// anyway - indistinguishable from the original, never-reconsidered hold.
+/// `crate::triage` would then read the stale text the next time its one
+/// recognised cause looks resolved and release the task straight through
+/// the decision this call was recording. Prepending (not appending) the new
+/// note keeps the old text as context without leaving the string starting
+/// with whatever pattern `crate::triage` matched before.
+fn reaffirmed_hold_reason(task: &Task, d: &Decision) -> String {
+    let note = match &d.reason {
+        Some(reason) => reason.clone(),
+        None => match task.answers.last() {
+            Some(a) => format!(
+                "conduct held this again with no new reason given; last operator \
+                 answer on record: {}",
+                a.answer
+            ),
+            None => "conduct held this again with no reason given".to_owned(),
+        },
+    };
+    match task.hold_reason.as_deref() {
+        Some(prior) if !prior.is_empty() => format!("{note}\n\n(previously: {prior})"),
+        _ => note,
+    }
+}
+
 /// Everything the conductor is shown about a `failed`/`held` task's last run.
 async fn outcome_for(task: &Task, repo: &Path) -> prompt::ConductOutcome {
     let Some(run_id) = task.runs.last().cloned() else {
@@ -449,7 +486,7 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
                 queue.put(&mut task)?;
             }
             Some(Recovery::Hold) => {
-                task.hold_machine(d.reason.clone());
+                task.hold_machine(Some(reaffirmed_hold_reason(&task, d)));
                 queue.put(&mut task)?;
             }
             Some(Recovery::Review) => {
@@ -1184,6 +1221,68 @@ mod tests {
             "must not fall back to queued"
         );
         assert_eq!(after.hold_reason.as_deref(), Some("out of attempts"));
+    }
+
+    #[test]
+    fn a_reaffirmed_hold_with_no_new_reason_is_not_silently_auto_released_by_triage() {
+        // A different path to the same bug round 1 fixed: a task
+        // machine-held for disk pressure, blocked on a conductor question,
+        // answered "keep it held", and restored to `held`. If the
+        // conductor's next decision reconfirms `recovery: hold` with no new
+        // `reason` - allowed, `Decision::reason` is optional - `hold_machine`
+        // must not silently leave the stale disk-pressure text in place, or
+        // `crate::triage::run_once` reads it as an unexamined, auto-resolvable
+        // hold and releases the task straight through the operator's answer
+        // the instant disk space looks fine again.
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("disk pressure, then reconsidered");
+        t.hold_machine(Some(
+            "not enough free space to start a run: 10 bytes free, 100 required by \
+             `[disk] min_free_bytes`"
+                .to_owned(),
+        ));
+        t.record_answer(
+            "How should this be handled?".to_owned(),
+            "keep it held, a human will look at it later".to_owned(),
+        );
+        queue.put(&mut t).unwrap();
+
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![Decision {
+                    id: t.id.clone(),
+                    recovery: Some(Recovery::Hold),
+                    ..Decision::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let after = queue.get(&t.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Held);
+        assert!(
+            !after
+                .hold_reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("not enough free space"),
+            "the stale disk-pressure text must not survive a reconfirmed hold: {:?}",
+            after.hold_reason
+        );
+
+        // The disk gate would report space is fine now - `crate::triage`
+        // must not read the old text and release the task through it.
+        let cfg_dir = tempdir().unwrap();
+        let config = cfg_dir.path().join("magi.toml");
+        std::fs::write(&config, "[disk]\nmin_free_bytes = 0\n").unwrap();
+        let report =
+            crate::triage::run_once(&queue, &questions, Some(&config), jiff::Timestamp::now());
+        assert!(report.resumed.is_empty(), "must not be auto-released");
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
     }
 
     #[test]
