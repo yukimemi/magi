@@ -141,6 +141,15 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// route, and the owner had them deleted (`magi task rm`); `391f` alone
 /// survived because a daemon still held its run at the moment of deletion,
 /// which is the only reason any record of this group still exists to audit.
+/// Quoted directly from that second audit's own turn (talk `07fe`, so this
+/// reads without needing access to that talk store), naming both by id:
+///
+/// > 12件がマージ済み(対応不要)、3件が未実装(妥当)、2件が部分実装(要確認)でした。
+/// > **マージ済み → hold/rmを推奨:** 6c5e, 1ddc, fcf5, e25b, cea2, 391f, 3202,
+/// > b0a1, 5365, af85, 9f26, 8df3
+///
+/// — followed by the owner answering "削除！" and the agent confirming "11件
+/// 削除完了。391f はいま実行中のdaemonが掴んでいて削除できませんでした."
 /// `git log` independently confirms both fixes: the ask-back feature `6c5e`
 /// wanted landed as `f0df474` ("let the owner ask back on a question...",
 /// #93) on 2026-09-06, and the release-bump automation `8df3` wanted landed
@@ -162,7 +171,19 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// roughly 50 minutes as instructed before the timeout cut it off; `bab1`
 /// ended its turn moments after filing its question without ever actually
 /// blocking on the wait, a separate protocol slip this schema change does
-/// not attempt to fix. Neither candidate's reply carries the
+/// not attempt to fix. `49ad`'s own `candidates[0].summary` (quoted here
+/// because both records predate schema 10 and, separately, predate a
+/// still-unrelated struct change that already makes today's `magi show`
+/// refuse to parse either of them — `unknown field 'planner'` — so this is
+/// read straight from `run.json` on disk, not through that command):
+///
+/// > タスクの内容（READY 状態の run を実リポジトリの main に `merge --no-ff`
+/// > する、GitHub Release を作る）を精査した結果、これは全てこのワーカーの
+/// > worktree の外にある実リポジトリと GitHub 上の共有状態に対する不可逆な
+/// > 操作であり […] 私自身の運用ルール「Work only inside this worktree.
+/// > Nothing outside it is yours.」と正面から矛盾すると判断しました。
+///
+/// Neither candidate's reply carries the
 /// `NO CHANGE NEEDED` marker below, so both runs correctly stay `Failed`
 /// under this schema, not `VerifiedNoop`: a run blocked on an unanswered
 /// authorization question is not a verified no-op, and reading the two

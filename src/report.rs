@@ -300,6 +300,16 @@ pub fn run(state: &RunState) -> String {
         );
         if let Some(evidence) = &c.verified_noop {
             let _ = writeln!(s, "      {}", dim(&first_line(evidence)));
+        } else if !c.summary.trim().is_empty() {
+            // The candidate's own account of what it did and why — the
+            // "## SUMMARY" `prompt::implement` asks for — was recorded on
+            // every run but never surfaced here, which left `magi show`
+            // silent about it even when the summary was the whole point (an
+            // implementer explaining *why* it wrote nothing, short of a
+            // verified no-op's own line above). One line, matching the
+            // house style other prose fields get in this report (see the
+            // review findings' `detail` below); the rest is in `run.json`.
+            let _ = writeln!(s, "      {}", dim(&first_line(&c.summary)));
         }
     }
 
@@ -1072,6 +1082,25 @@ mod tests {
         assert!(text.contains("3 files, 2 commits"));
         assert!(text.contains("winner        A"));
         assert!(!text.contains('\x1b'), "colour leaked into a plain render");
+    }
+
+    #[test]
+    fn a_candidates_own_summary_is_surfaced_not_only_kept_in_run_json() {
+        // Recorded on every run (`prompt::implement`'s `## SUMMARY`), but
+        // `run()` used to never print it at all — silent even when the
+        // summary was the one place an implementer explained itself (e.g.
+        // an investigation task's findings), and readable only by opening
+        // `run.json` by hand.
+        let _guard = plain();
+        let mut s = state();
+        s.candidates[0].summary =
+            "investigated 6c5e/8df3: both already merged, see talk 07fe.\nmore detail below."
+                .to_owned();
+        let text = run(&s);
+        assert!(
+            text.contains("investigated 6c5e/8df3: both already merged, see talk 07fe."),
+            "{text}"
+        );
     }
 
     #[test]
