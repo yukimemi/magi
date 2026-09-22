@@ -1125,11 +1125,12 @@ async fn dispatch(command: Command) -> Result<()> {
                 );
             } else {
                 let state = RunState::load(&id)?;
-                let live = magi::daemon::is_working_on(
+                let daemon_claims = magi::daemon::is_working_on(
                     &magi::run::home(),
                     &state.id,
                     jiff::Timestamp::now(),
                 );
+                let live = state.liveness(daemon_claims);
                 print!(
                     "{}{}",
                     report::run(&state),

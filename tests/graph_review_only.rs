@@ -7,7 +7,10 @@
 //! so it is exactly the kind of thing that would rot silently.
 mod common;
 
-use common::{Judges, fixture, fixture_with_quota, fixture_with_silent_review_seat};
+use common::{
+    Judges, fixture, fixture_with_quota, fixture_with_review_seat_that_recovers_on_retry,
+    fixture_with_silent_review_seat,
+};
 use magi::graph::Runner;
 use magi::run::RunStatus;
 
@@ -128,10 +131,69 @@ async fn a_reviewer_that_never_answered_is_never_reported_as_a_clean_round() {
             !round.clean,
             "a round missing half its panel must never be reported clean: {round:?}"
         );
+        let missing = round
+            .reviews
+            .iter()
+            .find(|r| r.reviewer == 2)
+            .expect("review-2's record is still in the round");
+        assert!(
+            missing.failed.is_some(),
+            "a seat that never produced a usable answer is `failed`, whatever \
+             `attempts` says: {missing:?}"
+        );
     }
     // Nothing was ever raised to fix, so the fixer never ran.
     assert!(state.reviews.iter().all(|r| r.fix.is_none()));
     assert_eq!(state.status, RunStatus::Blocked);
+}
+
+/// The addendum's third gap: a seat that times out and then answers on
+/// `ask_json_wave`'s nudge must read as recovered, not as silent — the two
+/// looked identical in history (a retry event and nothing else) before
+/// `ReviewRecord::attempts` existed.
+#[tokio::test]
+async fn a_reviewer_that_only_answers_on_retry_is_recorded_as_recovered_not_silent() {
+    let _home = common::home_lock().await;
+    let mut fx = fixture_with_review_seat_that_recovers_on_retry(_home, &["review-2"]);
+    fx.config.graph.review_rounds = 1;
+
+    run_git(&fx.repo, &["checkout", "-q", "-b", "feat/by-hand"]);
+    std::fs::write(fx.repo.join("note.txt"), "written by a human\n").unwrap();
+    run_git(&fx.repo, &["add", "-A"]);
+    run_git(&fx.repo, &["commit", "-q", "-m", "add note.txt by hand"]);
+    run_git(&fx.repo, &["checkout", "-q", "main"]);
+
+    let mut runner = Runner::review(&fx.repo, "feat/by-hand", fx.config.clone())
+        .await
+        .expect("open a review-only run");
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    assert_eq!(state.reviews.len(), 1, "{:?}", state.reviews);
+    let round = &state.reviews[0];
+    assert_eq!(round.answered, 2, "both seats answered, one on a retry");
+    assert!(!round.incomplete());
+    let recovered = round
+        .reviews
+        .iter()
+        .find(|r| r.reviewer == 2)
+        .expect("review-2's record is still in the round");
+    assert!(
+        recovered.failed.is_none(),
+        "a seat that did eventually answer is not `failed`: {recovered:?}"
+    );
+    assert!(
+        recovered.attempts > 0,
+        "recorded attempts must show the retry actually happened: {recovered:?}"
+    );
+    assert!(
+        state
+            .events
+            .iter()
+            .any(|e| e.node == "review" && e.message.contains("retry 1")),
+        "the retry itself is also visible in the event log: {:?}",
+        state.events
+    );
 }
 
 #[tokio::test]

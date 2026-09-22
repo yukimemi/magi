@@ -683,6 +683,7 @@ mod tests {
             verified_head: None,
             verified_at: None,
             reviews: vec![crate::run::ReviewRecord {
+                attempts: 0,
                 reviewer: 1,
                 agent: "mock".to_owned(),
                 summary: String::new(),

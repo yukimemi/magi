@@ -483,6 +483,7 @@ mod tests {
             verified_at: None,
             reviews: vec![
                 ReviewRecord {
+                    attempts: 0,
                     reviewer: 1,
                     agent: "alpha".to_owned(),
                     summary: String::new(),
@@ -501,6 +502,7 @@ mod tests {
                     duration_ms: 0,
                 },
                 ReviewRecord {
+                    attempts: 0,
                     reviewer: 2,
                     agent: "beta".to_owned(),
                     summary: String::new(),
@@ -563,6 +565,7 @@ mod tests {
             verified_head: None,
             verified_at: None,
             reviews: vec![ReviewRecord {
+                attempts: 0,
                 reviewer: 1,
                 agent: "alpha".to_owned(),
                 summary: String::new(),
@@ -620,6 +623,7 @@ mod tests {
             verified_at: None,
             reviews: vec![
                 ReviewRecord {
+                    attempts: 0,
                     reviewer: 1,
                     agent: "alpha".to_owned(),
                     summary: String::new(),
@@ -629,6 +633,7 @@ mod tests {
                     duration_ms: 0,
                 },
                 ReviewRecord {
+                    attempts: 0,
                     reviewer: 2,
                     agent: "beta".to_owned(),
                     summary: String::new(),
@@ -685,6 +690,7 @@ mod tests {
             verified_at: None,
             reviews: vec![
                 ReviewRecord {
+                    attempts: 0,
                     reviewer: 1,
                     agent: "alpha".to_owned(),
                     summary: String::new(),
@@ -700,6 +706,7 @@ mod tests {
                     duration_ms: 0,
                 },
                 ReviewRecord {
+                    attempts: 0,
                     reviewer: 2,
                     agent: "beta".to_owned(),
                     summary: String::new(),

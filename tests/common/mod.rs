@@ -177,6 +177,25 @@ if grep -q "Your revote" "$p"; then
   exit 0
 fi
 
+# Retry-recovery simulation for a review seat: a matching seat's first call
+# this round produces nothing usable, then its nudge (`ask_json_wave`'s own
+# retry, distinct from a resume) succeeds. Recognized by a marker file left
+# in the seat's own worktree rather than by prompt content, so it matches
+# both shapes a nudge can take — the whole original prompt plus the nudge
+# text when sessions do not continue, or the nudge text alone when they do
+# (see `prompt::nudge`) — without keying on either one. `MAGI_NODE` scopes
+# this to `review` so it cannot fire for a same-named seat elsewhere.
+if [ "$MAGI_NODE" = "review" ] && [ -n "$MOCK_REVIEW_RECOVERS_ON_RETRY_SEAT" ] && { case ",$MOCK_REVIEW_RECOVERS_ON_RETRY_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && ! grep -q "Your revote" "$p"; then
+  marker="retried-$seat"
+  if [ ! -f "$marker" ]; then
+    : > "$marker"
+    echo 'not parsable the first time'
+    exit 1
+  fi
+  printf '{"summary":"mock review: clean after a retry","vote":"approve","findings":[]}\n'
+  exit 0
+fi
+
 if grep -q "reviewers of" "$p"; then
   # Silent-seat simulation: a matching review seat produces nothing usable and
   # exits non-zero, which is exactly the record a real timeout leaves — the
@@ -626,6 +645,24 @@ pub fn fixture_with_silent_review_seat(home: HomeGuard, silent_seats: &[&str]) -
     let value = silent_seats.join(",");
     for a in &mut fx.config.agents {
         a.env.insert("MOCK_SILENT_SEAT".to_owned(), value.clone());
+    }
+    fx
+}
+
+/// Like [`fixture`], but the given review seats fail their first call and
+/// only answer once `ask_json_wave`'s own nudge re-asks them — the seat
+/// `ReviewRecord::attempts` exists to tell apart from
+/// [`fixture_with_silent_review_seat`]'s: `failed: None` with `attempts > 0`
+/// (recovered), never `failed: Some(_)` (never answered), even though both
+/// leave a visible retry in the event log.
+pub fn fixture_with_review_seat_that_recovers_on_retry(home: HomeGuard, seats: &[&str]) -> Fixture {
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    let value = seats.join(",");
+    for a in &mut fx.config.agents {
+        a.env.insert(
+            "MOCK_REVIEW_RECOVERS_ON_RETRY_SEAT".to_owned(),
+            value.clone(),
+        );
     }
     fx
 }

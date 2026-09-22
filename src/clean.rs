@@ -1134,6 +1134,10 @@ mod tests {
             started_at: now - SignedDuration::new(21_000, 0),
             timeout_secs: 3_600,
             attempt: 0,
+            task: None,
+            command: None,
+            index: None,
+            total: None,
         };
 
         let mut state = RunState::new(
@@ -1156,6 +1160,10 @@ mod tests {
                 started_at: now,
                 timeout_secs: 3_600,
                 attempt: 0,
+                task: None,
+                command: None,
+                index: None,
+                total: None,
             },
         );
         assert!(!clear_abandoned_active(&mut fresh, &home, now).unwrap());

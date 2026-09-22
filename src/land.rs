@@ -3084,6 +3084,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
 
     fn review_record(reviewer: usize, agent: &str, summary: &str) -> ReviewRecord {
         ReviewRecord {
+            attempts: 0,
             reviewer,
             agent: agent.to_owned(),
             summary: summary.to_owned(),
@@ -3211,6 +3212,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     /// answered with nothing to say.
     fn unanswered_review_record(reviewer: usize, agent: &str, reason: &str) -> ReviewRecord {
         ReviewRecord {
+            attempts: 0,
             reviewer,
             agent: agent.to_owned(),
             summary: String::new(),

@@ -593,9 +593,25 @@ impl Runner {
         // runs, so a resume can never show a seat as live when nothing is
         // asking it anything yet; the node that actually dispatches the next
         // wave repopulates it.
-        if self.state.clear_active() {
-            self.state.save()?;
-        }
+        self.state.clear_active();
+        // Recorded in the same spot, and flushed together with the clear
+        // above: this is the pid a reader checks (`RunState::liveness`) when
+        // no daemon claim exists to answer "is a process still driving this
+        // run" — a plain `magi run` / `magi review` typed into a terminal
+        // claims nothing there. Always overwritten, never only-if-absent, so
+        // a resumed run's stale pid from a previous, possibly-dead process
+        // can never survive into this one's own report. Unlike
+        // `clear_active`, this changes on every single `execute()` call, so
+        // the save below is now unconditional rather than only-if-cleared.
+        //
+        // `driver_started_at` is recorded in the same breath, from this same
+        // pid, so `liveness` can tell a live pid that is genuinely still us
+        // apart from one the OS has since handed to an unrelated process —
+        // see that field's own doc for why the pid alone is not enough.
+        let pid = std::process::id();
+        self.state.driver_pid = Some(pid);
+        self.state.driver_started_at = crate::proc::process_started_at(pid);
+        self.state.save()?;
         // A run that already lost its quorum never resumes into the verdict
         // machinery: `deliberate` and `vote` would otherwise clobber the
         // stalled marker back to Voting and the run would keep going past a
@@ -1040,7 +1056,7 @@ impl Runner {
         self.state.quota.extend(quota_losses);
 
         let mut records = Vec::with_capacity(results.len());
-        for (i, (seat, res)) in results.into_iter().enumerate() {
+        for (i, (seat, res, _attempts)) in results.into_iter().enumerate() {
             let agent_id = seat.agent.clone();
             self.state.seats.insert(seat.key.clone(), seat);
             match res {
@@ -2115,7 +2131,7 @@ impl Runner {
         .await;
         self.state.quota.extend(quota_losses);
 
-        for (j, (seat, res)) in results.into_iter().enumerate() {
+        for (j, (seat, res, _attempts)) in results.into_iter().enumerate() {
             let agent_id = seat.agent.clone();
             self.state.seats.insert(seat.key.clone(), seat);
             let mut record = Judgement {
@@ -2416,7 +2432,7 @@ impl Runner {
         .await;
         self.state.quota.extend(quota_losses);
 
-        for (&j, (seat, res)) in seats_at.iter().zip(results) {
+        for (&j, (seat, res, _attempts)) in seats_at.iter().zip(results) {
             let agent_id = seat.agent.clone();
             self.state.seats.insert(seat.key.clone(), seat);
             let initial = self
@@ -2755,7 +2771,7 @@ impl Runner {
 
         // Refresh the judgement of every seat that ranked again.
         let mut recovered: BTreeSet<usize> = BTreeSet::new();
-        for (&j, (seat, res)) in positions.iter().zip(results) {
+        for (&j, (seat, res, _attempts)) in positions.iter().zip(results) {
             self.state.seats.insert(seat.key.clone(), seat);
             let record = &mut self.state.judgements[j];
             match res {
@@ -2830,7 +2846,7 @@ impl Runner {
             },
         )
         .await;
-        for (&j, (seat, res)) in vote_pos.iter().zip(votes) {
+        for (&j, (seat, res, _attempts)) in vote_pos.iter().zip(votes) {
             let agent_id = seat.agent.clone();
             self.state.seats.insert(seat.key.clone(), seat);
             match res {
@@ -3720,7 +3736,7 @@ impl Runner {
 
             let mut records = Vec::new();
             let mut all_findings = Vec::new();
-            for (r, (seat, res)) in results.into_iter().enumerate() {
+            for (r, (seat, res, attempts)) in results.into_iter().enumerate() {
                 let agent_id = seat.agent.clone();
                 self.state.seats.insert(seat.key.clone(), seat);
                 let mut record = ReviewRecord {
@@ -3731,6 +3747,12 @@ impl Runner {
                     vote: None,
                     failed: None,
                     duration_ms: 0,
+                    // Set for both outcomes: `failed: Some(_)` with
+                    // `attempts > 0` is a seat every retry still lost, not a
+                    // recovered one — only `failed: None` with `attempts > 0`
+                    // reads as "answered after a nudge" (see this field's own
+                    // doc).
+                    attempts,
                 };
                 match res {
                     Ok((review, out)) => {
@@ -3890,7 +3912,7 @@ impl Runner {
                 .await;
                 self.state.quota.extend(recon_quota_losses);
 
-                for (&r, (seat, res)) in seats_at.iter().zip(recon_results) {
+                for (&r, (seat, res, _attempts)) in seats_at.iter().zip(recon_results) {
                     let agent_id = seat.agent.clone();
                     self.state.seats.insert(seat.key.clone(), seat);
                     let mut rec = ReviewRevoteRecord {
@@ -4622,13 +4644,22 @@ impl Runner {
                 &head,
                 timeout,
                 "final gate",
-                |_state, budget| {
+                |state, budget| {
                     let shell = shell.clone();
                     let gate_commands = gate_commands.clone();
                     let worktree = winner.worktree.clone();
                     async move {
-                        let (outcomes, timed_out_pids) =
-                            run_commands(&shell, &gate_commands, &worktree, budget).await;
+                        let (outcomes, timed_out_pids) = run_commands(
+                            state,
+                            "gate",
+                            "gate",
+                            0,
+                            &shell,
+                            &gate_commands,
+                            &worktree,
+                            budget,
+                        )
+                        .await;
                         (outcomes, false, timed_out_pids)
                     }
                 },
@@ -5489,7 +5520,7 @@ async fn ask_json_wave<T>(
     losses: &mut Vec<QuotaLoss>,
     state: &mut RunState,
     validate: &(dyn Fn(&T) -> Result<()> + Send + Sync),
-) -> Vec<(SeatState, Result<(T, AgentOutput)>)>
+) -> Vec<(SeatState, Result<(T, AgentOutput)>, usize)>
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
@@ -5497,6 +5528,13 @@ where
     let originals: Vec<SeatJob> = jobs;
     let mut seats: Vec<SeatState> = originals.iter().map(|j| j.seat.clone()).collect();
     let mut done: Vec<Option<Result<(T, AgentOutput)>>> = (0..n).map(|_| None).collect();
+    // Which attempt each seat's `done[i]` reflects — 0 for a first-ask
+    // answer, N once it has gone through N nudges. Read back once this
+    // returns, so a caller building a history record (`ReviewRecord`) can
+    // tell "never answered" (`failed: Some(_)`, `attempts == 0`) apart from
+    // "recovered after a nudge" (`failed: None`, `attempts > 0`) — see that
+    // field's own doc.
+    let mut attempts_used: Vec<usize> = vec![0; n];
     let mut pending: Vec<usize> = (0..n).collect();
 
     for attempt in 0..=retries {
@@ -5597,6 +5635,7 @@ where
             };
             let failed = parsed.is_err();
             done[i] = Some(parsed);
+            attempts_used[i] = attempt;
             // Do not re-ask a rate-limited seat (quota) — a retry is known to
             // fail the same way; and never re-ask a seat that already parsed.
             if failed && !quota {
@@ -5609,10 +5648,12 @@ where
     seats
         .into_iter()
         .zip(done)
-        .map(|(seat, res)| {
+        .zip(attempts_used)
+        .map(|((seat, res), attempts)| {
             (
                 seat,
                 res.unwrap_or_else(|| Err(anyhow::anyhow!("no attempt was made"))),
+                attempts,
             )
         })
         .collect()
@@ -5861,7 +5902,10 @@ async fn run_e2e_with_retry(
     timeout: Duration,
     context: &str,
 ) -> (Vec<CommandOutcome>, bool, Vec<u32>) {
-    let (mut e2e, mut timed_out_pids) = run_commands(shell, commands, worktree, timeout).await;
+    let (mut e2e, mut timed_out_pids) = run_commands(
+        state, "verify", "e2e", 0, shell, commands, worktree, timeout,
+    )
+    .await;
     for o in &e2e {
         state.event(
             "verify",
@@ -5880,7 +5924,10 @@ async fn run_e2e_with_retry(
                  before concluding"
             ),
         );
-        let retried = run_commands(shell, commands, worktree, timeout).await;
+        let retried = run_commands(
+            state, "verify", "e2e", 1, shell, commands, worktree, timeout,
+        )
+        .await;
         e2e = retried.0;
         // Both attempts' timeouts matter, not just the last one: the first
         // attempt's descendants may still be alive alongside the retry's.
@@ -5904,15 +5951,42 @@ async fn run_e2e_with_retry(
 /// this stopped waiting on it (best-effort: `None` when the platform did not
 /// hand one back) — see [`with_cache_lease`]'s use of it for why a caller
 /// that releases a shared resource afterward needs to know.
+///
+/// Records `task` into [`RunState::active`] at every command boundary
+/// (`RunState::task_command`) and clears it once the whole list has run
+/// (`RunState::task_finished`) — a `verify.e2e` / `verify.gate` list can run
+/// for minutes with no seat and no output of its own to show for it (see
+/// `CommandOutcome`'s doc on why an empty `e2e`/`gate` alone cannot be told
+/// apart from "not yet run" without this), and this is the only place that
+/// knows which command is running right now and how many are left. Three
+/// saves per command — start, not per second — matching the same "only at a
+/// boundary" rule [`wave`] already follows for seats.
+#[allow(clippy::too_many_arguments)]
 async fn run_commands(
+    state: &mut RunState,
+    node: &str,
+    task: &str,
+    attempt: usize,
     shell: &[String],
     commands: &[String],
     cwd: &Path,
     timeout: Duration,
 ) -> (Vec<CommandOutcome>, Vec<u32>) {
+    if commands.is_empty() {
+        // Nothing to mark as running and nothing to clear — an empty list
+        // means "not configured", and touching `active` (or the disk) over
+        // that would be a write for every round of a repo with no
+        // `verify.e2e` / `verify.gate` commands at all.
+        return (Vec::new(), Vec::new());
+    }
     let mut out = Vec::new();
     let mut timed_out_pids = Vec::new();
-    for command in commands {
+    let total = commands.len();
+    for (idx, command) in commands.iter().enumerate() {
+        state.task_command(task, node, attempt, command, idx + 1, total, timeout);
+        if let Err(e) = state.save() {
+            tracing::warn!("could not persist an in-progress {task} command: {e:#}");
+        }
         let started = Instant::now();
         let mut cmd = tokio::process::Command::new(&shell[0]);
         cmd.quiet();
@@ -5955,6 +6029,10 @@ async fn run_commands(
             duration_ms: started.elapsed().as_millis() as u64,
             resource_blocked: false,
         });
+    }
+    state.task_finished(task);
+    if let Err(e) = state.save() {
+        tracing::warn!("could not persist the end of {task}: {e:#}");
     }
     (out, timed_out_pids)
 }
@@ -7532,6 +7610,155 @@ mod tests {
         );
     }
 
+    /// The addendum's second gap: a `verify.gate` command running for real
+    /// wall-clock time had nothing at all to show for it in `active` before
+    /// `run_commands` learned to record it — a run could sit in `Gating` for
+    /// minutes with `magi show` and `GET /api/runs/{id}` both silent about
+    /// what was actually happening. Proven with a genuinely still-running
+    /// command, not just a before/after check on the final state: a poller
+    /// task reads the same `run.json` `gate()` is writing, the same way the
+    /// phone or `magi show` would, while the shell command is still blocked
+    /// on its own release marker.
+    #[tokio::test]
+    async fn gate_records_a_running_task_entry_while_its_command_is_still_in_flight() {
+        crate::run::set_home(std::env::temp_dir().join("magi-graph-test-home"));
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let mut config = Config::default();
+        config.verify.gate = vec![
+            "printf started > started.marker; i=0; while [ ! -f release.marker ] && \
+             [ \"$i\" -lt 100 ]; do i=$((i+1)); sleep 0.05; done"
+                .to_owned(),
+        ];
+
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            "deadbeef".to_owned(),
+            "task".to_owned(),
+            config,
+        );
+        let run_id = state.id.clone();
+        state.candidates = vec![Candidate {
+            index: 0,
+            label: 'A',
+            agent: "alpha".to_owned(),
+            branch: "does-not-exist".to_owned(),
+            worktree: repo.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: false,
+        }];
+        state.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 1)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("only candidate A produced a change".to_owned()),
+        });
+        state.reviews = vec![ReviewRound {
+            round: 1,
+            head: "deadbeef".to_owned(),
+            verified_head: None,
+            verified_at: None,
+            reviews: Vec::new(),
+            e2e: Vec::new(),
+            fix: None,
+            blocking: 0,
+            answered: 0,
+            expected: 0,
+            clean: true,
+            verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
+            progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
+        }];
+
+        let mut runner = Runner {
+            state,
+            roles: ResolvedRoles {
+                implementers: Vec::new(),
+                judges: Vec::new(),
+                reviewers: Vec::new(),
+                fixer: None,
+                conductor: conductor(),
+                implementer_roster: Vec::new(),
+            },
+            sem: Arc::new(Semaphore::new(1)),
+            pause: Pause::new(),
+            interrupt: Pause::new(),
+        };
+
+        let started_marker = repo.join("started.marker");
+        let release_marker = repo.join("release.marker");
+        let poller = tokio::spawn(async move {
+            // Bounded so a regression that never records the task entry
+            // fails this test in seconds instead of hanging the suite —
+            // the same shape `a_park_requested_while_a_seat_is_mid_call_
+            // does_not_cut_it_short` uses for the same reason.
+            for _ in 0..100 {
+                if started_marker.exists()
+                    && let Ok(s) = crate::run::RunState::load(&run_id)
+                    && let Some(a) = s.active.get("gate")
+                {
+                    std::fs::write(&release_marker, b"go").expect("release marker");
+                    return Some(a.clone());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            None
+        });
+
+        runner.gate().await.expect("gate");
+        let captured = poller.await.expect("poller task");
+        let captured = captured.expect(
+            "the poller never saw a `gate` task entry in run.json while the command was \
+             still blocked on its own release marker",
+        );
+
+        assert_eq!(captured.task.as_deref(), Some("gate"));
+        assert_eq!(captured.node, "gate");
+        assert_eq!(captured.index, Some(1));
+        assert_eq!(captured.total, Some(1));
+        assert!(
+            captured
+                .command
+                .as_deref()
+                .is_some_and(|c| c.contains("started.marker")),
+            "{captured:?}"
+        );
+
+        assert!(
+            runner.state.active.is_empty(),
+            "the entry must be cleared once the command actually finished: {:?}",
+            runner.state.active
+        );
+        assert!(runner.state.gate_ran);
+        assert!(runner.state.gate.iter().all(CommandOutcome::ok));
+    }
+
     /// The shape the incident this whole fix responds to actually had: the
     /// round budget spent, the last round's own e2e blocked on the shared
     /// build cache (held here by a live pid — this test process — exactly
@@ -8056,6 +8283,7 @@ mod tests {
             verified_head: None,
             verified_at: None,
             reviews: vec![ReviewRecord {
+                attempts: 0,
                 reviewer: 1,
                 agent: "alpha".to_owned(),
                 summary: String::new(),
@@ -8117,6 +8345,7 @@ mod tests {
             verified_head: None,
             verified_at: None,
             reviews: vec![ReviewRecord {
+                attempts: 0,
                 reviewer: 1,
                 agent: "alpha".to_owned(),
                 summary: String::new(),

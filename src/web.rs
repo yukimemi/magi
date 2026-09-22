@@ -2250,7 +2250,8 @@ struct RunDetailView {
     #[serde(flatten)]
     state: RunState,
     instruction_md: Vec<md::Node>,
-    /// Whether a live daemon currently claims this run.
+    /// Whether a process is actually still driving this run: `"live"`,
+    /// `"dead"`, or `"unknown"` — see [`crate::run::Liveness`].
     ///
     /// `state.active` (flattened in above) is only ever cleared by the
     /// process that populated it; a killed one leaves its last wave's
@@ -2258,8 +2259,12 @@ struct RunDetailView {
     /// tell "this seat is still answering" from "this seat was still
     /// answering when whatever was driving this run died" without a second
     /// route — see `ActiveSeat`'s own docs for why the entry alone is not
-    /// proof of either.
-    live: bool,
+    /// proof of either. A string rather than a bool on purpose: a daemon
+    /// claim proves `"live"`, `driver_pid` answering dead proves `"dead"`,
+    /// and neither proven is `"unknown"` — folding that third case into
+    /// either end of a bool is exactly the wrong call for a phone screen an
+    /// operator uses to decide whether to wait or to act.
+    live: crate::run::Liveness,
     /// Same field and meaning as [`RunSummary::unmerged_by_design`] — kept
     /// alongside the flattened `state` rather than inside it, since
     /// `RunState` has no business knowing which of its own methods a caller
@@ -2268,7 +2273,7 @@ struct RunDetailView {
 }
 
 impl RunDetailView {
-    fn of(state: RunState, live: bool) -> Self {
+    fn of(state: RunState, live: crate::run::Liveness) -> Self {
         Self {
             instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
             live,
@@ -2285,7 +2290,8 @@ async fn run_detail(
     blocking(move || {
         let id = resolve_run(&ui.runs, &id)?;
         let state = read_run(&ui.runs, &id)?;
-        let live = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
+        let daemon_claims = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
+        let live = state.liveness(daemon_claims);
         Ok(Json(RunDetailView::of(state, live)))
     })
     .await
@@ -2509,7 +2515,8 @@ async fn run_report(
         // is CPU work over the full state, which is the other reason this is
         // not on the executor.
         let state = read_run(&ui.runs, &id)?;
-        let live = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
+        let daemon_claims = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
+        let live = state.liveness(daemon_claims);
         Ok(format!(
             "{}{}",
             report::run(&state),
@@ -6897,17 +6904,99 @@ mod tests {
         )
         .expect("write run.json");
 
-        // No daemon.json at all: the entry cannot be told from a leftover, so
-        // the route must say so rather than let the phone assume it is live.
+        // No daemon.json at all, and no `driver_pid` recorded either (this
+        // state was written directly, never through `execute()`): there is
+        // nothing to confirm either way, so the route must say `"unknown"` —
+        // never `"dead"`, which is exactly the false diagnosis a manual `magi
+        // run` used to get from this route before `driver_pid` existed.
         let cold = f.get(&format!("/api/runs/{id}")).await.json();
         assert_eq!(cold["active"]["judge-2"]["node"], "judge");
-        assert_eq!(cold["live"], false, "{cold}");
+        assert_eq!(cold["live"], "unknown", "{cold}");
 
         // A fresh heartbeat naming exactly this run: the same entry now reads
         // as confirmed, not merely recorded.
         write_daemon(f.home.path(), Timestamp::now());
         let warm = f.get(&format!("/api/runs/{id}")).await.json();
-        assert_eq!(warm["live"], true, "{warm}");
+        assert_eq!(warm["live"], "live", "{warm}");
+    }
+
+    /// The gap `driver_pid` exists to close: a manual `magi run` / `magi
+    /// review` claims no daemon at all, so before this field existed the
+    /// route above read it as `"dead"` — indistinguishable from a run a
+    /// killed process abandoned — the whole time it was genuinely still
+    /// answering. With a live pid recorded, it must read `"live"` even
+    /// though no daemon claims it.
+    #[tokio::test]
+    async fn run_detail_reads_a_manual_run_with_a_live_driver_pid_as_live_without_a_daemon() {
+        let f = Fixture::start().await;
+        let id = "20260922-090000-cccc";
+        let mut state = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "Review only".to_owned(),
+            Config::default(),
+        );
+        state.id = id.to_owned();
+        state.status = RunStatus::Reviewing;
+        state.seat_started("review", "review-1", std::time::Duration::from_secs(120), 0);
+        // This test process's own pid: guaranteed alive, and never needs a
+        // real daemon or a second process to prove it. The matching start-time
+        // marker is what `liveness` now requires alongside a live pid — see
+        // `RunState::driver_started_at`'s own doc for why the pid alone is
+        // not enough.
+        state.driver_pid = Some(std::process::id());
+        state.driver_started_at = Some(
+            crate::proc::process_started_at(std::process::id())
+                .expect("this test process's own start time must be queryable"),
+        );
+        let dir = f.runs().join(id);
+        std::fs::create_dir_all(&dir).expect("run dir");
+        std::fs::write(
+            dir.join("run.json"),
+            serde_json::to_string_pretty(&state).expect("serialize run"),
+        )
+        .expect("write run.json");
+
+        let detail = f.get(&format!("/api/runs/{id}")).await.json();
+        assert_eq!(detail["live"], "live", "{detail}");
+    }
+
+    /// A killed manual run's pid can be handed to a wholly unrelated later
+    /// process — a live query on `driver_pid` alone would read this as
+    /// `"live"`, exactly the false positive `driver_started_at` exists to
+    /// catch (see that field's own doc, and `RunState::liveness_with`'s
+    /// pid-reuse test). The route must read it as `"dead"`, not `"live"`.
+    #[tokio::test]
+    async fn run_detail_reads_a_live_pid_as_dead_once_its_start_time_no_longer_matches() {
+        let f = Fixture::start().await;
+        let id = "20260922-090100-dddd";
+        let mut state = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "Review only".to_owned(),
+            Config::default(),
+        );
+        state.id = id.to_owned();
+        state.status = RunStatus::Reviewing;
+        state.seat_started("review", "review-1", std::time::Duration::from_secs(120), 0);
+        // This test process's own pid really is alive, but the marker
+        // recorded here does not match what it actually started at —
+        // standing in for the pid having since been reused by a different
+        // process than the one that wrote `run.json`.
+        state.driver_pid = Some(std::process::id());
+        state.driver_started_at = Some("not-this-processes-real-start-time".to_owned());
+        let dir = f.runs().join(id);
+        std::fs::create_dir_all(&dir).expect("run dir");
+        std::fs::write(
+            dir.join("run.json"),
+            serde_json::to_string_pretty(&state).expect("serialize run"),
+        )
+        .expect("write run.json");
+
+        let detail = f.get(&format!("/api/runs/{id}")).await.json();
+        assert_eq!(detail["live"], "dead", "{detail}");
     }
 
     #[tokio::test]

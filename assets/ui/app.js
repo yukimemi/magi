@@ -4566,14 +4566,19 @@ let armedRunDelete = null;
 let armedRunDeleteFocused = null;
 
 function runDeleteReason(run) {
-  /* `run.live` is whether a daemon's heartbeat currently claims this run
-     (`daemon::is_working_on`), the same check the delete route itself gates
-     on. A non-terminal `status` alone is not proof of that: a killed process
-     leaves it stuck (`implementing`, say) forever with nobody left to answer
-     for it, and blocking delete on `status` read that dead run as still in
-     flight right alongside a genuinely running one. */
-  if (run.live) {
+  /* `run.live` is `"live"` / `"dead"` / `"unknown"` (`run::Liveness`) \u2014 a
+     daemon claim or `driver_pid` proving one or the other, or neither
+     provable. A non-terminal `status` alone is not proof of anything: a
+     killed process leaves it stuck (`implementing`, say) forever with
+     nobody left to answer for it, and blocking delete on `status` read that
+     dead run as still in flight right alongside a genuinely running one.
+     The delete route itself still gates on its own daemon check
+     independently of this hint. */
+  if (run.live === "live") {
     return "This run is still in flight and cannot be deleted.";
+  }
+  if (run.live === "unknown") {
+    return "Whether this run is still in flight could not be confirmed \u2014 check before deleting.";
   }
   if (unfolded(run)) {
     return "Fold the candidate worktrees first \u2014 the button below does it.";
@@ -5380,62 +5385,79 @@ function commandList(heading, commands) {
   );
 }
 
-/* One line for the phase rail's label: which seat(s) the current phase is
-   still waiting on, or null when nothing is out. Seat identifiers only —
-   never an agent id, since a judge or reviewer seat is blind. */
-function activeNote(run) {
-  const active = run.active && typeof run.active === "object" ? run.active : {};
-  const seats = Object.keys(active).sort();
-  if (seats.length === 0) return null;
-  if (!run.live) return `${plural(seats.length, "seat", "seats")} left mid-answer by a dead process`;
-  return seats.length === 1
-    ? `${seats[0]} has not answered yet`
-    : `${plural(seats.length, "seat", "seats")} have not answered yet (${seats.join(", ")})`;
+/* Entries in `run.active` come in two shapes: a seat (blind — identifier
+   only, never an agent id) and a running `verify.e2e` / `verify.gate` task
+   (`task` set — no seat, no agent, just the command list's own name and,
+   while a command is running, the command itself). `ActiveSeat::task` on the
+   Rust side is the same tag this reads. */
+function isTaskEntry(a) {
+  return !!(a && a.task);
 }
 
-/* Seats still mid-answer, for the panel between "Landing" and "Verdict" —
-   the same place in the column as the ask panel's reasoning: while a seat is
-   still out, nothing below it that depends on the panel is going to change.
+/* One line for the phase rail's label: which seat(s)/task(s) the current
+   phase is still waiting on, or null when nothing is out. */
+function activeNote(run) {
+  const active = run.active && typeof run.active === "object" ? run.active : {};
+  const keys = Object.keys(active).sort();
+  if (keys.length === 0) return null;
+  if (run.live === "dead") return `${plural(keys.length, "seat", "seats")} left mid-answer by a dead process`;
+  if (run.live === "unknown") return `${plural(keys.length, "seat", "seats")} still listed as running; whether a process is still driving this run could not be confirmed`;
+  return keys.length === 1
+    ? `${keys[0]} has not answered yet`
+    : `${plural(keys.length, "seat", "seats")} have not answered yet (${keys.join(", ")})`;
+}
 
-   `run.active` is keyed by seat, not by candidate or judge number, and on
-   purpose carries no agent id: a judge or reviewer seat is blind, and the
-   identifier alone ("judge-2", "review-1") is what the operator needs to
-   answer "which seat is quiet" without this view becoming a second place
-   that could leak who is behind it mid-run. `run.live` says whether a daemon
-   is actually still asking these seats anything right now, or whether they
-   are a leftover from a process that died before it could say so itself —
-   see `ActiveSeat`'s Rust docs for why the entry alone never proves that. */
+/* Seats and running verify/gate tasks still mid-answer, for the panel
+   between "Landing" and "Verdict" — the same place in the column as the ask
+   panel's reasoning: while something is still out, nothing below it that
+   depends on the panel is going to change.
+
+   `run.active` is keyed by seat (or by task name for a command-list task),
+   and a seat entry carries no agent id on purpose: a judge or reviewer seat
+   is blind, and the identifier alone ("judge-2", "review-1") is what the
+   operator needs to answer "which seat is quiet" without this view becoming
+   a second place that could leak who is behind it mid-run — see
+   `ActiveSeat`'s Rust docs. `run.live` (`"live"` / `"dead"` / `"unknown"`,
+   `run::Liveness`) says whether a process is actually still asking these
+   seats anything right now, is provably not, or — no daemon claim and no
+   pid this build could confirm either way — simply unknown; never folded
+   into "dead" by guesswork. */
 function renderActive(run) {
   const active = run.active && typeof run.active === "object" ? run.active : {};
-  const seats = Object.keys(active).sort();
-  show($("run-active-panel"), seats.length > 0);
-  if (seats.length === 0) return;
+  const keys = Object.keys(active).sort();
+  show($("run-active-panel"), keys.length > 0);
+  if (keys.length === 0) return;
 
-  setText($("run-active-count"), String(seats.length));
+  setText($("run-active-count"), String(keys.length));
   const note = $("run-active-note");
-  show(note, !run.live);
-  if (!run.live) {
+  const uncertain = run.live !== "live";
+  show(note, uncertain);
+  if (run.live === "dead") {
     setText(note, "No live daemon claims this run right now — likely left behind by a killed process, not a seat that is actually still working.");
+  } else if (run.live === "unknown") {
+    setText(note, "Whether a process is still driving this run could not be confirmed — this may still be genuinely running.");
   }
 
   const list = $("run-active");
   clear(list);
   const now = Date.now();
-  for (const key of seats) {
+  for (const key of keys) {
     const a = active[key];
     const startedMs = Date.parse(a.started_at || "");
     const elapsed = Number.isFinite(startedMs) ? Math.max(Math.round((now - startedMs) / 1000), 0) : null;
     const budget = Number(a.timeout_secs) || 0;
     const remaining = elapsed === null ? null : Math.max(budget - elapsed, 0);
     const retry = Number(a.attempt) > 0 ? ` · retry ${a.attempt}` : "";
+    const progress = isTaskEntry(a) && a.index && a.total ? ` (${a.index}/${a.total})` : "";
     list.append(el("li", {},
       el("span", { class: "seat", text: key }),
-      el("span", { text: `${a.node || "?"}${retry}` }),
+      el("span", { text: `${a.node || "?"}${retry}${progress}` }),
       el("span", {
         text: elapsed === null
           ? "in progress"
           : `${elapsed}s elapsed · ${remaining}s left of ${budget}s`,
       }),
+      isTaskEntry(a) && a.command ? el("span", { class: "card-note", text: a.command }) : null,
     ));
   }
 }

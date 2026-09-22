@@ -977,9 +977,10 @@ fn reclaim_orphaned_running(queue: &Queue, max_attempts: usize) -> Vec<String> {
 
 /// Find every run whose `run.json` is provably dead — every seat it still
 /// lists as [`crate::run::RunState::active`] has overrun its own timeout, and
-/// no live daemon's heartbeat names the run right now — and fail it, clearing
-/// the leftover active seats so the run stops reading as `implementing` (or
-/// whichever node) forever.
+/// [`crate::run::RunState::liveness`] reads [`crate::run::Liveness::Dead`],
+/// not merely "no daemon claims it" — and fail it, clearing the leftover
+/// active seats so the run stops reading as `implementing` (or whichever
+/// node) forever.
 ///
 /// [`reclaim_orphaned_running`] settles the *task* a dead daemon left
 /// `running`, using whatever `run.json` already says — but nothing in that
@@ -1006,6 +1007,29 @@ fn reclaim_orphaned_running(queue: &Queue, max_attempts: usize) -> Vec<String> {
 /// whichever directory some *other* process or test pinned into that
 /// `OnceLock` first — mutating runs this call was never handed.
 fn reclaim_abandoned_runs(home: &Path, now: Timestamp) -> Vec<String> {
+    reclaim_abandoned_runs_with(
+        home,
+        now,
+        crate::proc::pid_status,
+        crate::proc::process_started_at,
+    )
+}
+
+/// [`reclaim_abandoned_runs`] with its `driver_pid` liveness/identity queries
+/// supplied by the caller — mirrors [`sweep_stale_claims_with`], which exists
+/// for the identical reason: this sweep's real damage (wiping a run's active
+/// seats and failing it) has to be provable against an injected answer in a
+/// test, not just the real process table.
+fn reclaim_abandoned_runs_with<F, G>(
+    home: &Path,
+    now: Timestamp,
+    query: F,
+    identity: G,
+) -> Vec<String>
+where
+    F: Fn(u32) -> Option<bool>,
+    G: Fn(u32) -> Option<String>,
+{
     let mut abandoned = Vec::new();
     for entry in std::fs::read_dir(home.join("runs"))
         .into_iter()
@@ -1029,7 +1053,22 @@ fn reclaim_abandoned_runs(home: &Path, now: Timestamp) -> Vec<String> {
         let Ok(mut state) = serde_json::from_str::<RunState>(&body) else {
             continue;
         };
-        if state.status.done() || !state.active_all_overrun(now) || is_working_on(home, &id, now) {
+        if state.status.done() || !state.active_all_overrun(now) {
+            continue;
+        }
+        // Not `!is_working_on(..)` alone: that is only "no *daemon* claims
+        // it", which is also the normal, healthy shape of a manual `magi
+        // run` / `magi review` sharing this same home — this scan walks
+        // every run on disk, not only ones this daemon itself started. Such
+        // a run's active seats can legitimately sit past their own timeout
+        // for a little while (the CLI finishing up, its result still being
+        // collected) without the process driving it having died. `liveness`
+        // is what actually tells the two apart, by corroborating
+        // `driver_pid` against the process it names — see its own doc. Only
+        // its strongest, provable answer licenses wiping this run's active
+        // seats and failing it out from under whatever is still running it.
+        let daemon_claims = is_working_on(home, &id, now);
+        if state.liveness_with(daemon_claims, &query, &identity) != crate::run::Liveness::Dead {
             continue;
         }
         state.abandon("daemon");
@@ -4260,11 +4299,18 @@ mod tests {
             started_at: now - jiff::SignedDuration::new(21_000, 0),
             timeout_secs: 3_600,
             attempt: 0,
+            task: None,
+            command: None,
+            index: None,
+            total: None,
         };
 
         let mut dead = run_state(RunStatus::Implementing);
         dead.id = "20260101-000000-dead".to_owned();
         dead.active.insert("impl-A".to_owned(), overrun_seat());
+        // A `driver_pid` the injected query below confirms gone outright —
+        // `liveness` reads this as `Dead`, not merely "no daemon claims it".
+        dead.driver_pid = Some(4242);
         dead.save_under(&home).unwrap();
 
         // Same shape, but a live daemon's heartbeat names it: must be left
@@ -4294,7 +4340,12 @@ mod tests {
         );
         questions.put(&mut q).unwrap();
 
-        let abandoned = reclaim_abandoned_runs(&home, now);
+        let abandoned = reclaim_abandoned_runs_with(
+            &home,
+            now,
+            |pid| if pid == 4242 { Some(false) } else { None },
+            |_| panic!("a query answering Dead outright needs no identity corroboration"),
+        );
         assert_eq!(abandoned, vec![dead.id.clone()]);
 
         let reloaded = read_run_under(&home, &dead.id);
@@ -4312,6 +4363,65 @@ mod tests {
             "a live daemon's claim protects it"
         );
         assert!(!still_alive.active.is_empty());
+    }
+
+    /// The exact shape a review round flagged as broken: `magi serve` running
+    /// in this same `home` scans *every* run on disk, including a manual
+    /// `magi review` / `magi run` this daemon never started and that
+    /// therefore claims no heartbeat of its own. Before this scan asked
+    /// `liveness` rather than just `is_working_on`, a manual run whose active
+    /// seat merely ran a little past its own timeout — the CLI finishing up,
+    /// its result still being collected — got wiped and failed by a daemon
+    /// that had nothing to do with it, out from under a process that was
+    /// still very much running.
+    #[test]
+    fn reclaim_abandoned_runs_leaves_a_live_manual_run_alone_even_though_no_daemon_claims_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let now = Timestamp::now();
+
+        let mut manual = run_state(RunStatus::Reviewing);
+        manual.id = "20260101-000000-manl".to_owned();
+        manual.active.insert(
+            "review-1".to_owned(),
+            crate::run::ActiveSeat {
+                node: "review".to_owned(),
+                started_at: now - jiff::SignedDuration::new(21_000, 0),
+                timeout_secs: 3_600,
+                attempt: 0,
+                task: None,
+                command: None,
+                index: None,
+                total: None,
+            },
+        );
+        // Not claimed by any daemon (no `daemon.json` at all in this `home`),
+        // but a real, still-running process: `liveness` must corroborate this
+        // as `Live`, not read the missing daemon claim as death.
+        manual.driver_pid = Some(4242);
+        manual.driver_started_at = Some("2026-09-22T10:00:00Z".to_owned());
+        manual.save_under(&home).unwrap();
+
+        let abandoned = reclaim_abandoned_runs_with(
+            &home,
+            now,
+            |pid| if pid == 4242 { Some(true) } else { None },
+            |pid| {
+                if pid == 4242 {
+                    Some("2026-09-22T10:00:00Z".to_owned())
+                } else {
+                    None
+                }
+            },
+        );
+        assert!(
+            abandoned.is_empty(),
+            "a manual run a real process is still driving must never be reclaimed: {abandoned:?}"
+        );
+
+        let reloaded = read_run_under(&home, &manual.id);
+        assert_eq!(reloaded.status, RunStatus::Reviewing);
+        assert!(!reloaded.active.is_empty());
     }
 
     #[test]
