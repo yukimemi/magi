@@ -99,7 +99,13 @@ pub struct Decision {
     /// One line explaining the block or the recovery.
     #[serde(default)]
     pub reason: Option<String>,
-    /// Recovery for a stalled or finished task. Ignored for a runnable one.
+    /// Recovery for a stalled or finished task. For a runnable (`queued`)
+    /// one, only [`Recovery::Hold`] has any effect - and only when
+    /// `blocked_by` is empty, since a `queued` task with something to wait on
+    /// is handled by that field instead - holding a task the operator has
+    /// already said should not compete again without filing another
+    /// `question` that only restates the same answer. `Requeue` and `Review`
+    /// have no meaning for a task that is already in line.
     #[serde(default)]
     pub recovery: Option<Recovery>,
     /// A question for the operator. When present, [`apply`] files it (unless
@@ -329,6 +335,19 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
         return Ok(());
     }
 
+    // `crate::triage` is already running its own question-and-answer cycle
+    // on this hold - see that module's doc on why it never calls
+    // `Task::block`. Layering a second, unrelated conductor question on top
+    // would move the task to `Blocked`, and `crate::triage::run_once` only
+    // ever looks at tasks still `held` - so the triage question left open
+    // would never be read back once it is answered, orphaned by a status
+    // change triage itself never asked for.
+    if task.status == TaskStatus::Held
+        && crate::triage::open_question_for(questions, &task.id).is_some()
+    {
+        return Ok(());
+    }
+
     if let Some(text) = &d.question {
         if task.status == TaskStatus::Done {
             return Ok(());
@@ -362,6 +381,13 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
     match task.status {
         TaskStatus::Queued if !d.blocked_by.is_empty() => {
             task.block(d.blocked_by.clone(), d.reason.clone());
+            queue.put(&mut task)?;
+        }
+        // See `Decision::recovery`'s doc: the only lever a runnable task has
+        // besides `blocked_by` is holding it outright, for a task whose
+        // answers already say it should not compete again.
+        TaskStatus::Queued if d.recovery == Some(Recovery::Hold) => {
+            task.hold_machine(d.reason.clone());
             queue.put(&mut task)?;
         }
         TaskStatus::Running => match d.recovery {
@@ -1072,6 +1098,143 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_held_task_asked_about_restores_to_held_once_answered() {
+        // Reproduces the reported bug: a task held after burning its
+        // attempts, once the conductor asks a follow-up question about it,
+        // must come back `held` - not `queued` - once the question is
+        // answered, whatever the answer said.
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("held out of attempts");
+        t.hold_machine(Some("out of attempts".to_owned()));
+        queue.put(&mut t).unwrap();
+
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![Decision {
+                    id: t.id.clone(),
+                    reason: Some("what should happen to this one?".to_owned()),
+                    question: Some("Hold it, or try again?".to_owned()),
+                    ..Decision::default()
+                }],
+            },
+        )
+        .unwrap();
+        let blocked = queue.get(&t.id).unwrap();
+        assert_eq!(blocked.status, TaskStatus::Blocked);
+        let question_id = blocked.blocked_by[0].clone();
+
+        let mut q = questions.get(&question_id).unwrap();
+        q.answer(Answer::Text("leave it held".to_owned())).unwrap();
+        questions.put(&mut q).unwrap();
+
+        // What `crate::daemon::resolve_blockers` does on the real queue.
+        let mut after = queue.get(&t.id).unwrap();
+        after.record_answer(q.summary.clone(), "leave it held".to_owned());
+        after.unblock(&question_id);
+        assert_eq!(
+            after.status,
+            TaskStatus::Held,
+            "must not fall back to queued"
+        );
+        assert_eq!(after.hold_reason.as_deref(), Some("out of attempts"));
+    }
+
+    #[test]
+    fn a_runnable_task_can_be_held_directly_without_a_question() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("already answered, should stay put");
+        queue.put(&mut t).unwrap();
+
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![Decision {
+                    id: t.id.clone(),
+                    recovery: Some(Recovery::Hold),
+                    reason: Some("operator already said keep this held".to_owned()),
+                    ..Decision::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let after = queue.get(&t.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Held);
+        assert_eq!(after.hold_source, Some(crate::queue::HoldSource::Machine));
+    }
+
+    #[test]
+    fn a_held_task_with_an_open_triage_question_is_left_to_triage() {
+        // `crate::triage` never calls `Task::block`, and only ever looks at
+        // tasks still `held` - so a conductor question that moved this task
+        // to `blocked` would orphan triage's own open question. The guard in
+        // `apply_one` must leave the task alone until triage's question
+        // settles.
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("held, triage already asking about it");
+        t.hold_machine(Some("cause unclear".to_owned()));
+        queue.put(&mut t).unwrap();
+
+        let mut triage_q = Question::new(
+            t.id.clone(),
+            crate::triage::NODE.to_owned(),
+            "triage".to_owned(),
+            "Still needed?".to_owned(),
+            String::new(),
+            vec![
+                "resume".to_owned(),
+                "not yet".to_owned(),
+                "discard".to_owned(),
+            ],
+        );
+        questions.put(&mut triage_q).unwrap();
+
+        for decision in [
+            Decision {
+                id: t.id.clone(),
+                question: Some("what now?".to_owned()),
+                ..Decision::default()
+            },
+            Decision {
+                id: t.id.clone(),
+                recovery: Some(Recovery::Requeue),
+                ..Decision::default()
+            },
+        ] {
+            apply(
+                &queue,
+                &questions,
+                &Verdict {
+                    decisions: vec![decision],
+                },
+            )
+            .unwrap();
+        }
+
+        let after = queue.get(&t.id).unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::Held,
+            "triage still owns this hold"
+        );
+        assert!(after.blocked_by.is_empty());
+        assert_eq!(
+            questions.list().len(),
+            1,
+            "no second, conductor-owned question was filed"
+        );
+    }
+
+    #[test]
     fn manual_hold_rejects_hostile_or_stale_conductor_recovery() {
         let dir = tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
@@ -1253,27 +1416,33 @@ mod tests {
     }
 
     #[test]
-    fn recovery_is_ignored_for_a_task_that_is_not_actually_stalled_or_finished() {
+    fn requeue_and_review_recovery_are_ignored_for_a_runnable_task() {
+        // `Hold` is the one exception - see `Decision::recovery`'s doc and
+        // `a_runnable_task_can_be_held_directly_without_a_question` - but a
+        // task already in line has nothing for `requeue` or `review` to do.
         let dir = tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let questions = Questions::at(dir.path().join("questions"));
-        let mut t = task("ordinary");
-        queue.put(&mut t).unwrap();
 
-        apply(
-            &queue,
-            &questions,
-            &Verdict {
-                decisions: vec![Decision {
-                    id: t.id.clone(),
-                    recovery: Some(Recovery::Hold),
-                    ..Decision::default()
-                }],
-            },
-        )
-        .unwrap();
+        for recovery in [Recovery::Requeue, Recovery::Review] {
+            let mut t = task("ordinary");
+            queue.put(&mut t).unwrap();
 
-        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+            apply(
+                &queue,
+                &questions,
+                &Verdict {
+                    decisions: vec![Decision {
+                        id: t.id.clone(),
+                        recovery: Some(recovery),
+                        ..Decision::default()
+                    }],
+                },
+            )
+            .unwrap();
+
+            assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+        }
     }
 
     #[tokio::test]

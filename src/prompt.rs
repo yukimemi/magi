@@ -1334,7 +1334,15 @@ pub fn conduct(
          # Runnable tasks\n\n\
          Decide which of these should wait on another task or on a question \
          you want to ask the operator. Leaving a task out of your reply \
-         changes nothing about it.\n\n",
+         changes nothing about it.\n\n\
+         A task already carrying one or more `answered \"...\": ...` lines \
+         has been through this before. If the operator's own words already \
+         settled that it should not compete again - stay held, this is \
+         closed, wait for a person - say so with `recovery: hold` instead of \
+         filing another `question` that only asks the same thing again: \
+         `blocked_by` and `question` both put the task back in the queue the \
+         moment they resolve, which is exactly what re-asking a settled \
+         question would undo.\n\n",
     );
     if runnable.is_empty() {
         s.push_str("(none)\n\n");
