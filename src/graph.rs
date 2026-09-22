@@ -1526,17 +1526,18 @@ impl Runner {
     /// to size.
     ///
     /// Walks forward from just past the seat's own original position in the
-    /// roster, wrapping back to the front rather than restarting there: a
-    /// later candidate slot (say `beta`, the roster's second entry) must fall
-    /// through to the *next* entry (`gamma`) on its own quota loss, not back
-    /// to `alpha`, which is almost certainly a different candidate's own
-    /// agent already. Tried by `spec.id`, never the whole [`AgentSpec`]: a
-    /// roster with the same id named twice must not let this retry that id
-    /// forever. The loop keeps falling through until an attempt lands
-    /// something other than `Quota` or every id in the roster has been tried,
-    /// at which point the seat is left exactly as `implement`'s own
-    /// `AgentOutcome::Quota` arm already handles it: one `QuotaLoss`
-    /// recorded, the candidate failed/empty.
+    /// roster, never wrapping back to the front: a later candidate slot (say
+    /// `beta`, the roster's second entry) must fall through to the *next*
+    /// entry (`gamma`) on its own quota loss, not back to `alpha`, which is
+    /// almost certainly a different candidate's own agent already — and once
+    /// the roster's tail is exhausted there is nothing left to fall through
+    /// to for *this* seat, wrapping or not. Tried by `spec.id`, never the
+    /// whole [`AgentSpec`]: a roster with the same id named twice must not
+    /// let this retry that id forever. The loop keeps falling through until
+    /// an attempt lands something other than `Quota` or the roster's tail
+    /// runs out of untried ids, at which point the seat is left exactly as
+    /// `implement`'s own `AgentOutcome::Quota` arm already handles it: one
+    /// `QuotaLoss` recorded, the candidate failed/empty.
     ///
     /// `sent` is taken mutably and updated with the fallback agent's spec:
     /// `resume_unconfirmed_commands`, which runs after this and also reads
@@ -5003,34 +5004,34 @@ fn has_context(spec: &AgentSpec, seat: &SeatState, sessions: bool) -> bool {
     agent::has_session(spec.kind, seat, sessions)
 }
 
-/// The next entry in `roster` after `start`, wrapping back to the front,
-/// whose id is not in `tried` yet.
+/// The next entry in `roster` after `start`, never wrapping back to the
+/// front, whose id is not in `tried` yet.
 ///
 /// Starts one past `start` rather than at the front of `roster`: `start` is
 /// the seat's own original position, and a seat whose candidate slot already
 /// sits on the roster's second entry must fall through to the third next, not
 /// restart at the first — which is very likely a different candidate's own
-/// agent already. Wraps around so an id earlier than `start` is still
-/// reachable once the entries after it are exhausted, the same way `rotate`
-/// already lets two candidate slots share one agent when the roster is
-/// shorter than `graph.candidates`.
+/// agent already. Never wraps back past `start`, for the same reason: an
+/// entry earlier in the roster than the seat's own position is almost
+/// certainly some *other* candidate slot's own agent, and once the tail of
+/// the roster is exhausted there are no more untried agents for *this* seat
+/// to fall through to — the caller's fallback chain ends there, exactly as
+/// "no further untried agents remain in the list for that seat" asks for.
 ///
 /// Matched by [`AgentSpec::id`], never the whole spec: a roster that names
 /// the same id twice (an operator's `roles.implementers` typo, or a
 /// `[[agents]]` list reused across roles) must not let
-/// [`Runner::resume_quota_losses`] retry that id forever — one pass over
-/// `roster` either finds an untried id or exhausts every entry, so this
-/// always terminates regardless of duplicates.
+/// [`Runner::resume_quota_losses`] retry that id forever — one forward pass
+/// over `roster` either finds an untried id or runs out, so this always
+/// terminates regardless of duplicates.
 fn next_untried_implementer<'a>(
     roster: &'a [AgentSpec],
     start: usize,
     tried: &BTreeSet<String>,
 ) -> Option<&'a AgentSpec> {
-    if roster.is_empty() {
-        return None;
-    }
-    (1..=roster.len())
-        .map(|offset| &roster[(start + offset) % roster.len()])
+    roster
+        .get(start + 1..)?
+        .iter()
         .find(|s| !tried.contains(&s.id))
 }
 
@@ -6216,13 +6217,23 @@ mod tests {
     }
 
     #[test]
-    fn next_untried_implementer_wraps_around_once_the_tail_is_exhausted() {
+    fn next_untried_implementer_does_not_wrap_back_past_its_own_start() {
         let roster = vec![spec("alpha"), spec("beta")];
         let tried = BTreeSet::from(["beta".to_owned()]);
-        // beta is the roster's last entry; nothing follows it without
-        // wrapping back to alpha, which beta's own seat has not tried.
-        let next = next_untried_implementer(&roster, 1, &tried);
-        assert_eq!(next.map(|s| s.id.as_str()), Some("alpha"));
+        // beta is the roster's last entry: nothing follows it, and alpha —
+        // earlier in the roster, almost certainly a different candidate
+        // slot's own agent — must not be reached by wrapping back to it.
+        assert!(next_untried_implementer(&roster, 1, &tried).is_none());
+    }
+
+    #[test]
+    fn next_untried_implementer_stops_once_the_tail_is_exhausted_even_if_earlier_ids_are_untried() {
+        let roster = vec![spec("alpha"), spec("beta"), spec("gamma")];
+        let tried = BTreeSet::from(["beta".to_owned(), "gamma".to_owned()]);
+        // beta (index 1) and gamma (index 2, the only entry after it) have
+        // both been tried; alpha (index 0) never has, but it comes before
+        // beta's own position, so there is nothing further for this seat.
+        assert!(next_untried_implementer(&roster, 1, &tried).is_none());
     }
 
     #[test]

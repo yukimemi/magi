@@ -187,3 +187,76 @@ async fn a_later_candidate_slots_seat_falls_back_past_its_own_position_not_the_r
     assert_eq!(slot1.agent, "gamma", "{slot1:?}");
     assert!(!slot1.empty && slot1.failed.is_none(), "{slot1:?}");
 }
+
+#[tokio::test]
+async fn a_later_candidate_slots_fallback_chain_stops_at_the_rosters_tail_without_wrapping() {
+    let _home = common::home_lock().await;
+    let mut fx = common::fixture(_home, common::Judges::Unanimous, false);
+    fx.config.graph.candidates = 2;
+    let labels = magi::blind::assign_labels(2, fx.config.blind.seed.expect("fixture pins a seed"));
+    let seat_for_slot_1 = format!("impl-{}", labels[1]);
+    // Slot 1's own agent (`beta`) and the only roster entry after it
+    // (`gamma`) both quota on this seat; `alpha` — earlier in the roster,
+    // and slot 0's own agent — never does. Once gamma also quotas there is
+    // nothing left forward of beta to fall through to, and the seat must
+    // fail rather than wrap back onto alpha.
+    for a in &mut fx.config.agents {
+        if a.id == "beta" || a.id == "gamma" {
+            a.env
+                .insert("MOCK_QUOTA_SEAT".to_owned(), seat_for_slot_1.clone());
+        }
+    }
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    // Slot 0 (alpha) still produces a viable candidate, so the run does not
+    // bail outright the way an all-empty implement round would — judging is
+    // simply skipped down to the one candidate that exists (`judge`'s own
+    // `viable.len() == 1` short-circuit).
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    // Exactly one loss, recorded once the fallback chain ran out — never a
+    // wrap back onto alpha, which would have recovered the seat instead.
+    assert_eq!(state.quota.len(), 1, "{:?}", state.quota);
+    assert_eq!(state.quota[0].seat, seat_for_slot_1);
+
+    let events: Vec<&str> = state
+        .events
+        .iter()
+        .filter(|e| e.node == "implement")
+        .map(|e| e.message.as_str())
+        .collect();
+    assert!(
+        events.iter().any(|m| m.contains("retrying with gamma")),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|m| m.contains("retrying with alpha")),
+        "must not wrap back onto a different candidate slot's own agent: {events:?}"
+    );
+
+    let slot0 = state
+        .candidates
+        .iter()
+        .find(|c| c.index == 0)
+        .expect("candidate slot 0");
+    assert_eq!(slot0.agent, "alpha", "{slot0:?}");
+    assert!(!slot0.empty && slot0.failed.is_none(), "{slot0:?}");
+
+    let slot1 = state
+        .candidates
+        .iter()
+        .find(|c| c.index == 1)
+        .expect("candidate slot 1");
+    assert!(slot1.empty, "{slot1:?}");
+    assert_eq!(
+        slot1.failed.as_deref(),
+        Some("rate limited (quota); produced no change")
+    );
+    // Nobody actually answered this seat — both fallback attempts also
+    // quota'd out — so it must keep its originally assigned agent, not the
+    // last one the (exhausted) fallback happened to try.
+    assert_eq!(slot1.agent, "beta", "{slot1:?}");
+}
