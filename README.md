@@ -31,7 +31,7 @@ flowchart TD
     direction TB
     prep["prep: worktrees + blind hook\n(no agent)"]
     advisor["advise: advisors ×A, read-only\n[roles] advisors (falls back to judges)\n[graph] advise, advisors"]
-    synth["advise: synthesis ×1, blends the advisors\nno [roles] field — always agent::pick"]
+    synth["advise: synthesis ×1, blends the advisors\n[roles] synthesizer"]
     impl["implement ×N\n[roles] implementers\n[graph] candidates"]
     judge["judge ×M, blind\n[roles] judges\n[graph] judges"]
     delib["deliberate\n[roles] judges\n[graph] deliberate_rounds"]
@@ -54,32 +54,22 @@ flowchart TD
     direction LR
     chatter["chatter ×1 per turn\n[roles] chatter"]
   end
-
-  classDef gap fill:#3a1414,stroke:#e05252,stroke-width:2px,color:#f5caca;
-  class synth gap;
 ```
 
 Every box above that spawns an agent has a `[roles]` field to pin it to a
-specific one — except the red one. That gap is real, not a documentation
-omission:
+specific one:
 
 | Seat | Runs | `[roles]` field | Other knobs | Pinnable? |
 |---|---|---|---|---|
 | conductor | once per poll cycle | `conductor` | — | yes |
 | advisors (design deliberation) | ×`advisors` (default 3) | `advisors` *(unset falls back to `judges`)* | `[graph] advise` on/off, `[graph] advisors` count | yes |
-| **advise-synthesis** (blends the advisors into one brief) | ×1 | **none** | — | **no** — always `agent::pick`'s default order |
+| advise-synthesis (blends the advisors into one brief) | ×1 | `synthesizer` *(unset falls back to a claude seat, else roster order)* | — | yes |
 | implementers | ×`candidates` (default 3) | `implementers` | `[graph] candidates` | yes |
 | judges (rank / deliberate / vote) | ×`judges` (default 3) | `judges` | `[graph] judges`, `deliberate_rounds` | yes |
 | reviewers | ×`reviewers` (default 3) | `reviewers` | `[graph] reviewers`, `review_rounds` | yes |
 | fixer (review loop and land loop) | ×1, only when findings block | `fixer` *(unset falls back to the winner's own seat)* | — | yes |
 | chatter (`magi chat`, `magi bump`) | ×1 per turn | `chatter` *(unset falls back to a claude seat, else roster order)* | — | yes |
 | tally / fold / gate / merge | n/a — no agent seat | — | `[verify] gate`, `[graph] land`, `land_approval` | n/a |
-
-`advise-synthesis` is the one seat in the whole graph with no dedicated
-`[roles]` entry: it always resolves through `agent::pick`'s bare default
-order, the same fallback every other seat only reaches when its own field is
-left unset. An operator who wants the advisor-blending step pinned to a
-specific agent currently cannot do it without narrowing `[agents]` itself.
 
 ## What makes the judging blind
 

@@ -1120,10 +1120,11 @@ impl Runner {
     /// anywhere else.
     ///
     /// Picked the same way [`crate::talk`]'s standing conversation and
-    /// [`crate::bump`]'s release-bump decision are: [`agent::pick`] with no
-    /// explicit id, rather than a dedicated `[roles]` entry — one more role
-    /// to configure for a seat that runs once per run and, unlike the
-    /// advisors it reads, never needs more than one.
+    /// [`crate::bump`]'s release-bump decision are: [`agent::pick`], with
+    /// `[roles] synthesizer` checked first and [`agent::pick`]'s own default
+    /// order (a claude seat, else the first runnable agent in roster order)
+    /// used when that field is unset — see `[roles] synthesizer`'s own doc
+    /// in [`crate::config`] for why a dedicated field exists here at all.
     #[allow(clippy::too_many_arguments)]
     async fn synthesize_brief(
         &mut self,
@@ -1136,7 +1137,8 @@ impl Runner {
         prompts: &Prompts,
         cache: Option<&Path>,
     ) -> Result<Option<String>> {
-        let spec = agent::pick(&self.state.config.agents, None, &agent::installed)?;
+        let want = self.state.config.roles.synthesizer.as_deref();
+        let spec = agent::pick(&self.state.config.agents, want, &agent::installed)?;
         let mut seat = self.seat("advise-synthesis", &spec.id);
         let proposals = advice.proposals();
         let mut prompt = prompt::with_overlay(
