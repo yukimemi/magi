@@ -336,6 +336,42 @@ pub struct Ui {
     /// drive the routes against a loop that only starts and stops; production
     /// is [`launch_daemon`] and nothing reassigns it.
     launch: Launch,
+    /// A test-only stop point inside `talk_say`'s busy branch. See
+    /// [`BusyQueueGate`].
+    #[cfg(test)]
+    busy_queue_gate: Arc<Mutex<Option<BusyQueueGate>>>,
+}
+
+/// A one-shot stop point the busy branch's queued-draft write can be made to
+/// pause at, right before [`talk::queue`] runs.
+///
+/// Exists because a test cannot otherwise pin *when*, relative to the turn
+/// slot being freed, that write happens: `blocking` runs it on
+/// `spawn_blocking`, whose `JoinHandle` resolves in a single poll if the job
+/// already finished, so counting polls on the handler future to park it at a
+/// particular `.await` is a guess about scheduling, not a fact about it - see
+/// `a_dropped_handler_future_after_queueing_still_drains_the_draft`, which
+/// used to do exactly that and paid for it with an occasional "async fn
+/// resumed after completion" panic under load.
+///
+/// `reached` fires the instant the write is about to run, so a test waits for
+/// a real event instead of a poll count. `release` then blocks the write
+/// until the test says to continue; it is a `std::sync::mpsc::Receiver`
+/// rather than an async channel because this all happens inside the
+/// `spawn_blocking` closure the write already runs on, off any runtime
+/// worker, so blocking here costs nothing the write was not already going to
+/// cost.
+#[cfg(test)]
+struct BusyQueueGate {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for BusyQueueGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BusyQueueGate").finish_non_exhaustive()
+    }
 }
 
 impl Ui {
@@ -365,6 +401,8 @@ impl Ui {
             merge: None,
             looping: Arc::default(),
             launch: launch_daemon,
+            #[cfg(test)]
+            busy_queue_gate: Arc::default(),
         }
     }
 
@@ -412,6 +450,23 @@ impl Ui {
     fn with_launch(mut self, launch: Launch) -> Self {
         self.launch = launch;
         self
+    }
+
+    /// Install a [`BusyQueueGate`] for the next pass through the busy
+    /// branch's queued-draft write, replacing any earlier one.
+    ///
+    /// A setter on `&self` rather than a `with_*` builder consumed once,
+    /// because a test that drives the busy branch more than once (as
+    /// `a_dropped_handler_future_after_queueing_still_drains_the_draft` does,
+    /// to build confidence the interleaving is handled deterministically and
+    /// not just on a lucky run) needs a fresh channel pair each time, on the
+    /// one `Ui` it already built its temp directories around.
+    #[cfg(test)]
+    fn set_busy_queue_gate(&self, gate: BusyQueueGate) {
+        *self
+            .busy_queue_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(gate);
     }
 
     /// The loop's state, for [`serve`]'s own way out.
@@ -3516,6 +3571,20 @@ async fn talk_say(
                         let id = id.clone();
                         move || {
                             let mut talk = ui.talks.get(&id)?;
+                            // A test-only stop point, right before the write
+                            // an interleaving test needs to pin - see
+                            // `BusyQueueGate`. `None` in every real server:
+                            // the field only exists under `#[cfg(test)]`.
+                            #[cfg(test)]
+                            if let Some(gate) = ui
+                                .busy_queue_gate
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .take()
+                            {
+                                let _ = gate.reached.send(());
+                                let _ = gate.release.recv();
+                            }
                             if let Err(error) =
                                 talk::queue(&mut talk, &ui.talks, &said, attachments)
                             {
@@ -5381,45 +5450,40 @@ mod tests {
     /// started: the message sat queued until some unrelated later `say`
     /// happened to pick it up.
     ///
-    /// Driving the handler future by hand reproduces that drop rather than
-    /// racing it. Polling it a fixed number of times parks it at a known
-    /// `.await`; nothing else polls it there, so the turn the test is holding
-    /// can be given up - through `drain_loop`, the protocol's other half -
-    /// before the handler is resumed for the poll that writes the draft. The
-    /// reclaim inside that write then finds the slot free, which is the case
-    /// under test, and the drop lands where axum's does: suspended on a
-    /// blocking task that is already dispatched and runs to completion
-    /// regardless of who is left waiting for it.
+    /// This used to drive the handler future by hand, polling it a fixed
+    /// number of times to park it at the `.await` where it asks for the turn
+    /// and finds it busy, before the reclaim's slot-free case could be set up
+    /// underneath it. That assumed a fixed number of polls lands at a fixed
+    /// `.await` - which is not true: `blocking` awaits a `spawn_blocking`
+    /// `JoinHandle`, and a `JoinHandle` already finished resolves in a single
+    /// poll, so any number of this handler's several `blocking` awaits can
+    /// collapse into one poll under load, landing the drive somewhere other
+    /// than intended - including, occasionally, straight past the handler's
+    /// own completion, which made polling it again panic with "async fn
+    /// resumed after completion". No poll count fixes that; the handler's
+    /// progress simply is not something a caller outside it can observe by
+    /// counting.
+    ///
+    /// [`BusyQueueGate`] replaces the poll count with a real stop point
+    /// inside the write itself, so the interleaving under test is pinned by
+    /// an event instead of a guess: the gate fires only once the handler has
+    /// actually decided `Busy` and is about to persist the draft, and it
+    /// blocks that write until the test lets it through. Between those two
+    /// moments the test drains the turn the handler found busy - through
+    /// `drain_loop`, the protocol's other half - and then aborts the handler
+    /// task outright, the same way axum drops a disconnected request's
+    /// future. The write, and the reclaim it may do, run to completion
+    /// regardless: they live in the `tokio::spawn` task the busy branch hands
+    /// to the runtime before ever touching the gate, wholly independent of
+    /// whether the handler that started it is still around - which is what
+    /// this test is actually checking. A drainer other than that reclaim
+    /// cannot exist here: the test's own `drain_loop` call happens before the
+    /// gate opens, so it runs while the queue is still empty and hands the
+    /// turn straight back rather than draining anything, closing off the
+    /// possibility of the final assertion passing without the reclaim ever
+    /// having done its job.
     #[tokio::test]
     async fn a_dropped_handler_future_after_queueing_still_drains_the_draft() {
-        /// Poll `fut` up to `max_polls` times, stopping early if it finishes.
-        /// Returns whether `fut` reached `Ready` — polling an `async fn`
-        /// again after that panics, so a caller driving the same `fut`
-        /// across more than one `drive` call must check this first.
-        async fn drive<F: std::future::Future>(
-            fut: &mut std::pin::Pin<Box<F>>,
-            max_polls: usize,
-        ) -> bool {
-            if max_polls == 0 {
-                return false;
-            }
-            let mut polls = 0usize;
-            let mut ready = false;
-            std::future::poll_fn(|cx| {
-                polls += 1;
-                match fut.as_mut().poll(cx) {
-                    std::task::Poll::Ready(_) => {
-                        ready = true;
-                        std::task::Poll::Ready(())
-                    }
-                    std::task::Poll::Pending if polls >= max_polls => std::task::Poll::Ready(()),
-                    std::task::Poll::Pending => std::task::Poll::Pending,
-                }
-            })
-            .await;
-            ready
-        }
-
         let tmp = TempDir::new().expect("tempdir");
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo dir");
@@ -5439,7 +5503,7 @@ mod tests {
         );
         let cfg = config_for(&repo).await.expect("discover config");
 
-        for polls_after_release in 1..=3usize {
+        for attempt in 0..3u32 {
             let talk = talk::begin(&talks, &cfg, repo.clone(), None).expect("begin talk");
             let id = talk.id.clone();
             // A turn is already running, which is what sends `talk_say` down
@@ -5449,7 +5513,14 @@ mod tests {
                 .expect("claim the turn")
                 .expect("a fresh talk owes nobody a turn");
 
-            let mut handler = Box::pin(talk_say(
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            ui.set_busy_queue_gate(BusyQueueGate {
+                reached: reached_tx,
+                release: release_rx,
+            });
+
+            let handler = tokio::spawn(talk_say(
                 State(Arc::clone(&ui)),
                 Path(id.clone()),
                 Ok(Json(NewTalkTurn {
@@ -5457,36 +5528,44 @@ mod tests {
                     attachments: Vec::new(),
                 })),
             ));
-            // Four awaits get the handler as far as asking for the turn:
-            // resolve, the closed-talk check, the attachment lookup, and the
-            // claim itself. Its answer - `Busy`, with the turn below still
-            // held - is waiting for a fifth poll that nothing here has made
-            // yet.
-            // On a loaded machine the queueing task behind the handler's
-            // `Busy` branch can land before this ever gets to drive it
-            // again - polling an `async fn` past `Ready` panics, so that
-            // has to be checked rather than assumed away.
-            let done = drive(&mut handler, 4).await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Wait for the busy branch to actually reach the gate, rather
+            // than for any fixed number of polls of anything - a bounded
+            // wait rather than a bare `.await` so a regression that never
+            // reaches the gate fails the test instead of hanging it.
+            tokio::time::timeout(Duration::from_secs(5), reached_rx)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "attempt {attempt}: talk {id} never reached the busy branch's queue write"
+                    )
+                })
+                .expect("the busy branch dropped the gate without using it");
+
             // The turn that was running now finishes and gives the slot up
             // the way a real one does - through `drain_loop`, which finds
-            // nothing queued yet and releases. The handler is parked and
-            // still believes the talk is busy, exactly the interleaving the
-            // reclaim exists for.
+            // nothing queued yet (the write is still held at the gate) and
+            // releases. The handler, parked inside `spawn_blocking` on the
+            // other side of the gate, still believes the talk is busy -
+            // exactly the interleaving the reclaim exists for.
             let running = talks.get(&id).expect("reload talk");
             drain_loop(running, talks.clone(), cfg.clone(), id.clone(), turn_guard).await;
-            // Resumed, the handler writes its draft and reclaims the now-free
-            // slot - and is then dropped, the way a reloading phone drops it.
-            if !done {
-                drive(&mut handler, polls_after_release).await;
-            }
-            drop(handler);
+
+            // Drop the handler future now, the way a reloading phone drops
+            // it: suspended waiting on the busy branch's answer, having
+            // itself made no more progress since it handed the write off.
+            handler.abort();
+            let _ = handler.await;
+
+            // Only now let the gated write proceed. It persists the draft
+            // and reclaims the now-free slot from inside the task the busy
+            // branch already spawned - unaffected by the handler's abort
+            // above, since that task was independent of the handler's own
+            // future from the moment it was spawned.
+            let _ = release_tx.send(());
 
             // A settled talk: the draft drained into an operator turn and
-            // answered. The write itself is already on its way - the blocking
-            // task carrying it outlives the dropped handler either way - so
-            // waiting for the answer is waiting for the drain the reclaim
-            // owes, not for the write.
+            // answered.
             let mut fresh = talks.get(&id).expect("reload talk");
             for _ in 0..SETTLE_STEPS {
                 if fresh.pending.is_empty() && fresh.turns.len() == 2 {
@@ -5497,9 +5576,9 @@ mod tests {
             }
             assert!(
                 fresh.pending.is_empty() && fresh.turns.len() == 2,
-                "polls {polls_after_release}: talk {id} left the operator's \
-                 text queued with no drainer - the reclaimed turn was dropped \
-                 along with the handler future (pending {:?}, {} turns)",
+                "attempt {attempt}: talk {id} left the operator's text queued \
+                 with no drainer - the reclaimed turn was dropped along with \
+                 the handler future (pending {:?}, {} turns)",
                 fresh.pending,
                 fresh.turns.len()
             );
