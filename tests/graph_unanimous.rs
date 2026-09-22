@@ -140,7 +140,9 @@ async fn a_unanimous_run_reaches_the_gate_without_deliberating() {
 
     // Folding cleans up the winner too, on request.
     let mut state = again.state;
-    let removed = fold_run(&mut state, true).await.expect("fold");
+    let removed = fold_run(&mut state, true, &magi::run::home())
+        .await
+        .expect("fold");
     assert!(!removed.is_empty());
     assert!(state.candidates.iter().all(|c| !c.worktree.exists()));
 }
