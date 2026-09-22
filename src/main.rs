@@ -1104,7 +1104,17 @@ async fn dispatch(command: Command) -> Result<()> {
             }
             for id in ids.into_iter().take(limit) {
                 match RunState::load(&id) {
-                    Ok(s) => println!("{}", report::line(&s)),
+                    Ok(s) => {
+                        let daemon_claims = magi::daemon::is_working_on(
+                            &magi::run::home(),
+                            &s.id,
+                            jiff::Timestamp::now(),
+                        );
+                        println!(
+                            "{}",
+                            report::line_with_liveness(&s, s.liveness(daemon_claims))
+                        );
+                    }
                     Err(e) => println!("{id}  <unreadable: {e}>"),
                 }
             }
@@ -1133,7 +1143,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 let live = state.liveness(daemon_claims);
                 print!(
                     "{}{}",
-                    report::run(&state),
+                    report::liveness_notice(&state, live) + &report::run(&state),
                     report::active_seats(&state, live)
                 );
             }

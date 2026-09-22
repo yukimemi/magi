@@ -2127,6 +2127,10 @@ struct RunSummary {
     /// would race the graph's own save of `run.json` and be overwritten at the
     /// next node boundary. Asking the store is always true and never races.
     waiting: bool,
+    /// Whether the process recorded as driving this run can still be proven
+    /// alive. The card uses a confirmed-dead non-terminal run as `stale`,
+    /// rather than presenting its last graph node as still in flight.
+    live: crate::run::Liveness,
     /// The land loop's last look at the pull request, when there is one.
     pr: Option<crate::run::PrRecord>,
     /// `status` is `"ready"`, but `[merge] mode = "none"` left it there by
@@ -2138,7 +2142,7 @@ struct RunSummary {
 }
 
 impl RunSummary {
-    fn of(state: &RunState, waiting: bool) -> Self {
+    fn of(state: &RunState, waiting: bool, live: crate::run::Liveness) -> Self {
         Self {
             id: state.id.clone(),
             short: state.short().to_owned(),
@@ -2163,6 +2167,7 @@ impl RunSummary {
             quota_losses: state.quota.len(),
             event: state.events.last().map(|e| e.message.clone()),
             waiting,
+            live,
             // Filled in by the list route, which is the only place that can
             // see a task's other attempts.
             superseded_by: None,
@@ -2205,7 +2210,9 @@ async fn runs_list(
             .map(|state| {
                 let waiting = !ui.questions.open_for(&state.id).is_empty();
                 let by = superseded.get(&state.id).cloned();
-                let mut row = RunSummary::of(&state, waiting);
+                let daemon_claims =
+                    crate::daemon::is_working_on(&ui.home, &state.id, jiff::Timestamp::now());
+                let mut row = RunSummary::of(&state, waiting, state.liveness(daemon_claims));
                 row.superseded_by = by.as_deref().map(crate::run::short_of).map(str::to_owned);
                 row
             })
@@ -2487,7 +2494,11 @@ async fn run_resume(
 
     // The same shape the list route returns, so the phone updates the card it
     // already has rather than learning a second schema for one button.
-    let queued = RunSummary::of(&state, !ui.questions.open_for(&id).is_empty());
+    let queued = RunSummary::of(
+        &state,
+        !ui.questions.open_for(&id).is_empty(),
+        state.liveness(false),
+    );
     let run = id.clone();
     tokio::spawn(async move {
         let _resume = _resume;
@@ -6999,6 +7010,27 @@ mod tests {
         assert_eq!(detail["live"], "dead", "{detail}");
     }
 
+    /// The deck's competition list is normally the first place an operator
+    /// sees an old run. It must carry the same process verdict as detail, or
+    /// its `reviewing` chip keeps falsely advertising a dead run as in flight.
+    #[test]
+    fn run_list_exposes_a_confirmed_dead_driver_for_stale_presentation() {
+        let mut state = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "Review only".to_owned(),
+            Config::default(),
+        );
+        state.id = "20260922-090200-dead".to_owned();
+        state.status = RunStatus::Reviewing;
+        let row = serde_json::to_value(RunSummary::of(&state, false, crate::run::Liveness::Dead))
+            .expect("serialize list row");
+        assert_eq!(row["status"], "reviewing");
+        assert_eq!(row["live"], "dead", "{row}");
+        assert!(!row["done"].as_bool().unwrap());
+    }
+
     #[tokio::test]
     async fn the_run_list_is_newest_first_and_honours_a_limit() {
         let f = Fixture::start().await;
@@ -8590,16 +8622,17 @@ mod tests {
             + shapes_body_start;
         let shapes_src = &APP_JS[shapes_body_start..shapes_close];
 
-        let mut shapes: Vec<(bool, String)> = Vec::new();
+        let mut shapes: Vec<(bool, String, bool)> = Vec::new();
         for entry in shapes_src.split('{').skip(1) {
             let waiting = entry.contains("waiting: true");
+            let dead = entry.contains("live: \"dead\"");
             let status_at =
                 entry.find("status: \"").expect("each shape names a status") + "status: \"".len();
             let status_end = entry[status_at..]
                 .find('"')
                 .expect("the status string is closed")
                 + status_at;
-            shapes.push((waiting, entry[status_at..status_end].to_string()));
+            shapes.push((waiting, entry[status_at..status_end].to_string(), dead));
         }
         assert!(shapes.len() >= 6, "parsed shapes: {shapes:?}");
 
@@ -8625,20 +8658,28 @@ mod tests {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let shapes: Vec<(bool, String, bool)> = shapes
+        let shapes: Vec<(bool, String, bool, bool)> = shapes
             .into_iter()
-            .map(|(waiting, status)| {
+            .map(|(waiting, status, dead)| {
                 let done = !not_done.contains(&status.as_str());
-                (waiting, status, done)
+                (waiting, status, dead, done)
             })
             .collect();
 
         // `runSection` reimplemented from assets/ui/app.js: `waiting` wins
         // outright, then merged/ready land, stalled/blocked/failed/
         // verified_noop end, and everything else is still in flight.
-        fn run_section(waiting: bool, status: &str) -> &'static str {
+        fn run_section(waiting: bool, status: &str, dead: bool) -> &'static str {
             if waiting {
                 return "waiting";
+            }
+            if dead
+                && !matches!(
+                    status,
+                    "merged" | "ready" | "stalled" | "blocked" | "failed" | "verified_noop"
+                )
+            {
+                return "stale";
             }
             match status {
                 "merged" | "ready" => "landed",
@@ -8647,12 +8688,13 @@ mod tests {
             }
         }
 
-        // RUN_STATE_FILTERS' five `match` functions, reimplemented the same
+        // RUN_STATE_FILTERS' six `match` functions, reimplemented the same
         // way.
-        fn filter_matches(filter_key: &str, waiting: bool, done: bool) -> bool {
+        fn filter_matches(filter_key: &str, waiting: bool, dead: bool, done: bool) -> bool {
             match filter_key {
                 "active" => !done,
-                "flight" => !done && !waiting,
+                "flight" => !done && !waiting && !dead,
+                "stale" => !done && !waiting && dead,
                 "waiting" => waiting,
                 "done" => done,
                 "all" => true,
@@ -8661,23 +8703,24 @@ mod tests {
         }
 
         let compatible = |section: &str, filter_key: &str| {
-            shapes.iter().any(|(waiting, status, done)| {
-                run_section(*waiting, status) == section
-                    && filter_matches(filter_key, *waiting, *done)
+            shapes.iter().any(|(waiting, status, dead, done)| {
+                run_section(*waiting, status, *dead) == section
+                    && filter_matches(filter_key, *waiting, *dead, *done)
             })
         };
 
         // One row per RUN_SECTIONS key, in RUN_STATE_FILTERS' own order
-        // (active, flight, waiting, done, all) - hand-derived from the
+        // (active, flight, stale, waiting, done, all) - hand-derived from the
         // lifecycle, independently of whatever REPRESENTATIVE_RUN_SHAPES
         // currently contains.
         let expected = [
-            ("waiting", [true, false, true, true, true]),
-            ("flight", [true, true, false, false, true]),
-            ("landed", [false, false, false, true, true]),
-            ("ended", [false, false, false, true, true]),
+            ("waiting", [true, false, false, true, true, true]),
+            ("stale", [true, false, true, false, false, true]),
+            ("flight", [true, true, false, false, false, true]),
+            ("landed", [false, false, false, false, true, true]),
+            ("ended", [false, false, false, false, true, true]),
         ];
-        let filter_keys = ["active", "flight", "waiting", "done", "all"];
+        let filter_keys = ["active", "flight", "stale", "waiting", "done", "all"];
 
         for (section, wants) in expected {
             for (filter_key, want) in filter_keys.iter().zip(wants) {
