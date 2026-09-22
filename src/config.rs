@@ -197,6 +197,17 @@ pub struct Roles {
     /// already thought about judge diversity gets advisor diversity for free
     /// instead of a fourth roster to maintain.
     pub advisors: Vec<String>,
+    /// Agent that blends [`Self::advisors`]' proposals into the one design
+    /// brief `graph::Runner::synthesize_brief` carries into every
+    /// implementer's prompt.
+    ///
+    /// The same precedent as [`Self::chatter`] and [`Self::conductor`] for a
+    /// seat that stands alone rather than rotating through the roster -
+    /// resolved through [`crate::agent::pick`], so unset falls back to its
+    /// own default order (a claude seat, else the first runnable agent in
+    /// roster order) - exactly today's behavior, unchanged by leaving this
+    /// field out.
+    pub synthesizer: Option<String>,
 }
 
 /// Graph shape and limits.
@@ -1487,7 +1498,8 @@ impl Config {
              implementers = []\n\
              judges = []\n\
              reviewers = []\n\
-             # conductor = \"opus\"  # arranges the queue; unset picks a seat like chatter does\n\n\
+             # conductor = \"opus\"  # arranges the queue; unset picks a seat like chatter does\n\
+             # synthesizer = \"opus\"  # blends the advisors into one brief; unset picks a seat like chatter does\n\n\
              [graph]\n\
              candidates = 3\n\
              judges = 3\n\
@@ -1687,6 +1699,37 @@ mod tests {
 
         cfg.roles.conductor = Some("missing".to_owned());
         assert!(cfg.resolve_roles().is_err());
+    }
+
+    #[test]
+    fn synthesizer_role_is_a_lazy_lookup_with_the_same_fallback_as_chatter() {
+        // Unlike `conductor`, `synthesizer` is never validated by
+        // `resolve_roles` — it is looked up lazily by
+        // `graph::Runner::synthesize_brief` the same way `[roles] chatter`
+        // is looked up by `talk::begin`, so this exercises `agent::pick`
+        // directly instead of going through `resolve_roles`.
+        let mut cfg = Config {
+            agents: vec![spec("a"), spec("b")],
+            ..Config::default()
+        };
+        let want = cfg.roles.synthesizer.as_deref();
+        assert_eq!(
+            crate::agent::pick(&cfg.agents, want, &crate::agent::installed)
+                .unwrap()
+                .id,
+            "a",
+            "unset falls back to agent::pick's own default order"
+        );
+
+        cfg.roles.synthesizer = Some("b".to_owned());
+        let want = cfg.roles.synthesizer.as_deref();
+        assert_eq!(
+            crate::agent::pick(&cfg.agents, want, &crate::agent::installed)
+                .unwrap()
+                .id,
+            "b",
+            "the named agent wins over the default order"
+        );
     }
 
     #[test]
