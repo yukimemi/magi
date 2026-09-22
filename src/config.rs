@@ -943,6 +943,14 @@ pub struct ResolvedRoles {
     pub fixer: Option<AgentSpec>,
     /// Queue conductor, explicitly selected or resolved by the standalone-seat fallback.
     pub conductor: AgentSpec,
+    /// The full ordered implementer roster, in [`Roles::implementers`]'s own
+    /// order — or `[[agents]]` in file order, when that list is empty. Unlike
+    /// [`Self::implementers`], never truncated to `graph.candidates` and
+    /// never `rotate`d/wrapped: a solo run (`candidates = 1`) resolves
+    /// `implementers` down to a single slot, but `graph::Runner`'s per-seat
+    /// quota fallback needs the *whole* list to walk forward through when
+    /// that one slot's agent runs out of quota mid-run.
+    pub implementer_roster: Vec<AgentSpec>,
 }
 
 /// Every array-valued key in a config table, as a dotted path.
@@ -1362,6 +1370,20 @@ impl Config {
         Ok(out)
     }
 
+    /// `ids`, resolved to specs in the order named, or the whole `[[agents]]`
+    /// roster in file order when `ids` is empty — the same "explicit ids
+    /// stand alone, an empty list means the whole roster" rule [`Self::rotate`]
+    /// applies, but with no `count` to truncate to and no `offset` to wrap by.
+    /// See [`ResolvedRoles::implementer_roster`] for why a truncated, rotated
+    /// list cannot answer the question this exists for.
+    fn full_roster(&self, ids: &[String]) -> Result<Vec<AgentSpec>> {
+        if ids.is_empty() {
+            Ok(self.agents.clone())
+        } else {
+            ids.iter().map(|id| self.agent(id).cloned()).collect()
+        }
+    }
+
     /// Fill the roles out to the configured widths.
     ///
     /// An empty role list rotates through the whole roster, so a three-agent
@@ -1399,6 +1421,7 @@ impl Config {
                 None => crate::agent::pick(&self.agents, None, &crate::agent::installed)
                     .unwrap_or_else(|_| self.agents[0].clone()),
             },
+            implementer_roster: self.full_roster(&self.roles.implementers)?,
         })
     }
 
@@ -1651,6 +1674,56 @@ mod tests {
         let roles = cfg.resolve_roles().unwrap();
         assert_eq!(roles.implementers.len(), 3);
         assert!(roles.judges.iter().all(|a| a.id == "solo"));
+    }
+
+    #[test]
+    fn implementer_roster_is_the_whole_agent_list_untruncated_when_unset() {
+        // `candidates = 1` (a solo run) still resolves `implementers` down to
+        // one slot, but `implementer_roster` must carry every agent in the
+        // roster, in file order, for `graph::Runner`'s quota fallback to walk
+        // forward through once that one slot's agent runs out of quota.
+        let cfg = Config {
+            agents: vec![spec("a"), spec("b"), spec("c")],
+            graph: Graph {
+                candidates: 1,
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        let roles = cfg.resolve_roles().unwrap();
+        assert_eq!(roles.implementers.len(), 1);
+        let roster: Vec<&str> = roles
+            .implementer_roster
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(roster, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn implementer_roster_follows_explicit_ids_in_the_order_named() {
+        let cfg = Config {
+            agents: vec![spec("a"), spec("b"), spec("c")],
+            roles: Roles {
+                implementers: vec!["c".to_owned(), "a".to_owned()],
+                ..Roles::default()
+            },
+            graph: Graph {
+                candidates: 1,
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        let roles = cfg.resolve_roles().unwrap();
+        // Unaffected by the new field: still just the first named id.
+        assert_eq!(roles.implementers.len(), 1);
+        assert_eq!(roles.implementers[0].id, "c");
+        let roster: Vec<&str> = roles
+            .implementer_roster
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(roster, ["c", "a"]);
     }
 
     #[test]
