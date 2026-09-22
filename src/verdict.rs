@@ -360,6 +360,28 @@ pub fn section(text: &str, heading: &str) -> Option<String> {
     out.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
+/// The marker `prompt::implement`'s reply format documents for an
+/// implementer that investigated and concluded, with evidence, that no code
+/// change belongs in this worktree — see that prompt's "Reply format"
+/// section for the exact wording asked for.
+pub const NO_CHANGE_NEEDED_MARKER: &str = "NO CHANGE NEEDED:";
+
+/// Pull the evidence out of an implementer's `## SUMMARY` section when it
+/// opens with [`NO_CHANGE_NEEDED_MARKER`].
+///
+/// Returns `None` for an ordinary bullet-list summary, and also for a
+/// marker with nothing after it — an unsupported claim must read exactly
+/// like a candidate that never made one, not like a verified one with an
+/// empty reason. This only recognises the *declaration*; whether it is
+/// trusted is [`crate::graph`]'s adoption guard's call, made from evidence
+/// this function cannot see (the CLI's own exit status, whether the tree is
+/// really empty, whether a command went unconfirmed).
+pub fn verified_noop(summary: &str) -> Option<String> {
+    let evidence = summary.trim_start().strip_prefix(NO_CHANGE_NEEDED_MARKER)?;
+    let evidence = evidence.trim();
+    (!evidence.is_empty()).then(|| evidence.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,5 +552,29 @@ mod tests {
         );
         assert_eq!(section(text, "notes").unwrap(), "ignore me");
         assert!(section(text, "missing").is_none());
+    }
+
+    #[test]
+    fn no_change_needed_marker_yields_its_evidence() {
+        let summary = "NO CHANGE NEEDED: already fixed by b32cfc4, which is on main \
+                        (git merge-base --is-ancestor confirms it).";
+        assert_eq!(
+            verified_noop(summary).unwrap(),
+            "already fixed by b32cfc4, which is on main (git merge-base --is-ancestor \
+             confirms it)."
+        );
+    }
+
+    #[test]
+    fn no_change_needed_marker_with_no_evidence_is_not_verified() {
+        assert!(verified_noop("NO CHANGE NEEDED:").is_none());
+        assert!(verified_noop("NO CHANGE NEEDED:   \n  ").is_none());
+    }
+
+    #[test]
+    fn an_ordinary_summary_is_not_verified() {
+        assert!(verified_noop("- changed the retry loop.\n- added a test.").is_none());
+        // The marker only counts leading the section, not mentioned in passing.
+        assert!(verified_noop("I considered NO CHANGE NEEDED: but wrote a fix instead.").is_none());
     }
 }

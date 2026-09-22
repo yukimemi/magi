@@ -108,7 +108,22 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// schema-8 record has no operator-fix history at all, and
 /// `#[serde(default)]` reads an empty list as exactly that: "none happened",
 /// not an unknown gap. Nothing about an existing field's meaning changes.
-pub const SCHEMA: u32 = 9;
+///
+/// 10: added `RunStatus::VerifiedNoop` and `Candidate::verified_noop`. Before
+/// this, an implementer that correctly concluded (with evidence) that a
+/// task's request was already satisfied elsewhere had no way to say so: the
+/// run ended the same way as one where every candidate simply failed to
+/// write anything — `after_implement` bailing with "no candidate produced a
+/// change; nothing to judge" and the run settling as a plain `Failed`. That
+/// conflated two very different facts (investigation run 391f's audit is
+/// what surfaced it: two attempts that had, correctly, found their fix
+/// already on `main`). A schema-9 record has no notion of either the new
+/// status or field, so a `VerifiedNoop` value is a meaning that cannot be
+/// reconstructed from an old record — hence the bump, not a
+/// `#[serde(default)]` for the status. `Candidate::verified_noop` alone
+/// *does* default-read as `None` on an old record, which is the honest
+/// reading: a run written before this schema never made the claim.
+pub const SCHEMA: u32 = 10;
 
 /// Where a run got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +166,20 @@ pub enum RunStatus {
     Blocked,
     /// The graph could not complete.
     Failed,
+    /// Every candidate wrote nothing, and every one of them said why in a way
+    /// that survived [`crate::graph::Runner`]'s adoption guard: a clean CLI
+    /// exit, an actually-empty tree, no command left with an unconfirmed
+    /// exit status, and non-empty evidence. Distinct from `Failed` on
+    /// purpose — see `SCHEMA`'s doc for schema 10 — because the two read
+    /// identically to an operator glancing at a card ("nothing happened")
+    /// while meaning opposite things: one is an agent that could not do the
+    /// work, the other is an agent that checked and the work was already
+    /// done. Settles the task through [`crate::queue::Task::handed_off`], not
+    /// [`crate::queue::Task::fail`]: a human still has to look — the claim is
+    /// unverified by magi itself — and `Held` (not `Failed`-and-requeued)
+    /// means nothing retries the task unattended on the same unconfirmed
+    /// claim while that look is pending.
+    VerifiedNoop,
 }
 
 impl RunStatus {
@@ -158,7 +187,12 @@ impl RunStatus {
     pub fn done(self) -> bool {
         matches!(
             self,
-            Self::Merged | Self::Ready | Self::Stalled | Self::Blocked | Self::Failed
+            Self::Merged
+                | Self::Ready
+                | Self::Stalled
+                | Self::Blocked
+                | Self::Failed
+                | Self::VerifiedNoop
         )
     }
 
@@ -180,6 +214,21 @@ impl RunStatus {
             Self::Stalled => "stalled",
             Self::Blocked => "blocked",
             Self::Failed => "failed",
+            Self::VerifiedNoop => "verified_noop",
+        }
+    }
+
+    /// Label for a human-facing listing or report — the same word as
+    /// [`Self::as_str`] except where the machine spelling would read harsher
+    /// than the state actually is. `VerifiedNoop` is the one case: its own
+    /// `as_str` exists for logs, JSON and event messages, none of which
+    /// should quietly grow a second vocabulary, but a bare "verified_noop" in
+    /// a report reads like an error code, not the qualified, evidence-backed
+    /// claim it actually is.
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::VerifiedNoop => "agent-verified no-op",
+            other => other.as_str(),
         }
     }
 
@@ -201,12 +250,18 @@ impl RunStatus {
     ///
     /// `Failed` does not qualify: the graph could not complete and there is
     /// no established point to continue from. Nor does a finished run, whose
-    /// answer is a new competition.
+    /// answer is a new competition. Nor does `VerifiedNoop`: every candidate
+    /// already agreed nothing belongs in this worktree, and resuming would
+    /// only re-ask the same question — the answer is for a human to check
+    /// the evidence, not for the graph to run again.
     ///
     /// Whether anything is *already* driving the run is a separate question,
     /// answered by `daemon::is_working_on` at the callers that need it.
     pub fn resumable(self) -> bool {
-        !matches!(self, Self::Merged | Self::Ready | Self::Failed)
+        !matches!(
+            self,
+            Self::Merged | Self::Ready | Self::Failed | Self::VerifiedNoop
+        )
     }
 }
 
@@ -243,6 +298,16 @@ pub struct Candidate {
     /// Why this candidate is not in the running.
     #[serde(default)]
     pub failed: Option<String>,
+    /// The evidence this candidate gave for writing no change on purpose —
+    /// the `NO CHANGE NEEDED:` marker `prompt::implement`'s reply format
+    /// documents, verbatim. `Some` only when [`crate::graph`]'s adoption
+    /// guard accepted the claim: the CLI exited cleanly, the tree really is
+    /// empty, no command in the reply was left with an unconfirmed exit
+    /// status, and the evidence itself is non-empty. A candidate that wrote
+    /// nothing and said nothing about why — the ordinary empty loss — always
+    /// reads `None` here, same as one written before schema 10 ever existed.
+    #[serde(default)]
+    pub verified_noop: Option<String>,
     /// Wall-clock time for the implementation.
     #[serde(default)]
     pub duration_ms: u64,
@@ -1543,6 +1608,15 @@ fn migrate_schema(mut state: RunState) -> Result<RunState> {
     // already left it as the correct empty `Vec`; this only advances the
     // version number.
     if state.schema == 8 {
+        state.schema = 9;
+    }
+    // Schema 9 predates `RunStatus::VerifiedNoop` and
+    // `Candidate::verified_noop`. Nothing to reconstruct: an old record never
+    // made the claim, `#[serde(default)]` already reads `verified_noop` as
+    // `None` on every candidate, and a `VerifiedNoop` status cannot appear in
+    // a schema-9 record at all — see `SCHEMA`'s doc for schema 10. This only
+    // advances the version number.
+    if state.schema == 9 {
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {
@@ -1566,6 +1640,23 @@ impl RunState {
     /// Candidates eligible for judging.
     pub fn viable(&self) -> Vec<&Candidate> {
         self.candidates.iter().filter(|c| c.viable()).collect()
+    }
+
+    /// Did every candidate write nothing, and every one of them back it with
+    /// evidence [`crate::graph`]'s adoption guard accepted?
+    ///
+    /// All-or-nothing on purpose: one candidate declaring `NO CHANGE NEEDED`
+    /// while another simply failed to produce anything is not agreement, it
+    /// is one candidate's unverified claim next to an ordinary loss, and the
+    /// run must still read as the `Failed` it is. Only ever meaningful when
+    /// [`Self::viable`] is already empty — a run with any real patch to judge
+    /// never reaches the caller that asks this.
+    pub fn all_candidates_verified_noop(&self) -> bool {
+        !self.candidates.is_empty()
+            && self
+                .candidates
+                .iter()
+                .all(|c| c.empty && c.verified_noop.is_some())
     }
 
     /// Findings still open when the review loop stopped trying: the last
@@ -2125,6 +2216,7 @@ mod tests {
             commits: 1,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         };
@@ -2841,6 +2933,7 @@ mod tests {
             commits: 1,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         });

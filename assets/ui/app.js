@@ -131,6 +131,12 @@ const RUN_STATUS = {
   stalled:      { glyph: "\u26a0", tone: "rust", note: "The judging panel never reached a quorum, so no verdict was recorded. The work is kept." },
   blocked:      { glyph: "\u2298", tone: "rust", note: "magi stopped short of merging." },
   failed:       { glyph: "\u2715", tone: "ink",  note: "The graph could not complete." },
+  /* Not a failure: every candidate wrote nothing, but every one of them said
+     why in a way that survived the adoption guard \u2014 same neutral `ink` as
+     `unmerged`, never `failed`'s tones, so a glance does not read this as the
+     agent breaking. magi has not confirmed the claim itself, which is why the
+     task still sits held for a human rather than closing on its own. */
+  verified_noop: { glyph: "\u2713", tone: "ink", note: "Every candidate reported, with evidence, that no code change was needed \u2014 the task's request was already satisfied elsewhere. magi has not verified the claim itself; check the candidate's evidence before closing the task." },
   /* Derived from RunSummary.waiting rather than trusted from the status
      string: the run parked in some node and the summary still names it. */
   waiting:      { glyph: "?", tone: "wait", note: "An agent stopped to ask you something. Nothing in this run moves until it is answered." },
@@ -1305,7 +1311,7 @@ function runSection(run) {
   if (run.unmerged_by_design) return "ended";
   const status = String(run.status || "");
   if (status === "merged" || status === "ready") return "landed";
-  if (status === "stalled" || status === "blocked" || status === "failed") return "ended";
+  if (status === "stalled" || status === "blocked" || status === "failed" || status === "verified_noop") return "ended";
   return "flight";
 }
 
@@ -1354,8 +1360,8 @@ function matchesRunState(run) {
    and Blocked are both "done" (`RunStatus::done()`) yet stay resumable, so
    a run parked there keeps its open question and still reads `waiting:
    true`. Those two are the only done statuses a waiting run can carry;
-   Merged/Ready/Failed always have their question swept before that status
-   is ever saved. */
+   Merged/Ready/Failed/VerifiedNoop always have their question swept before
+   that status is ever saved. */
 const REPRESENTATIVE_RUN_SHAPES = [
   { waiting: true, status: "implementing" },
   { waiting: true, status: "stalled" },
@@ -1366,6 +1372,7 @@ const REPRESENTATIVE_RUN_SHAPES = [
   { waiting: false, status: "stalled" },
   { waiting: false, status: "blocked" },
   { waiting: false, status: "failed" },
+  { waiting: false, status: "verified_noop" },
 ].map((shape) => ({ ...shape, done: !["implementing"].includes(shape.status) }));
 
 function sectionCompatibleWithStateFilter(sectionKey, filterKey) {
@@ -5166,7 +5173,11 @@ function renderCandidates(run) {
       ),
       facts.length ? numbers(facts) : null,
       dead
-        ? el("p", { class: "card-note", text: candidate.failed || "Produced no change at all." })
+        ? el("p", {
+            class: "card-note",
+            text: candidate.failed
+              || (candidate.verified_noop ? `Agent-verified no-op: ${candidate.verified_noop}` : "Produced no change at all."),
+          })
         : null,
       candidate.summary ? el("p", { class: "cand-summary", text: candidate.summary }) : null,
       candidate.stat ? el("pre", { class: "stat", text: candidate.stat }) : null,

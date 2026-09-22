@@ -68,14 +68,18 @@ fn status_word(state: &RunState) -> String {
     if state.unmerged_by_design() {
         return cyan("unmerged (no-op by design)");
     }
-    let text = format!("{:?}", state.status).to_lowercase();
+    let text = state.status.display_label();
     match state.status {
-        RunStatus::Merged => bold(&green(&text)),
-        RunStatus::Ready => green(&text),
-        RunStatus::Stalled => bold(&yellow(&text)),
-        RunStatus::Blocked => yellow(&text),
-        RunStatus::Failed => red(&text),
-        _ => cyan(&text),
+        RunStatus::Merged => bold(&green(text)),
+        RunStatus::Ready => green(text),
+        RunStatus::Stalled => bold(&yellow(text)),
+        RunStatus::Blocked => yellow(text),
+        RunStatus::Failed => red(text),
+        // Not `Failed`'s red: every candidate agreed, with evidence, that
+        // nothing belongs in this worktree — the opposite of a run that
+        // could not do the work. See `RunStatus::VerifiedNoop`'s own doc.
+        RunStatus::VerifiedNoop => cyan(text),
+        _ => cyan(text),
     }
 }
 
@@ -271,9 +275,13 @@ pub fn run(state: &RunState) -> String {
 
     let _ = writeln!(s, "\n{}", bold("candidates"));
     for c in &state.candidates {
-        let flag = match (&c.failed, c.empty) {
-            (Some(e), _) => red(&format!("failed: {e}")),
-            (None, true) => yellow("no change"),
+        let flag = match (&c.failed, c.empty, &c.verified_noop) {
+            (Some(e), _, _) => red(&format!("failed: {e}")),
+            // Neither red (nothing failed) nor plain yellow "no change" (that
+            // reads as an unexplained loss): the candidate gave a reason a
+            // human still has to check, not a claim magi itself confirmed.
+            (None, true, Some(_)) => cyan("agent-verified no-op (unconfirmed)"),
+            (None, true, None) => yellow("no change"),
             _ => format!("{} files, {} commits", c.files, c.commits),
         };
         let crown = if state.tally.as_ref().is_some_and(|t| t.winner == c.label) {
@@ -290,6 +298,9 @@ pub fn run(state: &RunState) -> String {
             c.duration_ms / 1000,
             crown
         );
+        if let Some(evidence) = &c.verified_noop {
+            let _ = writeln!(s, "      {}", dim(&first_line(evidence)));
+        }
     }
 
     if !state.judgements.is_empty() {
@@ -1029,6 +1040,7 @@ mod tests {
             commits: 2,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 42_000,
             folded: false,
         }];
@@ -1060,6 +1072,46 @@ mod tests {
         assert!(text.contains("3 files, 2 commits"));
         assert!(text.contains("winner        A"));
         assert!(!text.contains('\x1b'), "colour leaked into a plain render");
+    }
+
+    #[test]
+    fn a_verified_noop_run_does_not_read_as_a_failure() {
+        // Same spirit as `a_mode_none_merge_does_not_read_as_landed`: a run
+        // that settled without landing anything must not be misreadable as
+        // the ordinary failure it is not.
+        let _guard = plain();
+        let mut s = state();
+        s.status = RunStatus::VerifiedNoop;
+        s.tally = None;
+        s.candidates = vec![Candidate {
+            index: 0,
+            label: 'A',
+            agent: "opus".to_owned(),
+            branch: "magi/x/A".to_owned(),
+            worktree: PathBuf::from("/wt/A"),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: true,
+            failed: None,
+            verified_noop: Some("already fixed by b32cfc4, which is on main".to_owned()),
+            duration_ms: 9_000,
+            folded: false,
+        }];
+        let text = run(&s);
+        assert!(
+            text.contains("agent-verified no-op"),
+            "the status and the candidate flag must both say so: {text}"
+        );
+        assert!(
+            text.contains("already fixed by b32cfc4"),
+            "the evidence itself must be readable, not just the verdict: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("failed"),
+            "a verified no-op must never read as the failure it is not: {text}"
+        );
     }
 
     #[test]

@@ -855,8 +855,10 @@ impl Questions {
     /// The run-deleted case above and this one are the same fact - nobody is
     /// left to read an answer - reached by two different doors. This is the
     /// one for a run that finished on its own: merged, reached `Ready` with
-    /// nothing left to do, or failed outright with no established point to
-    /// resume from. Those are exactly the statuses [`RunStatus::resumable`]
+    /// nothing left to do, failed outright with no established point to
+    /// resume from, or every candidate agreed, with evidence, that nothing
+    /// belonged in the worktree. Those are exactly the statuses
+    /// [`RunStatus::resumable`]
     /// excludes, and that is the line this draws too - deliberately not
     /// [`RunStatus::done`], which also counts `Blocked` and `Stalled` as
     /// over. Both of those can still be picked back up with the candidates,
