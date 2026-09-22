@@ -1260,8 +1260,11 @@ impl Runner {
             format!("{} candidates in parallel", jobs.len()),
         );
         // Kept so a seat whose CLI hung up can be asked again from the same
-        // job: `wave` consumes what it is given.
-        let sent = jobs.clone();
+        // job: `wave` consumes what it is given. Mutable so `resume_quota_losses`
+        // can update a seat's own entry once a fallback agent takes it over —
+        // `resume_unconfirmed_commands`, which reads `sent` afterward, must see
+        // whichever agent actually answered, not the one that quota'd out.
+        let mut sent = jobs.clone();
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
             run: &run_id,
@@ -1273,7 +1276,7 @@ impl Runner {
         let mut results = wave(jobs, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
         self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
             .await;
-        self.resume_quota_losses(&mut results, &sent, &prompts, &run_id)
+        self.resume_quota_losses(&mut results, &mut sent, &prompts, &run_id)
             .await;
         self.resume_unconfirmed_commands(&mut results, &sent, &prompts, &run_id)
             .await;
@@ -1283,8 +1286,13 @@ impl Runner {
             // A quota fallback (`resume_quota_losses`) may have handed this
             // seat to a different agent than the one `prep` recorded on the
             // candidate; the stats tables and any later fixer-defaults-to-
-            // winner's-author lookup must credit whoever actually answered.
+            // winner's-author lookup must credit whoever actually answered —
+            // unless every fallback also quota'd out, in which case nobody
+            // actually answered and crediting the last agent tried would
+            // erase every earlier agent's own quota loss from the stats
+            // tables instead of just this one seat's.
             let agent = seat.agent.clone();
+            let exhausted_the_fallback_chain = matches!(&out, AgentOutcome::Quota(_));
             self.state.seats.insert(seat.key.clone(), seat);
             let label = self.state.candidates[i].label;
             let worktree = self.state.candidates[i].worktree.clone();
@@ -1362,7 +1370,9 @@ impl Runner {
             write_artifact(&self.state, &format!("cand-{label}.patch"), &patch)?;
 
             let c = &mut self.state.candidates[i];
-            c.agent = agent;
+            if !exhausted_the_fallback_chain {
+                c.agent = agent;
+            }
             c.summary = blind::sanitize_prose(&summary, &self.state.config.blind);
             c.stat = stat;
             c.files = files;
@@ -1515,13 +1525,25 @@ impl Runner {
     /// the machine's roster still exist once `implementers` has been cut down
     /// to size.
     ///
-    /// Tried by `spec.id`, never the whole [`AgentSpec`]: a roster with the
-    /// same id named twice must not let this retry that id forever. The loop
-    /// keeps falling through — sonnet, then cx, then oc, then agy — until an
-    /// attempt lands something other than `Quota` or the roster runs out of
-    /// untried ids, at which point the seat is left exactly as `implement`'s
-    /// own `AgentOutcome::Quota` arm already handles it: one `QuotaLoss`
+    /// Walks forward from just past the seat's own original position in the
+    /// roster, wrapping back to the front rather than restarting there: a
+    /// later candidate slot (say `beta`, the roster's second entry) must fall
+    /// through to the *next* entry (`gamma`) on its own quota loss, not back
+    /// to `alpha`, which is almost certainly a different candidate's own
+    /// agent already. Tried by `spec.id`, never the whole [`AgentSpec`]: a
+    /// roster with the same id named twice must not let this retry that id
+    /// forever. The loop keeps falling through until an attempt lands
+    /// something other than `Quota` or every id in the roster has been tried,
+    /// at which point the seat is left exactly as `implement`'s own
+    /// `AgentOutcome::Quota` arm already handles it: one `QuotaLoss`
     /// recorded, the candidate failed/empty.
+    ///
+    /// `sent` is taken mutably and updated with the fallback agent's spec:
+    /// `resume_unconfirmed_commands`, which runs after this and also reads
+    /// `sent`, must see whichever agent actually ended up answering the seat
+    /// — reading the stale, original spec there would check session
+    /// eligibility against the wrong CLI and could hand a fallback agent's
+    /// session id to the agent that just lost the seat to quota.
     ///
     /// Every fallback gets a fresh [`SeatState`], never the quota'd seat's own
     /// — `self.seat` only reuses state when the agent id is unchanged, so
@@ -1553,7 +1575,7 @@ impl Runner {
     async fn resume_quota_losses(
         &mut self,
         results: &mut [(usize, SeatState, AgentOutcome)],
-        sent: &[SeatJob],
+        sent: &mut [SeatJob],
         prompts: &Prompts,
         run_id: &str,
     ) {
@@ -1566,12 +1588,25 @@ impl Runner {
             .and_then(|a| a.synthesis.as_deref())
             .map(str::to_owned);
         for (wi, seat, out) in results.iter_mut() {
-            let Some(job) = sent.get(*wi) else { continue };
+            let Some(job) = sent.get_mut(*wi) else {
+                continue;
+            };
+            // Where the seat's own original agent sits in the roster — the
+            // fallback walk starts just past here, never at the front, so a
+            // later candidate slot's quota loss does not fall back onto an
+            // earlier slot's own agent.
+            let start = self
+                .roles
+                .implementer_roster
+                .iter()
+                .position(|s| s.id == job.spec.id)
+                .unwrap_or(0);
             let mut tried: BTreeSet<String> = BTreeSet::from([job.spec.id.clone()]);
             let mut fallback_attempt = 0usize;
             while matches!(&*out, AgentOutcome::Quota(_)) {
                 let Some(next) =
-                    next_untried_implementer(&self.roles.implementer_roster, &tried).cloned()
+                    next_untried_implementer(&self.roles.implementer_roster, start, &tried)
+                        .cloned()
                 else {
                     break;
                 };
@@ -1597,8 +1632,15 @@ impl Runner {
                 );
 
                 let new_seat = self.seat(&seat.key, &next.id);
+                // Kept in sync on `sent` itself, not just the local retry: a
+                // later helper (`resume_unconfirmed_commands`) reads `sent`
+                // after this one returns and must see whichever agent is now
+                // occupying the seat, not the one that just quota'd out —
+                // otherwise it would judge session/continuation eligibility
+                // by the wrong CLI and could resend a fallback's session id
+                // to the agent that lost it the seat in the first place.
+                job.spec = next.clone();
                 let mut retry = job.clone();
-                retry.spec = next.clone();
                 retry.seat = new_seat;
                 retry.prompt = prompt::implement(
                     &instruction,
@@ -4961,18 +5003,35 @@ fn has_context(spec: &AgentSpec, seat: &SeatState, sessions: bool) -> bool {
     agent::has_session(spec.kind, seat, sessions)
 }
 
-/// The first entry in `roster` whose id is not in `tried` yet.
+/// The next entry in `roster` after `start`, wrapping back to the front,
+/// whose id is not in `tried` yet.
+///
+/// Starts one past `start` rather than at the front of `roster`: `start` is
+/// the seat's own original position, and a seat whose candidate slot already
+/// sits on the roster's second entry must fall through to the third next, not
+/// restart at the first — which is very likely a different candidate's own
+/// agent already. Wraps around so an id earlier than `start` is still
+/// reachable once the entries after it are exhausted, the same way `rotate`
+/// already lets two candidate slots share one agent when the roster is
+/// shorter than `graph.candidates`.
 ///
 /// Matched by [`AgentSpec::id`], never the whole spec: a roster that names
-/// the same id twice (an operator's `roles.implementers` typo, or a `[[agents]]`
-/// list reused across roles) must not let [`Runner::resume_quota_losses`]
-/// retry that id forever — the loop it feeds stops precisely when this
-/// returns `None`.
+/// the same id twice (an operator's `roles.implementers` typo, or a
+/// `[[agents]]` list reused across roles) must not let
+/// [`Runner::resume_quota_losses`] retry that id forever — one pass over
+/// `roster` either finds an untried id or exhausts every entry, so this
+/// always terminates regardless of duplicates.
 fn next_untried_implementer<'a>(
     roster: &'a [AgentSpec],
+    start: usize,
     tried: &BTreeSet<String>,
 ) -> Option<&'a AgentSpec> {
-    roster.iter().find(|s| !tried.contains(&s.id))
+    if roster.is_empty() {
+        return None;
+    }
+    (1..=roster.len())
+        .map(|offset| &roster[(start + offset) % roster.len()])
+        .find(|s| !tried.contains(&s.id))
 }
 
 /// Did this reply report running a command whose own CLI never confirmed an
@@ -6141,15 +6200,36 @@ mod tests {
     }
 
     // `next_untried_implementer` is the property `resume_quota_losses`'s own
-    // fallback loop depends on to terminate: it must walk forward through the
-    // roster, and it must never hand back an id already tried, however many
-    // times that id happens to appear.
+    // fallback loop depends on to terminate: it must walk forward from the
+    // seat's own position, never restart at the front of the roster, and it
+    // must never hand back an id already tried, however many times that id
+    // happens to appear.
+
+    #[test]
+    fn next_untried_implementer_walks_forward_from_the_seats_own_position() {
+        let roster = vec![spec("alpha"), spec("beta"), spec("gamma")];
+        let tried = BTreeSet::from(["beta".to_owned()]);
+        // beta sits at index 1; the next candidate is gamma, never alpha —
+        // which is very likely a different candidate slot's own agent.
+        let next = next_untried_implementer(&roster, 1, &tried);
+        assert_eq!(next.map(|s| s.id.as_str()), Some("gamma"));
+    }
+
+    #[test]
+    fn next_untried_implementer_wraps_around_once_the_tail_is_exhausted() {
+        let roster = vec![spec("alpha"), spec("beta")];
+        let tried = BTreeSet::from(["beta".to_owned()]);
+        // beta is the roster's last entry; nothing follows it without
+        // wrapping back to alpha, which beta's own seat has not tried.
+        let next = next_untried_implementer(&roster, 1, &tried);
+        assert_eq!(next.map(|s| s.id.as_str()), Some("alpha"));
+    }
 
     #[test]
     fn next_untried_implementer_skips_ids_already_tried_even_when_duplicated() {
         let roster = vec![spec("a"), spec("a"), spec("b")];
         let tried = BTreeSet::from(["a".to_owned()]);
-        let next = next_untried_implementer(&roster, &tried);
+        let next = next_untried_implementer(&roster, 0, &tried);
         assert_eq!(next.map(|s| s.id.as_str()), Some("b"));
     }
 
@@ -6157,15 +6237,7 @@ mod tests {
     fn next_untried_implementer_returns_none_once_every_id_is_tried() {
         let roster = vec![spec("a"), spec("b")];
         let tried = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
-        assert!(next_untried_implementer(&roster, &tried).is_none());
-    }
-
-    #[test]
-    fn next_untried_implementer_walks_forward_in_roster_order() {
-        let roster = vec![spec("a"), spec("b"), spec("c")];
-        let tried = BTreeSet::from(["a".to_owned()]);
-        let next = next_untried_implementer(&roster, &tried);
-        assert_eq!(next.map(|s| s.id.as_str()), Some("b"), "not c: b is first");
+        assert!(next_untried_implementer(&roster, 0, &tried).is_none());
     }
 
     #[test]

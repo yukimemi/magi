@@ -472,8 +472,24 @@ pub fn fixture_with_quota_on_agents(
     quota_agents: &[&str],
     seats: &[&str],
 ) -> Fixture {
+    fixture_with_quota_on_agents_and_candidates(home, quota_agents, seats, 1)
+}
+
+/// Like [`fixture_with_quota_on_agents`], but leaves `candidates` to the
+/// caller instead of forcing the solo shape — for exercising *which* agent
+/// the fallback picks when more than one candidate slot is in play. Getting
+/// that choice wrong (e.g. always falling back to the roster's front instead
+/// of walking forward from the seat's own slot) would silently hand two
+/// candidates the same agent, or fall back onto an agent a different
+/// candidate slot already owns.
+pub fn fixture_with_quota_on_agents_and_candidates(
+    home: HomeGuard,
+    quota_agents: &[&str],
+    seats: &[&str],
+    candidates: usize,
+) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.candidates = candidates;
     let value = seats.join(",");
     for a in &mut fx.config.agents {
         if quota_agents.contains(&a.id.as_str()) {

@@ -116,4 +116,74 @@ async fn a_seat_that_exhausts_the_whole_roster_records_exactly_one_quota_loss() 
         a.failed.as_deref(),
         Some("rate limited (quota); produced no change")
     );
+    // Nobody actually answered — every fallback also quota'd out — so the
+    // candidate must keep the agent it was assigned at creation, not the
+    // last one the fallback happened to try. Crediting `gamma` here would
+    // erase `alpha`'s and `beta`'s own quota losses from any per-agent stats
+    // keyed on `Candidate::agent`, and unfairly count the loss against
+    // `gamma` alone.
+    assert_eq!(a.agent, "alpha", "{a:?}");
+}
+
+#[tokio::test]
+async fn a_later_candidate_slots_seat_falls_back_past_its_own_position_not_the_roster_front() {
+    let _home = common::home_lock().await;
+    let mut fx = common::fixture(_home, common::Judges::Unanimous, false);
+    fx.config.graph.candidates = 2;
+    // `implementers` rotation gives candidate slot 0 -> alpha, slot 1 ->
+    // beta (`Config::resolve_roles`, offset 0). Which *label* each slot lands
+    // on is a seeded shuffle (`blind::assign_labels`), so the seat name for
+    // slot 1 has to be computed from the fixture's own seed rather than
+    // assumed to be "impl-B".
+    let labels = magi::blind::assign_labels(2, fx.config.blind.seed.expect("fixture pins a seed"));
+    let seat_for_slot_1 = format!("impl-{}", labels[1]);
+    // Only slot 1's own agent (`beta`) is rate-limited; `alpha` and `gamma`
+    // are not. The fallback must walk forward from beta's own position in
+    // the roster (index 1) to gamma, never back to alpha, which is slot 0's
+    // own agent already.
+    for a in &mut fx.config.agents {
+        if a.id == "beta" {
+            a.env
+                .insert("MOCK_QUOTA_SEAT".to_owned(), seat_for_slot_1.clone());
+        }
+    }
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    assert!(state.quota.is_empty(), "{:?}", state.quota);
+
+    let events: Vec<&str> = state
+        .events
+        .iter()
+        .filter(|e| e.node == "implement")
+        .map(|e| e.message.as_str())
+        .collect();
+    assert!(
+        events.iter().any(|m| m.contains("retrying with gamma")),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|m| m.contains("retrying with alpha")),
+        "must not fall back onto a different candidate slot's own agent: {events:?}"
+    );
+
+    let slot0 = state
+        .candidates
+        .iter()
+        .find(|c| c.index == 0)
+        .expect("candidate slot 0");
+    assert_eq!(slot0.agent, "alpha", "{slot0:?}");
+    assert!(!slot0.empty && slot0.failed.is_none(), "{slot0:?}");
+
+    let slot1 = state
+        .candidates
+        .iter()
+        .find(|c| c.index == 1)
+        .expect("candidate slot 1");
+    assert_eq!(slot1.agent, "gamma", "{slot1:?}");
+    assert!(!slot1.empty && slot1.failed.is_none(), "{slot1:?}");
 }
