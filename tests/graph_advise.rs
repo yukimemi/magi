@@ -55,6 +55,67 @@ async fn advisor_proposals_are_gathered_and_synthesized_into_the_implementer_bri
 }
 
 #[tokio::test]
+async fn the_synthesizer_role_pins_the_synthesis_seat_to_a_named_agent() {
+    let home = common::home_lock().await;
+    let mut fx = fixture_with_advise(home, 2);
+    fx.config.graph.candidates = 1;
+    fx.config.roles = Roles {
+        synthesizer: Some("beta".to_owned()),
+        ..Roles::default()
+    };
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    assert!(
+        state
+            .advice
+            .as_ref()
+            .expect("advise ran")
+            .synthesis
+            .is_some()
+    );
+    let seat = state
+        .seats
+        .get("advise-synthesis")
+        .expect("the synthesis seat is recorded");
+    assert_eq!(
+        seat.agent, "beta",
+        "[roles] synthesizer must pin the synthesis seat, not the fixture's default order"
+    );
+}
+
+#[tokio::test]
+async fn an_unset_synthesizer_role_falls_back_to_the_default_order() {
+    let home = common::home_lock().await;
+    let mut fx = fixture_with_advise(home, 2);
+    fx.config.graph.candidates = 1;
+    assert!(
+        fx.config.roles.synthesizer.is_none(),
+        "the fixture must not already name a synthesizer"
+    );
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    let seat = state
+        .seats
+        .get("advise-synthesis")
+        .expect("the synthesis seat is recorded");
+    assert_eq!(
+        seat.agent, "alpha",
+        "none of the fixture's agents are `claude`, so an unset role falls back to \
+         the first runnable agent in roster order"
+    );
+}
+
+#[tokio::test]
 async fn the_on_off_switch_leaves_no_trace_when_off() {
     let home = common::home_lock().await;
     // The shared `fixture` already turns `advise` off; this asserts that

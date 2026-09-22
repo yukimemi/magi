@@ -231,7 +231,7 @@ pub async fn fold_due(
         // now, and none is a reason to stop the pass. Left unfolded, it is
         // simply due again next time; a `?` here stopped automatic folding
         // permanently at the first such run (finding R3-1-1 of run 51a3).
-        match crate::graph::fold_run(&mut state, drop_winner).await {
+        match crate::graph::fold_run(&mut state, drop_winner, home).await {
             Ok(_) => folded += 1,
             Err(e) => tracing::warn!("housekeep: fold {id}: {e:#}"),
         }
@@ -791,12 +791,6 @@ mod tests {
         let home = dir.path().to_path_buf();
         let disk = Disk::default();
         let now = ts("2026-09-05T00:00:00Z");
-        // `graph::fold_run` (invoked below for the due, readable runs) saves
-        // through the process-global home; pinning it to this test's own
-        // directory is what keeps that write off the operator's real one (see
-        // `run::home`'s doc). Harmless if another test already pinned it
-        // first - this test never reads that global value back.
-        crate::run::set_home(dir.path().to_path_buf());
 
         // 1. Runnable (judging): never folded, however old.
         let judging = "20260801-000000-0001";
@@ -823,13 +817,13 @@ mod tests {
 
         // 4. Finished, well past grace, current schema: the ordinary case
         //    `fold_due` has always acted on.
-        let due_ready = due_run(&runs, "20260801-000000-ffff", SCHEMA);
+        let due_ready = due_run(&runs, &wt, "20260801-000000-ffff", SCHEMA);
 
         // 5. Finished, well past grace, but written by a schema number this
         //    build no longer matches - the defect this task exists to fix.
         //    It still parses cleanly, so only the version number differs, and
         //    that alone must not block folding.
-        let due_old_schema = due_run(&runs, "20260801-000000-eeee", SCHEMA - 1);
+        let due_old_schema = due_run(&runs, &wt, "20260801-000000-eeee", SCHEMA - 1);
 
         let (folded, unreadable) =
             block_on(fold_due(&runs, &home, &wt, &disk, now)).expect("fold_due");
@@ -853,6 +847,20 @@ mod tests {
             runs.join(&due_old_schema).exists(),
             "an old-schema record survives its fold exactly like a current one"
         );
+        // `graph::fold_run` saves the state it just folded back to disk. That
+        // write must land under this test's own `runs` - the argument it
+        // passed to `fold_due`, not the process-global `run::home` - or a
+        // fold that landed somewhere else entirely would still be counted
+        // above as one of the two `folded` runs.
+        for id in [&due_ready, &due_old_schema] {
+            let saved = read_meta(&runs, id).expect("folded run still parses");
+            assert_ne!(
+                saved.updated_at,
+                ts("2026-08-01T00:00:00Z"),
+                "fold_run must have saved the updated state back through the \
+                 `runs` directory this test passed to fold_due"
+            );
+        }
     }
 
     /// `[disk] auto_fold = false` must leave the janitor's fold-and-reclaim
@@ -868,7 +876,7 @@ mod tests {
         let home = dir.path().to_path_buf();
         crate::run::set_home(dir.path().to_path_buf());
 
-        let due_id = due_run(&runs, "20260801-000000-ffff", SCHEMA);
+        let due_id = due_run(&runs, &wt, "20260801-000000-abcd", SCHEMA);
         std::fs::create_dir_all(wt.join("orphan").join("cand-A")).unwrap();
 
         let mut cfg = crate::config::Config::default();
@@ -1180,13 +1188,21 @@ mod tests {
     /// Write a fully-formed, `Ready`, well-past-grace `run.json` tagged with
     /// an arbitrary schema number - so a test can write one this build's own
     /// `RunState::new` could never produce on its own. Returns the id.
-    fn due_run(runs: &Path, id: &str, schema: u32) -> String {
+    ///
+    /// `wt` becomes this run's `graph.worktree_root`: left at the config
+    /// default, `RunState::worktree_root` falls through to
+    /// `run::default_worktree_root` - the operator's real `~/wt/magi` - and
+    /// `graph::fold_run`'s second sweep would then `read_dir` and remove
+    /// worktrees there instead of anything this test owns.
+    fn due_run(runs: &Path, wt: &Path, id: &str, schema: u32) -> String {
+        let mut config = crate::config::Config::default();
+        config.graph.worktree_root = Some(wt.to_path_buf());
         let mut state = RunState::new(
             PathBuf::from("/nonexistent/repo"),
             "main".to_owned(),
             "0000000000000000000000000000000000000000".to_owned(),
             String::new(),
-            crate::config::Config::default(),
+            config,
         );
         state.id = id.to_owned();
         state.status = RunStatus::Ready;

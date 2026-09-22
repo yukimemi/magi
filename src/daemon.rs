@@ -788,7 +788,23 @@ pub struct Verdict {
 /// | `Stalled`, no quota                    | `Failed`, or `Held`  | yes          |
 /// | `Blocked` with a PR                    | `Held`               | yes          |
 /// | `Blocked`, `Failed` otherwise          | `Failed`, or `Held`  | yes          |
+/// | `VerifiedNoop`                          | `Held`               | yes          |
 /// | anything non-terminal                  | `Failed`, or `Held`  | yes          |
+///
+/// The `VerifiedNoop` row is independent of the `Failed`-quota row above it,
+/// deliberately: every candidate agreeing there is nothing to write is not a
+/// machine fact about a rate limit, it is an unverified claim about the
+/// *task* that a human still has to check — see [`RunStatus::VerifiedNoop`]'s
+/// own doc and [`Task::handed_off`]. `Held` rather than `Done` on purpose: the
+/// claim could be wrong (a misread instruction, a stale check), and closing
+/// the task automatically on an implementer's say-so would be the exact
+/// failure mode task 391f's own audit was raised to avoid. `attempt spent` is
+/// `yes` here for the same reason it is on the `Blocked`-with-a-PR row just
+/// above, which settles through the same [`Task::handed_off`]: `Held` is not
+/// `Failed`-and-requeued, so nothing retries this task on the same unverified
+/// claim regardless of whether the one already-spent attempt is refunded, and
+/// [`Task::release`] resets the count to zero anyway the moment a human looks
+/// at the evidence and lets it run again.
 ///
 /// The `Stalled`-quota and `Failed`-quota rows are the ones worth reading
 /// twice, together. A quorum lost to rate limits is a property of the machine
@@ -831,6 +847,7 @@ pub fn settle(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usi
         RunStatus::Stalled | RunStatus::Failed => task.fail(detail, max_attempts),
         RunStatus::Blocked if verdict.left_pr => task.handed_off(detail),
         RunStatus::Blocked => task.fail(detail, max_attempts),
+        RunStatus::VerifiedNoop => task.handed_off(detail),
         other => task.fail(
             format!(
                 "the graph stopped at `{}` without reaching a terminal status: {detail}",
@@ -2711,6 +2728,14 @@ fn runnable(queue: &Queue) -> Vec<Task> {
 /// A stalled run names the seats the quota took out: "out of quota" is not
 /// actionable, while "judge-2, judge-3 hit a limit" tells the operator which
 /// agent to replace or which plan to top up.
+///
+/// Uses [`RunStatus::display_label`] rather than [`label`]/`as_str` on
+/// purpose: unlike `label`'s other callers (an internal log line, an
+/// already-a-bug fallback message), this string becomes `Task::last_error`
+/// verbatim, which the phone renders in the same alarm-styled box an
+/// ordinary failure gets — see `web::tests` and `assets/ui/app.js`'s
+/// `.err` styling. A bare `verified_noop` there would read exactly like the
+/// failure this whole feature exists to tell apart from one.
 fn describe(state: &RunState) -> String {
     let mut detail = if state.status == RunStatus::Stalled {
         let mut seats: Vec<&str> = state.quota.iter().map(|q| q.seat.as_str()).collect();
@@ -2725,7 +2750,7 @@ fn describe(state: &RunState) -> String {
             )
         }
     } else {
-        format!("run ended {}", label(state.status))
+        format!("run ended {}", state.status.display_label())
     };
     if let Some(last) = state.events.last() {
         detail.push_str(&format!(" ({}: {})", last.node, last.message));
@@ -2786,10 +2811,18 @@ fn diagnostic(state: &RunState) -> Option<String> {
 
     // No viable candidate: every implementer's own final word, sanitized the
     // same way a judge would have read it, so a run that actually finished
-    // the job does not read as an unexplained failure.
+    // the job does not read as an unexplained failure. A verified no-op is
+    // called out ahead of its own summary and apart from an ordinary
+    // failure's `why` — this is the one candidate shape whose diagnostic a
+    // human is expected to actually judge, not just skim.
     if state.viable().is_empty() {
         for c in &state.candidates {
-            if !c.summary.trim().is_empty() {
+            if let Some(evidence) = &c.verified_noop {
+                parts.push(format!(
+                    "candidate {} (agent-verified no-op, unconfirmed by magi): {evidence}",
+                    c.label
+                ));
+            } else if !c.summary.trim().is_empty() {
                 parts.push(format!("candidate {}: {}", c.label, c.summary.trim()));
             } else if let Some(why) = &c.failed {
                 parts.push(format!("candidate {}: {why}", c.label));
@@ -2810,9 +2843,12 @@ fn diagnostic(state: &RunState) -> Option<String> {
     ))
 }
 
-/// Stable lower-case name for a run status, for logs and task errors.
-/// One definition of a status's name, on the type that owns it: this table
-/// used to live here as a second copy, and a status renamed in one place would
+/// Stable lower-case name for a run status, for an internal log line and the
+/// "graph stopped without reaching a terminal status" bug message in
+/// [`settle`] — never for [`Task::last_error`] itself; see [`describe`]'s own
+/// doc for why that one reads [`RunStatus::display_label`] instead. One
+/// definition of a status's name, on the type that owns it: this table used
+/// to live here as a second copy, and a status renamed in one place would
 /// have gone on reading correctly in the other.
 fn label(status: RunStatus) -> &'static str {
     status.as_str()
@@ -3264,6 +3300,7 @@ mod tests {
             (RunStatus::Stalled, TaskStatus::Failed, 0),
             (RunStatus::Blocked, TaskStatus::Failed, 1),
             (RunStatus::Failed, TaskStatus::Failed, 1),
+            (RunStatus::VerifiedNoop, TaskStatus::Held, 1),
             (RunStatus::Prep, TaskStatus::Failed, 1),
             (RunStatus::Implementing, TaskStatus::Failed, 1),
             (RunStatus::Judging, TaskStatus::Failed, 1),
@@ -3387,6 +3424,43 @@ mod tests {
         );
         assert_eq!(empty_handed.status, TaskStatus::Failed);
         assert!(empty_handed.status.runnable());
+    }
+
+    #[test]
+    fn a_verified_noop_run_hands_off_rather_than_closing_or_auto_retrying() {
+        // Every candidate agreed, with evidence, that nothing belonged in the
+        // worktree. That is not a confirmed success to close automatically -
+        // a human still has to check the claim - and it is not an ordinary
+        // failure either, so this settles exactly like a pull request nobody
+        // merged yet: `Held`, same as `Blocked` with a PR.
+        let mut noop = task();
+        noop.start("20260912-131304-391f".to_owned());
+        settle(
+            &mut noop,
+            Verdict {
+                status: RunStatus::VerifiedNoop,
+                left_pr: false,
+                parked: false,
+                quota_hit: false,
+                no_viable_candidates: true,
+            },
+            "candidate A: already fixed by b32cfc4, on main",
+            4,
+        );
+        assert_eq!(
+            noop.status,
+            TaskStatus::Held,
+            "an unverified claim is a request for a human, not a failure"
+        );
+        assert!(
+            !noop.status.runnable(),
+            "the loop must not requeue this on the same unverified claim"
+        );
+        // `Task::release` resets attempts to zero the moment a human looks at
+        // the evidence and lets it run again, so it does not matter here
+        // whether the one attempt already spent stays spent - what matters is
+        // that nothing retries this task unattended in the meantime.
+        assert_eq!(noop.attempts, 1);
     }
 
     #[test]
@@ -3855,6 +3929,7 @@ mod tests {
             commits: usize::from(!empty),
             empty,
             failed: failed.map(str::to_owned),
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }
@@ -3900,6 +3975,21 @@ mod tests {
         assert!(d.contains("build"), "{d}");
         assert!(d.contains("lint"), "{d}");
         assert!(d.contains("fixer produced no commit"), "{d}");
+    }
+
+    #[test]
+    fn describe_never_leaves_a_verified_noop_reading_as_a_bare_status_code() {
+        // `describe`'s output becomes `Task::last_error` verbatim, and the
+        // phone renders that in the same alarm-styled box an ordinary
+        // failure gets. A bare `verified_noop` there would read exactly like
+        // the failure this status exists to be told apart from.
+        let state = run_state(RunStatus::VerifiedNoop);
+        let d = describe(&state);
+        assert!(
+            d.contains("agent-verified no-op"),
+            "expected the display label, not the wire spelling: {d}"
+        );
+        assert!(!d.contains("verified_noop"), "{d}");
     }
 
     #[test]

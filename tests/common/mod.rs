@@ -456,6 +456,49 @@ pub fn fixture_with_quota(home: HomeGuard, quota_seats: &[&str]) -> Fixture {
     fx
 }
 
+/// Like [`fixture_with_quota`], but the rate limit is scoped to specific
+/// *agents* rather than shared by the whole roster — the shape needed to
+/// exercise the implement node's per-seat quota fallback
+/// (`graph::Runner::resume_quota_losses`), where the same seat key must
+/// quota on one agent's turn and succeed once a different agent takes over.
+///
+/// Forces `candidates = 1`: a solo run is the motivating case for the
+/// fallback, since `Config::resolve_roles` only ever gives a solo seat one
+/// implementer slot, and judging a single candidate is skipped, so a test
+/// built on this fixture only pays for the implement calls it is actually
+/// about.
+pub fn fixture_with_quota_on_agents(
+    home: HomeGuard,
+    quota_agents: &[&str],
+    seats: &[&str],
+) -> Fixture {
+    fixture_with_quota_on_agents_and_candidates(home, quota_agents, seats, 1)
+}
+
+/// Like [`fixture_with_quota_on_agents`], but leaves `candidates` to the
+/// caller instead of forcing the solo shape — for exercising *which* agent
+/// the fallback picks when more than one candidate slot is in play. Getting
+/// that choice wrong (e.g. always falling back to the roster's front instead
+/// of walking forward from the seat's own slot) would silently hand two
+/// candidates the same agent, or fall back onto an agent a different
+/// candidate slot already owns.
+pub fn fixture_with_quota_on_agents_and_candidates(
+    home: HomeGuard,
+    quota_agents: &[&str],
+    seats: &[&str],
+    candidates: usize,
+) -> Fixture {
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    fx.config.graph.candidates = candidates;
+    let value = seats.join(",");
+    for a in &mut fx.config.agents {
+        if quota_agents.contains(&a.id.as_str()) {
+            a.env.insert("MOCK_QUOTA_SEAT".to_owned(), value.clone());
+        }
+    }
+    fx
+}
+
 /// Like [`fixture`], but the given judge seats fail with a *plain* error (no
 /// usable output) at their initial ranking — the non-quota counterpart to
 /// [`fixture_with_quota`]. Enough of these collapse the quorum the same way a

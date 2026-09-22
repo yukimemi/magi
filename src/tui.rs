@@ -94,11 +94,18 @@ impl Filter {
             Self::Active => !status.done(),
             Self::Done => matches!(status, RunStatus::Merged | RunStatus::Ready),
             // A stalled run wants a human even though it is terminal, so it
-            // surfaces under "attention", not "done".
+            // surfaces under "attention", not "done" — and so does a
+            // verified no-op: nothing landed, and the task it came from sits
+            // `Held` on exactly this claim until a human checks the evidence
+            // and closes it. Neither belongs with `Merged`/`Ready`, which
+            // need nobody.
             Self::Attention => {
                 matches!(
                     status,
-                    RunStatus::Stalled | RunStatus::Blocked | RunStatus::Failed
+                    RunStatus::Stalled
+                        | RunStatus::Blocked
+                        | RunStatus::Failed
+                        | RunStatus::VerifiedNoop
                 )
             }
         }
@@ -249,7 +256,10 @@ impl App {
         for l in &self.runs {
             match l.state.status {
                 RunStatus::Merged | RunStatus::Ready => c.done += 1,
-                RunStatus::Stalled | RunStatus::Blocked | RunStatus::Failed => c.attention += 1,
+                RunStatus::Stalled
+                | RunStatus::Blocked
+                | RunStatus::Failed
+                | RunStatus::VerifiedNoop => c.attention += 1,
                 _ => c.active += 1,
             }
         }
@@ -457,6 +467,10 @@ fn status_style(status: RunStatus) -> Style {
             .add_modifier(Modifier::BOLD),
         RunStatus::Blocked => Style::default().fg(Color::Yellow),
         RunStatus::Failed => Style::default().fg(Color::Red),
+        // Not `Failed`'s red: every candidate agreed, with evidence, that
+        // nothing belonged in this worktree — the opposite of a run that
+        // could not do the work.
+        RunStatus::VerifiedNoop => Style::default().fg(Color::Cyan),
         _ => Style::default().fg(Color::Cyan),
     }
 }
@@ -525,7 +539,7 @@ fn body(frame: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .map(|i| {
             let state = &app.runs[*i].state;
-            let status = format!("{:?}", state.status).to_lowercase();
+            let status = state.status.display_label().to_owned();
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{:<12}", status), status_style(state.status)),
                 Span::raw(format!(
@@ -716,6 +730,53 @@ mod tests {
         assert_eq!(c.attention, 1);
         assert_eq!(c.done, 1);
         assert_eq!(c.active + c.attention + c.done, c.total);
+    }
+
+    #[test]
+    fn a_verified_noop_run_counts_as_attention_not_active_or_done() {
+        // Nothing landed, so it does not belong with `Merged`/`Ready`, but it
+        // is also not the same wait as a stalled or blocked run: every
+        // candidate already agreed there was nothing to write, and the task
+        // it came from sits `Held` until a human checks the evidence. That
+        // is exactly what "attention" is for.
+        let a = App::new(vec![state(
+            "already fixed elsewhere",
+            RunStatus::VerifiedNoop,
+        )]);
+        let c = a.counts();
+        assert_eq!(c.attention, 1);
+        assert_eq!(c.active, 0);
+        assert_eq!(c.done, 0);
+
+        assert!(Filter::Attention.accepts(RunStatus::VerifiedNoop));
+        assert!(!Filter::Active.accepts(RunStatus::VerifiedNoop));
+        assert!(!Filter::Done.accepts(RunStatus::VerifiedNoop));
+    }
+
+    #[test]
+    fn a_verified_noop_run_does_not_render_as_failed() {
+        let mut a = App::new(vec![state(
+            "already fixed elsewhere",
+            RunStatus::VerifiedNoop,
+        )]);
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut a)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            rendered.contains("agent-verified no-op"),
+            "the list row must say what actually happened: {rendered}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("failed"),
+            "a verified no-op must never read as the failure it is not: {rendered}"
+        );
     }
 
     /// A corrupt state file must not make a row blink out of a live view.

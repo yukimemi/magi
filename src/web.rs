@@ -2391,7 +2391,7 @@ async fn run_fold(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResul
     };
     let removed = match state {
         Some(mut state) => {
-            let removed = crate::graph::fold_run(&mut state, true)
+            let removed = crate::graph::fold_run(&mut state, true, &ui.home)
                 .await
                 .map_err(|e| ApiError::internal(format!("{e:#}")))?;
             // Nothing left to remove is not the same thing as nothing left to
@@ -6980,6 +6980,46 @@ mod tests {
     }
 
     #[test]
+    fn queue_ui_presents_blocked_dependencies_and_resolved_questions() {
+        // A blocked task's chip and note must not fall back to a queued-like
+        // rendering - review 1623 R2-2-1's finding, fixed for the chip table
+        // itself by e11fc58 but never checked here.
+        assert!(APP_JS.contains("blocked: { glyph:"));
+        assert!(APP_JS.contains("Blocked. Waiting on another task or question to resolve."));
+
+        // `blocked_by` mixes task ids and question ids in the same list, and
+        // the client can only tell them apart by checking each id against
+        // what it actually knows - never by guessing from the id's shape.
+        assert!(APP_JS.contains("function classifyBlockedBy(blockedBy, tasksById, questionsById)"));
+        assert!(
+            APP_JS.contains(
+                "if (parts.length) noteText = `${noteText} Waiting on ${parts.join(\" and \")}.`;"
+            ),
+            "the note line must name what a blocked task is waiting on, not just that it is blocked"
+        );
+        // The classification must key off `status_str`, never off `blocked_by`
+        // or `block_reason` merely being present - both can survive briefly
+        // on a task a hold or a dead daemon just moved off `blocked`.
+        assert!(APP_JS.contains("if (status === \"blocked\") {"));
+
+        // A question a task is blocked on gets its own node in the same
+        // dependency graph, not just a task-shaped node with nothing known
+        // about it.
+        assert!(APP_JS.contains("function depNode(id, byId, questionNodes)"));
+        assert!(APP_JS.contains("questionNodes.set(dep, questionsById.get(dep));"));
+        assert!(
+            APP_JS.contains("location.hash = \"#/questions\";"),
+            "a question node must jump to the Questions screen, not pretend to be a task"
+        );
+
+        // `Task::answers` - decisions already made - are shown as a record on
+        // the card, the same disclosure style as the full instruction.
+        assert!(APP_JS.contains("Resolved questions"));
+        assert!(APP_JS.contains("r.answersList.append("));
+        assert!(APP_CSS.contains(".task-answers"));
+    }
+
+    #[test]
     fn review_rounds_tell_a_stale_verification_and_a_resource_block_apart_from_a_real_result() {
         assert!(
             APP_JS.contains("round.verified_head !== round.head"),
@@ -7289,6 +7329,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_json_carries_dependency_fields_and_a_hold_clears_them() {
+        // `TaskView` flattens `Task`, so this is really asserting that
+        // `#[serde(flatten)]` at web.rs:2530 hasn't quietly dropped a field -
+        // e11fc58 added `blocked_by`/`block_reason`/`answers` to `Task` but
+        // never touched web.rs, so nothing here caught it if it had.
+        let fx = Fixture::start().await;
+        let q = fx.queue();
+
+        let mut t = Task::new(
+            "Task".to_owned(),
+            "Instruction".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        t.block(
+            vec!["20260101-000000-dead".to_owned()],
+            Some("waiting on Task 1".to_owned()),
+        );
+        t.answers.push(crate::queue::AnsweredQuestion {
+            question: "Which backend?".to_owned(),
+            answer: "SQLite".to_owned(),
+        });
+        q.put(&mut t).expect("put t");
+
+        let res = fx.get("/api/queue").await;
+        assert_eq!(res.status, 200);
+        let list = res.json();
+        let view = list
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|v| v["id"] == t.id)
+            .expect("task in list");
+        assert_eq!(view["status_str"], "blocked");
+        assert_eq!(
+            view["blocked_by"],
+            serde_json::json!(["20260101-000000-dead"])
+        );
+        assert_eq!(view["block_reason"], "waiting on Task 1");
+        assert_eq!(view["answers"][0]["question"], "Which backend?");
+        assert_eq!(view["answers"][0]["answer"], "SQLite");
+
+        // A manual hold clears `blocked_by`/`block_reason` (`Task::hold_manual`)
+        // but never `answers` - that is a settled decision, not state
+        // describing the current block, so it survives.
+        let res = fx
+            .post(&format!("/api/queue/{}/hold", t.short()), None)
+            .await;
+        assert_eq!(res.status, 200);
+        let held = res.json();
+        assert_eq!(held["status_str"], "held");
+        assert_eq!(held["blocked_by"], serde_json::json!([]));
+        assert!(held["block_reason"].is_null());
+        assert_eq!(held["answers"][0]["answer"], "SQLite");
+    }
+
+    #[tokio::test]
     async fn delete_queue_task_deletes_file_and_guards_running_and_locked() {
         let fx = Fixture::start().await;
         let q = fx.queue();
@@ -7400,6 +7497,7 @@ mod tests {
             commits: 1,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: true,
         });
@@ -7467,6 +7565,7 @@ mod tests {
             commits: 1,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         });
@@ -8446,15 +8545,15 @@ mod tests {
             .collect();
 
         // `runSection` reimplemented from assets/ui/app.js: `waiting` wins
-        // outright, then merged/ready land, stalled/blocked/failed end, and
-        // everything else is still in flight.
+        // outright, then merged/ready land, stalled/blocked/failed/
+        // verified_noop end, and everything else is still in flight.
         fn run_section(waiting: bool, status: &str) -> &'static str {
             if waiting {
                 return "waiting";
             }
             match status {
                 "merged" | "ready" => "landed",
-                "stalled" | "blocked" | "failed" => "ended",
+                "stalled" | "blocked" | "failed" | "verified_noop" => "ended",
                 _ => "flight",
             }
         }

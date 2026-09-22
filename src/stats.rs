@@ -220,7 +220,11 @@ pub fn collect(states: &[RunState]) -> Stats {
                 agent: c.agent.clone(),
                 ..AgentStats::default()
             });
-            if c.empty {
+            // A verified no-op is not counted as the ordinary empty loss it
+            // would otherwise look like: the candidate gave evidence for
+            // writing nothing, which `entry.empty` exists to flag the
+            // *absence* of.
+            if c.empty && c.verified_noop.is_none() {
                 entry.empty += 1;
             }
             if c.viable() {
@@ -413,6 +417,7 @@ mod tests {
             commits: 1,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }

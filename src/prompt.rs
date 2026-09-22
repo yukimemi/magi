@@ -352,7 +352,15 @@ pub fn implement(instruction: &str, cwd: &str, language: &str, brief: Option<&st
          - what you changed (max 10 bullets)\n\
          - why, where it is not obvious\n\
          - risks a reviewer should check\n\
-         - how to verify by hand\n\n{}{}",
+         - how to verify by hand\n\n\
+         If, after investigating, you conclude the task's request is already \
+         satisfied elsewhere and no change belongs in this worktree, write no \
+         bullets. Instead start SUMMARY with a line reading exactly \
+         `NO CHANGE NEEDED:` followed by the evidence you verified it with — \
+         the commit SHA(s) you checked, the existing test name(s) that already \
+         cover it, the exact command you ran and its output, or the path you \
+         read. An empty or unsupported claim reads as an ordinary candidate \
+         that wrote nothing, not a verified one.\n\n{}{}",
         ask_the_owner(language),
         lang(language)
     )
@@ -932,6 +940,53 @@ pub fn fix(
     s.push('\n');
     s.push_str(&ask_the_owner(language));
     s.push_str(&lang(language));
+    s
+}
+
+/// Prompt for a targeted, operator-triggered fix: specific, already-recorded
+/// findings routed to a fixer outside the normal review round sequence.
+///
+/// Reuses [`fix`] for the findings block and the output contract — the JSON
+/// shape a fixer answers with is identical either way — and wraps it with the
+/// operator's own reasoning and an explicit scope rule, because the fixer's
+/// session may still remember other findings from earlier rounds of this same
+/// conversation that must not be touched here.
+pub fn operator_fix(
+    instruction: &str,
+    findings: &[Finding],
+    reason: &str,
+    stale: &[(String, String)],
+    current_head: &str,
+    language: &str,
+) -> String {
+    let mut s = format!(
+        "An operator has selected the finding(s) below from a saved review and \
+         is routing them to you directly. This is a targeted fix, not a new \
+         review round.\n\n\
+         # Why now\n\n{}\n\n",
+        reason.trim()
+    );
+    if !stale.is_empty() {
+        let _ = write!(
+            s,
+            "# Note on freshness\n\nThe branch has moved since some of these were \
+             raised; it is now at {current_head}. Re-check each still applies \
+             before acting on it:\n"
+        );
+        for (id, round_head) in stale {
+            let _ = writeln!(s, "- {id}: raised against {round_head}");
+        }
+        s.push('\n');
+    }
+    // `round`/`rounds` only drive `fix`'s "Review round N of M" display line;
+    // there is no round budget for this step, so both are 1 — one pass, not a
+    // count of anything.
+    s.push_str(&fix(instruction, findings, None, 1, 1, language));
+    s.push_str(
+        "\n# Scope\n\nAddress only the finding id(s) listed above. Do not act on \
+         any other issue, including one you recall from an earlier round of this \
+         same conversation, even if you still believe it is real.\n",
+    );
     s
 }
 
@@ -1883,6 +1938,13 @@ mod tests {
         assert!(p.contains("Co-Authored-By:"));
         assert!(p.contains("## SUMMARY"));
         assert!(p.contains("/tmp/wt"));
+    }
+
+    #[test]
+    fn implement_prompt_documents_the_no_change_needed_marker() {
+        let p = implement("do it", "/tmp/wt", "en", None);
+        assert!(p.contains("NO CHANGE NEEDED:"), "{p}");
+        assert!(p.contains("already satisfied elsewhere"), "{p}");
     }
 
     #[test]

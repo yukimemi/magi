@@ -131,6 +131,12 @@ const RUN_STATUS = {
   stalled:      { glyph: "\u26a0", tone: "rust", note: "The judging panel never reached a quorum, so no verdict was recorded. The work is kept." },
   blocked:      { glyph: "\u2298", tone: "rust", note: "magi stopped short of merging." },
   failed:       { glyph: "\u2715", tone: "ink",  note: "The graph could not complete." },
+  /* Not a failure: every candidate wrote nothing, but every one of them said
+     why in a way that survived the adoption guard \u2014 same neutral `ink` as
+     `unmerged`, never `failed`'s tones, so a glance does not read this as the
+     agent breaking. magi has not confirmed the claim itself, which is why the
+     task still sits held for a human rather than closing on its own. */
+  verified_noop: { glyph: "\u2713", tone: "ink", note: "Every candidate reported, with evidence, that no code change was needed \u2014 the task's request was already satisfied elsewhere. magi has not verified the claim itself; check the candidate's evidence before closing the task." },
   /* Derived from RunSummary.waiting rather than trusted from the status
      string: the run parked in some node and the summary still names it. */
   waiting:      { glyph: "?", tone: "wait", note: "An agent stopped to ask you something. Nothing in this run moves until it is answered." },
@@ -1305,7 +1311,7 @@ function runSection(run) {
   if (run.unmerged_by_design) return "ended";
   const status = String(run.status || "");
   if (status === "merged" || status === "ready") return "landed";
-  if (status === "stalled" || status === "blocked" || status === "failed") return "ended";
+  if (status === "stalled" || status === "blocked" || status === "failed" || status === "verified_noop") return "ended";
   return "flight";
 }
 
@@ -1354,8 +1360,8 @@ function matchesRunState(run) {
    and Blocked are both "done" (`RunStatus::done()`) yet stay resumable, so
    a run parked there keeps its open question and still reads `waiting:
    true`. Those two are the only done statuses a waiting run can carry;
-   Merged/Ready/Failed always have their question swept before that status
-   is ever saved. */
+   Merged/Ready/Failed/VerifiedNoop always have their question swept before
+   that status is ever saved. */
 const REPRESENTATIVE_RUN_SHAPES = [
   { waiting: true, status: "implementing" },
   { waiting: true, status: "stalled" },
@@ -1366,6 +1372,7 @@ const REPRESENTATIVE_RUN_SHAPES = [
   { waiting: false, status: "stalled" },
   { waiting: false, status: "blocked" },
   { waiting: false, status: "failed" },
+  { waiting: false, status: "verified_noop" },
 ].map((shape) => ({ ...shape, done: !["implementing"].includes(shape.status) }));
 
 function sectionCompatibleWithStateFilter(sectionKey, filterKey) {
@@ -1883,6 +1890,13 @@ function createTaskCard() {
   const instruction = el("details", { class: "advanced" },
     el("summary", { text: "Full instruction" }),
     el("div", { class: "instruction md" }));
+  /* `Task::answers` is history, not a decision waiting to be made - the
+     operator already settled these, possibly attempts ago - so it reads next
+     to the instruction as a record, not among the actions below. */
+  const answersList = el("dl", { class: "task-answers" });
+  const answers = el("details", { class: "advanced" },
+    el("summary", { text: "Resolved questions" }),
+    answersList);
   const runLink = el("a", { class: "btn btn-quiet" });
   /* Priority is a step, not a typed value: the operator wants "ahead of
      that other one", not to compose a number. +1/-1 both reach the same
@@ -1899,12 +1913,12 @@ function createTaskCard() {
 
   const card = el("li", { class: "card" },
     el("div", { class: "card-top" }, chipSlot, priority, solo, whenSlot),
-    title, meta, note, error, instruction, actions,
+    title, meta, note, error, instruction, answers, actions,
   );
   card.refs = {
     card, chipSlot, priority, solo, whenSlot, title, source, repo, attempts,
-    outcome, note, error, instruction, runLink, priorityDown, priorityUp,
-    editBtn, holdBox, doneBox, deleteBox,
+    outcome, note, error, instruction, answers, answersList, runLink,
+    priorityDown, priorityUp, editBtn, holdBox, doneBox, deleteBox,
   };
   return card;
 }
@@ -1958,9 +1972,29 @@ function updateTaskCard(row, task) {
      of the dependency (`main.rs`'s `magi task show` calls this "why"). Only
      one of the two is ever set, since a task is either held or blocked. */
   const waitingOn = task.hold_reason || task.block_reason;
-  const noteText = waitingOn && meta.note
+  let noteText = waitingOn && meta.note
     ? `${meta.note} Waiting on: ${waitingOn}`
     : meta.note || (waitingOn ? `Waiting on: ${waitingOn}` : "");
+
+  /* `status_str` alone decides whether the dependency breakdown gets added -
+     never the mere presence of `blocked_by`/`block_reason`. Both fields can
+     still be sitting on a task the daemon just released (`Task::hold_manual`,
+     `Task::hold_machine` and `Task::succeed` all clear them, but only once
+     the mutation lands), and reading them ahead of `status_str` would relabel
+     that gap as a dependency wait instead of whatever it actually is now. */
+  if (status === "blocked") {
+    const tasksById = new Map((state.queue || []).map((t) => [t.id, t]));
+    const questionsById = state.questions === null
+      ? null
+      : new Map(state.questions.map((q) => [q.id, q]));
+    const { tasks: depTasks, questions: depQuestions, unknown } =
+      classifyBlockedBy(task.blocked_by, tasksById, questionsById);
+    const parts = [];
+    if (depTasks.length) parts.push(plural(depTasks.length, "task", "tasks"));
+    if (depQuestions.length) parts.push(plural(depQuestions.length, "question", "questions"));
+    if (unknown.length) parts.push(plural(unknown.length, "unresolved dependency", "unresolved dependencies"));
+    if (parts.length) noteText = `${noteText} Waiting on ${parts.join(" and ")}.`;
+  }
   setText(r.note, noteText);
   show(r.note, Boolean(noteText));
 
@@ -1974,6 +2008,16 @@ function updateTaskCard(row, task) {
     renderMd(instructionBox, task.instruction_md);
   }
   show(r.instruction, full.trim() !== (task.title || "").trim() && full !== "");
+
+  const resolvedAnswers = Array.isArray(task.answers) ? task.answers : [];
+  clear(r.answersList);
+  for (const a of resolvedAnswers) {
+    r.answersList.append(
+      el("dt", { text: a.question }),
+      el("dd", { text: a.answer }),
+    );
+  }
+  show(r.answers, resolvedAnswers.length > 0);
 
   const runs = Array.isArray(task.runs) ? task.runs : [];
   const latest = runs.length ? runs[runs.length - 1] : null;
@@ -2408,7 +2452,10 @@ const query = state.queueSearch.trim().toLowerCase();
     show($("queue-search-status"), false);
     show(sectionsRoot, true);
     syncQueueSections(sectionsRoot, groupQueueBySection(tasks));
-    renderDependencyGraph(tasks);
+    const questionsById = state.questions === null
+      ? null
+      : new Map(state.questions.map((q) => [q.id, q]));
+    renderDependencyGraph(tasks, questionsById);
   } else {
     show(sectionsRoot, false);
     renderQueueSearch(tasks, query);
@@ -2422,19 +2469,49 @@ const query = state.queueSearch.trim().toLowerCase();
 /* ---- dependency graph --------------------------------------------------- *
  * `Task::blocked_by` can name another task's id or an open question's id -
  * see its doc in `queue.rs` - and the two id spaces look identical. This
- * client has no way to tell them apart except by asking whether the id is
- * one of the tasks already on this page, which is also exactly the filter
- * that keeps a question id from being drawn as a phantom node with nothing
- * known about it. A node is only ever built from a real `TaskView`. */
-function dependencyEdges(tasks) {
+ * client has no way to tell them apart except by checking each id against
+ * what it actually knows: the tasks already on this page, and (once loaded)
+ * the questions from `/api/questions`. An id that resolves to neither is
+ * left as a bare, unlinked id rather than drawn as a phantom node with
+ * nothing known about it - see `dependencyEdges` below, which applies the
+ * same rule to the graph. */
+function classifyBlockedBy(blockedBy, tasksById, questionsById) {
+  const ids = Array.isArray(blockedBy) ? blockedBy : [];
+  const tasks = [];
+  const questions = [];
+  const unknown = [];
+  /* `questionsById === null` means `/api/questions` has not landed yet -
+     that must never read the same as "this id resolves to nothing". An id
+     that cannot yet be checked against questions is dropped rather than
+     called unknown, and the next `loadQuestions()` re-render (see its call
+     to `renderQueue()`) gets another chance to classify it correctly. */
+  for (const id of ids) {
+    const task = tasksById.get(id);
+    if (task) { tasks.push(task); continue; }
+    if (questionsById === null) continue;
+    const question = questionsById.get(id);
+    if (question) questions.push(question);
+    else unknown.push(id);
+  }
+  return { tasks, questions, unknown };
+}
+
+function dependencyEdges(tasks, questionsById) {
   const byId = new Map(tasks.map((t) => [t.id, t]));
+  const questionNodes = new Map();
   const edges = [];
   for (const task of tasks) {
     for (const dep of Array.isArray(task.blocked_by) ? task.blocked_by : []) {
-      if (dep !== task.id && byId.has(dep)) edges.push({ from: task.id, to: dep });
+      if (dep === task.id) continue;
+      if (byId.has(dep)) {
+        edges.push({ from: task.id, to: dep });
+      } else if (questionsById && questionsById.has(dep)) {
+        questionNodes.set(dep, questionsById.get(dep));
+        edges.push({ from: task.id, to: dep });
+      }
     }
   }
-  return { byId, edges };
+  return { byId, questionNodes, edges };
 }
 
 /* Rank 0 is a task nothing here waits on further; a task blocked on one of
@@ -2470,14 +2547,47 @@ const DEP_NODE_H = 56;
 const DEP_COL_GAP = 24;
 const DEP_ROW_GAP = 48;
 
-/* One `<g>` per task, positioned by rank and by its slot within that rank's
+/* A uniform view of a graph node regardless of whether `id` resolved to a
+   `TaskView` or a question - everything past this point (sorting,
+   positioning, drawing) reads only this shape and never branches on kind
+   again except for the one thing that has to differ: where a click goes. */
+function depNode(id, byId, questionNodes) {
+  const t = byId.get(id);
+  if (t) {
+    const status = String(t.status_str || t.status || "");
+    return {
+      id,
+      kind: "task",
+      label: t.title || t.instruction || t.id,
+      status,
+      tone: toneOf(status, TASK_STATUS),
+      detail: t.block_reason ? `Waiting on: ${t.block_reason}` : "",
+    };
+  }
+  const q = questionNodes.get(id);
+  const status = String(q.status || "");
+  return {
+    id,
+    kind: "question",
+    label: q.summary || q.id,
+    status,
+    tone: toneOf(status, QUESTION_STATUS),
+    detail: "",
+  };
+}
+
+/* One `<g>` per node, positioned by rank and by its slot within that rank's
    row. Built fresh on every call, the same as `convergeDiagram` - the graph
    is small enough that a full rebuild costs nothing next to the layout work
-   it would take to diff it in place. */
-function renderDependencyGraph(tasks) {
+   it would take to diff it in place.
+   `questionsById` is `null` until `/api/questions` has loaded once - see
+   `classifyBlockedBy` for why that must not be read as "no questions". A
+   task blocked only on a question is simply left out of the graph until
+   then, the same as one blocked on an id nothing here recognises. */
+function renderDependencyGraph(tasks, questionsById) {
   const panel = $("queue-graph-panel");
   const host = $("queue-graph");
-  const { byId, edges } = dependencyEdges(tasks);
+  const { byId, questionNodes, edges } = dependencyEdges(tasks, questionsById);
 
   const nodeIds = new Set();
   for (const e of edges) { nodeIds.add(e.from); nodeIds.add(e.to); }
@@ -2486,20 +2596,29 @@ function renderDependencyGraph(tasks) {
   clear(host);
   if (nodeIds.size === 0) return;
 
-  setText($("queue-graph-count"), plural(nodeIds.size, "task", "tasks"));
+  const taskNodeCount = [...nodeIds].filter((id) => byId.has(id)).length;
+  const questionNodeCount = nodeIds.size - taskNodeCount;
+  const nodeCountText = questionNodeCount
+    ? `${plural(taskNodeCount, "task", "tasks")}, ${plural(questionNodeCount, "question", "questions")}`
+    : plural(taskNodeCount, "task", "tasks");
+  setText($("queue-graph-count"), nodeCountText);
 
   const outEdges = new Map();
   for (const id of nodeIds) outEdges.set(id, []);
   for (const e of edges) outEdges.get(e.from).push(e.to);
 
+  /* Every question node is a sink - nothing here waits on further via this
+     graph - so it lands at rank 0, the same as a task nothing here waits on,
+     without `dependencyRanks` needing to know kind exists. */
   const ranks = dependencyRanks(nodeIds, outEdges);
   const maxRank = Math.max(...ranks.values());
   const rows = Array.from({ length: maxRank + 1 }, () => []);
-  for (const id of nodeIds) rows[ranks.get(id)].push(byId.get(id));
+  const nodes = new Map([...nodeIds].map((id) => [id, depNode(id, byId, questionNodes)]));
+  for (const id of nodeIds) rows[ranks.get(id)].push(nodes.get(id));
   /* Stable, content-derived order rather than arrival order: a graph that
      reshuffles its columns on every poll is harder to read than one that
      shuffles its rows. */
-  for (const row of rows) row.sort((a, b) => (a.title || a.id).localeCompare(b.title || b.id));
+  for (const row of rows) row.sort((a, b) => a.label.localeCompare(b.label));
 
   const cols = Math.max(1, ...rows.map((row) => row.length));
   const width = cols * (DEP_NODE_W + DEP_COL_GAP) + DEP_COL_GAP;
@@ -2509,7 +2628,7 @@ function renderDependencyGraph(tasks) {
   rows.forEach((row, rank) => {
     const y = height - DEP_ROW_GAP - DEP_NODE_H / 2 - rank * (DEP_NODE_H + DEP_ROW_GAP);
     const slot = width / row.length;
-    row.forEach((task, i) => pos.set(task.id, { x: slot * (i + 0.5), y }));
+    row.forEach((node, i) => pos.set(node.id, { x: slot * (i + 0.5), y }));
   });
 
   /* No `role="img"` here, unlike `convergeDiagram` - this graph's `<g>`
@@ -2521,7 +2640,7 @@ function renderDependencyGraph(tasks) {
     viewBox: `0 0 ${width} ${height}`,
     width, height,
     class: "dep-graph",
-    "aria-label": `Dependency graph of ${plural(nodeIds.size, "task", "tasks")} and ${plural(edges.length, "dependency", "dependencies")}.`,
+    "aria-label": `Dependency graph of ${nodeCountText} and ${plural(edges.length, "dependency", "dependencies")}.`,
   });
 
   for (const e of edges) {
@@ -2544,26 +2663,33 @@ function renderDependencyGraph(tasks) {
   }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: "var(--line-2)" }))));
 
   for (const id of nodeIds) {
-    const t = byId.get(id);
+    const node = nodes.get(id);
     const { x, y } = pos.get(id);
-    const status = String(t.status_str || t.status || "");
-    const label = t.title || t.instruction || t.id;
+    const kindLabel = node.kind === "question" ? "question" : "task";
+    /* A question node jumps to the Questions screen the same way any other
+       navigation there does - see the `route.name === "questions"` handler
+       that calls `focusFirstAsk()` - rather than trying to scroll one
+       specific ask card into view from a different screen. */
+    const jump = node.kind === "question"
+      ? () => { location.hash = "#/questions"; }
+      : () => jumpToTask(node.id);
     const g = svg("g", {
       class: "dep-node",
-      "data-tone": toneOf(status, TASK_STATUS),
+      "data-tone": node.tone,
+      "data-kind": node.kind,
       tabindex: "0",
       role: "button",
-      "aria-label": `${label}, ${status}${t.block_reason ? `, waiting on: ${t.block_reason}` : ""}. Jump to this task.`,
+      "aria-label": `${node.label}, ${kindLabel} ${node.status}${node.detail ? `, ${node.detail.toLowerCase()}` : ""}. ${node.kind === "question" ? "Open questions." : "Jump to this task."}`,
     },
-    svg("title", { text: t.block_reason ? `${label}\n${status}\nWaiting on: ${t.block_reason}` : `${label}\n${status}` }),
+    svg("title", { text: node.detail ? `${node.label}\n${node.status}\n${node.detail}` : `${node.label}\n${node.status}` }),
     svg("rect", { x: x - DEP_NODE_W / 2, y: y - DEP_NODE_H / 2, width: DEP_NODE_W, height: DEP_NODE_H, rx: 10 }),
-    svg("text", { x, y: y - 8, class: "dep-node-title", "text-anchor": "middle", text: truncateLabel(label, 22) }),
-    svg("text", { x, y: y + 12, class: "dep-node-meta", "text-anchor": "middle", text: `${shortId(t.id)} · ${status}` }));
-    g.addEventListener("click", () => jumpToTask(t.id));
+    svg("text", { x, y: y - 8, class: "dep-node-title", "text-anchor": "middle", text: truncateLabel(node.label, 22) }),
+    svg("text", { x, y: y + 12, class: "dep-node-meta", "text-anchor": "middle", text: `${shortId(node.id)} · ${node.status}` }));
+    g.addEventListener("click", jump);
     g.addEventListener("keydown", (ev) => {
       if (ev.key !== "Enter" && ev.key !== " ") return;
       ev.preventDefault();
-      jumpToTask(t.id);
+      jump();
     });
     root.append(g);
   }
@@ -5047,7 +5173,11 @@ function renderCandidates(run) {
       ),
       facts.length ? numbers(facts) : null,
       dead
-        ? el("p", { class: "card-note", text: candidate.failed || "Produced no change at all." })
+        ? el("p", {
+            class: "card-note",
+            text: candidate.failed
+              || (candidate.verified_noop ? `Agent-verified no-op: ${candidate.verified_noop}` : "Produced no change at all."),
+          })
         : null,
       candidate.summary ? el("p", { class: "cand-summary", text: candidate.summary }) : null,
       candidate.stat ? el("pre", { class: "stat", text: candidate.stat }) : null,
@@ -5385,8 +5515,13 @@ async function loadQuestions() {
     renderQuestions();
     renderAskBar();
     /* A run's `waiting` only means something next to the questions, so both
-       views are re-rendered from the answer, not from the run revision. */
+       views are re-rendered from the answer, not from the run revision. The
+       Queue is included for the same reason: a task blocked on a question id
+       cannot be told apart from one blocked on an unresolved id until this
+       lands - see `classifyBlockedBy` - so the note line and dependency
+       graph both need another pass once it does. */
     renderRuns();
+    renderQueue();
     if (state.route.name === "run" && state.detail.run) renderRunDetail();
     ok();
   } catch (error) {

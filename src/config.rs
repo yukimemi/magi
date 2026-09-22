@@ -197,6 +197,17 @@ pub struct Roles {
     /// already thought about judge diversity gets advisor diversity for free
     /// instead of a fourth roster to maintain.
     pub advisors: Vec<String>,
+    /// Agent that blends [`Self::advisors`]' proposals into the one design
+    /// brief `graph::Runner::synthesize_brief` carries into every
+    /// implementer's prompt.
+    ///
+    /// The same precedent as [`Self::chatter`] and [`Self::conductor`] for a
+    /// seat that stands alone rather than rotating through the roster -
+    /// resolved through [`crate::agent::pick`], so unset falls back to its
+    /// own default order (a claude seat, else the first runnable agent in
+    /// roster order) - exactly today's behavior, unchanged by leaving this
+    /// field out.
+    pub synthesizer: Option<String>,
 }
 
 /// Graph shape and limits.
@@ -932,6 +943,14 @@ pub struct ResolvedRoles {
     pub fixer: Option<AgentSpec>,
     /// Queue conductor, explicitly selected or resolved by the standalone-seat fallback.
     pub conductor: AgentSpec,
+    /// The full ordered implementer roster, in [`Roles::implementers`]'s own
+    /// order — or `[[agents]]` in file order, when that list is empty. Unlike
+    /// [`Self::implementers`], never truncated to `graph.candidates` and
+    /// never `rotate`d/wrapped: a solo run (`candidates = 1`) resolves
+    /// `implementers` down to a single slot, but `graph::Runner`'s per-seat
+    /// quota fallback needs the *whole* list to walk forward through when
+    /// that one slot's agent runs out of quota mid-run.
+    pub implementer_roster: Vec<AgentSpec>,
 }
 
 /// Every array-valued key in a config table, as a dotted path.
@@ -1351,6 +1370,20 @@ impl Config {
         Ok(out)
     }
 
+    /// `ids`, resolved to specs in the order named, or the whole `[[agents]]`
+    /// roster in file order when `ids` is empty — the same "explicit ids
+    /// stand alone, an empty list means the whole roster" rule [`Self::rotate`]
+    /// applies, but with no `count` to truncate to and no `offset` to wrap by.
+    /// See [`ResolvedRoles::implementer_roster`] for why a truncated, rotated
+    /// list cannot answer the question this exists for.
+    fn full_roster(&self, ids: &[String]) -> Result<Vec<AgentSpec>> {
+        if ids.is_empty() {
+            Ok(self.agents.clone())
+        } else {
+            ids.iter().map(|id| self.agent(id).cloned()).collect()
+        }
+    }
+
     /// Fill the roles out to the configured widths.
     ///
     /// An empty role list rotates through the whole roster, so a three-agent
@@ -1388,6 +1421,7 @@ impl Config {
                 None => crate::agent::pick(&self.agents, None, &crate::agent::installed)
                     .unwrap_or_else(|_| self.agents[0].clone()),
             },
+            implementer_roster: self.full_roster(&self.roles.implementers)?,
         })
     }
 
@@ -1487,7 +1521,8 @@ impl Config {
              implementers = []\n\
              judges = []\n\
              reviewers = []\n\
-             # conductor = \"opus\"  # arranges the queue; unset picks a seat like chatter does\n\n\
+             # conductor = \"opus\"  # arranges the queue; unset picks a seat like chatter does\n\
+             # synthesizer = \"opus\"  # blends the advisors into one brief; unset picks a seat like chatter does\n\n\
              [graph]\n\
              candidates = 3\n\
              judges = 3\n\
@@ -1642,6 +1677,56 @@ mod tests {
     }
 
     #[test]
+    fn implementer_roster_is_the_whole_agent_list_untruncated_when_unset() {
+        // `candidates = 1` (a solo run) still resolves `implementers` down to
+        // one slot, but `implementer_roster` must carry every agent in the
+        // roster, in file order, for `graph::Runner`'s quota fallback to walk
+        // forward through once that one slot's agent runs out of quota.
+        let cfg = Config {
+            agents: vec![spec("a"), spec("b"), spec("c")],
+            graph: Graph {
+                candidates: 1,
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        let roles = cfg.resolve_roles().unwrap();
+        assert_eq!(roles.implementers.len(), 1);
+        let roster: Vec<&str> = roles
+            .implementer_roster
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(roster, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn implementer_roster_follows_explicit_ids_in_the_order_named() {
+        let cfg = Config {
+            agents: vec![spec("a"), spec("b"), spec("c")],
+            roles: Roles {
+                implementers: vec!["c".to_owned(), "a".to_owned()],
+                ..Roles::default()
+            },
+            graph: Graph {
+                candidates: 1,
+                ..Graph::default()
+            },
+            ..Config::default()
+        };
+        let roles = cfg.resolve_roles().unwrap();
+        // Unaffected by the new field: still just the first named id.
+        assert_eq!(roles.implementers.len(), 1);
+        assert_eq!(roles.implementers[0].id, "c");
+        let roster: Vec<&str> = roles
+            .implementer_roster
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(roster, ["c", "a"]);
+    }
+
+    #[test]
     fn explicit_roles_win() {
         let cfg = Config {
             agents: vec![spec("a"), spec("b")],
@@ -1687,6 +1772,37 @@ mod tests {
 
         cfg.roles.conductor = Some("missing".to_owned());
         assert!(cfg.resolve_roles().is_err());
+    }
+
+    #[test]
+    fn synthesizer_role_is_a_lazy_lookup_with_the_same_fallback_as_chatter() {
+        // Unlike `conductor`, `synthesizer` is never validated by
+        // `resolve_roles` — it is looked up lazily by
+        // `graph::Runner::synthesize_brief` the same way `[roles] chatter`
+        // is looked up by `talk::begin`, so this exercises `agent::pick`
+        // directly instead of going through `resolve_roles`.
+        let mut cfg = Config {
+            agents: vec![spec("a"), spec("b")],
+            ..Config::default()
+        };
+        let want = cfg.roles.synthesizer.as_deref();
+        assert_eq!(
+            crate::agent::pick(&cfg.agents, want, &crate::agent::installed)
+                .unwrap()
+                .id,
+            "a",
+            "unset falls back to agent::pick's own default order"
+        );
+
+        cfg.roles.synthesizer = Some("b".to_owned());
+        let want = cfg.roles.synthesizer.as_deref();
+        assert_eq!(
+            crate::agent::pick(&cfg.agents, want, &crate::agent::installed)
+                .unwrap()
+                .id,
+            "b",
+            "the named agent wins over the default order"
+        );
     }
 
     #[test]

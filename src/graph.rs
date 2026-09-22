@@ -45,12 +45,13 @@ use crate::queue;
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
     DeliberationRound, DeliberationTurn, E2eStatus, FixRecord, JobRecord, JobStatus, Judgement,
-    MergeOutcome, QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus,
-    Tally, VoteRecord, tail, write_artifact,
+    MergeOutcome, OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest, QuotaLoss,
+    ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, Tally, VoteRecord, tail,
+    write_artifact,
 };
 use crate::verdict::{
-    self, FinalVote, FixReport, Position, Proposal, Ranking, Review, ReviewRevote, ReviewVote,
-    Severity,
+    self, FinalVote, Finding, FixReport, Position, Proposal, Ranking, Review, ReviewRevote,
+    ReviewVote, Severity,
 };
 
 /// How much verification output is kept and fed back to the fixer.
@@ -306,6 +307,77 @@ async fn resolve_base(repo: &Path, base_branch: &str, remote: &str) -> Result<St
     })
 }
 
+/// Exclusive claim on one run's `magi fix` step, released on drop — including
+/// on an early return or a panic.
+///
+/// `daemon::is_working_on` only sees a heartbeat-publishing daemon; two
+/// manual `magi fix` invocations against the same run are otherwise
+/// invisible to each other and would race to remove and recreate the same
+/// worktree (see [`Runner::fix_selected`]). The lock file itself is the same
+/// `create_new` shape as `queue::Claim`, but unlike a queued task's lock —
+/// which is only ever reclaimed later, out of band, by
+/// `daemon::sweep_stale_claims` running inside `magi serve`/`magi web` — a
+/// `magi fix` invocation is not necessarily running under either of those, so
+/// nothing would ever sweep a lock a killed or crashed process left behind.
+/// [`Self::acquire`] therefore reclaims a stale lock itself, on the same
+/// conservative PID-liveness policy `sweep_stale_claims` and `cache`'s own
+/// lease use: an unreadable or unparsable pid, or a liveness query the
+/// platform cannot answer, reads as alive and the lock is left in place.
+struct FixClaim {
+    path: PathBuf,
+}
+
+impl FixClaim {
+    fn acquire(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let path = dir.join("fix.lock");
+        match Self::create(&path) {
+            Ok(claim) => Ok(claim),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if Self::reclaim_if_dead(&path) {
+                    Self::create(&path).with_context(|| format!("lock {}", path.display()))
+                } else {
+                    bail!(
+                        "another `magi fix` is already running for this run ({} exists)",
+                        path.display()
+                    )
+                }
+            }
+            Err(e) => Err(e).with_context(|| format!("lock {}", path.display())),
+        }
+    }
+
+    fn create(path: &Path) -> std::io::Result<Self> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        use std::io::Write as _;
+        // Read back by `reclaim_if_dead` on a later, stuck invocation.
+        writeln!(f, "{}", std::process::id())?;
+        Ok(Self {
+            path: path.to_owned(),
+        })
+    }
+
+    /// True if the lock named a process confirmed dead, in which case it was
+    /// also removed. Never true on an unreadable file, an unparsable pid, or
+    /// a liveness query the platform cannot answer — see this type's own doc.
+    fn reclaim_if_dead(path: &Path) -> bool {
+        let dead = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|body| body.trim().parse::<u32>().ok())
+            .is_some_and(|pid| !crate::proc::pid_alive(pid));
+        dead && std::fs::remove_file(path).is_ok()
+    }
+}
+
+impl Drop for FixClaim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 impl Runner {
     /// Start a fresh run against `repo`.
     pub async fn start(repo: &Path, instruction: String, config: Config) -> Result<Self> {
@@ -453,6 +525,7 @@ impl Runner {
             commits,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         });
@@ -574,6 +647,12 @@ impl Runner {
         if self.park_here()? {
             return Ok(());
         }
+        // `after_implement` already saved the state and settled any open
+        // questions when it set this; nothing later in the graph has
+        // anything to judge.
+        if self.state.status == RunStatus::VerifiedNoop {
+            return Ok(());
+        }
         self.judge().await?;
         if self.park_here()? {
             return Ok(());
@@ -652,13 +731,15 @@ impl Runner {
     /// `Blocked` and `Stalled` are `RunStatus::resumable` — a human can pick
     /// either back up with the candidates, the review round and the seat
     /// sessions already on disk, so a question an implementer asked mid-round
-    /// may still get a real answer read by a real resume. Only the three
-    /// statuses `resumable` excludes are actually final: the run merged, or
-    /// it reached `Ready` with nothing left to do, or it failed outright with
-    /// no established point to continue from. In every one of those the seat
-    /// that asked is gone for good, exactly like the run being deleted under
-    /// `magi run rm` - so the same cleanup applies, worded for what actually
-    /// happened instead of "the run was deleted".
+    /// may still get a real answer read by a real resume. Only the statuses
+    /// `resumable` excludes are actually final: the run merged, it reached
+    /// `Ready` with nothing left to do, it failed outright with no
+    /// established point to continue from, or every candidate agreed, with
+    /// evidence, that nothing belonged in the worktree (`VerifiedNoop`). In
+    /// every one of those the seat that asked is gone for good, exactly like
+    /// the run being deleted under `magi run rm` - so the same cleanup
+    /// applies, worded for what actually happened instead of "the run was
+    /// deleted".
     ///
     /// Best-effort and silent on success: called from every place `status`
     /// can land on one of those three, including ones a resumed run revisits,
@@ -746,6 +827,7 @@ impl Runner {
                 commits: 0,
                 empty: false,
                 failed: None,
+                verified_noop: None,
                 duration_ms: 0,
                 folded: false,
             });
@@ -1048,10 +1130,11 @@ impl Runner {
     /// anywhere else.
     ///
     /// Picked the same way [`crate::talk`]'s standing conversation and
-    /// [`crate::bump`]'s release-bump decision are: [`agent::pick`] with no
-    /// explicit id, rather than a dedicated `[roles]` entry — one more role
-    /// to configure for a seat that runs once per run and, unlike the
-    /// advisors it reads, never needs more than one.
+    /// [`crate::bump`]'s release-bump decision are: [`agent::pick`], with
+    /// `[roles] synthesizer` checked first and [`agent::pick`]'s own default
+    /// order (a claude seat, else the first runnable agent in roster order)
+    /// used when that field is unset — see `[roles] synthesizer`'s own doc
+    /// in [`crate::config`] for why a dedicated field exists here at all.
     #[allow(clippy::too_many_arguments)]
     async fn synthesize_brief(
         &mut self,
@@ -1064,7 +1147,8 @@ impl Runner {
         prompts: &Prompts,
         cache: Option<&Path>,
     ) -> Result<Option<String>> {
-        let spec = agent::pick(&self.state.config.agents, None, &agent::installed)?;
+        let want = self.state.config.roles.synthesizer.as_deref();
+        let spec = agent::pick(&self.state.config.agents, want, &agent::installed)?;
         let mut seat = self.seat("advise-synthesis", &spec.id);
         let proposals = advice.proposals();
         let mut prompt = prompt::with_overlay(
@@ -1176,8 +1260,11 @@ impl Runner {
             format!("{} candidates in parallel", jobs.len()),
         );
         // Kept so a seat whose CLI hung up can be asked again from the same
-        // job: `wave` consumes what it is given.
-        let sent = jobs.clone();
+        // job: `wave` consumes what it is given. Mutable so `resume_quota_losses`
+        // can update a seat's own entry once a fallback agent takes it over —
+        // `resume_unconfirmed_commands`, which reads `sent` afterward, must see
+        // whichever agent actually answered, not the one that quota'd out.
+        let mut sent = jobs.clone();
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
             run: &run_id,
@@ -1189,17 +1276,29 @@ impl Runner {
         let mut results = wave(jobs, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
         self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
             .await;
+        self.resume_quota_losses(&mut results, &mut sent, &prompts, &run_id)
+            .await;
         self.resume_unconfirmed_commands(&mut results, &sent, &prompts, &run_id)
             .await;
 
         for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
             let seat_key = seat.key.clone();
+            // A quota fallback (`resume_quota_losses`) may have handed this
+            // seat to a different agent than the one `prep` recorded on the
+            // candidate; the stats tables and any later fixer-defaults-to-
+            // winner's-author lookup must credit whoever actually answered —
+            // unless every fallback also quota'd out, in which case nobody
+            // actually answered and crediting the last agent tried would
+            // erase every earlier agent's own quota loss from the stats
+            // tables instead of just this one seat's.
+            let agent = seat.agent.clone();
+            let exhausted_the_fallback_chain = matches!(&out, AgentOutcome::Quota(_));
             self.state.seats.insert(seat.key.clone(), seat);
             let label = self.state.candidates[i].label;
             let worktree = self.state.candidates[i].worktree.clone();
             let base = self.state.base_commit.clone();
 
-            let (summary, duration, failed) = match out {
+            let (summary, duration, failed, verified_claim) = match out {
                 AgentOutcome::Ok(o) => {
                     let text = verdict::section(&o.text, "summary").unwrap_or(o.text.clone());
                     let failed = (!o.usable()).then(|| {
@@ -1209,7 +1308,8 @@ impl Runner {
                             format!("agent exited with {:?}", o.exit_code)
                         }
                     });
-                    (text, o.duration_ms, failed)
+                    let verified_claim = verified_noop_claim(failed.is_none(), &o.commands, &text);
+                    (text, o.duration_ms, failed, verified_claim)
                 }
                 // Left un-resumed by `resume_undelivered` (a dirty tree
                 // already rescues the work, or there was no session left to
@@ -1226,6 +1326,7 @@ impl Runner {
                         String::new(),
                         o.duration_ms,
                         Some(format!("the CLI dropped the stream ({why})")),
+                        None,
                     )
                 }
                 AgentOutcome::Quota(o) => {
@@ -1239,9 +1340,10 @@ impl Runner {
                         String::new(),
                         o.duration_ms,
                         Some("rate limited (quota); produced no change".to_owned()),
+                        None,
                     )
                 }
-                AgentOutcome::Failed(e) => (String::new(), 0, Some(e)),
+                AgentOutcome::Failed(e) => (String::new(), 0, Some(e), None),
             };
 
             // Rescue anything the agent edited but never committed: an
@@ -1268,6 +1370,9 @@ impl Runner {
             write_artifact(&self.state, &format!("cand-{label}.patch"), &patch)?;
 
             let c = &mut self.state.candidates[i];
+            if !exhausted_the_fallback_chain {
+                c.agent = agent;
+            }
             c.summary = blind::sanitize_prose(&summary, &self.state.config.blind);
             c.stat = stat;
             c.files = files;
@@ -1280,15 +1385,23 @@ impl Runner {
                 Some(_) if c.empty => failed,
                 _ => None,
             };
-            let note = match (&c.failed, c.empty, rescued) {
-                (Some(e), _, _) => format!("candidate {label}: {e}"),
-                (None, true, _) => format!("candidate {label}: no change produced"),
-                (None, false, true) => {
+            // Only an empty candidate can be a verified no-op: a claim next
+            // to a real patch is not what the marker is for, and `c.failed`
+            // being `Some` here already implies `verified_claim` was never
+            // set (see the guard above the match that produced it).
+            c.verified_noop = if c.empty { verified_claim } else { None };
+            let note = match (&c.failed, c.empty, &c.verified_noop, rescued) {
+                (Some(e), _, _, _) => format!("candidate {label}: {e}"),
+                (None, true, Some(_), _) => {
+                    format!("candidate {label}: no change produced (agent-verified no-op)")
+                }
+                (None, true, None, _) => format!("candidate {label}: no change produced"),
+                (None, false, _, true) => {
                     format!(
                         "candidate {label}: {files} files, {commits} commits (rescued an uncommitted tree)"
                     )
                 }
-                (None, false, false) => {
+                (None, false, _, false) => {
                     format!("candidate {label}: {files} files, {commits} commits")
                 }
             };
@@ -1396,6 +1509,166 @@ impl Runner {
                 run_one(retry, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
             *seat = resumed_seat;
             *out = resumed;
+        }
+    }
+
+    /// Fall an implement seat through to the next untried agent in the
+    /// implementer roster when it lost to quota, instead of leaving the
+    /// seat's loss final the moment one agent's account runs dry.
+    ///
+    /// Solo runs (`graph.candidates = 1`, `daemon::apply_solo`'s forced shape)
+    /// are the motivating case: `Config::resolve_roles`'s `implementers`
+    /// truncates to the single slot rotation picked, so a solo task whose one
+    /// implementer hits quota mid-run used to have nothing else to try. This
+    /// walks [`ResolvedRoles::implementer_roster`] instead — the untruncated,
+    /// unrotated roster — which is the only place the *other* candidates in
+    /// the machine's roster still exist once `implementers` has been cut down
+    /// to size.
+    ///
+    /// Walks forward from just past the seat's own original position in the
+    /// roster, never wrapping back to the front: a later candidate slot (say
+    /// `beta`, the roster's second entry) must fall through to the *next*
+    /// entry (`gamma`) on its own quota loss, not back to `alpha`, which is
+    /// almost certainly a different candidate's own agent already — and once
+    /// the roster's tail is exhausted there is nothing left to fall through
+    /// to for *this* seat, wrapping or not. Tried by `spec.id`, never the
+    /// whole [`AgentSpec`]: a roster with the same id named twice must not
+    /// let this retry that id forever. The loop keeps falling through until
+    /// an attempt lands something other than `Quota` or the roster's tail
+    /// runs out of untried ids, at which point the seat is left exactly as
+    /// `implement`'s own `AgentOutcome::Quota` arm already handles it: one
+    /// `QuotaLoss` recorded, the candidate failed/empty.
+    ///
+    /// `sent` is taken mutably and updated with the fallback agent's spec:
+    /// `resume_unconfirmed_commands`, which runs after this and also reads
+    /// `sent`, must see whichever agent actually ended up answering the seat
+    /// — reading the stale, original spec there would check session
+    /// eligibility against the wrong CLI and could hand a fallback agent's
+    /// session id to the agent that just lost the seat to quota.
+    ///
+    /// Every fallback gets a fresh [`SeatState`], never the quota'd seat's own
+    /// — `self.seat` only reuses state when the agent id is unchanged, so
+    /// handing it a different id already gets this for free. Reusing the old
+    /// seat would resume a different CLI's session as if it were a
+    /// continuation of this one.
+    ///
+    /// Unlike [`Runner::resume_undelivered`], not gated on a clean worktree:
+    /// a quota loss cuts an agent off mid-turn, so anything already in the
+    /// tree is unfinished work, not a completed candidate a re-ask would pay
+    /// for twice. A dirty tree is rescued into a commit first (the same
+    /// neutral-identity rescue `implement`'s own outcome loop gives every
+    /// candidate) so the next agent starts clean.
+    ///
+    /// The new agent gets the implementer's full prompt and full
+    /// `timeout_implement` budget, not `resume_after_drop`'s nudge-sized one:
+    /// it has no session and no context, and is implementing the task from
+    /// nothing, unlike a resumed drop which is only restating work already
+    /// done.
+    ///
+    /// Every intermediate `Quota` this loop absorbs is folded into a plain
+    /// `implement` event, never into `self.state.quota` — that is what
+    /// `daemon.rs`'s own backoff reads to decide a run's task attempt should
+    /// go unspent, and a seat that ultimately recovered on its second or
+    /// third agent is not the stalled panel that check exists to catch. Only
+    /// the final, unrecovered `Quota` (once the roster runs out) ever reaches
+    /// `self.state.quota`, via the ordinary `AgentOutcome::Quota` arm the
+    /// outcome loop already has — this helper never pushes to it itself.
+    async fn resume_quota_losses(
+        &mut self,
+        results: &mut [(usize, SeatState, AgentOutcome)],
+        sent: &mut [SeatJob],
+        prompts: &Prompts,
+        run_id: &str,
+    ) {
+        let instruction = self.state.instruction.clone();
+        let language = self.state.config.graph.language.clone();
+        let brief = self
+            .state
+            .advice
+            .as_ref()
+            .and_then(|a| a.synthesis.as_deref())
+            .map(str::to_owned);
+        for (wi, seat, out) in results.iter_mut() {
+            let Some(job) = sent.get_mut(*wi) else {
+                continue;
+            };
+            // Where the seat's own original agent sits in the roster — the
+            // fallback walk starts just past here, never at the front, so a
+            // later candidate slot's quota loss does not fall back onto an
+            // earlier slot's own agent.
+            let start = self
+                .roles
+                .implementer_roster
+                .iter()
+                .position(|s| s.id == job.spec.id)
+                .unwrap_or(0);
+            let mut tried: BTreeSet<String> = BTreeSet::from([job.spec.id.clone()]);
+            let mut fallback_attempt = 0usize;
+            while matches!(&*out, AgentOutcome::Quota(_)) {
+                let Some(next) =
+                    next_untried_implementer(&self.roles.implementer_roster, start, &tried)
+                        .cloned()
+                else {
+                    break;
+                };
+                tried.insert(next.id.clone());
+                fallback_attempt += 1;
+
+                git::commit_all(
+                    &job.cwd,
+                    &format!(
+                        "magi: candidate {} (uncommitted work before quota fallback)",
+                        seat.key
+                    ),
+                )
+                .await
+                .ok();
+
+                self.state.event(
+                    "implement",
+                    format!(
+                        "{}: rate limited (quota) on {}; retrying with {}",
+                        seat.key, seat.agent, next.id
+                    ),
+                );
+
+                let new_seat = self.seat(&seat.key, &next.id);
+                // Kept in sync on `sent` itself, not just the local retry: a
+                // later helper (`resume_unconfirmed_commands`) reads `sent`
+                // after this one returns and must see whichever agent is now
+                // occupying the seat, not the one that just quota'd out —
+                // otherwise it would judge session/continuation eligibility
+                // by the wrong CLI and could resend a fallback's session id
+                // to the agent that lost it the seat in the first place.
+                job.spec = next.clone();
+                let mut retry = job.clone();
+                retry.seat = new_seat;
+                retry.prompt = prompt::implement(
+                    &instruction,
+                    &job.cwd.to_string_lossy(),
+                    &language,
+                    brief.as_deref(),
+                );
+                retry.stem = format!("{}-quota-{}", job.stem, next.id);
+                let cache = self.state.config.cache_dir();
+                let ctx = WaveCtx {
+                    run: run_id,
+                    node: "implement",
+                    prompts,
+                    cache: cache.as_deref(),
+                    round: None,
+                };
+                let (fallback_seat, fallback_out) = run_one(
+                    retry,
+                    Arc::clone(&self.sem),
+                    &ctx,
+                    &mut self.state,
+                    fallback_attempt,
+                )
+                .await;
+                *seat = fallback_seat;
+                *out = fallback_out;
+            }
         }
     }
 
@@ -1718,6 +1991,22 @@ impl Runner {
         }
 
         if self.state.viable().is_empty() {
+            if self.state.all_candidates_verified_noop() {
+                // Every candidate agreed, with evidence the adoption guard
+                // accepted, that nothing belongs in this worktree. That is
+                // not the same fact as a candidate that simply failed to
+                // write anything, and settling it as an ordinary `Failed`
+                // (see `SCHEMA`'s doc for schema 10) is what let two of
+                // task 391f's attempts burn a retry each re-discovering the
+                // same already-landed fix. Terminal either way, so `judge`
+                // must never run over an empty candidate set — unlike the
+                // `Failed` branch below this returns `Ok`, not an error:
+                // nothing here failed.
+                self.state.status = RunStatus::VerifiedNoop;
+                self.state.save()?;
+                self.settle_questions();
+                return Ok(());
+            }
             self.state.status = RunStatus::Failed;
             self.state.save()?;
             self.settle_questions();
@@ -2799,6 +3088,466 @@ impl Runner {
             .base_sync
             .as_ref()
             .map_or_else(|| self.state.base_commit.clone(), |s| s.tip.clone())
+    }
+
+    // ------------------------------------------------------- operator fix
+
+    /// Route specific, already-recorded review findings to a fixer for a
+    /// targeted, out-of-band fix on the winning branch — `magi fix`'s own
+    /// entry point.
+    ///
+    /// Distinct from `review_loop`'s own fix step in three ways: it never
+    /// runs a reviewer wave, it never spends review-round budget, and what
+    /// happened is recorded as an [`OperatorFixRequest`] appended to
+    /// [`RunState::operator_fixes`], never folded into a [`ReviewRound`] —
+    /// see `run::SCHEMA`'s doc for schema 9 on why a reviewer's own severity
+    /// and vote must never be rewritten to look like a manufactured blocking
+    /// verdict.
+    ///
+    /// Only meaningful once review has actually concluded: `Ready` (handed
+    /// off with findings still open, or simply concluded clean while minor
+    /// findings sat unaddressed) or `Blocked` (round budget spent, or the
+    /// gate failed). Everything else is refused: a run still in progress
+    /// should simply be resumed, and a `Merged` run's branch has already
+    /// landed — reopening *this* run's own record cannot change that, so the
+    /// answer there is a fresh `magi review <branch>`.
+    ///
+    /// A real commit here re-verifies through a fresh, ordinary review-only
+    /// run on the same branch ([`Self::review`]) rather than reopening this
+    /// run's own `review_loop`: once any round in this run's history went
+    /// clean, `review_conclusion` treats that as permanent by design (the
+    /// same purity `gate`/`merge` rely on for safe reentry), so there is no
+    /// way to force one more genuine reviewer wave out of *this* run without
+    /// either rewriting history or weakening that guarantee for every other
+    /// caller. A review-only run costs nothing extra — no implementation, no
+    /// judging, no vote — and exercises the exact same review → verify →
+    /// gate → (human) merge path, unmodified.
+    pub async fn fix_selected(
+        &mut self,
+        ids: &[String],
+        reason: &str,
+        allow_stale: bool,
+    ) -> Result<()> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            bail!("a fix request needs a reason — that is the operator's own record of why");
+        }
+        if ids.is_empty() {
+            bail!("no finding id given");
+        }
+        if !matches!(self.state.status, RunStatus::Ready | RunStatus::Blocked) {
+            bail!(
+                "run {} is `{}`; only a `ready` or `blocked` run — one whose review \
+                 has already concluded — can be given a targeted fix. A run still \
+                 in progress should simply be resumed; a `merged` run's branch has \
+                 already landed, so its answer is a fresh `magi review <branch>`, \
+                 not reopening this run's own record",
+                self.state.id,
+                self.state.status.as_str()
+            );
+        }
+        let Some(winner) = self.state.winner().cloned() else {
+            bail!("run {} has no winning candidate to fix", self.state.id);
+        };
+        if !git::branch_exists(&self.state.repo, &winner.branch).await? {
+            bail!(
+                "branch `{}` no longer exists; this run cannot be extended",
+                winner.branch
+            );
+        }
+        let home = crate::run::home();
+        if crate::daemon::is_working_on(&home, &self.state.id, Timestamp::now()) {
+            bail!(
+                "run {} is currently being worked on by another magi process",
+                self.state.id
+            );
+        }
+        // Held for the rest of this call, including the follow-up review
+        // below: two `magi fix` invocations against the same run must not
+        // both reach the worktree manipulation further down, which would
+        // otherwise race to remove and recreate the same directory — see
+        // [`FixClaim`]'s own doc.
+        let _claim = FixClaim::acquire(&self.state.dir())?;
+
+        // Resolve every id before spending anything — an unknown id refuses
+        // the whole request rather than silently dropping it — and dedup
+        // while keeping the operator's own order.
+        let mut seen = BTreeSet::new();
+        let mut findings = Vec::new();
+        let mut missing = Vec::new();
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            match self.state.finding(id) {
+                Some((round, rec, f)) => findings.push(OperatorFixFinding {
+                    id: f.id.clone(),
+                    severity: f.severity,
+                    reviewer_vote: rec.vote,
+                    round: round.round,
+                    round_head: round.head.clone(),
+                    reviewer: rec.reviewer,
+                    agent: rec.agent.clone(),
+                    file: f.file.clone(),
+                    line: f.line,
+                    title: f.title.clone(),
+                    detail: f.detail.clone(),
+                    outcome: OperatorFixOutcome::Pending,
+                }),
+                None => missing.push(id.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            bail!(
+                "unknown finding id(s): {}; nothing was changed",
+                missing.join(", ")
+            );
+        }
+
+        let head_at_request = git::rev_parse(&self.state.repo, &winner.branch).await?;
+        let stale_details: Vec<(String, String)> = findings
+            .iter()
+            .filter(|f| f.round_head != head_at_request)
+            .map(|f| (f.id.clone(), f.round_head.clone()))
+            .collect();
+        let stale = !stale_details.is_empty();
+        if stale && !allow_stale {
+            bail!(
+                "the branch has moved since some finding(s) were raised — {} — now \
+                 at {}; pass --allow-stale to fix anyway, or re-run review first",
+                stale_details
+                    .iter()
+                    .map(|(id, head)| format!("{id} (raised against {})", short(head)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                short(&head_at_request)
+            );
+        }
+
+        let request = OperatorFixRequest {
+            requested_at: Timestamp::now(),
+            reason: reason.to_owned(),
+            findings,
+            head_at_request: head_at_request.clone(),
+            allow_stale,
+            stale,
+            fix: None,
+            result_head: None,
+            follow_up_review_run: None,
+        };
+        self.state.event(
+            "fix",
+            format!(
+                "operator requested a targeted fix on {} finding(s) ({}): {reason}",
+                request.findings.len(),
+                request
+                    .findings
+                    .iter()
+                    .map(|f| f.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        );
+        // Recorded now, before any worktree work or the fixer call itself —
+        // and re-saved at each checkpoint below: a crash at any point after
+        // this (mid fixer call, mid follow-up review) must not lose the fact
+        // that this was requested, for which findings, and why. Everything
+        // past this point reads and writes through `request_index` rather
+        // than a local variable, since `request` itself is moved here.
+        self.state.operator_fixes.push(request);
+        self.state.save()?;
+        let request_index = self.state.operator_fixes.len() - 1;
+
+        // A fresh, dedicated worktree for this one call, never the winner's
+        // own worktree in place: that one may already be gone (folded away),
+        // and reusing it in place would leave the branch checked out there
+        // when the follow-up review below tries to check it out again. Freed
+        // immediately after, either way — but only once confirmed clean:
+        // `worktree_remove` is a `git worktree remove --force`, which would
+        // otherwise discard uncommitted work left there by the operator or
+        // another process before this had a chance to even look at it.
+        if winner.worktree.exists() {
+            if !git::is_clean(&winner.worktree).await? {
+                bail!(
+                    "`{}` has uncommitted changes; refusing to touch it — commit or \
+                     discard them first",
+                    winner.worktree.display()
+                );
+            }
+            git::worktree_remove(&self.state.repo, &winner.worktree)
+                .await
+                .ok();
+        }
+        let fix_worktree = self.state.worktree_root().join("operator-fix");
+        let fix_worktree_s = fix_worktree.to_string_lossy().to_string();
+        git::git(
+            &self.state.repo,
+            &["worktree", "add", &fix_worktree_s, winner.branch.as_str()],
+        )
+        .await
+        .with_context(|| format!("checking out `{}` for the fix", winner.branch))?;
+        if !git::is_clean(&fix_worktree).await? {
+            git::worktree_remove(&self.state.repo, &fix_worktree)
+                .await
+                .ok();
+            bail!(
+                "`{}` has uncommitted changes; refusing to start a fix on a dirty tree",
+                winner.branch
+            );
+        }
+
+        let run_id = self.state.id.clone();
+        let prompts = self.state.config.prompts.clone();
+        let language = self.state.config.graph.language.clone();
+        let sessions = self.state.config.graph.sessions;
+        let artifacts = agent::artifacts_dir(&self.state.dir());
+        let (fix_spec, fix_seat_key) = match &self.roles.fixer {
+            Some(f) if f.id != winner.agent => (f.clone(), "fix".to_owned()),
+            _ => (
+                self.state
+                    .config
+                    .agent(&winner.agent)
+                    .cloned()
+                    .unwrap_or_else(|_| self.roles.implementers[winner.index].clone()),
+                format!("impl-{}", winner.label),
+            ),
+        };
+        let seat = self.seat(&fix_seat_key, &fix_spec.id);
+        let finding_list: Vec<Finding> = self.state.operator_fixes[request_index]
+            .findings
+            .iter()
+            .map(|f| Finding {
+                id: f.id.clone(),
+                severity: f.severity,
+                file: f.file.clone(),
+                line: f.line,
+                title: f.title.clone(),
+                detail: f.detail.clone(),
+            })
+            .collect();
+        let job = SeatJob {
+            prompt: prompt::operator_fix(
+                &self.state.instruction,
+                &finding_list,
+                reason,
+                &stale_details,
+                &head_at_request,
+                &language,
+            ),
+            spec: fix_spec.clone(),
+            seat,
+            cwd: fix_worktree.clone(),
+            timeout: Duration::from_secs(self.state.config.graph.timeout_fix),
+            allow_write: true,
+            sessions,
+            artifacts: artifacts.clone(),
+            stem: "operator-fix".to_owned(),
+        };
+        let cache = self.state.config.cache_dir();
+        let ctx = WaveCtx {
+            run: &run_id,
+            node: "fix",
+            prompts: &prompts,
+            cache: cache.as_deref(),
+            round: None,
+        };
+        let (seat, out) =
+            run_one(job.clone(), Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
+        let agent_id = seat.agent.clone();
+
+        let mut fix = FixRecord {
+            agent: agent_id,
+            addressed: Vec::new(),
+            rejected: Vec::new(),
+            notes: String::new(),
+            committed: false,
+            failed: None,
+            duration_ms: 0,
+            continuation: None,
+        };
+        let mut final_seat = seat.clone();
+        match out {
+            AgentOutcome::Ok(o) => {
+                fix.duration_ms = o.duration_ms;
+                let parsed = verdict::extract_json::<FixReport>(&o.text);
+                let incomplete_reason = match &parsed {
+                    Ok(_) if has_unconfirmed_command(&o.commands) => Some(
+                        "the reply parsed, but it reported a command whose own CLI \
+                         never confirmed an exit status"
+                            .to_owned(),
+                    ),
+                    Ok(_) => None,
+                    Err(e) => Some(e.to_string()),
+                };
+                match incomplete_reason {
+                    None => {
+                        let report = parsed.expect("checked Ok above");
+                        fix.addressed = report.addressed;
+                        fix.rejected = report.rejected;
+                        fix.notes = blind::sanitize_prose(&report.notes, &self.state.config.blind);
+                    }
+                    Some(reason) => {
+                        let (resumed_seat, resolved, failure, cont) = self
+                            .continue_fix_report(seat, reason, &job, &prompts, &run_id, 0)
+                            .await;
+                        fix.duration_ms += cont.cumulative_wait_ms;
+                        fix.continuation = Some(cont);
+                        final_seat = resumed_seat;
+                        match resolved {
+                            Some(report) => {
+                                fix.addressed = report.addressed;
+                                fix.rejected = report.rejected;
+                                fix.notes =
+                                    blind::sanitize_prose(&report.notes, &self.state.config.blind);
+                            }
+                            None => fix.failed = failure,
+                        }
+                    }
+                }
+            }
+            AgentOutcome::Dropped(o) => {
+                fix.duration_ms = o.duration_ms;
+                let why = o
+                    .dropped
+                    .as_ref()
+                    .map(|d| d.why.as_str())
+                    .unwrap_or("the CLI ended the stream without delivering its answer");
+                fix.failed = Some(format!("the CLI dropped the stream ({why})"));
+            }
+            AgentOutcome::Quota(o) => {
+                self.state.quota.push(QuotaLoss {
+                    seat: final_seat.key.clone(),
+                    node: "fix".to_owned(),
+                    at: Timestamp::now(),
+                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
+                });
+                fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
+            }
+            AgentOutcome::Failed(e) => fix.failed = Some(e),
+        }
+        if fix.continuation.is_none() {
+            fix.continuation = Some(ContinuationRecord::not_needed());
+        }
+        self.state.seats.insert(final_seat.key.clone(), final_seat);
+
+        git::commit_all(
+            &fix_worktree,
+            &format!(
+                "magi: operator-selected fix ({}) (uncommitted work)",
+                self.state.operator_fixes[request_index]
+                    .findings
+                    .iter()
+                    .map(|f| f.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+        .await
+        .ok();
+        let after = git::rev_parse(&fix_worktree, "HEAD").await?;
+        fix.committed = after != head_at_request;
+        git::worktree_remove(&self.state.repo, &fix_worktree)
+            .await
+            .ok();
+
+        self.state.event(
+            "fix",
+            match &fix.failed {
+                Some(reason) => format!(
+                    "operator fix: adoption report was lost ({reason}); {}",
+                    if fix.committed {
+                        "committed"
+                    } else {
+                        "NO new commit"
+                    }
+                ),
+                None => format!(
+                    "operator fix: {} addressed, {} rejected, {}",
+                    fix.addressed.len(),
+                    fix.rejected.len(),
+                    if fix.committed {
+                        "committed"
+                    } else {
+                        "NO new commit"
+                    }
+                ),
+            },
+        );
+
+        // Every selected finding gets an outcome — never left `Pending` once
+        // the fixer's own turn is over. A report that never came back at all
+        // marks every one of them `Unreported`, not silently "not addressed":
+        // quota, a dropped stream, or an exhausted continuation are gaps in
+        // the report, not evidence about the finding itself (see [`SCHEMA`]'s
+        // doc for schema 9 and [`OperatorFixOutcome::Unreported`]).
+        for f in &mut self.state.operator_fixes[request_index].findings {
+            f.outcome = if fix.failed.is_some() {
+                OperatorFixOutcome::Unreported
+            } else if fix.addressed.contains(&f.id) {
+                OperatorFixOutcome::Addressed
+            } else if let Some(r) = fix.rejected.iter().find(|r| r.id == f.id) {
+                OperatorFixOutcome::Rejected { why: r.why.clone() }
+            } else {
+                OperatorFixOutcome::Unreported
+            };
+        }
+
+        let committed = fix.committed;
+        if committed {
+            self.state.operator_fixes[request_index].result_head = Some(after.clone());
+        }
+        self.state.operator_fixes[request_index].fix = Some(fix);
+        // Saved again now that the fixer's own outcome is final, on top of
+        // the save right after the request was first pushed above.
+        self.state.save()?;
+
+        if committed {
+            self.state.event(
+                "fix",
+                format!(
+                    "operator fix committed {}; opening a follow-up review-only run",
+                    short(&after)
+                ),
+            );
+            match Self::review(&self.state.repo, &winner.branch, self.state.config.clone()).await {
+                Ok(mut follow_up) => {
+                    follow_up.state.event(
+                        "start",
+                        format!(
+                            "requested by an operator fix on run {} for finding(s) {}",
+                            self.state.id,
+                            self.state.operator_fixes[request_index]
+                                .findings
+                                .iter()
+                                .map(|f| f.id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ),
+                    );
+                    follow_up.state.save()?;
+                    let follow_up_id = follow_up.state.id.clone();
+                    if let Err(e) = follow_up.execute().await {
+                        self.state.event(
+                            "fix",
+                            format!(
+                                "follow-up review {follow_up_id} did not complete cleanly: {e:#}"
+                            ),
+                        );
+                    }
+                    self.state.operator_fixes[request_index].follow_up_review_run =
+                        Some(follow_up_id);
+                }
+                Err(e) => {
+                    self.state.event(
+                        "fix",
+                        format!("committed the fix but could not open a follow-up review: {e:#}"),
+                    );
+                }
+            }
+            self.state.save()?;
+        }
+
+        Ok(())
     }
 
     // --------------------------------------------------------------- review
@@ -4255,6 +5004,37 @@ fn has_context(spec: &AgentSpec, seat: &SeatState, sessions: bool) -> bool {
     agent::has_session(spec.kind, seat, sessions)
 }
 
+/// The next entry in `roster` after `start`, never wrapping back to the
+/// front, whose id is not in `tried` yet.
+///
+/// Starts one past `start` rather than at the front of `roster`: `start` is
+/// the seat's own original position, and a seat whose candidate slot already
+/// sits on the roster's second entry must fall through to the third next, not
+/// restart at the first — which is very likely a different candidate's own
+/// agent already. Never wraps back past `start`, for the same reason: an
+/// entry earlier in the roster than the seat's own position is almost
+/// certainly some *other* candidate slot's own agent, and once the tail of
+/// the roster is exhausted there are no more untried agents for *this* seat
+/// to fall through to — the caller's fallback chain ends there, exactly as
+/// "no further untried agents remain in the list for that seat" asks for.
+///
+/// Matched by [`AgentSpec::id`], never the whole spec: a roster that names
+/// the same id twice (an operator's `roles.implementers` typo, or a
+/// `[[agents]]` list reused across roles) must not let
+/// [`Runner::resume_quota_losses`] retry that id forever — one forward pass
+/// over `roster` either finds an untried id or runs out, so this always
+/// terminates regardless of duplicates.
+fn next_untried_implementer<'a>(
+    roster: &'a [AgentSpec],
+    start: usize,
+    tried: &BTreeSet<String>,
+) -> Option<&'a AgentSpec> {
+    roster
+        .get(start + 1..)?
+        .iter()
+        .find(|s| !tried.contains(&s.id))
+}
+
 /// Did this reply report running a command whose own CLI never confirmed an
 /// exit status?
 ///
@@ -4270,6 +5050,28 @@ fn has_context(spec: &AgentSpec, seat: &SeatState, sessions: bool) -> bool {
 /// at all, and so leaves no evidence here to find).
 fn has_unconfirmed_command(commands: &[agent::CommandEvidence]) -> bool {
     commands.iter().any(|c| c.exit_code.is_none())
+}
+
+/// Whether a `NO CHANGE NEEDED` marker in an implementer's reply should be
+/// trusted as a verified no-op — the adoption guard's own text-level half.
+///
+/// `usable` is the caller's `AgentOutput::usable()` (a clean CLI exit, not
+/// timed out): a marker only earns the benefit of the doubt from a turn the
+/// CLI itself vouches for finishing properly, the same house style
+/// `resume_unconfirmed_commands` and `continue_fix_report` already hold a
+/// *fix* report to for `commands`. A candidate that timed out, exited
+/// non-zero, or left a command unconfirmed is read as the ordinary loss it
+/// is, whatever prose it wrote — this returns `None` before it ever looks at
+/// `text`. The remaining guards (the tree really is empty, the evidence is
+/// non-empty) are the caller's: this only reads what the reply *claimed*.
+fn verified_noop_claim(
+    usable: bool,
+    commands: &[agent::CommandEvidence],
+    text: &str,
+) -> Option<String> {
+    (usable && !has_unconfirmed_command(commands))
+        .then(|| verdict::verified_noop(text))
+        .flatten()
 }
 
 fn short(commit: &str) -> String {
@@ -5281,7 +6083,14 @@ async fn gh_pr_create(cwd: &Path, base: &str, head: &str, body: &str) -> Result<
 }
 
 /// Tear a run's worktrees and branches down.
-pub async fn fold_run(state: &mut RunState, drop_winner: bool) -> Result<Vec<String>> {
+///
+/// `home` is where the updated `run.json` is saved (via
+/// [`RunState::save_under`]), never the process-global [`crate::run::home`]:
+/// a housekeeping pass already has its own honest `home` handed to it, and
+/// falling through to the global here would write back through whichever
+/// directory some other process or test pinned into that `OnceLock` first,
+/// not the one the caller actually resolved its `runs` and `state` from.
+pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> Result<Vec<String>> {
     let repo = state.repo.clone();
     let root = state.worktree_root();
     let winner = state.tally.as_ref().map(|t| t.winner);
@@ -5335,7 +6144,7 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool) -> Result<Vec<Str
         git::release_worktree_config(&repo).await.ok();
         state.enabled_worktree_config = false;
     }
-    state.save()?;
+    state.save_under(home)?;
     Ok(removed)
 }
 
@@ -5384,6 +6193,69 @@ mod tests {
             env: BTreeMap::new(),
             prompt_delivery: None,
         }
+    }
+
+    fn spec(id: &str) -> AgentSpec {
+        AgentSpec {
+            id: id.to_owned(),
+            kind: crate::config::AgentKind::Command,
+            model: None,
+            command: vec!["true".to_owned()],
+            extra_args: Vec::new(),
+            env: BTreeMap::new(),
+            prompt_delivery: None,
+        }
+    }
+
+    // `next_untried_implementer` is the property `resume_quota_losses`'s own
+    // fallback loop depends on to terminate: it must walk forward from the
+    // seat's own position, never restart at the front of the roster, and it
+    // must never hand back an id already tried, however many times that id
+    // happens to appear.
+
+    #[test]
+    fn next_untried_implementer_walks_forward_from_the_seats_own_position() {
+        let roster = vec![spec("alpha"), spec("beta"), spec("gamma")];
+        let tried = BTreeSet::from(["beta".to_owned()]);
+        // beta sits at index 1; the next candidate is gamma, never alpha —
+        // which is very likely a different candidate slot's own agent.
+        let next = next_untried_implementer(&roster, 1, &tried);
+        assert_eq!(next.map(|s| s.id.as_str()), Some("gamma"));
+    }
+
+    #[test]
+    fn next_untried_implementer_does_not_wrap_back_past_its_own_start() {
+        let roster = vec![spec("alpha"), spec("beta")];
+        let tried = BTreeSet::from(["beta".to_owned()]);
+        // beta is the roster's last entry: nothing follows it, and alpha —
+        // earlier in the roster, almost certainly a different candidate
+        // slot's own agent — must not be reached by wrapping back to it.
+        assert!(next_untried_implementer(&roster, 1, &tried).is_none());
+    }
+
+    #[test]
+    fn next_untried_implementer_stops_once_the_tail_is_exhausted_even_if_earlier_ids_are_untried() {
+        let roster = vec![spec("alpha"), spec("beta"), spec("gamma")];
+        let tried = BTreeSet::from(["beta".to_owned(), "gamma".to_owned()]);
+        // beta (index 1) and gamma (index 2, the only entry after it) have
+        // both been tried; alpha (index 0) never has, but it comes before
+        // beta's own position, so there is nothing further for this seat.
+        assert!(next_untried_implementer(&roster, 1, &tried).is_none());
+    }
+
+    #[test]
+    fn next_untried_implementer_skips_ids_already_tried_even_when_duplicated() {
+        let roster = vec![spec("a"), spec("a"), spec("b")];
+        let tried = BTreeSet::from(["a".to_owned()]);
+        let next = next_untried_implementer(&roster, 0, &tried);
+        assert_eq!(next.map(|s| s.id.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn next_untried_implementer_returns_none_once_every_id_is_tried() {
+        let roster = vec![spec("a"), spec("b")];
+        let tried = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
+        assert!(next_untried_implementer(&roster, 0, &tried).is_none());
     }
 
     #[test]
@@ -5806,6 +6678,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -5942,6 +6815,7 @@ mod tests {
             commits: 1,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 1234,
             folded: false,
         }];
@@ -6122,6 +6996,7 @@ mod tests {
                 commits: 0,
                 empty: false,
                 failed: None,
+                verified_noop: None,
                 duration_ms: 0,
                 folded: false,
             },
@@ -6137,6 +7012,7 @@ mod tests {
                 commits: 0,
                 empty: false,
                 failed: None,
+                verified_noop: None,
                 duration_ms: 0,
                 folded: false,
             },
@@ -6159,7 +7035,9 @@ mod tests {
         });
         state.status = RunStatus::Ready;
 
-        fold_run(&mut state, false).await.expect("fold_run");
+        fold_run(&mut state, false, &crate::run::home())
+            .await
+            .expect("fold_run");
 
         assert!(wt_a.exists(), "the unmerged winner's worktree survives");
         assert!(
@@ -6216,6 +7094,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -6282,6 +7161,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -6339,6 +7219,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -6391,6 +7272,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -6441,6 +7323,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -6489,6 +7372,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -6574,6 +7458,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -6622,6 +7507,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -6713,6 +7599,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -6764,6 +7651,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -6896,6 +7784,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -6957,6 +7846,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -7027,6 +7917,7 @@ mod tests {
             commits: 0,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         }];
@@ -7099,6 +7990,7 @@ mod tests {
                 reviewers: Vec::new(),
                 fixer: None,
                 conductor: conductor(),
+                implementer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -7445,5 +8337,119 @@ mod tests {
             evidence(Some(0)),
             evidence(None)
         ]));
+    }
+
+    #[test]
+    fn a_clean_usable_reply_with_the_marker_is_a_verified_claim() {
+        let text = "NO CHANGE NEEDED: already fixed by b32cfc4, on main.";
+        assert_eq!(
+            verified_noop_claim(true, &[], text).as_deref(),
+            Some("already fixed by b32cfc4, on main.")
+        );
+    }
+
+    #[test]
+    fn an_unusable_reply_never_earns_the_benefit_of_the_doubt() {
+        // A timeout or a bad exit code reads as the ordinary loss it is,
+        // whatever the reply's own prose claims.
+        let text = "NO CHANGE NEEDED: already fixed by b32cfc4, on main.";
+        assert!(verified_noop_claim(false, &[], text).is_none());
+    }
+
+    #[test]
+    fn an_unconfirmed_command_disqualifies_the_claim_even_on_a_usable_reply() {
+        let text = "NO CHANGE NEEDED: already fixed by b32cfc4, on main.";
+        assert!(verified_noop_claim(true, &[evidence(None)], text).is_none());
+        // A confirmed command alongside the marker is fine.
+        assert!(verified_noop_claim(true, &[evidence(Some(0))], text).is_some());
+    }
+
+    #[test]
+    fn an_ordinary_reply_with_no_marker_is_never_a_claim() {
+        assert!(verified_noop_claim(true, &[], "- did the thing\n- tested it").is_none());
+    }
+
+    /// Sets `runner.state.candidates` to one candidate per `(empty, verified)`
+    /// pair, in order, labelled A, B, C, ...
+    fn set_candidates(runner: &mut Runner, shape: &[(bool, Option<&str>)]) {
+        runner.state.candidates = shape
+            .iter()
+            .enumerate()
+            .map(|(i, &(empty, verified))| Candidate {
+                index: i,
+                label: (b'A' + i as u8) as char,
+                agent: "sonnet".to_owned(),
+                branch: format!("magi/x/{}", (b'A' + i as u8) as char),
+                worktree: PathBuf::from(format!("/wt/{i}")),
+                summary: String::new(),
+                stat: String::new(),
+                files: 0,
+                commits: 0,
+                empty,
+                failed: None,
+                verified_noop: verified.map(str::to_owned),
+                duration_ms: 0,
+                folded: false,
+            })
+            .collect();
+    }
+
+    #[test]
+    fn after_implement_reads_all_candidates_verified_as_a_noop_not_a_failure() {
+        ask_test_home();
+        let mut runner = runner_at(RunStatus::Implementing);
+        set_candidates(
+            &mut runner,
+            &[
+                (true, Some("already on main at b32cfc4")),
+                (true, Some("same fix, see the existing test")),
+            ],
+        );
+
+        runner
+            .after_implement()
+            .expect("a verified no-op is not an error");
+
+        assert_eq!(runner.state.status, RunStatus::VerifiedNoop);
+    }
+
+    #[test]
+    fn after_implement_does_not_accept_one_candidates_claim_next_to_an_ordinary_loss() {
+        ask_test_home();
+        let mut runner = runner_at(RunStatus::Implementing);
+        // Candidate A declares a verified no-op; candidate B simply wrote
+        // nothing and said nothing about why. One candidate's claim is not
+        // the whole run's agreement.
+        set_candidates(
+            &mut runner,
+            &[(true, Some("already on main at b32cfc4")), (true, None)],
+        );
+
+        let err = runner
+            .after_implement()
+            .expect_err("an unverified empty candidate must still fail the run");
+
+        assert!(
+            err.to_string().contains("no candidate produced a change"),
+            "{err}"
+        );
+        assert_eq!(runner.state.status, RunStatus::Failed);
+    }
+
+    #[test]
+    fn after_implement_still_fails_an_ordinary_all_empty_run() {
+        ask_test_home();
+        let mut runner = runner_at(RunStatus::Implementing);
+        set_candidates(&mut runner, &[(true, None), (true, None)]);
+
+        let err = runner
+            .after_implement()
+            .expect_err("no candidate declared anything; this is an ordinary failure");
+
+        assert!(
+            err.to_string().contains("no candidate produced a change"),
+            "{err}"
+        );
+        assert_eq!(runner.state.status, RunStatus::Failed);
     }
 }

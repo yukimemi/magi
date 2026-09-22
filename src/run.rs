@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::SeatState;
 use crate::blind::Leak;
 use crate::config::{Config, MergeMode};
-use crate::verdict::{Finding, Rejection, ReviewVote};
+use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 
 /// On-disk format version. Bumped when a field changes meaning, so a resumed
 /// run never half-reads a state file written by a different magi.
@@ -98,7 +98,98 @@ use crate::verdict::{Finding, Rejection, ReviewVote};
 /// guess. `verified_at` has no historical value to reconstruct and stays
 /// `None`, which reads through `verification_summary` as "checked at:
 /// unknown" — an honest gap, not a fabricated time.
-pub const SCHEMA: u32 = 8;
+/// 9: added [`RunState::operator_fixes`] — one record per `magi fix`
+/// invocation, routing specific, already-recorded findings to a fixer as a
+/// targeted, out-of-band fix outside the normal round sequence. Kept in a
+/// channel of its own rather than folded into [`ReviewRound`], because a
+/// reviewer's own severity and vote (copied verbatim onto
+/// [`OperatorFixFinding`]) must never be rewritten to look like the operator
+/// manufactured a blocking verdict — see `graph::Runner::fix_selected`. A
+/// schema-8 record has no operator-fix history at all, and
+/// `#[serde(default)]` reads an empty list as exactly that: "none happened",
+/// not an unknown gap. Nothing about an existing field's meaning changes.
+///
+/// 10: added `RunStatus::VerifiedNoop` and `Candidate::verified_noop`. Before
+/// this, an implementer that correctly concluded (with evidence) that a
+/// task's request was already satisfied elsewhere had no way to say so: the
+/// run ended the same way as one where every candidate simply failed to
+/// write anything — `after_implement` bailing with "no candidate produced a
+/// change; nothing to judge" and the run settling as a plain `Failed`. That
+/// conflated two very different facts (investigation run 391f's audit is
+/// what surfaced it: two attempts that had, correctly, found their fix
+/// already on `main`). A schema-9 record has no notion of either the new
+/// status or field, so a `VerifiedNoop` value is a meaning that cannot be
+/// reconstructed from an old record — hence the bump, not a
+/// `#[serde(default)]` for the status. `Candidate::verified_noop` alone
+/// *does* default-read as `None` on an old record, which is the honest
+/// reading: a run written before this schema never made the claim.
+///
+/// The report task 391f itself was raised from also named `6c5e`, `8df3` and
+/// `e9ce` as three more tasks whose implement wave ended the same
+/// diff-zero way, and the investigation traced all three — they do not
+/// share one cause.
+///
+/// `6c5e` and `8df3` are the same already-landed pattern as `391f`, not a
+/// coincidence: all three were re-queued together by a same-day audit of
+/// `done`-but-unlanded magi tasks (queue talk `20260912-115153-7216`,
+/// 2026-09-12 02:51–04:24), which found 17 magi tasks marked `done` with no
+/// merge to show for it and re-queued 16 of them, `6c5e` (a fix for the
+/// owner's `magi ask --thread` back-and-forth) and `8df3` (release
+/// automation) included. A second, same-day audit (talk
+/// `20260912-222053-07fe`, 13:20–13:36) then found 12 of those re-queued
+/// tasks — `391f`, `6c5e` and `8df3` among them — already merged by another
+/// route, and the owner had them deleted (`magi task rm`); `391f` alone
+/// survived because a daemon still held its run at the moment of deletion,
+/// which is the only reason any record of this group still exists to audit.
+/// Quoted directly from that second audit's own turn (talk `07fe`, so this
+/// reads without needing access to that talk store), naming both by id:
+///
+/// > 12件がマージ済み(対応不要)、3件が未実装(妥当)、2件が部分実装(要確認)でした。
+/// > **マージ済み → hold/rmを推奨:** 6c5e, 1ddc, fcf5, e25b, cea2, 391f, 3202,
+/// > b0a1, 5365, af85, 9f26, 8df3
+///
+/// — followed by the owner answering "削除！" and the agent confirming "11件
+/// 削除完了。391f はいま実行中のdaemonが掴んでいて削除できませんでした."
+/// `git log` independently confirms both fixes: the ask-back feature `6c5e`
+/// wanted landed as `f0df474` ("let the owner ask back on a question...",
+/// #93) on 2026-09-06, and the release-bump automation `8df3` wanted landed
+/// as `61005dd`/`bedd925` (open a release-bump PR on merge) on 2026-09-07
+/// and `116fcdc` (proportional version bump, #108) on 2026-09-08 — all
+/// before the 09-12 requeue. No run record survives the deletion for either
+/// task, so this schema's evidence is the audit transcript plus the
+/// independently re-checked `git log`, not a `run.json`.
+///
+/// `e9ce` is not that pattern at all, and is the reason the adoption guard
+/// below is all-or-nothing rather than "any candidate said so": its task
+/// asked an implementer to merge the real repository's `main` and cut a
+/// GitHub release — a destructive, out-of-worktree operation `AGENTS.md`
+/// names explicitly as not something to hand to an unattended candidate.
+/// Both of its runs (`20260912-053352-49ad`, `20260912-062629-bab1`)
+/// correctly refused, filed `magi ask` (questions `6196`, `6c9a`), and ended
+/// with an empty diff only because no answer arrived before the implement
+/// node's timeout — `49ad` looped `magi ask --wait` in the foreground for
+/// roughly 50 minutes as instructed before the timeout cut it off; `bab1`
+/// ended its turn moments after filing its question without ever actually
+/// blocking on the wait, a separate protocol slip this schema change does
+/// not attempt to fix. `49ad`'s own `candidates[0].summary` (quoted here
+/// because both records predate schema 10 and, separately, predate a
+/// still-unrelated struct change that already makes today's `magi show`
+/// refuse to parse either of them — `unknown field 'planner'` — so this is
+/// read straight from `run.json` on disk, not through that command):
+///
+/// > タスクの内容（READY 状態の run を実リポジトリの main に `merge --no-ff`
+/// > する、GitHub Release を作る）を精査した結果、これは全てこのワーカーの
+/// > worktree の外にある実リポジトリと GitHub 上の共有状態に対する不可逆な
+/// > 操作であり […] 私自身の運用ルール「Work only inside this worktree.
+/// > Nothing outside it is yours.」と正面から矛盾すると判断しました。
+///
+/// Neither candidate's reply carries the
+/// `NO CHANGE NEEDED` marker below, so both runs correctly stay `Failed`
+/// under this schema, not `VerifiedNoop`: a run blocked on an unanswered
+/// authorization question is not a verified no-op, and reading the two
+/// alike is exactly the misclassification the guard's per-candidate and
+/// whole-run conditions exist to refuse.
+pub const SCHEMA: u32 = 10;
 
 /// Where a run got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +232,20 @@ pub enum RunStatus {
     Blocked,
     /// The graph could not complete.
     Failed,
+    /// Every candidate wrote nothing, and every one of them said why in a way
+    /// that survived [`crate::graph::Runner`]'s adoption guard: a clean CLI
+    /// exit, an actually-empty tree, no command left with an unconfirmed
+    /// exit status, and non-empty evidence. Distinct from `Failed` on
+    /// purpose — see `SCHEMA`'s doc for schema 10 — because the two read
+    /// identically to an operator glancing at a card ("nothing happened")
+    /// while meaning opposite things: one is an agent that could not do the
+    /// work, the other is an agent that checked and the work was already
+    /// done. Settles the task through [`crate::queue::Task::handed_off`], not
+    /// [`crate::queue::Task::fail`]: a human still has to look — the claim is
+    /// unverified by magi itself — and `Held` (not `Failed`-and-requeued)
+    /// means nothing retries the task unattended on the same unconfirmed
+    /// claim while that look is pending.
+    VerifiedNoop,
 }
 
 impl RunStatus {
@@ -148,7 +253,12 @@ impl RunStatus {
     pub fn done(self) -> bool {
         matches!(
             self,
-            Self::Merged | Self::Ready | Self::Stalled | Self::Blocked | Self::Failed
+            Self::Merged
+                | Self::Ready
+                | Self::Stalled
+                | Self::Blocked
+                | Self::Failed
+                | Self::VerifiedNoop
         )
     }
 
@@ -170,6 +280,21 @@ impl RunStatus {
             Self::Stalled => "stalled",
             Self::Blocked => "blocked",
             Self::Failed => "failed",
+            Self::VerifiedNoop => "verified_noop",
+        }
+    }
+
+    /// Label for a human-facing listing or report — the same word as
+    /// [`Self::as_str`] except where the machine spelling would read harsher
+    /// than the state actually is. `VerifiedNoop` is the one case: its own
+    /// `as_str` exists for logs, JSON and event messages, none of which
+    /// should quietly grow a second vocabulary, but a bare "verified_noop" in
+    /// a report reads like an error code, not the qualified, evidence-backed
+    /// claim it actually is.
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::VerifiedNoop => "agent-verified no-op",
+            other => other.as_str(),
         }
     }
 
@@ -191,12 +316,18 @@ impl RunStatus {
     ///
     /// `Failed` does not qualify: the graph could not complete and there is
     /// no established point to continue from. Nor does a finished run, whose
-    /// answer is a new competition.
+    /// answer is a new competition. Nor does `VerifiedNoop`: every candidate
+    /// already agreed nothing belongs in this worktree, and resuming would
+    /// only re-ask the same question — the answer is for a human to check
+    /// the evidence, not for the graph to run again.
     ///
     /// Whether anything is *already* driving the run is a separate question,
     /// answered by `daemon::is_working_on` at the callers that need it.
     pub fn resumable(self) -> bool {
-        !matches!(self, Self::Merged | Self::Ready | Self::Failed)
+        !matches!(
+            self,
+            Self::Merged | Self::Ready | Self::Failed | Self::VerifiedNoop
+        )
     }
 }
 
@@ -233,6 +364,16 @@ pub struct Candidate {
     /// Why this candidate is not in the running.
     #[serde(default)]
     pub failed: Option<String>,
+    /// The evidence this candidate gave for writing no change on purpose —
+    /// the `NO CHANGE NEEDED:` marker `prompt::implement`'s reply format
+    /// documents, verbatim. `Some` only when [`crate::graph`]'s adoption
+    /// guard accepted the claim: the CLI exited cleanly, the tree really is
+    /// empty, no command in the reply was left with an unconfirmed exit
+    /// status, and the evidence itself is non-empty. A candidate that wrote
+    /// nothing and said nothing about why — the ordinary empty loss — always
+    /// reads `None` here, same as one written before schema 10 ever existed.
+    #[serde(default)]
+    pub verified_noop: Option<String>,
     /// Wall-clock time for the implementation.
     #[serde(default)]
     pub duration_ms: u64,
@@ -504,6 +645,111 @@ impl ContinuationRecord {
             outcome: ContinuationOutcome::NotNeeded,
         }
     }
+}
+
+/// What happened to one operator-selected finding after the fixer ran, as
+/// part of an [`OperatorFixRequest`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorFixOutcome {
+    /// The request has not run yet, or never got far enough to report.
+    #[default]
+    Pending,
+    /// The fixer's adoption report named this finding as addressed.
+    Addressed,
+    /// The fixer's adoption report declined it, with an argument.
+    Rejected {
+        /// The fixer's own reason.
+        why: String,
+    },
+    /// The fixer never delivered a usable adoption report at all — a
+    /// dropped stream, a quota hit, or a continuation budget spent without
+    /// recovering one (see `graph::Runner::continue_fix_report`). Distinct
+    /// from `Rejected`, which needs an argument this never produced, and
+    /// never written back as "addressed" or silently left `Pending` — a
+    /// gap in the report is its own outcome, not evidence either way about
+    /// the finding.
+    Unreported,
+}
+
+/// One finding an operator selected for [`OperatorFixRequest`], with the
+/// provenance a reviewer originally gave it, copied here verbatim.
+///
+/// Severity and vote are snapshots, never recomputed and never treated as
+/// blocking just because an operator picked the finding — only
+/// [`Severity::blocks`] on the original [`ReviewRecord`] decides that. This
+/// type exists so an operator's selection is an auditable *addition* to the
+/// record, not a rewrite of what a reviewer actually said.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorFixFinding {
+    /// Finding id, e.g. `R2-1-3`.
+    pub id: String,
+    /// Severity as the reviewer recorded it.
+    pub severity: Severity,
+    /// The reviewer seat's overall vote for the round this finding came
+    /// from, if one was cast.
+    #[serde(default)]
+    pub reviewer_vote: Option<ReviewVote>,
+    /// Review round the finding was raised in.
+    pub round: usize,
+    /// That round's own head — the commit the finding was actually raised
+    /// against, used for the freshness check against the branch's current
+    /// head at request time.
+    pub round_head: String,
+    /// Reviewer seat number, 1-based.
+    pub reviewer: usize,
+    /// Agent occupying that seat.
+    pub agent: String,
+    /// File the finding concerns.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Line the finding concerns.
+    #[serde(default)]
+    pub line: Option<u32>,
+    /// One-line summary.
+    pub title: String,
+    /// The argument.
+    #[serde(default)]
+    pub detail: String,
+    /// What happened to this finding after the fixer ran.
+    #[serde(default)]
+    pub outcome: OperatorFixOutcome,
+}
+
+/// One `magi fix` invocation: the operator's own record of which
+/// already-recorded findings they routed to a fixer, why, and what came
+/// back. See [`SCHEMA`]'s doc for schema 9 on why this is a channel of its
+/// own rather than a field on [`ReviewRound`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorFixRequest {
+    /// When `magi fix` was invoked.
+    pub requested_at: Timestamp,
+    /// The operator's own reasoning. Required and never empty at the CLI —
+    /// the audit trail this feature exists for.
+    pub reason: String,
+    /// The findings selected, each with its own provenance and outcome.
+    pub findings: Vec<OperatorFixFinding>,
+    /// The branch's head at the moment this request started executing.
+    pub head_at_request: String,
+    /// Did the operator pass `--allow-stale`?
+    pub allow_stale: bool,
+    /// Did any selected finding's own `round_head` differ from
+    /// `head_at_request`? Kept distinct from `allow_stale` — flipping that
+    /// flag does not retroactively make a request that was actually fresh
+    /// read as stale, or the reverse.
+    pub stale: bool,
+    /// The fixer's own attempt, once dispatched.
+    #[serde(default)]
+    pub fix: Option<FixRecord>,
+    /// Head after the fixer's commit, when it produced one.
+    #[serde(default)]
+    pub result_head: Option<String>,
+    /// The review-only run opened to re-verify the change, when one was
+    /// actually committed. `None` when nothing changed, so there was
+    /// nothing new to re-review — never left implicit as "not gotten to
+    /// yet".
+    #[serde(default)]
+    pub follow_up_review_run: Option<String>,
 }
 
 /// A command a seat's own CLI reported running, kept for `magi show` and for
@@ -1149,6 +1395,12 @@ pub struct RunState {
     /// ran".
     #[serde(default)]
     pub jobs: Vec<JobRecord>,
+    /// Operator-triggered targeted fixes — see [`OperatorFixRequest`] and
+    /// `SCHEMA`'s doc for schema 9. Empty on every record written before
+    /// this existed, which reads correctly as "no operator fix ever
+    /// requested".
+    #[serde(default)]
+    pub operator_fixes: Vec<OperatorFixRequest>,
 }
 
 impl RunState {
@@ -1196,6 +1448,7 @@ impl RunState {
             advise_attempted: false,
             events: Vec::new(),
             jobs: Vec::new(),
+            operator_fixes: Vec::new(),
         }
     }
 
@@ -1414,6 +1667,22 @@ fn migrate_schema(mut state: RunState) -> Result<RunState> {
                 round.verified_head = Some(round.head.clone());
             }
         }
+        state.schema = 8;
+    }
+    // Schema 8 predates `operator_fixes`. There is nothing to reconstruct —
+    // an old run simply never had one requested — so `#[serde(default)]`
+    // already left it as the correct empty `Vec`; this only advances the
+    // version number.
+    if state.schema == 8 {
+        state.schema = 9;
+    }
+    // Schema 9 predates `RunStatus::VerifiedNoop` and
+    // `Candidate::verified_noop`. Nothing to reconstruct: an old record never
+    // made the claim, `#[serde(default)]` already reads `verified_noop` as
+    // `None` on every candidate, and a `VerifiedNoop` status cannot appear in
+    // a schema-9 record at all — see `SCHEMA`'s doc for schema 10. This only
+    // advances the version number.
+    if state.schema == 9 {
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {
@@ -1439,6 +1708,23 @@ impl RunState {
         self.candidates.iter().filter(|c| c.viable()).collect()
     }
 
+    /// Did every candidate write nothing, and every one of them back it with
+    /// evidence [`crate::graph`]'s adoption guard accepted?
+    ///
+    /// All-or-nothing on purpose: one candidate declaring `NO CHANGE NEEDED`
+    /// while another simply failed to produce anything is not agreement, it
+    /// is one candidate's unverified claim next to an ordinary loss, and the
+    /// run must still read as the `Failed` it is. Only ever meaningful when
+    /// [`Self::viable`] is already empty — a run with any real patch to judge
+    /// never reaches the caller that asks this.
+    pub fn all_candidates_verified_noop(&self) -> bool {
+        !self.candidates.is_empty()
+            && self
+                .candidates
+                .iter()
+                .all(|c| c.empty && c.verified_noop.is_some())
+    }
+
     /// Findings still open when the review loop stopped trying: the last
     /// round's, exactly when that round was not clean. Empty on a run that
     /// never reviewed, or whose last round was clean.
@@ -1459,6 +1745,35 @@ impl RunState {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    /// Every finding raised in the most recent review round, regardless of
+    /// that round's own severity mix — unlike [`Self::open_findings`], not
+    /// filtered to a round that was not clean. This is the pool `magi fix`
+    /// reports as available to pick from: a round can conclude clean (no
+    /// finding blocked merge) while still carrying minor findings nobody
+    /// has acted on.
+    pub fn last_round_findings(&self) -> Vec<&Finding> {
+        self.reviews
+            .last()
+            .into_iter()
+            .flat_map(|r| r.reviews.iter())
+            .flat_map(|rec| rec.findings.iter())
+            .collect()
+    }
+
+    /// Look up a finding by id anywhere in this run's review history,
+    /// together with the round and reviewer record that raised it — the
+    /// provenance `magi fix` snapshots onto [`OperatorFixFinding`].
+    pub fn finding(&self, id: &str) -> Option<(&ReviewRound, &ReviewRecord, &Finding)> {
+        self.reviews.iter().find_map(|round| {
+            round.reviews.iter().find_map(|rec| {
+                rec.findings
+                    .iter()
+                    .find(|f| f.id == id)
+                    .map(|f| (round, rec, f))
+            })
+        })
     }
 
     /// Did this run reach a mergeable status (`Ready` or `Merged`) with
@@ -1967,6 +2282,7 @@ mod tests {
             commits: 1,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         };
@@ -2683,6 +2999,7 @@ mod tests {
             commits: 1,
             empty: false,
             failed: None,
+            verified_noop: None,
             duration_ms: 0,
             folded: false,
         });
