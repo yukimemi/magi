@@ -97,6 +97,12 @@ fn vote_tag(vote: ReviewVote) -> String {
 
 /// One-line summary, for `magi list`.
 pub fn line(state: &RunState) -> String {
+    line_with_liveness(state, Liveness::Unknown)
+}
+
+/// [`line`] with the independent process-liveness observation available to
+/// `magi list`.
+pub fn line_with_liveness(state: &RunState, live: Liveness) -> String {
     let winner = state
         .tally
         .as_ref()
@@ -115,8 +121,16 @@ pub fn line(state: &RunState) -> String {
         ),
         _ => String::new(),
     };
+    let stale = if !state.status.done() && live == Liveness::Dead {
+        format!(
+            "  {}",
+            bold(&yellow("STALE — driver exited; resume required"))
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "{}  {:<20}  {:>2}c {:>2}j  win {} ({}){quorum}  {}",
+        "{}  {:<20}  {:>2}c {:>2}j  win {} ({}){quorum}{stale}  {}",
         dim(&state.id),
         status_word(state),
         state.candidates.len(),
@@ -125,6 +139,20 @@ pub fn line(state: &RunState) -> String {
         agent,
         first_line(&state.instruction)
     )
+}
+
+/// A plainly visible verdict for a non-terminal run whose recorded driver is
+/// gone. Kept separate from [`active_seats`] because a process can die at a
+/// node boundary with no active seat left in the saved state.
+pub fn liveness_notice(state: &RunState, live: Liveness) -> String {
+    if !state.status.done() && live == Liveness::Dead {
+        format!(
+            "{}\n\n",
+            yellow("STALE — the process driving this run exited; resume it to continue.")
+        )
+    } else {
+        String::new()
+    }
 }
 
 fn first_line(text: &str) -> String {
@@ -1881,6 +1909,17 @@ mod tests {
             text.contains("no live daemon"),
             "a stale entry must not read as running: {text}"
         );
+    }
+
+    #[test]
+    fn list_line_marks_a_nonterminal_run_with_a_dead_driver_stale() {
+        let _guard = plain();
+        let mut s = state();
+        s.status = RunStatus::Reviewing;
+        let text = line_with_liveness(&s, Liveness::Dead);
+        assert!(text.contains("STALE"), "{text}");
+        assert!(text.contains("resume required"), "{text}");
+        assert!(liveness_notice(&s, Liveness::Dead).contains("STALE"));
     }
 
     /// A manual `magi run` / `magi review` claims no daemon, but its

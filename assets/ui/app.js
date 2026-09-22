@@ -130,6 +130,10 @@ const RUN_STATUS = {
      assumed them contradicted the card it sat on. */
   stalled:      { glyph: "\u26a0", tone: "rust", note: "The judging panel never reached a quorum, so no verdict was recorded. The work is kept." },
   blocked:      { glyph: "\u2298", tone: "rust", note: "magi stopped short of merging." },
+  /* Derived from a confirmed-dead driver, not from elapsed time. The saved
+     graph status says where its process stopped; this is the actionable fact:
+     nobody is currently moving it, so it must not sit under In flight. */
+  stale:        { glyph: "\u26a0", tone: "rust", note: "The process driving this run exited. Nothing is running; resume it to continue." },
   failed:       { glyph: "\u2715", tone: "ink",  note: "The graph could not complete." },
   /* Not a failure: every candidate wrote nothing, but every one of them said
      why in a way that survived the adoption guard \u2014 same neutral `ink` as
@@ -1168,7 +1172,7 @@ function updateRunCard(row, run) {
   /* `waiting` is a field of its own on the summary precisely because the
      status string still names the node the run parked in. It wins: a run
      nobody is working on must not read as one that is being worked on. */
-  const status = run.waiting ? "waiting" : run.unmerged_by_design ? "unmerged" : String(run.status || "");
+  const status = displayedRunStatus(run);
   const meta = RUN_STATUS[status] || {};
   const parked = isWaiting(run);
   const tone = toneOf(status, RUN_STATUS);
@@ -1298,13 +1302,30 @@ function updateRunTail(row, run, { parked, ask }) {
  * thing that needs a human regardless of which node it stopped in. */
 const RUN_SECTIONS = [
   { key: "waiting", label: "Waiting on you", defaultOpen: true },
+  { key: "stale", label: "Needs attention", defaultOpen: true },
   { key: "flight", label: "In flight", defaultOpen: true },
   { key: "landed", label: "Landed", defaultOpen: true },
   { key: "ended", label: "Ended", defaultOpen: true },
 ];
 
+/* `live` is the server's process-identity check, not an age heuristic. A
+   legacy run with no recorded driver is `unknown`, deliberately not stale:
+   guessing would turn a still-running manual invocation into a false alarm. */
+function isStale(run) {
+  const status = String(run.status || "");
+  return run.live === "dead" && !run.waiting
+    && !["merged", "ready", "stalled", "blocked", "failed", "verified_noop"].includes(status);
+}
+
+function displayedRunStatus(run) {
+  if (run.waiting) return "waiting";
+  if (run.unmerged_by_design) return "unmerged";
+  return isStale(run) ? "stale" : String(run.status || "");
+}
+
 function runSection(run) {
   if (run.waiting) return "waiting";
+  if (isStale(run)) return "stale";
   // `unmerged_by_design` is still `status: "ready"` on the wire, but nothing
   // ever lands it, so grouping it under "Landed" would say the opposite of
   // what happened; it belongs with the other runs that stopped for good.
@@ -1330,7 +1351,8 @@ function runSection(run) {
  * "all" stay one tap away for whoever wants the history. */
 const RUN_STATE_FILTERS = [
   { key: "active", label: "Active", countNoun: "active", match: (run) => !run.done },
-  { key: "flight", label: "In flight", countNoun: "in flight", match: (run) => !run.done && !run.waiting },
+  { key: "flight", label: "In flight", countNoun: "in flight", match: (run) => !run.done && !run.waiting && !isStale(run) },
+  { key: "stale", label: "Needs attention", countNoun: "stale", match: isStale },
   { key: "waiting", label: "Waiting", countNoun: "waiting", match: (run) => Boolean(run.waiting) },
   { key: "done", label: "Done", countNoun: "done", match: (run) => Boolean(run.done) },
   { key: "all", label: "All", countNoun: "runs", match: () => true },
@@ -1367,6 +1389,7 @@ const REPRESENTATIVE_RUN_SHAPES = [
   { waiting: true, status: "stalled" },
   { waiting: true, status: "blocked" },
   { waiting: false, status: "implementing" },
+  { waiting: false, status: "implementing", live: "dead" },
   { waiting: false, status: "merged" },
   { waiting: false, status: "ready" },
   { waiting: false, status: "stalled" },
@@ -4517,7 +4540,7 @@ function renderRunDetail() {
      is the state the operator has to act on. */
   const summary = (state.runs || []).find((r) => r.id === run.id);
   const parkedNow = Boolean(summary && isWaiting(summary)) || openFor(run.id).length > 0;
-  const status = parkedNow ? "waiting" : run.unmerged_by_design ? "unmerged" : String(run.status || "");
+  const status = parkedNow ? "waiting" : displayedRunStatus(run);
   const meta = RUN_STATUS[status] || {};
 
   const head = $("run-status");
@@ -4611,7 +4634,7 @@ function renderRunActions(run) {
   clear(box);
 
   const status = String(run.status || "");
-  if (["stalled", "blocked"].includes(status)) {
+  if (isStale(run) || ["stalled", "blocked"].includes(status)) {
     const busy = resumeBusy === run.id;
     const gone = !unfolded(run);
     box.append(
@@ -4625,7 +4648,9 @@ function renderRunActions(run) {
         }),
         el("p", { class: "card-note", text: gone
           ? "The candidate worktrees are gone, so there is nothing left to continue from. File the task again instead."
-          : "Carries on from where it stopped, re-asking only the seats that went missing. It spends agent calls." }),
+          : isStale(run)
+            ? "No process is driving this run. Resume continues from its last saved node and spends agent calls."
+            : "Carries on from where it stopped, re-asking only the seats that went missing. It spends agent calls." }),
       ),
     );
   }
