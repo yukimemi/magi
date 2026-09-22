@@ -5607,6 +5607,49 @@ mod tests {
     }
 
     #[test]
+    fn resolve_blockers_restores_a_held_task_to_held_instead_of_queuing_it() {
+        // Reproduces the reported bug (task 3958): a task held out of
+        // attempts, blocked on a `crate::conduct` follow-up question, must
+        // come back `held` once that question is answered - never `queued`,
+        // whatever the answer said - or it silently re-enters the
+        // competition queue with its attempts already exhausted.
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = ask::Questions::at(dir.path().join("questions"));
+
+        let mut q = crate::ask::Question::new(
+            "20260101-000001-main".to_owned(),
+            crate::conduct::NODE.to_owned(),
+            "conduct".to_owned(),
+            "How should this be handled?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut q).unwrap();
+        q.answer(crate::ask::Answer::Text(
+            "leave it held, a human will look at it later".to_owned(),
+        ))
+        .unwrap();
+        questions.put(&mut q).unwrap();
+
+        let mut held = task();
+        held.id = "20260101-000001-main".to_owned();
+        held.hold_machine(Some("out of attempts".to_owned()));
+        held.block(vec![q.id.clone()], Some("what now?".to_owned()));
+        queue.put(&mut held).unwrap();
+
+        resolve_blockers(&queue, &questions);
+
+        let after = queue.get(&held.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Held);
+        assert_eq!(after.hold_reason.as_deref(), Some("out of attempts"));
+        assert_eq!(
+            after.answers[0].answer,
+            "leave it held, a human will look at it later"
+        );
+    }
+
+    #[test]
     fn instruction_for_is_unchanged_without_any_answers() {
         let t = task();
         assert_eq!(instruction_for(&t), t.instruction);

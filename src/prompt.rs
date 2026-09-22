@@ -1334,7 +1334,15 @@ pub fn conduct(
          # Runnable tasks\n\n\
          Decide which of these should wait on another task or on a question \
          you want to ask the operator. Leaving a task out of your reply \
-         changes nothing about it.\n\n",
+         changes nothing about it.\n\n\
+         A task already carrying one or more `answered \"...\": ...` lines \
+         has been through this before. If the operator's own words already \
+         settled that it should not compete again - stay held, this is \
+         closed, wait for a person - say so with `recovery: hold` instead of \
+         filing another `question` that only asks the same thing again: \
+         `blocked_by` and `question` both put the task back in the queue the \
+         moment they resolve, which is exactly what re-asking a settled \
+         question would undo.\n\n",
     );
     if runnable.is_empty() {
         s.push_str("(none)\n\n");
@@ -1387,17 +1395,25 @@ pub fn conduct(
            reimplementation). Choose this when the branch is fundamentally \
            sound and what is left is a mergeable fix to its findings; choose \
            `requeue` instead when the findings say the design itself needs \
-           to change.\n\n\
+           to change.\n\
+         - `done` — the task's own goal is already met outside this loop \
+           entirely (an `answered` line below already says the branch was \
+           merged and the worktree cleaned up by hand, say) and running it \
+           again would only spend attempts on work with nothing left to do. \
+           Only once the operator's own words say so; never guess this one.\n\n\
          `hold` and `question` are not interchangeable labels for the same \
          thing: if your own diagnosis lets you write the human's next step \
          as one concrete sentence — shorten the PR title and open it, \
          delete the stale worktree and resume from review, confirm PR #N \
          already covers this and close the task — that sentence belongs in \
          `question` (with `choices` when the answer is a pick from a short \
-         list), never in `hold`'s `reason`. A `hold` whose `reason` reads \
-         like an instruction rather than a status report is a `question` \
-         you talked yourself out of asking. `hold` is for when no such \
-         one-line instruction exists yet; `question` is for when one \
+         list), never in `hold`'s `reason`. Once that question is answered \
+         and confirms the task is already done, use `done` on a later cycle \
+         rather than asking the same thing again. A `hold` whose `reason` \
+         reads like an instruction rather than a status report is a \
+         `question` you talked yourself out of asking. `hold` is for when \
+         no such one-line instruction exists yet; `question` is for when \
+         one \
          already does and only needs the human's word — or a quick manual \
          action — before the task can move again.\n\n\
          You may also `ask` the operator instead of choosing a recovery — \
@@ -1486,7 +1502,7 @@ pub fn conduct(
          ```json\n\
          {\"decisions\":[{\"id\":\"<task id>\",\"blocked_by\":[\"<task or \
          question id>\"],\"reason\":\"<one line>\",\"recovery\":\
-         \"requeue|hold|review\",\"question\":\"<text, optional>\",\
+         \"requeue|hold|review|done\",\"question\":\"<text, optional>\",\
          \"choices\":[\"<optional>\"]}]}\n\
          ```\n\n\
          Omit any field you have nothing to say for. `\"decisions\":[]` is a \

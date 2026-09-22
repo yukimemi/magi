@@ -38,6 +38,20 @@ use serde::{Deserialize, Serialize};
 
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
 ///
+/// 4: added [`Task::blocked_from`], the status a task had the moment it
+/// became [`TaskStatus::Blocked`], so [`Task::unblock`] restores it instead
+/// of always landing on [`TaskStatus::Queued`]. Without it, a task a human
+/// or `crate::triage` had deliberately left [`TaskStatus::Held`] — machine
+/// or manual — would lose that the instant `crate::conduct` blocked it on a
+/// follow-up question, and come back `Queued` the moment the question was
+/// answered, regardless of what the answer said: exactly the loop where a
+/// task the operator told to stay held instead re-enters the competition
+/// queue every time someone answers a question about it. `#[serde(default)]`
+/// so an older record reads as `None`; [`Task::unblock`] then falls back to
+/// inferring `Held` from surviving hold evidence ([`Task::hold_reason`] /
+/// [`Task::hold_source`], never cleared by [`Task::block`]) rather than
+/// guessing `Queued` outright — see [`Task::unblock`]'s own doc.
+///
 /// 3: added [`HoldSource`] so conductor recovery cannot release a hold an
 /// operator deliberately placed. Old records default to `None` and are
 /// protected as operator-held until an explicit release; the safe direction
@@ -52,7 +66,7 @@ use serde::{Deserialize, Serialize};
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 3;
+pub const SCHEMA: u32 = 4;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +250,20 @@ pub struct Task {
     /// `crate::conduct`. Cleared whenever `blocked_by` empties.
     #[serde(default)]
     pub block_reason: Option<String>,
+    /// The status this task had the moment [`Task::block`] most recently
+    /// moved it to [`TaskStatus::Blocked`] — what [`Task::unblock`] restores
+    /// once nothing is left in `blocked_by`, instead of always landing on
+    /// [`TaskStatus::Queued`]. See [`SCHEMA`]'s doc for schema 4 on why this
+    /// exists: an answer to a question `crate::conduct` filed about a
+    /// [`TaskStatus::Held`] task must not itself be what puts the task back
+    /// in the competition queue.
+    ///
+    /// `#[serde(default)]` so a queue file written before this field existed
+    /// reads as `None`; [`Task::unblock`] treats that the same as a task
+    /// blocked straight from `Queued`, unless surviving hold evidence says
+    /// otherwise.
+    #[serde(default)]
+    pub blocked_from: Option<TaskStatus>,
     /// Questions `crate::conduct` asked about this task that the operator has
     /// since answered, oldest first — what was asked, and what they said.
     ///
@@ -315,6 +343,7 @@ impl Task {
             diagnostic: None,
             blocked_by: Vec::new(),
             block_reason: None,
+            blocked_from: None,
             answers: Vec::new(),
             review_branch: None,
             fresh_start: false,
@@ -365,6 +394,7 @@ impl Task {
         self.diagnostic = None;
         self.blocked_by.clear();
         self.block_reason = None;
+        self.blocked_from = None;
     }
 
     /// Record a failed attempt. Out of attempts means held for a human, rather
@@ -430,6 +460,7 @@ impl Task {
         self.hold_source = Some(HoldSource::Manual);
         self.blocked_by.clear();
         self.block_reason = None;
+        self.blocked_from = None;
     }
 
     /// Take this task out of the loop's reach during automatic recovery.
@@ -444,12 +475,22 @@ impl Task {
         self.hold_source = Some(HoldSource::Machine);
         self.blocked_by.clear();
         self.block_reason = None;
+        self.blocked_from = None;
     }
 
     /// Block this task on other task ids and/or open question ids, chosen by
     /// `crate::conduct`. Pure: the caller still owns writing it back with
     /// [`Queue::put`].
+    ///
+    /// Records [`Task::blocked_from`] the first time this moves the task into
+    /// [`TaskStatus::Blocked`], and leaves it alone on a later call that adds
+    /// or replaces `blocked_by` while the task is already `Blocked` - a
+    /// second question about an already-blocked task must not overwrite the
+    /// status it should eventually return to with `Blocked` itself.
     pub fn block(&mut self, blocked_by: Vec<String>, reason: Option<String>) {
+        if self.status != TaskStatus::Blocked {
+            self.blocked_from = Some(self.status);
+        }
         self.status = TaskStatus::Blocked;
         self.blocked_by = blocked_by;
         self.block_reason = reason;
@@ -458,22 +499,41 @@ impl Task {
     /// Remove one resolved dependency (a task id that became [`TaskStatus::Done`],
     /// or a question id that became [`crate::ask::QuestionStatus::Answered`]).
     /// Once nothing is left in [`Task::blocked_by`], the task returns to
-    /// [`TaskStatus::Queued`] on its own - deciding *why* a task was blocked
-    /// was `crate::conduct`'s job, but noticing a dependency resolved needs no
-    /// model at all.
+    /// whatever [`Task::blocked_from`] recorded - deciding *why* a task was
+    /// blocked was `crate::conduct`'s job, but noticing a dependency resolved
+    /// needs no model at all, and restoring the status it interrupted needs
+    /// nothing more than what `block` already wrote down.
+    ///
+    /// A task blocked while `Running` restores to [`TaskStatus::Queued`]
+    /// instead: whatever process was running it is gone by the time this
+    /// runs, so there is nothing left to resume. A task with no recorded
+    /// `blocked_from` - a pre-schema-4 record, or one blocked before this
+    /// field existed - falls back to [`TaskStatus::Held`] when it still
+    /// carries hold evidence ([`Task::hold_reason`] or [`Task::hold_source`],
+    /// neither ever cleared by `block`), and to `Queued` otherwise: the same
+    /// choice `block` itself would have recorded, reconstructed from what
+    /// survived.
     ///
     /// A no-op, on purpose, for a task that is not [`TaskStatus::Blocked`]:
     /// `crate::daemon`'s deterministic resolver runs over every task on every
     /// poll, and a task that moved on for some other reason must not be
-    /// dragged back to `Queued` by a stale id it still happens to carry.
+    /// dragged back by a stale id it still happens to carry.
     pub fn unblock(&mut self, resolved_id: &str) {
         if self.status != TaskStatus::Blocked {
             return;
         }
         self.blocked_by.retain(|id| id != resolved_id);
         if self.blocked_by.is_empty() {
-            self.status = TaskStatus::Queued;
+            self.status = match self.blocked_from {
+                Some(TaskStatus::Running) => TaskStatus::Queued,
+                Some(other) => other,
+                None if self.hold_reason.is_some() || self.hold_source.is_some() => {
+                    TaskStatus::Held
+                }
+                None => TaskStatus::Queued,
+            };
             self.block_reason = None;
+            self.blocked_from = None;
         }
     }
 
@@ -608,6 +668,7 @@ impl Task {
         // as it overrides an ordinary hold.
         self.blocked_by.clear();
         self.block_reason = None;
+        self.blocked_from = None;
         self.review_branch = None;
         self.fresh_start = false;
     }
@@ -1195,6 +1256,101 @@ mod tests {
     fn unblocking_an_id_on_a_task_that_is_not_blocked_is_a_no_op() {
         let mut t = task("never blocked");
         t.unblock("whatever");
+        assert_eq!(t.status, TaskStatus::Queued);
+    }
+
+    #[test]
+    fn a_held_task_blocked_on_a_question_returns_to_held_not_queued() {
+        // The bug this guards: a task an operator (or `crate::triage`) has
+        // deliberately held, once `crate::conduct` blocks it on a follow-up
+        // question, must not silently re-enter the competition queue the
+        // moment that question is answered - whatever the answer said.
+        let mut t = task("held, then asked about");
+        t.hold_machine(Some("out of attempts".to_owned()));
+        assert_eq!(t.status, TaskStatus::Held);
+
+        t.block(vec!["q1".to_owned()], Some("what now?".to_owned()));
+        assert_eq!(t.status, TaskStatus::Blocked);
+
+        t.record_answer("what now?".to_owned(), "leave it held".to_owned());
+        t.unblock("q1");
+        assert_eq!(t.status, TaskStatus::Held, "must restore, not requeue");
+        assert_eq!(t.hold_reason.as_deref(), Some("out of attempts"));
+        assert_eq!(t.hold_source, Some(HoldSource::Machine));
+        assert!(t.blocked_from.is_none(), "consumed once restored");
+    }
+
+    #[test]
+    fn a_manually_held_task_blocked_on_a_question_returns_to_held() {
+        let mut t = task("manually held, then asked about");
+        t.hold_manual(Some("waiting on a dependency".to_owned()));
+
+        t.block(vec!["q1".to_owned()], None);
+        t.unblock("q1");
+
+        assert_eq!(t.status, TaskStatus::Held);
+        assert_eq!(t.hold_source, Some(HoldSource::Manual));
+    }
+
+    #[test]
+    fn re_blocking_an_already_blocked_task_keeps_the_original_blocked_from() {
+        // A second `Task::block` call - `crate::conduct` adding a question on
+        // top of an existing block - must not overwrite `blocked_from` with
+        // `Blocked` itself, or the task would restore into itself.
+        let mut t = task("held, blocked twice");
+        t.hold_machine(None);
+        t.block(vec!["q1".to_owned()], Some("first".to_owned()));
+        t.block(
+            vec!["q1".to_owned(), "q2".to_owned()],
+            Some("second".to_owned()),
+        );
+
+        t.unblock("q1");
+        assert_eq!(t.status, TaskStatus::Blocked, "q2 still outstanding");
+        t.unblock("q2");
+        assert_eq!(t.status, TaskStatus::Held);
+    }
+
+    #[test]
+    fn unblocking_a_task_blocked_while_running_lands_on_queued_not_running() {
+        // Whatever process was driving the run is gone by the time a
+        // conductor's question about it gets answered - there is nothing left
+        // to resume into.
+        let mut t = task("blocked mid-run");
+        t.start("run-1".to_owned());
+        assert_eq!(t.status, TaskStatus::Running);
+
+        t.block(vec!["q1".to_owned()], None);
+        t.unblock("q1");
+        assert_eq!(t.status, TaskStatus::Queued);
+    }
+
+    #[test]
+    fn a_pre_schema_4_blocked_record_with_hold_evidence_restores_to_held() {
+        // `blocked_from` is `None` for a record written before schema 4 (or,
+        // equivalently, deserialized straight from an on-disk file that never
+        // had the field). Held evidence surviving on the task - never cleared
+        // by `block` - is the only way left to tell such a record apart from
+        // one blocked straight out of `Queued`.
+        let mut t = task("legacy record, held before it was blocked");
+        t.hold_source = Some(HoldSource::Machine);
+        t.hold_reason = Some("legacy hold reason".to_owned());
+        t.status = TaskStatus::Blocked;
+        t.blocked_by = vec!["q1".to_owned()];
+        t.blocked_from = None;
+
+        t.unblock("q1");
+        assert_eq!(t.status, TaskStatus::Held);
+    }
+
+    #[test]
+    fn a_pre_schema_4_blocked_record_with_no_hold_evidence_restores_to_queued() {
+        let mut t = task("legacy record, ordinary dependency block");
+        t.status = TaskStatus::Blocked;
+        t.blocked_by = vec!["dep".to_owned()];
+        t.blocked_from = None;
+
+        t.unblock("dep");
         assert_eq!(t.status, TaskStatus::Queued);
     }
 

@@ -594,6 +594,27 @@ pub fn open_question_for(questions: &Questions, task_id: &str) -> Option<Questio
     latest_triage_question(questions, task_id).filter(|q| q.status.open())
 }
 
+/// Does this module still have unfinished business with `task`?
+///
+/// True while its latest triage question is still open (waiting on an
+/// answer), and true for a beat longer than [`open_question_for`] alone
+/// would say: once answered, the question sits [`QuestionStatus::Answered`]
+/// but unread until the next [`run_once`] pass actually applies it (see
+/// [`already_applied`]), and [`run_once`] only ever runs on a fully idle
+/// daemon tick - far less often than `crate::conduct` polls. A caller that
+/// only checked "is a question open" would walk straight through that gap
+/// the moment the operator answers, moving the task out of `held` before
+/// [`run_once`] gets a turn - orphaning the very answer it was about to
+/// apply, the same failure mode this function exists to keep `crate::conduct`
+/// out of. `crate::conduct::apply_one` is exactly that caller.
+pub fn pending_for(questions: &Questions, task: &Task) -> bool {
+    match latest_triage_question(questions, &task.id) {
+        Some(q) if q.status.open() => true,
+        Some(q) if q.status == QuestionStatus::Answered => !already_applied(task, &q),
+        _ => false,
+    }
+}
+
 /// Every task id with an open triage question right now - what `magi task
 /// list` uses to mark a held task that is already waiting on an operator
 /// decision, rather than have it read identically to one nobody has looked
@@ -937,5 +958,47 @@ mod tests {
             "an answered question is no longer open"
         );
         assert!(!open_task_ids(&questions).contains(&t.id));
+    }
+
+    #[test]
+    fn pending_for_stays_true_between_an_answer_and_the_next_run_once_pass() {
+        // `open_question_for` alone goes `None` the instant the operator
+        // answers, well before `run_once` - idle-tick only - gets a turn to
+        // actually apply that answer (see `already_applied`). `pending_for`
+        // exists so a caller polling far more often than `run_once` does -
+        // `crate::conduct::apply_one` - does not walk through that gap.
+        let (dir, q, questions) = store();
+        let mut t = task("gate went red", dir.path().join("repo"));
+        t.hold_machine(Some("gate red".to_owned()));
+        q.put(&mut t).unwrap();
+
+        assert!(!pending_for(&questions, &t));
+
+        run_once(&q, &questions, None, Timestamp::now());
+        let held = q.get(&t.id).unwrap();
+        assert!(pending_for(&questions, &held), "still waiting on an answer");
+
+        let mut asked = questions
+            .list()
+            .into_iter()
+            .find(|q| q.run == t.id)
+            .unwrap();
+        asked.answer(Answer::Choice(EN.wait.to_owned())).unwrap();
+        questions.put(&mut asked).unwrap();
+        assert!(!asked.status.open());
+
+        // The race window: answered, but `run_once` has not run again yet.
+        let still_held = q.get(&t.id).unwrap();
+        assert!(
+            pending_for(&questions, &still_held),
+            "answered but not yet applied is still pending"
+        );
+
+        run_once(&q, &questions, None, Timestamp::now());
+        let after = q.get(&t.id).unwrap();
+        assert!(
+            !pending_for(&questions, &after),
+            "the answer is applied now, nothing left pending"
+        );
     }
 }
