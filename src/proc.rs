@@ -140,6 +140,80 @@ where
     query(pid).ok()
 }
 
+/// An opaque marker identifying *which* process currently holds `pid`, not
+/// merely whether the number is in use — the OS-reported moment it started.
+/// Compared only for equality by the caller, never parsed as a timestamp:
+/// the two platform formats are not on the same scale, and nothing here
+/// needs to be.
+///
+/// A live pid alone never proves it is the process a caller thinks it is —
+/// pids get reused, sometimes within minutes on a busy machine — so
+/// [`crate::run::RunState::liveness`] uses this to corroborate a `driver_pid`
+/// that answered `pid_status(..) == Some(true)`: it records this marker
+/// alongside the pid, and a later mismatch means a *different* process now
+/// answers to that number, not that the original one is somehow still
+/// running under it. `None` when the platform could not say — a caller must
+/// treat that exactly like an unavailable [`pid_status`] query, not as
+/// either a match or a mismatch.
+#[must_use]
+pub fn process_started_at(pid: u32) -> Option<String> {
+    platform_process_started_at(pid).ok()
+}
+
+// `lstart` is `ps`'s own fixed-format wall-clock start time — POSIX portable
+// (unlike `/proc`, which does not exist on macOS/BSD), and a process never
+// reports a different one across its own lifetime, so two queries of the
+// same still-running process always agree byte for byte.
+fn platform_process_started_at(pid: u32) -> std::io::Result<String> {
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .output()?;
+        if !out.status.success() {
+            return Err(std::io::Error::other(format!(
+                "ps exited with {}",
+                out.status
+            )));
+        }
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if text.is_empty() {
+            return Err(std::io::Error::other("ps reported no such process"));
+        }
+        Ok(text)
+    }
+    #[cfg(windows)]
+    {
+        // Round-trip ("o") format: sub-millisecond precision, so two
+        // processes started in the same second (`lstart`'s own granularity
+        // on the Unix side above) still do not collide here.
+        let script = format!("(Get-Process -Id {pid} -ErrorAction Stop).StartTime.ToString('o')");
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .quiet()
+            .output()?;
+        if !out.status.success() {
+            return Err(std::io::Error::other(format!(
+                "PowerShell exited with {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if text.is_empty() {
+            return Err(std::io::Error::other("PowerShell reported no start time"));
+        }
+        Ok(text)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        Err(std::io::Error::other(
+            "process start time is unavailable on this platform",
+        ))
+    }
+}
+
 fn platform_pid_alive(pid: u32) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
@@ -467,6 +541,28 @@ mod tests {
             Err(error) => {
                 eprintln!("OS の PID 問い合わせは利用できません（テストプロセス {pid}）: {error}")
             }
+        }
+    }
+
+    /// 同じスモーク診断を `process_started_at` にも適用する: 実行中の
+    /// このテストプロセス自身に対して呼ぶと、利用可能な環境では必ず何か
+    /// 返り、そして二回呼んでも同じ値を返す — 同一プロセスの起動時刻が
+    /// 問い合わせのたびにずれては、pid 再利用との判別に使えない。
+    #[test]
+    fn platform_query_reports_this_running_process_start_time_consistently_or_unavailable() {
+        let pid = std::process::id();
+        match (
+            platform_process_started_at(pid),
+            platform_process_started_at(pid),
+        ) {
+            (Ok(first), Ok(second)) => assert_eq!(
+                first, second,
+                "同一の生存プロセスへの二回の問い合わせが食い違った"
+            ),
+            (Err(error), _) | (_, Err(error)) if std::env::var_os("CI").is_some() => {
+                panic!("CI で起動時刻の問い合わせを実行できない（テストプロセス {pid}）: {error}")
+            }
+            _ => eprintln!("起動時刻の問い合わせは利用できません（テストプロセス {pid}）"),
         }
     }
 }

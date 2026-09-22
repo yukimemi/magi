@@ -1243,13 +1243,19 @@ impl ActiveSeat {
 #[serde(rename_all = "lowercase")]
 pub enum Liveness {
     /// Proven: a daemon's heartbeat claims the run, or `driver_pid` answers
-    /// alive.
+    /// alive under the same identity (`driver_started_at`) this run recorded
+    /// for it.
     Live,
-    /// Proven: no daemon claim, and `driver_pid` answers dead.
+    /// Proven: no daemon claim, and either `driver_pid` answers dead outright
+    /// or it answers alive under a *different* identity than recorded — a
+    /// pid the OS has since handed to an unrelated process is exactly as
+    /// good as proof the original driver is gone (see
+    /// [`RunState::driver_started_at`]'s own doc).
     Dead,
-    /// Neither proven — no daemon claim, and either no `driver_pid` to ask or
-    /// the platform could not answer for the one recorded. Never treated as
-    /// `Dead`: see [`RunState::liveness_with`].
+    /// Neither proven — no daemon claim, and either no `driver_pid` to ask,
+    /// the platform could not answer for it, or a live pid with nothing (or
+    /// nothing queryable) to corroborate its identity against. Never treated
+    /// as `Dead`: see [`RunState::liveness_with`].
     Unknown,
 }
 
@@ -1439,6 +1445,22 @@ pub struct RunState {
     /// answering. See [`Liveness`] for how this and the daemon claim combine.
     #[serde(default)]
     pub driver_pid: Option<u32>,
+    /// The OS-reported moment [`Self::driver_pid`] started, recorded in the
+    /// same breath as the pid itself — an opaque marker
+    /// (`crate::proc::process_started_at`), compared only for equality.
+    ///
+    /// A pid alone never proves a live process is *this run's* driver: pids
+    /// get reused, sometimes within minutes on a busy machine, and a killed
+    /// manual `magi run` whose pid a later, wholly unrelated process happens
+    /// to receive would otherwise read back as `Liveness::Live` from that
+    /// coincidence alone. [`Self::liveness`] re-queries the current holder
+    /// of `driver_pid` and requires this marker to still match before
+    /// trusting a live answer — a mismatch means a different process now
+    /// answers to that number, and no marker to compare (an old run, or a
+    /// platform this build could not ask at record time) means neither
+    /// extreme can be proven.
+    #[serde(default)]
+    pub driver_started_at: Option<String>,
     /// Last observation of the winner's pull request, when a land loop ran.
     ///
     /// Persisted rather than derived from the event log because the phone asks
@@ -1527,6 +1549,7 @@ impl RunState {
             seats: BTreeMap::new(),
             active: BTreeMap::new(),
             driver_pid: None,
+            driver_started_at: None,
             pr: None,
             base_sync: None,
             advice: None,
@@ -1715,45 +1738,62 @@ impl RunState {
     }
 
     /// Whether a process is actually still driving this run, given whether a
-    /// daemon's heartbeat claims it and a process-liveness query for
+    /// daemon's heartbeat claims it and process-liveness/identity queries for
     /// [`Self::driver_pid`].
     ///
     /// A daemon claim wins outright when present — it is the stronger,
     /// independently-heartbeating signal. Absent that (every manual `magi
     /// run` / `magi review`, and every daemon-driven run whose daemon has
-    /// since exited cleanly), `driver_pid` is asked directly. `query` never
-    /// collapses an unavailable answer to either extreme: no `driver_pid` at
-    /// all (an old run, or a schema older than this field), a pid this build
-    /// cannot query, or a query that comes back inconclusive, all read as
-    /// [`Liveness::Unknown`] — never [`Liveness::Dead`]. A display that
+    /// since exited cleanly), `driver_pid` is asked directly. A live answer
+    /// alone is not enough to trust, though: pids get reused, so `identity`
+    /// re-queries whoever currently holds that pid and the result must still
+    /// match [`Self::driver_started_at`] — the marker recorded at the same
+    /// moment `driver_pid` was — before this reads `Live`. A mismatch means
+    /// a *different* process now answers to that number, which is exactly as
+    /// good as proof the original driver is gone, so that reads `Dead`; no
+    /// marker to compare against (an old run, or a platform this build could
+    /// not ask at record time) or a `None` from either query, and this
+    /// cannot tell either way, so it reads [`Liveness::Unknown`] — never
+    /// guessed as [`Liveness::Dead`] out of mere silence. A display that
     /// guessed "dead" out of missing information would be exactly the
     /// mtime-and-task-manager guessing this type exists to replace.
     ///
-    /// Kept generic over `query` so a test can inject an answer without
-    /// spawning a real process query — production code goes through
-    /// [`Self::liveness`], which supplies [`crate::proc::pid_status`].
+    /// Kept generic over `query` and `identity` so a test can inject answers
+    /// without spawning a real process query — production code goes through
+    /// [`Self::liveness`], which supplies [`crate::proc::pid_status`] and
+    /// [`crate::proc::process_started_at`].
     #[must_use]
-    pub fn liveness_with<F>(&self, daemon_claims: bool, query: F) -> Liveness
+    pub fn liveness_with<F, G>(&self, daemon_claims: bool, query: F, identity: G) -> Liveness
     where
         F: FnOnce(u32) -> Option<bool>,
+        G: FnOnce(u32) -> Option<String>,
     {
         if daemon_claims {
             return Liveness::Live;
         }
-        match self.driver_pid {
+        let Some(pid) = self.driver_pid else {
+            return Liveness::Unknown;
+        };
+        match query(pid) {
+            Some(false) => Liveness::Dead,
             None => Liveness::Unknown,
-            Some(pid) => match query(pid) {
-                Some(true) => Liveness::Live,
-                Some(false) => Liveness::Dead,
-                None => Liveness::Unknown,
+            Some(true) => match (&self.driver_started_at, identity(pid)) {
+                (Some(recorded), Some(current)) if *recorded == current => Liveness::Live,
+                (Some(_), Some(_)) => Liveness::Dead,
+                _ => Liveness::Unknown,
             },
         }
     }
 
-    /// [`Self::liveness_with`], backed by the real process-liveness query.
+    /// [`Self::liveness_with`], backed by the real process-liveness and
+    /// identity queries.
     #[must_use]
     pub fn liveness(&self, daemon_claims: bool) -> Liveness {
-        self.liveness_with(daemon_claims, crate::proc::pid_status)
+        self.liveness_with(
+            daemon_claims,
+            crate::proc::pid_status,
+            crate::proc::process_started_at,
+        )
     }
 
     /// Clear every seat this run still lists as active and fail it, unless it
@@ -2417,61 +2457,131 @@ mod tests {
         assert!(!s.active_all_overrun(now));
     }
 
-    /// A daemon claim wins outright, whatever `driver_pid` or the query says
-    /// — the stronger, independently-heartbeating signal.
+    /// A daemon claim wins outright, whatever `driver_pid` or either query
+    /// says — the stronger, independently-heartbeating signal. Neither query
+    /// closure is even called: a daemon claim short-circuits before either
+    /// one, which panicking closures here prove.
     #[test]
     fn liveness_reads_live_from_a_daemon_claim_alone() {
         let mut s = state();
         s.driver_pid = None;
         assert_eq!(
-            s.liveness_with(true, |_| None),
+            s.liveness_with(
+                true,
+                |_| panic!("a daemon claim needs no pid query"),
+                |_| panic!("a daemon claim needs no identity query")
+            ),
             Liveness::Live,
             "a daemon claim needs no pid to back it up"
         );
     }
 
     /// The gap `driver_pid` closes: no daemon claim (every manual `magi run`
-    /// / `magi review`), but the recorded pid answers alive.
+    /// / `magi review`), but the recorded pid answers alive *and* the
+    /// process currently holding it still carries the same start-time
+    /// marker this run recorded — proof it is genuinely the same process,
+    /// not merely the same number.
     #[test]
-    fn liveness_reads_live_from_a_confirmed_pid_without_a_daemon_claim() {
+    fn liveness_reads_live_from_a_confirmed_pid_with_a_matching_identity() {
         let mut s = state();
         s.driver_pid = Some(4242);
+        s.driver_started_at = Some("2026-09-22T10:00:00Z".to_owned());
         assert_eq!(
-            s.liveness_with(false, |pid| {
-                assert_eq!(pid, 4242);
-                Some(true)
-            }),
+            s.liveness_with(
+                false,
+                |pid| {
+                    assert_eq!(pid, 4242);
+                    Some(true)
+                },
+                |pid| {
+                    assert_eq!(pid, 4242);
+                    Some("2026-09-22T10:00:00Z".to_owned())
+                }
+            ),
             Liveness::Live
         );
     }
 
-    /// No daemon claim and the recorded pid confirmed gone: the only case
-    /// that reads as provably dead.
+    /// No daemon claim and the recorded pid confirmed gone by the OS itself
+    /// — dead outright, and the identity query is never even reached (a
+    /// panicking closure proves it), since there is nothing left to
+    /// corroborate.
     #[test]
-    fn liveness_reads_dead_only_from_a_confirmed_dead_pid() {
+    fn liveness_reads_dead_from_a_confirmed_dead_pid() {
         let mut s = state();
         s.driver_pid = Some(4242);
-        assert_eq!(s.liveness_with(false, |_| Some(false)), Liveness::Dead);
+        assert_eq!(
+            s.liveness_with(
+                false,
+                |_| Some(false),
+                |_| panic!("a confirmed-dead pid needs no identity query")
+            ),
+            Liveness::Dead
+        );
+    }
+
+    /// The gap this task's review round exists to close: a killed manual
+    /// run's pid gets handed to a wholly unrelated later process. `pid_status`
+    /// alone would read that as `Live` — the reused pid really is alive —
+    /// but the process now holding it started at a different moment than the
+    /// one this run recorded, so this must read `Dead`, not `Live`: a
+    /// mismatch is exactly as good as proof the original driver is gone.
+    #[test]
+    fn liveness_reads_dead_when_a_live_pid_no_longer_matches_the_recorded_start_time() {
+        let mut s = state();
+        s.driver_pid = Some(4242);
+        s.driver_started_at = Some("2026-09-22T10:00:00Z".to_owned());
+        assert_eq!(
+            s.liveness_with(
+                false,
+                |_| Some(true),
+                |_| Some("2026-09-22T11:30:00Z".to_owned())
+            ),
+            Liveness::Dead,
+            "the pid is alive, but under a different process than the one this run recorded"
+        );
     }
 
     /// Missing information never collapses to `Dead`: an old run with no
-    /// `driver_pid` at all, and a `driver_pid` this build could not query,
-    /// both read as `Unknown` — never a guess.
+    /// `driver_pid` at all, a `driver_pid` this build could not query, a live
+    /// pid with no recorded start time to compare (an even older run, before
+    /// that field existed), and a live pid whose current identity this build
+    /// could not re-query, all read as `Unknown` — never a guess in either
+    /// direction.
     #[test]
-    fn liveness_never_guesses_dead_out_of_missing_information() {
+    fn liveness_never_guesses_out_of_missing_information() {
         let mut s = state();
         s.driver_pid = None;
         assert_eq!(
-            s.liveness_with(false, |_| panic!("no pid to query")),
+            s.liveness_with(
+                false,
+                |_| panic!("no pid to query"),
+                |_| panic!("no pid to query")
+            ),
             Liveness::Unknown,
             "no driver_pid recorded at all — an old run predating this field"
         );
 
         s.driver_pid = Some(4242);
         assert_eq!(
-            s.liveness_with(false, |_| None),
+            s.liveness_with(false, |_| None, |_| panic!("inconclusive already")),
             Liveness::Unknown,
             "a pid to ask, but the platform could not answer for it"
+        );
+
+        s.driver_started_at = None;
+        assert_eq!(
+            s.liveness_with(false, |_| Some(true), |_| Some("anything".to_owned())),
+            Liveness::Unknown,
+            "a live pid, but no recorded marker to corroborate it against — an old run \
+             predating `driver_started_at`"
+        );
+
+        s.driver_started_at = Some("2026-09-22T10:00:00Z".to_owned());
+        assert_eq!(
+            s.liveness_with(false, |_| Some(true), |_| None),
+            Liveness::Unknown,
+            "a live pid and a recorded marker, but the identity re-query itself failed"
         );
     }
 

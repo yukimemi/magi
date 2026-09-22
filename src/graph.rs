@@ -603,7 +603,14 @@ impl Runner {
         // can never survive into this one's own report. Unlike
         // `clear_active`, this changes on every single `execute()` call, so
         // the save below is now unconditional rather than only-if-cleared.
-        self.state.driver_pid = Some(std::process::id());
+        //
+        // `driver_started_at` is recorded in the same breath, from this same
+        // pid, so `liveness` can tell a live pid that is genuinely still us
+        // apart from one the OS has since handed to an unrelated process —
+        // see that field's own doc for why the pid alone is not enough.
+        let pid = std::process::id();
+        self.state.driver_pid = Some(pid);
+        self.state.driver_started_at = crate::proc::process_started_at(pid);
         self.state.save()?;
         // A run that already lost its quorum never resumes into the verdict
         // machinery: `deliberate` and `vote` would otherwise clobber the

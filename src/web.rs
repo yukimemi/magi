@@ -6941,8 +6941,15 @@ mod tests {
         state.status = RunStatus::Reviewing;
         state.seat_started("review", "review-1", std::time::Duration::from_secs(120), 0);
         // This test process's own pid: guaranteed alive, and never needs a
-        // real daemon or a second process to prove it.
+        // real daemon or a second process to prove it. The matching start-time
+        // marker is what `liveness` now requires alongside a live pid — see
+        // `RunState::driver_started_at`'s own doc for why the pid alone is
+        // not enough.
         state.driver_pid = Some(std::process::id());
+        state.driver_started_at = Some(
+            crate::proc::process_started_at(std::process::id())
+                .expect("this test process's own start time must be queryable"),
+        );
         let dir = f.runs().join(id);
         std::fs::create_dir_all(&dir).expect("run dir");
         std::fs::write(
@@ -6953,6 +6960,43 @@ mod tests {
 
         let detail = f.get(&format!("/api/runs/{id}")).await.json();
         assert_eq!(detail["live"], "live", "{detail}");
+    }
+
+    /// A killed manual run's pid can be handed to a wholly unrelated later
+    /// process — a live query on `driver_pid` alone would read this as
+    /// `"live"`, exactly the false positive `driver_started_at` exists to
+    /// catch (see that field's own doc, and `RunState::liveness_with`'s
+    /// pid-reuse test). The route must read it as `"dead"`, not `"live"`.
+    #[tokio::test]
+    async fn run_detail_reads_a_live_pid_as_dead_once_its_start_time_no_longer_matches() {
+        let f = Fixture::start().await;
+        let id = "20260922-090100-dddd";
+        let mut state = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "Review only".to_owned(),
+            Config::default(),
+        );
+        state.id = id.to_owned();
+        state.status = RunStatus::Reviewing;
+        state.seat_started("review", "review-1", std::time::Duration::from_secs(120), 0);
+        // This test process's own pid really is alive, but the marker
+        // recorded here does not match what it actually started at —
+        // standing in for the pid having since been reused by a different
+        // process than the one that wrote `run.json`.
+        state.driver_pid = Some(std::process::id());
+        state.driver_started_at = Some("not-this-processes-real-start-time".to_owned());
+        let dir = f.runs().join(id);
+        std::fs::create_dir_all(&dir).expect("run dir");
+        std::fs::write(
+            dir.join("run.json"),
+            serde_json::to_string_pretty(&state).expect("serialize run"),
+        )
+        .expect("write run.json");
+
+        let detail = f.get(&format!("/api/runs/{id}")).await.json();
+        assert_eq!(detail["live"], "dead", "{detail}");
     }
 
     #[tokio::test]
