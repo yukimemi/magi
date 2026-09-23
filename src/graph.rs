@@ -5260,8 +5260,15 @@ impl Runner {
                 if bump::should_release_bump(self.state.status)
                     && let Err(e) = bump::after_merge(&mut self.state, &pr.url).await
                 {
+                    let reason = format!("{e:#}");
                     self.state
-                        .event("bump", format!("release bump skipped: {e:#}"));
+                        .event("bump", format!("release bump skipped: {reason}"));
+                    // Nothing else would tell the operator the release did
+                    // not happen. Skipped when `after_merge` already raised
+                    // its own notice for a PR it did open.
+                    if !self.state.needs_attention() {
+                        bump::report_problem(&mut self.state, None, None, &reason).await;
+                    }
                 }
                 self.state.save()?;
             }

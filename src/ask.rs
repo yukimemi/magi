@@ -880,7 +880,20 @@ impl Questions {
             "run {run} {}, so nothing is waiting for this answer",
             status.as_str()
         );
-        self.abandon_for_run(run, &why)
+        // A post-merge notice is the exception: it is filed *because* the run
+        // merged, and no agent waits on it - it is a to-do for the owner, not
+        // a question a dead seat asked. Abandoning it here would erase the
+        // only alert the moment the run settles.
+        let mut abandoned = 0;
+        for mut q in self.open_for(run) {
+            if q.node == crate::bump::NOTICE_NODE {
+                continue;
+            }
+            q.abandon(&why);
+            self.put(&mut q)?;
+            abandoned += 1;
+        }
+        Ok(abandoned)
     }
 
     /// Expand an id prefix to exactly one question id. The short id the phone

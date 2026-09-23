@@ -27,6 +27,7 @@ use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, Invocation, SeatState};
+use crate::ask;
 use crate::config::AgentSpec;
 use crate::git;
 use crate::land;
@@ -979,13 +980,152 @@ async fn after_merge_at(state: &mut RunState, pr_url: &str, home: Option<&Path>)
             ),
         );
     }
+    state.release_bump = Some(run::ReleaseBump {
+        pr_url: Some(pr_url_opened.clone()),
+        version: Some(next.clone()),
+        automerge_enabled: automerge_warning.is_none(),
+        ..run::ReleaseBump::default()
+    });
     if let Some(warning) = automerge_warning {
         state.event(
             "bump",
             format!("could not enable automerge on {pr_url_opened}: {warning}; merge it by hand"),
         );
+        report_problem(state, Some(&pr_url_opened), Some(&next), &warning).await;
     }
     Ok(())
+}
+
+/// The node name a post-merge notice is filed under. [`ask::Questions::settle_run`]
+/// exempts it: the run it belongs to is `Merged` by definition, and abandoning
+/// the notice on that ground would erase it the moment it is filed.
+pub const NOTICE_NODE: &str = "release-bump";
+/// Answer: the owner dealt with the release pull request themselves.
+const NOTICE_DONE: &str = "merged by hand";
+/// Answer: seen, nothing to do.
+const NOTICE_DISMISS: &str = "dismiss";
+
+/// What to tell the operator to do about a refused `gh pr merge --auto`.
+///
+/// Keys on the wording GitHub is known to use when the base branch has no
+/// required status checks (`enablePullRequestAutoMerge` / "protected branch
+/// rules"); anything else falls back to the generic advice, with the reason
+/// carried verbatim next to it.
+fn automerge_hint(reason: &str) -> &'static str {
+    let r = reason.to_lowercase();
+    if r.contains("enablepullrequestautomerge") || r.contains("protected branch rules") {
+        "merge the release pull request by hand, and enable branch protection with required \
+         status checks on the base branch so automerge can work next time"
+    } else {
+        "merge the release pull request by hand"
+    }
+}
+
+/// The comment left on the release pull request itself.
+fn automerge_failure_comment(reason: &str) -> String {
+    format!(
+        "magi could not enable automerge on this pull request: {reason}\n\n\
+         Action required: {}. Until then the release does not happen.",
+        automerge_hint(reason)
+    )
+}
+
+/// Record a post-merge problem on the run and file the operator-facing
+/// notice, without touching the forge. Returns the comment body meant for the
+/// release pull request when there is one.
+///
+/// Split from [`report_problem`] so the state, the question and the wording
+/// can be asserted without a `gh`.
+fn surface_problem(
+    state: &mut RunState,
+    store: &ask::Questions,
+    pr_url: Option<&str>,
+    version: Option<&str>,
+    reason: &str,
+) -> Result<(ask::Question, Option<String>)> {
+    let action = if pr_url.is_some() {
+        automerge_hint(reason).to_owned()
+    } else {
+        "the release bump did not run; open the release pull request by hand".to_owned()
+    };
+    let record = state.release_bump.get_or_insert_with(Default::default);
+    record.pr_url = pr_url.map(str::to_owned).or(record.pr_url.take());
+    record.version = version.map(str::to_owned).or(record.version.take());
+    record.automerge_enabled = false;
+    record.problem = Some(reason.to_owned());
+    record.action_required = Some(action.clone());
+
+    let summary = match pr_url {
+        Some(url) => format!("Release PR needs a human: {url}"),
+        None => "Release bump did not run".to_owned(),
+    };
+    let detail = format!(
+        "Run {} merged, but the release step after it failed.\n\n{reason}\n\n\
+         Action required: {action}.",
+        state.id
+    );
+    let mut q = ask::Question::new(
+        state.id.clone(),
+        NOTICE_NODE.to_owned(),
+        "bump".to_owned(),
+        summary,
+        detail,
+        vec![NOTICE_DONE.to_owned(), NOTICE_DISMISS.to_owned()],
+    );
+    store.put(&mut q).context("file the release-bump notice")?;
+    state.event(
+        "bump",
+        format!("needs attention: notice {} filed - {action}", q.short()),
+    );
+    let comment = pr_url.map(|_| automerge_failure_comment(reason));
+    Ok((q, comment))
+}
+
+/// Make a post-merge problem visible: record it, comment on the release pull
+/// request, and raise a notice through the question queue and the configured
+/// notifier. Every step is best-effort - a failed comment or webhook is an
+/// event, never a reason to lose the record or the run.
+pub async fn report_problem(
+    state: &mut RunState,
+    pr_url: Option<&str>,
+    version: Option<&str>,
+    reason: &str,
+) {
+    match surface_problem(state, &ask::Questions::open(), pr_url, version, reason) {
+        Ok((q, comment)) => {
+            if let (Some(url), Some(body)) = (pr_url, comment)
+                && let Err(e) = gh_pr_comment(&state.repo, url, &body).await
+            {
+                state.event("bump", format!("could not comment on {url}: {e:#}"));
+            }
+            if let Err(e) = ask::notify(&state.config.notify, &q).await {
+                tracing::warn!(
+                    "could not notify about release-bump notice {}: {e:#}",
+                    q.short()
+                );
+            }
+        }
+        Err(e) => state.event("bump", format!("could not raise a notice: {e:#}")),
+    }
+}
+
+async fn gh_pr_comment(cwd: &Path, pr_url: &str, body: &str) -> Result<()> {
+    let out = tokio::process::Command::new("gh")
+        .args(["pr", "comment", pr_url, "--body", body])
+        .current_dir(cwd)
+        .quiet()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("spawn gh pr comment")?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "gh pr comment: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+    }
 }
 
 /// Bump an already-open release pull request further, because a change more
@@ -1463,6 +1603,75 @@ mod tests {
             std::fs::read_dir(home.path()).unwrap().next().is_none(),
             "no marker and no lock may be created"
         );
+    }
+
+    const NO_RULES: &str = "gh pr merge --auto: GraphQL: Pull request Branch does not have \
+                            required protected branch rules (enablePullRequestAutoMerge)";
+
+    fn merged_state() -> RunState {
+        // `report::run` prints `state.dir()`; pin the global home like the
+        // report tests do so nothing reaches the operator's real one.
+        run::set_home(std::env::temp_dir().join("magi-report-test-home"));
+        let mut s = RunState::new(
+            PathBuf::from("/no/such/repo"),
+            "main".to_owned(),
+            "0000000000000000000000000000000000000000".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        );
+        s.status = RunStatus::Merged;
+        s
+    }
+
+    #[test]
+    fn the_known_automerge_refusal_names_branch_protection() {
+        assert!(automerge_hint(NO_RULES).contains("branch protection with required"));
+        let other = automerge_hint("gh: network unreachable");
+        assert!(!other.contains("branch protection"), "{other}");
+        let body = automerge_failure_comment(NO_RULES);
+        assert!(body.contains("enablePullRequestAutoMerge"), "{body}");
+        assert!(body.contains("Action required"), "{body}");
+    }
+
+    #[test]
+    fn an_automerge_failure_is_recorded_shown_and_filed_and_survives_settling() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ask::Questions::at(dir.path().join("questions"));
+        let mut state = merged_state();
+        let url = "https://github.com/o/r/pull/35";
+
+        let (q, comment) =
+            surface_problem(&mut state, &store, Some(url), Some("0.8.0"), NO_RULES).unwrap();
+
+        // The comment goes on the release PR and carries reason and fix.
+        let comment = comment.expect("a PR was opened, so it gets a comment");
+        assert!(comment.contains("branch protection"), "{comment}");
+
+        // The run is still Merged, but no longer reads as plain green.
+        assert_eq!(state.status, RunStatus::Merged);
+        assert!(state.needs_attention());
+        let text = crate::report::run(&state);
+        assert!(text.contains("release bump"), "{text}");
+        assert!(text.contains("FAILED"), "{text}");
+        assert!(text.contains(url), "{text}");
+        assert!(text.contains("action required"), "{text}");
+        assert!(crate::report::line(&state).contains("release needs a human"));
+
+        // A notice is open, and settling the merged run does not erase it.
+        assert_eq!(q.node, NOTICE_NODE);
+        assert_eq!(store.open_for(&state.id).len(), 1);
+        assert_eq!(store.settle_run(&state.id, RunStatus::Merged).unwrap(), 0);
+        assert!(store.get(&q.id).unwrap().status.open());
+    }
+
+    #[test]
+    fn a_bump_that_never_ran_is_surfaced_without_a_pr_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ask::Questions::at(dir.path().join("questions"));
+        let mut state = merged_state();
+        let (_, comment) = surface_problem(&mut state, &store, None, None, "no agent").unwrap();
+        assert!(comment.is_none());
+        assert!(state.needs_attention());
     }
 
     #[test]

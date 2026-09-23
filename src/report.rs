@@ -69,6 +69,9 @@ fn status_word(state: &RunState) -> String {
         return cyan("unmerged (no-op by design)");
     }
     let text = state.status.display_label();
+    if state.needs_attention() {
+        return bold(&yellow(&format!("{text} - release needs a human")));
+    }
     match state.status {
         RunStatus::Merged => bold(&green(text)),
         RunStatus::Ready => green(text),
@@ -903,6 +906,33 @@ pub fn run(state: &RunState) -> String {
                 },
                 m.detail.lines().next().unwrap_or("")
             );
+        }
+    }
+
+    if let Some(b) = &state.release_bump {
+        let _ = writeln!(s, "\n{}", bold("release bump"));
+        if let Some(v) = &b.version {
+            let _ = writeln!(s, "  version v{v}");
+        }
+        if let Some(url) = &b.pr_url {
+            let _ = writeln!(s, "  pr {url}");
+        }
+        let _ = writeln!(
+            s,
+            "  automerge {}",
+            if b.automerge_enabled {
+                green("enabled")
+            } else if b.problem.is_some() {
+                bold(&red("FAILED"))
+            } else {
+                dim("not enabled")
+            }
+        );
+        if let Some(p) = &b.problem {
+            let _ = writeln!(s, "  {}", p.lines().next().unwrap_or(""));
+        }
+        if let Some(a) = &b.action_required {
+            let _ = writeln!(s, "  {} {a}", bold(&yellow("action required:")));
         }
     }
 
