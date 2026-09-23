@@ -315,10 +315,12 @@ pub struct Task {
     /// opposite direction from [`Task::interrupt`]: that one asks a run
     /// already in flight to step aside; this one never asks anything to
     /// step aside, it only spends one additional, temporary concurrency
-    /// slot. The two are independent and may both be set, though doing so
-    /// is unusual: an urgent task competing for the ordinary interrupt
-    /// sequence gains nothing from it, since urgent dispatch never waits on
-    /// that sequence to begin with.
+    /// slot. The two are independent and may both be set on the same task:
+    /// `crate::daemon::allow_urgent_through_the_gate` is what keeps an
+    /// urgent task from ever sitting blocked behind an interrupt sequence -
+    /// its own, or an unrelated task's - so marking one task `urgent`
+    /// dispatches it immediately regardless of what any `interrupt`-marked
+    /// task elsewhere in the queue is doing.
     ///
     /// `#[serde(default)]` so a queue file written before this field existed
     /// still reads, as `false` - no task claims the urgent slot unless asked

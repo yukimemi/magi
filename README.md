@@ -246,6 +246,10 @@ first to leave the urgent slot, same as any other pair of tasks waits for a
 free ordinary one. And while an urgent run is in flight, `magi task interrupt`
 cannot take effect: that mechanism only ever starts once exactly one run is in
 flight, so a second, urgent run sitting alongside the first one holds it off.
+The reverse is not true, though — an unrelated `interrupt`-marked task never
+holds an urgent one back: an urgent task dispatches the moment it is
+runnable even while `magi task interrupt`'s own park/resume handoff is under
+way for something else.
 
 | verb | |
 |---|---|
