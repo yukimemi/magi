@@ -315,7 +315,16 @@ pub async fn invoke(
     tracing::debug!(seat = %seat.key, agent = %spec.id, argv = ?plan.argv, "spawning agent");
 
     let started = Instant::now();
-    let program = crate::config::find_program(&plan.argv[0]).map_or_else(
+    // Resolve against the PATH the child will actually see: `spec.env` may
+    // override it, and the resolved absolute path bypasses any later lookup.
+    let child_path = spec
+        .env
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+        .map(|(_, v)| std::ffi::OsString::from(v))
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    let program = crate::config::find_program_on(&plan.argv[0], &child_path).map_or_else(
         || plan.argv[0].clone().into(),
         std::path::PathBuf::into_os_string,
     );

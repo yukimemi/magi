@@ -1572,9 +1572,14 @@ pub fn which(program: &str) -> bool {
 /// On Windows an extensionless file is never a match: npm writes an `sh`
 /// script beside every `.cmd` shim, and spawning that fails with os error 193.
 pub fn find_program(program: &str) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
+    find_program_on(program, &std::env::var_os("PATH")?)
+}
+
+/// [`find_program`] against an explicit `PATH`, for a child whose environment
+/// overrides it.
+pub fn find_program_on(program: &str, paths: &std::ffi::OsStr) -> Option<PathBuf> {
     let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT".into());
-    find_program_in(program, &paths, cfg!(windows).then_some(pathext.as_str()))
+    find_program_in(program, paths, cfg!(windows).then_some(pathext.as_str()))
 }
 
 fn find_program_in(
