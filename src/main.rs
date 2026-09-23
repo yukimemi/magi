@@ -3987,9 +3987,12 @@ mod tests {
         assert_eq!(resolved, canonical);
         // `task add` stores exactly what `resolve_repo` returns, via `Task::new`
         // and nothing in between, so this is the value the queue would hold.
-        let task = Task::new("t".into(), "x".into(), resolved, magi::queue::Source::Human);
-        assert_eq!(task.repo, canonical);
-        assert!(task.repo.to_string_lossy().starts_with("\\\\?\\"));
+        let mut task = Task::new("t".into(), "x".into(), resolved, magi::queue::Source::Human);
+        let q = magi::queue::Queue::at(dir.path().join("queue"));
+        q.put(&mut task).unwrap();
+        let stored = q.get(&task.id).unwrap();
+        assert_eq!(stored.repo, canonical);
+        assert!(stored.repo.to_string_lossy().starts_with("\\\\?\\"));
     }
 
     #[tokio::test]
