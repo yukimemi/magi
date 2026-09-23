@@ -676,6 +676,9 @@ The full surface:
 id = "opus"
 kind = "claude"        # claude | opencode | antigravity | codex | command
 model = "opus"
+effort = "high"         # reasoning effort, in that CLI's own vocabulary;
+                         # magi passes it through unvalidated since it
+                         # differs per CLI
 
 [[agents]]
 id = "sonnet"

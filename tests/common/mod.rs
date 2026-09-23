@@ -484,6 +484,7 @@ pub fn fixture(home: HomeGuard, judges: Judges, require_fix: bool) -> Fixture {
         id: id.to_owned(),
         kind: AgentKind::Command,
         model: None,
+        effort: None,
         command: vec!["sh".to_owned(), script.to_string_lossy().into_owned()],
         extra_args: Vec::new(),
         env: env.clone(),

@@ -2021,6 +2021,7 @@ mod tests {
             id: "codex-one".to_owned(),
             kind: crate::config::AgentKind::Codex,
             model: None,
+            effort: None,
             command: vec!["codex".to_owned()],
             extra_args: Vec::new(),
             env: BTreeMap::new(),

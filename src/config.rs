@@ -106,6 +106,15 @@ pub struct AgentSpec {
     /// Model passed through to the CLI (`--model` / `-m`). CLI default if unset.
     #[serde(default)]
     pub model: Option<String>,
+    /// Reasoning effort passed through to the CLI, in whatever shape that
+    /// CLI's own flag takes (`--effort`, `--thinking=`, `--variant`, or
+    /// codex's `-c model_reasoning_effort=`). CLI default if unset.
+    /// Deliberately unvalidated: each CLI defines its own vocabulary (e.g.
+    /// `low`/`medium`/`high`, or `minimal`/`low`/`medium`/`high`/`xhigh`), so
+    /// magi passes the string through rather than checking it against one.
+    /// `kind = "command"` has no equivalent, same as it has no `model` flag.
+    #[serde(default)]
+    pub effort: Option<String>,
     /// `kind = "command"` only: argv. Supports `{prompt_file}`, `{cwd}`,
     /// `{label}`, `{session}` placeholders.
     #[serde(default)]
@@ -142,11 +151,16 @@ impl AgentSpec {
         })
     }
 
-    /// Human-facing label, e.g. `opus (claude:opus)`.
+    /// Human-facing label, e.g. `opus (claude:opus)` or
+    /// `opus (claude:opus, effort high)`.
     pub fn display(&self) -> String {
-        match &self.model {
+        let base = match &self.model {
             Some(m) => format!("{} ({}:{m})", self.id, self.kind.as_str()),
             None => format!("{} ({})", self.id, self.kind.as_str()),
+        };
+        match &self.effort {
+            Some(e) => format!("{}, effort {})", &base[..base.len() - 1], e),
+            None => base,
         }
     }
 }
@@ -1347,6 +1361,7 @@ impl Config {
                     id: id.to_owned(),
                     kind,
                     model: model.map(str::to_owned),
+                    effort: None,
                     command: Vec::new(),
                     extra_args: Vec::new(),
                     env: BTreeMap::new(),
@@ -1662,11 +1677,25 @@ mod tests {
             id: id.to_owned(),
             kind: AgentKind::Command,
             model: None,
+            effort: None,
             command: vec!["true".to_owned()],
             extra_args: Vec::new(),
             env: BTreeMap::new(),
             prompt_delivery: None,
         }
+    }
+
+    #[test]
+    fn display_shows_model_and_effort_when_set() {
+        let mut a = spec("opus");
+        a.kind = AgentKind::Claude;
+        assert_eq!(a.display(), "opus (claude)");
+        a.model = Some("opus".to_owned());
+        assert_eq!(a.display(), "opus (claude:opus)");
+        a.effort = Some("high".to_owned());
+        assert_eq!(a.display(), "opus (claude:opus, effort high)");
+        a.model = None;
+        assert_eq!(a.display(), "opus (claude, effort high)");
     }
 
     #[test]

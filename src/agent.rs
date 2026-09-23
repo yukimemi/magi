@@ -540,6 +540,10 @@ fn build_command(
                 argv.push("--model".to_owned());
                 argv.push(m.clone());
             }
+            if let Some(e) = &spec.effort {
+                argv.push("--effort".to_owned());
+                argv.push(e.clone());
+            }
             if inv.sessions {
                 let uuid = seat
                     .claude_session
@@ -578,6 +582,10 @@ fn build_command(
                 argv.push("-m".to_owned());
                 argv.push(m.clone());
             }
+            if let Some(e) = &spec.effort {
+                argv.push("--variant".to_owned());
+                argv.push(e.clone());
+            }
             if resuming {
                 argv.push("-s".to_owned());
                 argv.push(
@@ -610,6 +618,10 @@ fn build_command(
             if let Some(m) = &spec.model {
                 argv.push("--model".to_owned());
                 argv.push(m.clone());
+            }
+            if let Some(e) = &spec.effort {
+                argv.push("--effort".to_owned());
+                argv.push(e.clone());
             }
             if resuming {
                 argv.push("--conversation".to_owned());
@@ -684,6 +696,13 @@ fn build_command(
                 argv.push("-m".to_owned());
                 argv.push(m.clone());
             }
+            // codex has no direct `--reasoning-effort` flag on `exec` in this
+            // version; effort is set through the same config-override
+            // mechanism as `approval_policy` above.
+            if let Some(e) = &spec.effort {
+                argv.push("-c".to_owned());
+                argv.push(format!("model_reasoning_effort=\"{e}\""));
+            }
             // `resume` is a subcommand of `exec`, and it rejects the flags
             // above when they follow it - so every option is emitted first and
             // the subcommand last. Established by hand against codex-cli
@@ -718,6 +737,9 @@ fn build_command(
             if let Some(m) = &spec.model {
                 argv.push("--model".to_owned());
                 argv.push(m.clone());
+            }
+            if let Some(e) = &spec.effort {
+                argv.push(format!("--thinking={e}"));
             }
             // Established by hand against omp 18.1.19: `-p --mode=json` reports
             // the session id on its `"type":"session"` line, and
@@ -1363,6 +1385,7 @@ mod tests {
             id: "helper".to_owned(),
             kind: AgentKind::Command,
             model: None,
+            effort: None,
             command: vec![
                 std::env::current_exe()
                     .expect("locate test helper")
@@ -1403,6 +1426,7 @@ mod tests {
             id: "a".to_owned(),
             kind,
             model: model.map(str::to_owned),
+            effort: None,
             command: vec!["echo".to_owned(), "{label}".to_owned()],
             extra_args: Vec::new(),
             env: BTreeMap::new(),
@@ -1434,6 +1458,94 @@ mod tests {
             Path::new("/art/p.md"),
         )
         .unwrap()
+    }
+
+    fn plan_with_effort(kind: AgentKind, effort: Option<&str>) -> Plan {
+        let mut s = spec(kind, None);
+        s.effort = effort.map(str::to_owned);
+        let seat = SeatState::new("seat-1", "a", 1);
+        build_command(
+            &s,
+            &seat,
+            &inv(Path::new("."), Path::new("/art"), true),
+            Path::new("/art/p.md"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn effort_unset_adds_no_flag_for_any_native_kind() {
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Opencode,
+            AgentKind::Antigravity,
+            AgentKind::Codex,
+            AgentKind::Omp,
+        ] {
+            let p = plan_with_effort(kind, None);
+            assert!(
+                !p.argv.iter().any(|a| a.contains("effort") || a.contains("thinking")
+                    || a.contains("variant")),
+                "{kind:?} must not emit an effort flag when unset: {:?}",
+                p.argv
+            );
+        }
+    }
+
+    #[test]
+    fn claude_effort_set_emits_the_flag() {
+        let p = plan_with_effort(AgentKind::Claude, Some("high"));
+        assert!(p.argv.windows(2).any(|w| w == ["--effort", "high"]));
+    }
+
+    #[test]
+    fn antigravity_effort_set_emits_the_flag() {
+        let p = plan_with_effort(AgentKind::Antigravity, Some("high"));
+        assert!(p.argv.windows(2).any(|w| w == ["--effort", "high"]));
+    }
+
+    #[test]
+    fn opencode_effort_set_emits_variant() {
+        let p = plan_with_effort(AgentKind::Opencode, Some("high"));
+        assert!(p.argv.windows(2).any(|w| w == ["--variant", "high"]));
+    }
+
+    #[test]
+    fn omp_effort_set_emits_a_single_thinking_token() {
+        let p = plan_with_effort(AgentKind::Omp, Some("high"));
+        assert!(p.argv.iter().any(|a| a == "--thinking=high"));
+    }
+
+    #[test]
+    fn codex_effort_set_emits_a_config_override_before_any_resume_subcommand() {
+        let p = plan_with_effort(AgentKind::Codex, Some("high"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["-c", "model_reasoning_effort=\"high\""])
+        );
+
+        // `resume` is a subcommand that rejects options after it - the
+        // override must appear before it, exactly like `approval_policy`.
+        let mut s = spec(AgentKind::Codex, None);
+        s.effort = Some("high".to_owned());
+        let mut seat = SeatState::new("seat-1", "a", 1);
+        seat.captured_session = Some("sid".to_owned());
+        seat.turns = 1;
+        let resumed = build_command(
+            &s,
+            &seat,
+            &inv(Path::new("."), Path::new("/art"), true),
+            Path::new("/art/p.md"),
+        )
+        .unwrap();
+        let effort_pos = resumed
+            .argv
+            .iter()
+            .position(|a| a == "model_reasoning_effort=\"high\"")
+            .unwrap();
+        let resume_pos = resumed.argv.iter().position(|a| a == "resume").unwrap();
+        assert!(effort_pos < resume_pos);
     }
 
     #[test]
@@ -2494,6 +2606,7 @@ mod tests {
             id: id.to_owned(),
             kind,
             model: None,
+            effort: None,
             command: Vec::new(),
             extra_args: Vec::new(),
             env: BTreeMap::new(),

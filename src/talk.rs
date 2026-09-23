@@ -1281,6 +1281,7 @@ mod tests {
             id: "mock".to_owned(),
             kind: AgentKind::Command,
             model: None,
+            effort: None,
             command: vec!["sh".to_owned(), path.to_string_lossy().into_owned()],
             extra_args: Vec::new(),
             env,
