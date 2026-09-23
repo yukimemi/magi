@@ -234,6 +234,19 @@ daemon killed mid-run leaves a queue the next one picks up.
 parallel inside — candidates times judges — and two graphs at once doubles the
 burn on the agent-CLI quota that is the real constraint.
 
+`magi task add --urgent` is the escape hatch for the rare task that genuinely
+cannot wait. It dispatches the moment it is runnable, through one extra,
+temporary slot, alongside whatever is already running — the run already in
+flight is never paused, parked, or restarted to make room. It is not a way to
+raise `[daemon] max_concurrent_runs` for good: that setting, and its default
+of one, is unchanged, and while an urgent task is in flight quota burn can
+briefly reach `max_concurrent_runs + 1` runs at once instead of just one.
+Two `--urgent` tasks do not both jump the queue — the second waits for the
+first to leave the urgent slot, same as any other pair of tasks waits for a
+free ordinary one. And while an urgent run is in flight, `magi task interrupt`
+cannot take effect: that mechanism only ever starts once exactly one run is in
+flight, so a second, urgent run sitting alongside the first one holds it off.
+
 | verb | |
 |---|---|
 | `magi task add` | file work; text, `--file`, `--issue`, or stdin |

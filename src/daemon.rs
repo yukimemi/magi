@@ -1611,6 +1611,45 @@ struct DispatchLimits {
     pause_for_interrupts: bool,
 }
 
+/// Which semaphore, if any, dispatching a candidate should draw its permit
+/// from.
+///
+/// Pure and separate from [`poll`]'s loop body for the same reason
+/// [`advance_interrupt`] is: the choice between "skip the ordinary pool
+/// entirely", "spend the one urgent slot" and "spend an ordinary slot" is
+/// exactly the policy this feature adds, and a policy only exercisable by
+/// running the whole loop is a policy nobody checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermitKind {
+    /// A land-merge resume (see [`LandResume::Ready`]): bypasses every slot.
+    /// Checked first - a task can be both a land resume and marked
+    /// [`Task::urgent`], and the resume's own "must not queue behind
+    /// anything" guarantee takes precedence.
+    None,
+    /// [`Task::urgent`]: the one extra slot in `urgent_sem`, spent instead of
+    /// (never in addition to trying) the ordinary pool. This is what lets
+    /// an urgent task dispatch while every ordinary slot is already checked
+    /// out, and what stops a second urgent task from opening a third run: it
+    /// waits on this same one-slot semaphore rather than falling through to
+    /// the ordinary one.
+    Urgent,
+    /// The ordinary `max_concurrent_runs` pool - unaffected by either of the
+    /// above.
+    Ordinary,
+}
+
+/// [`PermitKind`] for one candidate. `priority` is [`LandResume::Ready`]'s
+/// own boolean, already computed by the caller from [`land_resume_state`].
+fn permit_kind(priority: bool, urgent: bool) -> PermitKind {
+    if priority {
+        PermitKind::None
+    } else if urgent {
+        PermitKind::Urgent
+    } else {
+        PermitKind::Ordinary
+    }
+}
+
 /// Poll the queue until stopped, factored out so [`drive`] owns only setup and
 /// teardown and cannot skip the teardown on an early return.
 ///
@@ -1645,6 +1684,14 @@ async fn poll(
     // and the attempt counter is what bounds it.
     let mut attempted: Vec<String> = Vec::new();
     let sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    // One extra, permanent slot for `--urgent` tasks (see `Task::urgent`),
+    // entirely separate from `sem`: an urgent candidate must dispatch
+    // alongside whatever `sem` already has checked out, never by waiting for
+    // one of those ordinary slots to free up and never by growing
+    // `max_concurrent_runs` itself. Sized at one, not unbounded - see
+    // `permit_kind`'s own doc - so a second `--urgent` task queues behind the
+    // first on this same slot rather than opening a third run.
+    let urgent_sem = Arc::new(tokio::sync::Semaphore::new(1));
     // A quota hit is a fact about the machine, not the task that happened to
     // surface it, and every other *ordinary* candidate is no less likely to
     // hit the same wall - see the warning below. A land-merge resume is
@@ -1831,16 +1878,24 @@ async fn poll(
             if !priority && cooling_down {
                 continue;
             }
-            let permit = if priority {
-                None
-            } else {
-                match Arc::clone(&sem).try_acquire_owned() {
+            let permit = match permit_kind(priority, candidate.urgent) {
+                PermitKind::None => None,
+                PermitKind::Urgent => match Arc::clone(&urgent_sem).try_acquire_owned() {
+                    Ok(p) => Some(p),
+                    // The one urgent slot is already spoken for by another
+                    // `--urgent` task's run. Keep looking rather than falling
+                    // back to the ordinary pool - see `PermitKind::Urgent`'s
+                    // own doc - a later candidate might still be an ordinary
+                    // task with a free slot, or another priority resume.
+                    Err(_) => continue,
+                },
+                PermitKind::Ordinary => match Arc::clone(&sem).try_acquire_owned() {
                     Ok(p) => Some(p),
                     // No ordinary slot free right now. A later candidate in
-                    // this same list might still be a priority resume, so
-                    // keep looking rather than stopping here.
+                    // this same list might still be a priority resume or an
+                    // urgent task, so keep looking rather than stopping here.
                     Err(_) => continue,
-                }
+                },
             };
 
             // A claim we cannot take means another daemon, or a human running
@@ -3011,6 +3066,26 @@ mod tests {
         let mut t = task();
         t.id = id.to_owned();
         t
+    }
+
+    /// The land-resume exemption wins outright, whether or not the candidate
+    /// also happens to be marked [`Task::urgent`]: a resume's own "must not
+    /// queue behind anything" guarantee cannot be weaker just because the
+    /// same task was also filed with `--urgent`.
+    #[test]
+    fn permit_kind_prefers_a_land_resume_over_the_urgent_slot() {
+        assert_eq!(permit_kind(true, false), PermitKind::None);
+        assert_eq!(permit_kind(true, true), PermitKind::None);
+    }
+
+    /// The one property this whole feature exists for: `--urgent` draws from
+    /// its own slot, never the ordinary `max_concurrent_runs` pool - and an
+    /// ordinary candidate draws from the ordinary pool exactly as before,
+    /// untouched by the urgent slot's existence.
+    #[test]
+    fn permit_kind_separates_urgent_from_ordinary() {
+        assert_eq!(permit_kind(false, true), PermitKind::Urgent);
+        assert_eq!(permit_kind(false, false), PermitKind::Ordinary);
     }
 
     /// The exact wiring `attempt` runs before minting anything: a config's
