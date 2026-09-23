@@ -42,14 +42,13 @@ e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo test --locked --all-
 gate = ["CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo make check"]
 
 [merge]
-mode = "pr"
 # `base` is set explicitly because this is a jj-colocated checkout: jj keeps
 # git's HEAD detached at the working-copy commit, so the `git symbolic-ref
 # HEAD` fallback in `git::current_branch` would fail here. Teaching magi to
 # read the jj bookmark instead is a real feature, not a workaround — tracked
 # as its own competition. That fallback only runs when `base` is unset,
 # though: with `base` given, `config.merge.base` wins over the fallback no
-# matter what `mode` is, so `mode = "pr"` here never reads HEAD at all — the
+# matter what `mode` is, so the inherited `mode = "pr"` never reads HEAD — the
 # `Pr` arm in `land.rs` just pushes the winner's worktree and opens a PR
 # against `state.base_branch`. The only mode that depends on HEAD is
 # `mode = "local"`, which merges directly in the primary worktree and needs
