@@ -1600,41 +1600,6 @@ fn interrupt_gate(state: &Interrupt, in_flight: &[String], candidates: Vec<Task>
     }
 }
 
-/// [`interrupt_gate`]'s output, with every [`Task::urgent`] candidate it
-/// withheld added back.
-///
-/// [`interrupt_gate`] exists to keep an *ordinary* competition and 75dd's
-/// park/resume handoff from ever running at the same moment - see its own
-/// doc. An `--urgent` task is a deliberately separate, additional
-/// concurrency lane that handoff predates and knows nothing about, and this
-/// feature's whole point is that such a task dispatches the moment it is
-/// runnable, never queued behind an unrelated interrupt sequence: without
-/// this, a task marked to interrupt on some *other*, unrelated candidate
-/// left every urgent candidate just as gated as an ordinary one for the
-/// whole Parking/Running/Resuming sequence, sometimes for as long as that
-/// other task's entire run.
-///
-/// `state`'s own transitions (`advance_interrupt`) are fed the same,
-/// unfiltered candidate list they always were, in [`poll`]'s call site - this
-/// only changes what gets dispatched, never what the sequence itself
-/// decides - so an ordinary interrupt untouched by `--urgent` behaves
-/// identically to before. A candidate marked *both* `urgent` and
-/// `interrupt` still goes through `interrupt_gate` like any other interrupt
-/// candidate on its own account; it is simply also eligible for the earlier
-/// dispatch this adds, so the one thing it can never do is sit blocked by
-/// its own interrupt sequence.
-fn allow_urgent_through_the_gate(gated: Vec<Task>, candidates: &[Task]) -> Vec<Task> {
-    let already: std::collections::BTreeSet<&str> = gated.iter().map(|t| t.id.as_str()).collect();
-    let extra: Vec<Task> = candidates
-        .iter()
-        .filter(|t| t.urgent && !already.contains(t.id.as_str()))
-        .cloned()
-        .collect();
-    let mut merged = gated;
-    merged.extend(extra);
-    merged
-}
-
 /// The daemon-loop knobs [`poll`] needs from [`crate::config::Daemon`],
 /// bundled into one parameter so `poll`'s own signature stays readable -
 /// see [`drive`]'s call site for where these are actually read.
@@ -1694,12 +1659,15 @@ fn permit_kind(priority: bool, urgent: bool) -> PermitKind {
 /// bound the moment [`land_resume_state`] reports it [`LandResume::Ready`]:
 /// the whole point of parking there is that it must not queue behind
 /// whatever else the loop happens to be running, even at the default of one.
-/// Both exemptions are still subject to the interrupt gate below: a
-/// land-resume candidate is exactly as much "something else running" as an
-/// ordinary one from the interrupt sequence's point of view, and letting it
-/// slip through while a run is being parked, or while the interrupt task
-/// itself has the floor, is precisely the second run this feature must never
-/// produce.
+/// A [`Task::urgent`] candidate is exempt from the same bound the same way,
+/// through its own one-slot `urgent_sem` (see [`permit_kind`]). Every one of
+/// these exemptions is still subject to the interrupt gate below, urgent
+/// included: a land-resume or urgent candidate is exactly as much "something
+/// else running" as an ordinary one from the interrupt sequence's point of
+/// view, and letting either slip through while a run is being parked, or
+/// while the interrupt task itself has the floor, is precisely the second
+/// run 75dd's own "at most one run, ever, at once" guarantee must never
+/// allow - see [`Interrupt`]'s own doc.
 async fn poll(
     opts: &Opts,
     queue: &Queue,
@@ -1893,8 +1861,7 @@ async fn poll(
                 }
             }
         }
-        let gated = interrupt_gate(&interrupt, &in_flight, candidates.clone());
-        let candidates = allow_urgent_through_the_gate(gated, &candidates);
+        let candidates = interrupt_gate(&interrupt, &in_flight, candidates);
 
         let cooling_down =
             lock(&quota_cooldown_until).is_some_and(|until| Timestamp::now() < until);
@@ -3378,12 +3345,21 @@ mod tests {
         );
     }
 
-    /// The finding this exists for: `interrupt_gate` alone withholds an
-    /// unrelated `--urgent` candidate for the whole Parking/Running/Resuming
-    /// sequence, same as any ordinary one - `allow_urgent_through_the_gate`
-    /// is what a caller must apply on top to keep that promise.
+    /// `interrupt_gate` knows nothing about [`Task::urgent`] and must not
+    /// grow a special case for it: an urgent candidate that is not the
+    /// interrupt task withholds exactly like an ordinary one for as long as
+    /// the parked run it is racing has not actually left flight. A version
+    /// of this feature once bypassed the gate for urgent candidates, on the
+    /// theory that a genuinely separate concurrency lane could not collide
+    /// with 75dd's own; it could, and did - the bypassed task dispatched
+    /// alongside a run 75dd's own state machine had only *asked* to park,
+    /// not yet confirmed gone, which is exactly the second run
+    /// `Interrupt::Parking`'s own doc says must never happen. There is no
+    /// tick during Parking/Running/Resuming where letting an extra
+    /// candidate through is safe, urgent or not - the parked run may still
+    /// be genuinely mid-call.
     #[test]
-    fn an_unrelated_interrupt_sequence_never_withholds_an_urgent_candidate() {
+    fn urgent_gains_no_exemption_from_an_active_interrupt_sequence() {
         for state in [
             Interrupt::Parking {
                 parked: vec!["running".to_owned()],
@@ -3402,38 +3378,32 @@ mod tests {
                 urgent_task("hot"),
                 task_with_id("ordinary"),
             ];
-            let gated = interrupt_gate(&state, &["running".to_owned()], candidates.clone());
-            let allowed = allow_urgent_through_the_gate(gated, &candidates);
+            let allowed = interrupt_gate(&state, &["running".to_owned()], candidates);
             assert!(
-                allowed.iter().any(|t| t.id == "hot"),
-                "the urgent candidate must dispatch regardless of state {state:?}: {allowed:?}"
-            );
-            assert!(
-                !allowed.iter().any(|t| t.id == "ordinary"),
-                "an ordinary, non-urgent, non-interrupt candidate stays gated \
-                 exactly as `interrupt_gate` alone already decided for state \
-                 {state:?}: {allowed:?}"
+                !allowed.iter().any(|t| t.id == "hot"),
+                "an urgent candidate must wait out the same gate as anything \
+                 else while the run it would run alongside has not actually \
+                 left flight, for state {state:?}: {allowed:?}"
             );
         }
     }
 
-    /// A candidate that is both marked `--urgent` and is the interrupt task
-    /// itself is not duplicated: once `interrupt_gate` already lets it
-    /// through on its own account (the `Resuming` case, once it is the
-    /// parked task getting its guaranteed resume), the urgent add-back must
-    /// not offer a second copy.
+    /// The one case where marking a task `--urgent` and `interrupt` at once
+    /// is not redundant: once the interrupt sequence's own guaranteed
+    /// resume/dispatch actually admits the task, it is unaffected by also
+    /// carrying `urgent` - `interrupt_gate` decides purely on identity,
+    /// never on the urgent flag.
     #[test]
-    fn an_urgent_candidate_already_let_through_is_not_duplicated() {
+    fn a_task_marked_both_urgent_and_interrupt_is_admitted_once_the_gate_itself_says_so() {
         let state = Interrupt::Resuming {
             parked: vec!["hot".to_owned()],
         };
         let candidates = vec![urgent_task("hot"), task()];
-        let gated = interrupt_gate(&state, &[], candidates.clone());
-        let allowed = allow_urgent_through_the_gate(gated, &candidates);
+        let allowed = interrupt_gate(&state, &[], candidates);
         assert_eq!(
             allowed.iter().filter(|t| t.id == "hot").count(),
             1,
-            "exactly one copy of the urgent/parked candidate: {allowed:?}"
+            "the gate's own decision is unaffected by the urgent flag: {allowed:?}"
         );
     }
 

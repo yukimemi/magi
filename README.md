@@ -243,13 +243,15 @@ of one, is unchanged, and while an urgent task is in flight quota burn can
 briefly reach `max_concurrent_runs + 1` runs at once instead of just one.
 Two `--urgent` tasks do not both jump the queue — the second waits for the
 first to leave the urgent slot, same as any other pair of tasks waits for a
-free ordinary one. And while an urgent run is in flight, `magi task interrupt`
-cannot take effect: that mechanism only ever starts once exactly one run is in
-flight, so a second, urgent run sitting alongside the first one holds it off.
-The reverse is not true, though — an unrelated `interrupt`-marked task never
-holds an urgent one back: an urgent task dispatches the moment it is
-runnable even while `magi task interrupt`'s own park/resume handoff is under
-way for something else.
+free ordinary one. `--urgent` and `magi task interrupt` (`[daemon]
+pause_for_interrupts`) do not compose, in either direction: while an urgent
+run is in flight, interrupt cannot start (it only ever begins once exactly
+one run is in flight); and while an interrupt's own park/resume handoff is
+under way — for that same task or an unrelated one — an urgent task waits
+out the same gate an ordinary task would, because the handoff's own "one run,
+never two" guarantee has to win over urgent's own "never wait" one. Both are
+opt-in and, together, a rare combination; `pause_for_interrupts` is off by
+default.
 
 | verb | |
 |---|---|
