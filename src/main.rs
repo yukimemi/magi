@@ -3977,14 +3977,19 @@ mod tests {
         let (dir, repo) = scratch_repo().await;
         let canonical = repo.canonicalize().unwrap();
         let s = canonical.to_string_lossy().into_owned();
-        let Some(tail) = s.strip_prefix("\\\\?\\") else {
-            return;
-        };
+        let tail = s
+            .strip_prefix("\\\\?\\")
+            .expect("Windows canonicalize yields a verbatim path");
         let broken = PathBuf::from(format!("\\?\\{tail}"));
         let resolved = resolve_repo(&broken, dir.path(), None)
             .await
             .expect("the repaired path resolves");
         assert_eq!(resolved, canonical);
+        // `task add` stores exactly what `resolve_repo` returns, via `Task::new`
+        // and nothing in between, so this is the value the queue would hold.
+        let task = Task::new("t".into(), "x".into(), resolved, magi::queue::Source::Human);
+        assert_eq!(task.repo, canonical);
+        assert!(task.repo.to_string_lossy().starts_with("\\\\?\\"));
     }
 
     #[tokio::test]
