@@ -1560,28 +1560,69 @@ impl Config {
 
 /// Is `program` on `PATH`?
 pub fn which(program: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    let exts: Vec<String> = std::env::var("PATHEXT")
-        .map(|v| v.split(';').map(|e| e.to_lowercase()).collect())
-        .unwrap_or_default();
-    std::env::split_paths(&paths).any(|dir| {
-        let direct = dir.join(program);
-        if direct.is_file() {
-            return true;
+    find_program(program).is_some()
+}
+
+/// The file a bare `program` name resolves to on `PATH`, the way the OS shell
+/// would find it.
+///
+/// Spawn agents through this, not by bare name: on Windows Rust's std
+/// only tries `name.exe`, so a CLI installed as an npm `.cmd` shim (codex
+/// since its 2026-09-23 reinstall) is "not found" even though a shell runs it.
+/// On Windows an extensionless file is never a match: npm writes an `sh`
+/// script beside every `.cmd` shim, and spawning that fails with os error 193.
+pub fn find_program(program: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT".into());
+    find_program_in(program, &paths, cfg!(windows).then_some(pathext.as_str()))
+}
+
+fn find_program_in(
+    program: &str,
+    paths: &std::ffi::OsStr,
+    pathext: Option<&str>,
+) -> Option<PathBuf> {
+    let p = Path::new(program);
+    if p.components().count() > 1 {
+        return p.is_file().then(|| p.to_path_buf());
+    }
+    std::env::split_paths(paths).find_map(|dir| match pathext {
+        Some(exts) => {
+            let bare = dir.join(program);
+            if p.extension().is_some() && bare.is_file() {
+                return Some(bare);
+            }
+            exts.split(';')
+                .filter(|e| !e.is_empty())
+                .map(|e| dir.join(format!("{program}{}", e.to_lowercase())))
+                .find(|c| c.is_file())
         }
-        exts.iter().any(|ext| {
-            let mut name = program.to_owned();
-            name.push_str(ext);
-            dir.join(name).is_file()
-        })
+        None => Some(dir.join(program)).filter(|c| c.is_file()),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// npm writes an extensionless `sh` script beside `codex.cmd`; on Windows
+    /// the `.cmd` is the spawnable one (os error 193 otherwise, 2026-09-23).
+    #[test]
+    fn windows_lookup_picks_the_cmd_shim_over_the_extensionless_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("codex"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("codex.cmd"), "@echo off\n").unwrap();
+        let paths = dir.path().as_os_str();
+        assert_eq!(
+            find_program_in("codex", paths, Some(".EXE;.CMD")),
+            Some(dir.path().join("codex.cmd"))
+        );
+        assert_eq!(
+            find_program_in("codex", paths, None),
+            Some(dir.path().join("codex"))
+        );
+        assert_eq!(find_program_in("claude", paths, Some(".EXE;.CMD")), None);
+    }
 
     fn spec(id: &str) -> AgentSpec {
         AgentSpec {

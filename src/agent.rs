@@ -315,7 +315,11 @@ pub async fn invoke(
     tracing::debug!(seat = %seat.key, agent = %spec.id, argv = ?plan.argv, "spawning agent");
 
     let started = Instant::now();
-    let mut cmd = Command::new(&plan.argv[0]);
+    let program = crate::config::find_program(&plan.argv[0]).map_or_else(
+        || plan.argv[0].clone().into(),
+        std::path::PathBuf::into_os_string,
+    );
+    let mut cmd = Command::new(program);
     cmd.args(&plan.argv[1..])
         .current_dir(inv.cwd)
         .envs(&spec.env)

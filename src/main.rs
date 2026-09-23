@@ -3000,7 +3000,9 @@ fn doctor_queue_and_loop(home: &Path) -> String {
 }
 
 async fn probe(program: &str, args: &[&str]) -> String {
-    match tokio::process::Command::new(program)
+    let resolved = magi::config::find_program(program)
+        .map_or_else(|| program.into(), std::path::PathBuf::into_os_string);
+    match tokio::process::Command::new(resolved)
         .args(args)
         // `magi doctor` probes every agent CLI in the roster; unquieted that is
         // one console window per kind blinking past on Windows.
