@@ -2636,6 +2636,27 @@ fn asking_is_not_this_seat_s_job(node: &str) -> Option<String> {
 /// fail in the first place - so it is re-checked with `git::toplevel`
 /// before ever replacing the operator's own directory.
 async fn resolve_repo(repo: &Path, cwd: &Path, hint: Option<&str>) -> Result<PathBuf> {
+    // A caller's shell (Git Bash's argument conversion, in the case that
+    // motivated this) can drop one backslash of `\\?\`. `?` cannot appear in a
+    // Windows file name, so the repaired form is only ever adopted when it
+    // names a real directory; anything else falls through untouched.
+    #[cfg(windows)]
+    let repaired = repair_verbatim_prefix(&repo.to_string_lossy())
+        .map(PathBuf::from)
+        .filter(|p| p.canonicalize().is_ok());
+    #[cfg(windows)]
+    let repo = match repaired.as_deref() {
+        Some(fixed) => {
+            eprintln!(
+                "--repo {} lost a backslash of its `\\\\?\\` prefix in transit (shell argument \
+                 conversion?); using {}",
+                repo.display(),
+                fixed.display()
+            );
+            fixed
+        }
+        None => repo,
+    };
     match repo.canonicalize() {
         Ok(canonical) => {
             if let Err(e) = magi::git::toplevel(&canonical).await {
@@ -2674,6 +2695,22 @@ async fn resolve_repo(repo: &Path, cwd: &Path, hint: Option<&str>) -> Result<Pat
             resolve_repo_by_name(repo, &cfg.repos.roots)
         }
     }
+}
+
+/// Rebuild `\\?\X:\...` from a form that lost one leading backslash
+/// (`\?\X:\...`, or `/?/X:/...`). Returns `None` for anything else, including
+/// the well-formed prefix, so nothing unrelated is ever rewritten. Pure and
+/// platform-independent; the caller decides whether the result exists.
+fn repair_verbatim_prefix(s: &str) -> Option<String> {
+    let rest = s.strip_prefix("\\?\\").or_else(|| s.strip_prefix("/?/"))?;
+    let b = rest.as_bytes();
+    if b.len() < 2 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
+        return None;
+    }
+    if b.len() > 2 && b[2] != b'\\' && b[2] != b'/' {
+        return None;
+    }
+    Some(format!("\\\\?\\{}", rest.replace('/', "\\")))
 }
 
 /// Resolve a `--repo` value that is not an existing path at all against
@@ -3913,6 +3950,41 @@ mod tests {
             .await
             .expect_err("a malformed extended-path prefix must not resolve");
         assert!(err.to_string().contains("does not exist"), "got: {err:#}");
+    }
+
+    #[test]
+    fn repair_verbatim_prefix_table() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("\\?\\C:\\Users\\x", Some("\\\\?\\C:\\Users\\x")),
+            ("/?/C:/Users/x", Some("\\\\?\\C:\\Users\\x")),
+            ("\\?\\C:", Some("\\\\?\\C:")),
+            ("\\\\?\\C:\\Users\\x", None),
+            ("C:\\Users\\x", None),
+            ("relative/path", None),
+            ("/usr/local/src", None),
+            ("owner/repo", None),
+            ("\\?\\CC:\\x", None),
+            ("\\?\\UNC\\host\\share", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(repair_verbatim_prefix(input).as_deref(), *want, "{input}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn resolve_repo_repairs_a_dropped_backslash_when_the_directory_exists() {
+        let (dir, repo) = scratch_repo().await;
+        let canonical = repo.canonicalize().unwrap();
+        let s = canonical.to_string_lossy().into_owned();
+        let Some(tail) = s.strip_prefix("\\\\?\\") else {
+            return;
+        };
+        let broken = PathBuf::from(format!("\\?\\{tail}"));
+        let resolved = resolve_repo(&broken, dir.path(), None)
+            .await
+            .expect("the repaired path resolves");
+        assert_eq!(resolved, canonical);
     }
 
     #[tokio::test]
