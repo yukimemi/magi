@@ -2878,14 +2878,22 @@ impl Runner {
         // A seat that ranked again is present even if its re-vote failed —
         // `tally` falls back to the initial ranking's first choice — so clear
         // its quota loss. Seats that still fail keep theirs and stay absent.
-        if !recovered.is_empty() {
-            let recovered_keys: BTreeSet<String> = recovered
-                .iter()
-                .map(|&j| format!("judge-{}", j + 1))
-                .collect();
-            self.state
-                .quota
-                .retain(|q| !recovered_keys.contains(&q.seat));
+        let recovered_keys: BTreeSet<String> = recovered
+            .iter()
+            .map(|&j| format!("judge-{}", j + 1))
+            .collect();
+        self.state
+            .quota
+            .retain(|q| !recovered_keys.contains(&q.seat));
+        // A seat that hit the limit again is a fresh loss, not the old one:
+        // replace the stale entry so the history stays one-per-seat and the
+        // daemon can tell this attempt's loss from a previous session's.
+        for loss in judge_losses.into_iter().chain(vote_losses) {
+            if recovered_keys.contains(&loss.seat) {
+                continue;
+            }
+            self.state.quota.retain(|q| q.seat != loss.seat);
+            self.state.quota.push(loss);
         }
 
         // Recompute the verdict from the refreshed panel.

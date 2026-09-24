@@ -461,7 +461,7 @@ pub struct VoteRecord {
 
 /// A seat that was taken out by a CLI rate limit / quota, recorded so a run
 /// whose panel collapsed does not masquerade as a healthy one.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaLoss {
     /// Seat key, e.g. `judge-1` or `review-2`.
     pub seat: String,
