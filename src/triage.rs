@@ -64,23 +64,21 @@
 //! comparison would silently misread a real "resume" answer as "keep held"
 //! the moment they disagree.
 //!
-//! # Idempotency, without a new field
+//! # Idempotency
 //!
 //! [`run_once`] runs on every daemon idle tick (see `crate::daemon::poll`)
-//! and on every `magi task triage`, so applying the *same* answered question
-//! twice has to be harmless - and, once a `HoldSource::Manual`/`None`
-//! question has been answered "not yet", finding a *fresh* one for the same
-//! task later (once it goes stale again) has to still be possible. Neither
-//! [`crate::queue::Task`] nor [`crate::ask::Question`] has a field for "this
-//! answer was already applied", so [`already_applied`] reads the same
-//! [`Question::short`] id back out of [`Task::hold_reason`] that
-//! [`keep_held_note`] appended to it - the same trick [`Question::abandon`]
-//! already uses to fold a fact into a text field that has no dedicated one.
-//! Appended, not written wholesale: the reason the hold happened in the first
-//! place is still worth reading in `magi task show` after an operator says
-//! "not yet". A "resume" or "discard" answer needs no marker at all: the task
-//! either leaves `held` entirely or stops existing, and either way it is
-//! never looked at by this module again.
+//! and on every `magi task triage`, so an answered question must be applied to
+//! a task **at most once**, and a *fresh* question for the same task (once it
+//! is held again, or goes stale) must still be possible. The record is
+//! [`Task::triage_applied`], the question ids already applied. It cannot live
+//! in [`Task::hold_reason`]: [`Task::release`] clears that, so a "resume"
+//! answer left no trace, and a released task that failed back to `held` was
+//! released again by the same old answer with its attempts reset - forever.
+//! A task that comes back to `held` after an applied answer is therefore a
+//! new hold, handled per [`HoldSource`] (a fresh question for a machine hold).
+//! [`already_applied`] also still reads the `[triage:<short>]` marker
+//! [`keep_held_note`] appends to the hold reason, for records that pre-date
+//! the field.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -379,7 +377,13 @@ fn marker_for(q: &Question) -> String {
 }
 
 /// Has `q`'s answer already been applied to `task`? See this module's doc.
+/// Checks [`Task::triage_applied`] first, which survives [`Task::release`].
 fn already_applied(task: &Task, q: &Question) -> bool {
+    if task.triage_applied(&q.id) {
+        return true;
+    }
+    // Records written before `Task::triage_applied` existed carry only the
+    // "keep held" marker in the hold reason.
     let marker = marker_for(q);
     task.hold_reason
         .as_deref()
@@ -592,6 +596,7 @@ pub fn run_once(
                 match interpret_answer(&q) {
                     AnswerAction::Resume => {
                         task.release();
+                        task.mark_triage_applied(&q.id);
                         if queue.put(&mut task).is_ok() {
                             report.answered.push(task.id.clone());
                         }
@@ -605,6 +610,7 @@ pub fn run_once(
                         let resolution = q.resolution().unwrap_or_default();
                         let note = keep_held_note(&task, &q, &resolution);
                         task.hold_manual(Some(note));
+                        task.mark_triage_applied(&q.id);
                         if queue.put(&mut task).is_ok() {
                             report.answered.push(task.id.clone());
                         }
@@ -912,6 +918,70 @@ mod tests {
         let back = q.get(&t.id).unwrap();
         assert_eq!(back.status, TaskStatus::Queued);
         assert!(back.hold_source.is_none());
+    }
+
+    /// A task released by a "resume" answer, run, and failed back to `held`.
+    fn resumed_then_failed(q: &Queue, questions: &Questions, dir: &std::path::Path) -> Task {
+        let mut t = task("gate went red", dir.join("repo"));
+        t.hold_machine(Some("gate red".to_owned()));
+        q.put(&mut t).unwrap();
+        run_once(q, questions, None, Timestamp::now());
+        let mut asked = questions
+            .list()
+            .into_iter()
+            .find(|q| q.run == t.id)
+            .unwrap();
+        asked.answer(Answer::Choice(EN.resume.to_owned())).unwrap();
+        questions.put(&mut asked).unwrap();
+
+        let report = run_once(q, questions, None, Timestamp::now());
+        assert_eq!(report.answered, [t.id.clone()]);
+        let mut back = q.get(&t.id).unwrap();
+        assert_eq!(back.status, TaskStatus::Queued);
+        assert_eq!(back.attempts, 0);
+
+        back.start("run-1".to_owned());
+        back.fail("rebase conflict", 1);
+        assert_eq!(back.status, TaskStatus::Held);
+        q.put(&mut back).unwrap();
+        back
+    }
+
+    #[test]
+    fn a_resume_answer_is_applied_once_and_a_new_machine_hold_is_asked_about() {
+        let (dir, q, questions) = store();
+        let t = resumed_then_failed(&q, &questions, dir.path());
+
+        let report = run_once(&q, &questions, None, Timestamp::now());
+        assert!(report.answered.is_empty(), "the old answer must not replay");
+        assert_eq!(report.asked, [t.id.clone()]);
+        let back = q.get(&t.id).unwrap();
+        assert_eq!(back.status, TaskStatus::Held);
+        assert_eq!(
+            questions
+                .list()
+                .into_iter()
+                .filter(|q| q.status.open())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_manual_hold_placed_after_a_resume_is_not_undone_by_the_old_answer() {
+        let (dir, q, questions) = store();
+        let mut t = resumed_then_failed(&q, &questions, dir.path());
+        t.hold_manual(Some("operator stopped this".to_owned()));
+        q.put(&mut t).unwrap();
+        let before = questions.list().len();
+
+        let report = run_once(&q, &questions, None, Timestamp::now());
+        assert!(report.answered.is_empty());
+        assert!(report.asked.is_empty());
+        let back = q.get(&t.id).unwrap();
+        assert_eq!(back.status, TaskStatus::Held);
+        assert_eq!(back.hold_source, Some(HoldSource::Manual));
+        assert_eq!(questions.list().len(), before);
     }
 
     #[test]

@@ -40,6 +40,16 @@ use crate::ask::Questions;
 
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
 ///
+/// 5: added [`Task::triage_applied`], the ids of triage questions whose
+/// answer has already been applied to this task. A "resume" answer used to
+/// leave no trace ([`Task::release`] clears [`Task::hold_reason`], which was
+/// the only place the applied marker lived), so when the released task failed
+/// its attempts and went back to `held`, the next idle pass found the same
+/// answered question "not applied" and released it again with `attempts` reset
+/// to 0 - the `max_attempts` bound never held. `#[serde(default)]` so an older
+/// record reads as empty. A task already looping when this build arrives has
+/// no record, so it is released once more, recorded, and then stays held.
+///
 /// 4: added [`Task::blocked_from`], the status a task had the moment it
 /// became [`TaskStatus::Blocked`], so [`Task::unblock`] restores it instead
 /// of always landing on [`TaskStatus::Queued`]. Without it, a task a human
@@ -68,7 +78,7 @@ use crate::ask::Questions;
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 4;
+pub const SCHEMA: u32 = 5;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +288,13 @@ pub struct Task {
     /// same as [`Task::runs`]: a release resets attempts, not evidence.
     #[serde(default)]
     pub answers: Vec<AnsweredQuestion>,
+    /// Ids of the `crate::triage` questions whose answer has been applied to
+    /// this task. Unlike [`Task::hold_reason`], [`Task::release`] and every
+    /// hold transition leave it alone, so an answer is applied at most once
+    /// however many times the task is held again. See [`SCHEMA`]'s doc for
+    /// schema 5. `#[serde(default)]` so an older record reads as empty.
+    #[serde(default)]
+    pub triage_applied: Vec<String>,
     /// Set by `crate::conduct` when it chooses `Review` recovery for a task
     /// whose branch survived a blocked run: the branch to reopen with
     /// `crate::graph::Runner::review` instead of competing from scratch.
@@ -371,6 +388,7 @@ impl Task {
             block_reason: None,
             blocked_from: None,
             answers: Vec::new(),
+            triage_applied: Vec::new(),
             review_branch: None,
             fresh_start: false,
             interrupt: false,
@@ -383,6 +401,18 @@ impl Task {
     /// Short form used in reports, matching a run's short id.
     pub fn short(&self) -> &str {
         short(&self.id)
+    }
+
+    /// Record that triage question `question_id`'s answer has been applied.
+    pub fn mark_triage_applied(&mut self, question_id: &str) {
+        if !self.triage_applied(question_id) {
+            self.triage_applied.push(question_id.to_owned());
+        }
+    }
+
+    /// Has triage question `question_id`'s answer already been applied?
+    pub fn triage_applied(&self, question_id: &str) -> bool {
+        self.triage_applied.iter().any(|id| id == question_id)
     }
 
     /// Record that a run has started for this task.
@@ -1093,6 +1123,27 @@ fn new_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn triage_applied_survives_release_and_old_records_read_as_empty() {
+        let mut t = Task::new(
+            "t".to_owned(),
+            "i".to_owned(),
+            PathBuf::from("r"),
+            Source::Human,
+        );
+        t.mark_triage_applied("q1");
+        t.mark_triage_applied("q1");
+        t.hold_machine(Some("x".to_owned()));
+        t.release();
+        assert_eq!(t.triage_applied, ["q1"]);
+        assert!(t.triage_applied("q1") && !t.triage_applied("q2"));
+
+        let mut v = serde_json::to_value(&t).unwrap();
+        v.as_object_mut().unwrap().remove("triage_applied");
+        let old: Task = serde_json::from_value(v).unwrap();
+        assert!(old.triage_applied.is_empty());
+    }
 
     /// A queue of its own, with no process-global state - which is the point of
     /// `Queue::at`, and why these can run in parallel.
