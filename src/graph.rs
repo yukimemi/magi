@@ -3299,7 +3299,18 @@ impl Runner {
         // otherwise discard uncommitted work left there by the operator or
         // another process before this had a chance to even look at it.
         if winner.worktree.exists() {
-            if !git::is_clean(&winner.worktree).await? {
+            // Lockfiles a rescue commit withheld stay untracked on purpose and
+            // are already recorded; they are not the operator's work to protect.
+            let dirty = git::git(
+                &winner.worktree,
+                &["status", "--porcelain", "--untracked-files=all"],
+            )
+            .await?;
+            let only_withheld = dirty.lines().all(|l| {
+                l.strip_prefix("?? ")
+                    .is_some_and(|p| self.state.withheld.iter().any(|w| w.path == p))
+            });
+            if !only_withheld {
                 bail!(
                     "`{}` has uncommitted changes; refusing to touch it — commit or \
                      discard them first",
