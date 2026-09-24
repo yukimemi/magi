@@ -6,7 +6,7 @@ use common::{Judges, fixture};
 use magi::graph::Runner;
 use magi::run::RunStatus;
 
-#[tokio::test]
+common::e2e! {
 async fn a_split_run_deliberates_then_collects_private_votes() {
     let home = common::home_lock().await;
     let fx = fixture(home, Judges::Split, true);
@@ -100,4 +100,5 @@ async fn a_split_run_deliberates_then_collects_private_votes() {
     assert!(winner.worktree.join("note.txt").is_file());
     assert!(winner.worktree.join("fixed.txt").is_file());
     assert!(winner.commits >= 1);
+}
 }

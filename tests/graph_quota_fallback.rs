@@ -10,7 +10,7 @@ mod common;
 use common::fixture_with_quota_on_agents;
 use magi::graph::Runner;
 
-#[tokio::test]
+common::e2e! {
 async fn a_solo_seat_falls_through_to_the_next_agent_and_recovers() {
     let _home = common::home_lock().await;
     // `alpha` (the only agent a solo run would otherwise ever pick) is
@@ -57,8 +57,9 @@ async fn a_solo_seat_falls_through_to_the_next_agent_and_recovers() {
     // that was rate limited out.
     assert_eq!(a.agent, "beta", "{a:?}");
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_seat_that_exhausts_the_whole_roster_records_exactly_one_quota_loss() {
     let _home = common::home_lock().await;
     // Every agent in the roster is rate-limited on this seat: the fallback
@@ -124,8 +125,9 @@ async fn a_seat_that_exhausts_the_whole_roster_records_exactly_one_quota_loss() 
     // `gamma` alone.
     assert_eq!(a.agent, "alpha", "{a:?}");
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_later_candidate_slots_seat_falls_back_past_its_own_position_not_the_roster_front() {
     let _home = common::home_lock().await;
     let mut fx = common::fixture(_home, common::Judges::Unanimous, false);
@@ -187,8 +189,9 @@ async fn a_later_candidate_slots_seat_falls_back_past_its_own_position_not_the_r
     assert_eq!(slot1.agent, "gamma", "{slot1:?}");
     assert!(!slot1.empty && slot1.failed.is_none(), "{slot1:?}");
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_later_candidate_slots_fallback_chain_stops_at_the_rosters_tail_without_wrapping() {
     let _home = common::home_lock().await;
     let mut fx = common::fixture(_home, common::Judges::Unanimous, false);
@@ -259,4 +262,5 @@ async fn a_later_candidate_slots_fallback_chain_stops_at_the_rosters_tail_withou
     // quota'd out — so it must keep its originally assigned agent, not the
     // last one the (exhausted) fallback happened to try.
     assert_eq!(slot1.agent, "beta", "{slot1:?}");
+}
 }

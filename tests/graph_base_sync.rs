@@ -82,7 +82,7 @@ fn land_on_origin(sideline: &std::path::Path, file: &str, content: &str) {
     run_git(sideline, &["push", "-q", "origin", "main"]);
 }
 
-#[tokio::test]
+common::e2e! {
 async fn the_gate_runs_on_a_tree_that_contains_what_landed_while_the_run_was_thinking() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
@@ -143,8 +143,9 @@ async fn the_gate_runs_on_a_tree_that_contains_what_landed_while_the_run_was_thi
         "the winner branch must descend from the current landing base"
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_base_that_conflicts_stops_the_run_without_a_review_round_or_a_fixer() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
@@ -206,4 +207,5 @@ async fn a_base_that_conflicts_stops_the_run_without_a_review_round_or_a_fixer()
             .success(),
         "the branch is kept"
     );
+}
 }

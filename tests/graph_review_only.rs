@@ -27,7 +27,7 @@ fn run_git(repo: &std::path::Path, args: &[&str]) {
     );
 }
 
-#[tokio::test]
+common::e2e! {
 async fn a_review_only_run_reviews_an_existing_branch_without_competing() {
     // `fixture()` sets a process-wide home directory, so any two tests in
     // this binary that build one must not run concurrently — every test here
@@ -98,8 +98,9 @@ async fn a_review_only_run_reviews_an_existing_branch_without_competing() {
         "the review worktree must stay attached to the branch"
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_reviewer_that_never_answered_is_never_reported_as_a_clean_round() {
     let _home = common::home_lock().await;
     let mut fx = fixture_with_silent_review_seat(_home, &["review-2"]);
@@ -146,12 +147,13 @@ async fn a_reviewer_that_never_answered_is_never_reported_as_a_clean_round() {
     assert!(state.reviews.iter().all(|r| r.fix.is_none()));
     assert_eq!(state.status, RunStatus::Blocked);
 }
+}
 
+common::e2e! {
 /// The addendum's third gap: a seat that times out and then answers on
 /// `ask_json_wave`'s nudge must read as recovered, not as silent — the two
 /// looked identical in history (a retry event and nothing else) before
 /// `ReviewRecord::attempts` existed.
-#[tokio::test]
 async fn a_reviewer_that_only_answers_on_retry_is_recorded_as_recovered_not_silent() {
     let _home = common::home_lock().await;
     let mut fx = fixture_with_review_seat_that_recovers_on_retry(_home, &["review-2"]);
@@ -195,8 +197,9 @@ async fn a_reviewer_that_only_answers_on_retry_is_recorded_as_recovered_not_sile
         state.events
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_reviewer_rate_limited_by_quota_gates_clean_on_the_answered_panel() {
     // The field report this closes: a rate-limited reviewer must not be
     // waited on round after round hoping its session limit lifts — the
@@ -254,8 +257,9 @@ async fn a_reviewer_rate_limited_by_quota_gates_clean_on_the_answered_panel() {
 
     assert_eq!(state.status, RunStatus::Ready);
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_panel_lost_entirely_to_quota_still_waits_instead_of_deciding_on_nobody() {
     // The other half of the same fix: excluding a rate-limited seat from
     // quorum must never go so far as calling a round clean with nobody left
@@ -289,8 +293,9 @@ async fn a_panel_lost_entirely_to_quota_still_waits_instead_of_deciding_on_nobod
     assert_eq!(state.quota.len(), 2, "{:?}", state.quota);
     assert_eq!(state.status, RunStatus::Blocked);
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn review_refuses_the_cases_that_cannot_mean_anything() {
     let _home = common::home_lock().await;
     let fx = fixture(_home, Judges::Unanimous, false);
@@ -306,4 +311,5 @@ async fn review_refuses_the_cases_that_cannot_mean_anything() {
     run_git(&fx.repo, &["branch", "feat/empty"]);
     let empty = Runner::review(&fx.repo, "feat/empty", fx.config.clone()).await;
     assert!(empty.is_err(), "a branch with no commits of its own");
+}
 }

@@ -19,7 +19,7 @@ use common::{
 use magi::graph::Runner;
 use magi::run::{ContinuationOutcome, RunStatus};
 
-#[tokio::test]
+common::e2e! {
 async fn a_fix_report_lost_on_a_clean_turn_is_recovered_by_resuming_the_seat() {
     let _home = common::home_lock().await;
     let fx = fixture_with_fix_report_lost(_home, &["impl-A"]);
@@ -75,8 +75,9 @@ async fn a_fix_report_lost_on_a_clean_turn_is_recovered_by_resuming_the_seat() {
         magi::report::run(state)
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_fix_report_that_never_recovers_gives_up_within_the_continuation_budget() {
     let _home = common::home_lock().await;
     let fx = fixture_with_fix_report_always_lost(_home, &["impl-A"]);
@@ -144,8 +145,9 @@ async fn a_fix_report_that_never_recovers_gives_up_within_the_continuation_budge
     assert_ne!(state.status, RunStatus::Merged);
     assert!(state.reviews.iter().all(|r| !r.clean));
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_fix_report_lost_with_no_session_left_is_not_resumed_into_a_blank_prompt() {
     let _home = common::home_lock().await;
     let mut fx = fixture_with_fix_report_lost(_home, &["impl-A"]);
@@ -193,8 +195,9 @@ async fn a_fix_report_lost_with_no_session_left_is_not_resumed_into_a_blank_prom
         "there is nothing to resume into, so no continuation call should have run"
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_valid_first_try_report_mentioning_waiting_is_never_resumed() {
     let _home = common::home_lock().await;
     let fx = fixture_with_fixer_mentioning_waiting(_home);
@@ -236,4 +239,5 @@ async fn a_valid_first_try_report_mentioning_waiting_is_never_resumed() {
         !art.join("fix-1-continue1.out").exists(),
         "a normal final report must never trigger a continuation call"
     );
+}
 }

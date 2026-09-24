@@ -12,7 +12,7 @@ use common::{fixture_always_blocked, home_lock};
 use magi::graph::Runner;
 use magi::run::RunStatus;
 
-#[tokio::test]
+common::e2e! {
 async fn a_blocked_run_stays_blocked_on_reentry() {
     let _home = home_lock().await;
     let fx = fixture_always_blocked(_home);
@@ -87,4 +87,5 @@ async fn a_blocked_run_stays_blocked_on_reentry() {
         "judge must not run — and log its skip — a second time: {:?}",
         state.events
     );
+}
 }

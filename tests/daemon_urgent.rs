@@ -70,7 +70,7 @@ async fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration, what: &st
 
 const MARKER_WAIT: Duration = Duration::from_secs(60);
 
-#[tokio::test]
+common::e2e! {
 async fn an_urgent_task_starts_alongside_an_already_running_task() {
     let home = home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
@@ -189,8 +189,9 @@ async fn an_urgent_task_starts_alongside_an_already_running_task() {
     assert_eq!(after_urgent.status, TaskStatus::Done, "{after_urgent:?}");
     assert_eq!(after_urgent.runs.len(), 1);
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn an_ordinary_task_still_waits_for_the_ordinary_slot_to_free() {
     let home = home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
@@ -293,4 +294,5 @@ async fn an_ordinary_task_still_waits_for_the_ordinary_slot_to_free() {
     );
     let after_plain = queue.get(&plain.id).unwrap();
     assert_eq!(after_plain.status, TaskStatus::Done, "{after_plain:?}");
+}
 }

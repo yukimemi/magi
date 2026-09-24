@@ -19,7 +19,7 @@ fn implementer_prompt(run_dir: &Path, label: char) -> String {
     .expect("implementer prompt artifact exists")
 }
 
-#[tokio::test]
+common::e2e! {
 async fn advisor_proposals_are_gathered_and_synthesized_into_the_implementer_briefing() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 2);
@@ -53,8 +53,9 @@ async fn advisor_proposals_are_gathered_and_synthesized_into_the_implementer_bri
     assert!(prompt.contains("# Design deliberation"), "{prompt}");
     assert!(prompt.contains(synthesis), "{prompt}");
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn the_synthesizer_role_pins_the_synthesis_seat_to_a_named_agent() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 2);
@@ -87,8 +88,9 @@ async fn the_synthesizer_role_pins_the_synthesis_seat_to_a_named_agent() {
         "[roles] synthesizer must pin the synthesis seat, not the fixture's default order"
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn an_unset_synthesizer_role_falls_back_to_the_default_order() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 2);
@@ -114,8 +116,9 @@ async fn an_unset_synthesizer_role_falls_back_to_the_default_order() {
          the first runnable agent in roster order"
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn the_on_off_switch_leaves_no_trace_when_off() {
     let home = common::home_lock().await;
     // The shared `fixture` already turns `advise` off; this asserts that
@@ -135,8 +138,9 @@ async fn the_on_off_switch_leaves_no_trace_when_off() {
     let prompt = implementer_prompt(&state.dir(), 'A');
     assert!(!prompt.contains("# Design deliberation"), "{prompt}");
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn the_proposal_count_config_controls_how_many_advisor_seats_are_asked() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 1);
@@ -155,8 +159,9 @@ async fn the_proposal_count_config_controls_how_many_advisor_seats_are_asked() {
         "[graph] advisors = 1 must ask exactly one seat"
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_failed_advisor_seat_still_leaves_a_record_and_the_others_still_synthesize() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 2);
@@ -206,8 +211,9 @@ async fn a_failed_advisor_seat_still_leaves_a_record_and_the_others_still_synthe
         "one usable proposal is enough to synthesize"
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn an_unresolvable_advisor_roster_does_not_fail_the_run_and_names_the_run_data() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 1);
@@ -246,7 +252,9 @@ async fn an_unresolvable_advisor_roster_does_not_fail_the_run_and_names_the_run_
     // not a precondition for the rest of the graph.
     assert!(state.status.done());
 }
+}
 
+common::e2e! {
 /// Reported: `advise`'s only reentry guard was `advise_attempted`, which a
 /// run written by a binary that predates the field deserializes as `false`
 /// (`#[serde(default)]`) regardless of how far the run actually got.
@@ -256,7 +264,6 @@ async fn an_unresolvable_advisor_roster_does_not_fail_the_run_and_names_the_run_
 /// that no longer existed, after implementation had already happened. The
 /// fix reads candidate progress directly, the same predicate `implement`
 /// itself uses to decide there is nothing left to do.
-#[tokio::test]
 async fn advise_does_not_reenter_once_implementation_has_already_progressed() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 2);
@@ -333,4 +340,5 @@ async fn advise_does_not_reenter_once_implementation_has_already_progressed() {
         "the skip must be recorded, not silent: {:?}",
         state.events
     );
+}
 }
