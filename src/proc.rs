@@ -160,6 +160,57 @@ pub fn process_started_at(pid: u32) -> Option<String> {
     platform_process_started_at(pid).ok()
 }
 
+/// A per-request memo over [`pid_status`] and [`process_started_at`].
+///
+/// A listing of hundreds of runs asks about the same few pids over and over,
+/// and on Windows every ask spawns a helper process. Asking once per pid is
+/// enough within one request; the probe is meant to be dropped with it, never
+/// kept, so a stale answer cannot outlive the moment it was read.
+pub struct ProcProbe<S, I> {
+    status: S,
+    identity: I,
+    alive: std::collections::HashMap<u32, Option<bool>>,
+    started: std::collections::HashMap<u32, Option<String>>,
+}
+
+impl ProcProbe<fn(u32) -> Option<bool>, fn(u32) -> Option<String>> {
+    /// A probe backed by the real platform queries.
+    #[must_use]
+    pub fn real() -> Self {
+        Self::new(pid_status, process_started_at)
+    }
+}
+
+impl<S, I> ProcProbe<S, I>
+where
+    S: FnMut(u32) -> Option<bool>,
+    I: FnMut(u32) -> Option<String>,
+{
+    /// A probe over caller-supplied queries.
+    #[must_use]
+    pub fn new(status: S, identity: I) -> Self {
+        Self {
+            status,
+            identity,
+            alive: std::collections::HashMap::new(),
+            started: std::collections::HashMap::new(),
+        }
+    }
+
+    /// [`pid_status`], asked at most once per pid.
+    pub fn status(&mut self, pid: u32) -> Option<bool> {
+        *self.alive.entry(pid).or_insert_with(|| (self.status)(pid))
+    }
+
+    /// [`process_started_at`], asked at most once per pid.
+    pub fn started_at(&mut self, pid: u32) -> Option<String> {
+        self.started
+            .entry(pid)
+            .or_insert_with(|| (self.identity)(pid))
+            .clone()
+    }
+}
+
 // `lstart` is `ps`'s own fixed-format wall-clock start time — POSIX portable
 // (unlike `/proc`, which does not exist on macOS/BSD), and a process never
 // reports a different one across its own lifetime, so two queries of the

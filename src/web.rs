@@ -2256,27 +2256,76 @@ async fn runs_list(
     let limit = q.limit.unwrap_or(LIST_DEFAULT).min(LIST_MAX);
     blocking(move || {
         let superseded = superseded_runs(&ui.queue);
-        let summaries = run_ids(&ui.runs)
+        // Everything the per-run rows share is read once here. Asking per run
+        // re-read every question file and the daemon status file for each of
+        // hundreds of runs, and spawned a process probe per run on Windows.
+        let open_runs: HashSet<String> = ui
+            .questions
+            .list()
+            .into_iter()
+            .filter(|q| q.status.open())
+            .map(|q| q.run)
+            .collect();
+        let claimed: HashSet<String> =
+            crate::daemon::current_work(&ui.home, jiff::Timestamp::now())
+                .into_iter()
+                .map(|c| c.run)
+                .collect();
+        let states = run_ids(&ui.runs)
             .into_iter()
             // A run whose state cannot be read is skipped, not fatal: a run
             // killed mid-write must not blank the history of every other one.
             // The detail route still explains it, which is where an operator
             // asking "what happened to that run" ends up.
             .filter_map(|id| read_run(&ui.runs, &id).ok())
-            .take(limit)
-            .map(|state| {
-                let waiting = !ui.questions.open_for(&state.id).is_empty();
-                let by = superseded.get(&state.id).cloned();
-                let daemon_claims =
-                    crate::daemon::is_working_on(&ui.home, &state.id, jiff::Timestamp::now());
-                let mut row = RunSummary::of(&state, waiting, state.liveness(daemon_claims));
-                row.superseded_by = by.as_deref().map(crate::run::short_of).map(str::to_owned);
-                row
-            })
-            .collect();
+            .take(limit);
+        let probe = std::cell::RefCell::new(crate::proc::ProcProbe::real());
+        let summaries = summarize(
+            states,
+            &open_runs,
+            &claimed,
+            &superseded,
+            |p| probe.borrow_mut().status(p),
+            |p| probe.borrow_mut().started_at(p),
+        );
         Ok(Json(summaries))
     })
     .await
+}
+
+/// The rows of the run list, given everything that is shared between them.
+///
+/// Pure over its inputs so a test can count how often the process queries are
+/// asked; `status_q` / `identity_q` are the queries [`RunState::liveness_with`]
+/// takes, called at most once per run.
+fn summarize<I, S, D>(
+    states: I,
+    open_runs: &HashSet<String>,
+    claimed: &HashSet<String>,
+    superseded: &HashMap<String, String>,
+    mut status_q: S,
+    mut identity_q: D,
+) -> Vec<RunSummary>
+where
+    I: IntoIterator<Item = RunState>,
+    S: FnMut(u32) -> Option<bool>,
+    D: FnMut(u32) -> Option<String>,
+{
+    states
+        .into_iter()
+        .map(|state| {
+            let waiting = open_runs.contains(&state.id);
+            let live =
+                state.liveness_with(claimed.contains(&state.id), &mut status_q, &mut identity_q);
+            let mut row = RunSummary::of(&state, waiting, live);
+            row.superseded_by = superseded
+                .get(&state.id)
+                .map(String::as_str)
+                .map(crate::run::short_of)
+                .map(str::to_owned);
+            row
+        })
+        .collect()
 }
 
 /// Runs that a later attempt at the same task replaced, mapped to the id of
@@ -7121,6 +7170,66 @@ mod tests {
     /// The deck's competition list is normally the first place an operator
     /// sees an old run. It must carry the same process verdict as detail, or
     /// its `reviewing` chip keeps falsely advertising a dead run as in flight.
+    #[test]
+    fn summarize_asks_about_each_pid_once_and_keeps_the_row_meaning() {
+        let mk = |id: &str, pid: Option<u32>| {
+            let mut s = RunState::new(
+                PathBuf::from("/repo/magi"),
+                "main".to_owned(),
+                "0123456789abcdef".to_owned(),
+                "Add a web UI".to_owned(),
+                Config::default(),
+            );
+            s.id = id.to_owned();
+            s.driver_pid = pid;
+            s.driver_started_at = Some("t0".to_owned());
+            s
+        };
+        let states = vec![
+            mk("20260902-140502-aaaa", Some(77)),
+            mk("20260902-140502-bbbb", Some(77)),
+            mk("20260902-140502-cccc", Some(77)),
+            mk("20260902-140502-dddd", None),
+        ];
+        let open: HashSet<String> = ["20260902-140502-bbbb".to_owned()].into();
+        let claimed: HashSet<String> = ["20260902-140502-dddd".to_owned()].into();
+        let sup: HashMap<String, String> = [(
+            "20260902-140502-aaaa".to_owned(),
+            "20260902-140502-cccc".to_owned(),
+        )]
+        .into();
+
+        let status_calls = std::cell::Cell::new(0);
+        let identity_calls = std::cell::Cell::new(0);
+        let probe = std::cell::RefCell::new(crate::proc::ProcProbe::new(
+            |_| {
+                status_calls.set(status_calls.get() + 1);
+                Some(true)
+            },
+            |_| {
+                identity_calls.set(identity_calls.get() + 1);
+                Some("t0".to_owned())
+            },
+        ));
+        let rows = summarize(
+            states,
+            &open,
+            &claimed,
+            &sup,
+            |p| probe.borrow_mut().status(p),
+            |p| probe.borrow_mut().started_at(p),
+        );
+
+        assert_eq!(status_calls.get(), 1, "one pid, one status query");
+        assert_eq!(identity_calls.get(), 1, "one pid, one identity query");
+        assert_eq!(rows.len(), 4);
+        assert!(!rows[0].waiting && rows[1].waiting);
+        assert_eq!(rows[0].live, crate::run::Liveness::Live);
+        assert_eq!(rows[3].live, crate::run::Liveness::Live, "claim alone");
+        assert_eq!(rows[0].superseded_by.as_deref(), Some("cccc"));
+        assert_eq!(rows[1].superseded_by, None);
+    }
+
     #[test]
     fn run_list_exposes_a_confirmed_dead_driver_for_stale_presentation() {
         let mut state = RunState::new(
