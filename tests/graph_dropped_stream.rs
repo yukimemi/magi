@@ -9,7 +9,7 @@ use common::{fixture_with_dropped_deliberation, fixture_with_dropped_stream};
 use magi::graph::Runner;
 use magi::run::RunStatus;
 
-#[tokio::test]
+common::e2e! {
 async fn a_dropped_stream_is_resumed_once_and_the_candidate_recovers() {
     let _home = common::home_lock().await;
     let fx = fixture_with_dropped_stream(_home, &["impl-B"]);
@@ -53,8 +53,9 @@ async fn a_dropped_stream_is_resumed_once_and_the_candidate_recovers() {
     assert!(b.failed.is_none(), "{b:?}");
     assert!(b.commits > 0, "{b:?}");
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_dropped_stream_with_no_session_left_is_not_resumed_into_a_blank_prompt() {
     let _home = common::home_lock().await;
     let mut fx = fixture_with_dropped_stream(_home, &["impl-B"]);
@@ -103,8 +104,9 @@ async fn a_dropped_stream_with_no_session_left_is_not_resumed_into_a_blank_promp
     assert!(b.empty, "{b:?}");
     assert_eq!(b.commits, 0, "{b:?}");
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_dropped_deliberation_turn_is_skipped_not_read_as_the_judges_position() {
     let _home = common::home_lock().await;
     // Judge 1's *deliberation round* reply is the dropped-stream shape, with a
@@ -159,4 +161,5 @@ async fn a_dropped_deliberation_turn_is_skipped_not_read_as_the_judges_position(
         "{}",
         magi::report::run(state)
     );
+}
 }

@@ -30,7 +30,7 @@ fn e2e_execution_events(events: &[Event], round: usize) -> Vec<&str> {
         .collect()
 }
 
-#[tokio::test]
+common::e2e! {
 async fn a_blocking_round_with_rounds_left_fixes_before_running_e2e() {
     let _guard = common::home_lock().await;
     // Blocking every round until the seats stop lying: perfect for pinning
@@ -76,8 +76,9 @@ async fn a_blocking_round_with_rounds_left_fixes_before_running_e2e() {
         state.events
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_head_with_no_more_blocking_findings_runs_e2e_before_going_clean() {
     let _guard = common::home_lock().await;
     // `require_fix = true` clears its single blocking finding once the fixer
@@ -121,8 +122,9 @@ async fn a_head_with_no_more_blocking_findings_runs_e2e_before_going_clean() {
     assert!(state.gate.iter().all(|o| o.ok()));
     assert_eq!(state.status, RunStatus::Ready);
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn the_e2e_every_round_flag_restores_the_old_diagnostic_behaviour() {
     let _guard = common::home_lock().await;
     let mut fx = fixture_that_never_clears(_guard, 3);
@@ -152,8 +154,9 @@ async fn the_e2e_every_round_flag_restores_the_old_diagnostic_behaviour() {
         state.events
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn the_final_round_never_defers_even_with_blocking_findings_left() {
     let _guard = common::home_lock().await;
     // Two rounds, never clears: round 1 has a repair round left (defers),
@@ -175,8 +178,9 @@ async fn the_final_round_never_defers_even_with_blocking_findings_left() {
     );
     assert!(!last.e2e.is_empty(), "{:?}", last.e2e);
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn exhausted_rounds_catch_up_on_a_deferred_e2e_before_deciding_the_gate() {
     let _guard = common::home_lock().await;
     // The fixer never actually touches the tree, so two stagnant rounds stop
@@ -221,7 +225,9 @@ async fn exhausted_rounds_catch_up_on_a_deferred_e2e_before_deciding_the_gate() 
     assert_eq!(state.status, RunStatus::Ready);
     assert!(state.handed_off_with_open_findings());
 }
+}
 
+common::e2e! {
 /// A round's own `e2e` must stay pinned to that round's own commit — never
 /// borrowed to answer for a later round's patch. Round 1's e2e runs (for
 /// real, thanks to `e2e_every_round`) against a tree that does not have the
@@ -230,7 +236,6 @@ async fn exhausted_rounds_catch_up_on_a_deferred_e2e_before_deciding_the_gate() 
 /// mock shape of the incident `ReviewRound::verification_summary` exists to
 /// stop repeating: an earlier round's red must never be read as proof about
 /// a later round's green patch.
-#[tokio::test]
 async fn each_rounds_verified_head_and_time_stay_pinned_to_that_rounds_own_commit() {
     let _guard = common::home_lock().await;
     let mut fx = fixture(_guard, Judges::Unanimous, true);
@@ -288,4 +293,5 @@ async fn each_rounds_verified_head_and_time_stay_pinned_to_that_rounds_own_commi
         .verification_summary(&r2.head)
         .expect("round 1's failure is still worth surfacing");
     assert!(carried_forward.label.contains("since superseded"));
+}
 }

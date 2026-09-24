@@ -9,7 +9,7 @@ use common::{Judges, fixture, home_lock};
 use magi::graph::Runner;
 use magi::run::RunStatus;
 
-#[tokio::test]
+common::e2e! {
 async fn a_cached_failed_gate_stays_blocked_and_does_not_run_again() {
     // `set_home` pins the first fixture's directory for this whole test
     // process. Reproduce a prior fixture explicitly so this case does not
@@ -112,8 +112,9 @@ async fn a_cached_failed_gate_stays_blocked_and_does_not_run_again() {
         "the old failed command is not represented as a new attempt"
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_cached_successful_gate_still_allows_the_interrupted_merge_step() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
@@ -165,4 +166,5 @@ async fn a_cached_successful_gate_still_allows_the_interrupted_merge_step() {
         gate_events,
         "a green cached command is not needlessly rerun"
     );
+}
 }

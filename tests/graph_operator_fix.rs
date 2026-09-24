@@ -42,7 +42,7 @@ fn git(repo: &std::path::Path, args: &[&str]) {
     );
 }
 
-#[tokio::test]
+common::e2e! {
 async fn a_selected_minor_finding_is_fixed_and_reverified_leaving_the_other_untouched() {
     let home = common::home_lock().await;
     let (_fx, mut runner) = ready_run_with_two_minor_findings(home).await;
@@ -103,8 +103,9 @@ async fn a_selected_minor_finding_is_fixed_and_reverified_leaving_the_other_unto
         follow_up.gate
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn an_unknown_finding_id_refuses_the_whole_request() {
     let home = common::home_lock().await;
     let (_fx, mut runner) = ready_run_with_two_minor_findings(home).await;
@@ -121,8 +122,9 @@ async fn an_unknown_finding_id_refuses_the_whole_request() {
         "a refused request must not be recorded"
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn an_empty_reason_is_refused() {
     let home = common::home_lock().await;
     let (_fx, mut runner) = ready_run_with_two_minor_findings(home).await;
@@ -132,8 +134,9 @@ async fn an_empty_reason_is_refused() {
     assert!(err.to_string().contains("reason"), "{err}");
     assert!(runner.state.operator_fixes.is_empty());
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_run_that_has_not_concluded_review_refuses_a_targeted_fix() {
     let home = common::home_lock().await;
     let (_fx, mut runner) = ready_run_with_two_minor_findings(home).await;
@@ -154,8 +157,9 @@ async fn a_run_that_has_not_concluded_review_refuses_a_targeted_fix() {
     assert!(err.to_string().contains("merged"), "{err}");
     assert!(err.to_string().contains("magi review"), "{err}");
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_run_already_being_worked_on_by_another_process_refuses_a_targeted_fix() {
     let home = common::home_lock().await;
     let (_fx, mut runner) = ready_run_with_two_minor_findings(home).await;
@@ -179,13 +183,14 @@ async fn a_run_already_being_worked_on_by_another_process_refuses_a_targeted_fix
     );
     assert!(runner.state.operator_fixes.is_empty());
 }
+}
 
+common::e2e! {
 /// A run whose own process crashed mid-fix leaves `fix.lock` behind with no
 /// live process holding it. A later `magi fix` on the same run must recover
 /// on its own — there is no `magi serve`/`magi web` sweep to rely on for a
 /// one-shot CLI invocation — but only once the recorded pid is confirmed
 /// dead, never on a guess.
-#[tokio::test]
 async fn a_lock_left_by_a_confirmed_dead_process_is_reclaimed() {
     let home = common::home_lock().await;
     let (_fx, mut runner) = ready_run_with_two_minor_findings(home).await;
@@ -217,11 +222,12 @@ async fn a_lock_left_by_a_confirmed_dead_process_is_reclaimed() {
         .expect("a lock naming a confirmed-dead pid must be reclaimed, not trusted");
     assert_eq!(runner.state.operator_fixes.len(), 1);
 }
+}
 
+common::e2e! {
 /// The mirror image of the reclaim test: a lock naming a pid that is still
 /// alive (this test process itself) must never be reclaimed, whatever else
 /// is going on — the conservative half of the policy.
-#[tokio::test]
 async fn a_lock_naming_a_live_process_is_never_reclaimed() {
     let home = common::home_lock().await;
     let (_fx, mut runner) = ready_run_with_two_minor_findings(home).await;
@@ -240,8 +246,9 @@ async fn a_lock_naming_a_live_process_is_never_reclaimed() {
     assert!(err.to_string().contains("already running"), "{err}");
     assert!(runner.state.operator_fixes.is_empty());
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_stale_finding_is_refused_unless_the_operator_allows_it() {
     let home = common::home_lock().await;
     let (_fx, mut runner) = ready_run_with_two_minor_findings(home).await;
@@ -270,4 +277,5 @@ async fn a_stale_finding_is_refused_unless_the_operator_allows_it() {
     assert!(request.stale);
     assert!(request.allow_stale);
     assert_eq!(request.findings[0].id, id);
+}
 }

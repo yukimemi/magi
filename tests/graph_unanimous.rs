@@ -5,7 +5,7 @@ use common::{Judges, fixture};
 use magi::graph::{Runner, fold_run};
 use magi::run::RunStatus;
 
-#[tokio::test]
+common::e2e! {
 async fn a_unanimous_run_reaches_the_gate_without_deliberating() {
     let home = common::home_lock().await;
     let fx = fixture(home, Judges::Unanimous, false);
@@ -145,4 +145,5 @@ async fn a_unanimous_run_reaches_the_gate_without_deliberating() {
         .expect("fold");
     assert!(!removed.is_empty());
     assert!(state.candidates.iter().all(|c| !c.worktree.exists()));
+}
 }

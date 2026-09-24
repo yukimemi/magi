@@ -39,6 +39,82 @@ pub async fn home_lock() -> HomeGuard {
     HOME_LOCK.lock().await
 }
 
+/// Set in the child a test re-executes itself as (see [`isolated`]).
+const CHILD_ENV: &str = "MAGI_E2E_CHILD";
+
+/// Counting semaphore bounding how many isolated children run at once.
+static SLOTS: LazyLock<(std::sync::Mutex<usize>, std::sync::Condvar)> = LazyLock::new(|| {
+    let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
+    (
+        std::sync::Mutex::new((cpus / 2).max(2)),
+        std::sync::Condvar::new(),
+    )
+});
+
+/// Run one end-to-end test in a process of its own.
+///
+/// These tests each mint runs under `run::set_home`'s process-wide `OnceLock`,
+/// so inside one process they can only take turns (`home_lock`), and the
+/// binaries themselves run one after another: the suite was a single queue of
+/// tens of subprocess-heavy scenes. Handed to libtest as an ordinary `#[test]`,
+/// the parent instead re-executes this same binary filtered to exactly this
+/// test, with `MAGI_E2E_CHILD` set. The child is the only place the body runs,
+/// on a runtime like `#[tokio::test]`'s; the parent's threads therefore run
+/// many children at once, each with a home of its own. Nothing about what a
+/// test asserts changes — only where it runs.
+///
+/// The parent insists the child reported `1 passed`: a name that drifts from
+/// what libtest filters on would otherwise run zero tests and pass. Concurrency
+/// is capped (half the CPUs) so load alone cannot trip a node timeout.
+pub fn isolated<F, Fut>(name: &str, body: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if std::env::var_os(CHILD_ENV).is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(body());
+        return;
+    }
+    let (lock, cv) = &*SLOTS;
+    let mut free = lock.lock().unwrap();
+    while *free == 0 {
+        free = cv.wait(free).unwrap();
+    }
+    *free -= 1;
+    drop(free);
+    let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD_ENV, "1")
+        .output();
+    *lock.lock().unwrap() += 1;
+    cv.notify_one();
+    let out = out.expect("spawn the test child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "isolated test `{name}` did not pass ({})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        out.status
+    );
+}
+
+/// Declares `async fn name() { .. }` as a `#[test]` that runs through
+/// [`isolated`]. The body is written exactly as a `#[tokio::test]` body was.
+macro_rules! e2e {
+    ($(#[$m:meta])* async fn $name:ident() $body:block) => {
+        $(#[$m])*
+        #[test]
+        fn $name() {
+            $crate::common::isolated(stringify!($name), || async $body)
+        }
+    };
+}
+pub(crate) use e2e;
+
 /// Judge behaviour for a scenario.
 pub enum Judges {
     /// Every judge ranks `A` first: no deliberation.
@@ -67,6 +143,11 @@ const MOCK: &str = r#"#!/bin/sh
 set -e
 p="$MAGI_PROMPT_FILE"
 seat="$MAGI_SEAT"
+
+# One read of the prompt, matched with shell builtins: each `grep -q` below was
+# a process spawn, and on Windows a spawn is the expensive part of a mock call.
+prompt=$(cat "$p")
+has() { case "$prompt" in *"$1"*) return 0 ;; esac; return 1; }
 
 # Attribution trail. `magi task add` turns MAGI_RUN / MAGI_NODE into a task's
 # source, so a run whose agents never receive them would silently attribute
@@ -112,7 +193,7 @@ fi
 # recognisable by the words `prompt::resume_after_drop` actually sends, and
 # falls through to the ordinary implementation branch at the bottom so it
 # always succeeds.
-if [ -n "$MOCK_DROPPED_SEAT" ] && { case ",$MOCK_DROPPED_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && ! grep -q "Your last reply never reached me" "$p"; then
+if [ -n "$MOCK_DROPPED_SEAT" ] && { case ",$MOCK_DROPPED_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && ! has "Your last reply never reached me"; then
   printf '{"conversation_id":"mock-convo-%s","status":"ERROR","response":"","error":"subscriber fell behind updates, stalled for 5s","usage":{"output_tokens":500}}\n' "$seat"
   exit 1
 fi
@@ -121,12 +202,12 @@ fi
 # and exits non-zero — distinctly NOT the rate-limit shape above, so the graph
 # must treat it as a plain failure (retried the configured number of times),
 # meanwhile still collapsing the quorum if enough seats drop.
-if [ -n "$MOCK_FAILED_SEAT" ] && { case ",$MOCK_FAILED_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && grep -q "independent judges" "$p"; then
+if [ -n "$MOCK_FAILED_SEAT" ] && { case ",$MOCK_FAILED_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && has "independent judges"; then
   echo 'not a ranking at all'
   exit 1
 fi
 
-if grep -q "Final vote" "$p"; then
+if has "Final vote"; then
   printf '```json\n{"vote":"%s","reason":"mock final vote"}\n```\n' "$MOCK_VOTE"
   exit 0
 fi
@@ -136,18 +217,18 @@ fi
 # same "billed work, nothing delivered" shape as above. Regression coverage
 # for `deliberate()`'s own `AgentOutcome` handling, which must skip the turn
 # rather than record the CLI's raw error JSON as the judge's position.
-if [ -n "$MOCK_DROPPED_DELIBERATE_SEAT" ] && { case ",$MOCK_DROPPED_DELIBERATE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && grep -q "deliberation round" "$p"; then
+if [ -n "$MOCK_DROPPED_DELIBERATE_SEAT" ] && { case ",$MOCK_DROPPED_DELIBERATE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && has "deliberation round"; then
   printf '{"conversation_id":"mock-convo-%s","status":"ERROR","response":"","error":"subscriber fell behind updates, stalled for 5s","usage":{"output_tokens":500}}\n' "$seat"
   exit 1
 fi
 
-if grep -q "deliberation round" "$p"; then
+if has "deliberation round"; then
   printf '## POSITION\nThe mock argues for %s and cites nothing.\n\n' "$MOCK_VOTE"
   printf '```json\n{"tentative":"%s"}\n```\n' "$MOCK_VOTE"
   exit 0
 fi
 
-if grep -q "independent judges" "$p"; then
+if has "independent judges"; then
   n="${seat#judge-}"
   if [ "$MOCK_JUDGES" = "split" ]; then
     case "$n" in
@@ -162,7 +243,7 @@ if grep -q "independent judges" "$p"; then
   exit 0
 fi
 
-if grep -q "Your revote" "$p"; then
+if has "Your revote"; then
   # Reconsideration after a split vote. A matching seat holds the same
   # `approve_with_findings` vote it cast initially; every other seat holds
   # its `approve`. Deterministic on purpose: the fixtures that exercise this
@@ -185,7 +266,7 @@ fi
 # text when sessions do not continue, or the nudge text alone when they do
 # (see `prompt::nudge`) — without keying on either one. `MAGI_NODE` scopes
 # this to `review` so it cannot fire for a same-named seat elsewhere.
-if [ "$MAGI_NODE" = "review" ] && [ -n "$MOCK_REVIEW_RECOVERS_ON_RETRY_SEAT" ] && { case ",$MOCK_REVIEW_RECOVERS_ON_RETRY_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && ! grep -q "Your revote" "$p"; then
+if [ "$MAGI_NODE" = "review" ] && [ -n "$MOCK_REVIEW_RECOVERS_ON_RETRY_SEAT" ] && { case ",$MOCK_REVIEW_RECOVERS_ON_RETRY_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && ! has "Your revote"; then
   marker="retried-$seat"
   if [ ! -f "$marker" ]; then
     : > "$marker"
@@ -196,7 +277,7 @@ if [ "$MAGI_NODE" = "review" ] && [ -n "$MOCK_REVIEW_RECOVERS_ON_RETRY_SEAT" ] &
   exit 0
 fi
 
-if grep -q "reviewers of" "$p"; then
+if has "reviewers of"; then
   # Silent-seat simulation: a matching review seat produces nothing usable and
   # exits non-zero, which is exactly the record a real timeout leaves — the
   # graph sees one `ReviewRecord` with `failed` set either way.
@@ -235,7 +316,7 @@ fi
 # original prompt's, is what this greps for). `MOCK_FIX_ALWAYS_INCOMPLETE_SEAT`
 # never recovers, for exhaustion coverage; every other matching seat recovers
 # on this, its first resumed call.
-if grep -q "the report this step requires" "$p"; then
+if has "the report this step requires"; then
   if [ -n "$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT" ] && { case ",$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     printf "Still waiting on the background test run; I will report back once it finishes.\n"
     exit 0
@@ -247,7 +328,7 @@ if grep -q "the report this step requires" "$p"; then
   exit 0
 fi
 
-if grep -q "Your patch was reviewed" "$p"; then
+if has "Your patch was reviewed"; then
   id=$(grep -o 'R[0-9]*-[0-9]*-[0-9]*' "$p" | head -1)
   # A fixer that claims to have addressed the finding but never touches the
   # tree — the self-report `graph::Runner::review_loop` no longer trusts for
@@ -301,7 +382,7 @@ fi
 # reply also leaves. Every other advisor seat proposes a design naming its
 # own seat and touching note.txt, so a synthesis that names a seat outright
 # has real, seat-specific wording to quote back.
-if grep -q "You are advisor" "$p"; then
+if has "You are advisor"; then
   if [ -n "$MOCK_ADVISOR_FAIL_SEAT" ] && { case ",$MOCK_ADVISOR_FAIL_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     echo 'not a proposal at all'
     exit 1
@@ -314,7 +395,7 @@ fi
 # `MOCK_SYNTH_NAMES` outright (space-separated seat keys) so the reflection
 # heuristic has an unambiguous "strong" case for those and a "faint" one for
 # any advisor left unnamed. Defaults to naming every seat that answered.
-if grep -q "opening a task for magi" "$p"; then
+if has "opening a task for magi"; then
   if [ -n "$MOCK_SYNTH_FAIL" ]; then
     echo 'not a synthesis at all'
     exit 1

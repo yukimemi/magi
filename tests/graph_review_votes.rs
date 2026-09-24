@@ -8,7 +8,7 @@ use magi::graph::Runner;
 use magi::run::RunStatus;
 use magi::verdict::ReviewVote;
 
-#[tokio::test]
+common::e2e! {
 async fn a_split_vote_earns_one_round_of_reconsideration_and_a_recorded_verdict() {
     let home = common::home_lock().await;
     let fx = fixture_with_split_review_vote(home, "review-2");
@@ -57,4 +57,5 @@ async fn a_split_vote_earns_one_round_of_reconsideration_and_a_recorded_verdict(
     // A split vote must never block a run that gate and e2e call green.
     assert!(state.gate.iter().all(|o| o.ok()));
     assert_eq!(state.status, RunStatus::Ready);
+}
 }

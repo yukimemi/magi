@@ -11,7 +11,7 @@ use magi::graph::Runner;
 use magi::report;
 use magi::run::RunStatus;
 
-#[tokio::test]
+common::e2e! {
 async fn a_single_candidate_run_is_uncontested_not_collapsed() {
     let home = common::home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
@@ -47,4 +47,5 @@ async fn a_single_candidate_run_is_uncontested_not_collapsed() {
     assert!(!text.contains("no usable ranking"), "{text}");
     assert!(!text.contains("still split"), "{text}");
     assert!(!text.contains("BELOW QUORUM"), "{text}");
+}
 }

@@ -21,7 +21,7 @@ fn dirty(repo: &std::path::Path) {
     std::fs::write(repo.join("unstaged.txt"), "more\n").expect("write unstaged");
 }
 
-#[tokio::test]
+common::e2e! {
 async fn a_run_starts_on_a_dirty_tree_and_branches_off_the_base() {
     let _home = common::home_lock().await;
     let fx = common::fixture(_home, common::Judges::Unanimous, false);
@@ -71,8 +71,9 @@ async fn a_run_starts_on_a_dirty_tree_and_branches_off_the_base() {
         "a staged-but-uncommitted file must not be in the run's base: {listed}"
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_run_branches_off_what_the_remote_has_not_a_stale_local_ref() {
     // The failure this defends: `land` merges the winner on GitHub, nothing
     // updates the local branch, and the next run branches off a base missing
@@ -229,4 +230,5 @@ async fn a_run_branches_off_what_the_remote_has_not_a_stale_local_ref() {
         &fx.repo,
     );
     assert!(listed.contains("landed.txt"), "got {listed}");
+}
 }

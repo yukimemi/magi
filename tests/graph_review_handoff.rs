@@ -12,7 +12,7 @@ use common::{Judges, fixture, fixture_that_never_clears, fixture_with_noop_fixer
 use magi::graph::Runner;
 use magi::run::RunStatus;
 
-#[tokio::test]
+common::e2e! {
 async fn a_spent_round_budget_hands_off_when_gate_and_e2e_stay_green() {
     let _guard = common::home_lock().await;
     let fx = fixture_that_never_clears(_guard, 2);
@@ -40,8 +40,9 @@ async fn a_spent_round_budget_hands_off_when_gate_and_e2e_stay_green() {
         "the findings that were still open must stay readable"
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_red_gate_after_the_round_budget_blocks_with_what_failed() {
     let _guard = common::home_lock().await;
     let mut fx = fixture_that_never_clears(_guard, 2);
@@ -68,8 +69,9 @@ async fn a_red_gate_after_the_round_budget_blocks_with_what_failed() {
         "the outcome must name what failed: {event_text}"
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_red_e2e_at_the_round_budget_blocks_with_what_failed() {
     let _guard = common::home_lock().await;
     let mut fx = fixture_that_never_clears(_guard, 2);
@@ -97,8 +99,9 @@ async fn a_red_e2e_at_the_round_budget_blocks_with_what_failed() {
         "the outcome must say verification failed, not just findings: {event_text}"
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_tree_that_stops_moving_hands_off_before_the_round_budget() {
     let _guard = common::home_lock().await;
     // A generous budget the run must not need: the fixer never actually
@@ -131,8 +134,9 @@ async fn a_tree_that_stops_moving_hands_off_before_the_round_budget() {
     assert_eq!(state.status, RunStatus::Ready);
     assert!(state.handed_off_with_open_findings());
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn catchup_e2e_records_the_actual_head_after_an_empty_fixer_commit() {
     let _guard = common::home_lock().await;
     let mut fx = fixture_that_never_clears(_guard, 6);
@@ -156,8 +160,9 @@ async fn catchup_e2e_records_the_actual_head_after_an_empty_fixer_commit() {
     );
     assert!(last.e2e.iter().all(|outcome| outcome.ok()));
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_clean_round_is_unaffected_by_any_of_this() {
     let _guard = common::home_lock().await;
     // The ordinary happy path (one blocker, one fix, clean) must still behave
@@ -178,4 +183,5 @@ async fn a_clean_round_is_unaffected_by_any_of_this() {
     assert_eq!(state.status, RunStatus::Ready);
     assert!(!state.handed_off_with_open_findings());
     assert!(state.open_findings().is_empty());
+}
 }

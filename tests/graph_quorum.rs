@@ -8,7 +8,7 @@ use magi::graph::Runner;
 use magi::report;
 use magi::run::RunStatus;
 
-#[tokio::test]
+common::e2e! {
 async fn below_quorum_run_is_stalled_not_ready_and_resumable() {
     let _home = common::home_lock().await;
     // Two of the three judges are rate-limited out at their ranking.
@@ -67,8 +67,9 @@ async fn below_quorum_run_is_stalled_not_ready_and_resumable() {
     assert_eq!(again.state.judgements.len(), 3);
     assert_eq!(again.state.tally.as_ref().unwrap().present, 1);
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_rate_limited_seat_is_recorded_and_the_panel_accounts_for_it() {
     let _home = common::home_lock().await;
     let fx = fixture_with_quota(_home, &["judge-1"]);
@@ -106,6 +107,7 @@ async fn a_rate_limited_seat_is_recorded_and_the_panel_accounts_for_it() {
         .count();
     assert_eq!(ranked, 2, "{:?}", state.judgements);
 }
+}
 
 // Note on what is *not* asserted here: an earlier version checked that no
 // `judge-1-retry1` artifact existed, to pin "a rate-limited seat is never
@@ -118,7 +120,7 @@ async fn a_rate_limited_seat_is_recorded_and_the_panel_accounts_for_it() {
 // quota, it will show up as duplicate `QuotaLoss` entries for one seat and node,
 // which is worth a test of its own once the behaviour is understood.
 
-#[tokio::test]
+common::e2e! {
 async fn a_stalled_run_recovers_to_ready_once_the_quota_resets() {
     let _home = common::home_lock().await;
     // Phase 1: two of three judges are rate-limited out — below quorum,
@@ -166,8 +168,9 @@ async fn a_stalled_run_recovers_to_ready_once_the_quota_resets() {
         report::line(&again.state)
     );
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_stalled_run_stays_stalled_when_the_quota_has_not_reset() {
     let _home = common::home_lock().await;
     // judge-1 and judge-2 are still rate-limited on resume, so the run cannot
@@ -191,8 +194,9 @@ async fn a_stalled_run_stays_stalled_when_the_quota_has_not_reset() {
     assert!(again.state.gate.is_empty());
     assert!(again.state.merge.is_none());
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_plain_failure_collapse_stalls_and_recovers_on_resume() {
     let _home = common::home_lock().await;
     // Two of the three judges fail with an *ordinary* error — no usable output,
@@ -273,8 +277,9 @@ async fn a_plain_failure_collapse_stalls_and_recovers_on_resume() {
     assert!(again.state.tally.as_ref().unwrap().met_quorum);
     assert_eq!(again.state.tally.as_ref().unwrap().present, 3);
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn a_plain_failure_collapse_stays_stalled_while_the_failure_persists() {
     let _home = common::home_lock().await;
     let fx = fixture_with_failure(_home, &["judge-1", "judge-2"]);
@@ -294,8 +299,9 @@ async fn a_plain_failure_collapse_stays_stalled_while_the_failure_persists() {
     assert!(again.state.gate.is_empty());
     assert!(again.state.merge.is_none());
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn the_full_panel_present_is_still_a_healthy_ready() {
     let _home = common::home_lock().await;
     // No quota: all three judges rank and vote, so the run reaches Ready as
@@ -317,4 +323,5 @@ async fn the_full_panel_present_is_still_a_healthy_ready() {
         "{}",
         report::line(state)
     );
+}
 }

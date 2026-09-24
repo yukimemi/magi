@@ -197,7 +197,7 @@ fn approval_question(run: &str) -> ask::Question {
     )
 }
 
-#[tokio::test]
+common::e2e! {
 async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task() {
     let home = home_lock().await;
     let fx = fixture(home, Judges::Unanimous, false);
@@ -286,8 +286,9 @@ async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task() {
     );
     assert!(run_after.parked);
 }
+}
 
-#[tokio::test]
+common::e2e! {
 async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own() {
     let home = home_lock().await;
     let fx = fixture(home, Judges::Unanimous, false);
@@ -378,4 +379,5 @@ async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own() {
         "the resume actually re-entered `land`: {:?}",
         run_after.events
     );
+}
 }
