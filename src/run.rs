@@ -474,6 +474,23 @@ pub struct QuotaLoss {
     pub reset: Option<String>,
 }
 
+/// A newly created lockfile of a package manager the directory does not use,
+/// which a rescue commit left untracked instead of committing. Recorded so the
+/// omission is visible: the file may be one the task really wanted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Withheld {
+    /// Repo-relative path.
+    pub path: String,
+    /// The manager the file belongs to.
+    pub manager: String,
+    /// The tracked file (or missing manifest) that made it foreign.
+    pub kept_by: String,
+    /// Node whose rescue commit withheld it.
+    pub node: String,
+    /// When.
+    pub at: Timestamp,
+}
+
 /// The mechanical count.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tally {
@@ -1411,6 +1428,9 @@ pub struct RunState {
     /// Seats lost to a CLI rate limit / quota, in the order they hit.
     #[serde(default)]
     pub quota: Vec<QuotaLoss>,
+    /// Stray foreign lockfiles a rescue commit left out, one entry per path.
+    #[serde(default)]
+    pub withheld: Vec<Withheld>,
     /// Parked at a node boundary, waiting to be resumed.
     ///
     /// A run that is neither finished nor being worked on is otherwise
@@ -1545,6 +1565,7 @@ impl RunState {
             merge: None,
             leaks: Vec::new(),
             quota: Vec::new(),
+            withheld: Vec::new(),
             parked: false,
             seats: BTreeMap::new(),
             active: BTreeMap::new(),
@@ -1583,6 +1604,30 @@ impl RunState {
             .clone()
             .unwrap_or_else(default_worktree_root)
             .join(self.short())
+    }
+
+    /// Record lockfiles a rescue commit withheld; a path already recorded by an
+    /// earlier round is not repeated.
+    pub fn note_withheld(&mut self, node: &str, strays: &[crate::git::Stray]) {
+        for s in strays {
+            if self.withheld.iter().any(|w| w.path == s.path) {
+                continue;
+            }
+            self.event(
+                node,
+                format!(
+                    "withheld stray lockfile {} ({}; the directory uses {})",
+                    s.path, s.manager, s.kept_by
+                ),
+            );
+            self.withheld.push(Withheld {
+                path: s.path.clone(),
+                manager: s.manager.clone(),
+                kept_by: s.kept_by.clone(),
+                node: node.to_owned(),
+                at: Timestamp::now(),
+            });
+        }
     }
 
     /// Note something in the run log and on the tracing stream.

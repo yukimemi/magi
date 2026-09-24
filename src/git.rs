@@ -266,6 +266,154 @@ pub async fn commit_all(worktree: &Path, message: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// A freshly created lockfile that belongs to a package manager the directory
+/// does not use, and was therefore left out of a rescue commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stray {
+    /// Repo-relative path, forward slashes.
+    pub path: String,
+    /// The package manager the file belongs to (`pnpm`, `cargo`, ...).
+    pub manager: String,
+    /// What made it foreign: the tracked lockfile (or `Cargo.toml`'s absence)
+    /// that says which manager the directory really uses.
+    pub kept_by: String,
+}
+
+/// What [`rescue_commit`] did.
+#[derive(Debug, Default)]
+pub struct Rescue {
+    /// Whether a commit was made.
+    pub committed: bool,
+    /// Files left untracked in the worktree instead of being committed.
+    pub withheld: Vec<Stray>,
+}
+
+/// `(ecosystem, manager)` for a lockfile's file name.
+fn lock_kind(name: &str) -> Option<(&'static str, &'static str)> {
+    Some(match name {
+        "package-lock.json" | "npm-shrinkwrap.json" => ("node", "npm"),
+        "yarn.lock" => ("node", "yarn"),
+        "pnpm-lock.yaml" => ("node", "pnpm"),
+        "bun.lock" | "bun.lockb" => ("node", "bun"),
+        "poetry.lock" => ("python", "poetry"),
+        "uv.lock" => ("python", "uv"),
+        "Pipfile.lock" => ("python", "pipenv"),
+        "pdm.lock" => ("python", "pdm"),
+        "Cargo.lock" => ("rust", "cargo"),
+        _ => return None,
+    })
+}
+
+fn split_dir(path: &str) -> (&str, &str) {
+    path.rsplit_once('/').unwrap_or(("", path))
+}
+
+/// Which of the newly created `untracked` files are lockfiles of a manager the
+/// repo does not use in that directory.
+///
+/// Foreign means: a lockfile of the same ecosystem but another manager is
+/// already tracked *in the same directory* (no recursion — a workspace root and
+/// a sub-package may legitimately differ), or, for `Cargo.lock`, there is no
+/// `Cargo.toml` beside it. A first lockfile in a directory with none is normal.
+pub fn stray_lockfiles(untracked: &[String], tracked: &[String]) -> Vec<Stray> {
+    let mut out = Vec::new();
+    for path in untracked {
+        let (dir, name) = split_dir(path);
+        let Some((eco, manager)) = lock_kind(name) else {
+            continue;
+        };
+        let beside = |other: &String| split_dir(other).0 == dir;
+        let kept_by = if manager == "cargo" {
+            let has_manifest = tracked
+                .iter()
+                .chain(untracked)
+                .any(|p| beside(p) && split_dir(p).1 == "Cargo.toml");
+            if has_manifest {
+                continue;
+            }
+            "no Cargo.toml in the directory".to_owned()
+        } else {
+            let Some(other) = tracked.iter().find(|p| {
+                beside(p)
+                    && lock_kind(split_dir(p).1).is_some_and(|(e, m)| e == eco && m != manager)
+            }) else {
+                continue;
+            };
+            other.clone()
+        };
+        out.push(Stray {
+            path: path.clone(),
+            manager: manager.to_owned(),
+            kept_by,
+        });
+    }
+    out
+}
+
+async fn nul_list(worktree: &Path, args: &[&str]) -> Result<Vec<String>> {
+    let out = git(worktree, args).await?;
+    Ok(out
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// [`commit_all`] for an agent's leftover work, minus stray foreign lockfiles.
+///
+/// The withheld files stay untracked in the worktree (nothing is deleted) and
+/// are returned so the caller can record them: silently dropping them could
+/// lose a file the task really asked for.
+pub async fn rescue_commit(worktree: &Path, message: &str) -> Result<Rescue> {
+    if git(worktree, &["status", "--porcelain"]).await?.is_empty() {
+        return Ok(Rescue::default());
+    }
+    let untracked = nul_list(
+        worktree,
+        &["ls-files", "-z", "--others", "--exclude-standard"],
+    )
+    .await?;
+    let tracked = nul_list(worktree, &["ls-files", "-z"]).await?;
+    let withheld = stray_lockfiles(&untracked, &tracked);
+
+    git(worktree, &["add", "-A"]).await?;
+    if !withheld.is_empty() {
+        let mut args = vec!["reset", "-q", "--"];
+        args.extend(withheld.iter().map(|s| s.path.as_str()));
+        git(worktree, &args).await?;
+    }
+    if git_raw(worktree, &["diff", "--cached", "--quiet"])
+        .await?
+        .ok()
+    {
+        return Ok(Rescue {
+            committed: false,
+            withheld,
+        });
+    }
+    let out = git_raw(
+        worktree,
+        &[
+            "-c",
+            "user.name=magi candidate",
+            "-c",
+            "user.email=magi@localhost",
+            "commit",
+            "--no-verify",
+            "-m",
+            message,
+        ],
+    )
+    .await?;
+    if !out.ok() {
+        bail!("rescue commit failed: {}", out.stderr);
+    }
+    Ok(Rescue {
+        committed: true,
+        withheld,
+    })
+}
+
 /// Enable `extensions.worktreeConfig` if it is not already on.
 ///
 /// Returns `true` when magi turned it on, so the caller can turn it back off
@@ -789,6 +937,113 @@ mod tests {
         assert!(is_clean(&repo).await.unwrap());
         tokio::fs::write(repo.join("a.txt"), "two\n").await.unwrap();
         assert!(!is_clean(&repo).await.unwrap());
+    }
+
+    async fn track(repo: &Path, name: &str, body: &str) {
+        let p = repo.join(name);
+        if let Some(d) = p.parent() {
+            tokio::fs::create_dir_all(d).await.unwrap();
+        }
+        tokio::fs::write(&p, body).await.unwrap();
+        git(repo, &["add", name]).await.unwrap();
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@localhost",
+                "commit",
+                "-q",
+                "-m",
+                "seed",
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rescue_withholds_a_foreign_lockfile() {
+        let (_g, repo) = scratch().await;
+        track(&repo, "web/bun.lock", "a\n").await;
+        tokio::fs::write(repo.join("web/pnpm-lock.yaml"), "x\n")
+            .await
+            .unwrap();
+        tokio::fs::write(repo.join("web/app.ts"), "real\n")
+            .await
+            .unwrap();
+
+        let r = rescue_commit(&repo, "rescue").await.unwrap();
+        assert!(r.committed);
+        assert_eq!(
+            r.withheld,
+            [Stray {
+                path: "web/pnpm-lock.yaml".to_owned(),
+                manager: "pnpm".to_owned(),
+                kept_by: "web/bun.lock".to_owned(),
+            }]
+        );
+        let files = git(&repo, &["show", "--name-only", "--format=", "HEAD"])
+            .await
+            .unwrap();
+        assert!(files.contains("web/app.ts"), "{files}");
+        assert!(!files.contains("pnpm-lock"), "{files}");
+        assert!(repo.join("web/pnpm-lock.yaml").is_file(), "not deleted");
+    }
+
+    #[tokio::test]
+    async fn rescue_with_only_a_stray_commits_nothing() {
+        let (_g, repo) = scratch().await;
+        track(&repo, "bun.lock", "a\n").await;
+        tokio::fs::write(repo.join("yarn.lock"), "x\n")
+            .await
+            .unwrap();
+        let r = rescue_commit(&repo, "rescue").await.unwrap();
+        assert!(!r.committed);
+        assert_eq!(r.withheld.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rescue_keeps_a_same_manager_lockfile_update() {
+        let (_g, repo) = scratch().await;
+        track(&repo, "bun.lock", "a\n").await;
+        tokio::fs::write(repo.join("bun.lock"), "b\n")
+            .await
+            .unwrap();
+        let r = rescue_commit(&repo, "rescue").await.unwrap();
+        assert!(r.committed);
+        assert!(r.withheld.is_empty());
+        let files = git(&repo, &["show", "--name-only", "--format=", "HEAD"])
+            .await
+            .unwrap();
+        assert_eq!(files, "bun.lock");
+    }
+
+    #[tokio::test]
+    async fn rescue_keeps_the_first_lockfile_in_a_bare_directory() {
+        let (_g, repo) = scratch().await;
+        track(&repo, "other/bun.lock", "a\n").await;
+        tokio::fs::create_dir_all(repo.join("web")).await.unwrap();
+        tokio::fs::write(repo.join("web/package-lock.json"), "{}\n")
+            .await
+            .unwrap();
+        let r = rescue_commit(&repo, "rescue").await.unwrap();
+        assert!(r.committed);
+        assert!(r.withheld.is_empty());
+    }
+
+    #[test]
+    fn a_cargo_lock_is_foreign_only_without_a_cargo_toml() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        assert_eq!(stray_lockfiles(&s(&["a/Cargo.lock"]), &s(&[])).len(), 1);
+        assert!(stray_lockfiles(&s(&["a/Cargo.lock"]), &s(&["a/Cargo.toml"])).is_empty());
+        assert!(stray_lockfiles(&s(&["a/Cargo.lock", "a/Cargo.toml"]), &s(&[])).is_empty());
+        // A manifest in another directory does not count.
+        assert_eq!(
+            stray_lockfiles(&s(&["a/Cargo.lock"]), &s(&["Cargo.toml"])).len(),
+            1
+        );
     }
 
     #[tokio::test]

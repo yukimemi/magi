@@ -1857,12 +1857,14 @@ async fn fix_round(
     let before = git::rev_parse(&winner.worktree, "HEAD").await?;
     // An agent that edited files but never committed would otherwise push
     // nothing and look like a refusal.
-    git::commit_all(
+    if let Ok(r) = git::rescue_commit(
         &winner.worktree,
         &format!("magi: land round {round} fixes (uncommitted work)"),
     )
     .await
-    .ok();
+    {
+        state.note_withheld("land", &r.withheld);
+    }
     let after = git::rev_parse(&winner.worktree, "HEAD").await?;
     if after == before {
         return Ok(Fixed::Declined);
