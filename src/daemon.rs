@@ -1900,8 +1900,11 @@ async fn poll(
                 // whole backlog can be run - and failed - in the seconds it
                 // takes each attempt to notice the CLI is out of quota.
                 if !quota.is_empty() {
-                    let hint = quota.iter().find_map(|q| q.reset.as_deref());
-                    let reset_at = hint.and_then(|h| parse_reset_hint(h, Timestamp::now()));
+                    let with_hint = quota.iter().find(|q| q.reset.is_some());
+                    let hint = with_hint.and_then(|q| q.reset.as_deref());
+                    let reset_at = with_hint.and_then(|q| {
+                        parse_reset_hint(q.reset.as_deref()?, Timestamp::now(), q.at)
+                    });
                     let wait = quota_wait(
                         reset_at,
                         Timestamp::now(),
@@ -2435,8 +2438,46 @@ fn quota_wait(
 /// explains why parsing it exactly "would be a bug factory" — so this only
 /// recognises the shapes actually observed in the wild, and returns `None`
 /// for anything else rather than guess at a format nobody has seen.
-fn parse_reset_hint(text: &str, now: Timestamp) -> Option<Timestamp> {
-    parse_reset_hint_zoned(text, now).or_else(|| parse_reset_hint_dated(text))
+///
+/// `recorded` is when the loss was noted ([`QuotaLoss::at`]). It anchors the
+/// relative shape (`"in 1h2m49s"`, agy's), which counts from the moment the CLI
+/// said it, not from whenever this loop happens to read it: anchoring on `now`
+/// would push the reset later on every read and would read an already-elapsed
+/// reset as still in the future. (A long hint is still clamped by
+/// [`QUOTA_WAIT_CAP`]; the anchor matters for short hints and elapsed ones.)
+fn parse_reset_hint(text: &str, now: Timestamp, recorded: Timestamp) -> Option<Timestamp> {
+    parse_reset_hint_zoned(text, now)
+        .or_else(|| parse_reset_hint_dated(text))
+        .or_else(|| parse_reset_hint_relative(text, recorded))
+}
+
+/// agy's shape: `"in 1h2m49s"` - `in`, then hours/minutes/seconds, each unit
+/// optional but at least one required, in that order. A bare number or any
+/// unknown unit is refused.
+fn parse_reset_hint_relative(text: &str, recorded: Timestamp) -> Option<Timestamp> {
+    let rest = text.trim().trim_end_matches('.').strip_prefix("in ")?;
+    let mut rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut total: i64 = 0;
+    let mut matched = false;
+    for (unit, secs) in [('h', 3600), ('m', 60), ('s', 1)] {
+        if let Some((digits, tail)) = rest.split_once(unit)
+            && !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+        {
+            total += digits.parse::<i64>().ok()?.checked_mul(secs)?;
+            rest = tail;
+            matched = true;
+        }
+    }
+    if !rest.is_empty() || !matched {
+        return None;
+    }
+    recorded
+        .checked_add(jiff::SignedDuration::from_secs(total))
+        .ok()
 }
 
 /// Reads a 12-hour `"H:MMam/pm"` clock reading (whitespace trimmed,
@@ -4767,22 +4808,22 @@ mod tests {
     fn parse_reset_hint_reads_the_claude_cli_shape_and_rolls_a_past_clock_to_tomorrow() {
         let now = "2026-09-07T02:50:00Z".parse::<Timestamp>().unwrap();
 
-        let at = parse_reset_hint("4:50am (UTC)", now).expect("a recognised shape parses");
+        let at = parse_reset_hint("4:50am (UTC)", now, now).expect("a recognised shape parses");
         assert_eq!(at.to_string(), "2026-09-07T04:50:00Z");
 
         // Same clock reading, but it has already gone by today: read as
         // tomorrow's, since the CLI would not still be reporting a limit past
         // its own stated reset.
         let already_past =
-            parse_reset_hint("1:00am (UTC)", now).expect("a recognised shape parses");
+            parse_reset_hint("1:00am (UTC)", now, now).expect("a recognised shape parses");
         assert_eq!(already_past.to_string(), "2026-09-08T01:00:00Z");
 
         assert!(
-            parse_reset_hint("session limit reached", now).is_none(),
+            parse_reset_hint("session limit reached", now, now).is_none(),
             "free text with no recognised shape is not guessed at"
         );
         assert!(
-            parse_reset_hint("4:50am (Nowhere/Fake)", now).is_none(),
+            parse_reset_hint("4:50am (Nowhere/Fake)", now, now).is_none(),
             "an unresolvable zone name is not guessed at either"
         );
     }
@@ -4796,6 +4837,7 @@ mod tests {
              https://chatgpt.com/codex/settings/usage to purchase more \
              credits or try again at Sep 19th, 2026 5:10 PM.",
             now,
+            now,
         )
         .expect("the codex reset wording is a recognised shape");
         assert_eq!(at.to_string(), "2026-09-19T17:10:00Z");
@@ -4804,23 +4846,42 @@ mod tests {
         // sentence-implied year than `now` is trusted as written rather than
         // rolled forward a year the way the bracketed shape rolls a
         // same-day clock reading to tomorrow.
-        let earlier = parse_reset_hint("try again at Jan 2nd, 2026 1:00 AM.", now)
+        let earlier = parse_reset_hint("try again at Jan 2nd, 2026 1:00 AM.", now, now)
             .expect("an explicit year needs no rollover");
         assert_eq!(earlier.to_string(), "2026-01-02T01:00:00Z");
 
         assert!(
-            parse_reset_hint("try again at Sep 19th, 26 5:10 PM.", now).is_none(),
+            parse_reset_hint("try again at Sep 19th, 26 5:10 PM.", now, now).is_none(),
             "a two-digit year is not the documented shape and is not guessed at"
         );
         assert!(
-            parse_reset_hint("try again at Sept 19th, 2026 5:10 PM.", now).is_none(),
+            parse_reset_hint("try again at Sept 19th, 2026 5:10 PM.", now, now).is_none(),
             "a four-letter month name is not the documented three-letter abbreviation"
         );
         assert!(
-            parse_reset_hint("try again at Sep 19th, 2026 5:10 PM (UTC).", now).is_none(),
+            parse_reset_hint("try again at Sep 19th, 2026 5:10 PM (UTC).", now, now).is_none(),
             "an explicit zone on the dated shape is a format nobody has \
              documented, and is refused rather than guessed at as UTC"
         );
+    }
+
+    #[test]
+    fn parse_reset_hint_reads_agys_relative_shape_from_when_the_loss_was_recorded() {
+        let now = "2026-09-24T12:00:00Z".parse::<Timestamp>().unwrap();
+        let recorded = "2026-09-24T08:00:00Z".parse::<Timestamp>().unwrap();
+
+        let at = parse_reset_hint("in 1h2m49s", now, recorded).expect("agy's shape parses");
+        assert_eq!(at.as_second() - recorded.as_second(), 3769);
+
+        let partial = parse_reset_hint("in 45m", now, recorded).expect("units are optional");
+        assert_eq!(partial.as_second() - recorded.as_second(), 45 * 60);
+
+        for bad in ["in ", "in 45", "in 3x", "in m", "in 1h junk", "1h2m"] {
+            assert!(
+                parse_reset_hint(bad, now, recorded).is_none(),
+                "{bad:?} must not be guessed at"
+            );
+        }
     }
 
     /// A loop whose queue lives in a temp tree and whose poll interval is far
