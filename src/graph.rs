@@ -4782,7 +4782,8 @@ impl Runner {
         let base = self.state.base_branch.clone();
         let mode = self.state.config.merge.mode;
         let style = self.state.config.merge.style;
-        let message = pr_body(&self.state, winner.label);
+        let pr = pr_message(&self.state, winner.label);
+        let message = pr.commit_message();
 
         let outcome = match mode {
             MergeMode::None => MergeOutcome {
@@ -4835,7 +4836,9 @@ impl Runner {
                         detail: pushed.stderr,
                     }
                 } else {
-                    let out = gh_pr_create(&winner.worktree, &base, &winner.branch, &message).await;
+                    let out =
+                        gh_pr_create(&winner.worktree, &base, &winner.branch, &pr.title, &pr.body)
+                            .await;
                     match out {
                         Ok(url) => MergeOutcome {
                             mode,
@@ -6061,72 +6064,19 @@ fn manual_merge_command(style: MergeStyle, repo: &Path, branch: &str, message: &
     match style {
         MergeStyle::Merge => format!("git -C {repo} merge --no-ff {branch}"),
         MergeStyle::Squash => {
-            let subject = message.lines().next().unwrap_or(branch);
+            // The subject sits inside double quotes, and a title an agent
+            // wrote may carry the characters that break out of them.
+            let subject = message
+                .lines()
+                .next()
+                .unwrap_or(branch)
+                .replace(['\\', '"', '$', '`'], "");
             format!(
                 "git -C {repo} merge --squash {branch} && git -C {repo} commit -m \"{subject}\""
             )
         }
         MergeStyle::Rebase => format!("git -C {repo} merge --ff-only {branch}"),
     }
-}
-
-/// The merge commit / pull request body: the task, and — when the winning
-/// review round was not clean — the findings still open and whatever the
-/// fixer declined, so `merge = "pr"` hands the reader the same material
-/// `magi show` does rather than a pull request that reads clean while
-/// `run.json` disagrees.
-///
-/// The first line doubles as the squash/merge commit subject
-/// (`manual_merge_command`), which takes it via `message.lines().next()`
-/// verbatim — so it has to be the task's own opening line, not run/candidate
-/// bookkeeping. The pull request title (`gh_pr_create`) starts from the same
-/// line but is further reshaped and truncated by `pr_title` to stay inside
-/// GitHub's limit; see that function for why. "Merge magi run ec12 (candidate
-/// B)" told a reader nothing about what landed once the run id had scrolled
-/// off the PR list. That bookkeeping still needs to be findable, just not
-/// from the title: the branch name already carries it
-/// (`RunState::branch_for`), and the footer below repeats it as plain tags
-/// for a reader holding only the merged commit or the PR body.
-///
-/// `state.instruction` can open with blank lines — a `--file` task is passed
-/// through verbatim (`task_text` only rejects a body that is blank
-/// *entirely*) — and `.lines().next()` on those reads back as `Some("")`, not
-/// `None`. `trim_start` drops exactly those leading blank lines so the first
-/// line is the task's real opening line, and the empty-after-trim case (a
-/// whitespace-only instruction) falls back the same way `queue::title_from`
-/// does for the same situation.
-fn pr_body(state: &RunState, winner: char) -> String {
-    let instruction = state.instruction.trim_start();
-    let mut message = if instruction.is_empty() {
-        "(empty task)".to_owned()
-    } else {
-        instruction.to_owned()
-    };
-
-    let open = state.open_findings();
-    if !open.is_empty() {
-        message.push_str("\n\n## Open review findings\n\n");
-        for f in &open {
-            message.push_str(&format!("- `{}` [{:?}] {}\n", f.id, f.severity, f.title));
-        }
-    }
-
-    if let Some(fix) = state.reviews.last().and_then(|r| r.fix.as_ref())
-        && !fix.rejected.is_empty()
-    {
-        message.push_str("\n## Declined by the fixer\n\n");
-        for r in &fix.rejected {
-            message.push_str(&format!("- `{}`: {}\n", r.id, r.why));
-        }
-    }
-
-    message.push_str(&format!(
-        "\n\n---\nmagi:run/{} magi:candidate-{}\n",
-        state.id,
-        winner.to_ascii_lowercase()
-    ));
-
-    message
 }
 
 /// GitHub's `createPullRequest` GraphQL mutation, which `gh pr create` calls
@@ -6141,19 +6091,150 @@ fn pr_body(state: &RunState, winner: char) -> String {
 /// comfortably inside it.
 const PR_TITLE_MAX: usize = 240;
 
-/// The pull request title: the PR body's first line, reshaped and truncated
-/// by [`queue::title_from`] the same way `magi show`'s task list titles are,
-/// so it stays inside GitHub's limit on `--title` (see [`PR_TITLE_MAX`]).
-fn pr_title(body: &str) -> String {
-    queue::title_from(body, PR_TITLE_MAX)
+/// What `merge = "pr"` (and the merge commit of the other modes) says about a
+/// change: a title and a body describing what was *implemented*, not the task
+/// that asked for it. A task reads as a request; a reader of the merged
+/// history wants the change.
+struct PrMessage {
+    title: String,
+    body: String,
+}
+
+impl PrMessage {
+    /// Title, blank line, body. The first line is the squash/merge commit
+    /// subject (`manual_merge_command` takes it via `lines().next()`), so it
+    /// has to stay one sensible line.
+    fn commit_message(&self) -> String {
+        format!("{}\n\n{}", self.title, self.body)
+    }
+}
+
+/// The text after a leading `TITLE:` (any case) on `line`.
+fn title_marker(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let head = line.get(..6)?;
+    head.eq_ignore_ascii_case("title:")
+        .then(|| line[6..].trim())
+}
+
+/// The implementer's own one-line title: the `TITLE:` line the implement
+/// prompt asks for at the top of its SUMMARY. Candidate commits are all
+/// `magi: candidate X (uncommitted work)`, so a commit subject is never a
+/// source, and a title that says as much is refused here too.
+fn summary_title(summary: &str) -> Option<String> {
+    let first = summary.lines().find(|l| !l.trim().is_empty())?;
+    let raw = title_marker(first)?;
+    if raw.is_empty() {
+        return None;
+    }
+    let title = queue::title_from(raw, PR_TITLE_MAX);
+    let lower = title.to_ascii_lowercase();
+    if lower.starts_with("magi:") || lower.contains("(uncommitted work)") {
+        return None;
+    }
+    Some(title)
+}
+
+/// `summary` without its `TITLE:` line, which the pull request title already
+/// carries.
+fn summary_without_title(summary: &str) -> String {
+    let mut lines = summary.trim().lines().peekable();
+    if lines.peek().is_some_and(|l| title_marker(l).is_some()) {
+        lines.next();
+    }
+    lines.collect::<Vec<_>>().join("\n").trim().to_owned()
+}
+
+/// The pull request title and body for the winning candidate.
+///
+/// Title: the implementer's `TITLE:` line ([`summary_title`]), falling back to
+/// the task's own opening line via [`queue::title_from`] when there is none.
+/// `state.instruction` can open with blank lines (`task_text` only rejects a
+/// body that is blank *entirely*), which `title_from` skips.
+///
+/// Body: the implementer's summary and the fixer's notes, then — when the
+/// winning review round was not clean — the findings still open and whatever
+/// the fixer declined, so `merge = "pr"` hands the reader the same material
+/// `magi show` does. The task follows inside a collapsed block, and the
+/// footer repeats the run and candidate as plain tags for a reader holding
+/// only the merged commit or the PR body.
+fn pr_message(state: &RunState, winner: char) -> PrMessage {
+    let summary = state
+        .candidates
+        .iter()
+        .find(|c| c.label == winner)
+        .map(|c| c.summary.as_str())
+        .unwrap_or_default();
+    let title = summary_title(summary)
+        .unwrap_or_else(|| queue::title_from(&state.instruction, PR_TITLE_MAX));
+
+    let mut body = String::new();
+    let what = summary_without_title(summary);
+    if !what.is_empty() {
+        body.push_str("## Summary\n\n");
+        body.push_str(&what);
+        body.push_str("\n\n");
+    }
+
+    let fix = state.reviews.last().and_then(|r| r.fix.as_ref());
+    if let Some(fix) = fix
+        && !fix.notes.trim().is_empty()
+    {
+        body.push_str("## Review fixes\n\n");
+        body.push_str(fix.notes.trim());
+        body.push_str("\n\n");
+    }
+
+    let open = state.open_findings();
+    if !open.is_empty() {
+        body.push_str("## Open review findings\n\n");
+        for f in &open {
+            body.push_str(&format!("- `{}` [{:?}] {}\n", f.id, f.severity, f.title));
+        }
+        body.push('\n');
+    }
+
+    if let Some(fix) = fix
+        && !fix.rejected.is_empty()
+    {
+        body.push_str("## Declined by the fixer\n\n");
+        for r in &fix.rejected {
+            body.push_str(&format!("- `{}`: {}\n", r.id, r.why));
+        }
+        body.push('\n');
+    }
+
+    let task = state.instruction.trim();
+    let task = if task.is_empty() {
+        "(empty task)"
+    } else {
+        task
+    };
+    body.push_str(&format!(
+        "<details>\n<summary>Original task</summary>\n\n{}\n\n</details>\n",
+        task.replace("</details>", "&lt;/details&gt;")
+    ));
+
+    body.push_str(&format!(
+        "\n---\nmagi:run/{} magi:candidate-{}\n",
+        state.id,
+        winner.to_ascii_lowercase()
+    ));
+
+    PrMessage { title, body }
 }
 
 /// `gh pr create`, returning the PR url.
-async fn gh_pr_create(cwd: &Path, base: &str, head: &str, body: &str) -> Result<String> {
-    let title = pr_title(body);
+async fn gh_pr_create(
+    cwd: &Path,
+    base: &str,
+    head: &str,
+    title: &str,
+    body: &str,
+) -> Result<String> {
     let out = tokio::process::Command::new("gh")
         .args([
-            "pr", "create", "--base", base, "--head", head, "--title", &title, "--body", body,
+            "pr", "create", "--base", base, "--head", head, "--title", title, "--body", body,
         ])
         .current_dir(cwd)
         .quiet()
@@ -8333,7 +8414,7 @@ mod tests {
             verdict: None,
         };
         let state = state_with_round(round);
-        let body = pr_body(&state, 'A');
+        let body = pr_message(&state, 'A').body;
 
         assert!(body.contains("add retries"), "the task must still be there");
         assert!(body.contains("R2-1-1"), "{body}");
@@ -8377,120 +8458,129 @@ mod tests {
             verdict: None,
         };
         let state = state_with_round(round);
-        let body = pr_body(&state, 'A');
+        let body = pr_message(&state, 'A').body;
         assert!(!body.contains("Open review findings"), "{body}");
         assert!(!body.contains("Declined"), "{body}");
     }
 
+    fn state_with_summary(instruction: &str, summary: &str) -> RunState {
+        let mut state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            instruction.to_owned(),
+            Config::default(),
+        );
+        state.candidates.push(Candidate {
+            index: 0,
+            label: 'A',
+            agent: "alpha".to_owned(),
+            branch: "magi/x/A".to_owned(),
+            worktree: PathBuf::from("/wt"),
+            summary: summary.to_owned(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            folded: false,
+            duration_ms: 0,
+        });
+        state
+    }
+
     #[test]
-    fn pr_body_titles_itself_from_the_task_not_run_or_candidate() {
-        let state = RunState::new(
+    fn pr_message_describes_the_change_not_the_task() {
+        let state = state_with_summary(
+            "今回やってほしいこと: results projector を直す",
+            "TITLE: fix(web): batch the runs list reads\n- reads run.json once\n- risk: none",
+        );
+        let m = pr_message(&state, 'A');
+        assert_eq!(m.title, "fix(web): batch the runs list reads");
+        assert!(
+            m.body.starts_with("## Summary\n\n- reads run.json once"),
+            "{}",
+            m.body
+        );
+        assert!(!m.body.contains("TITLE:"), "{}", m.body);
+        let task_at = m.body.find("今回やってほしいこと").unwrap();
+        let details_at = m.body.find("<details>").unwrap();
+        assert!(
+            details_at < task_at,
+            "the task lives inside <details>: {}",
+            m.body
+        );
+        assert!(m.body.contains(&format!("magi:run/{}", state.id)));
+        assert!(m.body.contains("magi:candidate-a"));
+    }
+
+    #[test]
+    fn pr_message_falls_back_to_the_task_without_a_title_line() {
+        let state = state_with_summary("\n\nadd retries\n\ndetails", "- did some things");
+        let m = pr_message(&state, 'A');
+        assert_eq!(m.title, "add retries");
+        assert!(
+            m.body.contains("## Summary\n\n- did some things"),
+            "{}",
+            m.body
+        );
+
+        let none = RunState::new(
             PathBuf::from("/repo"),
             "main".to_owned(),
             "abc1234".to_owned(),
             "add retries".to_owned(),
             Config::default(),
         );
-        let body = pr_body(&state, 'A');
-        let title = body.lines().next().unwrap();
-
-        assert_eq!(
-            title, "add retries",
-            "the title must be the task, not run/candidate bookkeeping: {body}"
-        );
-        assert!(
-            body.contains(&format!("magi:run/{}", state.id)),
-            "the run id must still be recoverable from the footer: {body}"
-        );
-        assert!(
-            body.contains("magi:candidate-a"),
-            "the candidate must still be recoverable from the footer: {body}"
-        );
+        let m = pr_message(&none, 'A');
+        assert_eq!(m.title, "add retries");
+        assert!(!m.body.contains("## Summary"), "{}", m.body);
     }
 
     #[test]
-    fn pr_body_never_titles_itself_off_a_blank_first_line() {
-        let leading_blank = RunState::new(
-            PathBuf::from("/repo"),
-            "main".to_owned(),
-            "abc1234".to_owned(),
-            "\n\n  \nadd retries\n\ndetails".to_owned(),
-            Config::default(),
-        );
-        let body = pr_body(&leading_blank, 'A');
-        assert_eq!(
-            body.lines().next(),
-            Some("add retries"),
-            "a leading blank line must not become an empty title: {body}"
-        );
-
-        let whitespace_only = RunState::new(
-            PathBuf::from("/repo"),
-            "main".to_owned(),
-            "abc1234".to_owned(),
-            "   \n  \n".to_owned(),
-            Config::default(),
-        );
-        let body = pr_body(&whitespace_only, 'A');
-        let title = body.lines().next().unwrap_or_default();
-        assert!(
-            !title.is_empty(),
-            "a whitespace-only instruction must still fall back to a non-empty title: {body}"
-        );
+    fn pr_message_refuses_the_candidate_commit_subject() {
+        for bad in [
+            "TITLE: magi: candidate A (uncommitted work)",
+            "TITLE: chore: stuff (uncommitted work)",
+            "TITLE:   ",
+        ] {
+            let state = state_with_summary("add retries", bad);
+            assert_eq!(pr_message(&state, 'A').title, "add retries", "{bad}");
+        }
     }
 
     #[test]
-    fn pr_title_truncates_a_first_line_over_githubs_limit() {
-        // A run 2963-shaped instruction: a single first line well past
-        // GitHub's 256-character createPullRequest limit, with a multi-byte
-        // character mixed in so the truncation is exercised on `chars()`
-        // counting rather than bytes.
-        let long_line = format!("fix the thing 🎉 {}", "x".repeat(400));
-        let title = pr_title(&long_line);
+    fn pr_message_bounds_a_very_long_task_and_title() {
+        let long = format!("fix the thing 🎉 {}", "x".repeat(5000));
+        let state = state_with_summary(&long, "- nothing");
+        let m = pr_message(&state, 'A');
+        assert!(m.title.chars().count() <= PR_TITLE_MAX, "{}", m.title);
+        assert!(!m.title.contains('\n'));
 
-        assert!(
-            title.chars().count() <= PR_TITLE_MAX,
-            "title must stay within PR_TITLE_MAX: {title:?} ({} chars)",
-            title.chars().count()
-        );
-        assert!(
-            title.chars().count() < 256,
-            "title must stay within GitHub's 256-character limit: {title:?}"
-        );
-        assert!(
-            title.ends_with('…'),
-            "a truncated title must say so: {title:?}"
-        );
+        let state = state_with_summary("task", &format!("TITLE: feat: {}", "y".repeat(5000)));
+        let m = pr_message(&state, 'A');
+        assert!(m.title.starts_with("feat: "));
+        assert!(m.title.chars().count() <= PR_TITLE_MAX, "{}", m.title);
+        assert_eq!(m.commit_message().lines().next(), Some(m.title.as_str()));
     }
 
     #[test]
-    fn pr_title_leaves_a_short_title_untouched() {
-        let title = pr_title("add retries\n\nmore detail below");
-        assert_eq!(title, "add retries");
+    fn pr_message_survives_a_task_that_closes_details() {
+        let state = state_with_summary("a </details> b", "TITLE: fix: x");
+        let m = pr_message(&state, 'A');
+        assert_eq!(m.body.matches("</details>").count(), 1, "{}", m.body);
     }
 
     #[test]
-    fn pr_title_strips_markdown_heading_markers() {
-        let title = pr_title("# Rework the config loader\n\ndetails");
-        assert_eq!(title, "Rework the config loader");
-    }
-
-    #[test]
-    fn pr_title_of_pr_body_stays_within_githubs_limit() {
-        let state = RunState::new(
-            PathBuf::from("/repo"),
-            "main".to_owned(),
-            "abc1234".to_owned(),
-            format!("fix the thing 🎉 {}", "x".repeat(400)),
-            Config::default(),
+    fn manual_squash_subject_cannot_break_out_of_its_quotes() {
+        let cmd = manual_merge_command(
+            MergeStyle::Squash,
+            Path::new("/repo"),
+            "b",
+            "fix: \"quoted\" $(x) `y`\n\nbody",
         );
-        let body = pr_body(&state, 'A');
-        let title = pr_title(&body);
-
-        assert!(
-            title.chars().count() < 256,
-            "the title gh_pr_create sends must stay within GitHub's limit: {title:?}"
-        );
+        assert!(cmd.ends_with("commit -m \"fix: quoted (x) y\""), "{cmd}");
     }
 
     #[test]

@@ -349,10 +349,15 @@ pub fn implement(instruction: &str, cwd: &str, language: &str, brief: Option<&st
          # Reply format\n\n\
          End your reply with, exactly:\n\n\
          ## SUMMARY\n\
+         TITLE: type(scope): one-line description of the change you made\n\
          - what you changed (max 10 bullets)\n\
          - why, where it is not obvious\n\
          - risks a reviewer should check\n\
          - how to verify by hand\n\n\
+         The `TITLE:` line is the first line under SUMMARY. It becomes the \
+         pull request title, so describe the change itself in a conventional-\
+         commit style (`fix(web): …`) and keep the `type(scope):` prefix in \
+         English. Do not write it for a NO CHANGE NEEDED reply.\n\n\
          If, after investigating, you conclude the task's request is already \
          satisfied elsewhere and no change belongs in this worktree, write no \
          bullets. Instead start SUMMARY with a line reading exactly \
