@@ -1364,12 +1364,18 @@ impl Runner {
 
             // Rescue anything the agent edited but never committed: an
             // uncommitted candidate would silently be an empty one.
-            let rescued = git::commit_all(
+            let rescued = match git::rescue_commit(
                 &worktree,
                 &format!("magi: candidate {label} (uncommitted work)"),
             )
             .await
-            .unwrap_or(false);
+            {
+                Ok(r) => {
+                    self.state.note_withheld("implement", &r.withheld);
+                    r.committed
+                }
+                Err(_) => false,
+            };
             let commits = git::commits_ahead(&worktree, &base, "HEAD")
                 .await
                 .unwrap_or(0);
@@ -1630,7 +1636,7 @@ impl Runner {
                 tried.insert(next.id.clone());
                 fallback_attempt += 1;
 
-                git::commit_all(
+                if let Ok(r) = git::rescue_commit(
                     &job.cwd,
                     &format!(
                         "magi: candidate {} (uncommitted work before quota fallback)",
@@ -1638,7 +1644,9 @@ impl Runner {
                     ),
                 )
                 .await
-                .ok();
+                {
+                    self.state.note_withheld("implement", &r.withheld);
+                }
 
                 self.state.event(
                     "implement",
@@ -3454,20 +3462,18 @@ impl Runner {
         }
         self.state.seats.insert(final_seat.key.clone(), final_seat);
 
-        git::commit_all(
-            &fix_worktree,
-            &format!(
-                "magi: operator-selected fix ({}) (uncommitted work)",
-                self.state.operator_fixes[request_index]
-                    .findings
-                    .iter()
-                    .map(|f| f.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        )
-        .await
-        .ok();
+        let rescue_message = format!(
+            "magi: operator-selected fix ({}) (uncommitted work)",
+            self.state.operator_fixes[request_index]
+                .findings
+                .iter()
+                .map(|f| f.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if let Ok(r) = git::rescue_commit(&fix_worktree, &rescue_message).await {
+            self.state.note_withheld("fix", &r.withheld);
+        }
         let after = git::rev_parse(&fix_worktree, "HEAD").await?;
         fix.committed = after != head_at_request;
         git::worktree_remove(&self.state.repo, &fix_worktree)
@@ -4327,12 +4333,14 @@ impl Runner {
             }
             fix.continuation = Some(continuation);
             self.state.seats.insert(final_seat.key.clone(), final_seat);
-            git::commit_all(
+            if let Ok(r) = git::rescue_commit(
                 &winner.worktree,
                 &format!("magi: review round {round} fixes (uncommitted work)"),
             )
             .await
-            .ok();
+            {
+                self.state.note_withheld("fix", &r.withheld);
+            }
             let after = git::rev_parse(&winner.worktree, "HEAD").await?;
             fix.committed = after != before;
             // Judged by what `git` says moved against base, never by the

@@ -486,6 +486,20 @@ pub fn run(state: &RunState) -> String {
         let _ = writeln!(s, "  winner        {}", bold(&green(&t.winner.to_string())));
     }
 
+    if !state.withheld.is_empty() {
+        let _ = writeln!(s, "\n{}", bold("withheld from commit"));
+        for w in &state.withheld {
+            let _ = writeln!(
+                s,
+                "  {} {}  ({} lockfile; the directory uses {})",
+                yellow("!"),
+                w.path,
+                w.manager,
+                w.kept_by
+            );
+        }
+    }
+
     if !state.reviews.is_empty() {
         let _ = writeln!(s, "\n{}", bold("review + verification"));
         for r in &state.reviews {
