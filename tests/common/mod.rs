@@ -412,7 +412,7 @@ fi
 echo "content from $seat" > note.txt
 git add -A >/dev/null 2>&1
 git commit -q -m "add note from $seat" >/dev/null 2>&1
-printf '## SUMMARY\n- created note.txt\n- no risks\n'
+printf '## SUMMARY\nTITLE: feat(note): create note.txt\n- created note.txt\n- no risks\n'
 "#;
 
 fn run_git(repo: &Path, args: &[&str]) {
