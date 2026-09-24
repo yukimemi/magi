@@ -422,7 +422,21 @@ pub async fn invoke(
     tokio::fs::write(&out_path, &stdout).await.ok();
     tokio::fs::write(&err_path, &stderr).await.ok();
 
-    let extracted = extract(spec.kind, &stdout);
+    let mut extracted = extract(spec.kind, &stdout);
+    if spec.kind == AgentKind::Antigravity && extracted.quota.is_none() {
+        extracted.quota = agy_quota(&stdout, &stderr);
+    }
+    if let Some(quota) = &extracted.quota {
+        // A quota response carries usage too, so it can look like a dropped
+        // stream; a rate limit is never worth re-asking, so it wins.
+        extracted.dropped = None;
+        tracing::warn!(
+            seat = %seat.key,
+            agent = %spec.id,
+            reset = ?quota.reset,
+            "agent is out of quota"
+        );
+    }
     if let Some(session) = extracted.session {
         match spec.kind {
             AgentKind::Claude => seat.claude_session = Some(session),
@@ -1106,6 +1120,54 @@ fn claude_quota(v: &serde_json::Value) -> Option<Quota> {
         .split("resets ")
         .nth(1)
         .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    Some(Quota { reset })
+}
+
+/// Recognise `agy` running out of quota, from either stream.
+///
+/// Observed shape while out of quota: stdout carries the JSON object
+/// `{"status":"ERROR","response":"","error":"Individual quota reached. … Resets
+/// in 1h2m49s."}` and stderr carries `AGY_ERROR: {"status":"RESOURCE_EXHAUSTED",
+/// "error_code":429,…}`. Either alone is enough (a mangled stdout must not hide
+/// a quota that stderr states plainly), but each is keyed on a *pair* of
+/// structured fields: `status: ERROR` with the quota text, or
+/// `RESOURCE_EXHAUSTED` together with 429. An error status alone, or a 429
+/// alone, stays an ordinary failure - the conservative side, as for
+/// [`claude_quota`].
+///
+/// The reset hint is what follows `Resets ` (e.g. `in 1h2m49s`), trailing full
+/// stop dropped.
+fn agy_quota(stdout: &str, stderr: &str) -> Option<Quota> {
+    let from_stdout = stdout
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .and_then(|v| {
+            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            let error = v.get("error").and_then(|e| e.as_str()).unwrap_or("");
+            (status.eq_ignore_ascii_case("error") && error.to_lowercase().contains("quota reached"))
+                .then(|| error.to_owned())
+        });
+    let from_stderr = || {
+        stderr.lines().find_map(|l| {
+            let v: serde_json::Value =
+                serde_json::from_str(l.trim().strip_prefix("AGY_ERROR:")?.trim()).ok()?;
+            let exhausted = v.get("status").and_then(|s| s.as_str()) == Some("RESOURCE_EXHAUSTED");
+            let code = v.get("error_code").and_then(serde_json::Value::as_u64) == Some(429);
+            (exhausted && code).then(|| {
+                v.get("short_error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+        })
+    };
+    let text = from_stdout.or_else(from_stderr)?;
+    let reset = text
+        .split_once("Resets ")
+        .map(|(_, rest)| rest.trim().trim_end_matches('.').trim())
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
     Some(Quota { reset })
@@ -2065,6 +2127,53 @@ mod tests {
         r#""output_tokens":14267,"thinking_tokens":9695,"cache_read_tokens":2200925,"#,
         r#""total_tokens":274380}}"#
     );
+
+    /// Run 1798's review seat, from `review-1-1.out` / `.err`.
+    const AGY_QUOTA_OUT: &str = concat!(
+        r#"{"conversation_id":"323c3b5b-0000","status":"ERROR","response":"","#,
+        r#""error":"Individual quota reached. Please upgrade your subscription to "#,
+        r#"increase your limits. Resets in 1h2m49s.","duration_seconds":265.9,"#,
+        r#""num_turns":2,"usage":{"input_tokens":1000,"output_tokens":50}}"#
+    );
+    const AGY_QUOTA_ERR: &str = concat!(
+        "error: Individual quota reached. Resets in 1h2m49s.\n",
+        r#"AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota "#,
+        r#"reached.","status":"RESOURCE_EXHAUSTED","error_code":429,"code_kind":"http","#,
+        r#""retryable":true}"#,
+        "\n"
+    );
+
+    #[test]
+    fn agy_out_of_quota_is_a_quota_with_the_reset_hint() {
+        let both = agy_quota(AGY_QUOTA_OUT, AGY_QUOTA_ERR).expect("both streams");
+        assert_eq!(both.reset.as_deref(), Some("in 1h2m49s"));
+        let stdout_only = agy_quota(AGY_QUOTA_OUT, "").expect("stdout alone");
+        assert_eq!(stdout_only.reset.as_deref(), Some("in 1h2m49s"));
+        // stderr alone: the hint is not in `short_error`, so none is carried.
+        let stderr_only = agy_quota("not json", AGY_QUOTA_ERR).expect("stderr alone");
+        assert!(stderr_only.reset.is_none());
+    }
+
+    #[test]
+    fn ordinary_agy_failures_are_not_a_quota() {
+        assert!(agy_quota(AGY_DROPPED, "").is_none());
+        assert!(agy_quota(r#"{"status":"ERROR","error":"boom"}"#, "").is_none());
+        assert!(
+            agy_quota(
+                "",
+                r#"AGY_ERROR: {"status":"RESOURCE_EXHAUSTED","error_code":500}"#
+            )
+            .is_none()
+        );
+        assert!(
+            agy_quota(
+                "",
+                r#"AGY_ERROR: {"status":"UNAVAILABLE","error_code":429}"#
+            )
+            .is_none()
+        );
+        assert!(agy_quota(r#"{"status":"SUCCESS","response":"ok"}"#, "").is_none());
+    }
 
     #[test]
     fn a_cli_that_hangs_up_on_billed_work_is_not_an_agent_that_produced_nothing() {
