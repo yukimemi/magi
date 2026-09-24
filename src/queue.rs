@@ -307,6 +307,30 @@ pub struct Task {
     /// anything unless asked to, exactly as before.
     #[serde(default)]
     pub interrupt: bool,
+    /// Marked by `magi task add --urgent`: `crate::daemon::poll` dispatches
+    /// this task through its own one-slot `urgent_sem` the moment it is
+    /// runnable, in addition to whatever is already running under the
+    /// ordinary `[daemon] max_concurrent_runs` pool - never instead of it,
+    /// and never by pausing or otherwise touching that run. This is the
+    /// opposite direction from [`Task::interrupt`]: that one asks a run
+    /// already in flight to step aside; this one never asks anything to
+    /// step aside, it only spends one additional, temporary concurrency
+    /// slot. The two are independent and may both be set on the same task,
+    /// but this exemption stops at `[daemon] pause_for_interrupts`'s own
+    /// park/resume handoff (75dd): while an interrupt sequence is actively
+    /// parking, running, or resuming - its own, or an unrelated task's -
+    /// `crate::daemon::interrupt_gate` withholds an urgent candidate exactly
+    /// like an ordinary one, never exempted. 75dd's "at most one run, ever,
+    /// at once" guarantee takes precedence, because the alternative is a run
+    /// still genuinely in flight (only *asked* to park, not yet gone) ending
+    /// up alongside a second one this feature let through - the very thing
+    /// that guarantee exists to rule out.
+    ///
+    /// `#[serde(default)]` so a queue file written before this field existed
+    /// still reads, as `false` - no task claims the urgent slot unless asked
+    /// to, exactly as before.
+    #[serde(default)]
+    pub urgent: bool,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -350,6 +374,7 @@ impl Task {
             review_branch: None,
             fresh_start: false,
             interrupt: false,
+            urgent: false,
             created_at: now,
             updated_at: now,
         }
@@ -1882,6 +1907,35 @@ mod tests {
 
         let task = q.get("20260101-000000-aaaa").expect("must still read");
         assert!(!task.solo, "a queue file with no `solo` field means false");
+    }
+
+    #[test]
+    fn a_task_recorded_without_an_urgent_field_still_reads_as_not_urgent() {
+        let (_dir, q) = queue();
+        let path = q.path_of("20260101-000000-bbbb");
+        std::fs::create_dir_all(q.root()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": SCHEMA,
+                "id": "20260101-000000-bbbb",
+                "title": "from before urgent existed",
+                "instruction": "from before urgent existed",
+                "repo": ".",
+                "source": { "kind": "human" },
+                "status": "queued",
+                "created_at": Timestamp::now().to_string(),
+                "updated_at": Timestamp::now().to_string(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let task = q.get("20260101-000000-bbbb").expect("must still read");
+        assert!(
+            !task.urgent,
+            "a queue file with no `urgent` field means false, same as `solo`"
+        );
     }
 
     #[test]

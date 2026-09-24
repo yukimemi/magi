@@ -470,6 +470,16 @@ enum TaskCmd {
         /// chat's `magi task add --solo` files.
         #[arg(long)]
         solo: bool,
+        /// Dispatch this task on the next poll through an extra, one-shot
+        /// concurrency slot, alongside whatever `magi serve` is already
+        /// running - never instead of it, and without pausing or otherwise
+        /// touching the run already in flight. For work that genuinely
+        /// cannot wait for `[daemon] max_concurrent_runs` to free up, not a
+        /// way to raise that setting: a second `--urgent` task queues behind
+        /// the first on this same one-shot slot rather than opening a third
+        /// run.
+        #[arg(long)]
+        urgent: bool,
         /// Print the filed task as JSON.
         #[arg(long)]
         json: bool,
@@ -2205,6 +2215,7 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             priority,
             repo,
             solo,
+            urgent,
             json,
         } => {
             if let Some(why) = mistyped_command(
@@ -2235,14 +2246,16 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             let mut task = Task::new(title, text, repo, source);
             task.priority = priority;
             task.solo = solo;
+            task.urgent = urgent;
             q.put(&mut task)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&task)?);
             } else {
                 println!(
-                    "filed {} [{}] {}",
+                    "filed {} [{}]{} {}",
                     task.short(),
                     task.source.label(),
+                    if task.urgent { " urgent" } else { "" },
                     task.title
                 );
             }
@@ -2278,8 +2291,9 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 } else {
                     ""
                 };
+                let urgent = if t.urgent { " [urgent]" } else { "" };
                 println!(
-                    "{}  {:<9}{:<4} {:<14} {}{question}",
+                    "{}  {:<9}{:<4} {:<14} {}{urgent}{question}",
                     t.short(),
                     t.status.as_str(),
                     attempts,
@@ -2301,6 +2315,9 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             println!("source    {}", t.source.label());
             println!("repo      {}", t.repo.display());
             println!("priority  {}", t.priority);
+            if t.urgent {
+                println!("urgent    yes");
+            }
             println!("attempts  {}", t.attempts);
             if !t.runs.is_empty() {
                 println!("runs      {}", t.runs.join(", "));
@@ -3716,6 +3733,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn task_add_urgent_parses_and_defaults_to_false() {
+        let urgent = Cli::try_parse_from(["magi", "task", "add", "--urgent", "do it"]).unwrap();
+        match urgent.command {
+            Some(Command::Task {
+                command: TaskCmd::Add { urgent, .. },
+            }) => assert!(urgent),
+            other => panic!("expected TaskCmd::Add, got {other:?}"),
+        }
+
+        let plain = Cli::try_parse_from(["magi", "task", "add", "do it"]).unwrap();
+        match plain.command {
+            Some(Command::Task {
+                command: TaskCmd::Add { urgent, .. },
+            }) => assert!(!urgent, "omitting --urgent must not turn it on"),
+            other => panic!("expected TaskCmd::Add, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_add_urgent_flag_is_what_sets_the_queued_tasks_urgent_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+
+        task_cmd_on(
+            TaskCmd::Add {
+                instruction: vec!["do".to_owned(), "the".to_owned(), "thing".to_owned()],
+                file: None,
+                issue: None,
+                title: None,
+                priority: 0,
+                repo: PathBuf::from("."),
+                solo: false,
+                urgent: true,
+                json: false,
+            },
+            q.clone(),
+        )
+        .await
+        .expect("file an urgent task");
+
+        task_cmd_on(
+            TaskCmd::Add {
+                instruction: vec!["do".to_owned(), "another".to_owned(), "thing".to_owned()],
+                file: None,
+                issue: None,
+                title: None,
+                priority: 0,
+                repo: PathBuf::from("."),
+                solo: false,
+                urgent: false,
+                json: false,
+            },
+            q.clone(),
+        )
+        .await
+        .expect("file a plain task");
+
+        let mut tasks = q.list();
+        tasks.sort_unstable_by(|a, b| a.title.cmp(&b.title));
+        assert_eq!(tasks.len(), 2);
+        let urgent = tasks.iter().find(|t| t.title == "do the thing").unwrap();
+        let plain = tasks
+            .iter()
+            .find(|t| t.title == "do another thing")
+            .unwrap();
+        assert!(urgent.urgent, "--urgent must land on the queued task");
+        assert!(!plain.urgent, "no --urgent must leave the task as false");
+    }
+
     #[tokio::test]
     async fn task_add_solo_flag_is_what_sets_the_queued_tasks_solo_field() {
         let dir = tempfile::tempdir().unwrap();
@@ -3730,6 +3817,7 @@ mod tests {
                 priority: 0,
                 repo: PathBuf::from("."),
                 solo: true,
+                urgent: false,
                 json: false,
             },
             q.clone(),
@@ -3746,6 +3834,7 @@ mod tests {
                 priority: 0,
                 repo: PathBuf::from("."),
                 solo: false,
+                urgent: false,
                 json: false,
             },
             q.clone(),
@@ -3783,6 +3872,7 @@ mod tests {
                 priority: 0,
                 repo: PathBuf::from("."),
                 solo: false,
+                urgent: false,
                 json: false,
             },
             q.clone(),
@@ -3801,6 +3891,7 @@ mod tests {
                 priority: 0,
                 repo: PathBuf::from("."),
                 solo: false,
+                urgent: false,
                 json: false,
             },
             q.clone(),
@@ -3835,6 +3926,7 @@ mod tests {
                 priority: 0,
                 repo: PathBuf::from("."),
                 solo: false,
+                urgent: false,
                 json: false,
             },
             q.clone(),
@@ -4101,6 +4193,7 @@ mod tests {
                 priority: 0,
                 repo: missing,
                 solo: false,
+                urgent: false,
                 json: false,
             },
             q.clone(),
@@ -4126,6 +4219,7 @@ mod tests {
                 priority: 0,
                 repo: repo.clone(),
                 solo: false,
+                urgent: false,
                 json: false,
             },
             q.clone(),
