@@ -183,12 +183,22 @@ async fn a_stalled_run_stays_stalled_when_the_quota_has_not_reset() {
     runner.execute().await.expect("execute");
     assert_eq!(runner.state.status, RunStatus::Stalled);
     let id = runner.state.id.clone();
+    let before = runner.state.quota.clone();
     drop(runner);
 
     let mut again = Runner::resume(&id).expect("resume");
     again.execute().await.expect("re-execute");
     assert_eq!(again.state.status, RunStatus::Stalled);
     assert_eq!(again.state.tally.as_ref().unwrap().present, 1);
+    // The re-failure is recorded as one fresh loss per seat, replacing the
+    // old one, so the daemon can tell it from a previous session's.
+    let mut seats: Vec<&str> = again.state.quota.iter().map(|q| q.seat.as_str()).collect();
+    seats.sort_unstable();
+    assert_eq!(seats, ["judge-1", "judge-2"]);
+    assert!(
+        again.state.quota.iter().all(|q| !before.contains(q)),
+        "a seat that hit quota again must carry a new loss"
+    );
     // Still below quorum: nothing was folded, reviewed, gated or merged.
     assert!(again.state.reviews.is_empty());
     assert!(again.state.gate.is_empty());
