@@ -350,7 +350,19 @@ pub fn prune_dir(dir: &Path, limit: u64) -> Result<Prune> {
     })
 }
 
+/// The one file a prune never selects, when it sits directly in the pruned root.
+///
+/// cargo writes `CACHEDIR.TAG` once, when it creates a target directory, so in
+/// a long-lived cache it is the oldest file and an oldest-first prune reaches it
+/// first. Without it `cargo clean -p` refuses ("missing or invalid
+/// `CACHEDIR.TAG` file"). The tag belongs to the cargo that made it, not to the
+/// prune. It still counts toward the directory's size; a same-named file in a
+/// subdirectory is an ordinary candidate.
+const PRESERVED_AT_ROOT: &str = "CACHEDIR.TAG";
+
 /// Files and directories under one root, walked up-front.
+///
+/// `files` are the deletion candidates; `total` also counts what is preserved.
 struct Tree {
     total: u64,
     files: Vec<(u128, u64, PathBuf)>,
@@ -390,6 +402,9 @@ impl Tree {
                 } else if meta.is_file() {
                     let size = meta.len();
                     total += size;
+                    if depth == 0 && entry.file_name() == PRESERVED_AT_ROOT {
+                        continue;
+                    }
                     let mtime = meta
                         .modified()
                         .ok()
@@ -584,6 +599,36 @@ mod tests {
         assert_eq!(pruned.freed, plan.freed);
         assert_eq!(pruned.remaining, plan.remaining);
         assert!(!old.exists());
+    }
+
+    #[test]
+    fn a_root_cachedir_tag_survives_even_as_the_oldest_file() {
+        // cargo writes the tag once, so in a long-lived cache it is the oldest
+        // file and used to be the first thing an over-cap prune deleted.
+        let t = tempfile::TempDir::new().expect("temp");
+        let tag = t.path().join("CACHEDIR.TAG");
+        fs::write(&tag, b"Signature: x").expect("write");
+        let f = fs::File::options().write(true).open(&tag).expect("open");
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .expect("mtime");
+        drop(f);
+        fs::write(t.path().join("a"), b"aaaa").expect("write");
+        fs::create_dir(t.path().join("sub")).expect("mkdir");
+        // A same-named file below the root is an ordinary candidate.
+        let nested = t.path().join("sub").join("CACHEDIR.TAG");
+        fs::write(&nested, b"nn").expect("write");
+
+        let limit = 12; // exactly the tag: every other file must go
+        let plan = plan_prune(t.path(), limit);
+        assert!(plan.files.iter().all(|(p, _)| p != &tag));
+        assert!(plan.remaining <= limit);
+
+        let pruned = prune_dir(t.path(), limit).expect("prune");
+        assert!(tag.exists(), "the root tag is never pruned");
+        assert!(pruned.remaining <= limit);
+        assert_eq!(pruned.freed, plan.freed);
+        assert_eq!(pruned.remaining, plan.remaining);
+        assert!(!nested.exists());
     }
 
     #[test]
