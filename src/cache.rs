@@ -734,6 +734,40 @@ fn refresh_stale_packages(worktree: &Path, cache_dir: &Path) -> Result<Vec<Strin
     Ok(names)
 }
 
+/// What cargo itself writes into a target directory it creates.
+const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+# This file is a cache directory tag created by cargo.\n\
+# For information about cache directory tags see https://bford.info/cachedir/\n";
+
+/// Recreate `CACHEDIR.TAG` in a cargo target directory that lost it, so
+/// `cargo clean -p` stops refusing. Returns whether a tag was written.
+///
+/// Heals caches an older prune already broke. Safe because the caller holds the
+/// lease, `cache_dir` is the directory magi itself handed cargo as its target,
+/// and it is only done when `.rustc_info.json` proves cargo has built there — a
+/// misconfigured path is never dressed up as a cargo target. An existing tag is
+/// never touched (`create_new`), and a missing directory is left for cargo.
+fn restore_cachedir_tag(cache_dir: &Path) -> Result<bool> {
+    use std::io::Write as _;
+    if !cache_dir.is_dir() || !cache_dir.join(".rustc_info.json").is_file() {
+        return Ok(false);
+    }
+    let tag = cache_dir.join("CACHEDIR.TAG");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tag)
+    {
+        Ok(mut f) => {
+            f.write_all(CACHEDIR_TAG.as_bytes())
+                .with_context(|| format!("write {}", tag.display()))?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("create {}", tag.display())),
+    }
+}
+
 /// Guarantee that a build against `cache_dir` from `(worktree, head)` never
 /// silently reuses another source's compiled output: clean the workspace's
 /// own packages out of the cache when the recorded identity disagrees, then
@@ -745,6 +779,15 @@ fn refresh_stale_packages(worktree: &Path, cache_dir: &Path) -> Result<Vec<Strin
 /// directory's contents, and it must never race a concurrent build the same
 /// way a plain `cargo clean` run by hand would not.
 pub fn ensure_fresh(home: &Path, cache_dir: &Path, identity: &Identity) -> Result<()> {
+    match restore_cachedir_tag(cache_dir) {
+        Ok(true) => tracing::info!(
+            cache = %cache_dir.display(),
+            "build cache: restored a missing CACHEDIR.TAG"
+        ),
+        Ok(false) => {}
+        // Not fatal: `cargo clean -p` below reports the real consequence.
+        Err(e) => tracing::warn!(error = %e, "build cache: could not restore CACHEDIR.TAG"),
+    }
     if needs_refresh(home, cache_dir, identity) {
         let cleaned = refresh_stale_packages(&PathBuf::from(&identity.worktree), cache_dir)?;
         tracing::info!(
@@ -769,6 +812,33 @@ mod tests {
             worktree: "/w".to_owned(),
             head: "deadbeef".to_owned(),
         }
+    }
+
+    #[test]
+    fn a_missing_cachedir_tag_is_restored_only_for_a_cargo_target() {
+        let t = tempfile::TempDir::new().expect("temp");
+        let cache = t.path().join("cache");
+        assert!(!restore_cachedir_tag(&cache).expect("missing dir"));
+        assert!(!cache.exists(), "a missing directory is left for cargo");
+
+        std::fs::create_dir_all(&cache).expect("mkdir");
+        assert!(!restore_cachedir_tag(&cache).expect("no rustc info"));
+        assert!(!cache.join("CACHEDIR.TAG").exists());
+
+        std::fs::write(cache.join(".rustc_info.json"), "{}").expect("info");
+        assert!(restore_cachedir_tag(&cache).expect("restore"));
+        let body = std::fs::read_to_string(cache.join("CACHEDIR.TAG")).expect("tag");
+        assert_eq!(
+            body.lines().next(),
+            Some("Signature: 8a477f597d28d172789f06886806bc55")
+        );
+
+        std::fs::write(cache.join("CACHEDIR.TAG"), "custom").expect("custom");
+        assert!(!restore_cachedir_tag(&cache).expect("existing"));
+        assert_eq!(
+            std::fs::read_to_string(cache.join("CACHEDIR.TAG")).expect("tag"),
+            "custom"
+        );
     }
 
     #[test]
