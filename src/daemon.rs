@@ -1957,33 +1957,22 @@ async fn poll(
                 // likely to hit the same wall: without a cooldown here a
                 // whole backlog can be run - and failed - in the seconds it
                 // takes each attempt to notice the CLI is out of quota.
-                if !quota.is_empty() {
-                    let with_hint = quota.iter().find(|q| q.reset.is_some());
-                    let hint = with_hint.and_then(|q| q.reset.as_deref());
-                    let reset_at = with_hint.and_then(|q| {
-                        parse_reset_hint(q.reset.as_deref()?, Timestamp::now(), q.at)
-                    });
-                    let wait = quota_wait(
-                        reset_at,
-                        Timestamp::now(),
-                        QUOTA_WAIT_FALLBACK,
-                        QUOTA_WAIT_CAP,
-                    );
-                    let secs = i64::try_from(wait.as_secs()).unwrap_or(i64::MAX);
-                    let until = Timestamp::now()
-                        .checked_add(jiff::SignedDuration::from_secs(secs))
-                        .unwrap_or(Timestamp::MAX);
+                let now = Timestamp::now();
+                if let Some(until) = cooldown_until(&quota, now) {
+                    let wait = until.as_second() - now.as_second();
                     *lock(&quota_cooldown_until) = Some(until);
+                    let hint = quota
+                        .iter()
+                        .find(|q| q.reset.is_some())
+                        .and_then(|q| q.reset.as_deref());
                     match hint {
                         Some(h) => tracing::warn!(
-                            "quota hit; waiting {}s before taking another ordinary task \
-                             (CLI reported reset: {h})",
-                            wait.as_secs()
+                            "quota hit; waiting {wait}s before taking another ordinary task \
+                             (CLI reported reset: {h})"
                         ),
                         None => tracing::warn!(
-                            "quota hit; waiting {}s before taking another ordinary task \
-                             (no reset hint reported)",
-                            wait.as_secs()
+                            "quota hit; waiting {wait}s before taking another ordinary task \
+                             (no reset hint reported)"
                         ),
                     }
                 }
@@ -2185,17 +2174,25 @@ async fn attempt(
         run,
     });
 
+    // `RunState::quota` is the run's whole history across every resume, so
+    // only what this execution added may arm the cooldown or earn a refund.
+    let quota_before = runner.state.quota.clone();
     let detail = match runner.execute().await {
         Ok(()) => describe(&runner.state),
         Err(e) => format!("{e:#}"),
     };
+    let fresh = losses_this_attempt(&quota_before, &runner.state.quota);
     let verdict = Verdict {
         status: runner.state.status,
         // A run that opened a pull request handed its work over, whatever the
         // gate then decided about merging it.
         left_pr: runner.state.pr.is_some(),
-        // Only a rate limit earns the task its attempt back.
-        quota_hit: !runner.state.quota.is_empty(),
+        // Only a rate limit earns the task its attempt back - and only one
+        // suffered now: a refund justified by a previous session's loss is
+        // the same mistake as re-arming the cooldown from it. A stalled run
+        // resumed without hitting quota again therefore spends its attempt,
+        // like any other failure of the task's own.
+        quota_hit: !fresh.is_empty(),
         // A run that parked was asked to stop; that is not a failure and must
         // not spend an attempt, or replacing the binary a few times would
         // exhaust a task's budget without an agent ever misbehaving.
@@ -2213,7 +2210,40 @@ async fn attempt(
         runner.state.short(),
         label(runner.state.status)
     );
-    runner.state.quota
+    fresh
+}
+
+/// The quota losses `after` holds that `before` did not: what one execution
+/// suffered, as opposed to the run's history.
+///
+/// Compared by value rather than by length or position because
+/// `Runner::recover_stall` drops a `QuotaLoss` when its seat ranks again, so
+/// the vector can shrink and shift under a resume. A retried seat that hits
+/// quota again is a `push` with a new `at`, so it shows up as new here.
+/// `reclaim` deliberately keeps reading the whole history: after a crash there
+/// is no attempt boundary to diff against.
+fn losses_this_attempt(before: &[QuotaLoss], after: &[QuotaLoss]) -> Vec<QuotaLoss> {
+    after
+        .iter()
+        .filter(|q| !before.contains(q))
+        .cloned()
+        .collect()
+}
+
+/// When the loop-wide quota cooldown should end, given this attempt's losses;
+/// `None` when there were none. Reset-hint parsing and the cap live here.
+fn cooldown_until(quota: &[QuotaLoss], now: Timestamp) -> Option<Timestamp> {
+    if quota.is_empty() {
+        return None;
+    }
+    let with_hint = quota.iter().find(|q| q.reset.is_some());
+    let reset_at = with_hint.and_then(|q| parse_reset_hint(q.reset.as_deref()?, now, q.at));
+    let wait = quota_wait(reset_at, now, QUOTA_WAIT_FALLBACK, QUOTA_WAIT_CAP);
+    let secs = i64::try_from(wait.as_secs()).unwrap_or(i64::MAX);
+    Some(
+        now.checked_add(jiff::SignedDuration::from_secs(secs))
+            .unwrap_or(Timestamp::MAX),
+    )
 }
 
 /// Cut this attempt's candidate count to one when the task asked to run
@@ -4915,6 +4945,62 @@ mod tests {
             plain_cfg.graph.candidates, 3,
             "a task that did not ask to run alone keeps the config's candidates"
         );
+    }
+
+    fn loss(seat: &str, at: &str, reset: Option<&str>) -> QuotaLoss {
+        QuotaLoss {
+            seat: seat.into(),
+            node: "judge".into(),
+            at: at.parse().unwrap(),
+            reset: reset.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_resumed_run_with_only_old_quota_losses_arms_no_cooldown() {
+        let old: Vec<QuotaLoss> = (1..=4)
+            .map(|i| {
+                loss(
+                    &format!("judge-{i}"),
+                    "2026-09-23T05:23:00Z",
+                    Some("2:40pm (Asia/Tokyo)"),
+                )
+            })
+            .collect();
+        let fresh = losses_this_attempt(&old, &old);
+        assert!(fresh.is_empty());
+        assert_eq!(cooldown_until(&fresh, Timestamp::now()), None);
+        // And it is not a `quota_hit` either: that is `!fresh.is_empty()`.
+    }
+
+    #[test]
+    fn a_new_quota_loss_during_the_attempt_still_arms_the_cooldown() {
+        let old = vec![loss("judge-1", "2026-09-23T05:23:00Z", None)];
+        let now = Timestamp::now();
+        let mut after = old.clone();
+        after.push(loss("judge-2", &now.to_string(), None));
+        let fresh = losses_this_attempt(&old, &after);
+        assert_eq!(fresh, vec![after[1].clone()]);
+        let until = cooldown_until(&fresh, now).expect("a fresh loss arms the cooldown");
+        assert_eq!(
+            until,
+            now + jiff::SignedDuration::from_secs(QUOTA_WAIT_FALLBACK.as_secs() as i64)
+        );
+    }
+
+    #[test]
+    fn a_recovered_seat_dropping_out_of_the_history_does_not_hide_a_new_loss() {
+        // `recover_stall` removes judge-1's loss and the retry then hits quota
+        // again: the vector is the same length, so an index diff sees nothing.
+        let before = vec![
+            loss("judge-1", "2026-09-23T05:23:00Z", None),
+            loss("judge-2", "2026-09-23T05:24:00Z", None),
+        ];
+        let after = vec![
+            loss("judge-2", "2026-09-23T05:24:00Z", None),
+            loss("judge-1", "2026-09-24T01:00:00Z", None),
+        ];
+        assert_eq!(losses_this_attempt(&before, &after), vec![after[1].clone()]);
     }
 
     #[test]
