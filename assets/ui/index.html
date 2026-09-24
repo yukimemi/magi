@@ -67,11 +67,11 @@
      from a phone that sat in the queue until somebody reached a keyboard was
      the last thing in this product that needed a terminal.
 
-     The button is deliberately not guarded by a confirmation the way the
-     merge approval is. Starting is cheap and stopping is not destructive —
-     the loop finishes the run it is on either way — so a second tap would
-     only be ceremony. What starting *does* spend is stated next to it
-     instead, in .daemon-why, which is also the button's description. -->
+     Starting is one tap: it is cheap and repeatable. Stopping takes two
+     (the same confirmed() helper the upgrade uses), because a stray tap from
+     a pocket would leave the queue stopped overnight. What starting *does*
+     spend is stated next to it, in .daemon-why, which is also the button's
+     description. -->
 <div class="daemon" id="daemon" role="status" aria-label="Loop status">
   <span class="daemon-dot" aria-hidden="true"></span>
   <span class="daemon-body">

@@ -8448,6 +8448,20 @@ mod tests {
     }
 
     #[test]
+    fn stopping_the_loop_arms_but_starting_does_not() {
+        // A stray tap must not leave the queue stopped overnight, so a stop is
+        // two taps through the same helper the upgrade uses; a start stays one.
+        assert!(APP_JS.contains("Finish the run(s) in flight, then stop claiming?"));
+        assert!(APP_JS.contains("Stop claiming new tasks? Nothing is in flight."));
+        assert!(APP_JS.contains("confirmed(button, question)"));
+        // The label put back on timeout is the one saved when arming, not a
+        // hard-coded upgrade caption that would rename the stop button.
+        assert!(!APP_JS.contains("setText(btn, \"Update & restart\");\n    }\n  }, 6000)"));
+        assert!(APP_JS.contains("const label = btn.textContent;"));
+        assert!(!APP_JS.contains("Neither direction is guarded"));
+    }
+
+    #[test]
     fn the_running_version_is_shown_regardless_of_whether_an_update_exists() {
         assert!(
             APP_JS.contains("state.health.version"),

@@ -712,6 +712,7 @@ function renderLoop() {
     setText(why, full);
     show(why, Boolean(full));
     show(button, false);
+    button.dataset.armed = "";
     button.onclick = null;
     syncControls();
   };
@@ -744,14 +745,25 @@ function renderLoop() {
     show(controls, !versionChip.hidden || !button.hidden || !park.hidden || !upgradeBtn.hidden);
   };
 
-  const control = (kind, label, note) => {
+  /* `question` is set only for a stop, which is confirmed by a second tap. A
+     redraw while that tap is pending keeps showing the question, so the
+     label never reads "Stop the loop" while the next tap already commits. */
+  const control = (kind, label, note, question = null) => {
     setText(why, [note, upgradeFailNote].filter(Boolean).join(" "));
     show(why, true);
     setAttr(button, "data-kind", kind);
-    setText(button, label);
+    if (question && button.dataset.armed === "yes") {
+      setText(button, question);
+    } else {
+      button.dataset.armed = "";
+      setText(button, label);
+    }
     show(button, true);
     button.disabled = false;
-    button.onclick = () => setLoop(kind === "start");
+    button.onclick = () => {
+      if (question && !confirmed(button, question)) return;
+      setLoop(kind === "start");
+    };
     syncControls();
   };
 
@@ -980,11 +992,15 @@ function renderLoop() {
      they are being told there is nothing to wait for. */
   control("stop", "Stop the loop", daemon.current && daemon.current.length > 0
     ? "It finishes the run(s) it is on first, then stops claiming. Nothing in flight is abandoned."
-    : "It stops claiming new tasks. Nothing is in flight, so nothing is interrupted.");
+    : "It stops claiming new tasks. Nothing is in flight, so nothing is interrupted.",
+  daemon.current && daemon.current.length > 0
+    ? "Finish the run(s) in flight, then stop claiming?"
+    : "Stop claiming new tasks? Nothing is in flight.");
 }
 
-/* Start or stop the loop in this server. Neither direction is guarded by a
-   second tap: starting is repeatable and stopping is not destructive.
+/* Start or stop the loop in this server. Starting is one tap: it is
+   repeatable. Stopping goes through `confirmed`, two taps, because a stray tap
+   from a phone in a pocket would otherwise leave the queue stopped overnight.
 
    Neither direction is believed on request, either. A stop is accepted while
    the loop is still running \u2014 reported as `stopping` when a run is in
@@ -1049,18 +1065,20 @@ async function upgrade() {
 /* One tap arms, the second commits, and the label says which state it is in.
    Used for the upgrade because it ends the process the operator is talking
    to - and a mis-tap that restarts the deck mid-competition is the kind of
-   thing a phone in a pocket does. */
+   thing a phone in a pocket does. Also used to stop the loop. The label is
+   saved once, when arming, and put back on timeout. */
 function confirmed(btn, question) {
   if (btn.dataset.armed === "yes") {
     btn.dataset.armed = "";
     return true;
   }
+  const label = btn.textContent;
   btn.dataset.armed = "yes";
   setText(btn, question);
   setTimeout(() => {
     if (btn.dataset.armed === "yes") {
       btn.dataset.armed = "";
-      setText(btn, "Update & restart");
+      setText(btn, label);
     }
   }, 6000);
   return false;
@@ -1097,6 +1115,7 @@ async function setLoop(running, park = false) {
       : `Could not ${running ? "start" : "stop"} the loop: ${error.message}`);
     await loadLoop();
   } finally {
+    button.dataset.armed = "";
     renderLoop();   /* restores the label, whichever way it went */
   }
 }
