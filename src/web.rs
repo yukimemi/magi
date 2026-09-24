@@ -1137,8 +1137,10 @@ async fn normalize_default_repo(repo: PathBuf) -> PathBuf {
 ///    waiting on and nothing but a process list to say the run was alive.
 /// 2. **Release.** Aborting *and awaiting* the task is what frees the socket:
 ///    the join resolves only once the task's future has been dropped, so the
-///    address is unbound before the next line rather than merely on its way
-///    there.
+///    listener is released before the next line. Connections it already
+///    accepted are served on tasks of their own and wind down asynchronously;
+///    on some platforms (macOS) they can briefly keep the address busy, and
+///    the successor's `bind_waiting` absorbs that.
 /// 3. **Start the successor**, which binds the address this process has just
 ///    let go of - see [`spawn_successor`] for what the other order cost.
 ///
@@ -6756,7 +6758,7 @@ mod tests {
     /// The other half is the older rule: the address must be free *before* the
     /// successor is started, or it dies on "address already in use" with its
     /// stdio sent to null and the deck never comes back.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_deck_answers_while_it_parks_and_frees_the_address_first() {
         let home = TempDir::new().expect("temp home");
         let runs = home.path().join("runs");
@@ -6784,9 +6786,36 @@ mod tests {
 
         // The successor's whole job, and the one thing it cannot do while this
         // process still holds the socket.
+        //
+        // One bind is not enough, and the reason is not this process's order of
+        // operations: aborting the accept loop drops the listener, but axum
+        // serves each accepted connection on a task of its own, and those are
+        // not aborted. The requests above left sockets on this very address,
+        // and under BSD's bind rules (macOS) a live socket on 127.0.0.1:port
+        // makes a fresh bind fail with EADDRINUSE until its task is dropped.
+        // Production absorbs that in `bind_waiting`; so does this. Only
+        // `AddrInUse` is retried, and the listener is released before the
+        // closure returns - were the order wrong, the listener would outlive
+        // the closure and every attempt would fail. Inferred from the bind
+        // rules and the code; not reproduced on macOS.
         let bound = std::sync::Mutex::new(None);
         hand_over(home.path(), &looping, served, || {
-            let attempt = std::net::TcpListener::bind(addr).map_err(|e| e.to_string());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let attempt = loop {
+                match std::net::TcpListener::bind(addr) {
+                    Ok(l) => {
+                        drop(l);
+                        break Ok(());
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::AddrInUse
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => break Err(e.to_string()),
+                }
+            };
             *bound.lock().expect("bound") = Some(attempt);
             Ok(())
         })
