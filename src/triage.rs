@@ -954,7 +954,7 @@ mod tests {
 
         let report = run_once(&q, &questions, None, Timestamp::now());
         assert!(report.answered.is_empty(), "the old answer must not replay");
-        assert_eq!(report.asked, [t.id.clone()]);
+        assert_eq!(report.asked, std::slice::from_ref(&t.id));
         let back = q.get(&t.id).unwrap();
         assert_eq!(back.status, TaskStatus::Held);
         assert_eq!(
