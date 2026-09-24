@@ -350,6 +350,13 @@ pub fn decision_prompt(
          {\"level\": \"major\" | \"minor\" | \"patch\", \"reason\": \"one line\"}\n\
          ```\n",
     );
+    // The reason is pasted into the release pull request's body.
+    let _ = write!(
+        s,
+        "\n{}\n\nThe `reason` goes into a GitHub pull request body, so write it \
+         in English.\n",
+        crate::prompt::GITHUB_ENGLISH_HEADING
+    );
     s
 }
 
@@ -1115,15 +1122,12 @@ async fn open_bump_pr(
         bail!("pushing {branch} failed: {}", pushed.stderr);
     }
 
-    let title = format!("chore: release v{next_version}");
-    let body = format!(
-        "Release bump: `{}` to `v{next_version}`.\n\n{}\n\n\
-         Triggered by run `{}`, which landed {source_pr_url}.\n\n\
-         version-bump-only; nothing here needs a review \
-         (AGENTS.md: \"Version-bump-only pull requests\").",
+    let (title, body) = release_pr(
         decision.level.as_str(),
-        decision.reason,
-        state.id,
+        &decision.reason,
+        next_version,
+        &state.id,
+        source_pr_url,
     );
     let url = gh_pr_create(worktree, &state.base_branch, branch, &title, &body).await?;
     let automerge_warning = match gh_enable_automerge(worktree, &url).await {
@@ -1158,6 +1162,27 @@ async fn sync_lockfile(worktree: &Path, cache_dir: Option<&Path>) -> Result<()> 
         );
     }
     Ok(())
+}
+
+/// Title and body of a release bump pull request. Fixed English whatever
+/// `[graph] language` says: it lands on GitHub. Pure so a test can hold it to
+/// that. (`reason` comes from the decision seat, which the prompt tells to
+/// write English.)
+fn release_pr(
+    level: &str,
+    reason: &str,
+    next_version: &str,
+    run_id: &str,
+    source_pr_url: &str,
+) -> (String, String) {
+    let title = format!("chore: release v{next_version}");
+    let body = format!(
+        "Release bump: `{level}` to `v{next_version}`.\n\n{reason}\n\n\
+         Triggered by run `{run_id}`, which landed {source_pr_url}.\n\n\
+         version-bump-only; nothing here needs a review \
+         (AGENTS.md: \"Version-bump-only pull requests\").",
+    );
+    (title, body)
 }
 
 /// The merged pull request's title, for [`land::merge_subject`].
@@ -1266,6 +1291,16 @@ async fn gh_pr_edit_title(cwd: &Path, pr_url: &str, title: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_facing_bump_text_is_english() {
+        let (title, body) =
+            release_pr("minor", "adds a flag", "0.37.0", "ab12", "https://x/pull/1");
+        assert!(title.is_ascii() && body.is_ascii(), "{title}\n{body}");
+        assert_eq!(title, "chore: release v0.37.0");
+        let p = decision_prompt("s", "i", "d", &[], "0.36.5");
+        assert!(p.contains(crate::prompt::GITHUB_ENGLISH_HEADING), "{p}");
+    }
     use crate::config::Config;
     use crate::land::PrLifecycle;
 

@@ -6184,6 +6184,8 @@ fn pr_message(state: &RunState, winner: char) -> PrMessage {
         .find(|c| c.label == winner)
         .map(|c| c.summary.as_str())
         .unwrap_or_default();
+    // The fallback is the operator's own words, not something generated, so it
+    // may be in the task's language; only the summary path is prompted English.
     let title = summary_title(summary)
         .unwrap_or_else(|| queue::title_from(&state.instruction, PR_TITLE_MAX));
 
@@ -8582,6 +8584,35 @@ mod tests {
         assert!(m.title.starts_with("feat: "));
         assert!(m.title.chars().count() <= PR_TITLE_MAX, "{}", m.title);
         assert_eq!(m.commit_message().lines().next(), Some(m.title.as_str()));
+    }
+
+    #[test]
+    fn pr_message_magi_text_is_english_and_the_task_is_verbatim() {
+        // What magi itself writes stays English under any configured language,
+        // so a future localisation of these headings fails here. (The agents'
+        // own text is held to English by the prompt only; magi cannot check it.)
+        let mut state = state_with_summary(
+            "add retries",
+            "TITLE: fix(web): batch reads\n- reads run.json once",
+        );
+        state.config.graph.language = "ja".to_owned();
+        let m = pr_message(&state, 'A');
+        assert!(m.title.is_ascii() && m.body.is_ascii(), "{}", m.body);
+
+        // The task is the operator's own text: it goes in untouched, and the
+        // fallback title (no summary) may be in its language too.
+        let task = "今回やってほしいこと: results projector を直す";
+        let mut state = state_with_summary(task, "- no title line");
+        state.config.graph.language = "ja".to_owned();
+        let m = pr_message(&state, 'A');
+        assert_eq!(m.title, task);
+        assert!(
+            m.body.contains(&format!(
+                "<summary>Original task</summary>\n\n{task}\n\n</details>"
+            )),
+            "{}",
+            m.body
+        );
     }
 
     #[test]

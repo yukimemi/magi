@@ -84,6 +84,59 @@ fn lang(language: &str) -> String {
     )
 }
 
+/// Heading of the fixed rule below; tests and callers key on it.
+pub const GITHUB_ENGLISH_HEADING: &str = "# GitHub text is always English";
+
+/// The rule that everything landing on GitHub is English, whatever
+/// `[graph] language` says and whatever language the task was written in.
+///
+/// A fixed rule, not a setting: GitHub is a public, worldwide surface, and
+/// `lang()` (which governs prose for the operator) used to colour PR titles
+/// and bodies too. It is appended *after* `lang()` so the exception is the
+/// last word rather than a line a model has already weighed against
+/// "write in Japanese", and it is emitted for English too, because a task
+/// written in another language can still pull a title out of an
+/// English-configured seat. `lang()` itself is untouched: judges and advisors
+/// share it and write nothing to GitHub.
+///
+/// Prompt-only: an agent that runs `gh` itself is trusted to follow it; magi
+/// cannot enforce it.
+pub fn github_english(language: &str) -> String {
+    let mut s = format!(
+        "\n\n{GITHUB_ENGLISH_HEADING}\n\n\
+         Pull request titles and bodies (the `TITLE:` line and the whole SUMMARY \
+         included), commit messages, issue titles and bodies, and comments posted \
+         to GitHub are always written in English, in every repository and \
+         whatever language the task is written in."
+    );
+    exempt_operator_prose(&mut s, language);
+    s
+}
+
+/// [`github_english`] for a reviewer: the only thing of theirs that reaches
+/// GitHub is a finding's `title`, which the pull request body lists.
+pub fn github_english_finding_titles(language: &str) -> String {
+    let mut s = format!(
+        "\n\n{GITHUB_ENGLISH_HEADING}\n\n\
+         Each finding's `title` can be copied into a pull request description, \
+         so it is always written in English, whatever language the task is \
+         written in. Any comment or issue you post to GitHub is English too."
+    );
+    exempt_operator_prose(&mut s, language);
+    s
+}
+
+fn exempt_operator_prose(s: &mut String, language: &str) {
+    if !is_english(language) {
+        let _ = write!(
+            s,
+            " The language instruction above does not apply to GitHub-facing \
+             text: prose addressed to the operator stays in {}.",
+            language_name(language)
+        );
+    }
+}
+
 /// Append the project's overlay for a node, under a heading of its own.
 ///
 /// The overlay is appended and never merged, so nothing a `magi.toml` says can
@@ -365,9 +418,10 @@ pub fn implement(instruction: &str, cwd: &str, language: &str, brief: Option<&st
          the commit SHA(s) you checked, the existing test name(s) that already \
          cover it, the exact command you ran and its output, or the path you \
          read. An empty or unsupported claim reads as an ordinary candidate \
-         that wrote nothing, not a verified one.\n\n{}{}",
+         that wrote nothing, not a verified one.\n\n{}{}{}",
         ask_the_owner(language),
-        lang(language)
+        lang(language),
+        github_english(language)
     )
 }
 
@@ -723,6 +777,7 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
     s.push('\n');
     s.push_str(&ask_the_owner(language));
     s.push_str(&lang(language));
+    s.push_str(&github_english_finding_titles(language));
     s
 }
 
@@ -945,6 +1000,7 @@ pub fn fix(
     s.push('\n');
     s.push_str(&ask_the_owner(language));
     s.push_str(&lang(language));
+    s.push_str(&github_english(language));
     s
 }
 
@@ -1612,6 +1668,59 @@ mod tests {
         assert!(p.contains("privately"));
         assert!(p.contains("Valid labels: A, B"));
         assert!(p.contains("\"vote\""));
+    }
+
+    /// Every seat that can put text on GitHub carries the English rule, after
+    /// the language line under a non-English setting; English is unchanged
+    /// except for the rule itself.
+    #[test]
+    fn github_writing_seats_carry_the_english_rule_after_the_language_line() {
+        let ja_ctx = ReviewCtx {
+            language: "ja",
+            ..review_ctx(true)
+        };
+        let ja = [
+            ("implement", implement("t", "/w", "ja", None)),
+            ("fix", fix("t", &[], None, 1, 2, "ja")),
+            (
+                "operator_fix",
+                operator_fix("t", &[], "why", &[], "abc", "ja"),
+            ),
+            ("review", review(&ja_ctx)),
+        ];
+        for (name, p) in &ja {
+            let lang_at = p.find("Write all prose in Japanese").expect(name);
+            let rule_at = p.find(GITHUB_ENGLISH_HEADING).expect(name);
+            assert!(lang_at < rule_at, "{name}: rule must come last");
+            assert_eq!(
+                p.matches("Write all prose in Japanese").count(),
+                1,
+                "{name}"
+            );
+            assert_eq!(p.matches(GITHUB_ENGLISH_HEADING).count(), 1, "{name}");
+            assert!(p[rule_at..].contains("does not apply"), "{name}");
+            assert!(p[rule_at..].contains("stays in Japanese"), "{name}");
+        }
+        assert!(ja[0].1.contains("commit messages, issue titles"));
+        assert!(ja[3].1.contains("`title`"));
+
+        let en = [
+            implement("t", "/w", "en", None),
+            fix("t", &[], None, 1, 2, "en"),
+            review(&review_ctx(true)),
+        ];
+        for p in &en {
+            assert!(p.contains(GITHUB_ENGLISH_HEADING));
+            assert!(!p.contains("Write all prose in"));
+            assert!(!p.contains("does not apply"));
+        }
+    }
+
+    #[test]
+    fn github_seats_that_do_not_write_to_github_are_left_alone() {
+        let p = judge("t", &[view('A')], 1, "abc", "ja");
+        assert!(!p.contains(GITHUB_ENGLISH_HEADING));
+        assert!(!advisor("t", 0, 2, "ja").contains(GITHUB_ENGLISH_HEADING));
     }
 
     fn review_ctx(competed: bool) -> ReviewCtx<'static> {
