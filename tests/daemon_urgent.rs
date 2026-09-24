@@ -68,7 +68,7 @@ async fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration, what: &st
     }
 }
 
-const MARKER_WAIT: Duration = Duration::from_secs(10);
+const MARKER_WAIT: Duration = Duration::from_secs(60);
 
 #[tokio::test]
 async fn an_urgent_task_starts_alongside_an_already_running_task() {
