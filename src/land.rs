@@ -1963,6 +1963,8 @@ fn fix_prompt(
     if !(language.trim().is_empty() || language.eq_ignore_ascii_case("en")) {
         let _ = write!(s, "\n\nWrite all prose in {language}.");
     }
+    // After the language line, so the exception is the last word on it.
+    s.push_str(&crate::prompt::github_english(language));
     if let Some(overlay) = state.config.prompts.overlay("fix") {
         let _ = write!(s, "\n\n{overlay}");
     }
@@ -2018,16 +2020,22 @@ fn run_of(details_url: &str) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
+/// The comment `stop` posts. Fixed English, whatever `[graph] language` says:
+/// it lands on GitHub, not in front of the operator. Pure so a test can hold
+/// it to that.
+fn stop_comment(run_id: &str, why: &str) -> String {
+    format!(
+        "{MARKER}\nmagi stopped landing this pull request: {why}\n\n\
+         The branch is untouched and the run is `{run_id}`. Nothing was merged."
+    )
+}
+
 /// Leave the pull request open, say why on it, and mark the run blocked.
 ///
 /// The comment is what makes an unattended stop actionable: the operator wakes
 /// up to a pull request that explains itself rather than to a silent queue.
 async fn stop(state: &mut RunState, repo: &Path, pr: &PrState, why: &str) -> Result<()> {
-    let body = format!(
-        "{MARKER}\nmagi stopped landing this pull request: {why}\n\n\
-         The branch is untouched and the run is `{}`. Nothing was merged.",
-        state.id
-    );
+    let body = stop_comment(&state.id, why);
     let posted = gh(
         repo,
         &[
@@ -3006,6 +3014,26 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 body: "this branch never checks the exit code".to_owned(),
             }],
         }
+    }
+
+    #[test]
+    fn github_facing_land_text_is_english_whatever_the_language() {
+        let mut state = run_state();
+        state.config.graph.language = "ja".to_owned();
+        let comment = stop_comment(&state.id, "checks are still red");
+        assert!(comment.is_ascii(), "{comment}");
+        assert!(comment.starts_with(MARKER));
+
+        let p = fix_prompt(&state, &green_pr(), 1, 2, "red", "");
+        let ja_at = p.find("Write all prose in ja").unwrap();
+        let rule_at = p.find(crate::prompt::GITHUB_ENGLISH_HEADING).unwrap();
+        assert!(ja_at < rule_at, "{p}");
+        assert!(p.contains("stays in Japanese"), "{p}");
+
+        state.config.graph.language = "en".to_owned();
+        let p = fix_prompt(&state, &green_pr(), 1, 2, "red", "");
+        assert!(p.contains(crate::prompt::GITHUB_ENGLISH_HEADING), "{p}");
+        assert!(!p.contains("does not apply"), "{p}");
     }
 
     const NUMSTAT: &str = "12\t3\tsrc/land.rs\n40\t1\tsrc/web.rs\n-\t-\tassets/logo.png";
