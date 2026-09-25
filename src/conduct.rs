@@ -188,7 +188,40 @@ fn view(t: &Task, max_attempts: usize) -> prompt::ConductTask {
                 answer: a.answer.clone(),
             })
             .collect(),
+        operator_resume: t.resume_override.as_ref().map(|o| {
+            format!(
+                "the operator explicitly answered \"resume\" at {}; do not hold this \
+                 task again for the same reason unless there is new information",
+                o.at
+            )
+        }),
     }
+}
+
+/// May the conductor's `Recovery::Hold` take effect on `task`, given an
+/// operator's recorded "resume" answer? The conductor is allowed to override
+/// that answer once - and the override is recorded so `crate::triage` can
+/// show the operator the contradiction - but never after the operator
+/// insisted (`forced`), and never a second time.
+///
+/// Returns `false` when the hold must not be applied (nothing to write).
+/// When it returns `true` the override, if any, has been recorded on `task`.
+fn may_hold(task: &mut Task, reason: &str) -> bool {
+    let Some(o) = task.resume_override.as_mut() else {
+        return true;
+    };
+    if o.forced {
+        tracing::warn!(
+            "conductor tried to hold task {} after the operator forced a resume: {reason}",
+            task.id
+        );
+        return false;
+    }
+    if o.conductor_rehold.is_some() {
+        return false;
+    }
+    o.conductor_rehold = Some(reason.to_owned());
+    true
 }
 
 /// Severity as a lowercase word, matching how `crate::verdict::Severity` is
@@ -247,6 +280,13 @@ fn reaffirmed_hold_reason(task: &Task, d: &Decision) -> String {
         Some(prior) if !prior.is_empty() => format!("{note}\n\n(previously: {prior})"),
         _ => note,
     }
+}
+
+/// The conductor's stated reason for a hold, or a stand-in when it gave none.
+fn hold_note(d: &Decision) -> String {
+    d.reason
+        .clone()
+        .unwrap_or_else(|| "(no reason given)".to_owned())
 }
 
 /// Everything the conductor is shown about a `failed`/`held` task's last run.
@@ -463,15 +503,17 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
         // besides `blocked_by` is holding it outright, for a task whose
         // answers already say it should not compete again.
         TaskStatus::Queued if d.recovery == Some(Recovery::Hold) => {
-            task.hold_machine(d.reason.clone());
-            queue.put(&mut task)?;
+            if may_hold(&mut task, &hold_note(d)) {
+                task.hold_machine(d.reason.clone());
+                queue.put(&mut task)?;
+            }
         }
         TaskStatus::Running => match d.recovery {
             Some(Recovery::Requeue) => {
                 task.requeue();
                 queue.put(&mut task)?;
             }
-            Some(Recovery::Hold) => {
+            Some(Recovery::Hold) if may_hold(&mut task, &hold_note(d)) => {
                 task.hold_machine(d.reason.clone());
                 queue.put(&mut task)?;
             }
@@ -486,8 +528,10 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
                 queue.put(&mut task)?;
             }
             Some(Recovery::Hold) => {
-                task.hold_machine(Some(reaffirmed_hold_reason(&task, d)));
-                queue.put(&mut task)?;
+                if may_hold(&mut task, &hold_note(d)) {
+                    task.hold_machine(Some(reaffirmed_hold_reason(&task, d)));
+                    queue.put(&mut task)?;
+                }
             }
             Some(Recovery::Review) => {
                 if let Some(branch) = surviving_branch(&task) {
@@ -1283,6 +1327,83 @@ mod tests {
             crate::triage::run_once(&queue, &questions, Some(&config), jiff::Timestamp::now());
         assert!(report.resumed.is_empty(), "must not be auto-released");
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+    }
+
+    #[test]
+    fn a_conductor_rehold_after_a_resume_answer_is_not_asked_again_identically() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let config = dir.path().join("magi.toml");
+        std::fs::write(&config, "[disk]\nmin_free_bytes = 0\n").unwrap();
+        let now = jiff::Timestamp::now();
+        let triage = || crate::triage::run_once(&queue, &questions, Some(&config), now);
+        let open = || {
+            questions
+                .list()
+                .into_iter()
+                .filter(|q| q.node == "triage" && q.status.open())
+                .collect::<Vec<_>>()
+        };
+        let hold = Decision {
+            recovery: Some(Recovery::Hold),
+            reason: Some("waiting on manual worktree cleanup".to_owned()),
+            ..Decision::default()
+        };
+
+        let mut t = task("looping hold");
+        t.hold_machine(Some("waiting on manual worktree cleanup".to_owned()));
+        queue.put(&mut t).unwrap();
+        let hold = Decision {
+            id: t.id.clone(),
+            ..hold
+        };
+
+        // 1. triage asks the ordinary machine question; the operator resumes.
+        assert_eq!(triage().asked.len(), 1);
+        let first = open().remove(0);
+        let mut q = questions.get(&first.id).unwrap();
+        let resume = q.choices[0].clone();
+        q.answer(Answer::Choice(resume)).unwrap();
+        questions.put(&mut q).unwrap();
+        assert_eq!(triage().answered.len(), 1);
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+
+        // 2. the conductor holds it again - allowed once, and recorded.
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![hold.clone()],
+            },
+        )
+        .unwrap();
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+
+        // 3. triage must say something different, once.
+        assert_eq!(triage().asked.len(), 1);
+        let second = open().remove(0);
+        assert_ne!(second.summary, first.summary);
+        assert_ne!(second.choices, first.choices);
+        assert!(second.detail.contains("waiting on manual worktree cleanup"));
+        assert!(triage().asked.is_empty(), "no duplicate question");
+        assert_eq!(open().len(), 1);
+
+        // 4. forcing a requeue makes the conductor's hold a no-op.
+        let mut q = questions.get(&second.id).unwrap();
+        let force = q.choices[0].clone();
+        q.answer(Answer::Choice(force)).unwrap();
+        questions.put(&mut q).unwrap();
+        assert_eq!(triage().answered.len(), 1);
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![hold],
+            },
+        )
+        .unwrap();
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
     }
 
     #[test]

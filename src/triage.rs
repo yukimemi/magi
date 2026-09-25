@@ -88,7 +88,7 @@ use jiff::Timestamp;
 use crate::ask::{Question, QuestionStatus, Questions};
 use crate::config::Config;
 use crate::disk;
-use crate::queue::{HoldSource, Queue, Task, TaskStatus};
+use crate::queue::{HoldSource, OperatorResume, Queue, Task, TaskStatus};
 
 /// Node recorded on every question this module files - `crate::conduct::NODE`
 /// for the same idea applied to a `crate::conduct` decision instead.
@@ -227,6 +227,55 @@ impl Wording {
         }
     }
 
+    fn summary_conductor_override(&self, task: &Task) -> String {
+        if self.lang == "ja" {
+            format!(
+                "再開と回答済みのタスク {} を conductor が再び保留しました",
+                task.short()
+            )
+        } else {
+            format!(
+                "task {} was resumed at your word, but the conductor held it again",
+                task.short()
+            )
+        }
+    }
+
+    fn why_conductor_override(&self, o: &OperatorResume) -> String {
+        let reason = o.conductor_rehold.as_deref().unwrap_or_default();
+        if self.lang == "ja" {
+            format!(
+                "{} に再開と回答済みですが、conductor が再び hold しました。conductor の理由: \
+                 {reason}\n\n強制再キューを選ぶと、以後 conductor はこのタスクを hold できません。",
+                o.at
+            )
+        } else {
+            format!(
+                "You answered \"resume\" at {}, but the conductor held the task again. \
+                 Its reason: {reason}\n\nForcing a requeue stops the conductor from \
+                 holding this task again.",
+                o.at
+            )
+        }
+    }
+
+    /// Positions match [`AnswerAction`]: 0 resume, 1 keep held, 2 discard.
+    fn choices_conductor_override(&self) -> Vec<String> {
+        if self.lang == "ja" {
+            vec![
+                "強制再キュー（conductor は再 hold 不可）".to_owned(),
+                "手動 hold のまま".to_owned(),
+                "捨ててよい".to_owned(),
+            ]
+        } else {
+            vec![
+                "force requeue (conductor must not hold again)".to_owned(),
+                "keep held (manual)".to_owned(),
+                "discard".to_owned(),
+            ]
+        }
+    }
+
     fn summary_legacy(&self, task: &Task) -> String {
         if self.lang == "ja" {
             format!(
@@ -283,6 +332,9 @@ impl Wording {
 enum Bucket {
     /// `HoldSource::Machine`, cause not verifiably resolved.
     MachineUnknown,
+    /// `HoldSource::Machine`, held by the conductor after the operator
+    /// answered "resume" (see [`Task::resume_override`]).
+    ConductorOverride,
     /// `hold_source` is `None`.
     Legacy,
     /// `HoldSource::Manual`, held past [`MANUAL_STALE_AFTER`].
@@ -399,7 +451,9 @@ fn latest_triage_question(questions: &Questions, task_id: &str) -> Option<Questi
         .list()
         .into_iter()
         .filter(|q| q.node == NODE && q.run == task_id)
-        .max_by(|a, b| a.id.cmp(&b.id))
+        // `asked_at` first: ids carry only whole seconds plus a random
+        // suffix, so two questions filed in the same second order randomly.
+        .max_by(|a, b| a.asked_at.cmp(&b.asked_at).then_with(|| a.id.cmp(&b.id)))
 }
 
 /// What an answered triage question's choice means, independent of which
@@ -466,15 +520,27 @@ fn file_question(
     let (summary, why, choices) = match bucket {
         Bucket::MachineUnknown => (
             w.summary_machine_unknown(task),
-            w.why_machine(),
+            w.why_machine().to_owned(),
             w.choices3(),
         ),
-        Bucket::Legacy => (w.summary_legacy(task), w.why_legacy(), w.choices3()),
+        Bucket::ConductorOverride => (
+            w.summary_conductor_override(task),
+            task.resume_override
+                .as_ref()
+                .map(|o| w.why_conductor_override(o))
+                .unwrap_or_default(),
+            w.choices_conductor_override(),
+        ),
+        Bucket::Legacy => (
+            w.summary_legacy(task),
+            w.why_legacy().to_owned(),
+            w.choices3(),
+        ),
         Bucket::ManualStale => {
             let days = (now.as_second() - task.updated_at.as_second()) / (24 * 60 * 60);
             (
                 w.summary_manual_stale(task, days),
-                w.why_manual(),
+                w.why_manual().to_owned(),
                 w.choices2(),
             )
         }
@@ -484,7 +550,7 @@ fn file_question(
         NODE.to_owned(),
         SEAT.to_owned(),
         summary,
-        w.detail(task, why),
+        w.detail(task, &why),
         choices,
     );
     questions.put(&mut q).ok()?;
@@ -595,7 +661,28 @@ pub fn run_once(
             if q.status == QuestionStatus::Answered && !already_applied(&task, &q) {
                 match interpret_answer(&q) {
                     AnswerAction::Resume => {
+                        // A second "resume", to the question about the
+                        // conductor's re-hold, forces it: the conductor may
+                        // not hold this task again. Any other resume records
+                        // the answer so a re-hold can be recognised.
+                        let contradicted = task
+                            .resume_override
+                            .as_ref()
+                            .is_some_and(|o| o.conductor_rehold.is_some());
+                        let record = match task.resume_override.take() {
+                            Some(mut o) if contradicted => {
+                                o.forced = true;
+                                o
+                            }
+                            _ => OperatorResume {
+                                question_id: q.id.clone(),
+                                at: now,
+                                conductor_rehold: None,
+                                forced: false,
+                            },
+                        };
                         task.release();
+                        task.resume_override = Some(record);
                         task.mark_triage_applied(&q.id);
                         if queue.put(&mut task).is_ok() {
                             report.answered.push(task.id.clone());
@@ -627,7 +714,17 @@ pub fn run_once(
 
         match task.hold_source {
             Some(HoldSource::Machine) => {
-                if cfg.as_ref().and_then(|c| machine_cause_resolved(&task, c)) == Some(true) {
+                let overridden = task
+                    .resume_override
+                    .as_ref()
+                    .is_some_and(|o| o.conductor_rehold.is_some() && !o.forced);
+                if overridden {
+                    if file_question(questions, &task, Bucket::ConductorOverride, w, now).is_some()
+                    {
+                        report.asked.push(task.id.clone());
+                    }
+                } else if cfg.as_ref().and_then(|c| machine_cause_resolved(&task, c)) == Some(true)
+                {
                     task.release();
                     if queue.put(&mut task).is_ok() {
                         report.resumed.push(task.id.clone());

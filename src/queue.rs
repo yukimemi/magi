@@ -40,6 +40,9 @@ use crate::ask::Questions;
 
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
 ///
+/// 6: added [`Task::resume_override`] (a field only; `#[serde(default)]`, so
+/// an older record reads as `None` and [`read_path`] still accepts it).
+///
 /// 5: added [`Task::triage_applied`], the ids of triage questions whose
 /// answer has already been applied to this task. A "resume" answer used to
 /// leave no trace ([`Task::release`] clears [`Task::hold_reason`], which was
@@ -78,7 +81,7 @@ use crate::ask::Questions;
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 5;
+pub const SCHEMA: u32 = 6;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +298,12 @@ pub struct Task {
     /// schema 5. `#[serde(default)]` so an older record reads as empty.
     #[serde(default)]
     pub triage_applied: Vec<String>,
+    /// The operator's "resume" answer to a triage question, kept until the
+    /// task actually runs (or is done) so `crate::conduct` cannot silently
+    /// undo it and `crate::triage` can tell that a hold it sees now came
+    /// *after* the answer. See [`OperatorResume`]. `#[serde(default)]`.
+    #[serde(default)]
+    pub resume_override: Option<OperatorResume>,
     /// Set by `crate::conduct` when it chooses `Review` recovery for a task
     /// whose branch survived a blocked run: the branch to reopen with
     /// `crate::graph::Runner::review` instead of competing from scratch.
@@ -354,6 +363,24 @@ pub struct Task {
     pub updated_at: Timestamp,
 }
 
+/// A triage "resume" answer and what became of it. See
+/// [`Task::resume_override`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorResume {
+    /// The triage question the operator answered.
+    pub question_id: String,
+    /// When the answer was applied.
+    pub at: Timestamp,
+    /// The reason `crate::conduct` gave for holding the task again after the
+    /// answer, if it did. The conductor may do this once.
+    #[serde(default)]
+    pub conductor_rehold: Option<String>,
+    /// The operator answered "resume" a second time, to the question about
+    /// that contradiction: the conductor may no longer hold this task.
+    #[serde(default)]
+    pub forced: bool,
+}
+
 /// One question `crate::conduct` asked about a task, and what the operator
 /// said back. See [`Task::answers`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,6 +416,7 @@ impl Task {
             blocked_from: None,
             answers: Vec::new(),
             triage_applied: Vec::new(),
+            resume_override: None,
             review_branch: None,
             fresh_start: false,
             interrupt: false,
@@ -432,6 +460,8 @@ impl Task {
         self.last_error = None;
         self.fresh_start = false;
         self.interrupt = false;
+        // The answer has been honoured: the task got its turn.
+        self.resume_override = None;
     }
 
     /// Record a successful run.
@@ -445,6 +475,7 @@ impl Task {
     /// something in `magi task show` and on its card, after it no longer is.
     pub fn succeed(&mut self) {
         self.status = TaskStatus::Done;
+        self.resume_override = None;
         self.last_error = None;
         self.hold_reason = None;
         self.hold_source = None;
