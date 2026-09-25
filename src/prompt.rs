@@ -1251,6 +1251,10 @@ pub struct ConductTask {
     /// Questions asked about this task and what the operator said back — see
     /// `crate::queue::Task::answers`.
     pub answers: Vec<ConductAnswer>,
+    /// A line saying the operator already answered "resume" to a triage
+    /// question about this task, when `crate::queue::Task::resume_override`
+    /// records one - see that field.
+    pub operator_resume: Option<String>,
 }
 
 /// One answered question, for [`ConductTask::answers`] and
@@ -1365,6 +1369,9 @@ fn conduct_task_block(t: &ConductTask) -> String {
     }
     for a in &t.answers {
         let _ = writeln!(s, "  answered \"{}\": {}", a.question, a.answer);
+    }
+    if let Some(note) = &t.operator_resume {
+        let _ = writeln!(s, "  operator_resume: {note}");
     }
     let _ = writeln!(
         s,
@@ -2300,6 +2307,7 @@ mod tests {
             hold_source: None,
             blocked_by: Vec::new(),
             answers: Vec::new(),
+            operator_resume: None,
         }
     }
 
