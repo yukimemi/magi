@@ -451,7 +451,9 @@ fn latest_triage_question(questions: &Questions, task_id: &str) -> Option<Questi
         .list()
         .into_iter()
         .filter(|q| q.node == NODE && q.run == task_id)
-        .max_by(|a, b| a.id.cmp(&b.id))
+        // `asked_at` first: ids carry only whole seconds plus a random
+        // suffix, so two questions filed in the same second order randomly.
+        .max_by(|a, b| a.asked_at.cmp(&b.asked_at).then_with(|| a.id.cmp(&b.id)))
 }
 
 /// What an answered triage question's choice means, independent of which
