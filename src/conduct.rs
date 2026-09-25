@@ -513,11 +513,9 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
                 task.requeue();
                 queue.put(&mut task)?;
             }
-            Some(Recovery::Hold) => {
-                if may_hold(&mut task, &hold_note(d)) {
-                    task.hold_machine(d.reason.clone());
-                    queue.put(&mut task)?;
-                }
+            Some(Recovery::Hold) if may_hold(&mut task, &hold_note(d)) => {
+                task.hold_machine(d.reason.clone());
+                queue.put(&mut task)?;
             }
             // `Review` reopens a branch, which only makes sense once a run
             // has actually stopped; a task still `running` has nothing to
