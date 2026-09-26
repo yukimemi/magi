@@ -534,6 +534,7 @@ pub fn fixture(home: HomeGuard, judges: Judges, require_fix: bool) -> Fixture {
         verify: Verify {
             e2e: vec!["test -f note.txt".to_owned()],
             gate: vec!["test -f note.txt".to_owned()],
+            pre_gate: Vec::new(),
             shell: Some(vec!["sh".to_owned(), "-c".to_owned()]),
         },
         merge: Merge {
