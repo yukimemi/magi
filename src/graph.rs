@@ -4755,16 +4755,14 @@ impl Runner {
         }
         self.state.pre_gate = outcomes;
         match git::commit_all(&winner.worktree, "magi: pre_gate (mechanical fixes)").await {
-            Ok(true) => {
-                match git::rev_parse(&winner.worktree, "HEAD").await {
-                    Ok(head) => {
-                        self.state
-                            .event("pre_gate", format!("committed mechanical fixes ({head})"));
-                        self.state.pre_gate_commit = Some(head);
-                    }
-                    Err(e) => tracing::warn!("pre_gate committed but HEAD unreadable: {e:#}"),
+            Ok(true) => match git::rev_parse(&winner.worktree, "HEAD").await {
+                Ok(head) => {
+                    self.state
+                        .event("pre_gate", format!("committed mechanical fixes ({head})"));
+                    self.state.pre_gate_commit = Some(head);
                 }
-            }
+                Err(e) => tracing::warn!("pre_gate committed but HEAD unreadable: {e:#}"),
+            },
             Ok(false) => {}
             Err(e) => tracing::warn!("pre_gate could not commit its changes: {e:#}"),
         }

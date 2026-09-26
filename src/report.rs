@@ -815,7 +815,11 @@ pub fn run(state: &RunState) -> String {
             let _ = writeln!(
                 s,
                 "  {}  {}",
-                if o.ok() { green("pass") } else { yellow("warn") },
+                if o.ok() {
+                    green("pass")
+                } else {
+                    yellow("warn")
+                },
                 o.command
             );
             if !o.ok() {
