@@ -2036,6 +2036,15 @@ function updateTaskCard(row, task) {
     if (depQuestions.length) parts.push(plural(depQuestions.length, "question", "questions"));
     if (unknown.length) parts.push(plural(unknown.length, "unresolved dependency", "unresolved dependencies"));
     if (parts.length) noteText = `${noteText} Waiting on ${parts.join(" and ")}.`;
+    /* `waits_on` is built server-side (`blockers::Inventory`), chain included,
+       so a 6081 -> 4135 -> 9db7 chain reads at a glance with no recursion
+       here. A non-empty `stuck_roots` means nothing in the loop will run it. */
+    const waitsOn = Array.isArray(task.waits_on) ? task.waits_on : [];
+    if (waitsOn.length) noteText = `${noteText} Blocked on ${waitsOn.join(", ")}.`;
+    const stuckRoots = Array.isArray(task.stuck_roots) ? task.stuck_roots : [];
+    if (stuckRoots.length) {
+      noteText = `${noteText} Stuck: nothing will run ${stuckRoots.join(", ")} - answer its question in Questions, or release it.`;
+    }
   }
   setText(r.note, noteText);
   show(r.note, Boolean(noteText));
