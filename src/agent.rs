@@ -1484,7 +1484,8 @@ mod tests {
         ] {
             let p = plan_with_effort(kind, None);
             assert!(
-                !p.argv.iter().any(|a| a.contains("effort") || a.contains("thinking")
+                !p.argv.iter().any(|a| a.contains("effort")
+                    || a.contains("thinking")
                     || a.contains("variant")),
                 "{kind:?} must not emit an effort flag when unset: {:?}",
                 p.argv
