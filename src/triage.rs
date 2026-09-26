@@ -752,7 +752,11 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
             return queue.remove(&root.id, false, questions).is_ok();
         }
         DepsAction::Detach => detach_dependants(queue, &root.id),
-        DepsAction::Nothing => {}
+        // Matches no offered choice, so there is nothing to apply. Left unmarked:
+        // marking it applied would read as "settled", and the next stuck check
+        // would file an identical question at once. Unmarked, it stays an
+        // answered question awaiting application, which suppresses re-asking.
+        DepsAction::Nothing => return false,
     }
     root.mark_triage_applied(&q.id);
     queue.put(&mut root).is_ok()
@@ -1385,6 +1389,25 @@ mod tests {
             "no per-dependant quarantine question"
         );
         assert!(report.quarantined.is_empty());
+    }
+
+    #[test]
+    fn an_unmatched_deps_answer_changes_nothing_and_is_not_reasked() {
+        let (dir, q, questions) = store();
+        let (root, mid, _leaf) = stuck_chain(&q, dir.path());
+        run_once(&q, &questions, None, Timestamp::now());
+        let mut asked = deps_questions(&questions).remove(0);
+        asked.choices.clear();
+        asked.answer(Answer::Text("dunno".to_owned())).unwrap();
+        questions.put(&mut asked).unwrap();
+
+        for _ in 0..2 {
+            let report = run_once(&q, &questions, None, Timestamp::now());
+            assert!(report.asked.is_empty() && report.answered.is_empty());
+        }
+        assert_eq!(deps_questions(&questions).len(), 1);
+        assert_eq!(q.get(&root.id).unwrap().status, TaskStatus::Held);
+        assert_eq!(q.get(&mid.id).unwrap().status, TaskStatus::Blocked);
     }
 
     #[test]
