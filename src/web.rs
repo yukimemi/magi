@@ -8895,6 +8895,74 @@ mod tests {
         assert!(APP_JS.contains("lost to quota"));
     }
 
+    /// A state chip's count and the cards drawn under it used to come from
+    /// two different populations: the badge counted the full, unfolded
+    /// `/api/runs` list, while the cards went through `foldRuns` and (outside
+    /// "all") an orphan hide the badge never applied. A badge could read "9"
+    /// with a single card on screen to show for it. Both now run through
+    /// `visibleRunsFor`, so this locks that they stay one function apart
+    /// rather than drifting back into two hand-rolled counts.
+    #[test]
+    fn run_state_badge_and_cards_share_one_filter() {
+        assert!(APP_JS.contains(
+            "function stateFilteredHeads(heads, filterKey)"
+        ));
+        assert!(APP_JS.contains("function visibleRunsFor(heads, filterKey)"));
+        assert!(APP_JS.contains(
+            "return stateFilteredHeads(heads, filterKey).filter(matchesFilter);"
+        ));
+        // The chip badges: each one counts through visibleRunsFor.
+        assert!(APP_JS.contains(
+            "setText(node.querySelector(\".state-chip-count\"), String(visibleRunsFor(heads, def.key).length));"
+        ));
+        // The card list: the selected chip's cards come from the very same
+        // stateFilteredHeads() step the badges use, then the same
+        // matchesFilter() the shared helper applies.
+        assert!(APP_JS.contains(
+            "const stateFiltered = stateFilteredHeads(heads, state.runsStateFilter);"
+        ));
+        assert!(APP_JS.contains("const visible = stateFiltered.filter(matchesFilter);"));
+        // Both are fed `heads` (post-fold), never the raw, unfolded list.
+        assert!(APP_JS.contains("if (runs.length > 0) renderRunStateChips(heads);"));
+    }
+
+    /// Unifying the badge and the card list on `heads` (above) only helps if
+    /// `heads` itself still has one entry per genuinely in-flight run. A
+    /// task's earlier attempt is only trustworthy to fold away once it is
+    /// done - that is the whole premise `superseded_by` folding rests on -
+    /// so `foldRuns` must refuse to walk a `superseded_by` chain through a
+    /// run that is not done, even if one is recorded (e.g. a fresh start
+    /// abandoning a still-running attempt): such a run has to surface as its
+    /// own head, or nine still-open runs would collapse into one card no
+    /// matter what the badge counts.
+    #[test]
+    fn folding_never_hides_a_run_that_is_not_done() {
+        assert!(
+            APP_JS.contains("if (!cur.done) break;"),
+            "foldRuns must stop walking forward the moment it lands on a run \
+             that is not done, rather than folding it under whatever it \
+             (possibly wrongly) names as its successor"
+        );
+    }
+
+    /// `foldRuns`' refusal to walk a not-done run into someone else's
+    /// children (above) leaves it standing as its own head, but that alone
+    /// was not enough: `isOrphanSuperseded` used to answer `true` for any
+    /// head naming a `superseded_by`, done or not, so `stateFilteredHeads`
+    /// hid that same still-open head right back out of every non-"all" tab
+    /// by a different path. Since `visibleRunsFor` (the badge) and
+    /// `renderRuns`' card list both run through `stateFilteredHeads`, the
+    /// badge and the cards agreed - just on zero, with the run itself never
+    /// shown anywhere outside "all".
+    #[test]
+    fn a_not_done_head_is_never_treated_as_an_orphan_to_hide() {
+        assert!(
+            APP_JS.contains("return run.done && typeof run.superseded_by === \"string\" && run.superseded_by !== \"\";"),
+            "isOrphanSuperseded must require the run to be done before a \
+             superseded_by on it hides the run from non-\"all\" tabs"
+        );
+    }
+
     /// The runs tree (section) and the state chips (waiting/done) are two
     /// independent lenses ANDed together in `renderRuns`, and some pairings
     /// can never both be true for any run - every "Landed"/"Ended" run is

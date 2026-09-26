@@ -1428,9 +1428,18 @@ function sectionCompatibleWithStateFilter(sectionKey, filterKey) {
    be folded under a newer card — it is genuinely an old attempt, just one
    this client has nowhere to nest. Hiding it by default is the same
    judgement call as hiding "done": it is not what an operator scanning for
-   what needs them wants in front of them, and "all" still shows it. */
+   what needs them wants in front of them, and "all" still shows it.
+
+   That reasoning only holds once the run itself is done, though: a head
+   that is not done but still names a `superseded_by` (foldRuns' own guard
+   against walking through one — see its doc there — leaves exactly this
+   case standing as its own head) is not an old attempt with nowhere to
+   nest, it is live work that has not been folded away at all. Hiding it
+   here too would undo that guard by a different path, so this only ever
+   answers `true` for a run whose own current state agrees it has
+   concluded. */
 function isOrphanSuperseded(run) {
-  return typeof run.superseded_by === "string" && run.superseded_by !== "";
+  return run.done && typeof run.superseded_by === "string" && run.superseded_by !== "";
 }
 
 /* Exactly one chip is ever selected, so picking the already-selected one is
@@ -1453,7 +1462,7 @@ function selectRunStateFilter(key) {
 /* Built once and then only updated in place, not rebuilt like the tree —
    there are only five of these, but a full rebuild on every SSE tick would
    still steal keyboard focus off whichever chip the operator just tapped. */
-function renderRunStateChips(runs) {
+function renderRunStateChips(heads) {
   const bar = $("runs-state-chips");
   if (!bar.childElementCount) {
     for (const def of RUN_STATE_FILTERS) {
@@ -1471,15 +1480,13 @@ function renderRunStateChips(runs) {
   }
   for (const node of bar.children) {
     const def = RUN_STATE_FILTERS.find((f) => f.key === node.dataset.key);
-    // Counted from the full, unfiltered /api/runs list, not from `heads` —
-    // a folded-away earlier attempt (see foldRuns) never gets its own card,
-    // but it is still a real done/waiting/in-flight run and belongs in the
-    // census this badge is reporting. Counting from `heads` instead would
-    // make a completed retry disappear from the "Done" badge entirely
-    // (0 where the fleet plainly has one), and it would still shift the
-    // moment the run in question got folded under a new attempt — the same
-    // unreadable-number failure mode this full-list count exists to avoid.
-    setText(node.querySelector(".state-chip-count"), String(runs.filter(def.match).length));
+    // Run through visibleRunsFor — the exact same state-match, orphan-hide
+    // and tree-filter steps renderRuns() applies before drawing a card — so
+    // a badge reading N always means N cards are one tap away. A run folded
+    // away or hidden as an old attempt still shows up in the "N superseded
+    // hidden" note next to the count, just not double-counted in a badge
+    // that promises tappable cards.
+    setText(node.querySelector(".state-chip-count"), String(visibleRunsFor(heads, def.key).length));
     setAttr(node, "aria-checked", state.runsStateFilter === def.key ? "true" : "false");
   }
 }
@@ -1502,7 +1509,19 @@ function renderRunStateChips(runs) {
    below and the pair vanishes silently. Each walk here instead remembers
    its whole path and, on closing a loop, mints the run the loop closed on as
    the head for every run on that path \u2014 itself included \u2014 so a cycle always
-   resolves to one real, present run rather than to none. */
+   resolves to one real, present run rather than to none.
+
+   And it stops the instant it lands on a run that is not done. A task only
+   ever gets a next attempt once its current one has concluded \u2014 that is
+   what makes an earlier attempt's `superseded_by` trustworthy \u2014 but a
+   still-open run naming one anyway (a `fresh_start` abandoning a live run
+   for a new competition, say) is exactly the case that invariant was
+   supposed to rule out. Walking through it regardless would fold a run the
+   operator can still act on underneath whatever it points to, disappearing
+   it from every non-"all" tab with no card of its own to show for it \u2014
+   worse than the unreadable-number problem the badge count separately
+   guards against, since here the run itself goes missing, not just a
+   number. Stopping here instead leaves it as its own head. */
 function foldRuns(runs) {
   const byShort = new Map();
   for (const run of runs) if (run.short) byShort.set(run.short, run);
@@ -1517,6 +1536,7 @@ function foldRuns(runs) {
     while (!headOf.has(cur.id) && !atIndex.has(cur.id)) {
       atIndex.set(cur.id, path.length);
       path.push(cur);
+      if (!cur.done) break;
       const next = nextOf(cur);
       if (!next) break;
       cur = next;
@@ -1583,6 +1603,28 @@ function matchesFilter(run) {
   if (!section) return true;
   if (runSection(run) !== section) return false;
   return !repo || repoLabel(run) === repo;
+}
+
+/* `heads` narrowed by one state-filter key: the state match, then (outside
+   "all") the orphan hide — the same two steps renderRuns() needs on its own
+   to report how many of them the orphan hide swallowed, so this stays a
+   plain function of (heads, filterKey) rather than folding that count in
+   too. */
+function stateFilteredHeads(heads, filterKey) {
+  const filter = RUN_STATE_FILTERS.find((f) => f.key === filterKey) || RUN_STATE_FILTERS[0];
+  const passingState = heads.filter(filter.match);
+  return filterKey === "all" ? passingState : passingState.filter((r) => !isOrphanSuperseded(r));
+}
+
+/* The one place that decides which of `heads` a given state-filter key would
+   actually put on screen — stateFilteredHeads(), then the tree's own
+   section/repo pick. renderRuns() uses this for the chip that is currently
+   selected to build the card list, and renderRunStateChips() uses it once
+   per chip to count every other one, so a badge and the cards behind it can
+   never name two different populations the way a hand-rolled second count
+   invites. */
+function visibleRunsFor(heads, filterKey) {
+  return stateFilteredHeads(heads, filterKey).filter(matchesFilter);
 }
 
 function selectRunsFilter(section, repo) {
@@ -1848,18 +1890,19 @@ function renderRuns() {
   const { heads, childrenOf } = foldRuns(runs);
 
   show($("runs-state-chips"), runs.length > 0);
-  if (runs.length > 0) renderRunStateChips(runs);
+  if (runs.length > 0) renderRunStateChips(heads);
 
   /* Two hidings, on by default, both lifted by "all": a done run and an old
      attempt (isOrphanSuperseded, or a whole entry in childrenOf) are both
      "not what needs me right now", which is the whole reason this filter
      exists. supersededHidden exists only to keep the count honest — without
      it, runs-count would say "3 in flight" while quietly also having
-     dropped a dozen cards the operator never asked to hide. */
+     dropped a dozen cards the operator never asked to hide. stateFiltered
+     comes from stateFilteredHeads() — the same helper visibleRunsFor() (and
+     so the chip badges just above) build on — so this card list and the
+     badge that promised it can never name two different populations. */
   const passingState = heads.filter(matchesRunState);
-  const stateFiltered = state.runsStateFilter === "all"
-    ? passingState
-    : passingState.filter((r) => !isOrphanSuperseded(r));
+  const stateFiltered = stateFilteredHeads(heads, state.runsStateFilter);
   const orphanHidden = passingState.length - stateFiltered.length;
 
   /* The tree stays built from every head regardless of the state chip, same
