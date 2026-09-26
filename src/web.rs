@@ -2659,6 +2659,13 @@ struct TaskView {
     /// instruction" panel. `task.instruction` is unchanged and still carries
     /// the raw text.
     instruction_md: Vec<md::Node>,
+    /// For a blocked task, what it waits on with each dependency's state, e.g.
+    /// `4135 (blocked → 9db7 held)`. Built server-side so the client never
+    /// recurses; empty for every other status.
+    waits_on: Vec<String>,
+    /// Short ids of the held (or cyclic) tasks a blocked task is frozen
+    /// behind - non-empty means nothing in the loop will ever run it.
+    stuck_roots: Vec<String>,
 }
 
 impl From<Task> for TaskView {
@@ -2667,7 +2674,25 @@ impl From<Task> for TaskView {
             source_label: task.source.label(),
             status_str: task.status.as_str(),
             instruction_md: md::to_nodes(&task.instruction, &md::ImageBase::None),
+            waits_on: Vec::new(),
+            stuck_roots: Vec::new(),
             task,
+        }
+    }
+}
+
+impl TaskView {
+    fn with_inventory(task: Task, inv: &crate::blockers::Inventory) -> Self {
+        let waits_on = inv.waits_on(&task);
+        let stuck_roots = inv
+            .stuck_roots(&task)
+            .iter()
+            .map(|r| r.rsplit('-').next().unwrap_or(r).to_owned())
+            .collect();
+        Self {
+            waits_on,
+            stuck_roots,
+            ..Self::from(task)
         }
     }
 }
@@ -2704,8 +2729,13 @@ async fn repos_list(
 
 async fn queue_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TaskView>>> {
     blocking(move || {
+        let tasks = ui.queue.list();
+        let inv = crate::blockers::Inventory::new(tasks.clone(), &ui.questions.list());
         Ok(Json(
-            ui.queue.list().into_iter().map(TaskView::from).collect(),
+            tasks
+                .into_iter()
+                .map(|t| TaskView::with_inventory(t, &inv))
+                .collect(),
         ))
     })
     .await
@@ -7721,6 +7751,50 @@ mod tests {
         assert_eq!(held["blocked_by"], serde_json::json!([]));
         assert!(held["block_reason"].is_null());
         assert_eq!(held["answers"][0]["answer"], "SQLite");
+    }
+
+    #[tokio::test]
+    async fn queue_json_shows_a_blocked_chain_and_its_stuck_root() {
+        let fx = Fixture::start().await;
+        let q = fx.queue();
+        let mk = |title: &str| {
+            Task::new(
+                title.to_owned(),
+                "Instruction".to_owned(),
+                PathBuf::from("/repo"),
+                Source::Human,
+            )
+        };
+        let mut root = mk("root");
+        root.hold_manual(Some("waiting".to_owned()));
+        q.put(&mut root).unwrap();
+        let mut mid = mk("mid");
+        mid.block(vec![root.id.clone()], None);
+        q.put(&mut mid).unwrap();
+        let mut leaf = mk("leaf");
+        leaf.block(vec![mid.id.clone()], None);
+        q.put(&mut leaf).unwrap();
+
+        let list = fx.get("/api/queue").await.json();
+        let find = |id: &str| {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        let leaf_view = find(&leaf.id);
+        assert_eq!(
+            leaf_view["waits_on"],
+            serde_json::json!([format!("{} (blocked → {} held)", mid.short(), root.short())])
+        );
+        assert_eq!(leaf_view["stuck_roots"], serde_json::json!([root.short()]));
+        assert_eq!(
+            find(&mid.id)["waits_on"],
+            serde_json::json!([format!("{} (held)", root.short())])
+        );
+        assert_eq!(find(&root.id)["waits_on"], serde_json::json!([]));
     }
 
     #[tokio::test]

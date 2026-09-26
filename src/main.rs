@@ -2279,7 +2279,11 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             // Only queried once, and only for the human-readable listing:
             // `--json` stays a faithful dump of `Task` itself, with nothing
             // triage-specific spliced in that is not on the task's own record.
-            let waiting_on_triage = triage::open_task_ids(&ask::Questions::open());
+            let questions_store = ask::Questions::open();
+            let waiting_on_triage = triage::open_task_ids(&questions_store);
+            // Built from the full listing, not the filtered one: a `done`
+            // dependency must still read as resolved rather than missing.
+            let inventory = magi::blockers::Inventory::new(q.list(), &questions_store.list());
             for t in &tasks {
                 let attempts = if t.attempts > 0 {
                     format!(" x{}", t.attempts)
@@ -2292,8 +2296,16 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                     ""
                 };
                 let urgent = if t.urgent { " [urgent]" } else { "" };
+                let waits = inventory.waits_on(t);
+                let waits = if waits.is_empty() {
+                    String::new()
+                } else if inventory.stuck_roots(t).is_empty() {
+                    format!("  [blocked on {}]", waits.join(", "))
+                } else {
+                    format!("  [blocked on {} - STUCK]", waits.join(", "))
+                };
                 println!(
-                    "{}  {:<9}{:<4} {:<14} {}{urgent}{question}",
+                    "{}  {:<9}{:<4} {:<14} {}{urgent}{question}{waits}",
                     t.short(),
                     t.status.as_str(),
                     attempts,
@@ -2346,6 +2358,22 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                     })
                     .collect();
                 println!("blocked on {}", annotated.join(", "));
+                let inventory = magi::blockers::Inventory::new(q.list(), &questions_store.list());
+                let chain = inventory.waits_on(&t);
+                if !chain.is_empty() {
+                    println!("chain     {}", chain.join(", "));
+                }
+                let roots = inventory.stuck_roots(&t);
+                if !roots.is_empty() {
+                    let names: Vec<&str> = roots
+                        .iter()
+                        .map(|r| r.rsplit('-').next().unwrap_or(r))
+                        .collect();
+                    println!(
+                        "stuck     nothing in the loop will run {} - see `magi task triage`",
+                        names.join(", ")
+                    );
+                }
                 if let Some(r) = &t.block_reason {
                     println!("why       {r}");
                 }

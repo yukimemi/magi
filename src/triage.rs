@@ -94,6 +94,11 @@ use crate::queue::{HoldSource, OperatorResume, Queue, Task, TaskStatus};
 /// for the same idea applied to a `crate::conduct` decision instead.
 pub const NODE: &str = "triage";
 
+/// Node on the question filed about a stuck dependency root - see
+/// [`ask_about_stuck_roots`]. Separate from [`NODE`] because the choices mean
+/// something else (position 2 is "detach the dependants", not "discard").
+pub const DEPS_NODE: &str = "triage-deps";
+
 /// Seat name on a filed question. Not a real agent seat - there is no model
 /// call anywhere in this module - but every [`Question`] needs one, and every
 /// other deterministic filer (`crate::land`'s merge approval) names itself
@@ -447,10 +452,15 @@ fn already_applied(task: &Task, q: &Question) -> bool {
 /// with nothing decided). Filters on both `node` and `run`, never `run`
 /// alone - see this module's doc on why a bare `run` match is not safe.
 fn latest_triage_question(questions: &Questions, task_id: &str) -> Option<Question> {
+    latest_question(questions, NODE, task_id)
+}
+
+/// [`latest_triage_question`] for any of this module's nodes.
+fn latest_question(questions: &Questions, node: &str, task_id: &str) -> Option<Question> {
     questions
         .list()
         .into_iter()
-        .filter(|q| q.node == NODE && q.run == task_id)
+        .filter(|q| q.node == node && q.run == task_id)
         // `asked_at` first: ids carry only whole seconds plus a random
         // suffix, so two questions filed in the same second order randomly.
         .max_by(|a, b| a.asked_at.cmp(&b.asked_at).then_with(|| a.id.cmp(&b.id)))
@@ -604,6 +614,247 @@ fn quarantine_orphaned_blocked(queue: &Queue, questions: &Questions) -> Vec<Stri
     quarantined
 }
 
+/// Choices of a [`DEPS_NODE`] question, by position: release the root, discard
+/// it, or detach the dependants from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepsAction {
+    Release,
+    Discard,
+    Detach,
+    /// An answer that matches no offered choice: nothing is changed.
+    Nothing,
+}
+
+fn interpret_deps_answer(q: &Question) -> DepsAction {
+    let resolution = q.resolution().unwrap_or_default();
+    match q.choices.iter().position(|c| *c == resolution) {
+        Some(0) => DepsAction::Release,
+        Some(1) => DepsAction::Discard,
+        Some(2) => DepsAction::Detach,
+        _ => DepsAction::Nothing,
+    }
+}
+
+/// Summary, body and choices of the question about one stuck root.
+fn deps_texts(w: &Wording, root: &Task, dependants: &[&Task]) -> (String, String, Vec<String>) {
+    let ja = w.lang == "ja";
+    let reason = root
+        .hold_reason
+        .as_deref()
+        .or(root.last_error.as_deref())
+        .unwrap_or(if ja {
+            "（記録なし）"
+        } else {
+            "(none recorded)"
+        });
+    let list: String = dependants
+        .iter()
+        .map(|t| format!("- {} {}\n", t.short(), t.title))
+        .collect();
+    if ja {
+        (
+            format!(
+                "{} ({}) が {} 件のタスクを止めています",
+                root.short(),
+                root.status.as_str(),
+                dependants.len()
+            ),
+            format!(
+                "task: {} ({})\ntitle: {}\n状態: {}\n理由: {reason}\n\n\
+                 このタスクは自動では実行されないため、依存している次のタスクは永遠に待ち続けます:\n{list}",
+                root.id,
+                root.short(),
+                root.title,
+                root.status.as_str()
+            ),
+            vec![
+                "依存先を再開する".to_owned(),
+                "依存先を捨てる（依存タスクは切り離して実行）".to_owned(),
+                "依存タスクを切り離す（依存先はそのまま）".to_owned(),
+            ],
+        )
+    } else {
+        (
+            format!(
+                "{} ({}) is freezing {} blocked task(s)",
+                root.short(),
+                root.status.as_str(),
+                dependants.len()
+            ),
+            format!(
+                "task: {} ({})\ntitle: {}\nstatus: {}\nreason: {reason}\n\n\
+                 Nothing in the loop will ever run this task, so these dependants wait \
+                 forever:\n{list}",
+                root.id,
+                root.short(),
+                root.title,
+                root.status.as_str()
+            ),
+            vec![
+                "release the dependency".to_owned(),
+                "discard the dependency (dependants are detached and run)".to_owned(),
+                "detach the dependants (the dependency stays as it is)".to_owned(),
+            ],
+        )
+    }
+}
+
+/// Detach every `blocked` task that names `root` directly: drop that one id
+/// from its `blocked_by` (`Task::unblock`), so a dependant with another
+/// unresolved blocker keeps waiting on it. Idempotent.
+fn detach_dependants(queue: &Queue, root: &str) {
+    for listed in queue.list() {
+        if listed.status != TaskStatus::Blocked || !listed.blocked_by.iter().any(|b| b == root) {
+            continue;
+        }
+        let Ok(_claim) = queue.claim(&listed.id) else {
+            continue;
+        };
+        let Ok(mut t) = queue.get(&listed.id) else {
+            continue;
+        };
+        if t.status != TaskStatus::Blocked {
+            continue;
+        }
+        t.unblock(root);
+        let _ = queue.put(&mut t);
+    }
+}
+
+/// Apply an answered [`DEPS_NODE`] question. Every step is idempotent, so a
+/// pass that dies half way is finished by the next one. Returns whether the
+/// answer was consumed.
+fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Timestamp) -> bool {
+    let Ok(_claim) = queue.claim(&q.run) else {
+        return false;
+    };
+    let Ok(mut root) = queue.get(&q.run) else {
+        return false;
+    };
+    if root.triage_applied(&q.id) {
+        return false;
+    }
+    match interpret_deps_answer(q) {
+        DepsAction::Release => {
+            if root.status == TaskStatus::Running {
+                return false;
+            }
+            root.release();
+            root.resume_override = Some(OperatorResume {
+                question_id: q.id.clone(),
+                at: now,
+                conductor_rehold: None,
+                forced: false,
+            });
+        }
+        DepsAction::Discard => {
+            detach_dependants(queue, &root.id);
+            return queue.remove(&root.id, false, questions).is_ok();
+        }
+        DepsAction::Detach => detach_dependants(queue, &root.id),
+        // Matches no offered choice, so there is nothing to apply. Left unmarked:
+        // marking it applied would read as "settled", and the next stuck check
+        // would file an identical question at once. Unmarked, it stays an
+        // answered question awaiting application, which suppresses re-asking.
+        DepsAction::Nothing => return false,
+    }
+    root.mark_triage_applied(&q.id);
+    queue.put(&mut root).is_ok()
+}
+
+/// One question per stuck dependency root, and apply the answers to earlier
+/// ones. See [`crate::blockers`] for what "stuck" means.
+///
+/// Not re-asked: a root with an open or answered-unapplied question; one whose
+/// own hold question ([`NODE`]) is still pending; and one whose question was
+/// abandoned unless the root or a task it freezes changed since. An *applied*
+/// answer leaves nothing stuck (released, discarded, or detached), so a root
+/// that is stuck again is a new situation and is asked about afresh.
+fn ask_about_stuck_roots(
+    queue: &Queue,
+    questions: &Questions,
+    config_override: Option<&Path>,
+    now: Timestamp,
+    report: &mut Report,
+) {
+    for q in questions.list() {
+        if q.node == DEPS_NODE
+            && q.status == QuestionStatus::Answered
+            && apply_deps_answer(queue, questions, &q, now)
+        {
+            report.answered.push(q.run.clone());
+        }
+    }
+
+    let all = questions.list();
+    let inv = crate::blockers::Inventory::new(queue.list(), &all);
+    let mut frozen: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (id, roots) in inv.stuck() {
+        for root in roots {
+            if root != id {
+                frozen.entry(root).or_default().push(id.clone());
+            }
+        }
+    }
+    // A cycle root freezes the others but may have no dependants of its own
+    // listed above when it is alone; a root with nothing to name is not asked.
+
+    for mut q in all
+        .iter()
+        .filter(|q| q.node == DEPS_NODE && q.status.open())
+        .cloned()
+    {
+        if !frozen.contains_key(&q.run) {
+            q.abandon("nothing waits on this task anymore");
+            let _ = questions.put(&mut q);
+        }
+    }
+
+    for (root_id, dependant_ids) in &frozen {
+        let Some(root) = inv.task(root_id) else {
+            continue;
+        };
+        let dependants: Vec<&Task> = dependant_ids.iter().filter_map(|d| inv.task(d)).collect();
+        let latest = all
+            .iter()
+            .filter(|q| q.node == DEPS_NODE && q.run == *root_id)
+            .max_by(|a, b| a.asked_at.cmp(&b.asked_at).then_with(|| a.id.cmp(&b.id)));
+        match latest {
+            Some(q) if q.status.open() => continue,
+            Some(q) if q.status == QuestionStatus::Answered && !root.triage_applied(&q.id) => {
+                continue;
+            }
+            Some(q) if q.status == QuestionStatus::Abandoned => {
+                let changed = root.updated_at > q.asked_at
+                    || dependants.iter().any(|t| t.updated_at > q.asked_at);
+                if !changed {
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        if pending_for(questions, root) {
+            continue;
+        }
+        let cfg = Config::discover(&repo_for(root), config_override)
+            .ok()
+            .map(|(c, _)| c);
+        let w = wording(cfg.as_ref().map_or("en", |c| c.graph.language.as_str()));
+        let (summary, detail, choices) = deps_texts(w, root, &dependants);
+        let mut question = Question::new(
+            root.id.clone(),
+            DEPS_NODE.to_owned(),
+            SEAT.to_owned(),
+            summary,
+            detail,
+            choices,
+        );
+        if questions.put(&mut question).is_ok() {
+            report.asked.push(root.id.clone());
+        }
+    }
+}
+
 /// Run one deterministic triage pass over every `held` task in `queue`. No
 /// model call anywhere in this function - see this module's own doc for what
 /// each `HoldSource` gets instead.
@@ -631,6 +882,7 @@ pub fn run_once(
         quarantined: quarantine_orphaned_blocked(queue, questions),
         ..Report::default()
     };
+    ask_about_stuck_roots(queue, questions, config_override, now, &mut report);
     for listed in queue.list() {
         if listed.status != TaskStatus::Held {
             continue;
@@ -645,6 +897,12 @@ pub fn run_once(
         // between the listing above and the claim just taken must not be
         // clobbered by a decision based on the stale copy.
         if task.status != TaskStatus::Held {
+            continue;
+        }
+        // A question about what this task freezes is already the one question
+        // it owes the operator; a second, about the hold itself, would ask two
+        // things at once.
+        if deps_pending(questions, &task) {
             continue;
         }
 
@@ -773,9 +1031,21 @@ pub fn open_question_for(questions: &Questions, task_id: &str) -> Option<Questio
 /// apply, the same failure mode this function exists to keep `crate::conduct`
 /// out of. `crate::conduct::apply_one` is exactly that caller.
 pub fn pending_for(questions: &Questions, task: &Task) -> bool {
-    match latest_triage_question(questions, &task.id) {
+    let own = match latest_triage_question(questions, &task.id) {
         Some(q) if q.status.open() => true,
         Some(q) if q.status == QuestionStatus::Answered => !already_applied(task, &q),
+        _ => false,
+    };
+    own || deps_pending(questions, task)
+}
+
+/// Is the latest [`DEPS_NODE`] question about `task` still open, or answered
+/// but not yet applied? Same reasoning as [`pending_for`]: the gap between an
+/// answer and the next [`run_once`] pass must not be walked through.
+fn deps_pending(questions: &Questions, task: &Task) -> bool {
+    match latest_question(questions, DEPS_NODE, &task.id) {
+        Some(q) if q.status.open() => true,
+        Some(q) if q.status == QuestionStatus::Answered => !task.triage_applied(&q.id),
         _ => false,
     }
 }
@@ -788,7 +1058,7 @@ pub fn open_task_ids(questions: &Questions) -> std::collections::BTreeSet<String
     questions
         .list()
         .into_iter()
-        .filter(|q| q.node == NODE && q.status.open())
+        .filter(|q| (q.node == NODE || q.node == DEPS_NODE) && q.status.open())
         .map(|q| q.run)
         .collect()
 }
@@ -966,6 +1236,206 @@ mod tests {
         let second = run_once(&q, &questions, None, Timestamp::now());
         assert!(second.quarantined.is_empty());
         assert!(second.asked.is_empty());
+    }
+
+    /// A held root with a chain of dependants: 9db7 <- 4135 <- 6081, and a
+    /// second direct dependant that also waits on a queued task.
+    fn stuck_chain(q: &Queue, dir: &std::path::Path) -> (Task, Task, Task) {
+        let mut root = task("root", dir.join("repo"));
+        root.hold_manual(Some("waiting".to_owned()));
+        q.put(&mut root).unwrap();
+        let mut mid = task("mid", dir.join("repo"));
+        mid.block(vec![root.id.clone()], None);
+        q.put(&mut mid).unwrap();
+        let mut leaf = task("leaf", dir.join("repo"));
+        leaf.block(vec![mid.id.clone()], None);
+        q.put(&mut leaf).unwrap();
+        (root, mid, leaf)
+    }
+
+    fn deps_questions(questions: &Questions) -> Vec<Question> {
+        questions
+            .list()
+            .into_iter()
+            .filter(|q| q.node == DEPS_NODE)
+            .collect()
+    }
+
+    fn answer_deps(questions: &Questions, choice: usize) {
+        let mut asked = deps_questions(questions).remove(0);
+        let c = asked.choices[choice].clone();
+        asked.answer(Answer::Choice(c)).unwrap();
+        questions.put(&mut asked).unwrap();
+    }
+
+    #[test]
+    fn a_stuck_chain_earns_one_question_naming_every_dependant_and_is_not_reasked() {
+        let (dir, q, questions) = store();
+        let (root, mid, leaf) = stuck_chain(&q, dir.path());
+
+        let first = run_once(&q, &questions, None, Timestamp::now());
+        assert_eq!(first.asked, std::slice::from_ref(&root.id));
+        let asked = deps_questions(&questions);
+        assert_eq!(asked.len(), 1, "one question per root, not per dependant");
+        assert_eq!(asked[0].run, root.id);
+        assert_eq!(asked[0].choices.len(), 3);
+        assert!(asked[0].detail.contains(mid.short()), "{}", asked[0].detail);
+        assert!(
+            asked[0].detail.contains(leaf.short()),
+            "{}",
+            asked[0].detail
+        );
+
+        let second = run_once(&q, &questions, None, Timestamp::now());
+        assert!(second.asked.is_empty());
+        assert_eq!(deps_questions(&questions).len(), 1);
+        assert!(pending_for(&questions, &q.get(&root.id).unwrap()));
+    }
+
+    #[test]
+    fn a_stuck_root_with_a_machine_hold_gets_only_the_dependency_question() {
+        let (dir, q, questions) = store();
+        let mut root = task("root", dir.path().join("repo"));
+        root.hold_machine(Some("gate red".to_owned()));
+        q.put(&mut root).unwrap();
+        let mut dep = task("dep", dir.path().join("repo"));
+        dep.block(vec![root.id.clone()], None);
+        q.put(&mut dep).unwrap();
+
+        run_once(&q, &questions, None, Timestamp::now());
+        run_once(&q, &questions, None, Timestamp::now());
+        assert_eq!(deps_questions(&questions).len(), 1);
+        assert_eq!(
+            questions.list().len(),
+            1,
+            "no second question about the hold"
+        );
+    }
+
+    #[test]
+    fn a_dependency_that_can_still_run_asks_nothing() {
+        let (dir, q, questions) = store();
+        let mut live = task("live", dir.path().join("repo"));
+        q.put(&mut live).unwrap();
+        let mut dep = task("dep", dir.path().join("repo"));
+        dep.block(vec![live.id.clone()], None);
+        q.put(&mut dep).unwrap();
+        let report = run_once(&q, &questions, None, Timestamp::now());
+        assert!(report.asked.is_empty());
+        assert!(questions.list().is_empty());
+    }
+
+    #[test]
+    fn answering_release_requeues_the_root_and_is_not_reasked() {
+        let (dir, q, questions) = store();
+        let (root, _mid, _leaf) = stuck_chain(&q, dir.path());
+        run_once(&q, &questions, None, Timestamp::now());
+        answer_deps(&questions, 0);
+
+        let report = run_once(&q, &questions, None, Timestamp::now());
+        assert_eq!(report.answered, std::slice::from_ref(&root.id));
+        assert!(report.asked.is_empty(), "applying must not re-ask");
+        assert_eq!(q.get(&root.id).unwrap().status, TaskStatus::Queued);
+        let again = run_once(&q, &questions, None, Timestamp::now());
+        assert!(again.asked.is_empty() && again.answered.is_empty());
+        assert_eq!(deps_questions(&questions).len(), 1);
+    }
+
+    #[test]
+    fn answering_detach_frees_the_direct_dependant_and_keeps_the_root() {
+        let (dir, q, questions) = store();
+        let (root, mid, leaf) = stuck_chain(&q, dir.path());
+        run_once(&q, &questions, None, Timestamp::now());
+        answer_deps(&questions, 2);
+
+        let report = run_once(&q, &questions, None, Timestamp::now());
+        assert!(report.asked.is_empty());
+        assert_eq!(q.get(&root.id).unwrap().status, TaskStatus::Held);
+        assert_eq!(q.get(&mid.id).unwrap().status, TaskStatus::Queued);
+        let leaf = q.get(&leaf.id).unwrap();
+        assert_eq!(leaf.status, TaskStatus::Blocked, "still waits on mid");
+        assert_eq!(leaf.blocked_by, std::slice::from_ref(&mid.id));
+    }
+
+    #[test]
+    fn a_dependant_that_can_progress_through_another_blocker_is_not_stuck() {
+        let (dir, q, questions) = store();
+        let (root, mid, _leaf) = stuck_chain(&q, dir.path());
+        let mut live = task("live", dir.path().join("repo"));
+        q.put(&mut live).unwrap();
+        let mut both = q.get(&mid.id).unwrap();
+        both.block(vec![root.id.clone(), live.id.clone()], None);
+        q.put(&mut both).unwrap();
+        // `mid` can still progress through `live`, so nothing is stuck yet.
+        assert!(
+            run_once(&q, &questions, None, Timestamp::now())
+                .asked
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn answering_discard_detaches_then_removes_the_root() {
+        let (dir, q, questions) = store();
+        let (root, mid, _leaf) = stuck_chain(&q, dir.path());
+        run_once(&q, &questions, None, Timestamp::now());
+        answer_deps(&questions, 1);
+
+        let report = run_once(&q, &questions, None, Timestamp::now());
+        assert!(q.get(&root.id).is_err());
+        assert_eq!(q.get(&mid.id).unwrap().status, TaskStatus::Queued);
+        assert!(
+            report.asked.is_empty(),
+            "no per-dependant quarantine question"
+        );
+        assert!(report.quarantined.is_empty());
+    }
+
+    #[test]
+    fn an_unmatched_deps_answer_changes_nothing_and_is_not_reasked() {
+        let (dir, q, questions) = store();
+        let (root, mid, _leaf) = stuck_chain(&q, dir.path());
+        run_once(&q, &questions, None, Timestamp::now());
+        let mut asked = deps_questions(&questions).remove(0);
+        asked.choices.clear();
+        asked.answer(Answer::Text("dunno".to_owned())).unwrap();
+        questions.put(&mut asked).unwrap();
+
+        for _ in 0..2 {
+            let report = run_once(&q, &questions, None, Timestamp::now());
+            assert!(report.asked.is_empty() && report.answered.is_empty());
+        }
+        assert_eq!(deps_questions(&questions).len(), 1);
+        assert_eq!(q.get(&root.id).unwrap().status, TaskStatus::Held);
+        assert_eq!(q.get(&mid.id).unwrap().status, TaskStatus::Blocked);
+    }
+
+    #[test]
+    fn a_dependency_cycle_terminates_and_is_asked_about_once() {
+        let (dir, q, questions) = store();
+        let mut a = task("a", dir.path().join("repo"));
+        let mut b = task("b", dir.path().join("repo"));
+        a.block(vec![b.id.clone()], None);
+        b.block(vec![a.id.clone()], None);
+        q.put(&mut a).unwrap();
+        q.put(&mut b).unwrap();
+
+        let first = run_once(&q, &questions, None, Timestamp::now());
+        assert_eq!(first.asked.len(), 1);
+        let second = run_once(&q, &questions, None, Timestamp::now());
+        assert!(second.asked.is_empty());
+        assert_eq!(deps_questions(&questions).len(), 1);
+    }
+
+    #[test]
+    fn a_missing_dependency_is_still_quarantined_not_asked_about_as_stuck() {
+        let (dir, q, questions) = store();
+        let mut t = task("orphan", dir.path().join("repo"));
+        t.block(vec!["20260101-000000-gone".to_owned()], None);
+        q.put(&mut t).unwrap();
+        let report = run_once(&q, &questions, None, Timestamp::now());
+        assert_eq!(report.quarantined, [t.id.clone()]);
+        assert!(deps_questions(&questions).is_empty());
     }
 
     #[test]
