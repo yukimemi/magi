@@ -40,6 +40,10 @@ cache = "{{ env.MAGI_CACHE | default(value='/tmp') }}"
 e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo test --locked --all-targets"]
 # Same gate as CI and the pre-push hook.
 gate = ["CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo make check"]
+# Run just before the gate, on the winner only. Run 892b was blocked by nothing
+# but a one-line rustfmt wrap; a formatter is deterministic, so run it rather
+# than argue about it with an agent. Changes land as one commit.
+pre_gate = ["cargo fmt --all"]
 
 [merge]
 # `base` is set explicitly because this is a jj-colocated checkout: jj keeps

@@ -809,6 +809,28 @@ pub fn run(state: &RunState) -> String {
         );
     }
 
+    if !state.pre_gate.is_empty() {
+        let _ = writeln!(s, "\n{}", bold("pre_gate"));
+        for o in &state.pre_gate {
+            let _ = writeln!(
+                s,
+                "  {}  {}",
+                if o.ok() {
+                    green("pass")
+                } else {
+                    yellow("warn")
+                },
+                o.command
+            );
+            if !o.ok() {
+                let _ = writeln!(s, "{}", dim(&tail(&o.output_tail, 2_000)));
+            }
+        }
+        if let Some(c) = &state.pre_gate_commit {
+            let _ = writeln!(s, "  committed mechanical fixes @ {}", short(c));
+        }
+    }
+
     // `state.gate.is_empty()` alone cannot tell "never ran" apart from "ran
     // with nothing configured" — see `RunState::gate_status`'s own doc — so
     // this reads the accessor rather than the raw list.

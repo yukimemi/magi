@@ -1443,6 +1443,14 @@ pub struct RunState {
     /// of `graph.gate_fix_rounds` instead of starting the budget over.
     #[serde(default)]
     pub gate_fixes: Vec<GateFixRecord>,
+    /// Outcomes of the `verify.pre_gate` commands from the latest time they
+    /// ran on the winner. Informational only: a failure here never blocks the
+    /// run, the gate stays the single arbiter. Overwritten on each pass.
+    #[serde(default)]
+    pub pre_gate: Vec<CommandOutcome>,
+    /// The latest commit a `pre_gate` pass made, if any pass left changes.
+    #[serde(default)]
+    pub pre_gate_commit: Option<String>,
     /// Merge outcome.
     #[serde(default)]
     pub merge: Option<MergeOutcome>,
@@ -1587,6 +1595,8 @@ impl RunState {
             gate: Vec::new(),
             gate_ran: false,
             gate_fixes: Vec::new(),
+            pre_gate: Vec::new(),
+            pre_gate_commit: None,
             merge: None,
             leaks: Vec::new(),
             quota: Vec::new(),

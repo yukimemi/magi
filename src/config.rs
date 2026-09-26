@@ -522,6 +522,16 @@ pub struct Verify {
     pub e2e: Vec<String>,
     /// Final gate. Must all exit 0 before a merge is attempted.
     pub gate: Vec<String>,
+    /// Mechanical fixers (formatters) run in the winner's worktree just before
+    /// `gate`, after review is clean. Anything they change is committed as one
+    /// neutral-identity commit so the gate and the PR see it. A command that
+    /// fails or times out is a warning, never a failed run: the gate stays the
+    /// single arbiter. Empty (the default) turns the feature off. Runs under
+    /// `graph.verify_timeout()` per command, like the gate. Meant for light
+    /// tools: it is not scanned for `CARGO_TARGET_DIR`, and it should be
+    /// idempotent since a resumed run may repeat it.
+    #[serde(default)]
+    pub pre_gate: Vec<String>,
     /// Shell used to run the commands above. Defaults to `sh -c`, or
     /// `cmd /C` when `sh` is not on `PATH`.
     pub shell: Option<Vec<String>>,
@@ -1038,7 +1048,7 @@ enum ArrayMerge {
 ///   concatenation would not be.
 fn array_merge_policy(key: &str) -> ArrayMerge {
     match key {
-        "verify.e2e" | "verify.gate" | "repos.roots" => ArrayMerge::Append,
+        "verify.e2e" | "verify.gate" | "verify.pre_gate" | "repos.roots" => ArrayMerge::Append,
         _ => ArrayMerge::Replace,
     }
 }
@@ -1554,7 +1564,12 @@ impl Config {
              # fed back to the fixer.\n\
              e2e = []\n\
              # Final gate. Every command must exit 0 before a merge.\n\
-             gate = []\n\n\
+             gate = []\n\
+             # Mechanical fixers (formatters) run in the winner's worktree just\n\
+             # before the gate; whatever they change becomes one commit. A failing\n\
+             # command only warns - the gate stays the arbiter. Same timeout as the\n\
+             # gate (timeout_verify). Keep it light and idempotent.\n\
+             # pre_gate = []\n\n\
              [merge]\n\
              # none | local | pr\n\
              mode = \"none\"\n\n\
@@ -2021,6 +2036,15 @@ mod tests {
         assert_eq!(parsed.graph.timeout_review, 1200);
         assert_eq!(parsed.graph.verify_timeout(), 1200);
         assert_eq!(parsed.update.mode, UpdateMode::Notify);
+    }
+
+    #[test]
+    fn pre_gate_defaults_to_empty_and_the_starter_documents_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        std::fs::write(&path, Config::starter_toml()).unwrap();
+        assert!(Config::load(&path).unwrap().verify.pre_gate.is_empty());
+        assert!(Config::starter_toml().contains("# pre_gate = []"));
     }
 
     #[test]

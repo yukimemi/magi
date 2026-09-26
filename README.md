@@ -724,6 +724,9 @@ on_leak = "warn"         # warn | redact | fail
 e2e = ["cargo test --locked"]
 # Final gate. Every command must exit 0 before a merge is attempted.
 gate = ["cargo make check"]
+# Mechanical fixers (formatters) run on the winner just before the gate; changes
+# become one commit. A failing command only warns. Uses timeout_verify.
+pre_gate = ["cargo fmt --all"]
 
 [merge]
 mode = "none"            # none | local | pr

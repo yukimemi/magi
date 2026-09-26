@@ -4701,9 +4701,80 @@ impl Runner {
         Ok(())
     }
 
+    /// Run `verify.pre_gate` in the winner's worktree, then fold whatever it
+    /// changed into one commit. Reached only from [`Self::run_gate`], i.e.
+    /// after review is clean and never on a candidate awaiting judging.
+    ///
+    /// Never fails the run: a non-zero exit or timeout is a warning and a
+    /// recorded outcome, and the gate remains the single arbiter. Nothing
+    /// configured means nothing happens - no event, no commit. `commit_all`
+    /// commits any leftover change under the neutral identity and returns
+    /// `false` when the tree is clean, so no empty commit is ever made.
+    async fn run_pre_gate(&mut self, winner: &Candidate) {
+        let commands = self.state.config.verify.pre_gate.clone();
+        if commands.is_empty() {
+            return;
+        }
+        let shell = self.state.config.shell();
+        let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
+        let (outcomes, _) = run_commands(
+            &mut self.state,
+            "pre_gate",
+            "pre_gate",
+            0,
+            &shell,
+            &commands,
+            &winner.worktree,
+            timeout,
+        )
+        .await;
+        for o in &outcomes {
+            if !o.ok() {
+                tracing::warn!(
+                    "pre_gate `{}` failed ({:?}); the gate decides",
+                    o.command,
+                    o.code
+                );
+            }
+            self.state.event(
+                "pre_gate",
+                format!(
+                    "`{}` -> {}",
+                    o.command,
+                    if o.ok() {
+                        "pass".to_owned()
+                    } else {
+                        format!(
+                            "FAIL ({:?})\n{}",
+                            o.code,
+                            tail(&o.output_tail, EVENT_OUTPUT_TAIL)
+                        )
+                    }
+                ),
+            );
+        }
+        self.state.pre_gate = outcomes;
+        match git::commit_all(&winner.worktree, "magi: pre_gate (mechanical fixes)").await {
+            Ok(true) => match git::rev_parse(&winner.worktree, "HEAD").await {
+                Ok(head) => {
+                    self.state
+                        .event("pre_gate", format!("committed mechanical fixes ({head})"));
+                    self.state.pre_gate_commit = Some(head);
+                }
+                Err(e) => tracing::warn!("pre_gate committed but HEAD unreadable: {e:#}"),
+            },
+            Ok(false) => {}
+            Err(e) => tracing::warn!("pre_gate could not commit its changes: {e:#}"),
+        }
+        if let Err(e) = self.state.save() {
+            tracing::warn!("could not persist the pre_gate record: {e:#}");
+        }
+    }
+
     /// Run `verify.gate` once against the winner's current tree, logging one
     /// event per command. Empty when nothing is configured.
     async fn run_gate(&mut self, winner: &Candidate) -> Result<Vec<CommandOutcome>> {
+        self.run_pre_gate(winner).await;
         let shell = self.state.config.shell();
         let gate_commands = self.state.config.verify.gate.clone();
         // Zero commands has nothing to run and nothing that could touch the
