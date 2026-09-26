@@ -1355,6 +1355,33 @@ pub struct PrRecord {
     pub rounds: usize,
 }
 
+/// What the post-merge release-bump step did, and whether it needs a human.
+///
+/// Recorded next to the `bump` events rather than instead of them: the events
+/// are the narrative, this is what `magi show`, the status word and the
+/// notification read without parsing prose. `status` stays `Merged` - the
+/// merge did happen - so [`RunState::needs_attention`] is the one place that
+/// says a merged run is not fully done.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseBump {
+    /// The release pull request, when one was opened.
+    #[serde(default)]
+    pub pr_url: Option<String>,
+    /// The version it releases.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Did enabling automerge on `pr_url` succeed?
+    #[serde(default)]
+    pub automerge_enabled: bool,
+    /// What went wrong, verbatim from the tool that said it.
+    #[serde(default)]
+    pub problem: Option<String>,
+    /// What the operator has to do about it. `Some` is what makes a merged run
+    /// read as needing attention.
+    #[serde(default)]
+    pub action_required: Option<String>,
+}
+
 /// The whole run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
@@ -1521,6 +1548,10 @@ pub struct RunState {
     /// would break the first time an event message was reworded.
     #[serde(default)]
     pub pr: Option<PrRecord>,
+    /// The post-merge release-bump step's outcome, when it got as far as
+    /// having one to report. See [`ReleaseBump`].
+    #[serde(default)]
+    pub release_bump: Option<ReleaseBump>,
     /// The last look at how far the winner's tree trailed the landing base,
     /// and the rebase(s) tried to close that gap. `None` until the tree has a
     /// winner to check.
@@ -1607,6 +1638,7 @@ impl RunState {
             driver_pid: None,
             driver_started_at: None,
             pr: None,
+            release_bump: None,
             base_sync: None,
             advice: None,
             advise_attempted: false,
@@ -2107,6 +2139,20 @@ impl RunState {
                 .merge
                 .as_ref()
                 .is_some_and(|m| m.mode == MergeMode::None)
+    }
+
+    /// Did a step after the merge leave something only a human can finish?
+    ///
+    /// Derived, not a status: the merge happened, so `status` stays `Merged`
+    /// and everything that branches on it keeps working. Display code asks
+    /// this so a merged run with an unmerged release PR does not read as
+    /// plain green.
+    pub fn needs_attention(&self) -> bool {
+        self.status == RunStatus::Merged
+            && self
+                .release_bump
+                .as_ref()
+                .is_some_and(|b| b.action_required.is_some())
     }
 
     /// Local-time creation stamp for reports.
