@@ -597,6 +597,25 @@ pub struct ReviewRevoteRecord {
     pub failed: Option<String>,
 }
 
+/// One fix round spent on a failing `verify.gate`: which fixer, what it did to
+/// the tree, and the gate output it was shown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateFixRecord {
+    /// Agent that applied the fix.
+    pub agent: String,
+    /// The gate output the fixer was handed, tail-truncated.
+    pub failed: Vec<CommandOutcome>,
+    /// What the fixer said it changed.
+    #[serde(default)]
+    pub notes: String,
+    /// Did the fix produce a commit?
+    #[serde(default)]
+    pub committed: bool,
+    /// Why the fix step produced nothing.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// The fixer's response to a round.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FixRecord {
@@ -1419,6 +1438,11 @@ pub struct RunState {
     /// `false` and is migrated in [`migrate_schema`].
     #[serde(default)]
     pub gate_ran: bool,
+    /// Fix rounds a failing gate has already spent, oldest first. Persisted
+    /// right after each fixer call so a resumed run spends only what is left
+    /// of `graph.gate_fix_rounds` instead of starting the budget over.
+    #[serde(default)]
+    pub gate_fixes: Vec<GateFixRecord>,
     /// Merge outcome.
     #[serde(default)]
     pub merge: Option<MergeOutcome>,
@@ -1562,6 +1586,7 @@ impl RunState {
             reviews: Vec::new(),
             gate: Vec::new(),
             gate_ran: false,
+            gate_fixes: Vec::new(),
             merge: None,
             leaks: Vec::new(),
             quota: Vec::new(),
