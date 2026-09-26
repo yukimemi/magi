@@ -1004,6 +1004,67 @@ pub fn fix(
     s
 }
 
+/// How much of one failed gate command's output the fixer is shown.
+const GATE_FIX_TAIL: usize = 6_000;
+
+/// Prompt for the fixer when the final `verify.gate` failed on a tree the
+/// reviewers had already cleared.
+///
+/// Deliberately not [`fix`]: there is no reviewer and no finding id here, so
+/// the reply contract says the id lists stay empty rather than inviting the
+/// fixer to hunt for ids that do not exist. The commands are whatever
+/// `[verify].gate` holds; nothing here knows what they run.
+pub fn gate_fix(
+    instruction: &str,
+    failed: &[crate::run::CommandOutcome],
+    attempt: usize,
+    cap: usize,
+    language: &str,
+) -> String {
+    let mut s = format!(
+        "Your patch failed the verification gate. Gate fix {attempt} of {cap}.\n\n\
+         The reviewers had no blocking findings left. What follows is not a \
+         reviewer's finding: it is the output of the command(s) configured as the \
+         final gate, run against your committed tree.\n\n\
+         # The task\n\n{instruction}\n\n\
+         # Failed gate command(s)\n"
+    );
+    for o in failed {
+        let _ = write!(
+            s,
+            "\n`{}` exited with {}\n\n```\n{}\n```\n",
+            o.command,
+            o.code
+                .map_or_else(|| "no exit code".to_owned(), |c| c.to_string()),
+            crate::run::tail(&o.output_tail, GATE_FIX_TAIL).trim()
+        );
+    }
+    s.push_str(
+        "\n# Rules\n\n\
+         1. Make the failing command(s) above pass, and commit the change in this \
+            worktree. Change only what the output points at.\n\
+         2. Do not weaken the gate: no disabling or skipping checks, no lint \
+            suppressions added to silence a warning, no edits to the gate's own \
+            configuration.\n\
+         3. There are no finding ids in this step. Leave `addressed` and \
+            `rejected` as empty arrays and describe the change in `notes`.\n\
+         4. Never name yourself, your vendor, or your model, anywhere.\n\
+         5. If you start something in the background (a test run, a build), \
+            do not end your reply while it is still pending. Confirm it \
+            finished and report on its actual result.\n\n\
+         # Output\n\n\
+         Your reasoning first, then exactly one fenced json block, last:\n\n\
+         ```json\n\
+         {\"addressed\":[],\"rejected\":[],\"notes\":\"what changed\"}\n\
+         ```",
+    );
+    s.push('\n');
+    s.push_str(&ask_the_owner(language));
+    s.push_str(&lang(language));
+    s.push_str(&github_english(language));
+    s
+}
+
 /// Prompt for a targeted, operator-triggered fix: specific, already-recorded
 /// findings routed to a fixer outside the normal review round sequence.
 ///

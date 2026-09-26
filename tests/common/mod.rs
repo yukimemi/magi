@@ -328,6 +328,21 @@ if has "the report this step requires"; then
   exit 0
 fi
 
+# The gate-fix round: the failure came from `verify.gate`, not a reviewer, so
+# there is no finding id to echo back. `MOCK_GATE_FIX_NOOP` leaves the tree as
+# it is, for a fixer that cannot help.
+if has "failed the verification gate"; then
+  if [ -n "$MOCK_GATE_FIX_NOOP" ]; then
+    printf '{"addressed":[],"rejected":[],"notes":"changed nothing"}\n'
+    exit 0
+  fi
+  echo "gate fix $$" >> gatefix.txt
+  git add -A >/dev/null 2>&1
+  git commit -q -m "fix the gate" >/dev/null 2>&1
+  printf '{"addressed":[],"rejected":[],"notes":"created gatefix.txt"}\n'
+  exit 0
+fi
+
 if has "Your patch was reviewed"; then
   id=$(grep -o 'R[0-9]*-[0-9]*-[0-9]*' "$p" | head -1)
   # A fixer that claims to have addressed the finding but never touches the

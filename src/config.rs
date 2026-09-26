@@ -257,6 +257,12 @@ pub struct Graph {
     pub reviewers: usize,
     /// Maximum review+fix rounds before the run is declared blocked.
     pub review_rounds: usize,
+    /// Fix rounds a failing `verify.gate` gets before the run is blocked. The
+    /// fixer is handed the gate's own output; `0` keeps the old behaviour of
+    /// blocking on the first red gate. Independent of [`Self::review_rounds`]
+    /// so a run that spent its review budget can still repair a one-line gate
+    /// failure.
+    pub gate_fix_rounds: usize,
     /// Maximum agent processes running at once.
     pub max_parallel: usize,
     /// Language for the prose the agents write (`en` / `ja` / any language name).
@@ -378,6 +384,7 @@ impl Default for Graph {
             deliberate_rounds: 1,
             reviewers: 3,
             review_rounds: 6,
+            gate_fix_rounds: 1,
             max_parallel: 4,
             language: "en".to_owned(),
             sessions: true,
@@ -1529,6 +1536,8 @@ impl Config {
              deliberate_rounds = 1\n\
              reviewers = 3\n\
              review_rounds = 6\n\
+             # Fix rounds a failing verify.gate gets before the run is blocked (0 = none).\n\
+             gate_fix_rounds = 1\n\
              max_parallel = 4\n\
              language = \"en\"\n\
              # One CLI conversation per seat: judges keep their own argument\n\

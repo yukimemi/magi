@@ -44,8 +44,8 @@ use crate::prompt::{
 use crate::queue;
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
-    DeliberationRound, DeliberationTurn, E2eStatus, FixRecord, JobRecord, JobStatus, Judgement,
-    MergeOutcome, OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest, QuotaLoss,
+    DeliberationRound, DeliberationTurn, E2eStatus, FixRecord, GateFixRecord, JobRecord, JobStatus,
+    Judgement, MergeOutcome, OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest, QuotaLoss,
     ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, Tally, VoteRecord, tail,
     write_artifact,
 };
@@ -3593,6 +3593,24 @@ impl Runner {
 
     // --------------------------------------------------------------- review
 
+    /// The agent and seat key that fix the winner's tree: the configured
+    /// fixer, else the winner's own implementer seat, whose conversation
+    /// continues now that the competition is over. Shared by the review loop
+    /// and the gate-fix round so both talk to the same seat.
+    fn fixer_spec(&self, winner: &Candidate) -> (AgentSpec, String) {
+        match &self.roles.fixer {
+            Some(f) if f.id != winner.agent => (f.clone(), "fix".to_owned()),
+            _ => (
+                self.state
+                    .config
+                    .agent(&winner.agent)
+                    .cloned()
+                    .unwrap_or_else(|_| self.roles.implementers[winner.index].clone()),
+                format!("impl-{}", winner.label),
+            ),
+        }
+    }
+
     async fn review_loop(&mut self) -> Result<()> {
         // A base that would not rebase is a person's decision, not a review
         // round: nothing here would change the answer, and reviewers and a
@@ -4213,17 +4231,7 @@ impl Runner {
 
             // Fix. The winner's own implementer seat continues its conversation:
             // the competition is over, so context is pure benefit now.
-            let (fix_spec, fix_seat_key) = match &self.roles.fixer {
-                Some(f) if f.id != winner.agent => (f.clone(), "fix".to_owned()),
-                _ => (
-                    self.state
-                        .config
-                        .agent(&winner.agent)
-                        .cloned()
-                        .unwrap_or_else(|_| self.roles.implementers[winner.index].clone()),
-                    format!("impl-{}", winner.label),
-                ),
-            };
+            let (fix_spec, fix_seat_key) = self.fixer_spec(&winner);
             let seat = self.seat(&fix_seat_key, &fix_spec.id);
             let blocking_findings: Vec<_> = all_findings
                 .iter()
@@ -4646,6 +4654,56 @@ impl Runner {
             return Ok(());
         };
         self.state.status = RunStatus::Gating;
+        let mut outcomes = self.run_gate(&winner).await?;
+        loop {
+            // A resource-blocked outcome means the gate command never actually
+            // ran - the shared build cache could not be acquired or confirmed
+            // fresh in time - which is evidence about the machine, not about
+            // the tree (see `CommandOutcome::resource_blocked`'s own doc).
+            // Recording it as a red gate would mark a run `Blocked` on nothing
+            // but contention magi has already logged; leaving `self.state.gate`
+            // empty and `self.state.gate_ran` false instead keeps the shape
+            // this function already treats as "still needs to run" (see the
+            // early-return above), so the next call retries the command
+            // rather than concluding anything.
+            if verify_inconclusive(&outcomes) {
+                self.state.save()?;
+                return Ok(());
+            }
+            if outcomes.iter().all(CommandOutcome::ok) {
+                break;
+            }
+            match self.gate_fix_round(&winner, &outcomes).await? {
+                GateFix::Retry => outcomes = self.run_gate(&winner).await?,
+                GateFix::Stop => break,
+                GateFix::Defer => {
+                    self.state.save()?;
+                    return Ok(());
+                }
+            }
+        }
+        let passed = outcomes.iter().all(CommandOutcome::ok);
+        self.state.gate = outcomes;
+        self.state.gate_ran = true;
+        if !passed {
+            self.state.status = RunStatus::Blocked;
+            let spent = self.state.gate_fixes.len();
+            self.state.event(
+                "gate",
+                if spent == 0 {
+                    "gate failed; not merging".to_owned()
+                } else {
+                    format!("gate failed after {spent} gate-fix round(s); not merging")
+                },
+            );
+        }
+        self.state.save()?;
+        Ok(())
+    }
+
+    /// Run `verify.gate` once against the winner's current tree, logging one
+    /// event per command. Empty when nothing is configured.
+    async fn run_gate(&mut self, winner: &Candidate) -> Result<Vec<CommandOutcome>> {
         let shell = self.state.config.shell();
         let gate_commands = self.state.config.verify.gate.clone();
         // Zero commands has nothing to run and nothing that could touch the
@@ -4722,29 +4780,207 @@ impl Runner {
                 ),
             );
         }
-        // A resource-blocked outcome means the gate command never actually
-        // ran - the shared build cache could not be acquired or confirmed
-        // fresh in time - which is evidence about the machine, not about the
-        // tree (see `CommandOutcome::resource_blocked`'s own doc). Recording
-        // it as a red gate would mark a run `Blocked` on nothing but
-        // contention magi has already logged above; leaving `self.state.gate`
-        // empty and `self.state.gate_ran` false instead keeps the shape this
-        // function already treats as "still needs to run" (see the
-        // early-return above), so the next call retries the command rather
-        // than concluding anything.
-        if verify_inconclusive(&outcomes) {
-            self.state.save()?;
-            return Ok(());
+        Ok(outcomes)
+    }
+
+    /// One bounded fix round for a failing gate.
+    ///
+    /// The fixer is told the failure came from the gate itself, not from a
+    /// reviewer, and is shown the failed commands, their exit codes and a tail
+    /// of their output - whatever `[verify].gate` holds, nothing here knows
+    /// what those commands run. Only a normal non-zero exit that printed
+    /// something earns a round (see [`gate_fixable`]): a timeout, a missing
+    /// command or a full disk says nothing about the code, and a fixer sent
+    /// after it can only appease the machine. The round is judged by what git
+    /// says moved, never by the fixer's own report, and `verify.e2e` runs
+    /// again before the gate does, so a fix cannot trade a green gate for a
+    /// red e2e unnoticed.
+    async fn gate_fix_round(
+        &mut self,
+        winner: &Candidate,
+        outcomes: &[CommandOutcome],
+    ) -> Result<GateFix> {
+        let cap = self.state.config.graph.gate_fix_rounds;
+        let spent = self.state.gate_fixes.len();
+        if spent >= cap {
+            if cap > 0 {
+                self.state.event(
+                    "gate",
+                    format!("{spent} gate-fix round(s) spent and the gate still fails"),
+                );
+            }
+            return Ok(GateFix::Stop);
         }
-        let passed = outcomes.iter().all(CommandOutcome::ok);
-        self.state.gate = outcomes;
-        self.state.gate_ran = true;
-        if !passed {
-            self.state.status = RunStatus::Blocked;
-            self.state.event("gate", "gate failed; not merging");
+        if !gate_fixable(outcomes) {
+            self.state.event(
+                "gate",
+                "gate failure is not an ordinary non-zero exit with output (timeout, missing \
+                 command or similar); not spending a fix round on it",
+            );
+            return Ok(GateFix::Stop);
         }
+        let min_free = self.state.config.disk.min_free_bytes;
+        if min_free > 0 {
+            match crate::disk::free_bytes(&winner.worktree) {
+                Ok(free) if crate::disk::enough_space(free, min_free) => {}
+                Ok(free) => {
+                    self.state.event(
+                        "gate",
+                        format!(
+                            "only {free} bytes free ({min_free} required by `[disk] \
+                             min_free_bytes`); not spending a fix round on a failure the disk \
+                             may explain"
+                        ),
+                    );
+                    return Ok(GateFix::Stop);
+                }
+                Err(e) => {
+                    self.state.event(
+                        "gate",
+                        format!("free disk space could not be measured ({e:#}); no fix round"),
+                    );
+                    return Ok(GateFix::Stop);
+                }
+            }
+        }
+
+        let attempt = spent + 1;
+        let run_id = self.state.id.clone();
+        let prompts = self.state.config.prompts.clone();
+        let failed: Vec<CommandOutcome> = outcomes.iter().filter(|o| !o.ok()).cloned().collect();
+        let base = self.landing_base();
+        let (fix_spec, fix_seat_key) = self.fixer_spec(winner);
+        let seat = self.seat(&fix_seat_key, &fix_spec.id);
+        let job = SeatJob {
+            prompt: prompt::gate_fix(
+                &self.state.instruction,
+                &failed,
+                attempt,
+                cap,
+                &self.state.config.graph.language,
+            ),
+            spec: fix_spec,
+            seat,
+            cwd: winner.worktree.clone(),
+            timeout: Duration::from_secs(self.state.config.graph.timeout_fix),
+            allow_write: true,
+            sessions: self.state.config.graph.sessions,
+            artifacts: agent::artifacts_dir(&self.state.dir()),
+            stem: format!("gate-fix-{attempt}"),
+        };
+        self.state.event(
+            "gate",
+            format!("gate failed; gate-fix round {attempt} of {cap}"),
+        );
+        let before = git::rev_parse(&winner.worktree, "HEAD").await?;
+        let patch = git::diff(&winner.worktree, &base, "HEAD").await?;
+        let cache = self.state.config.cache_dir();
+        let ctx = WaveCtx {
+            run: &run_id,
+            node: "gate-fix",
+            prompts: &prompts,
+            cache: cache.as_deref(),
+            round: None,
+        };
+        let (seat, out) = run_one(job, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
+        let mut record = GateFixRecord {
+            agent: seat.agent.clone(),
+            failed,
+            notes: String::new(),
+            committed: false,
+            error: None,
+        };
+        match out {
+            AgentOutcome::Ok(o) => {
+                // A missing report is not a failed fix: the round is judged
+                // by the tree below, and the report only carries prose.
+                if let Ok(report) = verdict::extract_json::<FixReport>(&o.text) {
+                    record.notes = blind::sanitize_prose(&report.notes, &self.state.config.blind);
+                }
+            }
+            AgentOutcome::Dropped(_) => {
+                record.error = Some("the CLI dropped the stream".to_owned());
+            }
+            AgentOutcome::Quota(o) => {
+                self.state.quota.push(QuotaLoss {
+                    seat: seat.key.clone(),
+                    node: "gate-fix".to_owned(),
+                    at: Timestamp::now(),
+                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
+                });
+                record.error = Some("rate limited (quota); fixer could not run".to_owned());
+            }
+            AgentOutcome::Failed(e) => record.error = Some(e),
+        }
+        self.state.seats.insert(seat.key.clone(), seat);
+        if let Ok(r) = git::rescue_commit(
+            &winner.worktree,
+            &format!("magi: gate fix {attempt} (uncommitted work)"),
+        )
+        .await
+        {
+            self.state.note_withheld("gate-fix", &r.withheld);
+        }
+        let after = git::rev_parse(&winner.worktree, "HEAD").await?;
+        record.committed = after != before;
+        let changed = git::diff(&winner.worktree, &base, "HEAD").await? != patch;
+        let note = record.error.clone();
+        self.state.gate_fixes.push(record);
         self.state.save()?;
-        Ok(())
+        if !changed {
+            self.state.event(
+                "gate",
+                match note {
+                    Some(why) => format!("gate-fix round {attempt}: fixer failed ({why})"),
+                    None => format!("gate-fix round {attempt}: the tree did not change"),
+                },
+            );
+            return Ok(GateFix::Stop);
+        }
+        self.state.event(
+            "gate",
+            format!("gate-fix round {attempt}: tree changed vs base; re-running verify.e2e"),
+        );
+
+        let commands = self.state.config.verify.e2e.clone();
+        if !commands.is_empty() {
+            let shell = self.state.config.shell();
+            let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
+            let cache_dir = self.state.config.cache_dir();
+            let context = format!("gate-fix round {attempt}");
+            let (e2e, _) = with_cache_lease(
+                &mut self.state,
+                cache_dir.as_deref(),
+                "e2e",
+                "e2e",
+                &winner.worktree,
+                &after,
+                timeout,
+                &context,
+                |state, budget| {
+                    let shell = shell.clone();
+                    let commands = commands.clone();
+                    let context = context.clone();
+                    let worktree = winner.worktree.clone();
+                    async move {
+                        run_e2e_with_retry(state, &shell, &commands, &worktree, budget, &context)
+                            .await
+                    }
+                },
+            )
+            .await;
+            if verify_inconclusive(&e2e) {
+                return Ok(GateFix::Defer);
+            }
+            if e2e.iter().any(|o| !o.ok()) {
+                self.state.event(
+                    "gate",
+                    format!("gate-fix round {attempt}: verify.e2e failed after the fix"),
+                );
+                return Ok(GateFix::Stop);
+            }
+        }
+        Ok(GateFix::Retry)
     }
 
     // ---------------------------------------------------------------- merge
@@ -5900,6 +6136,35 @@ async fn wait_for_pids_with<F: Fn(u32) -> bool>(
 /// this is true.
 fn verify_inconclusive(outcomes: &[CommandOutcome]) -> bool {
     outcomes.iter().any(|o| o.resource_blocked)
+}
+
+/// What [`Runner::gate_fix_round`] decided.
+enum GateFix {
+    /// The tree changed and `verify.e2e` is still green: run the gate again.
+    Retry,
+    /// No more rounds, nothing to fix, or the fix did not hold: the gate's
+    /// last failure stands and the run ends blocked.
+    Stop,
+    /// `verify.e2e` could not run after the fix (magi's own contention):
+    /// decide nothing now, a later reentry retries.
+    Defer,
+}
+
+/// Is every red command in `outcomes` an ordinary failure the code could
+/// explain: it ran, exited non-zero, and said something?
+///
+/// A timeout, a spawn failure and a killed process all leave `code` `None`;
+/// 126 / 127 are the POSIX shell's "cannot execute" / "not found". Output-free
+/// exits carry nothing for a fixer to act on. Language-agnostic on purpose:
+/// what the command is stays the gate's business.
+fn gate_fixable(outcomes: &[CommandOutcome]) -> bool {
+    let mut red = outcomes.iter().filter(|o| !o.ok()).peekable();
+    red.peek().is_some()
+        && red.all(|o| {
+            !o.resource_blocked
+                && matches!(o.code, Some(c) if c != 0 && c != 126 && c != 127)
+                && !o.output_tail.trim().is_empty()
+        })
 }
 
 /// Describe one verify command's outcome for the event log, distinguishing a
