@@ -1089,10 +1089,53 @@ pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
          nothing matches or more than one checkout shares that name, ask the \
          operator which repository they mean (or run `magi repos` yourself \
          to see the candidates) rather than guessing.\n",
-        repo = repo.display(),
+        repo = shell_safe_path(repo),
     );
     out.push_str(&language_note(language));
     out
+}
+
+/// A path spelled so an agent's shell hands it on unchanged. Git Bash rewrites
+/// a `\\?\C:\...` argument into `\?\C:\...` on its way to a native exe, which
+/// no directory answers to; `C:/...` survives that conversion and Windows
+/// accepts it. Only drive-letter verbatim paths change: UNC and Unix paths
+/// are returned as they are. Pure, so it is testable on every OS.
+pub fn shell_safe_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("\\\\?\\") {
+        let b = rest.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            return rest.replace('\\', "/");
+        }
+    }
+    s.into_owned()
+}
+
+#[cfg(test)]
+mod shell_safe_path_tests {
+    use super::*;
+
+    #[test]
+    fn strips_the_verbatim_prefix_and_uses_forward_slashes() {
+        assert_eq!(
+            shell_safe_path(Path::new("\\\\?\\C:\\Users\\x\\magi")),
+            "C:/Users/x/magi"
+        );
+    }
+
+    #[test]
+    fn leaves_other_paths_alone() {
+        for p in ["\\\\?\\UNC\\host\\share", "/home/x/magi", "C:\\Users\\x"] {
+            assert_eq!(shell_safe_path(Path::new(p)), p);
+        }
+    }
+
+    #[test]
+    fn briefing_names_the_repo_without_a_verbatim_prefix() {
+        let out = briefing(Path::new("\\\\?\\C:\\Users\\x\\magi"), "en", false);
+        assert!(out.contains("--repo C:/Users/x/magi "), "{out}");
+        assert!(!out.contains("\\\\?\\"), "{out}");
+    }
 }
 
 /// The operator is talking, so their language matters here more than in most
