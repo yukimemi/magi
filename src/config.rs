@@ -681,6 +681,9 @@ pub struct Merge {
     /// request sized to the change by an agent's own judgement, so a version
     /// bump does not depend on a human remembering to cut one.
     ///
+    /// Only acts on Rust repositories (a `Cargo.toml` at the root of the base
+    /// branch); on any other repository it is a no-op that records one event.
+    ///
     /// On by default. **Turning this off means a merge landed from the phone
     /// never becomes a release**, so `POST /api/upgrade` keeps reporting
     /// "already on the newest release" against a `main` that has moved past
@@ -1572,7 +1575,8 @@ impl Config {
              # pre_gate = []\n\n\
              [merge]\n\
              # none | local | pr\n\
-             mode = \"none\"\n\n\
+             mode = \"none\"\n\
+             # release_bump = true  # Rust (Cargo.toml) repositories only; a no-op elsewhere\n\n\
              [update]\n\
              # off | notify | install — checked in the background, throttled.\n\
              mode = \"notify\"\n\

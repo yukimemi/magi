@@ -719,6 +719,33 @@ async fn find_open_release_pr(repo: &Path) -> Result<Option<(String, String)>> {
 /// `cargo`) must never turn a landed run into a failed one. The caller logs
 /// whatever this returns and moves on.
 pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
+    after_merge_at(state, pr_url, None).await
+}
+
+/// Does the base branch carry a `Cargo.toml` at its root? Release bumps read
+/// and rewrite that file, so its absence means "not a Rust repository", which
+/// is not a fault. `ls-tree` rather than `cat-file -e`, so an unresolvable
+/// ref (a failed fetch, a misconfigured base) stays an error instead of being
+/// reported as a non-Rust repository.
+async fn base_has_cargo_toml(repo: &Path, remote: &str, base: &str) -> Result<bool> {
+    let out = git::git(
+        repo,
+        &[
+            "ls-tree",
+            "--name-only",
+            &format!("{remote}/{base}"),
+            "--",
+            "Cargo.toml",
+        ],
+    )
+    .await
+    .context("look for Cargo.toml on the base branch")?;
+    Ok(!out.trim().is_empty())
+}
+
+/// [`after_merge`] with an optional magi home, so tests can point the
+/// marker and its lock at a scratch directory.
+async fn after_merge_at(state: &mut RunState, pr_url: &str, home: Option<&Path>) -> Result<()> {
     if !state.config.merge.release_bump {
         return Ok(());
     }
@@ -740,7 +767,18 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
         return Ok(());
     }
 
-    let marker = marker_path(&run::home(), &repo);
+    // Outside the lock, and before anything that assumes a Rust manifest.
+    // Fetch first so a stale remote-tracking ref cannot misjudge the base.
+    git::fetch(&repo, &remote, &base).await.ok();
+    if !base_has_cargo_toml(&repo, &remote, &base).await? {
+        state.event(
+            "bump",
+            "release bump: no Cargo.toml on the base branch; release bumps are Rust-only, skipping",
+        );
+        return Ok(());
+    }
+
+    let marker = marker_path(&home.map_or_else(run::home, Path::to_path_buf), &repo);
     // Held for the rest of this function: the whole read-decide-write
     // sequence below is the critical section two `after_merge` calls landing
     // within the same window must not both be inside at once. See
@@ -1331,6 +1369,99 @@ mod tests {
         assert!(
             state.events.is_empty(),
             "nothing should happen at all, not even a logged event"
+        );
+    }
+
+    /// A bare `origin` plus a clone of it, `main` pushed with `files`.
+    async fn origin_with(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin.git");
+        let repo = dir.path().join("repo");
+        let o = origin.to_string_lossy().into_owned();
+        git::git(dir.path(), &["init", "--bare", "-b", "main", &o])
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&repo).await.unwrap();
+        git::git(&repo, &["init", "-b", "main"]).await.unwrap();
+        git::git(&repo, &["config", "user.name", "test"])
+            .await
+            .unwrap();
+        git::git(&repo, &["config", "user.email", "test@example.com"])
+            .await
+            .unwrap();
+        for (name, body) in files {
+            tokio::fs::write(repo.join(name), body).await.unwrap();
+        }
+        git::git(&repo, &["add", "-A"]).await.unwrap();
+        git::git(&repo, &["commit", "-m", "init"]).await.unwrap();
+        git::git(&repo, &["remote", "add", "origin", &o])
+            .await
+            .unwrap();
+        git::git(&repo, &["push", "origin", "main"]).await.unwrap();
+        (dir, repo)
+    }
+
+    #[tokio::test]
+    async fn base_has_cargo_toml_tells_rust_from_non_rust() {
+        let (_d, rust) = origin_with(&[("Cargo.toml", "[package]\nversion = \"0.1.0\"\n")]).await;
+        assert!(base_has_cargo_toml(&rust, "origin", "main").await.unwrap());
+        let (_d2, other) = origin_with(&[("README.md", "hi\n")]).await;
+        assert!(!base_has_cargo_toml(&other, "origin", "main").await.unwrap());
+        // An unresolvable ref is a fault, not "not Rust".
+        assert!(base_has_cargo_toml(&other, "origin", "nope").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_repo_without_cargo_toml_skips_with_one_event_and_no_lock() {
+        let (_d, repo) = origin_with(&[("README.md", "hi\n")]).await;
+        let home = tempfile::tempdir().unwrap();
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            "0000000000000000000000000000000000000000".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        );
+        state.candidates.push(crate::run::Candidate {
+            index: 0,
+            label: 'A',
+            agent: "x".to_owned(),
+            branch: "main".to_owned(),
+            worktree: repo.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        state.tally = Some(
+            serde_json::from_value(serde_json::json!({
+                "first_choice": {}, "borda": {}, "winner": "A",
+                "unanimous_initial": true, "deliberated": false,
+                "changed_votes": 0, "unanimous_final": true,
+            }))
+            .unwrap(),
+        );
+        after_merge_at(
+            &mut state,
+            "https://example.invalid/pull/1",
+            Some(home.path()),
+        )
+        .await
+        .expect("a non-Rust repository is not an error");
+        let bumps: Vec<_> = state.events.iter().filter(|e| e.node == "bump").collect();
+        assert_eq!(bumps.len(), 1, "{:?}", state.events);
+        assert_eq!(
+            bumps[0].message,
+            "release bump: no Cargo.toml on the base branch; release bumps are Rust-only, skipping"
+        );
+        assert!(
+            std::fs::read_dir(home.path()).unwrap().next().is_none(),
+            "no marker and no lock may be created"
         );
     }
 
