@@ -1096,6 +1096,11 @@ where
             tracing::warn!("could not persist abandoned run {id}: {e:#}");
             continue;
         }
+        // This run never passes through `Runner::execute` again, so its end
+        // is announced here.
+        if let Some(notice) = notices::run_ended(&state) {
+            notices::raise_in(home, notice);
+        }
         // The seat that asked is gone for good now, exactly like any other
         // door `graph::Runner::settle_questions` closes the moment `status`
         // lands somewhere non-resumable - see that method's own doc. Nothing
@@ -2929,36 +2934,10 @@ fn prepare_instruction(
     }
 }
 
-/// The notice for a task the machine or its attempt budget has held, or that
-/// failed outright.
-///
-/// Called from [`record`], the one place every task transition is written, so
-/// holds made outside a run's own settlement - a missing blocker, a config
-/// error that used up the attempts - are announced too. Keyed on the task with
-/// wording free of anything that varies between retries.
-fn task_notice(task: &Task) -> Option<Notice> {
-    let text = match task.status {
-        TaskStatus::Held => {
-            let why = task.hold_reason.as_deref().unwrap_or("no reason recorded");
-            format!("Task {} is held: {why}.", task.short())
-        }
-        TaskStatus::Failed => format!("Task {} failed.", task.short()),
-        _ => return None,
-    };
-    Some(
-        Notice::warn(&format!("task:{}", task.id), text).link(Link::Task {
-            id: task.id.clone(),
-        }),
-    )
-}
-
 /// Persist a transition. A queue write failure is logged rather than fatal: the
 /// run already happened, and taking the daemon down would only add a lost
 /// backlog to a full disk.
 fn record(queue: &Queue, task: &mut Task) {
-    if let Some(notice) = task_notice(task) {
-        notices::raise(notice);
-    }
     if let Err(e) = queue.put(task) {
         tracing::error!("could not record task {}: {e:#}", task.short());
         notices::raise(Notice::error(
@@ -4368,17 +4347,6 @@ mod tests {
         let d = diagnostic(&state).expect("a candidate's own failure reason must be surfaced");
         assert!(d.contains("candidate A"), "{d}");
         assert!(d.contains("agent timed out"), "{d}");
-    }
-
-    #[test]
-    fn a_held_or_failed_task_raises_one_stable_notice_and_a_queued_one_none() {
-        let mut t = task();
-        assert!(task_notice(&t).is_none());
-        t.hold_machine(Some("out of attempts".to_owned()));
-        let n = task_notice(&t).expect("held");
-        assert_eq!(n.key, format!("task:{}", t.id));
-        assert!(n.message.contains("out of attempts"));
-        assert_eq!(task_notice(&t).unwrap().message, n.message);
     }
 
     #[test]

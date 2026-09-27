@@ -242,6 +242,12 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// How long a caller waits for a notice's lock before proceeding without it.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Age after which a lock file is taken to belong to a dead process.
+const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Distinguishes temp files written by threads of one process.
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -299,19 +305,80 @@ impl Notices {
         read_path(&self.path_of(id))
     }
 
+    /// Run a read-modify-write of one notice under its lock file.
+    ///
+    /// `magi serve`, `magi web` and the CLI all update the same files, and a
+    /// unique temp file only makes each write atomic - it does not stop one
+    /// process saving a stale read over another's newer raise. The lock is an
+    /// exclusive-create file beside the notice; a holder that died is broken
+    /// after [`LOCK_STALE`], and a caller that cannot get it in
+    /// [`LOCK_WAIT`] proceeds anyway rather than lose the notice.
+    fn locked<T>(&self, id: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("create {}", self.root.display()))?;
+        let lock = self.root.join(format!("{id}.lock"));
+        let start = std::time::Instant::now();
+        let mut held = false;
+        while start.elapsed() < LOCK_WAIT {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock)
+            {
+                Ok(_) => {
+                    held = true;
+                    break;
+                }
+                Err(_) => {
+                    let stale = std::fs::metadata(&lock)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > LOCK_STALE);
+                    if stale {
+                        let _ = std::fs::remove_file(&lock);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+        let out = f();
+        if held {
+            let _ = std::fs::remove_file(&lock);
+        }
+        out
+    }
+
     /// File a notice, folding it into an existing one with the same key.
     pub fn raise(&self, incoming: Notice) -> Result<Notice> {
-        let now = Timestamp::now();
-        let stored = match read_path(&self.path_of(&incoming.id)) {
-            Ok(mut existing) => {
-                existing.raise_again(&incoming, now);
-                existing
-            }
-            Err(_) => incoming,
-        };
-        self.put(&stored)?;
+        let stored = self.locked(&incoming.id.clone(), || {
+            let now = Timestamp::now();
+            let stored = match read_path(&self.path_of(&incoming.id)) {
+                Ok(mut existing) => {
+                    existing.raise_again(&incoming, now);
+                    existing
+                }
+                Err(_) => incoming,
+            };
+            self.put(&stored)?;
+            Ok(stored)
+        })?;
         self.prune();
         Ok(stored)
+    }
+
+    /// Load, change and save one notice under its lock.
+    fn update(&self, id: &str, change: impl FnOnce(&mut Notice)) -> Result<Notice> {
+        if !valid_id(id) {
+            bail!("`{id}` is not a notification id");
+        }
+        self.locked(id, || {
+            let mut n = read_path(&self.path_of(id))?;
+            change(&mut n);
+            self.put(&n)?;
+            Ok(n)
+        })
     }
 
     /// Every notice on disk, unreadable files skipped, newest first.
@@ -343,30 +410,29 @@ impl Notices {
 
     /// Mark read, keeping the first read time.
     pub fn mark_read(&self, id: &str) -> Result<Notice> {
-        let mut n = self.get(id)?;
-        n.mark_read(Timestamp::now());
-        self.put(&n)?;
-        Ok(n)
+        let now = Timestamp::now();
+        self.update(id, |n| n.mark_read(now))
     }
 
     /// Mark every unread notice read; returns how many changed.
     pub fn mark_all_read(&self) -> Result<usize> {
         let now = Timestamp::now();
         let mut changed = 0;
-        for mut n in self.all().into_iter().filter(Notice::unread) {
-            n.mark_read(now);
-            self.put(&n)?;
-            changed += 1;
+        for n in self.all().into_iter().filter(Notice::unread) {
+            // Re-read under the lock: a raise since the scan may have made it
+            // a different, still-unread notice, which stays as it is.
+            let done = self.update(&n.id, |n| n.mark_read(now));
+            if done.is_ok() {
+                changed += 1;
+            }
         }
         Ok(changed)
     }
 
     /// Tombstone: read and hidden from the list.
     pub fn dismiss(&self, id: &str) -> Result<Notice> {
-        let mut n = self.get(id)?;
-        n.dismiss(Timestamp::now());
-        self.put(&n)?;
-        Ok(n)
+        let now = Timestamp::now();
+        self.update(id, |n| n.dismiss(now))
     }
 
     /// Keep at most [`CAP`] files. Best-effort.
@@ -450,6 +516,30 @@ pub fn run_ended(state: &crate::run::RunState) -> Option<Notice> {
             id: state.id.clone(),
         })
     })
+}
+
+/// The notice for a task the machine or its attempt budget has held, if it is.
+///
+/// Called from [`crate::queue::Queue::put`], which every task transition goes
+/// through, so a hold made anywhere - the loop, the conductor, triage, a
+/// dependency removed from under a blocked task - is announced. A hold the
+/// operator placed by hand is their own action and is not news. Keyed on the
+/// task, with wording free of anything that varies between retries.
+pub fn task_held(task: &crate::queue::Task) -> Option<Notice> {
+    use crate::queue::{HoldSource, TaskStatus};
+    if task.status != TaskStatus::Held || task.hold_source != Some(HoldSource::Machine) {
+        return None;
+    }
+    let why = task.hold_reason.as_deref().unwrap_or("no reason recorded");
+    Some(
+        Notice::warn(
+            &format!("task:{}", task.id),
+            format!("Task {} is held: {why}.", task.short()),
+        )
+        .link(Link::Task {
+            id: task.id.clone(),
+        }),
+    )
 }
 
 /// The notice for a run whose graph returned an error before it settled.
@@ -667,5 +757,40 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
             .count();
         assert_eq!(stray, 0);
+    }
+
+    #[test]
+    fn a_dead_holders_lock_is_broken_and_no_lock_is_left_behind() {
+        let (_d, s) = store();
+        let n = s.raise(Notice::info("k", "m")).unwrap();
+        let lock = s.root().join(format!("{}.lock", n.id));
+        std::fs::write(&lock, "").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        s.mark_read(&n.id).unwrap();
+        assert!(!lock.exists());
+        assert!(s.get(&n.id).unwrap().read_at.is_some());
+    }
+
+    #[test]
+    fn only_a_machine_hold_is_a_task_notice() {
+        let mut t = crate::queue::Task::new(
+            "t".to_owned(),
+            "do it".to_owned(),
+            std::path::PathBuf::from("/repo"),
+            crate::queue::Source::Human,
+        );
+        assert!(task_held(&t).is_none());
+        t.hold_manual(None);
+        assert!(task_held(&t).is_none(), "the operator's own hold");
+        t.hold_machine(Some("missing blocker".to_owned()));
+        let n = task_held(&t).expect("machine hold");
+        assert_eq!(n.key, format!("task:{}", t.id));
+        assert!(n.message.contains("missing blocker"));
     }
 }
