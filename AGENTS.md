@@ -1199,3 +1199,27 @@ go into a task file:
     absence of `artifacts/*.out`.
   - An opencode judge dropped out on a permission refusal, and the report showed
     it only as one ranking fewer.
+
+### The notification centre is not the question queue
+
+`src/notices.rs` backs the web header's bell. A notice is something to *know*
+(a failed release bump, a blocked run, a held task, a disk hold), never
+something to answer, so it does not reuse `ask::Questions`.
+
+- **Dedupe key = kind + subject, never prose** (`release-bump:<run>`,
+  `task:<id>`, `disk:<repo>`). The file name is derived from the key by a
+  stable FNV-1a (`notices::id_of`) - not `DefaultHasher` - so processes and
+  builds agree on it and no lock is needed. Keep producer messages free of
+  anything that varies between retries: a changed message relights a read
+  notice, so a number in the wording turns a retry loop into a flood.
+- **Dismiss is a tombstone.** An identical re-raise does not resurrect it; a
+  changed message or a higher severity does. Consequence accepted: a real
+  recurrence with identical wording stays hidden until the 200-notice cap
+  prunes the tombstone.
+- **`notifications_rev` lives in three places that must stay aligned**: the
+  `events` tuple, `HealthView`, and `applyRevisions_` / the initial load in
+  `app.js`. Miss one and the badge stops updating live (health is the
+  fallback when the stream is down).
+- **Producers go through `notices::raise` / `raise_in`** and are best-effort:
+  a failed write is a `tracing::warn`, never a failed run. `raise` is a no-op
+  in a unit test that never pinned a home (`run::try_home`).

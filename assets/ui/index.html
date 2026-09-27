@@ -55,6 +55,17 @@
     <a class="rail-link btn btn-gold" href="#/chat" data-nav="talks">Chat<span class="badge" id="talk-badge-rail" hidden></span></a>
   </nav>
 
+  <!-- The notification centre: things that need a look but are not a question
+       to answer. The badge is the unread count, kept live by the change
+       stream's notifications_rev. -->
+  <a class="icon-btn bell" href="#/notifications" id="bell" data-nav="notifications" aria-label="Notifications">
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M6 9a6 6 0 0 1 12 0c0 6 2 7.5 2 7.5H4S6 15 6 9z"/>
+      <path d="M10 20a2 2 0 0 0 4 0"/>
+    </svg>
+    <span class="badge" id="bell-badge" hidden></span>
+  </a>
+
   <button class="icon-btn" type="button" id="theme-toggle" aria-label="Colour theme: follow system">
     <span class="theme-glyph" aria-hidden="true"></span>
   </button>
@@ -293,6 +304,22 @@
       No agent is waiting on a decision. When one asks, its run parks here
       until you answer — and answered questions stay, as the record of what
       you decided and when.
+    </p>
+  </section>
+
+  <!-- NOTIFICATIONS ------------------------------------------------------ -->
+  <section class="view" id="view-notifications" aria-labelledby="notifications-h" hidden>
+    <div class="view-head">
+      <h1 id="notifications-h">Notifications</h1>
+      <p class="view-sub" id="notifications-count">Loading…</p>
+    </div>
+    <div class="notice-tools">
+      <button class="btn btn-quiet" type="button" id="notifications-read-all">Mark all read</button>
+    </div>
+    <ol class="notices" id="notifications-list"></ol>
+    <p class="empty" id="notifications-empty" hidden>
+      Nothing needs your attention. Failed release bumps, blocked runs and held
+      tasks show up here instead of only in a log.
     </p>
   </section>
 

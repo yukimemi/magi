@@ -117,6 +117,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::ask::{Answer, Question, Questions};
 use crate::config::{Config, Update, UpdateMode};
 use crate::md;
+use crate::notices::{Notice, Notices};
 use crate::proc::Quiet as _;
 use crate::queue::{Queue, Task, title_from};
 use crate::run::{RunState, RunStatus};
@@ -289,6 +290,9 @@ impl Default for Opts {
 pub struct Ui {
     queue: Queue,
     questions: Questions,
+    /// `<home>/notifications`, the bell's own store. Derived from `home` in
+    /// [`Ui::new`] so no constructor signature had to grow.
+    notices: Notices,
     talks: Talks,
     runs: PathBuf,
     home: PathBuf,
@@ -387,6 +391,7 @@ impl Ui {
         Self {
             queue,
             questions,
+            notices: Notices::at(home.join("notifications")),
             talks,
             runs,
             home,
@@ -795,6 +800,13 @@ impl Ui {
             .route("/api/questions/{id}/panel/index.html", get(question_panel))
             .route("/api/questions/{id}/panel/{name}", get(question_asset))
             .route("/api/questions/{id}/asset/{name}", get(question_asset))
+            .route("/api/notifications", get(notifications_list))
+            .route("/api/notifications/read-all", post(notifications_read_all))
+            .route("/api/notifications/{id}/read", post(notification_read))
+            .route(
+                "/api/notifications/{id}/dismiss",
+                post(notification_dismiss),
+            )
             .route("/api/talks", get(talks_list).post(talk_post))
             .route("/api/talks/{id}", get(talk_detail).delete(talk_delete))
             .route("/api/talks/{id}/say", post(talk_say))
@@ -1444,6 +1456,11 @@ struct HealthView {
     questions_rev: u64,
     /// See [`HealthView::questions_rev`]. The standing chat's own store.
     talks_rev: u64,
+    /// See [`HealthView::questions_rev`]. The notification centre's store.
+    notifications_rev: u64,
+    /// Notifications nobody has read yet: the bell's badge before
+    /// `/api/notifications` has answered.
+    notifications_unread: usize,
     /// See [`HealthView::questions_rev`]. The loop's counter is the one that
     /// is not on disk anywhere, so a phone with no change stream has no other
     /// way to notice that the loop it is waiting on was started from another
@@ -1760,6 +1777,8 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             runs_rev: runs_revision(&ui.runs),
             questions_rev: ui.questions.revision(),
             talks_rev: ui.talks.revision(),
+            notifications_rev: ui.notices.revision(),
+            notifications_unread: ui.notices.count_unread(),
             loop_rev,
             runs_unreadable: runs_unreadable(&ui.runs),
             questions_open: ui.questions.count_open(),
@@ -2906,7 +2925,7 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(4);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(POLL);
-        let mut last: Option<(u64, u64, u64, u64, u64)> = None;
+        let mut last: Option<(u64, u64, u64, u64, u64, u64)> = None;
         loop {
             // The first tick completes immediately, which is what makes the
             // stream announce the current revisions on connect.
@@ -2918,6 +2937,7 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
                     runs_revision(&state.runs),
                     state.questions.revision(),
                     state.talks.revision(),
+                    state.notices.revision(),
                     // The loop's counter is in-process state rather than a
                     // file, so nothing the three stats above look at would
                     // tell this phone that another one started the loop.
@@ -2935,7 +2955,8 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
                 "runs_rev": revisions.1,
                 "questions_rev": revisions.2,
                 "talks_rev": revisions.3,
-                "loop_rev": revisions.4,
+                "notifications_rev": revisions.4,
+                "loop_rev": revisions.5,
             });
             // Serializing five integers cannot fail; giving up beats looping.
             let Ok(event) = Event::default().event("change").json_data(payload) else {
@@ -3113,6 +3134,50 @@ async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<Questio
                 .map(QuestionView::from)
                 .collect(),
         ))
+    })
+    .await
+}
+
+/// `GET /api/notifications`: not dismissed, newest first, with the unread
+/// count so the badge and the list cannot disagree.
+async fn notifications_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<serde_json::Value>> {
+    blocking(move || {
+        let items = ui.notices.list();
+        let unread = items.iter().filter(|n| n.unread()).count();
+        Ok(Json(
+            serde_json::json!({ "unread": unread, "items": items }),
+        ))
+    })
+    .await
+}
+
+fn notice_error(e: anyhow::Error) -> ApiError {
+    // An unknown or malformed id and a vanished file are the same answer to
+    // the phone: that notification is gone.
+    ApiError::not_found(format!("{e:#}"))
+}
+
+/// `POST /api/notifications/{id}/read`.
+async fn notification_read(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Notice>> {
+    blocking(move || ui.notices.mark_read(&id).map(Json).map_err(notice_error)).await
+}
+
+/// `POST /api/notifications/{id}/dismiss`.
+async fn notification_dismiss(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Notice>> {
+    blocking(move || ui.notices.dismiss(&id).map(Json).map_err(notice_error)).await
+}
+
+/// `POST /api/notifications/read-all`.
+async fn notifications_read_all(State(ui): State<Arc<Ui>>) -> ApiResult<Json<serde_json::Value>> {
+    blocking(move || {
+        let changed = ui.notices.mark_all_read()?;
+        Ok(Json(serde_json::json!({ "marked": changed })))
     })
     .await
 }
@@ -5206,6 +5271,56 @@ mod tests {
             .await;
         assert_eq!(res.status, 404, "{}", res.body);
         assert!(res.json()["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn notifications_list_read_dismiss_and_health_agree() {
+        let fx = Fixture::start().await;
+        let store = Notices::at(fx.home.path().join("notifications"));
+        assert_eq!(fx.get("/api/notifications").await.json()["unread"], 0);
+        let rev0 = fx.get("/api/health").await.json()["notifications_rev"].clone();
+
+        let a = store.raise(Notice::warn("task:1", "held")).unwrap();
+        let b = store.raise(Notice::error("run:2", "blocked")).unwrap();
+
+        let health = fx.get("/api/health").await.json();
+        assert_eq!(health["notifications_unread"], 2);
+        assert_ne!(
+            health["notifications_rev"], rev0,
+            "the badge must move live"
+        );
+
+        let listed = fx.get("/api/notifications").await.json();
+        assert_eq!(listed["unread"], 2);
+        assert_eq!(listed["items"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["items"][0]["severity"], "error", "newest first");
+
+        let read = fx
+            .post(&format!("/api/notifications/{}/read", a.id), None)
+            .await;
+        assert_eq!(read.status, 200, "{}", read.body);
+        assert_eq!(fx.get("/api/notifications").await.json()["unread"], 1);
+
+        let gone = fx
+            .post(&format!("/api/notifications/{}/dismiss", b.id), None)
+            .await;
+        assert_eq!(gone.status, 200, "{}", gone.body);
+        let listed = fx.get("/api/notifications").await.json();
+        assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["unread"], 0);
+
+        store.raise(Notice::info("x", "again")).unwrap();
+        let all = fx.post("/api/notifications/read-all", None).await;
+        assert_eq!(all.status, 200, "{}", all.body);
+        assert_eq!(all.json()["marked"], 1);
+        assert_eq!(
+            fx.get("/api/health").await.json()["notifications_unread"],
+            0
+        );
+
+        let missing = fx.post("/api/notifications/nope/read", None).await;
+        assert_eq!(missing.status, 404, "{}", missing.body);
+        assert!(missing.json()["error"].is_string());
     }
 
     /// New work reaches the queue through `magi task add`, a standing talk's
@@ -7447,6 +7562,7 @@ mod tests {
                 && payload["runs_rev"].is_u64()
                 && payload["questions_rev"].is_u64()
                 && payload["talks_rev"].is_u64()
+                && payload["notifications_rev"].is_u64()
                 && payload["loop_rev"].is_u64(),
             "the client needs one revision per store to know what to refetch, \
              and `talks_rev` is the only notification a standing talk gets - a \
@@ -7467,6 +7583,7 @@ mod tests {
             "runs_rev",
             "questions_rev",
             "talks_rev",
+            "notifications_rev",
             "loop_rev",
         ] {
             assert!(

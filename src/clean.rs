@@ -83,7 +83,18 @@ pub async fn housekeep(
                 out.folded = folded;
                 out.unreadable = unreadable;
             }
-            Err(e) => tracing::warn!("housekeep: fold due runs: {e:#}"),
+            Err(e) => {
+                tracing::warn!("housekeep: fold due runs: {e:#}");
+                // Stable wording: the reason varies per pass, and a changed
+                // message would relight the bell on every retry.
+                crate::notices::raise_in(
+                    home,
+                    crate::notices::Notice::warn(
+                        "housekeep:fold",
+                        "Automatic cleanup of finished runs failed; disk usage may keep growing.",
+                    ),
+                );
+            }
         }
         out.orphaned_worktrees =
             fold_orphaned_worktrees(&runs, worktrees_root, home, cfg.disk.fold_grace_secs, now)

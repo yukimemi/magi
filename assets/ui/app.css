@@ -260,6 +260,8 @@ a { color: inherit; text-decoration: none; }
   color: var(--ink-2); cursor: pointer; font: inherit;
 }
 .icon-btn:active { background: var(--sunk); }
+.icon-btn { position: relative; }
+.bell .badge { position: absolute; top: 2px; right: 0; background: var(--rust); color: #fff; }
 .icon-btn svg { width: 20px; height: 20px; }
 
 /* Sun / moon / auto, drawn in CSS so the toggle costs no markup and no fetch. */
@@ -1853,3 +1855,22 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
   .card, .panel { box-shadow: none; break-inside: avoid; }
   .report { max-height: none; white-space: pre-wrap; }
 }
+
+/* ---- notification centre ------------------------------------------------ */
+.notice-tools { display: flex; justify-content: flex-end; }
+.notices { display: flex; flex-direction: column; gap: var(--s3); list-style: none; margin: 0; padding: 0; }
+.notice {
+  display: flex; flex-direction: column; gap: var(--s2);
+  padding: var(--s3) var(--s4);
+  background: var(--surface); border: 1px solid var(--edge); border-left: 4px solid var(--ink-3);
+  border-radius: var(--radius);
+}
+.notice[data-sev="warn"] { border-left-color: var(--gold); }
+.notice[data-sev="error"] { border-left-color: var(--rust); }
+.notice[data-read="1"] { opacity: .68; }
+.notice-msg { font-size: var(--t3); overflow-wrap: anywhere; }
+.notice[data-read="0"] .notice-msg { font-weight: 600; }
+.notice-meta { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: center; font-size: var(--t2); color: var(--ink-3); }
+.notice-meta a { color: var(--ink-2); display: inline-flex; align-items: center; min-height: var(--tap); }
+.notice-actions { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.notice-actions .btn { flex: 1 1 8rem; }
