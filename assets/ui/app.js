@@ -23,6 +23,7 @@ const API = {
   run: (id) => `/api/runs/${encodeURIComponent(id)}`,
   deleteRun: (id) => `/api/runs/${encodeURIComponent(id)}`,
   foldRun: (id) => `/api/runs/${encodeURIComponent(id)}/fold`,
+  foldMergedRun: (id) => `/api/runs/${encodeURIComponent(id)}/fold-merged`,
   resumeRun: (id) => `/api/runs/${encodeURIComponent(id)}/resume`,
   report: (id) => `/api/runs/${encodeURIComponent(id)}/report`,
   queue: "/api/queue",
@@ -4647,6 +4648,7 @@ function renderRunDetail() {
   renderQuota(run);
   renderTimeline(run);
   renderRunActions(run);
+  renderRunFoldMerged(run);
   renderRunDelete(run);
 
   setText($("run-report"), report === null ? "Loading\u2026" : report);
@@ -4803,6 +4805,86 @@ async function resumeRun(id) {
     fail(`Could not resume run ${shortId(id)}: ${error.message}`);
   } finally {
     resumeBusy = null;
+  }
+}
+
+let armedFoldMerged = null;
+let foldMergedBusy = null;
+
+/* Covers the gap `magi fold --merged <pr-url>` exists for: a run that
+   stopped `blocked` because magi never got as far as opening a pull request
+   of its own, which the operator then finished by hand on a pull request
+   magi never recorded. Shown only for exactly that shape — `blocked` with
+   no `merge` outcome recorded — since a run magi did land through its own
+   loop already has its own record of what happened. */
+function renderRunFoldMerged(run) {
+  const box = $("run-fold-merged-box");
+  if (!box) return;
+  clear(box);
+
+  const status = String(run.status || "");
+  if (status !== "blocked" || run.merge) return;
+
+  if (armedFoldMerged === run.id) {
+    const input = el("input", {
+      type: "text",
+      placeholder: "https://github.com/owner/repo/pull/123",
+    });
+    const cancel = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Cancel",
+      onclick: () => { armedFoldMerged = null; renderRunFoldMerged(run); },
+    });
+    const confirm = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: foldMergedBusy === run.id ? "Recording…" : "Record as merged",
+      disabled: foldMergedBusy === run.id,
+      onclick: () => foldMergedRun(run.id, input.value),
+    });
+    box.append(
+      el("div", { class: "stakes-confirm" },
+        el("p", { class: "card-note", text: "Paste the pull request the operator merged by hand. This confirms it is actually merged, records the run as landed, and folds its worktrees." }),
+        input,
+        el("div", { class: "stakes-row" }, cancel, confirm),
+      ),
+    );
+    requestAnimationFrame(() => input.focus({ preventScroll: true }));
+  } else {
+    box.append(
+      el("div", { class: "stakes-confirm" },
+        el("button", {
+          class: "btn btn-quiet",
+          type: "button",
+          text: "Record as merged…",
+          onclick: () => { armedFoldMerged = run.id; renderRunFoldMerged(run); },
+        }),
+        el("p", { class: "card-note", text: "For when this run's branch was merged outside of magi — no pull request magi opened itself is recorded here." }),
+      ),
+    );
+  }
+}
+
+async function foldMergedRun(id, prUrl) {
+  const url = String(prUrl || "").trim();
+  if (!url) {
+    fail("Paste the pull request's URL first.");
+    return;
+  }
+  foldMergedBusy = id;
+  try {
+    const out = await postJson(API.foldMergedRun(id), { pr_url: url });
+    ok();
+    announce(`Recorded ${shortId(id)} as merged via ${url}: ${out.before} → ${out.after}.`);
+    armedFoldMerged = null;
+    closeRunActions();
+    await loadRun(id);
+  } catch (error) {
+    closeRunActions();
+    fail(`Could not record ${shortId(id)} as merged: ${error.message}`);
+  } finally {
+    foldMergedBusy = null;
   }
 }
 

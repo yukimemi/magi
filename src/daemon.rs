@@ -2432,6 +2432,12 @@ async fn janitor(repo: &Path, opts: &Opts, home: &Path, worktrees_root: &Path) {
         };
         tracing::info!("housekeep: folded {} run(s){detail}", out.folded);
     }
+    if out.external_merges_recorded > 0 {
+        tracing::info!(
+            "housekeep: recorded {} run(s) as merged externally",
+            out.external_merges_recorded
+        );
+    }
     if out.cache_files > 0 {
         tracing::info!(
             "housekeep: pruned {} file(s) ({} bytes) from the shared cache",

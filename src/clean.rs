@@ -59,6 +59,11 @@ pub struct Housekeeping {
     /// Open questions abandoned because the run that asked them has already
     /// settled where nothing is coming back to read an answer.
     pub questions_abandoned: usize,
+    /// Runs found blocked on a merge magi never recorded — a pull request the
+    /// operator merged by hand while `land::land` never got as far as
+    /// opening one itself — and corrected automatically. See
+    /// [`reconcile_external_merges`].
+    pub external_merges_recorded: usize,
 }
 
 /// Run the janitor: fold due runs, reclaim orphaned worktrees, prune stale
@@ -105,6 +110,7 @@ pub async fn housekeep(
         if let Err(e) = crate::git::worktree_prune(repo).await {
             tracing::warn!("housekeep: prune worktree registrations: {e:#}");
         }
+        out.external_merges_recorded = reconcile_external_merges(&runs, home, &cfg.disk, now).await;
     }
     match prune_cache_if_over_limit(cfg, home) {
         Ok(Some(pruned)) => {
@@ -277,6 +283,141 @@ fn read_meta(runs: &Path, id: &str) -> Result<Meta> {
     let meta: Meta =
         serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
     Ok(meta)
+}
+
+/// Runs checked against GitHub in one janitor pass, at most.
+///
+/// A fleet with many stuck runs must not turn every idle tick into a burst of
+/// `gh pr list` calls; a run left unchecked this pass is checked again next
+/// pass, same as an unfolded due run is.
+const MAX_EXTERNAL_MERGE_CHECKS_PER_PASS: usize = 5;
+
+/// The fields [`reconcile_external_merges`] filters on before paying for a
+/// full [`RunState`] parse or a `gh` round trip.
+#[derive(Deserialize)]
+struct ExternalMergeMeta {
+    status: RunStatus,
+    updated_at: Timestamp,
+    #[serde(default)]
+    merge: Option<crate::run::MergeOutcome>,
+}
+
+fn read_external_merge_meta(runs: &Path, id: &str) -> Result<ExternalMergeMeta> {
+    let path = runs.join(id).join("run.json");
+    let body =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let meta: ExternalMergeMeta =
+        serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
+    Ok(meta)
+}
+
+/// Is a run worth asking GitHub about?
+///
+/// Pure, so the filter itself is assertable without a fixture that writes
+/// `run.json` files or spawns `gh`. Narrower than "blocked": `merge_recorded`
+/// excludes a run `land::land` already finished landing (successfully or
+/// not) - that path already carries its own record of what happened - and
+/// `due` gives an operator who is about to fix a run by hand a grace window
+/// before the janitor starts asking the same question about it.
+pub fn eligible_for_external_merge_check(
+    status: RunStatus,
+    merge_recorded: bool,
+    updated_at: Timestamp,
+    now: Timestamp,
+    grace_secs: u64,
+) -> bool {
+    status == RunStatus::Blocked && !merge_recorded && due(now, updated_at, grace_secs)
+}
+
+/// Close the gap `magi fold --merged` exists for, without waiting for an
+/// operator to notice and go find the pull request URL: a run that stopped
+/// `Blocked` with no `merge` recorded may have been merged anyway, by hand,
+/// on a pull request `land::land` never opened or never got to observe as
+/// merged. `land::find_external_merge` asks GitHub about the run's own
+/// winning branch, and only a pull request it can uniquely tie back to this
+/// run is ever acted on - see that function's own doc for what "uniquely"
+/// excludes.
+///
+/// A run this finds and fixes goes through [`crate::land::correct_manual_merge`]
+/// exactly as `magi fold --merged` would, then through [`crate::graph::fold_run`]
+/// so it stops holding worktrees the moment it stops needing them. A run this
+/// cannot decide about - `gh` unreachable, more than one candidate pull
+/// request, nothing found at all - is left exactly as it is; only an error
+/// asking GitHub raises a notice, since "nothing found" is the ordinary,
+/// expected shape of a run that really is just blocked.
+async fn reconcile_external_merges(runs: &Path, home: &Path, disk: &Disk, now: Timestamp) -> usize {
+    let mut ids: Vec<String> = std::fs::read_dir(runs)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().join("run.json").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    ids.sort_unstable();
+
+    let mut reconciled = 0usize;
+    let mut checked = 0usize;
+    for id in ids {
+        if checked >= MAX_EXTERNAL_MERGE_CHECKS_PER_PASS {
+            break;
+        }
+        if crate::daemon::is_working_on(home, &id, now) {
+            continue;
+        }
+        let meta = match read_external_merge_meta(runs, &id) {
+            Ok(meta) => meta,
+            // Already counted as unreadable by `fold_due`'s own pass; not
+            // worth a second warning for the same file.
+            Err(_) => continue,
+        };
+        if !eligible_for_external_merge_check(
+            meta.status,
+            meta.merge.is_some(),
+            meta.updated_at,
+            now,
+            disk.fold_grace_secs,
+        ) {
+            continue;
+        }
+        checked += 1;
+        let mut state = match read_state(runs, &id) {
+            Ok(state) => state,
+            Err(_) => continue,
+        };
+        match crate::land::find_external_merge(&state).await {
+            Ok(Some(found)) => {
+                match crate::land::correct_manual_merge(&mut state, &found.url).await {
+                    Ok(_) => {
+                        if let Err(e) = crate::graph::fold_run(&mut state, true, home).await {
+                            tracing::warn!(
+                                "housekeep: fold {id} after recording its external merge: {e:#}"
+                            );
+                        }
+                        reconciled += 1;
+                    }
+                    Err(e) => tracing::warn!(
+                        "housekeep: record external merge {} for {id}: {e:#}",
+                        found.url
+                    ),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("housekeep: check external merge for {id}: {e:#}");
+                crate::notices::raise_in(
+                    home,
+                    crate::notices::Notice::warn(
+                        &format!("merged-unrecorded:{id}"),
+                        format!(
+                            "Run {id} is blocked with no recorded merge, and checking GitHub \
+                             for a merge failed; check by hand."
+                        ),
+                    ),
+                );
+            }
+        }
+    }
+    reconciled
 }
 
 /// Read a whole run state from a runs directory, for folding only.
@@ -623,6 +764,104 @@ mod tests {
         assert!(!due(now, edge, grace));
         // A zero grace folds everything, ever.
         assert!(due(now, old, 0));
+    }
+
+    #[test]
+    fn a_run_qualifies_for_an_external_merge_check_only_when_blocked_unmerged_and_due() {
+        let now = ts("2026-09-05T00:00:00Z");
+        let grace = 600;
+        let old = now - SignedDuration::new(601, 0);
+        let fresh = now - SignedDuration::new(599, 0);
+
+        assert!(
+            eligible_for_external_merge_check(RunStatus::Blocked, false, old, now, grace),
+            "blocked, unmerged, and past its grace period is exactly the run this exists for"
+        );
+        assert!(
+            !eligible_for_external_merge_check(RunStatus::Blocked, false, fresh, now, grace),
+            "an operator mid-fix deserves the same grace window `fold_due` gives before \
+             the janitor starts asking GitHub about it"
+        );
+        assert!(
+            !eligible_for_external_merge_check(RunStatus::Blocked, true, old, now, grace),
+            "a run `land::land` already recorded a merge outcome for has its own answer \
+             already; this check is only for a run with nothing recorded at all"
+        );
+        assert!(
+            !eligible_for_external_merge_check(RunStatus::Stalled, false, old, now, grace),
+            "stalled is not blocked - it means the tally never reached quorum, which a \
+             pull request cannot fix"
+        );
+        assert!(
+            !eligible_for_external_merge_check(RunStatus::Ready, false, old, now, grace),
+            "ready has nothing to correct - it was never landed by design"
+        );
+    }
+
+    fn write_blocked_run(runs: &Path, id: &str, updated_at: Timestamp) {
+        let mut state = RunState::new(
+            PathBuf::from("/nonexistent/repo"),
+            "main".to_owned(),
+            "0000000000000000000000000000000000000000".to_owned(),
+            String::new(),
+            crate::config::Config::default(),
+        );
+        state.id = id.to_owned();
+        state.status = RunStatus::Blocked;
+        state.updated_at = updated_at;
+        std::fs::create_dir_all(runs.join(id)).unwrap();
+        std::fs::write(
+            runs.join(id).join("run.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// No run here can be confirmed merged - one has no repository `gh` can
+    /// even ask about, one has not sat blocked long enough, and one is
+    /// claimed by a live daemon - so the sweep must leave every one of them
+    /// exactly as it found them and never panic on the failures in between.
+    #[tokio::test]
+    async fn reconcile_external_merges_leaves_ineligible_and_unconfirmable_runs_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let home = dir.path().to_path_buf();
+        std::fs::create_dir_all(&runs).unwrap();
+
+        let now = ts("2026-09-05T00:00:00Z");
+        let disk = Disk {
+            fold_grace_secs: 600,
+            ..Disk::default()
+        };
+
+        let due_id = "20260905-000000-blkd";
+        write_blocked_run(&runs, due_id, ts("2026-08-01T00:00:00Z"));
+
+        let fresh_id = "20260905-000000-fres";
+        write_blocked_run(&runs, fresh_id, now);
+
+        let live_id = "20260905-000000-live";
+        write_blocked_run(&runs, live_id, ts("2026-08-01T00:00:00Z"));
+        let mut status = crate::daemon::Status::new();
+        status.current = vec![crate::daemon::Current {
+            task: "20260905-000000-task".to_owned(),
+            run: live_id.to_owned(),
+        }];
+        status.updated_at = now;
+        crate::daemon::write_status_to(&home.join("daemon.json"), &status).unwrap();
+
+        let reconciled = reconcile_external_merges(&runs, &home, &disk, now).await;
+        assert_eq!(
+            reconciled, 0,
+            "an unreachable repository can never be confirmed merged"
+        );
+        for id in [due_id, fresh_id, live_id] {
+            assert_eq!(
+                read_meta(&runs, id).unwrap().status,
+                RunStatus::Blocked,
+                "{id} must be left exactly as it was found"
+            );
+        }
     }
 
     #[test]
