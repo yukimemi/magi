@@ -6525,10 +6525,20 @@ fn pr_message(state: &RunState, winner: char) -> PrMessage {
         .find(|c| c.label == winner)
         .map(|c| c.summary.as_str())
         .unwrap_or_default();
-    // The fallback is the operator's own words, not something generated, so it
-    // may be in the task's language; only the summary path is prompted English.
-    let title = summary_title(summary)
-        .unwrap_or_else(|| queue::title_from(&state.instruction, PR_TITLE_MAX));
+    // The fallback is the operator's own words and may not be English; GitHub
+    // text always is, so a non-English task gets a neutral title instead.
+    let title = summary_title(summary).unwrap_or_else(|| {
+        let t = queue::title_from(&state.instruction, PR_TITLE_MAX);
+        if t.is_ascii() && t.chars().any(|c| c.is_ascii_alphabetic()) {
+            t
+        } else {
+            format!(
+                "chore: land candidate {} of run {}",
+                winner.to_ascii_uppercase(),
+                state.id
+            )
+        }
+    });
 
     let mut body = String::new();
     let what = summary_without_title(summary);
@@ -6583,7 +6593,13 @@ fn pr_message(state: &RunState, winner: char) -> PrMessage {
         winner.to_ascii_lowercase()
     ));
 
-    PrMessage { title, body }
+    // Prompts are advisory; this is the enforced half of the confidentiality
+    // rule, and it covers the verbatim task in <details> too.
+    let id = crate::scrub::Identity::current();
+    PrMessage {
+        title: crate::scrub::scrub(&title, &id),
+        body: crate::scrub::scrub(&body, &id),
+    }
 }
 
 /// `gh pr create`, returning the PR url.
@@ -8946,7 +8962,10 @@ mod tests {
         let mut state = state_with_summary(task, "- no title line");
         state.config.graph.language = "ja".to_owned();
         let m = pr_message(&state, 'A');
-        assert_eq!(m.title, task);
+        assert_eq!(
+            m.title,
+            format!("chore: land candidate A of run {}", state.id)
+        );
         assert!(
             m.body.contains(&format!(
                 "<summary>Original task</summary>\n\n{task}\n\n</details>"
@@ -8954,6 +8973,19 @@ mod tests {
             "{}",
             m.body
         );
+    }
+
+    #[test]
+    fn pr_message_scrubs_home_paths_and_addresses() {
+        let state = state_with_summary(
+            "fix it in /Users/someone/src/x",
+            "TITLE: fix(x): y\n- edited /home/someone/repo/src/a.rs on 10.1.2.3",
+        );
+        let m = pr_message(&state, 'A');
+        for leak in ["/Users/someone", "/home/someone", "10.1.2.3"] {
+            assert!(!m.body.contains(leak), "{}", m.body);
+        }
+        assert!(m.body.contains("~/repo/src/a.rs"), "{}", m.body);
     }
 
     #[test]

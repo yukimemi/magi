@@ -44,6 +44,7 @@ pub mod report;
 pub mod repos;
 pub mod rng;
 pub mod run;
+pub mod scrub;
 pub mod stats;
 pub mod talk;
 pub mod triage;

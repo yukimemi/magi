@@ -1094,7 +1094,12 @@ pub async fn report_problem(
     match surface_problem(state, &ask::Questions::open(), pr_url, version, reason) {
         Ok((q, comment)) => {
             if let (Some(url), Some(body)) = (pr_url, comment)
-                && let Err(e) = gh_pr_comment(&state.repo, url, &body).await
+                && let Err(e) = gh_pr_comment(
+                    &state.repo,
+                    url,
+                    &crate::scrub::scrub(&body, &crate::scrub::Identity::current()),
+                )
+                .await
             {
                 state.event("bump", format!("could not comment on {url}: {e:#}"));
             }
@@ -1213,7 +1218,10 @@ async fn escalate_pending(
     let title_warning = match gh_pr_edit_title(
         &worktree,
         &pending.pr_url,
-        &format!("chore: release v{next}"),
+        &crate::scrub::scrub(
+            &format!("chore: release v{next} ({} bump)", decision.level.as_str()),
+            &crate::scrub::Identity::current(),
+        ),
     )
     .await
     {
@@ -1307,6 +1315,11 @@ async fn open_bump_pr(
         &state.id,
         source_pr_url,
     );
+    let who = crate::scrub::Identity::current();
+    let (title, body) = (
+        crate::scrub::scrub(&title, &who),
+        crate::scrub::scrub(&body, &who),
+    );
     let url = gh_pr_create(worktree, &state.base_branch, branch, &title, &body).await?;
     let automerge_warning = match gh_enable_automerge(worktree, &url).await {
         Ok(()) => None,
@@ -1353,12 +1366,19 @@ fn release_pr(
     run_id: &str,
     source_pr_url: &str,
 ) -> (String, String) {
-    let title = format!("chore: release v{next_version}");
+    let title = format!("chore: release v{next_version} ({level} bump)");
     let body = format!(
-        "Release bump: `{level}` to `v{next_version}`.\n\n{reason}\n\n\
-         Triggered by run `{run_id}`, which landed {source_pr_url}.\n\n\
-         version-bump-only; nothing here needs a review \
-         (AGENTS.md: \"Version-bump-only pull requests\").",
+        "## Background\n\n\
+         A change that was just merged is a `{level}` change, so the crate needs a new \
+         release: {reason}\n\n\
+         Triggered by magi run `{run_id}`, which landed {source}.\n\n\
+         ## Change\n\n\
+         Raises the package version to `v{next_version}` in `Cargo.toml`, with \
+         `Cargo.lock` following it. Nothing else changes.\n\n\
+         ## Risk\n\n\
+         Version-bump-only, so there is nothing here for a reviewer to find. Merging \
+         it starts the release pipeline (auto-tag, then the release workflow).",
+        source = source_pr_url,
     );
     (title, body)
 }
@@ -1475,7 +1495,11 @@ mod tests {
         let (title, body) =
             release_pr("minor", "adds a flag", "0.37.0", "ab12", "https://x/pull/1");
         assert!(title.is_ascii() && body.is_ascii(), "{title}\n{body}");
-        assert_eq!(title, "chore: release v0.37.0");
+        assert_eq!(title, "chore: release v0.37.0 (minor bump)");
+        assert!(
+            body.contains("## Background") && body.contains("## Change"),
+            "{body}"
+        );
         let p = decision_prompt("s", "i", "d", &[], "0.36.5");
         assert!(p.contains(crate::prompt::GITHUB_ENGLISH_HEADING), "{p}");
     }
