@@ -943,7 +943,12 @@ async fn after_merge_at(state: &mut RunState, pr_url: &str, home: Option<&Path>)
     // release worktree left behind after a failed attempt would collide with
     // the next one this same run tries.
     git::worktree_remove(&repo, &worktree).await.ok();
-    let (pr_url_opened, automerge_warning) = opened?;
+    let (pr_url_opened, outcome) = opened?;
+    let (automerge_warning, merged_detail) = match outcome {
+        AutomergeOutcome::Enabled => (None, None),
+        AutomergeOutcome::MergedDirectly { detail } => (None, Some(detail)),
+        AutomergeOutcome::Failed { reason } => (Some(reason), None),
+    };
 
     // The pull request exists on the forge the moment `open_bump_pr` returns
     // its URL, regardless of what happens next - so the event that names it
@@ -983,9 +988,16 @@ async fn after_merge_at(state: &mut RunState, pr_url: &str, home: Option<&Path>)
     state.release_bump = Some(run::ReleaseBump {
         pr_url: Some(pr_url_opened.clone()),
         version: Some(next.clone()),
-        automerge_enabled: automerge_warning.is_none(),
+        automerge_enabled: automerge_warning.is_none() && merged_detail.is_none(),
+        merged_directly: merged_detail.is_some(),
         ..run::ReleaseBump::default()
     });
+    if let Some(detail) = merged_detail {
+        // Merged already: a pending marker would make the next merge wait on
+        // a pull request that is gone.
+        clear_marker(&marker);
+        state.event("bump", format!("merged v{next} directly: {detail}"));
+    }
     if let Some(warning) = automerge_warning {
         state.event(
             "bump",
@@ -1013,7 +1025,9 @@ const NOTICE_DISMISS: &str = "dismiss";
 /// carried verbatim next to it.
 fn automerge_hint(reason: &str) -> &'static str {
     let r = reason.to_lowercase();
-    if r.contains("enablepullrequestautomerge") || r.contains("protected branch rules") {
+    if is_clean_status_refusal(reason) {
+        "merge the release pull request by hand; CI is already green"
+    } else if r.contains("enablepullrequestautomerge") || r.contains("protected branch rules") {
         "merge the release pull request by hand, and enable branch protection with required \
          status checks on the base branch so automerge can work next time"
     } else {
@@ -1283,7 +1297,7 @@ async fn open_bump_pr(
     next_version: &str,
     decision: &BumpDecision,
     source_pr_url: &str,
-) -> Result<(String, Option<String>)> {
+) -> Result<(String, AutomergeOutcome)> {
     let cargo_toml_path = worktree.join("Cargo.toml");
     let toml = tokio::fs::read_to_string(&cargo_toml_path)
         .await
@@ -1321,11 +1335,114 @@ async fn open_bump_pr(
         crate::scrub::scrub(&body, &who),
     );
     let url = gh_pr_create(worktree, &state.base_branch, branch, &title, &body).await?;
-    let automerge_warning = match gh_enable_automerge(worktree, &url).await {
-        Ok(()) => None,
-        Err(e) => Some(e.to_string()),
+    let outcome = match gh_enable_automerge(worktree, &url).await {
+        Ok(()) => AutomergeOutcome::Enabled,
+        Err(e) => {
+            let reason = e.to_string();
+            if is_clean_status_refusal(&reason) {
+                gh_merge_directly(worktree, &url, &title, reason).await
+            } else {
+                AutomergeOutcome::Failed { reason }
+            }
+        }
     };
-    Ok((url, automerge_warning))
+    Ok((url, outcome))
+}
+
+/// What became of the release pull request's path to `main`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AutomergeOutcome {
+    /// Automerge is armed; CI green will merge it.
+    Enabled,
+    /// CI beat us to it, so magi merged the pull request itself.
+    MergedDirectly { detail: String },
+    /// Neither worked; a human has to merge it.
+    Failed { reason: String },
+}
+
+/// Is this GitHub's refusal to arm automerge on a pull request that is already
+/// mergeable? Automerge can only be enabled while something is still pending,
+/// so a fast CI that finishes first gets `Pull request is in clean status`.
+/// Both fragments are required so an unrelated "clean status" wording or a
+/// branch-protection refusal does not trigger a direct merge.
+fn is_clean_status_refusal(reason: &str) -> bool {
+    let r = reason.to_lowercase();
+    r.contains("is in clean status") && r.contains("enablepullrequestautomerge")
+}
+
+/// The direct merge, in the same shape [`land::merge_argv`] uses but addressed
+/// by URL: squash under the pull request's own title, delete the branch.
+fn bump_merge_argv(pr_url: &str, subject: &str) -> Vec<String> {
+    [
+        "pr",
+        "merge",
+        pr_url,
+        "--squash",
+        "--delete-branch",
+        "--subject",
+        subject,
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+/// Decide what a direct merge amounted to. No I/O. A zero exit is a merge; a
+/// non-zero one is judged by the forge (`after`), never by the exit code, and
+/// an unreadable forge is not evidence of success.
+fn resolve_direct_merge(
+    refusal: &str,
+    argv: &[String],
+    merge_ok: bool,
+    stderr: &str,
+    after: Option<land::PrLifecycle>,
+) -> AutomergeOutcome {
+    if merge_ok {
+        return AutomergeOutcome::MergedDirectly {
+            detail: format!("automerge was refused ({refusal}); gh {}", argv.join(" ")),
+        };
+    }
+    match land::merged_after_all(argv, stderr, after) {
+        Some(m) => AutomergeOutcome::MergedDirectly { detail: m.detail },
+        None => AutomergeOutcome::Failed {
+            reason: format!("{refusal}; merging directly failed too: {}", stderr.trim()),
+        },
+    }
+}
+
+/// Merge the pull request directly after automerge was refused as clean.
+/// Every failure lands in [`AutomergeOutcome::Failed`] so the caller keeps the
+/// warning-and-comment path.
+async fn gh_merge_directly(
+    cwd: &Path,
+    pr_url: &str,
+    subject: &str,
+    refusal: String,
+) -> AutomergeOutcome {
+    let argv = bump_merge_argv(pr_url, subject);
+    let out = match tokio::process::Command::new("gh")
+        .args(&argv)
+        .current_dir(cwd)
+        .quiet()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return AutomergeOutcome::Failed {
+                reason: format!("{refusal}; could not spawn gh to merge directly: {e}"),
+            };
+        }
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    // jj keeps HEAD detached, so `--delete-branch` exits non-zero after the
+    // merge has happened; ask the forge.
+    let after = if out.status.success() {
+        None
+    } else {
+        land::lifecycle(cwd, pr_url).await.ok()
+    };
+    resolve_direct_merge(&refusal, &argv, out.status.success(), &stderr, after)
 }
 
 /// Run `cargo build` so `Cargo.lock` follows the version bump, the same step
@@ -1655,6 +1772,69 @@ mod tests {
         let body = automerge_failure_comment(NO_RULES);
         assert!(body.contains("enablePullRequestAutoMerge"), "{body}");
         assert!(body.contains("Action required"), "{body}");
+    }
+
+    const CLEAN: &str = "gh pr merge --auto: GraphQL: Pull request Pull request is in clean \
+                         status (enablePullRequestAutoMerge)";
+
+    #[test]
+    fn clean_status_refusal_is_matched_narrowly() {
+        assert!(is_clean_status_refusal(CLEAN));
+        assert!(!is_clean_status_refusal(NO_RULES));
+        assert!(!is_clean_status_refusal("gh: network unreachable"));
+        assert!(!is_clean_status_refusal("Pull request is in clean status"));
+        assert!(automerge_hint(CLEAN).contains("already green"));
+    }
+
+    #[test]
+    fn the_direct_merge_argv_matches_the_land_flags() {
+        let a = bump_merge_argv("https://github.com/o/r/pull/9", "chore: release v1.0.0");
+        let l = land::merge_argv(9, "chore: release v1.0.0");
+        assert_eq!(a[..2], l[..2]);
+        assert_eq!(a[3..], l[3..]);
+        assert_eq!(a[2], "https://github.com/o/r/pull/9");
+    }
+
+    #[test]
+    fn a_direct_merge_is_judged_by_the_forge_not_the_exit_code() {
+        let argv = bump_merge_argv("u", "t");
+        let merged = |o: &AutomergeOutcome| matches!(o, AutomergeOutcome::MergedDirectly { .. });
+        assert!(merged(&resolve_direct_merge(CLEAN, &argv, true, "", None)));
+        let detached = "not on any branch";
+        assert!(merged(&resolve_direct_merge(
+            CLEAN,
+            &argv,
+            false,
+            detached,
+            Some(PrLifecycle::Merged)
+        )));
+        for after in [Some(PrLifecycle::Open), None] {
+            let o = resolve_direct_merge(CLEAN, &argv, false, "boom", after);
+            match o {
+                AutomergeOutcome::Failed { reason } => {
+                    assert!(
+                        reason.contains("clean status") && reason.contains("boom"),
+                        "{reason}"
+                    )
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_directly_merged_bump_is_not_reported_as_pending_or_failed() {
+        let mut state = merged_state();
+        state.release_bump = Some(run::ReleaseBump {
+            pr_url: Some("https://github.com/o/r/pull/9".to_owned()),
+            version: Some("1.0.0".to_owned()),
+            merged_directly: true,
+            ..run::ReleaseBump::default()
+        });
+        assert!(!state.needs_attention());
+        let text = crate::report::run(&state);
+        assert!(text.contains("merged directly"), "{text}");
+        assert!(!text.contains("FAILED"), "{text}");
     }
 
     #[test]
