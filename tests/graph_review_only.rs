@@ -345,7 +345,12 @@ fn wire_origin(fx: &common::Fixture) -> std::path::PathBuf {
     let side = fx.tmp.path().join("side");
     run_git(
         fx.tmp.path(),
-        &["clone", "-q", origin.to_str().unwrap(), side.to_str().unwrap()],
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            side.to_str().unwrap(),
+        ],
     );
     run_git(&side, &["config", "user.name", "other"]);
     run_git(&side, &["config", "user.email", "other@example.com"]);
