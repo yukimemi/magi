@@ -497,6 +497,13 @@ const state = {
      see scrollToSearchHit's own comment. Reset whenever the query is
      cleared, so the next search starts a fresh jump. */
   queueSearchJump: null,
+  /* A task id to scroll to and flash the moment the Backlog can show it -
+     set by applyRoute() when the hash names one (see noticeLink's task
+     links) and consumed once by consumeQueueFocus(), which renderQueue()
+     calls on every pass. Stays set across calls until state.queue has
+     actually loaded, so a notification tapped before boot finishes still
+     lands on its card once loadQueue() comes back. */
+  queueFocus: null,
   detail: { id: null, run: null, report: null },
   questions: null,
   /* The last /api/notifications answer: { unread, items }. */
@@ -2521,6 +2528,31 @@ const query = state.queueSearch.trim().toLowerCase();
      re-rendered from the queue rather than only from health: "off, with two
      tasks waiting" has to appear the moment the second one is filed. */
   renderLoop();
+  consumeQueueFocus();
+}
+
+/* Lands on the task named by state.queueFocus, set by applyRoute() from a
+   `#/queue/<id>` hash - a task notification's own link. Runs from the tail
+   of renderQueue(), which is called from every path that can make the
+   target findable: loadQueue() once state.queue has actually loaded, and
+   setQueueSearch() once a stale search from a previous visit is cleared
+   below. Consumed exactly once, before jumpToTask() runs, so a task that
+   turns out to have been folded or deleted since the notification fired
+   just drops the focus instead of leaving it to retry forever - jumpToTask()
+   itself already no-ops when the card is not on the page. */
+function consumeQueueFocus() {
+  const id = state.queueFocus;
+  if (!id || state.queue === null) return;
+  state.queueFocus = null;
+  if (state.queueSearch.trim() !== "") {
+    state.queueSearch = "";
+    const input = $("queue-search-input");
+    if (input) input.value = "";
+    state.queueSearchJump = null;
+    renderQueue();
+    return;
+  }
+  jumpToTask(id);
 }
 
 /* ---- dependency graph --------------------------------------------------- *
@@ -5643,7 +5675,7 @@ function renderBell() {
 function noticeLink(link) {
   if (!link) return null;
   if (link.kind === "run") return el("a", { href: `#/runs/${encodeURIComponent(link.id)}`, text: `Run ${shortId(link.id)}` });
-  if (link.kind === "task") return el("a", { href: "#/queue", text: `Task ${shortId(link.id)}` });
+  if (link.kind === "task") return el("a", { href: `#/queue/${encodeURIComponent(link.id)}`, text: `Task ${shortId(link.id)}` });
   if (link.kind === "url") {
     const href = forgeUrl(link.url);
     return href ? el("a", { href, target: "_blank", rel: "noopener noreferrer", text: "Open link" }) : null;
@@ -5850,6 +5882,7 @@ function subscribe() {
 /* ---- routing ----------------------------------------------------------- */
 function parseRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
+  if (parts[0] === "queue" && parts[1]) return { name: "queue", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "queue") return { name: "queue", id: null };
   if (parts[0] === "questions") return { name: "questions", id: null };
   if (parts[0] === "notifications") return { name: "notifications", id: null };
@@ -5912,6 +5945,16 @@ function applyRoute() {
   /* The operator arrived to answer one specific thing, so the caret goes on
      it rather than on the top of the document. */
   if (changed && route.name === "questions") focusFirstAsk();
+  /* A task notification's link names the card it is about (see noticeLink);
+     land on it the same way a single-hit search does, rather than leaving
+     the operator to scroll the whole Backlog by hand. Queued rather than
+     jumped to directly, since the Backlog may still be loading or mid a
+     stale search - see consumeQueueFocus(), which renderQueue() calls on
+     every pass and which is the thing that actually retries. */
+  if (changed && route.name === "queue" && route.id) {
+    state.queueFocus = route.id;
+    renderQueue();
+  }
   renderTitle();
 }
 

@@ -7503,6 +7503,40 @@ mod tests {
     }
 
     #[test]
+    fn a_task_notification_links_to_its_own_card_not_the_bare_backlog() {
+        // A `kind: "task"` notice link used to drop the id on the floor and
+        // point at `#/queue` outright, so every task notification landed on
+        // whatever happened to be first in the Backlog rather than the task
+        // it was actually about.
+        assert!(
+            APP_JS.contains(
+                "el(\"a\", { href: `#/queue/${encodeURIComponent(link.id)}`, text: `Task ${shortId(link.id)}` })"
+            ),
+            "a task notice's link must carry the task id into the hash, not just name the Backlog screen"
+        );
+        assert!(
+            !APP_JS.contains("el(\"a\", { href: \"#/queue\", text: `Task ${shortId(link.id)}` })"),
+            "regression: the task link must not go back to naming the bare Backlog route"
+        );
+
+        // The route parser has to read that id back out before applyRoute()
+        // can do anything with it.
+        assert!(
+            APP_JS.contains(
+                "if (parts[0] === \"queue\" && parts[1]) return { name: \"queue\", id: decodeURIComponent(parts[1]) };"
+            ),
+            "`#/queue/<id>` must parse into a route carrying that id"
+        );
+
+        // And the Backlog view has to actually land on the card once it can
+        // - see consumeQueueFocus(), which renderQueue() calls on every pass
+        // so a focus set before the queue has loaded is retried once it has.
+        assert!(APP_JS.contains("state.queueFocus = route.id;"));
+        assert!(APP_JS.contains("function consumeQueueFocus()"));
+        assert!(APP_JS.contains("jumpToTask(id);"));
+    }
+
+    #[test]
     fn review_rounds_tell_a_stale_verification_and_a_resource_block_apart_from_a_real_result() {
         assert!(
             APP_JS.contains("round.verified_head !== round.head"),
