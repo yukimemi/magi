@@ -2229,9 +2229,6 @@ async fn attempt(
     };
     settle_and_diagnose(task, verdict, &detail, opts.max_attempts, &runner.state);
     record(queue, task);
-    for notice in outcome_notices(task, &runner.state) {
-        notices::raise(notice);
-    }
     tracing::info!(
         "task {} is {} after run {} ({})",
         task.short(),
@@ -2932,52 +2929,36 @@ fn prepare_instruction(
     }
 }
 
-/// What the operator should hear about after an attempt settled: a run that
-/// ended without a merge or a pull request to carry on with, and a task the
-/// machine or the attempt budget now holds.
+/// The notice for a task the machine or its attempt budget has held, or that
+/// failed outright.
 ///
-/// Pure, so the wording and the keys are asserted without a magi home. Keys
-/// name the subject (`run:<id>`, `task:<id>`), never the prose, and the
-/// messages carry nothing that varies between retries, so a loop that keeps
-/// failing the same way updates one entry rather than flooding the bell.
-fn outcome_notices(task: &Task, state: &RunState) -> Vec<Notice> {
-    let mut out = Vec::new();
-    let failed = matches!(
-        state.status,
-        RunStatus::Blocked | RunStatus::Stalled | RunStatus::Failed
-    );
-    // A pull request left behind is a hand-off, and a parked run was only
-    // asked to stop: neither is news.
-    if failed && state.pr.is_none() && !state.parked {
-        out.push(
-            Notice::error(
-                &format!("run:{}", state.id),
-                format!("Run {} ended {}.", state.short(), label(state.status)),
-            )
-            .link(Link::Run {
-                id: state.id.clone(),
-            }),
-        );
-    }
-    if task.status == TaskStatus::Held {
-        let why = task.hold_reason.as_deref().unwrap_or("no reason recorded");
-        out.push(
-            Notice::warn(
-                &format!("task:{}", task.id),
-                format!("Task {} is held: {why}.", task.short()),
-            )
-            .link(Link::Task {
-                id: task.id.clone(),
-            }),
-        );
-    }
-    out
+/// Called from [`record`], the one place every task transition is written, so
+/// holds made outside a run's own settlement - a missing blocker, a config
+/// error that used up the attempts - are announced too. Keyed on the task with
+/// wording free of anything that varies between retries.
+fn task_notice(task: &Task) -> Option<Notice> {
+    let text = match task.status {
+        TaskStatus::Held => {
+            let why = task.hold_reason.as_deref().unwrap_or("no reason recorded");
+            format!("Task {} is held: {why}.", task.short())
+        }
+        TaskStatus::Failed => format!("Task {} failed.", task.short()),
+        _ => return None,
+    };
+    Some(
+        Notice::warn(&format!("task:{}", task.id), text).link(Link::Task {
+            id: task.id.clone(),
+        }),
+    )
 }
 
 /// Persist a transition. A queue write failure is logged rather than fatal: the
 /// run already happened, and taking the daemon down would only add a lost
 /// backlog to a full disk.
 fn record(queue: &Queue, task: &mut Task) {
+    if let Some(notice) = task_notice(task) {
+        notices::raise(notice);
+    }
     if let Err(e) = queue.put(task) {
         tracing::error!("could not record task {}: {e:#}", task.short());
         notices::raise(Notice::error(
@@ -4390,42 +4371,14 @@ mod tests {
     }
 
     #[test]
-    fn a_blocked_run_and_a_held_task_each_raise_one_stable_notice() {
+    fn a_held_or_failed_task_raises_one_stable_notice_and_a_queued_one_none() {
         let mut t = task();
-        let state = run_state(RunStatus::Blocked);
-        assert_eq!(
-            outcome_notices(&t, &state).len(),
-            1,
-            "queued task, blocked run"
-        );
-
+        assert!(task_notice(&t).is_none());
         t.hold_machine(Some("out of attempts".to_owned()));
-        let n = outcome_notices(&t, &state);
-        assert_eq!(n.len(), 2);
-        assert_eq!(n[0].key, format!("run:{}", state.id));
-        assert_eq!(n[1].key, format!("task:{}", t.id));
-        assert!(n[1].message.contains("out of attempts"));
-        // Same inputs, same notices: a retry loop cannot vary the wording.
-        assert_eq!(outcome_notices(&t, &state)[1].message, n[1].message);
-    }
-
-    #[test]
-    fn a_pull_request_or_a_parked_run_is_a_hand_off_not_a_notice() {
-        let t = task();
-        let mut with_pr = run_state(RunStatus::Blocked);
-        with_pr.pr = Some(crate::run::PrRecord {
-            url: "https://github.com/o/r/pull/1".to_owned(),
-            number: 1,
-            state: "open".to_owned(),
-            checks: "pending".to_owned(),
-            round: 0,
-            rounds: 3,
-        });
-        assert!(outcome_notices(&t, &with_pr).is_empty());
-        let mut parked = run_state(RunStatus::Stalled);
-        parked.parked = true;
-        assert!(outcome_notices(&t, &parked).is_empty());
-        assert!(outcome_notices(&t, &run_state(RunStatus::Merged)).is_empty());
+        let n = task_notice(&t).expect("held");
+        assert_eq!(n.key, format!("task:{}", t.id));
+        assert!(n.message.contains("out of attempts"));
+        assert_eq!(task_notice(&t).unwrap().message, n.message);
     }
 
     #[test]

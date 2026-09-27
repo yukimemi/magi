@@ -242,6 +242,9 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Distinguishes temp files written by threads of one process.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A notice store on disk.
 #[derive(Debug, Clone)]
 pub struct Notices {
@@ -273,9 +276,18 @@ impl Notices {
             .with_context(|| format!("create {}", self.root.display()))?;
         let body = serde_json::to_string_pretty(n).context("serialize notice")?;
         let path = self.path_of(&n.id);
-        let tmp = path.with_extension("json.tmp");
+        // Unique per write: two processes raising or marking the same notice
+        // must not share a temp file, or the second rename finds it gone.
+        let tmp = path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("replace {}", path.display()));
+        }
         Ok(())
     }
 
@@ -416,6 +428,37 @@ fn read_path(path: &Path) -> Result<Notice> {
         );
     }
     Ok(n)
+}
+
+/// The notice for a run that ended Blocked, Stalled or Failed, if it did.
+///
+/// A parked run was only asked to stop, so it is not news. A run that left a
+/// pull request behind still is: the PR is waiting on someone. Keyed on the
+/// run with a message free of anything that varies between attempts.
+pub fn run_ended(state: &crate::run::RunState) -> Option<Notice> {
+    use crate::run::RunStatus;
+    let failed = matches!(
+        state.status,
+        RunStatus::Blocked | RunStatus::Stalled | RunStatus::Failed
+    );
+    (failed && !state.parked).then(|| {
+        Notice::error(
+            &format!("run:{}", state.id),
+            format!("Run {} ended {}.", state.short(), state.status.as_str()),
+        )
+        .link(Link::Run {
+            id: state.id.clone(),
+        })
+    })
+}
+
+/// The notice for a run whose graph returned an error before it settled.
+pub fn run_stopped(id: &str, state: &crate::run::RunState) -> Notice {
+    Notice::error(
+        &format!("run:{id}"),
+        format!("Run {} stopped with an error.", state.short()),
+    )
+    .link(Link::Run { id: id.to_owned() })
 }
 
 /// The one function producers call. Best-effort by construction: a notice that
@@ -572,5 +615,57 @@ mod tests {
             "first_at":"2020-01-01T00:00:00Z","last_at":"2020-01-01T00:00:00Z"}"#;
         std::fs::write(s.path_of("x-1"), old).unwrap();
         assert_eq!(s.get("x-1").unwrap().count, 1);
+    }
+
+    fn state(status: crate::run::RunStatus) -> crate::run::RunState {
+        let mut st = crate::run::RunState::new(
+            std::path::PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234def".to_owned(),
+            "task".to_owned(),
+            crate::config::Config::default(),
+        );
+        st.status = status;
+        st
+    }
+
+    #[test]
+    fn a_run_that_ended_badly_is_news_unless_it_only_parked() {
+        use crate::run::RunStatus;
+        for bad in [RunStatus::Blocked, RunStatus::Stalled, RunStatus::Failed] {
+            let st = state(bad);
+            let n = run_ended(&st).expect("news");
+            assert_eq!(n.key, format!("run:{}", st.id));
+            assert_eq!(n.severity, Severity::Error);
+        }
+        assert!(run_ended(&state(RunStatus::Merged)).is_none());
+        let mut parked = state(RunStatus::Stalled);
+        parked.parked = true;
+        assert!(run_ended(&parked).is_none());
+    }
+
+    #[test]
+    fn concurrent_writers_of_one_key_all_succeed() {
+        let (_d, s) = store();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        s.raise(Notice::warn("same", "m")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(s.list().len(), 1);
+        let stray = std::fs::read_dir(s.root())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
+            .count();
+        assert_eq!(stray, 0);
     }
 }

@@ -581,7 +581,25 @@ impl Runner {
     }
 
     /// Walk the graph to a terminal state, skipping nodes already recorded.
+    ///
+    /// Every way a run is driven - the queue loop, `magi run`, a resume from
+    /// the phone - ends here, so this is the one place a run that ended
+    /// Blocked / Stalled / Failed, or died with an error, is announced to the
+    /// notification centre. Best-effort: see [`crate::notices::raise`].
     pub async fn execute(&mut self) -> Result<()> {
+        let result = self.execute_graph().await;
+        let ended = if result.is_err() {
+            Some(crate::notices::run_stopped(&self.state.id, &self.state))
+        } else {
+            crate::notices::run_ended(&self.state)
+        };
+        if let Some(notice) = ended {
+            crate::notices::raise(notice);
+        }
+        result
+    }
+
+    async fn execute_graph(&mut self) -> Result<()> {
         // Moving again, so it is no longer parked. Set before the walk rather
         // than in `resume`, so every way of re-entering the graph clears it
         // and a card cannot claim a run is waiting to be resumed while the
