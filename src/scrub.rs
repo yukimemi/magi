@@ -149,7 +149,7 @@ fn home_path(rest: &str, prev: Option<char>, id: &Identity) -> Option<(usize, &'
         && b[0].is_ascii_alphabetic()
         && b[1] == b':'
         && matches!(b[2], b'\\' | b'/')
-        && rest[3..8].eq_ignore_ascii_case("users")
+        && b[3..8].eq_ignore_ascii_case(b"users")
         && matches!(b[8], b'\\' | b'/')
     {
         let n = name_len(&rest[9..]);
@@ -326,6 +326,7 @@ mod tests {
 
     #[test]
     fn multibyte_input_does_not_panic_and_replacement_is_not_rescanned() {
+        assert_eq!(s("C:\\日本語 and C:/日本"), "C:\\日本語 and C:/日本");
         assert_eq!(s("é/Users/bob/é 日本 alice"), "é~/é 日本 [redacted-user]");
         let once = s("/Users/bob 10.0.0.1 a@b.io alice");
         assert_eq!(scrub(&once, &Identity::default()), once);
