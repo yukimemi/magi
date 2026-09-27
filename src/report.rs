@@ -922,6 +922,8 @@ pub fn run(state: &RunState) -> String {
             "  automerge {}",
             if b.automerge_enabled {
                 green("enabled")
+            } else if b.merged_directly {
+                green("not needed (CI was already green; merged directly)")
             } else if b.problem.is_some() {
                 bold(&red("FAILED"))
             } else {

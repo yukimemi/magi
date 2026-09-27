@@ -1373,6 +1373,11 @@ pub struct ReleaseBump {
     /// Did enabling automerge on `pr_url` succeed?
     #[serde(default)]
     pub automerge_enabled: bool,
+    /// GitHub refused automerge because CI had already finished (the pull
+    /// request was in clean status), so magi merged it directly. Kept apart
+    /// from `automerge_enabled`, which stays the plain fact it says it is.
+    #[serde(default)]
+    pub merged_directly: bool,
     /// What went wrong, verbatim from the tool that said it.
     #[serde(default)]
     pub problem: Option<String>,
