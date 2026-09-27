@@ -288,7 +288,8 @@ pub struct Runner {
 /// anything other than plain `git push` from this checkout (a jj colocated
 /// workspace, another clone) moves only the remote-tracking ref - so the local
 /// one can be a stale placeholder. It moves only when local is behind the remote or is an
-/// empty placeholder that diverged from it; unpushed local work is kept.
+/// empty placeholder that diverged from it; unpushed local work is kept, and a real
+/// divergence is refused rather than guessed at.
 async fn sync_review_branch(repo: &Path, branch: &str, remote: &str) -> Result<()> {
     let tracking = format!("{remote}/{branch}");
     let fetched = git::fetch(repo, remote, branch).await;
@@ -322,13 +323,13 @@ async fn sync_review_branch(repo: &Path, branch: &str, remote: &str) -> Result<(
                 .await?
                 .ok();
         if !placeholder {
-            tracing::warn!(
-                "local `{branch}` ({}) and {tracking} ({}) have diverged; reviewing the \
-                 local branch (`git branch -f {branch} {tracking}` to review the pushed work)",
+            bail!(
+                "local `{branch}` ({}) and {tracking} ({}) have diverged, so it is unclear \
+                 which one to review; reconcile them, e.g. `git branch -f {branch} {tracking}` \
+                 to review the pushed work, or push the local branch first",
                 short(&local_sha),
                 short(&remote_sha)
             );
-            return Ok(());
         }
     }
     let out = git::git_raw(repo, &["branch", "-f", branch, &tracking]).await?;

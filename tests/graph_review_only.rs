@@ -387,7 +387,7 @@ async fn a_stale_local_branch_is_fast_forwarded_to_the_pushed_work() {
 }
 
 common::e2e! {
-async fn a_diverged_branch_with_local_work_is_reviewed_as_it_is() {
+async fn a_diverged_branch_with_local_work_is_refused_and_leaves_no_worktree() {
     let _home = common::home_lock().await;
     let fx = fixture(_home, Judges::Unanimous, true);
     let side = wire_origin(&fx);
@@ -399,11 +399,18 @@ async fn a_diverged_branch_with_local_work_is_reviewed_as_it_is() {
     let local = rev(&fx.repo, "feat/split");
     push_real_work(&side, "feat/split");
 
-    let runner = Runner::review(&fx.repo, "feat/split", fx.config.clone())
+    let err = Runner::review(&fx.repo, "feat/split", fx.config.clone())
         .await
-        .expect("local work is reviewed");
+        .err()
+        .expect("a diverged branch must not be reviewed");
+    assert!(err.to_string().contains("diverged"), "{err}");
     assert_eq!(rev(&fx.repo, "refs/heads/feat/split"), local);
-    assert!(runner.state.candidates[0].worktree.join("local.txt").is_file());
+    let list = std::process::Command::new("git")
+        .args(["worktree", "list"])
+        .current_dir(&fx.repo)
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&list.stdout).contains("under-review"));
 }
 }
 
