@@ -31,6 +31,7 @@ use crate::ask;
 use crate::config::AgentSpec;
 use crate::git;
 use crate::land;
+use crate::notices::{Link, Notice, Notices};
 use crate::proc::Quiet as _;
 use crate::run::{self, RunState, RunStatus};
 use crate::verdict;
@@ -1008,14 +1009,11 @@ async fn after_merge_at(state: &mut RunState, pr_url: &str, home: Option<&Path>)
     Ok(())
 }
 
-/// The node name a post-merge notice is filed under. [`ask::Questions::settle_run`]
-/// exempts it: the run it belongs to is `Merged` by definition, and abandoning
-/// the notice on that ground would erase it the moment it is filed.
+/// The node name post-merge notices were filed under, back when they were
+/// questions. Kept because [`ask::Questions::settle_run`] must go on exempting
+/// any such question still open on disk; new problems go to
+/// [`crate::notices`] instead - nothing here is something to answer.
 pub const NOTICE_NODE: &str = "release-bump";
-/// Answer: the owner dealt with the release pull request themselves.
-const NOTICE_DONE: &str = "merged by hand";
-/// Answer: seen, nothing to do.
-const NOTICE_DISMISS: &str = "dismiss";
 
 /// What to tell the operator to do about a refused `gh pr merge --auto`.
 ///
@@ -1044,19 +1042,20 @@ fn automerge_failure_comment(reason: &str) -> String {
     )
 }
 
-/// Record a post-merge problem on the run and file the operator-facing
-/// notice, without touching the forge. Returns the comment body meant for the
-/// release pull request when there is one.
+/// Record a post-merge problem on the run and raise the operator-facing
+/// notification, without touching the forge. Returns the notice and the
+/// comment body meant for the release pull request when there is one.
 ///
-/// Split from [`report_problem`] so the state, the question and the wording
-/// can be asserted without a `gh`.
+/// Split from [`report_problem`] so the state, the notice and the wording
+/// can be asserted without a `gh`. The notice is keyed on the run, so a retry
+/// of the same failed bump folds into one entry instead of flooding the bell.
 fn surface_problem(
     state: &mut RunState,
-    store: &ask::Questions,
+    store: &Notices,
     pr_url: Option<&str>,
     version: Option<&str>,
     reason: &str,
-) -> Result<(ask::Question, Option<String>)> {
+) -> Result<(Notice, Option<String>)> {
     let action = if pr_url.is_some() {
         automerge_hint(reason).to_owned()
     } else {
@@ -1069,44 +1068,41 @@ fn surface_problem(
     record.problem = Some(reason.to_owned());
     record.action_required = Some(action.clone());
 
-    let summary = match pr_url {
-        Some(url) => format!("Release PR needs a human: {url}"),
-        None => "Release bump did not run".to_owned(),
+    let mut notice = Notice::error(
+        &format!("release-bump:{}", state.id),
+        format!(
+            "Run {} merged, but its release step failed: {action}.",
+            state.id
+        ),
+    );
+    notice = match pr_url {
+        Some(url) => notice.link(Link::Url {
+            url: url.to_owned(),
+        }),
+        None => notice.link(Link::Run {
+            id: state.id.clone(),
+        }),
     };
-    let detail = format!(
-        "Run {} merged, but the release step after it failed.\n\n{reason}\n\n\
-         Action required: {action}.",
-        state.id
-    );
-    let mut q = ask::Question::new(
-        state.id.clone(),
-        NOTICE_NODE.to_owned(),
-        "bump".to_owned(),
-        summary,
-        detail,
-        vec![NOTICE_DONE.to_owned(), NOTICE_DISMISS.to_owned()],
-    );
-    store.put(&mut q).context("file the release-bump notice")?;
-    state.event(
-        "bump",
-        format!("needs attention: notice {} filed - {action}", q.short()),
-    );
+    let notice = store
+        .raise(notice)
+        .context("raise the release-bump notification")?;
+    state.event("bump", format!("needs attention: {action}"));
     let comment = pr_url.map(|_| automerge_failure_comment(reason));
-    Ok((q, comment))
+    Ok((notice, comment))
 }
 
 /// Make a post-merge problem visible: record it, comment on the release pull
-/// request, and raise a notice through the question queue and the configured
-/// notifier. Every step is best-effort - a failed comment or webhook is an
-/// event, never a reason to lose the record or the run.
+/// request, raise a notification and run the configured notifier. Every step
+/// is best-effort - a failed comment or webhook is an event, never a reason to
+/// lose the record or the run.
 pub async fn report_problem(
     state: &mut RunState,
     pr_url: Option<&str>,
     version: Option<&str>,
     reason: &str,
 ) {
-    match surface_problem(state, &ask::Questions::open(), pr_url, version, reason) {
-        Ok((q, comment)) => {
+    match surface_problem(state, &Notices::open(), pr_url, version, reason) {
+        Ok((notice, comment)) => {
             if let (Some(url), Some(body)) = (pr_url, comment)
                 && let Err(e) = gh_pr_comment(
                     &state.repo,
@@ -1117,10 +1113,24 @@ pub async fn report_problem(
             {
                 state.event("bump", format!("could not comment on {url}: {e:#}"));
             }
+            // The webhook still speaks in question terms; a transient,
+            // never-stored one carries the text so it is not lost.
+            let summary = match pr_url {
+                Some(url) => format!("Release PR needs a human: {url}"),
+                None => "Release bump did not run".to_owned(),
+            };
+            let q = ask::Question::new(
+                state.id.clone(),
+                NOTICE_NODE.to_owned(),
+                "bump".to_owned(),
+                summary,
+                notice.message.clone(),
+                Vec::new(),
+            );
             if let Err(e) = ask::notify(&state.config.notify, &q).await {
                 tracing::warn!(
-                    "could not notify about release-bump notice {}: {e:#}",
-                    q.short()
+                    "could not notify about the release bump of {}: {e:#}",
+                    state.id
                 );
             }
         }
@@ -1606,6 +1616,7 @@ async fn gh_pr_edit_title(cwd: &Path, pr_url: &str, title: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notices::Severity;
 
     #[test]
     fn github_facing_bump_text_is_english() {
@@ -1840,11 +1851,12 @@ mod tests {
     #[test]
     fn an_automerge_failure_is_recorded_shown_and_filed_and_survives_settling() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ask::Questions::at(dir.path().join("questions"));
+        let store = Notices::at(dir.path().join("notifications"));
+        let questions = ask::Questions::at(dir.path().join("questions"));
         let mut state = merged_state();
         let url = "https://github.com/o/r/pull/35";
 
-        let (q, comment) =
+        let (n, comment) =
             surface_problem(&mut state, &store, Some(url), Some("0.8.0"), NO_RULES).unwrap();
 
         // The comment goes on the release PR and carries reason and fix.
@@ -1861,20 +1873,32 @@ mod tests {
         assert!(text.contains("action required"), "{text}");
         assert!(crate::report::line(&state).contains("release needs a human"));
 
-        // A notice is open, and settling the merged run does not erase it.
-        assert_eq!(q.node, NOTICE_NODE);
-        assert_eq!(store.open_for(&state.id).len(), 1);
-        assert_eq!(store.settle_run(&state.id, RunStatus::Merged).unwrap(), 0);
-        assert!(store.get(&q.id).unwrap().status.open());
+        // Exactly one notification, linked to the PR, and no question.
+        assert_eq!(n.severity, Severity::Error);
+        assert_eq!(
+            n.link,
+            Some(Link::Url {
+                url: url.to_owned()
+            })
+        );
+        assert_eq!(store.list().len(), 1);
+        assert!(questions.open_for(&state.id).is_empty());
+
+        // A retry of the same failure folds into the same entry.
+        surface_problem(&mut state, &store, Some(url), Some("0.8.0"), NO_RULES).unwrap();
+        let listed = store.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].count, 2);
     }
 
     #[test]
     fn a_bump_that_never_ran_is_surfaced_without_a_pr_comment() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ask::Questions::at(dir.path().join("questions"));
+        let store = Notices::at(dir.path().join("notifications"));
         let mut state = merged_state();
-        let (_, comment) = surface_problem(&mut state, &store, None, None, "no agent").unwrap();
+        let (n, comment) = surface_problem(&mut state, &store, None, None, "no agent").unwrap();
         assert!(comment.is_none());
+        assert!(matches!(n.link, Some(Link::Run { .. })));
         assert!(state.needs_attention());
     }
 

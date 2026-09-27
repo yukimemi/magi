@@ -63,6 +63,7 @@ use crate::conduct::Conductor;
 use crate::config::{Config, MergeMode};
 use crate::graph::Runner;
 use crate::land;
+use crate::notices::{self, Link, Notice};
 use crate::queue::{Queue, Task, TaskStatus};
 use crate::run::{QuotaLoss, RunState, RunStatus};
 use crate::triage;
@@ -1095,6 +1096,11 @@ where
             tracing::warn!("could not persist abandoned run {id}: {e:#}");
             continue;
         }
+        // This run never passes through `Runner::execute` again, so its end
+        // is announced here.
+        if let Some(notice) = notices::run_ended(&state) {
+            notices::raise_in(home, notice);
+        }
         // The seat that asked is gone for good now, exactly like any other
         // door `graph::Runner::settle_questions` closes the moment `status`
         // lands somewhere non-resumable - see that method's own doc. Nothing
@@ -1726,6 +1732,10 @@ async fn poll(
         while let Some(result) = inflight.try_join_next() {
             if let Err(e) = result {
                 tracing::error!("a spawned attempt did not finish cleanly: {e}");
+                notices::raise(Notice::error(
+                    "loop:attempt",
+                    "A queued attempt ended abnormally; check the task it was running.",
+                ));
             }
         }
 
@@ -1824,7 +1834,13 @@ async fn poll(
                         )
                         .await;
                 }
-                Err(e) => tracing::warn!("conductor: no config: {e:#}"),
+                Err(e) => {
+                    tracing::warn!("conductor: no config: {e:#}");
+                    notices::raise(Notice::warn(
+                        "loop:no-config",
+                        "The loop could not read this repository's config, so held tasks are not being triaged.",
+                    ));
+                }
             }
         }
 
@@ -2022,6 +2038,10 @@ async fn poll(
     while let Some(result) = inflight.join_next().await {
         if let Err(e) = result {
             tracing::error!("a spawned attempt did not finish cleanly: {e}");
+            notices::raise(Notice::error(
+                "loop:attempt",
+                "A queued attempt ended abnormally; check the task it was running.",
+            ));
         }
     }
     Ok(())
@@ -2074,6 +2094,17 @@ async fn attempt(
         task.hold_machine(Some(reason.clone()));
         record(queue, task);
         tracing::warn!("holding {} for want of disk space: {reason}", task.short());
+        // Stable wording - the free-space figures live in the task's hold
+        // reason, and changing numbers would relight the bell every poll.
+        notices::raise(
+            Notice::warn(
+                &format!("disk:{}", repo.display()),
+                "A task was held for want of free disk space; free some, then release it from the queue.",
+            )
+            .link(Link::Task {
+                id: task.id.clone(),
+            }),
+        );
         return Vec::new();
     }
 
@@ -2326,7 +2357,16 @@ async fn maybe_prune_cache_between_runs(
             pruned.freed
         ),
         Ok(_) => {}
-        Err(e) => tracing::warn!("housekeep: prune cache: {e:#}"),
+        Err(e) => {
+            tracing::warn!("housekeep: prune cache: {e:#}");
+            notices::raise_in(
+                home,
+                Notice::warn(
+                    "housekeep:cache",
+                    "Pruning the shared build cache failed; disk usage may keep growing.",
+                ),
+            );
+        }
     }
 }
 
@@ -2900,6 +2940,10 @@ fn prepare_instruction(
 fn record(queue: &Queue, task: &mut Task) {
     if let Err(e) = queue.put(task) {
         tracing::error!("could not record task {}: {e:#}", task.short());
+        notices::raise(Notice::error(
+            "loop:record",
+            "The loop could not save a task's state; check the disk.",
+        ));
     }
 }
 

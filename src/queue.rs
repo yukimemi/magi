@@ -801,6 +801,16 @@ impl Queue {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
+        // A machine hold is news for the notification centre, filed beside
+        // this queue (`<home>/queue` -> `<home>/notifications`) rather than
+        // through a process-global, so a queue in a temp directory notifies
+        // into that directory.
+        if let (Some(notice), Some(home)) = (
+            crate::notices::task_held(task),
+            self.root.parent().filter(|p| !p.as_os_str().is_empty()),
+        ) {
+            crate::notices::raise_in(home, notice);
+        }
         Ok(())
     }
 
@@ -1182,6 +1192,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::at(dir.path().join("queue"));
         (dir, q)
+    }
+
+    #[test]
+    fn putting_a_machine_held_task_files_a_notification_beside_the_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = task("held");
+        q.put(&mut t).unwrap();
+        assert_eq!(
+            crate::notices::Notices::at(dir.path().join("notifications"))
+                .list()
+                .len(),
+            0
+        );
+        t.hold_machine(Some("out of attempts".to_owned()));
+        q.put(&mut t).unwrap();
+        let listed = crate::notices::Notices::at(dir.path().join("notifications")).list();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].message.contains("out of attempts"));
     }
 
     fn task(title: &str) -> Task {

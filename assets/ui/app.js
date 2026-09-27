@@ -33,6 +33,10 @@ const API = {
   editTask: (id) => `/api/queue/${encodeURIComponent(id)}/edit`,
   doneTask: (id) => `/api/queue/${encodeURIComponent(id)}/done`,
   questions: "/api/questions",
+  notifications: "/api/notifications",
+  notificationsReadAll: "/api/notifications/read-all",
+  notificationRead: (id) => `/api/notifications/${encodeURIComponent(id)}/read`,
+  notificationDismiss: (id) => `/api/notifications/${encodeURIComponent(id)}/dismiss`,
   answer: (id) => `/api/questions/${encodeURIComponent(id)}/answer`,
   questionSay: (id) => `/api/questions/${encodeURIComponent(id)}/say`,
   /* Agent-authored HTML, served by its own endpoint so it lands in a
@@ -495,6 +499,8 @@ const state = {
   queueSearchJump: null,
   detail: { id: null, run: null, report: null },
   questions: null,
+  /* The last /api/notifications answer: { unread, items }. */
+  notices: null,
   /* Whether a question's panel endpoint actually answers. A sandboxed frame
      is opaque, so a 404 inside it is indistinguishable from a rendered
      panel; this is the answer to that, asked once per question. */
@@ -526,7 +532,7 @@ const state = {
   /* Turn count from the previous renderTalk() call, used to detect new turns
      arriving while the conversation is already on screen. */
   prevTalkTurnCount: 0,
-  rev: { queue: null, runs: null, questions: null, talks: null, loop: null },
+  rev: { queue: null, runs: null, questions: null, notifications: null, talks: null, loop: null },
   streamOpen: false,
   wrap: false,
   /* The upgrade stage last rendered, so a transition into "done" can be told
@@ -5604,6 +5610,87 @@ async function loadQuestions() {
   }
 }
 
+/* ---- notification centre ------------------------------------------------
+ * Not a question: nothing waits on these and there is nothing to answer. The
+ * bell's badge is the unread count; before /api/notifications has answered it
+ * falls back to health's own count. Every string from the API is rendered as
+ * text, and the one URL goes through forgeUrl(). */
+async function loadNotifications() {
+  try {
+    const out = await getJson(API.notifications);
+    state.notices = { unread: Number(out.unread) || 0, items: Array.isArray(out.items) ? out.items : [] };
+    renderNotifications();
+    renderBell();
+    ok();
+  } catch (error) {
+    fail(`Could not load notifications: ${error.message}`);
+  }
+}
+
+function unreadNotices() {
+  if (state.notices) return state.notices.unread;
+  return Number(state.health && state.health.notifications_unread) || 0;
+}
+
+function renderBell() {
+  const n = unreadNotices();
+  const badge = $("bell-badge");
+  setText(badge, n > 99 ? "99+" : n);
+  show(badge, n > 0);
+  setAttr($("bell"), "aria-label", n > 0 ? `Notifications, ${n} unread` : "Notifications");
+}
+
+function noticeLink(link) {
+  if (!link) return null;
+  if (link.kind === "run") return el("a", { href: `#/runs/${encodeURIComponent(link.id)}`, text: `Run ${shortId(link.id)}` });
+  if (link.kind === "task") return el("a", { href: "#/queue", text: `Task ${shortId(link.id)}` });
+  if (link.kind === "url") {
+    const href = forgeUrl(link.url);
+    return href ? el("a", { href, target: "_blank", rel: "noopener noreferrer", text: "Open link" }) : null;
+  }
+  return null;
+}
+
+async function noticeAction(url, failure) {
+  try {
+    await postJson(url);
+    await loadNotifications();
+  } catch (error) {
+    fail(`${failure}: ${error.message}`);
+  }
+}
+
+function renderNotifications() {
+  const list = $("notifications-list");
+  const data = state.notices;
+  if (!data) return;
+  const items = data.items;
+  setText($("notifications-count"), items.length === 0 ? "All clear." : `${plural(data.unread, "unread", "unread")} of ${items.length}`);
+  show($("notifications-empty"), items.length === 0);
+  show($("notifications-read-all"), data.unread > 0);
+  clear(list);
+  for (const n of items) {
+    const at = when(n.last_at);
+    const link = noticeLink(n.link);
+    const unread = !n.read_at;
+    list.append(el("li", { class: "notice", "data-sev": n.severity, "data-read": unread ? "0" : "1" },
+      el("div", { class: "notice-msg", text: n.message }),
+      el("div", { class: "notice-meta" },
+        el("span", { text: n.severity }),
+        el("time", { datetime: n.last_at, title: at.title, text: at.text }),
+        n.count > 1 ? el("span", { text: `\u00d7${n.count}` }) : null,
+        link),
+      el("div", { class: "notice-actions" },
+        unread ? el("button", { class: "btn btn-quiet", type: "button", text: "Mark read",
+          onclick: () => noticeAction(API.notificationRead(n.id), "Could not mark read") }) : null,
+        el("button", { class: "btn btn-quiet", type: "button", text: "Dismiss",
+          onclick: () => noticeAction(API.notificationDismiss(n.id), "Could not dismiss") }))));
+  }
+}
+
+$("notifications-read-all").addEventListener("click", () =>
+  noticeAction(API.notificationsReadAll, "Could not mark all read"));
+
 /* A restart hands the address from one process to the next, and the gap is
    meant to be sub-second (see `bind_waiting` server-side) - a fetch landing
    in it is not a fault. Reported as an error it used to read
@@ -5632,6 +5719,7 @@ function reportUnreachableDuringUpgrade(error) {
 async function loadHealth({ applyRevisions = false } = {}) {
   try {
     state.health = await getJson(API.health);
+    renderBell();
     /* Through applyLoop rather than a bare render, so a loop that went quiet
        between ticks is confirmed here too: with the stream up, this interval
        is the only thing that asks. */
@@ -5676,7 +5764,13 @@ async function applyRevisions_(source) {
   const runsRev = source.runs_rev;
   const questionsRev = source.questions_rev;
   const talksRev = source.talks_rev;
+  const notificationsRev = source.notifications_rev;
   const jobs = [];
+
+  if (notificationsRev !== state.rev.notifications) {
+    state.rev.notifications = notificationsRev;
+    jobs.push(loadNotifications());
+  }
 
   if (queueRev !== state.rev.queue) {
     state.rev.queue = queueRev;
@@ -5758,6 +5852,7 @@ function parseRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (parts[0] === "queue") return { name: "queue", id: null };
   if (parts[0] === "questions") return { name: "questions", id: null };
+  if (parts[0] === "notifications") return { name: "notifications", id: null };
   if (parts[0] === "chat" && parts[1]) return { name: "talk", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "chat") return { name: "talks", id: null };
   if (parts[0] === "runs" && parts[1]) return { name: "run", id: decodeURIComponent(parts[1]) };
@@ -5773,6 +5868,7 @@ function applyRoute() {
   show($("view-run"), route.name === "run");
   show($("view-queue"), route.name === "queue");
   show($("view-questions"), route.name === "questions");
+  show($("view-notifications"), route.name === "notifications");
   show($("view-talks"), route.name === "talks");
   show($("view-talk"), route.name === "talk");
 
@@ -6081,13 +6177,14 @@ async function boot() {
      all five now share one round trip, and renderRuns runs once more after
      to pick up whichever of health/runs landed second. */
   await Promise.allSettled([
-    loadHealth(), loadRuns(), loadQueue(), loadQuestions(), loadTalks(),
+    loadHealth(), loadRuns(), loadQueue(), loadQuestions(), loadTalks(), loadNotifications(),
   ]);
   if (state.health) {
     state.rev.queue = state.health.queue_rev;
     state.rev.runs = state.health.runs_rev;
     state.rev.questions = state.health.questions_rev;
     state.rev.talks = state.health.talks_rev;
+    state.rev.notifications = state.health.notifications_rev;
     state.rev.loop = state.health.loop_rev;
     if (state.health.loop) state.loop = state.health.loop;
   }

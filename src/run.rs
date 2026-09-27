@@ -2262,6 +2262,19 @@ fn resolve_home(pinned: Option<PathBuf>, magi_home_env: Option<std::ffi::OsStrin
     }
 }
 
+/// [`home`] without the test panic: `None` in a test that never pinned a
+/// home, so best-effort writers (see [`crate::notices::raise`]) skip the write
+/// instead of touching the operator's real state or aborting the test.
+pub fn try_home() -> Option<PathBuf> {
+    if cfg!(test) {
+        HOME.get()
+            .cloned()
+            .or_else(|| std::env::var_os("MAGI_HOME").map(PathBuf::from))
+    } else {
+        Some(home())
+    }
+}
+
 /// Pin the run home for this process. The first call wins.
 pub fn set_home(dir: PathBuf) {
     let _ = HOME.set(dir);
