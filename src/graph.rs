@@ -281,6 +281,74 @@ pub struct Runner {
 ///
 /// One function, called by both entry points. Two answers to "where does a run
 /// branch from" is the kind of drift nobody notices until a diff is wrong.
+/// Bring the local `branch` in line with `<remote>/<branch>` before a review
+/// checks it out.
+///
+/// `git worktree add <branch>` resolves the *local* ref, and a branch pushed by
+/// anything other than plain `git push` from this checkout (a jj colocated
+/// workspace, another clone) moves only the remote-tracking ref - so the local
+/// one can be a stale placeholder. It moves only when local is behind the remote or is an
+/// empty placeholder that diverged from it; unpushed local work is kept, and a real
+/// divergence is refused rather than guessed at.
+async fn sync_review_branch(repo: &Path, branch: &str, remote: &str) -> Result<()> {
+    let tracking = format!("{remote}/{branch}");
+    let fetched = git::fetch(repo, remote, branch).await;
+    let fresh = matches!(&fetched, Ok(o) if o.ok()) && git::rev_exists(repo, &tracking).await;
+    let local_exists = git::branch_exists(repo, branch).await?;
+    if !fresh {
+        if !local_exists {
+            bail!("no branch `{branch}` in {} or on {remote}", repo.display());
+        }
+        tracing::warn!(
+            "could not read {tracking}; reviewing the local `{branch}`, which may be stale"
+        );
+        return Ok(());
+    }
+    let remote_sha = git::rev_parse(repo, &tracking).await?;
+    if !local_exists {
+        git::git(repo, &["branch", branch, &tracking]).await?;
+        return Ok(());
+    }
+    let local_sha = git::rev_parse(repo, &format!("refs/heads/{branch}")).await?;
+    if local_sha == remote_sha || git::is_ancestor(repo, &remote_sha, &local_sha).await {
+        return Ok(());
+    }
+    if !git::is_ancestor(repo, &local_sha, &remote_sha).await {
+        // Diverged. A local tip that adds nothing over the fork point is a
+        // placeholder the remote's work replaced (a jj rewrite of the same
+        // change); anything else is local work we must not discard.
+        let mb = git::git_raw(repo, &["merge-base", &local_sha, &remote_sha]).await?;
+        let placeholder = mb.ok()
+            && git::git_raw(repo, &["diff", "--quiet", &mb.stdout, &local_sha])
+                .await?
+                .ok();
+        if !placeholder {
+            bail!(
+                "local `{branch}` ({}) and {tracking} ({}) have diverged, so it is unclear \
+                 which one to review; reconcile them, e.g. `git branch -f {branch} {tracking}` \
+                 to review the pushed work, or push the local branch first",
+                short(&local_sha),
+                short(&remote_sha)
+            );
+        }
+    }
+    let out = git::git_raw(repo, &["branch", "-f", branch, &tracking]).await?;
+    if !out.ok() {
+        bail!(
+            "local `{branch}` ({}) is stale against {tracking} ({}) but git will not move it: {}",
+            short(&local_sha),
+            short(&remote_sha),
+            out.stderr
+        );
+    }
+    tracing::warn!(
+        "local `{branch}` was stale: fast-forwarded {} -> {}",
+        short(&local_sha),
+        short(&remote_sha)
+    );
+    Ok(())
+}
+
 async fn resolve_base(repo: &Path, base_branch: &str, remote: &str) -> Result<String> {
     let tracking = format!("{remote}/{base_branch}");
     let fetched = git::fetch(repo, remote, base_branch).await;
@@ -445,9 +513,7 @@ impl Runner {
                 missing.join(", ")
             );
         }
-        if !git::branch_exists(&repo, branch).await? {
-            bail!("no branch `{branch}` in {}", repo.display());
-        }
+        sync_review_branch(&repo, branch, &config.merge.remote).await?;
         let base_branch = match config.merge.base.clone() {
             Some(b) => b,
             None => git::current_branch(&repo)
@@ -501,12 +567,31 @@ impl Runner {
             .await
             .unwrap_or(0);
         if commits == 0 {
+            git::worktree_remove(&repo, &worktree).await.ok();
             bail!("`{branch}` has no commits beyond {}", short(&base_commit));
         }
         let files = git::changed_files(&worktree, &base_commit, "HEAD")
             .await
             .map(|f| f.len())
             .unwrap_or(0);
+        if files == 0
+            && let (Ok(head_tree), Ok(base_tree)) = (
+                git::tree_of(&worktree, "HEAD").await,
+                git::tree_of(&worktree, &base_commit).await,
+            )
+            && head_tree == base_tree
+        {
+            let head = git::rev_parse(&worktree, "HEAD").await.unwrap_or_default();
+            git::worktree_remove(&repo, &worktree).await.ok();
+            bail!(
+                "`{branch}` at {} has a tree identical to base {}; this usually means \
+                 the branch ref is stale (check `git rev-parse refs/heads/{branch}` \
+                 against `{}/{branch}`) rather than an empty change",
+                short(&head),
+                short(&base_commit),
+                state.config.merge.remote
+            );
+        }
         let stat = git::diff_stat(&worktree, &base_commit, "HEAD")
             .await
             .unwrap_or_default();
