@@ -7503,6 +7503,80 @@ mod tests {
     }
 
     #[test]
+    fn a_task_notification_links_to_its_own_card_not_the_bare_backlog() {
+        // A `kind: "task"` notice link used to drop the id on the floor and
+        // point at `#/queue` outright, so every task notification landed on
+        // whatever happened to be first in the Backlog rather than the task
+        // it was actually about.
+        assert!(
+            APP_JS.contains(
+                "el(\"a\", { href: `#/queue/${encodeURIComponent(link.id)}`, text: `Task ${shortId(link.id)}` })"
+            ),
+            "a task notice's link must carry the task id into the hash, not just name the Backlog screen"
+        );
+        assert!(
+            !APP_JS.contains("el(\"a\", { href: \"#/queue\", text: `Task ${shortId(link.id)}` })"),
+            "regression: the task link must not go back to naming the bare Backlog route"
+        );
+
+        // The route parser has to read that id back out before applyRoute()
+        // can do anything with it.
+        assert!(
+            APP_JS.contains(
+                "if (parts[0] === \"queue\" && parts[1]) return { name: \"queue\", id: decodeURIComponent(parts[1]) };"
+            ),
+            "`#/queue/<id>` must parse into a route carrying that id"
+        );
+
+        // And the Backlog view has to actually land on the card once it can
+        // - see consumeQueueFocus(), which renderQueue() calls on every pass
+        // so a focus set before the queue has loaded is retried once it has.
+        assert!(APP_JS.contains("state.queueFocus = route.id;"));
+        assert!(APP_JS.contains("function consumeQueueFocus()"));
+        assert!(APP_JS.contains("jumpToTask(id);"));
+    }
+
+    #[test]
+    fn consuming_a_queue_focus_survives_clearing_a_stale_backlog_search() {
+        // consumeQueueFocus() clears an active Backlog search before it can
+        // scroll to the target card (the sections list is hidden while a
+        // search is showing), by recursing back into renderQueue(). The
+        // fixer's first cut nulled state.queueFocus before that recursive
+        // call, so the second pass saw nothing to jump to and the jump was
+        // silently dropped whenever a notification's link was opened with a
+        // stale search still active. state.queueFocus must only be cleared
+        // right before jumpToTask() actually runs.
+        assert!(
+            APP_JS.contains(
+                "  if (!id || state.queue === null) return;\n  if (state.queueSearch.trim() !== \"\") {"
+            ),
+            "the search-clearing branch must run before state.queueFocus is cleared, or the \
+             recursive renderQueue() call has nothing left to jump to"
+        );
+        assert!(
+            APP_JS.contains("state.queueFocus = null;\n  jumpToTask(id);"),
+            "state.queueFocus must be cleared immediately before the jump it guards, not earlier"
+        );
+    }
+
+    #[test]
+    fn a_notification_card_navigates_from_anywhere_on_it_not_just_its_link_text() {
+        // The task's own repro: only the link text inside .notice-meta was
+        // clickable, so a tap on the message, the timestamp, or the card's
+        // padding did nothing - on a phone that reads as "the card doesn't
+        // work" even though the tiny link inside it did. Mark read / Dismiss
+        // must keep working independently of this: `.closest("a, button")`
+        // is what lets a tap that actually lands on those elements fall
+        // through instead of being hijacked into a navigation.
+        assert!(
+            APP_JS.contains(
+                "onclick: link ? (event) => { if (!event.target.closest(\"a, button\")) link.click(); } : null"
+            ),
+            "the notice card itself must forward a tap outside its link/buttons to the link's own click"
+        );
+    }
+
+    #[test]
     fn review_rounds_tell_a_stale_verification_and_a_resource_block_apart_from_a_real_result() {
         assert!(
             APP_JS.contains("round.verified_head !== round.head"),
