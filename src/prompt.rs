@@ -109,8 +109,29 @@ pub fn github_english(language: &str) -> String {
          to GitHub are always written in English, in every repository and \
          whatever language the task is written in."
     );
+    s.push_str(&github_quality_rule());
+    s.push_str(&github_confidential_rule());
     exempt_operator_prose(&mut s, language);
     s
+}
+
+/// What a pull request description or issue must contain: written for a
+/// reviewer, not the task text pasted back.
+fn github_quality_rule() -> String {
+    " A pull request description or issue you write reads as a real one \
+     for a reviewer, never as the task text pasted in. It states the \
+     background / motivation (why the change is needed), what was actually \
+     changed (concretely, by area), and any risk or follow-up."
+        .to_owned()
+}
+
+/// Nothing that identifies the machine or its operator may reach GitHub.
+fn github_confidential_rule() -> String {
+    " Never put hostnames, usernames or local account names, IP addresses, \
+     home-directory or absolute filesystem paths, email addresses, tokens or \
+     other machine- or operator-identifying data in a title, body or comment; \
+     refer to files by repository-relative path."
+        .to_owned()
 }
 
 /// [`github_english`] for a reviewer: the only thing of theirs that reaches
@@ -122,6 +143,8 @@ pub fn github_english_finding_titles(language: &str) -> String {
          so it is always written in English, whatever language the task is \
          written in. Any comment or issue you post to GitHub is English too."
     );
+    s.push_str(&github_quality_rule());
+    s.push_str(&github_confidential_rule());
     exempt_operator_prose(&mut s, language);
     s
 }
@@ -403,10 +426,12 @@ pub fn implement(instruction: &str, cwd: &str, language: &str, brief: Option<&st
          End your reply with, exactly:\n\n\
          ## SUMMARY\n\
          TITLE: type(scope): one-line description of the change you made\n\
-         - what you changed (max 10 bullets)\n\
-         - why, where it is not obvious\n\
-         - risks a reviewer should check\n\
+         - background: why the change is needed\n\
+         - what you changed, concretely and by area (max 10 bullets)\n\
+         - risks or follow-up a reviewer should check\n\
          - how to verify by hand\n\n\
+         The SUMMARY becomes the pull request description, so write it for a \
+         reviewer who has not seen the task.\n\n\
          The `TITLE:` line is the first line under SUMMARY. It becomes the \
          pull request title, so describe the change itself in a conventional-\
          commit style (`fix(web): …`) and keep the `type(scope):` prefix in \
@@ -1643,6 +1668,25 @@ pub fn conduct(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn github_text_rules_cover_quality_and_confidentiality() {
+        for p in [
+            github_english("en"),
+            github_english("ja"),
+            github_english_finding_titles("en"),
+        ] {
+            assert!(p.contains("background / motivation"), "{p}");
+            assert!(p.contains("hostnames, usernames"), "{p}");
+            assert!(p.contains("repository-relative path"), "{p}");
+        }
+        assert!(implementer_reply_format_mentions_background());
+    }
+
+    fn implementer_reply_format_mentions_background() -> bool {
+        let src = include_str!("prompt.rs");
+        src.contains("- background: why the change is needed")
+    }
+
     use super::*;
     use crate::verdict::Severity;
 
