@@ -313,3 +313,123 @@ async fn review_refuses_the_cases_that_cannot_mean_anything() {
     assert!(empty.is_err(), "a branch with no commits of its own");
 }
 }
+
+fn rev(repo: &std::path::Path, rev: &str) -> String {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", rev])
+        .current_dir(repo)
+        .output()
+        .expect("spawn git");
+    assert!(out.status.success(), "rev-parse {rev}");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// A bare `origin` for `fx.repo` and a second clone that pushes to it, which
+/// stands in for a jj workspace moving only the remote-tracking ref.
+fn wire_origin(fx: &common::Fixture) -> std::path::PathBuf {
+    let origin = fx.tmp.path().join("origin.git");
+    run_git(
+        fx.tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "-q",
+            fx.repo.to_str().unwrap(),
+            origin.to_str().unwrap(),
+        ],
+    );
+    run_git(
+        &fx.repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    let side = fx.tmp.path().join("side");
+    run_git(
+        fx.tmp.path(),
+        &["clone", "-q", origin.to_str().unwrap(), side.to_str().unwrap()],
+    );
+    run_git(&side, &["config", "user.name", "other"]);
+    run_git(&side, &["config", "user.email", "other@example.com"]);
+    side
+}
+
+/// Push `branch` from the sideline with a real commit, while `fx.repo` keeps a
+/// local `branch` that is still the empty placeholder (or diverged).
+fn push_real_work(side: &std::path::Path, branch: &str) {
+    run_git(side, &["checkout", "-q", "-b", branch]);
+    std::fs::write(side.join("real.txt"), "the real change\n").unwrap();
+    run_git(side, &["add", "-A"]);
+    run_git(side, &["commit", "-q", "-m", "the real change"]);
+    run_git(side, &["push", "-q", "origin", branch]);
+}
+
+common::e2e! {
+async fn a_stale_local_branch_is_fast_forwarded_to_the_pushed_work() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let side = wire_origin(&fx);
+    run_git(&fx.repo, &["branch", "feat/pushed", "main"]);
+    push_real_work(&side, "feat/pushed");
+    let pushed = rev(&side, "HEAD");
+
+    let runner = Runner::review(&fx.repo, "feat/pushed", fx.config.clone())
+        .await
+        .expect("open a review-only run");
+    assert_eq!(rev(&fx.repo, "refs/heads/feat/pushed"), pushed);
+    let c = &runner.state.candidates[0];
+    assert!(c.worktree.join("real.txt").is_file());
+    assert_eq!(c.commits, 1);
+}
+}
+
+common::e2e! {
+async fn a_diverged_branch_is_refused_and_leaves_no_worktree() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let side = wire_origin(&fx);
+    run_git(&fx.repo, &["checkout", "-q", "-b", "feat/split"]);
+    std::fs::write(fx.repo.join("local.txt"), "local only\n").unwrap();
+    run_git(&fx.repo, &["add", "-A"]);
+    run_git(&fx.repo, &["commit", "-q", "-m", "local only"]);
+    run_git(&fx.repo, &["checkout", "-q", "main"]);
+    push_real_work(&side, "feat/split");
+
+    let err = Runner::review(&fx.repo, "feat/split", fx.config.clone())
+        .await
+        .err()
+        .expect("a diverged branch must not be reviewed");
+    assert!(err.to_string().contains("diverged"), "{err}");
+    let list = std::process::Command::new("git")
+        .args(["worktree", "list"])
+        .current_dir(&fx.repo)
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&list.stdout).contains("under-review"));
+}
+}
+
+common::e2e! {
+async fn a_branch_whose_tree_equals_the_base_is_refused_and_releases_its_worktree() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    run_git(&fx.repo, &["checkout", "-q", "-b", "feat/placeholder"]);
+    run_git(
+        &fx.repo,
+        &["commit", "-q", "--allow-empty", "-m", "placeholder"],
+    );
+    run_git(&fx.repo, &["checkout", "-q", "main"]);
+
+    let err = Runner::review(&fx.repo, "feat/placeholder", fx.config.clone())
+        .await
+        .err()
+        .expect("an empty-tree branch must not be reviewed");
+    assert!(err.to_string().contains("tree identical"), "{err}");
+    // The branch is not left locked by the aborted attempt.
+    run_git(&fx.repo, &["worktree", "prune"]);
+    let list = std::process::Command::new("git")
+        .args(["worktree", "list"])
+        .current_dir(&fx.repo)
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&list.stdout).contains("feat/placeholder"));
+}
+}

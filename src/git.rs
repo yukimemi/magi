@@ -698,6 +698,18 @@ pub async fn fetch(repo: &Path, remote: &str, branch: &str) -> Result<GitOut> {
     git_raw(repo, &["fetch", "--quiet", remote, &refspec]).await
 }
 
+/// Is `ancestor` an ancestor of (or equal to) `of`?
+pub async fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> bool {
+    git_raw(repo, &["merge-base", "--is-ancestor", ancestor, of])
+        .await
+        .is_ok_and(|o| o.ok())
+}
+
+/// The tree object id of `rev`.
+pub async fn tree_of(repo: &Path, rev: &str) -> Result<String> {
+    git(repo, &["rev-parse", &format!("{rev}^{{tree}}")]).await
+}
+
 /// Does this ref resolve?
 pub async fn rev_exists(repo: &Path, rev: &str) -> bool {
     git_raw(repo, &["rev-parse", "--verify", "--quiet", rev])
