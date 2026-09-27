@@ -387,7 +387,7 @@ async fn a_stale_local_branch_is_fast_forwarded_to_the_pushed_work() {
 }
 
 common::e2e! {
-async fn a_diverged_branch_is_refused_and_leaves_no_worktree() {
+async fn a_diverged_branch_with_local_work_is_reviewed_as_it_is() {
     let _home = common::home_lock().await;
     let fx = fixture(_home, Judges::Unanimous, true);
     let side = wire_origin(&fx);
@@ -396,19 +396,33 @@ async fn a_diverged_branch_is_refused_and_leaves_no_worktree() {
     run_git(&fx.repo, &["add", "-A"]);
     run_git(&fx.repo, &["commit", "-q", "-m", "local only"]);
     run_git(&fx.repo, &["checkout", "-q", "main"]);
+    let local = rev(&fx.repo, "feat/split");
     push_real_work(&side, "feat/split");
 
-    let err = Runner::review(&fx.repo, "feat/split", fx.config.clone())
+    let runner = Runner::review(&fx.repo, "feat/split", fx.config.clone())
         .await
-        .err()
-        .expect("a diverged branch must not be reviewed");
-    assert!(err.to_string().contains("diverged"), "{err}");
-    let list = std::process::Command::new("git")
-        .args(["worktree", "list"])
-        .current_dir(&fx.repo)
-        .output()
-        .unwrap();
-    assert!(!String::from_utf8_lossy(&list.stdout).contains("under-review"));
+        .expect("local work is reviewed");
+    assert_eq!(rev(&fx.repo, "refs/heads/feat/split"), local);
+    assert!(runner.state.candidates[0].worktree.join("local.txt").is_file());
+}
+}
+
+common::e2e! {
+async fn a_rewritten_placeholder_gives_way_to_the_pushed_work() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let side = wire_origin(&fx);
+    run_git(&fx.repo, &["checkout", "-q", "-b", "feat/rewritten"]);
+    run_git(&fx.repo, &["commit", "-q", "--allow-empty", "-m", "placeholder"]);
+    run_git(&fx.repo, &["checkout", "-q", "main"]);
+    push_real_work(&side, "feat/rewritten");
+    let pushed = rev(&side, "HEAD");
+
+    let runner = Runner::review(&fx.repo, "feat/rewritten", fx.config.clone())
+        .await
+        .expect("open a review-only run");
+    assert_eq!(rev(&fx.repo, "refs/heads/feat/rewritten"), pushed);
+    assert!(runner.state.candidates[0].worktree.join("real.txt").is_file());
 }
 }
 

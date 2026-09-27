@@ -287,8 +287,8 @@ pub struct Runner {
 /// `git worktree add <branch>` resolves the *local* ref, and a branch pushed by
 /// anything other than plain `git push` from this checkout (a jj colocated
 /// workspace, another clone) moves only the remote-tracking ref - so the local
-/// one can be a stale placeholder. Only a fast-forward moves it: an unpushed
-/// local tip is kept, and a divergence is left for a person.
+/// one can be a stale placeholder. It moves only when local is behind the remote or is an
+/// empty placeholder that diverged from it; unpushed local work is kept.
 async fn sync_review_branch(repo: &Path, branch: &str, remote: &str) -> Result<()> {
     let tracking = format!("{remote}/{branch}");
     let fetched = git::fetch(repo, remote, branch).await;
@@ -313,17 +313,28 @@ async fn sync_review_branch(repo: &Path, branch: &str, remote: &str) -> Result<(
         return Ok(());
     }
     if !git::is_ancestor(repo, &local_sha, &remote_sha).await {
-        bail!(
-            "local `{branch}` ({}) and {tracking} ({}) have diverged; reconcile them, e.g. \
-             `git branch -f {branch} {tracking}` to review the pushed work",
-            short(&local_sha),
-            short(&remote_sha)
-        );
+        // Diverged. A local tip that adds nothing over the fork point is a
+        // placeholder the remote's work replaced (a jj rewrite of the same
+        // change); anything else is local work we must not discard.
+        let mb = git::git_raw(repo, &["merge-base", &local_sha, &remote_sha]).await?;
+        let placeholder = mb.ok()
+            && git::git_raw(repo, &["diff", "--quiet", &mb.stdout, &local_sha])
+                .await?
+                .ok();
+        if !placeholder {
+            tracing::warn!(
+                "local `{branch}` ({}) and {tracking} ({}) have diverged; reviewing the \
+                 local branch (`git branch -f {branch} {tracking}` to review the pushed work)",
+                short(&local_sha),
+                short(&remote_sha)
+            );
+            return Ok(());
+        }
     }
     let out = git::git_raw(repo, &["branch", "-f", branch, &tracking]).await?;
     if !out.ok() {
         bail!(
-            "local `{branch}` ({}) is behind {tracking} ({}) but git will not move it: {}",
+            "local `{branch}` ({}) is stale against {tracking} ({}) but git will not move it: {}",
             short(&local_sha),
             short(&remote_sha),
             out.stderr
