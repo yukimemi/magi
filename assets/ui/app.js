@@ -2535,15 +2535,17 @@ const query = state.queueSearch.trim().toLowerCase();
    `#/queue/<id>` hash - a task notification's own link. Runs from the tail
    of renderQueue(), which is called from every path that can make the
    target findable: loadQueue() once state.queue has actually loaded, and
-   setQueueSearch() once a stale search from a previous visit is cleared
-   below. Consumed exactly once, before jumpToTask() runs, so a task that
-   turns out to have been folded or deleted since the notification fired
-   just drops the focus instead of leaving it to retry forever - jumpToTask()
+   the recursive renderQueue() call below once a stale search from a
+   previous visit is cleared. state.queueFocus is deliberately left set
+   through that recursive call - clearing it before the search branch ran
+   would make the second pass see nothing to jump to and silently drop the
+   jump. It is cleared only once jumpToTask() is actually about to run, so a
+   task that turns out to have been folded or deleted since the notification
+   fired just drops the focus instead of retrying forever - jumpToTask()
    itself already no-ops when the card is not on the page. */
 function consumeQueueFocus() {
   const id = state.queueFocus;
   if (!id || state.queue === null) return;
-  state.queueFocus = null;
   if (state.queueSearch.trim() !== "") {
     state.queueSearch = "";
     const input = $("queue-search-input");
@@ -2552,6 +2554,7 @@ function consumeQueueFocus() {
     renderQueue();
     return;
   }
+  state.queueFocus = null;
   jumpToTask(id);
 }
 
@@ -5705,7 +5708,15 @@ function renderNotifications() {
     const at = when(n.last_at);
     const link = noticeLink(n.link);
     const unread = !n.read_at;
-    list.append(el("li", { class: "notice", "data-sev": n.severity, "data-read": unread ? "0" : "1" },
+    /* The link itself is the one reliable tap target on a phone, but it is a
+       small piece of text at the end of the meta row - a tap on the message,
+       the timestamp, or the card's own padding landed on nothing. Forward
+       such a tap to the link's own click rather than duplicating what it
+       does (hash route vs. a new tab), and get out of the way of the
+       actions row: `.closest("a, button")` lets Mark read / Dismiss and the
+       link's own click keep behaving exactly as before. */
+    const card = el("li", { class: "notice", "data-sev": n.severity, "data-read": unread ? "0" : "1",
+      onclick: link ? (event) => { if (!event.target.closest("a, button")) link.click(); } : null },
       el("div", { class: "notice-msg", text: n.message }),
       el("div", { class: "notice-meta" },
         el("span", { text: n.severity }),
@@ -5716,7 +5727,8 @@ function renderNotifications() {
         unread ? el("button", { class: "btn btn-quiet", type: "button", text: "Mark read",
           onclick: () => noticeAction(API.notificationRead(n.id), "Could not mark read") }) : null,
         el("button", { class: "btn btn-quiet", type: "button", text: "Dismiss",
-          onclick: () => noticeAction(API.notificationDismiss(n.id), "Could not dismiss") }))));
+          onclick: () => noticeAction(API.notificationDismiss(n.id), "Could not dismiss") })));
+    list.append(card);
   }
 }
 

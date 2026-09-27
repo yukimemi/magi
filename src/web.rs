@@ -7537,6 +7537,46 @@ mod tests {
     }
 
     #[test]
+    fn consuming_a_queue_focus_survives_clearing_a_stale_backlog_search() {
+        // consumeQueueFocus() clears an active Backlog search before it can
+        // scroll to the target card (the sections list is hidden while a
+        // search is showing), by recursing back into renderQueue(). The
+        // fixer's first cut nulled state.queueFocus before that recursive
+        // call, so the second pass saw nothing to jump to and the jump was
+        // silently dropped whenever a notification's link was opened with a
+        // stale search still active. state.queueFocus must only be cleared
+        // right before jumpToTask() actually runs.
+        assert!(
+            APP_JS.contains(
+                "  if (!id || state.queue === null) return;\n  if (state.queueSearch.trim() !== \"\") {"
+            ),
+            "the search-clearing branch must run before state.queueFocus is cleared, or the \
+             recursive renderQueue() call has nothing left to jump to"
+        );
+        assert!(
+            APP_JS.contains("state.queueFocus = null;\n  jumpToTask(id);"),
+            "state.queueFocus must be cleared immediately before the jump it guards, not earlier"
+        );
+    }
+
+    #[test]
+    fn a_notification_card_navigates_from_anywhere_on_it_not_just_its_link_text() {
+        // The task's own repro: only the link text inside .notice-meta was
+        // clickable, so a tap on the message, the timestamp, or the card's
+        // padding did nothing - on a phone that reads as "the card doesn't
+        // work" even though the tiny link inside it did. Mark read / Dismiss
+        // must keep working independently of this: `.closest("a, button")`
+        // is what lets a tap that actually lands on those elements fall
+        // through instead of being hijacked into a navigation.
+        assert!(
+            APP_JS.contains(
+                "onclick: link ? (event) => { if (!event.target.closest(\"a, button\")) link.click(); } : null"
+            ),
+            "the notice card itself must forward a tap outside its link/buttons to the link's own click"
+        );
+    }
+
+    #[test]
     fn review_rounds_tell_a_stale_verification_and_a_resource_block_apart_from_a_real_result() {
         assert!(
             APP_JS.contains("round.verified_head !== round.head"),
