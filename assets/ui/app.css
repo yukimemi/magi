@@ -1194,9 +1194,10 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .cand[data-winner="1"] { background: var(--tint-gold); }
 .cand-head { display: flex; align-items: center; gap: var(--s2); }
 .cand-label {
-  width: 28px; height: 28px; flex: none;
+  min-width: 28px; width: auto; height: 28px; flex: none;
+  padding: 0 6px; white-space: nowrap;
   display: grid; place-items: center;
-  border-radius: 50%; border: 2px solid var(--cand-tone, var(--ink-3));
+  border-radius: 14px; border: 2px solid var(--cand-tone, var(--ink-3));
   color: var(--cand-tone, var(--ink)); background: var(--surface);
   font-weight: 700; font-size: var(--t3);
 }
