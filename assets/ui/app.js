@@ -4616,13 +4616,49 @@ function renderRunDetail() {
 
   const head = $("run-status");
   clear(head);
-  head.append(chip(status, RUN_STATUS));
+  /* A run whose task moved on is not the one to act on anymore, however its
+     own chip reads: the list route already says so on the card, but the
+     detail page — what an operator actually opens off a notification about a
+     blocked or failed run — went on showing a plain red chip with nothing
+     anywhere saying a retry had already resolved the work.
+
+     `run.latest_attempt` (added on this route for exactly this) is resolved
+     entirely on the server: it already names the task's *current* attempt,
+     not just the next one in the chain — an old run superseded by an
+     intermediate retry that is itself still Blocked points straight at
+     whichever attempt is current — carries that attempt's real id rather
+     than a short id this page would have to guess a full one from (two runs
+     can share a short suffix), and its own `resolved` flag is read off that
+     attempt's actual status on disk rather than off `state.runs`, a client
+     cache capped to a page size this route knows nothing about. None of
+     that can be reconstructed safely from the run list cache — see the
+     review round that put it here.
+
+     Never downgrade a run still moving (`PHASES` or parked): a later
+     attempt existing is not proof this one is done trying. */
+  const latest = run.latest_attempt && typeof run.latest_attempt.id === "string"
+    ? run.latest_attempt
+    : null;
+  const inFlight = PHASES.includes(status) || status === "waiting";
+  const superseded = Boolean(latest && latest.resolved) && !inFlight;
+
+  const statusChip = chip(status, RUN_STATUS);
+  setAttr(statusChip, "data-superseded", superseded ? "1" : null);
+  head.append(statusChip);
   const parkedAt = parkedNow ? (openFor(run.id)[0] || {}).node || null : null;
   const rail = PHASES.includes(status) || parkedAt
     ? phaseRail(status, parkedAt, activeNote(run))
     : null;
   if (rail) head.append(rail);
-  if (meta.note) head.append(el("p", { class: "card-note", text: meta.note }));
+  if (superseded) {
+    head.append(el("p", { class: "card-note card-superseded" },
+      "Superseded by ",
+      el("a", { href: `#/runs/${latest.id}`, text: latest.short }),
+      " — a later attempt at the same task finished this work.",
+    ));
+  } else if (meta.note) {
+    head.append(el("p", { class: "card-note", text: meta.note }));
+  }
 
   setText($("run-h"), firstLine(run.instruction) || shortId(run.id));
 

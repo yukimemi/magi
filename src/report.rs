@@ -158,6 +158,29 @@ pub fn liveness_notice(state: &RunState, live: Liveness) -> String {
     }
 }
 
+/// A plainly visible note for a run a later attempt at the same task already
+/// replaced — the terminal counterpart of the web UI's "Superseded by …"
+/// line. `later` is the short id of that later attempt, or `None` when this
+/// run is not superseded at all (the common case).
+///
+/// Kept as its own function, concatenated by the caller, rather than an
+/// argument threaded through [`run`] itself: `run` is called from `bump.rs`,
+/// `tui.rs` and every `magi show`/`magi list` path with no notion of "what
+/// replaced this", and adding a parameter there would mean guessing `None`
+/// at every one of those call sites instead of only at the one that knows.
+pub fn superseded_notice(later: Option<&str>) -> String {
+    match later {
+        Some(later) => format!(
+            "{}\n\n",
+            yellow(&format!(
+                "SUPERSEDED — a later attempt at this task ({later}) replaced it; this record \
+                 is kept but is not the one to act on."
+            ))
+        ),
+        None => String::new(),
+    }
+}
+
 fn first_line(text: &str) -> String {
     let line = text.lines().next().unwrap_or_default();
     if line.chars().count() > 68 {
@@ -1977,6 +2000,20 @@ mod tests {
             text.contains("no live daemon"),
             "a stale entry must not read as running: {text}"
         );
+    }
+
+    #[test]
+    fn superseded_notice_names_the_run_that_replaced_it() {
+        let _guard = plain();
+        let text = superseded_notice(Some("bbbb"));
+        assert!(text.contains("SUPERSEDED"), "{text}");
+        assert!(text.contains("bbbb"), "{text}");
+    }
+
+    #[test]
+    fn superseded_notice_is_silent_for_the_latest_attempt() {
+        let _guard = plain();
+        assert_eq!(superseded_notice(None), "");
     }
 
     #[test]

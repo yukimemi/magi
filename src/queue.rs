@@ -30,6 +30,7 @@
 //! has burned its attempts becomes [`TaskStatus::Held`] and waits for a human
 //! rather than for another agent.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -932,6 +933,65 @@ impl Queue {
         tasks
     }
 
+    /// Runs that a later attempt at the same task replaced, mapped to the id
+    /// of the attempt that replaced them.
+    ///
+    /// A task keeps its attempts in order, and the deck showed them as two
+    /// cards with the same title and no hint which was which: yukimemi asked
+    /// why `stalled` and `blocked` appeared twice for one task, and the
+    /// answer - "those are two tries, and the second one exists because of a
+    /// bug since fixed" - was not on the screen anywhere.
+    ///
+    /// Read from the queue rather than stored on the run, because the
+    /// ordering is the queue's fact: a `RunState` has no idea another attempt
+    /// happened after it.
+    pub fn superseded(&self) -> HashMap<String, String> {
+        let mut by = HashMap::new();
+        for task in self.list() {
+            for pair in task.runs.windows(2) {
+                if let [earlier, later] = pair {
+                    by.insert(earlier.clone(), later.clone());
+                }
+            }
+        }
+        by
+    }
+
+    /// Whether `run` is an earlier attempt a later one replaced, and if so
+    /// the id of that later attempt.
+    ///
+    /// Same walk as [`Queue::superseded`], narrowed to one run: a run detail
+    /// page asks about exactly one run at a time, and this keeps that call
+    /// site from building (and discarding) the whole map's `HashMap` just to
+    /// read one entry out of it.
+    pub fn superseded_by(&self, run: &str) -> Option<String> {
+        for task in self.list() {
+            if let Some(pos) = task.runs.iter().position(|r| r == run) {
+                return task.runs.get(pos + 1).cloned();
+            }
+        }
+        None
+    }
+
+    /// The task's own most recent attempt, when `run` belongs to that task
+    /// but is not already that attempt.
+    ///
+    /// Distinct from [`Queue::superseded_by`], which names only the very
+    /// next attempt: a chain of retries (A superseded by B superseded by C)
+    /// leaves an older run pointing at an intermediate one that may itself
+    /// be unresolved, and a run's own detail page needs to know where the
+    /// task's story currently stands - the chain's current head, C - not an
+    /// attempt in the middle of it that a client would otherwise have to
+    /// walk to by hand.
+    pub fn latest_attempt(&self, run: &str) -> Option<String> {
+        for task in self.list() {
+            if task.runs.iter().any(|r| r == run) {
+                return task.runs.last().filter(|last| **last != run).cloned();
+            }
+        }
+        None
+    }
+
     /// The task a daemon should run next, or `None` when the queue is idle.
     ///
     /// Highest priority first, oldest first within a priority, so a burst of
@@ -1220,6 +1280,62 @@ mod tests {
             PathBuf::from("."),
             Source::Human,
         )
+    }
+
+    #[test]
+    fn superseded_by_names_the_next_attempt_and_none_for_the_last() {
+        let (_dir, q) = queue();
+        let mut t = task("retried");
+        t.runs = vec!["aaaa".to_owned(), "bbbb".to_owned(), "cccc".to_owned()];
+        q.put(&mut t).unwrap();
+
+        assert_eq!(q.superseded_by("aaaa"), Some("bbbb".to_owned()));
+        assert_eq!(q.superseded_by("bbbb"), Some("cccc".to_owned()));
+        assert_eq!(
+            q.superseded_by("cccc"),
+            None,
+            "the latest attempt replaces nothing"
+        );
+        assert_eq!(
+            q.superseded_by("never-heard-of-it"),
+            None,
+            "a run belonging to no task on this queue is not superseded"
+        );
+
+        let mut by = HashMap::new();
+        by.insert("aaaa".to_owned(), "bbbb".to_owned());
+        by.insert("bbbb".to_owned(), "cccc".to_owned());
+        assert_eq!(
+            q.superseded(),
+            by,
+            "the whole-map and single-run forms must agree"
+        );
+    }
+
+    #[test]
+    fn latest_attempt_names_the_chain_s_current_head_not_just_the_next_one() {
+        let (_dir, q) = queue();
+        let mut t = task("retried twice");
+        t.runs = vec!["aaaa".to_owned(), "bbbb".to_owned(), "cccc".to_owned()];
+        q.put(&mut t).unwrap();
+
+        assert_eq!(
+            q.latest_attempt("aaaa"),
+            Some("cccc".to_owned()),
+            "an old attempt points straight at the chain's current head, not the \
+             next attempt in the middle of it"
+        );
+        assert_eq!(q.latest_attempt("bbbb"), Some("cccc".to_owned()));
+        assert_eq!(
+            q.latest_attempt("cccc"),
+            None,
+            "the latest attempt is not superseded by anything"
+        );
+        assert_eq!(
+            q.latest_attempt("never-heard-of-it"),
+            None,
+            "a run belonging to no task on this queue is not superseded"
+        );
     }
 
     #[test]

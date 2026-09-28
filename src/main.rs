@@ -1158,9 +1158,16 @@ async fn dispatch(command: Command) -> Result<()> {
                     jiff::Timestamp::now(),
                 );
                 let live = state.liveness(daemon_claims);
+                let superseded_by = Queue::at(magi::run::home().join("queue"))
+                    .superseded_by(&id)
+                    .as_deref()
+                    .map(magi::run::short_of)
+                    .map(str::to_owned);
                 print!(
                     "{}{}",
-                    report::liveness_notice(&state, live) + &report::run(&state),
+                    report::superseded_notice(superseded_by.as_deref())
+                        + &report::liveness_notice(&state, live)
+                        + &report::run(&state),
                     report::active_seats(&state, live)
                 );
             }
