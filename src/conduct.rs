@@ -546,6 +546,10 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
             }
             Some(Recovery::Done) => {
                 task.succeed();
+                // Same reason `magi task done` and the web UI's equivalent
+                // do this: the conductor closing a task by hand is just as
+                // much a finished story as the loop's own settle path.
+                crate::daemon::supersede_prior_runs(&task, &crate::run::home());
                 queue.put(&mut task)?;
             }
             None => {}

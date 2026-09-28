@@ -92,7 +92,13 @@ impl Filter {
         match self {
             Self::All => true,
             Self::Active => !status.done(),
-            Self::Done => matches!(status, RunStatus::Merged | RunStatus::Ready),
+            // `Superseded` sits with `Merged`/`Ready`, not `Attention`: a
+            // later attempt at the same task already settled it, so nobody
+            // needs to look at this one — see `RunStatus::Superseded`'s doc.
+            Self::Done => matches!(
+                status,
+                RunStatus::Merged | RunStatus::Ready | RunStatus::Superseded
+            ),
             // A stalled run wants a human even though it is terminal, so it
             // surfaces under "attention", not "done" — and so does a
             // verified no-op: nothing landed, and the task it came from sits
@@ -255,7 +261,7 @@ impl App {
         };
         for l in &self.runs {
             match l.state.status {
-                RunStatus::Merged | RunStatus::Ready => c.done += 1,
+                RunStatus::Merged | RunStatus::Ready | RunStatus::Superseded => c.done += 1,
                 RunStatus::Stalled
                 | RunStatus::Blocked
                 | RunStatus::Failed
@@ -471,6 +477,9 @@ fn status_style(status: RunStatus) -> Style {
         // nothing belonged in this worktree — the opposite of a run that
         // could not do the work.
         RunStatus::VerifiedNoop => Style::default().fg(Color::Cyan),
+        // Muted: a later attempt already settled the task, so this card
+        // needs nobody's attention.
+        RunStatus::Superseded => Style::default().fg(Color::DarkGray),
         _ => Style::default().fg(Color::Cyan),
     }
 }

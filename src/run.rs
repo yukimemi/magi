@@ -189,6 +189,19 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// authorization question is not a verified no-op, and reading the two
 /// alike is exactly the misclassification the guard's per-candidate and
 /// whole-run conditions exist to refuse.
+///
+/// `RunStatus::Superseded` (added without a bump, still schema 10) is
+/// additive in the ordinary sense — an old build reading a run written under
+/// a newer one only had `RunStatus` variants to worry about before this, and
+/// a record already on disk never contained the new variant to begin with —
+/// but it is not additive in the sense every earlier schema bump on this
+/// constant was: `daemon::supersede_prior_runs` now rewrites a `Blocked` or
+/// `Stalled` run's `status` field *after* it was first written, once a later
+/// attempt at the same task lands. Any tooling outside magi that reads
+/// `run.json` and assumes a terminal `status` is permanent once set — a
+/// monitoring script polling for `blocked`, say — needs to know that
+/// `superseded` is where some of those records now go instead of staying put
+/// forever; see that function's own doc for exactly when.
 pub const SCHEMA: u32 = 10;
 
 /// Where a run got to.
@@ -246,6 +259,16 @@ pub enum RunStatus {
     /// means nothing retries the task unattended on the same unconfirmed
     /// claim while that look is pending.
     VerifiedNoop,
+    /// A later attempt at the same task already finished the job — see
+    /// `crate::queue::Task::superseded_attempts` — so this run's own
+    /// `Blocked`/`Stalled` no longer means anyone has to look at it. Written
+    /// only over one of those two statuses, only once the task itself is
+    /// `crate::queue::TaskStatus::Done`, and only onto an attempt that comes
+    /// before the one that succeeded. Unlike them, not [`Self::resumable`]:
+    /// there is nothing left to resume towards, the task already has its
+    /// answer, and a fold is free to clean this run's worktree away without
+    /// waiting on a human to confirm that first.
+    Superseded,
 }
 
 impl RunStatus {
@@ -259,6 +282,7 @@ impl RunStatus {
                 | Self::Blocked
                 | Self::Failed
                 | Self::VerifiedNoop
+                | Self::Superseded
         )
     }
 
@@ -281,6 +305,7 @@ impl RunStatus {
             Self::Blocked => "blocked",
             Self::Failed => "failed",
             Self::VerifiedNoop => "verified_noop",
+            Self::Superseded => "superseded",
         }
     }
 
@@ -319,14 +344,16 @@ impl RunStatus {
     /// answer is a new competition. Nor does `VerifiedNoop`: every candidate
     /// already agreed nothing belongs in this worktree, and resuming would
     /// only re-ask the same question — the answer is for a human to check
-    /// the evidence, not for the graph to run again.
+    /// the evidence, not for the graph to run again. Nor does `Superseded`:
+    /// a later attempt at the same task already finished it, so there is
+    /// nothing left this run's own answer could still contribute.
     ///
     /// Whether anything is *already* driving the run is a separate question,
     /// answered by `daemon::is_working_on` at the callers that need it.
     pub fn resumable(self) -> bool {
         !matches!(
             self,
-            Self::Merged | Self::Ready | Self::Failed | Self::VerifiedNoop
+            Self::Merged | Self::Ready | Self::Failed | Self::VerifiedNoop | Self::Superseded
         )
     }
 }
@@ -1975,6 +2002,23 @@ impl RunState {
             serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
         migrate_schema(state)
     }
+
+    /// [`Self::load`], rooted at an explicit `home` instead of the
+    /// process-global one, and for a full id rather than a prefix — a caller
+    /// with its own `home` already has the exact id (from a `RunState` it
+    /// already read, or from `Task::runs`) and has no `runs_root` to search
+    /// for a prefix against in the first place. Same reasoning as
+    /// [`Self::save_under`]: a caller holding its own `home` explicitly must
+    /// not read back through whichever directory some *other* process or
+    /// test pinned into the global [`home`] `OnceLock` first.
+    pub fn load_under(id: &str, home: &Path) -> Result<Self> {
+        let path = home.join("runs").join(id).join("run.json");
+        let body =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let state: Self =
+            serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
+        migrate_schema(state)
+    }
 }
 
 fn migrate_schema(mut state: RunState) -> Result<RunState> {
@@ -2455,6 +2499,36 @@ mod tests {
             "add retries".to_owned(),
             Config::default(),
         )
+    }
+
+    #[test]
+    fn superseded_is_terminal_but_not_resumable() {
+        assert!(RunStatus::Superseded.done());
+        assert!(!RunStatus::Superseded.resumable());
+        assert_eq!(RunStatus::Superseded.as_str(), "superseded");
+    }
+
+    #[test]
+    fn load_under_reads_back_exactly_what_save_under_wrote_at_an_explicit_home() {
+        // Both rooted at an explicit `home` rather than the process-global
+        // one - a caller with its own `home` (a test fixture, a housekeeping
+        // pass) must round-trip through exactly that directory, never
+        // through whichever home some other test in the same binary pinned
+        // into the global `OnceLock` first.
+        let dir = tempfile::tempdir().unwrap();
+        let mut original = state();
+        original.id = "20260101-000000-load".to_owned();
+        original.status = RunStatus::Blocked;
+        original.save_under(dir.path()).unwrap();
+
+        let reloaded = RunState::load_under(&original.id, dir.path()).unwrap();
+        assert_eq!(reloaded.id, original.id);
+        assert_eq!(reloaded.status, RunStatus::Blocked);
+
+        assert!(
+            RunState::load_under("20260101-000000-none", dir.path()).is_err(),
+            "an id with nothing saved under this home must not silently read something else"
+        );
     }
 
     #[test]

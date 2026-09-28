@@ -486,6 +486,42 @@ impl Task {
         self.blocked_from = None;
     }
 
+    /// Earlier attempts at this task that a later one has since made moot —
+    /// empty unless the task is [`TaskStatus::Done`] *and* `last_run_succeeded`
+    /// says `runs.last()` is actually why.
+    ///
+    /// `runs` is oldest first, and [`Task::start`] is the only thing that
+    /// pushes to it, always right before the attempt it names either succeeds
+    /// or fails; `succeed` itself never touches `runs`. So whenever `status`
+    /// is `Done` *because* the loop itself saw that last attempt land
+    /// (`Merged`/`Ready`), everything before it in the same list is a retry
+    /// this task no longer needs. But `succeed` is also reachable directly —
+    /// `magi task done`, the web UI's equivalent, and the conductor's
+    /// `Recovery::Done` all call it on a task in *any* status, including one
+    /// whose last recorded attempt never landed at all (closed by hand after
+    /// a merge magi's own loop never saw). `runs.last()` alone cannot tell
+    /// those two cases apart — that requires the caller to have actually
+    /// looked at that run's own `status`, which this module has no way to
+    /// do — so `last_run_succeeded` is the caller's answer to exactly that
+    /// question, not something this function can derive from `Task` alone.
+    ///
+    /// Deliberately narrower than [`Queue::superseded`]'s "every earlier
+    /// attempt has a later one" walk, which fires the moment a retry starts
+    /// even though the retry itself might still fail: that reading is right
+    /// for the web UI's "a newer attempt exists, go look at that one
+    /// instead" note, but wrong for deciding a run no longer needs a human's
+    /// attention, which is only true once the task's story has actually
+    /// ended well. Two Blocked runs sitting side by side while a third
+    /// attempt is still in flight must not be touched by this — see
+    /// `daemon::supersede_prior_runs`, the caller that turns this list into
+    /// rewritten `run.json` files.
+    pub fn superseded_attempts(&self, last_run_succeeded: bool) -> &[String] {
+        if self.status != TaskStatus::Done || !last_run_succeeded || self.runs.len() < 2 {
+            return &[];
+        }
+        &self.runs[..self.runs.len() - 1]
+    }
+
     /// Record a failed attempt. Out of attempts means held for a human, rather
     /// than retried until the money runs out.
     ///
@@ -1309,6 +1345,59 @@ mod tests {
             q.superseded(),
             by,
             "the whole-map and single-run forms must agree"
+        );
+    }
+
+    #[test]
+    fn superseded_attempts_is_empty_until_the_task_is_done() {
+        let mut t = task("retried");
+        t.runs = vec!["aaaa".to_owned(), "bbbb".to_owned()];
+        t.status = TaskStatus::Failed;
+        assert_eq!(
+            t.superseded_attempts(true),
+            &[] as &[String],
+            "a task still retrying has no attempt yet that a later one made moot"
+        );
+
+        t.status = TaskStatus::Running;
+        assert_eq!(t.superseded_attempts(true), &[] as &[String]);
+    }
+
+    #[test]
+    fn superseded_attempts_names_every_run_before_the_one_that_succeeded() {
+        let mut t = task("retried");
+        t.runs = vec!["aaaa".to_owned(), "bbbb".to_owned(), "cccc".to_owned()];
+        t.status = TaskStatus::Done;
+        assert_eq!(
+            t.superseded_attempts(true),
+            &["aaaa".to_owned(), "bbbb".to_owned()],
+            "cccc is the attempt whose success made the task done, and stays out"
+        );
+    }
+
+    #[test]
+    fn superseded_attempts_is_empty_for_a_done_task_with_only_one_attempt() {
+        let mut t = task("first try landed");
+        t.runs = vec!["aaaa".to_owned()];
+        t.status = TaskStatus::Done;
+        assert_eq!(t.superseded_attempts(true), &[] as &[String]);
+    }
+
+    #[test]
+    fn superseded_attempts_is_empty_when_the_last_run_never_actually_succeeded() {
+        // `succeed` is reachable directly - `magi task done`, its web
+        // equivalent, and the conductor's `Recovery::Done` - on a task in
+        // any status, including one whose last recorded attempt is itself
+        // `Blocked`/`Failed`/anything but `Merged`/`Ready`. `runs.last()`
+        // alone cannot tell that apart from the loop's own settle path, so
+        // the caller's own read of that run's status is what decides this.
+        let mut t = task("closed by hand after a manual merge");
+        t.runs = vec!["aaaa".to_owned(), "bbbb".to_owned()];
+        t.status = TaskStatus::Done;
+        assert_eq!(
+            t.superseded_attempts(false),
+            &[] as &[String],
+            "nothing here is provably why the task is done, so nothing is superseded"
         );
     }
 
