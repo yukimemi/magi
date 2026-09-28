@@ -229,19 +229,26 @@ enum Command {
     Stats,
     /// Remove a run's worktrees and branches.
     Fold {
-        /// Run id; defaults to the most recent.
+        /// Run id. Defaults to the most recent run when `--merged` is not
+        /// given; required (and rejected at parse time otherwise) when it
+        /// is, since `--merged` rewrites a run's recorded status rather than
+        /// just cleaning up its worktrees, and guessing "the most recent run
+        /// on this machine" is not an acceptable guess for that.
         id: Option<String>,
         /// Also drop the winner's worktree and branch.
         #[arg(long)]
         all: bool,
         /// Correct a run stuck on a failed automatic merge: the operator (or
         /// an agent on their behalf) created and merged the pull request by
-        /// hand, and this is its URL. Verified against the forge before
-        /// anything is written - a URL that is not actually merged refuses
-        /// rather than guesses - and only then does `status` and the `merge`
-        /// section get rewritten to match, exactly as the automatic land loop
-        /// would have written them itself.
-        #[arg(long, value_name = "PR_URL")]
+        /// hand, and this is its URL. Requires an explicit run id (no
+        /// "most recent run" fallback - this rewrites `status`/`merge`, not
+        /// just worktrees) and is verified against the forge before anything
+        /// is written: a URL that is not actually merged refuses rather than
+        /// guesses, and a URL whose repository does not match the run's own
+        /// recorded repository refuses too. Only then does `status` and the
+        /// `merge` section get rewritten to match, exactly as the automatic
+        /// land loop would have written them itself.
+        #[arg(long, value_name = "PR_URL", requires = "id")]
         merged: Option<String>,
     },
     /// Inspect and shrink the shared build cache.
@@ -1172,6 +1179,20 @@ async fn dispatch(command: Command) -> Result<()> {
         }
 
         Command::Fold { id, all, merged } => {
+            // clap's own `requires = "id"` on `--merged` rejects this at parse
+            // time already; this is the belt to that suspenders for any
+            // caller that builds a `Command::Fold` directly rather than
+            // through `Cli::parse` (a test, or a future embedding). Falling
+            // back to "the most recent run on this machine" is fine for a
+            // plain worktree cleanup, but `--merged` rewrites a run's
+            // recorded status - guessing which run that is is exactly how an
+            // unrelated, still-`implementing` run gets its status clobbered.
+            if merged.is_some() && id.is_none() {
+                bail!(
+                    "`--merged` requires an explicit run id; pass the id of the run to correct \
+                     rather than letting it default to the most recent run"
+                );
+            }
             let id = match id {
                 Some(i) => resolve_id(&i)?,
                 None => latest_id().context("no runs yet")?,
@@ -3145,6 +3166,48 @@ mod tests {
                 clap::error::ErrorKind::ArgumentConflict,
                 "{clash:?}"
             );
+        }
+    }
+
+    /// `magi fold --merged <url>` used to default an omitted id to the most
+    /// recent run on the machine — the same class of bug behind the
+    /// shun/8c75 incident, where that default picked a completely unrelated,
+    /// still-in-progress run and rewrote its status from another
+    /// repository's pull request. `--merged` now requires an explicit id;
+    /// plain `fold` (just worktree cleanup) keeps the old default.
+    #[test]
+    fn fold_merged_requires_an_explicit_run_id() {
+        let err =
+            Cli::try_parse_from(["magi", "fold", "--merged", "https://github.com/o/r/pull/1"])
+                .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let with_id = Cli::try_parse_from([
+            "magi",
+            "fold",
+            "20260901-000000-aaaa",
+            "--merged",
+            "https://github.com/o/r/pull/1",
+        ])
+        .unwrap();
+        match with_id.command {
+            Some(Command::Fold { id, merged, .. }) => {
+                assert_eq!(id.as_deref(), Some("20260901-000000-aaaa"));
+                assert_eq!(merged.as_deref(), Some("https://github.com/o/r/pull/1"));
+            }
+            other => panic!("expected Command::Fold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_fold_still_allows_an_omitted_run_id() {
+        let bare = Cli::try_parse_from(["magi", "fold"]).unwrap();
+        match bare.command {
+            Some(Command::Fold { id, merged, .. }) => {
+                assert!(id.is_none());
+                assert!(merged.is_none());
+            }
+            other => panic!("expected Command::Fold, got {other:?}"),
         }
     }
 

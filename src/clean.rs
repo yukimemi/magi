@@ -393,10 +393,14 @@ fn write_external_merge_cursor(home: &Path, cursor: usize) {
 /// run is ever acted on - see that function's own doc for what "uniquely"
 /// excludes.
 ///
-/// A run this finds and fixes goes through [`crate::land::correct_manual_merge`]
-/// exactly as `magi fold --merged` would, then through [`crate::graph::fold_run`]
-/// so it stops holding worktrees the moment it stops needing them. A run this
-/// cannot decide about - `gh` unreachable, more than one candidate pull
+/// A run this finds and fixes goes through
+/// [`crate::land::correct_confirmed_external_merge`] - the same correction
+/// `magi fold --merged` performs, minus the same-repo guard that command
+/// needs and this loop doesn't (see that function's own doc: the URL here
+/// was never operator-supplied, it came from asking `state.repo`'s own
+/// remote) - then through [`crate::graph::fold_run`] so it stops holding
+/// worktrees the moment it stops needing them. A run this cannot decide
+/// about - `gh` unreachable, more than one candidate pull
 /// request, nothing found at all - is left exactly as it is; only an error
 /// asking GitHub raises a notice, since "nothing found" is the ordinary,
 /// expected shape of a run that really is just blocked.
@@ -459,7 +463,7 @@ async fn reconcile_external_merges(runs: &Path, home: &Path, disk: &Disk, now: T
         };
         match crate::land::find_external_merge(&state).await {
             Ok(Some(found)) => {
-                match crate::land::correct_manual_merge(&mut state, &found.url).await {
+                match crate::land::correct_confirmed_external_merge(&mut state, &found.url).await {
                     Ok(_) => {
                         if let Err(e) = crate::graph::fold_run(&mut state, true, home).await {
                             tracing::warn!(
