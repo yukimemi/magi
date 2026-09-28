@@ -303,26 +303,34 @@
     <!-- Same reasoning as /api/health's own runs_unreadable: a skipped run
          must be counted, not silently dropped from the tallies below. -->
     <p class="stats-banner" id="stats-unreadable-banner" hidden></p>
-    <p class="empty" id="stats-empty" hidden>Nothing has run yet.</p>
     <div id="stats-body" hidden>
-      <div class="stats-tiles" id="stats-kpis"></div>
+      <!-- Run-derived numbers only: a home with no runs yet has nothing to
+           put in these, so this whole block is what stats-empty replaces.
+           The queue panel below is not inside it - queue state does not
+           depend on any run ever having completed, and hiding it whenever
+           the run history happens to be empty would drop the one thing this
+           dashboard promises unconditionally (queued/running/held/done). -->
+      <p class="empty" id="stats-empty" hidden>Nothing has run yet.</p>
+      <div id="stats-runs-section">
+        <div class="stats-tiles" id="stats-kpis"></div>
 
-      <div class="panel">
-        <h2>Verdicts</h2>
-        <div class="stack-bar" id="stats-verdict-bar" role="img"></div>
-        <ul class="stats-legend" id="stats-verdict-legend"></ul>
-      </div>
+        <div class="panel">
+          <h2>Verdicts</h2>
+          <div class="stack-bar" id="stats-verdict-bar" role="img"></div>
+          <ul class="stats-legend" id="stats-verdict-legend"></ul>
+        </div>
 
-      <div class="panel" id="stats-agents-panel" hidden>
-        <h2>Implementation win rate</h2>
-        <p class="panel-note">Relative to this workload only — the task mix and seat rotation are not controlled.</p>
-        <div class="bar-rows" id="stats-agents-bars"></div>
-      </div>
+        <div class="panel" id="stats-agents-panel" hidden>
+          <h2>Implementation win rate</h2>
+          <p class="panel-note">Relative to this workload only — the task mix and seat rotation are not controlled.</p>
+          <div class="bar-rows" id="stats-agents-bars"></div>
+        </div>
 
-      <div class="panel" id="stats-reviewers-panel" hidden>
-        <h2>Review precision</h2>
-        <p class="panel-note">Adopted findings over submitted findings.</p>
-        <div class="bar-rows" id="stats-reviewers-bars"></div>
+        <div class="panel" id="stats-reviewers-panel" hidden>
+          <h2>Review precision</h2>
+          <p class="panel-note">Adopted findings over submitted findings.</p>
+          <div class="bar-rows" id="stats-reviewers-bars"></div>
+        </div>
       </div>
 
       <div class="panel">

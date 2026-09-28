@@ -1198,6 +1198,12 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
  * consistent with .dep-graph and .phases elsewhere in this file, which draw
  * the same way for the same reason - no build step, no dependency, nothing
  * to keep in sync with a bundler. */
+/* #stats-body wraps the run-derived section (KPIs, verdicts, agents,
+   reviewers - hidden together when there are no runs) and the queue panel,
+   which stays visible on its own regardless - see stats-body's own comment
+   in index.html. Both need the same flex-column gap .view gives its own
+   direct children, since neither is a direct child of .view any more. */
+#stats-body, #stats-runs-section { display: flex; flex-direction: column; gap: var(--s4); }
 .stats-tiles {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
   gap: var(--s3);

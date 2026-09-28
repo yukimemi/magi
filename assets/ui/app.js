@@ -2515,9 +2515,9 @@ function renderStats() {
     return;
   }
   const t = s.totals;
-  const nothing = t.runs === 0 && s.runs_unreadable === 0;
+  const noRuns = t.runs === 0 && s.runs_unreadable === 0;
 
-  setText($("stats-count"), nothing
+  setText($("stats-count"), noRuns
     ? "Nothing has run yet"
     : [
         `${plural(t.runs, "run", "runs")} recorded`,
@@ -2533,14 +2533,22 @@ function renderStats() {
     );
   }
 
-  show($("stats-empty"), nothing);
-  show($("stats-body"), !nothing);
-  if (nothing) return;
+  /* stats-body stays visible whenever there is anything to show at all -
+     which, unlike the run-only panels below, includes the queue: a home
+     that has never run a competition can still have tasks queued, and the
+     queue counts this dashboard promises are not derived from run history.
+     Only stats-runs-section (KPIs, verdicts, agents, reviewers) is gated on
+     noRuns; the queue panel is rendered unconditionally, right below. */
+  show($("stats-body"), true);
+  show($("stats-empty"), noRuns);
+  show($("stats-runs-section"), !noRuns);
 
-  renderStatsTiles(t);
-  renderStatsVerdictBar(t);
-  renderStatsAgents(s.agents);
-  renderStatsReviewers(s.reviewers);
+  if (!noRuns) {
+    renderStatsTiles(t);
+    renderStatsVerdictBar(t);
+    renderStatsAgents(s.agents);
+    renderStatsReviewers(s.reviewers);
+  }
   renderStatsQueue(s.queue);
 }
 

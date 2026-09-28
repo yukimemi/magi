@@ -8698,6 +8698,45 @@ mod tests {
         assert_eq!(res.status, 404);
     }
 
+    /// The queue tiles on the Stats tab must render even on a home with no
+    /// runs at all: queue state is not derived from run history, so hiding
+    /// the whole dashboard body behind "no runs yet" would drop the one
+    /// thing this tab promises unconditionally (queued/running/held/done).
+    /// A DOM-level test would need a browser this suite does not have, so
+    /// this pins the same invariant textually: `renderStatsQueue` is called
+    /// once in `renderStats`, and that call sits outside the `if (!noRuns)`
+    /// block that gates the run-derived panels.
+    #[test]
+    fn stats_queue_tiles_render_even_when_there_are_no_runs() {
+        let start = APP_JS
+            .find("function renderStats() {")
+            .expect("renderStats");
+        let end = start
+            + APP_JS[start..]
+                .find("function statsTile(")
+                .expect("the next top-level function");
+        let body = &APP_JS[start..end];
+
+        let gate_start = body.find("if (!noRuns) {").expect("the noRuns gate");
+        let gate_end = gate_start
+            + body[gate_start..]
+                .find("}\n  renderStatsQueue")
+                .expect("the gate's own closing brace, right before the unconditional call");
+        let gated = &body[gate_start..gate_end];
+
+        assert_eq!(
+            body.matches("renderStatsQueue(").count(),
+            1,
+            "renderStats must call renderStatsQueue exactly once: {body}"
+        );
+        assert!(
+            !gated.contains("renderStatsQueue"),
+            "renderStatsQueue must not be inside the `if (!noRuns)` block that hides the \
+             run-derived panels on an empty run history - the queue panel has to render \
+             regardless: {gated}"
+        );
+    }
+
     #[test]
     fn web_ui_delete_contract_in_front_end() {
         // 1. API block has both delete endpoints
