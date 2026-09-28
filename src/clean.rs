@@ -241,7 +241,14 @@ pub async fn fold_due(
                 state.schema
             );
         }
-        let drop_winner = state.status == RunStatus::Merged;
+        // `Merged`'s winner branch is safe to drop because it already landed
+        // in the real target branch; `Superseded`'s winner branch is safe to
+        // drop for a different reason - a later attempt at the same task is
+        // what actually landed (or didn't), so *this* run's own winner is
+        // never going to be merged by anyone. Every other terminal status
+        // keeps the winner: `Ready`/`Blocked`/`Stalled`/`Failed`/`VerifiedNoop`
+        // may still have a human's decision pending on that exact branch.
+        let drop_winner = matches!(state.status, RunStatus::Merged | RunStatus::Superseded);
         // One run's fold must not cost every later run its turn. A worktree
         // another borrower holds, a branch git refuses to delete, a repository
         // that has since moved: each is a reason this run cannot be folded
@@ -1760,5 +1767,159 @@ mod tests {
             read_meta(&runs, &superseded).is_ok(),
             "folding drops the worktree, not the record"
         );
+    }
+
+    /// A throwaway repo with one commit on `main`, for a test that needs a
+    /// real winner worktree `fold_run` can actually remove.
+    fn init_repo(dir: &Path) {
+        use crate::proc::Quiet as _;
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .quiet()
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.name", "magi test"]);
+        run(&["config", "user.email", "magi@example.com"]);
+        std::fs::write(dir.join("README.md"), "# fixture\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "init"]);
+    }
+
+    /// A due, terminal run with a decided winner that still has a real
+    /// worktree and branch on disk - so a test can tell whether folding it
+    /// actually removed the winner or only left it registered as folded.
+    async fn due_run_with_winner_worktree(
+        runs: &Path,
+        wt: &Path,
+        repo: &Path,
+        id: &str,
+        status: RunStatus,
+    ) -> (String, PathBuf) {
+        use crate::run::{Candidate, Tally};
+        use std::collections::BTreeMap;
+
+        let mut config = crate::config::Config::default();
+        config.graph.worktree_root = Some(wt.to_path_buf());
+        let mut state = RunState::new(
+            repo.to_path_buf(),
+            "main".to_owned(),
+            "0000000000000000000000000000000000000000".to_owned(),
+            String::new(),
+            config,
+        );
+        state.id = id.to_owned();
+        state.status = status;
+        state.updated_at = ts("2026-08-01T00:00:00Z");
+
+        let winner_wt = state.worktree_root().join("cand-A");
+        crate::git::worktree_add_branch(repo, &winner_wt, &format!("magi/{id}/A"), "main")
+            .await
+            .expect("winner worktree");
+
+        state.candidates.push(Candidate {
+            index: 0,
+            label: 'A',
+            agent: "agent".to_owned(),
+            branch: format!("magi/{id}/A"),
+            worktree: winner_wt.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        state.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 1)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 1,
+            present: 1,
+            quorum: 1,
+            met_quorum: true,
+            uncontested: None,
+        });
+        std::fs::create_dir_all(runs.join(id)).unwrap();
+        std::fs::write(
+            runs.join(id).join("run.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        (id.to_owned(), winner_wt)
+    }
+
+    #[tokio::test]
+    async fn fold_due_drops_a_superseded_runs_own_winner_worktree_but_keeps_a_readys() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let repo = dir.path().join("repo");
+        let home = dir.path().to_path_buf();
+        let disk = Disk::default();
+        let now = ts("2026-09-05T00:00:00Z");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let (superseded_id, superseded_wt) = due_run_with_winner_worktree(
+            &runs,
+            &wt,
+            &repo,
+            "20260801-000000-supw",
+            RunStatus::Superseded,
+        )
+        .await;
+        // `Ready` is auto-folded exactly like `Superseded` (both terminal and
+        // non-resumable), but never landed anywhere - its own winner is
+        // deliberately kept, which is what makes it the right contrast here.
+        // `Blocked`/`Stalled` are `resumable()` and so never even reach
+        // `fold_run` in the first place; they would not exercise the
+        // `drop_winner` choice this test is about.
+        let (ready_id, ready_wt) = due_run_with_winner_worktree(
+            &runs,
+            &wt,
+            &repo,
+            "20260801-000000-rdyw",
+            RunStatus::Ready,
+        )
+        .await;
+
+        let (folded, unreadable) = fold_due(&runs, &home, &wt, &disk, now)
+            .await
+            .expect("fold_due");
+        assert_eq!(folded, 2);
+        assert_eq!(unreadable, 0);
+
+        assert!(
+            !superseded_wt.exists(),
+            "a superseded run's own winner never lands anywhere else, so its worktree \
+             must be dropped exactly like a merged run's"
+        );
+        assert!(
+            ready_wt.exists(),
+            "a still-ready run's winner may yet be merged by hand - folding must not \
+             touch it"
+        );
+
+        // Both records survive the fold; only the worktrees differ.
+        assert!(read_meta(&runs, &superseded_id).is_ok());
+        assert!(read_meta(&runs, &ready_id).is_ok());
     }
 }

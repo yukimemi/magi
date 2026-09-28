@@ -2002,6 +2002,23 @@ impl RunState {
             serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
         migrate_schema(state)
     }
+
+    /// [`Self::load`], rooted at an explicit `home` instead of the
+    /// process-global one, and for a full id rather than a prefix — a caller
+    /// with its own `home` already has the exact id (from a `RunState` it
+    /// already read, or from `Task::runs`) and has no `runs_root` to search
+    /// for a prefix against in the first place. Same reasoning as
+    /// [`Self::save_under`]: a caller holding its own `home` explicitly must
+    /// not read back through whichever directory some *other* process or
+    /// test pinned into the global [`home`] `OnceLock` first.
+    pub fn load_under(id: &str, home: &Path) -> Result<Self> {
+        let path = home.join("runs").join(id).join("run.json");
+        let body =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let state: Self =
+            serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
+        migrate_schema(state)
+    }
 }
 
 fn migrate_schema(mut state: RunState) -> Result<RunState> {
@@ -2489,6 +2506,29 @@ mod tests {
         assert!(RunStatus::Superseded.done());
         assert!(!RunStatus::Superseded.resumable());
         assert_eq!(RunStatus::Superseded.as_str(), "superseded");
+    }
+
+    #[test]
+    fn load_under_reads_back_exactly_what_save_under_wrote_at_an_explicit_home() {
+        // Both rooted at an explicit `home` rather than the process-global
+        // one - a caller with its own `home` (a test fixture, a housekeeping
+        // pass) must round-trip through exactly that directory, never
+        // through whichever home some other test in the same binary pinned
+        // into the global `OnceLock` first.
+        let dir = tempfile::tempdir().unwrap();
+        let mut original = state();
+        original.id = "20260101-000000-load".to_owned();
+        original.status = RunStatus::Blocked;
+        original.save_under(dir.path()).unwrap();
+
+        let reloaded = RunState::load_under(&original.id, dir.path()).unwrap();
+        assert_eq!(reloaded.id, original.id);
+        assert_eq!(reloaded.status, RunStatus::Blocked);
+
+        assert!(
+            RunState::load_under("20260101-000000-none", dir.path()).is_err(),
+            "an id with nothing saved under this home must not silently read something else"
+        );
     }
 
     #[test]

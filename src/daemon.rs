@@ -65,7 +65,7 @@ use crate::graph::Runner;
 use crate::land;
 use crate::notices::{self, Link, Notice};
 use crate::queue::{Queue, Task, TaskStatus};
-use crate::run::{QuotaLoss, RunState, RunStatus};
+use crate::run::{Liveness, QuotaLoss, RunState, RunStatus};
 use crate::triage;
 
 /// On-disk format for [`Status`]. Bumped when a field's meaning changes.
@@ -883,14 +883,31 @@ pub fn settle(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usi
 /// itself has actually finished.
 ///
 /// Called right after whatever call set `task.status` to
-/// [`TaskStatus::Done`] — both `settle`'s own callers below, and
-/// `reclaim`'s. A run currently claimed by a live daemon is left alone
-/// (`is_working_on`): that can only be a stale entry in `runs` from a task
-/// someone reset and reran by hand, since a task cannot be `Done` while one
-/// of its own attempts is still in flight, but a run some *unrelated*
-/// process resumed on its own — `--resume` run by hand — is exactly the case
-/// this guard exists for. Anything not `Blocked` or `Stalled` (already
-/// terminal in some other way, or itself mid-run) is left untouched too.
+/// [`TaskStatus::Done`] — this module's own `settle`'s callers below and
+/// `reclaim`'s, but also every other place a task can be closed by hand
+/// without the loop ever settling it itself: `magi task done`
+/// (`main::TaskCmd::Done`) and `POST /api/queue/{id}/done`
+/// (`web::queue_done`). Closing a task by hand — after confirming a manual
+/// GitHub merge, say, exactly the workflow this repository's own
+/// "Landing a run's winner by hand" documents — is just as much "this task's
+/// story is over" as a daemon-driven `Merged`/`Ready` is, and skipping it
+/// there would leave every earlier attempt stuck at `Blocked`/`Stalled`
+/// forever, which is the exact backlog this status exists to clear. `pub`
+/// for those two out-of-module callers; everything else about this stays
+/// internal bookkeeping.
+///
+/// A run something is still actually driving is left alone: a
+/// task cannot be `Done` while one of its *own* attempts is still in flight,
+/// so a live one at this point can only be an unrelated process — a manual
+/// `--resume` of this old, now-moot run — and rewriting under it would just
+/// be undone (back to `Blocked`/`Stalled`, or worse) the next time that
+/// process itself saves. This is the same `daemon_claims` + [`RunState::liveness`]
+/// pair `run_report`/`run_detail` use for the same question elsewhere:
+/// `is_working_on` alone only ever proves a *daemon* claim, not a `magi run
+/// --resume` invoked by hand outside it, which `liveness` also checks via
+/// the run's own recorded `driver_pid`. Anything not `Blocked` or `Stalled`
+/// (already terminal in some other way, or itself mid-run) is left untouched
+/// too.
 ///
 /// Best-effort, like the rest of this module's bookkeeping: a load or save
 /// failure here is a `tracing::warn`, not a failed settle, and the next time
@@ -898,14 +915,18 @@ pub fn settle(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usi
 /// `reclaim_orphaned_running` — is another chance to catch up. There is no
 /// separate reconciliation pass; if that gap ever matters in practice, one
 /// can be added then.
-fn supersede_prior_runs(task: &Task) {
-    let home = crate::run::home();
+///
+/// `home` is a parameter, not the process-global [`crate::run::home`], for
+/// the same reason [`RunState::save_under`] takes one: `web::queue_done`
+/// calls this with `ui.home`, which is `crate::run::home()` in a real
+/// process but a fixture's own directory under test — falling through to
+/// the global there would read and write through whichever home some other
+/// test in the same binary happened to pin into that `OnceLock` first, not
+/// the run this call actually means.
+pub fn supersede_prior_runs(task: &Task, home: &Path) {
     let now = Timestamp::now();
     for id in task.superseded_attempts() {
-        if is_working_on(&home, id, now) {
-            continue;
-        }
-        let mut state = match RunState::load(id) {
+        let mut state = match RunState::load_under(id, home) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("could not load run {id} to mark it superseded: {e:#}");
@@ -915,8 +936,12 @@ fn supersede_prior_runs(task: &Task) {
         if !matches!(state.status, RunStatus::Blocked | RunStatus::Stalled) {
             continue;
         }
+        let daemon_claims = is_working_on(home, id, now);
+        if state.liveness(daemon_claims) == Liveness::Live {
+            continue;
+        }
         state.status = RunStatus::Superseded;
-        if let Err(e) = state.save() {
+        if let Err(e) = state.save_under(home) {
             tracing::warn!("could not mark run {id} superseded: {e:#}");
         }
     }
@@ -1034,7 +1059,7 @@ fn reclaim_orphaned_running(queue: &Queue, max_attempts: usize) -> Vec<String> {
         }
         reclaim(&mut task, last_run, max_attempts);
         if task.status == TaskStatus::Done {
-            supersede_prior_runs(&task);
+            supersede_prior_runs(&task, &crate::run::home());
         }
         record(queue, &mut task);
         reclaimed.push(task.id.clone());
@@ -2281,7 +2306,7 @@ async fn attempt(
     };
     settle_and_diagnose(task, verdict, &detail, opts.max_attempts, &runner.state);
     if task.status == TaskStatus::Done {
-        supersede_prior_runs(task);
+        supersede_prior_runs(task, &crate::run::home());
     }
     record(queue, task);
     tracing::info!(
@@ -4494,7 +4519,7 @@ mod tests {
         t.runs = vec![first.id.clone(), second.id.clone()];
         t.status = TaskStatus::Done;
 
-        supersede_prior_runs(&t);
+        supersede_prior_runs(&t, &crate::run::home());
 
         assert_eq!(
             RunState::load(&first.id).unwrap().status,
@@ -4505,6 +4530,43 @@ mod tests {
             RunState::load(&second.id).unwrap().status,
             RunStatus::Merged,
             "the run that actually succeeded is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn supersede_prior_runs_leaves_a_manually_resumed_attempt_alone() {
+        // `is_working_on` alone only proves a *daemon* claim; a `magi run
+        // --resume` invoked by hand outside the daemon never touches
+        // `daemon.json` at all, so it would look identical to a genuinely
+        // idle run without also consulting `RunState::liveness`, which reads
+        // this run's own recorded `driver_pid` instead.
+        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        let mut first = run_state(RunStatus::Blocked);
+        first.id = "20260101-000000-sup9".to_owned();
+        // This test process's own pid: guaranteed alive without needing a
+        // real second process or daemon.
+        first.driver_pid = Some(std::process::id());
+        first.driver_started_at = Some(
+            crate::proc::process_started_at(std::process::id())
+                .expect("this test process's own start time must be queryable"),
+        );
+        first.save().unwrap();
+        let mut second = run_state(RunStatus::Merged);
+        second.id = "20260101-000000-supa".to_owned();
+        second.save().unwrap();
+
+        let mut t = task();
+        t.runs = vec![first.id.clone(), second.id.clone()];
+        t.status = TaskStatus::Done;
+
+        supersede_prior_runs(&t, &crate::run::home());
+
+        assert_eq!(
+            RunState::load(&first.id).unwrap().status,
+            RunStatus::Blocked,
+            "a live driver_pid means something is still actually working this run, \
+             even though no daemon claims it - rewriting under it would just be \
+             undone the next time that process saves"
         );
     }
 
@@ -4525,7 +4587,7 @@ mod tests {
         // already exists.
         t.status = TaskStatus::Failed;
 
-        supersede_prior_runs(&t);
+        supersede_prior_runs(&t, &crate::run::home());
 
         assert_eq!(
             RunState::load(&first.id).unwrap().status,
@@ -4551,7 +4613,7 @@ mod tests {
         t.runs = vec![first.id.clone()];
         t.status = TaskStatus::Done;
 
-        supersede_prior_runs(&t);
+        supersede_prior_runs(&t, &crate::run::home());
 
         assert_eq!(
             RunState::load(&first.id).unwrap().status,
@@ -4580,7 +4642,7 @@ mod tests {
         t.runs = vec![failed.id.clone(), noop.id.clone(), winner.id.clone()];
         t.status = TaskStatus::Done;
 
-        supersede_prior_runs(&t);
+        supersede_prior_runs(&t, &crate::run::home());
 
         assert_eq!(
             RunState::load(&failed.id).unwrap().status,

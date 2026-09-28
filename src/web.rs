@@ -2976,8 +2976,17 @@ async fn queue_done(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskView>> {
-    mutate(ui, id, |t| {
+    let home = ui.home.clone();
+    mutate(ui, id, move |t| {
         t.succeed();
+        // Same as the loop's own settle path: closing a task by hand is just
+        // as much "this task's story is over" as a daemon-driven `Merged`/
+        // `Ready` is, so any earlier `Blocked`/`Stalled` attempt it leaves
+        // behind must stop looking like it still needs a human. `ui.home`,
+        // not the process-global `run::home()`: they agree in a real
+        // process, but only `ui.home` also agrees with a test fixture's own
+        // directory.
+        crate::daemon::supersede_prior_runs(t, &home);
         Ok(())
     })
     .await
@@ -6776,6 +6785,41 @@ mod tests {
             done.json()["hold_reason"].is_null(),
             "a done task cannot still be waiting on something: {}",
             done.body
+        );
+    }
+
+    #[tokio::test]
+    async fn done_from_the_phone_supersedes_an_earlier_blocked_attempt() {
+        // `queue_done` is the phone's way to close a task the loop never
+        // settled itself - after confirming a manual GitHub merge, say - and
+        // that is just as much "this task's story is over" as the loop's own
+        // `Merged`/`Ready` path, so it must trigger the same cleanup.
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let runs = f.runs();
+        write_run(&runs, "20260101-000000-doa1", RunStatus::Blocked);
+        write_run(&runs, "20260101-000000-doa2", RunStatus::Failed);
+
+        let mut task = Task::new(
+            "landed by hand".to_owned(),
+            "x".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        task.runs.push("20260101-000000-doa1".to_owned());
+        task.runs.push("20260101-000000-doa2".to_owned());
+        queue.put(&mut task).expect("file the task");
+
+        let done = f.post(&format!("/api/queue/{}/done", task.id), None).await;
+        assert_eq!(done.status, 200, "{}", done.body);
+
+        let reloaded_run = read_run(&runs, "20260101-000000-doa1")
+            .expect("run still on disk under this fixture's own home");
+        assert_eq!(
+            reloaded_run.status,
+            RunStatus::Superseded,
+            "closing the task by hand must relabel the earlier blocked attempt exactly \
+             like the loop's own settle path does"
         );
     }
 

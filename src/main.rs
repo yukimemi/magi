@@ -2457,6 +2457,10 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
         TaskCmd::Done { id } => {
             let mut t = q.get(&id)?;
             t.succeed();
+            // Closing a task by hand (a manual GitHub merge, say) is just as
+            // much a finished story as the loop's own `Merged`/`Ready` path -
+            // see `daemon::supersede_prior_runs`'s own doc.
+            magi::daemon::supersede_prior_runs(&t, &magi::run::home());
             q.put(&mut t)?;
             println!("done {} {}", t.short(), t.title);
             Ok(())
