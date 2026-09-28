@@ -1356,7 +1356,23 @@ pub async fn branch_is_ancestor(repo: &Path, branch: &str, base_branch: &str) ->
     Ok(out.status.success())
 }
 
-/// Parse `owner/repo` out of a GitHub pull request URL, with no network
+/// Parse `host/owner/repo` out of a forge URL, with no network access.
+///
+/// The host is part of the slug, not discarded: `owner/repo` alone would
+/// treat `github.example.com/o/r` and `github.com/o/r` as the same
+/// repository, which is exactly the mix-up the same-repo guard exists to
+/// catch. Returns `None` for anything that doesn't have a `<host>/<path>`
+/// shape at all.
+fn forge_slug(url: &str) -> Option<(String, &str)> {
+    let rest = url.rsplit("://").next()?;
+    let (host, path) = rest.split_once('/')?;
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_ascii_lowercase(), path))
+}
+
+/// Parse `host/owner/repo` out of a GitHub pull request URL, with no network
 /// access - the first half of the same-repo guard [`correct_manual_merge`]
 /// applies before it writes anything.
 ///
@@ -1364,8 +1380,7 @@ pub async fn branch_is_ancestor(repo: &Path, branch: &str, base_branch: &str) ->
 /// `https://<host>/<owner>/<repo>/pull/<n>`, which the caller treats as
 /// fail-closed: a URL this cannot make sense of refuses rather than guesses.
 pub(crate) fn slug_of_pr_url(url: &str) -> Option<String> {
-    let rest = url.rsplit("://").next()?;
-    let (_host, path) = rest.split_once('/')?;
+    let (host, path) = forge_slug(url)?;
     let mut segments = path.split('/');
     let owner = segments.next()?;
     let repo = segments.next()?;
@@ -1373,7 +1388,21 @@ pub(crate) fn slug_of_pr_url(url: &str) -> Option<String> {
     if owner.is_empty() || repo.is_empty() || kind != "pull" {
         return None;
     }
-    Some(format!("{owner}/{repo}"))
+    Some(format!("{host}/{owner}/{repo}"))
+}
+
+/// Parse `host/owner/repo` out of a plain repository URL (no `/pull/<n>`
+/// suffix), the shape `gh repo view --json url` returns - the other half of
+/// the same-repo guard, matched against [`slug_of_pr_url`]'s output.
+fn slug_of_repo_url(url: &str) -> Option<String> {
+    let (host, path) = forge_slug(url)?;
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{host}/{owner}/{repo}"))
 }
 
 /// Refuse to correct a run against a pull request from a different
@@ -1408,14 +1437,16 @@ pub(crate) fn ensure_same_repo(run_repo_slug: &str, pr_repo_slug: &str) -> Resul
     );
 }
 
-/// Ask the forge which `owner/repo` a local checkout's `origin` remote
+/// Ask the forge which `host/owner/repo` a local checkout's `origin` remote
 /// actually resolves to, for the same-repo guard in [`correct_manual_merge`].
 ///
 /// Asking `gh` rather than parsing `git remote -v` locally is deliberate: it
 /// normalizes case, SSH vs. HTTPS remotes, and a renamed or transferred
 /// repository the same way GitHub itself would recognize it, so the
 /// comparison in [`ensure_same_repo`] is against the same canonical slug on
-/// both sides.
+/// both sides. Reads `url` rather than `nameWithOwner` so the host is part of
+/// the answer too - `nameWithOwner` alone cannot tell a `github.com` repo from
+/// a same-named one on a GitHub Enterprise host.
 async fn repo_slug(repo: &Path) -> Result<String> {
     let out = gh(
         repo,
@@ -1423,21 +1454,21 @@ async fn repo_slug(repo: &Path) -> Result<String> {
             "repo".to_owned(),
             "view".to_owned(),
             "--json".to_owned(),
-            "nameWithOwner".to_owned(),
+            "url".to_owned(),
         ],
     )
     .await?;
     if !out.0 {
-        bail!("gh repo view --json nameWithOwner: {}", out.1);
+        bail!("gh repo view --json url: {}", out.1);
     }
     #[derive(Debug, Deserialize)]
-    #[serde(rename_all = "camelCase")]
     struct GhRepo {
-        name_with_owner: String,
+        url: String,
     }
     let parsed: GhRepo = serde_json::from_str(&out.1)
         .with_context(|| format!("parse `gh repo view` output: {}", out.1))?;
-    Ok(parsed.name_with_owner)
+    slug_of_repo_url(&parsed.url)
+        .with_context(|| format!("could not parse a host/owner/repo out of {}", parsed.url))
 }
 
 /// Confirm `url` is actually a merged pull request, then rewrite `state`'s
@@ -1446,22 +1477,35 @@ async fn repo_slug(repo: &Path) -> Result<String> {
 /// itself.
 ///
 /// This is `magi fold --merged`'s whole implementation, and also what the
-/// automatic janitor sweep (`clean::housekeep`) and the web `fold-merged`
-/// route call once they have a URL in hand — one operator recovery path for
-/// a merge magi could not finish on its own: a PR title too long for the
-/// GraphQL mutation, `gh pr create` unreachable, a stale token - closed by
-/// hand with a pull request magi never opened and so never recorded.
-/// Reusing `land::land` rather than writing `status`/`merge` directly keeps
-/// this one authoritative: a merged pull request decides
+/// web `fold-merged` route calls once it has a URL in hand — an operator
+/// recovery path for a merge magi could not finish on its own: a PR title too
+/// long for the GraphQL mutation, `gh pr create` unreachable, a stale token -
+/// closed by hand with a pull request magi never opened and so never
+/// recorded. Reusing `land::land` rather than writing `status`/`merge`
+/// directly keeps this one authoritative: a merged pull request decides
 /// `Step::Done { merged: true }` on the very first read, before any of
 /// `land`'s own checks/fix/rebase machinery can run, which is what makes it
 /// safe to call here even though this pull request was never magi's own.
+///
 /// [`ensure_same_repo`] is checked before anything else: a pull request from
 /// a different repository than the one `state` is recorded against is
-/// refused outright, regardless of its lifecycle. [`lifecycle`] is checked
-/// next and separately so a mistyped or still-open URL fails loudly without
-/// writing anything, rather than handing an open pull request to the full
-/// autonomous loop by accident.
+/// refused outright, regardless of its lifecycle. This is the guard for a
+/// URL an *operator* hands in - the CLI or the web route - where a stale or
+/// mistyped run id could otherwise get corrected from an unrelated
+/// repository's pull request (see the shun/8c75 incident in `magi fold`'s own
+/// CLI help). The automatic janitor sweep (`clean::reconcile_external_merges`)
+/// goes through [`correct_confirmed_external_merge`] instead, which skips
+/// this check: its `url` was never operator-supplied, it comes from
+/// [`find_external_merge`] querying `gh` from inside `state.repo` itself, so
+/// it is already guaranteed to name a pull request in that same repository -
+/// re-deriving and re-checking the repository here would only be a second
+/// `gh repo view` call that can fail for reasons that have nothing to do with
+/// correctness (a rate limit, a network blip), turning a self-heal that would
+/// otherwise have succeeded into a run left `Blocked` for another pass.
+///
+/// [`lifecycle`] is checked next and separately so a mistyped or still-open
+/// URL fails loudly without writing anything, rather than handing an open
+/// pull request to the full autonomous loop by accident.
 ///
 /// Correcting `status` this way does not run `bump::after_merge`
 /// (`src/bump.rs`): that call is made only from `graph::Runner::run_land`,
@@ -1485,6 +1529,27 @@ pub async fn correct_manual_merge(
     };
     let run_slug = repo_slug(&state.repo).await?;
     ensure_same_repo(&run_slug, &pr_slug)?;
+    correct_merge(state, url).await
+}
+
+/// The janitor's own entry point into the same correction
+/// [`correct_manual_merge`] performs for an operator-supplied URL, minus the
+/// same-repo guard - see that function's own doc for why skipping it here is
+/// safe rather than a hole: [`clean::reconcile_external_merges`] only ever
+/// calls this with a `url` [`find_external_merge`] already found by querying
+/// `state.repo`'s own remote, so the guard could never do anything here but
+/// fail on its own transient errors.
+///
+/// [`crate::clean`] is the only caller; `pub(crate)` rather than private only
+/// because it lives in a different module.
+pub(crate) async fn correct_confirmed_external_merge(
+    state: &mut RunState,
+    url: &str,
+) -> Result<(RunStatus, RunStatus)> {
+    correct_merge(state, url).await
+}
+
+async fn correct_merge(state: &mut RunState, url: &str) -> Result<(RunStatus, RunStatus)> {
     match lifecycle(&state.repo, url).await? {
         PrLifecycle::Merged => {}
         other => bail!(
@@ -2351,10 +2416,22 @@ async fn stop(state: &mut RunState, repo: &Path, pr: &PrState, why: &str) -> Res
 ///
 /// Combined because `gh` reports a refused merge on stderr and the pull request
 /// json on stdout, and both are evidence.
+///
+/// `GH_REPO` is stripped from the child's environment: every call site here
+/// passes an explicit `cwd` (or a full pull request URL) meaning to operate
+/// on *that* checkout's own remote, and `gh` prefers `GH_REPO` over the
+/// checkout it is sitting in when no `--repo` flag is given. Left unset, a
+/// `GH_REPO` the operator happens to have exported for an unrelated script
+/// would silently redirect [`repo_slug`] (and every other cwd-scoped call
+/// below) to a different repository than the one actually on disk - which
+/// for the same-repo guard in [`correct_manual_merge`] would mean the check
+/// could be made to agree with whatever repository a forged `--merged` URL
+/// claims, defeating it entirely.
 async fn gh(cwd: &Path, args: &[String]) -> Result<(bool, String)> {
     let out = tokio::process::Command::new("gh")
         .args(args)
         .current_dir(cwd)
+        .env_remove("GH_REPO")
         .quiet()
         .stdin(std::process::Stdio::null())
         .output()
@@ -3904,10 +3981,10 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     }
 
     #[test]
-    fn slug_of_pr_url_reads_owner_and_repo() {
+    fn slug_of_pr_url_reads_host_owner_and_repo() {
         assert_eq!(
             slug_of_pr_url("https://github.com/yukimemi/shun/pull/272").as_deref(),
-            Some("yukimemi/shun")
+            Some("github.com/yukimemi/shun")
         );
     }
 
@@ -3919,8 +3996,18 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     }
 
     #[test]
+    fn slug_of_repo_url_reads_host_owner_and_repo() {
+        assert_eq!(
+            slug_of_repo_url("https://github.com/yukimemi/magi").as_deref(),
+            Some("github.com/yukimemi/magi")
+        );
+        assert_eq!(slug_of_repo_url("https://github.com"), None);
+    }
+
+    #[test]
     fn ensure_same_repo_accepts_a_matching_slug_regardless_of_case() {
-        ensure_same_repo("yukimemi/magi", "YukiMemi/Magi").expect("same repo, different case");
+        ensure_same_repo("github.com/yukimemi/magi", "GitHub.Com/YukiMemi/Magi")
+            .expect("same repo, different case");
     }
 
     /// The shun/8c75 incident: an id-less `--merged` picked this repository's
@@ -3929,10 +4016,27 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     /// that even when an explicit (but wrong) id is given.
     #[test]
     fn ensure_same_repo_refuses_a_different_repo() {
-        let err = ensure_same_repo("yukimemi/magi", "yukimemi/shun").unwrap_err();
+        let err =
+            ensure_same_repo("github.com/yukimemi/magi", "github.com/yukimemi/shun").unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("yukimemi/magi"), "{msg}");
-        assert!(msg.contains("yukimemi/shun"), "{msg}");
+        assert!(msg.contains("github.com/yukimemi/magi"), "{msg}");
+        assert!(msg.contains("github.com/yukimemi/shun"), "{msg}");
+    }
+
+    /// Same owner/repo on two different forge hosts (a GitHub Enterprise
+    /// instance mirroring a `github.com` repository's name, say) must not be
+    /// treated as the same repository just because the trailing path
+    /// matches.
+    #[test]
+    fn ensure_same_repo_refuses_the_same_slug_on_a_different_host() {
+        let err = ensure_same_repo(
+            "github.com/yukimemi/magi",
+            "github.example.com/yukimemi/magi",
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("github.com/yukimemi/magi"), "{msg}");
+        assert!(msg.contains("github.example.com/yukimemi/magi"), "{msg}");
     }
 
     /// No winner decided yet means there is no branch to ask GitHub about at
