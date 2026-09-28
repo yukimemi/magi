@@ -9526,14 +9526,20 @@ mod tests {
             if dead
                 && !matches!(
                     status,
-                    "merged" | "ready" | "stalled" | "blocked" | "failed" | "verified_noop"
+                    "merged"
+                        | "ready"
+                        | "stalled"
+                        | "blocked"
+                        | "failed"
+                        | "verified_noop"
+                        | "superseded"
                 )
             {
                 return "stale";
             }
             match status {
                 "merged" | "ready" => "landed",
-                "stalled" | "blocked" | "failed" | "verified_noop" => "ended",
+                "stalled" | "blocked" | "failed" | "verified_noop" | "superseded" => "ended",
                 _ => "flight",
             }
         }

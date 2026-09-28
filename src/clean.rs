@@ -941,6 +941,11 @@ mod tests {
             !eligible_for_external_merge_check(RunStatus::Ready, false, old, now, grace),
             "ready has nothing to correct - it was never landed by design"
         );
+        assert!(
+            !eligible_for_external_merge_check(RunStatus::Superseded, false, old, now, grace),
+            "a superseded run's task already has its answer from a later attempt; \
+             there is nothing left for GitHub to confirm here"
+        );
     }
 
     /// A `Blocked` run with a decided winner, so `land::find_external_merge`
@@ -1691,6 +1696,18 @@ mod tests {
     /// `graph::fold_run`'s second sweep would then `read_dir` and remove
     /// worktrees there instead of anything this test owns.
     fn due_run(runs: &Path, wt: &Path, id: &str, schema: u32) -> String {
+        due_run_with_status(runs, wt, id, schema, RunStatus::Ready)
+    }
+
+    /// [`due_run`], with the terminal status a caller wants instead of the
+    /// `Ready` every other caller here happens to want.
+    fn due_run_with_status(
+        runs: &Path,
+        wt: &Path,
+        id: &str,
+        schema: u32,
+        status: RunStatus,
+    ) -> String {
         let mut config = crate::config::Config::default();
         config.graph.worktree_root = Some(wt.to_path_buf());
         let mut state = RunState::new(
@@ -1701,7 +1718,7 @@ mod tests {
             config,
         );
         state.id = id.to_owned();
-        state.status = RunStatus::Ready;
+        state.status = status;
         state.updated_at = ts("2026-08-01T00:00:00Z");
         let mut value = serde_json::to_value(&state).unwrap();
         value["schema"] = serde_json::json!(schema);
@@ -1712,5 +1729,36 @@ mod tests {
         )
         .unwrap();
         id.to_owned()
+    }
+
+    #[test]
+    fn fold_due_folds_a_superseded_run_same_as_any_other_terminal_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let home = dir.path().to_path_buf();
+        let disk = Disk::default();
+        let now = ts("2026-09-05T00:00:00Z");
+
+        let superseded = due_run_with_status(
+            &runs,
+            &wt,
+            "20260801-000000-cccc",
+            SCHEMA,
+            RunStatus::Superseded,
+        );
+
+        let (folded, unreadable) =
+            block_on(fold_due(&runs, &home, &wt, &disk, now)).expect("fold_due");
+        assert_eq!(
+            folded, 1,
+            "a superseded run has nothing left for a human to check, so it folds \
+             exactly like a merged one"
+        );
+        assert_eq!(unreadable, 0);
+        assert!(
+            read_meta(&runs, &superseded).is_ok(),
+            "folding drops the worktree, not the record"
+        );
     }
 }

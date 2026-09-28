@@ -189,6 +189,19 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// authorization question is not a verified no-op, and reading the two
 /// alike is exactly the misclassification the guard's per-candidate and
 /// whole-run conditions exist to refuse.
+///
+/// `RunStatus::Superseded` (added without a bump, still schema 10) is
+/// additive in the ordinary sense — an old build reading a run written under
+/// a newer one only had `RunStatus` variants to worry about before this, and
+/// a record already on disk never contained the new variant to begin with —
+/// but it is not additive in the sense every earlier schema bump on this
+/// constant was: `daemon::supersede_prior_runs` now rewrites a `Blocked` or
+/// `Stalled` run's `status` field *after* it was first written, once a later
+/// attempt at the same task lands. Any tooling outside magi that reads
+/// `run.json` and assumes a terminal `status` is permanent once set — a
+/// monitoring script polling for `blocked`, say — needs to know that
+/// `superseded` is where some of those records now go instead of staying put
+/// forever; see that function's own doc for exactly when.
 pub const SCHEMA: u32 = 10;
 
 /// Where a run got to.
@@ -246,6 +259,16 @@ pub enum RunStatus {
     /// means nothing retries the task unattended on the same unconfirmed
     /// claim while that look is pending.
     VerifiedNoop,
+    /// A later attempt at the same task already finished the job — see
+    /// `crate::queue::Task::superseded_attempts` — so this run's own
+    /// `Blocked`/`Stalled` no longer means anyone has to look at it. Written
+    /// only over one of those two statuses, only once the task itself is
+    /// `crate::queue::TaskStatus::Done`, and only onto an attempt that comes
+    /// before the one that succeeded. Unlike them, not [`Self::resumable`]:
+    /// there is nothing left to resume towards, the task already has its
+    /// answer, and a fold is free to clean this run's worktree away without
+    /// waiting on a human to confirm that first.
+    Superseded,
 }
 
 impl RunStatus {
@@ -259,6 +282,7 @@ impl RunStatus {
                 | Self::Blocked
                 | Self::Failed
                 | Self::VerifiedNoop
+                | Self::Superseded
         )
     }
 
@@ -281,6 +305,7 @@ impl RunStatus {
             Self::Blocked => "blocked",
             Self::Failed => "failed",
             Self::VerifiedNoop => "verified_noop",
+            Self::Superseded => "superseded",
         }
     }
 
@@ -319,14 +344,16 @@ impl RunStatus {
     /// answer is a new competition. Nor does `VerifiedNoop`: every candidate
     /// already agreed nothing belongs in this worktree, and resuming would
     /// only re-ask the same question — the answer is for a human to check
-    /// the evidence, not for the graph to run again.
+    /// the evidence, not for the graph to run again. Nor does `Superseded`:
+    /// a later attempt at the same task already finished it, so there is
+    /// nothing left this run's own answer could still contribute.
     ///
     /// Whether anything is *already* driving the run is a separate question,
     /// answered by `daemon::is_working_on` at the callers that need it.
     pub fn resumable(self) -> bool {
         !matches!(
             self,
-            Self::Merged | Self::Ready | Self::Failed | Self::VerifiedNoop
+            Self::Merged | Self::Ready | Self::Failed | Self::VerifiedNoop | Self::Superseded
         )
     }
 }
@@ -2455,6 +2482,13 @@ mod tests {
             "add retries".to_owned(),
             Config::default(),
         )
+    }
+
+    #[test]
+    fn superseded_is_terminal_but_not_resumable() {
+        assert!(RunStatus::Superseded.done());
+        assert!(!RunStatus::Superseded.resumable());
+        assert_eq!(RunStatus::Superseded.as_str(), "superseded");
     }
 
     #[test]

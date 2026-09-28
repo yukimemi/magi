@@ -82,6 +82,9 @@ fn status_word(state: &RunState) -> String {
         // nothing belongs in this worktree — the opposite of a run that
         // could not do the work. See `RunStatus::VerifiedNoop`'s own doc.
         RunStatus::VerifiedNoop => cyan(text),
+        // Muted, not `Blocked`'s yellow: nothing here needs a human's
+        // attention any more, a later attempt already settled the task.
+        RunStatus::Superseded => dim(text),
         _ => cyan(text),
     }
 }

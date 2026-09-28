@@ -146,6 +146,11 @@ const RUN_STATUS = {
      agent breaking. magi has not confirmed the claim itself, which is why the
      task still sits held for a human rather than closing on its own. */
   verified_noop: { glyph: "\u2713", tone: "ink", note: "Every candidate reported, with evidence, that no code change was needed \u2014 the task's request was already satisfied elsewhere. magi has not verified the claim itself; check the candidate's evidence before closing the task." },
+  /* Rewritten in place, after the fact, by `daemon::supersede_prior_runs`
+     once a later attempt at the same task actually finished it \u2014 this run's
+     own `blocked`/`stalled` no longer needs anyone's attention. Muted `ink`,
+     same family as `unmerged`/`verified_noop`: nothing here is a failure. */
+  superseded:   { glyph: "\u2296", tone: "ink", note: "A later attempt at the same task already finished it. This run's own result no longer needs attention." },
   /* Derived from RunSummary.waiting rather than trusted from the status
      string: the run parked in some node and the summary still names it. */
   waiting:      { glyph: "?", tone: "wait", note: "An agent stopped to ask you something. Nothing in this run moves until it is answered." },
@@ -1347,7 +1352,7 @@ const RUN_SECTIONS = [
 function isStale(run) {
   const status = String(run.status || "");
   return run.live === "dead" && !run.waiting
-    && !["merged", "ready", "stalled", "blocked", "failed", "verified_noop"].includes(status);
+    && !["merged", "ready", "stalled", "blocked", "failed", "verified_noop", "superseded"].includes(status);
 }
 
 function displayedRunStatus(run) {
@@ -1365,7 +1370,7 @@ function runSection(run) {
   if (run.unmerged_by_design) return "ended";
   const status = String(run.status || "");
   if (status === "merged" || status === "ready") return "landed";
-  if (status === "stalled" || status === "blocked" || status === "failed" || status === "verified_noop") return "ended";
+  if (status === "stalled" || status === "blocked" || status === "failed" || status === "verified_noop" || status === "superseded") return "ended";
   return "flight";
 }
 
@@ -1429,6 +1434,7 @@ const REPRESENTATIVE_RUN_SHAPES = [
   { waiting: false, status: "blocked" },
   { waiting: false, status: "failed" },
   { waiting: false, status: "verified_noop" },
+  { waiting: false, status: "superseded" },
 ].map((shape) => ({ ...shape, done: !["implementing"].includes(shape.status) }));
 
 function sectionCompatibleWithStateFilter(sectionKey, filterKey) {

@@ -212,6 +212,11 @@ pub fn collect(states: &[RunState]) -> Stats {
             RunStatus::Ready => totals.ready += 1,
             RunStatus::Blocked => totals.blocked += 1,
             RunStatus::Failed => totals.failed += 1,
+            // `Superseded` deliberately falls through here rather than
+            // adding to `blocked`: the task it belongs to already landed
+            // through a later run, which is the one this tally counts as
+            // the merge/ready outcome. Counting both would inflate the
+            // denominator with two outcomes for one task.
             _ => {}
         }
 

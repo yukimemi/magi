@@ -486,6 +486,34 @@ impl Task {
         self.blocked_from = None;
     }
 
+    /// Earlier attempts at this task that a later one has since made moot —
+    /// empty unless the task is [`TaskStatus::Done`].
+    ///
+    /// `runs` is oldest first, and [`Task::start`] is the only thing that
+    /// pushes to it, always right before the attempt it names either succeeds
+    /// or fails; `succeed` itself never touches `runs`. So once `status` is
+    /// `Done`, `runs.last()` is provably the attempt whose `Merged`/`Ready`
+    /// verdict is *why* it is `Done` — no separate lookup of that run's own
+    /// state is needed to know which one succeeded — and everything before it
+    /// in the same list is a retry this task no longer needs.
+    ///
+    /// Deliberately narrower than [`Queue::superseded`]'s "every earlier
+    /// attempt has a later one" walk, which fires the moment a retry starts
+    /// even though the retry itself might still fail: that reading is right
+    /// for the web UI's "a newer attempt exists, go look at that one
+    /// instead" note, but wrong for deciding a run no longer needs a human's
+    /// attention, which is only true once the task's story has actually
+    /// ended well. Two Blocked runs sitting side by side while a third
+    /// attempt is still in flight must not be touched by this — see
+    /// `daemon::supersede_prior_runs`, the caller that turns this list into
+    /// rewritten `run.json` files.
+    pub fn superseded_attempts(&self) -> &[String] {
+        if self.status != TaskStatus::Done || self.runs.len() < 2 {
+            return &[];
+        }
+        &self.runs[..self.runs.len() - 1]
+    }
+
     /// Record a failed attempt. Out of attempts means held for a human, rather
     /// than retried until the money runs out.
     ///
@@ -1310,6 +1338,41 @@ mod tests {
             by,
             "the whole-map and single-run forms must agree"
         );
+    }
+
+    #[test]
+    fn superseded_attempts_is_empty_until_the_task_is_done() {
+        let mut t = task("retried");
+        t.runs = vec!["aaaa".to_owned(), "bbbb".to_owned()];
+        t.status = TaskStatus::Failed;
+        assert_eq!(
+            t.superseded_attempts(),
+            &[] as &[String],
+            "a task still retrying has no attempt yet that a later one made moot"
+        );
+
+        t.status = TaskStatus::Running;
+        assert_eq!(t.superseded_attempts(), &[] as &[String]);
+    }
+
+    #[test]
+    fn superseded_attempts_names_every_run_before_the_one_that_succeeded() {
+        let mut t = task("retried");
+        t.runs = vec!["aaaa".to_owned(), "bbbb".to_owned(), "cccc".to_owned()];
+        t.status = TaskStatus::Done;
+        assert_eq!(
+            t.superseded_attempts(),
+            &["aaaa".to_owned(), "bbbb".to_owned()],
+            "cccc is the attempt whose success made the task done, and stays out"
+        );
+    }
+
+    #[test]
+    fn superseded_attempts_is_empty_for_a_done_task_with_only_one_attempt() {
+        let mut t = task("first try landed");
+        t.runs = vec!["aaaa".to_owned()];
+        t.status = TaskStatus::Done;
+        assert_eq!(t.superseded_attempts(), &[] as &[String]);
     }
 
     #[test]
