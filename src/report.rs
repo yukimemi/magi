@@ -1185,6 +1185,35 @@ pub fn stats(stats: &Stats) -> String {
         }
     }
 
+    if !stats.advisors.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n{} {}",
+            bold("design deliberation"),
+            dim(
+                "(approximate: reflection is read off word overlap with the synthesis brief, not a precise attribution)"
+            )
+        );
+        let _ = writeln!(
+            s,
+            "  {:<14}{:>7}{:>10}{:>8}{:>8}{:>9}{:>10}",
+            "advisor", "seats", "proposed", "strong", "faint", "absent", "reflect%"
+        );
+        for a in &stats.advisors {
+            let _ = writeln!(
+                s,
+                "  {:<14}{:>7}{:>10}{:>8}{:>8}{:>9}{:>9.0}%",
+                a.agent,
+                a.seated,
+                a.proposed,
+                a.strong,
+                a.faint,
+                a.absent,
+                a.reflection_rate()
+            );
+        }
+    }
+
     if stats.e2e.rounds > 0 || stats.e2e.deferred > 0 {
         let _ = writeln!(s, "\n{}", bold("verification"));
         let _ = writeln!(
@@ -2253,6 +2282,30 @@ mod tests {
         assert!(text.contains("0 total"));
         assert!(!text.contains("implementation"));
         assert!(!text.contains("node durations"));
+    }
+
+    #[test]
+    fn stats_table_renders_advisor_reflection() {
+        let _guard = plain();
+        let st = Stats {
+            advisors: vec![crate::stats::AdvisorStats {
+                agent: "alpha".to_owned(),
+                seated: 3,
+                proposed: 2,
+                absent: 1,
+                faint: 1,
+                strong: 1,
+            }],
+            ..Default::default()
+        };
+        let text = stats(&st);
+        assert!(text.contains("design deliberation"));
+        assert!(
+            text.contains("approximate"),
+            "must note the heuristic: {text}"
+        );
+        assert!(text.contains("alpha"));
+        assert!(text.contains("50%"));
     }
 
     #[test]
