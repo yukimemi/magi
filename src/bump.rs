@@ -244,6 +244,180 @@ fn rewrite_table_version(toml: &str, table: &str, new_version: &str) -> Result<S
     Ok(out)
 }
 
+/// Names of `[workspace.dependencies]` entries that name an internal member
+/// by *both* `path` and `version` - the shape `AGENTS.md`'s own "internal
+/// version pin" guidance recommends for a published member that another
+/// workspace member depends on. Parsed with the `toml` crate (already a
+/// dependency, used read-only here) rather than by scanning for the word
+/// `version`, so an ordinary `[dependencies]` entry in some other table, or a
+/// `[workspace.dependencies]` entry that carries only one of the two keys,
+/// never enters the candidate set:
+///
+/// - `path` only (no `version`): an unpublished, workspace-only member - not
+///   ours to touch.
+/// - `version` only (no `path`): an external crates.io dependency - not ours
+///   to touch either.
+///
+/// Returns an empty list, not an error, when the manifest has no
+/// `[workspace.dependencies]` table at all - the common single-crate shape -
+/// so [`rewrite_cargo_version`]'s existing `[package]` path is unaffected.
+fn internal_pin_names(toml: &str) -> Result<Vec<String>> {
+    let value: toml::Value = toml::from_str(toml).context("failed to parse Cargo.toml as TOML")?;
+    let mut names: Vec<String> = value
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|d| d.as_table())
+        .into_iter()
+        .flatten()
+        .filter(|(_, dep)| {
+            dep.as_table()
+                .is_some_and(|t| t.contains_key("path") && t.contains_key("version"))
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Rewrite the quoted string value of `key = "..."` on `line`, wherever it
+/// appears - once for an inline table (`name = { path = "..", version =
+/// ".." }`, either key order) and once for a dotted `[workspace.dependencies.
+/// name]` table's own `version = ".."` line. Returns `None` when `key` is not
+/// present on this line as a `key = "value"` pair, which the caller treats as
+/// "could not rewrite this one" rather than silently leaving it unbumped.
+fn rewrite_quoted_field(line: &str, key: &str, new_value: &str) -> Option<String> {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    let mut search_from = 0;
+    while let Some(rel) = line[search_from..].find(key) {
+        let key_start = search_from + rel;
+        let before_ok = key_start == 0 || !is_ident(line[..key_start].chars().next_back().unwrap());
+        let eq_pos = key_start
+            + key.len()
+            + (line[key_start + key.len()..].len()
+                - line[key_start + key.len()..].trim_start().len());
+        if before_ok && line[eq_pos..].starts_with('=') {
+            if let Some(open_quote) = line[eq_pos + 1..].find('"').map(|o| eq_pos + 1 + o) {
+                // Nothing but whitespace may sit between `=` and the opening quote.
+                if line[eq_pos + 1..open_quote].trim().is_empty() {
+                    let value_begin = open_quote + 1;
+                    if let Some(end_rel) = line[value_begin..].find('"') {
+                        let value_end = value_begin + end_rel;
+                        let mut out = String::with_capacity(line.len());
+                        out.push_str(&line[..value_begin]);
+                        out.push_str(new_value);
+                        out.push_str(&line[value_end..]);
+                        return Some(out);
+                    }
+                }
+            }
+        }
+        search_from = key_start + key.len();
+    }
+    None
+}
+
+/// Rewrite the `version` pin of each `[workspace.dependencies]` entry named
+/// in `names` to `new_version`, in both shapes Cargo accepts: the inline
+/// table (`name = { path = "..", version = "old" }`) and the dotted table
+/// (`[workspace.dependencies.name]` followed by its own `version = "old"`
+/// line). Every other byte, including entries not in `names`, is untouched -
+/// same discipline as [`rewrite_table_version`].
+///
+/// Bails rather than silently leaving a pin unbumped when a named entry's
+/// `version` field cannot be located on a single line this way (for example
+/// an inline table split across lines): a bump pull request that leaves a
+/// stale internal pin behind is exactly the failure this exists to prevent,
+/// so an unrepresentable form must stop the bump, not ship it half-done.
+fn rewrite_workspace_dependency_pins(
+    toml: &str,
+    names: &[String],
+    new_version: &str,
+) -> Result<String> {
+    if names.is_empty() {
+        return Ok(toml.to_owned());
+    }
+    let mut out = String::with_capacity(toml.len() + names.len() * 8);
+    let mut in_flat_table = false;
+    let mut in_named_table: Option<String> = None;
+    let mut rewritten: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for line in toml.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_flat_table = trimmed == "[workspace.dependencies]";
+            in_named_table = trimmed
+                .strip_prefix("[workspace.dependencies.")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .map(str::to_owned);
+            out.push_str(line);
+            continue;
+        }
+
+        let key = trimmed.split('=').next().map(str::trim);
+
+        if in_flat_table {
+            if let Some(name) = key.and_then(|k| names.iter().find(|n| n.as_str() == k)) {
+                if let Some(rewritten_line) = rewrite_quoted_field(line, "version", new_version) {
+                    rewritten.insert(name.clone());
+                    out.push_str(&rewritten_line);
+                    continue;
+                }
+            }
+        } else if let Some(table_name) = &in_named_table {
+            if key == Some("version") && names.iter().any(|n| n == table_name) {
+                if let Some(rewritten_line) = rewrite_quoted_field(line, "version", new_version) {
+                    rewritten.insert(table_name.clone());
+                    out.push_str(&rewritten_line);
+                    continue;
+                }
+            }
+        }
+
+        out.push_str(line);
+    }
+
+    for name in names {
+        if !rewritten.contains(name) {
+            bail!(
+                "could not rewrite the `[workspace.dependencies]` version pin \
+                 for `{name}` - its `version` field was not found in a shape \
+                 this rewrite understands"
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Confirm every entry in `names` now reads `new_version` under
+/// `[workspace.dependencies]`, by reparsing the rewritten manifest rather
+/// than trusting the line-based rewrite's own bookkeeping. The safety net
+/// this run-time failure on the pending release bump is guarding against
+/// happened once already: `kanadehq/kanade`'s pin was left stale and its own
+/// `internal_pins_match_the_workspace_version` regression test caught it in
+/// CI, after the bump pull request had already opened.
+fn verify_pins_rewritten(toml: &str, names: &[String], new_version: &str) -> Result<()> {
+    let value: toml::Value =
+        toml::from_str(toml).context("rewritten Cargo.toml failed to parse")?;
+    let deps = value
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|d| d.as_table());
+    for name in names {
+        let actual = deps
+            .and_then(|d| d.get(name))
+            .and_then(|dep| dep.as_table())
+            .and_then(|t| t.get("version"))
+            .and_then(|v| v.as_str());
+        if actual != Some(new_version) {
+            bail!(
+                "the `[workspace.dependencies]` version pin for `{name}` did \
+                 not end up at `{new_version}` after the rewrite"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Rewrite the release version, wherever this manifest actually declares it.
 ///
 /// A single crate carries its version under `[package]`. A workspace root
@@ -252,13 +426,32 @@ fn rewrite_table_version(toml: &str, table: &str, new_version: &str) -> Result<S
 /// does not exist there at all. `[package]` is tried first because it is the
 /// far more common shape and the one every existing bump so far has hit;
 /// `[workspace.package]` is the fallback for the shape that never worked
-/// before this. Either way exactly one table is ever touched, so the "one
-/// version line changes" property [`rewrite_table_version`] rests on holds
-/// regardless of which table it was.
+/// before this.
+///
+/// A workspace manifest can also carry a *second*, independent version
+/// literal per internal member: `[workspace.dependencies].<name>` entries
+/// that reference a published member by both `path` and `version`, exactly
+/// the shape `AGENTS.md` documents as the canonical place to centralize that
+/// pin. Cargo does not derive that literal from `[workspace.package]
+/// version` - nothing does - so once the table version is rewritten, every
+/// such pin is rewritten to match in the same edit, and the result is
+/// reparsed to confirm it before this function returns. An entry with only
+/// `path` (an unpublished workspace-only member) or only `version` (an
+/// external dependency) is left untouched, as is a plain single-crate
+/// manifest with no `[workspace.dependencies]` table at all.
 pub fn rewrite_cargo_version(toml: &str, new_version: &str) -> Result<String> {
-    rewrite_table_version(toml, "[package]", new_version)
+    let rewritten = rewrite_table_version(toml, "[package]", new_version)
         .or_else(|_| rewrite_table_version(toml, "[workspace.package]", new_version))
-        .context("no `version` field found under `[package]` or `[workspace.package]`")
+        .context("no `version` field found under `[package]` or `[workspace.package]`")?;
+
+    let pin_names = internal_pin_names(&rewritten)?;
+    if pin_names.is_empty() {
+        return Ok(rewritten);
+    }
+
+    let rewritten = rewrite_workspace_dependency_pins(&rewritten, &pin_names, new_version)?;
+    verify_pins_rewritten(&rewritten, &pin_names, new_version)?;
+    Ok(rewritten)
 }
 
 /// Find `table`'s `version` field, if it has one. No I/O.
@@ -2079,6 +2272,148 @@ foo = { version = \"1.2.3\" }\n";
             toml.lines().count(),
             "the rewrite replaces one line, it does not add or remove any"
         );
+    }
+
+    /// The exact failure that happened on `kanadehq/kanade`: an internal
+    /// member referenced by both `path` and `version` must have its pin
+    /// bumped alongside `[workspace.package]`, in the same edit.
+    #[test]
+    fn cargo_version_rewrite_bumps_an_internal_workspace_dependency_pin() {
+        let toml = "\
+[workspace]\n\
+members = [\"crates/kanade-shared\"]\n\
+\n\
+[workspace.package]\n\
+version = \"0.48.2\"\n\
+\n\
+[workspace.dependencies]\n\
+kanade-shared = { path = \"crates/kanade-shared\", version = \"0.48.2\" }\n";
+        let out = rewrite_cargo_version(toml, "0.48.3").unwrap();
+        assert!(out.contains("[workspace.package]\nversion = \"0.48.3\"\n"));
+        assert!(
+            out.contains(
+                "kanade-shared = { path = \"crates/kanade-shared\", version = \"0.48.3\" }"
+            ),
+            "the internal pin must move with the workspace version: {out}"
+        );
+    }
+
+    /// Key order inside the inline table must not matter.
+    #[test]
+    fn cargo_version_rewrite_bumps_an_internal_pin_with_version_before_path() {
+        let toml = "\
+[workspace.package]\n\
+version = \"1.0.0\"\n\
+\n\
+[workspace.dependencies]\n\
+inner = { version = \"1.0.0\", path = \"crates/inner\" }\n";
+        let out = rewrite_cargo_version(toml, "1.0.1").unwrap();
+        assert!(out.contains("inner = { version = \"1.0.1\", path = \"crates/inner\" }"));
+    }
+
+    /// The dotted-table form (`[workspace.dependencies.name]`) must be
+    /// rewritten too, not only the inline-table form.
+    #[test]
+    fn cargo_version_rewrite_bumps_an_internal_pin_in_dotted_table_form() {
+        let toml = "\
+[workspace.package]\n\
+version = \"2.3.0\"\n\
+\n\
+[workspace.dependencies.inner]\n\
+path = \"crates/inner\"\n\
+version = \"2.3.0\"\n";
+        let out = rewrite_cargo_version(toml, "2.4.0").unwrap();
+        assert!(out.contains("[workspace.package]\nversion = \"2.4.0\"\n"));
+        assert!(out.contains(
+            "[workspace.dependencies.inner]\npath = \"crates/inner\"\nversion = \"2.4.0\"\n"
+        ));
+    }
+
+    /// A workspace-only member with `path` but no `version` is unpublished
+    /// and must be left exactly alone.
+    #[test]
+    fn cargo_version_rewrite_leaves_a_path_only_workspace_dependency_untouched() {
+        let toml = "\
+[workspace.package]\n\
+version = \"0.1.0\"\n\
+\n\
+[workspace.dependencies]\n\
+internal-only = { path = \"crates/internal-only\" }\n";
+        let out = rewrite_cargo_version(toml, "0.2.0").unwrap();
+        assert!(out.contains("internal-only = { path = \"crates/internal-only\" }"));
+    }
+
+    /// An external crates.io dependency, `version` but no `path`, must never
+    /// be touched by the internal-pin logic even when it sits in
+    /// `[workspace.dependencies]` alongside a real internal pin.
+    #[test]
+    fn cargo_version_rewrite_leaves_an_external_dependency_untouched() {
+        let toml = "\
+[workspace.package]\n\
+version = \"0.1.0\"\n\
+\n\
+[workspace.dependencies]\n\
+serde = { version = \"1\", features = [\"derive\"] }\n\
+inner = { path = \"crates/inner\", version = \"0.1.0\" }\n";
+        let out = rewrite_cargo_version(toml, "0.2.0").unwrap();
+        assert!(out.contains("serde = { version = \"1\", features = [\"derive\"] }"));
+        assert!(out.contains("inner = { path = \"crates/inner\", version = \"0.2.0\" }"));
+    }
+
+    /// A manifest with no `[workspace.dependencies]` table at all must keep
+    /// bumping `[workspace.package]` exactly as before - regression guard
+    /// for the pre-existing behaviour this change extends.
+    #[test]
+    fn cargo_version_rewrite_without_workspace_dependencies_table_still_bumps_package() {
+        let toml = "[workspace.package]\nversion = \"0.9.0\"\nedition = \"2024\"\n";
+        let out = rewrite_cargo_version(toml, "0.10.0").unwrap();
+        assert_eq!(
+            out,
+            "[workspace.package]\nversion = \"0.10.0\"\nedition = \"2024\"\n"
+        );
+    }
+
+    /// The `kanadehq/kanade` shape itself: several internal-looking and
+    /// external entries mixed in one `[workspace.dependencies]` table.
+    #[test]
+    fn cargo_version_rewrite_handles_a_kanade_shaped_workspace_dependencies_table() {
+        let toml = "\
+[workspace.package]\n\
+version = \"0.48.2\"\n\
+\n\
+[workspace.dependencies]\n\
+anyhow = { version = \"1\" }\n\
+serde = { version = \"1\", features = [\"derive\"] }\n\
+kanade-shared = { path = \"crates/kanade-shared\", version = \"0.48.2\" }\n\
+kanade-core = { path = \"crates/kanade-core\", version = \"0.48.2\" }\n\
+kanade-internal-tool = { path = \"crates/kanade-internal-tool\" }\n";
+        let out = rewrite_cargo_version(toml, "0.48.3").unwrap();
+        assert!(out.contains("anyhow = { version = \"1\" }"));
+        assert!(out.contains("serde = { version = \"1\", features = [\"derive\"] }"));
+        assert!(
+            out.contains(
+                "kanade-shared = { path = \"crates/kanade-shared\", version = \"0.48.3\" }"
+            )
+        );
+        assert!(
+            out.contains("kanade-core = { path = \"crates/kanade-core\", version = \"0.48.3\" }")
+        );
+        assert!(out.contains("kanade-internal-tool = { path = \"crates/kanade-internal-tool\" }"));
+    }
+
+    /// A shape the line-based rewrite cannot express - an inline table split
+    /// across lines - must fail the whole bump rather than silently leave
+    /// the pin stale.
+    #[test]
+    fn cargo_version_rewrite_bails_on_an_unrepresentable_inline_table() {
+        let toml = "\
+[workspace.package]\n\
+version = \"0.1.0\"\n\
+\n\
+[workspace.dependencies]\n\
+inner = { path = \"crates/inner\",\n\
+    version = \"0.1.0\" }\n";
+        assert!(rewrite_cargo_version(toml, "0.2.0").is_err());
     }
 
     #[test]
