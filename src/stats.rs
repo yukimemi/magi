@@ -143,6 +143,22 @@ pub struct Totals {
     pub blocked: usize,
     /// Could not complete.
     pub failed: usize,
+    /// The judging panel never reached a quorum; the work is kept but the
+    /// verdict is not trustworthy. Never counted as `blocked` — see
+    /// `RunStatus::Stalled`'s own doc — so it needs its own counter to stay
+    /// visible in a breakdown rather than vanishing from every bucket.
+    pub stalled: usize,
+    /// Every candidate wrote nothing, and said why in a way that survived
+    /// the adoption guard: a claim, not a failure, and not yet verified.
+    pub verified_noop: usize,
+    /// A later attempt at the same task already finished it; this run's own
+    /// `blocked`/`stalled` no longer needs anyone's attention.
+    pub superseded: usize,
+    /// Still moving: any non-terminal status (prep through landing). Kept as
+    /// one bucket rather than one counter per node — the per-node position of
+    /// a live run belongs to `magi show`/the deck, not to a workload-wide
+    /// tally that is read well after the run in question has finished.
+    pub in_progress: usize,
     /// Runs that reached a tally.
     pub tallied: usize,
     /// Tallies where the judges' first choices disagreed.
@@ -212,12 +228,22 @@ pub fn collect(states: &[RunState]) -> Stats {
             RunStatus::Ready => totals.ready += 1,
             RunStatus::Blocked => totals.blocked += 1,
             RunStatus::Failed => totals.failed += 1,
-            // `Superseded` deliberately falls through here rather than
-            // adding to `blocked`: the task it belongs to already landed
-            // through a later run, which is the one this tally counts as
-            // the merge/ready outcome. Counting both would inflate the
-            // denominator with two outcomes for one task.
-            _ => {}
+            RunStatus::Stalled => totals.stalled += 1,
+            RunStatus::VerifiedNoop => totals.verified_noop += 1,
+            // Counted on its own rather than folded into `blocked`/`stalled`:
+            // the task it belongs to already landed through a later run,
+            // which is the one this tally counts as the merge/ready outcome,
+            // and folding it back in would inflate the denominator with two
+            // outcomes for one task.
+            RunStatus::Superseded => totals.superseded += 1,
+            RunStatus::Prep
+            | RunStatus::Implementing
+            | RunStatus::Judging
+            | RunStatus::Deliberating
+            | RunStatus::Voting
+            | RunStatus::Reviewing
+            | RunStatus::Gating
+            | RunStatus::Landing => totals.in_progress += 1,
         }
 
         for c in &state.candidates {
@@ -812,6 +838,46 @@ mod tests {
         assert_eq!(stats.e2e.failures, 2);
         assert_eq!(stats.e2e.sole_detections, 1);
         assert_eq!(stats.e2e.sole_rate(), 50.0);
+    }
+
+    #[test]
+    fn every_run_status_lands_in_exactly_one_breakdown_bucket() {
+        let states = vec![
+            state_with(Vec::new(), 'A', RunStatus::Merged),
+            state_with(Vec::new(), 'A', RunStatus::Ready),
+            state_with(Vec::new(), 'A', RunStatus::Blocked),
+            state_with(Vec::new(), 'A', RunStatus::Failed),
+            state_with(Vec::new(), 'A', RunStatus::Stalled),
+            state_with(Vec::new(), 'A', RunStatus::VerifiedNoop),
+            state_with(Vec::new(), 'A', RunStatus::Superseded),
+            state_with(Vec::new(), 'A', RunStatus::Implementing),
+            state_with(Vec::new(), 'A', RunStatus::Landing),
+        ];
+        let stats = collect(&states);
+        let t = &stats.totals;
+        assert_eq!(t.runs, 9);
+        assert_eq!(t.merged, 1);
+        assert_eq!(t.ready, 1);
+        assert_eq!(t.blocked, 1);
+        assert_eq!(t.failed, 1);
+        assert_eq!(t.stalled, 1);
+        assert_eq!(t.verified_noop, 1);
+        assert_eq!(t.superseded, 1);
+        // `Implementing` and `Landing` both fall into the one non-terminal
+        // bucket.
+        assert_eq!(t.in_progress, 2);
+        assert_eq!(
+            t.merged
+                + t.ready
+                + t.blocked
+                + t.failed
+                + t.stalled
+                + t.verified_noop
+                + t.superseded
+                + t.in_progress,
+            t.runs,
+            "every run must land in exactly one bucket of the breakdown"
+        );
     }
 
     #[test]
