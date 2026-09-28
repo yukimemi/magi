@@ -9182,9 +9182,22 @@ mod tests {
         // Front end: the detail page has to read the field this route now
         // carries, downgrade the chip, and link to the run that replaced it —
         // not just repeat the list card's own logic under a different name.
+        // The link is built off the resolved full id, not the bare short id
+        // the API sends: `superseded_by` alone is ambiguous, and
+        // `/api/runs/{short-id}` is not guaranteed to resolve to the one run
+        // that actually replaced this one.
         assert!(APP_JS.contains("run.superseded_by"));
         assert!(APP_JS.contains("data-superseded"));
-        assert!(APP_JS.contains("#/runs/${supersededBy}"));
+        assert!(APP_JS.contains("#/runs/${supersededTarget.id}"));
+        assert!(
+            !APP_JS.contains("#/runs/${supersededBy}"),
+            "a superseded-by link must resolve through the cached run list, not the bare short id"
+        );
+
+        // Front end: a later attempt that is itself unresolved must not make
+        // the earlier one read as finished — only a settled, successful
+        // status on the run that replaced it may downgrade the chip.
+        assert!(APP_JS.contains("SETTLED_OK"));
     }
 
     #[tokio::test]
