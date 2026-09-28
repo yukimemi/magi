@@ -244,6 +244,81 @@ fn rewrite_table_version(toml: &str, table: &str, new_version: &str) -> Result<S
     Ok(out)
 }
 
+/// Truncate `s` at the first `#` that is not inside a quoted string, the
+/// same rule a TOML parser uses to tell a comment from a literal `#` inside
+/// a value. Used only on table-header lines here (`[workspace.dependencies]
+/// # internal pins` is valid TOML), so header comparisons don't miss a
+/// section just because it carries a trailing comment.
+fn strip_trailing_comment(s: &str) -> &str {
+    let mut in_string = false;
+    let mut quote = '"';
+    for (i, c) in s.char_indices() {
+        if in_string {
+            if c == quote {
+                in_string = false;
+            }
+        } else if c == '"' || c == '\'' {
+            in_string = true;
+            quote = c;
+        } else if c == '#' {
+            return s[..i].trim_end();
+        }
+    }
+    s
+}
+
+/// Strip a single layer of matching quotes from a TOML key, so a
+/// `"name" = { .. }` or `'name' = { .. }` entry compares equal to the plain
+/// `name` the `toml` crate itself hands back for the same key - Cargo
+/// manifests almost never quote a dependency key (bare keys already allow
+/// `-`), but it is legal TOML and costs nothing extra to normalise.
+fn unquote_key(key: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = key.strip_prefix(quote).and_then(|k| k.strip_suffix(quote)) {
+            return inner;
+        }
+    }
+    key
+}
+
+/// Pull just the `[workspace.dependencies]` table - flat entries and any
+/// `[workspace.dependencies.<name>]` sub-tables - out of a full manifest and
+/// rewrite its headers to `[dependencies]` / `[dependencies.<name>]`, so the
+/// fragment parses standalone as TOML.
+///
+/// This is what keeps [`internal_pin_names`] and [`verify_pins_rewritten`]
+/// from imposing a whole-file strict-TOML precondition on every workspace
+/// manifest this rewrite runs against: only the dependency table itself has
+/// to parse, not any other section a hand-edited `Cargo.toml` might carry in
+/// a shape this crate's pinned `toml` version does not accept. Returns an
+/// empty string when the manifest has no such table at all.
+fn extract_workspace_dependencies_fragment(toml: &str) -> String {
+    let mut fragment = String::new();
+    let mut capturing = false;
+    for line in toml.split_inclusive('\n') {
+        let header = strip_trailing_comment(line.trim());
+        if header.starts_with('[') {
+            if header == "[workspace.dependencies]" {
+                capturing = true;
+                fragment.push_str("[dependencies]\n");
+            } else if let Some(name) = header
+                .strip_prefix("[workspace.dependencies.")
+                .and_then(|rest| rest.strip_suffix(']'))
+            {
+                capturing = true;
+                let _ = writeln!(fragment, "[dependencies.{name}]");
+            } else {
+                capturing = false;
+            }
+            continue;
+        }
+        if capturing {
+            fragment.push_str(line);
+        }
+    }
+    fragment
+}
+
 /// Names of `[workspace.dependencies]` entries that name an internal member
 /// by *both* `path` and `version` - the shape `AGENTS.md`'s own "internal
 /// version pin" guidance recommends for a published member that another
@@ -262,10 +337,14 @@ fn rewrite_table_version(toml: &str, table: &str, new_version: &str) -> Result<S
 /// `[workspace.dependencies]` table at all - the common single-crate shape -
 /// so [`rewrite_cargo_version`]'s existing `[package]` path is unaffected.
 fn internal_pin_names(toml: &str) -> Result<Vec<String>> {
-    let value: toml::Value = toml::from_str(toml).context("failed to parse Cargo.toml as TOML")?;
+    let fragment = extract_workspace_dependencies_fragment(toml);
+    if fragment.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: toml::Value =
+        toml::from_str(&fragment).context("failed to parse `[workspace.dependencies]` as TOML")?;
     let mut names: Vec<String> = value
-        .get("workspace")
-        .and_then(|w| w.get("dependencies"))
+        .get("dependencies")
         .and_then(|d| d.as_table())
         .into_iter()
         .flatten()
@@ -279,12 +358,15 @@ fn internal_pin_names(toml: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Rewrite the quoted string value of `key = "..."` on `line`, wherever it
-/// appears - once for an inline table (`name = { path = "..", version =
-/// ".." }`, either key order) and once for a dotted `[workspace.dependencies.
-/// name]` table's own `version = ".."` line. Returns `None` when `key` is not
-/// present on this line as a `key = "value"` pair, which the caller treats as
-/// "could not rewrite this one" rather than silently leaving it unbumped.
+/// Rewrite the quoted string value of `key = "..."` (or `key = '...'`, a
+/// literal string) on `line`, wherever it appears - once for an inline table
+/// (`name = { path = "..", version = ".." }`, either key order) and once for
+/// a dotted `[workspace.dependencies.name]` table's own `version = ".."`
+/// line. The replacement is written back between the *same* quote
+/// characters the line already used, so a literal-string pin stays a
+/// literal string. Returns `None` when `key` is not present on this line as
+/// a `key = "value"` pair, which the caller treats as "could not rewrite
+/// this one" rather than silently leaving it unbumped.
 fn rewrite_quoted_field(line: &str, key: &str, new_value: &str) -> Option<String> {
     let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
     let mut search_from = 0;
@@ -296,18 +378,22 @@ fn rewrite_quoted_field(line: &str, key: &str, new_value: &str) -> Option<String
             + (line[key_start + key.len()..].len()
                 - line[key_start + key.len()..].trim_start().len());
         if before_ok && line[eq_pos..].starts_with('=') {
-            if let Some(open_quote) = line[eq_pos + 1..].find('"').map(|o| eq_pos + 1 + o) {
-                // Nothing but whitespace may sit between `=` and the opening quote.
-                if line[eq_pos + 1..open_quote].trim().is_empty() {
-                    let value_begin = open_quote + 1;
-                    if let Some(end_rel) = line[value_begin..].find('"') {
-                        let value_end = value_begin + end_rel;
-                        let mut out = String::with_capacity(line.len());
-                        out.push_str(&line[..value_begin]);
-                        out.push_str(new_value);
-                        out.push_str(&line[value_end..]);
-                        return Some(out);
-                    }
+            let after_eq = &line[eq_pos + 1..];
+            let ws_len = after_eq.len() - after_eq.trim_start().len();
+            let quote_pos = eq_pos + 1 + ws_len;
+            if let Some(quote_char) = line[quote_pos..]
+                .chars()
+                .next()
+                .filter(|c| *c == '"' || *c == '\'')
+            {
+                let value_begin = quote_pos + quote_char.len_utf8();
+                if let Some(end_rel) = line[value_begin..].find(quote_char) {
+                    let value_end = value_begin + end_rel;
+                    let mut out = String::with_capacity(line.len());
+                    out.push_str(&line[..value_begin]);
+                    out.push_str(new_value);
+                    out.push_str(&line[value_end..]);
+                    return Some(out);
                 }
             }
         }
@@ -344,8 +430,9 @@ fn rewrite_workspace_dependency_pins(
     for line in toml.split_inclusive('\n') {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            in_flat_table = trimmed == "[workspace.dependencies]";
-            in_named_table = trimmed
+            let header = strip_trailing_comment(trimmed);
+            in_flat_table = header == "[workspace.dependencies]";
+            in_named_table = header
                 .strip_prefix("[workspace.dependencies.")
                 .and_then(|rest| rest.strip_suffix(']'))
                 .map(str::to_owned);
@@ -353,7 +440,7 @@ fn rewrite_workspace_dependency_pins(
             continue;
         }
 
-        let key = trimmed.split('=').next().map(str::trim);
+        let key = trimmed.split('=').next().map(str::trim).map(unquote_key);
 
         if in_flat_table {
             if let Some(name) = key.and_then(|k| names.iter().find(|n| n.as_str() == k)) {
@@ -396,12 +483,10 @@ fn rewrite_workspace_dependency_pins(
 /// `internal_pins_match_the_workspace_version` regression test caught it in
 /// CI, after the bump pull request had already opened.
 fn verify_pins_rewritten(toml: &str, names: &[String], new_version: &str) -> Result<()> {
-    let value: toml::Value =
-        toml::from_str(toml).context("rewritten Cargo.toml failed to parse")?;
-    let deps = value
-        .get("workspace")
-        .and_then(|w| w.get("dependencies"))
-        .and_then(|d| d.as_table());
+    let fragment = extract_workspace_dependencies_fragment(toml);
+    let value: toml::Value = toml::from_str(&fragment)
+        .context("rewritten `[workspace.dependencies]` failed to parse")?;
+    let deps = value.get("dependencies").and_then(|d| d.as_table());
     for name in names {
         let actual = deps
             .and_then(|d| d.get(name))
@@ -2414,6 +2499,73 @@ version = \"0.1.0\"\n\
 inner = { path = \"crates/inner\",\n\
     version = \"0.1.0\" }\n";
         assert!(rewrite_cargo_version(toml, "0.2.0").is_err());
+    }
+
+    /// A trailing comment on the `[workspace.dependencies]` header itself is
+    /// valid TOML and must not stop the section from being recognised.
+    #[test]
+    fn cargo_version_rewrite_recognises_a_commented_workspace_dependencies_header() {
+        let toml = "\
+[workspace.package]\n\
+version = \"0.1.0\"\n\
+\n\
+[workspace.dependencies] # internal pins\n\
+inner = { path = \"crates/inner\", version = \"0.1.0\" }\n";
+        let out = rewrite_cargo_version(toml, "0.2.0").unwrap();
+        assert!(out.contains("inner = { path = \"crates/inner\", version = \"0.2.0\" }"));
+    }
+
+    /// A quoted dependency key (`"inner" = { .. }`) is valid TOML and must
+    /// compare equal to the plain name the `toml` crate itself reports.
+    #[test]
+    fn cargo_version_rewrite_bumps_a_quoted_dependency_key() {
+        let toml = "\
+[workspace.package]\n\
+version = \"0.1.0\"\n\
+\n\
+[workspace.dependencies]\n\
+\"inner\" = { path = \"crates/inner\", version = \"0.1.0\" }\n";
+        let out = rewrite_cargo_version(toml, "0.2.0").unwrap();
+        assert!(out.contains("\"inner\" = { path = \"crates/inner\", version = \"0.2.0\" }"));
+    }
+
+    /// A literal (single-quoted) TOML string is a legal way to spell a
+    /// version pin, and the rewrite must preserve that quoting style rather
+    /// than failing to find it or silently switching it to a basic string.
+    #[test]
+    fn cargo_version_rewrite_bumps_a_literal_string_version_pin() {
+        let toml = "\
+[workspace.package]\n\
+version = \"0.1.0\"\n\
+\n\
+[workspace.dependencies]\n\
+inner = { path = 'crates/inner', version = '0.1.0' }\n";
+        let out = rewrite_cargo_version(toml, "0.2.0").unwrap();
+        assert!(out.contains("inner = { path = 'crates/inner', version = '0.2.0' }"));
+    }
+
+    /// A manifest whose unrelated sections would not satisfy a strict
+    /// whole-file TOML parse (here: a duplicate top-level table, which the
+    /// `toml` crate rejects) must still have its `[workspace.dependencies]`
+    /// pins rewritten - only that section's own syntax is a precondition,
+    /// not the rest of the file.
+    #[test]
+    fn cargo_version_rewrite_does_not_require_the_whole_file_to_parse() {
+        let toml = "\
+[workspace.package]\n\
+version = \"0.1.0\"\n\
+\n\
+[workspace.dependencies]\n\
+inner = { path = \"crates/inner\", version = \"0.1.0\" }\n\
+\n\
+[workspace.package]\n\
+edition = \"2024\"\n";
+        let out = rewrite_cargo_version(toml, "0.2.0").unwrap();
+        assert!(out.contains("inner = { path = \"crates/inner\", version = \"0.2.0\" }"));
+        assert!(
+            toml::from_str::<toml::Value>(toml).is_err(),
+            "the fixture itself must be invalid as a whole file, or this test proves nothing"
+        );
     }
 
     #[test]
