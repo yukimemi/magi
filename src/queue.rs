@@ -973,6 +973,25 @@ impl Queue {
         None
     }
 
+    /// The task's own most recent attempt, when `run` belongs to that task
+    /// but is not already that attempt.
+    ///
+    /// Distinct from [`Queue::superseded_by`], which names only the very
+    /// next attempt: a chain of retries (A superseded by B superseded by C)
+    /// leaves an older run pointing at an intermediate one that may itself
+    /// be unresolved, and a run's own detail page needs to know where the
+    /// task's story currently stands - the chain's current head, C - not an
+    /// attempt in the middle of it that a client would otherwise have to
+    /// walk to by hand.
+    pub fn latest_attempt(&self, run: &str) -> Option<String> {
+        for task in self.list() {
+            if task.runs.iter().any(|r| r == run) {
+                return task.runs.last().filter(|last| **last != run).cloned();
+            }
+        }
+        None
+    }
+
     /// The task a daemon should run next, or `None` when the queue is idle.
     ///
     /// Highest priority first, oldest first within a priority, so a burst of
@@ -1290,6 +1309,32 @@ mod tests {
             q.superseded(),
             by,
             "the whole-map and single-run forms must agree"
+        );
+    }
+
+    #[test]
+    fn latest_attempt_names_the_chain_s_current_head_not_just_the_next_one() {
+        let (_dir, q) = queue();
+        let mut t = task("retried twice");
+        t.runs = vec!["aaaa".to_owned(), "bbbb".to_owned(), "cccc".to_owned()];
+        q.put(&mut t).unwrap();
+
+        assert_eq!(
+            q.latest_attempt("aaaa"),
+            Some("cccc".to_owned()),
+            "an old attempt points straight at the chain's current head, not the \
+             next attempt in the middle of it"
+        );
+        assert_eq!(q.latest_attempt("bbbb"), Some("cccc".to_owned()));
+        assert_eq!(
+            q.latest_attempt("cccc"),
+            None,
+            "the latest attempt is not superseded by anything"
+        );
+        assert_eq!(
+            q.latest_attempt("never-heard-of-it"),
+            None,
+            "a run belonging to no task on this queue is not superseded"
         );
     }
 

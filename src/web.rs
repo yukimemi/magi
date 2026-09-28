@@ -2387,15 +2387,53 @@ struct RunDetailView {
     /// with nothing anywhere saying so — an operator opening it had no way
     /// to tell "this is done elsewhere" from "this still needs a retry".
     superseded_by: Option<String>,
+    /// The task's current attempt, when this run is an older one — resolved
+    /// from [`Queue::latest_attempt`] and this run's own state, not left for
+    /// the client to derive.
+    ///
+    /// Three things a client cannot safely do on its own drove this onto the
+    /// server: it has to name the chain's *current head*, not just the next
+    /// attempt (`superseded_by` above), because an intermediate retry in a
+    /// longer chain can itself still be unresolved; it has to resolve to a
+    /// real id rather than a short id a client would have to guess a full id
+    /// from, which is ambiguous the moment two runs share a suffix; and it
+    /// has to read that head's own status directly, because whether a run
+    /// list a client happens to have cached even contains that attempt
+    /// depends on a page limit this route knows nothing about.
+    latest_attempt: Option<LatestAttempt>,
+}
+
+/// The task's current attempt, as seen from an older one's detail page.
+#[derive(Debug, Serialize)]
+struct LatestAttempt {
+    id: String,
+    short: String,
+    /// Whether this attempt itself settled with a result nobody needs to
+    /// act on further. Deliberately narrow: only `Merged` and `Ready` count.
+    /// `VerifiedNoop` is excluded on purpose — it is a candidate's own
+    /// unconfirmed claim that no change was needed, which is exactly why it
+    /// settles the task through `Held` rather than `Done` and still waits on
+    /// a human to check the evidence; showing an older run as "finished
+    /// elsewhere" on the strength of an unverified claim would bury the
+    /// thing that still needs a look. `Blocked`/`Failed`/`Stalled` and every
+    /// in-flight status are excluded because they are exactly the
+    /// unresolved states this field exists to tell apart from a real finish.
+    resolved: bool,
 }
 
 impl RunDetailView {
-    fn of(state: RunState, live: crate::run::Liveness, superseded_by: Option<String>) -> Self {
+    fn of(
+        state: RunState,
+        live: crate::run::Liveness,
+        superseded_by: Option<String>,
+        latest_attempt: Option<LatestAttempt>,
+    ) -> Self {
         Self {
             instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
             live,
             unmerged_by_design: state.unmerged_by_design(),
             superseded_by,
+            latest_attempt,
             state,
         }
     }
@@ -2416,7 +2454,22 @@ async fn run_detail(
             .as_deref()
             .map(crate::run::short_of)
             .map(str::to_owned);
-        Ok(Json(RunDetailView::of(state, live, superseded_by)))
+        // Best-effort: an unreadable head (mid-write, or deleted) just means
+        // this run's own status stands on its own, same as no later attempt
+        // existing at all.
+        let latest_attempt = ui.queue.latest_attempt(&id).and_then(|head_id| {
+            read_run(&ui.runs, &head_id).ok().map(|head| LatestAttempt {
+                short: head.short().to_owned(),
+                resolved: matches!(head.status, RunStatus::Merged | RunStatus::Ready),
+                id: head.id,
+            })
+        });
+        Ok(Json(RunDetailView::of(
+            state,
+            live,
+            superseded_by,
+            latest_attempt,
+        )))
     })
     .await
 }
@@ -9172,32 +9225,121 @@ mod tests {
 
         let earlier = fx.get(&format!("/api/runs/{first}")).await.json();
         assert_eq!(earlier["superseded_by"], "dddd");
+        assert_eq!(earlier["latest_attempt"]["id"], second);
+        assert_eq!(earlier["latest_attempt"]["short"], "dddd");
+        assert_eq!(
+            earlier["latest_attempt"]["resolved"], true,
+            "the run that replaced it landed, so this one reads as settled"
+        );
 
         let later = fx.get(&format!("/api/runs/{second}")).await.json();
         assert!(
             later["superseded_by"].is_null(),
             "the latest attempt is not superseded by anything"
         );
+        assert!(
+            later["latest_attempt"].is_null(),
+            "the latest attempt has no later attempt of its own"
+        );
 
         // Front end: the detail page has to read the field this route now
         // carries, downgrade the chip, and link to the run that replaced it —
         // not just repeat the list card's own logic under a different name.
-        // The link is built off the resolved full id, not the bare short id
-        // the API sends: `superseded_by` alone is ambiguous, and
-        // `/api/runs/{short-id}` is not guaranteed to resolve to the one run
-        // that actually replaced this one.
-        assert!(APP_JS.contains("run.superseded_by"));
+        // The link is built off `latest_attempt.id`, the server-resolved
+        // full id, never a bare short string a client would have to guess a
+        // full run from.
+        assert!(APP_JS.contains("run.latest_attempt"));
         assert!(APP_JS.contains("data-superseded"));
-        assert!(APP_JS.contains("#/runs/${supersededTarget.id}"));
-        assert!(
-            !APP_JS.contains("#/runs/${supersededBy}"),
-            "a superseded-by link must resolve through the cached run list, not the bare short id"
+        assert!(APP_JS.contains("#/runs/${latest.id}"));
+    }
+
+    #[tokio::test]
+    async fn a_chain_of_retries_points_the_oldest_at_the_current_head() {
+        // A -> B -> C, all Blocked except the last. A's immediate successor
+        // (superseded_by) is B, which is itself unresolved; what an operator
+        // opening A's page actually needs is where the task's story stands
+        // *now* - C, not B - without depending on whether C happens to be in
+        // whatever page of /api/runs the client last cached.
+        let fx = Fixture::start().await;
+        let q = fx.queue();
+        let runs = fx.runs();
+        let (a, b, c) = (
+            "20260901-000000-aaaa",
+            "20260901-000000-bbbb",
+            "20260901-000000-cccc",
+        );
+        write_run(&runs, a, RunStatus::Blocked);
+        write_run(&runs, b, RunStatus::Blocked);
+        write_run(&runs, c, RunStatus::Merged);
+
+        let mut t = Task::new(
+            "retried twice".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        t.runs = vec![a.to_owned(), b.to_owned(), c.to_owned()];
+        q.put(&mut t).expect("put");
+
+        let view = fx.get(&format!("/api/runs/{a}")).await.json();
+        assert_eq!(view["superseded_by"], "bbbb", "the immediate successor");
+        assert_eq!(
+            view["latest_attempt"]["id"], c,
+            "the chain's current head, not the intermediate Blocked retry"
+        );
+        assert_eq!(view["latest_attempt"]["resolved"], true);
+
+        let mid = fx.get(&format!("/api/runs/{b}")).await.json();
+        assert_eq!(mid["latest_attempt"]["id"], c);
+        assert_eq!(mid["latest_attempt"]["resolved"], true);
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_or_unverified_successor_does_not_read_as_finished() {
+        let fx = Fixture::start().await;
+        let q = fx.queue();
+        let runs = fx.runs();
+
+        // Still Blocked: the task is not resolved, so the older run must not
+        // read as settled either.
+        let (still_blocked_a, still_blocked_b) = ("20260901-000000-e001", "20260901-000000-e002");
+        write_run(&runs, still_blocked_a, RunStatus::Blocked);
+        write_run(&runs, still_blocked_b, RunStatus::Blocked);
+        let mut t1 = Task::new(
+            "still stuck".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        t1.runs = vec![still_blocked_a.to_owned(), still_blocked_b.to_owned()];
+        q.put(&mut t1).expect("put");
+        let view1 = fx.get(&format!("/api/runs/{still_blocked_a}")).await.json();
+        assert_eq!(view1["latest_attempt"]["resolved"], false);
+
+        // VerifiedNoop: a candidate's own unconfirmed claim, held for a human
+        // to check - not a confirmed finish, so this must not read as
+        // resolved either, even though the run is done in the sense that
+        // nothing is still running.
+        let (noop_a, noop_b) = ("20260901-000000-e003", "20260901-000000-e004");
+        write_run(&runs, noop_a, RunStatus::Blocked);
+        write_run(&runs, noop_b, RunStatus::VerifiedNoop);
+        let mut t2 = Task::new(
+            "claims done".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        t2.runs = vec![noop_a.to_owned(), noop_b.to_owned()];
+        q.put(&mut t2).expect("put");
+        let view2 = fx.get(&format!("/api/runs/{noop_a}")).await.json();
+        assert_eq!(
+            view2["latest_attempt"]["resolved"], false,
+            "an unverified no-op claim must not read as a confirmed finish"
         );
 
-        // Front end: a later attempt that is itself unresolved must not make
-        // the earlier one read as finished — only a settled, successful
-        // status on the run that replaced it may downgrade the chip.
-        assert!(APP_JS.contains("SETTLED_OK"));
+        // Front end: an unresolved successor must not carry the "finished
+        // this work" note or the muted chip treatment.
+        assert!(APP_JS.contains("latest.resolved"));
     }
 
     #[tokio::test]

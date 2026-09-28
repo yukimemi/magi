@@ -4620,32 +4620,27 @@ function renderRunDetail() {
      own chip reads: the list route already says so on the card, but the
      detail page — what an operator actually opens off a notification about a
      blocked or failed run — went on showing a plain red chip with nothing
-     anywhere saying a retry had already finished the work. `run.superseded_by`
-     comes straight off this route now; the list's cached `summary` is only a
-     fallback for a payload from a build that predates it.
-     `supersededBy` is a *short* id (`run::short_of`, same shape as the list
-     card's own field, which is never a link — one big `<a>` per card cannot
-     nest another anchor), not something `/api/runs/{id}` can always resolve
-     safely: two different runs can share a short suffix, and the id alone
-     does not say which. `state.runs` (the list cache) carries each run's
-     real `id` next to its `short`, so the link is only built once that
-     lookup lands on exactly one row — never straight off the short string.
-     Never downgrade a run still moving (`PHASES` or parked): a later attempt
-     existing is not proof this one is done trying. And never claim the
-     later attempt *finished* the work unless its own status says so —
-     a chain where the next attempt is itself Blocked/Failed/Stalled (or
-     still running, or outside the cached list) must keep reading as
-     unresolved, not quietly downgrade to "done elsewhere". */
-  const supersededBy = typeof run.superseded_by === "string" && run.superseded_by
-    ? run.superseded_by
-    : (summary && typeof summary.superseded_by === "string" && summary.superseded_by) || null;
-  const supersededTarget = supersededBy
-    ? (state.runs || []).find((r) => r.short === supersededBy)
+     anywhere saying a retry had already resolved the work.
+
+     `run.latest_attempt` (added on this route for exactly this) is resolved
+     entirely on the server: it already names the task's *current* attempt,
+     not just the next one in the chain — an old run superseded by an
+     intermediate retry that is itself still Blocked points straight at
+     whichever attempt is current — carries that attempt's real id rather
+     than a short id this page would have to guess a full one from (two runs
+     can share a short suffix), and its own `resolved` flag is read off that
+     attempt's actual status on disk rather than off `state.runs`, a client
+     cache capped to a page size this route knows nothing about. None of
+     that can be reconstructed safely from the run list cache — see the
+     review round that put it here.
+
+     Never downgrade a run still moving (`PHASES` or parked): a later
+     attempt existing is not proof this one is done trying. */
+  const latest = run.latest_attempt && typeof run.latest_attempt.id === "string"
+    ? run.latest_attempt
     : null;
-  const SETTLED_OK = new Set(["merged", "ready", "unmerged", "verified_noop"]);
-  const supersededDone = Boolean(supersededTarget) && SETTLED_OK.has(displayedRunStatus(supersededTarget));
   const inFlight = PHASES.includes(status) || status === "waiting";
-  const superseded = supersededDone && !inFlight;
+  const superseded = Boolean(latest && latest.resolved) && !inFlight;
 
   const statusChip = chip(status, RUN_STATUS);
   setAttr(statusChip, "data-superseded", superseded ? "1" : null);
@@ -4658,7 +4653,7 @@ function renderRunDetail() {
   if (superseded) {
     head.append(el("p", { class: "card-note card-superseded" },
       "Superseded by ",
-      el("a", { href: `#/runs/${supersededTarget.id}`, text: supersededBy }),
+      el("a", { href: `#/runs/${latest.id}`, text: latest.short }),
       " — a later attempt at the same task finished this work.",
     ));
   } else if (meta.note) {
