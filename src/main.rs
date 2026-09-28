@@ -1185,8 +1185,8 @@ async fn dispatch(command: Command) -> Result<()> {
             let removed = match RunState::load(&id) {
                 Ok(mut state) => {
                     if let Some(url) = merged {
-                        // Boxed defensively: `correct_manual_merge` calls into
-                        // `land::land`, whose own loop nests
+                        // Boxed defensively: `land::correct_manual_merge` calls
+                        // into `land::land`, whose own loop nests
                         // `observe`/`approval_gate`/`fix_round` several layers
                         // deep, and awaiting that inline would fold the whole
                         // nested future into `dispatch`'s own generated state
@@ -1199,7 +1199,14 @@ async fn dispatch(command: Command) -> Result<()> {
                         // there is no reason to keep spending an already-tight
                         // budget when `Box::pin` moves this one to the heap
                         // for free.)
-                        Box::pin(correct_manual_merge(&mut state, &url)).await?;
+                        let (before, after) =
+                            Box::pin(land::correct_manual_merge(&mut state, &url)).await?;
+                        println!(
+                            "{}: corrected status {} -> {} from {url}",
+                            state.id,
+                            before.as_str(),
+                            after.as_str()
+                        );
                     }
                     let removed = fold_run(&mut state, all, &magi::run::home()).await?;
                     // Nothing left for `fold_run` to remove is not the same
@@ -1347,68 +1354,6 @@ async fn dispatch(command: Command) -> Result<()> {
             updater::run_self_update(yes, check_only, !std::io::stdin().is_terminal()).await
         }
     }
-}
-
-/// Confirm `url` is actually a merged pull request, then rewrite `state`'s
-/// `status` and `merge` exactly as the automatic land loop (`land::land`)
-/// would have written them had magi opened and merged this pull request
-/// itself.
-///
-/// This is `magi fold --merged`'s whole implementation: the operator's
-/// recovery from a merge magi could not finish on its own - a PR title too
-/// long for the GraphQL mutation, `gh pr create` unreachable, a stale token -
-/// closed by hand with a pull request magi never opened and so never
-/// recorded. Reusing `land::land` rather than writing `status`/`merge`
-/// directly keeps this one authoritative: a merged pull request decides
-/// `Step::Done { merged: true }` on the very first read, before any of
-/// `land`'s own checks/fix/rebase machinery can run, which is what makes it
-/// safe to call here even though this pull request was never magi's own.
-/// `land::lifecycle` is checked first and separately so a mistyped or still-
-/// open URL fails loudly without writing anything, rather than handing an
-/// open pull request to the full autonomous loop by accident.
-///
-/// Correcting `status` this way does not run `bump::after_merge`
-/// (`src/bump.rs`): that call is made only from `graph::Runner::run_land`,
-/// which this path never goes through. A release version bump this change
-/// might have earned is therefore not filed automatically and has to be
-/// requested by hand - recorded as an event on the run so the gap is visible
-/// to whoever reads it later, not just to this comment.
-async fn correct_manual_merge(state: &mut RunState, url: &str) -> Result<()> {
-    match land::lifecycle(&state.repo, url).await? {
-        land::PrLifecycle::Merged => {}
-        other => bail!(
-            "{url} is {}, not merged; refusing to record {} as merged on a guess",
-            other.as_str(),
-            state.id
-        ),
-    }
-    let before = state.status;
-    if let Err(e) = land::land(state, url).await {
-        // `land::land` sets `status` to `Landing` and saves before its first
-        // read of the pull request - see its own doc - so a failure here
-        // (a transient `gh` hiccup between the two forge reads this function
-        // makes) can leave the run stuck on that in-between value with
-        // nothing left driving it. Land it on the same terminal shape an
-        // automated `land` failure lands on instead of leaving it stuck.
-        state.status = RunStatus::Blocked;
-        state.event("fold", format!("manual-merge correction failed: {e:#}"));
-        state.save()?;
-        return Err(e).context(format!("confirming the merge of {url}"));
-    }
-    println!(
-        "{}: corrected status {} -> {} from {url}",
-        state.id,
-        before.as_str(),
-        state.status.as_str()
-    );
-    state.event(
-        "fold",
-        "operator recorded this pull request as a manual merge; this run never \
-         re-entered `land`, so `bump::after_merge` did not run for it - a release \
-         bump this change might warrant has to be filed by hand",
-    );
-    state.save()?;
-    Ok(())
 }
 
 /// One line describing an [`magi::cache::EntryStatus`] for `magi cache list`:

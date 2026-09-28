@@ -777,6 +777,7 @@ impl Ui {
             .route("/api/runs/{id}", get(run_detail).delete(run_delete))
             .route("/api/runs/{id}/report", get(run_report))
             .route("/api/runs/{id}/fold", post(run_fold))
+            .route("/api/runs/{id}/fold-merged", post(run_fold_merged))
             .route("/api/runs/{id}/resume", post(run_resume))
             .route("/api/queue", get(queue_list))
             .route("/api/queue/{id}", delete(queue_delete))
@@ -2560,6 +2561,82 @@ struct FoldView {
     /// Worktree paths and branch names removed, in the order they went.
     removed: Vec<String>,
     removed_count: usize,
+}
+
+/// `POST /api/runs/{id}/fold-merged` body: the pull request the operator
+/// merged outside of `land::land`'s own loop.
+#[derive(Debug, Deserialize)]
+struct FoldMergedBody {
+    #[serde(default)]
+    pr_url: String,
+}
+
+/// `POST /api/runs/{id}/fold-merged`.
+///
+/// The phone-reachable form of `magi fold --merged <pr-url>`: a run stuck
+/// `Blocked` with `merge: null` because magi never got as far as opening a
+/// pull request of its own (a title over GitHub's length limit, `gh pr
+/// create` unreachable, a stale token), which the operator then finished by
+/// hand on a pull request magi never recorded. The "Run actions" sheet used
+/// to have no way to tell it about that pull request short of a terminal and
+/// `magi fold --merged` — see `land::correct_manual_merge`'s own doc for why
+/// this exists and what it deliberately does not do (`bump::after_merge`).
+///
+/// Refused, like [`run_fold`], while a live daemon is working on the run: the
+/// correction rewrites the same `status`/`merge` fields a running graph would
+/// be writing to on its own.
+///
+/// Unlike [`run_resume`] this does not return 202: it makes at most two `gh`
+/// calls plus a fold, seconds of work, and the phone should get its answer
+/// (which pull request it recorded, and what changed) in the same round
+/// trip rather than learning it from the change stream.
+async fn run_fold_merged(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    Json(body): Json<FoldMergedBody>,
+) -> ApiResult<Json<FoldMergedView>> {
+    let pr_url = body.pr_url.trim().to_owned();
+    if pr_url.is_empty() {
+        return Err(ApiError::bad_request("pr_url is required"));
+    }
+    let (id, mut state) = {
+        let ui = Arc::clone(&ui);
+        blocking(move || {
+            let id = resolve_run(&ui.runs, &id)?;
+            if crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now()) {
+                return Err(ApiError::conflict(format!(
+                    "run {id} is being worked on by a live daemon right now"
+                )));
+            }
+            let state = read_run(&ui.runs, &id)?;
+            Ok((id, state))
+        })
+        .await?
+    };
+    let (before, after) = crate::land::correct_manual_merge(&mut state, &pr_url)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let removed = crate::graph::fold_run(&mut state, true, &ui.home)
+        .await
+        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    Ok(Json(FoldMergedView {
+        run: id,
+        before: before.as_str().to_owned(),
+        after: after.as_str().to_owned(),
+        removed,
+    }))
+}
+
+/// What [`run_fold_merged`] did, so the deck can say so.
+#[derive(Debug, Serialize)]
+struct FoldMergedView {
+    run: String,
+    /// `status` before the correction — normally `"blocked"`.
+    before: String,
+    /// `status` after — normally `"merged"`.
+    after: String,
+    /// Worktree paths and branch names the trailing fold removed.
+    removed: Vec<String>,
 }
 
 /// `POST /api/runs/{id}/resume`.
@@ -8385,6 +8462,98 @@ mod tests {
                 .unwrap()
                 .contains("live daemon"),
             "folding under a running agent would pull its worktree away"
+        );
+    }
+
+    #[tokio::test]
+    async fn fold_merged_requires_a_pr_url() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let id = "20260901-000000-nourl";
+        write_run(&runs, id, RunStatus::Blocked);
+
+        let res = fx
+            .post(&format!("/api/runs/{id}/fold-merged"), Some("{}"))
+            .await;
+        assert_eq!(res.status, 400, "{}", res.body);
+
+        let blank = fx
+            .post(
+                &format!("/api/runs/{id}/fold-merged"),
+                Some(r#"{"pr_url":"   "}"#),
+            )
+            .await;
+        assert_eq!(blank.status, 400, "{}", blank.body);
+    }
+
+    #[tokio::test]
+    async fn fold_merged_is_404_for_an_unknown_run() {
+        let fx = Fixture::start().await;
+        let res = fx
+            .post(
+                "/api/runs/nosuchrun/fold-merged",
+                Some(r#"{"pr_url":"https://github.com/owner/repo/pull/1"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 404, "{}", res.body);
+    }
+
+    #[tokio::test]
+    async fn fold_merged_is_refused_while_a_daemon_is_working_on_the_run() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let id = "20260901-000000-livemerge";
+        write_run(&runs, id, RunStatus::Blocked);
+
+        let mut beat = crate::daemon::Status::new();
+        beat.current = vec![crate::daemon::Current {
+            task: "20260901-000000-task".to_owned(),
+            run: id.to_owned(),
+        }];
+        beat.updated_at = jiff::Timestamp::now();
+        crate::daemon::write_status_to(&fx.home.path().join("daemon.json"), &beat)
+            .expect("publish a heartbeat");
+
+        let res = fx
+            .post(
+                &format!("/api/runs/{id}/fold-merged"),
+                Some(r#"{"pr_url":"https://github.com/owner/repo/pull/1"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 409, "{}", res.body);
+        assert!(
+            res.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("live daemon"),
+            "correcting a run's merge underneath a running agent would race \
+             whatever it is doing to the same `status`/`merge` fields"
+        );
+    }
+
+    /// A pull request `gh` cannot even ask about (no such remote, no such
+    /// repository) must never be recorded as a merge on a guess - the same
+    /// refusal `land::correct_manual_merge` gives `magi fold --merged` on the
+    /// command line, reached here through the phone route instead.
+    #[tokio::test]
+    async fn fold_merged_refuses_a_pull_request_it_cannot_confirm_is_merged() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let id = "20260901-000000-unconfirmed";
+        write_run(&runs, id, RunStatus::Blocked);
+
+        let res = fx
+            .post(
+                &format!("/api/runs/{id}/fold-merged"),
+                Some(r#"{"pr_url":"https://github.com/owner/repo/pull/1"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 400, "{}", res.body);
+        assert_eq!(
+            read_run(&runs, id).unwrap().status,
+            RunStatus::Blocked,
+            "a pull request that could not be confirmed merged must leave \
+             the run exactly where it was"
         );
     }
 

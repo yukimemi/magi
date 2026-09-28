@@ -45,7 +45,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use serde::Deserialize;
+use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, Invocation, SeatState};
 use crate::ask;
@@ -1230,6 +1231,194 @@ pub async fn lifecycle(repo: &Path, pr_url: &str) -> Result<PrLifecycle> {
     // (empty string, empty vec, zero) when this narrower `--json` selection
     // does not carry them - harmless, since only `.state` is read back.
     Ok(parse_pr(&view.1)?.state)
+}
+
+/// A pull request the operator merged outside of `land::land`'s own loop,
+/// found by asking GitHub about the run's own winning branch rather than
+/// requiring the operator to go and find the URL themselves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExternalMerge {
+    /// The pull request's URL, ready to hand to [`correct_manual_merge`].
+    pub url: String,
+    /// The pull request's number.
+    pub number: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhMergedPr {
+    url: String,
+    number: u64,
+    merged_at: String,
+    base_ref_name: String,
+}
+
+/// Pure half of [`find_external_merge`]: given the raw `gh pr list --head
+/// <branch> --state merged --json url,number,mergedAt,baseRefName` output,
+/// decide whether exactly one of the pull requests it lists could actually
+/// be *this* run's.
+///
+/// A branch name alone does not prove it: [`RunState::branch_for`] derives it
+/// from the run's own short id, so a collision with some other, unrelated
+/// task's merged pull request from a same-named branch is rare but not
+/// impossible once branches are deleted and ids run out. Filtering on
+/// `base_ref_name` (the branch this run actually targets) and `merged_at`
+/// (which cannot predate the run itself) rules that case out. More than one
+/// survivor is exactly as uninformative as zero — something this run cannot
+/// tell apart from another — so only a unique survivor is returned.
+fn pick_merged_pr(
+    json: &str,
+    base_branch: &str,
+    created_at: Timestamp,
+) -> Result<Option<ExternalMerge>> {
+    let raw: Vec<GhMergedPr> =
+        serde_json::from_str(json).context("parse `gh pr list ... --json ...` output")?;
+    let mut matches: Vec<ExternalMerge> = Vec::new();
+    for pr in raw {
+        if pr.base_ref_name != base_branch {
+            continue;
+        }
+        let Ok(merged_at) = pr.merged_at.parse::<Timestamp>() else {
+            continue;
+        };
+        if merged_at < created_at {
+            continue;
+        }
+        matches.push(ExternalMerge {
+            url: pr.url,
+            number: pr.number,
+        });
+    }
+    if matches.len() == 1 {
+        Ok(matches.pop())
+    } else {
+        Ok(None)
+    }
+}
+
+/// Ask GitHub whether this run's winning candidate branch was actually merged
+/// somewhere `land::land`'s own loop never saw — the gap `magi fold
+/// --merged` exists to close, minus the operator having to find the URL by
+/// hand.
+///
+/// `Ok(None)` covers every case where nothing can be said with confidence: no
+/// winner decided yet (nothing to check a branch for), no merged pull request
+/// found, or [`pick_merged_pr`] found more than one candidate and would not
+/// guess between them. Never wired to a weaker, URL-less signal like
+/// [`branch_is_ancestor`] — a caller wanting that has to ask for it
+/// separately, precisely because it cannot drive an automatic correction on
+/// its own (see that function's own doc).
+pub async fn find_external_merge(state: &RunState) -> Result<Option<ExternalMerge>> {
+    let Some(winner) = state.winner() else {
+        return Ok(None);
+    };
+    let branch = winner.branch.clone();
+    let out = gh(
+        &state.repo,
+        &[
+            "pr".to_owned(),
+            "list".to_owned(),
+            "--head".to_owned(),
+            branch.clone(),
+            "--state".to_owned(),
+            "merged".to_owned(),
+            "--json".to_owned(),
+            "url,number,mergedAt,baseRefName".to_owned(),
+        ],
+    )
+    .await?;
+    if !out.0 {
+        bail!("gh pr list --head {branch}: {}", out.1);
+    }
+    pick_merged_pr(&out.1, &state.base_branch, state.created_at)
+}
+
+/// Whether `branch` is, right now, an ancestor of `base_branch` in the local
+/// git graph — the weaker, URL-less signal that a branch landed somewhere.
+///
+/// Deliberately never consulted by [`find_external_merge`]: a base branch
+/// that has moved since the run started can make an old, abandoned branch
+/// look like an ancestor of the *current* base for reasons that have nothing
+/// to do with a merge (a later commit that happens to supersede it, an
+/// unrelated squash), and there is no pull request URL here to confirm
+/// against or to land through anyway. Its only honest use is a weaker
+/// notice — "this looks merged, go check" — never an automatic rewrite of
+/// `status`/`merge`.
+pub async fn branch_is_ancestor(repo: &Path, branch: &str, base_branch: &str) -> Result<bool> {
+    let out = tokio::process::Command::new("git")
+        .args(["merge-base", "--is-ancestor", branch, base_branch])
+        .current_dir(repo)
+        .quiet()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("spawn git merge-base --is-ancestor")?;
+    Ok(out.status.success())
+}
+
+/// Confirm `url` is actually a merged pull request, then rewrite `state`'s
+/// `status` and `merge` exactly as the automatic land loop (`land::land`)
+/// would have written them had magi opened and merged this pull request
+/// itself.
+///
+/// This is `magi fold --merged`'s whole implementation, and also what the
+/// automatic janitor sweep (`clean::housekeep`) and the web `fold-merged`
+/// route call once they have a URL in hand — one operator recovery path for
+/// a merge magi could not finish on its own: a PR title too long for the
+/// GraphQL mutation, `gh pr create` unreachable, a stale token - closed by
+/// hand with a pull request magi never opened and so never recorded.
+/// Reusing `land::land` rather than writing `status`/`merge` directly keeps
+/// this one authoritative: a merged pull request decides
+/// `Step::Done { merged: true }` on the very first read, before any of
+/// `land`'s own checks/fix/rebase machinery can run, which is what makes it
+/// safe to call here even though this pull request was never magi's own.
+/// [`lifecycle`] is checked first and separately so a mistyped or still-open
+/// URL fails loudly without writing anything, rather than handing an open
+/// pull request to the full autonomous loop by accident.
+///
+/// Correcting `status` this way does not run `bump::after_merge`
+/// (`src/bump.rs`): that call is made only from `graph::Runner::run_land`,
+/// which this path never goes through. A release version bump the change
+/// might have earned is therefore not filed automatically and has to be
+/// requested by hand - recorded as an event on the run so the gap is visible
+/// to whoever reads it later, not just wherever this was called from.
+///
+/// Returns the status before and after, so every caller (CLI, janitor, web
+/// route) can build its own log line or response from the same pair rather
+/// than each re-deriving it.
+pub async fn correct_manual_merge(
+    state: &mut RunState,
+    url: &str,
+) -> Result<(RunStatus, RunStatus)> {
+    match lifecycle(&state.repo, url).await? {
+        PrLifecycle::Merged => {}
+        other => bail!(
+            "{url} is {}, not merged; refusing to record {} as merged on a guess",
+            other.as_str(),
+            state.id
+        ),
+    }
+    let before = state.status;
+    if let Err(e) = land(state, url).await {
+        // `land` sets `status` to `Landing` and saves before its first read
+        // of the pull request — see its own doc — so a failure here (a
+        // transient `gh` hiccup between the two forge reads this function
+        // makes) can leave the run stuck on that in-between value with
+        // nothing left driving it. Land it on the same terminal shape an
+        // automated `land` failure lands on instead of leaving it stuck.
+        state.status = RunStatus::Blocked;
+        state.event("fold", format!("manual-merge correction failed: {e:#}"));
+        state.save()?;
+        return Err(e).context(format!("confirming the merge of {url}"));
+    }
+    state.event(
+        "fold",
+        "operator recorded this pull request as a manual merge; this run never \
+         re-entered `land`, so `bump::after_merge` did not run for it - a release \
+         bump this change might warrant has to be filed by hand",
+    );
+    state.save()?;
+    Ok((before, state.status))
 }
 
 /// Parse `gh api repos/{owner}/{repo}/pulls/<n>/comments` into inline review
@@ -3560,5 +3749,78 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let en = approval_panel(&state, &pr, "3\t1\tsrc/a.rs", "+ x", &commits, "feat: x");
         assert!(en.contains("Commits being squashed"), "{en}");
         assert_eq!(words("Klingon").html_lang, "en");
+    }
+
+    /// A `gh pr list` result naming exactly one pull request whose base and
+    /// merge time both fit the run is exactly the case
+    /// [`find_external_merge`] exists to act on.
+    #[test]
+    fn pick_merged_pr_picks_the_unique_match() {
+        let json = r#"[
+            {"url": "https://github.com/o/r/pull/42", "number": 42,
+             "mergedAt": "2026-09-20T10:00:00Z", "baseRefName": "main"}
+        ]"#;
+        let created_at: Timestamp = "2026-09-19T00:00:00Z".parse().unwrap();
+        let found = pick_merged_pr(json, "main", created_at)
+            .expect("valid json")
+            .expect("one unambiguous match");
+        assert_eq!(found.url, "https://github.com/o/r/pull/42");
+        assert_eq!(found.number, 42);
+    }
+
+    /// Two candidates surviving the filter is exactly as uninformative as
+    /// zero — a branch name can be reused across runs — so neither is
+    /// preferred over the other and nothing is recorded automatically.
+    #[test]
+    fn pick_merged_pr_refuses_when_more_than_one_candidate_survives() {
+        let json = r#"[
+            {"url": "https://github.com/o/r/pull/42", "number": 42,
+             "mergedAt": "2026-09-20T10:00:00Z", "baseRefName": "main"},
+            {"url": "https://github.com/o/r/pull/43", "number": 43,
+             "mergedAt": "2026-09-21T10:00:00Z", "baseRefName": "main"}
+        ]"#;
+        let created_at: Timestamp = "2026-09-19T00:00:00Z".parse().unwrap();
+        assert_eq!(pick_merged_pr(json, "main", created_at).unwrap(), None);
+    }
+
+    /// A pull request that targets a different base branch cannot be this
+    /// run's, whatever its head branch is named — a reused branch name from
+    /// an unrelated task must not be recorded as this run's merge.
+    #[test]
+    fn pick_merged_pr_ignores_a_different_base_branch() {
+        let json = r#"[
+            {"url": "https://github.com/o/r/pull/42", "number": 42,
+             "mergedAt": "2026-09-20T10:00:00Z", "baseRefName": "release"}
+        ]"#;
+        let created_at: Timestamp = "2026-09-19T00:00:00Z".parse().unwrap();
+        assert_eq!(pick_merged_pr(json, "main", created_at).unwrap(), None);
+    }
+
+    /// A pull request merged before this run was even created cannot be this
+    /// run's winner, no matter how its head branch is spelled.
+    #[test]
+    fn pick_merged_pr_ignores_a_merge_that_predates_the_run() {
+        let json = r#"[
+            {"url": "https://github.com/o/r/pull/42", "number": 42,
+             "mergedAt": "2026-09-18T10:00:00Z", "baseRefName": "main"}
+        ]"#;
+        let created_at: Timestamp = "2026-09-19T00:00:00Z".parse().unwrap();
+        assert_eq!(pick_merged_pr(json, "main", created_at).unwrap(), None);
+    }
+
+    /// No winner decided yet means there is no branch to ask GitHub about at
+    /// all — `find_external_merge` must return `None` without ever spawning
+    /// `gh`, which this proves by never providing a real repository to spawn
+    /// it in.
+    #[tokio::test]
+    async fn find_external_merge_returns_none_without_a_winner() {
+        let state = RunState::new(
+            PathBuf::from("/no/such/repo"),
+            "main".to_owned(),
+            "0000000000000000000000000000000000000000".to_owned(),
+            "irrelevant".to_owned(),
+            crate::config::Config::default(),
+        );
+        assert_eq!(find_external_merge(&state).await.unwrap(), None);
     }
 }
