@@ -329,6 +329,27 @@ pub fn eligible_for_external_merge_check(
     status == RunStatus::Blocked && !merge_recorded && due(now, updated_at, grace_secs)
 }
 
+/// Rotate `ids` so a fixed per-pass cap does not always land on the same
+/// prefix of the (lexicographically, hence chronologically) sorted list.
+///
+/// Pure and keyed on `now` rather than any cursor this module would have to
+/// persist between passes: a run id's own timestamp prefix already changes
+/// every pass, so `now`'s seconds modulo the list length walks the start
+/// point forward pass over pass without magi having to remember where it
+/// last stopped. Every eligible id gets its turn at the front of the window
+/// within `ids.len()` passes, however many later ids keep it company.
+fn rotate_for_pass(ids: &[String], now: Timestamp) -> Vec<String> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let start = now.as_second().rem_euclid(ids.len() as i64) as usize;
+    ids[start..]
+        .iter()
+        .chain(ids[..start].iter())
+        .cloned()
+        .collect()
+}
+
 /// Close the gap `magi fold --merged` exists for, without waiting for an
 /// operator to notice and go find the pull request URL: a run that stopped
 /// `Blocked` with no `merge` recorded may have been merged anyway, by hand,
@@ -355,12 +376,13 @@ async fn reconcile_external_merges(runs: &Path, home: &Path, disk: &Disk, now: T
         .collect();
     ids.sort_unstable();
 
-    let mut reconciled = 0usize;
-    let mut checked = 0usize;
+    // Every eligible id first, cheaply (a `Meta` read, no `gh`), then rotated
+    // before the cap is applied. Capping the sorted order directly would
+    // always land on the same lexicographic prefix - a fleet's oldest run ids
+    // - so a handful of long-blocked runs that never turn out to be merged
+    // would starve every id after them of a `gh` check, forever.
+    let mut eligible: Vec<String> = Vec::new();
     for id in ids {
-        if checked >= MAX_EXTERNAL_MERGE_CHECKS_PER_PASS {
-            break;
-        }
         if crate::daemon::is_working_on(home, &id, now) {
             continue;
         }
@@ -370,16 +392,22 @@ async fn reconcile_external_merges(runs: &Path, home: &Path, disk: &Disk, now: T
             // worth a second warning for the same file.
             Err(_) => continue,
         };
-        if !eligible_for_external_merge_check(
+        if eligible_for_external_merge_check(
             meta.status,
             meta.merge.is_some(),
             meta.updated_at,
             now,
             disk.fold_grace_secs,
         ) {
-            continue;
+            eligible.push(id);
         }
-        checked += 1;
+    }
+
+    let mut reconciled = 0usize;
+    for id in rotate_for_pass(&eligible, now)
+        .into_iter()
+        .take(MAX_EXTERNAL_MERGE_CHECKS_PER_PASS)
+    {
         let mut state = match read_state(runs, &id) {
             Ok(state) => state,
             Err(_) => continue,
@@ -764,6 +792,55 @@ mod tests {
         assert!(!due(now, edge, grace));
         // A zero grace folds everything, ever.
         assert!(due(now, old, 0));
+    }
+
+    #[test]
+    fn rotate_for_pass_moves_the_starting_point_as_now_advances() {
+        let ids: Vec<String> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // A pass at second 0 starts at the front, same as an unrotated list.
+        let at_0 = rotate_for_pass(&ids, Timestamp::from_second(0).unwrap());
+        assert_eq!(at_0, ids);
+
+        // A pass at second 2 (2 % 5 == 2) starts two ids further along, with
+        // the skipped front wrapping to the tail rather than being dropped.
+        let at_2 = rotate_for_pass(&ids, Timestamp::from_second(2).unwrap());
+        assert_eq!(at_2, vec!["c", "d", "e", "a", "b"]);
+
+        // Every id keeps its relative order; only the starting point moves.
+        for id in &ids {
+            assert!(at_2.contains(id));
+        }
+
+        // An empty list has no start point to compute and must not panic.
+        assert_eq!(
+            rotate_for_pass(&[], Timestamp::from_second(0).unwrap()),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A fleet with more eligible runs than one pass can check must not park
+    /// the same handful at the front of the window forever: over enough
+    /// passes, every eligible id gets a turn within the cap.
+    #[test]
+    fn rotate_for_pass_gives_every_id_a_turn_over_enough_passes() {
+        let ids: Vec<String> = (0..12).map(|n| format!("run-{n}")).collect();
+        let cap = 5usize;
+        let mut ever_seen_first: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for second in 0..ids.len() as i64 {
+            let rotated = rotate_for_pass(&ids, Timestamp::from_second(second).unwrap());
+            ever_seen_first.insert(rotated[0].clone());
+        }
+        assert_eq!(
+            ever_seen_first.len(),
+            ids.len(),
+            "every id must lead the window at least once across a full rotation, \
+             not just the first {cap} of them"
+        );
     }
 
     #[test]

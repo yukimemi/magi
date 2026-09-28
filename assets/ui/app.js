@@ -4600,6 +4600,7 @@ function renderRunDetail() {
        "cannot be undone". Clearing here, before the new run's data arrives,
        is what used to happen for free when the whole panel was hidden. */
     clear($("run-actions-box"));
+    clear($("run-fold-merged-box"));
     clear($("run-delete-box"));
     setText($("run-report"), report === null ? "Loading\u2026" : report);
     return;
