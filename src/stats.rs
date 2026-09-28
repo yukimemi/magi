@@ -193,6 +193,98 @@ impl Totals {
     }
 }
 
+/// Per-node duration breakdown, aggregated across every loaded run.
+///
+/// A duration here is the span between a node's *first* and *last* recorded
+/// event within one run — not time actually spent working. A node visited
+/// more than twice in one run (a retry, or a park/resume gap) has any idle
+/// time in between folded into that span, so this reads as an upper bound on
+/// the node's wall-clock cost, not a measurement of it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NodeDuration {
+    /// Node name, as it appears in `Event::node`.
+    pub node: String,
+    /// Runs where the node's span could be measured (at least two events).
+    pub runs: usize,
+    /// Sum of every measured run's span, in seconds.
+    pub total_secs: i64,
+    /// The longest single run's span, in seconds.
+    pub max_secs: i64,
+    /// Runs where the node had exactly one event — visited, but with no
+    /// second timestamp to measure a span against. Counted apart from `runs`
+    /// so a caller never has to guess whether a low mean hides unmeasured
+    /// visits.
+    pub single: usize,
+}
+
+impl NodeDuration {
+    /// Mean span across the runs that could be measured, in seconds.
+    ///
+    /// `0.0` when `runs` is zero, never a division by zero.
+    pub fn mean_secs(&self) -> f64 {
+        if self.runs == 0 {
+            0.0
+        } else {
+            self.total_secs as f64 / self.runs as f64
+        }
+    }
+}
+
+/// Derive a per-node duration breakdown from every loaded run's events.
+///
+/// For each run, a node's span is the gap between its earliest and latest
+/// [`crate::run::Event`] in that run. A node with fewer than two events in a
+/// run contributes no span (see [`NodeDuration::single`] for the one-event
+/// case); a run with no events for a node contributes nothing at all. Spans
+/// from every run are then summed per node.
+pub fn node_durations(states: &[RunState]) -> Vec<NodeDuration> {
+    let mut nodes: BTreeMap<String, NodeDuration> = BTreeMap::new();
+
+    for state in states {
+        let mut spans: BTreeMap<&str, (jiff::Timestamp, jiff::Timestamp, usize)> = BTreeMap::new();
+        for e in &state.events {
+            spans
+                .entry(e.node.as_str())
+                .and_modify(|(min, max, count)| {
+                    if e.at < *min {
+                        *min = e.at;
+                    }
+                    if e.at > *max {
+                        *max = e.at;
+                    }
+                    *count += 1;
+                })
+                .or_insert((e.at, e.at, 1));
+        }
+
+        for (node, (min, max, count)) in spans {
+            let entry = nodes
+                .entry(node.to_owned())
+                .or_insert_with(|| NodeDuration {
+                    node: node.to_owned(),
+                    ..NodeDuration::default()
+                });
+            if count < 2 {
+                entry.single += 1;
+                continue;
+            }
+            // `max - min` is never negative: both are the extremes of the
+            // same event set, and equal timestamps yield a zero-second span
+            // rather than being mistaken for an unmeasured visit.
+            let span_secs = (max - min).get_seconds();
+            entry.runs += 1;
+            entry.total_secs += span_secs;
+            if span_secs > entry.max_secs {
+                entry.max_secs = span_secs;
+            }
+        }
+    }
+
+    let mut nodes: Vec<NodeDuration> = nodes.into_values().collect();
+    nodes.sort_by(|a, b| b.total_secs.cmp(&a.total_secs).then(a.node.cmp(&b.node)));
+    nodes
+}
+
 /// Everything, aggregated.
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
@@ -204,6 +296,8 @@ pub struct Stats {
     pub reviewers: Vec<ReviewerStats>,
     /// Verification record.
     pub e2e: E2eStats,
+    /// Per-node duration breakdown, longest total first.
+    pub nodes: Vec<NodeDuration>,
 }
 
 /// Load every run on disk, skipping any that cannot be read.
@@ -382,11 +476,14 @@ pub fn collect(states: &[RunState]) -> Stats {
             .then(b.rounds.cmp(&a.rounds))
     });
 
+    let nodes = node_durations(states);
+
     Stats {
         totals,
         agents,
         reviewers,
         e2e,
+        nodes,
     }
 }
 
@@ -896,5 +993,84 @@ mod tests {
         assert!(same_defect(&a, &b));
         let c = finding("3", "src/z.rs", 900, "totally different", Severity::Nit);
         assert!(!same_defect(&a, &c));
+    }
+
+    fn event(node: &str, at_secs: i64, message: &str) -> crate::run::Event {
+        crate::run::Event {
+            at: jiff::Timestamp::from_second(at_secs).unwrap(),
+            node: node.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+
+    fn state_with_events(events: Vec<crate::run::Event>) -> RunState {
+        let mut s = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abcdef".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        );
+        s.events = events;
+        s
+    }
+
+    #[test]
+    fn a_node_with_multiple_events_spans_first_to_last() {
+        let s = state_with_events(vec![
+            event("implement", 1_000, "start"),
+            event("implement", 1_030, "still running"),
+            event("implement", 1_090, "done"),
+        ]);
+        let nodes = node_durations(&[s]);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node, "implement");
+        assert_eq!(nodes[0].runs, 1);
+        assert_eq!(nodes[0].total_secs, 90);
+        assert_eq!(nodes[0].max_secs, 90);
+        assert_eq!(nodes[0].single, 0);
+        assert_eq!(nodes[0].mean_secs(), 90.0);
+    }
+
+    #[test]
+    fn a_node_with_a_single_event_is_unmeasured_not_zero() {
+        let s = state_with_events(vec![event("gate", 2_000, "ran once")]);
+        let nodes = node_durations(&[s]);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node, "gate");
+        assert_eq!(nodes[0].runs, 0);
+        assert_eq!(nodes[0].total_secs, 0);
+        assert_eq!(nodes[0].single, 1);
+        // No measured runs: the mean must read as zero, never NaN or a
+        // fabricated span from the lone event.
+        assert_eq!(nodes[0].mean_secs(), 0.0);
+    }
+
+    #[test]
+    fn a_run_with_no_events_produces_no_node_rows() {
+        let s = state_with_events(vec![]);
+        let nodes = node_durations(&[s]);
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn multiple_runs_aggregate_the_same_node() {
+        let a = state_with_events(vec![event("judge", 0, "start"), event("judge", 60, "done")]);
+        let b = state_with_events(vec![
+            event("judge", 0, "start"),
+            event("judge", 200, "done"),
+        ]);
+        // A single-event run for the same node must add to `single` without
+        // disturbing the measured runs' total or max.
+        let c = state_with_events(vec![event("judge", 5, "start")]);
+        let nodes = node_durations(&[a, b, c]);
+        assert_eq!(nodes.len(), 1);
+        let judge = &nodes[0];
+        assert_eq!(judge.node, "judge");
+        assert_eq!(judge.runs, 2);
+        assert_eq!(judge.total_secs, 260);
+        assert_eq!(judge.max_secs, 200);
+        assert_eq!(judge.single, 1);
+        assert_eq!(judge.mean_secs(), 130.0);
     }
 }

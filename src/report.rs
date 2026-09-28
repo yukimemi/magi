@@ -1081,6 +1081,35 @@ pub fn active_seats(state: &RunState, live: Liveness) -> String {
     s
 }
 
+/// Render a whole number of seconds as `1h02m`, `3m05s` or `42s`.
+fn fmt_secs(secs: i64) -> String {
+    let secs = secs.max(0);
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// A fixed-width text bar, `value` proportional to `max` out of `width` cells.
+///
+/// Any positive value draws at least one cell, so a short-but-nonzero
+/// duration is never mistaken for an unmeasured one.
+fn bar(value: f64, max: f64, width: usize) -> String {
+    if max <= 0.0 || value <= 0.0 {
+        return String::new();
+    }
+    let cells = ((value / max) * width as f64)
+        .round()
+        .clamp(1.0, width as f64) as usize;
+    "█".repeat(cells)
+}
+
 /// Aggregate tables, for `magi stats`.
 pub fn stats(stats: &Stats) -> String {
     let t = &stats.totals;
@@ -1168,6 +1197,35 @@ pub fn stats(stats: &Stats) -> String {
             stats.e2e.sole_rate(),
             stats.e2e.deferred
         );
+    }
+
+    if !stats.nodes.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n{}",
+            bold("node durations (first to last event, per run)")
+        );
+        let max_mean = stats
+            .nodes
+            .iter()
+            .map(|n| n.mean_secs())
+            .fold(0.0_f64, f64::max);
+        for n in &stats.nodes {
+            let unmeasured = if n.single > 0 {
+                format!("  {}", dim(&format!("{} unmeasured", n.single)))
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                s,
+                "  {:<14}{:>6} runs{:>8} mean{:>8} max  {}{unmeasured}",
+                n.node,
+                n.runs,
+                fmt_secs(n.mean_secs().round() as i64),
+                fmt_secs(n.max_secs),
+                bar(n.mean_secs(), max_mean, 20)
+            );
+        }
     }
     s
 }
@@ -2194,5 +2252,37 @@ mod tests {
         let text = stats(&Stats::default());
         assert!(text.contains("0 total"));
         assert!(!text.contains("implementation"));
+        assert!(!text.contains("node durations"));
+    }
+
+    #[test]
+    fn stats_table_renders_node_durations_with_a_bar_and_unmeasured_count() {
+        let _guard = plain();
+        let mut st = Stats::default();
+        st.nodes = vec![
+            crate::stats::NodeDuration {
+                node: "implement".to_owned(),
+                runs: 2,
+                total_secs: 200,
+                max_secs: 150,
+                single: 1,
+            },
+            crate::stats::NodeDuration {
+                node: "gate".to_owned(),
+                runs: 0,
+                total_secs: 0,
+                max_secs: 0,
+                single: 3,
+            },
+        ];
+        let text = stats(&st);
+        assert!(text.contains("node durations"));
+        assert!(text.contains("implement"));
+        assert!(text.contains("2 runs"));
+        assert!(text.contains('█'), "the leader must draw a bar: {text}");
+        assert!(text.contains("1 unmeasured"));
+        assert!(text.contains("gate"));
+        assert!(text.contains("3 unmeasured"));
+        assert!(!text.contains('\x1b'), "colour leaked into a plain render");
     }
 }
