@@ -2258,23 +2258,25 @@ mod tests {
     #[test]
     fn stats_table_renders_node_durations_with_a_bar_and_unmeasured_count() {
         let _guard = plain();
-        let mut st = Stats::default();
-        st.nodes = vec![
-            crate::stats::NodeDuration {
-                node: "implement".to_owned(),
-                runs: 2,
-                total_secs: 200,
-                max_secs: 150,
-                single: 1,
-            },
-            crate::stats::NodeDuration {
-                node: "gate".to_owned(),
-                runs: 0,
-                total_secs: 0,
-                max_secs: 0,
-                single: 3,
-            },
-        ];
+        let st = Stats {
+            nodes: vec![
+                crate::stats::NodeDuration {
+                    node: "implement".to_owned(),
+                    runs: 2,
+                    total_secs: 200,
+                    max_secs: 150,
+                    single: 1,
+                },
+                crate::stats::NodeDuration {
+                    node: "gate".to_owned(),
+                    runs: 0,
+                    total_secs: 0,
+                    max_secs: 0,
+                    single: 3,
+                },
+            ],
+            ..Default::default()
+        };
         let text = stats(&st);
         assert!(text.contains("node durations"));
         assert!(text.contains("implement"));
