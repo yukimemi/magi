@@ -880,7 +880,10 @@ pub fn settle(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usi
 
 /// Rewrite this task's now-moot earlier attempts — [`Task::superseded_attempts`]
 /// — from `Blocked`/`Stalled` to [`RunStatus::Superseded`], once the task
-/// itself has actually finished.
+/// itself has actually finished *and* its own last attempt is provably why:
+/// this loads that run and requires `Merged`/`Ready` before touching
+/// anything earlier in `runs`, since `Task::succeed` can also be called
+/// directly on a task whose last attempt never landed at all.
 ///
 /// Called right after whatever call set `task.status` to
 /// [`TaskStatus::Done`] — this module's own `settle`'s callers below and
@@ -925,7 +928,18 @@ pub fn settle(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usi
 /// the run this call actually means.
 pub fn supersede_prior_runs(task: &Task, home: &Path) {
     let now = Timestamp::now();
-    for id in task.superseded_attempts() {
+    // `Task::superseded_attempts` cannot tell a loop-driven `Done` (always
+    // right behind a `Merged`/`Ready` verdict) from one set directly by
+    // `magi task done`/its web equivalent/the conductor on a task whose last
+    // recorded attempt never actually landed - that requires reading the
+    // run itself, which is exactly what this does before trusting anything
+    // in `runs` is safe to relabel.
+    let last_run_succeeded = task
+        .runs
+        .last()
+        .and_then(|id| RunState::load_under(id, home).ok())
+        .is_some_and(|s| matches!(s.status, RunStatus::Merged | RunStatus::Ready));
+    for id in task.superseded_attempts(last_run_succeeded) {
         let mut state = match RunState::load_under(id, home) {
             Ok(s) => s,
             Err(e) => {
@@ -944,6 +958,36 @@ pub fn supersede_prior_runs(task: &Task, home: &Path) {
         if let Err(e) = state.save_under(home) {
             tracing::warn!("could not mark run {id} superseded: {e:#}");
         }
+    }
+}
+
+/// Catch up every `Done` task [`supersede_prior_runs`] could not fully
+/// finish the moment it was called, because one of its earlier attempts was
+/// still live then - a `magi run --resume` invoked by hand on an old run,
+/// most likely.
+///
+/// That skip is correct at the time (rewriting under a run something is
+/// still actively saving would just be undone), but a task only ever
+/// reaches `Done` once, so without this nothing would ever look at it
+/// again: if that manual process later ends anywhere other than
+/// `Merged`/`Ready` - abandoned, or landed as another `Blocked` - the
+/// skipped attempt would sit at `Blocked`/`Stalled` forever, exactly the
+/// backlog this status exists to clear. Called on the same idle-only
+/// cadence as [`janitor`], next to it rather than folded into it: this
+/// walks `queue` and `janitor` never otherwise needs one.
+///
+/// Simply re-running [`supersede_prior_runs`] over every `Done` task with
+/// more than one attempt, every pass: each call is a handful of local file
+/// reads bounded by that task's own attempt count, the same order of cost
+/// [`clean::fold_due`] already pays scanning every run on disk on the same
+/// cadence, and a task already fully resolved costs one failed liveness
+/// check turned no-op the moment its lingering attempt is no longer live.
+fn resweep_superseded_attempts(queue: &Queue, home: &Path) {
+    for task in queue.list() {
+        if task.status != TaskStatus::Done || task.runs.len() < 2 {
+            continue;
+        }
+        supersede_prior_runs(&task, home);
     }
 }
 
@@ -1299,6 +1343,7 @@ async fn drive(
     // `--once` drains an already-idle queue without reaching the idle wait,
     // but must still perform the startup cleanup.
     janitor(&opts.repo, opts, home, worktrees_root).await;
+    resweep_superseded_attempts(queue, home);
 
     let outcome = poll(
         opts,
@@ -2087,6 +2132,7 @@ async fn poll(
             // daemon that reached a normal idle interval. The startup pass
             // cannot see runs or cache files produced by this drain.
             janitor(&opts.repo, opts, home, worktrees_root).await;
+            resweep_superseded_attempts(queue, home);
             triage_held(queue, home, opts).await;
             break;
         }
@@ -2100,6 +2146,7 @@ async fn poll(
         // wake permit. No run can start while this branch is active, so the
         // janitor still never races an in-flight compile.
         janitor(&opts.repo, opts, home, worktrees_root).await;
+        resweep_superseded_attempts(queue, home);
         triage_held(queue, home, opts).await;
     }
 
@@ -4571,6 +4618,58 @@ mod tests {
     }
 
     #[test]
+    fn resweep_catches_up_a_run_left_live_once_its_manual_process_is_no_longer_driving_it() {
+        // The first resweep must skip a still-live attempt exactly like
+        // `supersede_prior_runs` itself does; a later resweep, once that
+        // process is no longer actually driving it, is what closes the gap
+        // `supersede_prior_runs` alone leaves - a task only ever reaches
+        // `Done` once, so nothing else would ever look at this run again.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let queue = Queue::at(dir.path().join("queue"));
+
+        let mut first = run_state(RunStatus::Blocked);
+        first.id = "20260101-000000-supd".to_owned();
+        first.driver_pid = Some(std::process::id());
+        first.driver_started_at = Some(
+            crate::proc::process_started_at(std::process::id())
+                .expect("this test process's own start time must be queryable"),
+        );
+        first.save_under(&home).unwrap();
+        let mut second = run_state(RunStatus::Merged);
+        second.id = "20260101-000000-supe".to_owned();
+        second.save_under(&home).unwrap();
+
+        let mut t = task();
+        t.runs = vec![first.id.clone(), second.id.clone()];
+        t.status = TaskStatus::Done;
+        queue.put(&mut t).unwrap();
+
+        resweep_superseded_attempts(&queue, &home);
+        assert_eq!(
+            RunState::load_under(&first.id, &home).unwrap().status,
+            RunStatus::Blocked,
+            "still live on the first pass, so still untouched"
+        );
+
+        // Stand in for the manual process no longer being the one driving
+        // this run: same pid (this test process really is still alive), but
+        // an identity marker that no longer matches it - see
+        // `RunState::liveness`'s own doc for why a mismatched
+        // `driver_started_at` reads as `Dead`, not merely `Unknown`.
+        let mut stale = RunState::load_under(&first.id, &home).unwrap();
+        stale.driver_started_at = Some("not-this-processes-real-start-time".to_owned());
+        stale.save_under(&home).unwrap();
+
+        resweep_superseded_attempts(&queue, &home);
+        assert_eq!(
+            RunState::load_under(&first.id, &home).unwrap().status,
+            RunStatus::Superseded,
+            "the second pass catches up what the first one correctly skipped"
+        );
+    }
+
+    #[test]
     fn supersede_prior_runs_leaves_concurrent_blocked_attempts_alone_while_the_task_is_not_done() {
         crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
         let mut first = run_state(RunStatus::Blocked);
@@ -4619,6 +4718,36 @@ mod tests {
             RunState::load(&first.id).unwrap().status,
             RunStatus::Blocked,
             "a single-attempt task has no earlier run to supersede"
+        );
+    }
+
+    #[test]
+    fn supersede_prior_runs_does_nothing_when_the_last_recorded_attempt_never_landed() {
+        // `magi task done` (or the web/conductor equivalents) can close a
+        // task in any status, including one whose *last* recorded attempt is
+        // itself still `Blocked`/`Failed` - a manual merge magi's own loop
+        // never watched, say. `runs.last()` being `Done`-adjacent is not
+        // proof it actually succeeded, so nothing earlier may be relabelled
+        // on its say-so alone.
+        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        let mut first = run_state(RunStatus::Blocked);
+        first.id = "20260101-000000-supb".to_owned();
+        first.save().unwrap();
+        let mut second = run_state(RunStatus::Failed);
+        second.id = "20260101-000000-supc".to_owned();
+        second.save().unwrap();
+
+        let mut t = task();
+        t.runs = vec![first.id.clone(), second.id.clone()];
+        t.status = TaskStatus::Done;
+
+        supersede_prior_runs(&t, &crate::run::home());
+
+        assert_eq!(
+            RunState::load(&first.id).unwrap().status,
+            RunStatus::Blocked,
+            "the task's last attempt never landed, so there is nothing here \
+             actually superseding it"
         );
     }
 
