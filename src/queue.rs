@@ -178,6 +178,44 @@ impl TaskStatus {
     }
 }
 
+/// How many tasks sit in each [`TaskStatus`], for a dashboard tile — never a
+/// per-task view, so it carries no ids.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TaskCounts {
+    /// Waiting to be claimed.
+    pub queued: usize,
+    /// Claimed; a run is in flight.
+    pub running: usize,
+    /// A run finished and its gate passed.
+    pub done: usize,
+    /// A run finished without passing, and attempts remain.
+    pub failed: usize,
+    /// Out of attempts, or held by hand.
+    pub held: usize,
+    /// Waiting on another task or an unanswered question.
+    pub blocked: usize,
+}
+
+impl TaskCounts {
+    /// Tally `tasks` by status. A pure function over whatever [`Queue::list`]
+    /// already read, so it needs no root of its own and stays trivially
+    /// testable against a hand-built slice.
+    pub fn of(tasks: &[Task]) -> Self {
+        let mut counts = Self::default();
+        for t in tasks {
+            match t.status {
+                TaskStatus::Queued => counts.queued += 1,
+                TaskStatus::Running => counts.running += 1,
+                TaskStatus::Done => counts.done += 1,
+                TaskStatus::Failed => counts.failed += 1,
+                TaskStatus::Held => counts.held += 1,
+                TaskStatus::Blocked => counts.blocked += 1,
+            }
+        }
+        counts
+    }
+}
+
 /// One unit of work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1280,6 +1318,45 @@ mod tests {
         v.as_object_mut().unwrap().remove("triage_applied");
         let old: Task = serde_json::from_value(v).unwrap();
         assert!(old.triage_applied.is_empty());
+    }
+
+    #[test]
+    fn task_counts_of_empty_is_all_zero() {
+        assert_eq!(TaskCounts::of(&[]), TaskCounts::default());
+    }
+
+    #[test]
+    fn task_counts_of_tallies_every_status() {
+        let mut queued = Task::new(
+            "q".to_owned(),
+            "i".to_owned(),
+            PathBuf::from("."),
+            Source::Human,
+        );
+        queued.status = TaskStatus::Queued;
+        let mut running = queued.clone();
+        running.status = TaskStatus::Running;
+        let mut done = queued.clone();
+        done.status = TaskStatus::Done;
+        let mut failed = queued.clone();
+        failed.status = TaskStatus::Failed;
+        let mut held = queued.clone();
+        held.status = TaskStatus::Held;
+        let mut blocked = queued.clone();
+        blocked.status = TaskStatus::Blocked;
+
+        let counts = TaskCounts::of(&[queued, running, done.clone(), done, failed, held, blocked]);
+        assert_eq!(
+            counts,
+            TaskCounts {
+                queued: 1,
+                running: 1,
+                done: 2,
+                failed: 1,
+                held: 1,
+                blocked: 1,
+            }
+        );
     }
 
     /// A queue of its own, with no process-global state - which is the point of

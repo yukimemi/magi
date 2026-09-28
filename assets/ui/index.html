@@ -51,6 +51,7 @@
   <nav class="rail" aria-label="Sections">
     <a class="rail-link" href="#/runs" data-nav="runs">Runs</a>
     <a class="rail-link" href="#/queue" data-nav="queue">Queue</a>
+    <a class="rail-link" href="#/stats" data-nav="stats">Stats</a>
     <a class="rail-link" href="#/questions" data-nav="questions">Questions<span class="badge" id="ask-badge-rail" hidden></span></a>
     <a class="rail-link btn btn-gold" href="#/chat" data-nav="talks">Chat<span class="badge" id="talk-badge-rail" hidden></span></a>
   </nav>
@@ -293,6 +294,44 @@
     </p>
   </section>
 
+  <!-- STATS --------------------------------------------------------------- -->
+  <section class="view" id="view-stats" aria-labelledby="stats-h" hidden>
+    <div class="view-head">
+      <h1 id="stats-h">Stats</h1>
+      <p class="view-sub" id="stats-count">Loading…</p>
+    </div>
+    <!-- Same reasoning as /api/health's own runs_unreadable: a skipped run
+         must be counted, not silently dropped from the tallies below. -->
+    <p class="stats-banner" id="stats-unreadable-banner" hidden></p>
+    <p class="empty" id="stats-empty" hidden>Nothing has run yet.</p>
+    <div id="stats-body" hidden>
+      <div class="stats-tiles" id="stats-kpis"></div>
+
+      <div class="panel">
+        <h2>Verdicts</h2>
+        <div class="stack-bar" id="stats-verdict-bar" role="img"></div>
+        <ul class="stats-legend" id="stats-verdict-legend"></ul>
+      </div>
+
+      <div class="panel" id="stats-agents-panel" hidden>
+        <h2>Implementation win rate</h2>
+        <p class="panel-note">Relative to this workload only — the task mix and seat rotation are not controlled.</p>
+        <div class="bar-rows" id="stats-agents-bars"></div>
+      </div>
+
+      <div class="panel" id="stats-reviewers-panel" hidden>
+        <h2>Review precision</h2>
+        <p class="panel-note">Adopted findings over submitted findings.</p>
+        <div class="bar-rows" id="stats-reviewers-bars"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Queue</h2>
+        <div class="stats-tiles" id="stats-queue-tiles"></div>
+      </div>
+    </div>
+  </section>
+
   <!-- QUESTIONS --------------------------------------------------------- -->
   <section class="view" id="view-questions" aria-labelledby="questions-h" hidden>
     <div class="view-head">
@@ -431,6 +470,14 @@
       </svg>
     </span>
     <span>Queue</span>
+  </a>
+  <a class="dock-item" href="#/stats" data-nav="stats">
+    <span class="dock-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 19V10M12 19V5M19 19v-7"/>
+      </svg>
+    </span>
+    <span>Stats</span>
   </a>
   <a class="dock-item" href="#/questions" data-nav="questions">
     <span class="dock-glyph" aria-hidden="true">

@@ -122,7 +122,7 @@ use crate::proc::Quiet as _;
 use crate::queue::{Queue, Task, title_from};
 use crate::run::{RunState, RunStatus};
 use crate::talk::{Talk, Talks};
-use crate::{daemon, git, report, repos, run, talk, updater};
+use crate::{daemon, git, report, repos, run, stats, talk, updater};
 
 /// Default port. Chosen high and memorable; nothing else in the fleet uses it.
 pub const DEFAULT_PORT: u16 = 7878;
@@ -780,6 +780,7 @@ impl Ui {
             .route("/api/runs/{id}/fold-merged", post(run_fold_merged))
             .route("/api/runs/{id}/resume", post(run_resume))
             .route("/api/queue", get(queue_list))
+            .route("/api/stats", get(stats_get))
             .route("/api/queue/{id}", delete(queue_delete))
             .route("/api/repos", get(repos_list))
             .route("/api/queue/{id}/hold", post(queue_hold))
@@ -2877,6 +2878,226 @@ async fn queue_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TaskView>>>
                 .map(|t| TaskView::with_inventory(t, &inv))
                 .collect(),
         ))
+    })
+    .await
+}
+
+/// A rate together with its denominator, so the client can tell "computed as
+/// 0%" apart from "no data to compute it from" — both would otherwise
+/// serialize as `0.0`. `None` means the denominator was zero.
+#[derive(Debug, Serialize)]
+struct RateView {
+    pct: f64,
+    denominator: usize,
+}
+
+impl RateView {
+    fn of(numerator: usize, denominator: usize) -> Option<Self> {
+        (denominator > 0).then(|| Self {
+            pct: 100.0 * numerator as f64 / denominator as f64,
+            denominator,
+        })
+    }
+}
+
+/// [`crate::stats::Totals`] for the wire: the raw counters plus the derived
+/// rates, each paired with its own denominator via [`RateView`] rather than
+/// exposing `Stats`' own percentage methods directly — see this module's
+/// doc for why `Stats` itself is never serialized.
+#[derive(Debug, Serialize)]
+struct StatsTotalsView {
+    runs: usize,
+    merged: usize,
+    ready: usize,
+    blocked: usize,
+    failed: usize,
+    stalled: usize,
+    verified_noop: usize,
+    superseded: usize,
+    in_progress: usize,
+    completion_rate: Option<RateView>,
+    tallied: usize,
+    split: usize,
+    split_rate: Option<RateView>,
+    deliberated: usize,
+    minds_changed: usize,
+    converged: usize,
+    review_rounds: usize,
+}
+
+impl From<&stats::Totals> for StatsTotalsView {
+    fn from(t: &stats::Totals) -> Self {
+        Self {
+            runs: t.runs,
+            merged: t.merged,
+            ready: t.ready,
+            blocked: t.blocked,
+            failed: t.failed,
+            stalled: t.stalled,
+            verified_noop: t.verified_noop,
+            superseded: t.superseded,
+            in_progress: t.in_progress,
+            completion_rate: RateView::of(t.merged + t.ready, t.runs),
+            tallied: t.tallied,
+            split: t.split,
+            split_rate: RateView::of(t.split, t.tallied),
+            deliberated: t.deliberated,
+            minds_changed: t.minds_changed,
+            converged: t.converged,
+            review_rounds: t.review_rounds,
+        }
+    }
+}
+
+/// [`crate::stats::AgentStats`] for the wire.
+#[derive(Debug, Serialize)]
+struct AgentStatsView {
+    agent: String,
+    entered: usize,
+    wins: usize,
+    empty: usize,
+    win_rate: Option<RateView>,
+}
+
+impl From<&stats::AgentStats> for AgentStatsView {
+    fn from(a: &stats::AgentStats) -> Self {
+        Self {
+            agent: a.agent.clone(),
+            entered: a.entered,
+            wins: a.wins,
+            empty: a.empty,
+            win_rate: RateView::of(a.wins, a.entered),
+        }
+    }
+}
+
+/// [`crate::stats::ReviewerStats`] for the wire. `adopted_per_round` is a
+/// ratio, not a percentage, so it carries no [`RateView`] — just the raw
+/// value, `None` when `rounds` is zero.
+#[derive(Debug, Serialize)]
+struct ReviewerStatsView {
+    agent: String,
+    rounds: usize,
+    seated: usize,
+    submitted: usize,
+    adopted: usize,
+    unique: usize,
+    timeouts: usize,
+    adopted_per_round: Option<f64>,
+    precision: Option<RateView>,
+    unique_rate: Option<RateView>,
+    timeout_rate: Option<RateView>,
+}
+
+impl From<&stats::ReviewerStats> for ReviewerStatsView {
+    fn from(r: &stats::ReviewerStats) -> Self {
+        Self {
+            agent: r.agent.clone(),
+            rounds: r.rounds,
+            seated: r.seated,
+            submitted: r.submitted,
+            adopted: r.adopted,
+            unique: r.unique,
+            timeouts: r.timeouts,
+            adopted_per_round: (r.rounds > 0).then(|| r.adopted_per_round()),
+            precision: RateView::of(r.adopted, r.submitted),
+            unique_rate: RateView::of(r.unique, r.submitted),
+            timeout_rate: RateView::of(r.timeouts, r.seated),
+        }
+    }
+}
+
+/// [`crate::stats::E2eStats`] for the wire.
+#[derive(Debug, Serialize)]
+struct E2eStatsView {
+    rounds: usize,
+    failures: usize,
+    sole_detections: usize,
+    deferred: usize,
+    sole_rate: Option<RateView>,
+}
+
+impl From<&stats::E2eStats> for E2eStatsView {
+    fn from(e: &stats::E2eStats) -> Self {
+        Self {
+            rounds: e.rounds,
+            failures: e.failures,
+            sole_detections: e.sole_detections,
+            deferred: e.deferred,
+            sole_rate: RateView::of(e.sole_detections, e.failures),
+        }
+    }
+}
+
+/// [`crate::queue::TaskCounts`] for the wire.
+#[derive(Debug, Serialize)]
+struct TaskCountsView {
+    queued: usize,
+    running: usize,
+    done: usize,
+    failed: usize,
+    held: usize,
+    blocked: usize,
+}
+
+impl From<crate::queue::TaskCounts> for TaskCountsView {
+    fn from(c: crate::queue::TaskCounts) -> Self {
+        Self {
+            queued: c.queued,
+            running: c.running,
+            done: c.done,
+            failed: c.failed,
+            held: c.held,
+            blocked: c.blocked,
+        }
+    }
+}
+
+/// `GET /api/stats` - the whole answer. `Stats` itself carries no
+/// `Serialize`, deliberately: its fields (and the CLI text `report::stats`
+/// renders from them) are free to grow without that becoming a wire-contract
+/// change, and its zero-denominator rate methods (`0.0`) cannot tell "no
+/// data" from "computed and it really is zero" the way [`RateView`] does.
+#[derive(Debug, Serialize)]
+struct StatsView {
+    totals: StatsTotalsView,
+    /// Best win rate first, as [`stats::collect`] already sorts it.
+    agents: Vec<AgentStatsView>,
+    /// Most adopted-per-round first, as [`stats::collect`] already sorts it.
+    reviewers: Vec<ReviewerStatsView>,
+    e2e: E2eStatsView,
+    queue: TaskCountsView,
+    /// Same count and same meaning as [`HealthView::runs_unreadable`] - see
+    /// that field's doc. Asserted to match it in
+    /// `stats_runs_unreadable_matches_health`.
+    runs_unreadable: usize,
+}
+
+/// `GET /api/stats` - task and run statistics for the dashboard, aggregated
+/// by [`stats::collect`], the same function `magi stats` prints from. Reads
+/// every readable run on disk, exactly as [`runs_unreadable`] does, so the
+/// two counts can never drift apart the way a separately-maintained tally
+/// could.
+async fn stats_get(State(ui): State<Arc<Ui>>) -> ApiResult<Json<StatsView>> {
+    blocking(move || {
+        let states: Vec<RunState> = run_ids(&ui.runs)
+            .into_iter()
+            .filter_map(|id| read_run(&ui.runs, &id).ok())
+            .collect();
+        let collected = stats::collect(&states);
+        let queue_counts = crate::queue::TaskCounts::of(&ui.queue.list());
+        Ok(Json(StatsView {
+            totals: StatsTotalsView::from(&collected.totals),
+            agents: collected.agents.iter().map(AgentStatsView::from).collect(),
+            reviewers: collected
+                .reviewers
+                .iter()
+                .map(ReviewerStatsView::from)
+                .collect(),
+            e2e: E2eStatsView::from(&collected.e2e),
+            queue: TaskCountsView::from(queue_counts),
+            runs_unreadable: runs_unreadable(&ui.runs),
+        }))
     })
     .await
 }
@@ -7295,6 +7516,90 @@ mod tests {
         // directory full of older-schema runs looks like.
         let health = f.get("/api/health").await;
         assert_eq!(health.json()["runs_unreadable"], 1);
+    }
+
+    /// The dashboard reads every run's state itself rather than trusting a
+    /// separately-maintained count, so an unreadable run must be counted the
+    /// same way `/api/health` counts it - never silently dropped the way the
+    /// CLI's own `stats::load_all` drops it.
+    #[tokio::test]
+    async fn stats_runs_unreadable_matches_health() {
+        let f = Fixture::start().await;
+        write_run(&f.runs(), "20260902-140501-good", RunStatus::Ready);
+        let broken = f.runs().join("20260902-140502-bad");
+        std::fs::create_dir_all(&broken).expect("run dir");
+        std::fs::write(broken.join("run.json"), "{ truncated").expect("write run.json");
+
+        let stats = f.get("/api/stats").await;
+        let health = f.get("/api/health").await;
+
+        assert_eq!(stats.status, 200);
+        assert_eq!(stats.json()["totals"]["runs"], 1);
+        assert_eq!(stats.json()["runs_unreadable"], 1);
+        assert_eq!(
+            stats.json()["runs_unreadable"],
+            health.json()["runs_unreadable"],
+            "the dashboard and /api/health must never disagree about how many \
+             runs could not be read"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_verdict_breakdown_covers_stalled_and_in_progress_runs() {
+        let f = Fixture::start().await;
+        write_run(&f.runs(), "20260902-140501-a", RunStatus::Merged);
+        write_run(&f.runs(), "20260902-140502-b", RunStatus::Stalled);
+        write_run(&f.runs(), "20260902-140503-c", RunStatus::Implementing);
+
+        let totals = &f.get("/api/stats").await.json()["totals"];
+        assert_eq!(totals["runs"], 3);
+        assert_eq!(totals["merged"], 1);
+        assert_eq!(totals["stalled"], 1);
+        assert_eq!(totals["in_progress"], 1);
+        // A stalled run must never read as blocked/merged/ready - it is its
+        // own bucket, not folded into a "decided" one.
+        assert_eq!(totals["blocked"], 0);
+        assert_eq!(totals["ready"], 0);
+    }
+
+    #[tokio::test]
+    async fn stats_queue_counts_come_from_the_live_queue() {
+        let f = Fixture::start().await;
+        let q = f.queue();
+        let mut queued = Task::new(
+            "queued task".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        q.put(&mut queued).expect("put queued");
+        let mut held = Task::new(
+            "held task".to_owned(),
+            "do it later".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        held.hold_machine(Some("out of attempts".to_owned()));
+        q.put(&mut held).expect("put held");
+
+        let queue = f.get("/api/stats").await.json()["queue"].clone();
+        assert_eq!(queue["queued"], 1);
+        assert_eq!(queue["held"], 1);
+        assert_eq!(queue["running"], 0);
+        assert_eq!(queue["done"], 0);
+        assert_eq!(queue["failed"], 0);
+        assert_eq!(queue["blocked"], 0);
+    }
+
+    #[tokio::test]
+    async fn stats_on_an_empty_home_is_all_zero_not_an_error() {
+        let f = Fixture::start().await;
+        let stats = f.get("/api/stats").await;
+        assert_eq!(stats.status, 200);
+        assert_eq!(stats.json()["totals"]["runs"], 0);
+        assert_eq!(stats.json()["totals"]["completion_rate"], Value::Null);
+        assert_eq!(stats.json()["runs_unreadable"], 0);
+        assert!(stats.json()["agents"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

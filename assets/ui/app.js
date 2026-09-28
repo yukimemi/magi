@@ -27,6 +27,9 @@ const API = {
   resumeRun: (id) => `/api/runs/${encodeURIComponent(id)}/resume`,
   report: (id) => `/api/runs/${encodeURIComponent(id)}/report`,
   queue: "/api/queue",
+  /* Aggregated over every readable run plus the live queue — the same
+     numbers `magi stats` prints, reused rather than recomputed here. */
+  stats: "/api/stats",
   deleteTask: (id) => `/api/queue/${encodeURIComponent(id)}`,
   hold: (id) => `/api/queue/${encodeURIComponent(id)}/hold`,
   release: (id) => `/api/queue/${encodeURIComponent(id)}/release`,
@@ -491,6 +494,12 @@ const state = {
      survives a reload; defaults to open (see isSectionOpen()). */
   runsCollapsed: loadCollapsed(RUNS_COLLAPSE_KEY),
   queue: null,
+  /* The last /api/stats answer, or null before the dashboard has ever been
+     opened. Fetched lazily — see loadStats() and applyRevisions_() — rather
+     than at boot alongside the other views: it parses every readable run on
+     disk, and a phone that never opens the tab should not pay for that on
+     every revision tick. */
+  stats: null,
   /* Same idea for the Backlog's sections, kept separately since the two
      views don't share section keys or default open/closed state. */
   queueCollapsed: loadCollapsed(QUEUE_COLLAPSE_KEY),
@@ -2494,6 +2503,179 @@ function scrollToSearchHit(row) {
   row.classList.add("card-hit");
 }
 
+/* ---- stats dashboard ---------------------------------------------------
+ * Reuses exactly what /api/stats hands back - the same aggregation
+ * `magi stats` prints from - and draws it with plain <div>s the way
+ * .dep-graph and .phases already do elsewhere in this file. No canvas, no
+ * charting library, nothing that needs a build step. */
+function renderStats() {
+  const s = state.stats;
+  if (s === null) {
+    setText($("stats-count"), "Loading…");
+    return;
+  }
+  const t = s.totals;
+  const nothing = t.runs === 0 && s.runs_unreadable === 0;
+
+  setText($("stats-count"), nothing
+    ? "Nothing has run yet"
+    : [
+        `${plural(t.runs, "run", "runs")} recorded`,
+        s.runs_unreadable ? `${plural(s.runs_unreadable, "run", "runs")} unreadable` : null,
+      ].filter(Boolean).join(" · "));
+
+  show($("stats-unreadable-banner"), s.runs_unreadable > 0);
+  if (s.runs_unreadable > 0) {
+    setText(
+      $("stats-unreadable-banner"),
+      `${plural(s.runs_unreadable, "run", "runs")} on disk could not be read by this build ` +
+      `and ${s.runs_unreadable === 1 ? "is" : "are"} not counted in the numbers below.`,
+    );
+  }
+
+  show($("stats-empty"), nothing);
+  show($("stats-body"), !nothing);
+  if (nothing) return;
+
+  renderStatsTiles(t);
+  renderStatsVerdictBar(t);
+  renderStatsAgents(s.agents);
+  renderStatsReviewers(s.reviewers);
+  renderStatsQueue(s.queue);
+}
+
+function statsTile(label, value, tone) {
+  return el(
+    "div",
+    { class: "stats-tile", "data-tone": tone || null },
+    el("span", { class: "stats-tile-value", text: String(value) }),
+    el("span", { class: "stats-tile-label", text: label }),
+  );
+}
+
+/* A RateView (`{ pct, denominator }`) or null - the server's way of telling
+   "computed as 0%" apart from "no data to compute it from". Both render as
+   an em dash here rather than "0%", since a rate with nothing behind it is
+   not a fact about performance. */
+function statsPct(rate) {
+  return rate ? `${Math.round(rate.pct)}%` : "—";
+}
+
+function renderStatsTiles(t) {
+  const root = $("stats-kpis");
+  clear(root);
+  root.append(
+    statsTile("Total runs", t.runs),
+    statsTile("Merged", t.merged, "gold"),
+    statsTile("Ready", t.ready, "teal"),
+    statsTile("Blocked", t.blocked, "rust"),
+    statsTile("Stalled", t.stalled, "rust"),
+    statsTile("Completion", statsPct(t.completion_rate), "teal"),
+  );
+}
+
+/* One segment per non-empty RunStatus bucket. `blocked` and `stalled` share
+   a tone deliberately: both are runs that stopped short of a verdict, and
+   the legend (not the colour) is what tells them apart - see
+   RunStatus::Stalled's own doc for why a stall must never read as decided. */
+const STATS_VERDICT_BUCKETS = [
+  { key: "merged", label: "Merged", tone: "gold" },
+  { key: "ready", label: "Ready", tone: "teal" },
+  { key: "in_progress", label: "In flight", tone: "blue" },
+  { key: "blocked", label: "Blocked", tone: "rust" },
+  { key: "stalled", label: "Stalled", tone: "rust" },
+  { key: "failed", label: "Failed", tone: "ink" },
+  { key: "verified_noop", label: "Verified no-op", tone: "ink" },
+  { key: "superseded", label: "Superseded", tone: "ink" },
+];
+
+function renderStatsVerdictBar(t) {
+  const bar = $("stats-verdict-bar");
+  const legend = $("stats-verdict-legend");
+  clear(bar);
+  clear(legend);
+  const total = t.runs || 1;
+  const described = [];
+  for (const bucket of STATS_VERDICT_BUCKETS) {
+    const value = t[bucket.key];
+    if (!value) continue;
+    described.push(`${bucket.label} ${value}`);
+    bar.append(el("div", {
+      class: "stack-bar-seg",
+      "data-tone": bucket.tone,
+      style: `width: ${((100 * value) / total).toFixed(2)}%`,
+    }));
+    legend.append(el(
+      "li",
+      {},
+      el("span", { class: "stats-legend-dot", "data-tone": bucket.tone }),
+      el("span", { text: `${bucket.label} · ${value}` }),
+    ));
+  }
+  setAttr(bar, "aria-label", `Verdict breakdown of ${t.runs} runs: ${described.join(", ")}`);
+}
+
+/* Shared by the agent win-rate bars and the reviewer precision bars: a name,
+   a fraction, a percentage, and a track filled to that share of whichever
+   row in the table scored highest - so the tallest bar is always full width
+   rather than the tracks being scaled against 100% and every one of them
+   looking short on a workload where nobody wins often. */
+function statsBarRows(root, rows) {
+  clear(root);
+  const max = Math.max(...rows.map((r) => r.rate ? r.rate.pct : 0), 1);
+  rows.forEach((row, i) => {
+    const width = row.rate ? (100 * row.rate.pct) / max : 0;
+    root.append(el(
+      "div",
+      { class: "bar-row" },
+      el(
+        "div",
+        { class: "bar-row-head" },
+        el("span", { class: "bar-row-name", text: row.agent }),
+        el("span", { class: "bar-row-value", text: `${row.fraction} · ${statsPct(row.rate)}` }),
+      ),
+      el(
+        "div",
+        { class: "bar-track" },
+        el("div", { class: "bar-fill", style: `width: ${width.toFixed(1)}%; background: ${candTone(i)}` }),
+      ),
+    ));
+  });
+}
+
+function renderStatsAgents(agents) {
+  show($("stats-agents-panel"), agents.length > 0);
+  if (agents.length === 0) return;
+  statsBarRows($("stats-agents-bars"), agents.map((a) => ({
+    agent: a.agent,
+    fraction: `${a.wins}/${a.entered} won`,
+    rate: a.win_rate,
+  })));
+}
+
+function renderStatsReviewers(reviewers) {
+  show($("stats-reviewers-panel"), reviewers.length > 0);
+  if (reviewers.length === 0) return;
+  statsBarRows($("stats-reviewers-bars"), reviewers.map((r) => ({
+    agent: r.agent,
+    fraction: `${r.adopted}/${r.submitted} adopted`,
+    rate: r.precision,
+  })));
+}
+
+function renderStatsQueue(q) {
+  const root = $("stats-queue-tiles");
+  clear(root);
+  root.append(
+    statsTile("Queued", q.queued, "blue"),
+    statsTile("Running", q.running, "blue"),
+    statsTile("Done", q.done, "gold"),
+    statsTile("Failed", q.failed, "rust"),
+    statsTile("Held", q.held, "rust"),
+    statsTile("Blocked", q.blocked, "rust"),
+  );
+}
+
 function renderQueue() {
   const sectionsRoot = $("queue-sections");
   const tasks = state.queue;
@@ -3507,15 +3689,17 @@ function renderTitle() {
   const count = needsOwnerCount();
   const base = state.route.name === "queue"
     ? "Backlog \u2014 magi"
-    : state.route.name === "questions"
-      ? "Questions \u2014 magi"
-      : state.route.name === "talks"
-        ? "Chat \u2014 magi"
-        : state.route.name === "talk"
-          ? `Chat ${shortId(state.route.id)} \u2014 magi`
-          : state.route.name === "run"
-            ? `Run ${shortId(state.route.id)} \u2014 magi`
-            : "magi \u2014 observation deck";
+    : state.route.name === "stats"
+      ? "Stats \u2014 magi"
+      : state.route.name === "questions"
+        ? "Questions \u2014 magi"
+        : state.route.name === "talks"
+          ? "Chat \u2014 magi"
+          : state.route.name === "talk"
+            ? `Chat ${shortId(state.route.id)} \u2014 magi`
+            : state.route.name === "run"
+              ? `Run ${shortId(state.route.id)} \u2014 magi`
+              : "magi \u2014 observation deck";
   document.title = count > 0 ? `(${count}) ${base}` : base;
 }
 
@@ -5745,6 +5929,16 @@ async function loadQueue() {
   }
 }
 
+async function loadStats() {
+  try {
+    state.stats = await getJson(API.stats);
+    renderStats();
+    ok();
+  } catch (error) {
+    fail(`Could not load stats: ${error.message}`);
+  }
+}
+
 /* Questions are loaded whole rather than by id: the list is short by nature —
    a backlog of them would mean the loop had been stalled for days — and one
    fetch keeps the runs list, the ask bar and the open run in agreement about
@@ -5936,6 +6130,14 @@ async function applyRevisions_(source) {
   const notificationsRev = source.notifications_rev;
   const jobs = [];
 
+  /* Read before either revision below is overwritten: /api/stats aggregates
+     both the run history and the live queue, so either moving makes it
+     stale. Refetched only while the dashboard is actually on screen and the
+     page has opened it at least once - see state.stats's own comment for why
+     this does not also happen at boot. */
+  const statsStale = state.stats !== null
+    && (queueRev !== state.rev.queue || runsRev !== state.rev.runs);
+
   if (notificationsRev !== state.rev.notifications) {
     state.rev.notifications = notificationsRev;
     jobs.push(loadNotifications());
@@ -5950,6 +6152,7 @@ async function applyRevisions_(source) {
     jobs.push(loadRuns());
     if (state.route.name === "run" && state.detail.id) jobs.push(loadRun(state.detail.id));
   }
+  if (statsStale && state.route.name === "stats") jobs.push(loadStats());
   if (questionsRev !== state.rev.questions) {
     state.rev.questions = questionsRev;
     jobs.push(loadQuestions());
@@ -6021,6 +6224,7 @@ function parseRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (parts[0] === "queue" && parts[1]) return { name: "queue", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "queue") return { name: "queue", id: null };
+  if (parts[0] === "stats") return { name: "stats", id: null };
   if (parts[0] === "questions") return { name: "questions", id: null };
   if (parts[0] === "notifications") return { name: "notifications", id: null };
   if (parts[0] === "chat" && parts[1]) return { name: "talk", id: decodeURIComponent(parts[1]) };
@@ -6037,6 +6241,7 @@ function applyRoute() {
   show($("view-runs"), route.name === "runs");
   show($("view-run"), route.name === "run");
   show($("view-queue"), route.name === "queue");
+  show($("view-stats"), route.name === "stats");
   show($("view-questions"), route.name === "questions");
   show($("view-notifications"), route.name === "notifications");
   show($("view-talks"), route.name === "talks");
@@ -6092,6 +6297,10 @@ function applyRoute() {
     state.queueFocus = route.id;
     renderQueue();
   }
+  /* Fetched on arrival rather than at boot - see state.stats's own comment -
+     so every visit re-reads the current numbers even if nothing changed on
+     the stream since the last visit. */
+  if (changed && route.name === "stats") loadStats();
   renderTitle();
 }
 
