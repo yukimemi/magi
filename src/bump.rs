@@ -403,11 +403,13 @@ fn rewrite_quoted_field(line: &str, key: &str, new_value: &str) -> Option<String
 }
 
 /// Rewrite the `version` pin of each `[workspace.dependencies]` entry named
-/// in `names` to `new_version`, in both shapes Cargo accepts: the inline
-/// table (`name = { path = "..", version = "old" }`) and the dotted table
-/// (`[workspace.dependencies.name]` followed by its own `version = "old"`
-/// line). Every other byte, including entries not in `names`, is untouched -
-/// same discipline as [`rewrite_table_version`].
+/// in `names` to `new_version`, in every shape Cargo accepts: the inline
+/// table (`name = { path = "..", version = "old" }`), the dotted-key form
+/// under the flat table (`name.path = ".."` / `name.version = "old"` as two
+/// separate lines), and the dotted sub-table (`[workspace.dependencies.
+/// name]` followed by its own `version = "old"` line). Every other byte,
+/// including entries not in `names`, is untouched - same discipline as
+/// [`rewrite_table_version`].
 ///
 /// Bails rather than silently leaving a pin unbumped when a named entry's
 /// `version` field cannot be located on a single line this way (for example
@@ -443,7 +445,21 @@ fn rewrite_workspace_dependency_pins(
         let key = trimmed.split('=').next().map(str::trim).map(unquote_key);
 
         if in_flat_table {
+            // The inline-table form: `name = { path = "..", version = ".." }`.
             if let Some(name) = key.and_then(|k| names.iter().find(|n| n.as_str() == k)) {
+                if let Some(rewritten_line) = rewrite_quoted_field(line, "version", new_version) {
+                    rewritten.insert(name.clone());
+                    out.push_str(&rewritten_line);
+                    continue;
+                }
+            } else if let Some(name) = key.and_then(|k| {
+                k.strip_suffix(".version")
+                    .and_then(|prefix| names.iter().find(|n| n.as_str() == prefix))
+            }) {
+                // The dotted-key form: `name.path = ".."` / `name.version =
+                // ".."` as two separate lines directly under
+                // `[workspace.dependencies]`, with no inline table and no
+                // `[workspace.dependencies.name]` sub-header either.
                 if let Some(rewritten_line) = rewrite_quoted_field(line, "version", new_version) {
                     rewritten.insert(name.clone());
                     out.push_str(&rewritten_line);
@@ -2412,6 +2428,24 @@ version = \"2.3.0\"\n";
         assert!(out.contains(
             "[workspace.dependencies.inner]\npath = \"crates/inner\"\nversion = \"2.4.0\"\n"
         ));
+    }
+
+    /// The dotted-key form written as two separate lines directly under the
+    /// flat `[workspace.dependencies]` table - no inline table, no
+    /// `[workspace.dependencies.name]` sub-header - is also valid TOML and
+    /// must have its `version` line rewritten.
+    #[test]
+    fn cargo_version_rewrite_bumps_an_internal_pin_in_dotted_key_form() {
+        let toml = "\
+[workspace.package]\n\
+version = \"2.3.0\"\n\
+\n\
+[workspace.dependencies]\n\
+inner.path = \"crates/inner\"\n\
+inner.version = \"2.3.0\"\n";
+        let out = rewrite_cargo_version(toml, "2.4.0").unwrap();
+        assert!(out.contains("[workspace.package]\nversion = \"2.4.0\"\n"));
+        assert!(out.contains("inner.path = \"crates/inner\"\ninner.version = \"2.4.0\"\n"));
     }
 
     /// A workspace-only member with `path` but no `version` is unpublished
