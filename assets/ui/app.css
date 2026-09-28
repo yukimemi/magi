@@ -596,6 +596,16 @@ main {
 /* The run went away before anyone answered; the question is history, not work. */
 .chip[data-status="abandoned"] { background: var(--tint-ink); color: var(--on-ink); border-style: dashed; }
 
+/* superseded: a run a later attempt at the same task already replaced. Wins
+   over every `data-status` rule above regardless of source order — same
+   selector specificity, so it has to come last in the sheet — because a
+   `BLOCKED`/`FAILED` chip on a run nobody needs to act on anymore is exactly
+   the false alarm this exists to defuse. Same muted, dashed treatment as
+   `unmerged`/`abandoned`: still a real record, just not a live one. */
+.chip[data-superseded="1"] {
+  background: var(--tint-ink); color: var(--on-ink); border-style: dashed;
+}
+
 /* ---- queue: id search ---------------------------------------------------- *
  * A phone's only way to find one task in a backlog of dozens; see
  * queue-search-input in index.html. Laid out like .runs-filter's row rather

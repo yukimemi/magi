@@ -4616,13 +4616,38 @@ function renderRunDetail() {
 
   const head = $("run-status");
   clear(head);
-  head.append(chip(status, RUN_STATUS));
+  /* A run whose task moved on is not the one to act on anymore, however its
+     own chip reads: the list route already says so on the card, but the
+     detail page — what an operator actually opens off a notification about a
+     blocked or failed run — went on showing a plain red chip with nothing
+     anywhere saying a retry had already finished the work. `run.superseded_by`
+     comes straight off this route now; the list's cached `summary` is only a
+     fallback for a payload from a build that predates it. Never downgrade a
+     run still moving (`PHASES` or parked): a later attempt existing is not
+     proof this one is done trying. */
+  const supersededBy = typeof run.superseded_by === "string" && run.superseded_by
+    ? run.superseded_by
+    : (summary && typeof summary.superseded_by === "string" && summary.superseded_by) || null;
+  const inFlight = PHASES.includes(status) || status === "waiting";
+  const superseded = Boolean(supersededBy) && !inFlight;
+
+  const statusChip = chip(status, RUN_STATUS);
+  setAttr(statusChip, "data-superseded", superseded ? "1" : null);
+  head.append(statusChip);
   const parkedAt = parkedNow ? (openFor(run.id)[0] || {}).node || null : null;
   const rail = PHASES.includes(status) || parkedAt
     ? phaseRail(status, parkedAt, activeNote(run))
     : null;
   if (rail) head.append(rail);
-  if (meta.note) head.append(el("p", { class: "card-note", text: meta.note }));
+  if (superseded) {
+    head.append(el("p", { class: "card-note card-superseded" },
+      "Superseded by ",
+      el("a", { href: `#/runs/${supersededBy}`, text: supersededBy }),
+      " — a later attempt at the same task finished this work.",
+    ));
+  } else if (meta.note) {
+    head.append(el("p", { class: "card-note", text: meta.note }));
+  }
 
   setText($("run-h"), firstLine(run.instruction) || shortId(run.id));
 

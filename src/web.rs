@@ -2275,7 +2275,7 @@ async fn runs_list(
 ) -> ApiResult<Json<Vec<RunSummary>>> {
     let limit = q.limit.unwrap_or(LIST_DEFAULT).min(LIST_MAX);
     blocking(move || {
-        let superseded = superseded_runs(&ui.queue);
+        let superseded = ui.queue.superseded();
         // Everything the per-run rows share is read once here. Asking per run
         // re-read every question file and the daemon status file for each of
         // hundreds of runs, and spawned a process probe per run on Windows.
@@ -2348,30 +2348,6 @@ where
         .collect()
 }
 
-/// Runs that a later attempt at the same task replaced, mapped to the id of
-/// the attempt that replaced them.
-///
-/// A task keeps its attempts in order, and the deck showed them as two cards
-/// with the same title and no hint which was which: yukimemi asked why
-/// `stalled` and `blocked` appeared twice for one task, and the answer -
-/// "those are two tries, and the second one exists because of a bug since
-/// fixed" - was not on the screen anywhere.
-///
-/// Read from the queue rather than stored on the run, because the ordering is
-/// the queue's fact: a `RunState` has no idea another attempt happened after
-/// it.
-fn superseded_runs(queue: &Queue) -> HashMap<String, String> {
-    let mut by = HashMap::new();
-    for task in queue.list() {
-        for pair in task.runs.windows(2) {
-            if let [earlier, later] = pair {
-                by.insert(earlier.clone(), later.clone());
-            }
-        }
-    }
-    by
-}
-
 /// A run as the detail route hands it to the phone.
 ///
 /// The whole state, flattened, plus `instruction_md`: the Task panel renders
@@ -2403,14 +2379,23 @@ struct RunDetailView {
     /// `RunState` has no business knowing which of its own methods a caller
     /// wants serialized.
     unmerged_by_design: bool,
+    /// Same field and meaning as [`RunSummary::superseded_by`] — the list
+    /// route fills it from [`Queue::superseded`], the detail route from
+    /// [`Queue::superseded_by`], and both read the same underlying task
+    /// order. Without this the detail page could only ever show a red
+    /// `BLOCKED`/`FAILED` chip on a run a later attempt had already finished,
+    /// with nothing anywhere saying so — an operator opening it had no way
+    /// to tell "this is done elsewhere" from "this still needs a retry".
+    superseded_by: Option<String>,
 }
 
 impl RunDetailView {
-    fn of(state: RunState, live: crate::run::Liveness) -> Self {
+    fn of(state: RunState, live: crate::run::Liveness, superseded_by: Option<String>) -> Self {
         Self {
             instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
             live,
             unmerged_by_design: state.unmerged_by_design(),
+            superseded_by,
             state,
         }
     }
@@ -2425,7 +2410,13 @@ async fn run_detail(
         let state = read_run(&ui.runs, &id)?;
         let daemon_claims = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
         let live = state.liveness(daemon_claims);
-        Ok(Json(RunDetailView::of(state, live)))
+        let superseded_by = ui
+            .queue
+            .superseded_by(&id)
+            .as_deref()
+            .map(crate::run::short_of)
+            .map(str::to_owned);
+        Ok(Json(RunDetailView::of(state, live, superseded_by)))
     })
     .await
 }
@@ -9155,6 +9146,45 @@ mod tests {
         // Front end: the note has to be rendered, not just carried.
         assert!(APP_JS.contains("run.superseded_by"));
         assert!(APP_JS.contains("Superseded by"));
+    }
+
+    #[tokio::test]
+    async fn a_run_s_own_detail_page_says_what_replaced_it_too() {
+        // The list route has known this since the card fix above; the detail
+        // route — what an operator actually opens from a notification about
+        // a blocked run — did not, and went on showing a bare red BLOCKED
+        // chip for a run a retry had already finished.
+        let fx = Fixture::start().await;
+        let q = fx.queue();
+        let runs = fx.runs();
+        let (first, second) = ("20260901-000000-cccc", "20260901-000000-dddd");
+        write_run(&runs, first, RunStatus::Blocked);
+        write_run(&runs, second, RunStatus::Merged);
+
+        let mut t = Task::new(
+            "one task".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        t.runs = vec![first.to_owned(), second.to_owned()];
+        q.put(&mut t).expect("put");
+
+        let earlier = fx.get(&format!("/api/runs/{first}")).await.json();
+        assert_eq!(earlier["superseded_by"], "dddd");
+
+        let later = fx.get(&format!("/api/runs/{second}")).await.json();
+        assert!(
+            later["superseded_by"].is_null(),
+            "the latest attempt is not superseded by anything"
+        );
+
+        // Front end: the detail page has to read the field this route now
+        // carries, downgrade the chip, and link to the run that replaced it —
+        // not just repeat the list card's own logic under a different name.
+        assert!(APP_JS.contains("run.superseded_by"));
+        assert!(APP_JS.contains("data-superseded"));
+        assert!(APP_JS.contains("#/runs/${supersededBy}"));
     }
 
     #[tokio::test]
