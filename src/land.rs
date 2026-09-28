@@ -1356,6 +1356,90 @@ pub async fn branch_is_ancestor(repo: &Path, branch: &str, base_branch: &str) ->
     Ok(out.status.success())
 }
 
+/// Parse `owner/repo` out of a GitHub pull request URL, with no network
+/// access - the first half of the same-repo guard [`correct_manual_merge`]
+/// applies before it writes anything.
+///
+/// Returns `None` for anything that does not look like
+/// `https://<host>/<owner>/<repo>/pull/<n>`, which the caller treats as
+/// fail-closed: a URL this cannot make sense of refuses rather than guesses.
+pub(crate) fn slug_of_pr_url(url: &str) -> Option<String> {
+    let rest = url.rsplit("://").next()?;
+    let (_host, path) = rest.split_once('/')?;
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    let kind = segments.next()?;
+    if owner.is_empty() || repo.is_empty() || kind != "pull" {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+/// Refuse to correct a run against a pull request from a different
+/// repository than the one it is recorded against.
+///
+/// This is the guard the shun/8c75 incident argued for: an operator ran
+/// `magi fold --merged <shun PR url>` meaning to correct an old `Blocked` run
+/// in a different repository, omitted the run id, and the id defaulted to
+/// this machine's most recently created run - an unrelated, still-in-progress
+/// run in a completely different repository - which then had its `status`
+/// rewritten to `merged` from a pull request it had nothing to do with.
+/// `correct_manual_merge` now requires an explicit id (see `magi fold`'s own
+/// CLI help), but a mistyped or stale id could still name a run in a
+/// different repository than the one the URL belongs to, so this checks that
+/// independently rather than trusting the id alone.
+///
+/// Comparison is case-insensitive - GitHub owner/repo names are - and a
+/// mismatch names both slugs rather than just refusing, so an operator whose
+/// local checkout's `origin` is a fork of the repository the pull request was
+/// opened against (a legitimate setup this cannot tell apart from a genuine
+/// mix-up) can judge for themselves rather than being blocked with no way to
+/// see why.
+pub(crate) fn ensure_same_repo(run_repo_slug: &str, pr_repo_slug: &str) -> Result<()> {
+    if run_repo_slug.eq_ignore_ascii_case(pr_repo_slug) {
+        return Ok(());
+    }
+    bail!(
+        "refusing to correct this run: it is recorded against {run_repo_slug}, but the pull \
+         request URL belongs to {pr_repo_slug} - pass the run id whose repository the URL \
+         actually belongs to (or, if `origin` is a fork opened against a different upstream, \
+         verify by hand before treating this as a false positive)"
+    );
+}
+
+/// Ask the forge which `owner/repo` a local checkout's `origin` remote
+/// actually resolves to, for the same-repo guard in [`correct_manual_merge`].
+///
+/// Asking `gh` rather than parsing `git remote -v` locally is deliberate: it
+/// normalizes case, SSH vs. HTTPS remotes, and a renamed or transferred
+/// repository the same way GitHub itself would recognize it, so the
+/// comparison in [`ensure_same_repo`] is against the same canonical slug on
+/// both sides.
+async fn repo_slug(repo: &Path) -> Result<String> {
+    let out = gh(
+        repo,
+        &[
+            "repo".to_owned(),
+            "view".to_owned(),
+            "--json".to_owned(),
+            "nameWithOwner".to_owned(),
+        ],
+    )
+    .await?;
+    if !out.0 {
+        bail!("gh repo view --json nameWithOwner: {}", out.1);
+    }
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GhRepo {
+        name_with_owner: String,
+    }
+    let parsed: GhRepo = serde_json::from_str(&out.1)
+        .with_context(|| format!("parse `gh repo view` output: {}", out.1))?;
+    Ok(parsed.name_with_owner)
+}
+
 /// Confirm `url` is actually a merged pull request, then rewrite `state`'s
 /// `status` and `merge` exactly as the automatic land loop (`land::land`)
 /// would have written them had magi opened and merged this pull request
@@ -1372,9 +1456,12 @@ pub async fn branch_is_ancestor(repo: &Path, branch: &str, base_branch: &str) ->
 /// `Step::Done { merged: true }` on the very first read, before any of
 /// `land`'s own checks/fix/rebase machinery can run, which is what makes it
 /// safe to call here even though this pull request was never magi's own.
-/// [`lifecycle`] is checked first and separately so a mistyped or still-open
-/// URL fails loudly without writing anything, rather than handing an open
-/// pull request to the full autonomous loop by accident.
+/// [`ensure_same_repo`] is checked before anything else: a pull request from
+/// a different repository than the one `state` is recorded against is
+/// refused outright, regardless of its lifecycle. [`lifecycle`] is checked
+/// next and separately so a mistyped or still-open URL fails loudly without
+/// writing anything, rather than handing an open pull request to the full
+/// autonomous loop by accident.
 ///
 /// Correcting `status` this way does not run `bump::after_merge`
 /// (`src/bump.rs`): that call is made only from `graph::Runner::run_land`,
@@ -1390,6 +1477,14 @@ pub async fn correct_manual_merge(
     state: &mut RunState,
     url: &str,
 ) -> Result<(RunStatus, RunStatus)> {
+    let Some(pr_slug) = slug_of_pr_url(url) else {
+        bail!(
+            "could not parse an owner/repo out of {url}; refusing to guess which repository \
+             this pull request belongs to"
+        );
+    };
+    let run_slug = repo_slug(&state.repo).await?;
+    ensure_same_repo(&run_slug, &pr_slug)?;
     match lifecycle(&state.repo, url).await? {
         PrLifecycle::Merged => {}
         other => bail!(
@@ -3806,6 +3901,38 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         ]"#;
         let created_at: Timestamp = "2026-09-19T00:00:00Z".parse().unwrap();
         assert_eq!(pick_merged_pr(json, "main", created_at).unwrap(), None);
+    }
+
+    #[test]
+    fn slug_of_pr_url_reads_owner_and_repo() {
+        assert_eq!(
+            slug_of_pr_url("https://github.com/yukimemi/shun/pull/272").as_deref(),
+            Some("yukimemi/shun")
+        );
+    }
+
+    #[test]
+    fn slug_of_pr_url_refuses_a_url_with_no_pull_segment() {
+        assert_eq!(slug_of_pr_url("https://github.com/yukimemi/shun"), None);
+        assert_eq!(slug_of_pr_url("not a url at all"), None);
+        assert_eq!(slug_of_pr_url("https://github.com"), None);
+    }
+
+    #[test]
+    fn ensure_same_repo_accepts_a_matching_slug_regardless_of_case() {
+        ensure_same_repo("yukimemi/magi", "YukiMemi/Magi").expect("same repo, different case");
+    }
+
+    /// The shun/8c75 incident: an id-less `--merged` picked this repository's
+    /// own in-progress run and rewrote its status from a pull request in a
+    /// completely different repository. This is the guard that must catch
+    /// that even when an explicit (but wrong) id is given.
+    #[test]
+    fn ensure_same_repo_refuses_a_different_repo() {
+        let err = ensure_same_repo("yukimemi/magi", "yukimemi/shun").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("yukimemi/magi"), "{msg}");
+        assert!(msg.contains("yukimemi/shun"), "{msg}");
     }
 
     /// No winner decided yet means there is no branch to ask GitHub about at
