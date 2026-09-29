@@ -1357,6 +1357,19 @@ async fn drive(
         .unwrap_or_default();
     let concurrency = max_concurrent(daemon_cfg.max_concurrent_runs);
 
+    // Something has to be waiting on every question for as long as it is open,
+    // whether or not the agent's own `magi ask` survived. Its own task rather
+    // than a step of the poll loop: the poll loop is busy for the whole of a
+    // run, and an owner's reply must not queue behind one.
+    let waiter = tokio::spawn(crate::waiter::run(
+        crate::waiter::Waiter::new(
+            crate::ask::Questions::at(home.join("questions")),
+            home.to_path_buf(),
+            prepare(&opts.repo, opts).ok(),
+        ),
+        stop.clone(),
+    ));
+
     tracing::info!(
         "magi serve: queue {} (poll {}s, {} attempts per task, {} run(s) at once{})",
         queue.root().display(),
@@ -1390,6 +1403,7 @@ async fn drive(
     .await;
 
     beat.abort();
+    waiter.abort();
     clear_status_at(status_file);
     outcome
 }

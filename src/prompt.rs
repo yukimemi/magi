@@ -1137,6 +1137,73 @@ pub fn operator_fix(
     s
 }
 
+/// What the owner said, handed to the agent that asked.
+pub enum OwnerWord<'a> {
+    /// They spoke back without deciding.
+    Said(&'a str),
+    /// They decided.
+    Answered(&'a str),
+}
+
+/// Heading of [`question_resumed`]; the mock agent in `tests/common` keys on it.
+pub const QUESTION_RESUMED_HEADING: &str = "The owner has replied to the question you asked";
+
+/// The prompt that resumes a seat whose `magi ask` is gone, so the owner's
+/// word still reaches the agent that already holds the context.
+///
+/// Carries the question and the whole thread rather than trusting the resumed
+/// conversation to remember them: the seat's CLI session may have been
+/// compacted, and the cost of restating a few lines is nothing next to an
+/// agent acting on half a conversation. `thread` is `(who, body)` oldest
+/// first, the owner's `Operator` turns included, and `word` is the part the
+/// agent has not read.
+pub fn question_resumed(
+    id: &str,
+    summary: &str,
+    detail: &str,
+    thread: &[(&str, &str)],
+    word: &OwnerWord<'_>,
+    language: &str,
+) -> String {
+    let mut s = format!(
+        "# {QUESTION_RESUMED_HEADING}\n\n\
+         Your `magi ask` for this question is no longer running, so magi is \
+         handing you the owner's word directly. You are still the same seat, \
+         with the same working directory and the same conversation.\n\n\
+         ## The question ({id})\n\n{summary}\n"
+    );
+    if !detail.trim().is_empty() {
+        s.push_str(&format!("\n{}\n", detail.trim()));
+    }
+    if !thread.is_empty() {
+        s.push_str("\n## The conversation so far\n\n");
+        for (who, body) in thread {
+            let who = if *who == "operator" { "Owner" } else { "You" };
+            s.push_str(&format!(
+                "- **{who}**: {}\n",
+                body.trim().replace('\n', "\n  ")
+            ));
+        }
+    }
+    match word {
+        OwnerWord::Said(said) => s.push_str(&format!(
+            "\n## The owner says\n\n{}\n\n\
+             This is not a decision yet. Reply with `magi ask --thread {id} \
+             --summary \"...\"` (in the foreground) to keep talking, or, if it \
+             settles what you needed, carry on with your task.",
+            said.trim()
+        )),
+        OwnerWord::Answered(answer) => s.push_str(&format!(
+            "\n## The owner answered\n\n{}\n\n\
+             That settles the question. Carry on with your task on that basis; \
+             do not ask it again.",
+            answer.trim()
+        )),
+    }
+    s.push_str(&lang(language));
+    s
+}
+
 /// Follow-up when a reply could not be parsed.
 pub fn nudge(err: &str) -> String {
     format!(

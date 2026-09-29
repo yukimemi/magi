@@ -573,6 +573,57 @@ pub fn apply(queue: &Queue, questions: &Questions, verdict: &Verdict) -> Result<
     Ok(())
 }
 
+/// Where the conductor's seat is kept between turns, so the daemon waiter can
+/// resume it when the owner answers a question it asked.
+///
+/// A graph seat's session lives in its run's `RunState`; the conductor has no
+/// run, and until this file its seat existed only in memory.
+pub fn seat_path(home: &Path) -> PathBuf {
+    home.join("conduct").join("seat.json")
+}
+
+/// The seat the conductor last used, if it has taken a turn.
+pub fn load_seat(home: &Path) -> Option<SeatState> {
+    serde_json::from_str(&std::fs::read_to_string(seat_path(home)).ok()?).ok()
+}
+
+fn busy_path(home: &Path) -> PathBuf {
+    home.join("conduct").join("busy")
+}
+
+/// Is a conductor turn in flight right now?
+///
+/// A marker file rather than shared memory because the waiter reads it and the
+/// conductor is not necessarily in its process. A marker older than one turn's
+/// timeout (plus slack) was left by a turn that died and counts for nothing.
+pub fn busy(home: &Path) -> bool {
+    std::fs::metadata(busy_path(home))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < TURN_TIMEOUT + Duration::from_secs(30))
+}
+
+/// Removes the busy marker when a turn ends, however it ends.
+struct Busy(PathBuf);
+
+impl Busy {
+    fn mark(home: &Path) -> Self {
+        let path = busy_path(home);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, std::process::id().to_string());
+        Self(path)
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// The conductor's state across polling cycles: its own CLI-side conversation
 /// and the last (revision, stalled ∪ finished ids) pair it actually acted on.
 #[derive(Debug, Default)]
@@ -724,9 +775,19 @@ impl Conductor {
             attachments: &[],
         };
 
-        let out = agent::invoke(&spec, seat, &inv)
-            .await
-            .context("invoking the conductor")?;
+        let busy = Busy::mark(home);
+        let out = agent::invoke(&spec, seat, &inv).await;
+        drop(busy);
+        // Kept after every turn, failed or not: the CLI-side conversation is
+        // what a resumed question needs, and it exists once the turn ran.
+        if let Ok(body) = serde_json::to_string(&*seat) {
+            let path = seat_path(home);
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(path, body);
+        }
+        let out = out.context("invoking the conductor")?;
         if !out.usable() {
             bail!(
                 "no usable reply (exit {:?}, timed out {})",

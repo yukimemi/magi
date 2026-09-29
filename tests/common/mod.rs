@@ -156,6 +156,16 @@ has() { case "$prompt" in *"$1"*) return 0 ;; esac; return 1; }
 printf '%s %s %s\n' "$MAGI_RUN" "$MAGI_NODE" "$seat" \
   >> "$(dirname "$p")/attribution.log"
 
+# The daemon waiter resuming a seat whose `magi ask` is gone
+# (`prompt::question_resumed`). Records that the seat was resumed, and answers
+# in prose - not through `magi ask --thread` - so the waiter has to keep the
+# reply on the record itself.
+if has "The owner has replied to the question you asked"; then
+  echo "$seat" >> resumes.log
+  printf 'mock reply from %s\n' "$seat"
+  exit 0
+fi
+
 # Handshake simulation for "is a call genuinely in flight when a park is
 # requested": a matching implement seat writes a `started-<seat>` marker,
 # proof the caller can wait on that this process has actually begun, then

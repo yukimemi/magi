@@ -41,7 +41,9 @@ use crate::proc::Quiet as _;
 use crate::run::RunStatus;
 
 /// On-disk format for a question. Bumped when a field's meaning changes, or -
-/// as with [`Question::thread`] and now [`Question::answer_timeout`] - when a
+/// as with [`Question::thread`], [`Question::answer_timeout`] and now the
+/// waiter bookkeeping ([`Question::cwd`], [`Question::waiter`],
+/// [`Question::delivered_turns`], [`Question::answer_delivered`]) - when a
 /// new field is added that a much older magi has no notion of at all.
 ///
 /// The web UI is written against this shape by hand - there is no shared schema
@@ -54,7 +56,7 @@ use crate::run::RunStatus;
 /// "no conversation yet" rather than "unreadable", and a strict equality check
 /// would turn every bump into an upgrade that breaks reading yesterday's
 /// question files.
-pub const SCHEMA: u32 = 3;
+pub const SCHEMA: u32 = 4;
 
 /// How often the wait re-reads the question file.
 ///
@@ -109,6 +111,21 @@ const NOTIFY_TIMEOUT: Duration = Duration::from_secs(20);
 /// trip, while staying long enough that an owner who answers within the hour
 /// is not making an agent loop through fifteen slices to hear about it.
 const WAIT_SLICE: Duration = Duration::from_secs(240);
+
+/// How long a lease stays believable after its last beat.
+///
+/// Longer than [`WAIT_SLICE`]'s hand-back gap by a wide margin: a slice that
+/// ends with [`Wait::Pending`] leaves the asking agent a moment to call
+/// `magi ask --wait` again, and a reply leaves it a moment to call `--thread`.
+/// A holder that beats every [`POLL`] and is silent for ninety seconds is gone
+/// or about to be, and a lease that is merely between two calls must not be
+/// mistaken for that - the daemon waiter would start a second agent on a
+/// conversation the first is still in.
+pub const LEASE_TTL: Duration = Duration::from_secs(90);
+
+/// How long [`Questions::update`]'s lock may be held before it is presumed
+/// left behind by a writer that died.
+const LOCK_STALE: Duration = Duration::from_secs(10);
 
 /// Environment variable naming the base URL of the web UI, for `{url}`.
 ///
@@ -253,6 +270,54 @@ pub struct Turn {
     pub at: Timestamp,
 }
 
+/// Who is keeping watch over an open question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaiterKind {
+    /// The `magi ask` process the agent started.
+    Asker,
+    /// The `magi serve` waiter ([`crate::waiter`]), resuming the asking seat's
+    /// own session because the asker is gone.
+    Daemon,
+}
+
+/// The record's note of who was last known to be waiting.
+///
+/// A note, not a promise: nothing rewrites the question when a holder dies, so
+/// whether it still holds is read from the [`Lease`] beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waiter {
+    /// Who took the wait.
+    pub kind: WaiterKind,
+    /// When they took it.
+    pub since: Timestamp,
+}
+
+/// A sidecar (`<id>.lease`) saying that something is alive and waiting.
+///
+/// A sidecar rather than a field of the question because a holder beats every
+/// few seconds, and rewriting the question that often would race the phone's
+/// answer and say with lost updates. It is not `*.json`, so
+/// [`Questions::list`] never sees it. No pid check: pids are reused and mean
+/// different things across platforms, while a beat that stopped is evidence on
+/// every one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lease {
+    /// Who beat last.
+    pub kind: WaiterKind,
+    /// Their process id, for a human reading the file.
+    pub pid: u32,
+    /// When they beat last.
+    pub beat_at: Timestamp,
+}
+
+impl Lease {
+    /// Was the last beat recent enough to believe the holder is still there?
+    pub fn fresh(&self, now: Timestamp) -> bool {
+        now.as_second() - self.beat_at.as_second() <= LEASE_TTL.as_secs() as i64
+    }
+}
+
 /// One decision magi will not take on the owner's behalf.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -329,6 +394,25 @@ pub struct Question {
     /// question was actually asked with.
     #[serde(default)]
     pub answer_timeout: u64,
+    /// The directory the asking agent was working in when it asked, so the
+    /// daemon waiter can resume that agent's session from where it stood.
+    /// `None` for a question no `magi ask` filed (land's approval gate, a
+    /// release notice, one written before this field existed): those have no
+    /// agent to hand anything back to, and the waiter leaves them alone.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Who was last known to be waiting - see [`Waiter`].
+    #[serde(default)]
+    pub waiter: Option<Waiter>,
+    /// How many entries of [`Question::thread`] the agent has been shown, by
+    /// the asking process printing them or by the waiter resuming the seat.
+    /// The owner's turn at an index at or past this has reached nobody yet.
+    #[serde(default)]
+    pub delivered_turns: usize,
+    /// Has the agent been told the [`Answer`]? The asker prints it as it
+    /// returns; the waiter delivers it when the asker was gone.
+    #[serde(default)]
+    pub answer_delivered: bool,
 }
 
 impl Question {
@@ -359,6 +443,10 @@ impl Question {
             answer: None,
             thread: Vec::new(),
             answer_timeout: 0,
+            cwd: None,
+            waiter: None,
+            delivered_turns: 0,
+            answer_delivered: false,
         }
     }
 
@@ -534,12 +622,50 @@ impl Question {
             bail!("a reply to question {} cannot be empty", self.short());
         }
         self.choices = choices;
+        let unread = self.unread_from_owner().is_some();
         self.thread.push(Turn {
             who: Who::Agent,
             body,
             at: Timestamp::now(),
         });
+        // The agent has read everything up to its own reply - but only if
+        // nothing the owner said in the meantime is still unread. A second say
+        // that landed after the agent's last look must stay undelivered.
+        if !unread {
+            self.delivered_turns = self.thread.len();
+        }
         Ok(())
+    }
+
+    /// What the owner said that the agent has not read yet, oldest first,
+    /// joined. `None` unless the question is open and such a turn exists.
+    ///
+    /// Not [`Question::waiting_on_agent`]: an agent's reply can land *after* a
+    /// second owner turn it never saw, which leaves the last turn the agent's
+    /// and the ball apparently back with the owner while a say is still unread.
+    pub fn unread_from_owner(&self) -> Option<String> {
+        if !self.status.open() {
+            return None;
+        }
+        let from = self.delivered_turns.min(self.thread.len());
+        let said: Vec<&str> = self.thread[from..]
+            .iter()
+            .filter(|t| t.who == Who::Operator)
+            .map(|t| t.body.as_str())
+            .collect();
+        (!said.is_empty()).then(|| said.join("\n\n"))
+    }
+
+    /// When the conversation last moved: the newest thread turn, or the asking
+    /// itself, in seconds. `magi ask --thread` re-arms `answer_timeout` on
+    /// every reply, so a deadline runs from here and not from `asked_at`.
+    pub fn last_activity(&self) -> i64 {
+        self.thread
+            .iter()
+            .map(|t| t.at.as_second())
+            .max()
+            .unwrap_or(0)
+            .max(self.asked_at.as_second())
     }
 
     /// Is the ball in the agent's court?
@@ -770,6 +896,100 @@ impl Questions {
         }
         clear_dir(&self.panel_dir(id))?;
         clear_dir(&self.root.join(format!("{id}{PANEL_TMP}")))
+    }
+
+    /// Path of the lease sidecar for one question id.
+    pub fn lease_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.lease"))
+    }
+
+    /// The lease on a question, if a readable one exists.
+    pub fn read_lease(&self, id: &str) -> Option<Lease> {
+        let body = std::fs::read_to_string(self.lease_path(id)).ok()?;
+        serde_json::from_str(&body).ok()
+    }
+
+    /// Say, as `kind`, that something is alive and waiting on this question.
+    ///
+    /// Best-effort: a beat that cannot be written is a `tracing::debug`, never
+    /// a reason to abandon a wait - the worst it costs is the waiter deciding
+    /// the holder is gone a little early, and that is what the delivery guard
+    /// (the seat still being busy) is there for.
+    pub fn beat(&self, id: &str, kind: WaiterKind) {
+        let lease = Lease {
+            kind,
+            pid: std::process::id(),
+            beat_at: Timestamp::now(),
+        };
+        let path = self.lease_path(id);
+        let tmp = path.with_extension("lease.tmp");
+        let written = std::fs::create_dir_all(&self.root)
+            .and_then(|()| std::fs::write(&tmp, serde_json::to_string(&lease).unwrap_or_default()))
+            .and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = written {
+            tracing::debug!("could not beat the lease on question {id}: {e}");
+        }
+    }
+
+    /// Remove the lease sidecar. Absent is fine.
+    pub fn drop_lease(&self, id: &str) {
+        let _ = std::fs::remove_file(self.lease_path(id));
+    }
+
+    /// Read-modify-write one question under a short exclusive lock, so the
+    /// waiter's bookkeeping, the asker's and the phone's `say` cannot overwrite
+    /// each other with a copy that predates the others.
+    ///
+    /// [`Questions::put`] is an atomic *replace*, which protects a reader from
+    /// a torn file and does nothing for two writers that both read the same
+    /// version first. Everything that changes a question that can still be
+    /// answered goes through here: `f` sees the current record, not one loaded
+    /// earlier. A lock older than [`LOCK_STALE`] belongs to a writer that died
+    /// mid-update and is broken.
+    pub fn update<T>(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut Question) -> Result<T>,
+    ) -> Result<(Question, T)> {
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("create {}", self.root.display()))?;
+        let lock = self.root.join(format!("{id}.lock"));
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock)
+            {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&lock)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > LOCK_STALE);
+                    if stale {
+                        let _ = std::fs::remove_file(&lock);
+                    } else if started.elapsed() > LOCK_STALE {
+                        bail!("could not lock question {id}");
+                    } else {
+                        std::thread::sleep(Duration::from_millis(15));
+                    }
+                }
+                Err(e) => return Err(e).with_context(|| format!("lock {}", lock.display())),
+            }
+        }
+        struct Unlock(PathBuf);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _guard = Unlock(lock);
+        let mut q = read_path(&self.path_of(id))?;
+        let out = f(&mut q)?;
+        self.put(&mut q)?;
+        Ok((q, out))
     }
 
     /// Write a question, atomically, so a process killed mid-write leaves the
@@ -1029,7 +1249,12 @@ async fn wait_for_owner(
     timeout: Duration,
     poll: Duration,
 ) -> Result<Wait> {
-    store.put(q).context("file the question")?;
+    // A question that is already on disk (a `--thread` reply just wrote it under
+    // the lock) is left alone: this copy may predate an answer or say that
+    // landed since, and writing it back would erase that.
+    if !store.path_of(&q.id).is_file() {
+        store.put(q).context("file the question")?;
+    }
     if q.should_notify(Timestamp::now()) {
         if let Err(e) = notify(cfg, q).await {
             // A broken webhook is not a reason to throw away an implementation.
@@ -1050,6 +1275,45 @@ async fn wait_for_owner(
         q.summary
     );
     wait_loop(q, store, timeout, WAIT_SLICE, poll).await
+}
+
+/// Take the wait as this process: beat the lease and note it on the record.
+fn hold(store: &Questions, id: &str) {
+    store.beat(id, WaiterKind::Asker);
+    let took = store.update(id, |q| {
+        if q.status.open() {
+            q.waiter = Some(Waiter {
+                kind: WaiterKind::Asker,
+                since: Timestamp::now(),
+            });
+        }
+        Ok(())
+    });
+    if let Err(e) = took {
+        tracing::debug!("could not note the wait on question {id}: {e:#}");
+    }
+}
+
+/// Record that the agent has read everything so far, so the daemon waiter does
+/// not resume a session to tell it what was already printed.
+///
+/// Callers must invoke this only **after** the word reached the agent's stdout:
+/// marking first would let a tool timeout kill the process between the mark
+/// and the print, and the waiter would then consider a word delivered that no
+/// agent ever saw.
+pub fn hand_over(store: &Questions, q: &mut Question) {
+    let done = store.update(&q.id, |r| {
+        r.delivered_turns = r.delivered_turns.max(q.thread.len());
+        if r.status == QuestionStatus::Answered {
+            r.answer_delivered = true;
+        }
+        r.waiter = None;
+        Ok(())
+    });
+    match done {
+        Ok((fresh, ())) => *q = fresh,
+        Err(e) => tracing::debug!("could not record the hand-over of {}: {e:#}", q.short()),
+    }
 }
 
 /// The polling loop shared by a fresh wait and a resumed one.
@@ -1077,9 +1341,10 @@ async fn wait_loop(
     // new. `last_word_awaiting_reply` reads the question's own record of
     // whose turn it is - see [`Question::waiting_on_agent`] - rather than a
     // turn count this call would have to have been there to capture.
-    if let Some(said) = last_word_awaiting_reply(q) {
-        return Ok(Wait::Replied(said.to_owned()));
+    if let Some(said) = q.unread_from_owner() {
+        return Ok(Wait::Replied(said));
     }
+    hold(store, &q.id);
 
     let bounded = timeout.min(slice);
     let is_the_real_deadline = bounded >= timeout;
@@ -1088,13 +1353,29 @@ async fn wait_loop(
         let now = tokio::time::Instant::now();
         if now >= deadline {
             if !is_the_real_deadline {
+                // The lease is left to age out on purpose: the caller is about
+                // to run `magi ask --wait`, and that gap is what LEASE_TTL
+                // covers.
                 return Ok(Wait::Pending);
             }
-            q.abandon(format!(
-                "no answer within {}s of asking",
-                timeout.as_secs().max(1)
-            ));
-            store.put(q).context("record the abandoned question")?;
+            let why = format!("no answer within {}s of asking", timeout.as_secs().max(1));
+            // Re-checked on the record as it is now: the owner may have said
+            // something in time since the last poll, and that word is handed
+            // over, not abandoned.
+            let (fresh, unread) = store
+                .update(&q.id, |r| {
+                    let unread = r.unread_from_owner();
+                    if unread.is_none() {
+                        r.abandon(&why);
+                        r.waiter = None;
+                    }
+                    Ok(unread)
+                })
+                .context("record the abandoned question")?;
+            *q = fresh;
+            if let Some(said) = unread {
+                return Ok(Wait::Replied(said));
+            }
             tracing::warn!(
                 "question {} went unanswered for {}s; the run parks and the \
                  question stays as the record of it",
@@ -1104,6 +1385,7 @@ async fn wait_loop(
             return Ok(Wait::Abandoned);
         }
         tokio::time::sleep(poll.min(deadline - now)).await;
+        store.beat(&q.id, WaiterKind::Asker);
         match store.get(&q.id) {
             Ok(fresh) if !fresh.status.open() => {
                 // Whoever answered - the phone, `magi answer`, another daemon -
@@ -1118,8 +1400,7 @@ async fn wait_loop(
                 });
             }
             Ok(fresh) => {
-                if let Some(said) = last_word_awaiting_reply(&fresh) {
-                    let said = said.to_owned();
+                if let Some(said) = fresh.unread_from_owner() {
                     *q = fresh;
                     return Ok(Wait::Replied(said));
                 }
@@ -1134,22 +1415,6 @@ async fn wait_loop(
             }
         }
     }
-}
-
-/// The owner's own last word, if the agent has not caught up on it yet.
-///
-/// A thin wrapper over [`Question::waiting_on_agent`] that also hands back
-/// what was said: the state is on the record itself, not derived from
-/// anything this call has seen happen, so it reads correctly whether this is
-/// the process that has been polling all along or a fresh `--wait` that just
-/// loaded the question off disk for the first time. `None` on a fresh
-/// question, one the agent already replied to, or one that is no longer
-/// open.
-fn last_word_awaiting_reply(q: &Question) -> Option<&str> {
-    if !q.waiting_on_agent() {
-        return None;
-    }
-    q.thread.last().map(|t| t.body.as_str())
 }
 
 /// Run the operator's notification command, if one is configured.
@@ -1442,11 +1707,14 @@ mod tests {
             keys,
             [
                 "answer",
+                "answer_delivered",
                 "answer_timeout",
                 "answered_at",
                 "asked_at",
                 "assets",
                 "choices",
+                "cwd",
+                "delivered_turns",
                 "detail",
                 "id",
                 "node",
@@ -1457,10 +1725,11 @@ mod tests {
                 "status",
                 "summary",
                 "thread",
+                "waiter",
             ],
             "the on-disk field set is a contract with the front end"
         );
-        assert_eq!(open["schema"], 3);
+        assert_eq!(open["schema"], 4);
         assert_eq!(open["thread"], serde_json::json!([]));
         assert_eq!(open["id"], "20260902-231501-ab12");
         assert_eq!(open["run"], "20260902-201256-9fb7");
@@ -2377,5 +2646,17 @@ mod tests {
             "talking back is not a decision; the question stays open"
         );
         assert!(q.answer.is_none());
+    }
+
+    #[test]
+    fn a_say_that_lands_before_the_agents_reply_stays_unread() {
+        let mut q = choice_question();
+        q.say("A").unwrap();
+        q.delivered_turns = q.thread.len();
+        q.say("B").unwrap();
+        q.reply("about A", vec![]).unwrap();
+        assert_eq!(q.unread_from_owner().as_deref(), Some("B"));
+        q.delivered_turns = q.thread.len();
+        assert_eq!(q.unread_from_owner(), None);
     }
 }

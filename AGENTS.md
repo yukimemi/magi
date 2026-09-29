@@ -672,6 +672,51 @@ Three things that are load-bearing:
 The deck is read-only. Adding a key that mutates a run means adding a
 confirmation flow and an undo story; `magi fold` already exists for cleanup.
 
+### A question always has someone waiting on it
+
+`magi ask` runs inside the agent's own shell tool, which kills a long wait, and
+an agent can background the call and exit. The question then outlives the
+only process that would read the owner's reply. `src/waiter.rs` is the
+guarantee that something is always on the other end; it runs inside `magi
+serve` as its own task (not a step of the queue loop, which is busy for the
+whole of a run).
+
+- **The lease is a sidecar, not a field.** `<questions>/<id>.lease` holds
+  `{kind, pid, beat_at}`; the asker rewrites it every poll, the daemon while a
+  delivery runs. It is not `*.json`, so `list` never sees it, and it is not in
+  the question so the beat cannot race the phone's answer with a lost update.
+  Fresh means a beat within `ask::LEASE_TTL` (90 s), deliberately longer than
+  the gap between two `magi ask --wait` calls. **No pid checks** - pids are
+  reused and mean different things per platform. The record's own `waiter`
+  field is a note of who was last known to wait; the lease says whether they
+  still do (`QuestionView::holder`).
+- **Every change to a question that can still be answered goes through
+  `Questions::update`** (a read-modify-write under a short lock file), never
+  `get` + `put`: the answer, the say, the asker's bookkeeping and the
+  waiter's would otherwise overwrite each other.
+- **Never start a fresh consultant.** The waiter resumes the *same seat's*
+  session (`agent::has_session`, seat state from the run's `RunState`, or
+  `<home>/conduct/seat.json` for the conductor). If the session cannot be
+  resumed - no session, cwd gone, run over, agent left the roster - nothing
+  runs; a notice says why and the record is kept. Never assume a resume worked:
+  a failed turn leaves the word undelivered, and it is tried again after
+  `RETRY_AFTER`.
+- **Never a second agent while the first is blocked.** A fresh lease means
+  do nothing, and a seat still listed in `RunState::active` (or the
+  conductor's `busy` marker) is not resumed either: the CLI may outlive the
+  `magi ask` that was killed.
+- **Delivery is tracked in the record** (`delivered_turns`, `answer_delivered`),
+  set by the asker as it prints and by the waiter after a resumed turn. Where
+  the outcome is unknown the word stays undelivered: a repeat is better than a
+  drop. Only questions with `cwd` set (filed by `magi ask`) are the waiter's;
+  land's approval gate and release notices are not.
+- **A park drops a delivery in flight and writes nothing**; the lease just ages
+  out and a restarted waiter reads the same state from disk. `answer_timeout`
+  is obeyed: an unanswered question with no fresh lease is abandoned in the
+  asker's own words, but a word the owner gave in time is delivered first.
+- `waiter` writes no `RunState`: it clones the seat, so a resumed turn's
+  `turns` count is not persisted (only ever needs to be non-zero).
+
 ### The queue: data with pure transitions, I/O in one place
 
 `src/queue.rs` splits `Task` (data plus *pure* state changes) from `Queue`
