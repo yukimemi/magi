@@ -2552,6 +2552,47 @@ async fn attempt(
             );
             return Vec::new();
         }
+        // A branch that differs between here and the remote in ways magi
+        // cannot prove are the same change is a decision for the owner, not a
+        // failed attempt: ask with both sides laid out, spend no attempt, and
+        // let the answer requeue the task.
+        Err(e) if e.downcast_ref::<crate::reconcile::Diverged>().is_some() => {
+            let d = e
+                .downcast_ref::<crate::reconcile::Diverged>()
+                .expect("checked by the guard");
+            let mut q = ask::Question::new(
+                task.id.clone(),
+                "review".to_owned(),
+                "sync".to_owned(),
+                d.summary(),
+                d.detail(),
+                vec![
+                    format!(
+                        "Push the local branch (drops the {} commit(s) only on {})",
+                        d.origin_only.len(),
+                        d.remote
+                    ),
+                    format!(
+                        "Keep {} (drops the {} commit(s) only local)",
+                        d.remote,
+                        d.local_only.len()
+                    ),
+                ],
+            );
+            match Questions::open().put(&mut q) {
+                Ok(()) => {
+                    task.last_error = Some(format!("{e:#}"));
+                    task.block(vec![q.id.clone()], Some(d.summary()));
+                }
+                Err(put) => {
+                    tracing::warn!("could not file the divergence question: {put:#}");
+                    task.attempts += 1;
+                    task.fail(format!("could not start the run: {e:#}"), opts.max_attempts);
+                }
+            }
+            record(queue, task);
+            return Vec::new();
+        }
         Err(e) => {
             task.attempts += 1;
             task.fail(format!("could not start the run: {e:#}"), opts.max_attempts);

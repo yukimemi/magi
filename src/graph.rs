@@ -290,7 +290,7 @@ pub struct Runner {
 /// one can be a stale placeholder. It moves only when local is behind the remote or is an
 /// empty placeholder that diverged from it; unpushed local work is kept, and a real
 /// divergence is refused rather than guessed at.
-async fn sync_review_branch(repo: &Path, branch: &str, remote: &str) -> Result<()> {
+async fn sync_review_branch(repo: &Path, branch: &str, remote: &str, base: &str) -> Result<()> {
     let tracking = format!("{remote}/{branch}");
     let fetched = git::fetch(repo, remote, branch).await;
     let fresh = matches!(&fetched, Ok(o) if o.ok()) && git::rev_exists(repo, &tracking).await;
@@ -314,22 +314,24 @@ async fn sync_review_branch(repo: &Path, branch: &str, remote: &str) -> Result<(
         return Ok(());
     }
     if !git::is_ancestor(repo, &local_sha, &remote_sha).await {
-        // Diverged. A local tip that adds nothing over the fork point is a
-        // placeholder the remote's work replaced (a jj rewrite of the same
-        // change); anything else is local work we must not discard.
-        let mb = git::git_raw(repo, &["merge-base", &local_sha, &remote_sha]).await?;
-        let placeholder = mb.ok()
-            && git::git_raw(repo, &["diff", "--quiet", &mb.stdout, &local_sha])
-                .await?
-                .ok();
-        if !placeholder {
-            bail!(
-                "local `{branch}` ({}) and {tracking} ({}) have diverged, so it is unclear \
-                 which one to review; reconcile them, e.g. `git branch -f {branch} {tracking}` \
-                 to review the pushed work, or push the local branch first",
-                short(&local_sha),
-                short(&remote_sha)
-            );
+        // Diverged. `reconcile` settles it only when it can prove nothing is
+        // lost: a local tip that is the remote's change rebased is pushed over
+        // it (lease pinned to the tip read here), a tip whose every extra
+        // commit is empty is a placeholder the remote's work replaced, and
+        // anything else is two different changes - a question for a person.
+        match crate::reconcile::reconcile(repo, remote, branch, &local_sha, &remote_sha, base)
+            .await?
+        {
+            crate::reconcile::Reconciliation::Pushed => {
+                tracing::warn!(
+                    "local `{branch}` ({}) is {tracking} ({}) rebased; pushed it over",
+                    short(&local_sha),
+                    short(&remote_sha)
+                );
+                return Ok(());
+            }
+            crate::reconcile::Reconciliation::Placeholder => {}
+            crate::reconcile::Reconciliation::Genuine(d) => return Err((*d).into()),
         }
     }
     let out = git::git_raw(repo, &["branch", "-f", branch, &tracking]).await?;
@@ -585,7 +587,7 @@ impl Runner {
         max_parallel: usize,
         base_commit: String,
     ) -> Result<Self> {
-        sync_review_branch(repo, branch, &state.config.merge.remote).await?;
+        sync_review_branch(repo, branch, &state.config.merge.remote, &base_commit).await?;
         // The commit subjects are the closest thing to a task statement that
         // existing work carries, and the reviewers are told as much.
         let log = git::log_oneline(repo, &base_commit, branch)
@@ -3257,6 +3259,33 @@ impl Runner {
         );
         self.state.save()?;
 
+        // The remote's copy of the branch, read now and only if the fetch
+        // really succeeded (a stale tracking ref must never pin a lease). It is
+        // pushed over after a rebase only when it is a commit this branch
+        // already contains: anything else is somebody else's work.
+        let branch_tracking = format!("{remote}/{}", winner.branch);
+        let fetched_branch = git::fetch(&repo, &remote, &winner.branch).await;
+        let remote_tip = if matches!(&fetched_branch, Ok(o) if o.ok()) {
+            git::rev_parse(&repo, &branch_tracking).await.ok()
+        } else {
+            None
+        };
+        let remote_tip = match remote_tip {
+            Some(tip) if git::is_ancestor(&repo, &tip, &head).await => Some(tip),
+            Some(tip) => {
+                self.state.event(
+                    "land",
+                    format!(
+                        "{branch_tracking} ({}) is not part of {}; it will not be overwritten",
+                        short(&tip),
+                        winner.branch
+                    ),
+                );
+                None
+            }
+            None => None,
+        };
+
         let scratch = self.state.dir().join("base-sync");
         let rebased = git::rebase_branch_in_temp(&repo, &scratch, &winner.branch, &tracking).await;
         let attempts = attempts + 1;
@@ -3266,11 +3295,39 @@ impl Runner {
                 // checked out (the winner's) was not told; sync its index and
                 // files before anything reads them.
                 git::sync_to_head(&winner.worktree).await?;
+                let mut conflict = None;
+                if let Some(pinned) = &remote_tip {
+                    let pushed = git::push_pinned(&repo, &remote, &winner.branch, pinned).await;
+                    match pushed {
+                        Ok(o) if o.ok() => self.state.event(
+                            "land",
+                            format!("pushed rebased {} to {remote}", winner.branch),
+                        ),
+                        Ok(o) => {
+                            conflict = Some(format!(
+                                "rebased {} locally but {remote} refused the push (it moved                                  since {}; someone may have pushed): {}",
+                                winner.branch,
+                                short(pinned),
+                                o.stderr.chars().take(600).collect::<String>()
+                            ));
+                        }
+                        Err(e) => {
+                            conflict = Some(format!(
+                                "rebased {} locally but could not push it: {e:#}",
+                                winner.branch
+                            ));
+                        }
+                    }
+                }
+                if let Some(why) = &conflict {
+                    self.state.status = RunStatus::Blocked;
+                    self.state.event("land", why.clone());
+                }
                 self.state.base_sync = Some(BaseSync {
                     tip: tip.clone(),
                     behind: 0,
                     attempts,
-                    conflict: None,
+                    conflict,
                 });
                 self.state
                     .event("land", format!("rebased {} onto {tracking}", winner.branch));

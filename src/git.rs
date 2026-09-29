@@ -639,6 +639,40 @@ pub async fn push_rewritten(repo: &Path, remote: &str, branch: &str) -> Result<G
     git_raw(repo, &["push", "--force-with-lease", remote, branch]).await
 }
 
+/// Force-push `branch` only if `remote` still has it at `expected`.
+///
+/// The lease is pinned to a sha the caller read itself, not to whatever the
+/// remote-tracking ref says at push time: a `fetch` in between moves the
+/// tracking ref, and a bare lease would then be measured against the very
+/// commit it was meant to protect a person's push from. A remote that has
+/// moved on refuses the push, so a concurrent push fails the step instead of
+/// being lost.
+pub async fn push_pinned(
+    repo: &Path,
+    remote: &str,
+    branch: &str,
+    expected: &str,
+) -> Result<GitOut> {
+    let lease = format!("--force-with-lease=refs/heads/{branch}:{expected}");
+    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    git_raw(repo, &["push", &lease, remote, &refspec]).await
+}
+
+/// `git cherry <upstream> <head>`, split into the commits of `head` that have
+/// no patch-id twin in `upstream` (`+`) and those that do (`-`).
+pub async fn cherry(repo: &Path, upstream: &str, head: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let out = git(repo, &["cherry", upstream, head]).await?;
+    let (mut unmatched, mut matched) = (Vec::new(), Vec::new());
+    for line in out.lines() {
+        if let Some(sha) = line.strip_prefix("+ ") {
+            unmatched.push(sha.trim().to_owned());
+        } else if let Some(sha) = line.strip_prefix("- ") {
+            matched.push(sha.trim().to_owned());
+        }
+    }
+    Ok((unmatched, matched))
+}
+
 /// Rebase a branch onto `onto`, inside a throwaway worktree.
 ///
 /// A worktree of its own for two reasons. The repository magi runs in may be

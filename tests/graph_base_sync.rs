@@ -209,3 +209,48 @@ async fn a_base_that_conflicts_stops_the_run_without_a_review_round_or_a_fixer()
     );
 }
 }
+
+common::e2e! {
+async fn a_rebased_winner_is_pushed_over_the_remote_copy_magi_last_saw() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    let origin = wire_origin(&fx);
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+
+    // An earlier attempt published the branch; now the base moves.
+    let branch = runner.state.branch_for('A');
+    let base = runner.state.base_commit.clone();
+    run_git(
+        &fx.repo,
+        &["push", "-q", "origin", &format!("{base}:refs/heads/{branch}")],
+    );
+    land_on_origin(&origin.sideline, "upstream.txt", "landed meanwhile\n");
+
+    runner.execute().await.expect("execute");
+    let winner = runner.state.winner().expect("a winner");
+    assert!(
+        runner.state.base_sync.as_ref().is_some_and(|s| s.conflict.is_none()),
+        "{:?}",
+        runner.state.base_sync
+    );
+
+    let rev = |repo: &std::path::Path, r: &str| {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", r])
+            .current_dir(repo)
+            .output()
+            .expect("rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    let bare = fx.tmp.path().join("origin.git");
+    assert_eq!(
+        rev(&bare, &format!("refs/heads/{}", winner.branch)),
+        rev(&fx.repo, &format!("refs/heads/{}", winner.branch)),
+        "the rebased tip must reach the remote, not stay local"
+    );
+}
+}
