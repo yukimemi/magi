@@ -2122,9 +2122,18 @@ fn migrate_schema(mut state: RunState) -> Result<RunState> {
     if state.schema == 10 {
         state.schema = 11;
     }
-    // Schema 11 predates `driver_exited`: `false` is what an old record
-    // means, and the pid is asked as before. Only the version advances.
+    // Schema 11 predates `driver_exited`. A run that had already ended
+    // Blocked / Failed / Stalled stopped walking the graph, but its recorded
+    // pid may belong to a daemon still alive doing other work, which would pin
+    // it as running for good; those are marked exited. Any other status keeps
+    // `false`, and its pid is asked as before.
     if state.schema == 11 {
+        if matches!(
+            state.status,
+            RunStatus::Blocked | RunStatus::Failed | RunStatus::Stalled
+        ) {
+            state.driver_exited = true;
+        }
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {
@@ -2735,6 +2744,25 @@ mod tests {
         s.active
             .insert("impl-B".to_owned(), overrun_seat(now, 0, 3_600));
         assert!(!s.active_all_overrun(now));
+    }
+
+    /// A schema-11 run that ended Blocked cannot be pinned by a daemon pid
+    /// that is still alive; one still mid-walk keeps asking the pid.
+    #[test]
+    fn migrating_schema_11_marks_only_ended_runs_as_exited() {
+        for (status, exited) in [
+            (RunStatus::Blocked, true),
+            (RunStatus::Failed, true),
+            (RunStatus::Stalled, true),
+            (RunStatus::Reviewing, false),
+        ] {
+            let mut s = state();
+            s.schema = 11;
+            s.status = status;
+            let m = migrate_schema(s).unwrap();
+            assert_eq!(m.schema, SCHEMA);
+            assert_eq!(m.driver_exited, exited, "{status:?}");
+        }
     }
 
     /// A driver that recorded its own exit reads dead without its pid being
