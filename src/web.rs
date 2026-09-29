@@ -3059,6 +3059,44 @@ impl From<&stats::E2eStats> for E2eStatsView {
     }
 }
 
+/// [`crate::stats::ReleaseBumpStats`] for the wire.
+///
+/// `clean` is sent as a raw count, computed the same way
+/// [`stats::ReleaseBumpStats::clean`] computes it (`recorded -
+/// needs_attention`) — never derived client-side from `automerge_enabled`,
+/// which would misclassify a `merged_directly` bump (automerge rejected, but
+/// magi merged it directly, so no human involvement) as needing attention.
+#[derive(Debug, Serialize)]
+struct ReleaseBumpStatsView {
+    merged: usize,
+    recorded: usize,
+    pr_opened: usize,
+    automerge_enabled: usize,
+    merged_directly: usize,
+    needs_attention: usize,
+    clean: usize,
+    coverage_rate: Option<RateView>,
+    automerge_rate: Option<RateView>,
+    attention_rate: Option<RateView>,
+}
+
+impl From<&stats::ReleaseBumpStats> for ReleaseBumpStatsView {
+    fn from(b: &stats::ReleaseBumpStats) -> Self {
+        Self {
+            merged: b.merged,
+            recorded: b.recorded,
+            pr_opened: b.pr_opened,
+            automerge_enabled: b.automerge_enabled,
+            merged_directly: b.merged_directly,
+            needs_attention: b.needs_attention,
+            clean: b.clean(),
+            coverage_rate: RateView::of(b.recorded, b.merged),
+            automerge_rate: RateView::of(b.automerge_enabled, b.pr_opened),
+            attention_rate: RateView::of(b.needs_attention, b.recorded),
+        }
+    }
+}
+
 /// [`crate::queue::TaskCounts`] for the wire.
 #[derive(Debug, Serialize)]
 struct TaskCountsView {
@@ -3098,6 +3136,7 @@ struct StatsView {
     /// Highest reflection rate first, as [`stats::collect`] already sorts it.
     advisors: Vec<AdvisorStatsView>,
     e2e: E2eStatsView,
+    release_bumps: ReleaseBumpStatsView,
     queue: TaskCountsView,
     /// Same count and same meaning as [`HealthView::runs_unreadable`] - see
     /// that field's doc. Asserted to match it in
@@ -3132,6 +3171,7 @@ async fn stats_get(State(ui): State<Arc<Ui>>) -> ApiResult<Json<StatsView>> {
                 .map(AdvisorStatsView::from)
                 .collect(),
             e2e: E2eStatsView::from(&collected.e2e),
+            release_bumps: ReleaseBumpStatsView::from(&collected.release_bumps),
             queue: TaskCountsView::from(queue_counts),
             runs_unreadable: runs_unreadable(&ui.runs),
         }))
@@ -7662,6 +7702,86 @@ mod tests {
         assert_eq!(alpha["strong"], 1);
         assert_eq!(alpha["faint"], 0);
         assert_eq!(alpha["reflection_rate"]["pct"], 100.0);
+    }
+
+    #[tokio::test]
+    async fn stats_release_bumps_split_clean_from_attention() {
+        use crate::run::ReleaseBump;
+
+        let f = Fixture::start().await;
+
+        let mut clean = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        );
+        clean.id = "20260902-140501-a".to_owned();
+        clean.status = RunStatus::Merged;
+        clean.release_bump = Some(ReleaseBump {
+            pr_url: Some("https://github.com/o/r/pull/1".to_owned()),
+            version: Some("1.0.0".to_owned()),
+            automerge_enabled: true,
+            merged_directly: false,
+            problem: None,
+            action_required: None,
+        });
+
+        let mut blocked = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        );
+        blocked.id = "20260902-140502-b".to_owned();
+        blocked.status = RunStatus::Merged;
+        blocked.release_bump = Some(ReleaseBump {
+            pr_url: Some("https://github.com/o/r/pull/2".to_owned()),
+            version: Some("1.0.1".to_owned()),
+            automerge_enabled: false,
+            merged_directly: false,
+            problem: Some("checks red".to_owned()),
+            action_required: Some("look at the PR".to_owned()),
+        });
+
+        for state in [&clean, &blocked] {
+            let dir = f.runs().join(&state.id);
+            std::fs::create_dir_all(&dir).expect("run dir");
+            std::fs::write(
+                dir.join("run.json"),
+                serde_json::to_string_pretty(state).expect("serialize run"),
+            )
+            .expect("write run.json");
+        }
+
+        let bumps = f.get("/api/stats").await.json()["release_bumps"].clone();
+        assert_eq!(bumps["merged"], 2);
+        assert_eq!(bumps["recorded"], 2);
+        assert_eq!(bumps["pr_opened"], 2);
+        assert_eq!(bumps["automerge_enabled"], 1);
+        assert_eq!(bumps["needs_attention"], 1);
+        assert_eq!(bumps["clean"], 1);
+        assert_eq!(bumps["coverage_rate"]["pct"], 100.0);
+        assert_eq!(bumps["attention_rate"]["pct"], 50.0);
+    }
+
+    #[tokio::test]
+    async fn stats_release_bumps_rates_are_null_with_nothing_recorded() {
+        let f = Fixture::start().await;
+        write_run(&f.runs(), "20260902-140501-a", RunStatus::Merged);
+
+        let bumps = f.get("/api/stats").await.json()["release_bumps"].clone();
+        assert_eq!(bumps["merged"], 1);
+        assert_eq!(bumps["recorded"], 0);
+        // `merged` is nonzero, so coverage still reads as a real 0%, not an
+        // absent rate - "0 of 1 merged runs" is a fact, not a missing value.
+        assert_eq!(bumps["coverage_rate"]["pct"], 0.0);
+        // `pr_opened` and `recorded` are both zero here, so these rates have
+        // no denominator to compute from and must be null.
+        assert_eq!(bumps["automerge_rate"], Value::Null);
+        assert_eq!(bumps["attention_rate"], Value::Null);
     }
 
     #[tokio::test]

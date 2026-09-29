@@ -2549,6 +2549,7 @@ function renderStats() {
     renderStatsAgents(s.agents);
     renderStatsReviewers(s.reviewers);
     renderStatsAdvisors(s.advisors);
+    renderStatsBumps(s.release_bumps);
   }
   renderStatsQueue(s.queue);
 }
@@ -2680,6 +2681,26 @@ function renderStatsAdvisors(advisors) {
     fraction: `${a.strong}/${a.proposed} strong (${a.seated} seats · ${a.faint} faint · ${a.absent} no proposal)`,
     rate: a.reflection_rate,
   })));
+}
+
+/* Hidden entirely when `recorded` is zero - a repository that never uses
+   the release-bump step (or hasn't merged anything yet) should read as
+   "nothing to show", not as "every bump failed" from a row of zeroes. */
+function renderStatsBumps(b) {
+  show($("stats-bumps-panel"), b.recorded > 0);
+  if (b.recorded === 0) return;
+  const root = $("stats-bumps-tiles");
+  clear(root);
+  root.append(
+    statsTile("Recorded", `${b.recorded}/${b.merged}`, "blue"),
+    statsTile("Coverage", statsPct(b.coverage_rate), "blue"),
+    statsTile("PR opened", b.pr_opened, "blue"),
+    statsTile("Automerge enabled", b.automerge_enabled, "teal"),
+    statsTile("Merged directly", b.merged_directly, "teal"),
+    statsTile("Clean", b.clean, "gold"),
+    statsTile("Needs a human", b.needs_attention, "rust"),
+    statsTile("Attention rate", statsPct(b.attention_rate), "rust"),
+  );
 }
 
 function renderStatsQueue(q) {

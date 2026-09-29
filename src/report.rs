@@ -1214,6 +1214,33 @@ pub fn stats(stats: &Stats) -> String {
         }
     }
 
+    if stats.release_bumps.recorded > 0 {
+        let b = &stats.release_bumps;
+        let _ = writeln!(s, "\n{}", bold("release bumps"));
+        let _ = writeln!(
+            s,
+            "  {} of {} merged run(s) recorded a bump ({:.0}%)",
+            b.recorded,
+            b.merged,
+            b.coverage_rate()
+        );
+        let _ = writeln!(
+            s,
+            "  {} release PR(s) opened, {} automerge enabled ({:.0}%), {} merged directly",
+            b.pr_opened,
+            b.automerge_enabled,
+            b.automerge_rate(),
+            b.merged_directly
+        );
+        let _ = writeln!(
+            s,
+            "  {} clean, {} needed a human ({:.0}%)",
+            b.clean(),
+            b.needs_attention,
+            b.attention_rate()
+        );
+    }
+
     if stats.e2e.rounds > 0 || stats.e2e.deferred > 0 {
         let _ = writeln!(s, "\n{}", bold("verification"));
         let _ = writeln!(
