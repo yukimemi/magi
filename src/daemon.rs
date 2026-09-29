@@ -1971,6 +1971,10 @@ async fn poll(
         let finished: Vec<Task> = finished_tasks(queue)
             .into_iter()
             .filter(|task| !stalled_ids.contains(&task.id))
+            // A parked run is waiting for this loop, not for a decision: the
+            // conductor must not get to hold it or requeue it (a requeue
+            // sets `fresh_start` and re-competes) before `attempt` resumes.
+            .filter(|task| !awaiting_resume_with(task, |id| RunState::load_under(id, home)))
             .collect();
         let queued = queued_tasks(queue);
         // An empty queue has nothing to arrange. In particular, do not let
@@ -2999,6 +3003,28 @@ where
             None
         }
     }
+}
+
+/// Is `task` a failed task whose last run was parked at a node boundary, so
+/// that [`attempt`] will resume it on its own?
+///
+/// Mirrors [`unfinished_run_with`]'s own conditions (plus `parked`, and no
+/// pending review choice, which [`choose_starter`] ranks first). Pure, with an
+/// injected reader like its sibling. An unreadable run is not awaiting
+/// anything: it keeps going to the conductor as before.
+fn awaiting_resume_with<F>(task: &Task, load: F) -> bool
+where
+    F: FnOnce(&str) -> Result<RunState>,
+{
+    if task.status != TaskStatus::Failed || task.fresh_start || task.review_branch.is_some() {
+        return false;
+    }
+    let Some(id) = task.runs.last() else {
+        return false;
+    };
+    load(id).is_ok_and(|s| {
+        s.parked && s.status.resumable() && !s.released() && !exhausted_review_budget(&s)
+    })
 }
 
 /// Which of the three ways [`attempt`] can mint or continue a run this task
@@ -6757,6 +6783,54 @@ mod tests {
             reconsideration: Vec::new(),
             verdict: None,
         }
+    }
+
+    #[test]
+    fn awaiting_resume_is_a_failed_task_whose_last_run_parked_and_can_be_resumed() {
+        let mut run = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234def".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        run.status = RunStatus::Judging;
+        run.parked = true;
+        let mut task = Task::new(
+            "add retries".to_owned(),
+            "add retries".to_owned(),
+            PathBuf::from("/repo"),
+            crate::queue::Source::Human,
+        );
+        task.status = TaskStatus::Failed;
+        task.runs = vec![run.id.clone()];
+        let with = |t: &Task, r: &RunState| awaiting_resume_with(t, |_| Ok(r.clone()));
+        assert!(with(&task, &run), "parked after judging is the case");
+
+        let mut not_parked = run.clone();
+        not_parked.parked = false;
+        not_parked.status = RunStatus::Stalled;
+        assert!(!with(&task, &not_parked), "a stall is the conductor's");
+
+        let mut fresh = task.clone();
+        fresh.fresh_start = true;
+        assert!(!with(&fresh, &run), "a requeue asked for a new competition");
+
+        let mut review = task.clone();
+        review.review_branch = Some("magi/x/A".to_owned());
+        assert!(!with(&review, &run), "review is ranked before resume");
+
+        let mut held = task.clone();
+        held.status = TaskStatus::Held;
+        assert!(!with(&held, &run), "a hold stays visible to the conductor");
+
+        let mut released = run.clone();
+        released.released_to = Some("20260901-000000-new1".to_owned());
+        assert!(!with(&task, &released), "nothing left to resume into");
+
+        assert!(!awaiting_resume_with(&task, |_| anyhow::bail!(
+            "unreadable"
+        )));
     }
 
     #[test]

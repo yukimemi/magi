@@ -156,6 +156,21 @@ has() { case "$prompt" in *"$1"*) return 0 ;; esac; return 1; }
 printf '%s %s %s\n' "$MAGI_RUN" "$MAGI_NODE" "$seat" \
   >> "$(dirname "$p")/attribution.log"
 
+# The conductor (`conduct::NODE`). With `MOCK_CONDUCT_LOG` set it records that
+# it was consulted and answers the worst case: hold every task id it was shown.
+# A test that must keep the conductor away from a task asserts on the log.
+if [ "$MAGI_NODE" = "conduct" ] && [ -n "$MOCK_CONDUCT_LOG" ]; then
+  echo "$seat" >> "$MOCK_CONDUCT_LOG"
+  ids=$(printf '%s' "$prompt" | grep -o '[0-9]\{8\}-[0-9]\{6\}-[0-9a-f]\{4\}' | sort -u || true)
+  out=""; sep=""
+  for id in $ids; do
+    out="$out$sep{\"id\":\"$id\",\"recovery\":\"hold\",\"reason\":\"mock conductor holds\"}"
+    sep=","
+  done
+  printf '{"decisions":[%s]}\n' "$out"
+  exit 0
+fi
+
 # The daemon waiter resuming a seat whose `magi ask` is gone
 # (`prompt::question_resumed`). Records that the seat was resumed, and answers
 # in prose - not through `magi ask --thread` - so the waiter has to keep the
@@ -170,10 +185,11 @@ fi
 # requested": a matching implement seat writes a `started-<seat>` marker,
 # proof the caller can wait on that this process has actually begun, then
 # blocks until a `release-<seat>` marker appears before falling through to
-# the ordinary implementation branch below. Bounded to five seconds of
+# the ordinary implementation branch below. `MOCK_BLOCK_NODE` names another
+# node (say `judge`) to block instead of `implement`. Bounded to five seconds of
 # polling so a test bug fails fast instead of hanging the suite; an ordinary
 # test releases it within milliseconds of seeing the marker.
-if [ -n "$MOCK_BLOCK_SEAT" ] && [ "$MAGI_NODE" = "implement" ] && { case ",$MOCK_BLOCK_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+if [ -n "$MOCK_BLOCK_SEAT" ] && [ "$MAGI_NODE" = "${MOCK_BLOCK_NODE:-implement}" ] && { case ",$MOCK_BLOCK_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
   : > "$MOCK_BLOCK_DIR/started-$seat"
   i=0
   while [ ! -f "$MOCK_BLOCK_DIR/release-$seat" ] && [ "$i" -lt 500 ]; do
