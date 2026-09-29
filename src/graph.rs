@@ -527,7 +527,6 @@ impl Runner {
                 missing.join(", ")
             );
         }
-        sync_review_branch(&repo, branch, &config.merge.remote).await?;
         let base_branch = match config.merge.base.clone() {
             Some(b) => b,
             None => git::current_branch(&repo)
@@ -541,9 +540,55 @@ impl Runner {
 
         let roles = config.resolve_roles()?;
         let max_parallel = config.graph.max_parallel.max(1);
+        let mut state = RunState::new(
+            repo.clone(),
+            base_branch,
+            base_commit.clone(),
+            String::new(),
+            config,
+        );
+
+        // Released before anything else touches the branch: a stale local
+        // branch is moved with `git branch -f`, which git refuses while an
+        // earlier attempt's worktree still has it checked out. Everything
+        // after this point that can fail puts the old run back.
+        let released = match &takeover {
+            Some(takeover) => crate::handover::release(&repo, branch, &state.id, takeover).await?,
+            None => None,
+        };
+        if let Some(released) = &released {
+            state.event(
+                "release",
+                format!(
+                    "took `{branch}` over from run {}: its worktree was released",
+                    crate::run::short_of(&released.old_id)
+                ),
+            );
+        }
+        let opened =
+            Self::open_review(&repo, branch, state, roles, max_parallel, base_commit).await;
+        if opened.is_err()
+            && let Some(released) = &released
+        {
+            released.restore(&repo, branch).await;
+        }
+        opened
+    }
+
+    /// The half of [`Runner::review_taking_over`] that can fail after an
+    /// earlier attempt's worktree was released.
+    async fn open_review(
+        repo: &Path,
+        branch: &str,
+        mut state: RunState,
+        roles: ResolvedRoles,
+        max_parallel: usize,
+        base_commit: String,
+    ) -> Result<Self> {
+        sync_review_branch(repo, branch, &state.config.merge.remote).await?;
         // The commit subjects are the closest thing to a task statement that
         // existing work carries, and the reviewers are told as much.
-        let log = git::log_oneline(&repo, &base_commit, branch)
+        let log = git::log_oneline(repo, &base_commit, branch)
             .await
             .unwrap_or_default();
         let instruction = format!(
@@ -556,13 +601,7 @@ impl Runner {
                 log.trim()
             }
         );
-        let mut state = RunState::new(
-            repo.clone(),
-            base_branch,
-            base_commit.clone(),
-            instruction,
-            config,
-        );
+        state.instruction = instruction;
 
         // An attached worktree, so the fixer's commits land on the branch under
         // review rather than on a detached head nobody will look at again.
@@ -571,18 +610,7 @@ impl Runner {
             tokio::fs::create_dir_all(parent).await.ok();
         }
         let path = worktree.to_string_lossy().to_string();
-        if let Some(takeover) = &takeover
-            && let Some(old) = crate::handover::release(&repo, branch, &state.id, takeover).await?
-        {
-            state.event(
-                "release",
-                format!(
-                    "took `{branch}` over from run {}: its worktree was released",
-                    crate::run::short_of(&old)
-                ),
-            );
-        }
-        git::git(&repo, &["worktree", "add", &path, branch])
+        git::git(repo, &["worktree", "add", &path, branch])
             .await
             .with_context(|| {
                 format!("checking out `{branch}` at {path} (is it checked out elsewhere?)")
@@ -592,7 +620,7 @@ impl Runner {
             .await
             .unwrap_or(0);
         if commits == 0 {
-            git::worktree_remove(&repo, &worktree).await.ok();
+            git::worktree_remove(repo, &worktree).await.ok();
             bail!("`{branch}` has no commits beyond {}", short(&base_commit));
         }
         let files = git::changed_files(&worktree, &base_commit, "HEAD")
@@ -607,7 +635,7 @@ impl Runner {
             && head_tree == base_tree
         {
             let head = git::rev_parse(&worktree, "HEAD").await.unwrap_or_default();
-            git::worktree_remove(&repo, &worktree).await.ok();
+            git::worktree_remove(repo, &worktree).await.ok();
             bail!(
                 "`{branch}` at {} has a tree identical to base {}; this usually means \
                  the branch ref is stale (check `git rev-parse refs/heads/{branch}` \

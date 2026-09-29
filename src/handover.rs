@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::git;
 use crate::run::{Liveness, RunState, RunStatus};
@@ -35,6 +35,60 @@ pub struct Takeover {
     pub home: PathBuf,
 }
 
+/// The operator has to decide: the takeover was refused, and the text says why.
+///
+/// A distinct type so the queue loop can hold the task for a person instead
+/// of spending an attempt on it (see `daemon::attempt`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// A worktree that was released, with what is needed to put it back if the
+/// review that took the branch over never starts.
+#[derive(Debug, Clone)]
+pub struct Released {
+    /// The run whose worktree was released.
+    pub old_id: String,
+    index: usize,
+    path: PathBuf,
+    home: PathBuf,
+}
+
+impl Released {
+    /// Undo the release after the new run failed to start: check the branch
+    /// out again at the old path and unmark the old run. Best-effort - if the
+    /// worktree cannot be re-added the old run stays marked, which is true.
+    pub async fn restore(&self, repo: &Path, branch: &str) {
+        let path = self.path.to_string_lossy().to_string();
+        if let Err(e) = git::git(repo, &["worktree", "add", &path, branch]).await {
+            tracing::warn!(
+                "could not put run {}'s worktree back at {path}: {e:#}",
+                self.old_id
+            );
+            return;
+        }
+        let put_back = RunState::load_under(&self.old_id, &self.home).and_then(|mut s| {
+            if let Some(c) = s.candidates.get_mut(self.index) {
+                c.folded = false;
+            }
+            s.released_to = None;
+            s.released_branches.retain(|b| b != branch);
+            s.events.pop();
+            s.save_under(&self.home)
+        });
+        if let Err(e) = put_back {
+            tracing::warn!("could not unmark run {}: {e:#}", self.old_id);
+        }
+    }
+}
+
 /// What is known about the run and worktree holding the branch.
 #[derive(Debug, Clone)]
 pub struct Holder {
@@ -44,6 +98,9 @@ pub struct Holder {
     pub status: RunStatus,
     /// Whether anything is driving it.
     pub liveness: Liveness,
+    /// A driver pid is recorded but could not be shown dead: it may well be
+    /// running, so "unknown" must not read as "gone".
+    pub driver_unproven: bool,
     /// Any uncommitted change, untracked files included.
     pub dirty: bool,
     /// HEAD of the worktree.
@@ -71,9 +128,9 @@ fn short(sha: &str) -> String {
 
 /// Whether `holder`'s worktree may be released to a new run.
 ///
-/// [`Liveness::Unknown`] releases: it means no daemon claims the run and its
-/// driver could not be proven alive, which is exactly what a stale run whose
-/// driver died looks like. Only a *proven* live run is refused.
+/// [`Liveness::Unknown`] releases only when no driver pid was ever recorded
+/// (nothing that could still be running); a recorded pid that could not be
+/// shown dead is refused like a live one.
 pub fn decide(superseded: bool, holder: &Holder) -> Decision {
     if !superseded {
         return Decision::NotOurs;
@@ -81,6 +138,8 @@ pub fn decide(superseded: bool, holder: &Holder) -> Decision {
     let mut why = Vec::new();
     if holder.liveness == Liveness::Live {
         why.push("that run is being worked on right now".to_owned());
+    } else if holder.driver_unproven {
+        why.push("its driver process could not be shown to be gone".to_owned());
     }
     if holder.dirty {
         why.push("its worktree has uncommitted changes".to_owned());
@@ -113,10 +172,12 @@ async fn inspect(
     home: &Path,
 ) -> Result<Holder> {
     let claimed = crate::daemon::is_working_on(home, &state.id, jiff::Timestamp::now());
+    let liveness = state.liveness(claimed);
     Ok(Holder {
         run: state.id.clone(),
         status: state.status,
-        liveness: state.liveness(claimed),
+        liveness,
+        driver_unproven: liveness == Liveness::Unknown && state.driver_pid.is_some(),
         dirty: !git::status_porcelain(path).await?.trim().is_empty(),
         head: git::rev_parse(path, "HEAD").await?,
         tip: git::rev_parse(repo, &format!("refs/heads/{branch}")).await?,
@@ -130,7 +191,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 /// Release the worktree holding `branch` to `new_run`, when an earlier attempt
 /// at the same task holds it and it is safe. Returns the run whose worktree
-/// was released, or `None` when nothing needed (or was allowed) to happen.
+/// was released (see [`Released`]), or `None` when nothing needed (or was allowed) to happen.
 ///
 /// An `Err` is a refusal or a failed removal; the message is what the
 /// operator reads. Nothing is left half-done: the old run's record is written
@@ -140,7 +201,7 @@ pub async fn release(
     branch: &str,
     new_run: &str,
     takeover: &Takeover,
-) -> Result<Option<String>> {
+) -> Result<Option<Released>> {
     let Some(path) = git::worktree_holding(repo, branch).await? else {
         return Ok(None);
     };
@@ -161,18 +222,28 @@ pub async fn release(
         }
     }
     let Some((mut state, index)) = owner else {
-        return Ok(None);
+        return Err(Refused(format!(
+            "branch `{branch}` is checked out in {}, which is not a worktree of an earlier \
+             attempt at this task (a run of another task, or one made by hand), so it was \
+             not touched. Remove that worktree (`git worktree remove`) if it is not needed, \
+             and try again.",
+            path.display()
+        ))
+        .into());
     };
 
     let holder = inspect(repo, branch, &path, &state, &takeover.home).await?;
     match decide(true, &holder) {
         Decision::NotOurs => return Ok(None),
-        Decision::Refuse(why) => bail!(
-            "branch `{branch}` is checked out in {}: {why}. Commit or discard the work there \
-             and remove that worktree (`git worktree remove`), or say the run may be \
-             discarded, and try again.",
-            path.display()
-        ),
+        Decision::Refuse(why) => {
+            return Err(Refused(format!(
+                "branch `{branch}` is checked out in {}: {why}. Commit or discard the work \
+                 there and remove that worktree (`git worktree remove`), or say the run may be \
+                 discarded, and try again.",
+                path.display()
+            ))
+            .into());
+        }
         Decision::Release => {}
     }
 
@@ -192,13 +263,16 @@ pub async fn release(
     );
     state.save_under(&takeover.home)?;
 
-    // Re-read right before the removal: `worktree_remove` is `--force`, so
-    // anything that changed since the first look (a driver coming back, an
-    // edit) would be thrown away. Ignored files such as `target/` go with the
-    // worktree by design.
+    // Re-read right before the removal for the driver and the tip, and let git
+    // itself refuse a dirty worktree: the removal is *not* `--force`, so an
+    // edit made after the first look is refused rather than thrown away.
+    // Ignored files such as `target/` go with the worktree by design.
     let again = inspect(repo, branch, &path, &state, &takeover.home).await;
     let safe = matches!(&again, Ok(h) if decide(true, h) == Decision::Release);
-    let removed = safe && git::worktree_remove(repo, &path).await.unwrap_or(false);
+    let removed = safe
+        && git::worktree_remove_clean(repo, &path)
+            .await
+            .unwrap_or(false);
     if !removed || path.exists() {
         state = RunState::load_under(&old_id, &takeover.home)?;
         state.candidates[index].folded = false;
@@ -206,14 +280,21 @@ pub async fn release(
         state.released_branches.retain(|b| b != branch);
         state.events.pop();
         state.save_under(&takeover.home)?;
-        bail!(
+        return Err(Refused(format!(
             "branch `{branch}` is checked out in {} by run {}, and releasing that worktree \
-             failed or found it changed; it was left as it was",
+             failed or found it changed (git refuses to remove a worktree with uncommitted \
+             changes); it was left as it was",
             path.display(),
             crate::run::short_of(&old_id)
-        );
+        ))
+        .into());
     }
-    Ok(Some(old_id))
+    Ok(Some(Released {
+        old_id,
+        index,
+        path,
+        home: takeover.home.clone(),
+    }))
 }
 
 #[cfg(test)]
@@ -225,6 +306,7 @@ mod tests {
             run: "20260901-000000-f82f".to_owned(),
             status: RunStatus::Gating,
             liveness: Liveness::Unknown,
+            driver_unproven: false,
             dirty: false,
             head: "a".repeat(40),
             tip: "a".repeat(40),
@@ -269,6 +351,18 @@ mod tests {
             panic!("live must be refused");
         };
         assert!(why.contains("right now"), "{why}");
+    }
+
+    #[test]
+    fn a_driver_that_could_not_be_shown_dead_is_refused() {
+        let unproven = Holder {
+            driver_unproven: true,
+            ..holder()
+        };
+        let Decision::Refuse(why) = decide(true, &unproven) else {
+            panic!("an unproven driver must be refused");
+        };
+        assert!(why.contains("driver"), "{why}");
     }
 
     #[test]

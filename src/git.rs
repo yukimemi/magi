@@ -165,6 +165,14 @@ pub async fn worktree_remove(repo: &Path, path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Remove a worktree only if git finds it clean: no `--force`, so a change
+/// made after the caller last looked is refused rather than thrown away.
+/// Ignored files (`target/`) do not count as changes and go with it.
+pub async fn worktree_remove_clean(repo: &Path, path: &Path) -> Result<bool> {
+    let path_s = path.to_string_lossy().to_string();
+    Ok(git_raw(repo, &["worktree", "remove", &path_s]).await?.ok())
+}
+
 /// Unregister a linked worktree whose directory is about to be deleted by
 /// hand, so the path can be `worktree add`-ed again.
 ///

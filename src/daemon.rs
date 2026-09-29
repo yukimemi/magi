@@ -2336,6 +2336,30 @@ async fn attempt(
     };
     let mut runner = match started {
         Ok(r) => r,
+        // A branch an earlier attempt still holds and magi will not release
+        // by itself is the operator's call, not a failed attempt: hold the
+        // task with the reason, spend nothing, and say so on the bell.
+        Err(e) if e.downcast_ref::<crate::handover::Refused>().is_some() => {
+            let reason = format!("could not start the run: {e:#}");
+            task.last_error = Some(reason.clone());
+            task.hold_machine(Some(reason));
+            record(queue, task);
+            tracing::warn!(
+                "holding {} for a branch it cannot take over: {e:#}",
+                task.short()
+            );
+            // Stable wording; the specifics live in the task's hold reason.
+            notices::raise(
+                Notice::warn(
+                    &format!("handover:{}", task.id),
+                    "A task was held because an earlier attempt still has its branch checked out; see the task's hold reason, then release it from the queue.",
+                )
+                .link(Link::Task {
+                    id: task.id.clone(),
+                }),
+            );
+            return Vec::new();
+        }
         Err(e) => {
             task.attempts += 1;
             task.fail(format!("could not start the run: {e:#}"), opts.max_attempts);

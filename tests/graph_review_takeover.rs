@@ -140,6 +140,10 @@ async fn a_dirty_worktree_is_refused_and_left_alone() {
     .err()
     .expect("a dirty worktree must be refused");
 
+    assert!(
+        err.downcast_ref::<magi::handover::Refused>().is_some(),
+        "a refusal is typed so the queue holds the task instead of failing it"
+    );
     let text = format!("{err:#}");
     assert!(text.contains("uncommitted"), "{text}");
     assert!(text.contains("dirty") && text.contains("gating"), "{text}");
