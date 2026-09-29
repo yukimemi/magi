@@ -484,7 +484,14 @@ const state = {
      when nothing is picked. Lives only in memory — reloading the page always
      starts from the unfiltered list, since a filter is a lens on what's on
      screen right now, not a saved view. */
-  runsFilter: { section: null, repo: null },
+  /* `status`, when set, narrows to one exact RunStatus string (e.g.
+     "merged") regardless of section/repo — set by openRunsFiltered(), the
+     stats page's KPI tiles' way of landing on the Runs view already
+     narrowed to the bucket that was tapped. Independent of section/repo:
+     picking a tree node or a stats tile each replace the other's pick
+     rather than combining with it, so there is never a "these two disagree"
+     empty state to explain. */
+  runsFilter: { section: null, repo: null, status: null },
   /* Which state chip is picked above the Runs list. Lives only in memory for
      the same reason runsFilter does — a reload always starts from "active"
      rather than remembering "done" was picked last, since the whole point is
@@ -524,6 +531,14 @@ const state = {
      actually loaded, so a notification tapped before boot finishes still
      lands on its card once loadQueue() comes back. */
   queueFocus: null,
+  /* A QUEUE_SECTIONS key to expand and scroll into view the moment the
+     Backlog can show it - set by openQueueSectionFocus() (a stats queue
+     tile's own navigation) and consumed once by consumeQueueSectionFocus(),
+     which renderQueue() calls on every pass. Mirrors queueFocus above,
+     including staying set until state.queue has loaded and surviving the
+     stale-search-clear recursion - only cleared right before
+     revealQueueSection() actually runs. */
+  queueSectionFocus: null,
   detail: { id: null, run: null, report: null },
   questions: null,
   /* The last /api/notifications answer: { unread, items }. */
@@ -1457,6 +1472,16 @@ function sectionCompatibleWithStateFilter(sectionKey, filterKey) {
   return REPRESENTATIVE_RUN_SHAPES.some((run) => runSection(run) === sectionKey && filter.match(run));
 }
 
+/* Same idea as sectionCompatibleWithStateFilter, for the exact-status lens a
+   stats tile can set (see openRunsFiltered): "Merged" is done by
+   construction, so pairing it with "Active" or "In flight" always yields
+   zero cards the same way "Landed" does. */
+function statusCompatibleWithStateFilter(status, filterKey) {
+  const filter = RUN_STATE_FILTERS.find((f) => f.key === filterKey);
+  if (!filter) return true;
+  return REPRESENTATIVE_RUN_SHAPES.some((run) => run.status === status && filter.match(run));
+}
+
 /* A head that still names a `superseded_by` (see foldRuns below) is one
    whose successor fell outside the page /api/runs returned, so it could not
    be folded under a newer card — it is genuinely an old attempt, just one
@@ -1479,7 +1504,14 @@ function selectRunStateFilter(key) {
      cards with no way to tell why, so the now-stale tree pick is dropped
      rather than fought over. */
   if (state.runsFilter.section && !sectionCompatibleWithStateFilter(state.runsFilter.section, key)) {
-    state.runsFilter = { section: null, repo: null };
+    state.runsFilter = { ...state.runsFilter, section: null, repo: null };
+  }
+  /* Same guard for the exact-status lens a stats tile may have set (see
+     openRunsFiltered and statusCompatibleWithStateFilter) — e.g. "Merged"
+     (done by construction) paired with "Active" (not done) can never show a
+     card either. */
+  if (state.runsFilter.status && !statusCompatibleWithStateFilter(state.runsFilter.status, key)) {
+    state.runsFilter = { ...state.runsFilter, status: null };
   }
   renderRuns();
 }
@@ -1609,19 +1641,27 @@ function buildRunsTree(bySection) {
   return sections;
 }
 
-/* Only ever one filter active at a time: a section, or a section plus one of
-   its repos. There is no URL for it \u2014 the tree is a lens on the list
-   already on screen, not a place worth deep-linking to. */
+/* Two independent lenses ANDed together: a section (\u00b1 repo) from the
+   tree, and an exact status from a stats tile (see openRunsFiltered).
+   Picking either through its own UI (selectRunsFilter, openRunsFiltered)
+   replaces the whole state.runsFilter rather than merging into it, so the
+   two never end up disagreeing with no way for the operator to tell why.
+   There is no URL for any of this \u2014 it is a lens on the list already on
+   screen, not a place worth deep-linking to. */
 function matchesFilter(run) {
-  const { section, repo } = state.runsFilter;
+  const { section, repo, status } = state.runsFilter;
+  if (status && String(run.status || "") !== status) return false;
   if (!section) return true;
   if (runSection(run) !== section) return false;
   return !repo || repoLabel(run) === repo;
 }
 
 function selectRunsFilter(section, repo) {
-  const same = state.runsFilter.section === section && state.runsFilter.repo === (repo || null);
-  state.runsFilter = same ? { section: null, repo: null } : { section, repo: repo || null };
+  const same = state.runsFilter.section === section && state.runsFilter.repo === (repo || null)
+    && !state.runsFilter.status;
+  state.runsFilter = same
+    ? { section: null, repo: null, status: null }
+    : { section, repo: repo || null, status: null };
   /* Mirrors the guard in selectRunStateFilter: a chip picked earlier (e.g.
      "Active") can be incompatible with the newly picked section (e.g.
      "Landed", which is done by construction). Left alone that combination
@@ -1634,8 +1674,34 @@ function selectRunsFilter(section, repo) {
   renderRuns();
 }
 
+/* Stats-tile navigation into the Runs view: sets the exact-status lens and
+   drops section/repo (the two are never combined - see matchesFilter's own
+   comment) and always resets the state chip to "all", since a tile counts
+   every run in that status regardless of whether it is currently in flight,
+   waiting, or done, and the chip would otherwise silently hide the very
+   runs the tile promised to show.
+
+   applyRoute() only flips which view is visible - it does not itself
+   re-render the Runs list (that only happens from loadRuns()/the SSE poll,
+   since ordinarily nothing about the already-rendered cards has changed by
+   the time a plain #runs navigation lands). Here state.runsFilter *has*
+   just changed, so applyRoute() alone would leave last render's cards on
+   screen until the next poll. applyRoute() is still called explicitly
+   (rather than left to the hashchange listener) so the view flips
+   synchronously even when the hash string itself doesn't change - e.g.
+   tapping a tile while the Runs view happens to already be open, which
+   fires no hashchange event at all - and renderRuns() is what actually
+   redraws the list either way. */
+function openRunsFiltered(status) {
+  state.runsStateFilter = "all";
+  state.runsFilter = { section: null, repo: null, status };
+  location.hash = "#runs";
+  applyRoute();
+  renderRuns();
+}
+
 function clearRunsFilter() {
-  state.runsFilter = { section: null, repo: null };
+  state.runsFilter = { section: null, repo: null, status: null };
   renderRuns();
 }
 
@@ -1703,13 +1769,24 @@ function renderRunsTree(sections) {
 
 function renderRunsFilterBar() {
   const bar = $("runs-filter");
-  const { section, repo } = state.runsFilter;
-  if (!section) {
+  const { section, repo, status } = state.runsFilter;
+  if (!section && !status) {
     show(bar, false);
     return;
   }
-  const label = (RUN_SECTIONS.find((s) => s.key === section) || {}).label || section;
-  setText($("runs-filter-text"), `Showing ${label}${repo ? ` \u203a ${repo}` : ""}.`);
+  const parts = [];
+  if (section) {
+    const label = (RUN_SECTIONS.find((s) => s.key === section) || {}).label || section;
+    parts.push(repo ? `${label} \u203a ${repo}` : label);
+  }
+  // STATS_VERDICT_BUCKETS is declared further down the file, but this only
+  // ever runs from a render call, by which point the whole module has
+  // already been evaluated once.
+  if (status) {
+    const bucket = STATS_VERDICT_BUCKETS.find((b) => b.key === status);
+    parts.push(bucket ? bucket.label : status);
+  }
+  setText($("runs-filter-text"), `Showing ${parts.join(" + ")}.`);
   show(bar, true);
 }
 
@@ -1942,7 +2019,12 @@ function renderRuns() {
   // filter's empty state below, which only fires once the state filter has
   // already left something on the table for the tree to narrow further.
   show($("runs-state-empty"), runs.length > 0 && stateFiltered.length === 0);
-  show($("runs-filter-empty"), stateFiltered.length > 0 && Boolean(state.runsFilter.section) && visible.length === 0);
+  show(
+    $("runs-filter-empty"),
+    stateFiltered.length > 0
+      && Boolean(state.runsFilter.section || state.runsFilter.status)
+      && visible.length === 0,
+  );
 }
 
 /* ---- queue ------------------------------------------------------------- */
@@ -2582,12 +2664,30 @@ function renderStatsRepoSelector(repos, selected) {
   root.onchange = () => selectStatsRepo(root.value);
 }
 
-function statsTile(label, value, tone) {
-  return el(
-    "div",
-    { class: "stats-tile", "data-tone": tone || null },
+/* `activate`, when given, turns the tile into a real <button> - not a div
+   with an onclick, so it is reachable by keyboard and announced as a button
+   by a screen reader - carrying its own aria-label rather than relying on
+   the value/label text nodes alone, since "3 · MERGED" read literally is not
+   a sentence. A tile with no `activate` (Completion, the bump/agent/reviewer
+   panels) stays the plain, inert div it always was. */
+function statsTile(label, value, tone, activate) {
+  const kids = [
     el("span", { class: "stats-tile-value", text: String(value) }),
     el("span", { class: "stats-tile-label", text: label }),
+  ];
+  if (!activate) {
+    return el("div", { class: "stats-tile", "data-tone": tone || null }, ...kids);
+  }
+  return el(
+    "button",
+    {
+      class: "stats-tile",
+      type: "button",
+      "data-tone": tone || null,
+      "aria-label": activate.ariaLabel,
+      onclick: activate.onClick,
+    },
+    ...kids,
   );
 }
 
@@ -2599,15 +2699,26 @@ function statsPct(rate) {
   return rate ? `${Math.round(rate.pct)}%` : "—";
 }
 
+/* Every tile but Completion names an exact RunStatus and jumps to the Runs
+   view narrowed to it (see openRunsFiltered); Completion is a rate, not a
+   bucket of runs, so there is nothing for it to navigate to and it stays a
+   plain tile. */
 function renderStatsTiles(t) {
   const root = $("stats-kpis");
   clear(root);
+  const statusTile = (label, value, tone, status) => statsTile(label, value, tone, {
+    onClick: () => openRunsFiltered(status),
+    ariaLabel: `Show ${value} ${label.toLowerCase()} runs`,
+  });
   root.append(
-    statsTile("Total runs", t.runs),
-    statsTile("Merged", t.merged, "gold"),
-    statsTile("Ready", t.ready, "teal"),
-    statsTile("Blocked", t.blocked, "rust"),
-    statsTile("Stalled", t.stalled, "rust"),
+    statsTile("Total runs", t.runs, null, {
+      onClick: () => openRunsFiltered(null),
+      ariaLabel: `Show all ${t.runs} runs`,
+    }),
+    statusTile("Merged", t.merged, "gold", "merged"),
+    statusTile("Ready", t.ready, "teal", "ready"),
+    statusTile("Blocked", t.blocked, "rust", "blocked"),
+    statusTile("Stalled", t.stalled, "rust", "stalled"),
     statsTile("Completion", statsPct(t.completion_rate), "teal"),
   );
 }
@@ -2734,16 +2845,24 @@ function renderStatsBumps(b) {
   );
 }
 
+/* Every tile names a QUEUE_SECTIONS key and jumps to the Backlog with that
+   section expanded and scrolled into view (see openQueueSectionFocus).
+   Queued and Failed both land on "upnext" - the same section queueSection()
+   itself puts them in, since a card's own chip already tells them apart. */
 function renderStatsQueue(q) {
   const root = $("stats-queue-tiles");
   clear(root);
+  const sectionTile = (label, value, tone, sectionKey) => statsTile(label, value, tone, {
+    onClick: () => openQueueSectionFocus(sectionKey),
+    ariaLabel: `Show ${value} ${label.toLowerCase()} tasks`,
+  });
   root.append(
-    statsTile("Queued", q.queued, "blue"),
-    statsTile("Running", q.running, "blue"),
-    statsTile("Done", q.done, "gold"),
-    statsTile("Failed", q.failed, "rust"),
-    statsTile("Held", q.held, "rust"),
-    statsTile("Blocked", q.blocked, "rust"),
+    sectionTile("Queued", q.queued, "blue", "upnext"),
+    sectionTile("Running", q.running, "blue", "running"),
+    sectionTile("Done", q.done, "gold", "done"),
+    sectionTile("Failed", q.failed, "rust", "upnext"),
+    sectionTile("Held", q.held, "rust", "held"),
+    sectionTile("Blocked", q.blocked, "rust", "blocked"),
   );
 }
 
@@ -2789,6 +2908,23 @@ const query = state.queueSearch.trim().toLowerCase();
      tasks waiting" has to appear the moment the second one is filed. */
   renderLoop();
   consumeQueueFocus();
+  consumeQueueSectionFocus();
+}
+
+/* Stats-tile navigation into the Backlog: sets which QUEUE_SECTIONS key to
+   expand and scroll to (see consumeQueueSectionFocus, revealQueueSection).
+   Mirrors openRunsFiltered's own reasoning: applyRoute() only flips which
+   view is visible for a plain `#queue` hash (it calls renderQueue() itself
+   only for the `#/queue/<id>` task-focus form, see applyRoute's own
+   comment), so it is called explicitly here to flip the view synchronously
+   even when the hash doesn't change (the Backlog may already be open), and
+   renderQueue() is what actually consumes state.queueSectionFocus and
+   reveals the section. */
+function openQueueSectionFocus(sectionKey) {
+  state.queueSectionFocus = sectionKey;
+  location.hash = "#queue";
+  applyRoute();
+  renderQueue();
 }
 
 /* Lands on the task named by state.queueFocus, set by applyRoute() from a
@@ -2816,6 +2952,31 @@ function consumeQueueFocus() {
   }
   state.queueFocus = null;
   jumpToTask(id);
+}
+
+/* Mirrors consumeQueueFocus() above for a whole section instead of one task -
+   set by openQueueSectionFocus() (a stats queue tile's own navigation) and
+   consumed once revealQueueSection() has actually run. Same reasoning
+   throughout: the stale-search-clear branch recurses into renderQueue()
+   with state.queueSectionFocus deliberately still set, since nulling it
+   first would leave the second pass with nothing to reveal; a section that
+   is not on the page right now (nothing in it) drops the focus instead of
+   retrying forever, the same way jumpToTask() already no-ops on a missing
+   card. */
+function consumeQueueSectionFocus() {
+  const key = state.queueSectionFocus;
+  if (!key || state.queue === null) return;
+  if (state.queueSearch.trim() !== "") {
+    state.queueSearch = "";
+    const input = $("queue-search-input");
+    if (input) input.value = "";
+    state.queueSearchJump = null;
+    renderQueue();
+    return;
+  }
+  const details = document.querySelector(`#queue-sections details.list-section[data-key="${CSS.escape(key)}"]`);
+  state.queueSectionFocus = null;
+  if (details) revealQueueSection(details);
 }
 
 /* ---- dependency graph --------------------------------------------------- *
@@ -3049,6 +3210,25 @@ function renderDependencyGraph(tasks, questionsById) {
   host.append(root);
 }
 
+/* Opens a Backlog section (if closed) and persists that the same way every
+   other collapse toggle does, then scrolls it into view below the sticky
+   header - the expand/persist/sticky-offset handling jumpToTask() needs for
+   the section holding the card it jumps to, pulled out so a stats tile that
+   only names a section (not a task) can reuse exactly that without also
+   jumping to a card inside it. */
+function revealQueueSection(details) {
+  if (!details.open) {
+    details.open = true;
+    state.queueCollapsed[details.dataset.key] = true;
+    saveCollapsed(QUEUE_COLLAPSE_KEY, state.queueCollapsed);
+  }
+  const header = document.querySelector(".top");
+  const gap = header ? Math.ceil(header.getBoundingClientRect().height) + 4 : 0;
+  details.style.scrollMarginTop = `${gap}px`;
+  const motion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  details.scrollIntoView({ behavior: motion ? "auto" : "smooth", block: "start" });
+}
+
 /* Scroll a task's own card into view and flash it, the closest thing this
    page has to "jump to the detail" - the Queue card already carries the full
    instruction, status, and (via the note above) why it is blocked, so
@@ -3059,11 +3239,7 @@ function jumpToTask(id) {
   const card = document.querySelector(`#queue-sections li.card[data-key="${CSS.escape(id)}"]`);
   if (!card) return;
   const section = card.closest("details.list-section");
-  if (section && !section.open) {
-    section.open = true;
-    state.queueCollapsed[section.dataset.key] = true;
-    saveCollapsed(QUEUE_COLLAPSE_KEY, state.queueCollapsed);
-  }
+  if (section && !section.open) revealQueueSection(section);
   const header = document.querySelector(".top");
   const gap = header ? Math.ceil(header.getBoundingClientRect().height) + 4 : 0;
   card.style.scrollMarginTop = `${gap}px`;

@@ -1224,6 +1224,14 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .stats-tile[data-tone="teal"] .stats-tile-value { color: var(--on-teal); }
 .stats-tile[data-tone="rust"] .stats-tile-value { color: var(--on-rust); }
 .stats-tile[data-tone="blue"] .stats-tile-value { color: var(--on-blue); }
+/* Clickable stat cards (see statsTile's `activate` param in app.js) are a
+   real <button>, not a div with an onclick, so they need the usual UA
+   button reset - the rest of the look, including :focus-visible, is
+   inherited from the plain .stats-tile rule above and the page-wide
+   :focus-visible rule, no new tokens. Hover reuses the same sunk background
+   the Runs state chips already use for the same purpose. */
+.stats-tile:is(button) { font: inherit; color: inherit; text-align: inherit; cursor: pointer; width: 100%; }
+.stats-tile:is(button):hover { background: var(--sunk); }
 
 .stats-banner {
   background: var(--tint-rust); color: var(--on-rust);
