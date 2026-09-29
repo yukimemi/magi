@@ -840,6 +840,26 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
             decision,
             ActionDecision::Resume(_) | ActionDecision::Requeue | ActionDecision::Done
         );
+        if ran {
+            // Whoever delivers the answer first owns it: the waiter resuming
+            // the asking seat, or this. A delivery in flight keeps a fresh
+            // lease, and the flag is taken atomically *before* the task is
+            // touched, so the two can never both act on one answer.
+            if questions
+                .read_lease(&q.id)
+                .is_some_and(|l| l.fresh(Timestamp::now()))
+            {
+                continue;
+            }
+            let taken = questions.update(&q.id, |r| {
+                let free = !r.answer_delivered;
+                r.answer_delivered = true;
+                Ok(free)
+            });
+            if !matches!(taken, Ok((_, true))) {
+                continue;
+            }
+        }
         match decision {
             ActionDecision::Skip => continue,
             ActionDecision::Resume(run) => {
@@ -873,17 +893,6 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
         }
         task.mark_action_applied(&q.id);
         record(queue, &mut task);
-        // Only an action that actually ran counts as the answer being
-        // delivered; the waiter then does not resume the asking seat as well.
-        // A stale or refused one leaves the answer for the waiter as before.
-        if ran
-            && let Err(e) = questions.update(&q.id, |r| {
-                r.answer_delivered = true;
-                Ok(())
-            })
-        {
-            tracing::warn!("could not mark question {} handled: {e:#}", q.short());
-        }
     }
 }
 
@@ -7257,5 +7266,32 @@ mod tests {
         queue.put(&mut again).unwrap();
         apply_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+    }
+
+    #[test]
+    fn an_answer_the_waiter_already_delivered_is_not_acted_on_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let home = dir.path().join("home");
+        let mut state = run_state(RunStatus::Blocked);
+        state.id = "20260101-000000-act2".to_owned();
+        state.save_under(&home).unwrap();
+
+        let mut t = held_task_with(&state.id);
+        queue.put(&mut t).unwrap();
+        let mut q = action_question(&state.id, resume_action(&state.id));
+        q.answer_delivered = true;
+        questions.put(&mut q).unwrap();
+
+        apply_choice_actions(&queue, &questions, &home);
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+
+        // Undelivered: the daemon takes the delivery itself, exactly once.
+        let mut q2 = action_question(&state.id, resume_action(&state.id));
+        questions.put(&mut q2).unwrap();
+        apply_choice_actions(&queue, &questions, &home);
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+        assert!(questions.get(&q2.id).unwrap().answer_delivered);
     }
 }
