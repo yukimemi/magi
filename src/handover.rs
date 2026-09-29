@@ -33,6 +33,10 @@ pub struct Takeover {
     pub earlier: Vec<String>,
     /// The magi home their records live under.
     pub home: PathBuf,
+    /// The owner's answer to an earlier divergence question about the branch,
+    /// applied once the earlier worktree is released (git refuses to move a
+    /// branch that is checked out).
+    pub choice: Option<crate::reconcile::Choice>,
 }
 
 /// The operator has to decide: the takeover was refused, and the text says why.

@@ -567,6 +567,19 @@ impl Runner {
                 ),
             );
         }
+        // The owner's answer to an earlier divergence question is applied
+        // here: after the release (git will not move a checked-out branch)
+        // and before the sync that would otherwise ask again.
+        if let Some(choice) = takeover.as_ref().and_then(|t| t.choice.as_ref())
+            && let Err(e) =
+                crate::reconcile::apply_choice(&repo, &state.config.merge.remote, branch, choice)
+                    .await
+        {
+            if let Some(released) = &released {
+                released.restore(&repo, branch).await;
+            }
+            return Err(e.context("applying the owner's answer about the diverged branch"));
+        }
         let opened =
             Self::open_review(&repo, branch, state, roles, max_parallel, base_commit).await;
         if opened.is_err()

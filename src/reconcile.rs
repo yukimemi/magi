@@ -84,16 +84,18 @@ impl Diverged {
         summary_for(&self.branch, &self.remote)
     }
 
-    /// The two answers a person may give.
+    /// The two answers a person may give. Each carries the tips the question
+    /// showed, so applying one can refuse if either side has moved since.
     pub fn choices(&self) -> Vec<String> {
+        let tips = format!("[local={} origin={}]", self.local_tip, self.origin_tip);
         vec![
             format!(
-                "{PUSH_LOCAL} (drops the {} commit(s) only on {})",
+                "{PUSH_LOCAL} (drops the {} commit(s) only on {}) {tips}",
                 self.origin_only.len(),
                 self.remote
             ),
             format!(
-                "{KEEP_REMOTE} (drops the {} commit(s) only local)",
+                "{KEEP_REMOTE} (drops the {} commit(s) only local) {tips}",
                 self.local_only.len()
             ),
         ]
@@ -133,49 +135,76 @@ pub fn summary_for(branch: &str, remote: &str) -> String {
     format!("`{branch}` differs between this machine and {remote}: which side should magi keep?")
 }
 
-/// The owner's answer to a divergence question.
+/// What the owner chose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Choice {
+pub enum Side {
     /// Overwrite the remote with the local branch.
     PushLocal,
     /// Move the local branch onto the remote's.
     KeepRemote,
 }
 
+/// The owner's answer to a divergence question, with the tips they were shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    /// Which side to keep.
+    pub side: Side,
+    /// Local tip the question displayed.
+    pub local: String,
+    /// Remote tip the question displayed.
+    pub origin: String,
+}
+
 impl Choice {
-    /// Read an answer as one of the offered choices; anything else is `None`.
+    /// Read an answer as one of the offered choices; anything else (or an
+    /// answer without the tips) is `None`.
     pub fn from_answer(answer: &str) -> Option<Self> {
-        if answer.starts_with(PUSH_LOCAL) {
-            Some(Self::PushLocal)
+        let side = if answer.starts_with(PUSH_LOCAL) {
+            Side::PushLocal
         } else if answer.starts_with(KEEP_REMOTE) {
-            Some(Self::KeepRemote)
+            Side::KeepRemote
         } else {
-            None
-        }
+            return None;
+        };
+        let tips = answer.split_once("[local=")?.1.strip_suffix(']')?;
+        let (local, origin) = tips.split_once(" origin=")?;
+        Some(Self {
+            side,
+            local: local.to_owned(),
+            origin: origin.to_owned(),
+        })
     }
 }
 
-/// Carry out the owner's decision. Both moves are the explicit, informed
-/// choice of a person who was shown what each side loses.
+/// Carry out the owner's decision, but only against the tips they were shown.
 ///
-/// The remote is fetched first; a push pins its lease to the tip just read,
-/// and a refused lease is an error.
-pub async fn apply_choice(repo: &Path, remote: &str, branch: &str, choice: Choice) -> Result<()> {
+/// If the local branch or the remote has moved since the question was asked,
+/// what the owner approved is not what would happen, so this refuses and the
+/// next attempt asks afresh. The push pins its lease to the shown remote tip.
+pub async fn apply_choice(repo: &Path, remote: &str, branch: &str, choice: &Choice) -> Result<()> {
     let fetched = git::fetch(repo, remote, branch).await?;
     if !fetched.ok() {
         anyhow::bail!("could not read {remote}/{branch}: {}", fetched.stderr);
     }
     let tracking = format!("{remote}/{branch}");
-    let tip = git::rev_parse(repo, &tracking).await?;
-    match choice {
-        Choice::PushLocal => {
-            let out = git::push_pinned(repo, remote, branch, &tip).await?;
+    let origin = git::rev_parse(repo, &tracking).await?;
+    let local = git::rev_parse(repo, &format!("refs/heads/{branch}")).await?;
+    if origin != choice.origin || local != choice.local {
+        anyhow::bail!(
+            "`{branch}` moved since the question was asked (local {}, {remote} {});              the answer no longer describes it",
+            crate::run::short_of(&local),
+            crate::run::short_of(&origin)
+        );
+    }
+    match choice.side {
+        Side::PushLocal => {
+            let out = git::push_pinned(repo, remote, branch, &choice.origin).await?;
             if !out.ok() {
                 anyhow::bail!("push of `{branch}` was refused: {}", out.stderr);
             }
         }
-        Choice::KeepRemote => {
-            let out = git::git_raw(repo, &["branch", "-f", branch, &tip]).await?;
+        Side::KeepRemote => {
+            let out = git::git_raw(repo, &["branch", "-f", branch, &choice.origin]).await?;
             if !out.ok() {
                 anyhow::bail!("could not move `{branch}` onto {tracking}: {}", out.stderr);
             }
@@ -508,23 +537,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_owners_choice_is_applied_either_way() {
+    async fn the_owners_choice_is_applied_only_to_the_tips_shown() {
         assert_eq!(Choice::from_answer("nonsense"), None);
         let (_g, repo, origin) = fixture();
         let old_origin = sh(&repo, &["rev-parse", "work"]);
         advance_and_rebase(&repo);
         let local = sh(&repo, &["rev-parse", "work"]);
-        let answer = format!("{PUSH_LOCAL} (drops the 1 commit(s) only on origin)");
-        let choice = Choice::from_answer(&answer).unwrap();
-        apply_choice(&repo, "origin", "work", choice).await.unwrap();
+        let answer = |side: &str, o: &str| format!("{side} (drops) [local={local} origin={o}]");
+
+        // A remote that moved since the question refuses.
+        let stale = answer(PUSH_LOCAL, &"0".repeat(40));
+        let c = Choice::from_answer(&stale).unwrap();
+        assert!(apply_choice(&repo, "origin", "work", &c).await.is_err());
+        assert_eq!(sh(&origin, &["rev-parse", "work"]), old_origin);
+
+        let c = Choice::from_answer(&answer(PUSH_LOCAL, &old_origin)).unwrap();
+        apply_choice(&repo, "origin", "work", &c).await.unwrap();
         assert_eq!(sh(&origin, &["rev-parse", "work"]), local);
 
+        // Keep the remote: local is moved onto the (now identical) tip.
         sh(&repo, &["checkout", "-q", "main"]);
-        apply_choice(&repo, "origin", "work", Choice::KeepRemote)
-            .await
-            .unwrap();
+        sh(&repo, &["branch", "-f", "work", &old_origin]);
+        let c = Choice::from_answer(&format!(
+            "{KEEP_REMOTE} (drops) [local={old_origin} origin={local}]"
+        ))
+        .unwrap();
+        apply_choice(&repo, "origin", "work", &c).await.unwrap();
         assert_eq!(sh(&repo, &["rev-parse", "work"]), local);
-        assert_ne!(local, old_origin);
     }
 
     #[tokio::test]
