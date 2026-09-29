@@ -518,6 +518,17 @@ pub fn run_ended(state: &crate::run::RunState) -> Option<Notice> {
     })
 }
 
+/// The notice for a pull request that merged while checks were red.
+///
+/// Keyed on the run. `summary` names the repository, pull request and failing
+/// checks: with no notify command configured this is the only place the
+/// operator learns them. A run merges once, so the wording cannot churn.
+pub fn merged_red(run_id: &str, summary: &str) -> Notice {
+    Notice::warn(&format!("merged-red:{run_id}"), summary).link(Link::Run {
+        id: run_id.to_owned(),
+    })
+}
+
 /// The notice for a task the machine or its attempt budget has held, if it is.
 ///
 /// Called from [`crate::queue::Queue::put`], which every task transition goes
@@ -586,6 +597,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Notices::at(dir.path().join("notifications"));
         (dir, s)
+    }
+
+    #[test]
+    fn a_red_merge_notice_is_keyed_on_the_run_and_raised_once() {
+        let (_d, s) = store();
+        let n = merged_red("run-1", "Merged a/b PR #1 with red checks: x (u)");
+        assert_eq!(n.key, "merged-red:run-1");
+        assert_eq!(
+            n.link,
+            Some(Link::Run {
+                id: "run-1".to_owned()
+            })
+        );
+        s.raise(merged_red(
+            "run-1",
+            "Merged a/b PR #1 with red checks: x (u)",
+        ))
+        .unwrap();
+        s.raise(merged_red(
+            "run-1",
+            "Merged a/b PR #1 with red checks: x (u)",
+        ))
+        .unwrap();
+        assert_eq!(s.list().len(), 1);
     }
 
     #[test]

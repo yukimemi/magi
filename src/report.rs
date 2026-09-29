@@ -933,6 +933,16 @@ pub fn run(state: &RunState) -> String {
                 m.detail.lines().next().unwrap_or("")
             );
         }
+        if let Some(pr) = &state.pr
+            && !pr.red_at_merge.is_empty()
+        {
+            let _ = writeln!(
+                s,
+                "  {} {}",
+                yellow("merged with red checks:"),
+                pr.red_at_merge.join(", ")
+            );
+        }
     }
 
     if let Some(b) = &state.release_bump {

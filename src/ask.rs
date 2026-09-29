@@ -1163,6 +1163,12 @@ fn last_word_awaiting_reply(q: &Question) -> Option<&str> {
 /// An error here is reported, not swallowed, so `magi notify --test` can show
 /// the operator why nothing arrives. The waiting path logs it and carries on.
 pub async fn notify(cmd: &config::Notify, q: &Question) -> Result<()> {
+    notify_text(cmd, &q.run, &q.summary).await
+}
+
+/// [`notify`] for an event that is not a question: the same command, the same
+/// placeholders, with `summary` and `run` supplied directly.
+pub async fn notify_text(cmd: &config::Notify, run: &str, summary: &str) -> Result<()> {
     let Some((program, args)) = cmd.command.split_first() else {
         // No command configured: the web UI is the only surface, by choice.
         return Ok(());
@@ -1175,7 +1181,7 @@ pub async fn notify(cmd: &config::Notify, q: &Question) -> Result<()> {
              the address `magi web --open` printed"
         );
     }
-    let argv: Vec<String> = args.iter().map(|a| expand(a, q, &url)).collect();
+    let argv: Vec<String> = args.iter().map(|a| expand(a, run, summary, &url)).collect();
     tracing::debug!(program = %program, args = ?argv, "notifying");
 
     let mut child = tokio::process::Command::new(program);
@@ -1214,12 +1220,8 @@ pub async fn notify(cmd: &config::Notify, q: &Question) -> Result<()> {
 /// One left-to-right pass, so a substituted value is never scanned for further
 /// placeholders. Agent prose contains braces, and an agent quoting `{summary}`
 /// in a question must not make the notification recursive.
-fn expand(template: &str, q: &Question, url: &str) -> String {
-    let table = [
-        ("{summary}", q.summary.as_str()),
-        ("{run}", q.run.as_str()),
-        ("{url}", url),
-    ];
+fn expand(template: &str, run: &str, summary: &str, url: &str) -> String {
+    let table = [("{summary}", summary), ("{run}", run), ("{url}", url)];
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(at) = rest.find('{') {
@@ -1849,6 +1851,7 @@ mod tests {
 
         // No command at all is the default, and is silence rather than failure.
         assert!(notify(&quiet(), &q).await.is_ok());
+        assert!(notify_text(&quiet(), "run", "text").await.is_ok());
     }
 
     #[test]
@@ -1866,7 +1869,7 @@ mod tests {
         ];
         let argv: Vec<String> = template
             .iter()
-            .map(|a| expand(a, &q, "http://100.64.0.1:7777/#/questions"))
+            .map(|a| expand(a, &q.run, &q.summary, "http://100.64.0.1:7777/#/questions"))
             .collect();
 
         assert_eq!(
@@ -1887,15 +1890,18 @@ mod tests {
         // one left-to-right pass means a substituted value is never rescanned.
         q.summary = "should {url} be configurable?".to_owned();
         assert_eq!(
-            expand("{summary}", &q, "http://x/#/questions"),
+            expand("{summary}", &q.run, &q.summary, "http://x/#/questions"),
             "should {url} be configurable?"
         );
         // An unknown brace is the operator's own text and survives untouched.
         assert_eq!(
-            expand("{title}: {run}", &q, ""),
+            expand("{title}: {run}", &q.run, &q.summary, ""),
             "{title}: 20260902-201256-9fb7"
         );
-        assert_eq!(expand("no placeholders", &q, "http://x"), "no placeholders");
+        assert_eq!(
+            expand("no placeholders", &q.run, &q.summary, "http://x"),
+            "no placeholders"
+        );
     }
 
     #[test]
