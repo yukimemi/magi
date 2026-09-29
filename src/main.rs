@@ -1900,22 +1900,30 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
     let mut q = match thread {
         Some(id) => {
             let resolved = store.resolve_id(&id)?;
-            let mut q = store.get(&resolved)?;
-            // A question belongs to the run that asked it; a different run
-            // replying would be a stranger continuing someone else's
-            // conversation, and the owner has no way to tell the two apart on
-            // the card.
-            question_belongs_to_this_run(&q, &run, "reply to")?;
-            q.reply(thread_message(&summary, &detail), choices)?;
-            // Re-attached the same way a fresh ask's panel is: before the
-            // question is filed, so the owner never sees the reply a moment
-            // before the evidence for it.
-            if let Some(path) = &panel {
-                let html = std::fs::read_to_string(path)
-                    .with_context(|| format!("read {}", path.display()))?;
-                store.put_panel(&mut q, &html, &assets)?;
-            }
-            store.put(&mut q)?;
+            let html = match &panel {
+                Some(path) => Some(
+                    std::fs::read_to_string(path)
+                        .with_context(|| format!("read {}", path.display()))?,
+                ),
+                None => None,
+            };
+            // Read-modify-write under the store's lock, so an answer or say
+            // the owner records while this reply is being built is kept.
+            let (q, ()) = store.update(&resolved, |q| {
+                // A question belongs to the run that asked it; a different run
+                // replying would be a stranger continuing someone else's
+                // conversation, and the owner has no way to tell the two apart
+                // on the card.
+                question_belongs_to_this_run(q, &run, "reply to")?;
+                q.reply(thread_message(&summary, &detail), choices)?;
+                // Re-attached the same way a fresh ask's panel is: before the
+                // question is filed, so the owner never sees the reply a moment
+                // before the evidence for it.
+                if let Some(html) = &html {
+                    store.put_panel(q, html, &assets)?;
+                }
+                Ok(())
+            })?;
             eprintln!("replied on {} — waiting for the owner again", q.short());
             q
         }
@@ -1947,6 +1955,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
     match ask::ask_and_wait(&mut q, &store, &cfg.notify, budget).await? {
         ask::Wait::Answered(answer) => {
             println!("{answer}");
+            ask::hand_over(&store, &mut q);
             Ok(())
         }
         // Not an answer: the run can go on, but the decision the caller was
@@ -1961,6 +1970,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
                  --summary \"...\"",
                 q.id
             );
+            ask::hand_over(&store, &mut q);
             Ok(())
         }
         // Also not an answer, and also not a failure: this call's own slice
@@ -2018,8 +2028,8 @@ async fn ask_wait_cmd(
     // an error, and the answer must come out exactly as it would have if
     // this call's own wait had found it.
     if let Some(answer) = resolved_before_the_wait_even_starts(&q)? {
-        ask::hand_over(store, &mut q);
         println!("{answer}");
+        ask::hand_over(store, &mut q);
         return Ok(());
     }
 
@@ -2030,6 +2040,7 @@ async fn ask_wait_cmd(
     match ask::resume_wait(&mut q, store, remaining).await? {
         ask::Wait::Answered(answer) => {
             println!("{answer}");
+            ask::hand_over(store, &mut q);
             Ok(())
         }
         ask::Wait::Replied(said) => {
@@ -2039,6 +2050,7 @@ async fn ask_wait_cmd(
                  --summary \"...\"",
                 q.id
             );
+            ask::hand_over(store, &mut q);
             Ok(())
         }
         ask::Wait::Pending => {

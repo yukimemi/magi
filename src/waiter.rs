@@ -126,7 +126,7 @@ pub fn decide(
             } else {
                 default_timeout
             };
-            let deadline = q.asked_at.as_second().saturating_add(secs as i64);
+            let deadline = last_activity(q).saturating_add(secs as i64);
             if now.as_second() > deadline && !q.waiting_on_agent() {
                 Action::Expire
             } else {
@@ -134,6 +134,19 @@ pub fn decide(
             }
         }
     }
+}
+
+/// When the conversation last moved: the newest thread turn, or the asking
+/// itself. `magi ask --thread` re-arms `answer_timeout` on every reply, so the
+/// deadline runs from here and not from `asked_at`, or a live conversation
+/// would be abandoned mid-sentence.
+fn last_activity(q: &Question) -> i64 {
+    q.thread
+        .iter()
+        .map(|t| t.at.as_second())
+        .max()
+        .unwrap_or(0)
+        .max(q.asked_at.as_second())
 }
 
 /// Everything needed to resume one seat.
@@ -228,12 +241,21 @@ impl Waiter {
         };
         let why = format!("no answer within {}s of asking", secs.max(1));
         let done = self.store.update(&q.id, |r| {
+            // Decided again on the record as it is now: the owner may have
+            // spoken since the tick read it, and a word given in time is
+            // delivered, not abandoned.
+            let now = Timestamp::now();
+            let lease = self.store.read_lease(&r.id);
+            if decide(r, lease.as_ref(), false, self.default_timeout, now) != Action::Expire {
+                return Ok(false);
+            }
             r.abandon(&why);
             r.waiter = None;
-            Ok(())
+            Ok(true)
         });
         match done {
-            Ok(_) => {
+            Ok((_, false)) => {}
+            Ok((_, true)) => {
                 self.store.drop_lease(&q.id);
                 tracing::warn!(
                     "question {} went unanswered for {secs}s with nobody waiting; \
@@ -614,6 +636,19 @@ mod tests {
         assert_eq!(decide(&q, None, false, 86_400, ts(1001)), Action::Expire);
         q.cwd = None;
         assert_eq!(decide(&q, None, false, 86_400, ts(1001)), Action::Idle);
+    }
+
+    #[test]
+    fn the_deadline_runs_from_the_last_turn_not_from_asking() {
+        let mut q = asked(0);
+        q.thread.push(crate::ask::Turn {
+            who: Who::Agent,
+            body: "context".into(),
+            at: ts(4000),
+        });
+        q.delivered_turns = 1;
+        assert_eq!(decide(&q, None, false, 86_400, ts(4500)), Action::Idle);
+        assert_eq!(decide(&q, None, false, 86_400, ts(5001)), Action::Expire);
     }
 
     #[test]

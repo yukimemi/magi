@@ -1213,7 +1213,12 @@ async fn wait_for_owner(
     timeout: Duration,
     poll: Duration,
 ) -> Result<Wait> {
-    store.put(q).context("file the question")?;
+    // A question that is already on disk (a `--thread` reply just wrote it under
+    // the lock) is left alone: this copy may predate an answer or say that
+    // landed since, and writing it back would erase that.
+    if !store.path_of(&q.id).is_file() {
+        store.put(q).context("file the question")?;
+    }
     if q.should_notify(Timestamp::now()) {
         if let Err(e) = notify(cfg, q).await {
             // A broken webhook is not a reason to throw away an implementation.
@@ -1253,9 +1258,13 @@ fn hold(store: &Questions, id: &str) {
     }
 }
 
-/// The wait ended with something handed to the agent: record that it has read
-/// everything so far, so the daemon waiter does not resume a session to tell
-/// the agent what this process is about to print.
+/// Record that the agent has read everything so far, so the daemon waiter does
+/// not resume a session to tell it what was already printed.
+///
+/// Callers must invoke this only **after** the word reached the agent's stdout:
+/// marking first would let a tool timeout kill the process between the mark
+/// and the print, and the waiter would then consider a word delivered that no
+/// agent ever saw.
 pub fn hand_over(store: &Questions, q: &mut Question) {
     let done = store.update(&q.id, |r| {
         r.delivered_turns = r.delivered_turns.max(q.thread.len());
@@ -1297,9 +1306,7 @@ async fn wait_loop(
     // whose turn it is - see [`Question::waiting_on_agent`] - rather than a
     // turn count this call would have to have been there to capture.
     if let Some(said) = last_word_awaiting_reply(q) {
-        let said = said.to_owned();
-        hand_over(store, q);
-        return Ok(Wait::Replied(said));
+        return Ok(Wait::Replied(said.to_owned()));
     }
     hold(store, &q.id);
 
@@ -1340,9 +1347,6 @@ async fn wait_loop(
                 // owns the record now, so adopt theirs wholesale rather than
                 // merging into a copy that predates it.
                 *q = fresh;
-                if q.resolution().is_some() {
-                    hand_over(store, q);
-                }
                 return Ok(match q.resolution() {
                     Some(a) => Wait::Answered(a),
                     // Closed with no decision - abandoned elsewhere, most
@@ -1354,7 +1358,6 @@ async fn wait_loop(
                 if let Some(said) = last_word_awaiting_reply(&fresh) {
                     let said = said.to_owned();
                     *q = fresh;
-                    hand_over(store, q);
                     return Ok(Wait::Replied(said));
                 }
                 // Still open and not waiting on the agent - nothing this
