@@ -1007,7 +1007,37 @@ fn settle_and_diagnose(
     settle(task, verdict, detail, max_attempts);
     if task.status == TaskStatus::Held {
         task.diagnostic = diagnostic(state);
+        note_open_question(task, &state.id);
     }
+}
+
+/// If `task` is held with a `magi ask` question still open on `run`, name the
+/// question in [`Task::hold_reason`] rather than leaving the hold reading
+/// only [`describe`]'s run summary.
+///
+/// This is the shape task 20260928-191407-05fd left underspecified: an
+/// implementer settled a verified no-op and filed a question for the
+/// operator, and the hold that followed said nothing about the question
+/// waiting on them. Appended, not substituted - [`crate::triage`] parses the
+/// existing text ([`is_disk_hold`](crate::triage), the answered-question
+/// marker) and must keep seeing it unchanged.
+///
+/// Best-effort: an unreadable question store must not stop a run from
+/// settling, so this is a no-op rather than a propagated error when
+/// [`crate::run::try_home`] has nothing to offer or the store is empty.
+fn note_open_question(task: &mut Task, run: &str) {
+    let Some(home) = crate::run::try_home() else {
+        return;
+    };
+    let open = Questions::at(home.join("questions")).open_for(run);
+    let Some(q) = open.first() else {
+        return;
+    };
+    let base = task.hold_reason.clone().unwrap_or_default();
+    task.hold_reason = Some(format!(
+        "{base} - waiting for operator answer to question {}",
+        q.short()
+    ));
 }
 
 /// Reconcile a task left at [`TaskStatus::Running`] by a daemon that never
@@ -4550,6 +4580,72 @@ mod tests {
         assert_eq!(t.status, TaskStatus::Held);
         let d = t.diagnostic.expect("a held task must carry its diagnostic");
         assert!(d.contains("cargo test"), "{d}");
+    }
+
+    #[test]
+    fn a_held_task_names_the_open_question_it_is_waiting_on() {
+        // Task 20260928-191407-05fd's own bug: a verified no-op that filed a
+        // `magi ask` question settled Held with `hold_reason: null`, so the
+        // notification said nothing actionable. `note_open_question` should
+        // append the question id to whatever `handed_off` already wrote.
+        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        let home = crate::run::home();
+        let state = run_state(RunStatus::VerifiedNoop);
+        let mut q = ask::Question::new(
+            state.id.clone(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            "is this really a no-op?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        Questions::at(home.join("questions")).put(&mut q).unwrap();
+
+        let verdict = Verdict {
+            status: RunStatus::VerifiedNoop,
+            left_pr: false,
+            quota_hit: false,
+            parked: false,
+            no_viable_candidates: false,
+        };
+        let mut t = task();
+        t.start(state.id.clone());
+        settle_and_diagnose(&mut t, verdict, "run ended agent-verified no-op", 5, &state);
+
+        assert_eq!(t.status, TaskStatus::Held);
+        let reason = t.hold_reason.expect("a held task must record why");
+        assert!(
+            reason.starts_with("run ended agent-verified no-op"),
+            "the original settle reason must survive unchanged: {reason}"
+        );
+        assert!(
+            reason.contains(q.short()),
+            "the open question's id must be named so the notice is actionable: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_held_task_with_no_open_question_keeps_its_plain_reason() {
+        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        let state = run_state(RunStatus::VerifiedNoop);
+
+        let verdict = Verdict {
+            status: RunStatus::VerifiedNoop,
+            left_pr: false,
+            quota_hit: false,
+            parked: false,
+            no_viable_candidates: false,
+        };
+        let mut t = task();
+        t.start(state.id.clone());
+        settle_and_diagnose(&mut t, verdict, "run ended agent-verified no-op", 5, &state);
+
+        assert_eq!(t.status, TaskStatus::Held);
+        assert_eq!(
+            t.hold_reason.as_deref(),
+            Some("run ended agent-verified no-op"),
+            "nothing to append when the question was already answered or never asked"
+        );
     }
 
     #[test]
