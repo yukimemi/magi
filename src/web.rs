@@ -3007,6 +3007,36 @@ impl From<&stats::ReviewerStats> for ReviewerStatsView {
     }
 }
 
+/// [`crate::stats::AdvisorStats`] for the wire.
+///
+/// `reflection_rate` is approximate by construction — see
+/// [`crate::stats::AdvisorStats`]'s own doc — and the UI note that carries
+/// that caveat is static text in `index.html`, not a field here.
+#[derive(Debug, Serialize)]
+struct AdvisorStatsView {
+    agent: String,
+    seated: usize,
+    proposed: usize,
+    absent: usize,
+    faint: usize,
+    strong: usize,
+    reflection_rate: Option<RateView>,
+}
+
+impl From<&stats::AdvisorStats> for AdvisorStatsView {
+    fn from(a: &stats::AdvisorStats) -> Self {
+        Self {
+            agent: a.agent.clone(),
+            seated: a.seated,
+            proposed: a.proposed,
+            absent: a.absent,
+            faint: a.faint,
+            strong: a.strong,
+            reflection_rate: RateView::of(a.strong, a.proposed),
+        }
+    }
+}
+
 /// [`crate::stats::E2eStats`] for the wire.
 #[derive(Debug, Serialize)]
 struct E2eStatsView {
@@ -3065,6 +3095,8 @@ struct StatsView {
     agents: Vec<AgentStatsView>,
     /// Most adopted-per-round first, as [`stats::collect`] already sorts it.
     reviewers: Vec<ReviewerStatsView>,
+    /// Highest reflection rate first, as [`stats::collect`] already sorts it.
+    advisors: Vec<AdvisorStatsView>,
     e2e: E2eStatsView,
     queue: TaskCountsView,
     /// Same count and same meaning as [`HealthView::runs_unreadable`] - see
@@ -3093,6 +3125,11 @@ async fn stats_get(State(ui): State<Arc<Ui>>) -> ApiResult<Json<StatsView>> {
                 .reviewers
                 .iter()
                 .map(ReviewerStatsView::from)
+                .collect(),
+            advisors: collected
+                .advisors
+                .iter()
+                .map(AdvisorStatsView::from)
                 .collect(),
             e2e: E2eStatsView::from(&collected.e2e),
             queue: TaskCountsView::from(queue_counts),
@@ -7563,6 +7600,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stats_advisors_report_proposals_and_reflection() {
+        use crate::advise::{Advice, AdvisorRecord, Reflection};
+        use crate::verdict::Proposal;
+
+        let f = Fixture::start().await;
+        let mut state = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        );
+        state.id = "20260902-140501-a".to_owned();
+        state.status = RunStatus::Merged;
+        state.advice = Some(Advice {
+            records: vec![
+                AdvisorRecord {
+                    seat: "advisor-1".to_owned(),
+                    agent: "alpha".to_owned(),
+                    proposal: Some(Proposal {
+                        approach: "do it".to_owned(),
+                        key_tradeoff: "speed over memory".to_owned(),
+                        risks: Vec::new(),
+                        touches: Vec::new(),
+                        why_not_naive: "breaks under load".to_owned(),
+                    }),
+                    error: None,
+                    duration_ms: 0,
+                    reflection: Reflection::Strong,
+                },
+                AdvisorRecord {
+                    seat: "advisor-2".to_owned(),
+                    agent: "alpha".to_owned(),
+                    proposal: None,
+                    error: Some("timed out".to_owned()),
+                    duration_ms: 0,
+                    reflection: Reflection::Absent,
+                },
+            ],
+            synthesis: Some("blended brief".to_owned()),
+        });
+        let dir = f.runs().join(&state.id);
+        std::fs::create_dir_all(&dir).expect("run dir");
+        std::fs::write(
+            dir.join("run.json"),
+            serde_json::to_string_pretty(&state).expect("serialize run"),
+        )
+        .expect("write run.json");
+
+        let advisors = f.get("/api/stats").await.json()["advisors"].clone();
+        let alpha = advisors
+            .as_array()
+            .expect("an array")
+            .iter()
+            .find(|a| a["agent"] == "alpha")
+            .expect("alpha row");
+        assert_eq!(alpha["seated"], 2);
+        assert_eq!(alpha["proposed"], 1);
+        assert_eq!(alpha["absent"], 1);
+        assert_eq!(alpha["strong"], 1);
+        assert_eq!(alpha["faint"], 0);
+        assert_eq!(alpha["reflection_rate"]["pct"], 100.0);
+    }
+
+    #[tokio::test]
     async fn stats_queue_counts_come_from_the_live_queue() {
         let f = Fixture::start().await;
         let q = f.queue();
@@ -7600,6 +7702,7 @@ mod tests {
         assert_eq!(stats.json()["totals"]["completion_rate"], Value::Null);
         assert_eq!(stats.json()["runs_unreadable"], 0);
         assert!(stats.json()["agents"].as_array().unwrap().is_empty());
+        assert!(stats.json()["advisors"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

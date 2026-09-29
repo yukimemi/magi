@@ -100,6 +100,54 @@ impl ReviewerStats {
     }
 }
 
+/// Design-deliberation record for one agent.
+///
+/// Approximate by construction, same as [`crate::advise::Reflection`] itself:
+/// `strong`/`faint` come from a word-overlap heuristic against the synthesis
+/// brief, not from an explicit attribution, so [`Self::reflection_rate`] is a
+/// rough read on whose ideas seemed to land, not a precise credit split.
+#[derive(Debug, Clone, Default)]
+pub struct AdvisorStats {
+    /// Agent id.
+    pub agent: String,
+    /// Advisor seats it occupied, across every run with `[graph] advise` on.
+    pub seated: usize,
+    /// Seats where it produced a usable proposal (`record.proposal.is_some()`).
+    pub proposed: usize,
+    /// Seats where it produced no usable proposal at all (crashed, timed
+    /// out, or answered with nothing a proposal could be parsed out of).
+    /// Counted from `record.proposal.is_none()` directly rather than from
+    /// `record.reflection == Absent` — `reflection` is `#[serde(default)]`
+    /// and can be left at its default on a record from before
+    /// `apply_reflection` ran, which would otherwise double as a false
+    /// "absent".
+    pub absent: usize,
+    /// Proposals the synthesis brief carried little or no recognisable
+    /// trace of.
+    pub faint: usize,
+    /// Proposals the synthesis brief named outright or carried enough of to
+    /// count as a clear match.
+    pub strong: usize,
+}
+
+impl AdvisorStats {
+    /// Share of its proposals rated `Strong`, as a percentage. The
+    /// denominator is `proposed`, not `seated` — a seat that never produced
+    /// a proposal had nothing for the synthesis to reflect, so it cannot
+    /// count against this rate any more than a reviewer's silence counts
+    /// against [`ReviewerStats::precision`].
+    ///
+    /// Same caveat as the struct itself: this is a heuristic read on
+    /// reflection, not a precise attribution.
+    pub fn reflection_rate(&self) -> f64 {
+        if self.proposed == 0 {
+            0.0
+        } else {
+            100.0 * self.strong as f64 / self.proposed as f64
+        }
+    }
+}
+
 /// What real-machine verification caught that static review did not.
 #[derive(Debug, Clone, Default)]
 pub struct E2eStats {
@@ -294,6 +342,12 @@ pub struct Stats {
     pub agents: Vec<AgentStats>,
     /// Per-agent review record, most adopted-per-round first.
     pub reviewers: Vec<ReviewerStats>,
+    /// Per-agent design-deliberation record, highest reflection rate first.
+    /// Only runs where `[graph] advise` produced an [`crate::advise::Advice`]
+    /// contribute — a run with the stage off carries no signal either way,
+    /// and counting it would water down every agent's rate with seats that
+    /// were never asked.
+    pub advisors: Vec<AdvisorStats>,
     /// Verification record.
     pub e2e: E2eStats,
     /// Per-node duration breakdown, longest total first.
@@ -313,6 +367,7 @@ pub fn collect(states: &[RunState]) -> Stats {
     let mut totals = Totals::default();
     let mut agents: BTreeMap<String, AgentStats> = BTreeMap::new();
     let mut reviewers: BTreeMap<String, ReviewerStats> = BTreeMap::new();
+    let mut advisors: BTreeMap<String, AdvisorStats> = BTreeMap::new();
     let mut e2e = E2eStats::default();
 
     for state in states {
@@ -387,6 +442,38 @@ pub fn collect(states: &[RunState]) -> Stats {
                         ..AgentStats::default()
                     })
                     .wins += 1;
+            }
+        }
+
+        if let Some(advice) = &state.advice {
+            for rec in &advice.records {
+                let entry = advisors
+                    .entry(rec.agent.clone())
+                    .or_insert_with(|| AdvisorStats {
+                        agent: rec.agent.clone(),
+                        ..AdvisorStats::default()
+                    });
+                entry.seated += 1;
+                if rec.proposal.is_none() {
+                    entry.absent += 1;
+                    continue;
+                }
+                entry.proposed += 1;
+                match rec.reflection {
+                    crate::advise::Reflection::Strong => entry.strong += 1,
+                    crate::advise::Reflection::Faint => entry.faint += 1,
+                    // A proposal exists, so this is not a real "no proposal"
+                    // reading — see `AdvisorStats::absent`'s own doc for why
+                    // that count comes from `proposal.is_none()` instead of
+                    // this field. `graph::Runner::advise` always calls
+                    // `apply_reflection` before saving, so the only way a
+                    // proposed record keeps the default `Absent` is a run.json
+                    // predating the `reflection` field. Fold it into `faint`
+                    // rather than dropping it from the breakdown entirely:
+                    // that is what `classify()` itself falls back to when
+                    // there is nothing to score against.
+                    crate::advise::Reflection::Absent => entry.faint += 1,
+                }
             }
         }
 
@@ -476,12 +563,20 @@ pub fn collect(states: &[RunState]) -> Stats {
             .then(b.rounds.cmp(&a.rounds))
     });
 
+    let mut advisors: Vec<AdvisorStats> = advisors.into_values().collect();
+    advisors.sort_by(|a, b| {
+        b.reflection_rate()
+            .total_cmp(&a.reflection_rate())
+            .then(b.proposed.cmp(&a.proposed))
+    });
+
     let nodes = node_durations(states);
 
     Stats {
         totals,
         agents,
         reviewers,
+        advisors,
         e2e,
         nodes,
     }
@@ -984,6 +1079,100 @@ mod tests {
         assert_eq!(stats.totals.split_rate(), 0.0);
         assert_eq!(stats.e2e.sole_rate(), 0.0);
         assert!(stats.agents.is_empty());
+        assert!(stats.advisors.is_empty());
+        assert_eq!(AdvisorStats::default().reflection_rate(), 0.0);
+    }
+
+    fn advisor_record(
+        seat: &str,
+        agent: &str,
+        proposal: Option<crate::verdict::Proposal>,
+        reflection: crate::advise::Reflection,
+    ) -> crate::advise::AdvisorRecord {
+        crate::advise::AdvisorRecord {
+            seat: seat.to_owned(),
+            agent: agent.to_owned(),
+            proposal,
+            error: None,
+            duration_ms: 0,
+            reflection,
+        }
+    }
+
+    fn a_proposal() -> crate::verdict::Proposal {
+        crate::verdict::Proposal {
+            approach: "do the thing".to_owned(),
+            key_tradeoff: "speed over memory".to_owned(),
+            risks: Vec::new(),
+            touches: Vec::new(),
+            why_not_naive: "the naive version breaks under load".to_owned(),
+        }
+    }
+
+    #[test]
+    fn advisor_stats_count_proposed_absent_and_reflection_split() {
+        use crate::advise::{Advice, Reflection};
+
+        let mut s = state_with(Vec::new(), 'A', RunStatus::Merged);
+        s.advice = Some(Advice {
+            records: vec![
+                advisor_record("advisor-1", "alpha", Some(a_proposal()), Reflection::Strong),
+                advisor_record("advisor-2", "alpha", Some(a_proposal()), Reflection::Faint),
+                advisor_record("advisor-3", "alpha", None, Reflection::Absent),
+            ],
+            synthesis: Some("blended brief".to_owned()),
+        });
+
+        let stats = collect(&[s]);
+        let alpha = stats.advisors.iter().find(|a| a.agent == "alpha").unwrap();
+        assert_eq!(alpha.seated, 3);
+        assert_eq!(alpha.proposed, 2);
+        assert_eq!(alpha.absent, 1);
+        assert_eq!(alpha.strong, 1);
+        assert_eq!(alpha.faint, 1);
+        assert_eq!(alpha.reflection_rate(), 50.0);
+    }
+
+    #[test]
+    fn advisor_stats_count_absent_from_the_proposal_not_the_reflection_default() {
+        // A record whose `proposal` is `None` but whose `reflection` was
+        // never classified (predates `apply_reflection`, or the field's own
+        // serde default) must still count as `absent` — and a run whose
+        // synthesis never ran leaves every *proposed* record `Faint` by the
+        // same default, which must not spill into `absent` either.
+        //
+        // A third case: a proposed record whose `reflection` was *never*
+        // classified at all (a run.json predating the `reflection` field)
+        // must not vanish from the breakdown either — it has to land
+        // somewhere in faint/strong, not be silently dropped from all three
+        // counters while still counting toward `proposed`.
+        use crate::advise::{Advice, Reflection};
+
+        let mut s = state_with(Vec::new(), 'A', RunStatus::Merged);
+        s.advice = Some(Advice {
+            records: vec![
+                advisor_record("advisor-1", "alpha", None, Reflection::Absent),
+                advisor_record("advisor-2", "alpha", Some(a_proposal()), Reflection::Faint),
+                advisor_record("advisor-3", "alpha", Some(a_proposal()), Reflection::Absent),
+            ],
+            synthesis: None,
+        });
+
+        let stats = collect(&[s]);
+        let alpha = stats.advisors.iter().find(|a| a.agent == "alpha").unwrap();
+        assert_eq!(alpha.seated, 3);
+        assert_eq!(alpha.proposed, 2);
+        assert_eq!(alpha.absent, 1);
+        assert_eq!(alpha.faint, 2);
+        assert_eq!(alpha.strong, 0);
+    }
+
+    #[test]
+    fn advisor_stats_ignore_runs_with_advise_off() {
+        let s = state_with(Vec::new(), 'A', RunStatus::Merged);
+        assert!(s.advice.is_none());
+        let stats = collect(&[s]);
+        assert!(stats.advisors.is_empty());
     }
 
     #[test]

@@ -2548,6 +2548,7 @@ function renderStats() {
     renderStatsVerdictBar(t);
     renderStatsAgents(s.agents);
     renderStatsReviewers(s.reviewers);
+    renderStatsAdvisors(s.advisors);
   }
   renderStatsQueue(s.queue);
 }
@@ -2668,6 +2669,16 @@ function renderStatsReviewers(reviewers) {
     agent: r.agent,
     fraction: `${r.adopted}/${r.submitted} adopted`,
     rate: r.precision,
+  })));
+}
+
+function renderStatsAdvisors(advisors) {
+  show($("stats-advisors-panel"), advisors.length > 0);
+  if (advisors.length === 0) return;
+  statsBarRows($("stats-advisors-bars"), advisors.map((a) => ({
+    agent: a.agent,
+    fraction: `${a.strong}/${a.proposed} strong (${a.seated} seats · ${a.faint} faint · ${a.absent} no proposal)`,
+    rate: a.reflection_rate,
   })));
 }
 
