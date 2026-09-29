@@ -191,10 +191,10 @@ impl Wording {
     /// without opening a terminal - id, title, hold reason, hold source.
     ///
     /// Falls back to [`Task::last_error`] when [`Task::hold_reason`] is empty:
-    /// the most common `HoldSource::Machine` hold of all - `Task::fail` once
-    /// attempts run out - only ever sets `last_error`, never `hold_reason`, so
-    /// reading `hold_reason` alone would leave the question blank for exactly
-    /// the case requirement 4 exists for.
+    /// a record written before `Task::fail`/`Task::handed_off` started
+    /// copying `why` into `hold_reason` too, or one written by a still older
+    /// build, would otherwise leave the question blank for exactly the case
+    /// requirement 4 exists for.
     fn detail(&self, task: &Task, why: &str) -> String {
         let none = if self.lang == "ja" {
             "（記録なし）"
@@ -1653,15 +1653,16 @@ mod tests {
 
     #[test]
     fn a_question_falls_back_to_last_error_when_hold_reason_was_never_set() {
-        // `Task::fail` - the ordinary "out of attempts" machine hold - only
-        // ever sets `last_error`, never `hold_reason`. The question detail
-        // must still name a cause rather than reading "(none recorded)".
+        // A record written before `Task::fail` started copying `why` into
+        // `hold_reason` too (or one written by a still older build) carries
+        // only `last_error`. The question detail must still name a cause
+        // rather than reading "(none recorded)".
         let (dir, q, questions) = store();
         let mut t = task("kept failing the gate", dir.path().join("repo"));
         t.start("run-1".to_owned());
         t.fail("gate red three times running", 1);
         assert_eq!(t.status, TaskStatus::Held);
-        assert!(t.hold_reason.is_none(), "the case this test is about");
+        t.hold_reason = None; // simulate a pre-fix or pre-schema record
         q.put(&mut t).unwrap();
 
         run_once(&q, &questions, None, Timestamp::now());

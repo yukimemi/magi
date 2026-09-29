@@ -525,12 +525,22 @@ pub fn run_ended(state: &crate::run::RunState) -> Option<Notice> {
 /// dependency removed from under a blocked task - is announced. A hold the
 /// operator placed by hand is their own action and is not news. Keyed on the
 /// task, with wording free of anything that varies between retries.
+///
+/// Falls back to [`crate::queue::Task::last_error`] when `hold_reason` is
+/// empty, the same fallback `crate::triage`'s question detail uses: a record
+/// written before `Task::fail`/`Task::handed_off` started copying `why` into
+/// `hold_reason` too would otherwise still read "no reason recorded" even
+/// though the run said exactly why it stopped.
 pub fn task_held(task: &crate::queue::Task) -> Option<Notice> {
     use crate::queue::{HoldSource, TaskStatus};
     if task.status != TaskStatus::Held || task.hold_source != Some(HoldSource::Machine) {
         return None;
     }
-    let why = task.hold_reason.as_deref().unwrap_or("no reason recorded");
+    let why = task
+        .hold_reason
+        .as_deref()
+        .or(task.last_error.as_deref())
+        .unwrap_or("no reason recorded");
     Some(
         Notice::warn(
             &format!("task:{}", task.id),

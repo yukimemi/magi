@@ -570,15 +570,22 @@ impl Task {
     /// task released after a diagnosed hold and then failed again for an
     /// unrelated, undiagnosed reason (a config error, say) would go on
     /// showing the previous run's diagnostic as if it explained the new one.
+    ///
+    /// Also records `why` into [`Task::hold_reason`] when this ends up
+    /// [`TaskStatus::Held`], so the notification and `magi task show` say the
+    /// same thing as [`Task::last_error`] instead of leaving the hold's own
+    /// reason blank.
     pub fn fail(&mut self, why: impl Into<String>, max_attempts: usize) {
-        self.last_error = Some(why.into());
+        let why = why.into();
         self.diagnostic = None;
         self.status = if self.attempts >= max_attempts {
             self.hold_source = Some(HoldSource::Machine);
+            self.hold_reason = Some(why.clone());
             TaskStatus::Held
         } else {
             TaskStatus::Failed
         };
+        self.last_error = Some(why);
     }
 
     /// Record an attempt that failed for a reason the task is not responsible
@@ -806,11 +813,21 @@ impl Task {
     /// was re-competed from scratch four seconds after it opened.
     ///
     /// A pull request nobody merged is a request for a person, not a failure.
+    ///
+    /// Records `why` into [`Task::hold_reason`] as well as
+    /// [`Task::last_error`], so the notification centre and `magi task show`
+    /// say why the task is held rather than "no reason recorded". This is
+    /// also the path a verified no-op with an outstanding `magi ask` question
+    /// settles through - see `daemon::settle` and `daemon::settle_and_diagnose`,
+    /// which append the question id to `hold_reason` when one is still open
+    /// for the run.
     pub fn handed_off(&mut self, why: impl Into<String>) {
-        self.last_error = Some(why.into());
+        let why = why.into();
         self.diagnostic = None;
         self.status = TaskStatus::Held;
         self.hold_source = Some(HoldSource::Machine);
+        self.hold_reason = Some(why.clone());
+        self.last_error = Some(why);
     }
 
     /// Put a held or finished task back in line, with its attempt count reset
@@ -1605,6 +1622,26 @@ mod tests {
         );
         assert_eq!(t.runs, ["run-1", "run-2"]);
         assert_eq!(t.last_error.as_deref(), Some("gate red"));
+        assert_eq!(
+            t.hold_reason.as_deref(),
+            Some("gate red"),
+            "the hold must say why, not leave hold_reason null next to a \
+             populated last_error"
+        );
+    }
+
+    #[test]
+    fn handing_off_a_task_records_a_hold_reason_too() {
+        let mut t = task("left a pull request");
+        t.start("run-1".to_owned());
+        t.handed_off("run ended with a pull request open [run run-1]");
+        assert_eq!(t.status, TaskStatus::Held);
+        assert_eq!(t.hold_source, Some(HoldSource::Machine));
+        assert_eq!(
+            t.hold_reason.as_deref(),
+            Some("run ended with a pull request open [run run-1]")
+        );
+        assert_eq!(t.hold_reason, t.last_error);
     }
 
     #[test]
