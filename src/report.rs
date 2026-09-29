@@ -1214,7 +1214,7 @@ pub fn stats(stats: &Stats) -> String {
         }
     }
 
-    if stats.release_bumps.recorded > 0 {
+    if stats.release_bumps.merged > 0 {
         let b = &stats.release_bumps;
         let _ = writeln!(s, "\n{}", bold("release bumps"));
         let _ = writeln!(
@@ -2333,6 +2333,51 @@ mod tests {
         );
         assert!(text.contains("alpha"));
         assert!(text.contains("50%"));
+    }
+
+    #[test]
+    fn stats_table_shows_release_bump_coverage_even_when_nothing_was_recorded() {
+        // A repository that has merged runs but never wired up (or never hit)
+        // the release-bump step must still show "0 of N merged runs recorded
+        // a bump" - hiding the whole section on `recorded == 0` would make
+        // that gap invisible instead of reporting it.
+        let _guard = plain();
+        let st = Stats {
+            release_bumps: crate::stats::ReleaseBumpStats {
+                merged: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let text = stats(&st);
+        assert!(text.contains("release bumps"), "{text}");
+        assert!(
+            text.contains("0 of 3 merged run(s) recorded a bump"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn stats_table_renders_release_bump_coverage_and_attention() {
+        let _guard = plain();
+        let st = Stats {
+            release_bumps: crate::stats::ReleaseBumpStats {
+                merged: 4,
+                recorded: 2,
+                pr_opened: 2,
+                automerge_enabled: 1,
+                merged_directly: 0,
+                needs_attention: 1,
+            },
+            ..Default::default()
+        };
+        let text = stats(&st);
+        assert!(text.contains("release bumps"), "{text}");
+        assert!(
+            text.contains("2 of 4 merged run(s) recorded a bump (50%)"),
+            "{text}"
+        );
+        assert!(text.contains("1 clean, 1 needed a human (50%)"), "{text}");
     }
 
     #[test]

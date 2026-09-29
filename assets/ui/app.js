@@ -2683,12 +2683,15 @@ function renderStatsAdvisors(advisors) {
   })));
 }
 
-/* Hidden entirely when `recorded` is zero - a repository that never uses
-   the release-bump step (or hasn't merged anything yet) should read as
-   "nothing to show", not as "every bump failed" from a row of zeroes. */
+/* Hidden entirely when `merged` is zero - a home with nothing merged yet has
+   no coverage to report at all. Once at least one run has merged, the panel
+   stays visible even if `recorded` is zero: "0 of N merged runs recorded a
+   bump" is itself the fact this panel exists to show, and hiding it would
+   make a repository that never wired up the release-bump step look the same
+   as one this dashboard simply hasn't loaded data for yet. */
 function renderStatsBumps(b) {
-  show($("stats-bumps-panel"), b.recorded > 0);
-  if (b.recorded === 0) return;
+  show($("stats-bumps-panel"), b.merged > 0);
+  if (b.merged === 0) return;
   const root = $("stats-bumps-tiles");
   clear(root);
   root.append(
