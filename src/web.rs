@@ -8508,6 +8508,110 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_stats_kpi_tile_navigates_to_the_runs_view_pre_filtered_to_its_own_status() {
+        // Every KPI tile but Total runs and Completion names an exact
+        // RunStatus and hands it to openRunsFiltered(), which is what wires
+        // the click into state.runsFilter.status (matchesFilter's own
+        // status check) rather than the coarser runsStateFilter chips. Each
+        // status literal here must be one of the strings runSection() (and
+        // isStale()) actually compare a run's own `status` field against -
+        // a status this dashboard invented would filter to nothing.
+        assert!(
+            APP_JS.contains("onClick: () => openRunsFiltered(status)"),
+            "every KPI tile built through statusTile() must route its click through \
+             openRunsFiltered, the single place that sets the Runs filter"
+        );
+        for (label, status) in [
+            ("Merged", "merged"),
+            ("Ready", "ready"),
+            ("Blocked", "blocked"),
+            ("Stalled", "stalled"),
+        ] {
+            let call = format!("statusTile(\"{label}\", t.{status}, ");
+            assert!(
+                APP_JS.contains(&call),
+                "expected the {label} KPI tile built via {call}..."
+            );
+            assert!(
+                APP_JS.contains(&format!("status === \"{status}\"")),
+                "\"{status}\" must be a real RunStatus literal runSection()/isStale() already \
+                 compare a run against, not one invented only for the stats tile"
+            );
+        }
+        assert!(
+            APP_JS.contains("function openRunsFiltered(status)"),
+            "openRunsFiltered must exist as the single place a stats tile sets the Runs filter"
+        );
+        assert!(
+            APP_JS.contains("if (status && String(run.status || \"\") !== status) return false;"),
+            "matchesFilter must gate on the exact status a KPI tile named"
+        );
+    }
+
+    #[test]
+    fn every_stats_queue_tile_names_a_real_queue_section() {
+        // renderStatsQueue()'s tiles each call openQueueSectionFocus() with a
+        // QUEUE_SECTIONS key; a typo here would silently no-op the tile
+        // (consumeQueueSectionFocus finds no matching <details> and drops
+        // the focus) rather than fail loudly, so pin every key against the
+        // section list it has to resolve against.
+        assert!(
+            APP_JS.contains("onClick: () => openQueueSectionFocus(sectionKey)"),
+            "every queue tile built through sectionTile() must route its click through \
+             openQueueSectionFocus"
+        );
+        for key in ["upnext", "running", "done", "held", "blocked"] {
+            assert!(
+                APP_JS.contains(&format!("{{ key: \"{key}\",")),
+                "QUEUE_SECTIONS must define a \"{key}\" section for a stats tile to reveal"
+            );
+        }
+        // Queued and Failed intentionally both resolve to "upnext" - the
+        // same section queueSection() itself files them under - rather than
+        // getting a section each.
+        for line in [
+            "sectionTile(\"Queued\", q.queued, \"blue\", \"upnext\"),",
+            "sectionTile(\"Running\", q.running, \"blue\", \"running\"),",
+            "sectionTile(\"Done\", q.done, \"gold\", \"done\"),",
+            "sectionTile(\"Failed\", q.failed, \"rust\", \"upnext\"),",
+            "sectionTile(\"Held\", q.held, \"rust\", \"held\"),",
+            "sectionTile(\"Blocked\", q.blocked, \"rust\", \"blocked\"),",
+        ] {
+            assert!(APP_JS.contains(line), "expected a stats queue tile: {line}");
+        }
+    }
+
+    #[test]
+    fn a_stats_queue_tile_reveals_its_section_without_dropping_a_pending_task_focus() {
+        // Mirrors consuming_a_queue_focus_survives_clearing_a_stale_backlog_search
+        // above for the section-focus channel a stats queue tile drives:
+        // consumeQueueSectionFocus() must leave state.queueSectionFocus set
+        // through the stale-search-clear recursion into renderQueue(), and
+        // clear it only once revealQueueSection() is actually about to run -
+        // the same trap that once silently dropped a task-focus jump.
+        assert!(APP_JS.contains("function openQueueSectionFocus(sectionKey)"));
+        assert!(APP_JS.contains("function consumeQueueSectionFocus()"));
+        assert!(APP_JS.contains("function revealQueueSection(details)"));
+        assert!(
+            APP_JS.contains("consumeQueueFocus();\n  consumeQueueSectionFocus();"),
+            "renderQueue() must consume both focus channels on every pass"
+        );
+        assert!(
+            APP_JS.contains(
+                "  const key = state.queueSectionFocus;\n  if (!key || state.queue === null) return;\n  if (state.queueSearch.trim() !== \"\") {"
+            ),
+            "the search-clearing branch must run before state.queueSectionFocus is cleared, or \
+             the recursive renderQueue() call has nothing left to reveal"
+        );
+        assert!(
+            APP_JS.contains(
+                "  const details = document.querySelector(`#queue-sections details.list-section[data-key=\"${CSS.escape(key)}\"]`);\n  state.queueSectionFocus = null;\n  if (details) revealQueueSection(details);"
+            ),
+            "state.queueSectionFocus must only be cleared immediately before the reveal it guards"
+        );
+    }
+
     #[tokio::test]
     async fn the_change_stream_announces_the_current_revisions_on_connect() {
         let f = Fixture::start().await;
