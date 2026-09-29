@@ -2677,7 +2677,7 @@ function renderStatsAdvisors(advisors) {
   if (advisors.length === 0) return;
   statsBarRows($("stats-advisors-bars"), advisors.map((a) => ({
     agent: a.agent,
-    fraction: `${a.strong}/${a.proposed} strong · ${a.absent} no proposal`,
+    fraction: `${a.strong}/${a.proposed} strong (${a.seated} seats · ${a.faint} faint · ${a.absent} no proposal)`,
     rate: a.reflection_rate,
   })));
 }

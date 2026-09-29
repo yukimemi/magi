@@ -462,11 +462,17 @@ pub fn collect(states: &[RunState]) -> Stats {
                 match rec.reflection {
                     crate::advise::Reflection::Strong => entry.strong += 1,
                     crate::advise::Reflection::Faint => entry.faint += 1,
-                    // A proposal exists, so `Absent` here is the pre-classification
-                    // default rather than a real "no proposal" reading — see
-                    // `AdvisorStats::absent`'s own doc for why that count comes
-                    // from `proposal.is_none()` instead of this field.
-                    crate::advise::Reflection::Absent => {}
+                    // A proposal exists, so this is not a real "no proposal"
+                    // reading — see `AdvisorStats::absent`'s own doc for why
+                    // that count comes from `proposal.is_none()` instead of
+                    // this field. `graph::Runner::advise` always calls
+                    // `apply_reflection` before saving, so the only way a
+                    // proposed record keeps the default `Absent` is a run.json
+                    // predating the `reflection` field. Fold it into `faint`
+                    // rather than dropping it from the breakdown entirely:
+                    // that is what `classify()` itself falls back to when
+                    // there is nothing to score against.
+                    crate::advise::Reflection::Absent => entry.faint += 1,
                 }
             }
         }
@@ -1134,6 +1140,12 @@ mod tests {
         // serde default) must still count as `absent` — and a run whose
         // synthesis never ran leaves every *proposed* record `Faint` by the
         // same default, which must not spill into `absent` either.
+        //
+        // A third case: a proposed record whose `reflection` was *never*
+        // classified at all (a run.json predating the `reflection` field)
+        // must not vanish from the breakdown either — it has to land
+        // somewhere in faint/strong, not be silently dropped from all three
+        // counters while still counting toward `proposed`.
         use crate::advise::{Advice, Reflection};
 
         let mut s = state_with(Vec::new(), 'A', RunStatus::Merged);
@@ -1141,16 +1153,17 @@ mod tests {
             records: vec![
                 advisor_record("advisor-1", "alpha", None, Reflection::Absent),
                 advisor_record("advisor-2", "alpha", Some(a_proposal()), Reflection::Faint),
+                advisor_record("advisor-3", "alpha", Some(a_proposal()), Reflection::Absent),
             ],
             synthesis: None,
         });
 
         let stats = collect(&[s]);
         let alpha = stats.advisors.iter().find(|a| a.agent == "alpha").unwrap();
-        assert_eq!(alpha.seated, 2);
-        assert_eq!(alpha.proposed, 1);
+        assert_eq!(alpha.seated, 3);
+        assert_eq!(alpha.proposed, 2);
         assert_eq!(alpha.absent, 1);
-        assert_eq!(alpha.faint, 1);
+        assert_eq!(alpha.faint, 2);
         assert_eq!(alpha.strong, 0);
     }
 
