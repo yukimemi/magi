@@ -6,6 +6,7 @@
 //! them as "relative performance on my workload", which is the only claim the
 //! data supports.
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use crate::run::{RunState, RunStatus, list_ids};
 
@@ -285,7 +286,7 @@ impl NodeDuration {
 /// run contributes no span (see [`NodeDuration::single`] for the one-event
 /// case); a run with no events for a node contributes nothing at all. Spans
 /// from every run are then summed per node.
-pub fn node_durations(states: &[RunState]) -> Vec<NodeDuration> {
+pub fn node_durations<'a>(states: impl IntoIterator<Item = &'a RunState>) -> Vec<NodeDuration> {
     let mut nodes: BTreeMap<String, NodeDuration> = BTreeMap::new();
 
     for state in states {
@@ -441,8 +442,80 @@ pub fn load_all() -> Vec<RunState> {
         .collect()
 }
 
+/// One repository's [`Stats`], as grouped by [`by_repo`].
+#[derive(Debug, Clone)]
+pub struct RepoStats {
+    /// The grouping key: `RunState.repo` exactly as recorded, a normalised
+    /// full path. Never a display name — this is what a caller (the CLI's
+    /// `--repo` fallback, the web `?repo=` query) matches back against, and
+    /// matching by name would conflate two different checkouts that happen
+    /// to share a leaf directory.
+    pub repo: PathBuf,
+    /// Display name: `repo`'s file name, or the full path when it has none
+    /// (e.g. `/`). Collisions between repositories are the caller's problem
+    /// to disambiguate (see `report::repo_summary`), not this struct's.
+    pub name: String,
+    /// This repository's own aggregate, counted exactly as [`collect`]
+    /// counts the whole workload.
+    pub stats: Stats,
+}
+
+/// Group `states` by [`RunState::repo`] and aggregate each group with
+/// [`collect_refs`] — the same counting logic as [`collect`], just scoped to
+/// one repository at a time.
+///
+/// Sorted by run count descending, then by repo path ascending on ties, so
+/// the busiest repository leads the summary table.
+pub fn by_repo(states: &[RunState]) -> Vec<RepoStats> {
+    let mut groups: BTreeMap<PathBuf, Vec<&RunState>> = BTreeMap::new();
+    for state in states {
+        groups.entry(state.repo.clone()).or_default().push(state);
+    }
+
+    let mut out: Vec<RepoStats> = groups
+        .into_iter()
+        .map(|(repo, group)| {
+            let stats = collect_refs(group);
+            let name = repo
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| repo.to_string_lossy().into_owned());
+            RepoStats { repo, name, stats }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.stats
+            .totals
+            .runs
+            .cmp(&a.stats.totals.runs)
+            .then(a.repo.cmp(&b.repo))
+    });
+    out
+}
+
+/// Narrow `states` to those recorded against `repo` exactly.
+///
+/// Matches [`RunState::repo`] by full-path equality only, never by name — the
+/// name-fallback resolution a caller may want (a checkout that has since
+/// moved or been deleted) belongs one layer up, where a config or filesystem
+/// lookup can decide what "the same repository" means; this function has no
+/// such context and would otherwise risk conflating two different checkouts
+/// that happen to share a leaf directory.
+pub fn filter_repo<'a>(states: &'a [RunState], repo: &Path) -> Vec<&'a RunState> {
+    states.iter().filter(|s| s.repo == repo).collect()
+}
+
 /// Aggregate `states`.
 pub fn collect(states: &[RunState]) -> Stats {
+    collect_refs(states)
+}
+
+/// Aggregate `states`, over any iterator of references rather than a slice —
+/// what [`by_repo`] uses to run the same counting logic over each repository's
+/// own group without collecting it into an owned `Vec<RunState>` first.
+/// [`collect`] is a thin wrapper around this for the common whole-slice case.
+pub fn collect_refs<'a>(states: impl IntoIterator<Item = &'a RunState>) -> Stats {
+    let states: Vec<&'a RunState> = states.into_iter().collect();
     let mut totals = Totals::default();
     let mut agents: BTreeMap<String, AgentStats> = BTreeMap::new();
     let mut reviewers: BTreeMap<String, ReviewerStats> = BTreeMap::new();
@@ -450,7 +523,7 @@ pub fn collect(states: &[RunState]) -> Stats {
     let mut e2e = E2eStats::default();
     let mut release_bumps = ReleaseBumpStats::default();
 
-    for state in states {
+    for state in &states {
         totals.runs += 1;
         if state.status == RunStatus::Merged {
             release_bumps.merged += 1;
@@ -772,6 +845,17 @@ mod tests {
         });
         s.reviews = reviews;
         s.status = status;
+        s
+    }
+
+    fn state_with_repo(
+        reviews: Vec<ReviewRound>,
+        winner: char,
+        status: RunStatus,
+        repo: &str,
+    ) -> RunState {
+        let mut s = state_with(reviews, winner, status);
+        s.repo = PathBuf::from(repo);
         s
     }
 
@@ -1475,5 +1559,69 @@ mod tests {
         assert_eq!(judge.max_secs, 200);
         assert_eq!(judge.single, 1);
         assert_eq!(judge.mean_secs(), 130.0);
+    }
+
+    #[test]
+    fn by_repo_splits_states_and_group_totals_sum_to_the_whole() {
+        let states = vec![
+            state_with_repo(Vec::new(), 'A', RunStatus::Merged, "/repos/a"),
+            state_with_repo(Vec::new(), 'A', RunStatus::Blocked, "/repos/a"),
+            state_with_repo(Vec::new(), 'B', RunStatus::Merged, "/repos/b"),
+        ];
+        let groups = by_repo(&states);
+        assert_eq!(groups.len(), 2);
+
+        let total_runs: usize = groups.iter().map(|g| g.stats.totals.runs).sum();
+        assert_eq!(total_runs, collect(&states).totals.runs);
+        let total_merged: usize = groups.iter().map(|g| g.stats.totals.merged).sum();
+        assert_eq!(total_merged, collect(&states).totals.merged);
+
+        // Busiest repository (2 runs) sorts first.
+        assert_eq!(groups[0].repo, PathBuf::from("/repos/a"));
+        assert_eq!(groups[0].name, "a");
+        assert_eq!(groups[0].stats.totals.runs, 2);
+        assert_eq!(groups[1].repo, PathBuf::from("/repos/b"));
+        assert_eq!(groups[1].name, "b");
+        assert_eq!(groups[1].stats.totals.runs, 1);
+    }
+
+    #[test]
+    fn by_repo_breaks_a_run_count_tie_by_path() {
+        let states = vec![
+            state_with_repo(Vec::new(), 'A', RunStatus::Merged, "/repos/z"),
+            state_with_repo(Vec::new(), 'A', RunStatus::Merged, "/repos/a"),
+        ];
+        let groups = by_repo(&states);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].repo, PathBuf::from("/repos/a"));
+        assert_eq!(groups[1].repo, PathBuf::from("/repos/z"));
+    }
+
+    #[test]
+    fn by_repo_on_empty_input_yields_no_groups() {
+        assert!(by_repo(&[]).is_empty());
+    }
+
+    #[test]
+    fn filter_repo_matches_the_full_path_exactly() {
+        let states = vec![
+            state_with_repo(Vec::new(), 'A', RunStatus::Merged, "/repos/a"),
+            state_with_repo(Vec::new(), 'A', RunStatus::Merged, "/repos/ab"),
+        ];
+        let hits = filter_repo(&states, Path::new("/repos/a"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].repo, PathBuf::from("/repos/a"));
+    }
+
+    #[test]
+    fn filter_repo_returns_nothing_for_an_unknown_repo_or_empty_input() {
+        let states = vec![state_with_repo(
+            Vec::new(),
+            'A',
+            RunStatus::Merged,
+            "/repos/a",
+        )];
+        assert!(filter_repo(&states, Path::new("/repos/nope")).is_empty());
+        assert!(filter_repo(&[], Path::new("/repos/a")).is_empty());
     }
 }
