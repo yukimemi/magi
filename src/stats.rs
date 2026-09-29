@@ -333,6 +333,83 @@ pub fn node_durations(states: &[RunState]) -> Vec<NodeDuration> {
     nodes
 }
 
+/// What the post-merge release-bump step did, across every merged run.
+///
+/// `merged` is the denominator for [`Self::coverage_rate`]: a repository
+/// that never uses the release-bump step (no `auto-tag.yml`, see
+/// `kata:agents:rust:*`) should read as "0 of N merged runs recorded a
+/// bump", not vanish from the report the way it would if `recorded` were the
+/// denominator instead — silently excluding those runs would hide the
+/// coverage gap itself.
+#[derive(Debug, Clone, Default)]
+pub struct ReleaseBumpStats {
+    /// Merged runs, the denominator for [`Self::coverage_rate`].
+    pub merged: usize,
+    /// Merged runs that carry a [`crate::run::ReleaseBump`] record at all.
+    pub recorded: usize,
+    /// Recorded bumps that opened a release pull request.
+    pub pr_opened: usize,
+    /// Recorded bumps whose `automerge_enabled` is `true` at the point the
+    /// bump step finished. This is the *final* state, not "was automerge
+    /// enabled at some point" — `bump::surface_problem` flips it back to
+    /// `false` when GitHub later rejects automerge, so a bump that briefly
+    /// enabled it and then had it rejected counts here as not enabled.
+    pub automerge_enabled: usize,
+    /// Recorded bumps magi merged directly because GitHub refused automerge
+    /// on an already-green pull request. Counted apart from
+    /// `automerge_enabled` on purpose: a `merged_directly` bump needed no
+    /// human even though automerge itself never took, so folding it into
+    /// (or leaving it out of) the automerge count would misstate either
+    /// number.
+    pub merged_directly: usize,
+    /// Recorded bumps that ended with [`crate::run::RunState::needs_attention`]
+    /// true — a human has something to do.
+    pub needs_attention: usize,
+}
+
+impl ReleaseBumpStats {
+    /// Share of merged runs that recorded a release bump at all.
+    pub fn coverage_rate(&self) -> f64 {
+        if self.merged == 0 {
+            0.0
+        } else {
+            100.0 * self.recorded as f64 / self.merged as f64
+        }
+    }
+
+    /// Share of opened release PRs that ended with automerge enabled.
+    pub fn automerge_rate(&self) -> f64 {
+        if self.pr_opened == 0 {
+            0.0
+        } else {
+            100.0 * self.automerge_enabled as f64 / self.pr_opened as f64
+        }
+    }
+
+    /// Share of recorded bumps that needed a human.
+    pub fn attention_rate(&self) -> f64 {
+        if self.recorded == 0 {
+            0.0
+        } else {
+            100.0 * self.needs_attention as f64 / self.recorded as f64
+        }
+    }
+
+    /// Recorded bumps that finished with nothing for a human to do.
+    ///
+    /// Deliberately the difference `recorded - needs_attention`, not a
+    /// separate counter kept in step with `automerge_enabled`: a bump that
+    /// GitHub refused automerge on but that magi merged directly
+    /// (`merged_directly`) is clean — nobody had to act — even though
+    /// `automerge_enabled` is `false` for it. Counting clean bumps as
+    /// `automerge_enabled` alone would leave `merged_directly` cases in
+    /// neither the clean nor the attention bucket, and the two would stop
+    /// summing to `recorded`.
+    pub fn clean(&self) -> usize {
+        self.recorded.saturating_sub(self.needs_attention)
+    }
+}
+
 /// Everything, aggregated.
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
@@ -352,6 +429,8 @@ pub struct Stats {
     pub e2e: E2eStats,
     /// Per-node duration breakdown, longest total first.
     pub nodes: Vec<NodeDuration>,
+    /// Post-merge release-bump record, over every merged run.
+    pub release_bumps: ReleaseBumpStats,
 }
 
 /// Load every run on disk, skipping any that cannot be read.
@@ -369,9 +448,28 @@ pub fn collect(states: &[RunState]) -> Stats {
     let mut reviewers: BTreeMap<String, ReviewerStats> = BTreeMap::new();
     let mut advisors: BTreeMap<String, AdvisorStats> = BTreeMap::new();
     let mut e2e = E2eStats::default();
+    let mut release_bumps = ReleaseBumpStats::default();
 
     for state in states {
         totals.runs += 1;
+        if state.status == RunStatus::Merged {
+            release_bumps.merged += 1;
+            if let Some(b) = &state.release_bump {
+                release_bumps.recorded += 1;
+                if b.pr_url.is_some() {
+                    release_bumps.pr_opened += 1;
+                }
+                if b.automerge_enabled {
+                    release_bumps.automerge_enabled += 1;
+                }
+                if b.merged_directly {
+                    release_bumps.merged_directly += 1;
+                }
+            }
+            if state.needs_attention() {
+                release_bumps.needs_attention += 1;
+            }
+        }
         match state.status {
             RunStatus::Merged => totals.merged += 1,
             RunStatus::Ready => totals.ready += 1,
@@ -579,6 +677,7 @@ pub fn collect(states: &[RunState]) -> Stats {
         advisors,
         e2e,
         nodes,
+        release_bumps,
     }
 }
 
@@ -1182,6 +1281,121 @@ mod tests {
         assert!(same_defect(&a, &b));
         let c = finding("3", "src/z.rs", 900, "totally different", Severity::Nit);
         assert!(!same_defect(&a, &c));
+    }
+
+    #[test]
+    fn release_bump_stats_split_clean_from_attention_and_track_coverage() {
+        use crate::run::ReleaseBump;
+
+        // Not recorded at all: uses the release-bump step? unknown.
+        let unrecorded = state_with(Vec::new(), 'A', RunStatus::Merged);
+
+        // Clean: automerge worked, nobody had to look at it.
+        let mut automerged = state_with(Vec::new(), 'A', RunStatus::Merged);
+        automerged.release_bump = Some(ReleaseBump {
+            pr_url: Some("https://github.com/o/r/pull/1".to_owned()),
+            version: Some("1.2.3".to_owned()),
+            automerge_enabled: true,
+            merged_directly: false,
+            problem: None,
+            action_required: None,
+        });
+
+        // Also clean, but automerge itself was rejected by GitHub and magi
+        // merged the already-green PR directly - `automerge_enabled` reads
+        // false here, and that must not make this count as needing a human.
+        let mut merged_directly = state_with(Vec::new(), 'A', RunStatus::Merged);
+        merged_directly.release_bump = Some(ReleaseBump {
+            pr_url: Some("https://github.com/o/r/pull/2".to_owned()),
+            version: Some("1.2.4".to_owned()),
+            automerge_enabled: false,
+            merged_directly: true,
+            problem: None,
+            action_required: None,
+        });
+
+        // Needs a human, PR opened.
+        let mut blocked_with_pr = state_with(Vec::new(), 'A', RunStatus::Merged);
+        blocked_with_pr.release_bump = Some(ReleaseBump {
+            pr_url: Some("https://github.com/o/r/pull/3".to_owned()),
+            version: Some("1.2.5".to_owned()),
+            automerge_enabled: false,
+            merged_directly: false,
+            problem: Some("checks red".to_owned()),
+            action_required: Some("look at the PR".to_owned()),
+        });
+
+        // Needs a human, no PR ever opened.
+        let mut blocked_without_pr = state_with(Vec::new(), 'A', RunStatus::Merged);
+        blocked_without_pr.release_bump = Some(ReleaseBump {
+            pr_url: None,
+            version: Some("1.2.6".to_owned()),
+            automerge_enabled: false,
+            merged_directly: false,
+            problem: Some("gh pr create failed".to_owned()),
+            action_required: Some("open the PR by hand".to_owned()),
+        });
+
+        let stats = collect(&[
+            unrecorded,
+            automerged,
+            merged_directly,
+            blocked_with_pr,
+            blocked_without_pr,
+        ]);
+        let b = &stats.release_bumps;
+        assert_eq!(b.merged, 5);
+        assert_eq!(b.recorded, 4);
+        assert_eq!(b.pr_opened, 3);
+        assert_eq!(b.automerge_enabled, 1);
+        assert_eq!(b.merged_directly, 1);
+        assert_eq!(b.needs_attention, 2);
+        assert_eq!(b.clean(), 2);
+        // Clean and attention must always split `recorded` exactly.
+        assert_eq!(b.clean() + b.needs_attention, b.recorded);
+        assert_eq!(b.coverage_rate(), 80.0);
+        assert!((b.automerge_rate() - 33.333_333_333_333_336).abs() < 1e-9);
+        assert_eq!(b.attention_rate(), 50.0);
+    }
+
+    #[test]
+    fn release_bump_ignores_runs_that_are_not_merged() {
+        use crate::run::ReleaseBump;
+
+        let mut blocked = state_with(Vec::new(), 'A', RunStatus::Blocked);
+        blocked.release_bump = Some(ReleaseBump {
+            pr_url: Some("https://github.com/o/r/pull/9".to_owned()),
+            version: Some("9.9.9".to_owned()),
+            automerge_enabled: true,
+            merged_directly: false,
+            problem: None,
+            action_required: None,
+        });
+
+        let stats = collect(&[blocked]);
+        let b = &stats.release_bumps;
+        assert_eq!(b.merged, 0);
+        assert_eq!(b.recorded, 0);
+        assert_eq!(b.pr_opened, 0);
+    }
+
+    #[test]
+    fn release_bump_stats_are_zero_on_merged_runs_with_no_bump_or_no_runs() {
+        let stats = collect(&[state_with(Vec::new(), 'A', RunStatus::Merged)]);
+        let b = &stats.release_bumps;
+        assert_eq!(b.merged, 1);
+        assert_eq!(b.recorded, 0);
+        assert_eq!(b.coverage_rate(), 0.0);
+        assert_eq!(b.automerge_rate(), 0.0);
+        assert_eq!(b.attention_rate(), 0.0);
+        assert_eq!(b.clean(), 0);
+
+        let empty = collect(&[]);
+        let b = &empty.release_bumps;
+        assert_eq!(b.merged, 0);
+        assert_eq!(b.coverage_rate(), 0.0);
+        assert_eq!(b.automerge_rate(), 0.0);
+        assert_eq!(b.attention_rate(), 0.0);
     }
 
     fn event(node: &str, at_secs: i64, message: &str) -> crate::run::Event {

@@ -2549,6 +2549,7 @@ function renderStats() {
     renderStatsAgents(s.agents);
     renderStatsReviewers(s.reviewers);
     renderStatsAdvisors(s.advisors);
+    renderStatsBumps(s.release_bumps);
   }
   renderStatsQueue(s.queue);
 }
@@ -2680,6 +2681,29 @@ function renderStatsAdvisors(advisors) {
     fraction: `${a.strong}/${a.proposed} strong (${a.seated} seats · ${a.faint} faint · ${a.absent} no proposal)`,
     rate: a.reflection_rate,
   })));
+}
+
+/* Hidden entirely when `merged` is zero - a home with nothing merged yet has
+   no coverage to report at all. Once at least one run has merged, the panel
+   stays visible even if `recorded` is zero: "0 of N merged runs recorded a
+   bump" is itself the fact this panel exists to show, and hiding it would
+   make a repository that never wired up the release-bump step look the same
+   as one this dashboard simply hasn't loaded data for yet. */
+function renderStatsBumps(b) {
+  show($("stats-bumps-panel"), b.merged > 0);
+  if (b.merged === 0) return;
+  const root = $("stats-bumps-tiles");
+  clear(root);
+  root.append(
+    statsTile("Recorded", `${b.recorded}/${b.merged}`, "blue"),
+    statsTile("Coverage", statsPct(b.coverage_rate), "blue"),
+    statsTile("PR opened", b.pr_opened, "blue"),
+    statsTile("Automerge enabled", b.automerge_enabled, "teal"),
+    statsTile("Merged directly", b.merged_directly, "teal"),
+    statsTile("Clean", b.clean, "gold"),
+    statsTile("Needs a human", b.needs_attention, "rust"),
+    statsTile("Attention rate", statsPct(b.attention_rate), "rust"),
+  );
 }
 
 function renderStatsQueue(q) {
