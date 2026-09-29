@@ -202,7 +202,13 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// monitoring script polling for `blocked`, say — needs to know that
 /// `superseded` is where some of those records now go instead of staying put
 /// forever; see that function's own doc for exactly when.
-pub const SCHEMA: u32 = 10;
+///
+/// Schema 11 adds [`RunState::released_to`] / [`RunState::released_branches`]:
+/// a run whose worktree a later attempt at the same task took over
+/// (`crate::handover`) can no longer be resumed from where it was. The fields
+/// are additive, but an older build would happily resume such a run into a
+/// worktree that no longer exists, which is the one thing the bump is for.
+pub const SCHEMA: u32 = 11;
 
 /// Where a run got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1536,6 +1542,16 @@ pub struct RunState {
     /// the second is a leftover. Cleared by the resume that carries it on.
     #[serde(default)]
     pub parked: bool,
+    /// The run that took this run's worktree over, when one did — see
+    /// [`crate::handover`]. `Some` means the worktree is gone on purpose and
+    /// the run can no longer be resumed from it ([`Self::released`]).
+    #[serde(default)]
+    pub released_to: Option<String>,
+    /// Branches that outlived this run's released worktree and now belong to
+    /// the run in [`Self::released_to`] (and to its pull request). A later
+    /// fold must leave them alone.
+    #[serde(default)]
+    pub released_branches: Vec<String>,
     /// Per-seat conversation state.
     #[serde(default)]
     pub seats: BTreeMap<String, SeatState>,
@@ -1671,6 +1687,8 @@ impl RunState {
             quota: Vec::new(),
             withheld: Vec::new(),
             parked: false,
+            released_to: None,
+            released_branches: Vec::new(),
             seats: BTreeMap::new(),
             active: BTreeMap::new(),
             driver_pid: None,
@@ -2075,6 +2093,12 @@ fn migrate_schema(mut state: RunState) -> Result<RunState> {
     // a schema-9 record at all — see `SCHEMA`'s doc for schema 10. This only
     // advances the version number.
     if state.schema == 9 {
+        state.schema = 10;
+    }
+    // Schema 10 predates `released_to`: no old run ever had its worktree
+    // handed over, and `#[serde(default)]` reads exactly that. Only the
+    // version number advances.
+    if state.schema == 10 {
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {
@@ -2089,6 +2113,12 @@ fn migrate_schema(mut state: RunState) -> Result<RunState> {
 }
 
 impl RunState {
+    /// Whether a later attempt took this run's worktree over, so a resume has
+    /// nothing left to continue from.
+    pub fn released(&self) -> bool {
+        self.released_to.is_some()
+    }
+
     /// The winning candidate, once the tally has run.
     pub fn winner(&self) -> Option<&Candidate> {
         let label = self.tally.as_ref()?.winner;

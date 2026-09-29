@@ -35,6 +35,7 @@ pub mod daemon;
 pub mod disk;
 pub mod git;
 pub mod graph;
+pub mod handover;
 pub mod land;
 pub mod md;
 pub mod notices;
