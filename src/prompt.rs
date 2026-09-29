@@ -219,6 +219,20 @@ magi ask --summary \"Which storage backend?\" --choice SQLite --choice Redis\n\
 ```\n\n\
 It blocks and prints the owner's answer on stdout. Omit `--choice` for a \
 free-text reply.\n\n\
+**An answer is an instruction to you.** Every question presumes that once \
+the owner answers, you carry the answer out yourself: the process blocked \
+in `magi ask` continues with it. So never ask permission for something you \
+can and should just do - resuming a parked run, which the project \
+instructions already tell you to do, is done, not asked about. Only when a \
+part genuinely cannot be done by you, say in the question WHO will do it \
+(agent, operator or daemon) for each choice, and start each `--choice` label \
+with that actor, so the owner knows whether picking it leads to action or to \
+waiting on someone:\n\n\
+```sh\n\
+magi ask --summary \"Token expired: who rotates it?\" --choice \"agent: switch to the read-only mirror\" --choice \"operator: rotate the token, then I continue\"\n\
+```\n\n\
+Keep the actor word in English (`agent:`, `operator:`, `daemon:`) whatever \
+language the question is written in.\n\n\
 **Never put this in the background.** The process blocked inside `magi ask` \
 *is* the conversation with the owner - it is the only thing that will ever \
 read their answer. Backgrounding it, or letting your own process exit while \
@@ -259,7 +273,8 @@ of what the owner asked - the previous choices are gone otherwise, not kept. \
 Keep replying on the same thread until an answer comes back.\n\n\
 Ask sparingly. A question stops the run until a human notices it, and asking \
 about something you could have decided yourself is how that channel becomes \
-noise the owner learns to ignore.",
+noise the owner learns to ignore. Asking permission for something you were \
+already meant to do is the same noise.",
     );
     if !is_english(language) {
         // Load-bearing, and separate from `lang()` on purpose: the summary,
@@ -1714,7 +1729,10 @@ pub fn conduct(
          wait behind it. Instead, put the question in `question` (and \
          `choices`, if it is multiple choice) on a decision — magi files it \
          without blocking and blocks that task on its id. If a task already \
-         has an unanswered question of yours, do not ask it again.\n\n",
+         has an unanswered question of yours, do not ask it again. Here no blocked \
+process continues with the answer: your next cycle's decision and the \
+daemon carry it out, so a choice's actor label is `daemon:` or `operator:`, \
+never `agent:`.\n\n",
     );
 
     s.push_str(
@@ -2432,6 +2450,17 @@ mod tests {
             "the fix is a foreground call, not a background one: {p}"
         );
     }
+    #[test]
+    fn a_question_presumes_the_asker_acts_on_the_answer_and_names_who_acts() {
+        let p = implement("do it", "/tmp/wt", "en", None);
+        assert!(p.contains("never ask permission"), "{p}");
+        assert!(p.contains("resuming a parked run"), "{p}");
+        assert!(p.contains("agent: switch to the read-only mirror"), "{p}");
+        assert!(p.contains("operator: rotate the token"), "{p}");
+        let c = conduct(&[conduct_task("t1")], &[], &[], "en");
+        assert!(c.contains("never `agent:`"), "{c}");
+    }
+
     #[test]
     fn a_question_is_asked_in_the_operators_language_not_in_a_language_code() {
         // Reported from a real run: `language = "ja"` was set and the questions
