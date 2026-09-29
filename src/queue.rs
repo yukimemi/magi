@@ -2721,18 +2721,21 @@ mod tests {
     fn attachment_names_that_could_traverse_or_are_odd_are_refused() {
         let (dir, q) = queue();
         let mut t = task("bad names");
-        for name in [
-            "a..b.png",
-            ".hidden",
-            "C:foo.png",
-            "with space.png",
-            "-x.png",
-        ] {
+        for name in ["a..b.png", ".hidden", "with space.png", "-x.png"] {
             let src = source_file(dir.path(), name, "x");
             assert!(
                 q.attach(&mut t, &[src]).is_err(),
                 "`{name}` must be refused"
             );
+        }
+        // A drive-qualified name cannot exist as a file on Windows (joining it
+        // to a directory yields a drive-relative path to `foo.png` instead),
+        // so the rule is asserted on the name itself, everywhere.
+        assert!(!crate::ask::valid_asset_name("C:foo.png"));
+        #[cfg(not(windows))]
+        {
+            let src = source_file(dir.path(), "C:foo.png", "x");
+            assert!(q.attach(&mut t, &[src]).is_err());
         }
         let long = format!("{}.png", "a".repeat(70));
         let src = source_file(dir.path(), &long, "x");
