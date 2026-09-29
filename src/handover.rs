@@ -7,11 +7,11 @@
 //! may be deleted. Auto-fold cannot help: it only folds terminal runs, and an
 //! unfinished run keeps its worktrees on purpose so it can be resumed.
 //!
-//! When the run holding the branch is one this attempt supersedes
-//! ([`crate::queue::Task::earlier_attempts`]), nothing is left to resume it
-//! into, so its worktree - and only its worktree - is released before the
-//! review starts. The branch, every commit and any pull request stay
-//! exactly where they were.
+//! When the run holding the branch is an earlier attempt at the same task
+//! ([`crate::queue::Task::earlier_attempts`]) - superseded or not: blocked,
+//! failed, stale or parked alike - and nothing is driving it, its worktree
+//! (and only its worktree) is released before the review starts. The
+//! branch, every commit and any pull request stay exactly where they were.
 //!
 //! [`decide`] is pure; [`release`] is the only function here that touches git
 //! or disk. Only a queue-driven review takes over anything: a hand-run
@@ -190,7 +190,12 @@ async fn inspect(
         status: state.status,
         liveness,
         driver_unproven: liveness == Liveness::Unknown && state.driver_pid.is_some(),
-        dirty: !git::status_porcelain(path).await?.trim().is_empty(),
+        // Spelled out: `status.showUntrackedFiles=no` in a user's config would
+        // otherwise hide new files from `git status` and let them be deleted.
+        dirty: !git::git(path, &["status", "--porcelain", "--untracked-files=normal"])
+            .await?
+            .trim()
+            .is_empty(),
         head: git::rev_parse(path, "HEAD").await?,
         tip: git::rev_parse(repo, &format!("refs/heads/{branch}")).await?,
     })

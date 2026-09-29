@@ -197,3 +197,36 @@ async fn a_running_run_is_refused_and_left_alone() {
     assert!(!old.released());
 }
 }
+
+common::e2e! {
+async fn a_blocked_run_whose_driver_stopped_is_released_though_its_pid_lives() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (mut old, wt) = old_run(&fx);
+    // The daemon that drove the run is still up (this very process), but the
+    // run's walk ended: it is blocked, not running.
+    let pid = std::process::id();
+    old.status = RunStatus::Blocked;
+    old.driver_pid = Some(pid);
+    old.driver_started_at = magi::proc::process_started_at(pid);
+    old.driver_exited = true;
+    old.save().unwrap();
+    let tip = run_git(&fx.repo, &["rev-parse", BRANCH]);
+
+    let runner = Runner::review_taking_over(
+        &fx.repo,
+        BRANCH,
+        fx.config.clone(),
+        Some(takeover(&[&old])),
+    )
+    .await
+    .expect("a stopped driver does not hold the branch");
+
+    assert!(!wt.exists());
+    assert_eq!(run_git(&fx.repo, &["rev-parse", BRANCH]), tip, "the branch survives");
+    let old = RunState::load_under(&old.id, &magi::run::home()).unwrap();
+    assert_eq!(old.released_to.as_deref(), Some(runner.state.id.as_str()));
+    assert!(old.events.iter().any(|e| e.node == "release"));
+    assert!(Runner::resume(&old.id).is_err());
+}
+}

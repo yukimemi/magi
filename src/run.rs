@@ -208,7 +208,11 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// (`crate::handover`) can no longer be resumed from where it was. The fields
 /// are additive, but an older build would happily resume such a run into a
 /// worktree that no longer exists, which is the one thing the bump is for.
-pub const SCHEMA: u32 = 11;
+///
+/// Schema 12 adds [`RunState::driver_exited`]: the driver records that it
+/// stopped walking the graph. Additive, but an older build would keep reading
+/// a long-lived daemon's pid as a live driver of a run that ended long ago.
+pub const SCHEMA: u32 = 12;
 
 /// Where a run got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1594,6 +1598,17 @@ pub struct RunState {
     /// extreme can be proven.
     #[serde(default)]
     pub driver_started_at: Option<String>,
+    /// The process named by [`Self::driver_pid`] has stopped driving this run:
+    /// its graph walk returned, whatever the outcome. Cleared at the start of
+    /// every walk, set as the last write of one.
+    ///
+    /// A long-lived `magi serve` records its own pid and keeps it after the
+    /// run ends, so that pid answers alive with a matching identity for as
+    /// long as the daemon lives, and every blocked, failed or parked run it
+    /// ever drove would read as being worked on right now. A crash or kill
+    /// never sets this, and needs nothing to: the pid is dead then.
+    #[serde(default)]
+    pub driver_exited: bool,
     /// Last observation of the winner's pull request, when a land loop ran.
     ///
     /// Persisted rather than derived from the event log because the phone asks
@@ -1693,6 +1708,7 @@ impl RunState {
             active: BTreeMap::new(),
             driver_pid: None,
             driver_started_at: None,
+            driver_exited: false,
             pr: None,
             release_bump: None,
             base_sync: None,
@@ -1939,6 +1955,11 @@ impl RunState {
         if daemon_claims {
             return Liveness::Live;
         }
+        // The driver said itself that it stopped; its pid may well be alive
+        // (a daemon outlives the runs it drives), so it is not asked.
+        if self.driver_exited {
+            return Liveness::Dead;
+        }
         let Some(pid) = self.driver_pid else {
             return Liveness::Unknown;
         };
@@ -2099,6 +2120,11 @@ fn migrate_schema(mut state: RunState) -> Result<RunState> {
     // handed over, and `#[serde(default)]` reads exactly that. Only the
     // version number advances.
     if state.schema == 10 {
+        state.schema = 11;
+    }
+    // Schema 11 predates `driver_exited`: `false` is what an old record
+    // means, and the pid is asked as before. Only the version advances.
+    if state.schema == 11 {
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {
@@ -2709,6 +2735,22 @@ mod tests {
         s.active
             .insert("impl-B".to_owned(), overrun_seat(now, 0, 3_600));
         assert!(!s.active_all_overrun(now));
+    }
+
+    /// A driver that recorded its own exit reads dead without its pid being
+    /// asked: a daemon's pid outlives the runs it drove.
+    #[test]
+    fn an_exited_driver_is_dead_even_when_its_pid_answers_alive() {
+        let mut s = state();
+        s.driver_pid = Some(4242);
+        s.driver_started_at = Some("2026-09-22T10:00:00Z".to_owned());
+        s.driver_exited = true;
+        let never = |_| -> Option<bool> { panic!("the pid must not be asked") };
+        assert_eq!(
+            s.liveness_with(false, never, |_| panic!("nor its identity")),
+            Liveness::Dead
+        );
+        assert_eq!(s.liveness_with(true, never, |_| None), Liveness::Live);
     }
 
     /// A daemon claim wins outright, whatever `driver_pid` or either query
