@@ -1472,6 +1472,16 @@ function sectionCompatibleWithStateFilter(sectionKey, filterKey) {
   return REPRESENTATIVE_RUN_SHAPES.some((run) => runSection(run) === sectionKey && filter.match(run));
 }
 
+/* Same idea as sectionCompatibleWithStateFilter, for the exact-status lens a
+   stats tile can set (see openRunsFiltered): "Merged" is done by
+   construction, so pairing it with "Active" or "In flight" always yields
+   zero cards the same way "Landed" does. */
+function statusCompatibleWithStateFilter(status, filterKey) {
+  const filter = RUN_STATE_FILTERS.find((f) => f.key === filterKey);
+  if (!filter) return true;
+  return REPRESENTATIVE_RUN_SHAPES.some((run) => run.status === status && filter.match(run));
+}
+
 /* A head that still names a `superseded_by` (see foldRuns below) is one
    whose successor fell outside the page /api/runs returned, so it could not
    be folded under a newer card — it is genuinely an old attempt, just one
@@ -1494,7 +1504,14 @@ function selectRunStateFilter(key) {
      cards with no way to tell why, so the now-stale tree pick is dropped
      rather than fought over. */
   if (state.runsFilter.section && !sectionCompatibleWithStateFilter(state.runsFilter.section, key)) {
-    state.runsFilter = { section: null, repo: null };
+    state.runsFilter = { ...state.runsFilter, section: null, repo: null };
+  }
+  /* Same guard for the exact-status lens a stats tile may have set (see
+     openRunsFiltered and statusCompatibleWithStateFilter) — e.g. "Merged"
+     (done by construction) paired with "Active" (not done) can never show a
+     card either. */
+  if (state.runsFilter.status && !statusCompatibleWithStateFilter(state.runsFilter.status, key)) {
+    state.runsFilter = { ...state.runsFilter, status: null };
   }
   renderRuns();
 }
@@ -1662,15 +1679,25 @@ function selectRunsFilter(section, repo) {
    comment) and always resets the state chip to "all", since a tile counts
    every run in that status regardless of whether it is currently in flight,
    waiting, or done, and the chip would otherwise silently hide the very
-   runs the tile promised to show. */
+   runs the tile promised to show.
+
+   applyRoute() only flips which view is visible - it does not itself
+   re-render the Runs list (that only happens from loadRuns()/the SSE poll,
+   since ordinarily nothing about the already-rendered cards has changed by
+   the time a plain #runs navigation lands). Here state.runsFilter *has*
+   just changed, so applyRoute() alone would leave last render's cards on
+   screen until the next poll. applyRoute() is still called explicitly
+   (rather than left to the hashchange listener) so the view flips
+   synchronously even when the hash string itself doesn't change - e.g.
+   tapping a tile while the Runs view happens to already be open, which
+   fires no hashchange event at all - and renderRuns() is what actually
+   redraws the list either way. */
 function openRunsFiltered(status) {
   state.runsStateFilter = "all";
   state.runsFilter = { section: null, repo: null, status };
-  if (parseRoute().name === "runs") {
-    renderRuns();
-  } else {
-    location.hash = "#runs";
-  }
+  location.hash = "#runs";
+  applyRoute();
+  renderRuns();
 }
 
 function clearRunsFilter() {
@@ -2885,17 +2912,19 @@ const query = state.queueSearch.trim().toLowerCase();
 }
 
 /* Stats-tile navigation into the Backlog: sets which QUEUE_SECTIONS key to
-   expand and scroll to (see consumeQueueSectionFocus, revealQueueSection)
-   before touching the hash, then either re-renders immediately (already on
-   #queue, so no hashchange would otherwise fire) or lets the hash change
-   drive applyRoute() the normal way. */
+   expand and scroll to (see consumeQueueSectionFocus, revealQueueSection).
+   Mirrors openRunsFiltered's own reasoning: applyRoute() only flips which
+   view is visible for a plain `#queue` hash (it calls renderQueue() itself
+   only for the `#/queue/<id>` task-focus form, see applyRoute's own
+   comment), so it is called explicitly here to flip the view synchronously
+   even when the hash doesn't change (the Backlog may already be open), and
+   renderQueue() is what actually consumes state.queueSectionFocus and
+   reveals the section. */
 function openQueueSectionFocus(sectionKey) {
   state.queueSectionFocus = sectionKey;
-  if (parseRoute().name === "queue") {
-    renderQueue();
-  } else {
-    location.hash = "#queue";
-  }
+  location.hash = "#queue";
+  applyRoute();
+  renderQueue();
 }
 
 /* Lands on the task named by state.queueFocus, set by applyRoute() from a

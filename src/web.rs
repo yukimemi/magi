@@ -8547,6 +8547,35 @@ mod tests {
             APP_JS.contains("if (status && String(run.status || \"\") !== status) return false;"),
             "matchesFilter must gate on the exact status a KPI tile named"
         );
+        // applyRoute() only flips which view is visible for a plain `#runs`
+        // hash - it does not itself redraw the list (see applyRoute's own
+        // handling below) - so openRunsFiltered must call renderRuns()
+        // itself, and must call applyRoute() too so the view flips even
+        // when the hash string doesn't change (the operator may already be
+        // on the Runs view when a tile is tapped, which fires no
+        // hashchange event at all).
+        assert!(
+            APP_JS.contains("  location.hash = \"#runs\";\n  applyRoute();\n  renderRuns();\n}"),
+            "openRunsFiltered must explicitly re-render the Runs list, not rely on a \
+             hashchange event that may never fire"
+        );
+    }
+
+    #[test]
+    fn selecting_a_run_state_chip_drops_an_incompatible_status_filter() {
+        // A stats tile can leave state.runsFilter.status set to something
+        // done-by-construction (e.g. "merged") - picking "Active" afterward
+        // must drop it the same way an incompatible tree section is already
+        // dropped, or the Runs list renders permanently empty with no way
+        // for the operator to tell why.
+        assert!(APP_JS.contains("function statusCompatibleWithStateFilter(status, filterKey)"));
+        assert!(
+            APP_JS.contains(
+                "  if (state.runsFilter.status && !statusCompatibleWithStateFilter(state.runsFilter.status, key)) {\n    state.runsFilter = { ...state.runsFilter, status: null };\n  }"
+            ),
+            "selectRunStateFilter must clear an incompatible status filter, mirroring its own \
+             guard for an incompatible tree section"
+        );
     }
 
     #[test]
@@ -8609,6 +8638,18 @@ mod tests {
                 "  const details = document.querySelector(`#queue-sections details.list-section[data-key=\"${CSS.escape(key)}\"]`);\n  state.queueSectionFocus = null;\n  if (details) revealQueueSection(details);"
             ),
             "state.queueSectionFocus must only be cleared immediately before the reveal it guards"
+        );
+        // applyRoute() only calls renderQueue() itself for the `#/queue/<id>`
+        // task-focus form of the hash - a plain `#queue` navigation only
+        // flips which view is visible. openQueueSectionFocus() must
+        // therefore call renderQueue() itself, and applyRoute() too so the
+        // view flips even when the hash doesn't change (the Backlog may
+        // already be open when a tile is tapped, firing no hashchange
+        // event at all).
+        assert!(
+            APP_JS.contains("  location.hash = \"#queue\";\n  applyRoute();\n  renderQueue();\n}"),
+            "openQueueSectionFocus must explicitly re-render the Backlog, not rely on a \
+             hashchange event that may never fire"
         );
     }
 
