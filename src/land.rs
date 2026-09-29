@@ -1815,7 +1815,7 @@ async fn announce_red_merge(state: &mut RunState, pr: &PrState) {
         rec.red_at_merge = pr.failing.clone();
     }
     state.event("land", summary.clone());
-    crate::notices::raise(crate::notices::merged_red(&state.id, state.short()));
+    crate::notices::raise(crate::notices::merged_red(&state.id, &summary));
     if let Err(e) = ask::notify_text(&state.config.notify, &state.id, &summary).await {
         tracing::warn!("could not notify about a merge with red checks: {e:#}");
     }
