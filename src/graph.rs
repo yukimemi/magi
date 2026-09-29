@@ -733,6 +733,7 @@ impl Runner {
     /// notification centre. Best-effort: see [`crate::notices::raise`].
     pub async fn execute(&mut self) -> Result<()> {
         let result = self.execute_graph().await;
+        self.mark_driver_exited();
         let ended = if result.is_err() {
             Some(crate::notices::run_stopped(&self.state.id, &self.state))
         } else {
@@ -742,6 +743,29 @@ impl Runner {
             crate::notices::raise(notice);
         }
         result
+    }
+
+    /// Record that this process no longer drives the run, so its pid (a
+    /// daemon's outlives the run) is not read as a live driver.
+    ///
+    /// Written onto the record as it is on disk, never this copy: another
+    /// process may have resumed the run (recording its own pid and clearing
+    /// the flag) or released its worktree since this copy was read, and
+    /// saving over that would mark a running driver dead. Only a record still
+    /// naming this process as the driver is touched.
+    fn mark_driver_exited(&mut self) {
+        self.state.driver_exited = true;
+        let pid = std::process::id();
+        let Ok(mut disk) = RunState::load(&self.state.id) else {
+            return;
+        };
+        if disk.released_to.is_some() || disk.driver_pid != Some(pid) || disk.driver_exited {
+            return;
+        }
+        disk.driver_exited = true;
+        if let Err(e) = disk.save() {
+            tracing::warn!("could not record that run {} stopped: {e:#}", self.state.id);
+        }
     }
 
     async fn execute_graph(&mut self) -> Result<()> {
@@ -786,6 +810,7 @@ impl Runner {
         let pid = std::process::id();
         self.state.driver_pid = Some(pid);
         self.state.driver_started_at = crate::proc::process_started_at(pid);
+        self.state.driver_exited = false;
         self.state.save()?;
         // A run that already lost its quorum never resumes into the verdict
         // machinery: `deliberate` and `vote` would otherwise clobber the
