@@ -745,6 +745,7 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
                 at: now,
                 conductor_rehold: None,
                 forced: false,
+                pinned_run: None,
             });
         }
         DepsAction::Discard => {
@@ -937,6 +938,7 @@ pub fn run_once(
                                 at: now,
                                 conductor_rehold: None,
                                 forced: false,
+                                pinned_run: None,
                             },
                         };
                         task.release();

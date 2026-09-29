@@ -233,6 +233,15 @@ magi ask --summary \"Token expired: who rotates it?\" --choice \"agent: switch t
 ```\n\n\
 Keep the actor word in English (`agent:`, `operator:`, `daemon:`) whatever \
 language the question is written in.\n\n\
+When a choice should make the daemon act on the task behind your run once it \
+is picked, attach a structured action to that exact choice with `--action \
+\"<choice>=<verb>\"`: `resume` (continue this run, or `resume:<run-id>`), \
+`requeue` (a fresh competition) or `done`. The daemon never infers an action \
+from a label's wording, so a choice without `--action` only records the \
+answer.\n\n\
+```sh\n\
+magi ask --summary \"Continue this run?\" --choice \"daemon: resume the run\" --action \"daemon: resume the run=resume\" --choice \"operator: I will decide later\"\n\
+```\n\n\
 **Never put this in the background.** The process blocked inside `magi ask` \
 *is* the conversation with the owner - it is the only thing that will ever \
 read their answer. Backgrounding it, or letting your own process exit while \

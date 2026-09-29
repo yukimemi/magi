@@ -198,6 +198,15 @@ fn view(t: &Task, max_attempts: usize) -> prompt::ConductTask {
     }
 }
 
+/// Did the operator answer a `magi ask` choice with a `resume` action that
+/// this task has not yet acted on? Then `Recovery::Requeue` must not turn the
+/// task into a fresh competition either.
+fn pinned_resume(task: &Task) -> bool {
+    task.resume_override
+        .as_ref()
+        .is_some_and(|o| o.pinned_run.is_some())
+}
+
 /// May the conductor's `Recovery::Hold` take effect on `task`, given an
 /// operator's recorded "resume" answer? The conductor is allowed to override
 /// that answer once - and the override is recorded so `crate::triage` can
@@ -210,7 +219,7 @@ fn may_hold(task: &mut Task, reason: &str) -> bool {
     let Some(o) = task.resume_override.as_mut() else {
         return true;
     };
-    if o.forced {
+    if o.forced || o.pinned_run.is_some() {
         tracing::warn!(
             "conductor tried to hold task {} after the operator forced a resume: {reason}",
             task.id
@@ -452,6 +461,13 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
         return Ok(());
     }
 
+    // The operator's `resume` action is waiting for its turn: a question or a
+    // dependency would park the task before the daemon can run it.
+    let pinned = pinned_resume(&task);
+    if pinned && (d.question.is_some() || !d.blocked_by.is_empty()) {
+        return Ok(());
+    }
+
     if let Some(text) = &d.question {
         if task.status == TaskStatus::Done {
             return Ok(());
@@ -509,6 +525,7 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
             }
         }
         TaskStatus::Running => match d.recovery {
+            Some(Recovery::Requeue) if pinned_resume(&task) => {}
             Some(Recovery::Requeue) => {
                 task.requeue();
                 queue.put(&mut task)?;
@@ -523,6 +540,9 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
             _ => {}
         },
         TaskStatus::Failed | TaskStatus::Held => match d.recovery {
+            // The operator picked a specific run to continue; a fresh
+            // competition would throw that run away.
+            Some(Recovery::Requeue) if pinned_resume(&task) => {}
             Some(Recovery::Requeue) => {
                 task.requeue();
                 queue.put(&mut task)?;
@@ -2260,5 +2280,69 @@ mod tests {
         .unwrap();
         // Reaching here at all (no hang) is the assertion.
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Blocked);
+    }
+
+    #[test]
+    fn a_pinned_resume_is_not_held_or_requeued_by_the_conductor() {
+        let mut t = Task::new("t".into(), "t".into(), PathBuf::new(), Source::Human);
+        t.resume_override = Some(crate::queue::OperatorResume {
+            question_id: "q".into(),
+            at: jiff::Timestamp::now(),
+            conductor_rehold: None,
+            forced: false,
+            pinned_run: Some("run-1".into()),
+        });
+        assert!(pinned_resume(&t));
+        assert!(!may_hold(&mut t, "waiting for magi resume"));
+        assert!(
+            t.resume_override
+                .as_ref()
+                .unwrap()
+                .conductor_rehold
+                .is_none(),
+            "a refused hold is not recorded as an override"
+        );
+        t.resume_override = None;
+        assert!(!pinned_resume(&t));
+        assert!(may_hold(&mut t, "no override, so a hold is allowed"));
+    }
+
+    #[test]
+    fn a_pinned_resume_is_not_blocked_by_a_conductor_question_or_dependency() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("resume me");
+        t.resume_override = Some(crate::queue::OperatorResume {
+            question_id: "q".into(),
+            at: jiff::Timestamp::now(),
+            conductor_rehold: None,
+            forced: true,
+            pinned_run: Some("run-1".into()),
+        });
+        queue.put(&mut t).unwrap();
+
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![
+                    Decision {
+                        id: t.id.clone(),
+                        question: Some("really?".to_owned()),
+                        ..Decision::default()
+                    },
+                    Decision {
+                        id: t.id.clone(),
+                        blocked_by: vec!["other".to_owned()],
+                        ..Decision::default()
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+        assert!(questions.list().is_empty());
     }
 }

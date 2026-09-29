@@ -646,4 +646,20 @@ mod tests {
             Action::Deliver(_)
         ));
     }
+
+    #[test]
+    fn an_action_answer_is_delivered_until_the_daemon_marks_it_handled() {
+        let mut q = asked(0);
+        q.choices = vec!["A".into()];
+        q.actions
+            .insert("A".into(), crate::ask::ChoiceAction::Requeue);
+        q.answer(crate::ask::Answer::Choice("A".into())).unwrap();
+        assert_eq!(
+            decide(&q, None, false, 86_400, ts(10)),
+            Action::Deliver(Word::Answered("A".into())),
+            "an action nobody applied must not swallow the answer"
+        );
+        q.answer_delivered = true;
+        assert_eq!(decide(&q, None, false, 86_400, ts(10)), Action::Idle);
+    }
 }

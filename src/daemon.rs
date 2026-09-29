@@ -723,6 +723,179 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
     }
 }
 
+/// What [`decide_action`] concluded about one answered question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActionDecision {
+    /// Nothing to do now (no action, already applied, or the task is busy).
+    Skip,
+    /// Continue the named run instead of competing again.
+    Resume(String),
+    /// Requeue as a fresh competition.
+    Requeue,
+    /// Close the task as done.
+    Done,
+    /// The question is about an earlier attempt than the task's latest; it
+    /// is recorded as handled and changes nothing.
+    Stale,
+    /// The action cannot be carried out; hold the task and say why. Never
+    /// falls back to something else, because the operator chose this one.
+    Refuse(String),
+}
+
+/// Decide what the choice answered on `q` means for `task`. Pure: `load`
+/// reads a run's state, as with [`unfinished_run_with`].
+///
+/// `Resume` only fires on the task's *latest* run, and only while that run
+/// could actually make progress ([`RunStatus::resumable`], not released, review
+/// budget left); an answer naming anything else is refused rather than
+/// reinterpreted as a fresh competition.
+fn decide_action<F>(task: &Task, q: &ask::Question, load: F) -> ActionDecision
+where
+    F: FnOnce(&str) -> Result<RunState>,
+{
+    let Some(action) = q.chosen_action() else {
+        return ActionDecision::Skip;
+    };
+    if task.action_applied(&q.id)
+        || matches!(
+            task.status,
+            TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Done
+        )
+    {
+        return ActionDecision::Skip;
+    }
+    // A question about an earlier attempt must not act on a newer one. A
+    // conductor question is keyed by the task id, not a run, so it is exempt.
+    if q.node != crate::conduct::NODE && task.runs.last() != Some(&q.run) {
+        return ActionDecision::Stale;
+    }
+    match action {
+        ask::ChoiceAction::Requeue => ActionDecision::Requeue,
+        ask::ChoiceAction::Done => ActionDecision::Done,
+        ask::ChoiceAction::Resume { run } => {
+            if task.runs.last() != Some(run) {
+                return ActionDecision::Refuse(format!(
+                    "question {} asked to resume run {}, which is not this task's latest run",
+                    q.short(),
+                    ask::short_id(run)
+                ));
+            }
+            match load(run) {
+                Ok(s) if s.status.resumable() && !s.released() && !exhausted_review_budget(&s) => {
+                    ActionDecision::Resume(run.clone())
+                }
+                Ok(_) => ActionDecision::Refuse(format!(
+                    "question {} asked to resume run {}, which cannot make progress",
+                    q.short(),
+                    ask::short_id(run)
+                )),
+                Err(e) => ActionDecision::Refuse(format!(
+                    "question {} asked to resume run {}, which could not be read: {e:#}",
+                    q.short(),
+                    ask::short_id(run)
+                )),
+            }
+        }
+    }
+}
+
+/// The task an answered question speaks for: the one whose runs include the
+/// question's run, or - for a conductor question, filed under the task's own
+/// id - the task with that id.
+fn task_of_question<'a>(tasks: &'a [Task], q: &ask::Question) -> Option<&'a Task> {
+    if q.node == crate::conduct::NODE {
+        return tasks.iter().find(|t| t.id == q.run);
+    }
+    tasks.iter().find(|t| t.runs.contains(&q.run))
+}
+
+/// Carry out the [`ask::ChoiceAction`] attached to each answered choice, once.
+///
+/// Runs on every poll before the conductor looks at the queue. The task is
+/// re-read under its claim, so a task somebody completed or held by hand in
+/// the meantime is judged on what it is now. `Resume` releases the task and
+/// records a pinned [`crate::queue::OperatorResume`], which `crate::conduct`
+/// honours (no re-hold, no requeue) until the task runs and [`attempt`]'s
+/// ordinary `unfinished_run` logic resumes that same run.
+fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
+    let tasks = queue.list();
+    for q in questions.list() {
+        if q.chosen_action().is_none() {
+            continue;
+        }
+        let Some(listed) = task_of_question(&tasks, &q) else {
+            continue;
+        };
+        if listed.action_applied(&q.id) {
+            continue;
+        }
+        let Ok(_claim) = queue.claim(&listed.id) else {
+            continue;
+        };
+        let Ok(mut task) = queue.get(&listed.id) else {
+            continue;
+        };
+        let decision = decide_action(&task, &q, |id| RunState::load_under(id, home));
+        let ran = matches!(
+            decision,
+            ActionDecision::Resume(_) | ActionDecision::Requeue | ActionDecision::Done
+        );
+        if ran {
+            // Whoever delivers the answer first owns it: the waiter resuming
+            // the asking seat, or this. A delivery in flight keeps a fresh
+            // lease, and the flag is taken atomically *before* the task is
+            // touched, so the two can never both act on one answer.
+            if questions
+                .read_lease(&q.id)
+                .is_some_and(|l| l.fresh(Timestamp::now()))
+            {
+                continue;
+            }
+            let taken = questions.update(&q.id, |r| {
+                let free = !r.answer_delivered;
+                r.answer_delivered = true;
+                Ok(free)
+            });
+            if !matches!(taken, Ok((_, true))) {
+                continue;
+            }
+        }
+        match decision {
+            ActionDecision::Skip => continue,
+            ActionDecision::Resume(run) => {
+                task.release();
+                task.resume_override = Some(crate::queue::OperatorResume {
+                    question_id: q.id.clone(),
+                    at: Timestamp::now(),
+                    conductor_rehold: None,
+                    forced: true,
+                    pinned_run: Some(run),
+                });
+            }
+            ActionDecision::Stale => {}
+            ActionDecision::Requeue => task.requeue(),
+            ActionDecision::Done => {
+                task.succeed();
+                supersede_prior_runs(&task, home);
+            }
+            ActionDecision::Refuse(why) => {
+                task.hold_machine(Some(why));
+                notices::raise(
+                    Notice::warn(
+                        &format!("action:{}", q.id),
+                        "An answer asked the daemon to resume a run that cannot be resumed; the task stays held.",
+                    )
+                    .link(Link::Task {
+                        id: task.id.clone(),
+                    }),
+                );
+            }
+        }
+        task.mark_action_applied(&q.id);
+        record(queue, &mut task);
+    }
+}
+
 /// Retire an unanswered conductor question after its task no longer refers to
 /// it. Conductor questions use the task id in `Question::run`, so run-based
 /// cleanup cannot observe a manual release or completion.
@@ -1961,6 +2134,7 @@ async fn poll(
         // Deterministic: no model, run before the conductor sees anything so
         // its input reflects the queue's current, already-resolved state.
         resolve_blockers(queue, &questions);
+        apply_choice_actions(queue, &questions, home);
         reconcile_task_questions(queue, &questions);
 
         // The conductor gets one look per cycle, right before the loop takes
@@ -6952,5 +7126,172 @@ mod tests {
             }),
             None
         );
+    }
+
+    fn action_question(run: &str, action: ask::ChoiceAction) -> ask::Question {
+        let mut q = ask::Question::new(
+            run.to_owned(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            "continue?".to_owned(),
+            String::new(),
+            vec!["resume で続行する".to_owned(), "other".to_owned()],
+        );
+        q.actions.insert("resume で続行する".to_owned(), action);
+        q.answer(ask::Answer::Choice("resume で続行する".to_owned()))
+            .unwrap();
+        q
+    }
+
+    fn held_task_with(run: &str) -> Task {
+        let mut t = task();
+        t.runs = vec![run.to_owned()];
+        t.hold_machine(Some("waiting for magi resume to be executed".to_owned()));
+        t
+    }
+
+    fn resume_action(run: &str) -> ask::ChoiceAction {
+        ask::ChoiceAction::Resume { run: run.into() }
+    }
+
+    #[test]
+    fn decide_action_resumes_only_the_latest_resumable_run() {
+        let t = held_task_with("r1");
+        let q = action_question("r1", resume_action("r1"));
+        let load = |s: RunState| move |_: &str| Ok(s);
+        assert_eq!(
+            decide_action(&t, &q, load(run_state(RunStatus::Blocked))),
+            ActionDecision::Resume("r1".into())
+        );
+        // Not the latest run of the task.
+        let q_other = action_question("r1", resume_action("r0"));
+        assert!(matches!(
+            decide_action(&t, &q_other, load(run_state(RunStatus::Blocked))),
+            ActionDecision::Refuse(_)
+        ));
+        // A finished run cannot make progress.
+        assert!(matches!(
+            decide_action(&t, &q, load(run_state(RunStatus::Ready))),
+            ActionDecision::Refuse(_)
+        ));
+        // A released one either.
+        let mut released = run_state(RunStatus::Blocked);
+        released.released_to = Some("elsewhere".into());
+        assert!(matches!(
+            decide_action(&t, &q, load(released)),
+            ActionDecision::Refuse(_)
+        ));
+        // Unreadable state is a refusal, never a fresh competition.
+        assert!(matches!(
+            decide_action(&t, &q, |_: &str| bail!("gone")),
+            ActionDecision::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn decide_action_ignores_a_question_about_an_earlier_run() {
+        let mut t = held_task_with("r1");
+        t.runs.push("r2".to_owned());
+        let never = |_: &str| -> Result<RunState> { bail!("not read") };
+        assert_eq!(
+            decide_action(&t, &action_question("r1", ask::ChoiceAction::Done), never),
+            ActionDecision::Stale
+        );
+    }
+
+    #[test]
+    fn decide_action_maps_requeue_and_done_and_never_acts_twice() {
+        let mut t = held_task_with("r1");
+        let never = |_: &str| -> Result<RunState> { bail!("not read") };
+        assert_eq!(
+            decide_action(
+                &t,
+                &action_question("r1", ask::ChoiceAction::Requeue),
+                never
+            ),
+            ActionDecision::Requeue
+        );
+        let done_q = action_question("r1", ask::ChoiceAction::Done);
+        assert_eq!(decide_action(&t, &done_q, never), ActionDecision::Done);
+        t.mark_action_applied(&done_q.id);
+        assert_eq!(decide_action(&t, &done_q, never), ActionDecision::Skip);
+
+        // A plain answer (no action for that label) does nothing.
+        let mut plain = action_question("r1", ask::ChoiceAction::Done);
+        plain.actions.clear();
+        assert_eq!(
+            decide_action(&held_task_with("r1"), &plain, never),
+            ActionDecision::Skip
+        );
+        // A running task is left alone.
+        let mut running = held_task_with("r1");
+        running.status = TaskStatus::Running;
+        assert_eq!(
+            decide_action(
+                &running,
+                &action_question("r1", ask::ChoiceAction::Done),
+                never
+            ),
+            ActionDecision::Skip
+        );
+    }
+
+    #[test]
+    fn apply_choice_actions_releases_the_task_pinned_to_its_run_and_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let home = dir.path().join("home");
+        let mut state = run_state(RunStatus::Blocked);
+        state.id = "20260101-000000-act1".to_owned();
+        state.save_under(&home).unwrap();
+
+        let mut t = held_task_with(&state.id);
+        queue.put(&mut t).unwrap();
+        let mut q = action_question(&state.id, resume_action(&state.id));
+        questions.put(&mut q).unwrap();
+
+        apply_choice_actions(&queue, &questions, &home);
+        let after = queue.get(&t.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Queued);
+        assert!(!after.fresh_start);
+        assert!(after.action_applied(&q.id));
+        let pin = after.resume_override.clone().unwrap();
+        assert_eq!(pin.pinned_run.as_deref(), Some(state.id.as_str()));
+        assert!(pin.forced);
+
+        // Held again later: the same answer does not release it a second time.
+        let mut again = queue.get(&t.id).unwrap();
+        again.hold_machine(Some("later".into()));
+        queue.put(&mut again).unwrap();
+        apply_choice_actions(&queue, &questions, &home);
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+    }
+
+    #[test]
+    fn an_answer_the_waiter_already_delivered_is_not_acted_on_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let home = dir.path().join("home");
+        let mut state = run_state(RunStatus::Blocked);
+        state.id = "20260101-000000-act2".to_owned();
+        state.save_under(&home).unwrap();
+
+        let mut t = held_task_with(&state.id);
+        queue.put(&mut t).unwrap();
+        let mut q = action_question(&state.id, resume_action(&state.id));
+        q.answer_delivered = true;
+        questions.put(&mut q).unwrap();
+
+        apply_choice_actions(&queue, &questions, &home);
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+
+        // Undelivered: the daemon takes the delivery itself, exactly once.
+        let mut q2 = action_question(&state.id, resume_action(&state.id));
+        questions.put(&mut q2).unwrap();
+        apply_choice_actions(&queue, &questions, &home);
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+        assert!(questions.get(&q2.id).unwrap().answer_delivered);
     }
 }

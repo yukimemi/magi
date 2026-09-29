@@ -232,6 +232,96 @@ pub enum Answer {
     Text(String),
 }
 
+/// What the daemon does to the task behind a question when a particular
+/// choice is answered.
+///
+/// A closed set, attached to a choice by the asker (`magi ask --choice X
+/// --action X=resume`) and matched by the choice's exact text. Nothing here
+/// is ever derived from the wording of a label or of a free-text answer: a
+/// question without an action for the chosen label does nothing but answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "do", rename_all = "lowercase")]
+pub enum ChoiceAction {
+    /// Resume this run of the task that owns the question.
+    Resume {
+        /// The run to continue. Must still be the task's latest run.
+        run: String,
+    },
+    /// Requeue the task as a fresh competition.
+    Requeue,
+    /// Close the task as done.
+    Done,
+}
+
+impl ChoiceAction {
+    /// Parse a `--action` value: `<label>=<verb>`, where the verb is
+    /// `resume[:<run>]`, `requeue` or `done`. A `resume` without a run takes
+    /// `default_run` (the asker's own `MAGI_RUN`). Returns the label and its
+    /// action; whether the label is one of the choices is the caller's check.
+    pub fn parse(spec: &str, default_run: &str) -> Result<(String, Self)> {
+        let Some((label, verb)) = spec.rsplit_once('=') else {
+            bail!("`--action {spec}` must look like `<choice>=<resume[:run]|requeue|done>`");
+        };
+        let label = label.trim();
+        if label.is_empty() {
+            bail!("`--action {spec}` names no choice before `=`");
+        }
+        let verb = verb.trim();
+        let action = match verb.split_once(':') {
+            Some(("resume", run)) if !run.trim().is_empty() => Self::Resume {
+                run: run.trim().to_owned(),
+            },
+            None if verb == "resume" => {
+                if default_run.is_empty() {
+                    bail!("`--action {spec}` names no run and MAGI_RUN is not set");
+                }
+                Self::Resume {
+                    run: default_run.to_owned(),
+                }
+            }
+            None if verb == "requeue" => Self::Requeue,
+            None if verb == "done" => Self::Done,
+            _ => bail!(
+                "unknown action `{verb}` in `--action {spec}`; \
+                 use resume[:<run>], requeue or done"
+            ),
+        };
+        Ok((label.to_owned(), action))
+    }
+
+    /// Short human wording, for `magi show` and the card.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Resume { run } => format!("resume run {}", short(run)),
+            Self::Requeue => "requeue the task".to_owned(),
+            Self::Done => "mark the task done".to_owned(),
+        }
+    }
+}
+
+/// Parse every `--action` value against the offered `choices`, refusing a
+/// label the question does not offer (it could never fire).
+pub fn parse_actions(
+    specs: &[String],
+    choices: &[String],
+    default_run: &str,
+) -> Result<std::collections::BTreeMap<String, ChoiceAction>> {
+    let mut out = std::collections::BTreeMap::new();
+    for spec in specs {
+        let (label, action) = ChoiceAction::parse(spec, default_run)?;
+        if !choices.contains(&label) {
+            bail!(
+                "`--action {spec}`: `{label}` is not one of the --choice values ({})",
+                choices.join(", ")
+            );
+        }
+        if out.insert(label.clone(), action).is_some() {
+            bail!("more than one --action for `{label}`");
+        }
+    }
+    Ok(out)
+}
+
 /// Who wrote one turn of a question's conversation.
 ///
 /// Two values, not three: [`Question::thread`] is the record of a single
@@ -344,6 +434,11 @@ pub struct Question {
     /// is the whole difference between the two kinds of question, on disk, in
     /// the UI, and in [`Question::answer`]'s validation.
     pub choices: Vec<String>,
+    /// What the daemon does when a given choice is answered, keyed by the
+    /// choice's exact text. Empty for an ordinary question. A key is always
+    /// one of [`Question::choices`]; `#[serde(default)]` so older files read.
+    #[serde(default)]
+    pub actions: std::collections::BTreeMap<String, ChoiceAction>,
     /// Does this question have an agent-authored HTML panel beside it?
     ///
     /// Serialised with a default so a question written by an older magi - or
@@ -435,6 +530,7 @@ impl Question {
             summary,
             detail,
             choices,
+            actions: std::collections::BTreeMap::new(),
             panel: false,
             assets: Vec::new(),
             status: QuestionStatus::Open,
@@ -453,6 +549,15 @@ impl Question {
     /// Short form used in reports and on the phone, matching a run's short id.
     pub fn short(&self) -> &str {
         short(&self.id)
+    }
+
+    /// The action attached to the choice that was answered, if the question
+    /// is answered with a choice that carries one. Free text never matches.
+    pub fn chosen_action(&self) -> Option<&ChoiceAction> {
+        match (&self.status, &self.answer) {
+            (QuestionStatus::Answered, Some(Answer::Choice(c))) => self.actions.get(c),
+            _ => None,
+        }
     }
 
     /// Does this question want free text rather than one of a set?
@@ -621,6 +726,8 @@ impl Question {
         if body.trim().is_empty() {
             bail!("a reply to question {} cannot be empty", self.short());
         }
+        // An action whose label is no longer offered could never fire.
+        self.actions.retain(|label, _| choices.contains(label));
         self.choices = choices;
         let unread = self.unread_from_owner().is_some();
         self.thread.push(Turn {
@@ -1573,6 +1680,11 @@ fn read_path(path: &Path) -> Result<Question> {
     Ok(q)
 }
 
+/// [`short`] for callers outside this module (a run id shortens the same way).
+pub fn short_id(id: &str) -> &str {
+    short(id)
+}
+
 fn short(id: &str) -> &str {
     id.split('-').next_back().unwrap_or(id)
 }
@@ -1706,6 +1818,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "actions",
                 "answer",
                 "answer_delivered",
                 "answer_timeout",
@@ -2658,5 +2771,89 @@ mod tests {
         assert_eq!(q.unread_from_owner().as_deref(), Some("B"));
         q.delivered_turns = q.thread.len();
         assert_eq!(q.unread_from_owner(), None);
+    }
+
+    #[test]
+    fn action_specs_parse_strictly_and_must_name_an_offered_choice() {
+        let choices = vec!["resume で続行する".to_owned(), "wait".to_owned()];
+        let ok = parse_actions(
+            &[
+                "resume で続行する=resume".to_owned(),
+                "wait=done".to_owned(),
+            ],
+            &choices,
+            "run-1",
+        )
+        .unwrap();
+        assert_eq!(
+            ok["resume で続行する"],
+            ChoiceAction::Resume {
+                run: "run-1".into()
+            }
+        );
+        assert_eq!(ok["wait"], ChoiceAction::Done);
+
+        let named = ChoiceAction::parse("x=resume:abcd", "").unwrap();
+        assert_eq!(named.1, ChoiceAction::Resume { run: "abcd".into() });
+        assert_eq!(
+            ChoiceAction::parse("x=requeue", "").unwrap().1,
+            ChoiceAction::Requeue
+        );
+
+        for bad in [
+            "no-equals",
+            "=done",
+            "x=resume",
+            "x=resume:",
+            "x=explode",
+            "x=done:1",
+        ] {
+            assert!(ChoiceAction::parse(bad, "").is_err(), "{bad}");
+        }
+        assert!(parse_actions(&["ghost=done".to_owned()], &choices, "").is_err());
+        assert!(
+            parse_actions(
+                &["wait=done".to_owned(), "wait=requeue".to_owned()],
+                &choices,
+                ""
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn only_a_chosen_label_with_an_action_is_actionable() {
+        let mut q = choice_question();
+        q.choices = vec!["resume".to_owned(), "SQLite".to_owned()];
+        q.actions.insert("SQLite".to_owned(), ChoiceAction::Requeue);
+        assert!(q.chosen_action().is_none(), "unanswered");
+        q.answer(Answer::Choice("resume".to_owned())).unwrap();
+        assert!(
+            q.chosen_action().is_none(),
+            "a label that merely reads like an action does nothing"
+        );
+
+        let mut q2 = choice_question();
+        q2.choices = vec!["SQLite".to_owned()];
+        q2.actions
+            .insert("SQLite".to_owned(), ChoiceAction::Requeue);
+        q2.answer(Answer::Choice("SQLite".to_owned())).unwrap();
+        assert_eq!(q2.chosen_action(), Some(&ChoiceAction::Requeue));
+    }
+
+    #[test]
+    fn a_reply_drops_actions_whose_choice_is_gone_and_old_files_read_without_actions() {
+        let mut q = choice_question();
+        q.choices = vec!["A".to_owned(), "B".to_owned()];
+        q.actions.insert("A".to_owned(), ChoiceAction::Done);
+        q.actions.insert("B".to_owned(), ChoiceAction::Requeue);
+        q.reply("narrowing", vec!["B".to_owned()]).unwrap();
+        assert_eq!(q.actions.len(), 1);
+        assert!(q.actions.contains_key("B"));
+
+        let mut v = serde_json::to_value(&q).unwrap();
+        v.as_object_mut().unwrap().remove("actions");
+        let old: Question = serde_json::from_value(v).unwrap();
+        assert!(old.actions.is_empty());
     }
 }
