@@ -109,10 +109,6 @@ pub fn decide(
     }
     match q.status {
         QuestionStatus::Abandoned => Action::Idle,
-        // An answer that carries a structured action is the daemon's to carry
-        // out (it resumes or requeues the task itself); resuming the asking
-        // seat as well would start a second agent on the same run.
-        QuestionStatus::Answered if q.chosen_action().is_some() => Action::Idle,
         QuestionStatus::Answered => match q.resolution() {
             Some(a) if !q.answer_delivered && !seat_busy => Action::Deliver(Word::Answered(a)),
             _ => Action::Idle,
@@ -652,12 +648,18 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_carrying_an_action_is_left_to_the_daemon() {
+    fn an_action_answer_is_delivered_until_the_daemon_marks_it_handled() {
         let mut q = asked(0);
         q.choices = vec!["A".into()];
         q.actions
             .insert("A".into(), crate::ask::ChoiceAction::Requeue);
         q.answer(crate::ask::Answer::Choice("A".into())).unwrap();
+        assert_eq!(
+            decide(&q, None, false, 86_400, ts(10)),
+            Action::Deliver(Word::Answered("A".into())),
+            "an action nobody applied must not swallow the answer"
+        );
+        q.answer_delivered = true;
         assert_eq!(decide(&q, None, false, 86_400, ts(10)), Action::Idle);
     }
 }

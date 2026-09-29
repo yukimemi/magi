@@ -461,6 +461,13 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
         return Ok(());
     }
 
+    // The operator's `resume` action is waiting for its turn: a question or a
+    // dependency would park the task before the daemon can run it.
+    let pinned = pinned_resume(&task);
+    if pinned && (d.question.is_some() || !d.blocked_by.is_empty()) {
+        return Ok(());
+    }
+
     if let Some(text) = &d.question {
         if task.status == TaskStatus::Done {
             return Ok(());
@@ -2298,5 +2305,44 @@ mod tests {
         t.resume_override = None;
         assert!(!pinned_resume(&t));
         assert!(may_hold(&mut t, "no override, so a hold is allowed"));
+    }
+
+    #[test]
+    fn a_pinned_resume_is_not_blocked_by_a_conductor_question_or_dependency() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("resume me");
+        t.resume_override = Some(crate::queue::OperatorResume {
+            question_id: "q".into(),
+            at: jiff::Timestamp::now(),
+            conductor_rehold: None,
+            forced: true,
+            pinned_run: Some("run-1".into()),
+        });
+        queue.put(&mut t).unwrap();
+
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![
+                    Decision {
+                        id: t.id.clone(),
+                        question: Some("really?".to_owned()),
+                        ..Decision::default()
+                    },
+                    Decision {
+                        id: t.id.clone(),
+                        blocked_by: vec!["other".to_owned()],
+                        ..Decision::default()
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+        assert!(questions.list().is_empty());
     }
 }

@@ -734,6 +734,9 @@ enum ActionDecision {
     Requeue,
     /// Close the task as done.
     Done,
+    /// The question is about an earlier attempt than the task's latest; it
+    /// is recorded as handled and changes nothing.
+    Stale,
     /// The action cannot be carried out; hold the task and say why. Never
     /// falls back to something else, because the operator chose this one.
     Refuse(String),
@@ -760,6 +763,11 @@ where
         )
     {
         return ActionDecision::Skip;
+    }
+    // A question about an earlier attempt must not act on a newer one. A
+    // conductor question is keyed by the task id, not a run, so it is exempt.
+    if q.node != crate::conduct::NODE && task.runs.last() != Some(&q.run) {
+        return ActionDecision::Stale;
     }
     match action {
         ask::ChoiceAction::Requeue => ActionDecision::Requeue,
@@ -828,6 +836,10 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
             continue;
         };
         let decision = decide_action(&task, &q, |id| RunState::load_under(id, home));
+        let ran = matches!(
+            decision,
+            ActionDecision::Resume(_) | ActionDecision::Requeue | ActionDecision::Done
+        );
         match decision {
             ActionDecision::Skip => continue,
             ActionDecision::Resume(run) => {
@@ -840,6 +852,7 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
                     pinned_run: Some(run),
                 });
             }
+            ActionDecision::Stale => {}
             ActionDecision::Requeue => task.requeue(),
             ActionDecision::Done => {
                 task.succeed();
@@ -860,6 +873,17 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
         }
         task.mark_action_applied(&q.id);
         record(queue, &mut task);
+        // Only an action that actually ran counts as the answer being
+        // delivered; the waiter then does not resume the asking seat as well.
+        // A stale or refused one leaves the answer for the waiter as before.
+        if ran
+            && let Err(e) = questions.update(&q.id, |r| {
+                r.answer_delivered = true;
+                Ok(())
+            })
+        {
+            tracing::warn!("could not mark question {} handled: {e:#}", q.short());
+        }
     }
 }
 
@@ -7153,6 +7177,17 @@ mod tests {
             decide_action(&t, &q, |_: &str| bail!("gone")),
             ActionDecision::Refuse(_)
         ));
+    }
+
+    #[test]
+    fn decide_action_ignores_a_question_about_an_earlier_run() {
+        let mut t = held_task_with("r1");
+        t.runs.push("r2".to_owned());
+        let never = |_: &str| -> Result<RunState> { bail!("not read") };
+        assert_eq!(
+            decide_action(&t, &action_question("r1", ask::ChoiceAction::Done), never),
+            ActionDecision::Stale
+        );
     }
 
     #[test]
