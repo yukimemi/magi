@@ -114,7 +114,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::ask::{Answer, Question, Questions};
+use crate::ask::{self, Answer, Question, Questions};
 use crate::config::{Config, Update, UpdateMode};
 use crate::md;
 use crate::notices::{Notice, Notices};
@@ -3618,19 +3618,45 @@ struct QuestionView {
     /// [`RunSummary`]: it is a read of `thread`'s own last entry, and keeping
     /// it here means the client never has to re-derive that rule.
     waiting_on_agent: bool,
+    /// Who is waiting on this open question - see [`holder_of`]. Separate
+    /// from `waiting_on_agent`, which is whose *turn* it is, not whether
+    /// anyone is there to take it.
+    holder: Option<&'static str>,
 }
 
-impl From<Question> for QuestionView {
-    fn from(question: Question) -> Self {
+impl QuestionView {
+    /// The view of `question`, reading who is waiting on it from `store`.
+    ///
+    /// `holder` needs the lease sidecar, which is why this is not a `From`.
+    fn of(question: Question, store: &ask::Questions) -> Self {
         let base = md::ImageBase::QuestionPanel {
             id: question.id.clone(),
         };
+        let holder = holder_of(&question, store.read_lease(&question.id).as_ref());
         Self {
             detail_md: md::to_nodes(&question.detail, &base),
             waiting_on_agent: question.waiting_on_agent(),
+            holder,
             question,
         }
     }
+}
+
+/// Who is honestly waiting on an open question right now: `"asker"` (the
+/// agent's own `magi ask`), `"daemon"` (`magi serve` resuming its session), or
+/// `"nobody"` - the asker is gone and the daemon has not picked it up.
+///
+/// `None` for a question that is settled, and for one no `magi ask` filed
+/// (`cwd` unset), which has no agent to wait on it in the first place.
+fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
+    if !q.status.open() || q.cwd.is_none() {
+        return None;
+    }
+    Some(match lease.filter(|l| l.fresh(jiff::Timestamp::now())) {
+        Some(l) if l.kind == ask::WaiterKind::Daemon => "daemon",
+        Some(_) => "asker",
+        None => "nobody",
+    })
 }
 
 /// `GET /api/questions`.
@@ -3644,7 +3670,7 @@ async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<Questio
             ui.questions
                 .list()
                 .into_iter()
-                .map(QuestionView::from)
+                .map(|q| QuestionView::of(q, &ui.questions))
                 .collect(),
         ))
     })
@@ -3728,7 +3754,7 @@ async fn question_answer(
 
     blocking(move || {
         let id = resolve_question(&ui.questions, &id)?;
-        let mut q = ui
+        let q = ui
             .questions
             .get(&id)
             .map_err(|e| ApiError::from(e).with_status(StatusCode::INTERNAL_SERVER_ERROR))?;
@@ -3745,9 +3771,11 @@ async fn question_answer(
         // `Question::answer` owns the rules - an unoffered choice, free text on
         // a multiple-choice question, an empty reply - so the route does not
         // restate them and cannot drift from the CLI's behaviour.
-        q.answer(answer).map_err(ApiError::bad_request_from)?;
-        ui.questions.put(&mut q)?;
-        Ok(Json(QuestionView::from(q)))
+        let (q, ()) = ui
+            .questions
+            .update(&q.id, |r| r.answer(answer))
+            .map_err(ApiError::bad_request_from)?;
+        Ok(Json(QuestionView::of(q, &ui.questions)))
     })
     .await
 }
@@ -3776,7 +3804,7 @@ async fn question_say(
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
     blocking(move || {
         let id = resolve_question(&ui.questions, &id)?;
-        let mut q = ui
+        let q = ui
             .questions
             .get(&id)
             .map_err(|e| ApiError::from(e).with_status(StatusCode::INTERNAL_SERVER_ERROR))?;
@@ -3792,9 +3820,11 @@ async fn question_say(
         }
         // `Question::say` owns the one rule that matters here - an empty
         // message tells the agent nothing - so the route does not restate it.
-        q.say(body.body).map_err(ApiError::bad_request_from)?;
-        ui.questions.put(&mut q)?;
-        Ok(Json(QuestionView::from(q)))
+        let (q, ()) = ui
+            .questions
+            .update(&q.id, |r| r.say(body.body))
+            .map_err(ApiError::bad_request_from)?;
+        Ok(Json(QuestionView::of(q, &ui.questions)))
     })
     .await
 }
@@ -4862,6 +4892,33 @@ fn pick(ids: Vec<String>, prefix: &str, what: &str) -> ApiResult<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn holder_reads_the_lease_not_the_record() {
+        let mut q = Question::new(
+            "run".to_owned(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            "which?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        assert_eq!(holder_of(&q, None), None, "no `magi ask` filed it");
+        q.cwd = Some("/tmp".to_owned());
+        assert_eq!(holder_of(&q, None), Some("nobody"));
+        let beat = |kind, ago: i64| ask::Lease {
+            kind,
+            pid: 1,
+            beat_at: jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() - ago)
+                .unwrap(),
+        };
+        let fresh = beat(ask::WaiterKind::Asker, 1);
+        assert_eq!(holder_of(&q, Some(&fresh)), Some("asker"));
+        let daemon = beat(ask::WaiterKind::Daemon, 1);
+        assert_eq!(holder_of(&q, Some(&daemon)), Some("daemon"));
+        let stale = beat(ask::WaiterKind::Asker, 3600);
+        assert_eq!(holder_of(&q, Some(&stale)), Some("nobody"));
+    }
     use pretty_assertions::assert_eq;
     use serde_json::Value;
     use tempfile::TempDir;

@@ -1925,6 +1925,11 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
             // deadline this call actually asked with, not whatever `--timeout`
             // or the config default happens to say when it is called.
             q.answer_timeout = budget.as_secs();
+            // Where the seat stood, so the daemon waiter can resume it from
+            // there if this process is gone by the time the owner speaks.
+            q.cwd = std::env::current_dir()
+                .ok()
+                .map(|d| d.to_string_lossy().into_owned());
             // The panel is attached before the question is filed: a question
             // that appears on the phone a moment before its evidence does is a
             // question the owner answers without the evidence.
@@ -2013,6 +2018,7 @@ async fn ask_wait_cmd(
     // an error, and the answer must come out exactly as it would have if
     // this call's own wait had found it.
     if let Some(answer) = resolved_before_the_wait_even_starts(&q)? {
+        ask::hand_over(store, &mut q);
         println!("{answer}");
         return Ok(());
     }
@@ -2166,7 +2172,7 @@ fn answer_cmd(
         return Ok(());
     }
 
-    let mut q = match id {
+    let q = match id {
         Some(id) => store.get(&id)?,
         // Oldest first: the question that has been blocking longest.
         None => open
@@ -2178,8 +2184,7 @@ fn answer_cmd(
     if let Some(body) = say {
         // Not a decision: the question stays open and the run stays parked,
         // waiting on the agent's `magi ask --thread` rather than on the owner.
-        q.say(body)?;
-        store.put(&mut q)?;
+        store.update(&q.id, |r| r.say(body))?;
         println!("sent to {} — waiting for the agent's reply", q.short());
         return Ok(());
     }
@@ -2190,8 +2195,7 @@ fn answer_cmd(
     } else {
         ask::Answer::Choice(reply)
     };
-    q.answer(answer)?;
-    store.put(&mut q)?;
+    store.update(&q.id, |r| r.answer(answer))?;
     println!("answered {} {}", q.short(), q.summary);
     Ok(())
 }

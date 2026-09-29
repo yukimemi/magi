@@ -3711,10 +3711,25 @@ function updateAskCard(row, question, { compact = false } = {}) {
   }
   show(r.thread, turns.length > 0);
 
-  setText(r.waitingNote, waitingOnAgent
-    ? "Waiting for the agent to reply. There is nothing to decide until it does."
-    : "");
-  show(r.waitingNote, waitingOnAgent);
+  /* Who is honestly on the other end. `holder` comes from the lease beside the
+     question: "asker" is the agent's own `magi ask`, "daemon" is `magi serve`
+     resuming the agent's session, "nobody" means the asker is gone and nothing
+     has picked the question up yet. Only the first may claim the agent is
+     waiting. A question no `magi ask` filed carries no holder and keeps the
+     plain wording. */
+  const holder = open ? question.holder : null;
+  let waitingText = "";
+  if (holder === "nobody") {
+    waitingText = waitingOnAgent
+      ? "The agent that asked is no longer waiting. magi will resume its session with your message when magi serve picks it up; if it cannot, you will be told."
+      : "The agent that asked is no longer waiting. Your answer or message will be delivered by resuming its session when magi serve picks it up.";
+  } else if (holder === "daemon") {
+    waitingText = "magi is delivering this to the agent's session. There is nothing to decide until it replies.";
+  } else if (waitingOnAgent) {
+    waitingText = "Waiting for the agent to reply. There is nothing to decide until it does.";
+  }
+  setText(r.waitingNote, waitingText);
+  show(r.waitingNote, waitingText !== "");
 
   r.saySend.onclick = () => sayToQuestion(question.id, r.sayText.value, row);
   show(r.sayBox, open);

@@ -53,4 +53,5 @@ pub mod triage;
 pub mod tui;
 pub mod updater;
 pub mod verdict;
+pub mod waiter;
 pub mod web;
