@@ -2123,14 +2123,18 @@ fn migrate_schema(mut state: RunState) -> Result<RunState> {
         state.schema = 11;
     }
     // Schema 11 predates `driver_exited`. A run that had already ended
-    // Blocked / Failed / Stalled stopped walking the graph, but its recorded
+    // Blocked / Failed / Stalled, or was parked in Landing (which hands its
+    // daemon slot back), stopped walking the graph, but its recorded
     // pid may belong to a daemon still alive doing other work, which would pin
     // it as running for good; those are marked exited. Any other status keeps
-    // `false`, and its pid is asked as before.
+    // `false`, and its pid is asked as before. This is an inference from
+    // status, sound because a schema-11 record was written by a build that is
+    // gone once this one is installed (and a daemon claim, which wins
+    // regardless, still protects a run a live daemon is driving).
     if state.schema == 11 {
         if matches!(
             state.status,
-            RunStatus::Blocked | RunStatus::Failed | RunStatus::Stalled
+            RunStatus::Blocked | RunStatus::Failed | RunStatus::Stalled | RunStatus::Landing
         ) {
             state.driver_exited = true;
         }
@@ -2754,6 +2758,7 @@ mod tests {
             (RunStatus::Blocked, true),
             (RunStatus::Failed, true),
             (RunStatus::Stalled, true),
+            (RunStatus::Landing, true),
             (RunStatus::Reviewing, false),
         ] {
             let mut s = state();
