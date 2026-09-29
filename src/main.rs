@@ -2034,7 +2034,10 @@ async fn ask_wait_cmd(
     }
 
     let total = answer_timeout_for_wait(&q, timeout.unwrap_or(cfg.graph.answer_timeout));
-    let remaining = remaining_answer_budget(q.asked_at, total);
+    let remaining = remaining_answer_budget(
+        jiff::Timestamp::from_second(q.last_activity()).unwrap_or(q.asked_at),
+        total,
+    );
 
     eprintln!("resuming the wait on {} — waiting for the owner", q.short());
     match ask::resume_wait(&mut q, store, remaining).await? {

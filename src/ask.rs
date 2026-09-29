@@ -622,14 +622,50 @@ impl Question {
             bail!("a reply to question {} cannot be empty", self.short());
         }
         self.choices = choices;
+        let unread = self.unread_from_owner().is_some();
         self.thread.push(Turn {
             who: Who::Agent,
             body,
             at: Timestamp::now(),
         });
-        // The agent has, by definition, read everything up to its own reply.
-        self.delivered_turns = self.thread.len();
+        // The agent has read everything up to its own reply - but only if
+        // nothing the owner said in the meantime is still unread. A second say
+        // that landed after the agent's last look must stay undelivered.
+        if !unread {
+            self.delivered_turns = self.thread.len();
+        }
         Ok(())
+    }
+
+    /// What the owner said that the agent has not read yet, oldest first,
+    /// joined. `None` unless the question is open and such a turn exists.
+    ///
+    /// Not [`Question::waiting_on_agent`]: an agent's reply can land *after* a
+    /// second owner turn it never saw, which leaves the last turn the agent's
+    /// and the ball apparently back with the owner while a say is still unread.
+    pub fn unread_from_owner(&self) -> Option<String> {
+        if !self.status.open() {
+            return None;
+        }
+        let from = self.delivered_turns.min(self.thread.len());
+        let said: Vec<&str> = self.thread[from..]
+            .iter()
+            .filter(|t| t.who == Who::Operator)
+            .map(|t| t.body.as_str())
+            .collect();
+        (!said.is_empty()).then(|| said.join("\n\n"))
+    }
+
+    /// When the conversation last moved: the newest thread turn, or the asking
+    /// itself, in seconds. `magi ask --thread` re-arms `answer_timeout` on
+    /// every reply, so a deadline runs from here and not from `asked_at`.
+    pub fn last_activity(&self) -> i64 {
+        self.thread
+            .iter()
+            .map(|t| t.at.as_second())
+            .max()
+            .unwrap_or(0)
+            .max(self.asked_at.as_second())
     }
 
     /// Is the ball in the agent's court?
@@ -1305,8 +1341,8 @@ async fn wait_loop(
     // new. `last_word_awaiting_reply` reads the question's own record of
     // whose turn it is - see [`Question::waiting_on_agent`] - rather than a
     // turn count this call would have to have been there to capture.
-    if let Some(said) = last_word_awaiting_reply(q) {
-        return Ok(Wait::Replied(said.to_owned()));
+    if let Some(said) = q.unread_from_owner() {
+        return Ok(Wait::Replied(said));
     }
     hold(store, &q.id);
 
@@ -1323,14 +1359,23 @@ async fn wait_loop(
                 return Ok(Wait::Pending);
             }
             let why = format!("no answer within {}s of asking", timeout.as_secs().max(1));
-            let (fresh, ()) = store
+            // Re-checked on the record as it is now: the owner may have said
+            // something in time since the last poll, and that word is handed
+            // over, not abandoned.
+            let (fresh, unread) = store
                 .update(&q.id, |r| {
-                    r.abandon(&why);
-                    r.waiter = None;
-                    Ok(())
+                    let unread = r.unread_from_owner();
+                    if unread.is_none() {
+                        r.abandon(&why);
+                        r.waiter = None;
+                    }
+                    Ok(unread)
                 })
                 .context("record the abandoned question")?;
             *q = fresh;
+            if let Some(said) = unread {
+                return Ok(Wait::Replied(said));
+            }
             tracing::warn!(
                 "question {} went unanswered for {}s; the run parks and the \
                  question stays as the record of it",
@@ -1355,8 +1400,7 @@ async fn wait_loop(
                 });
             }
             Ok(fresh) => {
-                if let Some(said) = last_word_awaiting_reply(&fresh) {
-                    let said = said.to_owned();
+                if let Some(said) = fresh.unread_from_owner() {
                     *q = fresh;
                     return Ok(Wait::Replied(said));
                 }
@@ -1371,25 +1415,6 @@ async fn wait_loop(
             }
         }
     }
-}
-
-/// The owner's own last word, if the agent has not caught up on it yet.
-///
-/// A thin wrapper over [`Question::waiting_on_agent`] that also hands back
-/// what was said: the state is on the record itself, not derived from
-/// anything this call has seen happen, so it reads correctly whether this is
-/// the process that has been polling all along or a fresh `--wait` that just
-/// loaded the question off disk for the first time. `None` on a fresh
-/// question, one the agent already replied to, or one that is no longer
-/// open.
-fn last_word_awaiting_reply(q: &Question) -> Option<&str> {
-    // Already handed to the agent - by the daemon waiter resuming its session -
-    // means this wait must not print it a second time and send the agent round
-    // the same loop; it keeps waiting for what comes next.
-    if !q.waiting_on_agent() || q.delivered_turns >= q.thread.len() {
-        return None;
-    }
-    q.thread.last().map(|t| t.body.as_str())
 }
 
 /// Run the operator's notification command, if one is configured.
@@ -2621,5 +2646,17 @@ mod tests {
             "talking back is not a decision; the question stays open"
         );
         assert!(q.answer.is_none());
+    }
+
+    #[test]
+    fn a_say_that_lands_before_the_agents_reply_stays_unread() {
+        let mut q = choice_question();
+        q.say("A").unwrap();
+        q.delivered_turns = q.thread.len();
+        q.say("B").unwrap();
+        q.reply("about A", vec![]).unwrap();
+        assert_eq!(q.unread_from_owner().as_deref(), Some("B"));
+        q.delivered_turns = q.thread.len();
+        assert_eq!(q.unread_from_owner(), None);
     }
 }

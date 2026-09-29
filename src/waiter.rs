@@ -114,11 +114,10 @@ pub fn decide(
             _ => Action::Idle,
         },
         QuestionStatus::Open => {
-            if q.waiting_on_agent() && q.thread.len() > q.delivered_turns {
+            if let Some(said) = q.unread_from_owner() {
                 if seat_busy {
                     return Action::Idle;
                 }
-                let said = q.thread.last().map(|t| t.body.clone()).unwrap_or_default();
                 return Action::Deliver(Word::Said(said));
             }
             let secs = if q.answer_timeout > 0 {
@@ -126,27 +125,14 @@ pub fn decide(
             } else {
                 default_timeout
             };
-            let deadline = last_activity(q).saturating_add(secs as i64);
-            if now.as_second() > deadline && !q.waiting_on_agent() {
+            let deadline = q.last_activity().saturating_add(secs as i64);
+            if now.as_second() > deadline {
                 Action::Expire
             } else {
                 Action::Idle
             }
         }
     }
-}
-
-/// When the conversation last moved: the newest thread turn, or the asking
-/// itself. `magi ask --thread` re-arms `answer_timeout` on every reply, so the
-/// deadline runs from here and not from `asked_at`, or a live conversation
-/// would be abandoned mid-sentence.
-fn last_activity(q: &Question) -> i64 {
-    q.thread
-        .iter()
-        .map(|t| t.at.as_second())
-        .max()
-        .unwrap_or(0)
-        .max(q.asked_at.as_second())
 }
 
 /// Everything needed to resume one seat.
@@ -401,10 +387,10 @@ impl Waiter {
                 )
             })
             .collect();
-        // The owner's latest word has its own section in the prompt, so it is
-        // left out of the recap.
+        // What the owner said and the agent has not read has its own section in
+        // the prompt, so the recap stops at what it already read.
         let shown = match word {
-            Word::Said(_) => &thread[..thread.len().saturating_sub(1)],
+            Word::Said(_) => &thread[..q.delivered_turns.min(thread.len())],
             Word::Answered(_) => &thread[..],
         };
         let owner_word = match &word {
