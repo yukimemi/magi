@@ -4984,7 +4984,12 @@ function landOf(run) {
 function landNote(pr) {
   const rounds = Number(pr.rounds) || 0;
   const left = Math.max(rounds - (Number(pr.round) || 0), 0);
-  if (pr.state === "merged") return "Merged. The land loop is finished with this run.";
+  if (pr.state === "merged") {
+    const red = Array.isArray(pr.red_at_merge) ? pr.red_at_merge : [];
+    return red.length
+      ? `Merged with red checks (the forge did not require them): ${red.join(", ")}.`
+      : "Merged. The land loop is finished with this run.";
+  }
   if (pr.state === "closed") return "The pull request was closed without merging. This one needs you.";
   if (pr.checks === "red") {
     return left > 0

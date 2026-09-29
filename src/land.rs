@@ -1769,6 +1769,58 @@ fn repo_merge_lock(repo: &Path) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// `owner/repo` out of a pull request url, falling back to the checkout's
+/// directory name when the url is not the usual `host/owner/repo/pull/N`.
+fn repo_label(repo: &Path, pr_url: &str) -> String {
+    let parts: Vec<&str> = pr_url.split('/').collect();
+    if let Some(at) = parts.iter().rposition(|p| *p == "pull")
+        && at >= 2
+        && !parts[at - 1].is_empty()
+        && !parts[at - 2].is_empty()
+    {
+        return format!("{}/{}", parts[at - 2], parts[at - 1]);
+    }
+    repo.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The operator-facing sentence for a merge that went ahead with red checks,
+/// or `None` when the checks were not red. Judged on `checks`, not on
+/// `failing`, which can be non-empty on a green observation.
+fn red_merge_summary(repo_name: &str, pr: &PrState) -> Option<String> {
+    (pr.checks == Checks::Red).then(|| {
+        format!(
+            "Merged {repo_name} PR #{} with red checks: {} ({})",
+            pr.number,
+            if pr.failing.is_empty() {
+                "(none named)".to_owned()
+            } else {
+                pr.failing.join(", ")
+            },
+            pr.url
+        )
+    })
+}
+
+/// After a merge that succeeded: record which checks were red and tell the
+/// operator. The decision to merge is already made; this only makes it audible.
+/// Best-effort - a broken notifier never fails the run.
+async fn announce_red_merge(state: &mut RunState, pr: &PrState) {
+    let repo_name = repo_label(&state.repo, &pr.url);
+    let Some(summary) = red_merge_summary(&repo_name, pr) else {
+        return;
+    };
+    if let Some(rec) = state.pr.as_mut() {
+        rec.red_at_merge = pr.failing.clone();
+    }
+    state.event("land", summary.clone());
+    crate::notices::raise(crate::notices::merged_red(&state.id, state.short()));
+    if let Err(e) = ask::notify_text(&state.config.notify, &state.id, &summary).await {
+        tracing::warn!("could not notify about a merge with red checks: {e:#}");
+    }
+}
+
 /// Run the loop against a real pull request until it merges or the budget runs
 /// out.
 ///
@@ -1811,6 +1863,7 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
             checks: pr.checks.as_str().to_owned(),
             round,
             rounds: budget,
+            red_at_merge: Vec::new(),
         });
         state.save()?;
 
@@ -1904,6 +1957,7 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                         pr_record.state = pr.state.as_str().to_owned();
                     }
                     state.event("land", format!("merged {} as `{subject}`", pr.url));
+                    announce_red_merge(state, &pr).await;
                     state.save()?;
                     return Ok(pr);
                 }
@@ -1916,6 +1970,7 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                         pr_record.state = pr.state.as_str().to_owned();
                     }
                     state.event("land", format!("merged {} as `{subject}`", pr.url));
+                    announce_red_merge(state, &pr).await;
                     state.save()?;
                     return Ok(pr);
                 }
@@ -3179,6 +3234,42 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             decide(&unsaid, 0, 4, Duration::ZERO),
             Step::Fix { .. }
         ));
+    }
+
+    #[test]
+    fn a_red_merge_is_announced_with_every_failing_check_and_a_green_one_is_not() {
+        let mut red = pr(Checks::Red, &["test (windows-latest)", "coverage"], 0);
+        red.blocking = Blocking::No;
+        assert_eq!(
+            decide(&red, 0, 4, Duration::ZERO),
+            Step::Merge,
+            "announcing must not change the decision"
+        );
+        let said = red_merge_summary("yukimemi/magi", &red).expect("red merge is announced");
+        assert!(said.contains("yukimemi/magi"), "{said}");
+        assert!(said.contains("#16"), "{said}");
+        assert!(
+            said.contains("https://github.com/yukimemi/magi/pull/16"),
+            "{said}"
+        );
+        assert!(
+            said.contains("test (windows-latest)") && said.contains("coverage"),
+            "{said}"
+        );
+
+        // `failing` can be left over on a green observation; only `checks` counts.
+        let green = pr(Checks::Green, &["stale"], 0);
+        assert_eq!(red_merge_summary("yukimemi/magi", &green), None);
+    }
+
+    #[test]
+    fn the_repo_label_comes_from_the_pull_request_url() {
+        let p = Path::new("/tmp/checkout");
+        assert_eq!(
+            repo_label(p, "https://github.com/yukimemi/magi/pull/16"),
+            "yukimemi/magi"
+        );
+        assert_eq!(repo_label(p, "not a url"), "checkout");
     }
 
     #[test]

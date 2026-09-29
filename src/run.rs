@@ -1380,6 +1380,12 @@ pub struct PrRecord {
     pub round: usize,
     /// Land round budget.
     pub rounds: usize,
+    /// Checks that were red when the pull request merged anyway (the forge
+    /// said they do not block it). Empty for a green merge, and for any run
+    /// recorded before this field existed - so empty is not proof nothing was
+    /// red.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub red_at_merge: Vec<String>,
 }
 
 /// What the post-merge release-bump step did, and whether it needs a human.
