@@ -1698,6 +1698,13 @@ pub struct RunState {
     /// requested".
     #[serde(default)]
     pub operator_fixes: Vec<OperatorFixRequest>,
+    /// Absolute paths of the files the task was filed with (see
+    /// `crate::queue::Task::attachments`), listed in the implementers' prompt
+    /// and made readable to their seats. Refreshed from the task on every
+    /// start and resume, so a file attached while the task was held reaches a
+    /// resumed run. Additive and `#[serde(default)]`, so `SCHEMA` stays put.
+    #[serde(default)]
+    pub attachments: Vec<PathBuf>,
 }
 
 impl RunState {
@@ -1755,6 +1762,7 @@ impl RunState {
             base_sync: None,
             advice: None,
             advise_attempted: false,
+            attachments: Vec::new(),
             events: Vec::new(),
             jobs: Vec::new(),
             operator_fixes: Vec::new(),

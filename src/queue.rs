@@ -41,6 +41,10 @@ use crate::ask::Questions;
 
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
 ///
+/// 7: added [`Task::attachments`], names of files copied under
+/// `<id>.attachments/` beside the task file (a field only; `#[serde(default)]`,
+/// so an older record reads as empty and [`read_path`] still accepts it).
+///
 /// 6: added [`Task::resume_override`] (a field only; `#[serde(default)]`, so
 /// an older record reads as `None` and [`read_path`] still accepts it).
 ///
@@ -82,7 +86,7 @@ use crate::ask::Questions;
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 6;
+pub const SCHEMA: u32 = 7;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,6 +407,13 @@ pub struct Task {
     /// to, exactly as before.
     #[serde(default)]
     pub urgent: bool,
+    /// Files (typically screenshots) copied into `<id>.attachments/` beside
+    /// this task's file by [`Queue::attach`], as bare validated names. The
+    /// copy is what makes them reach the implementer: the original may be
+    /// cleaned up long before the task runs. Untouched by [`Task::edit`].
+    /// `#[serde(default)]` so an older record reads as empty.
+    #[serde(default)]
+    pub attachments: Vec<String>,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -476,6 +487,7 @@ impl Task {
             fresh_start: false,
             interrupt: false,
             urgent: false,
+            attachments: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -904,6 +916,50 @@ impl Task {
     }
 }
 
+/// Copy `src` into `dir` as `name`, or `stem-2.ext`, `stem-3.ext`, ... when
+/// that is taken. `create_new` makes the collision check atomic and also
+/// catches a case-insensitive filesystem. Returns the stored name and path.
+fn copy_new(dir: &Path, src: &Path, name: &str) -> Result<(String, PathBuf)> {
+    use std::io::ErrorKind;
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    for n in 1u32.. {
+        let candidate = if n == 1 {
+            name.to_owned()
+        } else {
+            let suffix = format!("-{n}");
+            let room = 64usize.saturating_sub(suffix.len() + ext.len());
+            let stem: String = stem.chars().take(room).collect();
+            format!("{stem}{suffix}{ext}")
+        };
+        if !crate::ask::valid_asset_name(&candidate) {
+            bail!("no valid attachment name is left for `{name}`");
+        }
+        let path = dir.join(&candidate);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut out) => {
+                let copied = std::fs::File::open(src)
+                    .and_then(|mut input| std::io::copy(&mut input, &mut out));
+                if let Err(e) = copied {
+                    drop(out);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e).with_context(|| format!("copy {}", src.display()));
+                }
+                return Ok((candidate, path));
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+        }
+    }
+    unreachable!("the counter never runs out")
+}
+
 /// A queue on disk.
 #[derive(Debug, Clone)]
 pub struct Queue {
@@ -930,6 +986,80 @@ impl Queue {
     /// Path for one task id.
     pub fn path_of(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.json"))
+    }
+
+    /// Directory holding a task's attachments. A sibling of the task file,
+    /// not a `*.json`, so [`Queue::list`] and [`Queue::revision`] never see it.
+    pub fn attachments_dir(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.attachments"))
+    }
+
+    /// Copy each of `sources` into `task`'s attachment directory and record
+    /// the stored names on `task` (persist with [`Queue::put`]). Returns the
+    /// names, in order.
+    ///
+    /// Every source is checked (a readable file, a name passing
+    /// [`crate::ask::valid_asset_name`]) before anything is copied, and a
+    /// copy that fails part-way removes only what this call created. A name
+    /// already taken is never overwritten: it becomes `stem-2.ext`,
+    /// `stem-3.ext`, ... A name that does not validate is refused rather than
+    /// sanitised - the operator renames the file.
+    pub fn attach(&self, task: &mut Task, sources: &[PathBuf]) -> Result<Vec<String>> {
+        let mut wanted = Vec::new();
+        for src in sources {
+            let name = src
+                .file_name()
+                .and_then(|n| n.to_str())
+                .with_context(|| format!("`{}` has no usable file name", src.display()))?;
+            if !crate::ask::valid_asset_name(name) {
+                bail!(
+                    "attachment name `{name}` must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}$ \
+                     with no `..`; rename the file and try again"
+                );
+            }
+            if !src.is_file() {
+                bail!("attachment `{}` is not a file", src.display());
+            }
+            wanted.push((src, name));
+        }
+        let dir = self.attachments_dir(&task.id);
+        let existed = dir.is_dir();
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let mut created: Vec<PathBuf> = Vec::new();
+        let mut names = Vec::new();
+        let mut copy_all = || -> Result<()> {
+            for (src, name) in &wanted {
+                let (stored, path) = copy_new(&dir, src, name)?;
+                created.push(path);
+                names.push(stored);
+            }
+            Ok(())
+        };
+        if let Err(e) = copy_all() {
+            for path in &created {
+                let _ = std::fs::remove_file(path);
+            }
+            if !existed {
+                let _ = std::fs::remove_dir(&dir);
+            }
+            return Err(e);
+        }
+        task.attachments.extend(names.iter().cloned());
+        Ok(names)
+    }
+
+    /// Absolute paths of `task`'s attachments, whatever shape this queue's
+    /// root has. Absolute because the prompt hands them to an agent whose
+    /// working directory is somewhere else entirely.
+    pub fn attachment_paths(&self, task: &Task) -> Vec<PathBuf> {
+        let dir = self.attachments_dir(&task.id);
+        task.attachments
+            .iter()
+            .map(|n| {
+                let p = dir.join(n);
+                std::path::absolute(&p).unwrap_or(p)
+            })
+            .collect()
     }
 
     /// Write a task, atomically, so a daemon killed mid-write leaves the
@@ -1000,6 +1130,12 @@ impl Queue {
         if let Err(e) = std::fs::remove_file(&lock) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 return Err(e).with_context(|| format!("remove {}", lock.display()));
+            }
+        }
+        let attachments = self.attachments_dir(&resolved);
+        if let Err(e) = std::fs::remove_dir_all(&attachments) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e).with_context(|| format!("remove {}", attachments.display()));
             }
         }
         let quarantined = self.quarantine_dependents_of(&resolved, questions);
@@ -2558,5 +2694,151 @@ mod tests {
             reason.contains(&still_valid.id),
             "the still-valid dependency must survive in the reason text: {reason}"
         );
+    }
+
+    fn source_file(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn an_attachment_copy_survives_deleting_its_source() {
+        let (dir, q) = queue();
+        let src = source_file(dir.path(), "shot.png", "pixels");
+        let mut t = task("with a picture");
+        let names = q.attach(&mut t, std::slice::from_ref(&src)).unwrap();
+        q.put(&mut t).unwrap();
+        std::fs::remove_file(&src).unwrap();
+        assert_eq!(names, ["shot.png"]);
+        let loaded = q.get(&t.id).unwrap();
+        let paths = q.attachment_paths(&loaded);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(std::fs::read_to_string(&paths[0]).unwrap(), "pixels");
+    }
+
+    #[test]
+    fn attachment_names_that_could_traverse_or_are_odd_are_refused() {
+        let (dir, q) = queue();
+        let mut t = task("bad names");
+        for name in [
+            "a..b.png",
+            ".hidden",
+            "C:foo.png",
+            "with space.png",
+            "-x.png",
+        ] {
+            let src = source_file(dir.path(), name, "x");
+            assert!(
+                q.attach(&mut t, &[src]).is_err(),
+                "`{name}` must be refused"
+            );
+        }
+        let long = format!("{}.png", "a".repeat(70));
+        let src = source_file(dir.path(), &long, "x");
+        assert!(q.attach(&mut t, &[src]).is_err());
+        assert!(t.attachments.is_empty());
+        assert!(!q.attachments_dir(&t.id).exists());
+    }
+
+    #[test]
+    fn a_taken_attachment_name_is_numbered_not_overwritten() {
+        let (dir, q) = queue();
+        let a = source_file(dir.path(), "shot.png", "one");
+        let sub = dir.path().join("other");
+        std::fs::create_dir_all(&sub).unwrap();
+        let b = source_file(&sub, "shot.png", "two");
+        let mut t = task("collision");
+        q.attach(&mut t, &[a]).unwrap();
+        q.attach(&mut t, &[b]).unwrap();
+        assert_eq!(t.attachments, ["shot.png", "shot-2.png"]);
+        let paths = q.attachment_paths(&t);
+        assert_eq!(std::fs::read_to_string(&paths[0]).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(&paths[1]).unwrap(), "two");
+    }
+
+    #[test]
+    fn a_renumbered_name_stays_inside_the_length_bound() {
+        let (dir, q) = queue();
+        let name = format!("{}.png", "a".repeat(60));
+        assert_eq!(name.len(), 64);
+        let a = source_file(dir.path(), &name, "one");
+        let sub = dir.path().join("other");
+        std::fs::create_dir_all(&sub).unwrap();
+        let b = source_file(&sub, &name, "two");
+        let mut t = task("long");
+        q.attach(&mut t, &[a, b]).unwrap();
+        assert_eq!(t.attachments.len(), 2);
+        assert!(
+            t.attachments
+                .iter()
+                .all(|n| crate::ask::valid_asset_name(n))
+        );
+        assert!(t.attachments[1].ends_with("-2.png"));
+    }
+
+    #[test]
+    fn a_failed_attach_keeps_existing_attachments_and_leaves_no_partial_copy() {
+        let (dir, q) = queue();
+        let good = source_file(dir.path(), "good.png", "ok");
+        let mut t = task("partial");
+        q.attach(&mut t, &[good]).unwrap();
+        let more = source_file(dir.path(), "more.png", "ok");
+        let missing = dir.path().join("missing.png");
+        assert!(q.attach(&mut t, &[more, missing]).is_err());
+        assert_eq!(t.attachments, ["good.png"]);
+        let on_disk: Vec<_> = std::fs::read_dir(q.attachments_dir(&t.id))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(on_disk.len(), 1);
+    }
+
+    #[test]
+    fn editing_a_task_keeps_its_attachments() {
+        let (dir, q) = queue();
+        let src = source_file(dir.path(), "shot.png", "x");
+        let mut t = task("editable");
+        q.attach(&mut t, &[src]).unwrap();
+        t.edit("new".to_owned(), "new text".to_owned()).unwrap();
+        q.put(&mut t).unwrap();
+        assert_eq!(q.get(&t.id).unwrap().attachments, ["shot.png"]);
+    }
+
+    #[test]
+    fn removing_a_task_deletes_its_attachments() {
+        let (dir, q) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
+        let src = source_file(dir.path(), "shot.png", "x");
+        let mut t = task("doomed");
+        q.attach(&mut t, &[src]).unwrap();
+        q.put(&mut t).unwrap();
+        assert!(q.attachments_dir(&t.id).is_dir());
+        q.remove(&t.id, false, &questions).unwrap();
+        assert!(!q.attachments_dir(&t.id).exists());
+        assert!(q.list().is_empty());
+    }
+
+    #[test]
+    fn a_task_written_before_attachments_still_reads() {
+        let (_dir, q) = queue();
+        let mut t = task("old");
+        q.put(&mut t).unwrap();
+        let path = q.path_of(&t.id);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("attachments");
+        std::fs::write(&path, v.to_string()).unwrap();
+        assert!(q.get(&t.id).unwrap().attachments.is_empty());
+    }
+
+    #[test]
+    fn attachment_paths_are_absolute_even_when_the_root_is_relative() {
+        let q = Queue::at(PathBuf::from("relative-queue"));
+        let mut t = task("rel");
+        t.attachments.push("shot.png".to_owned());
+        let paths = q.attachment_paths(&t);
+        assert!(paths[0].is_absolute(), "{}", paths[0].display());
+        assert!(paths[0].ends_with(format!("{}.attachments/shot.png", t.id)));
     }
 }

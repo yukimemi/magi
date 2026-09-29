@@ -1498,6 +1498,7 @@ impl Runner {
             .as_ref()
             .and_then(|a| a.synthesis.as_deref())
             .map(str::to_owned);
+        let attachments = self.state.attachments.clone();
 
         let mut jobs = Vec::new();
         for &i in &todo {
@@ -1517,6 +1518,7 @@ impl Runner {
                     &worktree.to_string_lossy(),
                     &language,
                     brief.as_deref(),
+                    &attachments,
                 ),
                 cwd: worktree,
                 timeout,
@@ -1866,6 +1868,7 @@ impl Runner {
             .as_ref()
             .and_then(|a| a.synthesis.as_deref())
             .map(str::to_owned);
+        let attachments = self.state.attachments.clone();
         for (wi, seat, out) in results.iter_mut() {
             let Some(job) = sent.get_mut(*wi) else {
                 continue;
@@ -1928,6 +1931,7 @@ impl Runner {
                     &job.cwd.to_string_lossy(),
                     &language,
                     brief.as_deref(),
+                    &attachments,
                 );
                 retry.stem = format!("{}-quota-{}", job.stem, next.id);
                 let cache = self.state.config.cache_dir();
@@ -5966,6 +5970,13 @@ async fn wave(
         let sem = Arc::clone(&sem);
         let run = run.to_owned();
         let node = node.to_owned();
+        // Only implementers were told about the task's attachments, so only
+        // their seats get the directory widened for reading.
+        let attachments = if node == "implement" {
+            state.attachments.clone()
+        } else {
+            Vec::new()
+        };
         // A read-only seat is never handed `CARGO_TARGET_DIR` — see
         // `prompt::build_cache_note`'s doc for why setting it anyway is
         // exactly how a sandboxed reviewer's write refusal got reported as a
@@ -5996,7 +6007,7 @@ async fn wave(
                     run: &run,
                     node: &node,
                     cache_dir: cache.as_deref(),
-                    attachments: &[],
+                    attachments: &attachments,
                 },
             )
             .await;

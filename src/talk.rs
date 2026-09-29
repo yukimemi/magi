@@ -1088,7 +1088,14 @@ pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
          the same way `magi repos` lists them. If the command fails because \
          nothing matches or more than one checkout shares that name, ask the \
          operator which repository they mean (or run `magi repos` yourself \
-         to see the candidates) rather than guessing.\n",
+         to see the candidates) rather than guessing.\n\n\
+         If the operator attached an image (a screenshot, say) that the task \
+         is about, pass it with `--attach <path>`, using the absolute path \
+         the turn's attachment note gives; repeat the flag for several. \
+         `magi task add --solo --attach <path> <instruction>` copies the \
+         file into the task, so the implementer receives it. Do not paste the \
+         path into <instruction> instead: deleting this conversation deletes \
+         its attachments, and then that path reaches no one.\n",
         repo = repo.display(),
     );
     out.push_str(&language_note(language));
@@ -2257,6 +2264,13 @@ mod tests {
         assert!(brief.contains("owner/repo"));
         assert!(brief.contains("magi repos"));
         assert!(brief.contains("ask the operator"));
+    }
+
+    #[test]
+    fn the_briefing_tells_the_assistant_to_pass_images_with_attach() {
+        let brief = briefing(Path::new("/repo"), "en", false);
+        assert!(brief.contains("--attach <path>"), "{brief}");
+        assert!(brief.contains("deleting this conversation"), "{brief}");
     }
 
     #[test]
