@@ -226,7 +226,20 @@ enum Command {
     /// bare `magi` does on a terminal.
     Tui,
     /// Aggregate win rates, reviewer precision, and verification yield.
-    Stats,
+    Stats {
+        /// Narrow the report to one repository, resolved the same way
+        /// `--repo` is resolved for `task add` (a path, or an `owner/repo`
+        /// name against `[repos] roots`). When that fails, falls back once
+        /// to a name match against repositories recorded in run history — a
+        /// checkout may have moved or been deleted since its runs completed,
+        /// and the history should stay filterable regardless. Omit this flag
+        /// entirely for the aggregate report across every repository; no
+        /// discovery fallback runs in that case, so a bare `magi stats`
+        /// never silently narrows itself to whatever repository `cwd`
+        /// happens to be in.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Remove a run's worktrees and branches.
     Fold {
         /// Run id. Defaults to the most recent run when `--merged` is not
@@ -1179,9 +1192,24 @@ async fn dispatch(command: Command) -> Result<()> {
         // report pane parses those same ANSI codes back into ratatui spans.
         Command::Tui => tui::run(),
 
-        Command::Stats => {
+        Command::Stats { repo } => {
             let states = stats::load_all();
-            print!("{}", report::stats(&stats::collect(&states)));
+            match repo {
+                Some(repo) => {
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    let resolved = resolve_stats_repo(&repo, &cwd, &states).await?;
+                    let filtered = stats::filter_repo(&states, &resolved);
+                    print!("{}", report::stats(&stats::collect_refs(filtered)));
+                }
+                None => {
+                    let by_repo = stats::by_repo(&states);
+                    if by_repo.len() > 1 {
+                        print!("{}", report::repo_summary(&by_repo));
+                        println!();
+                    }
+                    print!("{}", report::stats(&stats::collect(&states)));
+                }
+            }
             Ok(())
         }
 
@@ -2732,6 +2760,49 @@ fn resolve_repo_by_name(repo: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
     }
 }
 
+/// Resolve `magi stats --repo <value>` the same way `--repo` is resolved
+/// everywhere else ([`resolve_repo`]), with one extra fallback specific to
+/// stats: a repository whose checkout has since moved or been deleted still
+/// has run history, and that history should stay filterable by name.
+///
+/// The fallback only runs when [`resolve_repo`] itself fails, and matches
+/// `value` against the distinct repository paths actually recorded in
+/// `states` — full-name or last-segment match, same rule
+/// [`resolve_repo_by_name`] uses against `[repos] roots`. A miss returns
+/// `resolve_repo`'s own error rather than inventing one; an ambiguous match
+/// is refused rather than guessed at, for the same reason
+/// [`resolve_repo_by_name`] refuses one.
+async fn resolve_stats_repo(value: &Path, cwd: &Path, states: &[RunState]) -> Result<PathBuf> {
+    match resolve_repo(value, cwd, None).await {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            let query = value.to_string_lossy().replace('\\', "/");
+            let mut hits: Vec<&PathBuf> = states
+                .iter()
+                .map(|s| &s.repo)
+                .filter(|p| {
+                    let name = p.to_string_lossy().replace('\\', "/");
+                    name == query || name.rsplit('/').next() == Some(query.as_str())
+                })
+                .collect();
+            hits.sort();
+            hits.dedup();
+            match hits.len() {
+                1 => Ok(hits[0].clone()),
+                0 => Err(e),
+                n => bail!(
+                    "--repo `{query}` matches {n} repositories recorded in run history ({}); \
+                     use a full path to disambiguate",
+                    hits.iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
+        }
+    }
+}
+
 /// Who is filing this task.
 ///
 /// An agent inside a run is identified by the environment the graph gave it, so
@@ -4222,6 +4293,63 @@ mod tests {
     fn resolve_repo_by_name_reports_does_not_exist_when_nothing_matches() {
         let err = resolve_repo_by_name(Path::new("no-such-repo"), &[])
             .expect_err("no roots and no match must fail");
+        assert!(err.to_string().contains("does not exist"), "{err:#}");
+    }
+
+    /// A minimal recorded run against `repo`, for the `resolve_stats_repo`
+    /// fallback tests below - only the field the fallback reads matters.
+    fn run_against(repo: &str) -> RunState {
+        RunState::new(
+            PathBuf::from(repo),
+            "main".to_owned(),
+            "abcdef".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn resolve_stats_repo_falls_back_to_a_name_match_in_run_history() {
+        let _guard = NoMachineConfig::set();
+        let dir = tempfile::tempdir().unwrap();
+        let states = vec![run_against("/checkouts/yukimemi/magi")];
+
+        // `--repo magi` does not exist on disk and no `[repos] roots` are
+        // configured, so `resolve_repo` itself fails; the fallback then
+        // matches the bare name against the one repo recorded in history.
+        let resolved = resolve_stats_repo(Path::new("magi"), dir.path(), &states)
+            .await
+            .expect("a unique name match in run history resolves");
+        assert_eq!(resolved, PathBuf::from("/checkouts/yukimemi/magi"));
+    }
+
+    #[tokio::test]
+    async fn resolve_stats_repo_refuses_an_ambiguous_name_match() {
+        let _guard = NoMachineConfig::set();
+        let dir = tempfile::tempdir().unwrap();
+        let states = vec![
+            run_against("/checkouts/yukimemi/magi"),
+            run_against("/checkouts/someone-else/magi"),
+        ];
+
+        let err = resolve_stats_repo(Path::new("magi"), dir.path(), &states)
+            .await
+            .expect_err("an ambiguous name match must not pick one silently");
+        assert!(
+            err.to_string().contains("matches 2 repositories"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_stats_repo_reports_the_original_error_when_nothing_matches() {
+        let _guard = NoMachineConfig::set();
+        let dir = tempfile::tempdir().unwrap();
+        let states = vec![run_against("/checkouts/yukimemi/magi")];
+
+        let err = resolve_stats_repo(Path::new("no-such-repo"), dir.path(), &states)
+            .await
+            .expect_err("no match in history and no checkout must fail");
         assert!(err.to_string().contains("does not exist"), "{err:#}");
     }
 

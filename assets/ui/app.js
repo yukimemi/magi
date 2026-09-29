@@ -500,6 +500,11 @@ const state = {
      disk, and a phone that never opens the tab should not pay for that on
      every revision tick. */
   stats: null,
+  /* The repository `/api/stats` is currently narrowed to (the raw path from
+     `repos[].repo`, matched against `?repo=` exactly), or null for the
+     all-repositories aggregate - the default. In-memory only, same as
+     queueSearch: a reload starts back at the aggregate view. */
+  statsRepo: null,
   /* Same idea for the Backlog's sections, kept separately since the two
      views don't share section keys or default open/closed state. */
   queueCollapsed: loadCollapsed(QUEUE_COLLAPSE_KEY),
@@ -2533,6 +2538,9 @@ function renderStats() {
     );
   }
 
+  renderStatsRepoSelector(s.repos, s.repo);
+  show($("stats-queue-scope-note"), !!s.repo);
+
   /* stats-body stays visible whenever there is anything to show at all -
      which, unlike the run-only panels below, includes the queue: a home
      that has never run a competition can still have tasks queued, and the
@@ -2552,6 +2560,26 @@ function renderStats() {
     renderStatsBumps(s.release_bumps);
   }
   renderStatsQueue(s.queue);
+}
+
+/* Hidden entirely when at most one repository has runs recorded - a
+   selector with a single choice is noise. Rebuilt from scratch on every
+   render rather than diffed: the list changes rarely and is always short. */
+function renderStatsRepoSelector(repos, selected) {
+  const root = $("stats-repo");
+  show(root, repos.length > 1);
+  if (repos.length <= 1) return;
+
+  clear(root);
+  root.append(el("option", { value: "", text: "All repositories" }));
+  for (const r of repos) {
+    root.append(el("option", {
+      value: r.repo,
+      text: `${r.name} (${plural(r.runs, "run", "runs")})`,
+      selected: r.repo === selected ? true : null,
+    }));
+  }
+  root.onchange = () => selectStatsRepo(root.value);
 }
 
 function statsTile(label, value, tone) {
@@ -5974,12 +6002,22 @@ async function loadQueue() {
 
 async function loadStats() {
   try {
-    state.stats = await getJson(API.stats);
+    const url = state.statsRepo
+      ? `${API.stats}?repo=${encodeURIComponent(state.statsRepo)}`
+      : API.stats;
+    state.stats = await getJson(url);
     renderStats();
     ok();
   } catch (error) {
     fail(`Could not load stats: ${error.message}`);
   }
+}
+
+/* The repository selector's change handler - switches state.statsRepo and
+   refetches, same as any other filter control in this file. */
+function selectStatsRepo(value) {
+  state.statsRepo = value || null;
+  loadStats();
 }
 
 /* Questions are loaded whole rather than by id: the list is short by nature —

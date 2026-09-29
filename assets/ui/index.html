@@ -300,6 +300,10 @@
       <h1 id="stats-h">Stats</h1>
       <p class="view-sub" id="stats-count">Loading…</p>
     </div>
+    <!-- Hidden until more than one repository has runs recorded - see
+         renderStatsRepoSelector(). Defaults to "All repositories" (empty
+         value), the aggregate view built above. -->
+    <select class="stats-repo-select" id="stats-repo" hidden></select>
     <!-- Same reasoning as /api/health's own runs_unreadable: a skipped run
          must be counted, not silently dropped from the tallies below. -->
     <p class="stats-banner" id="stats-unreadable-banner" hidden></p>
@@ -347,6 +351,10 @@
 
       <div class="panel">
         <h2>Queue</h2>
+        <!-- Shown only while a single repository is selected - the queue
+             (and runs_unreadable above) are never scoped to it, and this
+             says so before a reader assumes otherwise. -->
+        <p class="panel-note" id="stats-queue-scope-note" hidden>Across every repository, not just the one selected above.</p>
         <div class="stats-tiles" id="stats-queue-tiles"></div>
       </div>
     </div>

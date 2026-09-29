@@ -3121,6 +3121,34 @@ impl From<crate::queue::TaskCounts> for TaskCountsView {
     }
 }
 
+/// [`crate::stats::RepoStats`] for the wire, one row per repository with
+/// runs recorded — the summary the UI's repository selector is built from.
+/// Carries no nested `Stats`: picking a repo means re-fetching
+/// `GET /api/stats?repo=<repo>`, which reuses this same route's own
+/// aggregation rather than duplicating it.
+#[derive(Debug, Serialize)]
+struct RepoSummaryView {
+    /// `RunState.repo` exactly as recorded — the value `?repo=` matches
+    /// against, full path and all (see [`stats_get`]'s own doc for why).
+    repo: String,
+    /// Display name only; never used for matching.
+    name: String,
+    runs: usize,
+    completion_rate: Option<RateView>,
+}
+
+impl From<&stats::RepoStats> for RepoSummaryView {
+    fn from(r: &stats::RepoStats) -> Self {
+        let t = &r.stats.totals;
+        Self {
+            repo: r.repo.to_string_lossy().into_owned(),
+            name: r.name.clone(),
+            runs: t.runs,
+            completion_rate: RateView::of(t.merged + t.ready, t.runs),
+        }
+    }
+}
+
 /// `GET /api/stats` - the whole answer. `Stats` itself carries no
 /// `Serialize`, deliberately: its fields (and the CLI text `report::stats`
 /// renders from them) are free to grow without that becoming a wire-contract
@@ -3141,21 +3169,68 @@ struct StatsView {
     /// Same count and same meaning as [`HealthView::runs_unreadable`] - see
     /// that field's doc. Asserted to match it in
     /// `stats_runs_unreadable_matches_health`.
+    ///
+    /// Always the whole-workload count, even when `repo` narrows every other
+    /// field to one repository - an unreadable `run.json` carries no `repo`
+    /// a per-repository count could attribute it to, and the queue/health
+    /// views this mirrors never scope it either. The UI must not present it
+    /// as if it were scoped to the selected repository.
     runs_unreadable: usize,
+    /// Every repository with runs recorded, most runs first - what the UI's
+    /// repository selector is built from. Always the full list regardless of
+    /// `repo`, so switching repositories never needs a second request.
+    repos: Vec<RepoSummaryView>,
+    /// The `?repo=` value this response was narrowed to, echoed back so the
+    /// UI can confirm its selection round-tripped. `None` for the aggregate,
+    /// all-repositories view.
+    repo: Option<String>,
+}
+
+/// `?repo=<path>` narrows `GET /api/stats` to the runs recorded against one
+/// repository. Matched by full-path equality against `RunState.repo` only
+/// (see [`stats::filter_repo`]) - never resolved by name the way the CLI's
+/// `--repo` is, because the value here always came from this same route's
+/// own `repos` list in an earlier response, never typed by a human. A value
+/// matching no run is a 404, not an empty aggregate: the caller asked for a
+/// specific, named repository, and silently returning zeroes would look
+/// exactly like a repository that has runs but none of interest.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct StatsQuery {
+    repo: Option<String>,
 }
 
 /// `GET /api/stats` - task and run statistics for the dashboard, aggregated
-/// by [`stats::collect`], the same function `magi stats` prints from. Reads
-/// every readable run on disk, exactly as [`runs_unreadable`] does, so the
-/// two counts can never drift apart the way a separately-maintained tally
-/// could.
-async fn stats_get(State(ui): State<Arc<Ui>>) -> ApiResult<Json<StatsView>> {
+/// by [`stats::collect`] (or [`stats::collect_refs`] over one repository's
+/// runs when `?repo=` narrows it), the same counting logic `magi stats`
+/// prints from. Reads every readable run on disk, exactly as
+/// [`runs_unreadable`] does, so the two counts can never drift apart the way
+/// a separately-maintained tally could.
+async fn stats_get(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<StatsQuery>,
+) -> ApiResult<Json<StatsView>> {
     blocking(move || {
         let states: Vec<RunState> = run_ids(&ui.runs)
             .into_iter()
             .filter_map(|id| read_run(&ui.runs, &id).ok())
             .collect();
-        let collected = stats::collect(&states);
+        let repos: Vec<RepoSummaryView> = stats::by_repo(&states)
+            .iter()
+            .map(RepoSummaryView::from)
+            .collect();
+        let collected = match &q.repo {
+            Some(repo) => {
+                let filtered = stats::filter_repo(&states, std::path::Path::new(repo));
+                if filtered.is_empty() {
+                    return Err(ApiError::not_found(format!(
+                        "no runs recorded against repo `{repo}`"
+                    )));
+                }
+                stats::collect_refs(filtered)
+            }
+            None => stats::collect(&states),
+        };
         let queue_counts = crate::queue::TaskCounts::of(&ui.queue.list());
         Ok(Json(StatsView {
             totals: StatsTotalsView::from(&collected.totals),
@@ -3174,6 +3249,8 @@ async fn stats_get(State(ui): State<Arc<Ui>>) -> ApiResult<Json<StatsView>> {
             release_bumps: ReleaseBumpStatsView::from(&collected.release_bumps),
             queue: TaskCountsView::from(queue_counts),
             runs_unreadable: runs_unreadable(&ui.runs),
+            repos,
+            repo: q.repo.clone(),
         }))
     })
     .await
@@ -5047,6 +5124,28 @@ mod tests {
             "main".to_owned(),
             "0123456789abcdef".to_owned(),
             "Add a web UI\n\nMobile first.".to_owned(),
+            Config::default(),
+        );
+        state.id = id.to_owned();
+        state.status = status;
+        let dir = runs.join(id);
+        std::fs::create_dir_all(&dir).expect("run dir");
+        std::fs::write(
+            dir.join("run.json"),
+            serde_json::to_string_pretty(&state).expect("serialize run"),
+        )
+        .expect("write run.json");
+    }
+
+    /// Same as [`write_run`], but against a named repository rather than the
+    /// fixed `/repo/magi` - for the `?repo=` stats tests, which need runs
+    /// spread across more than one.
+    fn write_run_repo(runs: &FsPath, id: &str, status: RunStatus, repo: &str) {
+        let mut state = RunState::new(
+            PathBuf::from(repo),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "task".to_owned(),
             Config::default(),
         );
         state.id = id.to_owned();
@@ -7823,6 +7922,90 @@ mod tests {
         assert_eq!(stats.json()["runs_unreadable"], 0);
         assert!(stats.json()["agents"].as_array().unwrap().is_empty());
         assert!(stats.json()["advisors"].as_array().unwrap().is_empty());
+        assert!(stats.json()["repos"].as_array().unwrap().is_empty());
+        assert_eq!(stats.json()["repo"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn stats_lists_every_repository_with_runs_recorded() {
+        let f = Fixture::start().await;
+        write_run_repo(
+            &f.runs(),
+            "20260902-140501-a",
+            RunStatus::Merged,
+            "/repos/a",
+        );
+        write_run_repo(
+            &f.runs(),
+            "20260902-140502-b",
+            RunStatus::Merged,
+            "/repos/a",
+        );
+        write_run_repo(
+            &f.runs(),
+            "20260902-140503-c",
+            RunStatus::Blocked,
+            "/repos/b",
+        );
+
+        let stats = f.get("/api/stats").await;
+        assert_eq!(stats.status, 200);
+        // Unfiltered - the aggregate across both repositories.
+        assert_eq!(stats.json()["totals"]["runs"], 3);
+        assert_eq!(stats.json()["repo"], Value::Null);
+
+        let repos = stats.json()["repos"].clone();
+        let repos = repos.as_array().unwrap();
+        assert_eq!(repos.len(), 2);
+        // Busiest (2 runs) first.
+        assert_eq!(repos[0]["repo"], "/repos/a");
+        assert_eq!(repos[0]["name"], "a");
+        assert_eq!(repos[0]["runs"], 2);
+        assert_eq!(repos[1]["repo"], "/repos/b");
+        assert_eq!(repos[1]["runs"], 1);
+    }
+
+    #[tokio::test]
+    async fn stats_repo_query_narrows_the_aggregate_to_one_repository() {
+        let f = Fixture::start().await;
+        write_run_repo(
+            &f.runs(),
+            "20260902-140501-a",
+            RunStatus::Merged,
+            "/repos/a",
+        );
+        write_run_repo(
+            &f.runs(),
+            "20260902-140502-b",
+            RunStatus::Blocked,
+            "/repos/b",
+        );
+
+        let stats = f.get("/api/stats?repo=%2Frepos%2Fa").await;
+        assert_eq!(stats.status, 200);
+        assert_eq!(stats.json()["totals"]["runs"], 1);
+        assert_eq!(stats.json()["totals"]["merged"], 1);
+        assert_eq!(stats.json()["repo"], "/repos/a");
+        // The repository list itself is unaffected by the filter - it is
+        // what a client switches repositories from.
+        assert_eq!(stats.json()["repos"].as_array().unwrap().len(), 2);
+        // runs_unreadable is a whole-workload count, never scoped to the
+        // selected repository - see StatsView::runs_unreadable's own doc.
+        assert_eq!(stats.json()["runs_unreadable"], 0);
+    }
+
+    #[tokio::test]
+    async fn stats_repo_query_for_an_unknown_repo_is_a_404() {
+        let f = Fixture::start().await;
+        write_run_repo(
+            &f.runs(),
+            "20260902-140501-a",
+            RunStatus::Merged,
+            "/repos/a",
+        );
+
+        let stats = f.get("/api/stats?repo=%2Frepos%2Fnope").await;
+        assert_eq!(stats.status, 404);
     }
 
     #[tokio::test]

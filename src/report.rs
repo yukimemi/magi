@@ -17,7 +17,7 @@ use crate::run::{
     CommandOutcome, ContinuationOutcome, E2eStatus, GateStatus, JobStatus, Liveness,
     OperatorFixOutcome, RunState, RunStatus, tail,
 };
-use crate::stats::Stats;
+use crate::stats::{RepoStats, Stats};
 use crate::verdict::ReviewVote;
 
 static COLOR: AtomicBool = AtomicBool::new(true);
@@ -1108,6 +1108,43 @@ fn bar(value: f64, max: f64, width: usize) -> String {
         .round()
         .clamp(1.0, width as f64) as usize;
     "█".repeat(cells)
+}
+
+/// Per-repository summary table: repo name, run count, completion rate.
+///
+/// `main.rs`'s `Command::Stats` is what decides *whether* to print this —
+/// only ahead of the plain (no `--repo`) report, and only when `repos.len() >
+/// 1` — this function only renders whatever it is handed.
+pub fn repo_summary(repos: &[RepoStats]) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "{}", bold("repos"));
+
+    // Two different checkouts can share a leaf directory name (`magi` under
+    // two different roots); disambiguate only those with their parent
+    // directory rather than paying the extra noise on every row.
+    let mut name_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for r in repos {
+        *name_counts.entry(r.name.as_str()).or_insert(0) += 1;
+    }
+
+    for r in repos {
+        let label = if name_counts.get(r.name.as_str()).copied().unwrap_or(0) > 1 {
+            match r.repo.parent().and_then(|p| p.file_name()) {
+                Some(parent) => format!("{} ({})", r.name, parent.to_string_lossy()),
+                None => r.name.clone(),
+            }
+        } else {
+            r.name.clone()
+        };
+        let _ = writeln!(
+            s,
+            "  {}  {} runs  {:.0}% completion",
+            label,
+            r.stats.totals.runs,
+            r.stats.totals.completion_rate()
+        );
+    }
+    s
 }
 
 /// Aggregate tables, for `magi stats`.
@@ -2309,6 +2346,45 @@ mod tests {
         assert!(text.contains("0 total"));
         assert!(!text.contains("implementation"));
         assert!(!text.contains("node durations"));
+    }
+
+    #[test]
+    fn repo_summary_lists_run_count_and_completion_rate() {
+        let _guard = plain();
+        let a = crate::stats::RepoStats {
+            repo: PathBuf::from("/repos/a"),
+            name: "a".to_owned(),
+            stats: Stats {
+                totals: crate::stats::Totals {
+                    runs: 4,
+                    merged: 2,
+                    ready: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        let text = repo_summary(&[a]);
+        assert!(text.contains("repos"), "{text}");
+        assert!(text.contains("a  4 runs  75% completion"), "{text}");
+    }
+
+    #[test]
+    fn repo_summary_disambiguates_colliding_names_with_the_parent_directory() {
+        let _guard = plain();
+        let a = crate::stats::RepoStats {
+            repo: PathBuf::from("/roots/one/magi"),
+            name: "magi".to_owned(),
+            stats: Stats::default(),
+        };
+        let b = crate::stats::RepoStats {
+            repo: PathBuf::from("/roots/two/magi"),
+            name: "magi".to_owned(),
+            stats: Stats::default(),
+        };
+        let text = repo_summary(&[a, b]);
+        assert!(text.contains("magi (one)"), "{text}");
+        assert!(text.contains("magi (two)"), "{text}");
     }
 
     #[test]

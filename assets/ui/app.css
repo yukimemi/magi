@@ -1204,6 +1204,11 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
    in index.html. Both need the same flex-column gap .view gives its own
    direct children, since neither is a direct child of .view any more. */
 #stats-body, #stats-runs-section { display: flex; flex-direction: column; gap: var(--s4); }
+/* Repository selector - only shown once more than one repository has runs
+   recorded, see renderStatsRepoSelector(). Sits under the view head, same
+   width rhythm as the generic select rule but without a .field wrapper's
+   extra top margin, since nothing labels it above. */
+.stats-repo-select { margin-top: 0; max-width: 320px; }
 .stats-tiles {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
   gap: var(--s3);
