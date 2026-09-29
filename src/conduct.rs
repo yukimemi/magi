@@ -68,25 +68,6 @@ pub const NODE: &str = "conduct";
 /// `crate::chat`'s own single-turn, no-write invocations.
 const TURN_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// How many of a task's [`Task::answers`] may already come from
-/// `crate::conduct` before a further `question` decision is refused in
-/// favor of [`Task::hold_machine`].
-///
-/// [`Task::answers`] only grows through [`crate::daemon::resolve_blockers`]
-/// recording an answer this module's own question produced (see
-/// [`Task::record_answer`]'s call site), so this counts settled
-/// conductor-and-operator exchanges specifically, not every question a task
-/// has ever seen. A model that does not register its own question as
-/// already answered - misreading [`prompt::ConductTask::answers`], or simply
-/// asking the same thing worded differently - would otherwise keep filing a
-/// fresh [`Question`] every cycle its revision changes, growing `magi answer
-/// --list` without bound and never letting the task actually rest; see
-/// `apply_one`'s use of this constant. Two lets one genuine follow-up
-/// through - a task that has needed more than that many rounds of the
-/// operator's own words is better served by a human looking at it directly
-/// than by another automated question.
-const MAX_SETTLED_CONDUCT_ANSWERS: usize = 2;
-
 /// What the conductor may choose for a `running`-but-stalled or a
 /// `failed`/`held` task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -481,18 +462,13 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
             .find(|q| q.status.open() && q.node == NODE && q.run == task.id)
         {
             Some(existing) => existing.id,
-            // See `MAX_SETTLED_CONDUCT_ANSWERS`'s own doc: this many
-            // conductor questions have already been answered about this
-            // task with nothing left open, so a further one is refused in
-            // favor of a hold rather than growing the question list forever.
-            None if task.answers.len() >= MAX_SETTLED_CONDUCT_ANSWERS => {
-                task.hold_machine(Some(format!(
-                    "conduct tried to ask another question after {} were \
-                     already answered about this task: {text}",
-                    task.answers.len()
-                )));
-                return queue.put(&mut task);
-            }
+            // No cap on settled answers: a question the operator can answer
+            // is never refused. The task goes `Blocked` and at most one
+            // conductor question is open at a time (reused above), so each
+            // further question costs one human answer. Run attempts are
+            // bounded by `max_attempts` and the queue's attempt accounting.
+            // A model rewording the same question can still recur once per
+            // answer; that cost falls on the operator, by choice.
             None => {
                 let mut q = Question::new(
                     task.id.clone(),
@@ -1589,12 +1565,9 @@ mod tests {
     }
 
     #[test]
-    fn a_third_conductor_question_after_two_settled_answers_holds_instead_of_asking_again() {
-        // Guards against the model not registering its own question as
-        // already answered and re-asking a version of it forever: once this
-        // many of the task's `answers` already came from `crate::conduct`,
-        // a further `question` decision is refused in favor of a hold - see
-        // `MAX_SETTLED_CONDUCT_ANSWERS`'s own doc.
+    fn a_question_after_two_settled_answers_is_still_filed_and_blocks() {
+        // A genuine question must stay answerable however many were settled
+        // before it: refusing it left `magi answer --list` empty.
         let dir = tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let questions = Questions::at(dir.path().join("questions"));
@@ -1608,24 +1581,40 @@ mod tests {
         queue.put(&mut t).unwrap();
         assert_eq!(questions.list().len(), 0);
 
-        apply(
-            &queue,
-            &questions,
-            &Verdict {
-                decisions: vec![Decision {
-                    id: t.id.clone(),
-                    question: Some("Handle this one? (3)".to_owned()),
-                    ..Decision::default()
-                }],
-            },
-        )
-        .unwrap();
+        let verdict = Verdict {
+            decisions: vec![Decision {
+                id: t.id.clone(),
+                question: Some("Branch conflicts with origin/main, how do we proceed?".to_owned()),
+                ..Decision::default()
+            }],
+        };
+        apply(&queue, &questions, &verdict).unwrap();
 
-        assert_eq!(questions.list().len(), 0, "no third question was filed");
+        let filed = questions.list();
+        assert_eq!(filed.len(), 1, "the question was filed");
+        assert_eq!(
+            filed[0].summary,
+            "Branch conflicts with origin/main, how do we proceed?"
+        );
+        assert!(filed[0].status.open());
+        assert_eq!(filed[0].node, NODE);
         let after = queue.get(&t.id).unwrap();
-        assert_eq!(after.status, TaskStatus::Held);
-        assert!(after.blocked_by.is_empty());
+        assert_eq!(after.status, TaskStatus::Blocked);
+        assert_eq!(after.blocked_by, vec![filed[0].id.clone()]);
         assert_eq!(after.answers.len(), 2, "the prior answers are untouched");
+        assert!(
+            !after
+                .hold_reason
+                .clone()
+                .unwrap_or_default()
+                .contains("conduct tried to ask"),
+            "no hold was applied"
+        );
+
+        apply(&queue, &questions, &verdict).unwrap();
+        let again = questions.list();
+        assert_eq!(again.len(), 1, "the open question is reused");
+        assert_eq!(again[0].id, filed[0].id);
     }
 
     #[test]
