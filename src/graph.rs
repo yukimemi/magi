@@ -504,6 +504,20 @@ impl Runner {
     /// returns early, `tally` is already present and `fold_losers` has no
     /// losers. Resuming such a run therefore does the right thing as well.
     pub async fn review(repo: &Path, branch: &str, config: Config) -> Result<Self> {
+        Self::review_taking_over(repo, branch, config, None).await
+    }
+
+    /// [`Runner::review`] for a queued task's retry: when an earlier attempt
+    /// at the same task still has `branch` checked out, its worktree is
+    /// released first if that is safe (see [`crate::handover`]), and the
+    /// review refuses with the reason if it is not. `None` is a hand-run
+    /// review and behaves exactly as [`Runner::review`] always did.
+    pub async fn review_taking_over(
+        repo: &Path,
+        branch: &str,
+        config: Config,
+        takeover: Option<crate::handover::Takeover>,
+    ) -> Result<Self> {
         let repo = git::toplevel(repo).await?;
         let missing = agent::missing_programs(&config.agents);
         if !missing.is_empty() {
@@ -557,6 +571,17 @@ impl Runner {
             tokio::fs::create_dir_all(parent).await.ok();
         }
         let path = worktree.to_string_lossy().to_string();
+        if let Some(takeover) = &takeover
+            && let Some(old) = crate::handover::release(&repo, branch, &state.id, takeover).await?
+        {
+            state.event(
+                "release",
+                format!(
+                    "took `{branch}` over from run {}: its worktree was released",
+                    crate::run::short_of(&old)
+                ),
+            );
+        }
         git::git(&repo, &["worktree", "add", &path, branch])
             .await
             .with_context(|| {
@@ -654,6 +679,13 @@ impl Runner {
     /// Reopen an existing run.
     pub fn resume(id: &str) -> Result<Self> {
         let state = RunState::load(id)?;
+        if let Some(to) = &state.released_to {
+            bail!(
+                "run {} cannot be resumed: its worktree was released to run {}",
+                state.short(),
+                crate::run::short_of(to)
+            );
+        }
         let roles = state.config.resolve_roles()?;
         let max_parallel = state.config.graph.max_parallel.max(1);
         Ok(Self {
@@ -6754,7 +6786,10 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
             git::worktree_remove(&repo, &c.worktree).await.ok();
             removed.push(c.worktree.to_string_lossy().into_owned());
         }
-        if git::branch_exists(&repo, &c.branch).await.unwrap_or(false) {
+        // A branch handed to a later run (and its pull request) is not this
+        // run's to delete.
+        let handed_over = state.released_branches.contains(&c.branch);
+        if !handed_over && git::branch_exists(&repo, &c.branch).await.unwrap_or(false) {
             git::branch_delete(&repo, &c.branch).await.ok();
             removed.push(c.branch.clone());
         }
@@ -7703,6 +7738,56 @@ mod tests {
             "the loser's branch is removed"
         );
         assert!(state.candidates[1].folded, "the loser is marked folded");
+    }
+
+    /// A branch handed to a later run is that run's (and its pull request's):
+    /// folding the run that released it must not delete it.
+    #[tokio::test]
+    async fn fold_run_keeps_a_branch_that_was_handed_to_a_later_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let home = tmp.path().join("home");
+
+        let mut config = Config::default();
+        config.graph.worktree_root = Some(tmp.path().join("wt"));
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            "deadbeef".to_owned(),
+            "task".to_owned(),
+            config,
+        );
+        // The worktree is already gone (released); the branch survives.
+        git::git(&repo, &["branch", "magi/x/A", "main"])
+            .await
+            .expect("branch");
+        state.candidates = vec![Candidate {
+            index: 0,
+            label: 'A',
+            agent: "alpha".to_owned(),
+            branch: "magi/x/A".to_owned(),
+            worktree: state.worktree_root().join("cand-A"),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: true,
+        }];
+        state.released_to = Some("20260901-000000-new1".to_owned());
+        state.released_branches = vec!["magi/x/A".to_owned()];
+
+        fold_run(&mut state, true, &home).await.expect("fold_run");
+
+        assert!(
+            git::branch_exists(&repo, "magi/x/A").await.unwrap(),
+            "the handed-over branch survives a fold"
+        );
     }
 
     /// `status == Ready` used to be read as "this is the harmless

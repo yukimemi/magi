@@ -2302,7 +2302,13 @@ async fn attempt(
                 "task {} reopens `{branch}` as a review-only pass",
                 task.short()
             );
-            Runner::review(&repo, branch, config).await
+            // Every earlier attempt is superseded by the one being minted
+            // now, so a branch one of them still holds may be taken over.
+            let takeover = crate::handover::Takeover {
+                earlier: task.earlier_attempts().to_vec(),
+                home: crate::run::home(),
+            };
+            Runner::review_taking_over(&repo, branch, config, Some(takeover)).await
         }
         Starter::Resume(id) => {
             tracing::info!("resuming run {id} rather than competing again");
@@ -2946,7 +2952,9 @@ where
 {
     let id = runs.last()?;
     match load(id) {
-        Ok(s) if s.status.resumable() && !exhausted_review_budget(&s) => Some(id.clone()),
+        Ok(s) if s.status.resumable() && !s.released() && !exhausted_review_budget(&s) => {
+            Some(id.clone())
+        }
         Ok(_) => None,
         Err(e) => {
             tracing::warn!("could not read run {id} for task {short}: {e:#}");
@@ -6711,6 +6719,28 @@ mod tests {
             reconsideration: Vec::new(),
             verdict: None,
         }
+    }
+
+    #[test]
+    fn unfinished_run_never_offers_a_run_whose_worktree_was_released() {
+        let mut released = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234def".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        released.status = RunStatus::Blocked;
+        assert_eq!(
+            unfinished_run_with(&[released.id.clone()], "t", |_| Ok(released.clone())),
+            Some(released.id.clone())
+        );
+        released.released_to = Some("20260901-000000-new1".to_owned());
+        assert_eq!(
+            unfinished_run_with(&[released.id.clone()], "t", |_| Ok(released.clone())),
+            None,
+            "there is nothing left to resume it into"
+        );
     }
 
     #[test]

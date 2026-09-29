@@ -5196,7 +5196,9 @@ function renderRunActions(run) {
           disabled: busy || gone,
           onclick: () => resumeRun(run.id),
         }),
-        el("p", { class: "card-note", text: gone
+        el("p", { class: "card-note", text: run.released_to
+          ? `This run's worktree was released to run ${String(run.released_to).split("-").pop()}, which took the branch over. It can no longer be resumed from here; carry on with that run.`
+          : gone
           ? "The candidate worktrees are gone, so there is nothing left to continue from. File the task again instead."
           : isStale(run)
             ? "No process is driving this run. Resume continues from its last saved node and spends agent calls."

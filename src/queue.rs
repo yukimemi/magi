@@ -560,6 +560,27 @@ impl Task {
         &self.runs[..self.runs.len() - 1]
     }
 
+    /// The attempt right after `run` in this task's history, if there is one.
+    ///
+    /// The one place "a later attempt replaced this run" is decided:
+    /// [`Queue::superseded`] and [`Queue::superseded_by`] (the web UI's
+    /// note) read it, and so does [`Task::earlier_attempts`], so what is shown
+    /// and what `crate::handover` acts on cannot disagree.
+    pub fn successor_of(&self, run: &str) -> Option<&String> {
+        let pos = self.runs.iter().position(|r| r == run)?;
+        self.runs.get(pos + 1)
+    }
+
+    /// Every run already recorded for this task, i.e. every run that an
+    /// attempt being minted *right now* supersedes.
+    ///
+    /// The new run is not in [`Task::runs`] yet when it decides what to take
+    /// over (`Task::start` pushes it afterwards), so "has a later attempt" is
+    /// true of everything listed here by the time the new run exists.
+    pub fn earlier_attempts(&self) -> &[String] {
+        &self.runs
+    }
+
     /// Record a failed attempt. Out of attempts means held for a human, rather
     /// than retried until the money runs out.
     ///
@@ -1039,8 +1060,8 @@ impl Queue {
     pub fn superseded(&self) -> HashMap<String, String> {
         let mut by = HashMap::new();
         for task in self.list() {
-            for pair in task.runs.windows(2) {
-                if let [earlier, later] = pair {
+            for earlier in &task.runs {
+                if let Some(later) = task.successor_of(earlier) {
                     by.insert(earlier.clone(), later.clone());
                 }
             }
@@ -1057,8 +1078,8 @@ impl Queue {
     /// read one entry out of it.
     pub fn superseded_by(&self, run: &str) -> Option<String> {
         for task in self.list() {
-            if let Some(pos) = task.runs.iter().position(|r| r == run) {
-                return task.runs.get(pos + 1).cloned();
+            if task.runs.iter().any(|r| r == run) {
+                return task.successor_of(run).cloned();
             }
         }
         None
@@ -1410,6 +1431,21 @@ mod tests {
             PathBuf::from("."),
             Source::Human,
         )
+    }
+
+    #[test]
+    fn earlier_attempts_is_every_recorded_run_and_agrees_with_the_display() {
+        let mut t = task("retried");
+        assert!(
+            t.earlier_attempts().is_empty(),
+            "a first attempt takes nothing over"
+        );
+        t.runs = vec!["aaaa".to_owned(), "bbbb".to_owned()];
+        assert_eq!(t.earlier_attempts(), ["aaaa", "bbbb"]);
+        // What the web note shows and what a takeover acts on are one rule.
+        assert_eq!(t.successor_of("aaaa"), Some(&"bbbb".to_owned()));
+        assert_eq!(t.successor_of("bbbb"), None);
+        assert_eq!(t.successor_of("zzzz"), None);
     }
 
     #[test]

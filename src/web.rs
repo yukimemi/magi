@@ -2716,6 +2716,14 @@ async fn run_resume(
         })
         .await?
     };
+    if let Some(to) = &state.released_to {
+        return Err(ApiError::conflict(format!(
+            "run {} can no longer be resumed: its worktree was released to run {}, which \
+             took the branch over.",
+            state.short(),
+            crate::run::short_of(to)
+        )));
+    }
     if !state.status.resumable() {
         return Err(ApiError::conflict(format!(
             "run {} is `{}`, and only a stalled or blocked run can be resumed",

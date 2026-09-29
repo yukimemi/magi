@@ -130,6 +130,28 @@ pub async fn reset_detached(worktree: &Path, rev: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where `branch` is checked out, if some worktree holds it.
+///
+/// Read from `git worktree list --porcelain` rather than out of an error
+/// message, which varies with git's version and locale.
+pub async fn worktree_holding(repo: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    let listing = git(repo, &["worktree", "list", "--porcelain"]).await?;
+    Ok(parse_worktree_holder(&listing, branch))
+}
+
+fn parse_worktree_holder(listing: &str, branch: &str) -> Option<PathBuf> {
+    let want = format!("refs/heads/{branch}");
+    let mut path: Option<PathBuf> = None;
+    for line in listing.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(p));
+        } else if line.strip_prefix("branch ") == Some(want.as_str()) {
+            return path;
+        }
+    }
+    None
+}
+
 /// Remove a worktree. Returns `Ok(false)` when git refused (e.g. the path is
 /// already gone), so callers can keep folding the rest of a run.
 pub async fn worktree_remove(repo: &Path, path: &Path) -> Result<bool> {
@@ -720,6 +742,19 @@ pub async fn rev_exists(repo: &Path, rev: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_holder_is_read_from_the_porcelain_listing() {
+        let listing = "worktree /repo\nHEAD aaa\nbranch refs/heads/main\n\n\
+                       worktree /wt/cand-A\nHEAD bbb\nbranch refs/heads/magi/f82f/A\n\n\
+                       worktree /wt/detached\nHEAD ccc\ndetached\n";
+        assert_eq!(
+            parse_worktree_holder(listing, "magi/f82f/A"),
+            Some(PathBuf::from("/wt/cand-A"))
+        );
+        assert_eq!(parse_worktree_holder(listing, "magi/f82f"), None);
+        assert_eq!(parse_worktree_holder(listing, "other"), None);
+    }
 
     async fn scratch() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
