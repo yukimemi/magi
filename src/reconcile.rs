@@ -78,12 +78,25 @@ fn describe(c: &Commit) -> String {
 }
 
 impl Diverged {
-    /// The one line the operator sees first.
+    /// The one line the operator sees first. Stable for a branch and remote:
+    /// [`Choice::from_answer`] callers match the recorded answer to it.
     pub fn summary(&self) -> String {
-        format!(
-            "`{}` differs between this machine and {}: which side should magi keep?",
-            self.branch, self.remote
-        )
+        summary_for(&self.branch, &self.remote)
+    }
+
+    /// The two answers a person may give.
+    pub fn choices(&self) -> Vec<String> {
+        vec![
+            format!(
+                "{PUSH_LOCAL} (drops the {} commit(s) only on {})",
+                self.origin_only.len(),
+                self.remote
+            ),
+            format!(
+                "{KEEP_REMOTE} (drops the {} commit(s) only local)",
+                self.local_only.len()
+            ),
+        ]
     }
 
     /// Both sides, what each holds, and what choosing the other loses.
@@ -110,6 +123,65 @@ impl Diverged {
             origin = list(&self.origin_only),
         )
     }
+}
+
+const PUSH_LOCAL: &str = "Push the local branch";
+const KEEP_REMOTE: &str = "Keep the remote copy";
+
+/// The question summary for `branch` on `remote`.
+pub fn summary_for(branch: &str, remote: &str) -> String {
+    format!("`{branch}` differs between this machine and {remote}: which side should magi keep?")
+}
+
+/// The owner's answer to a divergence question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// Overwrite the remote with the local branch.
+    PushLocal,
+    /// Move the local branch onto the remote's.
+    KeepRemote,
+}
+
+impl Choice {
+    /// Read an answer as one of the offered choices; anything else is `None`.
+    pub fn from_answer(answer: &str) -> Option<Self> {
+        if answer.starts_with(PUSH_LOCAL) {
+            Some(Self::PushLocal)
+        } else if answer.starts_with(KEEP_REMOTE) {
+            Some(Self::KeepRemote)
+        } else {
+            None
+        }
+    }
+}
+
+/// Carry out the owner's decision. Both moves are the explicit, informed
+/// choice of a person who was shown what each side loses.
+///
+/// The remote is fetched first; a push pins its lease to the tip just read,
+/// and a refused lease is an error.
+pub async fn apply_choice(repo: &Path, remote: &str, branch: &str, choice: Choice) -> Result<()> {
+    let fetched = git::fetch(repo, remote, branch).await?;
+    if !fetched.ok() {
+        anyhow::bail!("could not read {remote}/{branch}: {}", fetched.stderr);
+    }
+    let tracking = format!("{remote}/{branch}");
+    let tip = git::rev_parse(repo, &tracking).await?;
+    match choice {
+        Choice::PushLocal => {
+            let out = git::push_pinned(repo, remote, branch, &tip).await?;
+            if !out.ok() {
+                anyhow::bail!("push of `{branch}` was refused: {}", out.stderr);
+            }
+        }
+        Choice::KeepRemote => {
+            let out = git::git_raw(repo, &["branch", "-f", branch, &tip]).await?;
+            if !out.ok() {
+                anyhow::bail!("could not move `{branch}` onto {tracking}: {}", out.stderr);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What a divergence turned out to be.
@@ -148,20 +220,20 @@ async fn only_empty_non_merges(repo: &Path, exclude: &str, head: &str) -> Result
     Ok(true)
 }
 
-/// Look up which run made `sha`: a run that recorded it in an event, or one
-/// whose winning branch is `branch`. Best-effort and read-only.
-fn made_by(branch: &str, sha: &str) -> Option<String> {
+/// Look up which run made `sha`: a run that recorded it in an event.
+/// Best-effort and read-only. A run merely owning the branch name is not
+/// evidence: a person may have pushed onto that branch since.
+fn made_by(sha: &str) -> Option<String> {
     crate::run::try_home()?;
     let short: String = sha.chars().take(7).collect();
     crate::run::list_ids().into_iter().find_map(|id| {
         let state = crate::run::RunState::load(&id).ok()?;
-        let names_branch = state.candidates.iter().any(|c| c.branch == branch);
         let names_sha = state.events.iter().any(|e| e.message.contains(&short));
-        (names_sha || names_branch).then(|| format!("run {}", crate::run::short_of(&id)))
+        names_sha.then(|| format!("run {}", crate::run::short_of(&id)))
     })
 }
 
-async fn commits(repo: &Path, branch: &str, shas: &[String]) -> Vec<Commit> {
+async fn commits(repo: &Path, shas: &[String]) -> Vec<Commit> {
     let mut out = Vec::new();
     for sha in shas {
         let subject = git::git(repo, &["log", "-1", "--format=%s", sha])
@@ -170,7 +242,7 @@ async fn commits(repo: &Path, branch: &str, shas: &[String]) -> Vec<Commit> {
         out.push(Commit {
             sha: sha.clone(),
             subject,
-            made_by: made_by(branch, sha),
+            made_by: made_by(sha),
         });
     }
     out
@@ -227,8 +299,8 @@ pub async fn classify(
         remote: remote.to_owned(),
         local_tip: local.to_owned(),
         origin_tip: origin.to_owned(),
-        local_only: commits(repo, branch, &local_missing).await,
-        origin_only: commits(repo, branch, &origin_missing).await,
+        local_only: commits(repo, &local_missing).await,
+        origin_only: commits(repo, &origin_missing).await,
         reason: format!(
             "{} (a merge, a squash or a rebase with conflict resolution changes the patch \
              and cannot be matched)",
@@ -433,6 +505,26 @@ mod tests {
             origin_tip,
             "origin untouched"
         );
+    }
+
+    #[tokio::test]
+    async fn the_owners_choice_is_applied_either_way() {
+        assert_eq!(Choice::from_answer("nonsense"), None);
+        let (_g, repo, origin) = fixture();
+        let old_origin = sh(&repo, &["rev-parse", "work"]);
+        advance_and_rebase(&repo);
+        let local = sh(&repo, &["rev-parse", "work"]);
+        let answer = format!("{PUSH_LOCAL} (drops the 1 commit(s) only on origin)");
+        let choice = Choice::from_answer(&answer).unwrap();
+        apply_choice(&repo, "origin", "work", choice).await.unwrap();
+        assert_eq!(sh(&origin, &["rev-parse", "work"]), local);
+
+        sh(&repo, &["checkout", "-q", "main"]);
+        apply_choice(&repo, "origin", "work", Choice::KeepRemote)
+            .await
+            .unwrap();
+        assert_eq!(sh(&repo, &["rev-parse", "work"]), local);
+        assert_ne!(local, old_origin);
     }
 
     #[tokio::test]

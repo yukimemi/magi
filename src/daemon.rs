@@ -2500,6 +2500,7 @@ async fn attempt(
                 earlier: task.earlier_attempts().to_vec(),
                 home: crate::run::home(),
             };
+            apply_divergence_answer(&repo, branch, &config.merge.remote, task).await;
             Runner::review_taking_over(&repo, branch, config, Some(takeover)).await
         }
         Starter::Resume(id) => {
@@ -2566,18 +2567,7 @@ async fn attempt(
                 "sync".to_owned(),
                 d.summary(),
                 d.detail(),
-                vec![
-                    format!(
-                        "Push the local branch (drops the {} commit(s) only on {})",
-                        d.origin_only.len(),
-                        d.remote
-                    ),
-                    format!(
-                        "Keep {} (drops the {} commit(s) only local)",
-                        d.remote,
-                        d.local_only.len()
-                    ),
-                ],
+                d.choices(),
             );
             match Questions::open().put(&mut q) {
                 Ok(()) => {
@@ -3253,6 +3243,28 @@ enum Starter {
     Resume(String),
     /// `crate::graph::Runner::start`: a fresh competition.
     Start,
+}
+
+/// If the owner already answered this branch's divergence question, do what
+/// they chose before the review opens, and consume the answer so a later,
+/// different divergence asks again. A failure is logged and leaves the answer
+/// in place: the review then finds the divergence and asks once more.
+async fn apply_divergence_answer(repo: &Path, branch: &str, remote: &str, task: &mut Task) {
+    let summary = crate::reconcile::summary_for(branch, remote);
+    let Some((idx, choice)) = task.answers.iter().enumerate().rev().find_map(|(i, a)| {
+        (a.question == summary)
+            .then(|| crate::reconcile::Choice::from_answer(&a.answer))
+            .flatten()
+            .map(|c| (i, c))
+    }) else {
+        return;
+    };
+    match crate::reconcile::apply_choice(repo, remote, branch, choice).await {
+        Ok(()) => {
+            task.answers.remove(idx);
+        }
+        Err(e) => tracing::warn!("could not apply the owner's choice for `{branch}`: {e:#}"),
+    }
 }
 
 /// Decide which of [`Runner::review`], [`Runner::resume`] or [`Runner::start`]

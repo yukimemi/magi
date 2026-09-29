@@ -254,3 +254,40 @@ async fn a_rebased_winner_is_pushed_over_the_remote_copy_magi_last_saw() {
     );
 }
 }
+
+common::e2e! {
+async fn a_remote_branch_with_someone_elses_commits_blocks_the_base_sync() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    let origin = wire_origin(&fx);
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+
+    // A person pushed their own commit to the run's branch.
+    let branch = runner.state.branch_for('A');
+    run_git(&origin.sideline, &["checkout", "-q", "-b", "theirs"]);
+    std::fs::write(origin.sideline.join("theirs.txt"), "x\n").unwrap();
+    run_git(&origin.sideline, &["add", "-A"]);
+    run_git(&origin.sideline, &["commit", "-q", "-m", "a person's commit"]);
+    run_git(
+        &origin.sideline,
+        &["push", "-q", "origin", &format!("theirs:refs/heads/{branch}")],
+    );
+    land_on_origin(&origin.sideline, "upstream.txt", "landed meanwhile\n");
+    // land_on_origin commits on the sideline's current branch; put it on main.
+    run_git(&origin.sideline, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+
+    runner.execute().await.expect("execute");
+    assert_eq!(runner.state.status, RunStatus::Blocked);
+    let why = runner
+        .state
+        .base_sync
+        .as_ref()
+        .and_then(|s| s.conflict.clone())
+        .expect("a reason is recorded");
+    assert!(why.contains("does not contain"), "{why}");
+}
+}

@@ -3270,21 +3270,29 @@ impl Runner {
         } else {
             None
         };
-        let remote_tip = match remote_tip {
-            Some(tip) if git::is_ancestor(&repo, &tip, &head).await => Some(tip),
-            Some(tip) => {
-                self.state.event(
-                    "land",
-                    format!(
-                        "{branch_tracking} ({}) is not part of {}; it will not be overwritten",
-                        short(&tip),
-                        winner.branch
-                    ),
-                );
-                None
-            }
-            None => None,
-        };
+        // A remote tip this branch does not contain is somebody else's work:
+        // rebasing would leave a local tip that can never be pushed. Stop
+        // before touching anything and say so.
+        if let Some(theirs) = &remote_tip
+            && !git::is_ancestor(&repo, theirs, &head).await
+        {
+            let why = format!(
+                "{branch_tracking} ({}) has commits {} does not contain; not rebasing over \
+                 them",
+                short(theirs),
+                winner.branch
+            );
+            self.state.status = RunStatus::Blocked;
+            self.state.base_sync = Some(BaseSync {
+                tip,
+                behind,
+                attempts,
+                conflict: Some(why.clone()),
+            });
+            self.state.event("land", why);
+            self.state.save()?;
+            return Ok(());
+        }
 
         let scratch = self.state.dir().join("base-sync");
         let rebased = git::rebase_branch_in_temp(&repo, &scratch, &winner.branch, &tracking).await;
