@@ -198,6 +198,15 @@ fn view(t: &Task, max_attempts: usize) -> prompt::ConductTask {
     }
 }
 
+/// Did the operator answer a `magi ask` choice with a `resume` action that
+/// this task has not yet acted on? Then `Recovery::Requeue` must not turn the
+/// task into a fresh competition either.
+fn pinned_resume(task: &Task) -> bool {
+    task.resume_override
+        .as_ref()
+        .is_some_and(|o| o.pinned_run.is_some())
+}
+
 /// May the conductor's `Recovery::Hold` take effect on `task`, given an
 /// operator's recorded "resume" answer? The conductor is allowed to override
 /// that answer once - and the override is recorded so `crate::triage` can
@@ -210,7 +219,7 @@ fn may_hold(task: &mut Task, reason: &str) -> bool {
     let Some(o) = task.resume_override.as_mut() else {
         return true;
     };
-    if o.forced {
+    if o.forced || o.pinned_run.is_some() {
         tracing::warn!(
             "conductor tried to hold task {} after the operator forced a resume: {reason}",
             task.id
@@ -509,6 +518,7 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
             }
         }
         TaskStatus::Running => match d.recovery {
+            Some(Recovery::Requeue) if pinned_resume(&task) => {}
             Some(Recovery::Requeue) => {
                 task.requeue();
                 queue.put(&mut task)?;
@@ -523,6 +533,9 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
             _ => {}
         },
         TaskStatus::Failed | TaskStatus::Held => match d.recovery {
+            // The operator picked a specific run to continue; a fresh
+            // competition would throw that run away.
+            Some(Recovery::Requeue) if pinned_resume(&task) => {}
             Some(Recovery::Requeue) => {
                 task.requeue();
                 queue.put(&mut task)?;
@@ -2260,5 +2273,30 @@ mod tests {
         .unwrap();
         // Reaching here at all (no hang) is the assertion.
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Blocked);
+    }
+
+    #[test]
+    fn a_pinned_resume_is_not_held_or_requeued_by_the_conductor() {
+        let mut t = Task::new("t".into(), "t".into(), PathBuf::new(), Source::Human);
+        t.resume_override = Some(crate::queue::OperatorResume {
+            question_id: "q".into(),
+            at: jiff::Timestamp::now(),
+            conductor_rehold: None,
+            forced: false,
+            pinned_run: Some("run-1".into()),
+        });
+        assert!(pinned_resume(&t));
+        assert!(!may_hold(&mut t, "waiting for magi resume"));
+        assert!(
+            t.resume_override
+                .as_ref()
+                .unwrap()
+                .conductor_rehold
+                .is_none(),
+            "a refused hold is not recorded as an override"
+        );
+        t.resume_override = None;
+        assert!(!pinned_resume(&t));
+        assert!(may_hold(&mut t, "no override, so a hold is allowed"));
     }
 }

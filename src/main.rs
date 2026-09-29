@@ -373,6 +373,15 @@ enum Command {
         /// just repeat it.
         #[arg(long = "choice", conflicts_with = "wait")]
         choices: Vec<String>,
+        /// Have the daemon act when a choice is answered:
+        /// `<choice>=resume[:<run>]`, `<choice>=requeue` or `<choice>=done`.
+        /// The choice must be one of the `--choice` values, matched exactly;
+        /// `resume` without a run means this run (`MAGI_RUN`). The daemon acts
+        /// on the task that owns the run - resuming a run, requeuing the task
+        /// as a fresh competition, or closing it - and never guesses from the
+        /// answer's wording. With `--thread`, replaces the earlier actions.
+        #[arg(long = "action", conflicts_with = "wait")]
+        actions: Vec<String>,
         /// Seconds until the question's answer_timeout is reached. Defaults
         /// to the config's answer_timeout. Each call still only blocks for one
         /// slice of it - see the command's own doc. Recorded on the question
@@ -1353,6 +1362,7 @@ async fn dispatch(command: Command) -> Result<()> {
             summary,
             detail,
             choices,
+            actions,
             timeout,
             panel,
             assets,
@@ -1364,6 +1374,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 summary,
                 detail,
                 choices,
+                actions,
                 timeout,
                 panel,
                 assets,
@@ -1824,6 +1835,7 @@ struct AskArgs {
     summary: Option<String>,
     detail: Option<String>,
     choices: Vec<String>,
+    actions: Vec<String>,
     timeout: Option<u64>,
     panel: Option<PathBuf>,
     assets: Vec<PathBuf>,
@@ -1850,6 +1862,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         summary,
         detail,
         choices,
+        actions,
         timeout,
         panel,
         assets,
@@ -1896,6 +1909,9 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
     }
 
     let budget = std::time::Duration::from_secs(timeout.unwrap_or(cfg.graph.answer_timeout));
+    // Refused here, at filing time, so a typo cannot become a question whose
+    // chosen answer silently does nothing.
+    let actions = ask::parse_actions(&actions, &choices, &run)?;
 
     let mut q = match thread {
         Some(id) => {
@@ -1916,6 +1932,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
                 // on the card.
                 question_belongs_to_this_run(q, &run, "reply to")?;
                 q.reply(thread_message(&summary, &detail), choices)?;
+                q.actions = actions;
                 // Re-attached the same way a fresh ask's panel is: before the
                 // question is filed, so the owner never sees the reply a moment
                 // before the evidence for it.
@@ -1929,6 +1946,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         }
         None => {
             let mut q = ask::Question::new(run, node, seat, summary, detail, choices);
+            q.actions = actions;
             // Recorded once, here, so a later `magi ask --wait` enforces the
             // deadline this call actually asked with, not whatever `--timeout`
             // or the config default happens to say when it is called.
@@ -2181,7 +2199,15 @@ fn answer_cmd(
             if q.free_text() {
                 println!("      free text");
             } else {
-                println!("      {}", q.choices.join(" | "));
+                let labelled: Vec<String> = q
+                    .choices
+                    .iter()
+                    .map(|c| match q.actions.get(c) {
+                        Some(a) => format!("{c} [{}]", a.describe()),
+                        None => c.clone(),
+                    })
+                    .collect();
+                println!("      {}", labelled.join(" | "));
             }
         }
         return Ok(());

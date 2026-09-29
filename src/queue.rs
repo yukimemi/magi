@@ -337,6 +337,13 @@ pub struct Task {
     /// schema 5. `#[serde(default)]` so an older record reads as empty.
     #[serde(default)]
     pub triage_applied: Vec<String>,
+    /// Ids of the `magi ask` questions whose [`crate::ask::ChoiceAction`] has
+    /// been applied to this task. Separate from [`Task::triage_applied`]
+    /// (a different producer) and, like it, untouched by [`Task::release`],
+    /// so one answer acts at most once however often the task is held again.
+    /// `#[serde(default)]` so an older record reads as empty.
+    #[serde(default)]
+    pub actions_applied: Vec<String>,
     /// The operator's "resume" answer to a triage question, kept until the
     /// task actually runs (or is done) so `crate::conduct` cannot silently
     /// undo it and `crate::triage` can tell that a hold it sees now came
@@ -418,6 +425,14 @@ pub struct OperatorResume {
     /// that contradiction: the conductor may no longer hold this task.
     #[serde(default)]
     pub forced: bool,
+    /// Set when the answer was a structured `resume` action on a `magi ask`
+    /// choice ([`crate::ask::ChoiceAction::Resume`]): the run the operator
+    /// chose to continue. Its presence also stops `crate::conduct` from
+    /// requeuing the task into a fresh competition, which would discard
+    /// exactly the run that was named. Cleared with the rest of the record
+    /// once the task runs. `#[serde(default)]` so older records read as `None`.
+    #[serde(default)]
+    pub pinned_run: Option<String>,
 }
 
 /// One question `crate::conduct` asked about a task, and what the operator
@@ -455,6 +470,7 @@ impl Task {
             blocked_from: None,
             answers: Vec::new(),
             triage_applied: Vec::new(),
+            actions_applied: Vec::new(),
             resume_override: None,
             review_branch: None,
             fresh_start: false,
@@ -474,6 +490,19 @@ impl Task {
     pub fn mark_triage_applied(&mut self, question_id: &str) {
         if !self.triage_applied(question_id) {
             self.triage_applied.push(question_id.to_owned());
+        }
+    }
+
+    /// Has the action of `magi ask` question `question_id` already been
+    /// applied, or is it being applied now? See [`Task::actions_applied`].
+    pub fn action_applied(&self, question_id: &str) -> bool {
+        self.actions_applied.iter().any(|id| id == question_id)
+    }
+
+    /// Record that `magi ask` question `question_id`'s action was applied.
+    pub fn mark_action_applied(&mut self, question_id: &str) {
+        if !self.action_applied(question_id) {
+            self.actions_applied.push(question_id.to_owned());
         }
     }
 
