@@ -1114,19 +1114,20 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
    the row to check. What must not happen is the *panel* growing with it: the
    whole point of folding is a height that stops depending on how much there
    is to report. So the wrapped text is boxed to a fixed number of lines with
-   `line-clamp` - tall enough that the realistic worst case (every status
-   non-zero) reads in full - and that box's height is fixed rather than
-   content-driven, so one filed task and thirty produce the same collapsed
-   height either way. Anything that still would not fit past that many lines
-   is where the ellipsis applies, as the last resort rather than the first.
-   The label stays unshrunk so it never eats into the count's space. */
+   `line-clamp` - tall enough that the common case (one or two lines) reads
+   in full - and that box's height is fixed rather than content-driven, so
+   one filed task and thirty produce the same collapsed height either way.
+   The rare worst case (every status non-zero) is where the ellipsis
+   applies, as the last resort rather than the first, not something this box
+   is sized to fit in full. The label stays unshrunk so it never eats into
+   the count's space. */
 #talk-tasks-panel > summary { flex-wrap: nowrap; align-items: flex-start; }
 #talk-tasks-panel > summary .talk-tasks-label { flex: none; padding-top: .1em; }
 #talk-tasks-panel > summary #talk-tasks-count {
   flex: 1 1 auto; min-width: 0;
-  white-space: normal; line-height: 1.3; height: 3.9em;
-  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
-  line-clamp: 3; overflow: hidden; text-overflow: ellipsis;
+  white-space: normal; line-height: 1.3; height: 2.6em;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  line-clamp: 2; overflow: hidden; text-overflow: ellipsis;
 }
 
 .run-status { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
