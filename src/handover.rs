@@ -59,6 +59,9 @@ pub struct Released {
     index: usize,
     path: PathBuf,
     home: PathBuf,
+    /// The branch tip when the worktree was released; the branch sync may
+    /// have moved it since.
+    tip: String,
 }
 
 impl Released {
@@ -67,6 +70,15 @@ impl Released {
     /// worktree cannot be re-added the old run stays marked, which is true.
     pub async fn restore(&self, repo: &Path, branch: &str) {
         let path = self.path.to_string_lossy().to_string();
+        // Nothing holds the branch now, so it can be put back where the old
+        // run left it before its worktree is recreated at that commit.
+        let refname = format!("refs/heads/{branch}");
+        if git::rev_parse(repo, &refname).await.ok().as_deref() != Some(self.tip.as_str())
+            && let Err(e) = git::git(repo, &["branch", "-f", branch, &self.tip]).await
+        {
+            tracing::warn!("could not put `{branch}` back at {}: {e:#}", self.tip);
+            return;
+        }
         if let Err(e) = git::git(repo, &["worktree", "add", &path, branch]).await {
             tracing::warn!(
                 "could not put run {}'s worktree back at {path}: {e:#}",
@@ -267,7 +279,13 @@ pub async fn release(
     // itself refuse a dirty worktree: the removal is *not* `--force`, so an
     // edit made after the first look is refused rather than thrown away.
     // Ignored files such as `target/` go with the worktree by design.
-    let again = inspect(repo, branch, &path, &state, &takeover.home).await;
+    // Against the record as it is on disk now, not the copy read earlier: a
+    // resume that started in between has saved its driver there. (The resume
+    // side refuses a released run too - see `Runner::execute_graph`.)
+    let again = match RunState::load_under(&old_id, &takeover.home) {
+        Ok(fresh) => inspect(repo, branch, &path, &fresh, &takeover.home).await,
+        Err(e) => Err(e),
+    };
     let safe = matches!(&again, Ok(h) if decide(true, h) == Decision::Release);
     let removed = safe
         && git::worktree_remove_clean(repo, &path)
@@ -294,6 +312,7 @@ pub async fn release(
         index,
         path,
         home: takeover.home.clone(),
+        tip: holder.tip,
     }))
 }
 

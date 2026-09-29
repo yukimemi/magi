@@ -771,6 +771,18 @@ impl Runner {
         // pid, so `liveness` can tell a live pid that is genuinely still us
         // apart from one the OS has since handed to an unrelated process —
         // see that field's own doc for why the pid alone is not enough.
+        // A resume that raced a takeover: the record on disk says the worktree
+        // was handed to a later run after this copy was read. Saving over it
+        // would erase that and drive a run with nothing to run in.
+        if let Ok(disk) = RunState::load(&self.state.id)
+            && let Some(to) = &disk.released_to
+        {
+            bail!(
+                "run {} cannot continue: its worktree was released to run {}",
+                self.state.short(),
+                crate::run::short_of(to)
+            );
+        }
         let pid = std::process::id();
         self.state.driver_pid = Some(pid);
         self.state.driver_started_at = crate::proc::process_started_at(pid);
