@@ -721,12 +721,7 @@ impl Words {
 /// Pick the panel's language. Codes and names both, because `[graph] language`
 /// has always accepted either.
 fn words(language: &str) -> &'static Words {
-    let l = language.trim();
-    if l.eq_ignore_ascii_case("ja")
-        || l.eq_ignore_ascii_case("jp")
-        || l.eq_ignore_ascii_case("japanese")
-        || l.eq_ignore_ascii_case("日本語")
-    {
+    if crate::lang::is_japanese(language) {
         &JA
     } else {
         &EN

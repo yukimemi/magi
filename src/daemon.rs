@@ -689,9 +689,11 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
         }
         let missing = crate::queue::missing_blockers(queue, questions, &task.blocked_by);
         if !missing.is_empty() {
-            task.hold_machine(Some(crate::queue::missing_blocker_hold_reason(
+            let language = language_of(&task, Path::new("."));
+            task.hold_machine(Some(crate::queue::missing_blocker_hold_reason_in(
                 &task.blocked_by,
                 &missing,
+                &language,
             )));
             record(queue, &mut task);
             continue;
@@ -749,7 +751,7 @@ enum ActionDecision {
 /// could actually make progress ([`RunStatus::resumable`], not released, review
 /// budget left); an answer naming anything else is refused rather than
 /// reinterpreted as a fresh competition.
-fn decide_action<F>(task: &Task, q: &ask::Question, load: F) -> ActionDecision
+fn decide_action<F>(task: &Task, q: &ask::Question, p: &Phrases, load: F) -> ActionDecision
 where
     F: FnOnce(&str) -> Result<RunState>,
 {
@@ -774,29 +776,121 @@ where
         ask::ChoiceAction::Done => ActionDecision::Done,
         ask::ChoiceAction::Resume { run } => {
             if task.runs.last() != Some(run) {
-                return ActionDecision::Refuse(format!(
-                    "question {} asked to resume run {}, which is not this task's latest run",
+                return ActionDecision::Refuse((p.resume_not_latest)(
                     q.short(),
-                    ask::short_id(run)
+                    ask::short_id(run),
                 ));
             }
             match load(run) {
                 Ok(s) if s.status.resumable() && !s.released() && !exhausted_review_budget(&s) => {
                     ActionDecision::Resume(run.clone())
                 }
-                Ok(_) => ActionDecision::Refuse(format!(
-                    "question {} asked to resume run {}, which cannot make progress",
+                Ok(_) => ActionDecision::Refuse((p.resume_cannot_progress)(
                     q.short(),
-                    ask::short_id(run)
+                    ask::short_id(run),
                 )),
-                Err(e) => ActionDecision::Refuse(format!(
-                    "question {} asked to resume run {}, which could not be read: {e:#}",
+                Err(e) => ActionDecision::Refuse((p.resume_unreadable)(
                     q.short(),
-                    ask::short_id(run)
+                    ask::short_id(run),
+                    &format!("{e:#}"),
                 )),
             }
         }
     }
+}
+
+/// The fixed prose the daemon writes into [`Task::last_error`] and
+/// [`Task::hold_reason`], in the language of `[graph] language`. Same shape as
+/// `triage::Wording` and `land::Words`: only English and Japanese are
+/// translated, anything else falls back to English.
+///
+/// Rendered when the reason is *generated*, so a reason keeps the language it
+/// was written in if the setting changes later. The notification frame
+/// (`Task <id> is held:`) is not here and stays English.
+///
+/// Deliberately **not** translated, because other code reads them back by
+/// string: the disk gate prefixes (`triage::is_disk_hold`), `out of attempts`
+/// and `gate red`. IDs, node names, paths and external error text are embedded
+/// as they are.
+struct Phrases {
+    /// `{}` = status label, then the detail.
+    graph_stopped: fn(&str, &str) -> String,
+    quorum_lost: &'static str,
+    /// Followed by the seats' names.
+    quota_took_out: &'static str,
+    /// Followed by the status label.
+    run_ended: &'static str,
+    /// Followed by the question's short id.
+    waiting_for_answer: &'static str,
+    recovered_running: &'static str,
+    no_run_to_recover: &'static str,
+    could_not_start: &'static str,
+    resume_not_latest: fn(&str, &str) -> String,
+    resume_cannot_progress: fn(&str, &str) -> String,
+    resume_unreadable: fn(&str, &str, &str) -> String,
+}
+
+const PHRASES_EN: Phrases = Phrases {
+    graph_stopped: |status, detail| {
+        format!("the graph stopped at `{status}` without reaching a terminal status: {detail}")
+    },
+    quorum_lost: "the judging panel lost its quorum",
+    quota_took_out: "; quota took out ",
+    run_ended: "run ended ",
+    waiting_for_answer: " - waiting for operator answer to question ",
+    recovered_running: "recovered a `running` task whose daemon never recorded the outcome: ",
+    no_run_to_recover: "task was `running` with no live daemon and no readable \
+                        run to recover; held for a human to check what happened",
+    could_not_start: "could not start the run: ",
+    resume_not_latest: |q, run| {
+        format!("question {q} asked to resume run {run}, which is not this task's latest run")
+    },
+    resume_cannot_progress: |q, run| {
+        format!("question {q} asked to resume run {run}, which cannot make progress")
+    },
+    resume_unreadable: |q, run, e| {
+        format!("question {q} asked to resume run {run}, which could not be read: {e}")
+    },
+};
+
+const PHRASES_JA: Phrases = Phrases {
+    graph_stopped: |status, detail| {
+        format!("グラフが終端状態に達しないまま `{status}` で停止しました: {detail}")
+    },
+    quorum_lost: "審査パネルが定足数を失いました",
+    quota_took_out: "。クォータで脱落: ",
+    run_ended: "run 終了: ",
+    waiting_for_answer: " - オペレーターの回答待ち: 質問 ",
+    recovered_running: "daemon が結果を記録しないまま `running` だったタスクを回収しました: ",
+    no_run_to_recover: "タスクは `running` でしたが、生きた daemon も回収できる run も見つかりません。\
+                        何が起きたか人が確認するため保留にしました",
+    could_not_start: "run を開始できませんでした: ",
+    resume_not_latest: |q, run| {
+        format!(
+            "質問 {q} は run {run} の再開を求めましたが、これはタスクの最新の run ではありません"
+        )
+    },
+    resume_cannot_progress: |q, run| {
+        format!("質問 {q} は run {run} の再開を求めましたが、これは進行できません")
+    },
+    resume_unreadable: |q, run, e| {
+        format!("質問 {q} は run {run} の再開を求めましたが、読み込めませんでした: {e}")
+    },
+};
+
+fn phrases(language: &str) -> &'static Phrases {
+    if crate::lang::is_japanese(language) {
+        &PHRASES_JA
+    } else {
+        &PHRASES_EN
+    }
+}
+
+/// The language of the repository a task belongs to, read best-effort for the
+/// paths that have no run (and so no config of their own) to ask. An unreadable
+/// config is English, not an error: a hold reason must still get written.
+fn language_of(task: &Task, fallback: &Path) -> String {
+    crate::lang::of_repo(&repo_for(task, fallback))
 }
 
 /// The task an answered question speaks for: the one whose runs include the
@@ -835,7 +929,10 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
         let Ok(mut task) = queue.get(&listed.id) else {
             continue;
         };
-        let decision = decide_action(&task, &q, |id| RunState::load_under(id, home));
+        let language = language_of(&task, Path::new("."));
+        let decision = decide_action(&task, &q, phrases(&language), |id| {
+            RunState::load_under(id, home)
+        });
         let ran = matches!(
             decision,
             ActionDecision::Resume(_) | ActionDecision::Requeue | ActionDecision::Done
@@ -1022,6 +1119,11 @@ pub struct Verdict {
 /// `left_pr` splits the `Blocked` row, and it is the difference between a run
 /// that failed and a run that finished into a gate. See [`Task::handed_off`].
 pub fn settle(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usize) {
+    settle_in(task, verdict, detail, max_attempts, &PHRASES_EN)
+}
+
+/// [`settle`], with the daemon's own fixed prose in `p`'s language.
+fn settle_in(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usize, p: &Phrases) {
     // A parked run is the operator's own doing, and its work is intact on
     // disk. The task goes back in line with its attempt refunded so the next
     // loop resumes the same run - which `one_task` prefers over competing
@@ -1041,13 +1143,7 @@ pub fn settle(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usi
         RunStatus::Blocked if verdict.left_pr => task.handed_off(detail),
         RunStatus::Blocked => task.fail(detail, max_attempts),
         RunStatus::VerifiedNoop => task.handed_off(detail),
-        other => task.fail(
-            format!(
-                "the graph stopped at `{}` without reaching a terminal status: {detail}",
-                label(other)
-            ),
-            max_attempts,
-        ),
+        other => task.fail((p.graph_stopped)(label(other), detail), max_attempts),
     }
 }
 
@@ -1177,10 +1273,11 @@ fn settle_and_diagnose(
     max_attempts: usize,
     state: &RunState,
 ) {
-    settle(task, verdict, detail, max_attempts);
+    let p = phrases(&state.config.graph.language);
+    settle_in(task, verdict, detail, max_attempts, p);
     if task.status == TaskStatus::Held {
         task.diagnostic = diagnostic(state);
-        note_open_question(task, &state.id);
+        note_open_question(task, &state.id, p);
     }
 }
 
@@ -1198,7 +1295,7 @@ fn settle_and_diagnose(
 /// Best-effort: an unreadable question store must not stop a run from
 /// settling, so this is a no-op rather than a propagated error when
 /// [`crate::run::try_home`] has nothing to offer or the store is empty.
-fn note_open_question(task: &mut Task, run: &str) {
+fn note_open_question(task: &mut Task, run: &str, p: &Phrases) {
     let Some(home) = crate::run::try_home() else {
         return;
     };
@@ -1207,10 +1304,7 @@ fn note_open_question(task: &mut Task, run: &str) {
         return;
     };
     let base = task.hold_reason.clone().unwrap_or_default();
-    task.hold_reason = Some(format!(
-        "{base} - waiting for operator answer to question {}",
-        q.short()
-    ));
+    task.hold_reason = Some(format!("{base}{}{}", p.waiting_for_answer, q.short()));
 }
 
 /// Reconcile a task left at [`TaskStatus::Running`] by a daemon that never
@@ -1223,7 +1317,7 @@ fn note_open_question(task: &mut Task, run: &str) {
 /// exactly where a live daemon would have put it — the same policy table,
 /// not a second one that quietly drifts from it — and that is only checkable
 /// without spawning a real run.
-fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize) {
+fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize, language: &str) {
     match last_run {
         Some(state) => {
             let verdict = Verdict {
@@ -1234,14 +1328,16 @@ fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize) {
                 no_viable_candidates: state.viable().is_empty(),
             };
             let detail = format!(
-                "recovered a `running` task whose daemon never recorded the outcome: {}",
+                "{}{}",
+                phrases(&state.config.graph.language).recovered_running,
                 describe(&state)
             );
             settle_and_diagnose(task, verdict, &detail, max_attempts, &state);
         }
         None => {
-            let why = "task was `running` with no live daemon and no readable \
-                       run to recover; held for a human to check what happened";
+            // No run, so no config of its own: `language` is the task's
+            // repository's setting, read by the caller.
+            let why = phrases(language).no_run_to_recover;
             task.last_error = Some(why.to_owned());
             // The phone shows `hold_reason`, so a task held by the machine
             // says why there too and not only in `last_error`.
@@ -1304,7 +1400,12 @@ fn reclaim_orphaned_running(queue: &Queue, max_attempts: usize) -> Vec<String> {
         {
             tracing::warn!("abandon questions for {}: {e:#}", state.id);
         }
-        reclaim(&mut task, last_run, max_attempts);
+        let language = if last_run.is_none() {
+            language_of(&task, Path::new("."))
+        } else {
+            String::new()
+        };
+        reclaim(&mut task, last_run, max_attempts, &language);
         if task.status == TaskStatus::Done {
             supersede_prior_runs(&task, &crate::run::home());
         }
@@ -2422,6 +2523,7 @@ async fn attempt(
         }
     };
     apply_solo(&mut config, task);
+    let start_failed = phrases(&config.graph.language).could_not_start;
 
     // The free-space gate, checked *before* anything is minted: a task that
     // waits out a full disk costs nothing yet, and must not spend an attempt
@@ -2496,7 +2598,7 @@ async fn attempt(
         Ok(a) => a,
         Err(e) => {
             task.attempts += 1;
-            task.fail(format!("could not start the run: {e:#}"), opts.max_attempts);
+            task.fail(format!("{start_failed}{e:#}"), opts.max_attempts);
             record(queue, task);
             return Vec::new();
         }
@@ -2552,7 +2654,7 @@ async fn attempt(
         // by itself is the operator's call, not a failed attempt: hold the
         // task with the reason, spend nothing, and say so on the bell.
         Err(e) if e.downcast_ref::<crate::handover::Refused>().is_some() => {
-            let reason = format!("could not start the run: {e:#}");
+            let reason = format!("{start_failed}{e:#}");
             task.last_error = Some(reason.clone());
             task.hold_machine(Some(reason));
             record(queue, task);
@@ -2600,7 +2702,7 @@ async fn attempt(
                 Err(put) => {
                     tracing::warn!("could not file the divergence question: {put:#}");
                     task.attempts += 1;
-                    task.fail(format!("could not start the run: {e:#}"), opts.max_attempts);
+                    task.fail(format!("{start_failed}{e:#}"), opts.max_attempts);
                 }
             }
             record(queue, task);
@@ -2616,13 +2718,13 @@ async fn attempt(
                 && let Starter::Review(branch) = &starter
             {
                 task.review_branch = Some(branch.clone());
-                task.last_error = Some(format!("could not start the run: {e:#}"));
+                task.last_error = Some(format!("{start_failed}{e:#}"));
                 task.status = crate::queue::TaskStatus::Failed;
                 record(queue, task);
                 return Vec::new();
             }
             task.attempts += 1;
-            task.fail(format!("could not start the run: {e:#}"), opts.max_attempts);
+            task.fail(format!("{start_failed}{e:#}"), opts.max_attempts);
             record(queue, task);
             return Vec::new();
         }
@@ -2963,12 +3065,8 @@ fn disk_gate_with<F: Fn(&Path) -> Result<u64>>(
         return None;
     }
     match free_bytes(repo) {
-        Ok(free) => crate::disk::gate(free, min),
-        Err(e) => Some(format!(
-            "could not measure free space on {} ({e}); the disk gate refuses \
-             to let a run start blind",
-            repo.display()
-        )),
+        Ok(free) => crate::disk::gate_in(free, min, &config.graph.language),
+        Err(e) => Some(crate::disk::unmeasured_in(repo, &e, &config.graph.language)),
     }
 }
 
@@ -3481,20 +3579,18 @@ fn runnable(queue: &Queue) -> Vec<Task> {
 /// `.err` styling. A bare `verified_noop` there would read exactly like the
 /// failure this whole feature exists to tell apart from one.
 fn describe(state: &RunState) -> String {
+    let p = phrases(&state.config.graph.language);
     let mut detail = if state.status == RunStatus::Stalled {
         let mut seats: Vec<&str> = state.quota.iter().map(|q| q.seat.as_str()).collect();
         seats.sort_unstable();
         seats.dedup();
         if seats.is_empty() {
-            "the judging panel lost its quorum".to_owned()
+            p.quorum_lost.to_owned()
         } else {
-            format!(
-                "the judging panel lost its quorum; quota took out {}",
-                seats.join(", ")
-            )
+            format!("{}{}{}", p.quorum_lost, p.quota_took_out, seats.join(", "))
         }
     } else {
-        format!("run ended {}", state.status.display_label())
+        format!("{}{}", p.run_ended, state.status.display_label())
     };
     if let Some(last) = state.events.last() {
         detail.push_str(&format!(" ({}: {})", last.node, last.message));
@@ -4491,7 +4587,7 @@ mod tests {
             state.viable().is_empty(),
             "no candidate was added, so nothing is viable"
         );
-        reclaim(&mut t, Some(state), 2);
+        reclaim(&mut t, Some(state), 2, "en");
         assert_eq!(t.attempts, 0, "a recovered quota wipeout is refunded");
         assert!(t.status.runnable());
     }
@@ -4736,6 +4832,86 @@ mod tests {
         let swept = sweep_stale_claims_with(&queue, Duration::ZERO, |_| true);
         assert!(swept.is_empty(), "an unknown pid must keep its lock");
         assert!(queue.claim(&t.id).is_err(), "the lock remains protective");
+    }
+
+    fn run_state_in(status: RunStatus, language: &str) -> RunState {
+        let mut s = run_state(status);
+        s.config.graph.language = language.to_owned();
+        s
+    }
+
+    fn unstarted_verdict(status: RunStatus) -> Verdict {
+        Verdict {
+            status,
+            left_pr: false,
+            quota_hit: false,
+            parked: false,
+            no_viable_candidates: false,
+        }
+    }
+
+    #[test]
+    fn settle_renders_the_non_terminal_reason_in_the_configured_language() {
+        let reason = |language: &str| {
+            let mut t = task();
+            settle_in(
+                &mut t,
+                unstarted_verdict(RunStatus::Judging),
+                "boom",
+                1,
+                phrases(language),
+            );
+            t.last_error.or(t.hold_reason).unwrap_or_default()
+        };
+        assert!(
+            reason("en").starts_with("the graph stopped at `"),
+            "{}",
+            reason("en")
+        );
+        assert!(reason("ja").starts_with("グラフが終端状態に達しないまま"));
+        assert!(reason("日本語").contains("boom"));
+        assert_eq!(reason("fr"), reason("en"));
+    }
+
+    #[test]
+    fn describe_follows_the_run_language_and_keeps_the_run_id() {
+        let en = describe(&run_state_in(RunStatus::Stalled, "en"));
+        assert!(en.starts_with("the judging panel lost its quorum"), "{en}");
+        let ja = describe(&run_state_in(RunStatus::Stalled, "ja"));
+        assert!(ja.starts_with("審査パネルが定足数を失いました"), "{ja}");
+        assert!(ja.contains("[run "), "{ja}");
+        let ended = describe(&run_state_in(RunStatus::Failed, "jp"));
+        assert!(ended.starts_with("run 終了: "), "{ended}");
+        let mut de = run_state_in(RunStatus::Failed, "de");
+        let mut en = run_state_in(RunStatus::Failed, "en");
+        de.id = "same".to_owned();
+        en.id = "same".to_owned();
+        assert_eq!(describe(&de), describe(&en));
+    }
+
+    #[test]
+    fn refusals_and_recovery_prose_follow_the_language() {
+        let t = held_task_with("r1");
+        let q = action_question(
+            "r1",
+            ask::ChoiceAction::Resume {
+                run: "r1".to_owned(),
+            },
+        );
+        let refuse = |p: &Phrases| match decide_action(&t, &q, p, |_: &str| bail!("gone")) {
+            ActionDecision::Refuse(s) => s,
+            other => panic!("{other:?}"),
+        };
+        assert!(refuse(phrases("en")).contains("could not be read: gone"));
+        assert!(refuse(phrases("ja")).contains("読み込めませんでした: gone"));
+        assert_eq!(refuse(phrases("fr")), refuse(phrases("en")));
+
+        let mut held = task();
+        reclaim(&mut held, None, 2, "ja");
+        assert!(held.hold_reason.unwrap().contains("保留にしました"));
+        let mut held = task();
+        reclaim(&mut held, None, 2, "xx");
+        assert!(held.hold_reason.unwrap().contains("held for a human"));
     }
 
     fn run_state(status: RunStatus) -> RunState {
@@ -5298,7 +5474,7 @@ mod tests {
     fn reclaim_settles_a_running_task_against_its_last_run() {
         let mut t = task();
         t.start("20260904-000000-4043".to_owned());
-        reclaim(&mut t, Some(run_state(RunStatus::Ready)), 2);
+        reclaim(&mut t, Some(run_state(RunStatus::Ready)), 2, "en");
         assert_eq!(
             t.status,
             TaskStatus::Done,
@@ -5313,7 +5489,7 @@ mod tests {
         // policy for a task a daemon merely stopped without reporting.
         let mut t = task();
         t.start("20260904-000000-4043".to_owned());
-        reclaim(&mut t, Some(run_state(RunStatus::Blocked)), 2);
+        reclaim(&mut t, Some(run_state(RunStatus::Blocked)), 2, "en");
         assert_eq!(t.status, TaskStatus::Failed);
         assert!(t.status.runnable());
     }
@@ -5322,7 +5498,7 @@ mod tests {
     fn reclaim_holds_a_running_task_whose_run_cannot_be_found() {
         let mut t = task();
         t.start("20260904-000000-4043".to_owned());
-        reclaim(&mut t, None, 2);
+        reclaim(&mut t, None, 2, "en");
         assert_eq!(t.status, TaskStatus::Held);
         assert!(
             t.last_error
@@ -7277,30 +7453,35 @@ mod tests {
         let q = action_question("r1", resume_action("r1"));
         let load = |s: RunState| move |_: &str| Ok(s);
         assert_eq!(
-            decide_action(&t, &q, load(run_state(RunStatus::Blocked))),
+            decide_action(&t, &q, &PHRASES_EN, load(run_state(RunStatus::Blocked))),
             ActionDecision::Resume("r1".into())
         );
         // Not the latest run of the task.
         let q_other = action_question("r1", resume_action("r0"));
         assert!(matches!(
-            decide_action(&t, &q_other, load(run_state(RunStatus::Blocked))),
+            decide_action(
+                &t,
+                &q_other,
+                &PHRASES_EN,
+                load(run_state(RunStatus::Blocked))
+            ),
             ActionDecision::Refuse(_)
         ));
         // A finished run cannot make progress.
         assert!(matches!(
-            decide_action(&t, &q, load(run_state(RunStatus::Ready))),
+            decide_action(&t, &q, &PHRASES_EN, load(run_state(RunStatus::Ready))),
             ActionDecision::Refuse(_)
         ));
         // A released one either.
         let mut released = run_state(RunStatus::Blocked);
         released.released_to = Some("elsewhere".into());
         assert!(matches!(
-            decide_action(&t, &q, load(released)),
+            decide_action(&t, &q, &PHRASES_EN, load(released)),
             ActionDecision::Refuse(_)
         ));
         // Unreadable state is a refusal, never a fresh competition.
         assert!(matches!(
-            decide_action(&t, &q, |_: &str| bail!("gone")),
+            decide_action(&t, &q, &PHRASES_EN, |_: &str| bail!("gone")),
             ActionDecision::Refuse(_)
         ));
     }
@@ -7311,7 +7492,12 @@ mod tests {
         t.runs.push("r2".to_owned());
         let never = |_: &str| -> Result<RunState> { bail!("not read") };
         assert_eq!(
-            decide_action(&t, &action_question("r1", ask::ChoiceAction::Done), never),
+            decide_action(
+                &t,
+                &action_question("r1", ask::ChoiceAction::Done),
+                &PHRASES_EN,
+                never
+            ),
             ActionDecision::Stale
         );
     }
@@ -7324,20 +7510,27 @@ mod tests {
             decide_action(
                 &t,
                 &action_question("r1", ask::ChoiceAction::Requeue),
+                &PHRASES_EN,
                 never
             ),
             ActionDecision::Requeue
         );
         let done_q = action_question("r1", ask::ChoiceAction::Done);
-        assert_eq!(decide_action(&t, &done_q, never), ActionDecision::Done);
+        assert_eq!(
+            decide_action(&t, &done_q, &PHRASES_EN, never),
+            ActionDecision::Done
+        );
         t.mark_action_applied(&done_q.id);
-        assert_eq!(decide_action(&t, &done_q, never), ActionDecision::Skip);
+        assert_eq!(
+            decide_action(&t, &done_q, &PHRASES_EN, never),
+            ActionDecision::Skip
+        );
 
         // A plain answer (no action for that label) does nothing.
         let mut plain = action_question("r1", ask::ChoiceAction::Done);
         plain.actions.clear();
         assert_eq!(
-            decide_action(&held_task_with("r1"), &plain, never),
+            decide_action(&held_task_with("r1"), &plain, &PHRASES_EN, never),
             ActionDecision::Skip
         );
         // A running task is left alone.
@@ -7347,6 +7540,7 @@ mod tests {
             decide_action(
                 &running,
                 &action_question("r1", ask::ChoiceAction::Done),
+                &PHRASES_EN,
                 never
             ),
             ActionDecision::Skip

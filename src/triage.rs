@@ -151,12 +151,7 @@ const JA: Wording = Wording {
 /// Pick the wording. Codes and names both, the same acceptance
 /// `crate::land::words` gives `[graph] language`.
 fn wording(language: &str) -> &'static Wording {
-    let l = language.trim();
-    if l.eq_ignore_ascii_case("ja")
-        || l.eq_ignore_ascii_case("jp")
-        || l.eq_ignore_ascii_case("japanese")
-        || l.eq_ignore_ascii_case("日本語")
-    {
+    if crate::lang::is_japanese(language) {
         &JA
     } else {
         &EN
@@ -396,10 +391,9 @@ fn repo_for(task: &Task) -> PathBuf {
 /// with `crate::disk::gate`'s formatted string and `daemon::disk_gate`'s own
 /// message if either changes; nothing else ties them together.
 fn is_disk_hold(task: &Task) -> bool {
-    task.hold_reason.as_deref().is_some_and(|r| {
-        r.starts_with("not enough free space to start a run:")
-            || r.starts_with("could not measure free space on ")
-    })
+    task.hold_reason
+        .as_deref()
+        .is_some_and(crate::disk::is_gate_reason)
 }
 
 /// Has a `HoldSource::Machine` hold's cause resolved? `Some(true)` means yes -
@@ -603,9 +597,11 @@ fn quarantine_orphaned_blocked(queue: &Queue, questions: &Questions) -> Vec<Stri
         if missing.is_empty() {
             continue;
         }
-        task.hold_machine(Some(crate::queue::missing_blocker_hold_reason(
+        let language = crate::lang::of_repo(&repo_for(&task));
+        task.hold_machine(Some(crate::queue::missing_blocker_hold_reason_in(
             &task.blocked_by,
             &missing,
+            &language,
         )));
         if queue.put(&mut task).is_ok() {
             quarantined.push(task.id.clone());
