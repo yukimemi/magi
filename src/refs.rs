@@ -201,6 +201,20 @@ pub struct Plan {
 /// cannot both be the start and guessing which the task meant is refused.
 /// Unmerged bare shas already contained in the start are not picked twice.
 pub async fn plan(repo: &Path, seeds: &[Seed]) -> anyhow::Result<Plan> {
+    // A reference that cannot be resolved must not quietly become a start
+    // from the base alone: that is the empty tree this module exists to stop.
+    let unresolved: Vec<String> = seeds
+        .iter()
+        .filter(|s| s.kind == SeedKind::Unresolved)
+        .map(|s| format!("{} ({})", s.token, s.detail))
+        .collect();
+    if !unresolved.is_empty() {
+        anyhow::bail!(
+            "the task refers to work magi cannot resolve: {}; fix or remove the \
+             reference rather than start from the base with nothing to build on",
+            unresolved.join("; ")
+        );
+    }
     let mut start: Option<&Seed> = None;
     for s in seeds
         .iter()
@@ -397,7 +411,8 @@ mod tests {
         assert_eq!(seeds[1].kind, SeedKind::Unmerged);
         assert!(!seeds[1].branch);
 
-        let plan = plan(&repo, &seeds).await.unwrap();
+        assert!(plan(&repo, &seeds).await.is_err(), "unresolved refuses");
+        let plan = plan(&repo, &seeds[1..]).await.unwrap();
         assert_eq!(plan.start, None);
         assert_eq!(plan.picks, vec![fix.clone()]);
 

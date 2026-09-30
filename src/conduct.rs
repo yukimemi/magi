@@ -416,6 +416,9 @@ async fn attach_facts(cfg: &Config, repo: &Path, queue: &Queue, verdict: &mut Ve
         let facts = match base {
             Some(base) => {
                 let tracking = format!("{remote}/{base}");
+                // Best effort: a stale tracking ref would report work that
+                // has since landed as still missing from the base.
+                let _ = crate::git::fetch(&repo, remote, &base).await;
                 let against = if crate::git::rev_exists(&repo, &tracking).await {
                     tracking
                 } else {

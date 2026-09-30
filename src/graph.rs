@@ -452,6 +452,18 @@ impl Drop for FixClaim {
 impl Runner {
     /// Start a fresh run against `repo`.
     pub async fn start(repo: &Path, instruction: String, config: Config) -> Result<Self> {
+        Self::start_naming(repo, instruction, "", config).await
+    }
+
+    /// [`Runner::start`] for a queued task: `also_scan` (the task's title) is
+    /// searched for branch and commit references along with the instruction,
+    /// since a task may name the work it is about only in its title.
+    pub async fn start_naming(
+        repo: &Path,
+        instruction: String,
+        also_scan: &str,
+        config: Config,
+    ) -> Result<Self> {
         let repo = git::toplevel(repo).await?;
         let missing = agent::missing_programs(&config.agents);
         if !missing.is_empty() {
@@ -483,7 +495,13 @@ impl Runner {
         let max_parallel = config.graph.max_parallel.max(1);
         // A task that points at work already in the repository starts from
         // it; what the repository says about each reference is recorded.
-        let seeds = refs::resolve(&repo, &base_commit, &config.merge.remote, &instruction).await;
+        let seeds = refs::resolve(
+            &repo,
+            &base_commit,
+            &config.merge.remote,
+            &format!("{also_scan}\n{instruction}"),
+        )
+        .await;
         refs::plan(&repo, &seeds).await?;
         let mut state = RunState::new(repo, base_branch, base_commit, instruction, config);
         for seed in &seeds {
