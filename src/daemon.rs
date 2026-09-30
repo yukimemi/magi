@@ -2499,6 +2499,7 @@ async fn attempt(
             let takeover = crate::handover::Takeover {
                 earlier: task.earlier_attempts().to_vec(),
                 home: crate::run::home(),
+                choice: take_divergence_answer(branch, &config.merge.remote, task),
             };
             Runner::review_taking_over(&repo, branch, config, Some(takeover)).await
         }
@@ -2552,7 +2553,54 @@ async fn attempt(
             );
             return Vec::new();
         }
+        // A branch that differs between here and the remote in ways magi
+        // cannot prove are the same change is a decision for the owner, not a
+        // failed attempt: ask with both sides laid out, spend no attempt, and
+        // let the answer requeue the task.
+        Err(e) if e.downcast_ref::<crate::reconcile::Diverged>().is_some() => {
+            let d = e
+                .downcast_ref::<crate::reconcile::Diverged>()
+                .expect("checked by the guard");
+            let mut q = ask::Question::new(
+                task.id.clone(),
+                "review".to_owned(),
+                "sync".to_owned(),
+                d.summary(),
+                d.detail(),
+                d.choices(),
+            );
+            match Questions::open().put(&mut q) {
+                Ok(()) => {
+                    task.last_error = Some(format!("{e:#}"));
+                    // Consumed above by `take`; the answer has to reach a review
+                    // of this same branch, so keep pointing the task at it.
+                    task.review_branch = Some(d.branch.clone());
+                    task.block(vec![q.id.clone()], Some(d.summary()));
+                }
+                Err(put) => {
+                    tracing::warn!("could not file the divergence question: {put:#}");
+                    task.attempts += 1;
+                    task.fail(format!("could not start the run: {e:#}"), opts.max_attempts);
+                }
+            }
+            record(queue, task);
+            return Vec::new();
+        }
         Err(e) => {
+            // The answer was stale and nothing was applied: keep pointing at
+            // the branch so the next attempt asks again against its new tips.
+            // Nothing went wrong with the task, so no attempt is spent: a
+            // budget one short of its limit must not hold it instead of
+            // letting the question be asked again.
+            if e.downcast_ref::<crate::reconcile::Stale>().is_some()
+                && let Starter::Review(branch) = &starter
+            {
+                task.review_branch = Some(branch.clone());
+                task.last_error = Some(format!("could not start the run: {e:#}"));
+                task.status = crate::queue::TaskStatus::Failed;
+                record(queue, task);
+                return Vec::new();
+            }
             task.attempts += 1;
             task.fail(format!("could not start the run: {e:#}"), opts.max_attempts);
             record(queue, task);
@@ -3212,6 +3260,25 @@ enum Starter {
     Resume(String),
     /// `crate::graph::Runner::start`: a fresh competition.
     Start,
+}
+
+/// The owner's answer to this branch's divergence question, consumed from the
+/// task so a later, different divergence asks again. The runner applies it
+/// (see `Runner::review_taking_over`), after the earlier worktree is released.
+fn take_divergence_answer(
+    branch: &str,
+    remote: &str,
+    task: &mut Task,
+) -> Option<crate::reconcile::Choice> {
+    let summary = crate::reconcile::summary_for(branch, remote);
+    let (idx, choice) = task.answers.iter().enumerate().rev().find_map(|(i, a)| {
+        (a.question == summary)
+            .then(|| crate::reconcile::Choice::from_answer(&a.answer))
+            .flatten()
+            .map(|c| (i, c))
+    })?;
+    task.answers.remove(idx);
+    Some(choice)
 }
 
 /// Decide which of [`Runner::review`], [`Runner::resume`] or [`Runner::start`]
