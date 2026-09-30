@@ -2488,6 +2488,19 @@ async fn attempt(
         branch_exists,
         unfinished.as_deref(),
     );
+    // Absolute paths of the files the task was filed with, re-read from the
+    // task now so a file attached while it was held reaches a resumed run
+    // too. A stored name whose file has gone is an error before any agent is
+    // paid for, never a silent omission the implementer cannot notice.
+    let attachments = match task_attachments(queue, task) {
+        Ok(a) => a,
+        Err(e) => {
+            task.attempts += 1;
+            task.fail(format!("could not start the run: {e:#}"), opts.max_attempts);
+            record(queue, task);
+            return Vec::new();
+        }
+    };
     let started = match &starter {
         Starter::Review(branch) => {
             tracing::info!(
@@ -2511,6 +2524,7 @@ async fn attempt(
                 {
                     r.state.instruction = instruction;
                 }
+                r.state.attachments = attachments.clone();
                 r
             })
         }
@@ -2524,7 +2538,12 @@ async fn attempt(
             }
             let instruction = prepare_instruction(&starter, None, task)
                 .unwrap_or_else(|| task.instruction.clone());
-            Runner::start_naming(&repo, instruction, &task.title, config).await
+            Runner::start_naming(&repo, instruction, &task.title, config)
+                .await
+                .map(|mut r| {
+                    r.state.attachments = attachments.clone();
+                    r
+                })
         }
     };
     let mut runner = match started {
@@ -3379,6 +3398,20 @@ fn instruction_for(task: &Task) -> String {
 /// three times.
 fn resumed_instruction(old_instruction: &str, task: &Task) -> String {
     append_answers(strip_answers_block(old_instruction, task), task)
+}
+
+/// The task's attachments as absolute paths, each checked to still exist.
+fn task_attachments(queue: &Queue, task: &Task) -> Result<Vec<PathBuf>> {
+    let paths = queue.attachment_paths(task);
+    for (name, path) in task.attachments.iter().zip(&paths) {
+        if !path.is_file() {
+            bail!(
+                "attachment `{name}` is recorded on the task but {} is missing",
+                path.display()
+            );
+        }
+    }
+    Ok(paths)
 }
 
 /// What [`attempt`] should tell a [`Starter`] about `task`'s current operator
@@ -6832,6 +6865,22 @@ mod tests {
     fn instruction_for_is_unchanged_without_any_answers() {
         let t = task();
         assert_eq!(instruction_for(&t), t.instruction);
+    }
+
+    #[test]
+    fn task_attachments_are_absolute_and_a_missing_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let src = dir.path().join("shot.png");
+        std::fs::write(&src, "x").unwrap();
+        let mut t = task();
+        q.attach(&mut t, &[src]).unwrap();
+        let paths = task_attachments(&q, &t).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].is_absolute() && paths[0].is_file());
+        std::fs::remove_file(&paths[0]).unwrap();
+        let err = task_attachments(&q, &t).unwrap_err().to_string();
+        assert!(err.contains("shot.png"), "{err}");
     }
 
     #[test]

@@ -509,6 +509,11 @@ enum TaskCmd {
         /// run.
         #[arg(long)]
         urgent: bool,
+        /// Attach a file (typically a screenshot). Repeatable. Copied into the
+        /// task's own storage, so it outlives the original; the implementer is
+        /// handed its absolute path and told to open images first.
+        #[arg(long = "attach", value_name = "PATH")]
+        attach: Vec<PathBuf>,
         /// Print the filed task as JSON.
         #[arg(long)]
         json: bool,
@@ -592,6 +597,11 @@ enum TaskCmd {
         /// new instruction.
         #[arg(long)]
         title: Option<String>,
+        /// Attach a file (typically a screenshot) to the task, keeping the
+        /// ones it already has. Repeatable. With no new text given, only the
+        /// attachments change: stdin is not read and the text and title stay.
+        #[arg(long = "attach", value_name = "PATH")]
+        attach: Vec<PathBuf>,
     },
     /// Mark a task finished, without running anything.
     ///
@@ -2262,6 +2272,7 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             repo,
             solo,
             urgent,
+            attach,
             json,
         } => {
             if let Some(why) = mistyped_command(
@@ -2293,6 +2304,13 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             task.priority = priority;
             task.solo = solo;
             task.urgent = urgent;
+            if !attach.is_empty() {
+                let attach = absolute_paths(&attach, &cwd);
+                if let Err(e) = q.attach(&mut task, &attach) {
+                    let _ = std::fs::remove_dir_all(q.attachments_dir(&task.id));
+                    return Err(e);
+                }
+            }
             q.put(&mut task)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&task)?);
@@ -2377,6 +2395,13 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 println!("urgent    yes");
             }
             println!("attempts  {}", t.attempts);
+            let attachments = q.attachment_paths(&t);
+            if !attachments.is_empty() {
+                println!("attachments:");
+                for p in &attachments {
+                    println!("  {}", p.display());
+                }
+            }
             if !t.runs.is_empty() {
                 println!("runs      {}", t.runs.join(", "));
             }
@@ -2494,6 +2519,7 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             instruction,
             file,
             title,
+            attach,
         } => {
             if let Some(why) = mistyped_command(
                 &format!("magi task edit {id}"),
@@ -2508,6 +2534,20 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 .claim(&resolved)
                 .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
             let mut t = q.get(&resolved)?;
+            if !attach.is_empty() && instruction.is_empty() && file.is_none() && title.is_none() {
+                if !matches!(t.status, TaskStatus::Queued | TaskStatus::Held) {
+                    bail!(
+                        "task {} is {}; only a queued or held task can be edited",
+                        t.short(),
+                        t.status.as_str()
+                    );
+                }
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                q.attach(&mut t, &absolute_paths(&attach, &cwd))?;
+                q.put(&mut t)?;
+                println!("edited {} {}", t.short(), t.title);
+                return Ok(());
+            }
             let text = task_text(&instruction, file.as_deref(), None).await?;
             if instruction.is_empty() && file.is_none() {
                 // Same stdin gap as `task add`: no positional words means
@@ -2522,6 +2562,10 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             }
             let title = title.unwrap_or_else(|| queue::title_from(&text, 72));
             t.edit(title, text)?;
+            if !attach.is_empty() {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                q.attach(&mut t, &absolute_paths(&attach, &cwd))?;
+            }
             q.put(&mut t)?;
             println!("edited {} {}", t.short(), t.title);
             Ok(())
@@ -2593,6 +2637,12 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `paths` made absolute against `cwd`, so an attachment given relatively
+/// resolves the same way whatever the process later does with its directory.
+fn absolute_paths(paths: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
+    paths.iter().map(|p| cwd.join(p)).collect()
 }
 
 /// `magi repos`: everything [`repos::scan`] finds under `[repos] roots`, one
@@ -3897,6 +3947,76 @@ mod tests {
     }
 
     #[test]
+    fn task_add_and_edit_accept_a_repeatable_attach_flag() {
+        let cli = Cli::try_parse_from([
+            "magi", "task", "add", "--attach", "a.png", "--attach", "b.png", "do it",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Task {
+                command: TaskCmd::Add { attach, .. },
+            }) => assert_eq!(attach, [PathBuf::from("a.png"), PathBuf::from("b.png")]),
+            other => panic!("expected TaskCmd::Add, got {other:?}"),
+        }
+        let cli =
+            Cli::try_parse_from(["magi", "task", "edit", "abc", "--attach", "a.png"]).unwrap();
+        match cli.command {
+            Some(Command::Task {
+                command: TaskCmd::Edit { attach, .. },
+            }) => assert_eq!(attach, [PathBuf::from("a.png")]),
+            other => panic!("expected TaskCmd::Edit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_add_attach_copies_and_edit_attach_only_keeps_the_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let shot = dir.path().join("shot.png");
+        std::fs::write(&shot, "pixels").unwrap();
+        task_cmd_on(
+            TaskCmd::Add {
+                instruction: vec!["make".to_owned(), "it".to_owned(), "pretty".to_owned()],
+                file: None,
+                issue: None,
+                title: None,
+                priority: 0,
+                repo: PathBuf::from("."),
+                solo: true,
+                urgent: false,
+                attach: vec![shot.clone()],
+                json: false,
+            },
+            q.clone(),
+        )
+        .await
+        .expect("file a task with an attachment");
+        std::fs::remove_file(&shot).unwrap();
+        let filed = q.list().pop().unwrap();
+        assert_eq!(filed.attachments, ["shot.png"]);
+        assert!(q.attachment_paths(&filed)[0].is_file());
+
+        let more = dir.path().join("more.png");
+        std::fs::write(&more, "more").unwrap();
+        task_cmd_on(
+            TaskCmd::Edit {
+                id: filed.id.clone(),
+                instruction: Vec::new(),
+                file: None,
+                title: None,
+                attach: vec![more],
+            },
+            q.clone(),
+        )
+        .await
+        .expect("attach to an existing task");
+        let after = q.get(&filed.id).unwrap();
+        assert_eq!(after.attachments, ["shot.png", "more.png"]);
+        assert_eq!(after.instruction, filed.instruction);
+        assert_eq!(after.title, filed.title);
+    }
+
+    #[test]
     fn task_add_urgent_parses_and_defaults_to_false() {
         let urgent = Cli::try_parse_from(["magi", "task", "add", "--urgent", "do it"]).unwrap();
         match urgent.command {
@@ -3930,6 +4050,7 @@ mod tests {
                 repo: PathBuf::from("."),
                 solo: false,
                 urgent: true,
+                attach: Vec::new(),
                 json: false,
             },
             q.clone(),
@@ -3947,6 +4068,7 @@ mod tests {
                 repo: PathBuf::from("."),
                 solo: false,
                 urgent: false,
+                attach: Vec::new(),
                 json: false,
             },
             q.clone(),
@@ -3981,6 +4103,7 @@ mod tests {
                 repo: PathBuf::from("."),
                 solo: true,
                 urgent: false,
+                attach: Vec::new(),
                 json: false,
             },
             q.clone(),
@@ -3998,6 +4121,7 @@ mod tests {
                 repo: PathBuf::from("."),
                 solo: false,
                 urgent: false,
+                attach: Vec::new(),
                 json: false,
             },
             q.clone(),
@@ -4036,6 +4160,7 @@ mod tests {
                 repo: PathBuf::from("."),
                 solo: false,
                 urgent: false,
+                attach: Vec::new(),
                 json: false,
             },
             q.clone(),
@@ -4055,6 +4180,7 @@ mod tests {
                 repo: PathBuf::from("."),
                 solo: false,
                 urgent: false,
+                attach: Vec::new(),
                 json: false,
             },
             q.clone(),
@@ -4090,6 +4216,7 @@ mod tests {
                 repo: PathBuf::from("."),
                 solo: false,
                 urgent: false,
+                attach: Vec::new(),
                 json: false,
             },
             q.clone(),
@@ -4414,6 +4541,7 @@ mod tests {
                 repo: missing,
                 solo: false,
                 urgent: false,
+                attach: Vec::new(),
                 json: false,
             },
             q.clone(),
@@ -4440,6 +4568,7 @@ mod tests {
                 repo: repo.clone(),
                 solo: false,
                 urgent: false,
+                attach: Vec::new(),
                 json: false,
             },
             q.clone(),
@@ -4692,6 +4821,7 @@ mod tests {
                 instruction: vec!["new".to_owned(), "instruction".to_owned()],
                 file: None,
                 title: Some("new title".to_owned()),
+                attach: Vec::new(),
             },
             q.clone(),
         )
@@ -4721,6 +4851,7 @@ mod tests {
                 instruction: vec!["nope".to_owned()],
                 file: None,
                 title: None,
+                attach: Vec::new(),
             },
             q.clone(),
         )
@@ -4749,6 +4880,7 @@ mod tests {
                 instruction: vec!["list".to_owned()],
                 file: None,
                 title: None,
+                attach: Vec::new(),
             },
             q.clone(),
         )
@@ -4800,6 +4932,7 @@ mod tests {
                 instruction: vec!["nope".to_owned()],
                 file: None,
                 title: None,
+                attach: Vec::new(),
             },
             q.clone(),
         )

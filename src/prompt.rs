@@ -12,6 +12,7 @@
 //!   against the repository, and to name a trigger for every defect. That is
 //!   what makes an unread patch defensible.
 use std::fmt::Write as _;
+use std::path::PathBuf;
 
 use crate::verdict::{Finding, Proposal, ReviewVote};
 
@@ -408,7 +409,32 @@ polices.",
 /// advisor's proposal was usable. `None` when `[graph] advise` is off, the
 /// stage found nothing usable, or the synthesis seat itself failed - the
 /// implementer then gets exactly the prompt it always did.
-pub fn implement(instruction: &str, cwd: &str, language: &str, brief: Option<&str>) -> String {
+///
+/// `attachments` are absolute paths of files the task was filed with
+/// (screenshots, typically), which live outside the worktree. Empty leaves the
+/// prompt exactly as it always was.
+pub fn implement(
+    instruction: &str,
+    cwd: &str,
+    language: &str,
+    brief: Option<&str>,
+    attachments: &[PathBuf],
+) -> String {
+    let attachments_section = if attachments.is_empty() {
+        String::new()
+    } else {
+        let list: String = attachments
+            .iter()
+            .map(|p| format!("- {}\n", p.display()))
+            .collect();
+        format!(
+            "# Attachments\n\n\
+             The task was filed with these files:\n\n{list}\n\
+             Open every image among them and look at it before you start. \
+             They live outside your worktree, so read them where they are: do \
+             not copy them into the worktree and do not commit them.\n\n"
+        )
+    };
     let brief_section = brief
         .filter(|b| !b.trim().is_empty())
         .map(|b| {
@@ -427,7 +453,7 @@ pub fn implement(instruction: &str, cwd: &str, language: &str, brief: Option<&st
         "You are implementing a change in an isolated git worktree.\n\n\
          # Working directory\n\n{cwd}\n\n\
          # Task\n\n{instruction}\n\n\
-         {brief_section}# Rules\n\n\
+         {attachments_section}{brief_section}# Rules\n\n\
          1. Work only inside this worktree. Nothing outside it is yours.\n\
          2. Commit your work. Anything left uncommitted is committed for you \
             under a neutral identity, so commit deliberately if the history \
@@ -2007,7 +2033,7 @@ mod tests {
             ..review_ctx(true)
         };
         let ja = [
-            ("implement", implement("t", "/w", "ja", None)),
+            ("implement", implement("t", "/w", "ja", None, &[])),
             ("fix", fix("t", &[], None, 1, 2, "ja")),
             (
                 "operator_fix",
@@ -2032,7 +2058,7 @@ mod tests {
         assert!(ja[3].1.contains("`title`"));
 
         let en = [
-            implement("t", "/w", "en", None),
+            implement("t", "/w", "en", None, &[]),
             fix("t", &[], None, 1, 2, "en"),
             review(&review_ctx(true)),
         ];
@@ -2391,7 +2417,7 @@ mod tests {
 
     #[test]
     fn implement_prompt_bans_attribution_and_asks_for_a_summary() {
-        let p = implement("do it", "/tmp/wt", "en", None);
+        let p = implement("do it", "/tmp/wt", "en", None, &[]);
         assert!(p.contains("Co-Authored-By:"));
         assert!(p.contains("## SUMMARY"));
         assert!(p.contains("/tmp/wt"));
@@ -2399,7 +2425,7 @@ mod tests {
 
     #[test]
     fn implement_prompt_documents_the_no_change_needed_marker() {
-        let p = implement("do it", "/tmp/wt", "en", None);
+        let p = implement("do it", "/tmp/wt", "en", None, &[]);
         assert!(p.contains("NO CHANGE NEEDED:"), "{p}");
         assert!(p.contains("already satisfied elsewhere"), "{p}");
     }
@@ -2411,6 +2437,7 @@ mod tests {
             "/tmp/wt",
             "en",
             Some("advisor-1 argued for polling; the brief adopts it."),
+            &[],
         );
         assert!(p.contains("# Design deliberation"), "{p}");
         assert!(p.contains("advisor-1 argued for polling"), "{p}");
@@ -2421,17 +2448,39 @@ mod tests {
 
     #[test]
     fn implement_prompt_omits_the_brief_section_with_no_brief() {
-        let without_brief = implement("do it", "/tmp/wt", "en", None);
+        let without_brief = implement("do it", "/tmp/wt", "en", None, &[]);
         assert!(
             !without_brief.contains("# Design deliberation"),
             "{without_brief}"
         );
 
-        let blank = implement("do it", "/tmp/wt", "en", Some("   "));
+        let blank = implement("do it", "/tmp/wt", "en", Some("   "), &[]);
         assert!(
             !blank.contains("# Design deliberation"),
             "an all-whitespace brief must not add an empty section: {blank}"
         );
+    }
+
+    #[test]
+    fn implement_prompt_lists_attachments_by_absolute_path_after_the_task() {
+        let atts = [
+            PathBuf::from("/q/abc.attachments/shot.png"),
+            PathBuf::from("/q/abc.attachments/log.txt"),
+        ];
+        let p = implement("do it", "/tmp/wt", "en", None, &atts);
+        assert!(p.contains("# Attachments"), "{p}");
+        assert!(p.contains("- /q/abc.attachments/shot.png\n"), "{p}");
+        assert!(p.contains("- /q/abc.attachments/log.txt\n"), "{p}");
+        assert!(p.contains("Open every image"), "{p}");
+        assert!(p.contains("do not commit them"), "{p}");
+        assert!(p.find("# Task").unwrap() < p.find("# Attachments").unwrap());
+        assert!(p.find("# Attachments").unwrap() < p.find("# Rules").unwrap());
+    }
+
+    #[test]
+    fn implement_prompt_omits_the_attachments_section_when_there_are_none() {
+        let p = implement("do it", "/tmp/wt", "en", None, &[]);
+        assert!(!p.contains("# Attachments"), "{p}");
     }
 
     #[test]
@@ -2472,7 +2521,7 @@ mod tests {
     }
     #[test]
     fn an_implementer_is_told_it_can_ask_and_how_the_panel_is_sandboxed() {
-        let p = implement("do it", "/tmp/wt", "en", None);
+        let p = implement("do it", "/tmp/wt", "en", None, &[]);
         // A capability an agent is not told about is one nobody uses.
         assert!(p.contains("magi ask"), "{p}");
         assert!(p.contains("--panel"), "{p}");
@@ -2551,7 +2600,7 @@ mod tests {
 
     #[test]
     fn an_implementer_is_told_how_to_reply_when_the_owner_asks_back() {
-        let p = implement("do it", "/tmp/wt", "en", None);
+        let p = implement("do it", "/tmp/wt", "en", None, &[]);
         assert!(p.contains("--thread"), "{p}");
         assert!(
             p.contains("exits 0"),
@@ -2569,7 +2618,7 @@ mod tests {
         // child that would have read the reply died with it, and the owner's
         // eventual answer had nobody left listening. The prompt has to rule
         // this out explicitly rather than trust it is obvious.
-        let p = implement("do it", "/tmp/wt", "en", None);
+        let p = implement("do it", "/tmp/wt", "en", None, &[]);
         assert!(
             p.contains("Never put this in the background"),
             "the exact failure mode has to be named, not implied: {p}"
@@ -2582,7 +2631,7 @@ mod tests {
     }
     #[test]
     fn a_question_presumes_the_asker_acts_on_the_answer_and_names_who_acts() {
-        let p = implement("do it", "/tmp/wt", "en", None);
+        let p = implement("do it", "/tmp/wt", "en", None, &[]);
         assert!(p.contains("never ask permission"), "{p}");
         assert!(p.contains("resuming a parked run"), "{p}");
         assert!(p.contains("agent: switch to the read-only mirror"), "{p}");
@@ -2595,7 +2644,7 @@ mod tests {
     fn a_question_is_asked_in_the_operators_language_not_in_a_language_code() {
         // Reported from a real run: `language = "ja"` was set and the questions
         // still arrived in English. Two causes, both fixed here.
-        let ja = implement("do it", "/tmp/wt", "ja", None);
+        let ja = implement("do it", "/tmp/wt", "ja", None, &[]);
 
         // 1. The code reached the prompt verbatim - "Write all prose in ja" is
         //    an instruction a model can read as noise.
@@ -2614,12 +2663,12 @@ mod tests {
 
         // English is the default and must stay silent rather than adding a
         // paragraph telling the model to do what it was going to do anyway.
-        let en = implement("do it", "/tmp/wt", "en", None);
+        let en = implement("do it", "/tmp/wt", "en", None, &[]);
         assert!(!en.contains("Write the question in"), "{en}");
         assert!(!en.contains("Write all prose in"), "{en}");
 
         // A language magi has no code for is repeated as the operator wrote it.
-        let other = implement("do it", "/tmp/wt", "Brazilian Portuguese", None);
+        let other = implement("do it", "/tmp/wt", "Brazilian Portuguese", None, &[]);
         assert!(other.contains("Write the question in Brazilian Portuguese."));
     }
 

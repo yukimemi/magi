@@ -1295,3 +1295,16 @@ something to answer, so it does not reuse `ask::Questions`.
   message or higher severity pages again; `Task::hold_reason` is untouched, so
   `magi task show` keeps the reason. The release / land question
   (`bump::NOTICE_NODE`) never covers anything.
+
+### Task attachments live beside the task file, outside the worktree
+
+`magi task add|edit --attach <PATH>` copies a file into `<queue>/<id>.attachments/`
+(`Queue::attach`), never a `*.json`, so `Queue::list` and `revision` do not see
+it; `Queue::remove` deletes the directory. Names must pass
+`ask::valid_asset_name` and are numbered, never overwritten. `queue::SCHEMA` is
+bumped to 7 for `Task::attachments` (the existing convention: schema 6 was a
+field-only bump too); `run::SCHEMA` is not, since `RunState::attachments` is
+additive and `migrate_schema` would otherwise need another arm. The daemon
+refreshes `RunState::attachments` from the task on every start and resume, and
+the implementer prompt lists the absolute paths under `# Attachments`. `task
+done` does not delete them.
