@@ -296,6 +296,7 @@ pub fn describe(seeds: &[Seed]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proc::Quiet as _;
 
     #[test]
     fn scan_finds_branches_and_shas() {
@@ -315,6 +316,7 @@ mod tests {
 
     fn sh(dir: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
+            .quiet()
             .args(args)
             .current_dir(dir)
             .output()
@@ -343,6 +345,7 @@ mod tests {
             ],
         );
         let out = std::process::Command::new("git")
+            .quiet()
             .args(["rev-parse", "HEAD"])
             .current_dir(dir)
             .output()

@@ -8057,6 +8057,7 @@ mod tests {
         init_repo(&repo);
         let run = |args: &[&str]| {
             let out = std::process::Command::new("git")
+                .quiet()
                 .args(args)
                 .current_dir(&repo)
                 .output()
