@@ -1268,3 +1268,16 @@ something to answer, so it does not reuse `ask::Questions`.
 - **Producers go through `notices::raise` / `raise_in`** and are best-effort:
   a failed write is a `tracing::warn`, never a failed run. `raise` is a no-op
   in a unit test that never pinned a home (`run::try_home`).
+
+- **One cause pages once.** A `Notice` carries `subjects` (the task / run ids it
+  is about) and `covered_by`. When an open question whose `run` equals a
+  subject exists and is about the same kind of cause (a conduct / triage question
+  covers that task's hold and handover notices, a question from inside a run
+  covers that run's ended / stopped notices, and the two never cross; time
+  proximity is not used) - at raise time (`notices::raise_in`) or is filed afterwards
+  (`Questions::put`, first write only, via `notices::quiet_for`) - the notice is
+  still written, but already read and pointing at the question. Dedupe is
+  expressed as read state, never as a tombstone, so a recurrence with a changed
+  message or higher severity pages again; `Task::hold_reason` is untouched, so
+  `magi task show` keeps the reason. The release / land question
+  (`bump::NOTICE_NODE`) never covers anything.
