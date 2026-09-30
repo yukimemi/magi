@@ -145,22 +145,88 @@ async fn the_gate_runs_on_a_tree_that_contains_what_landed_while_the_run_was_thi
 }
 }
 
+/// Make every mock agent behave as `var` says (see the mock's rebase branch).
+fn set_agent_env(fx: &mut common::Fixture, var: &str) {
+    for a in &mut fx.config.agents {
+        a.env.insert(var.to_owned(), "1".to_owned());
+    }
+}
+
+fn rebase_fix_calls(state: &magi::run::RunState) -> usize {
+    std::fs::read_to_string(state.dir().join("artifacts").join("rebase-fix.log"))
+        .map(|t| t.lines().count())
+        .unwrap_or(0)
+}
+
 common::e2e! {
-async fn a_base_that_conflicts_stops_the_run_without_a_review_round_or_a_fixer() {
+async fn a_conflicting_base_is_resolved_by_the_fixer_and_the_run_goes_on_to_review() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-    // See the sibling test above: the panel is not what this scenario is
-    // about, and a solo candidate is cheaper.
     fx.config.graph.candidates = 1;
+    // The base gains its own, different `note.txt` - the path the candidate
+    // creates - so replaying the candidate's commit cannot avoid a conflict.
     let origin = wire_origin(&fx);
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
         .await
         .expect("start");
+    land_on_origin(
+        &origin.sideline,
+        "note.txt",
+        "a conflicting note from upstream\n",
+    );
 
-    // The base gains its own, different `note.txt` - the same path the
-    // candidate creates - so replaying the candidate's commit cannot avoid a
-    // conflict.
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    let sync = state.base_sync.as_ref().expect("base sync recorded");
+    assert!(sync.conflict.is_none(), "unexpected: {:?}", sync.conflict);
+    assert_eq!(state.status, RunStatus::Ready);
+    assert_eq!(state.rebase_fixes.len(), 1, "{:?}", state.rebase_fixes);
+    assert_eq!(state.rebase_fixes[0].paths, vec!["note.txt".to_owned()]);
+    assert!(state.rebase_fixes[0].finished);
+    assert_eq!(rebase_fix_calls(state), 1);
+
+    // Review and the gate ran on the resolved tree.
+    assert!(!state.reviews.is_empty(), "review must have run");
+    assert!(state.gate.iter().all(|o| o.ok()), "{:?}", state.gate);
+
+    let winner = state.winner().expect("a winner");
+    let note = std::fs::read_to_string(winner.worktree.join("note.txt")).unwrap();
+    assert!(
+        note.contains("a conflicting note from upstream"),
+        "the base's side must survive: {note}"
+    );
+    assert!(!note.contains("<<<<<<<"), "{note}");
+    let tip = std::process::Command::new("git")
+        .args(["rev-parse", "origin/main"])
+        .current_dir(&fx.repo)
+        .output()
+        .expect("rev-parse");
+    let tip = String::from_utf8_lossy(&tip.stdout).trim().to_owned();
+    assert!(
+        is_ancestor(&fx.repo, &tip, &winner.branch),
+        "the resolved branch must descend from the base"
+    );
+    assert!(
+        !state.dir().join("base-sync").exists(),
+        "the throwaway worktree is removed"
+    );
+}
+}
+
+common::e2e! {
+async fn a_fixer_that_never_resolves_the_conflict_blocks_the_run_and_says_what_was_tried() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    set_agent_env(&mut fx, "MOCK_REBASE_FIX_NOOP");
+    let origin = wire_origin(&fx);
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    let branch = runner.state.branch_for('A');
     land_on_origin(
         &origin.sideline,
         "note.txt",
@@ -172,41 +238,120 @@ async fn a_base_that_conflicts_stops_the_run_without_a_review_round_or_a_fixer()
 
     let sync = state.base_sync.as_ref().expect("base sync recorded");
     let why = sync.conflict.as_ref().expect("a conflict must be recorded");
-    assert!(
-        why.to_lowercase().contains("conflict"),
-        "the reason is what git said: {why}"
-    );
+    assert!(why.to_lowercase().contains("conflict"), "{why}");
+    assert!(why.contains("3 of 3"), "rounds spent are named: {why}");
+    assert!(why.contains("note.txt"), "remaining paths are named: {why}");
     assert_eq!(state.status, RunStatus::Blocked);
     assert!(sync.behind > 0, "the lag was recorded before the attempt");
+    assert_eq!(state.rebase_fixes.len(), 3);
+    assert_eq!(rebase_fix_calls(state), 3);
 
-    // A conflict is a decision, not a fix round: nothing past it ran.
+    // Nothing past the base sync ran.
     assert!(state.reviews.is_empty(), "{:?}", state.reviews);
     assert!(state.gate.is_empty());
-    let log = std::fs::read_to_string(state.dir().join("artifacts").join("attribution.log"))
-        .unwrap_or_default();
-    assert!(
-        !log.lines()
-            .any(|l| matches!(l.split_whitespace().nth(1), Some("review") | Some("fix"))),
-        "reviewers and the fixer must not have run: {log}"
-    );
 
-    // The conflicted tree and branch are left for a person, not discarded.
+    // The branch is exactly where it was and the scratch tree is gone.
     let winner = state.winner().expect("a winner");
     assert!(winner.worktree.exists(), "the worktree is kept");
+    assert!(!state.dir().join("base-sync").exists());
     assert!(
-        std::process::Command::new("git")
-            .args([
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{}", winner.branch),
-            ])
-            .current_dir(&fx.repo)
-            .status()
-            .expect("show-ref")
-            .success(),
-        "the branch is kept"
+        !is_ancestor(&fx.repo, "origin/main", &branch),
+        "the branch must not have moved"
     );
+}
+}
+
+common::e2e! {
+async fn a_fixer_that_abandons_the_rebase_is_not_mistaken_for_success() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    set_agent_env(&mut fx, "MOCK_REBASE_FIX_ABORT");
+    let origin = wire_origin(&fx);
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    let branch = runner.state.branch_for('A');
+    land_on_origin(&origin.sideline, "note.txt", "upstream\n");
+
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+    assert_eq!(state.status, RunStatus::Blocked);
+    let why = state
+        .base_sync
+        .as_ref()
+        .and_then(|s| s.conflict.clone())
+        .expect("a reason is recorded");
+    assert!(why.contains("without the base"), "{why}");
+    assert!(state.reviews.is_empty());
+    assert!(!is_ancestor(&fx.repo, "origin/main", &branch));
+}
+}
+
+common::e2e! {
+async fn the_conflict_round_bound_is_counted_in_state_and_survives_a_resume() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    set_agent_env(&mut fx, "MOCK_REBASE_FIX_NOOP");
+    let origin = wire_origin(&fx);
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    land_on_origin(&origin.sideline, "note.txt", "upstream\n");
+
+    // Two rounds were already spent by an earlier process of this run.
+    for _ in 0..2 {
+        runner.state.rebase_fixes.push(magi::run::RebaseFixRecord {
+            agent: "mock".to_owned(),
+            paths: vec!["note.txt".to_owned()],
+            finished: false,
+            error: None,
+        });
+    }
+    runner.state.save().expect("save");
+
+    runner.execute().await.expect("execute");
+    assert_eq!(
+        rebase_fix_calls(&runner.state),
+        1,
+        "only the one round left may be spent"
+    );
+    assert_eq!(runner.state.rebase_fixes.len(), 3);
+    assert_eq!(runner.state.status, RunStatus::Blocked);
+
+    // What was counted is what is on disk.
+    let loaded = magi::run::RunState::load(&runner.state.id).expect("load");
+    assert_eq!(loaded.rebase_fixes.len(), 3);
+}
+}
+
+common::e2e! {
+async fn with_no_conflict_rounds_a_conflict_stops_without_asking_a_fixer() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    fx.config.graph.review_rounds = 0;
+    let origin = wire_origin(&fx);
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    land_on_origin(&origin.sideline, "note.txt", "upstream\n");
+
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+    assert_eq!(state.status, RunStatus::Blocked);
+    let why = state
+        .base_sync
+        .as_ref()
+        .and_then(|s| s.conflict.clone())
+        .expect("a reason is recorded");
+    assert!(why.contains("0 of 0"), "{why}");
+    assert_eq!(rebase_fix_calls(state), 0);
+    assert!(state.rebase_fixes.is_empty());
 }
 }
 

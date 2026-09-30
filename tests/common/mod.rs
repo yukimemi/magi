@@ -171,6 +171,40 @@ if [ "$MAGI_NODE" = "conduct" ] && [ -n "$MOCK_CONDUCT_LOG" ]; then
   exit 0
 fi
 
+# A rebase stopped on a conflict (`prompt::rebase_conflict`; its heading
+# phrase is what this greps for). The fixer resolves by keeping both sides of
+# every unmerged file, stages them and continues the rebase, repeating while
+# git stops again. `MOCK_REBASE_FIX_NOOP` leaves the conflict standing, for a
+# fixer that cannot help; `MOCK_REBASE_FIX_ABORT` runs `git rebase --abort`,
+# which leaves a tidy tree with no base in it. Both count their calls in
+# `rebase-fix.log` in the run's artifacts directory.
+if has "Your rebase stopped on a conflict"; then
+  echo "$seat" >> "$(dirname "$p")/rebase-fix.log"
+  if [ -n "$MOCK_REBASE_FIX_NOOP" ]; then
+    printf '{"addressed":[],"rejected":[],"notes":"changed nothing"}\n'
+    exit 0
+  fi
+  if [ -n "$MOCK_REBASE_FIX_ABORT" ]; then
+    git rebase --abort >/dev/null 2>&1 || true
+    printf '{"addressed":[],"rejected":[],"notes":"aborted"}\n'
+    exit 0
+  fi
+  n=0
+  while [ "$n" -lt 5 ]; do
+    files=$(git diff --name-only --diff-filter=U)
+    [ -z "$files" ] && break
+    for f in $files; do
+      { git show ":2:$f"; git show ":3:$f"; } > "$f.merged"
+      mv "$f.merged" "$f"
+      git add "$f" >/dev/null 2>&1
+    done
+    GIT_EDITOR=true git rebase --continue >/dev/null 2>&1 || true
+    n=$((n + 1))
+  done
+  printf '{"addressed":[],"rejected":[],"notes":"kept both sides"}\n'
+  exit 0
+fi
+
 # The daemon waiter resuming a seat whose `magi ask` is gone
 # (`prompt::question_resumed`). Records that the seat was resumed, and answers
 # in prose - not through `magi ask --thread` - so the waiter has to keep the

@@ -653,6 +653,26 @@ pub struct GateFixRecord {
     pub error: Option<String>,
 }
 
+/// One fixer round spent on a rebase that stopped on a conflict: which fixer,
+/// what it was shown and whether git says the rebase then finished.
+///
+/// The number of these is the budget spent (`graph.review_rounds` is the cap),
+/// written to disk *before* the fixer runs so a park or crash cannot hand the
+/// round back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebaseFixRecord {
+    /// Agent asked to resolve the conflict.
+    pub agent: String,
+    /// Paths git reported unmerged when the round started.
+    pub paths: Vec<String>,
+    /// Did git report the rebase finished after the round?
+    #[serde(default)]
+    pub finished: bool,
+    /// Why the round produced nothing (agent failure, quota).
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// The fixer's response to a round.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FixRecord {
@@ -1523,6 +1543,11 @@ pub struct RunState {
     /// of `graph.gate_fix_rounds` instead of starting the budget over.
     #[serde(default)]
     pub gate_fixes: Vec<GateFixRecord>,
+    /// Fixer rounds spent on a rebase conflict (base sync and land share one
+    /// budget, `graph.review_rounds`), oldest first. Persisted right before
+    /// each fixer call, so a resumed run spends only what is left.
+    #[serde(default)]
+    pub rebase_fixes: Vec<RebaseFixRecord>,
     /// Outcomes of the `verify.pre_gate` commands from the latest time they
     /// ran on the winner. Informational only: a failure here never blocks the
     /// run, the gate stays the single arbiter. Overwritten on each pass.
@@ -1705,6 +1730,7 @@ impl RunState {
             gate: Vec::new(),
             gate_ran: false,
             gate_fixes: Vec::new(),
+            rebase_fixes: Vec::new(),
             pre_gate: Vec::new(),
             pre_gate_commit: None,
             merge: None,
