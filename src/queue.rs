@@ -1168,14 +1168,21 @@ impl Queue {
     /// Delete `*.attachments.removing` directories a previous [`Queue::remove`]
     /// could not finish deleting. The task record is already gone by then, so
     /// the id no longer resolves and the removal cannot be retried by name;
-    /// every later removal sweeps them instead. Best-effort.
+    /// every later removal sweeps them instead. A directory whose record still
+    /// exists belongs to a removal in progress and is left alone. Best-effort.
     fn sweep_removed_attachments(&self) {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return;
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
-            if name.to_string_lossy().ends_with(".attachments.removing") {
+            let name = name.to_string_lossy();
+            let Some(id) = name.strip_suffix(".attachments.removing") else {
+                continue;
+            };
+            // A record still on disk means a removal is mid-flight (or about
+            // to roll back): the directory is its to delete or restore.
+            if !self.path_of(id).exists() {
                 if let Err(e) = std::fs::remove_dir_all(entry.path()) {
                     tracing::warn!("leftover attachments {}: {e}", entry.path().display());
                 }
