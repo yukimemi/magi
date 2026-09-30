@@ -217,6 +217,19 @@ pub async fn apply_choice(repo: &Path, remote: &str, branch: &str, choice: &Choi
         Side::PushLocal => {
             let out = git::push_pinned(repo, remote, branch, &choice.origin).await?;
             if !out.ok() {
+                // A refused lease means the remote moved after it was read:
+                // the answer is stale, not the push broken.
+                let moved = git::fetch(repo, remote, branch).await.is_ok_and(|f| f.ok())
+                    && git::rev_parse(repo, &tracking)
+                        .await
+                        .is_ok_and(|now| now != choice.origin);
+                if moved {
+                    return Err(Stale(format!(
+                        "{remote}/{branch} moved while the owner's answer was being applied; \
+                         the answer no longer describes it"
+                    ))
+                    .into());
+                }
                 anyhow::bail!("push of `{branch}` was refused: {}", out.stderr);
             }
         }

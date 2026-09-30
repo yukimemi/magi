@@ -2589,10 +2589,17 @@ async fn attempt(
         Err(e) => {
             // The answer was stale and nothing was applied: keep pointing at
             // the branch so the next attempt asks again against its new tips.
+            // Nothing went wrong with the task, so no attempt is spent: a
+            // budget one short of its limit must not hold it instead of
+            // letting the question be asked again.
             if e.downcast_ref::<crate::reconcile::Stale>().is_some()
                 && let Starter::Review(branch) = &starter
             {
                 task.review_branch = Some(branch.clone());
+                task.last_error = Some(format!("could not start the run: {e:#}"));
+                task.status = crate::queue::TaskStatus::Failed;
+                record(queue, task);
+                return Vec::new();
             }
             task.attempts += 1;
             task.fail(format!("could not start the run: {e:#}"), opts.max_attempts);
