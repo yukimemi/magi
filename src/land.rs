@@ -1316,11 +1316,12 @@ pub enum OpenPr {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GhOpenPr {
-    #[serde(default)]
+    // `url` and `baseRefName` are required: a record missing either must be a
+    // parse error, not a pull request that silently fails the base filter and
+    // reads as "none open" (which would go on to create a duplicate).
     url: String,
     #[serde(default)]
     title: String,
-    #[serde(default)]
     base_ref_name: String,
 }
 
@@ -4146,6 +4147,9 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             OpenPr::Many(vec!["u1".into(), "u2".into()])
         );
         assert!(pick_open_pr("not json", "main").is_err());
+        // An incomplete record is an error, never "nothing open".
+        assert!(pick_open_pr(r#"[{"url":"u","title":"t"}]"#, "main").is_err());
+        assert!(pick_open_pr(r#"[{"title":"t","baseRefName":"main"}]"#, "main").is_err());
     }
 
     #[test]
