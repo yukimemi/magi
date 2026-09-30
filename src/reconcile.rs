@@ -68,6 +68,21 @@ impl std::fmt::Display for Diverged {
 
 impl std::error::Error for Diverged {}
 
+/// The owner's answer described tips that no longer exist: nothing was done.
+///
+/// A distinct type so the queue loop can keep pointing the task at the branch
+/// and let the next attempt ask again against the tips as they are now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stale(pub String);
+
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Stale {}
+
 fn describe(c: &Commit) -> String {
     format!(
         "- `{}` {} (made by: {})",
@@ -190,11 +205,13 @@ pub async fn apply_choice(repo: &Path, remote: &str, branch: &str, choice: &Choi
     let origin = git::rev_parse(repo, &tracking).await?;
     let local = git::rev_parse(repo, &format!("refs/heads/{branch}")).await?;
     if origin != choice.origin || local != choice.local {
-        anyhow::bail!(
-            "`{branch}` moved since the question was asked (local {}, {remote} {});              the answer no longer describes it",
+        return Err(Stale(format!(
+            "`{branch}` moved since the question was asked (local {}, {remote} {}); \
+             the answer no longer describes it",
             crate::run::short_of(&local),
             crate::run::short_of(&origin)
-        );
+        ))
+        .into());
     }
     match choice.side {
         Side::PushLocal => {
@@ -277,6 +294,29 @@ async fn commits(repo: &Path, shas: &[String]) -> Vec<Commit> {
     out
 }
 
+/// Merge commits reachable from `head` and not from `exclude`.
+async fn merges(repo: &Path, exclude: &str, head: &str) -> Result<Vec<String>> {
+    let out = git::git(
+        repo,
+        &["rev-list", "--merges", &format!("{exclude}..{head}")],
+    )
+    .await?;
+    Ok(out.lines().map(str::to_owned).collect())
+}
+
+/// What `origin` has that no `local` commit repeats: patches `git cherry`
+/// finds unmatched, plus every merge, which `git cherry` cannot see and
+/// which may carry conflict resolutions or other content of its own.
+pub async fn origin_missing(repo: &Path, local: &str, origin: &str) -> Result<Vec<String>> {
+    let (mut missing, _) = git::cherry(repo, local, origin).await?;
+    for sha in merges(repo, local, origin).await? {
+        if !missing.contains(&sha) {
+            missing.push(sha);
+        }
+    }
+    Ok(missing)
+}
+
 /// Classify a divergence between `local` and `origin` (both shas).
 ///
 /// `base` is the base branch's tip: commits reachable from it are what a
@@ -298,11 +338,18 @@ pub async fn classify(
 
     // What origin has that no local commit repeats, and what local has that
     // no origin commit repeats, ignoring commits the base already holds.
-    let (origin_missing, _) = git::cherry(repo, local, origin).await?;
+    let origin_missing = origin_missing(repo, local, origin).await?;
     let (local_extra, _) = git::cherry(repo, origin, local).await?;
     let mut local_missing = Vec::new();
     for sha in local_extra {
         if !git::is_ancestor(repo, &sha, base).await {
+            local_missing.push(sha);
+        }
+    }
+    // `git cherry` skips merge commits, so a local merge is content nobody
+    // matched: it is never proven redundant.
+    for sha in merges(repo, origin, local).await? {
+        if !git::is_ancestor(repo, &sha, base).await && !local_missing.contains(&sha) {
             local_missing.push(sha);
         }
     }
@@ -439,6 +486,34 @@ mod tests {
         sh(repo, &["push", "-q", "origin", "main"]);
         sh(repo, &["checkout", "-q", "work"]);
         sh(repo, &["rebase", "-q", "main"]);
+    }
+
+    #[tokio::test]
+    async fn a_merge_only_on_the_remote_is_never_a_pure_rebase() {
+        let (g, repo, origin) = fixture();
+        advance_and_rebase(&repo);
+
+        let other = g.path().join("other");
+        sh(
+            g.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "other"],
+        );
+        sh(&other, &["config", "user.name", "o"]);
+        sh(&other, &["config", "user.email", "o@example.com"]);
+        sh(&other, &["checkout", "-q", "-b", "side", "origin/work~1"]);
+        commit(&other, "side.txt", "s\n", "side");
+        sh(&other, &["checkout", "-q", "work"]);
+        sh(&other, &["merge", "-q", "--no-ff", "-m", "merge", "side"]);
+        sh(&other, &["push", "-q", "origin", "work"]);
+        sh(&repo, &["fetch", "-q", "origin"]);
+
+        let local = sh(&repo, &["rev-parse", "work"]);
+        let remote = sh(&repo, &["rev-parse", "origin/work"]);
+        let base = sh(&repo, &["rev-parse", "main"]);
+        let r = classify(&repo, "origin", "work", &local, &remote, &base)
+            .await
+            .unwrap();
+        assert!(matches!(r, Divergence::Genuine(_)), "{r:?}");
     }
 
     #[tokio::test]

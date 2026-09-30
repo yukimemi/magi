@@ -3275,7 +3275,8 @@ impl Runner {
         // The remote's copy of the branch, read now and only if the fetch
         // really succeeded (a stale tracking ref must never pin a lease). It is
         // pushed over after a rebase only when it is a commit this branch
-        // already contains: anything else is somebody else's work.
+        // already contains, by ancestry or by patch (an earlier rebase of ours
+        // that never reached the remote): anything else is somebody else's work.
         let branch_tracking = format!("{remote}/{}", winner.branch);
         let fetched_branch = git::fetch(&repo, &remote, &winner.branch).await;
         let remote_tip = if matches!(&fetched_branch, Ok(o) if o.ok()) {
@@ -3288,6 +3289,9 @@ impl Runner {
         // before touching anything and say so.
         if let Some(theirs) = &remote_tip
             && !git::is_ancestor(&repo, theirs, &head).await
+            && !crate::reconcile::origin_missing(&repo, &head, theirs)
+                .await
+                .is_ok_and(|missing| missing.is_empty())
         {
             let why = format!(
                 "{branch_tracking} ({}) has commits {} does not contain; not rebasing over \

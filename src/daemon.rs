@@ -2587,6 +2587,13 @@ async fn attempt(
             return Vec::new();
         }
         Err(e) => {
+            // The answer was stale and nothing was applied: keep pointing at
+            // the branch so the next attempt asks again against its new tips.
+            if e.downcast_ref::<crate::reconcile::Stale>().is_some()
+                && let Starter::Review(branch) = &starter
+            {
+                task.review_branch = Some(branch.clone());
+            }
             task.attempts += 1;
             task.fail(format!("could not start the run: {e:#}"), opts.max_attempts);
             record(queue, task);
