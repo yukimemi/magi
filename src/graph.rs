@@ -5546,9 +5546,38 @@ impl Runner {
                         empty: false,
                     }
                 } else {
-                    let out =
-                        gh_pr_create(&winner.worktree, &base, &winner.branch, &pr.title, &pr.body)
-                            .await;
+                    // A retry or resume of a run whose branch already has an
+                    // open pull request adopts it rather than failing on a
+                    // duplicate. Only this winner branch into this base:
+                    // `branch_for` derives the name from the run id, so a
+                    // different run's pull request never matches.
+                    let found = land::find_open_pr(&winner.worktree, &winner.branch, &base).await;
+                    let out = match pr_merge_plan(found) {
+                        PrPlan::Create => {
+                            gh_pr_create(
+                                &winner.worktree,
+                                &base,
+                                &winner.branch,
+                                &pr.title,
+                                &pr.body,
+                            )
+                            .await
+                        }
+                        PrPlan::Adopt { url, title } => {
+                            self.state
+                                .event("merge", format!("Pr: adopted open pull request {url}"));
+                            if title != pr.title
+                                && let Err(e) =
+                                    land::set_pr_title(&winner.worktree, &url, &pr.title).await
+                            {
+                                tracing::warn!("could not refresh title of {url}: {e:#}");
+                                self.state
+                                    .event("merge", format!("Pr: title refresh failed: {e:#}"));
+                            }
+                            Ok(url)
+                        }
+                        PrPlan::Stop(why) => Err(anyhow::anyhow!(why)),
+                    };
                     match out {
                         Ok(url) => MergeOutcome {
                             mode,
@@ -7046,6 +7075,29 @@ fn empty_candidate_detail(state: &RunState, base: &str) -> String {
     detail
 }
 
+/// What the `Pr` merge does once it knows whether the branch already has an
+/// open pull request.
+#[derive(Debug, PartialEq, Eq)]
+enum PrPlan {
+    Create,
+    Adopt { url: String, title: String },
+    Stop(String),
+}
+
+/// Pure decision behind the `Pr` merge: none -> create, one -> adopt, many or
+/// a failed lookup -> stop with the real reason. Never guesses.
+fn pr_merge_plan(found: Result<land::OpenPr>) -> PrPlan {
+    match found {
+        Ok(land::OpenPr::None) => PrPlan::Create,
+        Ok(land::OpenPr::One { url, title }) => PrPlan::Adopt { url, title },
+        Ok(land::OpenPr::Many(urls)) => PrPlan::Stop(format!(
+            "several open pull requests exist for this branch, not picking one: {}",
+            urls.join(" ")
+        )),
+        Err(e) => PrPlan::Stop(format!("could not look up open pull requests: {e:#}")),
+    }
+}
+
 /// `gh pr create`, returning the PR url.
 async fn gh_pr_create(
     cwd: &Path,
@@ -7170,6 +7222,31 @@ pub fn worst_open(state: &RunState) -> Option<Severity> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pr_merge_plan_creates_adopts_or_stops() {
+        assert_eq!(pr_merge_plan(Ok(land::OpenPr::None)), PrPlan::Create);
+        assert_eq!(
+            pr_merge_plan(Ok(land::OpenPr::One {
+                url: "u".into(),
+                title: "t".into()
+            })),
+            PrPlan::Adopt {
+                url: "u".into(),
+                title: "t".into()
+            }
+        );
+        let PrPlan::Stop(many) =
+            pr_merge_plan(Ok(land::OpenPr::Many(vec!["a".into(), "b".into()])))
+        else {
+            panic!("many must stop");
+        };
+        assert!(many.contains('a') && many.contains('b'));
+        let PrPlan::Stop(err) = pr_merge_plan(Err(anyhow::anyhow!("bad token"))) else {
+            panic!("a failed lookup must stop");
+        };
+        assert!(err.contains("bad token"));
+    }
+
     use super::*;
     use crate::run::GateStatus;
     use std::collections::BTreeMap;

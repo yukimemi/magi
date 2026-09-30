@@ -388,6 +388,30 @@ async fn outcome_for(task: &Task, repo: &Path) -> prompt::ConductOutcome {
     }
 }
 
+/// Whether the task's latest run's winner branch already has an open pull
+/// request into the run's own base - a fact the repository can answer, so the
+/// operator is never asked it. `None` when there is no run or winner to check.
+async fn open_pr_fact(task: &Task, repo: &Path) -> Option<String> {
+    let id = task.runs.last()?;
+    let state = match RunState::load(id) {
+        Ok(s) => s,
+        Err(e) => return Some(format!("could not check open pull requests: {e:#}")),
+    };
+    let branch = state.winner()?.branch.clone();
+    let base = state.base_branch.clone();
+    match crate::land::find_open_pr(repo, &branch, &base).await {
+        Ok(crate::land::OpenPr::None) => None,
+        Ok(crate::land::OpenPr::One { url, .. }) => Some(format!(
+            "pull request {url} is already open for {branch} into {base}"
+        )),
+        Ok(crate::land::OpenPr::Many(urls)) => Some(format!(
+            "several pull requests are already open for {branch} into {base}: {}",
+            urls.join(" ")
+        )),
+        Err(e) => Some(format!("could not check open pull requests: {e:#}")),
+    }
+}
+
 /// Append what the repository says about the branches and commits a task
 /// names to every question the conductor is about to file, so the operator is
 /// never asked a fact git can answer ("is it already on main?"). Done here,
@@ -404,7 +428,13 @@ async fn attach_facts(cfg: &Config, repo: &Path, queue: &Queue, verdict: &mut Ve
             continue;
         };
         let text = format!("{}\n{}", task.title, task.instruction);
+        let pr_fact = open_pr_fact(&task, repo_for(&task, repo).as_path()).await;
         if crate::refs::scan(&text).is_empty() {
+            if let (Some(fact), Some(q)) = (pr_fact, d.question.as_mut()) {
+                q.push_str(&format!(
+                    "\n\nChecked against the repository (magi did this, not the model):\n{fact}"
+                ));
+            }
             continue;
         }
         let repo = repo_for(&task, repo);
@@ -446,6 +476,10 @@ async fn attach_facts(cfg: &Config, repo: &Path, queue: &Queue, verdict: &mut Ve
                 }
             }
             None => Some("could not check the repository: no base branch known".to_owned()),
+        };
+        let facts = match (facts, pr_fact) {
+            (Some(f), Some(p)) => Some(format!("{f}\n{p}")),
+            (f, p) => f.or(p),
         };
         if let (Some(facts), Some(q)) = (facts, d.question.as_mut()) {
             q.push_str(&format!(

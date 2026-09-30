@@ -1297,6 +1297,106 @@ fn pick_merged_pr(
     }
 }
 
+/// What `gh pr list --head <branch> --base <base> --state open` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenPr {
+    /// Nothing open: the caller creates one.
+    None,
+    /// Exactly one: the caller adopts it instead of creating a second.
+    One {
+        /// The pull request's URL.
+        url: String,
+        /// Its current title.
+        title: String,
+    },
+    /// More than one: magi does not pick between them.
+    Many(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhOpenPr {
+    // `url` and `baseRefName` are required: a record missing either must be a
+    // parse error, not a pull request that silently fails the base filter and
+    // reads as "none open" (which would go on to create a duplicate).
+    url: String,
+    #[serde(default)]
+    title: String,
+    base_ref_name: String,
+}
+
+/// Pure half of [`find_open_pr`]: classify the raw `--json
+/// number,url,title,baseRefName` output. Entries whose base is not `base` are
+/// dropped even though the query already filtered on it, so a stub or an old
+/// `gh` that ignores `--base` cannot get a pull request into the wrong branch
+/// adopted.
+pub fn pick_open_pr(json: &str, base: &str) -> Result<OpenPr> {
+    let raw: Vec<GhOpenPr> =
+        serde_json::from_str(json).context("parse `gh pr list ... --json ...` output")?;
+    let mut hits: Vec<GhOpenPr> = raw
+        .into_iter()
+        .filter(|p| p.base_ref_name == base)
+        .collect();
+    Ok(match hits.len() {
+        0 => OpenPr::None,
+        1 => {
+            let p = hits.remove(0);
+            OpenPr::One {
+                url: p.url,
+                title: p.title,
+            }
+        }
+        _ => OpenPr::Many(hits.into_iter().map(|p| p.url).collect()),
+    })
+}
+
+/// Open pull requests whose head is `branch` and whose base is `base`. A
+/// failing `gh` is an error carrying its own output, never "none": guessing
+/// there is how a duplicate gets created.
+pub async fn find_open_pr(repo: &Path, branch: &str, base: &str) -> Result<OpenPr> {
+    let (ok, out) = gh(
+        repo,
+        &[
+            "pr".to_owned(),
+            "list".to_owned(),
+            "--head".to_owned(),
+            branch.to_owned(),
+            "--base".to_owned(),
+            base.to_owned(),
+            "--state".to_owned(),
+            "open".to_owned(),
+            "--json".to_owned(),
+            "number,url,title,baseRefName".to_owned(),
+        ],
+    )
+    .await?;
+    if !ok {
+        bail!("gh pr list failed: {out}");
+    }
+    pick_open_pr(&out, base)
+}
+
+/// `gh pr edit <url> --title <title>`, for an adopted pull request whose title
+/// differs from the one this run computed. Only the title: the body may have
+/// been edited by the owner and cannot be compared.
+pub async fn set_pr_title(repo: &Path, url: &str, title: &str) -> Result<()> {
+    let (ok, out) = gh(
+        repo,
+        &[
+            "pr".to_owned(),
+            "edit".to_owned(),
+            url.to_owned(),
+            "--title".to_owned(),
+            title.to_owned(),
+        ],
+    )
+    .await?;
+    if !ok {
+        bail!("gh pr edit failed: {out}");
+    }
+    Ok(())
+}
+
 /// Ask GitHub whether this run's winning candidate branch was actually merged
 /// somewhere `land::land`'s own loop never saw — the gap `magi fold
 /// --merged` exists to close, minus the operator having to find the URL by
@@ -4028,6 +4128,30 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     /// A `gh pr list` result naming exactly one pull request whose base and
     /// merge time both fit the run is exactly the case
     /// [`find_external_merge`] exists to act on.
+    #[test]
+    fn pick_open_pr_classifies_by_count_and_base() {
+        let one = r#"[{"number":58,"url":"https://x/pull/58","title":"t","baseRefName":"main"}]"#;
+        assert_eq!(
+            pick_open_pr(one, "main").unwrap(),
+            OpenPr::One {
+                url: "https://x/pull/58".into(),
+                title: "t".into()
+            }
+        );
+        assert_eq!(pick_open_pr("[]", "main").unwrap(), OpenPr::None);
+        assert_eq!(pick_open_pr(one, "dev").unwrap(), OpenPr::None);
+        let two = r#"[{"number":1,"url":"u1","title":"","baseRefName":"main"},
+                     {"number":2,"url":"u2","title":"","baseRefName":"main"}]"#;
+        assert_eq!(
+            pick_open_pr(two, "main").unwrap(),
+            OpenPr::Many(vec!["u1".into(), "u2".into()])
+        );
+        assert!(pick_open_pr("not json", "main").is_err());
+        // An incomplete record is an error, never "nothing open".
+        assert!(pick_open_pr(r#"[{"url":"u","title":"t"}]"#, "main").is_err());
+        assert!(pick_open_pr(r#"[{"title":"t","baseRefName":"main"}]"#, "main").is_err());
+    }
+
     #[test]
     fn pick_merged_pr_picks_the_unique_match() {
         let json = r#"[
