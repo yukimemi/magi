@@ -1128,7 +1128,9 @@ impl Queue {
         // rename (cheap, and undone if the record cannot be removed), then the
         // record goes, and only then is the set-aside directory deleted for
         // real. A failure before the record is gone loses nothing; a failure
-        // after it leaves at most an orphan `.removing` directory.
+        // after it leaves at most an orphan `.removing` directory, which the
+        // next removal sweeps.
+        self.sweep_removed_attachments();
         let attachments = self.attachments_dir(&resolved);
         let aside = self.root.join(format!("{resolved}.attachments.removing"));
         let moved = match std::fs::rename(&attachments, &aside) {
@@ -1161,6 +1163,24 @@ impl Queue {
             id: resolved,
             quarantined,
         })
+    }
+
+    /// Delete `*.attachments.removing` directories a previous [`Queue::remove`]
+    /// could not finish deleting. The task record is already gone by then, so
+    /// the id no longer resolves and the removal cannot be retried by name;
+    /// every later removal sweeps them instead. Best-effort.
+    fn sweep_removed_attachments(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with(".attachments.removing") {
+                if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                    tracing::warn!("leftover attachments {}: {e}", entry.path().display());
+                }
+            }
+        }
     }
 
     /// Move every `blocked` task naming `dependency` in its own `blocked_by`
