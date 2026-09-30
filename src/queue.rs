@@ -1124,18 +1124,20 @@ impl Queue {
         if in_flight {
             bail!("task {resolved} is being run by a live daemon right now");
         }
+        // Attachments go first: if they cannot be removed the task record must
+        // survive, or the id no longer resolves and a retry is impossible.
+        let attachments = self.attachments_dir(&resolved);
+        if let Err(e) = std::fs::remove_dir_all(&attachments) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e).with_context(|| format!("remove {}", attachments.display()));
+            }
+        }
         let path = self.path_of(&resolved);
         std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
         let lock = self.lock_path(&resolved);
         if let Err(e) = std::fs::remove_file(&lock) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 return Err(e).with_context(|| format!("remove {}", lock.display()));
-            }
-        }
-        let attachments = self.attachments_dir(&resolved);
-        if let Err(e) = std::fs::remove_dir_all(&attachments) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(e).with_context(|| format!("remove {}", attachments.display()));
             }
         }
         let quarantined = self.quarantine_dependents_of(&resolved, questions);
