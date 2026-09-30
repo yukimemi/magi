@@ -54,8 +54,10 @@ pub struct Turn {
 /// noise, and the questions agents asked came back in English on a repository
 /// configured for Japanese. Naming the language is the whole fix.
 fn language_name(language: &str) -> &str {
+    if crate::lang::is_japanese(language) {
+        return "Japanese";
+    }
     match language.trim() {
-        "ja" | "jp" => "Japanese",
         "en" => "English",
         "de" => "German",
         "fr" => "French",
@@ -81,6 +83,23 @@ fn lang(language: &str) -> String {
     }
     format!(
         "\n\nWrite all prose in {}. Keep the JSON keys and the labels as specified.",
+        language_name(language)
+    )
+}
+
+/// The sentence that makes the text an agent writes into a task's hold reason
+/// or recovery note follow `[graph] language`. Those strings are shown to the
+/// operator verbatim in the notification list, next to the daemon's own fixed
+/// wording (see `daemon::Phrases`), and `lang()` alone leaves it ambiguous
+/// whether JSON *values* are prose. Empty for English, so an English prompt is
+/// unchanged byte for byte.
+fn hold_reason_language(language: &str) -> String {
+    if is_english(language) {
+        return String::new();
+    }
+    format!(
+        "\n\nThe `reason` of a `hold` and any `recovery` note are shown to the \
+         operator as they are: write them in {}.",
         language_name(language)
     )
 }
@@ -1904,6 +1923,7 @@ never `agent:`.\n\n",
          valid answer when nothing here needs changing.",
     );
     s.push_str(&lang(language));
+    s.push_str(&hold_reason_language(language));
     s
 }
 
@@ -2688,6 +2708,18 @@ mod tests {
             blocked_by: Vec::new(),
             answers: Vec::new(),
             operator_resume: None,
+        }
+    }
+
+    #[test]
+    fn the_conduct_prompt_asks_for_hold_reasons_in_the_configured_language_only() {
+        let t = [conduct_task("t1")];
+        let ja = conduct(&t, &[], &[], "ja");
+        assert!(ja.contains("`reason` of a `hold`"), "{ja}");
+        assert!(ja.contains("write them in Japanese"), "{ja}");
+        for l in ["en", ""] {
+            let en = conduct(&t, &[], &[], l);
+            assert!(!en.contains("`reason` of a `hold` and any"), "{en}");
         }
     }
 

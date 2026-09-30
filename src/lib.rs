@@ -37,6 +37,7 @@ pub mod git;
 pub mod graph;
 pub mod handover;
 pub mod land;
+pub mod lang;
 pub mod md;
 pub mod notices;
 pub mod proc;

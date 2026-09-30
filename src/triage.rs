@@ -151,12 +151,7 @@ const JA: Wording = Wording {
 /// Pick the wording. Codes and names both, the same acceptance
 /// `crate::land::words` gives `[graph] language`.
 fn wording(language: &str) -> &'static Wording {
-    let l = language.trim();
-    if l.eq_ignore_ascii_case("ja")
-        || l.eq_ignore_ascii_case("jp")
-        || l.eq_ignore_ascii_case("japanese")
-        || l.eq_ignore_ascii_case("日本語")
-    {
+    if crate::lang::is_japanese(language) {
         &JA
     } else {
         &EN
