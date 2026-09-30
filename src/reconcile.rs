@@ -68,6 +68,15 @@ impl std::fmt::Display for Diverged {
 
 impl std::error::Error for Diverged {}
 
+/// Whether `remote/branch` is now somewhere other than `pinned`, i.e. a refused
+/// lease was refused because someone pushed, not because the push is broken.
+async fn remote_moved(repo: &Path, remote: &str, branch: &str, pinned: &str) -> bool {
+    git::fetch(repo, remote, branch).await.is_ok_and(|f| f.ok())
+        && git::rev_parse(repo, &format!("{remote}/{branch}"))
+            .await
+            .is_ok_and(|now| now != pinned)
+}
+
 /// The owner's answer described tips that no longer exist: nothing was done.
 ///
 /// A distinct type so the queue loop can keep pointing the task at the branch
@@ -219,11 +228,7 @@ pub async fn apply_choice(repo: &Path, remote: &str, branch: &str, choice: &Choi
             if !out.ok() {
                 // A refused lease means the remote moved after it was read:
                 // the answer is stale, not the push broken.
-                let moved = git::fetch(repo, remote, branch).await.is_ok_and(|f| f.ok())
-                    && git::rev_parse(repo, &tracking)
-                        .await
-                        .is_ok_and(|now| now != choice.origin);
-                if moved {
+                if remote_moved(repo, remote, branch, &choice.origin).await {
                     return Err(Stale(format!(
                         "{remote}/{branch} moved while the owner's answer was being applied; \
                          the answer no longer describes it"
@@ -401,9 +406,9 @@ pub async fn classify(
 /// If `local` is provably `origin`'s change rebased, push it with a lease
 /// pinned to `origin` and say so; `Ok(false)` when it is not.
 ///
-/// The one place a divergence is settled without asking. A refused lease is an
-/// error: someone pushed since `origin` was read, and that is now a real
-/// divergence for a person, so nothing is forced.
+/// The one place a divergence is settled without asking. A refused lease because
+/// someone pushed since `origin` was read is [`Stale`]: the next attempt
+/// classifies both tips afresh. Nothing is ever forced.
 pub async fn reconcile(
     repo: &Path,
     remote: &str,
@@ -418,6 +423,13 @@ pub async fn reconcile(
         Divergence::PureRebase => {
             let out = git::push_pinned(repo, remote, branch, origin).await?;
             if !out.ok() {
+                if remote_moved(repo, remote, branch, origin).await {
+                    return Err(Stale(format!(
+                        "{remote}/{branch} moved while the rebase was being pushed; \
+                         the next attempt looks at both tips afresh"
+                    ))
+                    .into());
+                }
                 anyhow::bail!(
                     "`{branch}` is a rebase of {remote}/{branch}, but the push was refused \
                      (someone may have pushed since {}): {}",
@@ -585,6 +597,30 @@ mod tests {
             .unwrap();
         assert!(matches!(r, Reconciliation::Pushed), "{r:?}");
         assert_eq!(sh(&origin, &["rev-parse", "work"]), local);
+    }
+
+    #[tokio::test]
+    async fn a_refused_lease_after_a_pure_rebase_is_stale() {
+        let (g, repo, origin) = fixture();
+        let origin_tip = sh(&repo, &["rev-parse", "work"]);
+        advance_and_rebase(&repo);
+        let local = sh(&repo, &["rev-parse", "work"]);
+        let base = sh(&repo, &["rev-parse", "main"]);
+        let other = g.path().join("other");
+        sh(
+            g.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "other"],
+        );
+        sh(&other, &["config", "user.name", "o"]);
+        sh(&other, &["config", "user.email", "o@example.com"]);
+        sh(&other, &["checkout", "-q", "work"]);
+        commit(&other, "theirs.txt", "x\n", "theirs: pushed meanwhile");
+        sh(&other, &["push", "-q", "origin", "work"]);
+
+        let err = reconcile(&repo, "origin", "work", &local, &origin_tip, &base)
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<Stale>().is_some(), "{err:#}");
     }
 
     #[tokio::test]
