@@ -109,21 +109,22 @@ pub fn scan(text: &str) -> Vec<Token> {
 
 /// Check every reference in `text` against `repo`, relative to `base_commit`.
 ///
-/// A bare hex string that names no commit is dropped silently (it was most
-/// likely never a sha); a `magi/...` branch that cannot be found is kept as
-/// [`SeedKind::Unresolved`] so the run says so.
+/// A `magi/...` branch or a mixed letter-and-digit hex string that names
+/// nothing is kept as [`SeedKind::Unresolved`] so the run says so. An
+/// all-digit token (a date, an id) is dropped silently: it was almost never a
+/// sha, and refusing a task over it would be worse than ignoring it.
 pub async fn resolve(repo: &Path, base_commit: &str, remote: &str, text: &str) -> Vec<Seed> {
     let mut seeds: Vec<Seed> = Vec::new();
     for token in scan(text) {
         let found = match commit_for(repo, remote, &token).await {
             Some(sha) => sha,
             None => {
-                if token.branch {
+                if token.branch || token.text.chars().any(|c| c.is_ascii_alphabetic()) {
                     seeds.push(Seed {
                         token: token.text.clone(),
                         kind: SeedKind::Unresolved,
                         sha: String::new(),
-                        branch: true,
+                        branch: token.branch,
                         detail: format!("no branch or commit named {}", token.text),
                     });
                 }
@@ -409,6 +410,14 @@ mod tests {
         assert_eq!(seeds.len(), 2, "{seeds:?}");
         assert_eq!(seeds[0].kind, SeedKind::Unresolved);
         assert_eq!(seeds[1].kind, SeedKind::Unmerged);
+        let ghost = resolve(&repo, &base, "origin", "cherry-pick abc1234f").await;
+        assert_eq!(ghost.len(), 1, "{ghost:?}");
+        assert_eq!(ghost[0].kind, SeedKind::Unresolved);
+        assert!(
+            resolve(&repo, &base, "origin", "on 20260930")
+                .await
+                .is_empty()
+        );
         assert!(!seeds[1].branch);
 
         assert!(plan(&repo, &seeds).await.is_err(), "unresolved refuses");

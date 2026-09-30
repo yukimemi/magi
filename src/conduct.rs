@@ -415,10 +415,13 @@ async fn attach_facts(cfg: &Config, repo: &Path, queue: &Queue, verdict: &mut Ve
         };
         let facts = match base {
             Some(base) => {
+                let base_name = base.clone();
                 let tracking = format!("{remote}/{base}");
                 // Best effort: a stale tracking ref would report work that
                 // has since landed as still missing from the base.
-                let _ = crate::git::fetch(&repo, remote, &base).await;
+                let refreshed = crate::git::fetch(&repo, remote, &base)
+                    .await
+                    .is_ok_and(|o| o.ok());
                 let against = if crate::git::rev_exists(&repo, &tracking).await {
                     tracking
                 } else {
@@ -427,7 +430,18 @@ async fn attach_facts(cfg: &Config, repo: &Path, queue: &Queue, verdict: &mut Ve
                 match crate::git::rev_parse(&repo, &against).await {
                     Ok(tip) => crate::refs::describe(
                         &crate::refs::resolve(&repo, &tip, remote, &text).await,
-                    ),
+                    )
+                    .map(|facts| {
+                        if refreshed {
+                            facts
+                        } else {
+                            format!(
+                                "{facts}\n(could not fetch {remote}/{base_name}: this is \
+                                 against the local `{against}`, which may be behind the \
+                                 remote)"
+                            )
+                        }
+                    }),
                     Err(e) => Some(format!("could not check the repository: {e:#}")),
                 }
             }
