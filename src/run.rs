@@ -1221,6 +1221,11 @@ pub struct MergeOutcome {
     /// Command output, or the command the operator should run.
     #[serde(default)]
     pub detail: String,
+    /// The winner had no commits ahead of the base, so no pull request was
+    /// attempted. Distinct from a `gh` failure: nothing was wrong with the
+    /// tooling, there was simply nothing to land.
+    #[serde(default)]
+    pub empty: bool,
 }
 
 /// A seat currently mid-answer: a prompt was sent and no reply has landed yet.
@@ -1556,6 +1561,11 @@ pub struct RunState {
     /// fold must leave them alone.
     #[serde(default)]
     pub released_branches: Vec<String>,
+    /// Existing branches and commits the task text names, and what the
+    /// repository says about each (`crate::refs`). Unmerged ones seed the
+    /// candidates; `base_commit` stays the comparison point.
+    #[serde(default)]
+    pub seeds: Vec<crate::refs::Seed>,
     /// Per-seat conversation state.
     #[serde(default)]
     pub seats: BTreeMap<String, SeatState>,
@@ -1704,6 +1714,7 @@ impl RunState {
             parked: false,
             released_to: None,
             released_branches: Vec::new(),
+            seeds: Vec::new(),
             seats: BTreeMap::new(),
             active: BTreeMap::new(),
             driver_pid: None,
@@ -3331,6 +3342,7 @@ mod tests {
             mode: MergeMode::None,
             ok: true,
             detail: "git merge --no-ff magi/x/A".to_owned(),
+            empty: false,
         });
         assert!(
             s.unmerged_by_design(),
@@ -3344,6 +3356,7 @@ mod tests {
             mode: MergeMode::Pr,
             ok: false,
             detail: "https://example.com/pr/1 was closed without merging".to_owned(),
+            empty: false,
         });
         assert!(
             !s.unmerged_by_design(),
@@ -3356,6 +3369,7 @@ mod tests {
             mode: MergeMode::None,
             ok: true,
             detail: "git merge --no-ff magi/x/A".to_owned(),
+            empty: false,
         });
         assert!(
             !s.unmerged_by_design(),

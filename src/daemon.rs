@@ -2524,7 +2524,7 @@ async fn attempt(
             }
             let instruction = prepare_instruction(&starter, None, task)
                 .unwrap_or_else(|| task.instruction.clone());
-            Runner::start(&repo, instruction, config).await
+            Runner::start_naming(&repo, instruction, &task.title, config).await
         }
     };
     let mut runner = match started {

@@ -179,6 +179,7 @@ fn parked_run(repo: &std::path::Path, config: &magi::config::Config) -> RunState
         mode: MergeMode::Pr,
         ok: true,
         detail: "https://example.invalid/x/y/pull/1".to_owned(),
+        empty: false,
     });
     state.status = RunStatus::Landing;
     state.parked = true;

@@ -1508,6 +1508,13 @@ pub struct ConductOutcome {
     pub branch: Option<String>,
     /// Short hash of `branch`'s head, when it could be read.
     pub branch_head: Option<String>,
+    /// What the repository says about the branches and commits the task
+    /// names (`crate::refs::describe`): already on the base, or not, and
+    /// which branches hold them. Facts git could answer, so the conductor
+    /// never has to ask the operator for them.
+    pub references: Option<String>,
+    /// The run ended with an empty winner: no pull request was tried.
+    pub empty_candidate: bool,
 }
 
 /// A `Failed`/`Held` task together with how its last run ended.
@@ -1726,6 +1733,19 @@ pub fn conduct(
                 (None, _) => {
                     s.push_str("  branch: (none survived — `review` is unavailable)\n");
                 }
+            }
+            if o.empty_candidate {
+                s.push_str(
+                    "  the winner had 0 commits ahead of the base (an empty candidate, \
+                     not a `gh` failure)\n",
+                );
+            }
+            if let Some(refs) = &o.references {
+                let _ = writeln!(
+                    s,
+                    "  references in the task, checked against the repository:\n{}",
+                    refs.replace('\n', "\n  ")
+                );
             }
             s.push('\n');
         }
@@ -2569,6 +2589,8 @@ mod tests {
                 rounds: Vec::new(),
                 branch: Some("magi/diag/A".to_owned()),
                 branch_head: Some("abc1234".to_owned()),
+                references: None,
+                empty_candidate: false,
             },
         };
         let body = conduct(&[], &[], &[finished], "en");
@@ -2606,6 +2628,8 @@ mod tests {
                     rounds: Vec::new(),
                     branch: None,
                     branch_head: None,
+                    references: None,
+                    empty_candidate: false,
                 },
             }],
             "en",
@@ -2690,6 +2714,8 @@ mod tests {
                 ],
                 branch: Some("magi/eba2/A".to_owned()),
                 branch_head: Some("0de0077".to_owned()),
+                references: None,
+                empty_candidate: false,
             },
         };
         let body = conduct(&[], &[], &[finished], "en");

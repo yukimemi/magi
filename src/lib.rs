@@ -43,6 +43,7 @@ pub mod proc;
 pub mod prompt;
 pub mod queue;
 pub mod reconcile;
+pub mod refs;
 pub mod report;
 pub mod repos;
 pub mod rng;

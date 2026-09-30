@@ -308,6 +308,7 @@ pub(crate) fn merged_after_all(
             argv.join(" "),
             stderr.trim()
         ),
+        empty: false,
     })
 }
 
@@ -1895,6 +1896,7 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                     mode: MergeMode::Pr,
                     ok: merged,
                     detail: detail.clone(),
+                    empty: false,
                 });
                 state.event("land", detail);
                 state.save()?;
@@ -1948,6 +1950,7 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                         mode: MergeMode::Pr,
                         ok: true,
                         detail: format!("gh {}", argv.join(" ")),
+                        empty: false,
                     });
                     // The last `state.pr` snapshot is whatever the poll before
                     // this merge observed - still `open` - and nothing below
@@ -2461,6 +2464,7 @@ async fn stop(state: &mut RunState, repo: &Path, pr: &PrState, why: &str) -> Res
         mode: MergeMode::Pr,
         ok: false,
         detail: why.to_owned(),
+        empty: false,
     });
     state.event("land", format!("stopped: {why}"));
     state.save()?;

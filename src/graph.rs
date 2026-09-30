@@ -42,6 +42,7 @@ use crate::prompt::{
     self, CandidateView, Lens, ReviewPatch, ReviewReconsiderCtx, ReviewSeatReport, Turn,
 };
 use crate::queue;
+use crate::refs;
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
     DeliberationRound, DeliberationTurn, E2eStatus, FixRecord, GateFixRecord, JobRecord, JobStatus,
@@ -451,6 +452,18 @@ impl Drop for FixClaim {
 impl Runner {
     /// Start a fresh run against `repo`.
     pub async fn start(repo: &Path, instruction: String, config: Config) -> Result<Self> {
+        Self::start_naming(repo, instruction, "", config).await
+    }
+
+    /// [`Runner::start`] for a queued task: `also_scan` (the task's title) is
+    /// searched for branch and commit references along with the instruction,
+    /// since a task may name the work it is about only in its title.
+    pub async fn start_naming(
+        repo: &Path,
+        instruction: String,
+        also_scan: &str,
+        config: Config,
+    ) -> Result<Self> {
         let repo = git::toplevel(repo).await?;
         let missing = agent::missing_programs(&config.agents);
         if !missing.is_empty() {
@@ -480,7 +493,24 @@ impl Runner {
         }
         let roles = config.resolve_roles()?;
         let max_parallel = config.graph.max_parallel.max(1);
+        // A task that points at work already in the repository starts from
+        // it; what the repository says about each reference is recorded.
+        let seeds = refs::resolve(
+            &repo,
+            &base_commit,
+            &config.merge.remote,
+            &format!("{also_scan}\n{instruction}"),
+        )
+        .await;
+        refs::plan(&repo, &seeds).await?;
         let mut state = RunState::new(repo, base_branch, base_commit, instruction, config);
+        for seed in &seeds {
+            state.event(
+                "seed",
+                refs::describe(std::slice::from_ref(seed)).unwrap_or_default(),
+            );
+        }
+        state.seeds = seeds;
         state.event("start", format!("run {} created", state.id));
         state.save()?;
         Ok(Self {
@@ -1007,6 +1037,8 @@ impl Runner {
         self.state.status = RunStatus::Prep;
         let repo = self.state.repo.clone();
         let base = self.state.base_commit.clone();
+        let plan = refs::plan(&repo, &self.state.seeds).await?;
+        let start = plan.start.clone().unwrap_or_else(|| base.clone());
         let root = self.state.worktree_root();
         let labels = blind::assign_labels(self.roles.implementers.len(), self.state.seed);
 
@@ -1041,11 +1073,20 @@ impl Runner {
         {
             let branch = self.state.branch_for(label);
             let worktree = root.join(format!("cand-{label}"));
-            git::worktree_add_branch(&repo, &worktree, &branch, &base).await?;
+            git::worktree_add_branch(&repo, &worktree, &branch, &start).await?;
             if self.state.config.blind.commit_msg_hook {
                 git::set_worktree_hooks_path(&worktree, &hooks_dir).await?;
             }
             git::local_exclude(&worktree, "/.magi/").await?;
+            for pick in &plan.picks {
+                if let Err(e) = git::cherry_pick(&worktree, pick).await {
+                    self.state.status = RunStatus::Blocked;
+                    self.state
+                        .event("prep", format!("cannot apply referenced commit: {e}"));
+                    self.state.save()?;
+                    return Err(e);
+                }
+            }
             self.state.candidates.push(Candidate {
                 index,
                 label,
@@ -1467,7 +1508,7 @@ impl Runner {
             let spec = self.roles.implementers[index].clone();
             let seat_key = format!("impl-{label}");
             let seat = self.seat(&seat_key, &spec.id);
-            let instruction = self.state.instruction.clone();
+            let instruction = seeded_instruction(&self.state);
             jobs.push(SeatJob {
                 spec,
                 seat,
@@ -1817,7 +1858,7 @@ impl Runner {
         prompts: &Prompts,
         run_id: &str,
     ) {
-        let instruction = self.state.instruction.clone();
+        let instruction = seeded_instruction(&self.state);
         let language = self.state.config.graph.language.clone();
         let brief = self
             .state
@@ -5398,7 +5439,18 @@ impl Runner {
                 mode,
                 ok: true,
                 detail: manual_merge_command(style, &repo, &winner.branch, &message),
+                empty: false,
             },
+            MergeMode::Pr | MergeMode::Local
+                if merge_is_empty(&repo, &self.state, &winner.branch, mode).await =>
+            {
+                MergeOutcome {
+                    mode,
+                    ok: false,
+                    detail: empty_candidate_detail(&self.state, &base),
+                    empty: true,
+                }
+            }
             MergeMode::Local => {
                 let on = git::current_branch(&repo).await?;
                 if on.as_deref() != Some(base.as_str()) {
@@ -5410,12 +5462,14 @@ impl Runner {
                             repo.display(),
                             on.unwrap_or_else(|| "a detached HEAD".to_owned())
                         ),
+                        empty: false,
                     }
                 } else if !git::is_clean(&repo).await? {
                     MergeOutcome {
                         mode,
                         ok: false,
                         detail: format!("{} is dirty; refusing to merge", repo.display()),
+                        empty: false,
                     }
                 } else {
                     let out = match style {
@@ -5431,6 +5485,7 @@ impl Runner {
                         mode,
                         ok: out.ok(),
                         detail: if out.ok() { out.stdout } else { out.stderr },
+                        empty: false,
                     }
                 }
             }
@@ -5442,6 +5497,7 @@ impl Runner {
                         mode,
                         ok: false,
                         detail: pushed.stderr,
+                        empty: false,
                     }
                 } else {
                     let out =
@@ -5452,11 +5508,13 @@ impl Runner {
                             mode,
                             ok: true,
                             detail: url,
+                            empty: false,
                         },
                         Err(e) => MergeOutcome {
                             mode,
                             ok: false,
                             detail: e.to_string(),
+                            empty: false,
                         },
                     }
                 }
@@ -6884,6 +6942,57 @@ fn pr_message(state: &RunState, winner: char) -> PrMessage {
     }
 }
 
+/// The task with what the repository says about the existing work it names
+/// appended, so an implementer knows what it started from and what it must
+/// not redo. Unchanged when the task names nothing.
+fn seeded_instruction(state: &RunState) -> String {
+    match refs::describe(&state.seeds) {
+        Some(facts) => format!(
+            "{}\n\n# Existing work the task refers to\n\n{facts}\n\n\
+             Candidates start from the unmerged branch named above, when there \
+             is one, and carry any unmerged commit named by sha as a \
+             cherry-pick. Check that this is what the task meant before \
+             building on it.",
+            state.instruction
+        ),
+        None => state.instruction.clone(),
+    }
+}
+
+/// Does the winner have no commits ahead of the base it would land on?
+/// Any failure to find out reads as "not empty": the merge then behaves as it
+/// always did rather than refusing on a guess.
+async fn merge_is_empty(repo: &Path, state: &RunState, branch: &str, mode: MergeMode) -> bool {
+    let base = &state.base_branch;
+    let mut against = base.clone();
+    if mode == MergeMode::Pr {
+        let remote = &state.config.merge.remote;
+        let tracking = format!("{remote}/{base}");
+        let fetched = git::fetch(repo, remote, base).await;
+        if fetched.is_ok_and(|o| o.ok()) && git::rev_exists(repo, &tracking).await {
+            against = tracking;
+        }
+    }
+    matches!(git::commits_ahead(repo, &against, branch).await, Ok(0))
+}
+
+/// Why nothing was opened for an empty winner, with what the task's own
+/// references resolved to.
+fn empty_candidate_detail(state: &RunState, base: &str) -> String {
+    let mut detail = format!(
+        "empty candidate: the winning branch has 0 commits ahead of {base}, so there is \
+         nothing to open a pull request for"
+    );
+    match refs::describe(&state.seeds) {
+        Some(facts) => detail.push_str(&format!("\nReferences in the task:\n{facts}")),
+        None => detail.push_str(
+            "\nThe task names no existing branch or commit; if it means to land work \
+             that lives elsewhere, name the branch (magi/<run>/<label>) or the sha.",
+        ),
+    }
+    detail
+}
+
 /// `gh pr create`, returning the PR url.
 async fn gh_pr_create(
     cwd: &Path,
@@ -7937,6 +8046,54 @@ mod tests {
         );
     }
 
+    /// A winner with nothing ahead of the base is caught before `gh` is ever
+    /// asked for a pull request, and the message carries what the task's
+    /// references resolved to.
+    #[tokio::test]
+    async fn an_empty_winner_is_detected_before_a_pull_request_is_attempted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .quiet()
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?}");
+        };
+        run(&["branch", "magi/x/A"]);
+        run(&["checkout", "-q", "-b", "magi/x/B"]);
+        std::fs::write(repo.join("f.txt"), "x\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "work"]);
+        run(&["checkout", "-q", "main"]);
+
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            "deadbeef".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        );
+        state.seeds = vec![refs::Seed {
+            token: "magi/27b2/A".to_owned(),
+            kind: refs::SeedKind::Unresolved,
+            sha: String::new(),
+            branch: true,
+            detail: "no branch or commit named magi/27b2/A".to_owned(),
+        }];
+
+        assert!(merge_is_empty(&repo, &state, "magi/x/A", MergeMode::Pr).await);
+        assert!(merge_is_empty(&repo, &state, "magi/x/A", MergeMode::Local).await);
+        assert!(!merge_is_empty(&repo, &state, "magi/x/B", MergeMode::Pr).await);
+        let detail = empty_candidate_detail(&state, "main");
+        assert!(detail.starts_with("empty candidate"), "{detail}");
+        assert!(detail.contains("magi/27b2/A"), "{detail}");
+    }
+
     /// `status == Ready` used to be read as "this is the harmless
     /// `MergeMode::None` no-op path, nothing to guard" (graph.rs, prior to
     /// this test). But `land` sets the very same status when a `MergeMode::Pr`
@@ -8031,6 +8188,7 @@ mod tests {
             mode: MergeMode::Local,
             ok: false,
             detail: "already concluded".to_owned(),
+            empty: false,
         });
 
         let mut runner = Runner {
@@ -9002,6 +9160,7 @@ mod tests {
             mode: MergeMode::Pr,
             ok: true,
             detail: "https://example.invalid/x/y/pull/1".to_owned(),
+            empty: false,
         });
 
         // The Landing-resume shortcut calls `run_land` directly rather than

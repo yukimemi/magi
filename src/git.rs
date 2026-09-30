@@ -769,6 +769,84 @@ pub async fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> bool {
         .is_ok_and(|o| o.ok())
 }
 
+/// [`is_ancestor`] that keeps "no" apart from "could not tell": `merge-base
+/// --is-ancestor` exits 0 for yes, 1 for no and anything else for an error
+/// (an unknown object, a shallow clone), and reading an error as "no" would
+/// report a merged change as unmerged.
+pub async fn ancestry(repo: &Path, ancestor: &str, of: &str) -> Result<bool> {
+    let out = git_raw(repo, &["merge-base", "--is-ancestor", ancestor, of]).await?;
+    match out.code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "git merge-base --is-ancestor {ancestor} {of} failed (exit {:?}): {}",
+            out.code,
+            out.stderr
+        ),
+    }
+}
+
+/// The commit `rev` names, or `None` when it names no commit here.
+pub async fn commit_of(repo: &Path, rev: &str) -> Option<String> {
+    let spec = format!("{rev}^{{commit}}");
+    let out = git_raw(repo, &["rev-parse", "--verify", "--quiet", &spec])
+        .await
+        .ok()?;
+    (out.ok() && !out.stdout.is_empty()).then_some(out.stdout)
+}
+
+/// Local and remote-tracking branches that contain `commit`.
+pub async fn branches_containing(repo: &Path, commit: &str) -> Result<Vec<String>> {
+    let out = git(
+        repo,
+        &[
+            "branch",
+            "-a",
+            "--contains",
+            commit,
+            "--format=%(refname:short)",
+        ],
+    )
+    .await?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.ends_with("/HEAD") && !l.contains("HEAD detached"))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Cherry-pick `commit` onto the worktree's HEAD under a neutral committer.
+/// On a conflict the pick is aborted, so the worktree is left as it was, and
+/// git's own words come back as the error.
+pub async fn cherry_pick(worktree: &Path, commit: &str) -> Result<()> {
+    let out = git_raw(
+        worktree,
+        &[
+            "-c",
+            "user.name=magi candidate",
+            "-c",
+            "user.email=magi@localhost",
+            "cherry-pick",
+            "-x",
+            commit,
+        ],
+    )
+    .await?;
+    if out.ok() {
+        return Ok(());
+    }
+    let _ = git_raw(worktree, &["cherry-pick", "--abort"]).await;
+    bail!(
+        "cherry-pick of {commit} failed: {}",
+        if out.stderr.is_empty() {
+            out.stdout
+        } else {
+            out.stderr
+        }
+    )
+}
+
 /// The tree object id of `rev`.
 pub async fn tree_of(repo: &Path, rev: &str) -> Result<String> {
     git(repo, &["rev-parse", &format!("{rev}^{{tree}}")]).await
