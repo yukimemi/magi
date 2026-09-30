@@ -184,11 +184,14 @@ pub async fn resolve(repo: &Path, base_commit: &str, remote: &str, text: &str) -
 }
 
 async fn commit_for(repo: &Path, remote: &str, token: &Token) -> Option<String> {
-    if token.branch {
-        // Best effort: a stale remote-tracking ref must not seed a run, and a
-        // branch that only exists locally makes this fail harmlessly.
-        let _ = git::fetch(repo, remote, &token.text).await;
-    }
+    // A remote-tracking ref is only believed right after a fetch that
+    // succeeded: if the remote branch was deleted or the fetch failed, what is
+    // left is a stale copy and must not seed a run. A branch that only exists
+    // locally makes the fetch fail harmlessly.
+    let fetched = token.branch
+        && git::fetch(repo, remote, &token.text)
+            .await
+            .is_ok_and(|o| o.ok());
     let local = match git::commit_of(repo, &token.text).await {
         // `magi/x/A` must be a branch, not e.g. a tag or path-like revision.
         Some(sha)
@@ -201,7 +204,11 @@ async fn commit_for(repo: &Path, remote: &str, token: &Token) -> Option<String> 
     if !token.branch {
         return local;
     }
-    let tracked = git::commit_of(repo, &format!("refs/remotes/{remote}/{}", token.text)).await;
+    let tracked = if fetched {
+        git::commit_of(repo, &format!("refs/remotes/{remote}/{}", token.text)).await
+    } else {
+        None
+    };
     match (local, tracked) {
         // The remote has moved on from the local branch: the newer tip is the
         // work the task means.
