@@ -108,6 +108,15 @@ pub struct Notice {
     /// When it was dismissed; the tombstone.
     #[serde(default)]
     pub dismissed_at: Option<Timestamp>,
+    /// The task and run ids this notice is about. A question whose `run`
+    /// names one of them already pages the operator for the same cause.
+    #[serde(default)]
+    pub subjects: Vec<String>,
+    /// The question that carries this notice as context, when it was filed
+    /// already read for that reason. Never a tombstone: a recurrence with a
+    /// changed message or higher severity is unread again.
+    #[serde(default)]
+    pub covered_by: Option<String>,
     /// On-disk format version.
     #[serde(default = "schema")]
     pub schema: u32,
@@ -136,8 +145,20 @@ impl Notice {
             count: 1,
             read_at: None,
             dismissed_at: None,
+            subjects: Vec::new(),
+            covered_by: None,
             schema: SCHEMA,
         }
+    }
+
+    /// Name the task / run ids this notice is about.
+    pub fn about<I, S>(mut self, subjects: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.subjects = subjects.into_iter().map(Into::into).collect();
+        self
     }
 
     /// An [`Severity::Info`] notice.
@@ -174,11 +195,25 @@ impl Notice {
         if again.link.is_some() {
             self.link = again.link.clone();
         }
-        if again.message != self.message || again.severity > self.severity {
+        if !again.subjects.is_empty() {
+            self.subjects = again.subjects.clone();
+        }
+        let escalated = again.severity > self.severity;
+        if again.message != self.message || escalated {
             self.message = again.message.clone();
             self.severity = self.severity.max(again.severity);
             self.read_at = None;
             self.dismissed_at = None;
+            self.covered_by = None;
+        }
+        // A question already pages for this cause: keep the record, skip the
+        // second page. A higher severity is news the question did not carry.
+        if let Some(q) = &again.covered_by
+            && !escalated
+            && self.unread()
+        {
+            self.read_at = Some(now);
+            self.covered_by = Some(q.clone());
         }
     }
 
@@ -359,13 +394,34 @@ impl Notices {
                     existing.raise_again(&incoming, now);
                     existing
                 }
-                Err(_) => incoming,
+                Err(_) => {
+                    let mut fresh = incoming;
+                    if fresh.covered_by.is_some() {
+                        fresh.read_at = Some(now);
+                    }
+                    fresh
+                }
             };
             self.put(&stored)?;
             Ok(stored)
         })?;
         self.prune();
         Ok(stored)
+    }
+
+    /// Mark every unread notice about `subject` read, recording `question` as
+    /// the card that carries it. Best-effort per notice.
+    pub fn cover(&self, subject: &str, question: &str) {
+        for n in self.all() {
+            if n.unread() && n.subjects.iter().any(|s| s == subject) {
+                let _ = self.update(&n.id, |n| {
+                    if n.unread() {
+                        n.mark_read(Timestamp::now());
+                        n.covered_by = Some(question.to_owned());
+                    }
+                });
+            }
+        }
     }
 
     /// Load, change and save one notice under its lock.
@@ -515,6 +571,7 @@ pub fn run_ended(state: &crate::run::RunState) -> Option<Notice> {
         .link(Link::Run {
             id: state.id.clone(),
         })
+        .about([state.id.clone()])
     })
 }
 
@@ -559,7 +616,8 @@ pub fn task_held(task: &crate::queue::Task) -> Option<Notice> {
         )
         .link(Link::Task {
             id: task.id.clone(),
-        }),
+        })
+        .about([task.id.clone()]),
     )
 }
 
@@ -570,6 +628,7 @@ pub fn run_stopped(id: &str, state: &crate::run::RunState) -> Notice {
         format!("Run {} stopped with an error.", state.short()),
     )
     .link(Link::Run { id: id.to_owned() })
+    .about([id.to_owned()])
 }
 
 /// The one function producers call. Best-effort by construction: a notice that
@@ -581,9 +640,36 @@ pub fn raise(notice: Notice) {
     }
 }
 
+/// Does open question `q` already page the operator for what `n` reports?
+/// Exact match on `Question::run` (a task id for the conductor and triage, a
+/// run id for the graph); the land / release question is a to-do, not a
+/// duplicate, so it never covers anything.
+pub fn covers(q: &crate::ask::Question, n: &Notice) -> bool {
+    q.status.open() && q.node != crate::bump::NOTICE_NODE && n.subjects.contains(&q.run)
+}
+
+fn covering_question(home: &Path, n: &Notice) -> Option<String> {
+    if n.subjects.is_empty() {
+        return None;
+    }
+    crate::ask::Questions::at(home.join("questions"))
+        .list()
+        .into_iter()
+        .find(|q| covers(q, n))
+        .map(|q| q.id)
+}
+
+/// A question was just filed for `run`: quiet the unread notices about it.
+pub fn quiet_for(home: &Path, run: &str, question: &str) {
+    Notices::at(home.join("notifications")).cover(run, question);
+}
+
 /// [`raise`] into an explicit magi home, for callers that already carry one
 /// (the janitor) and so must not reach for the process-global.
-pub fn raise_in(home: &Path, notice: Notice) {
+pub fn raise_in(home: &Path, mut notice: Notice) {
+    if let Some(q) = covering_question(home, &notice) {
+        notice.covered_by = Some(q);
+    }
     if let Err(e) = Notices::at(home.join("notifications")).raise(notice) {
         tracing::warn!("could not file a notification: {e:#}");
     }
@@ -837,5 +923,132 @@ mod tests {
         let n = task_held(&t).expect("machine hold");
         assert_eq!(n.key, format!("task:{}", t.id));
         assert!(n.message.contains("missing blocker"));
+    }
+
+    fn held_task() -> crate::queue::Task {
+        let mut t = crate::queue::Task::new(
+            "t".to_owned(),
+            "do it".to_owned(),
+            std::path::PathBuf::from("/repo"),
+            crate::queue::Source::Human,
+        );
+        t.hold_machine(Some("branch b is checked out".to_owned()));
+        t
+    }
+
+    fn ask(home: &Path, run: &str, node: &str) -> crate::ask::Question {
+        let mut q = crate::ask::Question::new(
+            run.to_owned(),
+            node.to_owned(),
+            "conductor".to_owned(),
+            "cannot resume".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        crate::ask::Questions::at(home.join("questions"))
+            .put(&mut q)
+            .unwrap();
+        q
+    }
+
+    fn unread(home: &Path) -> usize {
+        Notices::at(home.join("notifications")).count_unread()
+    }
+
+    #[test]
+    fn a_hold_with_an_open_question_for_the_task_pages_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = held_task();
+        let q = ask(dir.path(), &t.id, "conduct");
+        crate::queue::Queue::at(dir.path().join("queue"))
+            .put(&mut t)
+            .unwrap();
+        let s = Notices::at(dir.path().join("notifications"));
+        assert_eq!(s.count_unread(), 0);
+        let n = s.list().pop().expect("the record is kept");
+        assert_eq!(n.covered_by.as_deref(), Some(q.id.as_str()));
+        assert!(n.message.contains("checked out"));
+    }
+
+    #[test]
+    fn a_hold_with_no_question_still_notifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = held_task();
+        crate::queue::Queue::at(dir.path().join("queue"))
+            .put(&mut t)
+            .unwrap();
+        assert_eq!(unread(dir.path()), 1);
+    }
+
+    #[test]
+    fn a_question_for_another_task_does_not_suppress() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = held_task();
+        ask(dir.path(), "some-other-task", "conduct");
+        crate::queue::Queue::at(dir.path().join("queue"))
+            .put(&mut t)
+            .unwrap();
+        assert_eq!(unread(dir.path()), 1);
+    }
+
+    #[test]
+    fn a_question_filed_after_the_hold_quiets_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = held_task();
+        crate::queue::Queue::at(dir.path().join("queue"))
+            .put(&mut t)
+            .unwrap();
+        assert_eq!(unread(dir.path()), 1);
+        let q = ask(dir.path(), &t.id, "conduct");
+        assert_eq!(unread(dir.path()), 0);
+        // A later update of the same question does not run the hook again.
+        let s = Notices::at(dir.path().join("notifications"));
+        let id = s.list()[0].id.clone();
+        s.update(&id, |n| n.read_at = None).unwrap();
+        let mut again = crate::ask::Questions::at(dir.path().join("questions"))
+            .get(&q.id)
+            .unwrap();
+        crate::ask::Questions::at(dir.path().join("questions"))
+            .put(&mut again)
+            .unwrap();
+        assert_eq!(unread(dir.path()), 1);
+    }
+
+    #[test]
+    fn a_blocked_run_with_an_open_question_is_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        ask(dir.path(), "run-1", "implement");
+        raise_in(
+            dir.path(),
+            Notice::error("run:run-1", "Run r ended blocked.").about(["run-1"]),
+        );
+        assert_eq!(unread(dir.path()), 0);
+        raise_in(
+            dir.path(),
+            Notice::error("run:run-2", "Run r ended blocked.").about(["run-2"]),
+        );
+        assert_eq!(unread(dir.path()), 1);
+    }
+
+    #[test]
+    fn escalation_makes_a_covered_notice_unread_again() {
+        let dir = tempfile::tempdir().unwrap();
+        ask(dir.path(), "t1", "conduct");
+        raise_in(dir.path(), Notice::warn("task:t1", "held").about(["t1"]));
+        assert_eq!(unread(dir.path()), 0);
+        raise_in(dir.path(), Notice::error("task:t1", "held").about(["t1"]));
+        assert_eq!(unread(dir.path()), 1);
+    }
+
+    #[test]
+    fn covers_matches_run_exactly_and_ignores_release_questions() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = Notice::warn("k", "m").about(["t1"]);
+        let q = ask(dir.path(), "t1", "conduct");
+        assert!(covers(&q, &n));
+        assert!(!covers(&q, &Notice::warn("k", "m")));
+        assert!(!covers(&q, &Notice::warn("k", "m").about(["t"])));
+        let release = ask(dir.path(), "t1", crate::bump::NOTICE_NODE);
+        assert!(!covers(&release, &n));
     }
 }

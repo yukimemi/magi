@@ -6320,6 +6320,7 @@ function renderNotifications() {
         el("span", { text: n.severity }),
         el("time", { datetime: n.last_at, title: at.title, text: at.text }),
         n.count > 1 ? el("span", { text: `\u00d7${n.count}` }) : null,
+        n.covered_by ? el("span", { text: `in question ${n.covered_by.slice(0, 8)}` }) : null,
         link),
       el("div", { class: "notice-actions" },
         unread ? el("button", { class: "btn btn-quiet", type: "button", text: "Mark read",

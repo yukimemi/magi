@@ -2549,7 +2549,8 @@ async fn attempt(
                 )
                 .link(Link::Task {
                     id: task.id.clone(),
-                }),
+                })
+                .about([task.id.clone()]),
             );
             return Vec::new();
         }

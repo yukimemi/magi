@@ -1108,8 +1108,18 @@ impl Questions {
         let body = serde_json::to_string_pretty(q).context("serialize question")?;
         let path = self.path_of(&q.id);
         let tmp = path.with_extension("json.tmp");
+        let is_new = !path.exists();
         std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
+        // A first write of an open question pages the operator, so a separate
+        // notification about the same task or run is now a second page.
+        if is_new
+            && q.status.open()
+            && q.node != crate::bump::NOTICE_NODE
+            && let Some(home) = self.root.parent().filter(|p| !p.as_os_str().is_empty())
+        {
+            crate::notices::quiet_for(home, &q.run, &q.id);
+        }
         Ok(())
     }
 
