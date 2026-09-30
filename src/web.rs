@@ -8121,6 +8121,7 @@ mod tests {
             mode: crate::config::MergeMode::None,
             ok: true,
             detail: "git -C /repo merge --no-ff magi/x/A".to_owned(),
+            empty: false,
         });
         write_state(&f.runs(), &none_run);
 
@@ -8137,6 +8138,7 @@ mod tests {
             mode: crate::config::MergeMode::Pr,
             ok: false,
             detail: "https://example.com/pr/1 was closed without merging".to_owned(),
+            empty: false,
         });
         write_state(&f.runs(), &pr_run);
 

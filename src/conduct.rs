@@ -292,6 +292,8 @@ async fn outcome_for(task: &Task, repo: &Path) -> prompt::ConductOutcome {
             rounds: Vec::new(),
             branch: None,
             branch_head: None,
+            references: None,
+            empty_candidate: false,
         };
     };
     let state = match RunState::load(&run_id) {
@@ -315,6 +317,8 @@ async fn outcome_for(task: &Task, repo: &Path) -> prompt::ConductOutcome {
                 rounds: Vec::new(),
                 branch: None,
                 branch_head: None,
+                references: None,
+                empty_candidate: false,
             };
         }
     };
@@ -379,6 +383,58 @@ async fn outcome_for(task: &Task, repo: &Path) -> prompt::ConductOutcome {
         rounds,
         branch,
         branch_head,
+        references: crate::refs::describe(&state.seeds),
+        empty_candidate: state.merge.as_ref().is_some_and(|m| m.empty),
+    }
+}
+
+/// Append what the repository says about the branches and commits a task
+/// names to every question the conductor is about to file, so the operator is
+/// never asked a fact git can answer ("is it already on main?"). Done here,
+/// in code, rather than trusted to the model: a question the model wrote
+/// without checking still reaches the operator with the answer attached.
+/// When it cannot be checked the question says so instead of guessing.
+async fn attach_facts(cfg: &Config, repo: &Path, queue: &Queue, verdict: &mut Verdict) {
+    for d in verdict
+        .decisions
+        .iter_mut()
+        .filter(|d| d.question.is_some())
+    {
+        let Ok(task) = queue.get(&d.id) else {
+            continue;
+        };
+        let text = format!("{}\n{}", task.title, task.instruction);
+        if crate::refs::scan(&text).is_empty() {
+            continue;
+        }
+        let repo = repo_for(&task, repo);
+        let remote = &cfg.merge.remote;
+        let base = match cfg.merge.base.clone() {
+            Some(b) => Some(b),
+            None => crate::git::current_branch(&repo).await.ok().flatten(),
+        };
+        let facts = match base {
+            Some(base) => {
+                let tracking = format!("{remote}/{base}");
+                let against = if crate::git::rev_exists(&repo, &tracking).await {
+                    tracking
+                } else {
+                    base
+                };
+                match crate::git::rev_parse(&repo, &against).await {
+                    Ok(tip) => crate::refs::describe(
+                        &crate::refs::resolve(&repo, &tip, remote, &text).await,
+                    ),
+                    Err(e) => Some(format!("could not check the repository: {e:#}")),
+                }
+            }
+            None => Some("could not check the repository: no base branch known".to_owned()),
+        };
+        if let (Some(facts), Some(q)) = (facts, d.question.as_mut()) {
+            q.push_str(&format!(
+                "\n\nChecked against the repository (magi did this, not the model):\n{facts}"
+            ));
+        }
     }
 }
 
@@ -791,8 +847,9 @@ impl Conductor {
                 out.timed_out
             );
         }
-        let verdict: Verdict = verdict::extract_json(&out.text)
+        let mut verdict: Verdict = verdict::extract_json(&out.text)
             .context("the conductor's reply could not be parsed")?;
+        attach_facts(cfg, repo, queue, &mut verdict).await;
         apply(queue, questions, &verdict)
     }
 }

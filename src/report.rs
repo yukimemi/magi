@@ -927,6 +927,8 @@ pub fn run(state: &RunState) -> String {
                 m.mode,
                 if m.ok {
                     green("ok")
+                } else if m.empty {
+                    yellow("empty candidate — nothing to land")
                 } else {
                     yellow("not merged")
                 },
@@ -1570,6 +1572,7 @@ mod tests {
             mode: crate::config::MergeMode::None,
             ok: true,
             detail: "git -C /repo merge --no-ff magi/x/A".to_owned(),
+            empty: false,
         });
         let text = run(&s);
         assert!(
@@ -1603,6 +1606,7 @@ mod tests {
             detail: "git -C /repo merge --squash magi/x/A && git -C /repo commit -m \"add \
                       retries\""
                 .to_owned(),
+            empty: false,
         });
         let text = run(&s);
         assert!(
@@ -1621,6 +1625,7 @@ mod tests {
             mode: crate::config::MergeMode::None,
             ok: true,
             detail: "git -C /repo merge --no-ff magi/x/A".to_owned(),
+            empty: false,
         });
 
         let list = line(&s);
@@ -1650,6 +1655,7 @@ mod tests {
             mode: crate::config::MergeMode::Pr,
             ok: false,
             detail: "https://example.com/pr/1 was closed without merging".to_owned(),
+            empty: false,
         });
 
         let list = line(&s);
