@@ -456,12 +456,14 @@ pub enum Reconciliation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proc::Quiet as _;
     use std::path::PathBuf;
 
     fn sh(dir: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
+            .quiet()
             .output()
             .unwrap();
         assert!(
