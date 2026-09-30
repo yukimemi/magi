@@ -641,23 +641,27 @@ pub fn raise(notice: Notice) {
 }
 
 /// Does open question `q` already page the operator for what `n` reports?
-/// Exact match on `Question::run` (a task id for the conductor and triage, a
-/// run id for the graph); the land / release question is a to-do, not a
-/// duplicate, so it never covers anything.
 ///
-/// Same subject is not the same cause: a question left open for something
-/// else must not swallow a later hold, so the two must also have happened
-/// within the cover window (`COVER_WINDOW_SECS`) of each other.
+/// The cause is decided by what each side is about, not by when it happened:
+/// a conductor / triage question exists *because* its task is held, so it
+/// covers that task's hold and handover notices whenever it was filed; a
+/// question raised from inside a run (any other seat node) covers that run's
+/// ended / stopped notices and never a task hold. Exact match on
+/// `Question::run` (a task id for the former, a run id for the latter). The
+/// land approval and release questions are to-dos, not duplicates, and cover
+/// nothing.
 pub fn covers(q: &crate::ask::Question, n: &Notice) -> bool {
-    q.status.open()
-        && q.node != crate::bump::NOTICE_NODE
-        && n.subjects.contains(&q.run)
-        && (q.asked_at.as_second() - n.last_at.as_second()).abs() <= COVER_WINDOW_SECS
+    if !q.status.open() || !n.subjects.contains(&q.run) {
+        return false;
+    }
+    let about_task = n.key.starts_with("task:") || n.key.starts_with("handover:");
+    let about_run = n.key.starts_with("run:");
+    match q.node.as_str() {
+        crate::bump::NOTICE_NODE | crate::land::APPROVAL_NODE => false,
+        crate::conduct::NODE | crate::triage::NODE | crate::triage::DEPS_NODE => about_task,
+        _ => about_run,
+    }
 }
-
-/// How close in time a question and a notice about one subject must be to
-/// count as one event: the conductor files its question right after the hold.
-const COVER_WINDOW_SECS: i64 = 120;
 
 fn covering_question(home: &Path, n: &Notice) -> Option<String> {
     if n.subjects.is_empty() {
@@ -736,9 +740,9 @@ mod tests {
     #[test]
     fn a_rise_in_severity_resurrects_a_dismissed_notice_but_a_repeat_does_not() {
         let now = Timestamp::now();
-        let mut n = Notice::warn("k", "m");
+        let mut n = Notice::warn("task:x", "m");
         n.dismiss(now);
-        n.raise_again(&Notice::warn("k", "m"), now);
+        n.raise_again(&Notice::warn("task:x", "m"), now);
         assert!(n.dismissed_at.is_some(), "tombstone holds");
         n.raise_again(&Notice::error("k", "m"), now);
         assert!(n.unread());
@@ -1054,42 +1058,42 @@ mod tests {
     #[test]
     fn covers_matches_run_exactly_and_ignores_release_questions() {
         let dir = tempfile::tempdir().unwrap();
-        let n = Notice::warn("k", "m").about(["t1"]);
+        let n = Notice::warn("task:x", "m").about(["t1"]);
         let q = ask(dir.path(), "t1", "conduct");
         assert!(covers(&q, &n));
-        assert!(!covers(&q, &Notice::warn("k", "m")));
-        assert!(!covers(&q, &Notice::warn("k", "m").about(["t"])));
+        assert!(!covers(&q, &Notice::warn("task:x", "m")));
+        assert!(!covers(&q, &Notice::warn("task:x", "m").about(["t"])));
         let release = ask(dir.path(), "t1", crate::bump::NOTICE_NODE);
         assert!(!covers(&release, &n));
     }
 
     #[test]
-    fn a_question_left_open_for_another_cause_does_not_swallow_a_later_hold() {
+    fn a_run_question_does_not_swallow_a_task_hold_and_vice_versa() {
         let dir = tempfile::tempdir().unwrap();
-        let mut old = crate::ask::Question::new(
-            "t1".to_owned(),
-            "conduct".to_owned(),
-            "conductor".to_owned(),
-            "something else".to_owned(),
-            String::new(),
-            Vec::new(),
-        );
-        old.asked_at = Timestamp::from_second(Timestamp::now().as_second() - 3600).unwrap();
-        crate::ask::Questions::at(dir.path().join("questions"))
-            .put(&mut old)
-            .unwrap();
+        ask(dir.path(), "t1", "implement");
         raise_in(dir.path(), Notice::warn("task:t1", "held").about(["t1"]));
         assert_eq!(unread(dir.path()), 1);
+        ask(dir.path(), "r1", "conduct");
+        raise_in(dir.path(), Notice::error("run:r1", "ended").about(["r1"]));
+        assert_eq!(unread(dir.path()), 2);
     }
 
     #[test]
-    fn a_stale_unread_notice_is_not_quieted_by_a_new_question() {
+    fn a_conduct_question_covers_the_hold_however_late_it_was_filed() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Notices::at(dir.path().join("notifications"));
-        let mut n = Notice::warn("task:t1", "held").about(["t1"]);
-        n.last_at = Timestamp::from_second(Timestamp::now().as_second() - 3600).unwrap();
-        s.raise(n).unwrap();
-        ask(dir.path(), "t1", "conduct");
-        assert_eq!(unread(dir.path()), 1);
+        let mut q = crate::ask::Question::new(
+            "t1".to_owned(),
+            "conduct".to_owned(),
+            "conductor".to_owned(),
+            "s".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        q.asked_at = Timestamp::from_second(Timestamp::now().as_second() - 3600).unwrap();
+        crate::ask::Questions::at(dir.path().join("questions"))
+            .put(&mut q)
+            .unwrap();
+        raise_in(dir.path(), Notice::warn("task:t1", "held").about(["t1"]));
+        assert_eq!(unread(dir.path()), 0);
     }
 }

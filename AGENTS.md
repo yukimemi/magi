@@ -1271,8 +1271,10 @@ something to answer, so it does not reuse `ask::Questions`.
 
 - **One cause pages once.** A `Notice` carries `subjects` (the task / run ids it
   is about) and `covered_by`. When an open question whose `run` equals a
-  subject exists and was asked within two minutes of the notice (same subject is
-  not same cause) - at raise time (`notices::raise_in`) or is filed afterwards
+  subject exists and is about the same kind of cause (a conduct / triage question
+  covers that task's hold and handover notices, a question from inside a run
+  covers that run's ended / stopped notices, and the two never cross; time
+  proximity is not used) - at raise time (`notices::raise_in`) or is filed afterwards
   (`Questions::put`, first write only, via `notices::quiet_for`) - the notice is
   still written, but already read and pointing at the question. Dedupe is
   expressed as read state, never as a tombstone, so a recurrence with a changed
