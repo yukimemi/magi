@@ -246,10 +246,21 @@ async fn finish(
     let cap = state.config.graph.review_rounds;
     let unmerged = git::unmerged_paths(scratch).await.unwrap_or_default();
     let head = git::rev_parse(scratch, "HEAD").await.unwrap_or_default();
-    let marked: Vec<String> = touched
-        .iter()
+    // Not only the paths seen unmerged at a round's start: one round may
+    // continue through several commits, and a later commit's conflict never
+    // shows up at a loop head. Everything the result changes relative to the
+    // base is checked.
+    let mut candidates: Vec<String> = touched.to_vec();
+    if let Ok(changed) = git::git(scratch, &["diff", "--name-only", onto_sha, "HEAD"]).await {
+        for p in changed.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if !candidates.iter().any(|c| c == p) {
+                candidates.push(p.to_owned());
+            }
+        }
+    }
+    let marked: Vec<String> = candidates
+        .into_iter()
         .filter(|p| has_markers(scratch, p))
-        .cloned()
         .collect();
 
     let problem = if !unmerged.is_empty() {

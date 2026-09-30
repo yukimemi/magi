@@ -3286,6 +3286,21 @@ impl Runner {
         let attempts = self.state.base_sync.as_ref().map_or(0, |s| s.attempts);
 
         if behind == 0 {
+            // A fixer-finished rebase moves the branch ref before the
+            // winner's worktree is told (`sync_to_head` below). A run that
+            // died in between resumes here with `behind == 0` and a tree still
+            // holding the pre-rebase files, which review and the gate would
+            // then read. Tracked changes against HEAD are that signature.
+            if !self.state.rebase_fixes.is_empty()
+                && git::git(
+                    &winner.worktree,
+                    &["status", "--porcelain", "--untracked-files=no"],
+                )
+                .await
+                .is_ok_and(|o| !o.trim().is_empty())
+            {
+                git::sync_to_head(&winner.worktree).await?;
+            }
             self.state.base_sync = Some(BaseSync {
                 tip,
                 behind: 0,
