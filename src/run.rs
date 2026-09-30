@@ -665,6 +665,10 @@ pub struct RebaseFixRecord {
     pub agent: String,
     /// Paths git reported unmerged when the round started.
     pub paths: Vec<String>,
+    /// The branch tip the rebase started from, so a resumed run can tell a
+    /// worktree still holding those files from one with edits of its own.
+    #[serde(default)]
+    pub from: Option<String>,
     /// Did git report the rebase finished after the round?
     #[serde(default)]
     pub finished: bool,

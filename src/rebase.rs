@@ -150,6 +150,7 @@ pub async fn rebase_with_fixer(
         state.rebase_fixes.push(RebaseFixRecord {
             agent: spec.id.clone(),
             paths: paths.clone(),
+            from: Some(orig.clone()),
             finished: false,
             error: None,
         });
@@ -263,10 +264,24 @@ async fn finish(
         .filter(|p| has_markers(scratch, p))
         .collect();
 
+    // Skipping every conflicting commit leaves the branch equal to the base:
+    // the ancestry test below passes and the branch's work is gone. Empty is
+    // only acceptable when every original commit already has a patch twin on
+    // the base.
+    let emptied = head == onto_sha
+        && git::cherry(&repo, onto_sha, orig)
+            .await
+            .map_or(true, |(unmatched, _)| !unmatched.is_empty());
+
     let problem = if !unmerged.is_empty() {
         Some(("paths are still unmerged", unmerged))
     } else if !marked.is_empty() {
         Some(("conflict markers were left in the tree", marked))
+    } else if emptied {
+        Some((
+            "the rebase ended with none of the branch's commits applied (all skipped)",
+            touched.to_vec(),
+        ))
     } else if head.is_empty() || !git::is_ancestor(&repo, onto_sha, &head).await {
         Some((
             "the rebase ended without the base in the result (abandoned or skipped)",

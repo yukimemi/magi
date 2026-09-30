@@ -290,6 +290,36 @@ async fn a_fixer_that_abandons_the_rebase_is_not_mistaken_for_success() {
 }
 
 common::e2e! {
+async fn a_fixer_that_skips_every_commit_does_not_lose_the_branch() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    set_agent_env(&mut fx, "MOCK_REBASE_FIX_SKIP");
+    let origin = wire_origin(&fx);
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+        .await
+        .expect("start");
+    land_on_origin(&origin.sideline, "note.txt", "upstream\n");
+
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+    assert_eq!(state.status, RunStatus::Blocked);
+    let why = state
+        .base_sync
+        .as_ref()
+        .and_then(|s| s.conflict.clone())
+        .expect("a reason is recorded");
+    assert!(why.contains("all skipped"), "{why}");
+    let winner = state.winner().expect("a winner");
+    assert!(
+        !is_ancestor(&fx.repo, "origin/main", &winner.branch),
+        "the branch keeps its own commits"
+    );
+}
+}
+
+common::e2e! {
 async fn the_conflict_round_bound_is_counted_in_state_and_survives_a_resume() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
@@ -307,6 +337,7 @@ async fn the_conflict_round_bound_is_counted_in_state_and_survives_a_resume() {
         runner.state.rebase_fixes.push(magi::run::RebaseFixRecord {
             agent: "mock".to_owned(),
             paths: vec!["note.txt".to_owned()],
+            from: None,
             finished: false,
             error: None,
         });

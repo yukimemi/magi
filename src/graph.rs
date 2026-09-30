@@ -3290,14 +3290,20 @@ impl Runner {
             // winner's worktree is told (`sync_to_head` below). A run that
             // died in between resumes here with `behind == 0` and a tree still
             // holding the pre-rebase files, which review and the gate would
-            // then read. Tracked changes against HEAD are that signature.
-            if !self.state.rebase_fixes.is_empty()
-                && git::git(
-                    &winner.worktree,
-                    &["status", "--porcelain", "--untracked-files=no"],
-                )
-                .await
-                .is_ok_and(|o| !o.trim().is_empty())
+            // then read. That state is exactly: HEAD moved off the tip the
+            // rebase started from, yet the tree is still identical to that
+            // tip. A tree with edits of its own differs from it, so nothing
+            // is thrown away.
+            if let Some(from) = self
+                .state
+                .rebase_fixes
+                .iter()
+                .rev()
+                .find_map(|r| r.from.clone())
+                && from != head
+                && git::git_raw(&winner.worktree, &["diff", "--quiet", &from])
+                    .await
+                    .is_ok_and(|o| o.ok())
             {
                 git::sync_to_head(&winner.worktree).await?;
             }

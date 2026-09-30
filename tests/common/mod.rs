@@ -189,6 +189,15 @@ if has "Your rebase stopped on a conflict"; then
     printf '{"addressed":[],"rejected":[],"notes":"aborted"}\n'
     exit 0
   fi
+  if [ -n "$MOCK_REBASE_FIX_SKIP" ]; then
+    n=0
+    while [ "$n" -lt 5 ] && [ -d "$(git rev-parse --git-path rebase-merge)" ]; do
+      git rebase --skip >/dev/null 2>&1 || true
+      n=$((n + 1))
+    done
+    printf '{"addressed":[],"rejected":[],"notes":"skipped"}\n'
+    exit 0
+  fi
   n=0
   while [ "$n" -lt 5 ]; do
     files=$(git diff --name-only --diff-filter=U)
