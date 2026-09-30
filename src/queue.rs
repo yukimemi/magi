@@ -1124,16 +1124,32 @@ impl Queue {
         if in_flight {
             bail!("task {resolved} is being run by a live daemon right now");
         }
-        // Attachments go first: if they cannot be removed the task record must
-        // survive, or the id no longer resolves and a retry is impossible.
+        // Neither step may strand the other. The attachments are set aside by a
+        // rename (cheap, and undone if the record cannot be removed), then the
+        // record goes, and only then is the set-aside directory deleted for
+        // real. A failure before the record is gone loses nothing; a failure
+        // after it leaves at most an orphan `.removing` directory.
         let attachments = self.attachments_dir(&resolved);
-        if let Err(e) = std::fs::remove_dir_all(&attachments) {
-            if e.kind() != std::io::ErrorKind::NotFound {
+        let aside = self.root.join(format!("{resolved}.attachments.removing"));
+        let moved = match std::fs::rename(&attachments, &aside) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
                 return Err(e).with_context(|| format!("remove {}", attachments.display()));
             }
-        }
+        };
         let path = self.path_of(&resolved);
-        std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        if let Err(e) = std::fs::remove_file(&path) {
+            if moved {
+                let _ = std::fs::rename(&aside, &attachments);
+            }
+            return Err(e).with_context(|| format!("remove {}", path.display()));
+        }
+        if moved {
+            if let Err(e) = std::fs::remove_dir_all(&aside) {
+                tracing::warn!("leftover attachments {}: {e}", aside.display());
+            }
+        }
         let lock = self.lock_path(&resolved);
         if let Err(e) = std::fs::remove_file(&lock) {
             if e.kind() != std::io::ErrorKind::NotFound {
