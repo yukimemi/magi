@@ -411,13 +411,13 @@ impl Notices {
 
     /// Mark every unread notice about `subject` read, recording `question` as
     /// the card that carries it. Best-effort per notice.
-    pub fn cover(&self, subject: &str, question: &str) {
+    pub fn cover(&self, question: &crate::ask::Question) {
         for n in self.all() {
-            if n.unread() && n.subjects.iter().any(|s| s == subject) {
+            if n.unread() && covers(question, &n) {
                 let _ = self.update(&n.id, |n| {
                     if n.unread() {
                         n.mark_read(Timestamp::now());
-                        n.covered_by = Some(question.to_owned());
+                        n.covered_by = Some(question.id.clone());
                     }
                 });
             }
@@ -644,9 +644,20 @@ pub fn raise(notice: Notice) {
 /// Exact match on `Question::run` (a task id for the conductor and triage, a
 /// run id for the graph); the land / release question is a to-do, not a
 /// duplicate, so it never covers anything.
+///
+/// Same subject is not the same cause: a question left open for something
+/// else must not swallow a later hold, so the two must also have happened
+/// within the cover window (`COVER_WINDOW_SECS`) of each other.
 pub fn covers(q: &crate::ask::Question, n: &Notice) -> bool {
-    q.status.open() && q.node != crate::bump::NOTICE_NODE && n.subjects.contains(&q.run)
+    q.status.open()
+        && q.node != crate::bump::NOTICE_NODE
+        && n.subjects.contains(&q.run)
+        && (q.asked_at.as_second() - n.last_at.as_second()).abs() <= COVER_WINDOW_SECS
 }
+
+/// How close in time a question and a notice about one subject must be to
+/// count as one event: the conductor files its question right after the hold.
+const COVER_WINDOW_SECS: i64 = 120;
 
 fn covering_question(home: &Path, n: &Notice) -> Option<String> {
     if n.subjects.is_empty() {
@@ -660,8 +671,8 @@ fn covering_question(home: &Path, n: &Notice) -> Option<String> {
 }
 
 /// A question was just filed for `run`: quiet the unread notices about it.
-pub fn quiet_for(home: &Path, run: &str, question: &str) {
-    Notices::at(home.join("notifications")).cover(run, question);
+pub fn quiet_for(home: &Path, question: &crate::ask::Question) {
+    Notices::at(home.join("notifications")).cover(question);
 }
 
 /// [`raise`] into an explicit magi home, for callers that already carry one
@@ -1050,5 +1061,35 @@ mod tests {
         assert!(!covers(&q, &Notice::warn("k", "m").about(["t"])));
         let release = ask(dir.path(), "t1", crate::bump::NOTICE_NODE);
         assert!(!covers(&release, &n));
+    }
+
+    #[test]
+    fn a_question_left_open_for_another_cause_does_not_swallow_a_later_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut old = crate::ask::Question::new(
+            "t1".to_owned(),
+            "conduct".to_owned(),
+            "conductor".to_owned(),
+            "something else".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        old.asked_at = Timestamp::from_second(Timestamp::now().as_second() - 3600).unwrap();
+        crate::ask::Questions::at(dir.path().join("questions"))
+            .put(&mut old)
+            .unwrap();
+        raise_in(dir.path(), Notice::warn("task:t1", "held").about(["t1"]));
+        assert_eq!(unread(dir.path()), 1);
+    }
+
+    #[test]
+    fn a_stale_unread_notice_is_not_quieted_by_a_new_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Notices::at(dir.path().join("notifications"));
+        let mut n = Notice::warn("task:t1", "held").about(["t1"]);
+        n.last_at = Timestamp::from_second(Timestamp::now().as_second() - 3600).unwrap();
+        s.raise(n).unwrap();
+        ask(dir.path(), "t1", "conduct");
+        assert_eq!(unread(dir.path()), 1);
     }
 }

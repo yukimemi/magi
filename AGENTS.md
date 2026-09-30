@@ -1271,7 +1271,8 @@ something to answer, so it does not reuse `ask::Questions`.
 
 - **One cause pages once.** A `Notice` carries `subjects` (the task / run ids it
   is about) and `covered_by`. When an open question whose `run` equals a
-  subject exists - at raise time (`notices::raise_in`) or is filed afterwards
+  subject exists and was asked within two minutes of the notice (same subject is
+  not same cause) - at raise time (`notices::raise_in`) or is filed afterwards
   (`Questions::put`, first write only, via `notices::quiet_for`) - the notice is
   still written, but already read and pointing at the question. Dedupe is
   expressed as read state, never as a tombstone, so a recurrence with a changed

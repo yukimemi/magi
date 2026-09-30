@@ -1118,7 +1118,7 @@ impl Questions {
             && q.node != crate::bump::NOTICE_NODE
             && let Some(home) = self.root.parent().filter(|p| !p.as_os_str().is_empty())
         {
-            crate::notices::quiet_for(home, &q.run, &q.id);
+            crate::notices::quiet_for(home, q);
         }
         Ok(())
     }
