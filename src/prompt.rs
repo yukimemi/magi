@@ -91,16 +91,17 @@ fn lang(language: &str) -> String {
 /// or recovery note follow `[graph] language`. Those strings are shown to the
 /// operator verbatim in the notification list, next to the daemon's own fixed
 /// wording (see `daemon::Phrases`), and `lang()` alone leaves it ambiguous
-/// whether JSON *values* are prose. Empty for English, so an English prompt is
-/// unchanged byte for byte.
+/// whether JSON *values* are prose. Stated for English too, so a task or
+/// earlier answer written in another language cannot pull the reason along.
 fn hold_reason_language(language: &str) -> String {
-    if is_english(language) {
-        return String::new();
-    }
+    let name = if is_english(language) {
+        "English"
+    } else {
+        language_name(language)
+    };
     format!(
         "\n\nThe `reason` of a `hold` and any `recovery` note are shown to the \
-         operator as they are: write them in {}.",
-        language_name(language)
+         operator as they are: write them in {name}."
     )
 }
 
@@ -2712,14 +2713,14 @@ mod tests {
     }
 
     #[test]
-    fn the_conduct_prompt_asks_for_hold_reasons_in_the_configured_language_only() {
+    fn the_conduct_prompt_asks_for_hold_reasons_in_the_configured_language() {
         let t = [conduct_task("t1")];
         let ja = conduct(&t, &[], &[], "ja");
         assert!(ja.contains("`reason` of a `hold`"), "{ja}");
         assert!(ja.contains("write them in Japanese"), "{ja}");
         for l in ["en", ""] {
             let en = conduct(&t, &[], &[], l);
-            assert!(!en.contains("`reason` of a `hold` and any"), "{en}");
+            assert!(en.contains("write them in English"), "{en}");
         }
     }
 

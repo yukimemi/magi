@@ -1213,9 +1213,11 @@ impl Queue {
                 continue;
             }
             let missing = missing_blockers(self, questions, &task.blocked_by);
-            task.hold_machine(Some(missing_blocker_hold_reason(
+            let language = crate::lang::of_repo(&task.repo);
+            task.hold_machine(Some(missing_blocker_hold_reason_in(
                 &task.blocked_by,
                 &missing,
+                &language,
             )));
             if self.put(&mut task).is_ok() {
                 quarantined.push(task.id.clone());
@@ -1526,11 +1528,28 @@ pub fn missing_blockers(
 /// in, so this text is the only place that information survives for an
 /// operator deciding whether to release the task outright.
 pub fn missing_blocker_hold_reason(blocked_by: &[String], missing: &[String]) -> String {
-    format!(
-        "blocked on {} but {} no longer exist(s) on disk - see `magi task triage`",
-        blocked_by.join(", "),
-        missing.join(", "),
-    )
+    missing_blocker_hold_reason_in(blocked_by, missing, "en")
+}
+
+/// [`missing_blocker_hold_reason`] in `language` (Japanese, else English).
+pub fn missing_blocker_hold_reason_in(
+    blocked_by: &[String],
+    missing: &[String],
+    language: &str,
+) -> String {
+    if crate::lang::is_japanese(language) {
+        format!(
+            "{} を待っていましたが、{} はディスク上に存在しません - `magi task triage` を参照",
+            blocked_by.join(", "),
+            missing.join(", "),
+        )
+    } else {
+        format!(
+            "blocked on {} but {} no longer exist(s) on disk - see `magi task triage`",
+            blocked_by.join(", "),
+            missing.join(", "),
+        )
+    }
 }
 
 fn short(id: &str) -> &str {
@@ -1545,6 +1564,16 @@ fn new_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_blocker_reason_follows_the_language() {
+        let b = vec!["a".to_owned()];
+        let en = missing_blocker_hold_reason_in(&b, &b, "en");
+        assert_eq!(en, missing_blocker_hold_reason(&b, &b));
+        assert!(en.starts_with("blocked on a"));
+        assert!(missing_blocker_hold_reason_in(&b, &b, "ja").contains("存在しません"));
+        assert_eq!(missing_blocker_hold_reason_in(&b, &b, "de"), en);
+    }
+
     use super::*;
 
     #[test]

@@ -28,14 +28,61 @@ pub fn enough_space(free: u64, min_free: u64) -> bool {
 /// starting a run on a disk that may already be full is the incident this
 /// whole module exists to prevent.
 pub fn gate(free: u64, min_free: u64) -> Option<String> {
+    gate_in(free, min_free, "en")
+}
+
+/// Prefix of [`gate_in`]'s reason, per language. [`is_gate_reason`] matches
+/// both, so translating the text cannot stop triage's auto-requeue.
+const SHORT_EN: &str = "not enough free space to start a run:";
+const SHORT_JA: &str = "run を開始するための空き容量が不足しています:";
+/// Prefix of the reason for a failed measurement, per language.
+pub const UNMEASURED_EN: &str = "could not measure free space on ";
+/// See [`UNMEASURED_EN`].
+pub const UNMEASURED_JA: &str = "空き容量を測定できませんでした: ";
+
+/// [`gate`], with the reason in `language` (`en`, or Japanese; anything else
+/// is English).
+pub fn gate_in(free: u64, min_free: u64, language: &str) -> Option<String> {
     if enough_space(free, min_free) {
         None
+    } else if crate::lang::is_japanese(language) {
+        Some(format!(
+            "{SHORT_JA} 空き {free} バイト、`[disk] min_free_bytes` の要求は {min_free} バイト"
+        ))
     } else {
         Some(format!(
-            "not enough free space to start a run: {free} bytes free, \
+            "{SHORT_EN} {free} bytes free, \
              {min_free} required by `[disk] min_free_bytes`"
         ))
     }
+}
+
+/// The reason for a measurement that failed, in `language`.
+pub fn unmeasured_in(
+    path: &std::path::Path,
+    err: &dyn std::fmt::Display,
+    language: &str,
+) -> String {
+    if crate::lang::is_japanese(language) {
+        format!(
+            "{UNMEASURED_JA}{} ({err}); ディスクゲートは測定できないまま run を開始させません",
+            path.display()
+        )
+    } else {
+        format!(
+            "{UNMEASURED_EN}{} ({err}); the disk gate refuses \
+             to let a run start blind",
+            path.display()
+        )
+    }
+}
+
+/// Is `reason` one of this module's disk-gate reasons, in either language?
+/// What triage reads back to decide a hold is disk pressure.
+pub fn is_gate_reason(reason: &str) -> bool {
+    [SHORT_EN, SHORT_JA, UNMEASURED_EN, UNMEASURED_JA]
+        .iter()
+        .any(|p| reason.starts_with(p))
 }
 
 /// Is `size` past `limit`? One comparison, shared by the janitor and the
@@ -438,6 +485,21 @@ fn strip_empty_dirs(dirs: &[(usize, PathBuf)]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gate_reasons_follow_the_language_and_stay_recognisable() {
+        let en = gate_in(1, 10, "en").unwrap();
+        let ja = gate_in(1, 10, "日本語").unwrap();
+        assert_eq!(gate_in(1, 10, "fr").unwrap(), en);
+        assert_eq!(en, gate(1, 10).unwrap());
+        assert!(ja.starts_with("run を開始"), "{ja}");
+        assert!(is_gate_reason(&en) && is_gate_reason(&ja));
+        let p = std::path::Path::new("/x");
+        let m_ja = unmeasured_in(p, &"boom", "ja");
+        assert!(m_ja.contains("測定できませんでした") && is_gate_reason(&m_ja));
+        assert!(is_gate_reason(&unmeasured_in(p, &"boom", "en")));
+        assert!(!is_gate_reason("something else"));
+    }
+
     use super::*;
     use std::fs;
 

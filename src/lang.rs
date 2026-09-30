@@ -15,6 +15,15 @@ pub fn is_japanese(language: &str) -> bool {
         || l.eq_ignore_ascii_case("日本語")
 }
 
+/// `[graph] language` of the repository at `repo`, read best-effort for
+/// callers with no run (and so no config of their own). An unreadable config
+/// is English: a hold reason must still get written.
+pub fn of_repo(repo: &std::path::Path) -> String {
+    crate::config::Config::discover(repo, None)
+        .map(|(c, _)| c.graph.language)
+        .unwrap_or_else(|_| "en".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

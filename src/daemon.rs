@@ -689,9 +689,11 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
         }
         let missing = crate::queue::missing_blockers(queue, questions, &task.blocked_by);
         if !missing.is_empty() {
-            task.hold_machine(Some(crate::queue::missing_blocker_hold_reason(
+            let language = language_of(&task, Path::new("."));
+            task.hold_machine(Some(crate::queue::missing_blocker_hold_reason_in(
                 &task.blocked_by,
                 &missing,
+                &language,
             )));
             record(queue, &mut task);
             continue;
@@ -835,7 +837,7 @@ const PHRASES_EN: Phrases = Phrases {
     quorum_lost: "the judging panel lost its quorum",
     quota_took_out: "; quota took out ",
     run_ended: "run ended ",
-    waiting_for_answer: "waiting for operator answer to question ",
+    waiting_for_answer: " - waiting for operator answer to question ",
     recovered_running: "recovered a `running` task whose daemon never recorded the outcome: ",
     no_run_to_recover: "task was `running` with no live daemon and no readable \
                         run to recover; held for a human to check what happened",
@@ -888,9 +890,7 @@ fn phrases(language: &str) -> &'static Phrases {
 /// paths that have no run (and so no config of their own) to ask. An unreadable
 /// config is English, not an error: a hold reason must still get written.
 fn language_of(task: &Task, fallback: &Path) -> String {
-    Config::discover(&repo_for(task, fallback), None)
-        .map(|(c, _)| c.graph.language)
-        .unwrap_or_else(|_| "en".to_owned())
+    crate::lang::of_repo(&repo_for(task, fallback))
 }
 
 /// The task an answered question speaks for: the one whose runs include the
@@ -3065,12 +3065,8 @@ fn disk_gate_with<F: Fn(&Path) -> Result<u64>>(
         return None;
     }
     match free_bytes(repo) {
-        Ok(free) => crate::disk::gate(free, min),
-        Err(e) => Some(format!(
-            "could not measure free space on {} ({e}); the disk gate refuses \
-             to let a run start blind",
-            repo.display()
-        )),
+        Ok(free) => crate::disk::gate_in(free, min, &config.graph.language),
+        Err(e) => Some(crate::disk::unmeasured_in(repo, &e, &config.graph.language)),
     }
 }
 
