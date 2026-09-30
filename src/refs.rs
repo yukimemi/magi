@@ -72,7 +72,7 @@ pub fn scan(text: &str) -> Vec<Token> {
         }
     };
     let mut word = String::new();
-    let flush = |word: &mut String, push: &mut dyn FnMut(Token)| {
+    let flush = |word: &mut String, hash: bool, push: &mut dyn FnMut(Token)| {
         let w = word.trim_matches(|c| matches!(c, '.' | '-' | '/' | '_'));
         if let Some(rest) = w.strip_prefix("magi/") {
             let parts: Vec<&str> = rest.split('/').collect();
@@ -82,7 +82,8 @@ pub fn scan(text: &str) -> Vec<Token> {
                     branch: true,
                 });
             }
-        } else if (7..=40).contains(&w.len())
+        } else if !hash
+            && (7..=40).contains(&w.len())
             && w.chars().all(|c| c.is_ascii_hexdigit())
             && w.chars().any(|c| c.is_ascii_digit())
         {
@@ -93,14 +94,21 @@ pub fn scan(text: &str) -> Vec<Token> {
         }
         word.clear();
     };
+    // `#deadbeef` is a colour (or an issue-style tag), not a commit.
+    let mut hash = false;
+    let mut prev = ' ';
     for c in text.chars() {
         if is_word(c) {
+            if word.is_empty() {
+                hash = prev == '#';
+            }
             word.push(c);
         } else {
-            flush(&mut word, &mut push);
+            flush(&mut word, hash, &mut push);
         }
+        prev = c;
     }
-    flush(&mut word, &mut push);
+    flush(&mut word, hash, &mut push);
     // Branch names first: a sha that is one of them is then the same
     // reference, and the name is the one worth keeping.
     out.sort_by_key(|t| !t.branch);
@@ -176,16 +184,31 @@ pub async fn resolve(repo: &Path, base_commit: &str, remote: &str, text: &str) -
 }
 
 async fn commit_for(repo: &Path, remote: &str, token: &Token) -> Option<String> {
-    if let Some(sha) = git::commit_of(repo, &token.text).await {
-        // `magi/x/A` must be a branch, not e.g. a tag or path-like revision.
-        if !token.branch || git::branch_exists(repo, &token.text).await.unwrap_or(false) {
-            return Some(sha);
-        }
-    }
     if token.branch {
-        return git::commit_of(repo, &format!("refs/remotes/{remote}/{}", token.text)).await;
+        // Best effort: a stale remote-tracking ref must not seed a run, and a
+        // branch that only exists locally makes this fail harmlessly.
+        let _ = git::fetch(repo, remote, &token.text).await;
     }
-    None
+    let local = match git::commit_of(repo, &token.text).await {
+        // `magi/x/A` must be a branch, not e.g. a tag or path-like revision.
+        Some(sha)
+            if !token.branch || git::branch_exists(repo, &token.text).await.unwrap_or(false) =>
+        {
+            Some(sha)
+        }
+        _ => None,
+    };
+    if !token.branch {
+        return local;
+    }
+    let tracked = git::commit_of(repo, &format!("refs/remotes/{remote}/{}", token.text)).await;
+    match (local, tracked) {
+        // The remote has moved on from the local branch: the newer tip is the
+        // work the task means.
+        (Some(l), Some(t)) if l != t && git::is_ancestor(repo, &l, &t).await => Some(t),
+        (Some(l), _) => Some(l),
+        (None, t) => t,
+    }
 }
 
 /// Where the candidates start and what is applied on top.
@@ -200,22 +223,14 @@ pub struct Plan {
 /// Turn resolved seeds into a starting point. Unmerged branches must form a
 /// single line of history (each one contained in the next); two that diverge
 /// cannot both be the start and guessing which the task meant is refused.
-/// Unmerged bare shas already contained in the start are not picked twice.
+/// Unmerged bare shas already contained in the start are not picked twice,
+/// and are ordered oldest first whatever order the task listed them in.
+///
+/// An unresolved reference does not refuse the task: a hex word or a
+/// `magi/...` path in prose is often not a reference at all. It stays in the
+/// facts the candidates read, and a candidate that ends up empty is refused at
+/// merge time.
 pub async fn plan(repo: &Path, seeds: &[Seed]) -> anyhow::Result<Plan> {
-    // A reference that cannot be resolved must not quietly become a start
-    // from the base alone: that is the empty tree this module exists to stop.
-    let unresolved: Vec<String> = seeds
-        .iter()
-        .filter(|s| s.kind == SeedKind::Unresolved)
-        .map(|s| format!("{} ({})", s.token, s.detail))
-        .collect();
-    if !unresolved.is_empty() {
-        anyhow::bail!(
-            "the task refers to work magi cannot resolve: {}; fix or remove the \
-             reference rather than start from the base with nothing to build on",
-            unresolved.join("; ")
-        );
-    }
     let mut start: Option<&Seed> = None;
     for s in seeds
         .iter()
@@ -247,7 +262,19 @@ pub async fn plan(repo: &Path, seeds: &[Seed]) -> anyhow::Result<Plan> {
         {
             continue;
         }
-        picks.push(s.sha.clone());
+        if picks.contains(&s.sha) {
+            continue;
+        }
+        // Insert before the first pick this one is an ancestor of, so
+        // dependent commits apply in history order.
+        let mut at = picks.len();
+        for (i, p) in picks.iter().enumerate() {
+            if git::ancestry(repo, &s.sha, p).await? {
+                at = i;
+                break;
+            }
+        }
+        picks.insert(at, s.sha.clone());
     }
     Ok(Plan {
         start: start.map(|s| s.sha.clone()),
@@ -307,6 +334,11 @@ mod tests {
         let texts: Vec<&str> = t.iter().map(|t| t.text.as_str()).collect();
         assert_eq!(texts, vec!["magi/27b2/A", "dc2e888"]);
         assert!(t[0].branch && !t[1].branch);
+    }
+
+    #[test]
+    fn scan_ignores_hex_colours() {
+        assert!(scan("Change the color to #deadbeef and #0a1b2c3d").is_empty());
     }
 
     #[test]
@@ -423,8 +455,7 @@ mod tests {
         );
         assert!(!seeds[1].branch);
 
-        assert!(plan(&repo, &seeds).await.is_err(), "unresolved refuses");
-        let plan = plan(&repo, &seeds[1..]).await.unwrap();
+        let plan = plan(&repo, &seeds).await.unwrap();
         assert_eq!(plan.start, None);
         assert_eq!(plan.picks, vec![fix.clone()]);
 
