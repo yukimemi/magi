@@ -673,7 +673,22 @@ pub async fn cherry(repo: &Path, upstream: &str, head: &str) -> Result<(Vec<Stri
     Ok((unmatched, matched))
 }
 
-/// Rebase a branch onto `onto`, inside a throwaway worktree.
+/// How [`rebase_start`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebaseStart {
+    /// It applied; the branch points at the rebased commits and the throwaway
+    /// worktree is gone.
+    Applied,
+    /// It stopped on a conflict and the throwaway worktree was **kept**
+    /// mid-rebase, for someone to resolve. Carries what git said.
+    Conflicted(String),
+    /// It failed without leaving a rebase in progress; the worktree is gone
+    /// and the branch is untouched. Carries what git said.
+    Failed(String),
+}
+
+/// Start rebasing `branch` onto `onto` inside a throwaway worktree, and leave
+/// a conflict standing.
 ///
 /// A worktree of its own for two reasons. The repository magi runs in may be
 /// jj-colocated, where git `HEAD` is detached and a rebase in the primary
@@ -681,15 +696,17 @@ pub async fn cherry(repo: &Path, upstream: &str, head: &str) -> Result<(Vec<Stri
 /// leaves state behind, which is far easier to discard with the whole
 /// directory than to unpick in a tree somebody is using.
 ///
-/// `Ok(None)` means it applied and the branch now points at the rebased
-/// commits. `Ok(Some(why))` means it did not: the branch is untouched, and
-/// the string is what git said - a person has to decide.
-pub async fn rebase_branch_in_temp(
+/// Unlike [`rebase_branch_in_temp`] this does not abort on a conflict: the
+/// caller decides whether to hand the conflicted tree to a fixer or to call
+/// [`rebase_abort`]. Any leftover at `scratch` from an earlier attempt is
+/// removed first, so callers re-entering a rebase already in progress must
+/// check [`rebase_in_progress`] before calling this.
+pub async fn rebase_start(
     repo: &Path,
     scratch: &Path,
     branch: &str,
     onto: &str,
-) -> Result<Option<String>> {
+) -> Result<RebaseStart> {
     // Removed first so a leftover from an interrupted attempt cannot make
     // `worktree add` fail on a path that already exists.
     worktree_remove(repo, scratch).await.ok();
@@ -708,17 +725,78 @@ pub async fn rebase_branch_in_temp(
     let out = git_raw(scratch, &["rebase", onto]).await?;
     if out.ok() {
         worktree_remove(repo, scratch).await.ok();
-        return Ok(None);
+        return Ok(RebaseStart::Applied);
     }
-    // Leave nothing half-rebased behind: abort, then drop the tree entirely.
-    git_raw(scratch, &["rebase", "--abort"]).await.ok();
     let why = if out.stderr.trim().is_empty() {
         out.stdout.trim().to_owned()
     } else {
         out.stderr.trim().to_owned()
     };
+    if rebase_in_progress(scratch).await {
+        return Ok(RebaseStart::Conflicted(why));
+    }
     worktree_remove(repo, scratch).await.ok();
-    Ok(Some(why))
+    Ok(RebaseStart::Failed(why))
+}
+
+/// Is a rebase (merge or apply backend) in progress in `worktree`?
+pub async fn rebase_in_progress(worktree: &Path) -> bool {
+    for name in ["rebase-merge", "rebase-apply"] {
+        let Ok(p) = git(worktree, &["rev-parse", "--git-path", name]).await else {
+            continue;
+        };
+        let p = Path::new(p.trim());
+        let full = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            worktree.join(p)
+        };
+        if full.exists() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Paths git reports as unmerged in `worktree`.
+pub async fn unmerged_paths(worktree: &Path) -> Result<Vec<String>> {
+    let out = git(worktree, &["diff", "--name-only", "--diff-filter=U"]).await?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Abandon a rebase left standing by [`rebase_start`] and drop its worktree.
+/// The branch is exactly where it was before the rebase began.
+pub async fn rebase_abort(repo: &Path, scratch: &Path) {
+    git_raw(scratch, &["rebase", "--abort"]).await.ok();
+    worktree_remove(repo, scratch).await.ok();
+}
+
+/// Rebase a branch onto `onto`, inside a throwaway worktree.
+///
+/// `Ok(None)` means it applied and the branch now points at the rebased
+/// commits. `Ok(Some(why))` means it did not: the branch is untouched, and
+/// the string is what git said - a person has to decide. Nothing half-rebased
+/// is left behind; see [`rebase_start`] for the variant that keeps a conflict
+/// standing.
+pub async fn rebase_branch_in_temp(
+    repo: &Path,
+    scratch: &Path,
+    branch: &str,
+    onto: &str,
+) -> Result<Option<String>> {
+    match rebase_start(repo, scratch, branch, onto).await? {
+        RebaseStart::Applied => Ok(None),
+        RebaseStart::Failed(why) => Ok(Some(why)),
+        RebaseStart::Conflicted(why) => {
+            rebase_abort(repo, scratch).await;
+            Ok(Some(why))
+        }
+    }
 }
 
 /// Bring an *attached* worktree's index and files in line with wherever its

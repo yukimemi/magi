@@ -42,6 +42,7 @@ pub mod notices;
 pub mod proc;
 pub mod prompt;
 pub mod queue;
+pub mod rebase;
 pub mod reconcile;
 pub mod refs;
 pub mod report;

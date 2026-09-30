@@ -3231,20 +3231,30 @@ impl Runner {
     /// one day as a green run whose merge would have reverted a file another
     /// pull request had already landed.
     ///
-    /// Reuses [`git::rebase_branch_in_temp`] rather than a second
-    /// implementation of the same idea: `land::Step::Rebase` already worked
-    /// out the rules - throwaway worktree, conflict stops and reports rather
-    /// than feeding a fixer, nothing runs in the primary tree - and a second
-    /// rebase path is exactly the kind of drift `resolve_base`'s own doc
-    /// warns about ("two answers to a question nobody notices until a diff is
-    /// wrong").
+    /// Reuses [`crate::rebase::rebase_with_fixer`], the same routine
+    /// `land::Step::Rebase` calls, rather than a second implementation of the
+    /// same idea: a throwaway worktree, nothing runs in the primary tree, and
+    /// a second rebase path is exactly the kind of drift `resolve_base`'s own
+    /// doc warns about ("two answers to a question nobody notices until a
+    /// diff is wrong").
     ///
-    /// Bounded by [`BASE_SYNC_ROUNDS`], counted in `state.base_sync.attempts`
-    /// so it survives a park/resume. A conflict or a push failure sets
-    /// `state.base_sync.conflict` and leaves the branch and worktree exactly
-    /// as they were - untouched, for a person to look at - which is also what
-    /// makes re-entering this function afterwards a no-op instead of a second
-    /// attempt at the same wall.
+    /// A conflict is not the end of the road: the standing rebase is handed
+    /// to the fixer seat, at most `graph.review_rounds` times, counted in
+    /// `state.rebase_fixes` (so it survives a park/resume and is shared with
+    /// land). Once it finishes, review and the gate run as usual on the
+    /// rebased tree, which is where a breakage the new base caused is caught
+    /// by the ordinary gate-fix round. magi resolves nothing itself.
+    ///
+    /// Two different bounds, easy to confuse: [`BASE_SYNC_ROUNDS`], counted in
+    /// `state.base_sync.attempts`, is how many times the base is *rebased
+    /// onto* (a base that keeps moving); `rebase_fixes` is how many times a
+    /// *conflict* was given to a fixer. When the fixer cannot finish the
+    /// rebase the branch is restored, `state.base_sync.conflict` is set with
+    /// what was tried (rounds spent, paths still conflicted) and the branch
+    /// and worktree stay exactly as they were - untouched, for a person to
+    /// look at - which is also what makes re-entering this function
+    /// afterwards a no-op instead of a second attempt at the same wall. A
+    /// push failure ends the same way.
     async fn sync_to_base(&mut self) -> Result<()> {
         if self
             .state
@@ -3276,6 +3286,27 @@ impl Runner {
         let attempts = self.state.base_sync.as_ref().map_or(0, |s| s.attempts);
 
         if behind == 0 {
+            // A fixer-finished rebase moves the branch ref before the
+            // winner's worktree is told (`sync_to_head` below). A run that
+            // died in between resumes here with `behind == 0` and a tree still
+            // holding the pre-rebase files, which review and the gate would
+            // then read. That state is exactly: HEAD moved off the tip the
+            // rebase started from, yet the tree is still identical to that
+            // tip. A tree with edits of its own differs from it, so nothing
+            // is thrown away.
+            if let Some(from) = self
+                .state
+                .rebase_fixes
+                .iter()
+                .rev()
+                .find_map(|r| r.from.clone())
+                && from != head
+                && git::git_raw(&winner.worktree, &["diff", "--quiet", &from])
+                    .await
+                    .is_ok_and(|o| o.ok())
+            {
+                git::sync_to_head(&winner.worktree).await?;
+            }
             self.state.base_sync = Some(BaseSync {
                 tip,
                 behind: 0,
@@ -3353,7 +3384,18 @@ impl Runner {
         }
 
         let scratch = self.state.dir().join("base-sync");
-        let rebased = git::rebase_branch_in_temp(&repo, &scratch, &winner.branch, &tracking).await;
+        let rebased = match crate::rebase::rebase_with_fixer(
+            &mut self.state,
+            &scratch,
+            &winner.branch,
+            &tracking,
+        )
+        .await
+        {
+            Ok(crate::rebase::Rebased::Applied) => Ok(None),
+            Ok(crate::rebase::Rebased::Stopped(why)) => Ok(Some(why)),
+            Err(e) => Err(e),
+        };
         let attempts = attempts + 1;
         match rebased {
             Ok(None) => {

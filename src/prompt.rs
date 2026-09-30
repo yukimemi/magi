@@ -1114,6 +1114,107 @@ pub fn gate_fix(
     s
 }
 
+/// What the fixer is told when a rebase of the winning branch stopped on a
+/// conflict.
+///
+/// The heading phrase `Your rebase stopped on a conflict` is load-bearing:
+/// `tests/common/mod.rs` dispatches its mock on it.
+///
+/// `worktree` is spelled out as an absolute path because the seat's
+/// conversation may remember the branch's own worktree, and the resolution has
+/// to happen here, mid-rebase, not there.
+pub struct RebaseConflict<'a> {
+    /// The task statement the branch implements.
+    pub instruction: &'a str,
+    /// Absolute path of the throwaway worktree holding the standing rebase.
+    pub worktree: &'a std::path::Path,
+    /// Branch being rebased.
+    pub branch: &'a str,
+    /// Ref it is rebased onto.
+    pub onto: &'a str,
+    /// Paths git reports unmerged.
+    pub paths: &'a [String],
+    /// Subjects of the branch's own commits being replayed.
+    pub branch_subjects: &'a [String],
+    /// Subjects of the commits the base gained.
+    pub onto_subjects: &'a [String],
+    /// The conflicted regions, markers included.
+    pub hunks: &'a str,
+    /// This conflict round, 1-based.
+    pub round: usize,
+    /// The round budget.
+    pub cap: usize,
+    /// Reply language.
+    pub language: &'a str,
+}
+
+/// See [`RebaseConflict`].
+pub fn rebase_conflict(c: &RebaseConflict<'_>) -> String {
+    let (branch, onto, round, cap) = (c.branch, c.onto, c.round, c.cap);
+    let mut s = format!(
+        "Your rebase stopped on a conflict. Conflict round {round} of {cap}.\n\n\
+         `{branch}` is being rebased onto `{onto}` in the throwaway worktree \
+         `{}`. The rebase is stopped part-way with unresolved conflicts. Work \
+         **only in that directory**; do not touch any other worktree of this \
+         repository.\n\n\
+         # The task the branch implements\n\n{}\n\n\
+         # Conflicted paths\n\n",
+        c.worktree.display(),
+        c.instruction
+    );
+    for p in c.paths {
+        let _ = writeln!(s, "- `{p}`");
+    }
+    let list = |title: String, subjects: &[String]| {
+        let mut b = format!("\n# {title}\n\n");
+        if subjects.is_empty() {
+            b.push_str("(none)\n");
+        }
+        for l in subjects {
+            let _ = writeln!(b, "- {l}");
+        }
+        b
+    };
+    s.push_str(&list(
+        format!("Commits on `{branch}` being replayed (the intent to keep)"),
+        c.branch_subjects,
+    ));
+    s.push_str(&list(
+        format!("Commits `{onto}` gained meanwhile (already landed; keep them)"),
+        c.onto_subjects,
+    ));
+    let _ = write!(s, "\n# Conflict markers\n\n```\n{}\n```\n", c.hunks.trim());
+    s.push_str(
+        "\n# Rules\n\n\
+         1. Resolve every conflict in the working tree, keeping the intent of \
+            the branch **and** what the base gained. Keeping both sides is \
+            often right; pick one side only when the other is truly \
+            superseded.\n\
+         2. Stage the resolved files with `git add`, then complete the rebase \
+            with `GIT_EDITOR=true git rebase --continue`. If git stops again on \
+            the next commit, resolve that too and continue until the rebase \
+            has finished.\n\
+         3. Do not run `git rebase --abort` or `--skip`, do not reset or move \
+            the branch, and do not push. Leave no conflict markers behind.\n\
+         4. Aim for a tree that builds and passes the project's checks against \
+            the new base; if the base added a rule the branch's code now \
+            violates, fix that too.\n\
+         5. Never name yourself, your vendor, or your model, anywhere.\n\
+         6. If you start something in the background (a test run, a build), do \
+            not end your reply while it is still pending.\n\n\
+         # Output\n\n\
+         Your reasoning first, then exactly one fenced json block, last:\n\n\
+         ```json\n\
+         {\"addressed\":[],\"rejected\":[],\"notes\":\"how each conflict was resolved\"}\n\
+         ```",
+    );
+    s.push('\n');
+    s.push_str(&ask_the_owner(c.language));
+    s.push_str(&lang(c.language));
+    s.push_str(&github_english(c.language));
+    s
+}
+
 /// Prompt for a targeted, operator-triggered fix: specific, already-recorded
 /// findings routed to a fixer outside the normal review round sequence.
 ///

@@ -2024,7 +2024,13 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                 git::fetch(&repo, "origin", &base).await.ok();
                 let scratch = state.dir().join("rebase");
                 let onto = format!("origin/{base}");
-                match git::rebase_branch_in_temp(&repo, &scratch, &branch, &onto).await {
+                let rebased =
+                    match crate::rebase::rebase_with_fixer(state, &scratch, &branch, &onto).await {
+                        Ok(crate::rebase::Rebased::Applied) => Ok(None),
+                        Ok(crate::rebase::Rebased::Stopped(why)) => Ok(Some(why)),
+                        Err(e) => Err(e),
+                    };
+                match rebased {
                     Ok(None) => {
                         let pushed = {
                             let merge_lock = repo_merge_lock(&repo);
@@ -2046,7 +2052,8 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                         waited = Duration::ZERO;
                         tokio::time::sleep(POLL).await;
                     }
-                    // A conflict is a decision, not a chore.
+                    // The fixer's rounds are spent (or it could not finish):
+                    // that is a decision for a person.
                     Ok(Some(conflict)) => {
                         let why = format!(
                             "{} conflicts with {base} and the rebase did not apply: {}",
@@ -2293,7 +2300,7 @@ async fn fix_round(
 }
 
 /// Fetch or create a seat, keeping its conversation across nodes.
-fn seat_of(state: &mut RunState, key: &str, agent: &str) -> SeatState {
+pub(crate) fn seat_of(state: &mut RunState, key: &str, agent: &str) -> SeatState {
     if let Some(existing) = state.seats.get(key)
         && existing.agent == agent
     {

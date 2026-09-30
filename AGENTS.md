@@ -768,8 +768,22 @@ spends none of it, since the change is not what is wrong. The rebase happens
 in a throwaway worktree - this repository is jj-colocated, so a rebase in the
 primary tree would move a detached `HEAD` under the operator - and pushes with
 `--force-with-lease`, so a person's push to the same branch fails the step
-instead of being lost. A rebase that conflicts stops and reports what git
-said: that is judgement, and it belongs to a person.
+instead of being lost. A rebase that conflicts is handed to the fixer seat
+(`rebase::rebase_with_fixer`, shared by `graph::Runner::sync_to_base` and
+land): the conflict is left standing in the throwaway worktree and the agent
+resolves it and runs `git rebase --continue`. magi never resolves a conflict
+itself. The budget is `graph.review_rounds`, counted in
+`RunState::rebase_fixes` and saved *before* each call (so a park or crash
+cannot hand a round back), shared by both callers, and touching neither the
+task's attempts nor land's own rebase budget. A round is judged by what git
+says - rebase no longer in progress, nothing unmerged, no markers left in a
+path that conflicted, the base an ancestor of the result - never by the
+fixer's report; whether the tree builds is left to the review and gate that
+follow. When the rounds are spent, the fixer hit its quota, or it could not
+finish, the branch ref is restored, the worktree removed and the old
+behaviour applies: `base_sync.conflict` (or land's `stop`) carries what was
+tried - rounds spent and the paths still conflicted - for the conductor to
+quote, and a person decides.
 
 **A pull request is a hand-off, not a failure.** `settle` takes `left_pr`, and
 a `Blocked` run that opened one holds its task instead of requeueing it. Run
