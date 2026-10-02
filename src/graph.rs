@@ -5675,11 +5675,11 @@ impl Runner {
                 if bump::should_release_bump(self.state.status)
                     && let Err(e) = bump::after_merge(&mut self.state, &pr.url).await
                 {
-                    // Deliberately only an event: most `Err`s here mean the
-                    // bump did not apply (no `Cargo.toml`, no agent
-                    // installed, an unusable decision), not that a release
-                    // PR is stranded. `after_merge` raises its own notice
-                    // once a PR exists and needs a human.
+                    // The event is the run's own record. Not-eligible cases
+                    // (disabled, no `Cargo.toml`, ...) return `Ok`, so an
+                    // `Err` is a bump that was tried and failed:
+                    // `after_merge` itself raises the operator notice for
+                    // that, whether or not a release PR exists yet.
                     self.state
                         .event("bump", format!("release bump skipped: {e:#}"));
                 }
