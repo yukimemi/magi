@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, Invocation, SeatState};
@@ -1229,16 +1229,23 @@ async fn after_merge_at(state: &mut RunState, pr_url: &str, home: Option<&Path>)
         .to_string();
     let branch = format!("chore/release-v{next}");
     let worktree = state.dir().join("bump");
-    git::worktree_remove(&repo, &worktree).await.ok();
-    git::worktree_add_branch(&repo, &worktree, &branch, &format!("{remote}/{base}"))
-        .await
-        .context("create the release-bump worktree")?;
-    let opened = open_bump_pr(state, &worktree, &branch, &next, &decision, pr_url).await;
-    // Throwaway either way: nothing downstream reads this worktree, and a
-    // release worktree left behind after a failed attempt would collide with
-    // the next one this same run tries.
-    git::worktree_remove(&repo, &worktree).await.ok();
-    let (pr_url_opened, outcome) = opened?;
+    let (shared, branch_ref, next_ref, decision_ref) = (&*state, &branch, &next, &decision);
+    let (pr_url_opened, outcome) =
+        release_attempt(
+            &repo,
+            &remote,
+            &base,
+            &worktree,
+            &branch,
+            |head| {
+                let repo = repo.clone();
+                async move { gh_open_pr_for_head(&repo, &head).await }
+            },
+            |wt| async move {
+                open_bump_pr(shared, &wt, branch_ref, next_ref, decision_ref, pr_url).await
+            },
+        )
+        .await?;
     let (automerge_warning, merged_detail) = match outcome {
         AutomergeOutcome::Enabled => (None, None),
         AutomergeOutcome::MergedDirectly { detail } => (None, Some(detail)),
@@ -1585,6 +1592,190 @@ async fn escalate_pending(
                 pending.pr_url
             ),
         );
+    }
+    Ok(())
+}
+
+/// Does an open pull request have `branch` as its head? Any head repository
+/// counts: the question is only whether the branch name is spoken for.
+async fn gh_open_pr_for_head(repo: &Path, branch: &str) -> Result<bool> {
+    let out = tokio::process::Command::new("gh")
+        .args([
+            "pr", "list", "--head", branch, "--state", "open", "--json", "url",
+        ])
+        .current_dir(repo)
+        .quiet()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("spawn gh pr list")?;
+    if !out.status.success() {
+        bail!(
+            "gh pr list --head {branch}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let prs: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout)
+        .with_context(|| format!("parse the pull requests headed by {branch}"))?;
+    Ok(!prs.is_empty())
+}
+
+/// Create the release branch and worktree, run `fill` in it, and leave nothing
+/// behind unless a pull request came out of it.
+///
+/// A leftover `chore/release-vX.Y.Z` from an earlier failed attempt is
+/// inspected rather than fatal ([`reclaim_stale_branch`]), once per attempt. A
+/// failure of `fill` - or of creating the worktree - removes the worktree and
+/// the branch this attempt made, except a branch that reached the remote,
+/// which is kept and said so in the returned error.
+async fn release_attempt<T, F, Fut, P, PFut>(
+    repo: &Path,
+    remote: &str,
+    base: &str,
+    worktree: &Path,
+    branch: &str,
+    open_pr: P,
+    fill: F,
+) -> Result<T>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+    P: Fn(String) -> PFut,
+    PFut: std::future::Future<Output = Result<bool>>,
+{
+    let start = format!("{remote}/{base}");
+    git::worktree_remove(repo, worktree).await.ok();
+    let mut retried = false;
+    if git::branch_exists(repo, branch).await? {
+        reclaim_stale_branch(repo, remote, &start, branch, &open_pr).await?;
+        retried = true;
+    }
+    loop {
+        // Two steps instead of `worktree add -b`, so that who made the branch
+        // is known from which step failed rather than guessed from git's
+        // wording or the branch's tip: `git branch` creates the ref atomically
+        // or fails, and only a branch it created is this attempt's.
+        if let Err(e) = git::git(repo, &["branch", branch, &start]).await {
+            let e = e.context("create the release branch");
+            if !git::branch_exists(repo, branch).await.unwrap_or(false) {
+                return Err(e);
+            }
+            // It appeared since the check above: somebody else's.
+            if retried {
+                return Err(anyhow!(
+                    "{e:#}; left {branch} in place: it is not one this attempt created"
+                ));
+            }
+            retried = true;
+            if let Err(r) = reclaim_stale_branch(repo, remote, &start, branch, &open_pr).await {
+                return Err(anyhow!("{r:#} (after: {e:#})"));
+            }
+            continue;
+        }
+        if let Some(parent) = worktree.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        let path = worktree.to_string_lossy();
+        if let Err(e) = git::git(repo, &["worktree", "add", &path, branch]).await {
+            let e = e.context("create the release-bump worktree");
+            return Err(discard_attempt(repo, remote, worktree, branch, e).await);
+        }
+        break;
+    }
+    match fill(worktree.to_path_buf()).await {
+        Ok(v) => {
+            // The branch lives on in the pull request; the worktree is
+            // throwaway and a stale one would collide with the next attempt.
+            git::worktree_remove(repo, worktree).await.ok();
+            Ok(v)
+        }
+        Err(e) => Err(discard_attempt(repo, remote, worktree, branch, e).await),
+    }
+}
+
+/// Undo what a failed attempt created and fold the outcome into its error.
+async fn discard_attempt(
+    repo: &Path,
+    remote: &str,
+    worktree: &Path,
+    branch: &str,
+    cause: anyhow::Error,
+) -> anyhow::Error {
+    git::worktree_remove(repo, worktree).await.ok();
+    if !git::branch_exists(repo, branch).await.unwrap_or(false) {
+        return cause;
+    }
+    // The remote's own answer decides, not whether a push was attempted: a
+    // push that failed half way may still have landed the ref.
+    let note = match git::remote_has_branch(repo, remote, branch).await {
+        Ok(false) => match git::branch_delete(repo, branch).await {
+            Ok(true) => return cause,
+            _ => format!("could not delete the local branch {branch}"),
+        },
+        Ok(true) => format!("left {branch} in place: it was pushed to {remote}"),
+        Err(e) => format!(
+            "left {branch} in place: could not tell whether it was pushed to {remote} ({e:#})"
+        ),
+    };
+    anyhow!("{cause:#}; {note}")
+}
+
+/// A branch of the release's name already exists. Delete it so the attempt can
+/// go on if and only if it holds nothing: not on the remote, no open pull
+/// request, and no commit that `start` (`<remote>/<base>`) lacks. Anything
+/// unproven fails closed with a reason that names the branch.
+async fn reclaim_stale_branch<P, PFut>(
+    repo: &Path,
+    remote: &str,
+    start: &str,
+    branch: &str,
+    open_pr: &P,
+) -> Result<()>
+where
+    P: Fn(String) -> PFut,
+    PFut: std::future::Future<Output = Result<bool>>,
+{
+    match git::remote_has_branch(repo, remote, branch).await {
+        Ok(false) => {}
+        Ok(true) => bail!("the branch {branch} already exists and is on {remote}; left alone"),
+        Err(e) => bail!(
+            "the branch {branch} already exists and could not check whether {remote} has it              ({e:#}); left alone"
+        ),
+    }
+    match open_pr(branch.to_string()).await {
+        Ok(false) => {}
+        Ok(true) => {
+            bail!("the branch {branch} already exists and has an open pull request; left alone")
+        }
+        Err(e) => bail!(
+            "the branch {branch} already exists and could not check for an open pull request \
+             ({e:#}); left alone"
+        ),
+    }
+    match git::commits_ahead(repo, start, branch).await {
+        Ok(0) => {}
+        Ok(n) => bail!(
+            "the branch {branch} already exists with {n} commit(s) not in {start}; left alone"
+        ),
+        Err(e) => bail!(
+            "the branch {branch} already exists and could not compare it with {start} ({e:#}); \
+             left alone"
+        ),
+    }
+    if let Some(held) = git::worktree_holding(repo, branch).await? {
+        let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => a == b,
+        };
+        if same(&held, repo) {
+            bail!(
+                "the branch {branch} already exists and is checked out in the main checkout; left alone"
+            );
+        }
+        git::worktree_remove(repo, &held).await.ok();
+    }
+    if !git::branch_delete(repo, branch).await? {
+        bail!("the branch {branch} already exists and could not be deleted; left alone");
     }
     Ok(())
 }
@@ -1985,6 +2176,175 @@ mod tests {
             .unwrap();
         git::git(&repo, &["push", "origin", "main"]).await.unwrap();
         (dir, repo)
+    }
+
+    async fn no_pr(_: String) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// `origin_with` plus a branch `b` made from `main`, optionally one commit
+    /// ahead of it.
+    async fn with_branch(ahead: bool) -> (tempfile::TempDir, PathBuf) {
+        let (d, repo) = origin_with(&[("f", "x\n")]).await;
+        git::git(&repo, &["branch", "b"]).await.unwrap();
+        if ahead {
+            git::git(&repo, &["checkout", "-q", "b"]).await.unwrap();
+            git::git(&repo, &["commit", "--allow-empty", "-m", "wip"])
+                .await
+                .unwrap();
+            git::git(&repo, &["checkout", "-q", "main"]).await.unwrap();
+        }
+        (d, repo)
+    }
+
+    async fn attempt(repo: &Path, open_pr: bool, fail_after_push: Option<bool>) -> Result<()> {
+        let wt = repo.parent().unwrap().join("bump");
+        release_attempt(
+            repo,
+            "origin",
+            "main",
+            &wt,
+            "b",
+            |_| async move { Ok(open_pr) },
+            |w| async move {
+                if fail_after_push == Some(true) {
+                    git::push(&w, "origin", "b").await?;
+                }
+                if fail_after_push.is_some() {
+                    bail!("cargo build failed");
+                }
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_stale_ancestor_branch_is_deleted_and_the_attempt_proceeds() {
+        let (_d, repo) = with_branch(false).await;
+        attempt(&repo, false, None).await.unwrap();
+        // Success keeps the branch (it backs the pull request).
+        assert!(git::branch_exists(&repo, "b").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_stale_branch_holding_a_leftover_worktree_is_reclaimed() {
+        let (_d, repo) = with_branch(false).await;
+        let old = repo.parent().unwrap().join("old");
+        git::git(&repo, &["worktree", "add", &old.to_string_lossy(), "b"])
+            .await
+            .unwrap();
+        attempt(&repo, false, None).await.unwrap();
+        assert!(!old.exists());
+    }
+
+    #[tokio::test]
+    async fn a_stale_branch_with_an_unmerged_commit_is_kept_with_a_reason() {
+        let (_d, repo) = with_branch(true).await;
+        let e = attempt(&repo, false, None).await.unwrap_err().to_string();
+        assert!(e.contains("`b`") || e.contains("branch b"), "{e}");
+        assert!(e.contains("1 commit(s) not in origin/main"), "{e}");
+        assert!(git::branch_exists(&repo, "b").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_stale_branch_on_the_remote_is_kept() {
+        let (_d, repo) = with_branch(false).await;
+        git::git(&repo, &["push", "origin", "b"]).await.unwrap();
+        let e = attempt(&repo, false, None).await.unwrap_err().to_string();
+        assert!(e.contains("branch b") && e.contains("is on origin"), "{e}");
+        assert!(git::branch_exists(&repo, "b").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_stale_branch_with_an_open_pull_request_is_kept() {
+        let (_d, repo) = with_branch(false).await;
+        let e = attempt(&repo, true, None).await.unwrap_err().to_string();
+        assert!(e.contains("open pull request"), "{e}");
+        assert!(git::branch_exists(&repo, "b").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_unanswerable_pull_request_check_keeps_the_branch() {
+        let (_d, repo) = with_branch(false).await;
+        let wt = repo.parent().unwrap().join("bump");
+        let e = release_attempt(
+            &repo,
+            "origin",
+            "main",
+            &wt,
+            "b",
+            |_| async { bail!("offline") },
+            |_| async { Ok(()) },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("could not check for an open pull request"),
+            "{e}"
+        );
+        assert!(git::branch_exists(&repo, "b").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_removes_its_own_worktree_and_branch() {
+        let (_d, repo) = origin_with(&[("f", "x\n")]).await;
+        let wt = repo.parent().unwrap().join("bump");
+        let e = attempt(&repo, false, Some(false)).await.unwrap_err();
+        assert!(format!("{e:#}").contains("cargo build failed"));
+        assert!(!wt.exists());
+        assert!(!git::branch_exists(&repo, "b").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_pushed_branch_survives_a_failed_attempt_and_the_reason_says_so() {
+        let (_d, repo) = origin_with(&[("f", "x\n")]).await;
+        let e = attempt(&repo, false, Some(true)).await.unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("cargo build failed") && e.contains("pushed to origin"),
+            "{e}"
+        );
+        assert!(git::branch_exists(&repo, "b").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_branch_left_by_a_half_done_worktree_add_is_removed() {
+        // No pre-existing branch; the worktree path sits under a regular
+        // file, so `worktree add -b` may create the branch and then fail.
+        let (_d, repo) = origin_with(&[("f", "x\n")]).await;
+        let blocker = repo.parent().unwrap().join("blocker");
+        tokio::fs::write(&blocker, "file").await.unwrap();
+        let wt = blocker.join("bump");
+        let r = release_attempt(
+            &repo,
+            "origin",
+            "main",
+            &wt,
+            "b",
+            |_| async { bail!("offline") },
+            |_| async { Ok(()) },
+        )
+        .await;
+        assert!(r.is_err());
+        assert!(!git::branch_exists(&repo, "b").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_retry_is_taken_at_most_once() {
+        // The branch is reclaimed, but the worktree path cannot be created, so
+        // the second creation fails too: no third try, and no loop.
+        let (_d, repo) = with_branch(false).await;
+        let blocker = repo.parent().unwrap().join("blocker");
+        tokio::fs::write(&blocker, "file").await.unwrap();
+        let wt = blocker.join("bump");
+        let r = release_attempt(&repo, "origin", "main", &wt, "b", no_pr, |_| async {
+            Ok(())
+        })
+        .await;
+        assert!(r.is_err());
+        assert!(!git::branch_exists(&repo, "b").await.unwrap());
     }
 
     #[tokio::test]
