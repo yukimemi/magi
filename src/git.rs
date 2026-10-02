@@ -225,6 +225,21 @@ pub async fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
     )
 }
 
+/// Does `remote` have `branch`? `Err` when that cannot be told (unreachable
+/// remote), which callers must not read as "no".
+pub async fn remote_has_branch(repo: &Path, remote: &str, branch: &str) -> Result<bool> {
+    let refname = format!("refs/heads/{branch}");
+    let out = git_raw(repo, &["ls-remote", "--exit-code", remote, &refname]).await?;
+    match out.code {
+        Some(0) => Ok(true),
+        Some(2) => Ok(false),
+        code => bail!(
+            "git ls-remote {remote} failed (exit {code:?}): {}",
+            out.stderr
+        ),
+    }
+}
+
 /// Patch of `head` against the merge base with `base`.
 pub async fn diff(worktree: &Path, base: &str, head: &str) -> Result<String> {
     let range = format!("{base}...{head}");
