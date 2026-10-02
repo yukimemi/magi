@@ -1419,6 +1419,7 @@ fn automerge_failure_comment(reason: &str) -> String {
 /// Split from [`report_problem`] so the state, the notice and the wording
 /// can be asserted without a `gh`. The notice is keyed on the run, so a retry
 /// of the same failed bump folds into one entry instead of flooding the bell.
+#[cfg(test)]
 fn surface_problem(
     state: &mut RunState,
     store: &Notices,
