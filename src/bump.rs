@@ -1014,8 +1014,40 @@ async fn find_open_release_pr(repo: &Path) -> Result<Option<(String, String)>> {
 /// has already succeeded, so a failure here (the decision call, `gh`,
 /// `cargo`) must never turn a landed run into a failed one. The caller logs
 /// whatever this returns and moves on.
+///
+/// An `Err` is a bump that was tried and failed, never one that was not
+/// eligible (every such case returns `Ok` after an event). When it fails
+/// before any release pull request exists, the operator is notified here, so
+/// the caller only has to record the event: nobody would otherwise learn that
+/// a release silently never happened. A failure with a pull request in hand
+/// goes through [`report_problem`] with its URL instead, and is not repeated.
 pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
-    after_merge_at(state, pr_url, None).await
+    after_merge_at(state, pr_url, None, None).await
+}
+
+/// What one attempt had settled by the time it failed.
+#[derive(Debug, Default)]
+struct Progress {
+    /// The target version, once the decision had been made.
+    version: Option<String>,
+    /// A release pull request this attempt was already working on.
+    pr_url: Option<String>,
+}
+
+/// The `(version, reason)` to notify with for a failed attempt, or `None` when
+/// a release pull request already exists and the failure is reported against
+/// it. The reason is the first line of the full error chain, so the operator
+/// can tell a stale branch from a build failure.
+fn notice_for_failure(
+    progress: &Progress,
+    err: &anyhow::Error,
+) -> Option<(Option<String>, String)> {
+    if progress.pr_url.is_some() {
+        return None;
+    }
+    let chain = format!("{err:#}");
+    let reason = chain.lines().next().unwrap_or_default().trim().to_owned();
+    Some((progress.version.clone(), reason))
 }
 
 /// Does the base branch carry a `Cargo.toml` at its root? Release bumps read
@@ -1041,7 +1073,34 @@ async fn base_has_cargo_toml(repo: &Path, remote: &str, base: &str) -> Result<bo
 
 /// [`after_merge`] with an optional magi home, so tests can point the
 /// marker and its lock at a scratch directory.
-async fn after_merge_at(state: &mut RunState, pr_url: &str, home: Option<&Path>) -> Result<()> {
+/// `store` is where a notice is raised; `None` is the operator's own.
+async fn after_merge_at(
+    state: &mut RunState,
+    pr_url: &str,
+    home: Option<&Path>,
+    store: Option<&Notices>,
+) -> Result<()> {
+    let mut progress = Progress::default();
+    let result = after_merge_inner(state, pr_url, home, &mut progress).await;
+    if let Err(e) = &result
+        && let Some((version, reason)) = notice_for_failure(&progress, e)
+    {
+        match store {
+            Some(store) => {
+                report_problem_in(state, store, None, version.as_deref(), &reason).await;
+            }
+            None => report_problem(state, None, version.as_deref(), &reason).await,
+        }
+    }
+    result
+}
+
+async fn after_merge_inner(
+    state: &mut RunState,
+    pr_url: &str,
+    home: Option<&Path>,
+    progress: &mut Progress,
+) -> Result<()> {
     if !state.config.merge.release_bump {
         return Ok(());
     }
@@ -1219,6 +1278,7 @@ async fn after_merge_at(state: &mut RunState, pr_url: &str, home: Option<&Path>)
                 Ok(())
             }
             PendingAction::Escalate => {
+                progress.pr_url = Some(p.pr_url.clone());
                 escalate_pending(state, &repo, &remote, &p, &decision, &base_version, &marker).await
             }
         };
@@ -1227,6 +1287,7 @@ async fn after_merge_at(state: &mut RunState, pr_url: &str, home: Option<&Path>)
     let next = Version::parse(&base_version)?
         .bump(decision.level)
         .to_string();
+    progress.version = Some(next.clone());
     let branch = format!("chore/release-v{next}");
     let worktree = state.dir().join("bump");
     let (shared, branch_ref, next_ref, decision_ref) = (&*state, &branch, &next, &decision);
@@ -1360,7 +1421,16 @@ fn surface_problem(
     let action = if pr_url.is_some() {
         automerge_hint(reason).to_owned()
     } else {
-        "the release bump did not run; open the release pull request by hand".to_owned()
+        let target = version.map(|v| format!(" to v{v}")).unwrap_or_default();
+        let cause = reason
+            .lines()
+            .next()
+            .filter(|l| !l.is_empty())
+            .map(|l| format!(" ({l})"))
+            .unwrap_or_default();
+        format!(
+            "the release bump{target} did not run{cause}; open the release pull request by hand"
+        )
     };
     let record = state.release_bump.get_or_insert_with(Default::default);
     record.pr_url = pr_url.map(str::to_owned).or(record.pr_url.take());
@@ -1402,7 +1472,18 @@ pub async fn report_problem(
     version: Option<&str>,
     reason: &str,
 ) {
-    match surface_problem(state, &Notices::open(), pr_url, version, reason) {
+    report_problem_in(state, &Notices::open(), pr_url, version, reason).await;
+}
+
+/// [`report_problem`] against an explicit notice store.
+async fn report_problem_in(
+    state: &mut RunState,
+    store: &Notices,
+    pr_url: Option<&str>,
+    version: Option<&str>,
+    reason: &str,
+) {
+    match surface_problem(state, store, pr_url, version, reason) {
         Ok((notice, comment)) => {
             if let (Some(url), Some(body)) = (pr_url, comment)
                 && let Err(e) = gh_pr_comment(
@@ -2396,6 +2477,7 @@ mod tests {
             &mut state,
             "https://example.invalid/pull/1",
             Some(home.path()),
+            None,
         )
         .await
         .expect("a non-Rust repository is not an error");
@@ -2409,6 +2491,119 @@ mod tests {
             std::fs::read_dir(home.path()).unwrap().next().is_none(),
             "no marker and no lock may be created"
         );
+    }
+
+    fn winner_state(repo: &Path, base: &str) -> RunState {
+        let mut state = RunState::new(
+            repo.to_path_buf(),
+            base.to_owned(),
+            "0000000000000000000000000000000000000000".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        );
+        state.candidates.push(crate::run::Candidate {
+            index: 0,
+            label: 'A',
+            agent: "x".to_owned(),
+            branch: "main".to_owned(),
+            worktree: repo.to_path_buf(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        state.tally = Some(
+            serde_json::from_value(serde_json::json!({
+                "first_choice": {}, "borda": {}, "winner": "A",
+                "unanimous_initial": true, "deliberated": false,
+                "changed_votes": 0, "unanimous_final": true,
+            }))
+            .unwrap(),
+        );
+        state
+    }
+
+    #[tokio::test]
+    async fn a_real_failure_without_a_pr_raises_one_notice_and_a_retry_folds_into_it() {
+        let (_d, repo) =
+            origin_with(&[("Cargo.toml", "[package]\nname=\"x\"\nversion=\"0.1.0\"\n")]).await;
+        let home = tempfile::tempdir().unwrap();
+        let store = Notices::at(home.path().join("notifications"));
+        // An unresolvable base is a fault, not "not eligible".
+        let mut state = winner_state(&repo, "nope");
+        let url = "https://example.invalid/pull/1";
+        after_merge_at(&mut state, url, Some(home.path()), Some(&store))
+            .await
+            .expect_err("an unresolvable base is a failure");
+        let listed = store.list();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert!(
+            listed[0].message.contains("did not run"),
+            "{}",
+            listed[0].message
+        );
+        assert!(
+            listed[0].message.contains("Cargo.toml"),
+            "{}",
+            listed[0].message
+        );
+        assert!(state.events.iter().any(|e| e.node == "bump"));
+        after_merge_at(&mut state, url, Some(home.path()), Some(&store))
+            .await
+            .expect_err("still failing");
+        let listed = store.list();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].count, 2);
+    }
+
+    #[tokio::test]
+    async fn not_eligible_cases_raise_no_notice() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Notices::at(home.path().join("notifications"));
+        let url = "https://example.invalid/pull/1";
+        // No Cargo.toml on the base branch.
+        let (_d, repo) = origin_with(&[("README.md", "hi\n")]).await;
+        let mut state = winner_state(&repo, "main");
+        after_merge_at(&mut state, url, Some(home.path()), Some(&store))
+            .await
+            .unwrap();
+        // Disabled.
+        let mut state = winner_state(&repo, "nope");
+        state.config.merge.release_bump = false;
+        after_merge_at(&mut state, url, Some(home.path()), Some(&store))
+            .await
+            .unwrap();
+        // No winner.
+        let mut state = winner_state(&repo, "nope");
+        state.tally = None;
+        after_merge_at(&mut state, url, Some(home.path()), Some(&store))
+            .await
+            .unwrap();
+        assert!(store.list().is_empty(), "{:?}", store.list());
+    }
+
+    #[test]
+    fn a_failure_with_a_pr_is_not_notified_twice_and_carries_what_it_knows_without_one() {
+        let err = anyhow!("outer context").context("cargo build failed\nsecond line");
+        let with_pr = Progress {
+            version: Some("0.2.0".into()),
+            pr_url: Some("https://example.invalid/pull/9".into()),
+        };
+        assert!(notice_for_failure(&with_pr, &err).is_none());
+        let without = Progress {
+            version: Some("0.2.0".into()),
+            pr_url: None,
+        };
+        let (v, reason) = notice_for_failure(&without, &err).unwrap();
+        assert_eq!(v.as_deref(), Some("0.2.0"));
+        assert_eq!(reason, "cargo build failed");
+        let (v, _) = notice_for_failure(&Progress::default(), &err).unwrap();
+        assert_eq!(v, None);
     }
 
     const NO_RULES: &str = "gh pr merge --auto: GraphQL: Pull request Branch does not have \
