@@ -1651,31 +1651,36 @@ where
         retried = true;
     }
     loop {
-        let Err(e) = git::worktree_add_branch(repo, worktree, branch, &start).await else {
-            break;
-        };
-        let e = e.context("create the release-bump worktree");
-        if !git::branch_exists(repo, branch).await.unwrap_or(false) {
-            git::worktree_remove(repo, worktree).await.ok();
-            return Err(e);
+        // Two steps instead of `worktree add -b`, so that who made the branch
+        // is known from which step failed rather than guessed from git's
+        // wording or the branch's tip: `git branch` creates the ref atomically
+        // or fails, and only a branch it created is this attempt's.
+        if let Err(e) = git::git(repo, &["branch", branch, &start]).await {
+            let e = e.context("create the release branch");
+            if !git::branch_exists(repo, branch).await.unwrap_or(false) {
+                return Err(e);
+            }
+            // It appeared since the check above: somebody else's.
+            if retried {
+                return Err(anyhow!(
+                    "{e:#}; left {branch} in place: it is not one this attempt created"
+                ));
+            }
+            retried = true;
+            if let Err(r) = reclaim_stale_branch(repo, remote, &start, branch, &open_pr).await {
+                return Err(anyhow!("{r:#} (after: {e:#})"));
+            }
+            continue;
         }
-        // The branch was absent before the add, so it is either what a
-        // half-done `worktree add -b` left behind or something that appeared
-        // meanwhile. Only the former, at the start commit and off the remote,
-        // is this attempt's to delete.
-        if made_here(repo, remote, &start, branch).await {
+        if let Some(parent) = worktree.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        let path = worktree.to_string_lossy();
+        if let Err(e) = git::git(repo, &["worktree", "add", &path, branch]).await {
+            let e = e.context("create the release-bump worktree");
             return Err(discard_attempt(repo, remote, worktree, branch, e).await);
         }
-        git::worktree_remove(repo, worktree).await.ok();
-        if retried {
-            return Err(anyhow!(
-                "{e:#}; left {branch} in place: it is not one this attempt created"
-            ));
-        }
-        retried = true;
-        if let Err(r) = reclaim_stale_branch(repo, remote, &start, branch, &open_pr).await {
-            return Err(anyhow!("{r:#} (after: {e:#})"));
-        }
+        break;
     }
     match fill(worktree.to_path_buf()).await {
         Ok(v) => {
@@ -1686,22 +1691,6 @@ where
         }
         Err(e) => Err(discard_attempt(repo, remote, worktree, branch, e).await),
     }
-}
-
-/// Is `branch` exactly what a half-finished `worktree add -b <branch> <start>`
-/// leaves: at `start`'s commit and unknown to the remote? Unproven is "no".
-async fn made_here(repo: &Path, remote: &str, start: &str, branch: &str) -> bool {
-    let (Ok(tip), Ok(base)) = (
-        git::rev_parse(repo, &format!("refs/heads/{branch}")).await,
-        git::rev_parse(repo, start).await,
-    ) else {
-        return false;
-    };
-    tip == base
-        && matches!(
-            git::remote_has_branch(repo, remote, branch).await,
-            Ok(false)
-        )
 }
 
 /// Undo what a failed attempt created and fold the outcome into its error.
