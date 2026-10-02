@@ -1021,6 +1021,10 @@ async fn find_open_release_pr(repo: &Path) -> Result<Option<(String, String)>> {
 /// the caller only has to record the event: nobody would otherwise learn that
 /// a release silently never happened. A failure with a pull request in hand
 /// goes through [`report_problem`] with its URL instead, and is not repeated.
+/// A failure while a pending release pull request is in play (the decision or
+/// an escalation of it) is notified here too, naming that pull request: the
+/// escalation path itself never raises one, so suppressing it would leave the
+/// operator with nothing.
 pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
     after_merge_at(state, pr_url, None, None).await
 }
@@ -1030,24 +1034,24 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) -> Result<()> {
 struct Progress {
     /// The target version, once the decision had been made.
     version: Option<String>,
-    /// A release pull request this attempt was already working on.
-    pr_url: Option<String>,
+    /// A release pull request already pending when this attempt started.
+    pending_pr: Option<String>,
 }
 
-/// The `(version, reason)` to notify with for a failed attempt, or `None` when
-/// a release pull request already exists and the failure is reported against
-/// it. The reason is the first line of the full error chain, so the operator
-/// can tell a stale branch from a build failure.
-fn notice_for_failure(
-    progress: &Progress,
-    err: &anyhow::Error,
-) -> Option<(Option<String>, String)> {
-    if progress.pr_url.is_some() {
-        return None;
-    }
+/// The `(version, reason)` to notify with for a failed attempt. The reason is
+/// the first line of the full error chain, so the operator can tell a stale
+/// branch from a build failure, and names the pending pull request when there
+/// is one. A pull request this attempt opened never reaches here: past
+/// `gh pr create` nothing returns `Err`, and automerge trouble goes through
+/// [`report_problem`] itself.
+fn notice_for_failure(progress: &Progress, err: &anyhow::Error) -> (Option<String>, String) {
     let chain = format!("{err:#}");
-    let reason = chain.lines().next().unwrap_or_default().trim().to_owned();
-    Some((progress.version.clone(), reason))
+    let first = chain.lines().next().unwrap_or_default().trim();
+    let reason = match &progress.pending_pr {
+        Some(url) => format!("{first} (pending release pull request: {url})"),
+        None => first.to_owned(),
+    };
+    (progress.version.clone(), reason)
 }
 
 /// Does the base branch carry a `Cargo.toml` at its root? Release bumps read
@@ -1082,9 +1086,8 @@ async fn after_merge_at(
 ) -> Result<()> {
     let mut progress = Progress::default();
     let result = after_merge_inner(state, pr_url, home, &mut progress).await;
-    if let Err(e) = &result
-        && let Some((version, reason)) = notice_for_failure(&progress, e)
-    {
+    if let Err(e) = &result {
+        let (version, reason) = notice_for_failure(&progress, e);
         match store {
             Some(store) => {
                 report_problem_in(state, store, None, version.as_deref(), &reason).await;
@@ -1212,6 +1215,7 @@ async fn after_merge_inner(
         }
     }
 
+    progress.pending_pr = pending.as_ref().map(|p| p.pr_url.clone());
     let title = pr_title(&repo, pr_url).await.unwrap_or_default();
     let subject = land::merge_subject(&title, &state.instruction);
     let stat = git::diff_stat(&winner.worktree, &base, &winner.branch)
@@ -1278,7 +1282,6 @@ async fn after_merge_inner(
                 Ok(())
             }
             PendingAction::Escalate => {
-                progress.pr_url = Some(p.pr_url.clone());
                 escalate_pending(state, &repo, &remote, &p, &decision, &base_version, &marker).await
             }
         };
@@ -1421,16 +1424,21 @@ fn surface_problem(
     let action = if pr_url.is_some() {
         automerge_hint(reason).to_owned()
     } else {
-        let target = version.map(|v| format!(" to v{v}")).unwrap_or_default();
-        let cause = reason
-            .lines()
-            .next()
-            .filter(|l| !l.is_empty())
-            .map(|l| format!(" ({l})"))
-            .unwrap_or_default();
-        format!(
-            "the release bump{target} did not run{cause}; open the release pull request by hand"
-        )
+        let ja = crate::lang::is_japanese(&state.config.graph.language);
+        let first = reason.lines().next().filter(|l| !l.is_empty());
+        if ja {
+            let target = version.map(|v| format!(" (v{v})")).unwrap_or_default();
+            let cause = first.map(|l| format!(" ({l})")).unwrap_or_default();
+            format!(
+                "リリースバンプ{target}は実行されませんでした{cause}。リリース PR を手で開いてください"
+            )
+        } else {
+            let target = version.map(|v| format!(" to v{v}")).unwrap_or_default();
+            let cause = first.map(|l| format!(" ({l})")).unwrap_or_default();
+            format!(
+                "the release bump{target} did not run{cause}; open the release pull request by hand"
+            )
+        }
     };
     let record = state.release_bump.get_or_insert_with(Default::default);
     record.pr_url = pr_url.map(str::to_owned).or(record.pr_url.take());
@@ -1499,6 +1507,9 @@ async fn report_problem_in(
             // never-stored one carries the text so it is not lost.
             let summary = match pr_url {
                 Some(url) => format!("Release PR needs a human: {url}"),
+                None if crate::lang::is_japanese(&state.config.graph.language) => {
+                    "リリースバンプが実行されませんでした".to_owned()
+                }
                 None => "Release bump did not run".to_owned(),
             };
             let q = ask::Question::new(
@@ -2588,22 +2599,33 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_with_a_pr_is_not_notified_twice_and_carries_what_it_knows_without_one() {
+    fn the_no_pr_notice_follows_the_configured_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Notices::at(dir.path().join("notifications"));
+        let mut state = merged_state();
+        state.config.graph.language = "ja".to_owned();
+        let (n, _) = surface_problem(&mut state, &store, None, Some("0.2.0"), "boom").unwrap();
+        assert!(n.message.contains("実行されませんでした"), "{}", n.message);
+        assert!(n.message.contains("boom") && n.message.contains("v0.2.0"));
+    }
+
+    #[test]
+    fn a_failure_notice_names_the_pending_pr_and_the_first_line_of_the_cause() {
         let err = anyhow!("outer context").context("cargo build failed\nsecond line");
         let with_pr = Progress {
             version: Some("0.2.0".into()),
-            pr_url: Some("https://example.invalid/pull/9".into()),
+            pending_pr: Some("https://example.invalid/pull/9".into()),
         };
-        assert!(notice_for_failure(&with_pr, &err).is_none());
-        let without = Progress {
-            version: Some("0.2.0".into()),
-            pr_url: None,
-        };
-        let (v, reason) = notice_for_failure(&without, &err).unwrap();
+        let (v, reason) = notice_for_failure(&with_pr, &err);
         assert_eq!(v.as_deref(), Some("0.2.0"));
-        assert_eq!(reason, "cargo build failed");
-        let (v, _) = notice_for_failure(&Progress::default(), &err).unwrap();
+        assert!(
+            reason.starts_with("cargo build failed (pending"),
+            "{reason}"
+        );
+        assert!(reason.contains("pull/9"));
+        let (v, reason) = notice_for_failure(&Progress::default(), &err);
         assert_eq!(v, None);
+        assert_eq!(reason, "cargo build failed");
     }
 
     const NO_RULES: &str = "gh pr merge --auto: GraphQL: Pull request Branch does not have \
