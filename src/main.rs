@@ -2306,12 +2306,10 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             task.urgent = urgent;
             if !attach.is_empty() {
                 let attach = absolute_paths(&attach, &cwd);
-                if let Err(e) = q.attach(&mut task, &attach) {
-                    let _ = std::fs::remove_dir_all(q.attachments_dir(&task.id));
-                    return Err(e);
-                }
+                q.attach_and_put(&mut task, &attach)?;
+            } else {
+                q.put(&mut task)?;
             }
-            q.put(&mut task)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&task)?);
             } else {
@@ -2543,8 +2541,7 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                     );
                 }
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                q.attach(&mut t, &absolute_paths(&attach, &cwd))?;
-                q.put(&mut t)?;
+                q.attach_and_put(&mut t, &absolute_paths(&attach, &cwd))?;
                 println!("edited {} {}", t.short(), t.title);
                 return Ok(());
             }
@@ -2564,9 +2561,10 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             t.edit(title, text)?;
             if !attach.is_empty() {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                q.attach(&mut t, &absolute_paths(&attach, &cwd))?;
+                q.attach_and_put(&mut t, &absolute_paths(&attach, &cwd))?;
+            } else {
+                q.put(&mut t)?;
             }
-            q.put(&mut t)?;
             println!("edited {} {}", t.short(), t.title);
             Ok(())
         }

@@ -1048,6 +1048,34 @@ impl Queue {
         Ok(names)
     }
 
+    /// [`Queue::attach`] then [`Queue::put`], undoing the copies when the
+    /// record cannot be written. Without the undo the files sit in
+    /// `<id>.attachments/` with no task pointing at them.
+    ///
+    /// Only what this call copied is removed (the names `attach` returned,
+    /// and the directory itself only when it did not exist before and is
+    /// empty), never an attachment an earlier save recorded. `task` is rolled
+    /// back too, and the error the caller sees is `put`'s own. This relies on
+    /// a failed `put` leaving the stored record untouched, which its
+    /// write-then-rename guarantees.
+    pub fn attach_and_put(&self, task: &mut Task, sources: &[PathBuf]) -> Result<Vec<String>> {
+        let dir = self.attachments_dir(&task.id);
+        let existed = dir.is_dir();
+        let before = task.attachments.len();
+        let names = self.attach(task, sources)?;
+        if let Err(e) = self.put(task) {
+            for name in &names {
+                let _ = std::fs::remove_file(dir.join(name));
+            }
+            if !existed {
+                let _ = std::fs::remove_dir(&dir);
+            }
+            task.attachments.truncate(before);
+            return Err(e);
+        }
+        Ok(names)
+    }
+
     /// Absolute paths of `task`'s attachments, whatever shape this queue's
     /// root has. Absolute because the prompt hands them to an agent whose
     /// working directory is somewhere else entirely.
@@ -1124,6 +1152,22 @@ impl Queue {
         if in_flight {
             bail!("task {resolved} is being run by a live daemon right now");
         }
+        self.remove_record_with_attachments(&resolved, |p| std::fs::remove_file(p))?;
+        let quarantined = self.quarantine_dependents_of(&resolved, questions);
+        Ok(Removal {
+            id: resolved,
+            quarantined,
+        })
+    }
+
+    /// The attachment-and-record half of [`Queue::remove`]. `remove_record` is
+    /// how the record file is deleted; production passes `remove_file`, and a
+    /// test passes a failing one to prove the attachments come back.
+    fn remove_record_with_attachments(
+        &self,
+        resolved: &str,
+        remove_record: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<()> {
         // Neither step may strand the other. The attachments are set aside by a
         // rename (cheap, and undone if the record cannot be removed), then the
         // record goes, and only then is the set-aside directory deleted for
@@ -1131,7 +1175,7 @@ impl Queue {
         // after it leaves at most an orphan `.removing` directory, which the
         // next removal sweeps.
         self.sweep_removed_attachments();
-        let attachments = self.attachments_dir(&resolved);
+        let attachments = self.attachments_dir(resolved);
         let aside = self.root.join(format!("{resolved}.attachments.removing"));
         let moved = match std::fs::rename(&attachments, &aside) {
             Ok(()) => true,
@@ -1140,8 +1184,8 @@ impl Queue {
                 return Err(e).with_context(|| format!("remove {}", attachments.display()));
             }
         };
-        let path = self.path_of(&resolved);
-        if let Err(e) = std::fs::remove_file(&path) {
+        let path = self.path_of(resolved);
+        if let Err(e) = remove_record(&path) {
             if moved {
                 let _ = std::fs::rename(&aside, &attachments);
             }
@@ -1152,17 +1196,13 @@ impl Queue {
                 tracing::warn!("leftover attachments {}: {e}", aside.display());
             }
         }
-        let lock = self.lock_path(&resolved);
+        let lock = self.lock_path(resolved);
         if let Err(e) = std::fs::remove_file(&lock) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 return Err(e).with_context(|| format!("remove {}", lock.display()));
             }
         }
-        let quarantined = self.quarantine_dependents_of(&resolved, questions);
-        Ok(Removal {
-            id: resolved,
-            quarantined,
-        })
+        Ok(())
     }
 
     /// Delete `*.attachments.removing` directories a previous [`Queue::remove`]
@@ -2869,6 +2909,107 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(on_disk.len(), 1);
+    }
+
+    /// Make the next `put` of `t` fail: its temp file's path is a directory.
+    fn block_put(q: &Queue, t: &Task) -> PathBuf {
+        let tmp = q.path_of(&t.id).with_extension("json.tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn a_failed_put_leaves_no_new_attachment_directory() {
+        let (dir, q) = queue();
+        let mut t = task("fresh");
+        let tmp = block_put(&q, &t);
+        let src = source_file(dir.path(), "shot.png", "x");
+        assert!(q.attach_and_put(&mut t, &[src]).is_err());
+        assert!(t.attachments.is_empty());
+        assert!(!q.attachments_dir(&t.id).exists());
+        assert!(!q.path_of(&t.id).exists());
+        std::fs::remove_dir(tmp).unwrap();
+    }
+
+    #[test]
+    fn a_failed_put_removes_only_the_copy_it_just_made() {
+        let (dir, q) = queue();
+        let mut t = task("edited");
+        let first = source_file(dir.path(), "first.png", "1");
+        q.attach_and_put(&mut t, &[first]).unwrap();
+        block_put(&q, &t);
+        let second = source_file(dir.path(), "second.png", "2");
+        assert!(q.attach_and_put(&mut t, &[second]).is_err());
+        assert_eq!(t.attachments, ["first.png"]);
+        let on_disk: Vec<_> = std::fs::read_dir(q.attachments_dir(&t.id))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(on_disk, ["first.png"]);
+        assert_eq!(q.get(&t.id).unwrap().attachments, ["first.png"]);
+    }
+
+    #[test]
+    fn a_leftover_removing_directory_is_swept_by_the_next_removal() {
+        let (dir, q) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
+        let gone = task("gone");
+        let mut other = task("other");
+        let mut live = task("live");
+        q.put(&mut other).unwrap();
+        q.put(&mut live).unwrap();
+        // `gone` has no record: its removal finished deleting the record but
+        // not the set-aside attachments.
+        let orphan = q.root.join(format!("{}.attachments.removing", gone.id));
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("shot.png"), "x").unwrap();
+        // `live` still has a record, so its `.removing` belongs to a removal
+        // in progress and must be left alone.
+        let busy = q.root.join(format!("{}.attachments.removing", live.id));
+        std::fs::create_dir_all(&busy).unwrap();
+
+        q.remove(&other.id, false, &questions).unwrap();
+        assert!(!orphan.exists(), "an orphan is swept");
+        assert!(busy.exists(), "a removal in progress is left alone");
+    }
+
+    #[test]
+    fn a_blocked_aside_rename_fails_the_removal_and_loses_nothing() {
+        let (dir, q) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("stuck");
+        let src = source_file(dir.path(), "shot.png", "x");
+        q.attach_and_put(&mut t, &[src]).unwrap();
+        // A non-empty directory already at the set-aside name makes the rename
+        // fail; its record is present, so the sweep leaves it in place.
+        let aside = q.root.join(format!("{}.attachments.removing", t.id));
+        std::fs::create_dir_all(&aside).unwrap();
+        std::fs::write(aside.join("old.png"), "o").unwrap();
+        assert!(q.remove(&t.id, false, &questions).is_err());
+        assert!(q.path_of(&t.id).exists());
+        assert!(q.attachments_dir(&t.id).join("shot.png").is_file());
+    }
+
+    #[test]
+    fn a_failed_record_removal_puts_the_attachments_back() {
+        let (dir, q) = queue();
+        let mut t = task("rollback");
+        let src = source_file(dir.path(), "shot.png", "x");
+        q.attach_and_put(&mut t, &[src]).unwrap();
+        let err = q
+            .remove_record_with_attachments(&t.id, |_| {
+                Err(std::io::Error::other("injected failure"))
+            })
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("injected failure"));
+        assert!(q.path_of(&t.id).exists());
+        assert!(q.attachments_dir(&t.id).join("shot.png").is_file());
+        assert!(
+            !q.root
+                .join(format!("{}.attachments.removing", t.id))
+                .exists()
+        );
     }
 
     #[test]
