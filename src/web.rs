@@ -636,7 +636,10 @@ impl Ui {
         match self.start_loop(foreign) {
             Ok(()) => true,
             Err(e) => {
-                let why = format!("the loop could not be resumed after the upgrade: {}", e.message);
+                let why = format!(
+                    "the loop could not be resumed after the upgrade: {}",
+                    e.message
+                );
                 tracing::warn!("{why}");
                 let mut state = self.lock_loop();
                 state.last_error = Some(why);
