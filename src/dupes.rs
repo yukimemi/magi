@@ -31,6 +31,7 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
+use crate::proc::Quiet as _;
 use crate::queue::{Queue, Task, TaskStatus};
 use crate::run::RunStatus;
 
@@ -336,6 +337,7 @@ pub fn check_with(
 /// own remote, not whatever the environment points at.
 fn gh_open_pr(repo: &Path, n: u64) -> Option<String> {
     let mut child = Command::new("gh")
+        .quiet()
         .args(["pr", "view", &n.to_string(), "--json", "state,url"])
         .current_dir(repo)
         .env_remove("GH_REPO")
@@ -464,6 +466,7 @@ impl Idents {
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
+        .quiet()
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -612,6 +615,7 @@ mod tests {
 
     fn sh(cwd: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
+            .quiet()
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
             .args(args)
             .current_dir(cwd)
