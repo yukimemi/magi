@@ -13,10 +13,16 @@
 //! (and only its worktree) is released before the review starts. The
 //! branch, every commit and any pull request stay exactly where they were.
 //!
+//! A branch held by a run of *another* task is released on the same terms when
+//! magi can prove the worktree is its own: the path is a candidate worktree
+//! one run's record names, laid under that record's own worktree root, and the
+//! run is not being driven. Anything else - a path magi did not make, a live
+//! run, uncommitted files - is left alone and the refusal names which.
+//!
 //! [`decide`] is pure; [`release`] is the only function here that touches git
-//! or disk. Only a queue-driven review takes over anything: a hand-run
-//! `magi review` has no task, so it carries no [`Takeover`] and behaves as it
-//! always did.
+//! or disk. A hand-run `magi review` has no task, so it carries a [`Takeover`]
+//! with no earlier attempts and can only release a worktree of a run magi
+//! itself recorded.
 
 use std::path::{Path, PathBuf};
 
@@ -66,6 +72,8 @@ pub struct Released {
     /// The branch tip when the worktree was released; the branch sync may
     /// have moved it since.
     tip: String,
+    /// What was released and why it was safe, for the new run's events.
+    pub audit: String,
 }
 
 impl Released {
@@ -119,10 +127,26 @@ pub struct Holder {
     pub driver_unproven: bool,
     /// Any uncommitted change, untracked files included.
     pub dirty: bool,
+    /// The first few changed paths, for the refusal text.
+    pub dirty_files: Vec<String>,
+    /// The recorded driver pid, for the refusal text.
+    pub driver_pid: Option<u32>,
     /// HEAD of the worktree.
     pub head: String,
     /// The branch tip in the repository.
     pub tip: String,
+}
+
+/// Whose worktree holds the branch, as far as magi can prove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Owner {
+    /// A candidate worktree of an earlier attempt at the same task.
+    EarlierAttempt,
+    /// A candidate worktree some run's record names, laid under that run's
+    /// own worktree root: magi made it.
+    MagiRun,
+    /// Not provably magi's; the text says why.
+    Foreign(String),
 }
 
 /// The verdict of [`decide`].
@@ -130,12 +154,8 @@ pub struct Holder {
 pub enum Decision {
     /// Safe to release the worktree.
     Release,
-    /// Ours to decide about, but not safe; the text says why, for the
-    /// operator.
+    /// Not safe to release; the text says exactly why, for the operator.
     Refuse(String),
-    /// Not a superseded run's worktree: leave it alone and let git's own
-    /// refusal stand.
-    NotOurs,
 }
 
 fn short(sha: &str) -> String {
@@ -146,19 +166,31 @@ fn short(sha: &str) -> String {
 ///
 /// [`Liveness::Unknown`] releases only when no driver pid was ever recorded
 /// (nothing that could still be running); a recorded pid that could not be
-/// shown dead is refused like a live one.
-pub fn decide(superseded: bool, holder: &Holder) -> Decision {
-    if !superseded {
-        return Decision::NotOurs;
+/// shown dead is refused like a live one. A run of another task that is in
+/// `landing` (possibly waiting on the owner's approval) is refused as well.
+pub fn decide(owner: &Owner, holder: &Holder) -> Decision {
+    if let Owner::Foreign(why) = owner {
+        return Decision::Refuse(why.clone());
     }
     let mut why = Vec::new();
     if holder.liveness == Liveness::Live {
-        why.push("that run is being worked on right now".to_owned());
+        why.push(format!(
+            "run {} is being worked on right now{}",
+            crate::run::short_of(&holder.run),
+            holder
+                .driver_pid
+                .map(|p| format!(" (driver pid {p})"))
+                .unwrap_or_default()
+        ));
     } else if holder.driver_unproven {
         why.push("its driver process could not be shown to be gone".to_owned());
     }
+    if *owner == Owner::MagiRun && holder.status == RunStatus::Landing {
+        why.push("that run is in `landing`, possibly waiting on an approval".to_owned());
+    }
     if holder.dirty {
-        why.push("its worktree has uncommitted changes".to_owned());
+        let files = holder.dirty_files.join(", ");
+        why.push(format!("its worktree has uncommitted changes ({files})"));
     }
     if holder.head != holder.tip {
         why.push("its HEAD is not at the branch tip".to_owned());
@@ -166,10 +198,13 @@ pub fn decide(superseded: bool, holder: &Holder) -> Decision {
     if why.is_empty() {
         return Decision::Release;
     }
+    let kind = match owner {
+        Owner::EarlierAttempt => "an earlier attempt at this task",
+        _ => "a magi run of another task",
+    };
     Decision::Refuse(format!(
-        "run {} (status `{}`, worktree {}, HEAD {}, branch tip {}) is an earlier attempt \
-         at this task and still has the branch checked out, so it was not released \
-         automatically: {}",
+        "run {} (status `{}`, worktree {}, HEAD {}, branch tip {}) is {kind} and still has the \
+         branch checked out, so it was not released automatically: {}",
         crate::run::short_of(&holder.run),
         holder.status.as_str(),
         if holder.dirty { "dirty" } else { "clean" },
@@ -189,17 +224,21 @@ async fn inspect(
 ) -> Result<Holder> {
     let claimed = crate::daemon::is_working_on(home, &state.id, jiff::Timestamp::now());
     let liveness = state.liveness(claimed);
+    // Spelled out: `status.showUntrackedFiles=no` in a user's config would
+    // otherwise hide new files from `git status` and let them be deleted.
+    let porcelain = git::git(path, &["status", "--porcelain", "--untracked-files=normal"]).await?;
     Ok(Holder {
         run: state.id.clone(),
         status: state.status,
         liveness,
         driver_unproven: liveness == Liveness::Unknown && state.driver_pid.is_some(),
-        // Spelled out: `status.showUntrackedFiles=no` in a user's config would
-        // otherwise hide new files from `git status` and let them be deleted.
-        dirty: !git::git(path, &["status", "--porcelain", "--untracked-files=normal"])
-            .await?
-            .trim()
-            .is_empty(),
+        dirty: !porcelain.trim().is_empty(),
+        dirty_files: porcelain
+            .lines()
+            .take(5)
+            .map(|l| l.get(3..).unwrap_or(l).trim().to_owned())
+            .collect(),
+        driver_pid: state.driver_pid,
         head: git::rev_parse(path, "HEAD").await?,
         tip: git::rev_parse(repo, &format!("refs/heads/{branch}")).await?,
     })
@@ -210,8 +249,57 @@ fn same_path(a: &Path, b: &Path) -> bool {
     canon(a) == canon(b)
 }
 
+fn foreign(branch: &str, path: &Path, why: &str) -> anyhow::Error {
+    Refused(format!(
+        "branch `{branch}` is checked out in {}, which magi will not remove by itself: {why}. \
+         Remove that worktree (`git worktree remove`) if it is not needed, and try again.",
+        path.display()
+    ))
+    .into()
+}
+
+/// The run and candidate whose recorded worktree is `path`, when magi
+/// provably made it: the record names the path, the path sits directly in the
+/// record's own worktree root (`<root>/<short>/<dir>`), and exactly one run
+/// says so. `Err` is the reason a path under a root could not be proven.
+fn find_magi_owner(
+    path: &Path,
+    home: &Path,
+) -> std::result::Result<Option<(RunState, usize)>, String> {
+    let Some(bay) = path.parent() else {
+        return Ok(None);
+    };
+    let Some(bay_name) = bay.file_name().and_then(|n| n.to_str()) else {
+        return Ok(None);
+    };
+    let mut found = Vec::new();
+    for id in crate::run::list_ids_in(&home.join("runs")) {
+        if crate::run::short_of(&id) != bay_name {
+            continue;
+        }
+        let Ok(state) = RunState::load_under(&id, home) else {
+            return Err(format!("run {bay_name}'s record could not be read"));
+        };
+        if !same_path(&state.worktree_root(), bay) {
+            continue;
+        }
+        if let Some(i) = state
+            .candidates
+            .iter()
+            .position(|c| !c.folded && same_path(&c.worktree, path))
+        {
+            found.push((state, i));
+        }
+    }
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop()),
+        _ => Err(format!("more than one run record claims it ({bay_name})")),
+    }
+}
+
 /// Release the worktree holding `branch` to `new_run`, when an earlier attempt
-/// at the same task holds it and it is safe. Returns the run whose worktree
+/// at the same task, or a run magi itself recorded, holds it and it is safe. Returns the run whose worktree
 /// was released (see [`Released`]), or `None` when nothing needed (or was allowed) to happen.
 ///
 /// An `Err` is a refusal or a failed removal; the message is what the
@@ -226,8 +314,8 @@ pub async fn release(
     let Some(path) = git::worktree_holding(repo, branch).await? else {
         return Ok(None);
     };
-    // The holder has to be an unfolded candidate worktree of a run in the
-    // list. One nobody recorded (made by hand, say) is not ours to touch.
+    // The holder has to be an unfolded candidate worktree of a run on record.
+    // One nobody recorded (made by hand, say) is not ours to touch.
     let mut owner = None;
     for id in &takeover.earlier {
         let Ok(state) = RunState::load_under(id, &takeover.home) else {
@@ -238,35 +326,44 @@ pub async fn release(
             .iter()
             .position(|c| !c.folded && same_path(&c.worktree, &path))
         {
-            owner = Some((state, i));
+            owner = Some((state, i, Owner::EarlierAttempt));
             break;
         }
     }
-    let Some((mut state, index)) = owner else {
-        return Err(Refused(format!(
-            "branch `{branch}` is checked out in {}, which is not a worktree of an earlier \
-             attempt at this task (a run of another task, or one made by hand), so it was \
-             not touched. Remove that worktree (`git worktree remove`) if it is not needed, \
-             and try again.",
-            path.display()
-        ))
-        .into());
+    if owner.is_none() {
+        owner = match find_magi_owner(&path, &takeover.home) {
+            Ok(found) => found.map(|(s, i)| (s, i, Owner::MagiRun)),
+            Err(why) => return Err(foreign(branch, &path, &why)),
+        };
+    }
+    let Some((mut state, index, kind)) = owner else {
+        return Err(foreign(
+            branch,
+            &path,
+            &format!(
+                "{} is not a candidate worktree any magi run recorded (made by hand, or by \
+                 something other than magi)",
+                path.display()
+            ),
+        ));
     };
 
     let holder = inspect(repo, branch, &path, &state, &takeover.home).await?;
-    match decide(true, &holder) {
-        Decision::NotOurs => return Ok(None),
-        Decision::Refuse(why) => {
-            return Err(Refused(format!(
-                "branch `{branch}` is checked out in {}: {why}. Commit or discard the work \
-                 there and remove that worktree (`git worktree remove`), or say the run may be \
-                 discarded, and try again.",
-                path.display()
-            ))
-            .into());
-        }
-        Decision::Release => {}
+    if let Decision::Refuse(why) = decide(&kind, &holder) {
+        return Err(Refused(format!(
+            "branch `{branch}` is checked out in {}: {why}. Commit or discard the work \
+             there and remove that worktree (`git worktree remove`), or say the run may be \
+             discarded, and try again.",
+            path.display()
+        ))
+        .into());
     }
+    let audit = format!(
+        "run {} (status `{}`, no driver, clean, HEAD {} = branch tip, branch `{branch}` kept)",
+        crate::run::short_of(&holder.run),
+        holder.status.as_str(),
+        short(&holder.head)
+    );
 
     let old_id = state.id.clone();
     state.candidates[index].folded = true;
@@ -277,8 +374,8 @@ pub async fn release(
     state.event(
         "release",
         format!(
-            "worktree of `{branch}` released to run {}; this run can no longer be resumed \
-             from here",
+            "worktree of `{branch}` released to run {}: {audit}; this run can no longer be \
+             resumed from here",
             crate::run::short_of(new_run)
         ),
     );
@@ -295,7 +392,7 @@ pub async fn release(
         Ok(fresh) => inspect(repo, branch, &path, &fresh, &takeover.home).await,
         Err(e) => Err(e),
     };
-    let safe = matches!(&again, Ok(h) if decide(true, h) == Decision::Release);
+    let safe = matches!(&again, Ok(h) if decide(&kind, h) == Decision::Release);
     let removed = safe
         && git::worktree_remove_clean(repo, &path)
             .await
@@ -306,6 +403,13 @@ pub async fn release(
         state.released_to = None;
         state.released_branches.retain(|b| b != branch);
         state.events.pop();
+        state.event(
+            "release",
+            format!(
+                "release of `{branch}` to run {} was undone: {audit}",
+                crate::run::short_of(new_run)
+            ),
+        );
         state.save_under(&takeover.home)?;
         return Err(Refused(format!(
             "branch `{branch}` is checked out in {} by run {}, and releasing that worktree \
@@ -322,6 +426,7 @@ pub async fn release(
         path,
         home: takeover.home.clone(),
         tip: holder.tip,
+        audit,
     }))
 }
 
@@ -336,6 +441,8 @@ mod tests {
             liveness: Liveness::Unknown,
             driver_unproven: false,
             dirty: false,
+            dirty_files: Vec::new(),
+            driver_pid: None,
             head: "a".repeat(40),
             tip: "a".repeat(40),
         }
@@ -343,29 +450,50 @@ mod tests {
 
     #[test]
     fn a_clean_superseded_stale_run_is_released() {
-        assert_eq!(decide(true, &holder()), Decision::Release);
+        assert_eq!(decide(&Owner::EarlierAttempt, &holder()), Decision::Release);
         let dead = Holder {
             liveness: Liveness::Dead,
             ..holder()
         };
-        assert_eq!(decide(true, &dead), Decision::Release);
+        assert_eq!(decide(&Owner::EarlierAttempt, &dead), Decision::Release);
     }
 
     #[test]
-    fn a_run_that_is_not_superseded_is_not_ours() {
-        assert_eq!(decide(false, &holder()), Decision::NotOurs);
+    fn a_foreign_worktree_is_refused_with_its_reason() {
+        let owner = Owner::Foreign("it is a foreign path".to_owned());
+        assert_eq!(
+            decide(&owner, &holder()),
+            Decision::Refuse("it is a foreign path".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_landing_run_of_another_task_is_refused_but_an_earlier_attempt_is_not() {
+        let landing = Holder {
+            status: RunStatus::Landing,
+            ..holder()
+        };
+        assert!(matches!(
+            decide(&Owner::MagiRun, &landing),
+            Decision::Refuse(_)
+        ));
+        assert_eq!(decide(&Owner::EarlierAttempt, &landing), Decision::Release);
     }
 
     #[test]
     fn a_dirty_worktree_is_refused_and_says_why() {
         let dirty = Holder {
             dirty: true,
+            dirty_files: vec!["scratch.txt".to_owned()],
             ..holder()
         };
-        let Decision::Refuse(why) = decide(true, &dirty) else {
+        let Decision::Refuse(why) = decide(&Owner::EarlierAttempt, &dirty) else {
             panic!("dirty must be refused");
         };
-        assert!(why.contains("uncommitted"), "{why}");
+        assert!(
+            why.contains("uncommitted") && why.contains("scratch.txt"),
+            "{why}"
+        );
         assert!(why.contains("f82f") && why.contains("gating") && why.contains("dirty"));
     }
 
@@ -373,12 +501,16 @@ mod tests {
     fn a_live_run_is_refused() {
         let live = Holder {
             liveness: Liveness::Live,
+            driver_pid: Some(4242),
             ..holder()
         };
-        let Decision::Refuse(why) = decide(true, &live) else {
+        let Decision::Refuse(why) = decide(&Owner::EarlierAttempt, &live) else {
             panic!("live must be refused");
         };
-        assert!(why.contains("right now"), "{why}");
+        assert!(
+            why.contains("right now") && why.contains("f82f") && why.contains("4242"),
+            "{why}"
+        );
     }
 
     #[test]
@@ -387,7 +519,7 @@ mod tests {
             driver_unproven: true,
             ..holder()
         };
-        let Decision::Refuse(why) = decide(true, &unproven) else {
+        let Decision::Refuse(why) = decide(&Owner::EarlierAttempt, &unproven) else {
             panic!("an unproven driver must be refused");
         };
         assert!(why.contains("driver"), "{why}");
@@ -399,6 +531,9 @@ mod tests {
             head: "b".repeat(40),
             ..holder()
         };
-        assert!(matches!(decide(true, &off), Decision::Refuse(_)));
+        assert!(matches!(
+            decide(&Owner::EarlierAttempt, &off),
+            Decision::Refuse(_)
+        ));
     }
 }

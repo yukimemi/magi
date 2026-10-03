@@ -164,8 +164,13 @@ async fn a_run_that_is_not_superseded_is_left_alone() {
     let result =
         Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[]))).await;
 
-    assert!(result.is_err(), "git still refuses to share the branch");
-    assert!(wt.exists(), "a run nobody superseded keeps its worktree");
+    let err = result.err().expect("git still refuses to share the branch");
+    let text = format!("{err:#}");
+    assert!(
+        err.downcast_ref::<magi::handover::Refused>().is_some() && text.contains("by hand"),
+        "the refusal says the path is not magi's: {text}"
+    );
+    assert!(wt.exists(), "a worktree magi did not make keeps its worktree");
     let old = RunState::load_under(&old.id, &magi::run::home()).unwrap();
     assert!(!old.released());
 }
@@ -229,5 +234,122 @@ async fn a_blocked_run_whose_driver_stopped_is_released_though_its_pid_lives() {
     assert_eq!(old.released_to.as_deref(), Some(runner.state.id.as_str()));
     assert!(old.events.iter().any(|e| e.node == "release"));
     assert!(Runner::resume(&old.id).is_err());
+}
+}
+
+/// A run of *another* task, finished (blocked, no driver), whose candidate
+/// worktree sits where magi lays them: `<worktree root>/<short>/cand-A`.
+fn other_task_run(fx: &common::Fixture) -> (RunState, PathBuf) {
+    let base = run_git(&fx.repo, &["rev-parse", "main"]);
+    let mut state = RunState::new(
+        fx.repo.clone(),
+        "main".to_owned(),
+        base,
+        "another task".to_owned(),
+        fx.config.clone(),
+    );
+    let wt = state.worktree_root().join("cand-A");
+    std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    run_git(
+        &fx.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            BRANCH,
+            &wt.to_string_lossy(),
+            "main",
+        ],
+    );
+    std::fs::write(wt.join("note.txt"), "by the other run\n").unwrap();
+    run_git(&wt, &["add", "-A"]);
+    run_git(&wt, &["commit", "-q", "-m", "other run work"]);
+    state.status = RunStatus::Blocked;
+    state.candidates.push(Candidate {
+        index: 0,
+        label: 'A',
+        agent: "(existing branch)".to_owned(),
+        branch: BRANCH.to_owned(),
+        worktree: wt.clone(),
+        summary: String::new(),
+        stat: String::new(),
+        files: 1,
+        commits: 1,
+        empty: false,
+        failed: None,
+        verified_noop: None,
+        duration_ms: 0,
+        folded: false,
+    });
+    state.save().expect("save the other run");
+    (state, wt)
+}
+
+common::e2e! {
+async fn a_clean_dead_run_of_another_task_is_released_and_audited() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (old, wt) = other_task_run(&fx);
+    let tip = run_git(&fx.repo, &["rev-parse", BRANCH]);
+
+    let runner = Runner::review_taking_over(
+        &fx.repo,
+        BRANCH,
+        fx.config.clone(),
+        Some(takeover(&[])),
+    )
+    .await
+    .expect("a clean worktree of a dead run is released");
+
+    assert!(!wt.exists());
+    assert_eq!(run_git(&fx.repo, &["rev-parse", BRANCH]), tip, "the branch survives");
+    let old = RunState::load_under(&old.id, &magi::run::home()).unwrap();
+    assert_eq!(old.released_to.as_deref(), Some(runner.state.id.as_str()));
+    let note = old.events.iter().find(|e| e.node == "release").expect("audited");
+    assert!(note.message.contains("clean") && note.message.contains("blocked"), "{}", note.message);
+    assert!(runner.state.events.iter().any(|e| e.node == "release" && e.message.contains("clean")));
+}
+}
+
+common::e2e! {
+async fn a_dirty_worktree_of_another_task_names_the_files() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (old, wt) = other_task_run(&fx);
+    std::fs::write(wt.join("scratch.txt"), "unsaved\n").unwrap();
+
+    let err = Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[])))
+        .await
+        .err()
+        .expect("dirty must be refused");
+    assert!(err.downcast_ref::<magi::handover::Refused>().is_some());
+    let text = format!("{err:#}");
+    assert!(text.contains("scratch.txt") && text.contains("uncommitted"), "{text}");
+    assert!(wt.join("scratch.txt").exists());
+    assert!(!RunState::load_under(&old.id, &magi::run::home()).unwrap().released());
+}
+}
+
+common::e2e! {
+async fn a_live_run_of_another_task_is_left_alone_and_named() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (mut old, wt) = other_task_run(&fx);
+    let pid = std::process::id();
+    old.status = RunStatus::Reviewing;
+    old.driver_pid = Some(pid);
+    old.driver_started_at = magi::proc::process_started_at(pid);
+    old.save().unwrap();
+
+    let err = Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[])))
+        .await
+        .err()
+        .expect("a live run must be refused");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("right now") && text.contains(magi::run::short_of(&old.id)),
+        "{text}"
+    );
+    assert!(wt.exists());
 }
 }
