@@ -1979,3 +1979,12 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 .notice-meta a { color: var(--ink-2); display: inline-flex; align-items: center; min-height: var(--tap); }
 .notice-actions { display: flex; flex-wrap: wrap; gap: var(--s2); }
 .notice-actions .btn { flex: 1 1 8rem; }
+
+/* ---- task detail ------------------------------------------------------- */
+.task-runs { display: flex; flex-direction: column; gap: var(--s3); list-style: none; padding: 0; margin: 0; }
+.task-runs li { display: flex; flex-direction: column; gap: var(--s1); padding: var(--s3); border: 1px solid var(--line, currentColor); border-radius: var(--r2, 8px); }
+.task-runs .task-run-top { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
+.task-runs .task-run-n { font-family: var(--mono); color: var(--ink-3); }
+.task-runs .task-run-desc, .task-runs .task-run-out { font-size: var(--t3); color: var(--ink-2); overflow-wrap: anywhere; }
+.card-title.is-link { cursor: pointer; }
+.back-task { font-size: var(--t3); }

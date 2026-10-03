@@ -27,6 +27,7 @@ const API = {
   resumeRun: (id) => `/api/runs/${encodeURIComponent(id)}/resume`,
   report: (id) => `/api/runs/${encodeURIComponent(id)}/report`,
   queue: "/api/queue",
+  task: (id) => `/api/queue/${encodeURIComponent(id)}`,
   /* Aggregated over every readable run plus the live queue — the same
      numbers `magi stats` prints, reused rather than recomputed here. */
   stats: "/api/stats",
@@ -545,6 +546,8 @@ const state = {
      revealQueueSection() actually runs. */
   queueSectionFocus: null,
   detail: { id: null, run: null, report: null },
+  /* The task page's own subject: { id, task } while on #/tasks/<id>. */
+  taskDetail: { id: null, task: null, error: null },
   questions: null,
   /* The last /api/notifications answer: { unread, items }. */
   notices: null,
@@ -2073,6 +2076,7 @@ function createTaskCard() {
     el("summary", { text: "Resolved questions" }),
     answersList);
   const runLink = el("a", { class: "btn btn-quiet" });
+  const historyLink = el("a", { class: "btn btn-quiet", text: "Attempts" });
   /* Priority is a step, not a typed value: the operator wants "ahead of
      that other one", not to compose a number. +1/-1 both reach the same
      places a competing task's priority already sits. */
@@ -2084,15 +2088,22 @@ function createTaskCard() {
   const doneBox = el("span", { class: "task-done-box" });
   const deleteBox = el("span", { class: "task-delete-box" });
   const actions = el("div", { class: "card-actions" },
-    runLink, priorityBox, editBtn, holdBox, doneBox, deleteBox);
+    historyLink, runLink, priorityBox, editBtn, holdBox, doneBox, deleteBox);
 
   const card = el("li", { class: "card" },
     el("div", { class: "card-top" }, chipSlot, priority, solo, permalink, whenSlot),
     title, meta, note, error, instruction, answers, actions,
   );
+  /* Tapping the card body opens the task page; anything interactive inside it
+     (buttons, links, the details disclosures, selectable text) keeps its own
+     behaviour. */
+  title.classList.add("is-link");
+  title.addEventListener("click", () => {
+    if (card.dataset.taskId) location.hash = `#/tasks/${encodeURIComponent(card.dataset.taskId)}`;
+  });
   card.refs = {
     card, chipSlot, priority, solo, permalink, whenSlot, title, source, repo, attempts,
-    outcome, note, error, instruction, answers, answersList, runLink,
+    outcome, note, error, instruction, answers, answersList, runLink, historyLink,
     priorityDown, priorityUp, editBtn, holdBox, doneBox, deleteBox,
   };
   return card;
@@ -2110,6 +2121,7 @@ function updateTaskCard(row, task) {
   setText(r.permalink, shortId(task.id));
   setAttr(r.permalink, "href", `#/queue/${encodeURIComponent(task.id)}`);
   setAttr(r.permalink, "aria-label", `Link to task ${task.id}`);
+  setAttr(r.historyLink, "href", `#/tasks/${encodeURIComponent(task.id)}`);
 
   const next = chip(status, TASK_STATUS);
   if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
@@ -4008,7 +4020,9 @@ function renderTitle() {
             ? `Chat ${shortId(state.route.id)} \u2014 magi`
             : state.route.name === "run"
               ? `Run ${shortId(state.route.id)} \u2014 magi`
-              : "magi \u2014 observation deck";
+              : state.route.name === "task"
+                ? `Task ${shortId(state.route.id)} \u2014 magi`
+                : "magi \u2014 observation deck";
   document.title = count > 0 ? `(${count}) ${base}` : base;
 }
 
@@ -5178,6 +5192,13 @@ function renderRunDetail() {
   const repoName = typeof run.repo === "string" ? run.repo.split(/[\\/]/).filter(Boolean).pop() : "";
   setText($("run-meta"),
     `${shortId(run.id)} \u00b7 ${repoName} \u00b7 ${run.base_branch || ""} \u00b7 started ${created.text} \u00b7 updated ${updated.text}`);
+  /* The way back to the task whose attempt this is. */
+  const taskLink = $("run-task-link");
+  if (run.task && run.task.id) {
+    setAttr(taskLink, "href", `#/tasks/${encodeURIComponent(run.task.id)}`);
+    setText(taskLink, `Task ${run.task.short} \u2014 all attempts`);
+  }
+  show(taskLink, Boolean(run.task && run.task.id));
   setAttr($("run-meta"), "title", `${run.id}\n${run.repo || ""}\nstarted ${created.title}\nupdated ${updated.title}`);
 
   const instructionEl = $("run-instruction");
@@ -6472,6 +6493,9 @@ async function applyRevisions_(source) {
   const statsStale = state.stats !== null
     && (queueRev !== state.rev.queue || runsRev !== state.rev.runs);
 
+  /* Same reason, read before the revisions are overwritten. */
+  const taskStale = queueRev !== state.rev.queue || runsRev !== state.rev.runs;
+
   if (notificationsRev !== state.rev.notifications) {
     state.rev.notifications = notificationsRev;
     jobs.push(loadNotifications());
@@ -6485,6 +6509,10 @@ async function applyRevisions_(source) {
     state.rev.runs = runsRev;
     jobs.push(loadRuns());
     if (state.route.name === "run" && state.detail.id) jobs.push(loadRun(state.detail.id));
+  }
+  /* A task's page lists its runs' statuses, so either stream moving can stale it. */
+  if (taskStale && state.route.name === "task" && state.taskDetail.id) {
+    jobs.push(loadTask(state.taskDetail.id));
   }
   if (statsStale && state.route.name === "stats") jobs.push(loadStats());
   if (questionsRev !== state.rev.questions) {
@@ -6556,6 +6584,7 @@ function subscribe() {
 /* ---- routing ----------------------------------------------------------- */
 function parseRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
+  if (parts[0] === "tasks" && parts[1]) return { name: "task", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "queue" && parts[1]) return { name: "queue", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "queue") return { name: "queue", id: null };
   if (parts[0] === "stats") return { name: "stats", id: null };
@@ -6575,6 +6604,7 @@ function applyRoute() {
   show($("view-runs"), route.name === "runs");
   show($("view-run"), route.name === "run");
   show($("view-queue"), route.name === "queue");
+  show($("view-task"), route.name === "task");
   show($("view-stats"), route.name === "stats");
   show($("view-questions"), route.name === "questions");
   show($("view-notifications"), route.name === "notifications");
@@ -6588,6 +6618,7 @@ function applyRoute() {
   if (route.name !== "run") closeRunActions();
 
   const section = route.name === "run" ? "runs"
+    : route.name === "task" ? "queue"
     : route.name === "talk" ? "talks"
     : route.name;
   for (const link of document.querySelectorAll("[data-nav]")) {
@@ -6598,6 +6629,12 @@ function applyRoute() {
     if (state.detail.id !== route.id) loadRun(route.id);
   } else {
     state.detail = { id: null, run: null, report: null };
+  }
+
+  if (route.name === "task") {
+    if (state.taskDetail.id !== route.id) loadTask(route.id);
+  } else {
+    state.taskDetail = { id: null, task: null, error: null };
   }
 
   /* A conversation that is not on screen is dropped so the next one cannot
@@ -6641,6 +6678,96 @@ function applyRoute() {
      the stream since the last visit. */
   if (changed && route.name === "stats") loadStats();
   renderTitle();
+}
+
+/* ---- task detail --------------------------------------------------------
+ * Everything here comes from GET /api/queue/{id}: the server reads every run
+ * in Task.runs and says what kind of attempt each was and how it ended, so
+ * this only lays it out. */
+async function loadTask(id) {
+  if (state.taskDetail.id !== id) state.taskDetail = { id, task: null, error: null };
+  renderTask();
+  try {
+    const task = await getJson(API.task(id));
+    if (state.taskDetail.id !== id) return;   /* navigated away */
+    state.taskDetail.task = task;
+    state.taskDetail.error = null;
+    ok();
+  } catch (e) {
+    if (state.taskDetail.id !== id) return;
+    state.taskDetail.error = e.message;
+    fail(`Could not load task ${shortId(id)}: ${e.message}`);
+  }
+  renderTask();
+}
+
+function renderTask() {
+  const { id, task, error } = state.taskDetail;
+  const head = $("task-status");
+  clear(head);
+  if (!task) {
+    setText($("task-h"), error ? `Task ${shortId(id || "")} could not be loaded` : "Loading task\u2026");
+    setText($("task-meta"), error || "");
+    show($("task-why-panel"), false);
+    clear($("task-runs"));
+    setText($("task-attempts-count"), "");
+    return;
+  }
+  const status = String(task.status_str || task.status || "");
+  head.append(chip(status, TASK_STATUS));
+  setText($("task-h"), task.title || shortId(task.id));
+  const repoName = typeof task.repo === "string" ? task.repo.split(/[\\/]/).filter(Boolean).pop() : "";
+  const spent = Number(task.attempts) || 0;
+  setText($("task-meta"), [
+    shortId(task.id),
+    task.source_label,
+    repoName,
+    task.solo ? "solo" : "",
+    `${spent} of ${task.max_attempts} attempts used`,
+  ].filter(Boolean).join(" \u00b7 "));
+  setAttr($("task-meta"), "title", task.id);
+
+  const waitingOn = task.hold_reason || task.block_reason;
+  const noteBits = [(TASK_STATUS[status] || {}).note, waitingOn ? `Waiting on: ${waitingOn}` : ""].filter(Boolean);
+  setText($("task-note"), noteBits.join(" "));
+  show($("task-note"), noteBits.length > 0);
+  setText($("task-error"), task.last_error || "");
+  show($("task-error"), Boolean(task.last_error));
+  show($("task-why-panel"), noteBits.length > 0 || Boolean(task.last_error));
+
+  const box = $("task-instruction");
+  if (box.dataset.forTask !== task.id) {
+    box.dataset.forTask = task.id;
+    renderMd(box, task.instruction_md);
+  }
+
+  const history = Array.isArray(task.history) ? task.history : [];
+  setText($("task-attempts-count"), history.length ? `${history.length} run${history.length === 1 ? "" : "s"}` : "");
+  setText($("task-attempts-note"), `${task.attempts_note || ""} (Budget shown is the default of ${task.max_attempts}; a loop started with a different limit uses its own.)`);
+  const unreadable = Number(task.runs_unreadable) || 0;
+  setText($("task-unreadable"), unreadable
+    ? `${unreadable} of these runs could not be read by this build and are listed without detail.`
+    : "");
+  show($("task-unreadable"), unreadable > 0);
+
+  const list = $("task-runs");
+  clear(list);
+  if (!history.length) {
+    list.append(el("li", { text: "No run has started for this task yet." }));
+  }
+  for (const h of history) {
+    const top = el("div", { class: "task-run-top" },
+      el("span", { class: "task-run-n", text: `#${h.n}` }),
+      h.status ? chip(h.status, RUN_STATUS) : el("span", { class: "tag", text: "unreadable" }),
+      el("a", { href: `#/runs/${encodeURIComponent(h.id)}`, text: `Run ${h.short}`, title: h.id }),
+      el("span", { class: "tag", "data-tone": "ink", text: h.kind }),
+    );
+    if (h.provisional) top.append(el("span", { class: "tag", "data-tone": "rust", text: "provisional" }));
+    const li = el("li", {}, top, el("div", { class: "task-run-desc", text: h.description }));
+    if (h.outcome) li.append(el("div", { class: "task-run-out", text: h.outcome }));
+    if (h.pr) li.append(el("a", { href: h.pr, target: "_blank", rel: "noopener noreferrer", text: "Pull request" }));
+    list.append(li);
+  }
 }
 
 /* ---- run actions sheet -------------------------------------------------- */

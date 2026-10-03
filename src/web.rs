@@ -108,7 +108,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt as _;
@@ -826,8 +826,8 @@ impl Ui {
             .route("/api/runs/{id}/fold-merged", post(run_fold_merged))
             .route("/api/runs/{id}/resume", post(run_resume))
             .route("/api/queue", get(queue_list))
+            .route("/api/queue/{id}", get(task_detail).delete(queue_delete))
             .route("/api/stats", get(stats_get))
-            .route("/api/queue/{id}", delete(queue_delete))
             .route("/api/repos", get(repos_list))
             .route("/api/queue/{id}/hold", post(queue_hold))
             .route("/api/queue/{id}/release", post(queue_release))
@@ -2481,6 +2481,17 @@ struct RunDetailView {
     /// list a client happens to have cached even contains that attempt
     /// depends on a page limit this route knows nothing about.
     latest_attempt: Option<LatestAttempt>,
+    /// The queue task this run belongs to, so the detail page can link back
+    /// to the task's own page. `None` for a run nobody queued (`magi run`).
+    task: Option<TaskRef>,
+}
+
+/// A task named from a run's detail page.
+#[derive(Debug, Serialize)]
+struct TaskRef {
+    id: String,
+    short: String,
+    title: String,
 }
 
 /// The task's current attempt, as seen from an older one's detail page.
@@ -2507,6 +2518,7 @@ impl RunDetailView {
         live: crate::run::Liveness,
         superseded_by: Option<String>,
         latest_attempt: Option<LatestAttempt>,
+        task: Option<TaskRef>,
     ) -> Self {
         Self {
             instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
@@ -2514,6 +2526,7 @@ impl RunDetailView {
             unmerged_by_design: state.unmerged_by_design(),
             superseded_by,
             latest_attempt,
+            task,
             state,
         }
     }
@@ -2544,11 +2557,22 @@ async fn run_detail(
                 id: head.id,
             })
         });
+        let task = ui
+            .queue
+            .list()
+            .into_iter()
+            .find(|t| t.runs.contains(&id))
+            .map(|t| TaskRef {
+                short: t.short().to_owned(),
+                title: t.title.clone(),
+                id: t.id,
+            });
         Ok(Json(RunDetailView::of(
             state,
             live,
             superseded_by,
             latest_attempt,
+            task,
         )))
     })
     .await
@@ -2965,6 +2989,217 @@ async fn queue_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TaskView>>>
                 .map(|t| TaskView::with_inventory(t, &inv))
                 .collect(),
         ))
+    })
+    .await
+}
+
+/// One attempt in a task's history, as the task page lists it.
+#[derive(Debug, Serialize)]
+struct TaskRunView {
+    /// 1-based position in [`Task::runs`].
+    n: usize,
+    id: String,
+    short: String,
+    /// `competition`, `solo`, `review`, `resume` or `unknown` (record unreadable).
+    kind: &'static str,
+    /// The run's own status string; `None` when its record cannot be read.
+    status: Option<&'static str>,
+    /// Whether this build could read the run's record. Counted, never hidden.
+    readable: bool,
+    /// A verdict from a collapsed panel is provisional, never a decision.
+    provisional: bool,
+    /// What kind of attempt this was, in one line.
+    description: String,
+    /// How it ended and why the task moved on (or what it is doing now).
+    outcome: String,
+    created_at: Option<Timestamp>,
+    pr: Option<String>,
+}
+
+/// `GET /api/queue/{id}` - one task with every attempt it went through.
+#[derive(Debug, Serialize)]
+struct TaskDetailView {
+    #[serde(flatten)]
+    task: TaskView,
+    /// The attempt budget `magi serve` / `magi web` start a loop with unless
+    /// told otherwise; the loop's own flag is not visible from here.
+    max_attempts: usize,
+    history: Vec<TaskRunView>,
+    /// How many entries of `history` could not be read.
+    runs_unreadable: usize,
+    /// Why the attempt count can be lower than the number of runs.
+    attempts_note: &'static str,
+}
+
+const ATTEMPTS_NOTE: &str = "Attempts count how many times the loop claimed this task since it was last released, \
+and releasing a task resets the count while keeping every run. An attempt is also handed back when a run stalled \
+on an agent rate limit or was parked for an upgrade, and a run that is resumed continues the same run, so the \
+runs listed can outnumber the attempts shown.";
+
+/// The branch a review-only run reopened, read off the instruction
+/// `Runner::open_review` writes.
+fn review_branch_of(instruction: &str) -> Option<&str> {
+    let rest = instruction.strip_prefix("Review the work already on branch `")?;
+    rest.split('`').next().filter(|b| !b.is_empty())
+}
+
+/// Describe one entry of a task's run list. Pure: everything it needs is on
+/// the run and the task, so it is asserted without a server.
+fn task_run_view(
+    n: usize,
+    id: &str,
+    state: Option<&RunState>,
+    resumed: bool,
+    prior: Option<(&str, RunStatus)>,
+    last: bool,
+    task: &Task,
+) -> TaskRunView {
+    let short = run::short_of(id).to_owned();
+    let Some(s) = state else {
+        return TaskRunView {
+            n,
+            id: id.to_owned(),
+            short,
+            kind: "unknown",
+            status: None,
+            readable: false,
+            provisional: false,
+            description:
+                "This run's record could not be read by this build (written by a different \
+                          magi, or removed), so what kind of attempt it was is unknown."
+                    .to_owned(),
+            outcome: String::new(),
+            created_at: None,
+            pr: None,
+        };
+    };
+    let branch = review_branch_of(&s.instruction);
+    let kind = if resumed {
+        "resume"
+    } else if branch.is_some() {
+        "review"
+    } else if task.solo || s.candidates.len() == 1 {
+        "solo"
+    } else {
+        "competition"
+    };
+    let mut description = match kind {
+        "resume" => {
+            format!("Resumed run {short}: the same run carried on instead of competing again.")
+        }
+        "review" => format!(
+            "Review the work already on branch `{}`: a review-only pass, no new implementation.",
+            branch.unwrap_or_default()
+        ),
+        "solo" => "Solo run: one implementer straight into review.".to_owned(),
+        _ => format!(
+            "Competition: {} candidates judged blind.",
+            s.candidates.len().max(1)
+        ),
+    };
+    if !resumed && let Some((p, st)) = prior {
+        description.push_str(&format!(
+            " A retry: run {p} before it ended {}.",
+            st.display_label()
+        ));
+    }
+
+    let status = s.status;
+    let provisional = matches!(status, RunStatus::Stalled)
+        || s.tally.as_ref().is_some_and(|t| !t.met_quorum) && !status.done();
+    let head = match status {
+        RunStatus::Merged => "Merged.".to_owned(),
+        RunStatus::Ready => "Ready: passed the gate, not merged.".to_owned(),
+        RunStatus::Superseded => "Superseded: a later attempt finished the task.".to_owned(),
+        RunStatus::Stalled => {
+            "Stalled: the judging panel never reached a quorum, so there is no verdict.".to_owned()
+        }
+        RunStatus::Blocked => "Blocked: review or gate left something open.".to_owned(),
+        RunStatus::Failed => "Failed: the graph could not complete.".to_owned(),
+        RunStatus::VerifiedNoop => {
+            "Verified no-op: the candidates found nothing to change.".to_owned()
+        }
+        other if other.done() => format!("Ended {}.", other.display_label()),
+        other => format!("In progress ({}).", other.display_label()),
+    };
+    let why = if !status.done() {
+        String::new()
+    } else if s.parked {
+        " The operator parked it; the attempt was handed back and the run resumes.".to_owned()
+    } else if matches!(
+        status,
+        RunStatus::Merged | RunStatus::Ready | RunStatus::Superseded
+    ) {
+        String::new()
+    } else if matches!(status, RunStatus::Stalled) && !s.quota.is_empty()
+        || matches!(status, RunStatus::Failed) && !s.quota.is_empty() && s.viable().is_empty()
+    {
+        " An agent hit its rate limit, so the attempt was handed back.".to_owned()
+    } else if matches!(status, RunStatus::Blocked | RunStatus::VerifiedNoop) && s.pr.is_some() {
+        " It left a pull request open, so the task was held for a person rather than retried."
+            .to_owned()
+    } else if matches!(status, RunStatus::VerifiedNoop) {
+        " Held for a person to check the claim.".to_owned()
+    } else if last {
+        " It spent an attempt; the task retries until the budget runs out, then is held.".to_owned()
+    } else {
+        " It spent an attempt, and the task moved on to the next run.".to_owned()
+    };
+    TaskRunView {
+        n,
+        id: id.to_owned(),
+        short,
+        kind,
+        status: Some(status.as_str()),
+        readable: true,
+        provisional,
+        description,
+        outcome: format!("{head}{why}"),
+        created_at: Some(s.created_at),
+        pr: s.pr.as_ref().map(|p| p.url.clone()),
+    }
+}
+
+async fn task_detail(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<TaskDetailView>> {
+    blocking(move || {
+        let id = resolve_task(&ui.queue, &id)?;
+        let task = ui
+            .queue
+            .get(&id)
+            .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+        let inv = crate::blockers::Inventory::new(ui.queue.list(), &ui.questions.list());
+        let mut history = Vec::with_capacity(task.runs.len());
+        let mut seen: Vec<&str> = Vec::new();
+        let mut prior: Option<(&str, RunStatus)> = None;
+        for (i, run_id) in task.runs.iter().enumerate() {
+            let state = read_run(&ui.runs, run_id).ok();
+            let resumed = seen.contains(&run_id.as_str());
+            seen.push(run_id);
+            let last = i + 1 == task.runs.len();
+            history.push(task_run_view(
+                i + 1,
+                run_id,
+                state.as_ref(),
+                resumed,
+                prior,
+                last,
+                &task,
+            ));
+            if let Some(s) = &state {
+                prior = Some((run::short_of(run_id), s.status));
+            }
+        }
+        let runs_unreadable = history.iter().filter(|h| !h.readable).count();
+        Ok(Json(TaskDetailView {
+            max_attempts: daemon::Opts::default().max_attempts,
+            history,
+            runs_unreadable,
+            attempts_note: ATTEMPTS_NOTE,
+            task: TaskView::with_inventory(task, &inv),
+        }))
     })
     .await
 }
@@ -6971,6 +7206,72 @@ mod tests {
         let f = Fixture::start().await;
         let res = f.delete("/api/talks/nonexistent-id").await;
         assert_eq!(res.status, 404, "{}", res.body);
+    }
+
+    /// A task's page lists every run it ever had, in order, and says what kind
+    /// of attempt each was - including a resume, which re-pushes the same run
+    /// id, and a run whose record this build cannot read.
+    #[tokio::test]
+    async fn task_detail_lists_every_run_with_what_kind_of_attempt_it_was() {
+        let f = Fixture::start().await;
+        let (a, b, gone) = (
+            "20260902-140501-aaaa",
+            "20260902-140502-bbbb",
+            "20260902-140503-cccc",
+        );
+        write_run(&f.runs(), a, RunStatus::Stalled);
+        let mut review = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "Review the work already on branch `magi/aaaa/A`. There is no task statement."
+                .to_owned(),
+            Config::default(),
+        );
+        review.id = b.to_owned();
+        review.status = RunStatus::Merged;
+        write_state(&f.runs(), &review);
+
+        let mut task = Task::new(
+            "retry".to_owned(),
+            "Do the thing".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        task.start(a.to_owned());
+        task.stall("quota");
+        task.start(a.to_owned());
+        task.start(b.to_owned());
+        task.start(gone.to_owned());
+        f.queue().put(&mut task).expect("file the task");
+
+        let res = f.get(&format!("/api/queue/{}", task.id)).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let v = res.json();
+        let h = v["history"].as_array().expect("history");
+        assert_eq!(h.len(), 4, "{v}");
+        assert_eq!(h[0]["kind"], "competition");
+        assert_eq!(h[0]["status"], "stalled");
+        assert_eq!(h[0]["provisional"], true, "a stall is never a decision");
+        assert_eq!(h[1]["kind"], "resume", "{v}");
+        assert_eq!(h[2]["kind"], "review");
+        assert!(
+            h[2]["description"]
+                .as_str()
+                .unwrap()
+                .contains("magi/aaaa/A")
+        );
+        assert_eq!(h[2]["status"], "merged");
+        assert_eq!(h[3]["readable"], false, "an unreadable run is shown");
+        assert_eq!(v["runs_unreadable"], 1);
+        assert_eq!(v["instruction"], "Do the thing");
+        assert!(v["attempts_note"].as_str().unwrap().contains("handed back"));
+
+        // The run's own page links back to the task.
+        let run = f.get(&format!("/api/runs/{a}")).await.json();
+        assert_eq!(run["task"]["id"], task.id.as_str(), "{run}");
+
+        assert_eq!(f.get("/api/queue/nosuchtask").await.status, 404);
     }
 
     #[tokio::test]
