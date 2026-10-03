@@ -531,6 +531,11 @@ const state = {
      actually loaded, so a notification tapped before boot finishes still
      lands on its card once loadQueue() comes back. */
   queueFocus: null,
+  /* The task id of a `#/queue/<id>` link the loaded Backlog has no card for,
+     so renderQueue() can say so instead of showing the plain list as if
+     nothing had been asked. Cleared when the card appears or the route
+     moves on. */
+  queueFocusMissing: null,
   /* A QUEUE_SECTIONS key to expand and scroll into view the moment the
      Backlog can show it - set by openQueueSectionFocus() (a stats queue
      tile's own navigation) and consumed once by consumeQueueSectionFocus(),
@@ -2031,6 +2036,7 @@ function renderRuns() {
 function createTaskCard() {
   const chipSlot = el("span");
   const priority = el("span", { class: "tag", "data-tone": "ink" });
+  const permalink = el("a", { class: "card-permalink" });
   /* `solo` runs one implementer straight into review instead of the usual
      multi-agent competition - a fact about how the task will be spent that a
      card must show, the same way priority is shown, rather than something
@@ -2070,11 +2076,11 @@ function createTaskCard() {
     runLink, priorityBox, editBtn, holdBox, doneBox, deleteBox);
 
   const card = el("li", { class: "card" },
-    el("div", { class: "card-top" }, chipSlot, priority, solo, whenSlot),
+    el("div", { class: "card-top" }, chipSlot, priority, solo, permalink, whenSlot),
     title, meta, note, error, instruction, answers, actions,
   );
   card.refs = {
-    card, chipSlot, priority, solo, whenSlot, title, source, repo, attempts,
+    card, chipSlot, priority, solo, permalink, whenSlot, title, source, repo, attempts,
     outcome, note, error, instruction, answers, answersList, runLink,
     priorityDown, priorityUp, editBtn, holdBox, doneBox, deleteBox,
   };
@@ -2087,6 +2093,12 @@ function updateTaskCard(row, task) {
   const meta = TASK_STATUS[status] || {};
 
   setAttr(r.card, "data-tone", toneOf(status, TASK_STATUS));
+  /* The full id, a stable hook for jumpToTask() that does not depend on
+     syncList's own data-key. */
+  setAttr(r.card, "data-task-id", task.id);
+  setText(r.permalink, shortId(task.id));
+  setAttr(r.permalink, "href", `#/queue/${encodeURIComponent(task.id)}`);
+  setAttr(r.permalink, "aria-label", `Link to task ${task.id}`);
 
   const next = chip(status, TASK_STATUS);
   if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
@@ -2885,6 +2897,7 @@ function renderQueue() {
   if (held) parts.push(`${held} held`);
   setText($("queue-count"), tasks.length === 0 ? "Nothing waiting" : parts.join(", "));
 
+  renderQueueFocusStatus(tasks);
   show($("queue-search"), tasks.length > 0);
   show($("queue-empty"), tasks.length === 0);
 const query = state.queueSearch.trim().toLowerCase();
@@ -2935,13 +2948,18 @@ function openQueueSectionFocus(sectionKey) {
    previous visit is cleared. state.queueFocus is deliberately left set
    through that recursive call - clearing it before the search branch ran
    would make the second pass see nothing to jump to and silently drop the
-   jump. It is cleared only once jumpToTask() is actually about to run, so a
-   task that turns out to have been folded or deleted since the notification
-   fired just drops the focus instead of retrying forever - jumpToTask()
-   itself already no-ops when the card is not on the page. */
+   jump. It is cleared only once jumpToTask() has actually landed: a card that
+   is not there yet keeps the focus, so it still gets its one scroll and flash
+   if it arrives later over the change stream, and renderQueueFocusStatus()
+   says meanwhile that it is not in the Backlog. The focus is dropped when the
+   route moves off this task (applyRoute) or no longer names it (above). */
 function consumeQueueFocus() {
   const id = state.queueFocus;
   if (!id || state.queue === null) return;
+  if (state.route.name !== "queue" || state.route.id !== id) {
+    state.queueFocus = null;
+    return;
+  }
   if (state.queueSearch.trim() !== "") {
     state.queueSearch = "";
     const input = $("queue-search-input");
@@ -2950,8 +2968,25 @@ function consumeQueueFocus() {
     renderQueue();
     return;
   }
-  state.queueFocus = null;
-  jumpToTask(id);
+  if (jumpToTask(id)) state.queueFocus = null;
+}
+
+/* Says so when `#/queue/<id>` names a task the loaded Backlog does not hold.
+   Deliberately does not claim why (folded, deleted, done and closed all look
+   the same from here), and clears itself the moment the card shows up. */
+function renderQueueFocusStatus(tasks) {
+  const box = $("queue-focus-status");
+  if (!box) return;
+  const id = state.queueFocus;
+  const missing = Boolean(id) && !tasks.some((t) => t.id === id);
+  state.queueFocusMissing = missing ? id : null;
+  show(box, missing);
+  if (!missing) return;
+  clear(box);
+  box.append(
+    `Task ${shortId(id)} is not in the current Backlog. `,
+    el("a", { href: "#/queue", text: "Show all" }),
+  );
 }
 
 /* Mirrors consumeQueueFocus() above for a whole section instead of one task -
@@ -3236,8 +3271,8 @@ function revealQueueSection(details) {
    section first: a card sitting in a collapsed section cannot be scrolled
    to at all. */
 function jumpToTask(id) {
-  const card = document.querySelector(`#queue-sections li.card[data-key="${CSS.escape(id)}"]`);
-  if (!card) return;
+  const card = document.querySelector(`#queue-sections li.card[data-task-id="${CSS.escape(id)}"]`);
+  if (!card) return false;
   const section = card.closest("details.list-section");
   if (section && !section.open) revealQueueSection(section);
   const header = document.querySelector(".top");
@@ -3250,6 +3285,7 @@ function jumpToTask(id) {
   // that was already jumped to once this session.
   void card.offsetWidth;
   card.classList.add("card-flash");
+  return true;
 }
 
 /* ---- questions --------------------------------------------------------- *
@@ -6580,6 +6616,11 @@ function applyRoute() {
      jumped to directly, since the Backlog may still be loading or mid a
      stale search - see consumeQueueFocus(), which renderQueue() calls on
      every pass and which is the thing that actually retries. */
+  if (changed && !(route.name === "queue" && route.id)) {
+    state.queueFocus = null;
+    state.queueFocusMissing = null;
+    show($("queue-focus-status"), false);
+  }
   if (changed && route.name === "queue" && route.id) {
     state.queueFocus = route.id;
     renderQueue();

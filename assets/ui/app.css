@@ -612,6 +612,9 @@ main {
  * than a bare <input> so it reads as a control, not a stray text field. */
 .queue-search { display: flex; align-items: center; gap: var(--s3); margin-bottom: var(--s3); }
 .queue-search input[type="search"] { flex: 1; margin-top: 0; }
+.queue-focus-status { margin: 0 0 var(--s3); font-size: var(--t3); color: var(--ink-2); }
+.card-permalink { font-size: var(--t1); color: var(--ink-3); text-decoration: none; }
+.card-permalink:hover, .card-permalink:focus-visible { color: var(--ink-2); text-decoration: underline; }
 .queue-search-status { margin: calc(-1 * var(--s2)) 0 var(--s3); font-size: var(--t3); color: var(--ink-2); }
 
 /* The single-hit flash: a plain background pulse rather than color-mix(), for

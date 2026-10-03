@@ -8545,9 +8545,18 @@ mod tests {
              recursive renderQueue() call has nothing left to jump to"
         );
         assert!(
-            APP_JS.contains("state.queueFocus = null;\n  jumpToTask(id);"),
-            "state.queueFocus must be cleared immediately before the jump it guards, not earlier"
+            APP_JS.contains("if (jumpToTask(id)) state.queueFocus = null;"),
+            "state.queueFocus must be cleared only once the jump has landed, so a card that \
+             arrives later still gets it"
         );
+        assert!(APP_JS.contains("state.queueFocusMissing = missing ? id : null;"));
+        assert!(APP_JS.contains("is not in the current Backlog."));
+        assert!(APP_JS.contains("li.card[data-task-id=\""));
+        assert!(APP_JS.contains("setAttr(r.card, \"data-task-id\", task.id);"));
+        assert!(APP_JS.contains("`#/queue/${encodeURIComponent(task.id)}`"));
+        assert!(APP_CSS.contains(".card-permalink"));
+        assert!(APP_CSS.contains(".queue-focus-status"));
+        assert!(APP_JS.contains("const section = route.name === \"run\" ? \"runs\""));
     }
 
     #[test]
