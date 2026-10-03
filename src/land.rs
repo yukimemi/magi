@@ -1385,6 +1385,22 @@ struct GhPrHead {
     head_ref_oid: String,
 }
 
+/// Why [`closable`] said no, and whether asking again later could say yes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// A later attempt may succeed (the head moved, the view was unreadable);
+    /// `false` means this pull request is simply not the run's to close.
+    pub retry: bool,
+    /// What was wrong.
+    pub why: String,
+}
+
+impl Refusal {
+    fn final_(why: String) -> Self {
+        Self { retry: false, why }
+    }
+}
+
 /// Pure half of [`close_superseded_pr`]: read `gh pr view --json
 /// headRefName,baseRefName,state,isCrossRepository` and say whether closing
 /// is safe, `Err` carrying the reason when it is not.
@@ -1398,31 +1414,51 @@ pub fn closable(
     branch: &str,
     base: &str,
     verified: &[String],
-) -> std::result::Result<(), String> {
-    let pr: GhPrHead =
-        serde_json::from_str(json).map_err(|e| format!("could not read the pull request ({e})"))?;
+) -> std::result::Result<(), Refusal> {
+    let pr: GhPrHead = serde_json::from_str(json).map_err(|e| Refusal {
+        retry: true,
+        why: format!("could not read the pull request ({e})"),
+    })?;
     if pr.head_ref_name != branch {
-        return Err(format!(
+        return Err(Refusal::final_(format!(
             "its head is `{}`, not this run's `{branch}`",
             pr.head_ref_name
-        ));
-    }
-    if !verified.contains(&pr.head_ref_oid) {
-        return Err(format!(
-            "its head {} is not a commit this run checked against the base",
-            crate::already::short_sha(&pr.head_ref_oid)
-        ));
+        )));
     }
     if pr.is_cross_repository {
-        return Err("its head lives in a fork".to_owned());
+        return Err(Refusal::final_("its head lives in a fork".to_owned()));
     }
     if pr.base_ref_name != base {
-        return Err(format!("it targets `{}`, not `{base}`", pr.base_ref_name));
+        return Err(Refusal::final_(format!(
+            "it targets `{}`, not `{base}`",
+            pr.base_ref_name
+        )));
     }
     if !pr.state.eq_ignore_ascii_case("open") {
-        return Err(format!("it is already {}", pr.state.to_ascii_lowercase()));
+        return Err(Refusal::final_(format!(
+            "it is already {}",
+            pr.state.to_ascii_lowercase()
+        )));
+    }
+    // Last, so a pull request that is not this run's at all is reported as
+    // such. A head that is this branch but not a commit checked against the
+    // base (somebody pushed since) may well get checked next time: retry.
+    if !verified.contains(&pr.head_ref_oid) {
+        return Err(Refusal {
+            retry: true,
+            why: format!(
+                "its head {} is not a commit this run checked against the base",
+                crate::already::short_sha(&pr.head_ref_oid)
+            ),
+        });
     }
     Ok(())
+}
+
+/// Does this `gh` failure mean there is no GitHub to ask, as opposed to a
+/// request that failed?
+fn forge_unavailable(message: &str) -> bool {
+    message.contains("known GitHub host") || message.contains("spawn gh")
 }
 
 /// The comment left on a pull request closed because its change is already on
@@ -1449,8 +1485,11 @@ pub fn superseded_comment(base: &str, evidence: &crate::already::Evidence) -> St
 }
 
 /// Close the open pull request for `branch`, if there is one and it is
-/// provably this run's, with a comment naming what supersedes it. Returns the
-/// URL closed, or `None` with the reason when nothing was touched.
+/// provably this run's, with a comment naming what supersedes it. `Ok(Ok(url))` is
+/// the URL closed; `Ok(Err(why))` is a final "nothing to close" (no pull request,
+/// not this run's, no forge); `Err` is anything a later attempt could resolve (a
+/// failed `gh` call, a head that moved since it was checked), which the caller
+/// must not treat as settled.
 ///
 /// The recorded `state.pr` is preferred, else the forge is asked for an open
 /// pull request on `branch`; either way the candidate is re-read and passed
@@ -1466,15 +1505,15 @@ pub async fn close_superseded_pr(
     let base = state.base_branch.clone();
     let url = match state.pr.as_ref().filter(|p| p.state == "open") {
         Some(p) => p.url.clone(),
-        // No recorded pull request: whether the forge can even be asked
-        // (a repository with no GitHub remote, `gh` not logged in) says
-        // nothing about this run, so a failed lookup is "none found", not an
-        // error that would keep a settled run open.
-        None => match find_open_pr(&repo, branch, &base)
-            .await
-            .map_err(|e| format!("could not look for a pull request: {e:#}"))
-        {
-            Err(why) => return Ok(Err(why)),
+        // No recorded pull request. A forge that cannot be asked at all (no
+        // GitHub remote, no `gh`) says nothing about this run, so that is
+        // "none found"; any other lookup failure is an error, because "could
+        // not look" is not "nothing there" and the caller must retry.
+        None => match find_open_pr(&repo, branch, &base).await {
+            Err(e) if forge_unavailable(&format!("{e:#}")) => {
+                return Ok(Err(format!("no forge to ask: {e:#}")));
+            }
+            Err(e) => return Err(e),
             Ok(OpenPr::One { url, .. }) => url,
             Ok(OpenPr::None) => return Ok(Err("no open pull request".to_owned())),
             Ok(OpenPr::Many(urls)) => {
@@ -1499,8 +1538,13 @@ pub async fn close_superseded_pr(
     if !ok {
         bail!("gh pr view {url} failed: {view}");
     }
-    if let Err(why) = closable(&view, branch, &base, verified) {
-        return Ok(Err(format!("left {url} open: {why}")));
+    if let Err(refusal) = closable(&view, branch, &base, verified) {
+        // A pull request whose head cannot be tied to what was proven is not
+        // one to walk away from: the caller keeps the run resumable.
+        if refusal.retry {
+            bail!("left {url} open: {}", refusal.why);
+        }
+        return Ok(Err(format!("left {url} open: {}", refusal.why)));
     }
     let (ok, out) = gh(
         &repo,
@@ -2947,13 +2991,31 @@ mod tests {
             (head_json("magi/27b2/A", "main", "MERGED", false), "already"),
             (head_json("magi/27b2/A", "main", "CLOSED", false), "already"),
         ] {
-            let err = closable(&json, "magi/27b2/A", "main", &["aaa".to_owned()]).unwrap_err();
+            let err = closable(&json, "magi/27b2/A", "main", &["aaa".to_owned()])
+                .unwrap_err()
+                .why;
             assert!(err.contains(why), "{json}: {err}");
         }
         // A head that moved on past what was verified is left alone.
         let moved = head_json("magi/27b2/A", "main", "OPEN", false);
         let err = closable(&moved, "magi/27b2/A", "main", &["bbb".to_owned()]).unwrap_err();
-        assert!(err.contains("not a commit"), "{err}");
+        assert!(err.retry && err.why.contains("not a commit"), "{err:?}");
+        assert!(
+            !closable(
+                &head_json("x", "main", "OPEN", false),
+                "magi/27b2/A",
+                "main",
+                &[]
+            )
+            .unwrap_err()
+            .retry
+        );
+        assert!(forge_unavailable(
+            "gh pr list failed: none of the git remotes configured for this repository point to a known GitHub host."
+        ));
+        assert!(!forge_unavailable(
+            "gh pr list failed: error connecting to api.github.com"
+        ));
         assert!(closable("not json", "magi/27b2/A", "main", &[]).is_err());
         // A record that does not say whether it is a fork is not trusted.
         assert!(
