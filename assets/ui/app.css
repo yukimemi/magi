@@ -1130,6 +1130,14 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   line-clamp: 2; overflow: hidden; text-overflow: ellipsis;
 }
 
+.talk-task-link {
+  display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap;
+  min-height: var(--tap); color: inherit;
+}
+.talk-task-link > span:last-child {
+  text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 3px;
+}
+
 .run-status { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
 .instruction { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--t4); color: var(--ink); }
 
