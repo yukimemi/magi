@@ -119,7 +119,7 @@ use crate::config::{Config, Update, UpdateMode};
 use crate::md;
 use crate::notices::{Notice, Notices};
 use crate::proc::Quiet as _;
-use crate::queue::{Queue, Task, title_from};
+use crate::queue::{Queue, Task, TaskStatus, title_from};
 use crate::run::{RunState, RunStatus};
 use crate::talk::{Talk, Talks};
 use crate::{daemon, git, report, repos, run, stats, talk, updater};
@@ -3014,6 +3014,121 @@ struct TaskRunView {
     outcome: String,
     created_at: Option<Timestamp>,
     pr: Option<String>,
+    /// Why this pass ended, classified once; the flowchart is built from it.
+    exit: RunExit,
+    /// What the pass did to the task's attempt budget.
+    attempt: AttemptCost,
+    /// The branch a review-only run reopened.
+    branch: Option<String>,
+}
+
+/// How one pass over a run ended, as far as the task's life is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RunExit {
+    Unreadable,
+    /// An earlier pass of a run id that appears again: it stopped short.
+    Interrupted,
+    Parked,
+    QuotaStall,
+    Merged,
+    Ready,
+    Superseded,
+    /// Stalled without a rate limit to blame: no verdict, attempt spent.
+    Stalled,
+    /// Blocked / no-op with a pull request left open: held for a person.
+    HeldWithPr,
+    NoopHeld,
+    /// Blocked or failed: the attempt is spent and the task retries or holds.
+    Spent,
+    InProgress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AttemptCost {
+    Spent,
+    Refunded,
+    None,
+    /// Cannot be told from the records that remain.
+    Unknown,
+}
+
+impl RunExit {
+    fn of(s: Option<&RunState>, resumed_later: bool) -> Self {
+        let Some(s) = s else {
+            return Self::Unreadable;
+        };
+        let status = s.status;
+        if resumed_later {
+            Self::Interrupted
+        } else if s.parked {
+            Self::Parked
+        } else if !status.done() {
+            Self::InProgress
+        } else if matches!(status, RunStatus::Merged) {
+            Self::Merged
+        } else if matches!(status, RunStatus::Ready) {
+            Self::Ready
+        } else if matches!(status, RunStatus::Superseded) {
+            Self::Superseded
+        } else if matches!(status, RunStatus::Stalled) && !s.quota.is_empty()
+            || matches!(status, RunStatus::Failed) && !s.quota.is_empty() && s.viable().is_empty()
+        {
+            Self::QuotaStall
+        } else if matches!(status, RunStatus::Blocked | RunStatus::VerifiedNoop) && s.pr.is_some() {
+            Self::HeldWithPr
+        } else if matches!(status, RunStatus::VerifiedNoop) {
+            Self::NoopHeld
+        } else if matches!(status, RunStatus::Stalled) {
+            Self::Stalled
+        } else {
+            Self::Spent
+        }
+    }
+
+    fn cost(self) -> AttemptCost {
+        match self {
+            Self::Interrupted | Self::Parked | Self::QuotaStall => AttemptCost::Refunded,
+            Self::Merged
+            | Self::Ready
+            | Self::Stalled
+            | Self::HeldWithPr
+            | Self::NoopHeld
+            | Self::Spent => AttemptCost::Spent,
+            Self::InProgress => AttemptCost::None,
+            Self::Unreadable | Self::Superseded => AttemptCost::Unknown,
+        }
+    }
+
+    /// Short edge wording for leaving a run this way.
+    fn edge_label(self, status: Option<&str>) -> String {
+        match self {
+            Self::Unreadable => "record unreadable".to_owned(),
+            Self::Interrupted => "interrupted, attempt refunded".to_owned(),
+            Self::Parked => "parked, attempt refunded".to_owned(),
+            Self::QuotaStall => "quota stall, attempt refunded".to_owned(),
+            Self::Merged => "merged".to_owned(),
+            Self::Ready => "ready, not merged".to_owned(),
+            Self::Superseded => "superseded by a later attempt".to_owned(),
+            Self::Stalled => "stalled, no verdict, attempt spent".to_owned(),
+            Self::HeldWithPr => "blocked, PR left open".to_owned(),
+            Self::NoopHeld => "verified no-op".to_owned(),
+            Self::Spent => format!("{}, attempt spent", status.unwrap_or("ended")),
+            Self::InProgress => "in progress".to_owned(),
+        }
+    }
+
+    /// Does a task in `end` follow from a run that ended this way? When not,
+    /// somebody closed or held the task by hand.
+    fn explains(self, end: TaskStatus) -> bool {
+        match self {
+            Self::Merged => end == TaskStatus::Done,
+            Self::HeldWithPr | Self::NoopHeld => end == TaskStatus::Held,
+            Self::Unreadable | Self::Superseded | Self::Ready => true,
+            _ => end != TaskStatus::Done,
+        }
+    }
 }
 
 /// `GET /api/queue/{id}` - one task with every attempt it went through.
@@ -3025,6 +3140,7 @@ struct TaskDetailView {
     /// told otherwise; the loop's own flag is not visible from here.
     max_attempts: usize,
     history: Vec<TaskRunView>,
+    flow: FlowView,
     /// How many entries of `history` could not be read.
     runs_unreadable: usize,
     /// Why the attempt count can be lower than the number of runs.
@@ -3083,6 +3199,9 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
             outcome: String::new(),
             created_at: None,
             pr: None,
+            exit: RunExit::Unreadable,
+            attempt: AttemptCost::Unknown,
+            branch: None,
         };
     };
     let branch = review_branch_of(&s.instruction);
@@ -3176,6 +3295,7 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
     } else {
         " It spent an attempt, and the task moved on to the next run.".to_owned()
     };
+    let exit = RunExit::of(Some(s), resumed_later.is_some());
     TaskRunView {
         n,
         id: id.to_owned(),
@@ -3188,7 +3308,176 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
         outcome: format!("{head}{why}"),
         created_at: Some(s.created_at),
         pr: s.pr.as_ref().map(|p| p.url.clone()),
+        exit,
+        attempt: exit.cost(),
+        branch: branch.map(str::to_owned),
     }
+}
+
+/// One box of the task's flowchart.
+#[derive(Debug, Serialize, PartialEq)]
+struct FlowNode {
+    /// Unique by position: a resumed run id appears once per pass.
+    key: String,
+    /// `start`, `run` or `end`.
+    kind: &'static str,
+    label: String,
+    /// Run status (or the task's, for `end`); `None` when it is not a fact
+    /// about this box (unreadable, or a pass the run later resumed from).
+    status: Option<&'static str>,
+    /// Why there is no status: `unreadable`, `interrupted` or `no verdict`.
+    note: Option<&'static str>,
+    run_kind: Option<&'static str>,
+    detail: Option<String>,
+    /// A readable run with a real verdict; a stall never is.
+    decided: bool,
+    readable: bool,
+    href: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct FlowEdge {
+    from: String,
+    to: String,
+    label: String,
+    attempt: AttemptCost,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct FlowView {
+    nodes: Vec<FlowNode>,
+    edges: Vec<FlowEdge>,
+    /// Attempts the task has counted since it was last released.
+    attempts: usize,
+    max_attempts: usize,
+}
+
+/// Turn a task and its described runs into the flowchart's boxes and arrows.
+/// Pure: the page only draws what this returns.
+fn task_flow(task: &Task, history: &[TaskRunView], max_attempts: usize) -> FlowView {
+    let node = |key: &str, kind, label: String| FlowNode {
+        key: key.to_owned(),
+        kind,
+        label,
+        status: None,
+        note: None,
+        run_kind: None,
+        detail: None,
+        decided: false,
+        readable: true,
+        href: None,
+    };
+    let mut nodes = vec![node("start", "start", "Task queued".to_owned())];
+    let mut edges: Vec<FlowEdge> = Vec::new();
+    let mut prev = "start".to_owned();
+    let mut prev_exit: Option<(RunExit, Option<&str>)> = None;
+    for (i, h) in history.iter().enumerate() {
+        let key = format!("run-{}", h.n);
+        let mut n = node(&key, "run", format!("Run {}", h.short));
+        n.run_kind = Some(h.kind);
+        n.readable = h.readable;
+        n.href = Some(format!("#/runs/{}", h.id));
+        n.decided = h.readable && !h.provisional;
+        n.detail = h
+            .branch
+            .as_ref()
+            .map(|b| format!("review-only run of branch {b}"));
+        match h.exit {
+            RunExit::Unreadable => n.note = Some("unreadable"),
+            RunExit::Interrupted => n.note = Some("interrupted"),
+            _ => {
+                n.status = h.status;
+                if h.provisional {
+                    n.note = Some("no verdict");
+                }
+            }
+        }
+        let into = match h.kind {
+            "review" => Some(format!(
+                "review-only run of branch {}",
+                h.branch.as_deref().unwrap_or("?")
+            )),
+            "resume" => Some("resume the same run".to_owned()),
+            _ if i > 0 => Some("retry".to_owned()),
+            _ => None,
+        };
+        let label = match (prev_exit, into) {
+            (Some((e, st)), Some(i)) => format!("{} \u{2192} {i}", e.edge_label(st)),
+            (Some((e, st)), None) => e.edge_label(st),
+            (None, Some(i)) => i,
+            (None, None) => "claimed".to_owned(),
+        };
+        edges.push(FlowEdge {
+            from: prev.clone(),
+            to: key.clone(),
+            label,
+            attempt: prev_exit.map_or(AttemptCost::None, |(e, _)| e.cost()),
+        });
+        prev_exit = Some((h.exit, h.status));
+        prev = key;
+        nodes.push(n);
+    }
+    let mut end = node("end", "end", task.status.as_str().to_owned());
+    end.status = Some(task.status.as_str());
+    nodes.push(end);
+    let (label, attempt) = match prev_exit {
+        None => (
+            format!("no run yet \u{2192} {}", task.status.as_str()),
+            AttemptCost::None,
+        ),
+        Some((e, st)) if e.explains(task.status) => (
+            format!("{} \u{2192} {}", e.edge_label(st), task.status.as_str()),
+            e.cost(),
+        ),
+        Some((e, _)) => (
+            format!("closed by hand: task is {}", task.status.as_str()),
+            e.cost(),
+        ),
+    };
+    edges.push(FlowEdge {
+        from: prev,
+        to: "end".to_owned(),
+        label,
+        attempt,
+    });
+    FlowView {
+        nodes,
+        edges,
+        attempts: task.attempts,
+        max_attempts,
+    }
+}
+
+/// Describe every entry of `task.runs`, in order, reading each run's record
+/// through `read`.
+fn task_history(task: &Task, read: impl Fn(&str) -> Option<RunState>) -> Vec<TaskRunView> {
+    let mut history = Vec::with_capacity(task.runs.len());
+    let mut seen: Vec<&str> = Vec::new();
+    let mut prior: Option<(&str, RunStatus)> = None;
+    for (i, run_id) in task.runs.iter().enumerate() {
+        let state = read(run_id);
+        let resumed = seen.contains(&run_id.as_str());
+        seen.push(run_id);
+        history.push(task_run_view(
+            run_id,
+            state.as_ref(),
+            RunSlot {
+                n: i + 1,
+                resumed,
+                resumed_later: task.runs[i + 1..]
+                    .iter()
+                    .position(|r| r == run_id)
+                    .map(|off| i + off + 2),
+                prior,
+                last: i + 1 == task.runs.len(),
+            },
+            task,
+        ));
+        if let Some(s) = &state {
+            prior = Some((run::short_of(run_id), s.status));
+        }
+    }
+    history
 }
 
 async fn task_detail(
@@ -3202,36 +3491,13 @@ async fn task_detail(
             .get(&id)
             .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
         let inv = crate::blockers::Inventory::new(ui.queue.list(), &ui.questions.list());
-        let mut history = Vec::with_capacity(task.runs.len());
-        let mut seen: Vec<&str> = Vec::new();
-        let mut prior: Option<(&str, RunStatus)> = None;
-        for (i, run_id) in task.runs.iter().enumerate() {
-            let state = read_run(&ui.runs, run_id).ok();
-            let resumed = seen.contains(&run_id.as_str());
-            seen.push(run_id);
-            let last = i + 1 == task.runs.len();
-            history.push(task_run_view(
-                run_id,
-                state.as_ref(),
-                RunSlot {
-                    n: i + 1,
-                    resumed,
-                    resumed_later: task.runs[i + 1..]
-                        .iter()
-                        .position(|r| r == run_id)
-                        .map(|off| i + off + 2),
-                    prior,
-                    last,
-                },
-                &task,
-            ));
-            if let Some(s) = &state {
-                prior = Some((run::short_of(run_id), s.status));
-            }
-        }
+        let history = task_history(&task, |id| read_run(&ui.runs, id).ok());
         let runs_unreadable = history.iter().filter(|h| !h.readable).count();
+        let max_attempts = daemon::Opts::default().max_attempts;
+        let flow = task_flow(&task, &history, max_attempts);
         Ok(Json(TaskDetailView {
-            max_attempts: daemon::Opts::default().max_attempts,
+            max_attempts,
+            flow,
             history,
             runs_unreadable,
             attempts_note: ATTEMPTS_NOTE,
@@ -5295,7 +5561,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::queue::{Source, TaskStatus};
+    use crate::queue::Source;
 
     /// How many 10ms steps a settle loop takes before it calls a stall a
     /// stall - thirty seconds.
@@ -7312,6 +7578,10 @@ mod tests {
         assert_eq!(h[2]["status"], "merged");
         assert_eq!(h[3]["readable"], false, "an unreadable run is shown");
         assert_eq!(v["runs_unreadable"], 1);
+        let nodes = v["flow"]["nodes"].as_array().expect("flow nodes");
+        assert_eq!(nodes.len(), 6, "start + four passes + end: {v}");
+        assert_eq!(nodes[4]["note"], "unreadable");
+        assert_eq!(v["flow"]["edges"].as_array().unwrap().len(), 5);
         assert_eq!(v["instruction"], "Do the thing");
         assert!(v["attempts_note"].as_str().unwrap().contains("handed back"));
 
@@ -7320,6 +7590,179 @@ mod tests {
         assert_eq!(run["task"]["id"], task.id.as_str(), "{run}");
 
         assert_eq!(f.get("/api/queue/nosuchtask").await.status, 404);
+    }
+
+    fn flow_run(status: RunStatus, edit: impl FnOnce(&mut RunState)) -> RunState {
+        let mut s = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "Do it".to_owned(),
+            Config::default(),
+        );
+        s.status = status;
+        edit(&mut s);
+        s
+    }
+
+    fn flow_task(runs: &[&str]) -> Task {
+        let mut t = Task::new(
+            "t".to_owned(),
+            "Do it".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        for r in runs {
+            t.start((*r).to_owned());
+        }
+        t
+    }
+
+    fn flow_for(task: &Task, states: &[(&str, Option<RunState>)]) -> FlowView {
+        let h = task_history(task, |id| {
+            states
+                .iter()
+                .find(|(i, _)| *i == id)
+                .and_then(|(_, s)| s.clone())
+        });
+        task_flow(task, &h, 5)
+    }
+
+    const FA: &str = "20260902-140501-aaaa";
+    const FB: &str = "20260902-140502-bbbb";
+
+    #[test]
+    fn flow_follows_blocked_retry_merged_to_done() {
+        let mut t = flow_task(&[FA, FB]);
+        t.status = TaskStatus::Done;
+        let f = flow_for(
+            &t,
+            &[
+                (FA, Some(flow_run(RunStatus::Blocked, |_| {}))),
+                (FB, Some(flow_run(RunStatus::Merged, |_| {}))),
+            ],
+        );
+        let keys: Vec<_> = f.nodes.iter().map(|n| n.key.as_str()).collect();
+        assert_eq!(keys, ["start", "run-1", "run-2", "end"]);
+        assert_eq!(f.edges.len(), 3);
+        assert_eq!(f.edges[0].label, "claimed");
+        assert_eq!(f.edges[1].label, "blocked, attempt spent \u{2192} retry");
+        assert_eq!(f.edges[1].attempt, AttemptCost::Spent);
+        assert_eq!(f.edges[2].label, "merged \u{2192} done");
+        assert_eq!(
+            f.nodes[2].href.as_deref(),
+            Some("#/runs/20260902-140502-bbbb")
+        );
+        assert!(f.nodes[2].decided);
+    }
+
+    #[test]
+    fn flow_quota_stall_is_refunded_and_never_decided_then_resumes() {
+        let quota = || {
+            flow_run(RunStatus::Stalled, |s| {
+                s.quota.push(crate::run::QuotaLoss {
+                    seat: "judge-1".to_owned(),
+                    node: "judge".to_owned(),
+                    at: Timestamp::now(),
+                    reset: None,
+                })
+            })
+        };
+        let mut t = flow_task(&[FA, FA]);
+        t.status = TaskStatus::Queued;
+        let f = flow_for(&t, &[(FA, Some(quota()))]);
+        assert_eq!(f.nodes.len(), 4, "a repeated id is one node per pass");
+        assert_eq!(f.nodes[1].note, Some("interrupted"));
+        assert_eq!(
+            f.nodes[1].status, None,
+            "no outcome copied onto an earlier pass"
+        );
+        assert_eq!(f.edges[1].attempt, AttemptCost::Refunded);
+        assert!(f.edges[1].label.contains("resume the same run"));
+        assert_eq!(
+            f.edges[2].label,
+            "quota stall, attempt refunded \u{2192} queued"
+        );
+        assert!(!f.nodes[2].decided, "a stall is not a decision");
+        assert_eq!(f.nodes[2].note, Some("no verdict"));
+    }
+
+    #[test]
+    fn flow_parked_refunds_and_stall_without_quota_spends() {
+        let mut t = flow_task(&[FA]);
+        t.status = TaskStatus::Queued;
+        let f = flow_for(
+            &t,
+            &[(
+                FA,
+                Some(flow_run(RunStatus::Implementing, |s| s.parked = true)),
+            )],
+        );
+        assert_eq!(f.edges[1].label, "parked, attempt refunded \u{2192} queued");
+        assert_eq!(f.edges[1].attempt, AttemptCost::Refunded);
+        let f = flow_for(&t, &[(FA, Some(flow_run(RunStatus::Stalled, |_| {})))]);
+        assert_eq!(f.edges[1].attempt, AttemptCost::Spent);
+        assert!(!f.nodes[1].decided);
+    }
+
+    #[test]
+    fn flow_keeps_an_unreadable_run_as_its_own_node() {
+        let t = flow_task(&[FA, FB]);
+        let f = flow_for(&t, &[(FB, Some(flow_run(RunStatus::Blocked, |_| {})))]);
+        assert_eq!(f.nodes[1].note, Some("unreadable"));
+        assert!(!f.nodes[1].readable);
+        assert_eq!(f.nodes[1].run_kind, Some("unknown"));
+        assert_eq!(f.edges[1].attempt, AttemptCost::Unknown);
+    }
+
+    #[test]
+    fn flow_names_the_branch_of_a_review_only_run() {
+        let t = flow_task(&[FA]);
+        let f = flow_for(
+            &t,
+            &[(
+                FA,
+                Some(flow_run(RunStatus::Merged, |s| {
+                    s.instruction = "Review the work already on branch `magi/x/A`. Go.".to_owned()
+                })),
+            )],
+        );
+        assert_eq!(f.edges[0].label, "review-only run of branch magi/x/A");
+        assert_eq!(
+            f.nodes[1].detail.as_deref(),
+            Some("review-only run of branch magi/x/A")
+        );
+    }
+
+    #[test]
+    fn flow_ends_held_with_the_pr_left_open_and_flags_hand_edits() {
+        let mut t = flow_task(&[FA]);
+        t.status = TaskStatus::Held;
+        let pr = crate::run::PrRecord {
+            url: "https://example.test/pr/1".to_owned(),
+            number: 1,
+            state: "open".to_owned(),
+            checks: "green".to_owned(),
+            round: 0,
+            rounds: 3,
+            red_at_merge: Vec::new(),
+        };
+        let blocked = flow_run(RunStatus::Blocked, |s| s.pr = Some(pr));
+        let f = flow_for(&t, &[(FA, Some(blocked.clone()))]);
+        assert_eq!(f.edges[1].label, "blocked, PR left open \u{2192} held");
+        t.status = TaskStatus::Done;
+        let f = flow_for(&t, &[(FA, Some(blocked))]);
+        assert_eq!(f.edges[1].label, "closed by hand: task is done");
+    }
+
+    #[test]
+    fn flow_with_no_runs_goes_from_queued_to_queued() {
+        let t = flow_task(&[]);
+        let f = flow_for(&t, &[]);
+        assert_eq!(f.nodes.len(), 2);
+        assert_eq!(f.edges.len(), 1);
+        assert_eq!(f.edges[0].label, "no run yet \u{2192} queued");
+        assert_eq!(f.edges[0].attempt, AttemptCost::None);
     }
 
     /// A run parked mid-flight keeps a non-terminal status; the page must

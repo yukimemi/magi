@@ -1981,6 +1981,20 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 .notice-actions .btn { flex: 1 1 8rem; }
 
 /* ---- task detail ------------------------------------------------------- */
+.task-flow { list-style: none; margin: 0 0 var(--s4); padding: 0; display: flex; flex-direction: column; align-items: stretch; }
+.task-flow .flow-node { display: flex; flex-direction: column; gap: var(--s1); padding: var(--s3); background: var(--surface); border: 1px solid var(--line-2); border-radius: var(--radius-sm); color: var(--ink); text-decoration: none; min-width: 0; overflow-wrap: anywhere; }
+.task-flow a.flow-node { min-height: var(--tap); }
+.task-flow .flow-node[data-kind="start"], .task-flow .flow-node[data-kind="end"] { background: var(--sunk); }
+.task-flow .flow-node[data-undecided] { border-style: dashed; border-color: var(--rust); }
+.task-flow .flow-node[data-unreadable] { border-style: dashed; border-color: var(--line-2); color: var(--ink-3); }
+.task-flow .flow-top { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
+.task-flow .flow-detail { font-size: var(--t2); color: var(--ink-2); }
+.task-flow .flow-edge { position: relative; margin: 0; padding: var(--s2) 0 var(--s2) var(--s5); border-left: 2px solid var(--line-2); margin-left: var(--s4); font-size: var(--t2); color: var(--ink-2); overflow-wrap: anywhere; }
+.task-flow .flow-edge::after { content: ""; position: absolute; left: -6px; bottom: -1px; border: 5px solid transparent; border-top: 7px solid var(--line-2); border-bottom: 0; }
+.task-flow .flow-edge[data-attempt="refunded"] { border-left-style: dashed; }
+.task-flow .flow-edge[data-attempt="unknown"] { border-left-style: dotted; }
+.task-flow .flow-cost { display: inline-block; margin-left: var(--s2); font-family: var(--mono); font-size: var(--t1); color: var(--ink-3); }
+.task-runs-h { font-size: var(--t3); color: var(--ink-2); margin: var(--s3) 0 var(--s2); }
 .task-runs { display: flex; flex-direction: column; gap: var(--s3); list-style: none; padding: 0; margin: 0; }
 .task-runs li { display: flex; flex-direction: column; gap: var(--s1); padding: var(--s3); border: 1px solid var(--line, currentColor); border-radius: var(--r2, 8px); }
 .task-runs .task-run-top { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
