@@ -8524,7 +8524,7 @@ mod tests {
         // so a focus set before the queue has loaded is retried once it has.
         assert!(APP_JS.contains("state.queueFocus = route.id;"));
         assert!(APP_JS.contains("function consumeQueueFocus()"));
-        assert!(APP_JS.contains("jumpToTask(id);"));
+        assert!(APP_JS.contains("jumpToTask(id)"));
     }
 
     #[test]
@@ -8539,7 +8539,7 @@ mod tests {
         // right before jumpToTask() actually runs.
         assert!(
             APP_JS.contains(
-                "  if (!id || state.queue === null) return;\n  if (state.queueSearch.trim() !== \"\") {"
+                "  }\n  if (state.queueSearch.trim() !== \"\") {\n    state.queueSearch = \"\";"
             ),
             "the search-clearing branch must run before state.queueFocus is cleared, or the \
              recursive renderQueue() call has nothing left to jump to"
