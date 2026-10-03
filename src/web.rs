@@ -8488,7 +8488,13 @@ mod tests {
             let body = &APP_JS[start..start + 900];
             assert!(body.contains("task.runs[") || body.contains("runs[runs.length - 1]"));
             assert!(body.contains("setAttr(r.link, \"href\""));
-            assert!(body.contains("#/runs/") && body.contains("#/queue"));
+            assert!(body.contains(
+                "latest ? `#/runs/${latest}` : `#/queue/${encodeURIComponent(task.id)}`"
+            ));
+            assert!(
+                !body.contains(": \"#/queue\""),
+                "a task with no run must link to its own queue card, not the bare queue"
+            );
             assert!(APP_CSS.contains(".talk-task-link"));
         }
     }
