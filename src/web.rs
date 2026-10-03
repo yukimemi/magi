@@ -3031,6 +3031,10 @@ enum RunExit {
     Interrupted,
     Parked,
     QuotaStall,
+    /// Stalled on a resumed pass with quota losses on record: they may be
+    /// left over from an earlier pass, so whether this one was refunded is
+    /// not knowable.
+    ResumedQuotaStall,
     Merged,
     Ready,
     Superseded,
@@ -3055,7 +3059,7 @@ enum AttemptCost {
 }
 
 impl RunExit {
-    fn of(s: Option<&RunState>, resumed_later: bool) -> Self {
+    fn of(s: Option<&RunState>, resumed_later: bool, resumed: bool) -> Self {
         let Some(s) = s else {
             return Self::Unreadable;
         };
@@ -3075,7 +3079,11 @@ impl RunExit {
         } else if matches!(status, RunStatus::Stalled) && !s.quota.is_empty()
             || matches!(status, RunStatus::Failed) && !s.quota.is_empty() && s.viable().is_empty()
         {
-            Self::QuotaStall
+            if resumed {
+                Self::ResumedQuotaStall
+            } else {
+                Self::QuotaStall
+            }
         } else if matches!(status, RunStatus::Blocked | RunStatus::VerifiedNoop) && s.pr.is_some() {
             Self::HeldWithPr
         } else if matches!(status, RunStatus::VerifiedNoop) {
@@ -3089,7 +3097,7 @@ impl RunExit {
 
     fn cost(self) -> AttemptCost {
         match self {
-            Self::Interrupted | Self::Parked | Self::QuotaStall => AttemptCost::Refunded,
+            Self::Parked | Self::QuotaStall => AttemptCost::Refunded,
             Self::Merged
             | Self::Ready
             | Self::Stalled
@@ -3097,7 +3105,9 @@ impl RunExit {
             | Self::NoopHeld
             | Self::Spent => AttemptCost::Spent,
             Self::InProgress => AttemptCost::None,
-            Self::Unreadable | Self::Superseded => AttemptCost::Unknown,
+            Self::Unreadable | Self::Superseded | Self::Interrupted | Self::ResumedQuotaStall => {
+                AttemptCost::Unknown
+            }
         }
     }
 
@@ -3105,9 +3115,10 @@ impl RunExit {
     fn edge_label(self, status: Option<&str>) -> String {
         match self {
             Self::Unreadable => "record unreadable".to_owned(),
-            Self::Interrupted => "interrupted, attempt refunded".to_owned(),
+            Self::Interrupted => "interrupted before the run finished".to_owned(),
             Self::Parked => "parked, attempt refunded".to_owned(),
             Self::QuotaStall => "quota stall, attempt refunded".to_owned(),
+            Self::ResumedQuotaStall => "stalled after a resume, refund unknown".to_owned(),
             Self::Merged => "merged".to_owned(),
             Self::Ready => "ready, not merged".to_owned(),
             Self::Superseded => "superseded by a later attempt".to_owned(),
@@ -3295,7 +3306,7 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
     } else {
         " It spent an attempt, and the task moved on to the next run.".to_owned()
     };
-    let exit = RunExit::of(Some(s), resumed_later.is_some());
+    let exit = RunExit::of(Some(s), resumed_later.is_some(), resumed);
     TaskRunView {
         n,
         id: id.to_owned(),
@@ -7677,14 +7688,39 @@ mod tests {
             f.nodes[1].status, None,
             "no outcome copied onto an earlier pass"
         );
-        assert_eq!(f.edges[1].attempt, AttemptCost::Refunded);
+        assert_eq!(
+            f.edges[1].attempt,
+            AttemptCost::Unknown,
+            "a resume does not prove the earlier pass was refunded"
+        );
         assert!(f.edges[1].label.contains("resume the same run"));
+        assert_eq!(f.edges[2].attempt, AttemptCost::Unknown);
         assert_eq!(
             f.edges[2].label,
-            "quota stall, attempt refunded \u{2192} queued"
+            "stalled after a resume, refund unknown \u{2192} queued"
         );
         assert!(!f.nodes[2].decided, "a stall is not a decision");
         assert_eq!(f.nodes[2].note, Some("no verdict"));
+    }
+
+    #[test]
+    fn flow_single_pass_quota_stall_is_refunded() {
+        let t = flow_task(&[FA]);
+        let f = flow_for(
+            &t,
+            &[(
+                FA,
+                Some(flow_run(RunStatus::Stalled, |s| {
+                    s.quota.push(crate::run::QuotaLoss {
+                        seat: "judge-1".to_owned(),
+                        node: "judge".to_owned(),
+                        at: Timestamp::now(),
+                        reset: None,
+                    })
+                })),
+            )],
+        );
+        assert_eq!(f.edges[1].attempt, AttemptCost::Refunded);
     }
 
     #[test]
