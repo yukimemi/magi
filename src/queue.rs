@@ -1104,7 +1104,20 @@ impl Queue {
 
     /// Write a task, atomically, so a daemon killed mid-write leaves the
     /// previous state readable rather than a truncated file.
+    ///
+    /// Runs already recorded on disk that `task` does not carry are kept, not
+    /// dropped: `magi run --task` links a run into a task from another
+    /// process ([`Queue::link_run`]) while a daemon may hold a snapshot taken
+    /// before it, and writing that snapshot back whole would erase the link.
+    /// Nothing ever removes a run from a task, so the union loses nothing.
     pub fn put(&self, task: &mut Task) -> Result<()> {
+        if let Ok(stored) = read_path(&self.path_of(&task.id)) {
+            for run in stored.runs {
+                if !task.runs.contains(&run) {
+                    task.runs.push(run);
+                }
+            }
+        }
         task.updated_at = Timestamp::now();
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
@@ -3108,5 +3121,29 @@ mod tests {
         assert_eq!(again.runs.len(), 1, "linking twice must not duplicate");
         assert_eq!(queue.get(&t.id).unwrap().runs.len(), 1);
         assert!(queue.link_run("no-such-task", "r").is_err());
+    }
+
+    #[test]
+    fn put_keeps_a_run_linked_after_the_writer_took_its_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut t = Task::new(
+            "t".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("."),
+            Source::Human,
+        );
+        queue.put(&mut t).unwrap();
+        // The daemon's copy, taken before the link.
+        let mut snapshot = queue.get(&t.id).unwrap();
+        queue.link_run(&t.id, "20260930-092817-ec34").unwrap();
+
+        snapshot.start("20260930-000000-aaaa".to_owned());
+        queue.put(&mut snapshot).unwrap();
+
+        let stored = queue.get(&t.id).unwrap();
+        assert!(stored.runs.contains(&"20260930-092817-ec34".to_owned()));
+        assert!(stored.runs.contains(&"20260930-000000-aaaa".to_owned()));
+        assert_eq!(stored.attempts, 1);
     }
 }
