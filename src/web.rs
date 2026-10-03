@@ -3033,8 +3033,8 @@ struct TaskDetailView {
 
 const ATTEMPTS_NOTE: &str = "Attempts count how many times the loop claimed this task since it was last released, \
 and releasing a task resets the count while keeping every run. An attempt is also handed back when a run stalled \
-on an agent rate limit or was parked for an upgrade, and a run that is resumed continues the same run, so the \
-runs listed can outnumber the attempts shown.";
+on an agent rate limit or was parked for an upgrade. A resumed run still counts as an attempt (it appears again \
+in the list), so the runs listed can outnumber the attempts shown only after a release or a handed-back attempt.";
 
 /// The branch a review-only run reopened, read off the instruction
 /// `Runner::open_review` writes.
@@ -3043,17 +3043,29 @@ fn review_branch_of(instruction: &str) -> Option<&str> {
     rest.split('`').next().filter(|b| !b.is_empty())
 }
 
+/// Where an entry sits in a task's run list.
+struct RunSlot<'a> {
+    /// 1-based position.
+    n: usize,
+    /// The same run id appeared earlier: this pass resumed it.
+    resumed: bool,
+    /// Position of a later pass over the same run id, if any.
+    resumed_later: Option<usize>,
+    /// The previous distinct run and how it ended, for the retry note.
+    prior: Option<(&'a str, RunStatus)>,
+    last: bool,
+}
+
 /// Describe one entry of a task's run list. Pure: everything it needs is on
 /// the run and the task, so it is asserted without a server.
-fn task_run_view(
-    n: usize,
-    id: &str,
-    state: Option<&RunState>,
-    resumed: bool,
-    prior: Option<(&str, RunStatus)>,
-    last: bool,
-    task: &Task,
-) -> TaskRunView {
+fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Task) -> TaskRunView {
+    let RunSlot {
+        n,
+        resumed,
+        resumed_later,
+        prior,
+        last,
+    } = at;
     let short = run::short_of(id).to_owned();
     let Some(s) = state else {
         return TaskRunView {
@@ -3107,34 +3119,48 @@ fn task_run_view(
     let status = s.status;
     let provisional = matches!(status, RunStatus::Stalled)
         || s.tally.as_ref().is_some_and(|t| !t.met_quorum) && !status.done();
-    let head = match status {
-        RunStatus::Merged => "Merged.".to_owned(),
-        RunStatus::Ready => "Ready: passed the gate, not merged.".to_owned(),
-        RunStatus::Superseded => "Superseded: a later attempt finished the task.".to_owned(),
-        RunStatus::Stalled => {
-            "Stalled: the judging panel never reached a quorum, so there is no verdict.".to_owned()
-        }
-        RunStatus::Blocked => "Blocked: review or gate left something open.".to_owned(),
-        RunStatus::Failed => "Failed: the graph could not complete.".to_owned(),
-        RunStatus::VerifiedNoop => {
-            "Verified no-op: the candidates found nothing to change.".to_owned()
-        }
-        other if other.done() => format!("Ended {}.", other.display_label()),
-        other => format!("In progress ({}).", other.display_label()),
-    };
-    let why = if !status.done() {
+    let head = if resumed_later.is_some() {
         String::new()
+    } else {
+        match status {
+            RunStatus::Merged => "Merged.".to_owned(),
+            RunStatus::Ready => "Ready: passed the gate, not merged.".to_owned(),
+            RunStatus::Superseded => "Superseded: a later attempt finished the task.".to_owned(),
+            RunStatus::Stalled => {
+                "Stalled: the judging panel never reached a quorum, so there is no verdict."
+                    .to_owned()
+            }
+            RunStatus::Blocked => "Blocked: review or gate left something open.".to_owned(),
+            RunStatus::Failed => "Failed: the graph could not complete.".to_owned(),
+            RunStatus::VerifiedNoop => {
+                "Verified no-op: the candidates found nothing to change.".to_owned()
+            }
+            other if other.done() => format!("Ended {}.", other.display_label()),
+            other => format!("In progress ({}).", other.display_label()),
+        }
+    };
+    let why = if let Some(k) = resumed_later {
+        // Both rows read the same record, so only the later pass can speak
+        // for how the run ended; this one just says it was picked up again.
+        String::new()
+            + &format!(
+                " This pass was carried on by pass #{k} of the same run; the status shown is the run's current one."
+            )
     } else if s.parked {
-        " The operator parked it; the attempt was handed back and the run resumes.".to_owned()
-    } else if matches!(
-        status,
-        RunStatus::Merged | RunStatus::Ready | RunStatus::Superseded
-    ) {
+        " Parked by the operator at a node boundary; the attempt was handed back and the run resumes."
+            .to_owned()
+    } else if !status.done()
+        || matches!(
+            status,
+            RunStatus::Merged | RunStatus::Ready | RunStatus::Superseded
+        )
+    {
         String::new()
     } else if matches!(status, RunStatus::Stalled) && !s.quota.is_empty()
         || matches!(status, RunStatus::Failed) && !s.quota.is_empty() && s.viable().is_empty()
     {
-        " An agent hit its rate limit, so the attempt was handed back.".to_owned()
+        " An agent hit its rate limit during this run; when that is what stalls a pass the attempt is handed back."
+            .to_owned()
     } else if matches!(status, RunStatus::Blocked | RunStatus::VerifiedNoop) && s.pr.is_some() {
         " It left a pull request open, so the task was held for a person rather than retried."
             .to_owned()
@@ -3180,12 +3206,18 @@ async fn task_detail(
             seen.push(run_id);
             let last = i + 1 == task.runs.len();
             history.push(task_run_view(
-                i + 1,
                 run_id,
                 state.as_ref(),
-                resumed,
-                prior,
-                last,
+                RunSlot {
+                    n: i + 1,
+                    resumed,
+                    resumed_later: task.runs[i + 1..]
+                        .iter()
+                        .position(|r| r == run_id)
+                        .map(|off| i + off + 2),
+                    prior,
+                    last,
+                },
                 &task,
             ));
             if let Some(s) = &state {
@@ -7254,6 +7286,14 @@ mod tests {
         assert_eq!(h[0]["status"], "stalled");
         assert_eq!(h[0]["provisional"], true, "a stall is never a decision");
         assert_eq!(h[1]["kind"], "resume", "{v}");
+        assert!(
+            h[0]["outcome"].as_str().unwrap().contains("pass #2"),
+            "an earlier pass of a resumed run must not claim the final outcome: {v}"
+        );
+        assert!(
+            !h[1]["outcome"].as_str().unwrap().contains("handed back."),
+            "{v}"
+        );
         assert_eq!(h[2]["kind"], "review");
         assert!(
             h[2]["description"]
@@ -7272,6 +7312,40 @@ mod tests {
         assert_eq!(run["task"]["id"], task.id.as_str(), "{run}");
 
         assert_eq!(f.get("/api/queue/nosuchtask").await.status, 404);
+    }
+
+    /// A run parked mid-flight keeps a non-terminal status; the page must
+    /// still say why it stopped and that the attempt came back.
+    #[test]
+    fn a_parked_non_terminal_run_is_explained_as_parked() {
+        let mut s = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "Do it".to_owned(),
+            Config::default(),
+        );
+        s.status = RunStatus::Implementing;
+        s.parked = true;
+        let task = Task::new(
+            "t".to_owned(),
+            "Do it".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        let v = task_run_view(
+            "20260902-140501-aaaa",
+            Some(&s),
+            RunSlot {
+                n: 1,
+                resumed: false,
+                resumed_later: None,
+                prior: None,
+                last: true,
+            },
+            &task,
+        );
+        assert!(v.outcome.contains("Parked"), "{}", v.outcome);
     }
 
     #[tokio::test]
