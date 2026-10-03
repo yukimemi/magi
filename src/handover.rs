@@ -326,6 +326,21 @@ pub async fn release(
             .iter()
             .position(|c| !c.folded && same_path(&c.worktree, &path))
         {
+            // Naming the path is not enough: magi must have laid it too.
+            if !path
+                .parent()
+                .is_some_and(|b| same_path(&state.worktree_root(), b))
+            {
+                return Err(foreign(
+                    branch,
+                    &path,
+                    &format!(
+                        "run {} records it, but it is outside that run's worktree root, so \
+                         magi did not make it",
+                        crate::run::short_of(id)
+                    ),
+                ));
+            }
             owner = Some((state, i, Owner::EarlierAttempt));
             break;
         }

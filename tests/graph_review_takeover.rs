@@ -32,7 +32,24 @@ fn run_git(cwd: &Path, args: &[&str]) -> String {
 /// An earlier run, mid-flight, whose candidate worktree holds `BRANCH` with one
 /// commit on it. Returns the saved run and the worktree path.
 fn old_run(fx: &common::Fixture) -> (RunState, PathBuf) {
-    let wt = fx.tmp.path().join("old-wt").join("cand-A");
+    old_run_at(fx, false)
+}
+
+/// [`old_run`], with the worktree outside magi's worktree root when `outside`.
+fn old_run_at(fx: &common::Fixture, outside: bool) -> (RunState, PathBuf) {
+    let base = run_git(&fx.repo, &["rev-parse", "main"]);
+    let mut state = RunState::new(
+        fx.repo.clone(),
+        "main".to_owned(),
+        base,
+        "task".to_owned(),
+        fx.config.clone(),
+    );
+    let wt = if outside {
+        fx.tmp.path().join("old-wt").join("cand-A")
+    } else {
+        state.worktree_root().join("cand-A")
+    };
     std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
     run_git(
         &fx.repo,
@@ -49,14 +66,6 @@ fn old_run(fx: &common::Fixture) -> (RunState, PathBuf) {
     run_git(&wt, &["add", "-A"]);
     run_git(&wt, &["commit", "-q", "-m", "old run work"]);
 
-    let base = run_git(&fx.repo, &["rev-parse", "main"]);
-    let mut state = RunState::new(
-        fx.repo.clone(),
-        "main".to_owned(),
-        base,
-        "task".to_owned(),
-        fx.config.clone(),
-    );
     state.status = RunStatus::Gating;
     state.candidates.push(Candidate {
         index: 0,
@@ -158,7 +167,7 @@ common::e2e! {
 async fn a_run_that_is_not_superseded_is_left_alone() {
     let _home = common::home_lock().await;
     let fx = fixture(_home, Judges::Unanimous, true);
-    let (old, wt) = old_run(&fx);
+    let (old, wt) = old_run_at(&fx, true);
 
     // Not among the task's earlier attempts, e.g. another task's run.
     let result =
@@ -351,5 +360,22 @@ async fn a_live_run_of_another_task_is_left_alone_and_named() {
         "{text}"
     );
     assert!(wt.exists());
+}
+}
+
+common::e2e! {
+async fn an_earlier_attempts_worktree_outside_the_worktree_root_is_left_alone() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (old, wt) = old_run_at(&fx, true);
+
+    let err = Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[&old])))
+        .await
+        .err()
+        .expect("a path magi did not lay must be refused");
+    assert!(err.downcast_ref::<magi::handover::Refused>().is_some());
+    assert!(format!("{err:#}").contains("worktree root"), "{err:#}");
+    assert!(wt.exists());
+    assert!(!RunState::load_under(&old.id, &magi::run::home()).unwrap().released());
 }
 }
