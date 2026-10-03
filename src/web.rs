@@ -9230,7 +9230,7 @@ mod tests {
     #[tokio::test]
     async fn run_detail_shows_the_origin_and_reads_a_pre_origin_run_as_unknown() {
         let f = Fixture::start().await;
-        let mut write = |id: &str, origin: Option<crate::run::Origin>, schema: Option<u32>| {
+        let write = |id: &str, origin: Option<crate::run::Origin>, schema: Option<u32>| {
             let mut state = RunState::new(
                 PathBuf::from("/repo/magi"),
                 "main".to_owned(),
