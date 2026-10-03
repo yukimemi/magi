@@ -972,6 +972,19 @@ fn copy_new(dir: &Path, src: &Path, name: &str) -> Result<(String, PathBuf)> {
     unreachable!("the counter never runs out")
 }
 
+/// How long a task's write lock may stand before it is read as left behind by
+/// a writer that died.
+const TASK_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Guard for [`Queue::lock_task`]; removes the lock file on drop.
+struct TaskLock(PathBuf);
+
+impl Drop for TaskLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// A queue on disk.
 #[derive(Debug, Clone)]
 pub struct Queue {
@@ -1111,6 +1124,12 @@ impl Queue {
     /// before it, and writing that snapshot back whole would erase the link.
     /// Nothing ever removes a run from a task, so the union loses nothing.
     pub fn put(&self, task: &mut Task) -> Result<()> {
+        let _lock = self.lock_task(&task.id)?;
+        self.put_unlocked(task)
+    }
+
+    /// [`Queue::put`] for a caller already holding [`Queue::lock_task`].
+    fn put_unlocked(&self, task: &mut Task) -> Result<()> {
         if let Ok(stored) = read_path(&self.path_of(&task.id)) {
             for run in stored.runs {
                 if !task.runs.contains(&run) {
@@ -1144,11 +1163,53 @@ impl Queue {
     /// and written back in one breath, because [`Queue::put`] replaces the
     /// whole record. Returns the task as stored.
     pub fn link_run(&self, id: &str, run: &str) -> Result<Task> {
-        let mut task = self.get(id)?;
+        let id = self.resolve_id(id)?;
+        // Read inside the lock, so the record written back is the current one
+        // and a daemon's write cannot slip between the read and the write.
+        let _lock = self.lock_task(&id)?;
+        let mut task = self.get(&id)?;
         if task.link_run(run) {
-            self.put(&mut task)?;
+            self.put_unlocked(&mut task)?;
         }
         Ok(task)
+    }
+
+    /// Exclusive right to rewrite task `id`'s record, held until the guard
+    /// drops. Every writer ([`Queue::put`], [`Queue::link_run`]) takes it, so
+    /// a process linking a run and the daemon saving a transition are
+    /// serialized instead of last-writer-wins. A lock older than
+    /// [`TASK_LOCK_STALE`] belongs to a writer that died mid-update and is
+    /// broken. Not the claim lock (`<id>.lock`), which a daemon holds for a
+    /// whole run.
+    fn lock_task(&self, id: &str) -> Result<TaskLock> {
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("create {}", self.root.display()))?;
+        let path = self.root.join(format!("{id}.write-lock"));
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(TaskLock(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > TASK_LOCK_STALE);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                    } else if started.elapsed() > TASK_LOCK_STALE {
+                        bail!("could not lock task {id}");
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(15));
+                    }
+                }
+                Err(e) => return Err(e).with_context(|| format!("lock {}", path.display())),
+            }
+        }
     }
 
     /// Load a task by id or unambiguous id prefix.
@@ -3145,5 +3206,49 @@ mod tests {
         assert!(stored.runs.contains(&"20260930-092817-ec34".to_owned()));
         assert!(stored.runs.contains(&"20260930-000000-aaaa".to_owned()));
         assert_eq!(stored.attempts, 1);
+    }
+
+    #[test]
+    fn concurrent_links_and_daemon_saves_lose_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut t = Task::new(
+            "t".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("."),
+            Source::Human,
+        );
+        queue.put(&mut t).unwrap();
+        let id = t.id.clone();
+
+        let linkers: Vec<_> = (0..4)
+            .map(|n| {
+                let (queue, id) = (queue.clone(), id.clone());
+                std::thread::spawn(move || {
+                    for k in 0..10 {
+                        queue
+                            .link_run(&id, &format!("20260930-00000{n}-l{k:03}"))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        // The daemon's side: transitions saved from its own, ever staler,
+        // copy of the task.
+        let mut mine = queue.get(&id).unwrap();
+        for k in 0..10 {
+            mine.start(format!("20260930-000009-d{k:03}"));
+            queue.put(&mut mine).unwrap();
+        }
+        for l in linkers {
+            l.join().unwrap();
+        }
+
+        let stored = queue.get(&id).unwrap();
+        assert_eq!(stored.runs.len(), 50, "{:?}", stored.runs);
+        assert_eq!(
+            stored.attempts, 10,
+            "linking never rewinds the daemon's work"
+        );
     }
 }
