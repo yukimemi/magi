@@ -95,6 +95,10 @@ struct RunOpts {
     /// Prepare and print the plan without spending an agent call.
     #[arg(long)]
     dry_run: bool,
+    /// Start even though the instruction names a branch, commit or pull
+    /// request that unfinished work already owns.
+    #[arg(long)]
+    force: bool,
 }
 
 impl RunOpts {
@@ -112,6 +116,7 @@ impl RunOpts {
             merge: self.merge.or(other.merge),
             seed: self.seed.or(other.seed),
             dry_run: self.dry_run || other.dry_run,
+            force: self.force || other.force,
         }
     }
 }
@@ -177,6 +182,10 @@ enum Command {
         /// What to do with the branch once it is clean.
         #[arg(long, value_enum)]
         merge: Option<MergeArg>,
+        /// Review even though an unfinished task or run already owns this
+        /// branch.
+        #[arg(long)]
+        force: bool,
     },
     /// Route specific, already-recorded review findings from a saved run to
     /// a fixer, for a targeted fix on the same branch — never a re-review or
@@ -514,6 +523,10 @@ enum TaskCmd {
         /// handed its absolute path and told to open images first.
         #[arg(long = "attach", value_name = "PATH")]
         attach: Vec<PathBuf>,
+        /// File even though the text names a branch, commit or pull request
+        /// that an unfinished task, run or open PR already owns.
+        #[arg(long)]
+        force: bool,
         /// Print the filed task as JSON.
         #[arg(long)]
         json: bool,
@@ -1029,6 +1042,9 @@ async fn dispatch(command: Command) -> Result<()> {
                     cfg.blind.seed = Some(s);
                 }
                 println!("config: {}", describe_layers(&from));
+                if !opts.force {
+                    refuse_duplicates(&Queue::open(), &magi::run::runs_root(), &repo, &task, None)?;
+                }
                 // The same free-space gate the daemon obeys: a run that cannot
                 // finish must not start, and a held task must not spend an
                 // attempt on the way in.
@@ -1061,8 +1077,18 @@ async fn dispatch(command: Command) -> Result<()> {
             reviewers,
             review_rounds,
             merge,
+            force,
         } => {
             let (mut cfg, from) = Config::discover(&repo, config.as_deref())?;
+            if !force {
+                refuse_duplicates(
+                    &Queue::open(),
+                    &magi::run::runs_root(),
+                    &repo,
+                    "",
+                    Some(&branch),
+                )?;
+            }
             if let Some(n) = reviewers {
                 cfg.graph.reviewers = n;
             }
@@ -2252,6 +2278,29 @@ fn answer_cmd(
 }
 
 /// The `magi task` verbs.
+/// Refuse to start or file work that names a branch, commit or pull request
+/// unfinished work already owns. Runs before anything is written, so a refusal
+/// leaves no trace; `--force` skips it.
+fn refuse_duplicates(
+    q: &Queue,
+    runs: &Path,
+    repo: &Path,
+    text: &str,
+    review_branch: Option<&str>,
+) -> Result<()> {
+    let hits = magi::dupes::check(q, runs, repo, text, review_branch, None);
+    if hits.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{}",
+        magi::dupes::Duplicate(hits).render(
+            "Nothing was filed. If it is not a duplicate, repeat the command with --force; \
+             an agent should tell the operator about this instead of forcing it."
+        )
+    )
+}
+
 async fn task_cmd(command: TaskCmd) -> Result<()> {
     task_cmd_on(command, Queue::open()).await
 }
@@ -2273,6 +2322,7 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             solo,
             urgent,
             attach,
+            force,
             json,
         } => {
             if let Some(why) = mistyped_command(
@@ -2300,6 +2350,13 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             // a `held` later as an opaque OS error from a failed git spawn.
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let repo = resolve_repo(&repo, &cwd, Some(&text)).await?;
+            if !force {
+                let home = q
+                    .root()
+                    .parent()
+                    .map_or_else(PathBuf::new, Path::to_path_buf);
+                refuse_duplicates(&q, &home.join("runs"), &repo, &text, None)?;
+            }
             let mut task = Task::new(title, text, repo, source);
             task.priority = priority;
             task.solo = solo;
@@ -3983,6 +4040,7 @@ mod tests {
                 solo: true,
                 urgent: false,
                 attach: vec![shot.clone()],
+                force: false,
                 json: false,
             },
             q.clone(),
@@ -4049,6 +4107,7 @@ mod tests {
                 solo: false,
                 urgent: true,
                 attach: Vec::new(),
+                force: false,
                 json: false,
             },
             q.clone(),
@@ -4067,6 +4126,7 @@ mod tests {
                 solo: false,
                 urgent: false,
                 attach: Vec::new(),
+                force: false,
                 json: false,
             },
             q.clone(),
@@ -4102,6 +4162,7 @@ mod tests {
                 solo: true,
                 urgent: false,
                 attach: Vec::new(),
+                force: false,
                 json: false,
             },
             q.clone(),
@@ -4120,6 +4181,7 @@ mod tests {
                 solo: false,
                 urgent: false,
                 attach: Vec::new(),
+                force: false,
                 json: false,
             },
             q.clone(),
@@ -4159,6 +4221,7 @@ mod tests {
                 solo: false,
                 urgent: false,
                 attach: Vec::new(),
+                force: false,
                 json: false,
             },
             q.clone(),
@@ -4179,6 +4242,7 @@ mod tests {
                 solo: false,
                 urgent: false,
                 attach: Vec::new(),
+                force: false,
                 json: false,
             },
             q.clone(),
@@ -4215,6 +4279,7 @@ mod tests {
                 solo: false,
                 urgent: false,
                 attach: Vec::new(),
+                force: false,
                 json: false,
             },
             q.clone(),
@@ -4540,6 +4605,7 @@ mod tests {
                 solo: false,
                 urgent: false,
                 attach: Vec::new(),
+                force: false,
                 json: false,
             },
             q.clone(),
@@ -4567,6 +4633,7 @@ mod tests {
                 solo: false,
                 urgent: false,
                 attach: Vec::new(),
+                force: false,
                 json: false,
             },
             q.clone(),
@@ -4577,6 +4644,49 @@ mod tests {
         let tasks = q.list();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].repo, repo.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn task_add_refuses_a_duplicate_until_forced() {
+        let (_repo_dir, repo) = scratch_repo().await;
+        let queue_dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(queue_dir.path().join("queue"));
+        let mut owner = Task::new(
+            "owner".to_owned(),
+            "review it".to_owned(),
+            repo.canonicalize().unwrap(),
+            queue::Source::Human,
+        );
+        owner.review_branch = Some("magi/ab12/A".to_owned());
+        q.put(&mut owner).unwrap();
+        let add = |force| TaskCmd::Add {
+            instruction: vec!["land".to_owned(), "magi/ab12/A".to_owned()],
+            file: None,
+            issue: None,
+            title: None,
+            priority: 0,
+            repo: repo.clone(),
+            solo: false,
+            urgent: false,
+            attach: Vec::new(),
+            force,
+            json: false,
+        };
+
+        let err = task_cmd_on(add(false), q.clone())
+            .await
+            .expect_err("a duplicate must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("magi/ab12/A") && msg.contains("--force"),
+            "got: {msg}"
+        );
+        assert_eq!(q.list().len(), 1, "a refusal files nothing");
+
+        task_cmd_on(add(true), q.clone())
+            .await
+            .expect("--force files it");
+        assert_eq!(q.list().len(), 2);
     }
 
     #[test]

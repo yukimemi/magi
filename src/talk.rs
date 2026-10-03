@@ -1076,7 +1076,11 @@ pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
          Run:\n\n\
          magi task add --solo --repo {repo} <instruction>\n\n\
          and tell the operator the task id it prints, so they can follow it \
-         from the Queue. Write <instruction> so that an implementer who has \
+         from the Queue. If it refuses with a duplicate warning (the \
+         instruction names a branch, commit or pull request that an \
+         unfinished task, run or PR already owns), do not repeat it with \
+         --force yourself: tell the operator what it matched and let them \
+         decide. Write <instruction> so that an implementer who has \
          never seen this conversation can act on it alone - it is everything \
          they get. Use --solo: it runs the task through one implementer \
          straight into review instead of the usual multi-agent competition, \

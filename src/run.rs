@@ -2483,7 +2483,13 @@ pub fn run_dir(id: &str) -> PathBuf {
 /// counted, never hidden - the readers already say why each one cannot be
 /// read, and `fold_unreadable` is how a record like this leaves.
 pub fn list_ids() -> Vec<String> {
-    let mut ids: Vec<String> = std::fs::read_dir(runs_root())
+    list_ids_in(&runs_root())
+}
+
+/// [`list_ids`] against an explicit runs root, for callers (and tests) that
+/// must not depend on the process-global home.
+pub fn list_ids_in(root: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = std::fs::read_dir(root)
         .into_iter()
         .flatten()
         .flatten()

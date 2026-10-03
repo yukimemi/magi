@@ -3331,6 +3331,10 @@ async fn queue_priority(
 struct EditBody {
     title: String,
     instruction: String,
+    /// Save even though the new text names a branch, commit or pull request
+    /// that unfinished work already owns.
+    #[serde(default)]
+    force: bool,
 }
 
 /// `POST /api/queue/{id}/edit` - the full-text replacement the phone's edit
@@ -3342,7 +3346,15 @@ async fn queue_edit(
     body: std::result::Result<Json<EditBody>, JsonRejection>,
 ) -> ApiResult<Json<TaskView>> {
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    let (queue, runs) = (ui.queue.clone(), ui.runs.clone());
     mutate(ui, id, move |t| {
+        if !body.force && body.instruction != t.instruction {
+            let hits =
+                crate::dupes::check(&queue, &runs, &t.repo, &body.instruction, None, Some(&t.id));
+            if !hits.is_empty() {
+                return Err(crate::dupes::Duplicate(hits).into());
+            }
+        }
         t.edit(body.title.clone(), body.instruction.clone())
     })
     .await
@@ -3420,7 +3432,13 @@ async fn mutate(
             ))
         })?;
         let mut task = ui.queue.get(&id)?;
-        change(&mut task).map_err(ApiError::bad_request_from)?;
+        change(&mut task).map_err(|e| match e.downcast::<crate::dupes::Duplicate>() {
+            Ok(dup) => ApiError::conflict(dup.render(
+                "Nothing was saved. If it is not a duplicate, repeat the request with \
+                 \"force\": true.",
+            )),
+            Err(e) => ApiError::bad_request_from(e),
+        })?;
         ui.queue.put(&mut task)?;
         Ok(Json(TaskView::from(task)))
     })
@@ -7120,6 +7138,53 @@ mod tests {
         let reloaded = queue.get(&task.id).expect("reload");
         assert_eq!(reloaded.title, "new title");
         assert_eq!(reloaded.instruction, "new instruction");
+    }
+
+    #[tokio::test]
+    async fn editing_in_a_duplicate_is_a_409_naming_the_match_until_forced() {
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let mut owner = Task::new(
+            "owner".to_owned(),
+            "review it".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        owner.review_branch = Some("magi/ab12/A".to_owned());
+        queue.put(&mut owner).expect("file the owner");
+        let mut task = Task::new(
+            "draft".to_owned(),
+            "old".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        queue.put(&mut task).expect("file the draft");
+        let url = format!("/api/queue/{}/edit", task.id);
+
+        let refused = f
+            .post(
+                &url,
+                Some(r#"{"title":"t","instruction":"land magi/ab12/A"}"#),
+            )
+            .await;
+        assert_eq!(refused.status, 409, "{}", refused.body);
+        let msg = refused.json()["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            msg.contains("magi/ab12/A") && msg.contains("force"),
+            "{msg}"
+        );
+        assert_eq!(queue.get(&task.id).expect("reload").instruction, "old");
+
+        let forced = f
+            .post(
+                &url,
+                Some(r#"{"title":"t","instruction":"land magi/ab12/A","force":true}"#),
+            )
+            .await;
+        assert_eq!(forced.status, 200, "{}", forced.body);
     }
 
     #[tokio::test]
