@@ -572,6 +572,11 @@ impl Ui {
             )));
         }
         let mut state = self.lock_loop();
+        // An operator who stops the loop has decided it stays stopped, even
+        // across an upgrade that was already in flight.
+        if !park {
+            state.resume_after_handover = false;
+        }
         let Some(live) = state.live.as_ref() else {
             return Ok(());
         };
@@ -615,6 +620,32 @@ impl Ui {
             merge: live.map_or_else(|| self.merge.clone(), |live| live.opts.merge.clone()),
             last_error: state.last_error.clone(),
             daemon: DaemonView::of(reading),
+        }
+    }
+
+    /// Start the loop in a successor whose predecessor was running one.
+    ///
+    /// Goes through the same path as the UI's start-loop action. A refusal
+    /// (another process owns the loop) is logged and left in `last_error`;
+    /// the loop then simply stays stopped.
+    fn resume_after_handover(&self, resume: bool) -> bool {
+        if !resume {
+            return false;
+        }
+        let foreign = Foreign::of(daemon::read_status(&self.home).as_ref());
+        match self.start_loop(foreign) {
+            Ok(()) => true,
+            Err(e) => {
+                let why = format!(
+                    "the loop could not be resumed after the upgrade: {}",
+                    e.message
+                );
+                tracing::warn!("{why}");
+                let mut state = self.lock_loop();
+                state.last_error = Some(why);
+                state.rev += 1;
+                false
+            }
         }
     }
 
@@ -717,6 +748,21 @@ impl Ui {
     fn park_for_upgrade(&self) -> ApiResult<Option<String>> {
         let parking = {
             let mut state = self.lock_loop();
+            // Decided here, before the park: by the time the handover fires
+            // an idle loop has already seen the park and ended, so `live`
+            // would read as "was never running". A loop the operator had
+            // already stopped stays stopped.
+            //
+            // Sticky: a second upgrade request finds the loop already
+            // stopping because of the first one's park, and must not read
+            // that as the operator having stopped it. Only an explicit stop
+            // or a failed update clears an earlier intent.
+            let resume = state.resume_after_handover
+                || state
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.alive() && !live.stop.stopped());
+            state.resume_after_handover = resume;
             let Some(live) = state.live.as_ref() else {
                 return Ok(None);
             };
@@ -944,6 +990,14 @@ async fn bind_waiting(socket: SocketAddr) -> Result<tokio::net::TcpListener> {
 /// take this address over. One per process: there is one address to hand on.
 static HANDOVER: std::sync::LazyLock<Notify> = std::sync::LazyLock::new(Notify::new);
 
+/// Set to `1` on the successor when the loop was running at handover.
+const RESUME_LOOP_ENV: &str = "MAGI_WEB_RESUME_LOOP";
+
+/// Whether the environment value asks for the loop to be resumed.
+fn resume_requested(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
 /// Start this binary again with the same arguments, detached.
 ///
 /// Called from [`serve`]'s exit path, *after* the listener has been dropped,
@@ -955,12 +1009,23 @@ static HANDOVER: std::sync::LazyLock<Notify> = std::sync::LazyLock::new(Notify::
 ///
 /// Detached and without inherited stdio: the successor has to outlive this
 /// process, and must not hold open a pipe a terminal is waiting on.
-fn spawn_successor() -> Result<()> {
+///
+/// `resume` tells the successor to start the queue loop, through
+/// [`RESUME_LOOP_ENV`]. It is always set or removed explicitly so a value this
+/// process inherited from its own predecessor cannot leak into a generation
+/// that should not resume. The successor's own environment keeps the variable
+/// (and so do the agent CLIs it starts); `serve` reads it once at startup.
+fn spawn_successor(resume: bool) -> Result<()> {
     let exe = std::env::current_exe().context("find this binary")?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     tracing::info!("restarting: {} {}", exe.display(), args.join(" "));
 
     let mut cmd = std::process::Command::new(&exe);
+    if resume {
+        cmd.env(RESUME_LOOP_ENV, "1");
+    } else {
+        cmd.env_remove(RESUME_LOOP_ENV);
+    }
     cmd.args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1044,11 +1109,15 @@ pub async fn serve(opts: Opts) -> Result<()> {
          reach this address can file and hold tasks: the tailnet is the \
          security boundary"
     );
-    tracing::info!(
-        "the queue loop is not running yet - start it from the UI, which is \
-         the whole reason this process can: nothing in the queue moves until \
-         something is running the loop"
-    );
+    if ui.resume_after_handover(resume_requested(std::env::var_os(RESUME_LOOP_ENV))) {
+        tracing::info!("resumed the loop the predecessor was running");
+    } else {
+        tracing::info!(
+            "the queue loop is not running yet - start it from the UI, which is \
+             the whole reason this process can: nothing in the queue moves until \
+             something is running the loop"
+        );
+    }
     if opts.open {
         // The URL alone on stdout, for a caller that wants to open it. magi
         // does not spawn a browser: on the machine this usually runs on there
@@ -1166,7 +1235,7 @@ async fn hand_over(
     home: &FsPath,
     looping: &Mutex<LoopState>,
     served: tokio::task::JoinHandle<std::io::Result<()>>,
-    successor: impl FnOnce() -> Result<()>,
+    successor: impl FnOnce(bool) -> Result<()>,
 ) -> Result<()> {
     if let Some(mut progress) = updater::read_progress(home) {
         progress.advance(updater::Stage::Parking);
@@ -1175,11 +1244,14 @@ async fn hand_over(
     finish_loop(looping).await;
     served.abort();
     let _ = served.await;
+    // Read last: the deck answers for the whole park, so an operator's stop
+    // during the wait must still be honoured by the successor.
+    let resume = lock_or_recover(looping).resume_after_handover;
     if let Some(mut progress) = updater::read_progress(home) {
         progress.advance(updater::Stage::Restarting);
         let _ = updater::write_progress(home, &progress);
     }
-    successor()
+    successor(resume)
 }
 
 /// Ask the loop to stop and wait for it, on the way out of [`serve`].
@@ -1914,6 +1986,11 @@ struct LoopState {
     /// Why the last loop ended, when it ended badly. See
     /// [`LoopView::last_error`].
     last_error: Option<String>,
+    /// The loop was running (and not already stopping) when the last upgrade
+    /// parked it, so the successor should start one. Set afresh by every
+    /// [`Ui::park_for_upgrade`], cleared by an explicit stop and by a failed
+    /// update.
+    resume_after_handover: bool,
 }
 
 /// A loop in flight.
@@ -2131,9 +2208,11 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
     let _ = updater::write_progress(&ui.home, &progress);
 
     let home = ui.home.clone();
+    let looping = ui.looping();
     tokio::spawn(async move {
         if let Err(e) = upgrade_and_restart(home.clone()).await {
             tracing::error!("the upgrade did not complete: {e:#}");
+            lock_or_recover(&looping).resume_after_handover = false;
             if let Some(mut progress) = updater::read_progress(&home) {
                 progress.fail(format!("{e:#}"));
                 let _ = updater::write_progress(&home, &progress);
@@ -7723,7 +7802,7 @@ mod tests {
         // the closure and every attempt would fail. Inferred from the bind
         // rules and the code; not reproduced on macOS.
         let bound = std::sync::Mutex::new(None);
-        hand_over(home.path(), &looping, served, || {
+        hand_over(home.path(), &looping, served, |_| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let attempt = loop {
                 match std::net::TcpListener::bind(addr) {
@@ -10131,7 +10210,7 @@ mod tests {
         let progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
         crate::updater::write_progress(home.path(), &progress).expect("seed progress");
 
-        hand_over(home.path(), &looping, served, || Ok(()))
+        hand_over(home.path(), &looping, served, |_| Ok(()))
             .await
             .expect("hand over");
 
@@ -10142,6 +10221,109 @@ mod tests {
             "hand_over owns the record through parking and up to restarting; \
              the successor is what finishes it"
         );
+    }
+
+    fn idle_ui(home: &TempDir) -> Ui {
+        let runs = home.path().join("runs");
+        std::fs::create_dir_all(&runs).expect("runs dir");
+        Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            Talks::at(home.path().join("talks")),
+            runs,
+            home.path().to_path_buf(),
+            PathBuf::from("/repo/magi"),
+        )
+        .with_launch(launch_idle)
+    }
+
+    /// Run `hand_over` against `ui` and return what the successor was told.
+    async fn handed_over(home: &TempDir, ui: Ui) -> bool {
+        let looping = ui.looping();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback");
+        let served = tokio::spawn(axum::serve(listener, ui.router()).into_future());
+        let told = std::sync::Mutex::new(None);
+        hand_over(home.path(), &looping, served, |resume| {
+            *told.lock().unwrap() = Some(resume);
+            Ok(())
+        })
+        .await
+        .expect("hand over");
+        told.into_inner().unwrap().expect("successor was started")
+    }
+
+    #[tokio::test]
+    async fn a_running_loop_is_resumed_by_the_successor() {
+        let home = TempDir::new().expect("temp home");
+        let ui = idle_ui(&home);
+        ui.start_loop(None).expect("start");
+        ui.park_for_upgrade().expect("park");
+        // The idle loop sees the park and ends before the handover fires.
+        for _ in 0..500 {
+            if !ui.loop_view(None).running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(handed_over(&home, ui).await, "a running loop must resume");
+
+        let successor = idle_ui(&home);
+        assert!(!successor.loop_view(None).running);
+        assert!(successor.resume_after_handover(true));
+        assert!(successor.loop_view(None).running);
+        successor.stop_loop(None, false).expect("stop");
+    }
+
+    #[tokio::test]
+    async fn a_second_upgrade_request_keeps_the_resume_intent() {
+        let home = TempDir::new().expect("temp home");
+        let ui = idle_ui(&home);
+        ui.start_loop(None).expect("start");
+        ui.park_for_upgrade().expect("first park");
+        ui.park_for_upgrade().expect("second park");
+        assert!(handed_over(&home, ui).await);
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_the_handover_wait_is_honoured() {
+        let home = TempDir::new().expect("temp home");
+        let ui = idle_ui(&home);
+        ui.start_loop(None).expect("start");
+        ui.park_for_upgrade().expect("park");
+        ui.stop_loop(None, false).expect("stop");
+        assert!(!handed_over(&home, ui).await);
+    }
+
+    #[tokio::test]
+    async fn an_idle_loop_stays_stopped_across_the_handover() {
+        let home = TempDir::new().expect("temp home");
+        let ui = idle_ui(&home);
+        ui.park_for_upgrade().expect("park");
+        assert!(!handed_over(&home, ui).await);
+
+        let successor = idle_ui(&home);
+        assert!(!successor.resume_after_handover(false));
+        assert!(!successor.loop_view(None).running);
+    }
+
+    #[tokio::test]
+    async fn a_loop_the_operator_stopped_is_not_resumed() {
+        let home = TempDir::new().expect("temp home");
+        let ui = idle_ui(&home);
+        ui.start_loop(None).expect("start");
+        ui.stop_loop(None, false).expect("stop");
+        ui.park_for_upgrade().expect("park");
+        assert!(!handed_over(&home, ui).await);
+    }
+
+    #[test]
+    fn only_an_explicit_one_requests_a_resume() {
+        assert!(!resume_requested(None));
+        assert!(!resume_requested(Some("0".into())));
+        assert!(!resume_requested(Some("".into())));
+        assert!(resume_requested(Some("1".into())));
     }
 
     #[test]
