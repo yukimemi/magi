@@ -235,6 +235,12 @@ pub fn check_with(
         .filter(|t| Some(t.id.as_str()) == ignore_task)
         .flat_map(|t| t.runs.iter().cloned())
         .collect();
+    // PRs the edited task's own runs opened: never a rival, forge or not.
+    let own_prs: BTreeSet<u64> = own_runs
+        .iter()
+        .filter_map(|id| RunView::read(runs_root, id))
+        .filter_map(|v| v.pr.map(|p| p.number))
+        .collect();
 
     let mut claims: Vec<Claim> = Vec::new();
     let mut from_task: BTreeSet<String> = BTreeSet::new();
@@ -305,6 +311,7 @@ pub fn check_with(
         if hits
             .iter()
             .any(|h| h.signal == Signal::Pr && h.token == token)
+            || own_prs.contains(&n)
             || !asked.insert(n)
         {
             continue;
@@ -833,5 +840,15 @@ mod tests {
         let hits = check_with(&f.q, &f.runs, &f.repo, "#48", None, None, &open);
         assert!(hits.iter().all(|h| h.owner != Owner::Pr), "{hits:?}");
         assert!(!hits.is_empty());
+    }
+
+    #[test]
+    fn an_edited_tasks_own_open_pr_is_not_a_forge_hit() {
+        let (f, base, _) = fx();
+        write_run(&f, RID, "ready", &base, Some((48, "open")));
+        let t = file_task(&f, TaskStatus::Running, &[RID]);
+        let open = |_: &Path, _: u64| Some("u".to_owned());
+        let hits = check_with(&f.q, &f.runs, &f.repo, "#48", None, Some(&t.id), &open);
+        assert!(hits.is_empty(), "{hits:?}");
     }
 }
