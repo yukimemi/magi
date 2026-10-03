@@ -3140,12 +3140,17 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
         }
     };
     let why = if let Some(k) = resumed_later {
-        // Both rows read the same record, so only the later pass can speak
-        // for how the run ended; this one just says it was picked up again.
-        String::new()
-            + &format!(
-                " This pass was carried on by pass #{k} of the same run; the status shown is the run's current one."
-            )
+        // A run is only picked up again while it is unfinished, so an earlier
+        // pass of a repeated id stopped short; the record keeps only the run's
+        // latest status, which is left to the pass that carried it on.
+        let cause = if s.quota.is_empty() {
+            "the operator parked it for an upgrade"
+        } else {
+            "an agent hit its rate limit"
+        };
+        format!(
+            " This pass stopped before the run finished ({cause}), so the attempt was handed back; pass #{k} resumed the same run, and the status shown is the run's current one."
+        )
     } else if s.parked {
         " Parked by the operator at a node boundary; the attempt was handed back and the run resumes."
             .to_owned()
@@ -7287,7 +7292,10 @@ mod tests {
         assert_eq!(h[0]["provisional"], true, "a stall is never a decision");
         assert_eq!(h[1]["kind"], "resume", "{v}");
         assert!(
-            h[0]["outcome"].as_str().unwrap().contains("pass #2"),
+            h[0]["outcome"]
+                .as_str()
+                .unwrap()
+                .contains("handed back; pass #2"),
             "an earlier pass of a resumed run must not claim the final outcome: {v}"
         );
         assert!(
