@@ -2274,7 +2274,9 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
 }
 
 /// What a fix round did.
-enum Fixed {
+#[doc(hidden)]
+#[derive(Debug, PartialEq)]
+pub enum Fixed {
     /// The fixer committed something.
     Committed,
     /// The fixer ran and chose to change nothing.
@@ -2288,7 +2290,8 @@ enum Fixed {
 /// The fixer works in the winner's own worktree so its commits land on the
 /// branch the pull request is built from, and it runs with `allow_write` for
 /// the same reason.
-async fn fix_round(
+#[doc(hidden)]
+pub async fn fix_round(
     state: &mut RunState,
     pr: &PrState,
     round: usize,
@@ -2327,6 +2330,10 @@ async fn fix_round(
     } else {
         prompt
     };
+    // Read before the fixer runs: it normally commits for itself, so HEAD has
+    // already moved by the time it returns and a later read would see no
+    // progress (run 20261004-041622-5769 stopped on a fix that had landed).
+    let before = git::rev_parse(&winner.worktree, "HEAD").await?;
     let out = agent::invoke(
         &spec,
         &mut seat,
@@ -2363,7 +2370,6 @@ async fn fix_round(
         Err(e) => return Ok(Fixed::Failed(format!("{e:#}"))),
     }
 
-    let before = git::rev_parse(&winner.worktree, "HEAD").await?;
     // An agent that edited files but never committed would otherwise push
     // nothing and look like a refusal.
     if let Ok(r) = git::rescue_commit(
