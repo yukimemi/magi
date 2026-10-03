@@ -2666,7 +2666,7 @@ async fn attempt(
             notices::raise(
                 Notice::warn(
                     &format!("handover:{}", task.id),
-                    "A task was held because an earlier attempt still has its branch checked out; see the task's hold reason, then release it from the queue.",
+                    "A task was held because its branch is still checked out in another worktree that magi would not remove by itself; see the task's hold reason, then release it from the queue.",
                 )
                 .link(Link::Task {
                     id: task.id.clone(),

@@ -543,7 +543,8 @@ impl Runner {
     /// at the same task still has `branch` checked out, its worktree is
     /// released first if that is safe (see [`crate::handover`]), and the
     /// review refuses with the reason if it is not. `None` is a hand-run
-    /// review and behaves exactly as [`Runner::review`] always did.
+    /// review: it has no earlier attempts, so only a worktree of a dead run
+    /// magi recorded itself can be released.
     pub async fn review_taking_over(
         repo: &Path,
         branch: &str,
@@ -584,23 +585,28 @@ impl Runner {
         // branch is moved with `git branch -f`, which git refuses while an
         // earlier attempt's worktree still has it checked out. Everything
         // after this point that can fail puts the old run back.
-        let released = match &takeover {
-            Some(takeover) => crate::handover::release(&repo, branch, &state.id, takeover).await?,
-            None => None,
-        };
+        // A hand-run review has no task, hence no earlier attempts, but a
+        // worktree of a dead run magi made may still be released.
+        let takeover = takeover.unwrap_or_else(|| crate::handover::Takeover {
+            earlier: Vec::new(),
+            home: crate::run::home(),
+            choice: None,
+        });
+        let released = crate::handover::release(&repo, branch, &state.id, &takeover).await?;
         if let Some(released) = &released {
             state.event(
                 "release",
                 format!(
-                    "took `{branch}` over from run {}: its worktree was released",
-                    crate::run::short_of(&released.old_id)
+                    "took `{branch}` over from run {}: its worktree was released: {}",
+                    crate::run::short_of(&released.old_id),
+                    released.audit
                 ),
             );
         }
         // The owner's answer to an earlier divergence question is applied
         // here: after the release (git will not move a checked-out branch)
         // and before the sync that would otherwise ask again.
-        if let Some(choice) = takeover.as_ref().and_then(|t| t.choice.as_ref())
+        if let Some(choice) = takeover.choice.as_ref()
             && let Err(e) =
                 crate::reconcile::apply_choice(&repo, &state.config.merge.remote, branch, choice)
                     .await
