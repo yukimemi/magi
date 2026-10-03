@@ -8581,6 +8581,14 @@ mod tests {
     }
 
     #[test]
+    fn live_runs_are_never_hidden_or_folded_as_superseded() {
+        assert!(APP_JS.contains("function isLiveAttempt(run) {\n  return !run.done;"));
+        assert!(APP_JS.contains("if (isLiveAttempt(run)) return false;"));
+        assert!(APP_JS.contains("(!isLiveAttempt(run) && run.superseded_by"));
+        assert!(APP_JS.contains("kids.filter(matchesRunState).length"));
+    }
+
+    #[test]
     fn review_rounds_label_a_distinct_verified_head() {
         assert!(APP_JS.contains("round.verified_head"));
         assert!(APP_JS.contains("verified HEAD"));
