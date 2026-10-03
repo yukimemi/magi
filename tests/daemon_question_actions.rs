@@ -48,9 +48,14 @@ async fn answered_resume_action_is_executed(label: &str) {
 
     // Park a real run while a judge call is in flight.
     let pause = Pause::new();
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
-        .await
-        .expect("start");
+    let mut runner = Runner::start(
+        &fx.repo,
+        "create note.txt".to_owned(),
+        fx.config.clone(),
+        magi::run::Origin::operator(),
+    )
+    .await
+    .expect("start");
     runner.on_pause(pause.clone());
     let started = block_dir.join("started-judge-1");
     let release = block_dir.join("release-judge-1");

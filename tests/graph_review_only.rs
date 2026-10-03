@@ -43,9 +43,14 @@ async fn a_review_only_run_reviews_an_existing_branch_without_competing() {
     run_git(&fx.repo, &["commit", "-q", "-m", "add note.txt by hand"]);
     run_git(&fx.repo, &["checkout", "-q", "main"]);
 
-    let mut runner = Runner::review(&fx.repo, "feat/by-hand", fx.config.clone())
+    let mut runner = Runner::review(&fx.repo, "feat/by-hand", fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("open a review-only run");
+
+    // The origin is on disk from the first save, passed in rather than read
+    // from the environment, so this holds under `MAGI_RUN` too.
+    let on_disk = magi::run::RunState::load(&runner.state.id).expect("load the fresh run");
+    assert_eq!(on_disk.origin, Some(magi::run::Origin::operator()));
 
     // Before anything runs: one candidate, credited to nobody, already the
     // winner.
@@ -113,7 +118,7 @@ async fn a_reviewer_that_never_answered_is_never_reported_as_a_clean_round() {
     run_git(&fx.repo, &["commit", "-q", "-m", "add note.txt by hand"]);
     run_git(&fx.repo, &["checkout", "-q", "main"]);
 
-    let mut runner = Runner::review(&fx.repo, "feat/by-hand", fx.config.clone())
+    let mut runner = Runner::review(&fx.repo, "feat/by-hand", fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("open a review-only run");
     runner.execute().await.expect("execute");
@@ -165,7 +170,7 @@ async fn a_reviewer_that_only_answers_on_retry_is_recorded_as_recovered_not_sile
     run_git(&fx.repo, &["commit", "-q", "-m", "add note.txt by hand"]);
     run_git(&fx.repo, &["checkout", "-q", "main"]);
 
-    let mut runner = Runner::review(&fx.repo, "feat/by-hand", fx.config.clone())
+    let mut runner = Runner::review(&fx.repo, "feat/by-hand", fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("open a review-only run");
     runner.execute().await.expect("execute");
@@ -219,7 +224,7 @@ async fn a_reviewer_rate_limited_by_quota_gates_clean_on_the_answered_panel() {
     run_git(&fx.repo, &["commit", "-q", "-m", "add note.txt by hand"]);
     run_git(&fx.repo, &["checkout", "-q", "main"]);
 
-    let mut runner = Runner::review(&fx.repo, "feat/by-hand", fx.config.clone())
+    let mut runner = Runner::review(&fx.repo, "feat/by-hand", fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("open a review-only run");
     runner.execute().await.expect("execute");
@@ -276,7 +281,7 @@ async fn a_panel_lost_entirely_to_quota_still_waits_instead_of_deciding_on_nobod
     run_git(&fx.repo, &["commit", "-q", "-m", "add note.txt by hand"]);
     run_git(&fx.repo, &["checkout", "-q", "main"]);
 
-    let mut runner = Runner::review(&fx.repo, "feat/by-hand", fx.config.clone())
+    let mut runner = Runner::review(&fx.repo, "feat/by-hand", fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("open a review-only run");
     runner.execute().await.expect("execute");
@@ -300,16 +305,16 @@ async fn review_refuses_the_cases_that_cannot_mean_anything() {
     let _home = common::home_lock().await;
     let fx = fixture(_home, Judges::Unanimous, false);
 
-    let missing = Runner::review(&fx.repo, "no/such/branch", fx.config.clone()).await;
+    let missing = Runner::review(&fx.repo, "no/such/branch", fx.config.clone(), magi::run::Origin::operator()).await;
     assert!(missing.is_err(), "a branch that does not exist");
 
     // The base branch itself has nothing to review against.
-    let base = Runner::review(&fx.repo, "main", fx.config.clone()).await;
+    let base = Runner::review(&fx.repo, "main", fx.config.clone(), magi::run::Origin::operator()).await;
     assert!(base.is_err(), "reviewing the base branch");
 
     // A branch with no commits beyond base is not a change.
     run_git(&fx.repo, &["branch", "feat/empty"]);
-    let empty = Runner::review(&fx.repo, "feat/empty", fx.config.clone()).await;
+    let empty = Runner::review(&fx.repo, "feat/empty", fx.config.clone(), magi::run::Origin::operator()).await;
     assert!(empty.is_err(), "a branch with no commits of its own");
 }
 }
@@ -376,7 +381,7 @@ async fn a_stale_local_branch_is_fast_forwarded_to_the_pushed_work() {
     push_real_work(&side, "feat/pushed");
     let pushed = rev(&side, "HEAD");
 
-    let runner = Runner::review(&fx.repo, "feat/pushed", fx.config.clone())
+    let runner = Runner::review(&fx.repo, "feat/pushed", fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("open a review-only run");
     assert_eq!(rev(&fx.repo, "refs/heads/feat/pushed"), pushed);
@@ -399,7 +404,7 @@ async fn a_diverged_branch_with_local_work_is_refused_and_leaves_no_worktree() {
     let local = rev(&fx.repo, "feat/split");
     push_real_work(&side, "feat/split");
 
-    let err = Runner::review(&fx.repo, "feat/split", fx.config.clone())
+    let err = Runner::review(&fx.repo, "feat/split", fx.config.clone(), magi::run::Origin::operator())
         .await
         .err()
         .expect("a diverged branch must not be reviewed");
@@ -425,7 +430,7 @@ async fn a_rewritten_placeholder_gives_way_to_the_pushed_work() {
     push_real_work(&side, "feat/rewritten");
     let pushed = rev(&side, "HEAD");
 
-    let runner = Runner::review(&fx.repo, "feat/rewritten", fx.config.clone())
+    let runner = Runner::review(&fx.repo, "feat/rewritten", fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("open a review-only run");
     assert_eq!(rev(&fx.repo, "refs/heads/feat/rewritten"), pushed);
@@ -444,7 +449,7 @@ async fn a_branch_whose_tree_equals_the_base_is_refused_and_releases_its_worktre
     );
     run_git(&fx.repo, &["checkout", "-q", "main"]);
 
-    let err = Runner::review(&fx.repo, "feat/placeholder", fx.config.clone())
+    let err = Runner::review(&fx.repo, "feat/placeholder", fx.config.clone(), magi::run::Origin::operator())
         .await
         .err()
         .expect("an empty-tree branch must not be reviewed");

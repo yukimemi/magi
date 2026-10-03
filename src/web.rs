@@ -2296,6 +2296,9 @@ struct RunSummary {
     /// [`RunState::unmerged_by_design`]. The front end reads this rather than
     /// re-deriving the same check from `status` and `merge.mode` itself.
     unmerged_by_design: bool,
+    /// Who started the run, as the one label every surface shares; the
+    /// "origin unknown" wording when the record predates origins.
+    origin_label: String,
 }
 
 impl RunSummary {
@@ -2329,6 +2332,7 @@ impl RunSummary {
             // see a task's other attempts.
             superseded_by: None,
             pr: state.pr.clone(),
+            origin_label: crate::run::origin_label(state.origin.as_ref()),
         }
     }
 }
@@ -2484,6 +2488,10 @@ struct RunDetailView {
     /// The queue task this run belongs to, so the detail page can link back
     /// to the task's own page. `None` for a run nobody queued (`magi run`).
     task: Option<TaskRef>,
+    /// [`crate::run::Origin::label`], or the "origin unknown" wording for a
+    /// run recorded before origins existed. `origin` itself (flattened in
+    /// with `state`) is `null` in that case.
+    origin_label: String,
 }
 
 /// A task named from a run's detail page.
@@ -2522,6 +2530,7 @@ impl RunDetailView {
     ) -> Self {
         Self {
             instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
+            origin_label: crate::run::origin_label(state.origin.as_ref()),
             live,
             unmerged_by_design: state.unmerged_by_design(),
             superseded_by,
@@ -4197,15 +4206,11 @@ fn read_run(runs: &FsPath, id: &str) -> Result<RunState> {
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let state: RunState =
         serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
-    if state.schema != run::SCHEMA {
-        anyhow::bail!(
-            "run {} was written by a different magi (schema {}, this build speaks {})",
-            state.id,
-            state.schema,
-            run::SCHEMA
-        );
-    }
-    Ok(state)
+    // The same migration `RunState::load` applies, so a record from the
+    // previous schema reads here as it does everywhere else (an origin-less
+    // run shows as "origin unknown") instead of vanishing from the phone the
+    // moment the schema is bumped.
+    run::migrate_schema(state)
 }
 
 /// Runs on disk under `runs` whose state this build cannot parse - almost
@@ -9218,6 +9223,61 @@ mod tests {
         write_daemon(f.home.path(), Timestamp::now());
         let warm = f.get(&format!("/api/runs/{id}")).await.json();
         assert_eq!(warm["live"], "live", "{warm}");
+    }
+
+    /// Where a run came from is shown, and a run written before origins were
+    /// recorded (schema 12, no `origin` key) stays readable and says so.
+    #[tokio::test]
+    async fn run_detail_shows_the_origin_and_reads_a_pre_origin_run_as_unknown() {
+        let f = Fixture::start().await;
+        let write = |id: &str, origin: Option<crate::run::Origin>, schema: Option<u32>| {
+            let mut state = RunState::new(
+                PathBuf::from("/repo/magi"),
+                "main".to_owned(),
+                "0123456789abcdef".to_owned(),
+                "Add a web UI".to_owned(),
+                Config::default(),
+            );
+            state.id = id.to_owned();
+            state.origin = origin;
+            let mut value = serde_json::to_value(&state).expect("serialize run");
+            if let Some(schema) = schema {
+                value["schema"] = serde_json::json!(schema);
+                value.as_object_mut().unwrap().remove("origin");
+            }
+            let dir = f.runs().join(id);
+            std::fs::create_dir_all(&dir).expect("run dir");
+            std::fs::write(dir.join("run.json"), value.to_string()).expect("write run.json");
+        };
+        write(
+            "20260930-092817-ec34",
+            Some(crate::run::Origin::from_agent_env(
+                Some(("4a7b".to_owned(), "chat".to_owned())),
+                None,
+            )),
+            None,
+        );
+        write("20260930-092817-0ld1", None, Some(12));
+
+        let new = f.get("/api/runs/20260930-092817-ec34").await.json();
+        assert_eq!(new["origin_label"], "chat 4a7b", "{new}");
+        assert_eq!(new["origin"]["by"]["kind"], "chat", "{new}");
+
+        let old = f.get("/api/runs/20260930-092817-0ld1").await.json();
+        assert_eq!(
+            old["origin_label"], "origin unknown (started before origins were recorded)",
+            "{old}"
+        );
+        assert!(old["origin"].is_null(), "{old}");
+
+        let list = f.get("/api/runs").await.json();
+        let labels: Vec<_> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["origin_label"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(labels.contains(&"chat 4a7b".to_owned()), "{list}");
     }
 
     /// The gap `driver_pid` exists to close: a manual `magi run` / `magi

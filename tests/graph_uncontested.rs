@@ -17,7 +17,7 @@ async fn a_single_candidate_run_is_uncontested_not_collapsed() {
     let mut fx = fixture(home, Judges::Unanimous, false);
     fx.config.graph.candidates = 1;
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");

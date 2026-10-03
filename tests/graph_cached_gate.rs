@@ -31,7 +31,7 @@ async fn a_cached_failed_gate_stays_blocked_and_does_not_run_again() {
     // skips judging and is cheaper.
     fx.config.graph.candidates = 1;
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("first execution");
@@ -121,7 +121,7 @@ async fn a_cached_successful_gate_still_allows_the_interrupted_merge_step() {
     // Gate-reentry behaviour does not depend on the panel; a solo candidate
     // skips judging and is cheaper.
     fx.config.graph.candidates = 1;
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("first execution");

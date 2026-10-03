@@ -25,7 +25,7 @@ async fn advisor_proposals_are_gathered_and_synthesized_into_the_implementer_bri
     let mut fx = fixture_with_advise(home, 2);
     fx.config.graph.candidates = 1;
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -65,7 +65,7 @@ async fn the_synthesizer_role_pins_the_synthesis_seat_to_a_named_agent() {
         ..Roles::default()
     };
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -100,7 +100,7 @@ async fn an_unset_synthesizer_role_falls_back_to_the_default_order() {
         "the fixture must not already name a synthesizer"
     );
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -127,7 +127,7 @@ async fn the_on_off_switch_leaves_no_trace_when_off() {
     assert!(!fx.config.graph.advise);
     fx.config.graph.candidates = 1;
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -146,7 +146,7 @@ async fn the_proposal_count_config_controls_how_many_advisor_seats_are_asked() {
     let mut fx = fixture_with_advise(home, 1);
     fx.config.graph.candidates = 1;
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -173,7 +173,7 @@ async fn a_failed_advisor_seat_still_leaves_a_record_and_the_others_still_synthe
             .insert("MOCK_SYNTH_NAMES".to_owned(), "advisor-2".to_owned());
     }
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -223,7 +223,7 @@ async fn an_unresolvable_advisor_roster_does_not_fail_the_run_and_names_the_run_
         ..Roles::default()
     };
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner
@@ -269,7 +269,7 @@ async fn advise_does_not_reenter_once_implementation_has_already_progressed() {
     let mut fx = fixture_with_advise(home, 2);
     fx.config.graph.candidates = 1;
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");

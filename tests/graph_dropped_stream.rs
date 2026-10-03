@@ -13,7 +13,7 @@ common::e2e! {
 async fn a_dropped_stream_is_resumed_once_and_the_candidate_recovers() {
     let _home = common::home_lock().await;
     let fx = fixture_with_dropped_stream(_home, &["impl-B"]);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -65,7 +65,7 @@ async fn a_dropped_stream_with_no_session_left_is_not_resumed_into_a_blank_promp
     // conversation — a wasted call that is worse than just leaving this as
     // the ordinary failure it already is.
     fx.config.graph.sessions = false;
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -115,7 +115,7 @@ async fn a_dropped_deliberation_turn_is_skipped_not_read_as_the_judges_position(
     // true) and get read by `deliberate()` as if the CLI's raw error JSON were
     // judge 1's argued position.
     let fx = fixture_with_dropped_deliberation(_home, &["judge-1"]);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");

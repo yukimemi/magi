@@ -45,7 +45,7 @@ async fn a_run_parked_after_judging_is_resumed_by_the_daemon_without_an_operator
 
     // Park a real run while a judge call is in flight.
     let pause = Pause::new();
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.on_pause(pause.clone());

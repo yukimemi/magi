@@ -37,7 +37,7 @@ async fn a_blocking_round_with_rounds_left_fixes_before_running_e2e() {
     // "round 1 must not have run e2e" without racing whether the fixer
     // happens to clear the finding immediately.
     let fx = fixture_that_never_clears(_guard, 3);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -88,7 +88,7 @@ async fn a_head_with_no_more_blocking_findings_runs_e2e_before_going_clean() {
     // judging entirely, dropping three implement calls and a judge/vote wave
     // that nothing here asserts on.
     fx.config.graph.candidates = 1;
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -129,7 +129,7 @@ async fn the_e2e_every_round_flag_restores_the_old_diagnostic_behaviour() {
     let _guard = common::home_lock().await;
     let mut fx = fixture_that_never_clears(_guard, 3);
     fx.config.graph.e2e_every_round = true;
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -163,7 +163,7 @@ async fn the_final_round_never_defers_even_with_blocking_findings_left() {
     // round 2 is the budget's last round (must not defer — nothing would
     // ever verify it otherwise, since the run stops right after).
     let fx = fixture_that_never_clears(_guard, 2);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -189,7 +189,7 @@ async fn exhausted_rounds_catch_up_on_a_deferred_e2e_before_deciding_the_gate() 
     // stop must not read that silence as green: it must run e2e for real on
     // the tree it is about to stop touching before deciding anything.
     let fx = fixture_with_noop_fixer(_guard, 6);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -247,7 +247,7 @@ async fn each_rounds_verified_head_and_time_stay_pinned_to_that_rounds_own_commi
     // shown a genuinely earlier, now-superseded result rather than a made-up
     // one.
     fx.config.verify.e2e = vec!["test -f fixed.txt".to_owned()];
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
