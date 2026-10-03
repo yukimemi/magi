@@ -21,7 +21,7 @@ async fn a_hook_that_changes_files_lands_as_one_commit_before_the_gate() {
     fx.config.disk.min_free_bytes = 0;
     fx.config.verify.pre_gate = vec!["echo formatted >> fmt.txt".to_owned()];
     fx.config.verify.gate = vec![gate_expects(1)];
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -42,7 +42,7 @@ async fn a_hook_that_changes_nothing_makes_no_commit() {
     fx.config.disk.min_free_bytes = 0;
     fx.config.verify.pre_gate = vec!["true".to_owned()];
     fx.config.verify.gate = vec![gate_expects(0)];
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -60,7 +60,7 @@ async fn a_failing_hook_warns_and_the_gate_still_runs() {
     let mut fx = fixture(home, Judges::Unanimous, false);
     fx.config.disk.min_free_bytes = 0;
     fx.config.verify.pre_gate = vec!["exit 3".to_owned()];
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -81,7 +81,7 @@ async fn an_empty_pre_gate_changes_nothing() {
     let mut fx = fixture(home, Judges::Unanimous, false);
     fx.config.disk.min_free_bytes = 0;
     fx.config.verify.gate = vec![gate_expects(0)];
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");

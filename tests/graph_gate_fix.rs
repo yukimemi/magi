@@ -27,7 +27,7 @@ async fn a_gate_that_fails_once_is_fixed_and_the_run_proceeds_to_merge() {
     let mut fx = fixture(home, Judges::Unanimous, false);
     fx.config.disk.min_free_bytes = 0;
     fx.config.verify.gate = vec![GATE_NEEDS_FIX.to_owned()];
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -57,7 +57,7 @@ async fn a_gate_that_keeps_failing_blocks_after_the_cap_with_its_last_output() {
     fx.config.disk.min_free_bytes = 0;
     fx.config.graph.gate_fix_rounds = 2;
     fx.config.verify.gate = vec!["echo still red; exit 1".to_owned()];
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -82,7 +82,7 @@ async fn a_gate_timeout_is_not_a_code_failure_and_spends_no_fix_round() {
     fx.config.disk.min_free_bytes = 0;
     fx.config.graph.timeout_verify = Some(1);
     fx.config.verify.gate = vec!["sleep 5".to_owned()];
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -104,7 +104,7 @@ async fn a_gate_fix_that_changes_nothing_ends_blocked_after_one_round() {
         agent.env.insert("MOCK_GATE_FIX_NOOP".to_owned(), "1".to_owned());
     }
     fx.config.verify.gate = vec![GATE_NEEDS_FIX.to_owned()];
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");

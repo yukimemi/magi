@@ -16,7 +16,7 @@ common::e2e! {
 async fn a_blocked_run_stays_blocked_on_reentry() {
     let _home = home_lock().await;
     let fx = fixture_always_blocked(_home);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");

@@ -106,7 +106,7 @@ async fn a_clean_superseded_run_has_its_worktree_released() {
         &fx.repo,
         BRANCH,
         fx.config.clone(),
-        Some(takeover(&[&old])),
+        Some(takeover(&[&old])), magi::run::Origin::operator(),
     )
     .await
     .expect("the review takes the branch over");
@@ -144,7 +144,7 @@ async fn a_dirty_worktree_is_refused_and_left_alone() {
         &fx.repo,
         BRANCH,
         fx.config.clone(),
-        Some(takeover(&[&old])),
+        Some(takeover(&[&old])), magi::run::Origin::operator(),
     )
     .await
     .err()
@@ -171,7 +171,7 @@ async fn a_run_that_is_not_superseded_is_left_alone() {
 
     // Not among the task's earlier attempts, e.g. another task's run.
     let result =
-        Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[]))).await;
+        Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[])), magi::run::Origin::operator()).await;
 
     let err = result.err().expect("git still refuses to share the branch");
     let text = format!("{err:#}");
@@ -200,7 +200,7 @@ async fn a_running_run_is_refused_and_left_alone() {
         &fx.repo,
         BRANCH,
         fx.config.clone(),
-        Some(takeover(&[&old])),
+        Some(takeover(&[&old])), magi::run::Origin::operator(),
     )
     .await
     .err()
@@ -232,7 +232,7 @@ async fn a_blocked_run_whose_driver_stopped_is_released_though_its_pid_lives() {
         &fx.repo,
         BRANCH,
         fx.config.clone(),
-        Some(takeover(&[&old])),
+        Some(takeover(&[&old])), magi::run::Origin::operator(),
     )
     .await
     .expect("a stopped driver does not hold the branch");
@@ -305,7 +305,7 @@ async fn a_clean_dead_run_of_another_task_is_released_and_audited() {
         &fx.repo,
         BRANCH,
         fx.config.clone(),
-        Some(takeover(&[])),
+        Some(takeover(&[])), magi::run::Origin::operator(),
     )
     .await
     .expect("a clean worktree of a dead run is released");
@@ -327,7 +327,7 @@ async fn a_dirty_worktree_of_another_task_names_the_files() {
     let (old, wt) = other_task_run(&fx);
     std::fs::write(wt.join("scratch.txt"), "unsaved\n").unwrap();
 
-    let err = Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[])))
+    let err = Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[])), magi::run::Origin::operator())
         .await
         .err()
         .expect("dirty must be refused");
@@ -350,7 +350,7 @@ async fn a_live_run_of_another_task_is_left_alone_and_named() {
     old.driver_started_at = magi::proc::process_started_at(pid);
     old.save().unwrap();
 
-    let err = Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[])))
+    let err = Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[])), magi::run::Origin::operator())
         .await
         .err()
         .expect("a live run must be refused");
@@ -369,7 +369,7 @@ async fn an_earlier_attempts_worktree_outside_the_worktree_root_is_left_alone() 
     let fx = fixture(_home, Judges::Unanimous, true);
     let (old, wt) = old_run_at(&fx, true);
 
-    let err = Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[&old])))
+    let err = Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[&old])), magi::run::Origin::operator())
         .await
         .err()
         .expect("a path magi did not lay must be refused");

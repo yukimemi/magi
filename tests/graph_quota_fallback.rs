@@ -16,7 +16,7 @@ async fn a_solo_seat_falls_through_to_the_next_agent_and_recovers() {
     // `alpha` (the only agent a solo run would otherwise ever pick) is
     // rate-limited on the implement seat; `beta` and `gamma` are not.
     let fx = fixture_with_quota_on_agents(_home, &["alpha"], &["impl-A"]);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -65,7 +65,7 @@ async fn a_seat_that_exhausts_the_whole_roster_records_exactly_one_quota_loss() 
     // Every agent in the roster is rate-limited on this seat: the fallback
     // chain runs out and today's behaviour applies unchanged.
     let fx = fixture_with_quota_on_agents(_home, &["alpha", "beta", "gamma"], &["impl-A"]);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     // An ordinary all-empty implement round: `after_implement` still fails
@@ -150,7 +150,7 @@ async fn a_later_candidate_slots_seat_falls_back_past_its_own_position_not_the_r
         }
     }
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -210,7 +210,7 @@ async fn a_later_candidate_slots_fallback_chain_stops_at_the_rosters_tail_withou
         }
     }
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     // Slot 0 (alpha) still produces a viable candidate, so the run does not

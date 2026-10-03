@@ -46,9 +46,9 @@ use crate::refs;
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
     DeliberationRound, DeliberationTurn, E2eStatus, FixRecord, GateFixRecord, JobRecord, JobStatus,
-    Judgement, MergeOutcome, OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest, QuotaLoss,
-    ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, Tally, VoteRecord, tail,
-    write_artifact,
+    Judgement, MergeOutcome, OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest, Origin,
+    QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, Tally,
+    VoteRecord, tail, write_artifact,
 };
 use crate::verdict::{
     self, FinalVote, Finding, FixReport, Position, Proposal, Ranking, Review, ReviewRevote,
@@ -451,8 +451,13 @@ impl Drop for FixClaim {
 
 impl Runner {
     /// Start a fresh run against `repo`.
-    pub async fn start(repo: &Path, instruction: String, config: Config) -> Result<Self> {
-        Self::start_naming(repo, instruction, "", config).await
+    pub async fn start(
+        repo: &Path,
+        instruction: String,
+        config: Config,
+        origin: Origin,
+    ) -> Result<Self> {
+        Self::start_naming(repo, instruction, "", config, origin).await
     }
 
     /// [`Runner::start`] for a queued task: `also_scan` (the task's title) is
@@ -463,6 +468,7 @@ impl Runner {
         instruction: String,
         also_scan: &str,
         config: Config,
+        origin: Origin,
     ) -> Result<Self> {
         let repo = git::toplevel(repo).await?;
         let missing = agent::missing_programs(&config.agents);
@@ -504,6 +510,10 @@ impl Runner {
         .await;
         refs::plan(&repo, &seeds).await?;
         let mut state = RunState::new(repo, base_branch, base_commit, instruction, config);
+        // Recorded before the first save, so a crash right after minting
+        // cannot leave a run with no origin. Legibility only: nothing reads it
+        // to decide anything.
+        state.origin = Some(origin);
         for seed in &seeds {
             state.event(
                 "seed",
@@ -535,8 +545,8 @@ impl Runner {
     /// `deliberate` has fewer than two first choices to reconcile, `vote`
     /// returns early, `tally` is already present and `fold_losers` has no
     /// losers. Resuming such a run therefore does the right thing as well.
-    pub async fn review(repo: &Path, branch: &str, config: Config) -> Result<Self> {
-        Self::review_taking_over(repo, branch, config, None).await
+    pub async fn review(repo: &Path, branch: &str, config: Config, origin: Origin) -> Result<Self> {
+        Self::review_taking_over(repo, branch, config, None, origin).await
     }
 
     /// [`Runner::review`] for a queued task's retry: when an earlier attempt
@@ -550,6 +560,7 @@ impl Runner {
         branch: &str,
         config: Config,
         takeover: Option<crate::handover::Takeover>,
+        origin: Origin,
     ) -> Result<Self> {
         let repo = git::toplevel(repo).await?;
         let missing = agent::missing_programs(&config.agents);
@@ -580,6 +591,7 @@ impl Runner {
             String::new(),
             config,
         );
+        state.origin = Some(origin);
 
         // Released before anything else touches the branch: a stale local
         // branch is moved with `git branch -f`, which git refuses while an
@@ -3925,7 +3937,18 @@ impl Runner {
                     short(&after)
                 ),
             );
-            match Self::review(&self.state.repo, &winner.branch, self.state.config.clone()).await {
+            // The operator asked for the fix, and the follow-up serves whatever
+            // task the run it follows served.
+            let origin =
+                Origin::operator().serving(self.state.origin.as_ref().and_then(|o| o.task.clone()));
+            match Self::review(
+                &self.state.repo,
+                &winner.branch,
+                self.state.config.clone(),
+                origin,
+            )
+            .await
+            {
                 Ok(mut follow_up) => {
                     follow_up.state.event(
                         "start",

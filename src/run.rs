@@ -212,7 +212,116 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// Schema 12 adds [`RunState::driver_exited`]: the driver records that it
 /// stopped walking the graph. Additive, but an older build would keep reading
 /// a long-lived daemon's pid as a live driver of a run that ended long ago.
-pub const SCHEMA: u32 = 12;
+///
+/// Schema 13 adds [`RunState::origin`]: who started the run and which task it
+/// stood in for. Additive, and an older record is deliberately left with
+/// `None` ("origin unknown") rather than guessed at — a run from before this
+/// existed must not read as an operator's when nobody knows. The bump exists
+/// so a run is never mistaken for one whose origin was known and empty.
+pub const SCHEMA: u32 = 13;
+
+/// What an unrecorded origin reads as, wherever one is shown.
+pub const ORIGIN_UNKNOWN: &str = "origin unknown (started before origins were recorded)";
+
+/// Who started a run. Legibility only: nothing branches on it, the same rule
+/// as `agent::Invocation::run` / `node`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StartedBy {
+    /// The daemon, minting an attempt for a queue task.
+    Queue {
+        /// The task the attempt belongs to.
+        task: String,
+    },
+    /// An agent inside a talk (chat) conversation, via `magi run` / `magi review`.
+    Chat {
+        /// Talk id, e.g. `4a7b`.
+        talk: String,
+    },
+    /// An agent seat inside another run, identified by the `MAGI_RUN` /
+    /// `MAGI_NODE` it was spawned with.
+    Seat {
+        /// Run the seat belonged to.
+        run: String,
+        /// Node it was working in.
+        node: String,
+    },
+    /// A person at a terminal (or anything that carries no attribution).
+    Operator,
+}
+
+/// Where a run came from, and the task it was meant to finish, if any.
+///
+/// Kept as two facts because they vary independently: a chat agent may start a
+/// run on behalf of a queue task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    /// Who started it.
+    pub by: StartedBy,
+    /// The queue task this run serves, when it names one.
+    #[serde(default)]
+    pub task: Option<String>,
+}
+
+impl Origin {
+    /// A run a person started with no task attached.
+    pub fn operator() -> Self {
+        Self {
+            by: StartedBy::Operator,
+            task: None,
+        }
+    }
+
+    /// An attempt the daemon mints for `task`.
+    pub fn queue(task: &str) -> Self {
+        Self {
+            by: StartedBy::Queue {
+                task: task.to_owned(),
+            },
+            task: Some(task.to_owned()),
+        }
+    }
+
+    /// Attribute from the `MAGI_RUN` / `MAGI_NODE` pair `agent::invoke`
+    /// exports, as `(run, node)`; `None` for no (or blank) `run` is an
+    /// operator. A node of `chat` is the talk layer, whose run is the talk id.
+    pub fn from_agent_env(env: Option<(String, String)>, task: Option<String>) -> Self {
+        let by = match env {
+            Some((run, node)) if node == "chat" => StartedBy::Chat { talk: run },
+            Some((run, node)) => StartedBy::Seat { run, node },
+            None => StartedBy::Operator,
+        };
+        Self { by, task }
+    }
+
+    /// The same origin, naming `task` as the one it serves.
+    pub fn serving(mut self, task: Option<String>) -> Self {
+        if task.is_some() {
+            self.task = task;
+        }
+        self
+    }
+
+    /// One short label for lists, reports and the web UI.
+    pub fn label(&self) -> String {
+        let by = match &self.by {
+            StartedBy::Queue { task } => format!("task {}", short_of(task)),
+            StartedBy::Chat { talk } => format!("chat {}", short_of(talk)),
+            StartedBy::Seat { run, node } => format!("{node}@{}", short_of(run)),
+            StartedBy::Operator => "operator".to_owned(),
+        };
+        match (&self.by, &self.task) {
+            (StartedBy::Queue { task: a }, Some(b)) if a == b => by,
+            (_, Some(t)) => format!("{by}, for task {}", short_of(t)),
+            _ => by,
+        }
+    }
+}
+
+/// [`Origin::label`] for a run that may predate origins.
+pub fn origin_label(origin: Option<&Origin>) -> String {
+    origin.map_or_else(|| ORIGIN_UNKNOWN.to_owned(), Origin::label)
+}
 
 /// Where a run got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1705,6 +1814,11 @@ pub struct RunState {
     /// resumed run. Additive and `#[serde(default)]`, so `SCHEMA` stays put.
     #[serde(default)]
     pub attachments: Vec<PathBuf>,
+    /// Who started this run and which task it serves — see [`Origin`] and
+    /// `SCHEMA`'s doc for schema 13. `None` is a run recorded before origins
+    /// existed, and is reported as unknown, never as an operator's.
+    #[serde(default)]
+    pub origin: Option<Origin>,
 }
 
 impl RunState {
@@ -1763,6 +1877,7 @@ impl RunState {
             advice: None,
             advise_attempted: false,
             attachments: Vec::new(),
+            origin: None,
             events: Vec::new(),
             jobs: Vec::new(),
             operator_fixes: Vec::new(),
@@ -2115,7 +2230,7 @@ impl RunState {
     }
 }
 
-fn migrate_schema(mut state: RunState) -> Result<RunState> {
+pub(crate) fn migrate_schema(mut state: RunState) -> Result<RunState> {
     // Schema 5 predates deferred e2e. Its empty e2e lists therefore mean
     // "not configured", never "deferred"; serde's field defaults retain
     // exactly that representation while this migration permits resumes.
@@ -2187,6 +2302,12 @@ fn migrate_schema(mut state: RunState) -> Result<RunState> {
         ) {
             state.driver_exited = true;
         }
+        state.schema = 12;
+    }
+    // Schema 12 predates `origin`. Nothing is reconstructed: `None` already
+    // says "unknown", which is the truth for a run nobody recorded. Only the
+    // version number advances.
+    if state.schema == 12 {
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {
@@ -3580,6 +3701,73 @@ mod tests {
         assert!(
             migrated.reviews[0].verified_head.is_none(),
             "a deferred round never ran e2e; there is nothing to reconstruct"
+        );
+    }
+
+    #[test]
+    fn origin_round_trips_through_the_run_state() {
+        let mut s = state();
+        s.origin = Some(Origin::from_agent_env(
+            Some(("4a7b".to_owned(), "chat".to_owned())),
+            Some("20260930-092817-4f6f".to_owned()),
+        ));
+        let back: RunState =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).expect("parse back");
+        assert_eq!(back.origin, s.origin);
+        assert_eq!(
+            back.origin.as_ref().unwrap().by,
+            StartedBy::Chat {
+                talk: "4a7b".to_owned()
+            }
+        );
+        assert_eq!(
+            origin_label(back.origin.as_ref()),
+            "chat 4a7b, for task 4f6f"
+        );
+    }
+
+    #[test]
+    fn a_schema_twelve_record_without_an_origin_loads_and_reads_as_unknown() {
+        let mut value = serde_json::to_value(state()).expect("serialize state");
+        let object = value.as_object_mut().expect("state object");
+        object.insert("schema".to_owned(), serde_json::json!(12));
+        object.remove("origin");
+        let old: RunState = serde_json::from_value(value).expect("schema-12 shape parses");
+        assert!(old.origin.is_none());
+        let migrated = migrate_schema(old).expect("schema 12 migrates");
+        assert_eq!(migrated.schema, SCHEMA);
+        assert!(
+            migrated.origin.is_none(),
+            "an origin nobody recorded is not invented"
+        );
+        assert_eq!(
+            origin_label(migrated.origin.as_ref()),
+            "origin unknown (started before origins were recorded)"
+        );
+    }
+
+    #[test]
+    fn origin_attributes_agents_by_node_and_never_by_guesswork() {
+        let chat = Origin::from_agent_env(Some(("4a7b".to_owned(), "chat".to_owned())), None);
+        assert_eq!(
+            chat.by,
+            StartedBy::Chat {
+                talk: "4a7b".into()
+            }
+        );
+        let seat = Origin::from_agent_env(
+            Some(("20260930-092817-ec34".to_owned(), "implement".to_owned())),
+            None,
+        );
+        assert_eq!(seat.label(), "implement@ec34");
+        assert_eq!(Origin::from_agent_env(None, None), Origin::operator());
+        assert_eq!(Origin::operator().label(), "operator");
+        assert_eq!(Origin::queue("20260930-000000-4f6f").label(), "task 4f6f");
+        assert_eq!(
+            Origin::operator()
+                .serving(Some("20260930-000000-4f6f".to_owned()))
+                .label(),
+            "operator, for task 4f6f"
         );
     }
 

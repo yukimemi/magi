@@ -12,7 +12,7 @@ common::e2e! {
 async fn a_split_vote_earns_one_round_of_reconsideration_and_a_recorded_verdict() {
     let home = common::home_lock().await;
     let fx = fixture_with_split_review_vote(home, "review-2");
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");

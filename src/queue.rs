@@ -544,6 +544,18 @@ impl Task {
         self.resume_override = None;
     }
 
+    /// Note that `run` serves this task without otherwise changing its life:
+    /// no status, attempt or interrupt change, unlike [`Task::start`]. For a
+    /// run somebody else started on the task's behalf (`magi run --task`);
+    /// idempotent. Returns whether anything was added.
+    pub fn link_run(&mut self, run: &str) -> bool {
+        if self.runs.iter().any(|r| r == run) {
+            return false;
+        }
+        self.runs.push(run.to_owned());
+        true
+    }
+
     /// Record a successful run.
     ///
     /// Both `magi task done` and `POST /api/queue/{id}/done` can close a held
@@ -1112,6 +1124,18 @@ impl Queue {
             crate::notices::raise_in(home, notice);
         }
         Ok(())
+    }
+
+    /// Append `run` to the runs of the task `id` (or an unambiguous prefix),
+    /// leaving everything else about it alone — see [`Task::link_run`]. Read
+    /// and written back in one breath, because [`Queue::put`] replaces the
+    /// whole record. Returns the task as stored.
+    pub fn link_run(&self, id: &str, run: &str) -> Result<Task> {
+        let mut task = self.get(id)?;
+        if task.link_run(run) {
+            self.put(&mut task)?;
+        }
+        Ok(task)
     }
 
     /// Load a task by id or unambiguous id prefix.
@@ -3059,5 +3083,30 @@ mod tests {
         let paths = q.attachment_paths(&t);
         assert!(paths[0].is_absolute(), "{}", paths[0].display());
         assert!(paths[0].ends_with(format!("{}.attachments/shot.png", t.id)));
+    }
+
+    #[test]
+    fn link_run_adds_a_run_once_and_touches_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut t = Task::new(
+            "t".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("."),
+            Source::Human,
+        );
+        queue.put(&mut t).unwrap();
+        let before = queue.get(&t.id).unwrap();
+
+        let linked = queue.link_run(&t.id[..4], "20260930-092817-ec34").unwrap();
+        assert_eq!(linked.runs, vec!["20260930-092817-ec34".to_owned()]);
+        assert_eq!(linked.status, before.status);
+        assert_eq!(linked.attempts, before.attempts);
+        assert_eq!(linked.interrupt, before.interrupt);
+
+        let again = queue.link_run(&t.id, "20260930-092817-ec34").unwrap();
+        assert_eq!(again.runs.len(), 1, "linking twice must not duplicate");
+        assert_eq!(queue.get(&t.id).unwrap().runs.len(), 1);
+        assert!(queue.link_run("no-such-task", "r").is_err());
     }
 }

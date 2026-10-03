@@ -39,7 +39,7 @@ async fn a_run_starts_on_a_dirty_tree_and_branches_off_the_base() {
         "the fixture should be dirty, got {porcelain:?}"
     );
 
-    let runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("a dirty working copy must not stop a run");
 
@@ -178,7 +178,7 @@ async fn a_run_branches_off_what_the_remote_has_not_a_stale_local_ref() {
     let local_tip = git(&["rev-parse", &base], &fx.repo);
     assert_ne!(local_tip, remote_tip, "the local ref must start out behind");
 
-    let runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
 

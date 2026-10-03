@@ -92,7 +92,7 @@ async fn the_gate_runs_on_a_tree_that_contains_what_landed_while_the_run_was_thi
     fx.config.graph.candidates = 1;
     let origin = wire_origin(&fx);
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
 
@@ -167,7 +167,7 @@ async fn a_conflicting_base_is_resolved_by_the_fixer_and_the_run_goes_on_to_revi
     // creates - so replaying the candidate's commit cannot avoid a conflict.
     let origin = wire_origin(&fx);
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     land_on_origin(
@@ -223,7 +223,7 @@ async fn a_fixer_that_never_resolves_the_conflict_blocks_the_run_and_says_what_w
     set_agent_env(&mut fx, "MOCK_REBASE_FIX_NOOP");
     let origin = wire_origin(&fx);
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     let branch = runner.state.branch_for('A');
@@ -269,7 +269,7 @@ async fn a_fixer_that_abandons_the_rebase_is_not_mistaken_for_success() {
     set_agent_env(&mut fx, "MOCK_REBASE_FIX_ABORT");
     let origin = wire_origin(&fx);
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     let branch = runner.state.branch_for('A');
@@ -297,7 +297,7 @@ async fn a_fixer_that_skips_every_commit_does_not_lose_the_branch() {
     set_agent_env(&mut fx, "MOCK_REBASE_FIX_SKIP");
     let origin = wire_origin(&fx);
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     land_on_origin(&origin.sideline, "note.txt", "upstream\n");
@@ -327,7 +327,7 @@ async fn the_conflict_round_bound_is_counted_in_state_and_survives_a_resume() {
     set_agent_env(&mut fx, "MOCK_REBASE_FIX_NOOP");
     let origin = wire_origin(&fx);
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     land_on_origin(&origin.sideline, "note.txt", "upstream\n");
@@ -367,7 +367,7 @@ async fn with_no_conflict_rounds_a_conflict_stops_without_asking_a_fixer() {
     fx.config.graph.review_rounds = 0;
     let origin = wire_origin(&fx);
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     land_on_origin(&origin.sideline, "note.txt", "upstream\n");
@@ -393,7 +393,7 @@ async fn a_rebased_winner_is_pushed_over_the_remote_copy_magi_last_saw() {
     fx.config.graph.candidates = 1;
     let origin = wire_origin(&fx);
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
 
@@ -438,7 +438,7 @@ async fn a_remote_branch_with_someone_elses_commits_blocks_the_base_sync() {
     fx.config.graph.candidates = 1;
     let origin = wire_origin(&fx);
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
 

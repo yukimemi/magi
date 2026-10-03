@@ -18,9 +18,14 @@ use magi::run::{OperatorFixOutcome, RunState, RunStatus};
 /// longer exists.
 async fn ready_run_with_two_minor_findings(home: common::HomeGuard) -> (common::Fixture, Runner) {
     let fx = fixture_with_split_review_vote(home, "review-1,review-2");
-    let mut runner = Runner::start(&fx.repo, "add retries".to_owned(), fx.config.clone())
-        .await
-        .expect("start");
+    let mut runner = Runner::start(
+        &fx.repo,
+        "add retries".to_owned(),
+        fx.config.clone(),
+        magi::run::Origin::operator(),
+    )
+    .await
+    .expect("start");
     runner.execute().await.expect("execute");
     assert_eq!(runner.state.status, RunStatus::Ready, "{:?}", runner.state);
     assert_eq!(runner.state.reviews.len(), 1);
