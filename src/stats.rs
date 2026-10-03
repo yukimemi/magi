@@ -555,7 +555,11 @@ pub fn collect_refs<'a>(states: impl IntoIterator<Item = &'a RunState>) -> Stats
             // which is the one this tally counts as the merge/ready outcome,
             // and folding it back in would inflate the denominator with two
             // outcomes for one task.
-            RunStatus::Superseded => totals.superseded += 1,
+            //
+            // `AlreadyInBase` is the same story from the other side: the
+            // change reached the base by another route, so it shares the
+            // bucket instead of becoming a second outcome for one change.
+            RunStatus::Superseded | RunStatus::AlreadyInBase => totals.superseded += 1,
             RunStatus::Prep
             | RunStatus::Implementing
             | RunStatus::Judging

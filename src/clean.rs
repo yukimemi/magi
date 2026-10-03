@@ -248,7 +248,12 @@ pub async fn fold_due(
         // never going to be merged by anyone. Every other terminal status
         // keeps the winner: `Ready`/`Blocked`/`Stalled`/`Failed`/`VerifiedNoop`
         // may still have a human's decision pending on that exact branch.
-        let drop_winner = matches!(state.status, RunStatus::Merged | RunStatus::Superseded);
+        // `AlreadyInBase` is the same: the change is on the base under other
+        // commit ids, so the branch holds nothing anyone still needs.
+        let drop_winner = matches!(
+            state.status,
+            RunStatus::Merged | RunStatus::Superseded | RunStatus::AlreadyInBase
+        );
         // One run's fold must not cost every later run its turn. A worktree
         // another borrower holds, a branch git refuses to delete, a repository
         // that has since moved: each is a reason this run cannot be folded

@@ -1371,6 +1371,130 @@ pub async fn find_open_pr(repo: &Path, branch: &str, base: &str) -> Result<OpenP
     pick_open_pr(&out, base)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPrHead {
+    head_ref_name: String,
+    base_ref_name: String,
+    state: String,
+    // Required, like `GhOpenPr`'s fields: a record that cannot say whether the
+    // head lives in a fork must be a parse error, never "same repository".
+    is_cross_repository: bool,
+}
+
+/// Pure half of [`close_superseded_pr`]: read `gh pr view --json
+/// headRefName,baseRefName,state,isCrossRepository` and say whether closing
+/// is safe, `Err` carrying the reason when it is not.
+///
+/// Closing is outward-facing, so every property is checked on what the forge
+/// says now, not on what magi recorded: the head must be exactly `branch` in
+/// this repository (a fork's branch of the same name is somebody else's), the
+/// base must be `base`, and the pull request must still be open.
+pub fn closable(json: &str, branch: &str, base: &str) -> std::result::Result<(), String> {
+    let pr: GhPrHead =
+        serde_json::from_str(json).map_err(|e| format!("could not read the pull request ({e})"))?;
+    if pr.head_ref_name != branch {
+        return Err(format!(
+            "its head is `{}`, not this run's `{branch}`",
+            pr.head_ref_name
+        ));
+    }
+    if pr.is_cross_repository {
+        return Err("its head lives in a fork".to_owned());
+    }
+    if pr.base_ref_name != base {
+        return Err(format!("it targets `{}`, not `{base}`", pr.base_ref_name));
+    }
+    if !pr.state.eq_ignore_ascii_case("open") {
+        return Err(format!("it is already {}", pr.state.to_ascii_lowercase()));
+    }
+    Ok(())
+}
+
+/// The comment left on a pull request closed because its change is already on
+/// the base.
+pub fn superseded_comment(base: &str, evidence: &crate::already::Evidence) -> String {
+    let how = match evidence.proof {
+        crate::already::Proof::PatchId => format!(
+            "carried by commit {} on `{base}` with the same patch",
+            evidence.names()
+        ),
+        crate::already::Proof::Tree => format!(
+            "already part of `{base}` (merging this branch changes nothing at {})",
+            crate::already::short_sha(&evidence.tip)
+        ),
+    };
+    format!(
+        "Closing: everything this branch adds is {how}, so there is nothing left to \
+         land. This pull request was closed automatically after that was verified; \
+         reopen it if you disagree."
+    )
+}
+
+/// Close the open pull request for `branch`, if there is one and it is
+/// provably this run's, with a comment naming what supersedes it. Returns the
+/// URL closed, or `None` with the reason when nothing was touched.
+///
+/// The recorded `state.pr` is preferred, else the forge is asked for an open
+/// pull request on `branch`; either way the candidate is re-read and passed
+/// through [`closable`] before anything is written.
+pub async fn close_superseded_pr(
+    state: &mut RunState,
+    branch: &str,
+    evidence: &crate::already::Evidence,
+) -> Result<std::result::Result<String, String>> {
+    let repo = state.repo.clone();
+    let base = state.base_branch.clone();
+    let url = match state.pr.as_ref().filter(|p| p.state == "open") {
+        Some(p) => p.url.clone(),
+        None => match find_open_pr(&repo, branch, &base).await? {
+            OpenPr::One { url, .. } => url,
+            OpenPr::None => return Ok(Err("no open pull request".to_owned())),
+            OpenPr::Many(urls) => {
+                return Ok(Err(format!(
+                    "{} open pull requests name it; not choosing between them",
+                    urls.len()
+                )));
+            }
+        },
+    };
+    let (ok, view) = gh(
+        &repo,
+        &[
+            "pr".to_owned(),
+            "view".to_owned(),
+            url.clone(),
+            "--json".to_owned(),
+            "headRefName,baseRefName,state,isCrossRepository".to_owned(),
+        ],
+    )
+    .await?;
+    if !ok {
+        bail!("gh pr view {url} failed: {view}");
+    }
+    if let Err(why) = closable(&view, branch, &base) {
+        return Ok(Err(format!("left {url} open: {why}")));
+    }
+    let (ok, out) = gh(
+        &repo,
+        &[
+            "pr".to_owned(),
+            "close".to_owned(),
+            url.clone(),
+            "--comment".to_owned(),
+            superseded_comment(&base, evidence),
+        ],
+    )
+    .await?;
+    if !ok {
+        bail!("gh pr close {url} failed: {out}");
+    }
+    if let Some(p) = state.pr.as_mut().filter(|p| p.url == url) {
+        p.state = "closed".to_owned();
+    }
+    Ok(Ok(url))
+}
+
 /// `gh pr edit <url> --title <title>`, for an adopted pull request whose title
 /// differs from the one this run computed. Only the title: the body may have
 /// been edited by the owner and cannot be compared.
@@ -2774,6 +2898,50 @@ impl Default for GhUser {
 mod tests {
     use super::*;
     use crate::run::{Candidate, ReviewRecord, ReviewRound, Tally};
+
+    fn head_json(head: &str, base: &str, state: &str, cross: bool) -> String {
+        format!(
+            r#"{{"headRefName":"{head}","baseRefName":"{base}","state":"{state}","isCrossRepository":{cross}}}"#
+        )
+    }
+
+    #[test]
+    fn a_pull_request_is_closed_only_when_its_head_is_exactly_the_runs_branch() {
+        let ok = head_json("magi/27b2/A", "main", "OPEN", false);
+        assert_eq!(closable(&ok, "magi/27b2/A", "main"), Ok(()));
+        for (json, why) in [
+            (head_json("magi/27b2/B", "main", "OPEN", false), "head"),
+            (head_json("magi/27b2/A-2", "main", "OPEN", false), "head"),
+            (head_json("magi/27b2/A", "main", "OPEN", true), "fork"),
+            (head_json("magi/27b2/A", "dev", "OPEN", false), "targets"),
+            (head_json("magi/27b2/A", "main", "MERGED", false), "already"),
+            (head_json("magi/27b2/A", "main", "CLOSED", false), "already"),
+        ] {
+            let err = closable(&json, "magi/27b2/A", "main").unwrap_err();
+            assert!(err.contains(why), "{json}: {err}");
+        }
+        assert!(closable("not json", "magi/27b2/A", "main").is_err());
+        // A record that does not say whether it is a fork is not trusted.
+        assert!(
+            closable(
+                r#"{"headRefName":"b","baseRefName":"main","state":"OPEN"}"#,
+                "b",
+                "main"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_close_comment_names_the_commit_on_the_base() {
+        let e = crate::already::Evidence {
+            proof: crate::already::Proof::PatchId,
+            tip: "1234567890".to_owned(),
+            commits: vec!["0e368de0000".to_owned()],
+        };
+        let c = superseded_comment("main", &e);
+        assert!(c.contains("0e368de") && c.contains("`main`"), "{c}");
+    }
 
     /// Real `gh pr view` output for the open pull request #10 (Renovate's apm bump), trimmed to four checks and its one comment. Every check passed or was skipped by the review workflow, and the only comment is CodeRabbit's trigger notice.
     const GREEN_OPEN: &str = r####"{

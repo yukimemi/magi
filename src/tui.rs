@@ -97,7 +97,10 @@ impl Filter {
             // needs to look at this one — see `RunStatus::Superseded`'s doc.
             Self::Done => matches!(
                 status,
-                RunStatus::Merged | RunStatus::Ready | RunStatus::Superseded
+                RunStatus::Merged
+                    | RunStatus::Ready
+                    | RunStatus::Superseded
+                    | RunStatus::AlreadyInBase
             ),
             // A stalled run wants a human even though it is terminal, so it
             // surfaces under "attention", not "done" — and so does a
@@ -261,7 +264,10 @@ impl App {
         };
         for l in &self.runs {
             match l.state.status {
-                RunStatus::Merged | RunStatus::Ready | RunStatus::Superseded => c.done += 1,
+                RunStatus::Merged
+                | RunStatus::Ready
+                | RunStatus::Superseded
+                | RunStatus::AlreadyInBase => c.done += 1,
                 RunStatus::Stalled
                 | RunStatus::Blocked
                 | RunStatus::Failed
@@ -479,7 +485,7 @@ fn status_style(status: RunStatus) -> Style {
         RunStatus::VerifiedNoop => Style::default().fg(Color::Cyan),
         // Muted: a later attempt already settled the task, so this card
         // needs nobody's attention.
-        RunStatus::Superseded => Style::default().fg(Color::DarkGray),
+        RunStatus::Superseded | RunStatus::AlreadyInBase => Style::default().fg(Color::DarkGray),
         _ => Style::default().fg(Color::Cyan),
     }
 }

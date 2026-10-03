@@ -1038,8 +1038,14 @@ impl Runner {
         // a second time, and the gate is the one node whose "green" gets
         // acted on.
         self.sync_to_base().await?;
+        if self.state.status == RunStatus::AlreadyInBase {
+            return Ok(());
+        }
         self.review_loop().await?;
         self.sync_to_base().await?;
+        if self.state.status == RunStatus::AlreadyInBase {
+            return Ok(());
+        }
         self.gate().await?;
         self.merge().await?;
         self.state.save()?;
@@ -3278,14 +3284,14 @@ impl Runner {
     /// afterwards a no-op instead of a second attempt at the same wall. A
     /// push failure ends the same way.
     async fn sync_to_base(&mut self) -> Result<()> {
-        if self
+        if self.state.status == RunStatus::AlreadyInBase {
+            return Ok(());
+        }
+        let conflicted = self
             .state
             .base_sync
             .as_ref()
-            .is_some_and(|s| s.conflict.is_some())
-        {
-            return Ok(());
-        }
+            .is_some_and(|s| s.conflict.is_some());
         let Some(winner) = self.state.winner().cloned() else {
             return Ok(());
         };
@@ -3306,6 +3312,21 @@ impl Runner {
         let head = git::rev_parse(&winner.worktree, "HEAD").await?;
         let behind = git::commits_ahead(&repo, &head, &tip).await.unwrap_or(0);
         let attempts = self.state.base_sync.as_ref().map_or(0, |s| s.attempts);
+
+        // Before any rebase, and before a recorded conflict is honoured: a
+        // branch whose change reached the base under other commit ids has
+        // nothing to rebase and nothing to conflict with, and a run that
+        // already stopped on that phantom conflict recovers here on resume.
+        if behind > 0
+            && self
+                .settle_already_in(&winner.branch, &tip, &head, attempts, behind)
+                .await?
+        {
+            return Ok(());
+        }
+        if conflicted {
+            return Ok(());
+        }
 
         if behind == 0 {
             // A fixer-finished rebase moves the branch ref before the
@@ -3334,6 +3355,7 @@ impl Runner {
                 behind: 0,
                 attempts,
                 conflict: None,
+                already_in: None,
             });
             self.state.save()?;
             return Ok(());
@@ -3351,6 +3373,7 @@ impl Runner {
                 behind,
                 attempts,
                 conflict: Some(why.clone()),
+                already_in: None,
             });
             self.state.event("land", why);
             self.state.save()?;
@@ -3399,6 +3422,7 @@ impl Runner {
                 behind,
                 attempts,
                 conflict: Some(why.clone()),
+                already_in: None,
             });
             self.state.event("land", why);
             self.state.save()?;
@@ -3458,6 +3482,7 @@ impl Runner {
                     behind: 0,
                     attempts,
                     conflict,
+                    already_in: None,
                 });
                 self.state
                     .event("land", format!("rebased {} onto {tracking}", winner.branch));
@@ -3474,6 +3499,7 @@ impl Runner {
                     behind,
                     attempts,
                     conflict: Some(why.clone()),
+                    already_in: None,
                 });
                 self.state.event("land", why);
             }
@@ -3485,12 +3511,72 @@ impl Runner {
                     behind,
                     attempts,
                     conflict: Some(why.clone()),
+                    already_in: None,
                 });
                 self.state.event("land", why);
             }
         }
         self.state.save()?;
         Ok(())
+    }
+
+    /// End the run as [`RunStatus::AlreadyInBase`] when `head`'s whole change
+    /// is already on `tip` under other commit ids ([`crate::already`]); returns
+    /// whether it did.
+    ///
+    /// Checked only when the base is ahead of the branch. A failing check is
+    /// "not proven" - the ordinary rebase path then decides - never a reason to
+    /// stop the run. The pull request, if any, is closed best-effort after the
+    /// state is saved, so a forge failure cannot lose the outcome.
+    async fn settle_already_in(
+        &mut self,
+        branch: &str,
+        tip: &str,
+        head: &str,
+        attempts: usize,
+        behind: usize,
+    ) -> Result<bool> {
+        let repo = self.state.repo.clone();
+        let evidence = match crate::already::classify(&repo, tip, head).await {
+            Ok(Some(e)) => e,
+            Ok(None) => return Ok(false),
+            Err(e) => {
+                tracing::warn!("already-in-base check for {branch}: {e:#}");
+                return Ok(false);
+            }
+        };
+        let base_branch = self.state.base_branch.clone();
+        let remote = self.state.config.merge.remote.clone();
+        let message = format!(
+            "{branch} is already in {remote}/{base_branch} as {} ({} match); nothing left to \
+             land",
+            evidence.names(),
+            evidence.proof.as_str()
+        );
+        self.state.status = RunStatus::AlreadyInBase;
+        self.state.base_sync = Some(BaseSync {
+            tip: tip.to_owned(),
+            behind,
+            attempts,
+            conflict: None,
+            already_in: Some(evidence.clone()),
+        });
+        self.state.event("land", message);
+        self.state.save()?;
+        match crate::land::close_superseded_pr(&mut self.state, branch, &evidence).await {
+            Ok(Ok(url)) => self
+                .state
+                .event("land", format!("closed {url}: superseded on {base_branch}")),
+            Ok(Err(why)) => self
+                .state
+                .event("land", format!("did not close a pull request: {why}")),
+            Err(e) => self
+                .state
+                .event("land", format!("could not close the pull request: {e:#}")),
+        }
+        self.state.save()?;
+        self.settle_questions();
+        Ok(true)
     }
 
     /// The commit review and gate diff against: the tip [`Self::sync_to_base`]
