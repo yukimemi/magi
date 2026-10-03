@@ -749,10 +749,16 @@ impl Ui {
             // an idle loop has already seen the park and ended, so `live`
             // would read as "was never running". A loop the operator had
             // already stopped stays stopped.
-            let resume = state
-                .live
-                .as_ref()
-                .is_some_and(|live| live.alive() && !live.stop.stopped());
+            //
+            // Sticky: a second upgrade request finds the loop already
+            // stopping because of the first one's park, and must not read
+            // that as the operator having stopped it. Only an explicit stop
+            // or a failed update clears an earlier intent.
+            let resume = state.resume_after_handover
+                || state
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.alive() && !live.stop.stopped());
             state.resume_after_handover = resume;
             let Some(live) = state.live.as_ref() else {
                 return Ok(None);
@@ -1232,10 +1238,12 @@ async fn hand_over(
         progress.advance(updater::Stage::Parking);
         let _ = updater::write_progress(home, &progress);
     }
-    let resume = lock_or_recover(looping).resume_after_handover;
     finish_loop(looping).await;
     served.abort();
     let _ = served.await;
+    // Read last: the deck answers for the whole park, so an operator's stop
+    // during the wait must still be honoured by the successor.
+    let resume = lock_or_recover(looping).resume_after_handover;
     if let Some(mut progress) = updater::read_progress(home) {
         progress.advance(updater::Stage::Restarting);
         let _ = updater::write_progress(home, &progress);
@@ -10263,6 +10271,26 @@ mod tests {
         assert!(successor.resume_after_handover(true));
         assert!(successor.loop_view(None).running);
         successor.stop_loop(None, false).expect("stop");
+    }
+
+    #[tokio::test]
+    async fn a_second_upgrade_request_keeps_the_resume_intent() {
+        let home = TempDir::new().expect("temp home");
+        let ui = idle_ui(&home);
+        ui.start_loop(None).expect("start");
+        ui.park_for_upgrade().expect("first park");
+        ui.park_for_upgrade().expect("second park");
+        assert!(handed_over(&home, ui).await);
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_the_handover_wait_is_honoured() {
+        let home = TempDir::new().expect("temp home");
+        let ui = idle_ui(&home);
+        ui.start_loop(None).expect("start");
+        ui.park_for_upgrade().expect("park");
+        ui.stop_loop(None, false).expect("stop");
+        assert!(!handed_over(&home, ui).await);
     }
 
     #[tokio::test]
