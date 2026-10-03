@@ -1308,7 +1308,9 @@ compiler ties together, so a new field that names a branch or PR belongs in
 `dupes::task_claims` / `run_claims`. `run.json` is read through a tolerant
 view, not `RunState::load`, so a schema bump cannot silently drop claims. The
 daemon's retries, requeues, review requests and resumes never go through this
-check: they would collide with themselves.
+check: they would collide with themselves. A PR number the text names that no
+record explains is asked of the forge (`gh pr view`, 5 s cap, any failure is
+"unknown" and ignored); tests inject that lookup via `dupes::check_with`.
 
 ### Task attachments live beside the task file, outside the worktree
 

@@ -52,6 +52,8 @@ pub enum Owner {
     Task,
     /// A recorded run.
     Run,
+    /// A pull request the forge reports open that no record here owns.
+    Pr,
 }
 
 /// One reason a new piece of work looks like one already under way.
@@ -76,6 +78,7 @@ impl fmt::Display for Hit {
         let kind = match self.owner {
             Owner::Task => "task",
             Owner::Run => "run",
+            Owner::Pr => "pull request",
         };
         let what = match self.signal {
             Signal::Branch => "names branch",
@@ -200,6 +203,30 @@ pub fn check(
     review_branch: Option<&str>,
     ignore_task: Option<&str>,
 ) -> Vec<Hit> {
+    check_with(
+        queue,
+        runs_root,
+        repo,
+        text,
+        review_branch,
+        ignore_task,
+        &gh_open_pr,
+    )
+}
+
+/// [`check`] with the forge lookup supplied: `open_pr(repo, n)` says whether
+/// pull request `n` of `repo` is open (`Some(url)`) or not / unknown (`None`).
+/// It is asked only about numbers the text names that no local record already
+/// explained, so a PR magi never produced (opened by hand) still collides.
+pub fn check_with(
+    queue: &Queue,
+    runs_root: &Path,
+    repo: &Path,
+    text: &str,
+    review_branch: Option<&str>,
+    ignore_task: Option<&str>,
+    open_pr: &dyn Fn(&Path, u64) -> Option<String>,
+) -> Vec<Hit> {
     let mut idents = Idents::default();
     let here = idents.of(repo);
     let tasks = queue.list();
@@ -269,7 +296,67 @@ pub fn check(
             }
         }
     }
+    let mut asked = BTreeSet::new();
+    for n in prs.iter().filter_map(|m| match m {
+        Mention::Number(n) => Some(*n),
+        Mention::Url(u) => u.rsplit('/').next().and_then(|d| d.parse().ok()),
+    }) {
+        let token = format!("#{n}");
+        if hits
+            .iter()
+            .any(|h| h.signal == Signal::Pr && h.token == token)
+            || !asked.insert(n)
+        {
+            continue;
+        }
+        if let Some(url) = open_pr(repo, n) {
+            hits.push(Hit {
+                owner: Owner::Pr,
+                id: token.clone(),
+                status: "open".into(),
+                signal: Signal::Pr,
+                token,
+                via: format!("an open pull request with no run record here ({url})"),
+            });
+        }
+    }
     hits
+}
+
+/// Ask the forge, via `gh`, whether PR `n` is open. Best effort and bounded:
+/// any failure (no `gh`, no remote, offline, a slow answer) is `None`, i.e.
+/// today's behaviour. `GH_REPO` is dropped so the PR is looked up in `repo`'s
+/// own remote, not whatever the environment points at.
+fn gh_open_pr(repo: &Path, n: u64) -> Option<String> {
+    let mut child = Command::new("gh")
+        .args(["pr", "view", &n.to_string(), "--json", "state,url"])
+        .current_dir(repo)
+        .env_remove("GH_REPO")
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait().ok()? {
+            Some(status) if status.success() => break,
+            Some(_) => return None,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+    let mut raw = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut raw).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    (v["state"] == "OPEN")
+        .then(|| v["url"].as_str().map(str::to_owned))
+        .flatten()
 }
 
 fn task_claims(t: &Task, runs_root: &Path, seen: &mut BTreeSet<String>) -> Vec<Claim> {
@@ -582,7 +669,7 @@ mod tests {
     const RID: &str = "20260901-100000-aaaa";
 
     fn run(f: &Fx, text: &str, review: Option<&str>) -> Vec<Hit> {
-        check(&f.q, &f.runs, &f.repo, text, review, None)
+        check_with(&f.q, &f.runs, &f.repo, text, review, None, &|_, _| None)
     }
 
     #[test]
@@ -689,9 +776,25 @@ mod tests {
         let other = f._tmp.path().join("other");
         std::fs::create_dir_all(&other).unwrap();
         sh(&other, &["init", "-q"]);
-        assert!(check(&f.q, &f.runs, &other, "magi/aaaa/A", None, None).is_empty());
+        assert!(
+            check_with(&f.q, &f.runs, &other, "magi/aaaa/A", None, None, &|_, _| {
+                None
+            })
+            .is_empty()
+        );
         // Editing the task that owns the run never collides with itself.
-        assert!(check(&f.q, &f.runs, &f.repo, "magi/aaaa/A", None, Some(&t.id)).is_empty());
+        assert!(
+            check_with(
+                &f.q,
+                &f.runs,
+                &f.repo,
+                "magi/aaaa/A",
+                None,
+                Some(&t.id),
+                &|_, _| None
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -703,6 +806,32 @@ mod tests {
             &f.repo,
             &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "other"],
         );
-        assert!(!check(&f.q, &f.runs, &wt, "magi/aaaa/A", None, None).is_empty());
+        assert!(
+            !check_with(&f.q, &f.runs, &wt, "magi/aaaa/A", None, None, &|_, _| None).is_empty()
+        );
+    }
+
+    #[test]
+    fn an_open_pr_without_a_run_record_matches_through_the_forge() {
+        let (f, _, _) = fx();
+        let open = |_: &Path, n: u64| (n == 48).then(|| "https://example.test/pull/48".to_owned());
+        let hit = |text: &str| check_with(&f.q, &f.runs, &f.repo, text, None, None, &open);
+        let hits = hit("finish PR #48");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].owner, Owner::Pr);
+        assert!(hits[0].to_string().contains("#48"));
+        // Closed / unknown / unnamed PRs never match.
+        assert!(hit("finish PR #49").is_empty());
+        assert!(hit("finish the work").is_empty());
+    }
+
+    #[test]
+    fn a_forge_hit_does_not_repeat_a_pr_a_run_already_explains() {
+        let (f, base, _) = fx();
+        write_run(&f, RID, "ready", &base, Some((48, "open")));
+        let open = |_: &Path, _: u64| Some("u".to_owned());
+        let hits = check_with(&f.q, &f.runs, &f.repo, "#48", None, None, &open);
+        assert!(hits.iter().all(|h| h.owner != Owner::Pr), "{hits:?}");
+        assert!(!hits.is_empty());
     }
 }
