@@ -6710,6 +6710,8 @@ function renderTask() {
     setText($("task-meta"), error || "");
     show($("task-why-panel"), false);
     clear($("task-runs"));
+    clear($("task-flow"));
+    setText($("task-flow-summary"), "");
     setText($("task-attempts-count"), "");
     return;
   }
@@ -6750,6 +6752,8 @@ function renderTask() {
     : "");
   show($("task-unreadable"), unreadable > 0);
 
+  renderTaskFlow(task.flow);
+
   const list = $("task-runs");
   clear(list);
   if (!history.length) {
@@ -6767,6 +6771,41 @@ function renderTask() {
     if (h.outcome) li.append(el("div", { class: "task-run-out", text: h.outcome }));
     if (h.pr) li.append(el("a", { href: h.pr, target: "_blank", rel: "noopener noreferrer", text: "Pull request" }));
     list.append(li);
+  }
+}
+
+/* The chart is drawn from `task.flow` as the server built it (nodes and edges
+ * in order); nothing here infers why a run ended. Plain DOM, no SVG: a
+ * vertical stack wraps at phone width and follows the theme's variables. */
+const FLOW_COST = { spent: "\u22121 attempt", refunded: "\u21ba refunded", unknown: "attempt unknown" };
+
+function renderTaskFlow(flow) {
+  const list = $("task-flow");
+  clear(list);
+  const nodes = flow && Array.isArray(flow.nodes) ? flow.nodes : [];
+  setText($("task-flow-summary"), flow
+    ? `${nodes.filter((n) => n.kind === "run").length} runs \u00b7 ${flow.attempts} of ${flow.max_attempts} attempts counted`
+    : "");
+  if (!flow) return;
+  const edgeTo = new Map((flow.edges || []).map((e) => [e.to, e]));
+  for (const n of nodes) {
+    const e = edgeTo.get(n.key);
+    if (e) {
+      const cost = FLOW_COST[e.attempt];
+      const li = el("li", { class: "flow-edge", "data-attempt": e.attempt, text: e.label });
+      if (cost) li.append(el("span", { class: "flow-cost", text: cost }));
+      list.append(li);
+    }
+    const top = el("div", { class: "flow-top" }, el("strong", { text: n.label }));
+    if (n.status) top.append(chip(n.status, n.kind === "end" ? TASK_STATUS : RUN_STATUS));
+    if (n.note) top.append(el("span", { class: "tag", "data-tone": n.note === "no verdict" ? "rust" : "ink", text: n.note }));
+    if (n.run_kind && n.run_kind !== "unknown") top.append(el("span", { class: "tag", "data-tone": "ink", text: n.run_kind }));
+    const attrs = { class: "flow-node", "data-kind": n.kind };
+    if (n.kind === "run" && !n.decided && n.readable) attrs["data-undecided"] = "";
+    if (!n.readable) attrs["data-unreadable"] = "";
+    const box = el(n.href ? "a" : "div", n.href ? { ...attrs, href: n.href } : attrs, top);
+    if (n.detail) box.append(el("div", { class: "flow-detail", text: n.detail }));
+    list.append(el("li", {}, box));
   }
 }
 
