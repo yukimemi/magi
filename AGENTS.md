@@ -1296,6 +1296,22 @@ something to answer, so it does not reuse `ask::Questions`.
   `magi task show` keeps the reason. The release / land question
   (`bump::NOTICE_NODE`) never covers anything.
 
+### Duplicate-work claims are gathered from several places
+
+`src/dupes.rs` refuses (`--force` overrides) a `magi task add`, `magi run` or
+`magi review`, and a web edit that changes a task's instruction, when it names
+a branch, a commit SHA or a pull request that unfinished work already owns.
+Only concrete identifiers match, never text similarity. What counts as
+"owned" is spread over `Task::review_branch`, `Task::runs`, and each run's
+`candidates[].branch` / `pr` / `base_commit` in `run.json`, none of which a
+compiler ties together, so a new field that names a branch or PR belongs in
+`dupes::task_claims` / `run_claims`. `run.json` is read through a tolerant
+view, not `RunState::load`, so a schema bump cannot silently drop claims. The
+daemon's retries, requeues, review requests and resumes never go through this
+check: they would collide with themselves. A PR number the text names that no
+record explains is asked of the forge (`gh pr view`, 5 s cap, any failure is
+"unknown" and ignored); tests inject that lookup via `dupes::check_with`.
+
 ### Task attachments live beside the task file, outside the worktree
 
 `magi task add|edit --attach <PATH>` copies a file into `<queue>/<id>.attachments/`

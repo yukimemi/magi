@@ -33,6 +33,7 @@ pub mod conduct;
 pub mod config;
 pub mod daemon;
 pub mod disk;
+pub mod dupes;
 pub mod git;
 pub mod graph;
 pub mod handover;

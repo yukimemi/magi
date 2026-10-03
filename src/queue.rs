@@ -1592,7 +1592,8 @@ pub fn missing_blocker_hold_reason_in(
     }
 }
 
-fn short(id: &str) -> &str {
+/// The last dash-separated part of an id, the form people say aloud.
+pub fn short(id: &str) -> &str {
     id.split('-').next_back().unwrap_or(id)
 }
 
