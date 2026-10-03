@@ -1389,6 +1389,14 @@ function isStale(run) {
     && !["merged", "ready", "stalled", "blocked", "failed", "verified_noop", "superseded"].includes(status);
 }
 
+/* A run that has not finished is never "an old attempt", whatever its
+   `superseded_by` says: hiding it would drop a live card while the state
+   chip's count still includes it. Only a `done` run may be hidden or folded
+   as superseded. */
+function isLiveAttempt(run) {
+  return !run.done;
+}
+
 function displayedRunStatus(run) {
   if (run.waiting) return "waiting";
   if (run.unmerged_by_design) return "unmerged";
@@ -1492,8 +1500,10 @@ function statusCompatibleWithStateFilter(status, filterKey) {
    be folded under a newer card — it is genuinely an old attempt, just one
    this client has nowhere to nest. Hiding it by default is the same
    judgement call as hiding "done": it is not what an operator scanning for
-   what needs them wants in front of them, and "all" still shows it. */
+   what needs them wants in front of them, and "all" still shows it. A run
+   that is still live is never treated this way (see isLiveAttempt). */
 function isOrphanSuperseded(run) {
+  if (isLiveAttempt(run)) return false;
   return typeof run.superseded_by === "string" && run.superseded_by !== "";
 }
 
@@ -1577,7 +1587,8 @@ function renderRunStateChips(runs) {
 function foldRuns(runs) {
   const byShort = new Map();
   for (const run of runs) if (run.short) byShort.set(run.short, run);
-  const nextOf = (run) => (run.superseded_by && byShort.get(run.superseded_by)) || null;
+  // A live run is always its own head: it is still going, not folded away.
+  const nextOf = (run) => (!isLiveAttempt(run) && run.superseded_by && byShort.get(run.superseded_by)) || null;
 
   const headOf = new Map();
   for (const run of runs) {
@@ -1996,7 +2007,7 @@ function renderRuns() {
      instead of adding a second code path for the same outcome. */
   const foldedHidden = state.runsStateFilter === "all"
     ? 0
-    : visible.reduce((sum, run) => sum + (childrenOf.get(run.id) || []).length, 0);
+    : [...childrenOf.values()].reduce((sum, kids) => sum + kids.filter(matchesRunState).length, 0);
   const childrenForRender = state.runsStateFilter === "all" ? childrenOf : new Map();
   syncRunSections(sectionsRoot, groupBySection(visible), childrenForRender);
 
