@@ -181,6 +181,7 @@
       <div class="run-status" id="run-status"></div>
       <h1 id="run-h">Loading run…</h1>
       <p class="view-sub" id="run-meta"></p>
+      <a class="back-task" id="run-task-link" hidden></a>
     </div>
 
     <!-- On a phone both wrappers are display:contents, so these panels flow in
@@ -255,6 +256,30 @@
         <h2>Timeline</h2>
         <ol class="timeline" id="run-events"></ol>
       </div>
+    </div>
+  </section>
+
+  <!-- TASK DETAIL ------------------------------------------------------ -->
+  <section class="view" id="view-task" aria-labelledby="task-h" hidden>
+    <a class="back" href="#/queue">Backlog</a>
+    <div class="view-head">
+      <div class="run-status" id="task-status"></div>
+      <h1 id="task-h">Loading task…</h1>
+      <p class="view-sub" id="task-meta"></p>
+    </div>
+    <div class="panel" id="task-why-panel" hidden>
+      <p class="card-note" id="task-note"></p>
+      <pre class="err" id="task-error" hidden></pre>
+    </div>
+    <div class="panel">
+      <h2>Instruction</h2>
+      <div class="instruction md" id="task-instruction"></div>
+    </div>
+    <div class="panel">
+      <h2>Attempts <span class="count" id="task-attempts-count"></span></h2>
+      <p class="panel-note" id="task-attempts-note"></p>
+      <p class="panel-note" id="task-unreadable" hidden></p>
+      <ol class="task-runs" id="task-runs"></ol>
     </div>
   </section>
 
