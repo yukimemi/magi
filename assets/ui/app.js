@@ -4443,11 +4443,11 @@ function updateTalkTaskRow(row, task) {
   else r.chipSlot.append(next);
   setText(r.title, `${task.title || task.id} · ${shortId(task.id)}`);
   /* A task with a run is followed on that run; one still waiting has none,
-     so it goes to the queue. Written on every update so the href moves when
+     so it goes to its own queue card. Written on every update so the href moves when
      a run appears without the row being rebuilt. */
   const runs = Array.isArray(task.runs) ? task.runs : [];
   const latest = runs.length ? runs[runs.length - 1] : null;
-  setAttr(r.link, "href", latest ? `#/runs/${latest}` : "#/queue");
+  setAttr(r.link, "href", latest ? `#/runs/${latest}` : `#/queue/${encodeURIComponent(task.id)}`);
 }
 
 function renderTalk() {
