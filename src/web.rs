@@ -8524,7 +8524,7 @@ mod tests {
         // so a focus set before the queue has loaded is retried once it has.
         assert!(APP_JS.contains("state.queueFocus = route.id;"));
         assert!(APP_JS.contains("function consumeQueueFocus()"));
-        assert!(APP_JS.contains("jumpToTask(id);"));
+        assert!(APP_JS.contains("jumpToTask(id)"));
     }
 
     #[test]
@@ -8539,15 +8539,24 @@ mod tests {
         // right before jumpToTask() actually runs.
         assert!(
             APP_JS.contains(
-                "  if (!id || state.queue === null) return;\n  if (state.queueSearch.trim() !== \"\") {"
+                "  }\n  if (state.queueSearch.trim() !== \"\") {\n    state.queueSearch = \"\";"
             ),
             "the search-clearing branch must run before state.queueFocus is cleared, or the \
              recursive renderQueue() call has nothing left to jump to"
         );
         assert!(
-            APP_JS.contains("state.queueFocus = null;\n  jumpToTask(id);"),
-            "state.queueFocus must be cleared immediately before the jump it guards, not earlier"
+            APP_JS.contains("if (jumpToTask(id)) state.queueFocus = null;"),
+            "state.queueFocus must be cleared only once the jump has landed, so a card that \
+             arrives later still gets it"
         );
+        assert!(APP_JS.contains("state.queueFocusMissing = missing ? id : null;"));
+        assert!(APP_JS.contains("is not in the current Backlog."));
+        assert!(APP_JS.contains("li.card[data-task-id=\""));
+        assert!(APP_JS.contains("setAttr(r.card, \"data-task-id\", task.id);"));
+        assert!(APP_JS.contains("`#/queue/${encodeURIComponent(task.id)}`"));
+        assert!(APP_CSS.contains(".card-permalink"));
+        assert!(APP_CSS.contains(".queue-focus-status"));
+        assert!(APP_JS.contains("const section = route.name === \"run\" ? \"runs\""));
     }
 
     #[test]
