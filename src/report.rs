@@ -135,14 +135,21 @@ pub fn line_with_liveness(state: &RunState, live: Liveness) -> String {
     } else {
         String::new()
     };
+    // The full unknown wording is for `magi show`; a row only needs to say
+    // there is no record.
+    let origin = state
+        .origin
+        .as_ref()
+        .map_or("origin unknown".to_owned(), crate::run::Origin::label);
     format!(
-        "{}  {:<20}  {:>2}c {:>2}j  win {} ({}){quorum}{stale}  {}",
+        "{}  {:<20}  {:>2}c {:>2}j  win {} ({}){quorum}{stale}  {}  {}",
         dim(&state.id),
         status_word(state),
         state.candidates.len(),
         state.judgements.len(),
         winner,
         agent,
+        dim(&format!("[{origin}]")),
         first_line(&state.instruction)
     )
 }
@@ -328,6 +335,11 @@ pub fn run(state: &RunState) -> String {
     );
     let _ = writeln!(s, "  created {}", state.created_local());
     let _ = writeln!(s, "  task    {}", first_line(&state.instruction));
+    let _ = writeln!(
+        s,
+        "  origin  {}",
+        crate::run::origin_label(state.origin.as_ref())
+    );
     let _ = writeln!(s, "  state   {}", state.dir().display());
 
     let _ = writeln!(s, "\n{}", bold("candidates"));

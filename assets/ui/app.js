@@ -5191,7 +5191,8 @@ function renderRunDetail() {
   const updated = when(run.updated_at);
   const repoName = typeof run.repo === "string" ? run.repo.split(/[\\/]/).filter(Boolean).pop() : "";
   setText($("run-meta"),
-    `${shortId(run.id)} \u00b7 ${repoName} \u00b7 ${run.base_branch || ""} \u00b7 started ${created.text} \u00b7 updated ${updated.text}`);
+    `${shortId(run.id)} \u00b7 ${repoName} \u00b7 ${run.base_branch || ""} \u00b7 started ${created.text} \u00b7 updated ${updated.text}`
+    + (run.origin_label ? ` \u00b7 ${run.origin ? "from " : ""}${run.origin_label}` : ""));
   /* The way back to the task whose attempt this is. */
   const taskLink = $("run-task-link");
   if (run.task && run.task.id) {

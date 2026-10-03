@@ -14,7 +14,7 @@ async fn a_parked_run_keeps_its_work_and_resumes_into_the_next_node() {
     let _home = home_lock().await;
     let fx = fixture(_home, Judges::Unanimous, false);
     let pause = Pause::new();
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.on_pause(pause.clone());
@@ -81,7 +81,7 @@ async fn a_resumed_run_drops_a_stale_active_marker_left_by_a_killed_process() {
     let _home = home_lock().await;
     let fx = fixture(_home, Judges::Unanimous, false);
     let pause = Pause::new();
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.on_pause(pause.clone());
@@ -132,7 +132,7 @@ async fn execute_records_its_own_pid_as_the_driver_on_every_entry() {
     let _home = home_lock().await;
     let fx = fixture(_home, Judges::Unanimous, false);
     let pause = Pause::new();
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.on_pause(pause.clone());
@@ -162,7 +162,7 @@ async fn a_park_asked_for_mid_walk_stops_at_the_boundary_after_it() {
     let _home = home_lock().await;
     let fx = fixture(_home, Judges::Unanimous, false);
     let pause = Pause::new();
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.on_pause(pause.clone());
@@ -221,7 +221,7 @@ async fn a_park_requested_while_a_seat_is_mid_call_does_not_cut_it_short() {
     }
 
     let pause = Pause::new();
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.on_pause(pause.clone());

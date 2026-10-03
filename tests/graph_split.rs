@@ -10,7 +10,7 @@ common::e2e! {
 async fn a_split_run_deliberates_then_collects_private_votes() {
     let home = common::home_lock().await;
     let fx = fixture(home, Judges::Split, true);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");

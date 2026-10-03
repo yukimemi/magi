@@ -99,6 +99,9 @@ struct RunOpts {
     /// request that unfinished work already owns.
     #[arg(long)]
     force: bool,
+    /// The queue task this run serves; the run is added to that task's runs.
+    #[arg(long, value_name = "TASK_ID")]
+    task: Option<String>,
 }
 
 impl RunOpts {
@@ -117,6 +120,7 @@ impl RunOpts {
             seed: self.seed.or(other.seed),
             dry_run: self.dry_run || other.dry_run,
             force: self.force || other.force,
+            task: self.task.or(other.task),
         }
     }
 }
@@ -186,6 +190,10 @@ enum Command {
         /// branch.
         #[arg(long)]
         force: bool,
+        /// The queue task this review serves; the run is added to that
+        /// task's runs.
+        #[arg(long, value_name = "TASK_ID")]
+        task: Option<String>,
     },
     /// Route specific, already-recorded review findings from a saved run to
     /// a fixer, for a targeted fix on the same branch — never a re-review or
@@ -1056,7 +1064,10 @@ async fn dispatch(command: Command) -> Result<()> {
                         bail!("{reason}");
                     }
                 }
-                Runner::start(&repo, task, cfg).await?
+                let (origin, serves) = direct_origin(opts.task.as_deref())?;
+                let runner = Runner::start(&repo, task, cfg, origin).await?;
+                link_to_task(&runner, serves)?;
+                runner
             };
 
             if opts.dry_run {
@@ -1078,6 +1089,7 @@ async fn dispatch(command: Command) -> Result<()> {
             review_rounds,
             merge,
             force,
+            task,
         } => {
             let (mut cfg, from) = Config::discover(&repo, config.as_deref())?;
             if !force {
@@ -1111,7 +1123,9 @@ async fn dispatch(command: Command) -> Result<()> {
                     bail!("{reason}");
                 }
             }
-            let mut runner = Runner::review(&repo, &branch, cfg).await?;
+            let (origin, serves) = direct_origin(task.as_deref())?;
+            let mut runner = Runner::review(&repo, &branch, cfg, origin).await?;
+            link_to_task(&runner, serves)?;
             let result = runner.execute().await;
             print!("{}", report::run(&runner.state));
             exit_status(result, runner.state.status, runner.state.pr.is_some())
@@ -2980,13 +2994,48 @@ async fn task_source(issue: Option<u64>) -> Source {
             .unwrap_or_else(|| "unknown".to_owned());
         return Source::Issue { number, repo };
     }
-    match std::env::var("MAGI_RUN") {
-        Ok(run) if !run.trim().is_empty() => Source::Agent {
-            run,
-            node: std::env::var("MAGI_NODE").unwrap_or_else(|_| "agent".to_owned()),
-        },
-        _ => Source::Human,
+    match agent_env() {
+        Some((run, node)) => Source::Agent { run, node },
+        None => Source::Human,
     }
+}
+
+/// The `(run, node)` an agent seat was spawned with: `MAGI_RUN` and
+/// `MAGI_NODE`, which only `agent::invoke` sets. `None` for a person at a
+/// terminal. A missing node reads as `agent`.
+fn agent_env() -> Option<(String, String)> {
+    let run = std::env::var("MAGI_RUN").ok()?;
+    if run.trim().is_empty() {
+        return None;
+    }
+    let node = std::env::var("MAGI_NODE").unwrap_or_else(|_| "agent".to_owned());
+    Some((run, node))
+}
+
+/// The origin of a run started from this command line, and the full id of the
+/// queue task it names with `--task`. The task is looked up *before* anything
+/// is minted, so a mistyped id starts nothing.
+fn direct_origin(task: Option<&str>) -> Result<(magi::run::Origin, Option<String>)> {
+    let serves = task
+        .map(|t| Queue::open().resolve_id(t))
+        .transpose()
+        .context("--task")?;
+    Ok((
+        magi::run::Origin::from_agent_env(agent_env(), serves.clone()),
+        serves,
+    ))
+}
+
+/// Add a freshly started run to the runs of the task it serves. Failing is
+/// loud and happens before the graph runs: a run the task cannot see is
+/// exactly what `--task` exists to prevent.
+fn link_to_task(runner: &Runner, serves: Option<String>) -> Result<()> {
+    if let Some(task) = serves {
+        Queue::open()
+            .link_run(&task, &runner.state.id)
+            .with_context(|| format!("link run {} to task {task}", runner.state.short()))?;
+    }
+    Ok(())
 }
 
 async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {

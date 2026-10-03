@@ -2616,7 +2616,14 @@ async fn attempt(
                 home: crate::run::home(),
                 choice: take_divergence_answer(branch, &config.merge.remote, task),
             };
-            Runner::review_taking_over(&repo, branch, config, Some(takeover)).await
+            Runner::review_taking_over(
+                &repo,
+                branch,
+                config,
+                Some(takeover),
+                crate::run::Origin::queue(&task.id),
+            )
+            .await
         }
         Starter::Resume(id) => {
             tracing::info!("resuming run {id} rather than competing again");
@@ -2640,12 +2647,18 @@ async fn attempt(
             }
             let instruction = prepare_instruction(&starter, None, task)
                 .unwrap_or_else(|| task.instruction.clone());
-            Runner::start_naming(&repo, instruction, &task.title, config)
-                .await
-                .map(|mut r| {
-                    r.state.attachments = attachments.clone();
-                    r
-                })
+            Runner::start_naming(
+                &repo,
+                instruction,
+                &task.title,
+                config,
+                crate::run::Origin::queue(&task.id),
+            )
+            .await
+            .map(|mut r| {
+                r.state.attachments = attachments.clone();
+                r
+            })
         }
     };
     let mut runner = match started {
@@ -3334,7 +3347,16 @@ where
 {
     let id = runs.last()?;
     match load(id) {
-        Ok(s) if s.status.resumable() && !s.released() && !exhausted_review_budget(&s) => {
+        // A run some process is driving right now is not "unfinished" in the
+        // sense of waiting to be picked up: `magi run --task` links a direct
+        // run into `runs` while it is still executing, and resuming it here
+        // would put a second driver on the same worktrees.
+        Ok(s)
+            if s.status.resumable()
+                && !s.released()
+                && !exhausted_review_budget(&s)
+                && s.liveness(false) != crate::run::Liveness::Live =>
+        {
             Some(id.clone())
         }
         Ok(_) => None,

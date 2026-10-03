@@ -23,7 +23,7 @@ common::e2e! {
 async fn a_fix_report_lost_on_a_clean_turn_is_recovered_by_resuming_the_seat() {
     let _home = common::home_lock().await;
     let fx = fixture_with_fix_report_lost(_home, &["impl-A"]);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -81,7 +81,7 @@ common::e2e! {
 async fn a_fix_report_that_never_recovers_gives_up_within_the_continuation_budget() {
     let _home = common::home_lock().await;
     let fx = fixture_with_fix_report_always_lost(_home, &["impl-A"]);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -157,7 +157,7 @@ async fn a_fix_report_lost_with_no_session_left_is_not_resumed_into_a_blank_prom
     // into a brand-new conversation, worse than the ordinary failure this
     // already is.
     fx.config.graph.sessions = false;
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -201,7 +201,7 @@ common::e2e! {
 async fn a_valid_first_try_report_mentioning_waiting_is_never_resumed() {
     let _home = common::home_lock().await;
     let fx = fixture_with_fixer_mentioning_waiting(_home);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");

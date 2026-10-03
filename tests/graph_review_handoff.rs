@@ -16,7 +16,7 @@ common::e2e! {
 async fn a_spent_round_budget_hands_off_when_gate_and_e2e_stay_green() {
     let _guard = common::home_lock().await;
     let fx = fixture_that_never_clears(_guard, 2);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -49,7 +49,7 @@ async fn a_red_gate_after_the_round_budget_blocks_with_what_failed() {
     // The review loop's own e2e (`test -f note.txt`) still passes; only the
     // final gate is red, so this exercises the gate path specifically.
     fx.config.verify.gate = vec!["false".to_owned()];
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -78,7 +78,7 @@ async fn a_red_e2e_at_the_round_budget_blocks_with_what_failed() {
     // Red inside the review loop's own verification, not the separate gate
     // step — this exercises `stop_reviewing`'s e2e branch directly.
     fx.config.verify.e2e = vec!["false".to_owned()];
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -107,7 +107,7 @@ async fn a_tree_that_stops_moving_hands_off_before_the_round_budget() {
     // A generous budget the run must not need: the fixer never actually
     // changes the tree, so two stagnant rounds must be enough to stop.
     let fx = fixture_with_noop_fixer(_guard, 6);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -145,7 +145,7 @@ async fn catchup_e2e_records_the_actual_head_after_an_empty_fixer_commit() {
             .env
             .insert("MOCK_FIXER_EMPTY_COMMIT".to_owned(), "1".to_owned());
     }
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
@@ -173,7 +173,7 @@ async fn a_clean_round_is_unaffected_by_any_of_this() {
     // `fixture_that_never_clears`'s doc comment for why a solo candidate is
     // enough and cheaper.
     fx.config.graph.candidates = 1;
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
