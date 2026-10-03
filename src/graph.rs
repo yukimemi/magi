@@ -3526,8 +3526,16 @@ impl Runner {
     ///
     /// Checked only when the base is ahead of the branch. A failing check is
     /// "not proven" - the ordinary rebase path then decides - never a reason to
-    /// stop the run. The pull request, if any, is closed best-effort after the
-    /// state is saved, so a forge failure cannot lose the outcome.
+    /// stop the run.
+    ///
+    /// The remote copy of the branch is held to the same standard as the local
+    /// one: if it carries a tip this worktree does not, that tip must itself be
+    /// proven in the base, or nothing is settled (a pull request would
+    /// otherwise be closed over commits nobody checked). The pull request is
+    /// closed *before* the terminal status is saved; if that fails for a
+    /// reason other than a refusal (no network, a `gh` error) the run is left
+    /// `Blocked` with the reason as its conflict, which a resume retries -
+    /// the same recovery a phantom conflict gets.
     async fn settle_already_in(
         &mut self,
         branch: &str,
@@ -3537,7 +3545,9 @@ impl Runner {
         behind: usize,
     ) -> Result<bool> {
         let repo = self.state.repo.clone();
-        let evidence = match crate::already::classify(&repo, tip, head).await {
+        let remote = self.state.config.merge.remote.clone();
+        let start = self.state.base_commit.clone();
+        let evidence = match crate::already::classify(&repo, tip, head, Some(&start)).await {
             Ok(Some(e)) => e,
             Ok(None) => return Ok(false),
             Err(e) => {
@@ -3545,35 +3555,60 @@ impl Runner {
                 return Ok(false);
             }
         };
+        let mut verified = vec![head.to_owned()];
+        let fetched = git::fetch(&repo, &remote, branch).await;
+        if matches!(&fetched, Ok(o) if o.ok())
+            && let Ok(theirs) = git::rev_parse(&repo, &format!("{remote}/{branch}")).await
+            && theirs != head
+        {
+            match crate::already::classify(&repo, tip, &theirs, Some(&start)).await {
+                Ok(Some(_)) => verified.push(theirs),
+                _ => return Ok(false),
+            }
+        }
         let base_branch = self.state.base_branch.clone();
-        let remote = self.state.config.merge.remote.clone();
         let message = format!(
             "{branch} is already in {remote}/{base_branch} as {} ({} match); nothing left to \
              land",
             evidence.names(),
             evidence.proof.as_str()
         );
-        self.state.status = RunStatus::AlreadyInBase;
-        self.state.base_sync = Some(BaseSync {
-            tip: tip.to_owned(),
-            behind,
-            attempts,
-            conflict: None,
-            already_in: Some(evidence.clone()),
-        });
-        self.state.event("land", message);
-        self.state.save()?;
-        match crate::land::close_superseded_pr(&mut self.state, branch, &evidence).await {
+        let closed =
+            crate::land::close_superseded_pr(&mut self.state, branch, &evidence, &verified).await;
+        match closed {
             Ok(Ok(url)) => self
                 .state
                 .event("land", format!("closed {url}: superseded on {base_branch}")),
             Ok(Err(why)) => self
                 .state
                 .event("land", format!("did not close a pull request: {why}")),
-            Err(e) => self
-                .state
-                .event("land", format!("could not close the pull request: {e:#}")),
+            Err(e) => {
+                let why = format!(
+                    "{branch} is already in {remote}/{base_branch}, but its pull request could \
+                     not be closed ({e:#}); resume to retry"
+                );
+                self.state.status = RunStatus::Blocked;
+                self.state.base_sync = Some(BaseSync {
+                    tip: tip.to_owned(),
+                    behind,
+                    attempts,
+                    conflict: Some(why.clone()),
+                    already_in: None,
+                });
+                self.state.event("land", why);
+                self.state.save()?;
+                return Ok(true);
+            }
         }
+        self.state.status = RunStatus::AlreadyInBase;
+        self.state.base_sync = Some(BaseSync {
+            tip: tip.to_owned(),
+            behind,
+            attempts,
+            conflict: None,
+            already_in: Some(evidence),
+        });
+        self.state.event("land", message);
         self.state.save()?;
         self.settle_questions();
         Ok(true)

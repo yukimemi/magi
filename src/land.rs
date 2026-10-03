@@ -1380,6 +1380,9 @@ struct GhPrHead {
     // Required, like `GhOpenPr`'s fields: a record that cannot say whether the
     // head lives in a fork must be a parse error, never "same repository".
     is_cross_repository: bool,
+    // Required too: it is what ties the pull request to the commits that were
+    // actually proven to be on the base.
+    head_ref_oid: String,
 }
 
 /// Pure half of [`close_superseded_pr`]: read `gh pr view --json
@@ -1390,13 +1393,24 @@ struct GhPrHead {
 /// says now, not on what magi recorded: the head must be exactly `branch` in
 /// this repository (a fork's branch of the same name is somebody else's), the
 /// base must be `base`, and the pull request must still be open.
-pub fn closable(json: &str, branch: &str, base: &str) -> std::result::Result<(), String> {
+pub fn closable(
+    json: &str,
+    branch: &str,
+    base: &str,
+    verified: &[String],
+) -> std::result::Result<(), String> {
     let pr: GhPrHead =
         serde_json::from_str(json).map_err(|e| format!("could not read the pull request ({e})"))?;
     if pr.head_ref_name != branch {
         return Err(format!(
             "its head is `{}`, not this run's `{branch}`",
             pr.head_ref_name
+        ));
+    }
+    if !verified.contains(&pr.head_ref_oid) {
+        return Err(format!(
+            "its head {} is not a commit this run checked against the base",
+            crate::already::short_sha(&pr.head_ref_oid)
         ));
     }
     if pr.is_cross_repository {
@@ -1419,6 +1433,9 @@ pub fn superseded_comment(base: &str, evidence: &crate::already::Evidence) -> St
             "carried by commit {} on `{base}` with the same patch",
             evidence.names()
         ),
+        crate::already::Proof::Ancestry => {
+            format!("already in the history of `{base}` as {}", evidence.names())
+        }
         crate::already::Proof::Tree => format!(
             "already part of `{base}` (merging this branch changes nothing at {})",
             crate::already::short_sha(&evidence.tip)
@@ -1437,20 +1454,30 @@ pub fn superseded_comment(base: &str, evidence: &crate::already::Evidence) -> St
 ///
 /// The recorded `state.pr` is preferred, else the forge is asked for an open
 /// pull request on `branch`; either way the candidate is re-read and passed
-/// through [`closable`] before anything is written.
+/// through [`closable`] before anything is written; `verified` lists the
+/// commits proven to be on the base, and the pull request's head must be one.
 pub async fn close_superseded_pr(
     state: &mut RunState,
     branch: &str,
     evidence: &crate::already::Evidence,
+    verified: &[String],
 ) -> Result<std::result::Result<String, String>> {
     let repo = state.repo.clone();
     let base = state.base_branch.clone();
     let url = match state.pr.as_ref().filter(|p| p.state == "open") {
         Some(p) => p.url.clone(),
-        None => match find_open_pr(&repo, branch, &base).await? {
-            OpenPr::One { url, .. } => url,
-            OpenPr::None => return Ok(Err("no open pull request".to_owned())),
-            OpenPr::Many(urls) => {
+        // No recorded pull request: whether the forge can even be asked
+        // (a repository with no GitHub remote, `gh` not logged in) says
+        // nothing about this run, so a failed lookup is "none found", not an
+        // error that would keep a settled run open.
+        None => match find_open_pr(&repo, branch, &base)
+            .await
+            .map_err(|e| format!("could not look for a pull request: {e:#}"))
+        {
+            Err(why) => return Ok(Err(why)),
+            Ok(OpenPr::One { url, .. }) => url,
+            Ok(OpenPr::None) => return Ok(Err("no open pull request".to_owned())),
+            Ok(OpenPr::Many(urls)) => {
                 return Ok(Err(format!(
                     "{} open pull requests name it; not choosing between them",
                     urls.len()
@@ -1465,14 +1492,14 @@ pub async fn close_superseded_pr(
             "view".to_owned(),
             url.clone(),
             "--json".to_owned(),
-            "headRefName,baseRefName,state,isCrossRepository".to_owned(),
+            "headRefName,headRefOid,baseRefName,state,isCrossRepository".to_owned(),
         ],
     )
     .await?;
     if !ok {
         bail!("gh pr view {url} failed: {view}");
     }
-    if let Err(why) = closable(&view, branch, &base) {
+    if let Err(why) = closable(&view, branch, &base, verified) {
         return Ok(Err(format!("left {url} open: {why}")));
     }
     let (ok, out) = gh(
@@ -2901,14 +2928,17 @@ mod tests {
 
     fn head_json(head: &str, base: &str, state: &str, cross: bool) -> String {
         format!(
-            r#"{{"headRefName":"{head}","baseRefName":"{base}","state":"{state}","isCrossRepository":{cross}}}"#
+            r#"{{"headRefName":"{head}","headRefOid":"aaa","baseRefName":"{base}","state":"{state}","isCrossRepository":{cross}}}"#
         )
     }
 
     #[test]
     fn a_pull_request_is_closed_only_when_its_head_is_exactly_the_runs_branch() {
         let ok = head_json("magi/27b2/A", "main", "OPEN", false);
-        assert_eq!(closable(&ok, "magi/27b2/A", "main"), Ok(()));
+        assert_eq!(
+            closable(&ok, "magi/27b2/A", "main", &["aaa".to_owned()]),
+            Ok(())
+        );
         for (json, why) in [
             (head_json("magi/27b2/B", "main", "OPEN", false), "head"),
             (head_json("magi/27b2/A-2", "main", "OPEN", false), "head"),
@@ -2917,16 +2947,21 @@ mod tests {
             (head_json("magi/27b2/A", "main", "MERGED", false), "already"),
             (head_json("magi/27b2/A", "main", "CLOSED", false), "already"),
         ] {
-            let err = closable(&json, "magi/27b2/A", "main").unwrap_err();
+            let err = closable(&json, "magi/27b2/A", "main", &["aaa".to_owned()]).unwrap_err();
             assert!(err.contains(why), "{json}: {err}");
         }
-        assert!(closable("not json", "magi/27b2/A", "main").is_err());
+        // A head that moved on past what was verified is left alone.
+        let moved = head_json("magi/27b2/A", "main", "OPEN", false);
+        let err = closable(&moved, "magi/27b2/A", "main", &["bbb".to_owned()]).unwrap_err();
+        assert!(err.contains("not a commit"), "{err}");
+        assert!(closable("not json", "magi/27b2/A", "main", &[]).is_err());
         // A record that does not say whether it is a fork is not trusted.
         assert!(
             closable(
-                r#"{"headRefName":"b","baseRefName":"main","state":"OPEN"}"#,
+                r#"{"headRefName":"b","headRefOid":"aaa","baseRefName":"main","state":"OPEN"}"#,
                 "b",
-                "main"
+                "main",
+                &["aaa".to_owned()]
             )
             .is_err()
         );

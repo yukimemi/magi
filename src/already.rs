@@ -44,6 +44,8 @@ pub enum Proof {
     PatchId,
     /// Merging the branch into the base yields the base's own tree.
     Tree,
+    /// The branch tip is itself an ancestor of the base.
+    Ancestry,
 }
 
 impl Proof {
@@ -52,6 +54,7 @@ impl Proof {
         match self {
             Self::PatchId => "patch-id",
             Self::Tree => "tree",
+            Self::Ancestry => "ancestry",
         }
     }
 }
@@ -133,9 +136,30 @@ pub fn short_sha(sha: &str) -> &str {
 
 /// Ask git whether `head` is already represented in `base`. Both are pinned
 /// to ids first so a ref that moves mid-check cannot split the answer.
-pub async fn classify(repo: &Path, base: &str, head: &str) -> Result<Option<Evidence>> {
+///
+/// `start` is the commit the branch was cut from, when known: a branch still
+/// sitting on it adds nothing and is not "contained" in any meaningful sense,
+/// even though it is an ancestor of a base that has moved on.
+pub async fn classify(
+    repo: &Path,
+    base: &str,
+    head: &str,
+    start: Option<&str>,
+) -> Result<Option<Evidence>> {
     let base = git::rev_parse(repo, base).await?;
     let head = git::rev_parse(repo, head).await?;
+    if start.is_some_and(|s| s == head) {
+        return Ok(None);
+    }
+    if git::is_ancestor(repo, &head, &base).await {
+        // Already part of the base's history; nothing is added over the
+        // merge-base, which would otherwise read as "nothing to judge".
+        return Ok(Some(Evidence {
+            proof: Proof::Ancestry,
+            tip: base,
+            commits: vec![head],
+        }));
+    }
     let merge_base = git::git(repo, &["merge-base", &base, &head]).await?;
     let range = format!("{merge_base}..{head}");
     let added: Vec<String> = git::git(repo, &["rev-list", &range])
@@ -156,7 +180,7 @@ pub async fn classify(repo: &Path, base: &str, head: &str) -> Result<Option<Evid
         Proof::PatchId => twins(repo, &merge_base, &base, &head, &matched)
             .await
             .unwrap_or_default(),
-        Proof::Tree => Vec::new(),
+        Proof::Tree | Proof::Ancestry => Vec::new(),
     };
     Ok(Some(Evidence {
         proof,
@@ -348,7 +372,7 @@ mod tests {
         sh(&repo, &["cherry-pick", &orig]);
         let twin = sh(&repo, &["rev-parse", "HEAD"]);
         assert_ne!(twin, orig);
-        let e = classify(&repo, "main", "work")
+        let e = classify(&repo, "main", "work", None)
             .await
             .unwrap()
             .expect("already in");
@@ -366,7 +390,7 @@ mod tests {
         sh(&repo, &["merge", "--squash", "work"]);
         sh(&repo, &["commit", "-q", "-m", "squashed"]);
         commit(&repo, "later.txt", "later\n", "later");
-        let e = classify(&repo, "main", "work")
+        let e = classify(&repo, "main", "work", None)
             .await
             .unwrap()
             .expect("already in");
@@ -382,7 +406,12 @@ mod tests {
         commit(&repo, "b.txt", "b\n", "two");
         sh(&repo, &["switch", "-q", "main"]);
         sh(&repo, &["cherry-pick", &first]);
-        assert!(classify(&repo, "main", "work").await.unwrap().is_none());
+        assert!(
+            classify(&repo, "main", "work", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -392,6 +421,36 @@ mod tests {
         commit(&repo, "base.txt", "mine\n", "mine");
         sh(&repo, &["switch", "-q", "main"]);
         commit(&repo, "base.txt", "theirs\n", "theirs");
-        assert!(classify(&repo, "main", "work").await.unwrap().is_none());
+        assert!(
+            classify(&repo, "main", "work", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_already_in_the_base_history_is_detected_unless_it_is_the_start() {
+        let (_d, repo) = repo();
+        let start = sh(&repo, &["rev-parse", "HEAD"]);
+        sh(&repo, &["switch", "-q", "-c", "work"]);
+        let tip = commit(&repo, "a.txt", "a\n", "one");
+        sh(&repo, &["switch", "-q", "main"]);
+        sh(&repo, &["merge", "-q", "--ff-only", "work"]);
+        commit(&repo, "later.txt", "later\n", "later");
+        let e = classify(&repo, "main", "work", Some(&start))
+            .await
+            .unwrap()
+            .expect("already in");
+        assert_eq!(e.proof, Proof::Ancestry);
+        assert_eq!(e.commits, vec![tip]);
+        // A branch that never left its start adds nothing.
+        sh(&repo, &["branch", "idle", &start]);
+        assert!(
+            classify(&repo, "main", "idle", Some(&start))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
