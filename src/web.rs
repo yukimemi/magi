@@ -8482,7 +8482,9 @@ mod tests {
         assert!(APP_JS.contains("r.answersList.append("));
         assert!(APP_CSS.contains(".task-answers"));
         {
-            let start = APP_JS.find("function updateTalkTaskRow").expect("updateTalkTaskRow");
+            let start = APP_JS
+                .find("function updateTalkTaskRow")
+                .expect("updateTalkTaskRow");
             let body = &APP_JS[start..start + 900];
             assert!(body.contains("task.runs[") || body.contains("runs[runs.length - 1]"));
             assert!(body.contains("setAttr(r.link, \"href\""));
