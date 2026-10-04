@@ -219,21 +219,29 @@ async fn a_plain_failure_collapse_stalls_and_recovers_on_resume() {
     runner.execute().await.expect("execute");
     let state = &runner.state;
 
-    // A plain failure is not mistaken for quota, and is not nudged on the same
-    // agent: the seat is handed to the next roster agent instead (judge-1 is
-    // `beta`, so `gamma`), and the chain stops there because `gamma` fails it
-    // the same way. judge-2 is `gamma` itself, the roster's tail.
+    // A plain failure is not mistaken for quota. judge-1 is `beta`, which has a
+    // successor, so it is handed to `gamma` rather than nudged; `gamma` fails
+    // it the same way, and being the roster's tail it then gets the ordinary
+    // same-agent retry. judge-2 is `gamma` itself, the tail from the start.
     let art = state.dir().join("artifacts");
     assert!(
-        !art.join("judge-1-retry1.out").exists(),
-        "a failed agent is handed over, not re-asked"
+        art.join("judge-1-retry1.out").exists(),
+        "a seat with no successor left is retried like any other unusable reply"
     );
     assert!(
         state.quota.is_empty(),
         "a plain failure is not a quota loss"
     );
-    // The handover is a fact in the timeline and in the structured record, not
-    // only an artifact on disk.
+    // The retry and the handover are facts in the timeline and in the
+    // structured record, not only artifacts on disk.
+    assert!(
+        state
+            .events
+            .iter()
+            .any(|e| e.node == "judge" && e.message.contains("retry 1")),
+        "no retry event recorded: {:?}",
+        state.events
+    );
     assert!(
         state
             .events

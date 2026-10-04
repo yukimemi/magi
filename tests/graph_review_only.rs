@@ -163,6 +163,9 @@ async fn a_reviewer_that_only_answers_on_retry_is_recorded_as_recovered_not_sile
     let _home = common::home_lock().await;
     let mut fx = fixture_with_review_seat_that_recovers_on_retry(_home, &["review-2"]);
     fx.config.graph.review_rounds = 1;
+    // A single-agent roster: review-2 has no successor to be handed to, so the
+    // same agent is nudged (a seat with a successor would be handed over).
+    fx.config.agents.truncate(1);
 
     run_git(&fx.repo, &["checkout", "-q", "-b", "feat/by-hand"]);
     std::fs::write(fx.repo.join("note.txt"), "written by a human\n").unwrap();
