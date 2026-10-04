@@ -274,6 +274,16 @@ async fn finish(
             .await
             .map_or(true, |(unmatched, _)| !unmatched.is_empty());
 
+    // A fixer that ran `git rebase --skip` on one of several commits lets the
+    // rest apply and the rebase finish; `emptied` only sees the whole change
+    // vanishing. Find the commits that are neither in the result nor already
+    // on the base.
+    let dropped = if unmerged.is_empty() && marked.is_empty() && !emptied && !head.is_empty() {
+        dropped_commits(&repo, onto_sha, orig, &head).await
+    } else {
+        Vec::new()
+    };
+
     let problem = if !unmerged.is_empty() {
         Some(("paths are still unmerged", unmerged))
     } else if !marked.is_empty() {
@@ -282,6 +292,11 @@ async fn finish(
         Some((
             "the rebase ended with none of the branch's commits applied (all skipped)",
             touched.to_vec(),
+        ))
+    } else if !dropped.is_empty() {
+        Some((
+            "the rebase dropped some of the branch's commits (skipped?)",
+            dropped,
         ))
     } else if head.is_empty() || !git::is_ancestor(&repo, onto_sha, &head).await {
         Some((
@@ -307,6 +322,100 @@ async fn finish(
             Ok(Rebased::Stopped(why))
         }
     }
+}
+
+/// Subjects of the commits `orig` had over `onto_sha` that the rebased `head`
+/// no longer represents. Empty when all survive or the check could not run
+/// (the other checks still apply).
+///
+/// Commits are matched by what a rebase preserves (author, author date,
+/// subject), not by patch-id: a commit the fixer resolved has a new patch-id
+/// by design. A commit whose patch already exists on the base is not expected
+/// in the result, and one with a patch twin in the result counts as present.
+async fn dropped_commits(repo: &Path, onto_sha: &str, orig: &str, head: &str) -> Vec<String> {
+    let Ok((unmatched, _)) = git::cherry(repo, onto_sha, orig).await else {
+        return Vec::new();
+    };
+    if unmatched.is_empty() {
+        return Vec::new();
+    }
+    let (Ok(origin), Ok(result)) = (
+        git::commit_keys(repo, &format!("{onto_sha}..{orig}")).await,
+        git::commit_keys(repo, &format!("{onto_sha}..{head}")).await,
+    ) else {
+        return Vec::new();
+    };
+    let expected: Vec<git::CommitKey> = origin
+        .into_iter()
+        .filter(|c| unmatched.contains(&c.sha))
+        .collect();
+    let have: Vec<String> = result.into_iter().map(|c| c.key).collect();
+    let twins = git::cherry(repo, head, orig)
+        .await
+        .map(|(_, matched)| matched)
+        .unwrap_or_default();
+    let mut lost = Vec::new();
+    for c in missing_commits(&expected, &have, &twins) {
+        // Git also drops a commit on its own when its change is already on
+        // the base under a different patch (e.g. folded into one upstream
+        // commit). That is not a loss: every path it touched holds the same
+        // content in the result.
+        if !already_in_result(repo, &c.sha, head).await {
+            lost.push(c.key.rsplit('\u{1f}').next().unwrap_or(&c.key).to_owned());
+        }
+    }
+    lost
+}
+
+/// Does `head` hold, for every path `sha` touched, exactly `sha`'s content?
+async fn already_in_result(repo: &Path, sha: &str, head: &str) -> bool {
+    let Ok(paths) = git::git(
+        repo,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "--root",
+            sha,
+        ],
+    )
+    .await
+    else {
+        return false;
+    };
+    for p in paths.lines().filter(|l| !l.is_empty()) {
+        let a = git::git(repo, &["rev-parse", &format!("{sha}:{p}")])
+            .await
+            .ok();
+        let b = git::git(repo, &["rev-parse", &format!("{head}:{p}")])
+            .await
+            .ok();
+        if a.is_none() || a != b {
+            return false;
+        }
+    }
+    true
+}
+
+/// The pure half of [`dropped_commits`]: the `expected` commits whose
+/// key is not left in `have` (a multiset: each result commit covers one
+/// expected commit) and whose sha is not in `twins`.
+fn missing_commits(
+    expected: &[git::CommitKey],
+    have: &[String],
+    twins: &[String],
+) -> Vec<git::CommitKey> {
+    let mut pool: Vec<Option<&String>> = have.iter().map(Some).collect();
+    let mut lost = Vec::new();
+    for c in expected {
+        if let Some(slot) = pool.iter_mut().find(|s| **s == Some(&c.key)) {
+            *slot = None;
+        } else if !twins.contains(&c.sha) {
+            lost.push(c.clone());
+        }
+    }
+    lost
 }
 
 /// Give up: abort whatever is standing, drop the worktree and put the branch
@@ -396,4 +505,43 @@ fn hunks(worktree: &Path, paths: &[String]) -> String {
         out.push_str(&file);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ck(sha: &str, subject: &str) -> git::CommitKey {
+        git::CommitKey {
+            sha: sha.to_owned(),
+            key: format!("n\u{1f}e\u{1f}1 +0000\u{1f}{subject}"),
+        }
+    }
+
+    #[test]
+    fn nothing_is_missing_when_every_key_is_present() {
+        let exp = [ck("a", "one"), ck("b", "two")];
+        let have = vec![exp[1].key.clone(), exp[0].key.clone()];
+        assert!(missing_commits(&exp, &have, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_dropped_commit_is_named_by_subject() {
+        let exp = [ck("a", "one"), ck("b", "two")];
+        let have = vec![exp[1].key.clone()];
+        assert_eq!(missing_commits(&exp, &have, &[]), vec![exp[0].clone()]);
+    }
+
+    #[test]
+    fn duplicate_keys_are_counted_not_collapsed() {
+        let exp = [ck("a", "same"), ck("b", "same")];
+        let have = vec![exp[0].key.clone()];
+        assert_eq!(missing_commits(&exp, &have, &[]), vec![exp[1].clone()]);
+    }
+
+    #[test]
+    fn a_patch_twin_in_the_result_is_not_a_loss() {
+        let exp = [ck("a", "one")];
+        assert!(missing_commits(&exp, &[], &["a".to_owned()]).is_empty());
+    }
 }
