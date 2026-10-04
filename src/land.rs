@@ -1108,6 +1108,69 @@ fn contested_to_ask(state: &RunState) -> Option<ContestedHandoff> {
     }
 }
 
+/// What a merge-approval question's deputy is told: the pull request, the run,
+/// what each answer does, and - when the run's record is readable - the
+/// contested hand-off the question was filed over.
+///
+/// A snapshot taken when the deputy is attached, so it says so and points at
+/// `magi show` / `gh pr view` for anything current. `state` is `None` for a run
+/// that cannot be read; what is missing is named as missing, and no past
+/// approval basis is rebuilt from today's state.
+pub fn deputy_brief(q: &ask::Question, state: Option<&RunState>) -> String {
+    let mut s = format!(
+        "This is the merge approval for run {run} (`magi show {run}`). The question's \
+         own text above names the pull request. Answering `{APPROVE}` squash-merges \
+         it into the base branch, which cannot be undone; `{HOLD}` leaves the pull \
+         request open. Silence is a hold: the owner not answering never merges. Only \
+         the owner choosing `{APPROVE}`, or writing the single word `{APPROVE}`, \
+         merges; no other wording is a decision.\n\n\
+         This brief is a snapshot from when you were attached: check `magi show {run}` \
+         and `gh pr view` (read-only) before telling the owner anything current. \
+         You run with permission to write the question record, and what keeps you \
+         from touching anything else is this brief and your instructions - so do \
+         not change files, branches or the pull request.",
+        run = q.run
+    );
+    let Some(state) = state else {
+        s.push_str(
+            "\n\nThe run's record could not be read, so the pull request, the panel \
+             summary and any contested findings are not known to you beyond the \
+             question's own text. Say so to the owner rather than guessing.",
+        );
+        return s;
+    };
+    if let Some(pr) = &state.pr {
+        s.push_str(&format!(
+            "\n\nPull request #{} {} (recorded state: {}, last seen).",
+            pr.number, pr.url, pr.state
+        ));
+    }
+    s.push_str(&format!("\nBase branch: `{}`.", state.base_branch));
+    if let Some(w) = state.winner() {
+        s.push_str(&format!("\nWinning branch: `{}`.", w.branch));
+    }
+    match contested_to_ask(state) {
+        Some(c) => {
+            s.push_str(
+                "\n\nThis question was filed although merge approvals are off, because \
+                 the review hand-off is contested. Open findings:",
+            );
+            for f in &c.findings {
+                let at = match (&f.file, f.line) {
+                    (Some(file), Some(line)) => format!(" ({file}:{line})"),
+                    (Some(file), None) => format!(" ({file})"),
+                    _ => String::new(),
+                };
+                s.push_str(&format!("\n- [{}] {:?}{at}: {}", f.id, f.severity, f.title));
+            }
+            let seats: Vec<String> = c.rejecters.iter().map(|(n, _)| format!("#{n}")).collect();
+            s.push_str(&format!("\nReviewers who rejected: {}.", seats.join(", ")));
+        }
+        None => s.push_str("\n\nThe review hand-off was not recorded as contested."),
+    }
+    s
+}
+
 /// Ask the owner before merging, with the whole case attached as a panel.
 ///
 /// The evidence is gathered from the winner's own worktree with the `git` CLI,
@@ -5020,6 +5083,39 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             contested_to_ask(&state).is_none(),
             "the switch restores today"
         );
+    }
+
+    #[test]
+    fn the_deputy_brief_carries_the_pr_the_findings_and_names_what_is_missing() {
+        let q = ask::Question::new(
+            "run-1".to_owned(),
+            APPROVAL_NODE.to_owned(),
+            "land".to_owned(),
+            "Merge?".to_owned(),
+            String::new(),
+            vec![APPROVE.to_owned(), HOLD.to_owned()],
+        );
+        let none = deputy_brief(&q, None);
+        assert!(none.contains("could not be read"), "{none}");
+        assert!(none.contains("Silence is a hold"), "{none}");
+
+        let mut state = run_state();
+        state.pr = Some(crate::run::PrRecord {
+            url: "https://example.test/pull/7".to_owned(),
+            number: 7,
+            state: "open".to_owned(),
+            checks: "green".to_owned(),
+            round: 0,
+            rounds: 3,
+            red_at_merge: Vec::new(),
+        });
+        state.contested_handoff = Some(contested());
+        let b = deputy_brief(&q, Some(&state));
+        assert!(b.contains("https://example.test/pull/7"), "{b}");
+        assert!(b.contains("R3-1-1") && b.contains("src/a.rs:1"), "{b}");
+        assert!(b.contains("#1"), "the rejecting seat: {b}");
+        state.contested_handoff = None;
+        assert!(deputy_brief(&q, Some(&state)).contains("not recorded as contested"));
     }
 
     #[test]

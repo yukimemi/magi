@@ -4082,9 +4082,8 @@ function updateAskCard(row, question, { compact = false } = {}) {
      seat magi serve runs for a conductor question, "daemon" is `magi serve`
      resuming the agent's session, "nobody" means nothing is listening right
      now. "Waiting for the agent" is only said when one of the first three is
-     actually attached; otherwise the note names who is not listening. A
-     question no agent waits on at all (land's approval gate) carries no holder
-     and keeps the plain wording. */
+     actually attached; otherwise the note names who is not listening. The
+     merge approval is served by a deputy too, but a say there never merges. */
   const holder = open ? question.holder : null;
   const hasDeputy = Boolean(question.deputy);
   /* With follow-up agents off nobody will ever answer a say, so the choice
@@ -4100,6 +4099,8 @@ function updateAskCard(row, question, { compact = false } = {}) {
       : "The follow-up agent for this question is not running right now. magi serve will wake it when you reply.";
   } else if (holder === "nobody" && question.node === "conduct") {
     waitingText = "No agent is listening on this question. Your message is recorded, but nothing will read it until magi serve attaches a follow-up agent. Tapping a choice still decides it.";
+  } else if (holder === "nobody" && question.node === "land-approval") {
+    waitingText = "No agent is listening on this merge approval. Your message is recorded, but nothing will read it until magi serve attaches a follow-up agent. Only tapping merge, or writing the single word merge, merges; silence holds.";
   } else if (holder === "nobody") {
     waitingText = waitingOnAgent
       ? "The agent that asked is no longer waiting. magi will resume its session with your message when magi serve picks it up; if it cannot, you will be told."
@@ -4109,7 +4110,9 @@ function updateAskCard(row, question, { compact = false } = {}) {
   } else if (holder === "deputy") {
     waitingText = waitingOnAgent
       ? "The follow-up agent for this question is reading your message. There is nothing to decide until it replies."
-      : "A follow-up agent is listening on this question for the conductor and will answer if you write back.";
+      : (question.node === "land-approval"
+        ? "A follow-up agent is listening on this merge approval and will answer if you write back. Only tapping merge, or writing the single word merge, merges; silence holds."
+        : "A follow-up agent is listening on this question for the conductor and will answer if you write back.");
   } else if (waitingOnAgent && (holder === "asker")) {
     waitingText = "Waiting for the agent to reply. There is nothing to decide until it does.";
   } else if (waitingOnAgent) {

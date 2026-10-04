@@ -2124,8 +2124,8 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
     }
 }
 
-/// `magi ask --settle <id> --choice <label> --quote <words>`: a conductor
-/// question's deputy recording that the owner's free text decided it.
+/// `magi ask --settle <id> --choice <label> --quote <words>`: a deputy of a
+/// conductor question or a merge approval recording that the owner's free text decided it.
 ///
 /// The seat is `MAGI_SEAT`, set only by `agent::invoke`, so it cannot be
 /// claimed from a shell; [`ask::Question::settle_by_deputy`] compares it with
@@ -2136,13 +2136,20 @@ fn ask_settle_cmd(store: &ask::Questions, id: &str, choices: &[String], quote: &
         bail!("give exactly one --choice: the option the owner's words decided");
     };
     if std::env::var("MAGI_NODE").as_deref() != Ok(magi::deputy::NODE) {
-        bail!("only a conductor question's deputy may settle a question");
+        bail!("only a question's deputy may settle a question");
     }
     let seat = std::env::var("MAGI_SEAT").unwrap_or_default();
     let resolved = store.resolve_id(id)?;
     let queue = magi::queue::Queue::open();
     store.update(&resolved, |q| {
-        if let Ok(task) = queue.get(&q.run)
+        // A conductor question's `run` is the task id; a merge approval's is
+        // the run id, so the task is the one that run belongs to.
+        let task = queue.get(&q.run).ok().or_else(|| {
+            (q.node == magi::land::APPROVAL_NODE)
+                .then(|| queue.list().into_iter().find(|t| t.runs.contains(&q.run)))
+                .flatten()
+        });
+        if let Some(task) = task
             && task.operator_held()
         {
             bail!(

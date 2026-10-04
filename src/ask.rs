@@ -755,6 +755,31 @@ impl Question {
                 self.short()
             );
         }
+        if self.node == crate::land::APPROVAL_NODE {
+            // The merge is irreversible and a say is not a decision: only the
+            // owner's whole message being the answer word counts, so "don't
+            // merge" or "merge, but ..." can never be quoted into a merge.
+            let word = if label == crate::land::APPROVE {
+                Some(crate::land::APPROVE)
+            } else if label == crate::land::HOLD {
+                Some(crate::land::HOLD)
+            } else {
+                None
+            };
+            let exact = word.is_some_and(|w| {
+                quote.eq_ignore_ascii_case(w)
+                    && self
+                        .thread
+                        .iter()
+                        .any(|t| t.who == Who::Operator && t.body.trim().eq_ignore_ascii_case(w))
+            });
+            if !exact {
+                bail!(
+                    "on a merge approval only an owner message that is exactly `{label}` \
+                     settles it; ask what they mean with `--thread` instead"
+                );
+            }
+        }
         self.thread.push(Turn {
             who: Who::Agent,
             body: format!("Settled as `{label}` on the owner's words: \"{quote}\""),
@@ -2762,6 +2787,41 @@ mod tests {
         let agent_turn = serde_json::json!({"who": "agent", "body": "hi", "at": value["at"]});
         let parsed: Turn = serde_json::from_value(agent_turn).unwrap();
         assert_eq!(parsed.who, Who::Agent);
+    }
+
+    #[test]
+    fn a_merge_approval_settles_only_on_the_owners_exact_word() {
+        let mut q = Question::new(
+            "run".into(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Merge?".into(),
+            String::new(),
+            vec!["merge".into(), "hold".into()],
+        );
+        let mut dep = Deputy::new("brief".into());
+        dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
+        q.deputy = Some(dep);
+        q.say("please don't merge yet").unwrap();
+        assert!(q.settle_by_deputy("deputy-x", "merge", "merge").is_err());
+        assert!(
+            q.settle_by_deputy("deputy-x", "merge", "don't merge")
+                .is_err()
+        );
+        assert!(
+            q.settle_by_deputy("deputy-x", "hold", "don't merge")
+                .is_err()
+        );
+        assert_eq!(q.status, QuestionStatus::Open);
+        q.reply("do you mean hold?", vec!["merge".into(), "hold".into()])
+            .unwrap();
+        q.say(" Merge ").unwrap();
+        assert!(
+            q.settle_by_deputy("deputy-x", "merge", "erge").is_err(),
+            "a fragment is not the word"
+        );
+        q.settle_by_deputy("deputy-x", "merge", "Merge").unwrap();
+        assert_eq!(q.resolution().as_deref(), Some("merge"));
     }
 
     #[test]

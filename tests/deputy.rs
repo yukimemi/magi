@@ -349,3 +349,76 @@ async fn an_unresolvable_deputy_agent_cannot_keep_a_question_open() {
     assert_eq!(s.store.get(&s.q.id).unwrap().status, QuestionStatus::Abandoned);
 }
 }
+
+fn file_land(store: &Questions, summary: &str) -> Question {
+    let mut q = Question::new(
+        "20260101-000001-run".to_owned(),
+        magi::land::APPROVAL_NODE.to_owned(),
+        "land".to_owned(),
+        summary.to_owned(),
+        "https://example.test/pull/7 is green".to_owned(),
+        vec![magi::land::APPROVE.to_owned(), magi::land::HOLD.to_owned()],
+    );
+    store.put(&mut q).expect("file the approval");
+    q
+}
+
+common::e2e! {
+async fn a_say_on_a_merge_approval_gets_a_deputy_and_never_the_waiter() {
+    let s = scene(home_lock().await);
+    let land = file_land(&s.store, "Merge #7?");
+    s.store.update(&land.id, |q| q.say("what changed?")).unwrap();
+    let mut d = deputies(&s, 2);
+    // Only the approval is under test: retire the conductor's question.
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+
+    turn(&mut d).await;
+
+    let q = s.store.get(&land.id).unwrap();
+    assert_eq!(q.status, QuestionStatus::Open, "a say never settles the approval");
+    assert!(q.cwd.is_none(), "a cwd would make it the waiter's");
+    assert!(q.answer_timeout > 0);
+    let dep = q.deputy.as_ref().expect("a deputy was attached");
+    assert_eq!(dep.starts, 1);
+    assert!(dep.brief.contains("snapshot"), "{}", dep.brief);
+    assert!(dep.brief.contains("could not be read"), "no run record here: {}", dep.brief);
+    assert_eq!(q.thread.last().unwrap().who, Who::Agent, "the say was answered");
+    assert_eq!(q.delivered_turns, q.thread.len());
+
+    // The waiter never resumes it, with or without a deputy.
+    s.store.update(&land.id, |q| q.say("and the tests?")).unwrap();
+    let before = log(&s).len();
+    let mut waiter = Waiter::new(s.store.clone(), s.home.clone(), None);
+    waiter.tick(Timestamp::now(), &|| false).await;
+    assert_eq!(log(&s).len(), before);
+    assert_eq!(s.store.get(&land.id).unwrap().status, QuestionStatus::Open);
+}
+}
+
+#[test]
+fn a_merge_approvals_deadline_never_moves_on_a_reply() {
+    let mut land = Question::new(
+        "run".to_owned(),
+        magi::land::APPROVAL_NODE.to_owned(),
+        "land".to_owned(),
+        "Merge?".to_owned(),
+        String::new(),
+        vec!["merge".to_owned(), "hold".to_owned()],
+    );
+    land.answer_timeout = 1000;
+    let base = land.asked_at.as_second();
+    land.say("why?").unwrap();
+    land.thread[0].at = Timestamp::from_second(base + 900).unwrap();
+    assert_eq!(magi::deputy::deadline(&land, 5), base + 1000);
+
+    let mut c = land.clone();
+    c.node = magi::conduct::NODE.to_owned();
+    assert_eq!(
+        magi::deputy::deadline(&c, 5),
+        base + 900 + 1000,
+        "a conductor question still re-arms"
+    );
+    assert_eq!(magi::deputy::kind_of(&land), Some(magi::deputy::Kind::Land));
+    c.node = "implement".to_owned();
+    assert_eq!(magi::deputy::kind_of(&c), None);
+}
