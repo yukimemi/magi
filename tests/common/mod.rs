@@ -171,6 +171,17 @@ if [ "$MAGI_NODE" = "conduct" ] && [ -n "$MOCK_CONDUCT_LOG" ]; then
   exit 0
 fi
 
+# The land fix round (`land::fix_round`): the fixer commits for itself and
+# neither pushes nor leaves anything for `rescue_commit`, which is what a real
+# fixer does. Prompt phrasing matches `land::fix_prompt`'s opening line.
+if has "Your patch is open as a pull request and it is not landing"; then
+  echo "land fix $$" >> landfix.txt
+  git add -A >/dev/null 2>&1
+  git commit -q -m "fix the failing check" >/dev/null 2>&1
+  printf '{"addressed":[],"rejected":[],"notes":"committed landfix.txt"}\n'
+  exit 0
+fi
+
 # A rebase stopped on a conflict (`prompt::rebase_conflict`; its heading
 # phrase is what this greps for). The fixer resolves by keeping both sides of
 # every unmerged file, stages them and continues the rebase, repeating while
