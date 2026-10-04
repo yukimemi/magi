@@ -5790,16 +5790,18 @@ mod tests {
     fn deputies_enabled_follows_the_config() {
         // An explicit roster, so the result never depends on which agent CLIs
         // this machine has installed.
-        let mut on = Config::default();
-        on.agents = vec![crate::config::AgentSpec {
-            id: "stub".to_owned(),
-            kind: AgentKind::Command,
-            model: None,
-            command: vec!["true".to_owned()],
-            extra_args: Vec::new(),
-            env: Default::default(),
-            prompt_delivery: None,
-        }];
+        let on = Config {
+            agents: vec![crate::config::AgentSpec {
+                id: "stub".to_owned(),
+                kind: AgentKind::Command,
+                model: None,
+                command: vec!["true".to_owned()],
+                extra_args: Vec::new(),
+                env: Default::default(),
+                prompt_delivery: None,
+            }],
+            ..Config::default()
+        };
         assert!(crate::deputy::can_start(Some(&on), ""));
         assert!(crate::deputy::can_start(Some(&on), "stub"));
         let mut off = on.clone();
