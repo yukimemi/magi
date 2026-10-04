@@ -854,9 +854,13 @@ fn input_side(usage: &serde_json::Value, input: &[&str], cache: &[&str]) -> Opti
 ///   conversation reached this turn, and adding them would count the same
 ///   prefix once per tool round-trip.
 /// - **Missing or mistyped usage is `None`**, which the UI shows as "unknown".
-/// - claude and agy report cache reads separately from `input_tokens`, so those
-///   are added; codex's `cached_input_tokens` is a subset of `input_tokens`
-///   and is *not* added.
+/// - **A cumulative total is not a context size, so it is `None`.** claude's
+///   result `usage` sums every model call of the turn, so it is trusted only
+///   when `num_turns` is 1 (a single call, where sum and last coincide).
+///   codex's `turn.completed.usage` is the session's running input total and
+///   repeats the same context on every resumed turn; it carries no per-call
+///   figure, so codex is always unknown rather than a made-up number.
+/// - agy reports cache reads separately from `input_tokens`, so those are added.
 ///
 /// agy's counters may be cumulative for the whole print-mode call rather than
 /// for one request, so for that CLI the number is an upper bound.
@@ -870,6 +874,9 @@ fn context_tokens(kind: AgentKind, stdout: &str) -> Option<u64> {
     match kind {
         AgentKind::Claude => {
             let v = serde_json::from_str::<Value>(stdout.trim()).ok()?;
+            if uint(&v, "num_turns") != Some(1) {
+                return None;
+            }
             input_side(
                 v.get("usage")?,
                 &["input_tokens"],
@@ -903,10 +910,7 @@ fn context_tokens(kind: AgentKind, stdout: &str) -> Option<u64> {
                 .find_map(|l| serde_json::from_str::<Value>(l.trim()).ok())?;
             input_side(v.get("usage")?, &["input_tokens"], &["cache_read_tokens"])
         }
-        AgentKind::Codex => lines()
-            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("turn.completed"))
-            .filter_map(|v| uint(v.get("usage")?, "input_tokens"))
-            .next_back(),
+        AgentKind::Codex => None,
         AgentKind::Omp => lines()
             .flat_map(|v| {
                 // Same walk as the answer: `agent_end` carries the thread,
@@ -2910,14 +2914,17 @@ mod tests {
 
     #[test]
     fn claude_context_tokens_add_cache_and_stay_unknown_without_usage() {
-        let full = r#"{"result":"ok","usage":{"input_tokens":10,"cache_creation_input_tokens":200,"cache_read_input_tokens":3000,"output_tokens":5}}"#;
+        let full = r#"{"result":"ok","num_turns":1,"usage":{"input_tokens":10,"cache_creation_input_tokens":200,"cache_read_input_tokens":3000,"output_tokens":5}}"#;
         assert_eq!(context_tokens(AgentKind::Claude, full), Some(3210));
-        let no_cache = r#"{"result":"ok","usage":{"input_tokens":10}}"#;
+        let no_cache = r#"{"result":"ok","num_turns":1,"usage":{"input_tokens":10}}"#;
         assert_eq!(context_tokens(AgentKind::Claude, no_cache), Some(10));
         for missing in [
             r#"{"result":"ok"}"#,
-            r#"{"result":"ok","usage":{"output_tokens":5}}"#,
-            r#"{"result":"ok","usage":{"input_tokens":"many"}}"#,
+            r#"{"result":"ok","num_turns":1,"usage":{"output_tokens":5}}"#,
+            r#"{"result":"ok","num_turns":1,"usage":{"input_tokens":"many"}}"#,
+            // Several model calls: the usage is a sum, not a context size.
+            r#"{"result":"ok","num_turns":3,"usage":{"input_tokens":10}}"#,
+            r#"{"result":"ok","usage":{"input_tokens":10}}"#,
             "not json",
         ] {
             assert_eq!(
@@ -2953,17 +2960,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_context_tokens_take_last_turn_and_do_not_add_cached() {
+    fn codex_context_tokens_are_unknown_because_usage_is_cumulative() {
         let out = concat!(
-            "tracing noise\n",
             r#"{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":900}}"#,
-            "\n",
-            r#"{"type":"turn.completed","usage":{"input_tokens":1500,"cached_input_tokens":1400}}"#,
             "\n"
         );
-        assert_eq!(context_tokens(AgentKind::Codex, out), Some(1500));
-        let none = r#"{"type":"turn.completed"}"#;
-        assert_eq!(context_tokens(AgentKind::Codex, none), None);
+        assert_eq!(context_tokens(AgentKind::Codex, out), None);
     }
 
     #[test]
