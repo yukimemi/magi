@@ -569,11 +569,9 @@ const state = {
     runs: { status: "idle", forText: "", seq: 0, timer: null, hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" },
     tasks: { status: "idle", forText: "", seq: 0, timer: null, hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" },
   },
-  /* `${query}\0${id}` of the single-hit jump renderQueueSearch last actually
-     performed, so a background poll that re-renders the same query without
-     a new unique hit does not yank the operator back to the card mid-read -
-     see scrollToSearchHit's own comment. Reset whenever the query is
-     cleared, so the next search starts a fresh jump. */
+  /* `${query}\0${id}` of the last single-hit jump, so the immediate id
+     match and the full-text reply for the same input do not jump twice.
+     Background renders never jump. Reset when the query is cleared. */
   queueSearchJump: null,
   /* A task id to scroll to and flash the moment the Backlog can show it -
      set by applyRoute() when the hash names one (a Backlog card's
@@ -2724,9 +2722,9 @@ function resetSearch(scope) {
   Object.assign(s, { status: "idle", forText: "", hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" });
 }
 
-function renderSearchScope(scope) {
+function renderSearchScope(scope, allowSearchJump = false) {
   if (scope === "runs") renderRuns();
-  else renderQueue();
+  else renderQueue(allowSearchJump);
 }
 
 /* Called on every keystroke: debounces, and never touches the input itself, so
@@ -2741,12 +2739,12 @@ function scheduleSearch(scope) {
   clearTimeout(s.timer);
   s.status = "loading";
   s.seq += 1; // a reply still in flight answers an older query
-  s.timer = setTimeout(() => runSearch(scope), SEARCH_DEBOUNCE_MS);
+  s.timer = setTimeout(() => runSearch(scope, true), SEARCH_DEBOUNCE_MS);
 }
 
 /* The previous hits stay on screen while a new request is in flight (and on
    the periodic refresh), so the list does not flash empty between keystrokes. */
-async function runSearch(scope) {
+async function runSearch(scope, allowSearchJump = false) {
   const text = searchText(scope);
   const s = state.search[scope];
   if (text === "") return;
@@ -2765,7 +2763,7 @@ async function runSearch(scope) {
     if (mine !== s.seq) return;
     Object.assign(s, { status: "error", error: error.message || String(error), hits: new Map(), forText: "" });
   }
-  renderSearchScope(scope);
+  renderSearchScope(scope, allowSearchJump);
 }
 
 /* After the list behind a search reloaded: ask again without debouncing. */
@@ -2873,7 +2871,7 @@ function setQueueSearch(value) {
   state.queueSearch = value;
   if (value.trim() === "") state.queueSearchJump = null;
   scheduleSearch("tasks");
-  renderQueue();
+  renderQueue(true);
 }
 
 function setRunsSearch(value) {
@@ -2885,7 +2883,7 @@ function setRunsSearch(value) {
 /* Search results are a flat list rather than the sectioned view below: a
    section that starts collapsed (Held, Done) would otherwise hide the very
    card the operator typed an id to find. */
-function renderQueueSearch(tasks, query) {
+function renderQueueSearch(tasks, query, allowSearchJump = false) {
   const results = $("queue-search-results");
   const matches = tasks.filter((t) => state.search.tasks.hits.has(t.id) || matchesTaskId(t.id, query));
 
@@ -2905,13 +2903,11 @@ function renderQueueSearch(tasks, query) {
      list. Two or more stay a list to choose from, same as the CLI's own
      "matches N tasks" refusal, just rendered instead of erroring.
 
-     Gated on jumpKey actually changing: renderQueue() re-runs on every SSE
-     revision and, without streaming, every 10s health poll, whether or not
-     this search had anything to do with the change. Re-jumping (and
-     re-flashing) on each of those would drag the view back to the card out
-     from under an operator who is mid-read - see scrollToLastTurn's own
-     rule against exactly that. */
-  if (matches.length === 1) {
+     Only input and its debounced reply may jump. SSE revisions and health
+     polls may introduce or replace a unique hit without moving the view.
+     The jump key also avoids repeating an immediate id-match jump when
+     the full-text reply arrives. */
+  if (allowSearchJump && matches.length === 1) {
     const jumpKey = `${query}\0${matches[0].id}`;
     if (state.queueSearchJump !== jumpKey) {
       state.queueSearchJump = jumpKey;
@@ -3214,7 +3210,7 @@ function renderStatsQueue(q) {
   );
 }
 
-function renderQueue() {
+function renderQueue(allowSearchJump = false) {
   const sectionsRoot = $("queue-sections");
   const tasks = state.queue;
 
@@ -3250,7 +3246,7 @@ const query = state.queueSearch.trim().toLowerCase();
     renderDependencyGraph(tasks, questionsById);
   } else {
     show(sectionsRoot, false);
-    renderQueueSearch(tasks, query);
+    renderQueueSearch(tasks, query, allowSearchJump);
   }
   /* The strip's wording depends on how many tasks are runnable, so it is
      re-rendered from the queue rather than only from health: "off, with two
