@@ -227,6 +227,15 @@ fn query_process(pid: u32) -> std::io::Result<Option<u64>> {
             "process queries are unavailable on this platform",
         ));
     }
+    // Start times are `boot_time + ticks`; when `/proc/stat` has no `btime`
+    // sysinfo substitutes a moving clock, so the same live pid would get a
+    // different identity on every query.
+    #[cfg(target_os = "linux")]
+    if !linux_boot_time_readable() {
+        return Err(std::io::Error::other(
+            "boot time is unreadable: start times would not be stable",
+        ));
+    }
     let pid = Pid::from_u32(pid);
     let own = Pid::from_u32(std::process::id());
     let mut system = System::new();
@@ -255,7 +264,53 @@ fn query_process(pid: u32) -> std::io::Result<Option<u64>> {
             "process exists but its entry could not be read",
         ));
     }
+    // A `/proc` mounted with `hidepid=1|2` hides other users' pids, so a miss
+    // is not proof of absence there; nor is one when the mount table cannot
+    // be read to tell.
+    #[cfg(target_os = "linux")]
+    if found.is_none() && !linux_proc_shows_all_pids() {
+        return Err(std::io::Error::other(
+            "absence is unprovable: /proc may hide other users' processes",
+        ));
+    }
     Ok(found)
+}
+
+/// Whether `/proc/stat` carries a non-zero `btime` line.
+#[cfg(target_os = "linux")]
+fn linux_boot_time_readable() -> bool {
+    std::fs::read_to_string("/proc/stat").is_ok_and(|s| stat_has_btime(&s))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn stat_has_btime(stat: &str) -> bool {
+    stat.lines().any(|l| {
+        l.strip_prefix("btime ")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .is_some_and(|v| v > 0)
+    })
+}
+
+/// Whether `/proc` is mounted without `hidepid`, judged from the mount table.
+/// An unreadable table or a missing `/proc` entry answers `false`.
+#[cfg(target_os = "linux")]
+fn linux_proc_shows_all_pids() -> bool {
+    std::fs::read_to_string("/proc/self/mountinfo").is_ok_and(|s| mountinfo_proc_unhidden(&s))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn mountinfo_proc_unhidden(mountinfo: &str) -> bool {
+    mountinfo
+        .lines()
+        .rfind(|l| l.split_whitespace().nth(4) == Some("/proc"))
+        .is_some_and(|l| {
+            !l.split(|c: char| c.is_whitespace() || c == ',').any(|o| {
+                matches!(
+                    o,
+                    "hidepid=1" | "hidepid=2" | "hidepid=invisible" | "hidepid=noaccess"
+                )
+            })
+        })
 }
 
 /// Whether the identity marker format is the current one: a plain integer
@@ -380,6 +435,18 @@ mod tests {
             offenders.is_empty(),
             "Command::new without .quiet() and no documented exemption: {offenders:?}"
         );
+    }
+
+    #[test]
+    fn btime_and_hidepid_parsers_distrust_what_they_cannot_confirm() {
+        assert!(stat_has_btime("cpu 1 2\nbtime 1700000000\n"));
+        assert!(!stat_has_btime("cpu 1 2\n"));
+        assert!(!stat_has_btime("btime 0\n"));
+        let open = "25 1 0:5 / /proc rw,nosuid - proc proc rw";
+        let hidden = "25 1 0:5 / /proc rw,nosuid - proc proc rw,hidepid=2";
+        assert!(mountinfo_proc_unhidden(open));
+        assert!(!mountinfo_proc_unhidden(hidden));
+        assert!(!mountinfo_proc_unhidden(""));
     }
 
     #[test]
