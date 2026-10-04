@@ -114,8 +114,9 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::agent;
 use crate::ask::{self, Answer, Question, Questions};
-use crate::config::{Config, Update, UpdateMode};
+use crate::config::{AgentKind, Config, Update, UpdateMode};
 use crate::md;
 use crate::notices::{Notice, Notices};
 use crate::proc::Quiet as _;
@@ -861,6 +862,7 @@ impl Ui {
             .route("/api/talks/{id}/pending/resume", post(talk_pending_resume))
             .route("/api/talks/{id}/pending/clear", post(talk_pending_clear))
             .route("/api/talks/{id}/pending/edit", post(talk_pending_edit))
+            .route("/api/talks/{id}/agent", post(talk_agent))
             .route("/api/talks/{id}/close", post(talk_close))
             .route("/api/talks/{id}/reopen", post(talk_reopen))
             // `DefaultBodyLimit` is raised only on this one route - every
@@ -4707,6 +4709,18 @@ struct TalkDetailView {
     #[serde(flatten)]
     view: TalkView,
     tasks: Vec<TaskView>,
+    /// The agents this talk's repository can switch to; empty when its
+    /// configuration cannot be read, which must not fail the whole detail.
+    roster: Vec<RosterEntry>,
+}
+
+/// One roster agent as the talk's agent selector shows it.
+#[derive(Debug, Serialize)]
+struct RosterEntry {
+    id: String,
+    kind: AgentKind,
+    /// Whether its CLI is on `PATH`, i.e. whether choosing it can work.
+    runnable: bool,
 }
 
 /// `GET /api/talks`.
@@ -4778,9 +4792,22 @@ async fn talk_detail(
             .into_iter()
             .map(TaskView::from)
             .collect();
+        let roster = Config::discover(&talk.repo, None)
+            .map(|(cfg, _)| {
+                cfg.agents
+                    .iter()
+                    .map(|a| RosterEntry {
+                        id: a.id.clone(),
+                        kind: a.kind,
+                        runnable: agent::installed(a),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Json(TalkDetailView {
             view: TalkView::new(talk, thinking),
             tasks,
+            roster,
         }))
     })
     .await
@@ -5305,6 +5332,79 @@ async fn talk_pending_edit(
         tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
     }
     Ok(Json(view))
+}
+
+/// The body of `POST /api/talks/{id}/agent`.
+#[derive(Debug, Deserialize)]
+struct TalkAgent {
+    agent: String,
+}
+
+/// `POST /api/talks/{id}/agent` - hand the conversation to another roster
+/// agent. Holds the talk's turn guard for the whole switch so a `/say` cannot
+/// start a turn on the old session between the check and the write; one that
+/// arrives in that window finds the talk busy and becomes a draft.
+async fn talk_agent(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    Json(body): Json<TalkAgent>,
+) -> ApiResult<Json<TalkView>> {
+    let id = {
+        let ui = Arc::clone(&ui);
+        blocking(move || resolve_talk(&ui.talks, &id)).await?
+    };
+    let repo = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || Ok(ui.talks.get(&id)?.repo)).await?
+    };
+    let cfg = config_for(&repo).await?;
+    let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
+        return Err(ApiError::conflict(
+            "a talk turn is running; change the agent once it has answered",
+        ));
+    };
+    let switched = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        let cfg = cfg.clone();
+        blocking(move || {
+            let spec = agent::pick(&cfg.agents, Some(&body.agent), &agent::installed)
+                .map_err(ApiError::bad_request_from)?;
+            let mut talk = ui.talks.get(&id)?;
+            if !talk.status.open() {
+                return Err(ApiError::conflict(format!(
+                    "talk {} is {} and takes no more turns",
+                    talk.short(),
+                    talk.status.as_str()
+                )));
+            }
+            talk::switch_agent(&mut talk, &ui.talks, &spec)?;
+            Ok(talk)
+        })
+        .await
+    };
+    // A `/say` that landed while this held the claim saw the talk busy and
+    // left a durable draft, trusting the claim's owner to drain it. So the
+    // claim goes to `drain_loop` whatever the outcome - it releases at once
+    // when nothing is queued - rather than being dropped here.
+    let fresh = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || Ok(ui.talks.get(&id)?)).await
+    };
+    let draining = match fresh {
+        Ok(talk) => {
+            let draining = talk.status.open()
+                && (!talk.pending.is_empty() || !talk.pending_attachments.is_empty());
+            let talks = ui.talks.clone();
+            tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+            draining
+        }
+        Err(_) => false,
+    };
+    let talk = switched?;
+    Ok(Json(TalkView::new(talk, draining)))
 }
 
 /// `POST /api/talks/{id}/close`.
@@ -6724,6 +6824,87 @@ mod tests {
 
         let listed = f.get("/api/talks").await.json();
         assert_eq!(listed.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn talk_agent_switches_the_roster_agent_and_refuses_unknown_busy_or_closed() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let second = MOCK_AGENT_TOML.replace("\"mock\"", "\"second\"");
+        std::fs::write(
+            repo.join("magi.toml"),
+            format!("{MOCK_AGENT_TOML}\n{second}"),
+        )
+        .expect("write magi.toml");
+        let home = TempDir::new().expect("temp home");
+        let talks = Talks::at(home.path().join("talks"));
+        let ui = Arc::new(
+            Ui::new(
+                Queue::at(home.path().join("queue")),
+                Questions::at(home.path().join("questions")),
+                talks.clone(),
+                home.path().join("runs"),
+                home.path().to_path_buf(),
+                repo.clone(),
+            )
+            .with_worktrees_root(home.path().join("wt")),
+        );
+        let cfg = config_for(&repo).await.expect("discover config");
+        let talk = talk::begin(&talks, &cfg, repo.clone(), Some("mock")).expect("begin talk");
+        let id = talk.id.clone();
+        let call = |agent: &str| {
+            talk_agent(
+                State(Arc::clone(&ui)),
+                Path(id.clone()),
+                Json(TalkAgent {
+                    agent: agent.to_owned(),
+                }),
+            )
+        };
+
+        let unknown = call("nobody").await.expect_err("unknown agent");
+        assert_eq!(
+            unknown.status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            unknown.message
+        );
+
+        {
+            // The refused call hands its claim to a drain loop that releases
+            // it a moment later.
+            let mut claimed = None;
+            for _ in 0..200 {
+                claimed = ui.begin_talk_turn(&id).expect("claim");
+                if claimed.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let _busy = claimed.expect("free");
+            let busy = call("second").await.expect_err("busy talk");
+            assert_eq!(busy.status, StatusCode::CONFLICT, "{}", busy.message);
+        }
+        assert_eq!(talks.get(&id).expect("reload").agent, "mock");
+
+        let Json(view) = call("second").await.expect("switch");
+        assert_eq!(view.talk.agent, "second");
+        assert_eq!(view.talk.turns.len(), 1, "the change is noted");
+        let saved = talks.get(&id).expect("reload");
+        assert_eq!(saved.agent, "second");
+        assert_eq!(saved.turns.len(), 1);
+
+        let detail = talk_detail(State(Arc::clone(&ui)), Path(id.clone()))
+            .await
+            .expect("detail");
+        let roster: Vec<&str> = detail.0.roster.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(roster, ["mock", "second"]);
+
+        let mut closed = talks.get(&id).expect("reload");
+        talk::close(&mut closed, &talks).expect("close");
+        let refused = call("mock").await.expect_err("closed talk");
+        assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.message);
     }
 
     #[tokio::test]

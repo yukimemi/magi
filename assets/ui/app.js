@@ -59,6 +59,7 @@ const API = {
   talkPendingClear: (id) => `/api/talks/${encodeURIComponent(id)}/pending/clear`,
   talkPendingEdit: (id) => `/api/talks/${encodeURIComponent(id)}/pending/edit`,
   talkClose: (id) => `/api/talks/${encodeURIComponent(id)}/close`,
+  talkAgent: (id) => `/api/talks/${encodeURIComponent(id)}/agent`,
   talkReopen: (id) => `/api/talks/${encodeURIComponent(id)}/reopen`,
   talkDelete: (id) => `/api/talks/${encodeURIComponent(id)}`,
   /* One image, uploaded the moment it is picked/pasted/dropped - well before
@@ -566,7 +567,7 @@ const state = {
      reload. A conversation absent from this map has never been opened, so
      every agent turn in it counts as unread. */
   talkReads: loadCollapsed(TALK_READS_KEY),
-  talkDetail: { id: null, talk: null },
+  talkDetail: { id: null, talk: null, roster: [] },
   /* Images picked, pasted or dropped for the *next* `talk-say`, not yet part
      of any turn. Each item is `{ localId, previewUrl, name, status,
      serverId, mime, bytes }` with `status` one of `"uploading"` /
@@ -4408,6 +4409,7 @@ async function loadTalk(id) {
     trackTalkThinking(talk, observed);
     if (state.talkDetail.id !== id) return;
     state.talkDetail.talk = talk;
+    state.talkDetail.roster = Array.isArray(talk.roster) ? talk.roster : [];
     renderTalk();
     ok();
   } catch (error) {
@@ -4497,6 +4499,7 @@ function renderTalk() {
     show($("talk-close-go"), false);
     show($("talk-reopen-go"), false);
     show($("talk-wait"), false);
+    show($("talk-agent-box"), false);
     clear($("talk-delete-box"));
     renderTalkThumbs();
     return;
@@ -4566,8 +4569,66 @@ function renderTalk() {
   $("talk-send").disabled = uploading;
   setText($("talk-send"), uploading ? "Uploading…" : busy ? "Queue next" : "Send");
   renderTalkPending(talk);
+  renderTalkAgent(talk, busy);
   show($("talk-wait"), busy);
   renderTalkDelete(talk);
+}
+
+/* The agent selector. Native <select>, so a phone gets its own picker. Never
+   touched while it has focus (a refresh must not yank an open picker), and
+   disabled whenever a switch could not be honoured: a turn in flight, a
+   switch already posting, a closed conversation, or nobody to switch to. */
+let talkAgentSwitching = false;
+
+function renderTalkAgent(talk, busy) {
+  const box = $("talk-agent-box");
+  const select = $("talk-agent");
+  const roster = state.talkDetail.roster || [];
+  show(box, roster.length > 0);
+  if (document.activeElement !== select) {
+    clear(select);
+    const ids = roster.map((r) => r.id);
+    const entries = ids.includes(talk.agent) ? roster : [{ id: talk.agent, kind: "", runnable: false }, ...roster];
+    for (const r of entries) {
+      select.append(el("option", {
+        value: r.id,
+        text: r.kind ? `${r.id} (${r.kind})` : r.id,
+        disabled: !(r.runnable || r.id === talk.agent),
+      }));
+    }
+    select.value = talk.agent;
+  }
+  select.disabled = busy || talkAgentSwitching
+    || String(talk.status || "open") !== "open" || roster.length < 2;
+}
+
+async function switchTalkAgent() {
+  const id = state.talkDetail.id;
+  const select = $("talk-agent");
+  const agent = select.value;
+  const current = state.talkDetail.talk;
+  if (!id || !current || agent === current.agent) return;
+  talkAgentSwitching = true;
+  renderTalk();
+  try {
+    const talk = await postJson(API.talkAgent(id), { agent });
+    /* Only the conversation still on screen takes the answer: the operator
+       may have navigated away while this was in flight. */
+    if (state.talkDetail.id === id) {
+      state.talkDetail.talk = talk;
+      announce(`Agent changed to ${agent}.`);
+    }
+    await loadTalks();
+    ok();
+  } catch (error) {
+    fail(`Could not change the agent: ${error.message}`);
+  } finally {
+    talkAgentSwitching = false;
+    if (state.talkDetail.id === id) {
+      select.blur();
+      renderTalk();
+    }
+  }
 }
 
 /* Pending is server data, not an optimistic browser-only message: it survives
@@ -4876,7 +4937,7 @@ async function startTalk() {
   try {
     const talk = await postJson(API.talks, {});
     state.talks = sortTalks([talk, ...(state.talks || []).filter((t) => t.id !== talk.id)]);
-    state.talkDetail = { id: talk.id, talk };
+    state.talkDetail = { id: talk.id, talk, roster: [] };
     trackTalkThinking(talk);
     renderTalks();
     announce("Conversation opened.");
@@ -6652,13 +6713,13 @@ function applyRoute() {
     if (changed) state.openingTalk = true;
     if (state.talkDetail.id !== route.id) {
       resetTalkAttachments(route.id);
-      state.talkDetail = { id: route.id, talk: null };
+      state.talkDetail = { id: route.id, talk: null, roster: [] };
       loadTalk(route.id);
     }
     renderTalk();
   } else if (state.talkDetail.id) {
     resetTalkAttachments(null);
-    state.talkDetail = { id: null, talk: null };
+    state.talkDetail = { id: null, talk: null, roster: [] };
   }
 
   if (changed) window.scrollTo({ top: 0 });
@@ -7013,6 +7074,7 @@ function wire() {
   $("talks-mark-all-read").addEventListener("click", markAllTalksRead);
   $("talk-say").addEventListener("submit", sendTalkTurn);
   $("talk-close-go").addEventListener("click", closeTalk);
+  $("talk-agent").addEventListener("change", switchTalkAgent);
   $("talk-reopen-go").addEventListener("click", reopenTalk);
   $("talk-tasks-panel").addEventListener("toggle", () => {
     const panel = $("talk-tasks-panel");

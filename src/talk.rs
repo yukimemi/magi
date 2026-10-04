@@ -52,7 +52,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, Invocation, SeatState};
-use crate::config::Config;
+use crate::config::{AgentSpec, Config};
 use crate::queue::{Queue, Source, Task};
 
 /// On-disk format for a conversation. Bumped when a field's meaning changes.
@@ -683,6 +683,40 @@ pub fn reopen(talk: &mut Talk, store: &Talks) -> Result<()> {
     Ok(())
 }
 
+/// Hand the conversation to another roster agent.
+///
+/// A CLI session belongs to one CLI and cannot be carried to another, so the
+/// seat is minted afresh rather than edited: the next turn finds
+/// `seat.turns == 0` and re-sends the transcript, since the new agent has
+/// heard none of it. A magi-written note records the change in the
+/// transcript. Returns `false` (and writes nothing, not even a note) when the
+/// stored talk already uses `spec`.
+///
+/// Re-reads under [`Talks::guard`], like [`close`], and errors rather than
+/// resurrecting a record a concurrent delete removed. Refusing a closed talk
+/// or a turn in flight is the caller's job: only it can see the latter.
+pub fn switch_agent(talk: &mut Talk, store: &Talks, spec: &AgentSpec) -> Result<bool> {
+    let _guard = store.guard();
+    let mut fresh = store
+        .get(&talk.id)
+        .with_context(|| format!("talk {} was deleted", talk.short()))?;
+    if fresh.agent == spec.id {
+        *talk = fresh;
+        return Ok(false);
+    }
+    let from = std::mem::replace(&mut fresh.agent, spec.id.clone());
+    fresh.seat = SeatState::new(SEAT, &spec.id, crate::rng::entropy());
+    fresh.turns.push(Turn {
+        who: Who::Agent,
+        body: format!("{MAGI_NOTE}agent changed from {from} to {}", spec.id),
+        at: Timestamp::now(),
+        attachments: Vec::new(),
+    });
+    store.put(&mut fresh)?;
+    *talk = fresh;
+    Ok(true)
+}
+
 /// Discard the durable draft without adding a transcript turn.
 pub fn clear_pending(talk: &mut Talk, store: &Talks) -> Result<()> {
     let _guard = store.guard();
@@ -783,10 +817,19 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             .last()
             .map_or(&[][..], |t| t.attachments.as_slice()),
     );
-    let body = if talk.seat.turns == 0 {
+    let first_ever = talk.turns.len() <= 1;
+    let body = if talk.seat.turns == 0 && first_ever {
         format!(
             "{}\n\n# Operator\n\n{text}{last_note}",
             briefing(&talk.repo, &cfg.graph.language, cfg.talk.allow_write)
+        )
+    } else if talk.seat.turns == 0 {
+        // A fresh seat on a conversation that already has history (the agent
+        // was switched): the briefing, then everything said so far.
+        format!(
+            "{}\n\n{}\n\n# Operator\n\n{text}{last_note}",
+            briefing(&talk.repo, &cfg.graph.language, cfg.talk.allow_write),
+            transcript(talk, store)
         )
     } else if resuming {
         format!("{text}{last_note}")
@@ -807,7 +850,10 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         .collect();
 
     let artifacts = store.artifacts_of(&talk.id);
-    let stem = format!("turn-{}", talk.seat.turns + 1);
+    // From the transcript, not the seat: a switched agent's seat restarts at
+    // zero and must not overwrite an earlier turn's artifacts.
+    let operator_turns = talk.turns.iter().filter(|t| t.who == Who::Operator).count();
+    let stem = format!("turn-{}", operator_turns.max(1));
     // The chat's build cache is the same shared one the graph's seats get, so
     // a conversation that compiles does not mint another multi-GB target dir.
     let cache_dir = cfg.cache_dir();
@@ -989,6 +1035,7 @@ fn transcript(talk: &Talk, store: &Talks) -> String {
     for t in &talk.turns {
         let who = match t.who {
             Who::Operator => "operator",
+            Who::Agent if t.body.starts_with(MAGI_NOTE) => "magi",
             Who::Agent => "you",
         };
         out.push_str(&format!("\n## {who}\n\n{}\n", t.body.trim()));
@@ -1578,6 +1625,45 @@ mod tests {
             "the briefing is sent once, not on every turn: {second_prompt}"
         );
         assert!(second_prompt.contains("and how is it locked?"));
+    }
+
+    #[tokio::test]
+    async fn switching_agent_resets_the_seat_notes_it_and_resends_the_transcript() {
+        let (tmp, talks) = store();
+        let a = mock_agent(tmp.path(), ECHO, BTreeMap::new());
+        let mut b = a.clone();
+        b.id = "other".to_owned();
+        let mut cfg = config(a.clone());
+        cfg.agents.push(b.clone());
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), Some(&a.id)).expect("begin");
+        say(&mut talk, &talks, &cfg, "remember the walrus", Vec::new())
+            .await
+            .expect("first turn");
+        let old_session = talk.seat.claude_session.clone();
+        assert_eq!(talk.seat.turns, 1);
+
+        assert!(switch_agent(&mut talk, &talks, &b).expect("switch"));
+        assert_eq!(talk.agent, "other");
+        assert_eq!(talk.seat.turns, 0);
+        assert_eq!(talk.seat.agent, "other");
+        assert_ne!(talk.seat.claude_session, old_session);
+        let note = talk.turns.last().expect("note");
+        assert_eq!(note.who, Who::Agent);
+        assert!(note.body.starts_with(MAGI_NOTE), "{}", note.body);
+        assert!(note.body.contains("changed from"), "{}", note.body);
+        assert_eq!(talks.get(&talk.id).expect("reload").agent, "other");
+
+        let before = talk.turns.len();
+        assert!(!switch_agent(&mut talk, &talks, &b).expect("same agent"));
+        assert_eq!(talk.turns.len(), before, "a no-op writes no note");
+
+        say(&mut talk, &talks, &cfg, "what did I say?", Vec::new())
+            .await
+            .expect("turn after switch");
+        let prompt = &talk.turns.last().expect("reply").body;
+        assert!(prompt.contains("remember the walrus"), "{prompt}");
+        assert!(prompt.contains("## magi"), "{prompt}");
+        assert!(prompt.contains("what did I say?"), "{prompt}");
     }
 
     #[tokio::test]
