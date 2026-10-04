@@ -240,7 +240,13 @@ fn query_process(pid: u32) -> std::io::Result<Option<u64>> {
     let own = Pid::from_u32(std::process::id());
     let mut system = System::new();
     system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid, own]),
+        // A duplicate pid in the list (querying this process itself) makes
+        // `sysinfo` drop the entry, so the target is only added when distinct.
+        ProcessesToUpdate::Some(&if pid == own {
+            vec![own]
+        } else {
+            vec![pid, own]
+        }),
         true,
         ProcessRefreshKind::nothing(),
     );
