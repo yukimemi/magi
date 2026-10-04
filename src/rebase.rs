@@ -617,6 +617,7 @@ fn hunks(worktree: &Path, paths: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proc::Quiet as _;
 
     fn ck(sha: &str, subject: &str) -> git::CommitKey {
         git::CommitKey {
@@ -655,6 +656,7 @@ mod tests {
 
     fn sh(dir: &Path, args: &[&str]) {
         let o = std::process::Command::new("git")
+            .quiet()
             .args(args)
             .current_dir(dir)
             .output()
@@ -728,6 +730,7 @@ mod tests {
     async fn commit_dated(d: &Path, msg: &str) -> String {
         sh(d, &["add", "-A"]);
         let st = std::process::Command::new("git")
+            .quiet()
             .current_dir(d)
             .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00+0000")
             .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00+0000")
