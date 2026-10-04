@@ -2509,6 +2509,10 @@ fn classify_refusal(after: Option<&Seen>, rechecked: bool, observed_head: &str) 
     if !after.head.eq_ignore_ascii_case(observed_head) {
         return Refused::Pending;
     }
+    // The same binding the loop applies: checks of another commit say nothing.
+    if bound_head(&after.head, &after.rollup_head, None).is_none() {
+        return Refused::Pending;
+    }
     let state = after.merge_state.to_ascii_uppercase();
     if matches!(after.pr.checks, Checks::Pending | Checks::Unknown)
         || state.is_empty()
@@ -2987,6 +2991,20 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
         tracing::warn!("gh api pulls/{}/comments: {}", pr.number, inline.1);
     }
 
+    // The rollup is the pull request's last commit's. `gh pr view` lists only
+    // the first 100 commits, so on a long pull request its last entry is not
+    // that commit; ask for the last one directly and use the list only when it
+    // is certainly complete.
+    let rollup_head = match last_commit_oid(repo, pr.number).await {
+        Some(oid) => oid,
+        None if raw.commits.len() < 100 => raw
+            .commits
+            .last()
+            .map(|c| c.oid.clone())
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+
     let failing_urls = raw
         .status_check_rollup
         .iter()
@@ -3006,6 +3024,37 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
             .unwrap_or_default(),
         merge_state: raw.merge_state_status,
     })
+}
+
+/// The oid of the pull request's last commit, whose checks the rollup lists.
+/// `None` when the forge could not be asked or answered unreadably.
+async fn last_commit_oid(repo: &Path, number: u64) -> Option<String> {
+    let out = gh(
+        repo,
+        &[
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-F".to_owned(),
+            "owner={owner}".to_owned(),
+            "-F".to_owned(),
+            "repo={repo}".to_owned(),
+            "-F".to_owned(),
+            format!("number={number}"),
+            "-f".to_owned(),
+            "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,\
+             name:$repo){pullRequest(number:$number){commits(last:1){nodes{commit{oid}}}}}}"
+                .to_owned(),
+        ],
+    )
+    .await
+    .ok()?;
+    if !out.0 {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&out.1).ok()?;
+    v.pointer("/data/repository/pullRequest/commits/nodes/0/commit/oid")
+        .and_then(|o| o.as_str())
+        .map(str::to_owned)
 }
 
 /// What a fix round did.
@@ -5695,6 +5744,13 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(state.status, RunStatus::Blocked);
         let why = state.merge.as_ref().unwrap().detail.clone();
         assert!(why.contains("new") && why.contains("old"), "{why}");
+    }
+
+    #[test]
+    fn a_refusal_read_against_another_commits_checks_is_pending() {
+        let mut after = seen("a", Checks::Green, "BLOCKED", false);
+        after.rollup_head = "old".to_owned();
+        assert_eq!(classify_refusal(Some(&after), true, "a"), Refused::Pending);
     }
 
     #[tokio::test]
