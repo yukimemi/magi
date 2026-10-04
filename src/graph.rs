@@ -1443,9 +1443,12 @@ impl Runner {
         prompts: &Prompts,
         cache: Option<&Path>,
     ) -> Result<Option<String>> {
-        let want = self.state.config.roles.synthesizer.as_deref();
-        let spec = agent::pick(&self.state.config.agents, want, &agent::installed)?;
-        let mut seat = self.seat("advise-synthesis", &spec.id);
+        let chain = agent::pick_chain(
+            &self.state.config.agents,
+            self.state.config.roles.synthesizer.as_ref(),
+            &agent::installed,
+            "synthesizer",
+        )?;
         let proposals = advice.proposals();
         let mut prompt = prompt::with_overlay(
             prompt::synthesize_brief(instruction, &proposals, language),
@@ -1460,25 +1463,51 @@ impl Runner {
             prompt.push_str(&prompt::build_cache_note("advise", false));
         }
         let timeout = Duration::from_secs(self.state.config.graph.timeout_judge.max(1));
-        let out = agent::invoke(
-            &spec,
-            &mut seat,
-            &Invocation {
-                cwd,
-                prompt: &prompt,
-                timeout,
-                allow_write: false,
-                sessions: false,
-                artifacts,
-                stem: "advise-synthesis",
-                run: run_id,
-                node: "advise",
-                cache_dir: None,
-                attachments: &[],
-            },
-        )
-        .await?;
-        self.state.seats.insert(seat.key.clone(), seat);
+        // Each id is tried once, in order; a quota hit, error or unusable
+        // answer moves to the next. The seat is single-turn (`sessions:
+        // false`) and the prompt is the whole context, so a fallback agent
+        // needs nothing carried over.
+        let mut last = None;
+        for (n, spec) in chain.iter().enumerate() {
+            if n > 0 {
+                self.state
+                    .event("advise", format!("synthesis falling back to {}", spec.id));
+            }
+            let mut seat = self.seat("advise-synthesis", &spec.id);
+            let outcome = agent::invoke(
+                spec,
+                &mut seat,
+                &Invocation {
+                    cwd,
+                    prompt: &prompt,
+                    timeout,
+                    allow_write: false,
+                    sessions: false,
+                    artifacts,
+                    stem: &if n == 0 {
+                        "advise-synthesis".to_owned()
+                    } else {
+                        format!("advise-synthesis-{}", spec.id)
+                    },
+                    run: run_id,
+                    node: "advise",
+                    cache_dir: None,
+                    attachments: &[],
+                },
+            )
+            .await;
+            if outcome.is_ok() {
+                self.state.seats.insert(seat.key.clone(), seat);
+            }
+            let advance = agent::chain_advances(&outcome);
+            last = Some(outcome);
+            if !advance {
+                break;
+            }
+        }
+        // Exhausted: the last attempt's result is what a single failed seat
+        // would have produced.
+        let out = last.expect("a chain holds at least one agent")?;
         if !out.usable() {
             return Ok(None);
         }

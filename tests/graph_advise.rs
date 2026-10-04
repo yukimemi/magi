@@ -61,7 +61,7 @@ async fn the_synthesizer_role_pins_the_synthesis_seat_to_a_named_agent() {
     let mut fx = fixture_with_advise(home, 2);
     fx.config.graph.candidates = 1;
     fx.config.roles = Roles {
-        synthesizer: Some("beta".to_owned()),
+        synthesizer: Some("beta".into()),
         ..Roles::default()
     };
 

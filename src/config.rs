@@ -151,6 +151,51 @@ impl AgentSpec {
     }
 }
 
+/// A standalone seat's agent: one roster id, or an ordered fallback chain.
+///
+/// The string form is what every existing config uses and serializes back as
+/// a string; the array form tries each id at most once, in order, moving on
+/// when a call ends in quota or fails (see [`crate::agent::pick_chain`]).
+/// An empty string or array is the same as unset.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum AgentChoice {
+    /// One agent id.
+    One(String),
+    /// Ordered fallback chain of agent ids.
+    Chain(Vec<String>),
+}
+
+impl AgentChoice {
+    /// The ids named, in order, with blanks dropped. Empty means unset.
+    pub fn ids(&self) -> Vec<&str> {
+        let all: Vec<&str> = match self {
+            Self::One(id) => vec![id.as_str()],
+            Self::Chain(ids) => ids.iter().map(String::as_str).collect(),
+        };
+        all.into_iter()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    /// The first id named, if any.
+    pub fn primary(&self) -> Option<&str> {
+        self.ids().into_iter().next()
+    }
+}
+
+impl From<&str> for AgentChoice {
+    fn from(id: &str) -> Self {
+        Self::One(id.to_owned())
+    }
+}
+
+/// The first id of an optional choice: what a single-seat caller resolves.
+pub fn primary(choice: Option<&AgentChoice>) -> Option<&str> {
+    choice.and_then(AgentChoice::primary)
+}
+
 /// Explicit role assignment. Empty lists are filled in by
 /// [`Config::resolve_roles`] by rotating the roster.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -174,7 +219,10 @@ pub struct Roles {
     /// seat for the same account's concurrency. A timeout on an ordinary chat
     /// turn traced to exactly this - `opus` triple-booked as chatter and judge
     /// - is what this field exists to let an operator break apart.
-    pub chatter: Option<String>,
+    ///
+    /// Accepts one id or an ordered array of ids: a fallback chain, see
+    /// [`AgentChoice`].
+    pub chatter: Option<AgentChoice>,
     /// Agent that arranges the queue between polls: `crate::conduct`'s single
     /// seat, called once per cycle to decide a runnable task's `blocked_by`
     /// and how a stalled or finished task recovers.
@@ -185,7 +233,9 @@ pub struct Roles {
     /// (a claude seat, else the first runnable agent) rather than reusing a
     /// judge or reviewer seat that the conductor's own poll-cycle cadence
     /// would otherwise compete with for the same account's concurrency.
-    pub conductor: Option<String>,
+    ///
+    /// Accepts a string or a fallback chain, like [`Self::chatter`].
+    pub conductor: Option<AgentChoice>,
     /// Seats for the design-deliberation stage `graph::Runner::advise` runs
     /// before `implement`: independent, read-only design proposals gathered
     /// once a run has a settled task instruction and before any implementer
@@ -207,7 +257,9 @@ pub struct Roles {
     /// own default order (a claude seat, else the first runnable agent in
     /// roster order) - exactly today's behavior, unchanged by leaving this
     /// field out.
-    pub synthesizer: Option<String>,
+    ///
+    /// Accepts a string or a fallback chain, like [`Self::chatter`].
+    pub synthesizer: Option<AgentChoice>,
 }
 
 /// Graph shape and limits.
@@ -1432,13 +1484,22 @@ impl Config {
             // not preflight a CLI. The other graph seats have always deferred
             // that failure to invocation; doing it only for the conductor
             // made otherwise usable graph commands and `doctor` fail as one.
-            conductor: match self.roles.conductor.as_deref() {
-                Some(id) => self.agent(id)?.clone(),
+            conductor: match self.roles.conductor.as_ref().map(AgentChoice::ids) {
+                Some(ids) if ids.len() == 1 => self.agent(ids[0])?.clone(),
+                // A fallback chain: the first id the roster knows. The rest
+                // are `agent::pick_chain`'s business at invocation.
+                Some(ids) if !ids.is_empty() => ids
+                    .iter()
+                    .find_map(|id| self.agent(id).ok())
+                    .cloned()
+                    .with_context(|| {
+                        format!("[roles] conductor names no agent in the roster: {ids:?}")
+                    })?,
                 // Keep the normal standalone-seat preference when something
                 // is installed, but retain a roster fallback when it is not.
                 // Invocation then reports the unavailable CLI in the same
                 // place it does for every other graph role.
-                None => crate::agent::pick(&self.agents, None, &crate::agent::installed)
+                _ => crate::agent::pick(&self.agents, None, &crate::agent::installed)
                     .unwrap_or_else(|_| self.agents[0].clone()),
             },
             implementer_roster: self.full_roster(&self.roles.implementers)?,
@@ -1542,7 +1603,8 @@ impl Config {
              judges = []\n\
              reviewers = []\n\
              # conductor = \"opus\"  # arranges the queue; unset picks a seat like chatter does\n\
-             # synthesizer = \"opus\"  # blends the advisors into one brief; unset picks a seat like chatter does\n\n\
+             # synthesizer = \"opus\"  # blends the advisors into one brief; unset picks a seat like chatter does\n\
+             # synthesizer = [\"opus\", \"codex\"]  # array form: fallback chain, each tried once on quota or failure\n\n\
              [graph]\n\
              candidates = 3\n\
              judges = 3\n\
@@ -1841,11 +1903,46 @@ mod tests {
         };
         assert_eq!(cfg.resolve_roles().unwrap().conductor.id, "a");
 
-        cfg.roles.conductor = Some("b".to_owned());
+        cfg.roles.conductor = Some("b".into());
         assert_eq!(cfg.resolve_roles().unwrap().conductor.id, "b");
 
-        cfg.roles.conductor = Some("missing".to_owned());
+        cfg.roles.conductor = Some("missing".into());
         assert!(cfg.resolve_roles().is_err());
+    }
+
+    #[test]
+    fn a_standalone_role_takes_a_string_or_an_array_and_round_trips() {
+        let one: Roles = toml::from_str("synthesizer = \"opus\"").unwrap();
+        assert_eq!(one.synthesizer, Some(AgentChoice::One("opus".to_owned())));
+        assert_eq!(primary(one.synthesizer.as_ref()), Some("opus"));
+
+        let chain: Roles = toml::from_str("chatter = [\"opus\", \"codex\"]").unwrap();
+        assert_eq!(chain.chatter.as_ref().unwrap().ids(), ["opus", "codex"]);
+        assert_eq!(primary(chain.chatter.as_ref()), Some("opus"));
+
+        for roles in [one, chain] {
+            let text = toml::to_string(&roles).unwrap();
+            let back: Roles = toml::from_str(&text).unwrap();
+            assert_eq!(back.synthesizer, roles.synthesizer);
+            assert_eq!(back.chatter, roles.chatter);
+        }
+        let text = toml::to_string(&Roles {
+            conductor: Some("x".into()),
+            ..Roles::default()
+        })
+        .unwrap();
+        assert!(
+            text.contains("conductor = \"x\""),
+            "string stays a string: {text}"
+        );
+        assert!(toml::from_str::<Roles>("synthesizer = 3").is_err());
+    }
+
+    #[test]
+    fn an_empty_choice_counts_as_unset() {
+        assert!(AgentChoice::Chain(Vec::new()).ids().is_empty());
+        assert!(AgentChoice::One("  ".to_owned()).ids().is_empty());
+        assert_eq!(primary(Some(&AgentChoice::Chain(vec![]))), None);
     }
 
     #[test]
@@ -1859,7 +1956,7 @@ mod tests {
             agents: vec![spec("a"), spec("b")],
             ..Config::default()
         };
-        let want = cfg.roles.synthesizer.as_deref();
+        let want = primary(cfg.roles.synthesizer.as_ref());
         assert_eq!(
             crate::agent::pick(&cfg.agents, want, &crate::agent::installed)
                 .unwrap()
@@ -1868,8 +1965,8 @@ mod tests {
             "unset falls back to agent::pick's own default order"
         );
 
-        cfg.roles.synthesizer = Some("b".to_owned());
-        let want = cfg.roles.synthesizer.as_deref();
+        cfg.roles.synthesizer = Some("b".into());
+        let want = primary(cfg.roles.synthesizer.as_ref());
         assert_eq!(
             crate::agent::pick(&cfg.agents, want, &crate::agent::installed)
                 .unwrap()
@@ -2257,7 +2354,7 @@ mod tests {
         .unwrap();
 
         let cfg = Config::load_layers(&[machine, repo]).expect("layers merge");
-        assert_eq!(cfg.roles.chatter.as_deref(), Some("opus"));
+        assert_eq!(primary(cfg.roles.chatter.as_ref()), Some("opus"));
         assert_eq!(cfg.roles.implementers, ["oc"]);
         assert_eq!(cfg.agents.len(), 1, "the roster is not doubled");
     }

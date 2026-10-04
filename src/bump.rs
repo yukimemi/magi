@@ -1230,7 +1230,7 @@ async fn after_merge_inner(
     // overridden for this decision too.
     let spec: AgentSpec = agent::pick(
         &state.config.agents,
-        state.config.roles.chatter.as_deref(),
+        crate::config::primary(state.config.roles.chatter.as_ref()),
         &agent::installed,
     )
     .context("choose an agent for the release-bump decision")?;

@@ -506,6 +506,32 @@ docs, and each is asserted in `src/agent.rs` tests:
 may rely on memory. If it says no, the node re-sends full context. Never assume
 a resume worked.
 
+### `[roles]` synthesizer / chatter / conductor take a fallback chain
+
+Each accepts a string (unchanged) or an ordered array of ids
+(`config::AgentChoice`, untagged). `agent::pick_chain` resolves it: unset or
+empty is `agent::pick`'s default order; a duplicate id keeps its first
+appearance; an unknown or uninstalled id is skipped with a `tracing::warn`;
+nothing resolving is an error naming the role. `agent::chain_advances` is the
+one place that decides to move on (error, quota - judged apart from `usable`
+- or an unusable answer).
+
+- **Each id is tried at most once per call.** That is the whole retry bound:
+  a plain `for`, never a loop back. An exhausted chain ends as the last
+  single failed seat would (`Ok(None)` for the synthesizer, the first
+  agent's failure note for chat, the same error for the conductor).
+- **A fallback agent gets a fresh `SeatState`**, never the previous agent's
+  seat renamed, so `agent::has_session` is false and full context is
+  re-sent. The conductor falls back only through the call and the parse of
+  its reply, never through `apply`, which would file queue changes twice.
+- **A chat's fallback persists.** `talk.agent` switches to the agent that
+  answered (with a magi note in the transcript); quota coming back does not
+  move it home, an operator's agent switch does. Only a talk whose agent is
+  in `[roles] chatter`'s chain falls back; an explicit `--agent` is a chain
+  of one. A turn can now cost up to N x the turn timeout.
+- `[roles]` roster roles (implementers, judges, reviewers, advisors) are
+  untouched.
+
 ### opencode has no read-only mode
 
 `--auto` gates **every** permission in opencode, reads included. A judge or
