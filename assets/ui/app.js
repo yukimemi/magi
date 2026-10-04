@@ -2359,60 +2359,45 @@ function updateTaskCard(row, task) {
   r.editBtn.onclick = () => openTaskEdit(task);
   show(r.editBtn, status !== "done");
 
-  renderTaskHoldBox(row, task);
-  renderTaskDoneBox(row, task);
+  const host = cardHost(row, task);
+  renderTaskHoldBox(host, task, r.holdBox);
+  renderTaskDoneBox(host, task, r.doneBox);
+  renderTaskDeleteBox(host, task, r.deleteBox);
+}
 
-  /* Two-step delete: first tap arms, second tap sends the DELETE request.
-     Cancel takes the position of the initial button and receives focus. */
-  clear(r.deleteBox);
-  const armed = row.dataset.armedDelete === "1";
-  if (armed) {
-    const cancel = el("button", {
-      class: "btn btn-quiet",
-      type: "button",
-      text: "Cancel",
-      onclick: () => {
-        row.dataset.armedDelete = "";
-        updateTaskCard(row, task);
-      },
-    });
-    const confirm = el("button", {
-      class: "btn btn-quiet",
-      type: "button",
-      text: "Delete now",
-      onclick: () => deleteTask(task.id, row),
-    });
-    r.deleteBox.append(
-      el("div", { class: "stakes-confirm" },
-        el("p", { class: "stakes-warn", text: "Deletes the task file. Its id, who filed it, and any run history go with it and cannot be recovered." }),
-        el("div", { class: "stakes-row" }, cancel, confirm),
-      ),
-    );
-    requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
-  } else {
-    const del = el("button", {
-      class: "btn btn-quiet",
-      type: "button",
-      text: "Delete…",
-      disabled: status === "running",
-      onclick: () => {
-        row.dataset.armedDelete = "1";
-        updateTaskCard(row, task);
-      },
-    });
-    setAttr(del, "aria-label", `Delete task ${task.title || task.id}`);
-    r.deleteBox.append(del);
-  }
+/* The Queue card and the task detail's actions sheet render the same Hold /
+   Done / Delete controls. A host says where each one keeps its two-step
+   state and where the outcome goes, so the rules exist once:
+     armed(key)    is this two-step control open?
+     set(key, on)  open / close it and redraw
+     focus()       should a freshly drawn control take focus?
+     reason / setReason   the Hold reason typed so far (sheet only)
+     refresh(id)   a change landed
+     error(msg)    a change was refused
+     deleted(id)   the task is gone */
+function cardHost(row, task) {
+  const cap = (key) => key[0].toUpperCase() + key.slice(1);
+  return {
+    armed: (key) => row.dataset[`armed${cap(key)}`] === "1",
+    set: (key, on) => {
+      row.dataset[`armed${cap(key)}`] = on ? "1" : "";
+      const latest = (state.queue || []).find((t) => t.id === task.id) || task;
+      updateTaskCard(row, latest);
+    },
+    focus: () => true,
+    refresh: () => refreshTask(task.id),
+    error: (msg) => fail(msg),
+    deleted: () => loadQueue(),
+  };
 }
 
 /* Hold takes an optional reason, so unlike release it is not a single tap:
    the first tap opens a short text field rather than acting immediately,
    the same two-step shape delete already uses but for input instead of
    confirmation. Release stays one tap - there is nothing to ask it. */
-function renderTaskHoldBox(row, task) {
-  const r = row.refs;
+function renderTaskHoldBox(host, task, box) {
   const status = String(task.status_str || task.status || "");
-  clear(r.holdBox);
+  clear(box);
   if (status === "done") return;
 
   if (status === "held") {
@@ -2420,57 +2405,53 @@ function renderTaskHoldBox(row, task) {
       class: "btn btn-quiet",
       type: "button",
       text: "Release",
-      onclick: () => mutateTask(task.id, "release", release),
+      onclick: () => mutateTask(task.id, "release", release, host),
     });
     setAttr(release, "aria-label", `Release task ${task.title || task.id}`);
-    r.holdBox.append(release);
+    box.append(release);
     return;
   }
 
-  if (row.dataset.armedHold === "1") {
+  if (host.armed("hold")) {
     const reasonInput = el("input", {
       type: "text",
       placeholder: "What is this waiting on? (optional)",
     });
+    if (host.reason) reasonInput.value = host.reason();
+    if (host.setReason) reasonInput.addEventListener("input", () => host.setReason(reasonInput.value));
     const cancel = el("button", {
       class: "btn btn-quiet",
       type: "button",
       text: "Cancel",
-      onclick: () => {
-        row.dataset.armedHold = "";
-        updateTaskCard(row, task);
-      },
+      onclick: () => host.set("hold", false),
     });
     const confirm = el("button", {
       class: "btn btn-quiet",
       type: "button",
       text: "Hold",
-      onclick: () => holdTask(task.id, reasonInput.value, row, confirm),
+      onclick: () => holdTask(task.id, reasonInput.value, host, confirm),
     });
-    r.holdBox.append(
+    box.append(
       el("div", { class: "stakes-confirm" },
         reasonInput,
         el("div", { class: "stakes-row" }, cancel, confirm),
       ),
     );
-    requestAnimationFrame(() => reasonInput.focus({ preventScroll: true }));
+    if (host.focus()) requestAnimationFrame(() => reasonInput.focus({ preventScroll: true }));
   } else {
     const hold = el("button", {
       class: "btn btn-quiet",
       type: "button",
       text: "Hold…",
       disabled: status === "running",
-      onclick: () => {
-        row.dataset.armedHold = "1";
-        updateTaskCard(row, task);
-      },
+      onclick: () => host.set("hold", true),
     });
     setAttr(hold, "aria-label", `Hold task ${task.title || task.id}`);
-    r.holdBox.append(hold);
+    box.append(hold);
   }
 }
 
-async function holdTask(id, reason, row, button) {
+async function holdTask(id, reason, host, button) {
   const label = button.textContent;
   button.disabled = true;
   setText(button, "…");
@@ -2478,12 +2459,12 @@ async function holdTask(id, reason, row, button) {
     await postJson(API.hold(id), reason.trim() ? { reason: reason.trim() } : undefined);
     ok();
     announce(`Task ${shortId(id)} held.`);
-    row.dataset.armedHold = "";
-    await loadQueue();
+    host.set("hold", false);
+    await host.refresh(id);
   } catch (error) {
     setText(button, label);
     button.disabled = false;
-    fail(`Could not hold task ${shortId(id)}: ${error.message}`);
+    host.error(`Could not hold task ${shortId(id)}: ${error.message}`);
   }
 }
 
@@ -2491,51 +2472,44 @@ async function holdTask(id, reason, row, button) {
    an operator could tap for "I am finished with this" without reading
    closely - so the confirm text carries the difference, in the same tone
    Delete's already does: one keeps the record, one removes it. */
-function renderTaskDoneBox(row, task) {
-  const r = row.refs;
+function renderTaskDoneBox(host, task, box) {
   const status = String(task.status_str || task.status || "");
-  clear(r.doneBox);
+  clear(box);
   if (status === "done") return;
 
-  if (row.dataset.armedDone === "1") {
+  if (host.armed("done")) {
     const cancel = el("button", {
       class: "btn btn-quiet",
       type: "button",
       text: "Cancel",
-      onclick: () => {
-        row.dataset.armedDone = "";
-        updateTaskCard(row, task);
-      },
+      onclick: () => host.set("done", false),
     });
     const confirm = el("button", {
       class: "btn btn-quiet",
       type: "button",
       text: "Yes, mark done",
-      onclick: () => doneTask(task.id, row, confirm),
+      onclick: () => doneTask(task.id, host, confirm),
     });
-    r.doneBox.append(
+    box.append(
       el("div", { class: "stakes-confirm" },
         el("p", { class: "hint", text: "Marks the task finished. Its id, who filed it, and its run history are kept — nothing is deleted." }),
         el("div", { class: "stakes-row" }, cancel, confirm),
       ),
     );
-    requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+    if (host.focus()) requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
   } else {
     const done = el("button", {
       class: "btn btn-quiet",
       type: "button",
       text: "Mark done…",
-      onclick: () => {
-        row.dataset.armedDone = "1";
-        updateTaskCard(row, task);
-      },
+      onclick: () => host.set("done", true),
     });
     setAttr(done, "aria-label", `Mark task ${task.title || task.id} done`);
-    r.doneBox.append(done);
+    box.append(done);
   }
 }
 
-async function doneTask(id, row, button) {
+async function doneTask(id, host, button) {
   const label = button.textContent;
   button.disabled = true;
   setText(button, "…");
@@ -2543,55 +2517,97 @@ async function doneTask(id, row, button) {
     await postJson(API.doneTask(id));
     ok();
     announce(`Task ${shortId(id)} marked done.`);
-    row.dataset.armedDone = "";
-    await loadQueue();
+    host.set("done", false);
+    await host.refresh(id);
   } catch (error) {
     setText(button, label);
     button.disabled = false;
-    fail(`Could not mark task ${shortId(id)} done: ${error.message}`);
+    host.error(`Could not mark task ${shortId(id)} done: ${error.message}`);
   }
 }
 
-async function changePriority(id, priority) {
+/* Two-step delete: first tap arms, second tap sends the DELETE request.
+   Cancel takes the position of the initial button and receives focus. */
+function renderTaskDeleteBox(host, task, box) {
+  const status = String(task.status_str || task.status || "");
+  clear(box);
+  if (host.armed("delete")) {
+    const cancel = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Cancel",
+      onclick: () => host.set("delete", false),
+    });
+    const confirm = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Delete now",
+      onclick: () => deleteTask(task.id, host),
+    });
+    box.append(
+      el("div", { class: "stakes-confirm" },
+        el("p", { class: "stakes-warn", text: "Deletes the task file. Its id, who filed it, and any run history go with it and cannot be recovered." }),
+        el("div", { class: "stakes-row" }, cancel, confirm),
+      ),
+    );
+    if (host.focus()) requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+  } else {
+    const del = el("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Delete…",
+      disabled: status === "running",
+      onclick: () => host.set("delete", true),
+    });
+    setAttr(del, "aria-label", `Delete task ${task.title || task.id}`);
+    box.append(del);
+  }
+}
+
+/* A change to one task: the Queue, and the detail page when it is that task. */
+async function refreshTask(id) {
+  const jobs = [loadQueue()];
+  if (state.taskDetail.id === id) jobs.push(loadTask(id));
+  await Promise.all(jobs);
+}
+
+async function changePriority(id, priority, host = null) {
   try {
     await postJson(API.priority(id), { priority });
     ok();
     announce(`Task ${shortId(id)} priority set to ${priority}.`);
-    await loadQueue();
+    await refreshTask(id);
   } catch (error) {
-    fail(`Could not change priority of task ${shortId(id)}: ${error.message}`);
+    const msg = `Could not change priority of task ${shortId(id)}: ${error.message}`;
+    if (host) host.error(msg); else fail(msg);
   }
 }
 
-async function deleteTask(id, row) {
+async function deleteTask(id, host) {
   try {
     await deleteReq(API.deleteTask(id));
     ok();
     announce(`Task ${shortId(id)} removed.`);
-    await loadQueue();
+    await host.deleted(id);
   } catch (error) {
-    if (row) {
-      row.dataset.armedDelete = "";
-      const task = (state.queue || []).find((t) => t.id === id);
-      if (task) updateTaskCard(row, task);
-    }
-    fail(`Could not delete task ${shortId(id)}: ${error.message}`);
+    host.set("delete", false);
+    host.error(`Could not delete task ${shortId(id)}: ${error.message}`);
   }
 }
 
-async function mutateTask(id, action, button) {
+async function mutateTask(id, action, button, host) {
   const label = button.textContent;
   button.disabled = true;
-  setText(button, "\u2026");
+  setText(button, "…");
   try {
     await postJson(action === "hold" ? API.hold(id) : API.release(id));
     ok();
     announce(`Task ${shortId(id)} ${action === "hold" ? "held" : "released"}.`);
-    await loadQueue();
+    await host.refresh(id);
   } catch (error) {
     setText(button, label);
     button.disabled = false;
-    fail(`Could not ${action} task ${shortId(id)}: ${error.message}`);
+    host.error(`Could not ${action} task ${shortId(id)}: ${error.message}`);
   }
 }
 
@@ -7019,6 +7035,9 @@ function applyRoute() {
      around to be tapped from another screen. */
   show($("run-actions-fab"), route.name === "run");
   if (route.name !== "run") closeRunActions();
+  /* Same for the task detail's own fab. */
+  show($("task-actions-fab"), route.name === "task");
+  if (route.name !== "task") closeTaskActions();
 
   const section = route.name === "run" ? "runs"
     : route.name === "task" ? "queue"
@@ -7289,6 +7308,7 @@ function renderTask() {
     clear($("task-flow"));
     setText($("task-flow-summary"), "");
     setText($("task-attempts-count"), "");
+    renderTaskActions(null);
     return;
   }
   const status = String(task.status_str || task.status || "");
@@ -7323,10 +7343,12 @@ function renderTask() {
   show($("task-why-panel"), noteBits.length > 0 || Boolean(task.last_error));
 
   const box = $("task-instruction");
-  if (box.dataset.forTask !== task.id) {
-    box.dataset.forTask = task.id;
+  const stamp = `${task.id}:${task.instruction_md || task.instruction || ""}`;
+  if (box.dataset.forTask !== stamp) {
+    box.dataset.forTask = stamp;
     renderMd(box, task.instruction_md);
   }
+  renderTaskActions(task);
 
   const history = Array.isArray(task.history) ? task.history : [];
   setText($("task-attempts-count"), history.length ? `${history.length} run${history.length === 1 ? "" : "s"}` : "");
@@ -7405,6 +7427,115 @@ function closeRunActions() {
   if (dialog.open) dialog.close();
 }
 
+/* ---- task actions sheet -------------------------------------------------
+ * The task detail's counterpart of the run actions sheet: every operation the
+ * Queue card offers, through the same renderers and handlers, with a host
+ * that keeps its two-step state here and shows a refusal inside the sheet
+ * (the banner from fail() would sit behind the open dialog). */
+const taskSheet = { id: null, armed: {}, reason: "", focus: false };
+
+function taskSheetHost(id) {
+  return {
+    armed: (key) => taskSheet.id === id && Boolean(taskSheet.armed[key]),
+    set: (key, on) => {
+      if (taskSheet.id !== id) return;
+      taskSheet.armed[key] = on;
+      if (key === "hold" && !on) taskSheet.reason = "";
+      taskSheet.focus = on;
+      renderTaskActions(state.taskDetail.task);
+    },
+    focus: () => {
+      const f = taskSheet.focus;
+      taskSheet.focus = false;
+      return f;
+    },
+    reason: () => taskSheet.reason,
+    setReason: (v) => { taskSheet.reason = v; },
+    refresh: (tid) => refreshTask(tid),
+    error: (msg) => {
+      if (taskSheet.id !== id) return;
+      setText($("task-actions-error"), msg);
+      show($("task-actions-error"), true);
+    },
+    deleted: async (tid) => {
+      closeTaskActions();
+      taskSheet.id = null;
+      state.taskDetail = { id: null, task: null, error: null };
+      if (location.hash !== "#/queue") location.hash = "#/queue";
+      await loadQueue();
+    },
+  };
+}
+
+function renderTaskActions(task) {
+  const boxes = ["priority", "edit", "hold", "done", "delete"].map((k) => $(`task-actions-${k}`));
+  if (!task || task.id !== taskSheet.id) {
+    taskSheet.id = task ? task.id : null;
+    taskSheet.armed = {};
+    taskSheet.reason = "";
+    taskSheet.focus = false;
+    show($("task-actions-error"), false);
+    setText($("task-actions-error"), "");
+  }
+  if (!task) {
+    boxes.forEach(clear);
+    closeTaskActions();
+    return;
+  }
+  const [priorityBox, editBox, holdBox, doneBox, deleteBox] = boxes;
+  const host = taskSheetHost(task.id);
+  const status = String(task.status_str || task.status || "");
+  const running = status === "running";
+  const name = task.title || task.id;
+
+  clear(priorityBox);
+  const now = Number(task.priority) || 0;
+  const lower = el("button", {
+    class: "btn btn-quiet", type: "button", text: "Lower priority",
+    disabled: running, onclick: () => changePriority(task.id, now - 1, host),
+  });
+  const raise = el("button", {
+    class: "btn btn-quiet", type: "button", text: "Raise priority",
+    disabled: running, onclick: () => changePriority(task.id, now + 1, host),
+  });
+  setAttr(lower, "aria-label", `Lower priority of ${name}`);
+  setAttr(raise, "aria-label", `Raise priority of ${name}`);
+  priorityBox.append(
+    el("div", { class: "stakes-row" }, lower, raise),
+    el("p", { class: "hint", text: running
+      ? `Priority ${now}. A running task has left the pool the loop picks from, so its priority cannot change.`
+      : `Priority ${now}.` }),
+  );
+
+  clear(editBox);
+  if (status !== "done") {
+    const editable = status === "queued" || status === "held";
+    const edit = el("button", {
+      class: "btn btn-quiet", type: "button", text: "Edit…", disabled: !editable,
+      onclick: () => { closeTaskActions(); openTaskEdit(task); },
+    });
+    editBox.append(edit);
+    if (!editable) editBox.append(el("p", { class: "hint", text: "Only a queued or held task's instruction can be edited." }));
+  }
+
+  renderTaskHoldBox(host, task, holdBox);
+  renderTaskDoneBox(host, task, doneBox);
+  renderTaskDeleteBox(host, task, deleteBox);
+  if (running) {
+    deleteBox.append(el("p", { class: "hint", text: "A running task cannot be held or deleted until its run ends." }));
+  }
+}
+
+function openTaskActions() {
+  const dialog = $("task-actions-sheet");
+  if (!dialog.open) dialog.showModal();
+}
+
+function closeTaskActions() {
+  const dialog = $("task-actions-sheet");
+  if (dialog.open) dialog.close();
+}
+
 /* ---- task edit sheet ----------------------------------------------------
  * Full-text replacement, not append: the operator may want to rewrite the
  * task as much as add to it, so the field opens with the current instruction
@@ -7448,7 +7579,7 @@ async function saveTaskEdit() {
     ok();
     announce(`Task ${shortId(id)} edited.`);
     closeTaskEdit();
-    await loadQueue();
+    await refreshTask(id);
   } catch (error) {
     setText($("task-edit-error"), error.message);
     show($("task-edit-error"), true);
@@ -7542,6 +7673,15 @@ function wire() {
     }
   });
   $("run-actions-fab").addEventListener("click", openRunActions);
+  $("task-actions-fab").addEventListener("click", openTaskActions);
+  $("task-actions-close").addEventListener("click", closeTaskActions);
+  $("task-actions-sheet").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeTaskActions();
+  });
+  $("task-actions-sheet").addEventListener("close", () => {
+    const fab = $("task-actions-fab");
+    if (!fab.hidden) fab.focus({ preventScroll: true });
+  });
   $("run-actions-close").addEventListener("click", closeRunActions);
   /* Clicking the backdrop hits the dialog element itself, since nothing else
      is there to catch it — a click on the sheet's own content lands on a

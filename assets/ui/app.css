@@ -1469,14 +1469,18 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 
 /* Clears the fab so the last panel in run detail is never permanently hidden
    behind it. */
-#view-run { padding-bottom: calc(var(--tap) + var(--s6)); }
+#view-run,
+#view-task { padding-bottom: calc(var(--tap) + var(--s6)); }
 
 /* The fab's sheet has no <form> — its content is built and rerendered
    from JS — so it gets its own head/body padding instead of borrowing a
    form's, a shape this document no longer has. */
-#run-actions-sheet[open] { display: flex; flex-direction: column; }
-#run-actions-sheet .sheet-head { flex: none; padding: var(--s4) var(--s4) 0; }
-#run-actions-sheet .sheet-body {
+#run-actions-sheet[open],
+#task-actions-sheet[open] { display: flex; flex-direction: column; }
+#run-actions-sheet .sheet-head,
+#task-actions-sheet .sheet-head { flex: none; padding: var(--s4) var(--s4) 0; }
+#run-actions-sheet .sheet-body,
+#task-actions-sheet .sheet-body {
   display: flex; flex-direction: column; gap: var(--s4);
   padding: var(--s4);
   padding-bottom: calc(var(--s4) + env(safe-area-inset-bottom));
