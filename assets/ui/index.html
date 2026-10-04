@@ -154,6 +154,15 @@
              (the tree is desktop-only, see .runs-tree in app.css) — this is
              the only per-state control a phone gets, which is why it sits
              above everything else rather than beside it. -->
+        <!-- Full-text search over everything a run recorded (statement,
+             candidates, reviews, verdicts, events, PR info, ids). Several
+             words are ANDed. Static, so refreshes never touch focus. -->
+        <div class="queue-search" id="runs-search" hidden>
+          <label class="sr-only" for="runs-search-input">Search runs</label>
+          <input type="search" id="runs-search-input" placeholder="Search runs… (all words must match)" autocomplete="off" spellcheck="false" enterkeyhint="search">
+          <button class="btn btn-quiet" type="button" id="runs-search-clear" hidden>Clear</button>
+        </div>
+        <p class="queue-search-status" id="runs-search-status" role="status" hidden></p>
         <div class="state-chips" id="runs-state-chips" role="radiogroup" aria-label="Filter runs by state" hidden></div>
         <div class="runs-filter" id="runs-filter" hidden>
           <p id="runs-filter-text"></p>
@@ -314,14 +323,14 @@
          below instead of opening a second list, so one hit and a pile of
          candidates both read the same way. -->
     <div class="queue-search" id="queue-search" hidden>
-      <label class="sr-only" for="queue-search-input">Find a task by id</label>
-      <input type="search" id="queue-search-input" placeholder="Find by task id… (e.g. c71c)" autocomplete="off" spellcheck="false">
+      <label class="sr-only" for="queue-search-input">Search tasks</label>
+      <input type="search" id="queue-search-input" placeholder="Search tasks… (id, instruction, reasons; all words must match)" autocomplete="off" spellcheck="false" enterkeyhint="search">
       <button class="btn btn-quiet" type="button" id="queue-search-clear" hidden>Clear</button>
     </div>
     <p class="queue-focus-status" id="queue-focus-status" role="status" hidden></p>
     <p class="queue-search-status" id="queue-search-status" role="status" hidden></p>
     <ol class="cards" id="queue-search-results" hidden></ol>
-    <p class="empty" id="queue-search-empty" hidden>No task matches this id.</p>
+    <p class="empty" id="queue-search-empty" hidden>No task matches this search.</p>
 
     <div class="panel" id="queue-graph-panel" hidden>
       <h2>Blocked on <span class="count" id="queue-graph-count"></span></h2>

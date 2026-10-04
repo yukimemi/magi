@@ -841,6 +841,7 @@ impl Ui {
             .route("/api/runs/{id}/fold-merged", post(run_fold_merged))
             .route("/api/runs/{id}/resume", post(run_resume))
             .route("/api/queue", get(queue_list))
+            .route("/api/search", get(search_get))
             .route("/api/queue/{id}", get(task_detail).delete(queue_delete))
             .route("/api/stats", get(stats_get))
             .route("/api/repos", get(repos_list))
@@ -3197,6 +3198,282 @@ async fn queue_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TaskView>>>
                 .map(|t| TaskView::with_inventory(t, &inv))
                 .collect(),
         ))
+    })
+    .await
+}
+
+/// Most hits one search returns. The rest are counted in `total`.
+const SEARCH_MAX_HITS: usize = 100;
+/// Longest query, in characters, and most terms it is split into.
+const SEARCH_MAX_QUERY: usize = 200;
+const SEARCH_MAX_TERMS: usize = 8;
+/// Characters of context kept before the first hit, and after it.
+const SNIPPET_BEFORE: usize = 50;
+const SNIPPET_AFTER: usize = 110;
+
+/// `?scope=runs|tasks&q=...`
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    q: String,
+}
+
+/// One piece of a snippet. `hit` pieces are what matched; the client renders
+/// them as `<mark>` through DOM text nodes, so no markup is ever built here.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct SnippetPart {
+    text: String,
+    hit: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchHit {
+    id: String,
+    /// The name of the field the snippet was cut from.
+    field: String,
+    snippet: Vec<SnippetPart>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchView {
+    scope: String,
+    q: String,
+    /// At most [`SEARCH_MAX_HITS`], newest runs / queue order first.
+    hits: Vec<SearchHit>,
+    /// Every match, hits beyond the cap included.
+    total: usize,
+    truncated: bool,
+    /// Runs whose `run.json` could not be parsed at all. They were not
+    /// searched; the same meaning as `runs_unreadable` in `/api/health`.
+    unreadable: usize,
+}
+
+/// The text leaves of a JSON document, with the name of the field each sits
+/// under. Keys and numbers are skipped: they are structure, not prose.
+fn text_leaves<'a>(
+    value: &'a serde_json::Value,
+    field: &'a str,
+    out: &mut Vec<(&'a str, &'a str)>,
+) {
+    match value {
+        serde_json::Value::String(s) => out.push((field, s)),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| text_leaves(v, field, out)),
+        serde_json::Value::Object(map) => map.iter().for_each(|(k, v)| text_leaves(v, k, out)),
+        _ => {}
+    }
+}
+
+/// Lower-case one character without changing how many there are, so indices
+/// in the lowered text are indices in the original.
+fn fold_char(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// Split a query into its lower-cased terms.
+fn search_terms(q: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for t in q.split_whitespace() {
+        let t = t.to_lowercase();
+        if !terms.contains(&t) {
+            terms.push(t);
+        }
+    }
+    terms
+}
+
+/// Match `terms` (all of them, anywhere in the document) against the leaves
+/// and cut a snippet around the first hit. `None` when a term is missing.
+fn search_document(terms: &[String], leaves: &[(&str, &str)]) -> Option<SearchHit> {
+    let lowered: Vec<String> = leaves.iter().map(|(_, s)| s.to_lowercase()).collect();
+    let mut first: Option<usize> = None;
+    for term in terms {
+        let at = lowered.iter().position(|l| l.contains(term.as_str()))?;
+        first = Some(first.map_or(at, |f| f.min(at)));
+    }
+    // The leaf holding the earliest hit of any term is where the snippet is cut.
+    let (field, text) = leaves[first?];
+    Some(SearchHit {
+        id: String::new(),
+        field: field.to_owned(),
+        snippet: snippet_of(text, terms),
+    })
+}
+
+/// A window of `text` around the first occurrence of any term, whitespace
+/// collapsed, with every term occurrence inside the window marked.
+fn snippet_of(text: &str, terms: &[String]) -> Vec<SnippetPart> {
+    let chars: Vec<char> = text.chars().collect();
+    let folded: Vec<char> = chars.iter().map(|c| fold_char(*c)).collect();
+    let needles: Vec<Vec<char>> = terms
+        .iter()
+        .map(|t| t.chars().map(fold_char).collect())
+        .collect();
+    let find = |from: usize, to: usize| -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize)> = None;
+        for n in needles.iter().filter(|n| !n.is_empty()) {
+            let last = to.saturating_sub(n.len());
+            if let Some(i) = (from..=last).find(|&i| folded[i..i + n.len()] == n[..])
+                && best.is_none_or(|(b, _)| i < b)
+            {
+                best = Some((i, i + n.len()));
+            }
+        }
+        best
+    };
+    let Some((start, _)) = find(0, chars.len()) else {
+        // Matched only through a case mapping that changes length: show the head.
+        let head: String = chars.iter().take(SNIPPET_AFTER).collect();
+        return vec![SnippetPart {
+            text: head.split_whitespace().collect::<Vec<_>>().join(" "),
+            hit: false,
+        }];
+    };
+    let lo = start.saturating_sub(SNIPPET_BEFORE);
+    let hi = (start + SNIPPET_AFTER).min(chars.len());
+    let mut parts: Vec<SnippetPart> = Vec::new();
+    let mut push = |s: &[char], hit: bool| {
+        if s.is_empty() {
+            return;
+        }
+        let text: String = s.iter().collect();
+        match parts.last_mut() {
+            Some(p) if p.hit == hit => p.text.push_str(&text),
+            _ => parts.push(SnippetPart { text, hit }),
+        }
+    };
+    if lo > 0 {
+        push(&['\u{2026}'], false);
+    }
+    let mut at = lo;
+    while at < hi {
+        match find(at, hi) {
+            Some((s, e)) => {
+                push(&chars[at..s], false);
+                push(&chars[s..e], true);
+                at = e;
+            }
+            None => {
+                push(&chars[at..hi], false);
+                at = hi;
+            }
+        }
+    }
+    if hi < chars.len() {
+        push(&['\u{2026}'], false);
+    }
+    // Collapse whitespace (newlines in an instruction) without disturbing the
+    // hit boundaries.
+    let mut prev_space = false;
+    for p in &mut parts {
+        let mut out = String::with_capacity(p.text.len());
+        for c in p.text.chars() {
+            if c.is_whitespace() {
+                if !prev_space {
+                    out.push(' ');
+                }
+                prev_space = true;
+            } else {
+                out.push(c);
+                prev_space = false;
+            }
+        }
+        p.text = out;
+    }
+    parts.retain(|p| !p.text.is_empty());
+    parts
+}
+
+/// The search over `docs` (id, document), newest first, capped.
+fn search_docs<I>(terms: &[String], docs: I, view: &mut SearchView)
+where
+    I: IntoIterator<Item = (String, serde_json::Value)>,
+{
+    for (id, doc) in docs {
+        let mut leaves = Vec::new();
+        // The id is text an operator types too, and it is a map key on disk,
+        // not a leaf.
+        leaves.push(("id", id.as_str()));
+        text_leaves(&doc, "", &mut leaves);
+        if let Some(mut hit) = search_document(terms, &leaves) {
+            view.total += 1;
+            if view.hits.len() < SEARCH_MAX_HITS {
+                hit.id = id;
+                view.hits.push(hit);
+            }
+        }
+    }
+    view.truncated = view.total > view.hits.len();
+}
+
+/// Read-only full-text search over every run's `run.json` or every task.
+///
+/// Documents are read as plain JSON rather than `RunState` / `Task`, so a
+/// record from an older schema still searches; only a file that is not JSON
+/// at all is counted in `unreadable`. `artifacts/*.out` are not searched.
+async fn search_get(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<SearchQuery>,
+) -> ApiResult<Json<SearchView>> {
+    let query = q.q.trim().to_owned();
+    if query.is_empty() {
+        return Err(ApiError::bad_request("q must not be empty"));
+    }
+    if query.chars().count() > SEARCH_MAX_QUERY {
+        return Err(ApiError::bad_request(format!(
+            "q is longer than {SEARCH_MAX_QUERY} characters"
+        )));
+    }
+    let terms = search_terms(&query);
+    if terms.len() > SEARCH_MAX_TERMS {
+        return Err(ApiError::bad_request(format!(
+            "q has more than {SEARCH_MAX_TERMS} terms"
+        )));
+    }
+    let scope = q.scope;
+    if scope != "runs" && scope != "tasks" {
+        return Err(ApiError::bad_request("scope must be runs or tasks"));
+    }
+    blocking(move || {
+        let mut view = SearchView {
+            scope: scope.clone(),
+            q: query,
+            hits: Vec::new(),
+            total: 0,
+            truncated: false,
+            unreadable: 0,
+        };
+        if scope == "runs" {
+            let mut unreadable = 0;
+            let docs: Vec<(String, serde_json::Value)> = run_ids(&ui.runs)
+                .into_iter()
+                .filter_map(|id| {
+                    let body = std::fs::read_to_string(ui.runs.join(&id).join("run.json")).ok();
+                    match body.and_then(|b| serde_json::from_str(&b).ok()) {
+                        Some(v) => Some((id, v)),
+                        None => {
+                            unreadable += 1;
+                            None
+                        }
+                    }
+                })
+                .collect();
+            view.unreadable = unreadable;
+            search_docs(&terms, docs, &mut view);
+        } else {
+            let docs = ui.queue.list().into_iter().filter_map(|t| {
+                let mut v = serde_json::to_value(&t).ok()?;
+                // `source` serialises as a tagged object; the label is what
+                // the operator reads ("human", "chat@a1b2").
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("filed_by".to_owned(), t.source.label().into());
+                }
+                Some((t.id, v))
+            });
+            search_docs(&terms, docs, &mut view);
+        }
+        Ok(Json(view))
     })
     .await
 }
@@ -9509,6 +9786,133 @@ mod tests {
     /// separately-maintained count, so an unreadable run must be counted the
     /// same way `/api/health` counts it - never silently dropped the way the
     /// CLI's own `stats::load_all` drops it.
+    #[tokio::test]
+    async fn search_finds_nested_run_text_ands_terms_and_counts_unreadable() {
+        let f = Fixture::start().await;
+        let runs = f.runs();
+        write_run(&runs, "20260902-140501-aaaa", RunStatus::Merged);
+        write_run(&runs, "20260902-140502-bbbb", RunStatus::Merged);
+        // Text three levels down, in a shape no current RunState has: an older
+        // schema must still search.
+        let path = runs.join("20260902-140502-bbbb").join("run.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["legacy"] = serde_json::json!({ "rounds": [{ "finding": { "text": "The Quokka leaks\nacross threads" } }] });
+        std::fs::write(&path, v.to_string()).unwrap();
+        std::fs::create_dir_all(runs.join("20260902-140503-cccc")).unwrap();
+        std::fs::write(
+            runs.join("20260902-140503-cccc").join("run.json"),
+            "{ not json",
+        )
+        .unwrap();
+
+        let res = f.get("/api/search?scope=runs&q=quokka").await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let v = res.json();
+        assert_eq!(v["total"], 1, "{v}");
+        assert_eq!(v["hits"][0]["id"], "20260902-140502-bbbb");
+        assert_eq!(v["hits"][0]["field"], "text");
+        assert_eq!(v["unreadable"], 1, "an unparsable run is counted: {v}");
+        let parts = v["hits"][0]["snippet"].as_array().unwrap();
+        assert!(
+            parts
+                .iter()
+                .any(|p| p["hit"] == true && p["text"] == "Quokka"),
+            "{v}"
+        );
+        let flat: String = parts.iter().map(|p| p["text"].as_str().unwrap()).collect();
+        assert_eq!(
+            flat, "The Quokka leaks across threads",
+            "whitespace is collapsed"
+        );
+
+        // Terms are ANDed, across different fields, case-insensitively.
+        let both = f
+            .get("/api/search?scope=runs&q=MOBILE%20quokka")
+            .await
+            .json();
+        assert_eq!(both["total"], 1, "{both}");
+        let neither = f
+            .get("/api/search?scope=runs&q=quokka%20zebra")
+            .await
+            .json();
+        assert_eq!(neither["total"], 0, "{neither}");
+        // Everything in the task statement is reachable, not only the row text.
+        let stmt = f
+            .get("/api/search?scope=runs&q=mobile%20first")
+            .await
+            .json();
+        assert_eq!(stmt["total"], 2, "{stmt}");
+        let by_id = f.get("/api/search?scope=runs&q=140501-aaaa").await.json();
+        assert_eq!(by_id["hits"][0]["id"], "20260902-140501-aaaa", "{by_id}");
+    }
+
+    #[tokio::test]
+    async fn search_caps_hits_and_snippet_length() {
+        let f = Fixture::start().await;
+        let runs = f.runs();
+        for n in 0..(SEARCH_MAX_HITS + 5) {
+            write_run(&runs, &format!("20260902-140501-{n:04}"), RunStatus::Merged);
+        }
+        let v = f.get("/api/search?scope=runs&q=web").await.json();
+        assert_eq!(v["hits"].as_array().unwrap().len(), SEARCH_MAX_HITS);
+        assert_eq!(v["total"], SEARCH_MAX_HITS + 5);
+        assert_eq!(v["truncated"], true);
+
+        let long = format!("{}needle{}", "x".repeat(5000), "y".repeat(5000));
+        let parts = snippet_of(&long, &["needle".to_owned()]);
+        let len: usize = parts.iter().map(|p| p.text.chars().count()).sum();
+        assert!(len <= SNIPPET_BEFORE + SNIPPET_AFTER + 2, "{len}");
+        assert!(parts.iter().any(|p| p.hit && p.text == "needle"));
+    }
+
+    #[tokio::test]
+    async fn search_tasks_reads_every_field_and_rejects_bad_requests() {
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let mut t = Task::new(
+            "short title".to_owned(),
+            "line one\nthe hidden Armadillo detail".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Agent {
+                run: "r1".to_owned(),
+                node: "chat".to_owned(),
+            },
+        );
+        t.last_error = Some("disk full on /tmp".to_owned());
+        queue.put(&mut t).expect("file the task");
+
+        for (q, want) in [
+            ("armadillo", 1),
+            ("disk%20FULL", 1),
+            ("chat", 1),
+            ("queued", 1),
+            ("short%20nothing", 0),
+        ] {
+            let v = f
+                .get(&format!("/api/search?scope=tasks&q={q}"))
+                .await
+                .json();
+            assert_eq!(v["total"], want, "{q}: {v}");
+        }
+        for bad in [
+            "/api/search?scope=tasks&q=",
+            "/api/search?scope=tasks&q=%20",
+            "/api/search?scope=nope&q=a",
+            "/api/search?q=a",
+        ] {
+            assert_eq!(f.get(bad).await.status, 400, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_search_ui_never_renders_hits_with_inner_html() {
+        assert!(APP_JS.contains("/api/search"));
+        assert!(APP_JS.contains("el(\"mark\""));
+        assert!(INDEX_HTML.contains("id=\"runs-search-input\""));
+        assert!(INDEX_HTML.contains("id=\"queue-search-input\""));
+    }
+
     #[tokio::test]
     async fn stats_runs_unreadable_matches_health() {
         let f = Fixture::start().await;

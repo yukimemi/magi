@@ -613,7 +613,14 @@ main {
  * queue-search-input in index.html. Laid out like .runs-filter's row rather
  * than a bare <input> so it reads as a control, not a stray text field. */
 .queue-search { display: flex; align-items: center; gap: var(--s3); margin-bottom: var(--s3); }
-.queue-search input[type="search"] { flex: 1; margin-top: 0; }
+.queue-search input[type="search"] { flex: 1; margin-top: 0; width: 100%; font-size: 16px; }
+.queue-search-status.search-error { color: var(--rust, #b3402a); font-weight: 600; }
+/* A search hit's context line: the field it came from, then the text with the
+   matched words marked. Built from text nodes, never markup. */
+.card-snippet { margin: var(--s2) 0 0; font-size: var(--t3); color: var(--ink-2); overflow-wrap: anywhere; }
+.card-snippet[hidden] { display: none; }
+.card-snippet .snippet-field { margin-right: var(--s2); font-size: var(--t1); color: var(--ink-3); text-transform: uppercase; letter-spacing: .04em; }
+.card-snippet mark { background: rgba(240, 190, 40, .45); color: inherit; border-radius: 2px; padding: 0 1px; }
 .queue-focus-status { margin: 0 0 var(--s3); font-size: var(--t3); color: var(--ink-2); }
 .card-permalink { font-size: var(--t1); color: var(--ink-3); text-decoration: none; }
 .card-permalink:hover, .card-permalink:focus-visible { color: var(--ink-2); text-decoration: underline; }
