@@ -47,7 +47,7 @@ use crate::rng::SplitMix64;
 
 /// Conversation state for one seat, persisted with the run so `magi run
 /// --resume` continues the same CLI conversations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatState {
     /// Stable seat name, e.g. `impl-A`, `judge-2`, `review-1`, `fix`.
     pub key: String,
@@ -129,6 +129,11 @@ pub struct Invocation<'a> {
     /// them; the prompt text naming each path and its mime is built by the
     /// caller, not here.
     pub attachments: &'a [PathBuf],
+    /// Directories outside `cwd` the seat may write, when it may write at all.
+    /// Only codex's `workspace-write` sandbox is confined to the workspace, so
+    /// only it needs this: a deputy's `magi ask` writes the question store,
+    /// which lives under magi's data directory, not in the repository.
+    pub writable: &'a [PathBuf],
 }
 
 /// Evidence that a CLI ran out of its rate limit / quota, distinct from an
@@ -680,6 +685,18 @@ fn build_command(
             // asks blocks until its timeout kills it.
             argv.push("-c".to_owned());
             argv.push("approval_policy=\"never\"".to_owned());
+            if inv.allow_write && !inv.writable.is_empty() {
+                let roots: Vec<String> = inv
+                    .writable
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                argv.push("-c".to_owned());
+                argv.push(format!(
+                    "sandbox_workspace_write.writable_roots={}",
+                    serde_json::to_string(&roots).unwrap_or_else(|_| "[]".to_owned())
+                ));
+            }
             if let Some(m) = &spec.model {
                 argv.push("-m".to_owned());
                 argv.push(m.clone());
@@ -1473,6 +1490,7 @@ mod tests {
             node: "test",
             cache_dir: None,
             attachments: &[],
+            writable: &[],
         }
     }
 
@@ -1568,6 +1586,26 @@ mod tests {
 
     /// The three things about `codex exec` that were established by hand and
     /// that a rewrite would silently get wrong.
+    #[test]
+    fn codex_gets_extra_writable_roots_only_when_it_may_write() {
+        let seat = SeatState::new("deputy-x", "a", 7);
+        let roots = [PathBuf::from("/data/questions")];
+        let mk = |allow_write: bool| {
+            let mut i = inv(Path::new("."), Path::new("/art"), allow_write);
+            i.writable = &roots;
+            build_command(
+                &spec(AgentKind::Codex, None),
+                &seat,
+                &i,
+                Path::new("/art/p.md"),
+            )
+            .unwrap()
+        };
+        let want = "sandbox_workspace_write.writable_roots=[\"/data/questions\"]";
+        assert!(mk(true).argv.windows(2).any(|w| w == ["-c", want]));
+        assert!(!mk(false).argv.iter().any(|a| a.contains("writable_roots")));
+    }
+
     #[test]
     fn codex_is_sandboxed_reads_stdin_and_puts_resume_last() {
         let mut seat = SeatState::new("judge-1", "a", 7);
@@ -1881,6 +1919,7 @@ mod tests {
                 node: "test",
                 cache_dir: None,
                 attachments: &[],
+                writable: &[],
             },
             Path::new("/art/p.md"),
         )
@@ -1906,6 +1945,7 @@ mod tests {
             &seat,
             &Invocation {
                 attachments: &[],
+                writable: &[],
                 ..inv(Path::new("."), Path::new("/art"), true)
             },
             Path::new("/art/p.md"),
@@ -1921,6 +1961,7 @@ mod tests {
             &seat,
             &Invocation {
                 attachments: &atts,
+                writable: &[],
                 ..inv(Path::new("."), Path::new("/art"), true)
             },
             Path::new("/art/p.md"),
@@ -1950,6 +1991,7 @@ mod tests {
             &seat,
             &Invocation {
                 attachments: &atts,
+                writable: &[],
                 ..inv(Path::new("."), Path::new("/art"), true)
             },
             Path::new("/art/p.md"),
@@ -2318,6 +2360,7 @@ mod tests {
                 node: "test",
                 cache_dir: None,
                 attachments: &[],
+                writable: &[],
             },
         )
         .await
@@ -2353,6 +2396,7 @@ mod tests {
                 node: "test",
                 cache_dir: Some(&cache),
                 attachments: &[],
+                writable: &[],
             },
         )
         .await
@@ -2399,6 +2443,7 @@ mod tests {
                 node: "test",
                 cache_dir: None,
                 attachments: &[],
+                writable: &[],
             },
         )
         .await;
@@ -2444,6 +2489,7 @@ mod tests {
                 node: "test",
                 cache_dir: None,
                 attachments: &[],
+                writable: &[],
             },
         )
         .await
@@ -2472,6 +2518,7 @@ mod tests {
                 node: "test",
                 cache_dir: None,
                 attachments: &[],
+                writable: &[],
             },
         )
         .await
@@ -2510,6 +2557,7 @@ mod tests {
                 node: "test",
                 cache_dir: None,
                 attachments: &[],
+                writable: &[],
             },
         )
         .await

@@ -1375,6 +1375,128 @@ pub fn question_resumed(
     s
 }
 
+/// Heading of the deputy prompt, which the end-to-end mock agent greps for.
+pub const DEPUTY_HEADING: &str = "You are the conductor's deputy";
+
+/// What a conductor question's deputy is told.
+///
+/// The deputy is a seat of its own that waits on one question for the
+/// conductor, which must never wait itself. `brief` is the conductor's own
+/// context for the question (task, reasoning, what each option leads to);
+/// `thread` is the conversation so far, `(who, body)` oldest first, and
+/// `unread` is what the owner said that no agent has read yet.
+pub struct DeputyPrompt<'a> {
+    /// Question id.
+    pub id: &'a str,
+    /// The question's one line.
+    pub summary: &'a str,
+    /// The question's longer explanation.
+    pub detail: &'a str,
+    /// The conductor's context for it.
+    pub brief: &'a str,
+    /// The choices currently on offer.
+    pub choices: &'a [String],
+    /// The conversation the deputy has already read.
+    pub thread: &'a [(&'a str, &'a str)],
+    /// What the owner said that nobody has read yet.
+    pub unread: Option<&'a str>,
+    /// Is this the deputy's own session coming back?
+    pub resumed: bool,
+    /// The short first turn that only lets the seat be saved: no waiting yet.
+    pub handover: bool,
+    /// Language the owner reads.
+    pub language: &'a str,
+}
+
+/// See [`DeputyPrompt`].
+pub fn deputy(p: &DeputyPrompt<'_>) -> String {
+    let DeputyPrompt {
+        id,
+        summary,
+        detail,
+        brief,
+        choices,
+        thread,
+        unread,
+        resumed,
+        handover,
+        language,
+    } = *p;
+    let mut s = format!(
+        "# {DEPUTY_HEADING}\n\n\
+         The conductor asked the owner a question and may not wait for the \
+         answer itself, so you are the one that does. You hold this one \
+         question ({id}) and nothing else: you do not edit files, merge, or \
+         touch the queue.\n\n"
+    );
+    if resumed {
+        s.push_str(
+            "You are resuming your own earlier conversation; what follows is \
+             the same context again, brought up to date.\n\n",
+        );
+    }
+    s.push_str(&format!("## The question ({id})\n\n{summary}\n"));
+    if !detail.trim().is_empty() {
+        s.push_str(&format!("\n{}\n", detail.trim()));
+    }
+    if !choices.is_empty() {
+        s.push_str("\n## The choices on offer\n\n");
+        for c in choices {
+            s.push_str(&format!("- {c}\n"));
+        }
+    }
+    s.push_str(&format!(
+        "\n## What the conductor knew\n\n{}\n",
+        brief.trim()
+    ));
+    if !thread.is_empty() {
+        s.push_str("\n## The conversation so far\n\n");
+        for (who, body) in thread {
+            let who = if *who == "operator" { "Owner" } else { "You" };
+            s.push_str(&format!(
+                "- **{who}**: {}\n",
+                body.trim().replace('\n', "\n  ")
+            ));
+        }
+    }
+    if let Some(said) = unread {
+        s.push_str(&format!(
+            "\n## The owner has said, and nobody has answered yet\n\n{}\n",
+            said.trim()
+        ));
+    }
+    if handover {
+        s.push_str(
+            "\n## Now\n\nDo not run any command now. This turn only hands you \
+             the context above. Reply with the single word `ready`; your next \
+             turn tells you to start waiting.\n",
+        );
+        s.push_str(&lang(language));
+        return s;
+    }
+    s.push_str(&format!(
+        "\n## What to do\n\n\
+         1. Wait for the owner with `magi ask --wait {id}`, in the foreground. \
+         It stops by itself after a while with \"no answer yet\"; call it again, \
+         exactly the same, until something comes back. Never put it in the \
+         background.\n\
+         2. If the owner replied without deciding, answer them on the same \
+         question: `magi ask --thread {id} --summary \"...\"`, and repeat every \
+         `--choice` listed above - a reply replaces the choices, so leaving them \
+         out would take the options away. Use what the conductor knew; if you do \
+         not know, say so.\n\
+         3. If the owner's own words clearly pick one of the choices (they said \
+         \"setup done\" and that is one of the options), record it with \
+         `magi ask --settle {id} --choice \"<the choice, exactly>\" --quote \
+         \"<their words, exactly>\"`. If it is at all ambiguous, ask them with \
+         `--thread` instead; a wrong settle sends the task down the wrong path.\n\
+         4. When `magi ask` prints an answer, or says the question is settled or \
+         abandoned, you are done: stop. Magi applies the outcome itself.\n"
+    ));
+    s.push_str(&lang(language));
+    s
+}
+
 /// Follow-up when a reply could not be parsed.
 pub fn nudge(err: &str) -> String {
     format!(

@@ -1493,6 +1493,7 @@ impl Runner {
                     node: "advise",
                     cache_dir: None,
                     attachments: &[],
+                    writable: &[],
                 },
             )
             .await;
@@ -6220,6 +6221,7 @@ async fn wave(
                     node: &node,
                     cache_dir: cache.as_deref(),
                     attachments: &attachments,
+                    writable: &[],
                 },
             )
             .await;

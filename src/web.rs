@@ -4307,16 +4307,23 @@ impl QuestionView {
 }
 
 /// Who is honestly waiting on an open question right now: `"asker"` (the
-/// agent's own `magi ask`), `"daemon"` (`magi serve` resuming its session), or
-/// `"nobody"` - the asker is gone and the daemon has not picked it up.
+/// agent's own `magi ask`), `"deputy"` (the follow-up seat `magi serve` runs
+/// for a conductor question), `"daemon"` (`magi serve` resuming the asking
+/// seat's session), or `"nobody"` - the asker is gone and nothing has picked it
+/// up, or the question never had anyone listening (a conductor question from
+/// before deputies).
 ///
-/// `None` for a question that is settled, and for one no `magi ask` filed
-/// (`cwd` unset), which has no agent to wait on it in the first place.
+/// `None` for a question that is settled, and for one that is not an agent's
+/// to wait on at all (land's approval gate, a release notice).
 fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
-    if !q.status.open() || q.cwd.is_none() {
+    if !q.status.open() {
         return None;
     }
+    if q.cwd.is_none() && q.deputy.is_none() {
+        return (q.node == crate::conduct::NODE).then_some("nobody");
+    }
     Some(match lease.filter(|l| l.fresh(jiff::Timestamp::now())) {
+        Some(_) if q.deputy.is_some() => "deputy",
         Some(l) if l.kind == ask::WaiterKind::Daemon => "daemon",
         Some(_) => "asker",
         None => "nobody",
@@ -5680,6 +5687,24 @@ mod tests {
         assert_eq!(holder_of(&q, Some(&daemon)), Some("daemon"));
         let stale = beat(ask::WaiterKind::Asker, 3600);
         assert_eq!(holder_of(&q, Some(&stale)), Some("nobody"));
+
+        // A conductor question says "deputy" only while one is attached and
+        // alive, and "nobody" - never silence - when nothing ever listened.
+        let mut c = Question::new(
+            "task".to_owned(),
+            crate::conduct::NODE.to_owned(),
+            "conduct".to_owned(),
+            "which?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        assert_eq!(holder_of(&c, None), Some("nobody"));
+        c.cwd = Some("/tmp".to_owned());
+        c.deputy = Some(ask::Deputy::new("brief".to_owned()));
+        assert_eq!(holder_of(&c, Some(&fresh)), Some("deputy"));
+        let deputy = beat(ask::WaiterKind::Deputy, 1);
+        assert_eq!(holder_of(&c, Some(&deputy)), Some("deputy"));
+        assert_eq!(holder_of(&c, Some(&stale)), Some("nobody"));
     }
     use pretty_assertions::assert_eq;
     use serde_json::Value;

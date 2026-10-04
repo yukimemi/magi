@@ -201,6 +201,18 @@ impl Waiter {
                 Action::Idle => {}
                 Action::Expire => self.expire(&q),
                 Action::Deliver(word) => {
+                    // A question with a deputy is the deputy's to read
+                    // (`crate::deputy`); resuming the conductor's own seat
+                    // here would fork a conversation that is not its own.
+                    if q.deputy.is_some() {
+                        // Unless that deputy is spent: then nobody will read
+                        // the word, and the deadline still has to retire the
+                        // question.
+                        if crate::deputy::exhausted_past_deadline(&q, self.default_timeout, now) {
+                            self.expire(&q);
+                        }
+                        continue;
+                    }
                     if self.seat_busy(&q, now) {
                         continue;
                     }
@@ -232,7 +244,10 @@ impl Waiter {
             // delivered, not abandoned.
             let now = Timestamp::now();
             let lease = self.store.read_lease(&r.id);
-            if decide(r, lease.as_ref(), false, self.default_timeout, now) != Action::Expire {
+            if decide(r, lease.as_ref(), false, self.default_timeout, now) != Action::Expire
+                && !(lease.as_ref().is_none_or(|l| !l.fresh(now))
+                    && crate::deputy::exhausted_past_deadline(r, self.default_timeout, now))
+            {
                 return Ok(false);
             }
             r.abandon(&why);
@@ -343,7 +358,7 @@ impl Waiter {
         };
 
         let claim = self.store.root().join(format!("{}.claim", q.id));
-        if !take_claim(&claim) {
+        if !take_claim(&claim, DELIVERY_TIMEOUT + Duration::from_secs(60)) {
             return Ok(());
         }
         let _release = Release(claim);
@@ -421,6 +436,7 @@ impl Waiter {
             node: &q.node,
             cache_dir,
             attachments: &[],
+            writable: &[],
         };
 
         let store = self.store.clone();
@@ -498,7 +514,7 @@ impl Waiter {
 /// Take the delivery claim, so two waiters (`magi serve` twice, or a stray
 /// second daemon) cannot resume the same seat at once. A claim older than a
 /// whole delivery plus slack was left by a process that died.
-fn take_claim(path: &std::path::Path) -> bool {
+pub(crate) fn take_claim(path: &std::path::Path, stale_after: Duration) -> bool {
     let attempt = || {
         std::fs::OpenOptions::new()
             .write(true)
@@ -513,7 +529,7 @@ fn take_claim(path: &std::path::Path) -> bool {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age > DELIVERY_TIMEOUT + Duration::from_secs(60));
+        .is_some_and(|age| age > stale_after);
     if stale {
         let _ = std::fs::remove_file(path);
         return attempt();
@@ -522,7 +538,7 @@ fn take_claim(path: &std::path::Path) -> bool {
 }
 
 /// Removes the delivery claim when the delivery ends, however it ends.
-struct Release(PathBuf);
+pub(crate) struct Release(pub(crate) PathBuf);
 
 impl Drop for Release {
     fn drop(&mut self) {

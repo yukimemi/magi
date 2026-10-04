@@ -1253,6 +1253,7 @@ async fn after_merge_inner(
             node: "bump",
             cache_dir: state.config.cache_dir().as_deref(),
             attachments: &[],
+            writable: &[],
         },
     )
     .await

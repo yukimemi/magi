@@ -180,6 +180,7 @@ pub async fn rebase_with_fixer(
                 node: "rebase",
                 cache_dir: state.config.cache_dir().as_deref(),
                 attachments: &[],
+                writable: &[],
             },
         )
         .await;

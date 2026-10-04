@@ -1015,6 +1015,42 @@ first agent already knows.
   `--thread` is unrelated and keeps re-arming a fresh `answer_timeout` on
   every reply, exactly as before.
 
+### A conductor's question has a deputy, and the conductor still never waits
+
+`src/deputy.rs` runs one short-lived seat per open conductor question
+(`node == conduct::NODE`), as its own task inside `magi serve` beside the
+waiter. It exists because a free-text reply to a conductor question used to
+reach nobody: the conductor is non-blocking, and `Conductor::worth_a_look` does
+not move on a say.
+
+- **The seat is `deputy-<question id>`, never the conductor's.** `conduct/seat.json`
+  is rewritten by every cycle for the whole queue, and sessions are keyed by seat
+  name, never by agent id. `waiter` leaves any question with a `deputy` alone
+  (`q.deputy.is_some()`): resuming the conductor's seat there would fork it.
+- **`Question::deputy` is persisted and written only through `Questions::update`**
+  (the owner's say and answer write the same file). It holds the brief, the agent,
+  the `SeatState` and `starts`. A restarted daemon resumes the seat only when
+  `agent::has_session` says so; otherwise a fresh seat gets the whole context
+  again. `ask::SCHEMA` is 5 for it, `#[serde(default)]` as ever.
+- **Bounded twice.** `daemon.max_deputies` (default 2) at once, and
+  `deputy::MAX_STARTS` per question, never reset by a restart. The deadline is
+  the question's `answer_timeout` from `last_activity`: the waiter retires the
+  question, and `daemon::resolve_blockers` then moves a task blocked on an
+  abandoned conductor question to a machine hold.
+- **A say is not a decision.** The deputy answers it with `magi ask --thread`
+  (repeating the choices, which a reply replaces). `magi ask --settle` records an
+  answer only for `MAGI_NODE=deputy` with the seat recorded on the question, an
+  offered label, and a verbatim quote of something the owner said, and never on
+  an `operator_held` task. Applying the outcome stays with the daemon's existing
+  answer path; the deputy applies nothing. It runs with `allow_write: true` because `magi ask` writes the question record and a read-only sandbox (codex) refuses that; like opencode/omp seats, its read-only-ness rests on the prompt.
+- **A fresh seat takes a short handover turn first**, so its session id is persisted before the hours-long `magi ask --wait` turn (`agent::invoke` learns it only on return). The claim file covers only the start decision (60 s stale), the lease covers the turn, and a spent deputy (`MAX_STARTS`) no longer shields an expired question from the waiter.
+- **The UI says who listens.** `web::holder_of` returns `deputy` only for a fresh
+  lease on a question with a deputy, and `nobody` for a conductor question that
+  has no one; `app.js` says "Waiting for the agent" only for `asker` / `deputy` /
+  `daemon`.
+- The mock agent in `tests/common/mod.rs` greps `prompt::DEPUTY_HEADING`; reword
+  the heading and update both.
+
 ### The web UI: one binary, no authentication, and no lying empty states
 
 `src/web.rs` serves `assets/ui/{index.html,app.css,app.js}` through

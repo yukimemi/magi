@@ -377,7 +377,11 @@ enum Command {
     Ask {
         /// One-line question, or - with `--thread` - this agent's reply. Not
         /// given with `--wait`, which has nothing new to say.
-        #[arg(long, required_unless_present = "wait", conflicts_with = "wait")]
+        #[arg(
+            long,
+            required_unless_present_any = ["wait", "settle"],
+            conflicts_with_all = ["wait", "settle"]
+        )]
         summary: Option<String>,
         /// Longer explanation, markdown. Reads stdin when omitted.
         #[arg(long, conflicts_with = "wait")]
@@ -431,8 +435,20 @@ enum Command {
         /// [`ask::Wait::Pending`]), in a fresh process the tool timeout that
         /// killed the last one has never seen. Same ownership rule as
         /// `--thread` - refused for a question this run did not ask.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "settle")]
         wait: Option<String>,
+        /// For a conductor question's deputy only: record that the owner's own
+        /// words decided it. Takes the question id; give the decided option
+        /// as the single `--choice` and the owner's words as `--quote`.
+        /// Refused unless this is that question's deputy seat, the option was
+        /// offered, and the quote is something the owner actually said.
+        /// Nothing is applied here - the daemon acts on the recorded answer
+        /// exactly as it does for one tapped on the phone.
+        #[arg(long, requires = "quote")]
+        settle: Option<String>,
+        /// The owner's words that justify `--settle`, verbatim.
+        #[arg(long, requires = "settle")]
+        quote: Option<String>,
     },
     /// Answer a question an agent is waiting on, or ask it back.
     Answer {
@@ -1419,6 +1435,8 @@ async fn dispatch(command: Command) -> Result<()> {
             repo,
             thread,
             wait,
+            settle,
+            quote,
         } => {
             ask_cmd(AskArgs {
                 summary,
@@ -1431,6 +1449,8 @@ async fn dispatch(command: Command) -> Result<()> {
                 repo,
                 thread,
                 wait,
+                settle,
+                quote,
             })
             .await
         }
@@ -1892,6 +1912,8 @@ struct AskArgs {
     repo: PathBuf,
     thread: Option<String>,
     wait: Option<String>,
+    settle: Option<String>,
+    quote: Option<String>,
 }
 
 /// The one message `--summary`/`--detail` make, whether that is a fresh
@@ -1919,6 +1941,8 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         repo,
         thread,
         wait,
+        settle,
+        quote,
     } = args;
 
     let (cfg, _) = Config::discover(&repo, None).unwrap_or_default();
@@ -1929,6 +1953,9 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
     // detail to fall back to stdin for, no turn to append.
     if let Some(id) = wait {
         return ask_wait_cmd(&store, &cfg, timeout, &id).await;
+    }
+    if let Some(id) = settle {
+        return ask_settle_cmd(&store, &id, &choices, quote.as_deref().unwrap_or_default());
     }
     let summary = summary.context("give --summary, or resume a wait with --wait <question-id>")?;
 
@@ -2061,6 +2088,38 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
             budget.as_secs()
         ),
     }
+}
+
+/// `magi ask --settle <id> --choice <label> --quote <words>`: a conductor
+/// question's deputy recording that the owner's free text decided it.
+///
+/// The seat is `MAGI_SEAT`, set only by `agent::invoke`, so it cannot be
+/// claimed from a shell; [`ask::Question::settle_by_deputy`] compares it with
+/// the seat recorded on the question. A task the operator holds by hand is
+/// never settled this way: an answer must not be able to release it.
+fn ask_settle_cmd(store: &ask::Questions, id: &str, choices: &[String], quote: &str) -> Result<()> {
+    let [label] = choices else {
+        bail!("give exactly one --choice: the option the owner's words decided");
+    };
+    if std::env::var("MAGI_NODE").as_deref() != Ok(magi::deputy::NODE) {
+        bail!("only a conductor question's deputy may settle a question");
+    }
+    let seat = std::env::var("MAGI_SEAT").unwrap_or_default();
+    let resolved = store.resolve_id(id)?;
+    let queue = magi::queue::Queue::open();
+    store.update(&resolved, |q| {
+        if let Ok(task) = queue.get(&q.run)
+            && task.operator_held()
+        {
+            bail!(
+                "task {} is held by the operator; an answer cannot settle it",
+                task.short()
+            );
+        }
+        q.settle_by_deputy(&seat, label, quote)
+    })?;
+    println!("settled on `{label}`; the daemon applies it from here");
+    Ok(())
 }
 
 /// `magi ask --wait <id>`: resume waiting on a question this run already
