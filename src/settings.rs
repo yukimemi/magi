@@ -16,6 +16,17 @@
 //! before the original is replaced by a rename. Anything the line patcher
 //! cannot place (an inline `roles = { .. }`, say) fails that check and is
 //! refused with a readable message instead of being guessed at.
+//!
+//! The machine file applies to every repository, so two more rules hold. The
+//! detected roster is never written down (`Config::load_layers` fills `agents`
+//! from `PATH` whenever no layer declares the key), so a role save adds no
+//! second `[[agents]]` declaration and CLIs installed later are still found.
+//! And a save is also loaded against every other checkout found under
+//! `[repos] roots`: one that loaded before and would not now (it declares the
+//! same `roles.*` key) refuses the save in words. Limits: checkouts outside
+//! `roots` are not checked, a checkout already broken is ignored, and another
+//! process editing a repo config between the check and the rename is not
+//! prevented. The view shows the same lock up front.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -155,13 +166,6 @@ fn declares(table: &toml::Table, key: &str) -> bool {
         .is_some_and(|r| r.contains_key(key))
 }
 
-fn defines_agents(table: &toml::Table) -> bool {
-    table
-        .get("agents")
-        .and_then(toml::Value::as_array)
-        .is_some_and(|a| !a.is_empty())
-}
-
 fn choice_ids(choice: Option<&AgentChoice>) -> Vec<String> {
     choice
         .map(|c| c.ids().into_iter().map(str::to_owned).collect())
@@ -225,6 +229,20 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
         .collect();
     let is_machine = |p: &Path| machine.is_some_and(|m| m == p);
 
+    let mut other_declares: BTreeMap<&str, String> = BTreeMap::new();
+    for other in other_checkouts(repo, &cfg.repos.roots) {
+        let theirs = Config::layer_tables(&repo_layers(&other.path));
+        for key in ROLE_KEYS {
+            if theirs
+                .iter()
+                .any(|(_, t)| t.as_ref().is_ok_and(|t| declares(t, key)))
+            {
+                other_declares
+                    .entry(key)
+                    .or_insert_with(|| other.name.clone());
+            }
+        }
+    }
     let resolved = cfg.resolve_roles();
     let advisors = cfg.advisors();
     for key in ROLE_KEYS {
@@ -242,9 +260,16 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
             (
                 false,
                 Some(format!(
-                    "This repository decides it: `{key}` is set in {}. Change it there; \
-                     a machine setting would be overridden or make the config invalid.",
+                    "This repo overrides roles.{key} in {} - edit it there.",
                     p.display()
+                )),
+            )
+        } else if let Some(name) = other_declares.get(key) {
+            (
+                false,
+                Some(format!(
+                    "`{name}` declares roles.{key} in its own config, so a machine setting \
+                     would stop it from loading. Edit it there."
                 )),
             )
         } else if machine.is_none() {
@@ -418,27 +443,6 @@ pub(crate) fn save(
     for (key, ids) in &edits {
         text = patch_role(&text, key, ids).map_err(SaveError::Refused)?;
     }
-    // A machine file made here is the only layer that defines agents once it
-    // exists, so the roster on screen (found on PATH) is written down with it.
-    let agents_defined = Config::layer_tables(&layer_paths(repo, Some(machine)))
-        .iter()
-        .any(|(_, t)| t.as_ref().is_ok_and(defines_agents));
-    if !agents_defined {
-        let detected = Config::autodetected();
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        for a in &detected.agents {
-            text.push_str(&format!("\n[[agents]]\nid = {}\n", quote(&a.id)));
-            if let Ok(kind) = toml::Value::try_from(a.kind) {
-                text.push_str(&format!("kind = {kind}\n"));
-            }
-            if let Some(model) = &a.model {
-                text.push_str(&format!("model = {}\n", quote(model)));
-            }
-        }
-    }
-
     let dir = machine
         .parent()
         .ok_or_else(|| SaveError::Internal("the machine config has no parent directory".into()))?;
@@ -480,6 +484,7 @@ pub(crate) fn save(
             ))));
         }
     }
+    other_repos_still_load(repo, machine, &tmp, &loaded.repos.roots).map_err(cleanup)?;
     std::fs::rename(&tmp, machine).map_err(|e| {
         cleanup(SaveError::Internal(format!(
             "replacing {}: {e}",
@@ -487,6 +492,50 @@ pub(crate) fn save(
         )))
     })?;
     Ok(view(repo, Some(machine)))
+}
+
+/// Every checkout under `roots` other than `repo` that has its own config
+/// layers.
+fn other_checkouts(repo: &Path, roots: &[PathBuf]) -> Vec<crate::repos::Repo> {
+    let here = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    crate::repos::scan(roots)
+        .into_iter()
+        .filter(|r| r.path != here && !repo_layers(&r.path).is_empty())
+        .collect()
+}
+
+/// The machine file applies to every repository, so a proposal is checked
+/// against each other known checkout too: one that loaded with the old machine
+/// file and no longer loads with `proposal` (a `roles.*` array now declared in
+/// two layers) refuses the save. A checkout that did not load before is not
+/// this change's doing and is ignored.
+fn other_repos_still_load(
+    repo: &Path,
+    machine: &Path,
+    proposal: &Path,
+    roots: &[PathBuf],
+) -> Result<(), SaveError> {
+    for other in other_checkouts(repo, roots) {
+        let layers = repo_layers(&other.path);
+        let mut old = layer_paths(&other.path, Some(machine));
+        if old.is_empty() {
+            old = layers.clone();
+        }
+        if Config::load_layers(&old).is_err() {
+            continue;
+        }
+        let mut new = vec![proposal.to_path_buf()];
+        new.extend(layers);
+        if let Err(e) = Config::load_layers(&new) {
+            return Err(SaveError::Refused(format!(
+                "Nothing was saved: this machine setting would stop `{}` from loading, \
+                 because that repository declares the same setting in its own config \
+                 ({e:#}). Edit it there, or remove it from that repository first.",
+                other.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn write_synced(path: &Path, text: &str) -> std::io::Result<()> {
@@ -1040,6 +1089,122 @@ mod tests {
             a.seats.iter().all(|s| s == "b") && !a.seats.is_empty(),
             "{:?}",
             a.seats
+        );
+    }
+
+    /// A current repo whose config names `roots`, and a second checkout under
+    /// it whose own `magi.toml` is `other_toml`.
+    fn two_repos(tmp: &TempDir, other_toml: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = tmp.path().join("ghq");
+        let repo = root.join("h").join("o").join("cur");
+        let other = root.join("h").join("o").join("other");
+        for d in [&repo, &other] {
+            std::fs::create_dir_all(d.join(".git")).unwrap();
+        }
+        std::fs::write(
+            repo.join("magi.toml"),
+            format!(
+                "{AGENTS}\n[repos]\nroots = [{}]\n",
+                quote(&root.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        std::fs::write(other.join("magi.toml"), other_toml).unwrap();
+        let machine = tmp.path().join("m").join("magi").join("config.toml");
+        (repo, other, machine)
+    }
+
+    #[test]
+    fn saving_judges_is_refused_when_another_repo_declares_them() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, other, machine) =
+            two_repos(&tmp, &format!("{AGENTS}\n[roles]\njudges = [\"a\"]\n"));
+        let v = view(&repo, Some(&machine));
+        let j = v.roles.iter().find(|r| r.key == "judges").unwrap();
+        assert!(!j.editable, "{:?}", j.locked_reason);
+        let err = save(
+            &repo,
+            Some(&machine),
+            &v.revision,
+            &BTreeMap::from([("judges".to_owned(), ids(&["b"]))]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SaveError::Refused(m) if m.contains("o/other")),
+            "{err:?}"
+        );
+        assert!(!machine.exists());
+        assert!(Config::load_layers(&repo_layers(&other)).is_ok());
+        // A key nobody else declares still saves, and the other repo loads.
+        save(
+            &repo,
+            Some(&machine),
+            &v.revision,
+            &BTreeMap::from([("reviewers".to_owned(), ids(&["b"]))]),
+        )
+        .unwrap();
+        let mut layers = vec![machine.clone()];
+        layers.extend(repo_layers(&other));
+        assert!(Config::load_layers(&layers).is_ok());
+    }
+
+    #[test]
+    fn saving_a_role_writes_no_agents_and_detection_stays_dynamic() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("magi.toml"), "[graph]\ncandidates = 1\n").unwrap();
+        let machine = tmp.path().join("m").join("magi").join("config.toml");
+        let v = view(&repo, Some(&machine));
+        let Some(first) = Config::autodetected().agents.first().map(|a| a.id.clone()) else {
+            return; // no agent CLI on PATH here; nothing to pick
+        };
+        save(
+            &repo,
+            Some(&machine),
+            &v.revision,
+            &BTreeMap::from([("judges".to_owned(), ids(&[&first]))]),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&machine).unwrap();
+        assert!(!text.contains("[[agents]]"), "{text}");
+        let after = view(&repo, Some(&machine));
+        assert!(after.agents.iter().all(|a| a.source == "detected"));
+        assert_eq!(
+            ids_of(
+                &Config::load_layers(&layer_paths(&repo, Some(&machine)))
+                    .unwrap()
+                    .agents
+            ),
+            ids_of(&Config::autodetected().agents)
+        );
+    }
+
+    #[test]
+    fn an_explicit_empty_agents_list_is_kept() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("magi.toml");
+        std::fs::write(&f, "agents = []\n").unwrap();
+        assert!(Config::load_layers(&[f]).unwrap().agents.is_empty());
+    }
+
+    #[test]
+    fn the_repo_lock_says_the_repo_overrides_the_key() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("magi.toml"),
+            format!("{AGENTS}\n[roles]\njudges = [\"a\"]\n"),
+        )
+        .unwrap();
+        let machine = tmp.path().join("m").join("magi").join("config.toml");
+        let v = view(&repo, Some(&machine));
+        let j = v.roles.iter().find(|r| r.key == "judges").unwrap();
+        let why = j.locked_reason.as_deref().unwrap();
+        assert!(
+            why.starts_with("This repo overrides roles.judges in "),
+            "{why}"
         );
     }
 }
