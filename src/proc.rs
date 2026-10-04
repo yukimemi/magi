@@ -244,7 +244,18 @@ fn query_process(pid: u32) -> std::io::Result<Option<u64>> {
             "process table is unreadable: this process is not listed",
         ));
     }
-    Ok(system.process(pid).map(sysinfo::Process::start_time))
+    let found = system.process(pid).map(sysinfo::Process::start_time);
+    // This process being listed does not prove the target's own entry could
+    // be read: an unreadable `/proc/<pid>/stat` leaves a live pid out of the
+    // table. On Linux the directory itself is the independent witness - if it
+    // exists the pid is alive, so "not listed" is a failed read, not absence.
+    #[cfg(target_os = "linux")]
+    if found.is_none() && std::path::Path::new(&format!("/proc/{}", pid.as_u32())).exists() {
+        return Err(std::io::Error::other(
+            "process exists but its entry could not be read",
+        ));
+    }
+    Ok(found)
 }
 
 /// Whether the identity marker format is the current one: a plain integer
