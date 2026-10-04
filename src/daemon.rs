@@ -5519,7 +5519,7 @@ mod tests {
         // `RunState::liveness`'s own doc for why a mismatched
         // `driver_started_at` reads as `Dead`, not merely `Unknown`.
         let mut stale = RunState::load_under(&first.id, &home).unwrap();
-        stale.driver_started_at = Some("not-this-processes-real-start-time".to_owned());
+        stale.driver_started_at = Some("1".to_owned());
         stale.save_under(&home).unwrap();
 
         resweep_superseded_attempts(&queue, &home);
@@ -5909,7 +5909,7 @@ mod tests {
         // but a real, still-running process: `liveness` must corroborate this
         // as `Live`, not read the missing daemon claim as death.
         manual.driver_pid = Some(4242);
-        manual.driver_started_at = Some("2026-09-22T10:00:00Z".to_owned());
+        manual.driver_started_at = Some("1790000000".to_owned());
         manual.save_under(&home).unwrap();
 
         let abandoned = reclaim_abandoned_runs_with(
@@ -5918,7 +5918,7 @@ mod tests {
             |pid| if pid == 4242 { Some(true) } else { None },
             |pid| {
                 if pid == 4242 {
-                    Some("2026-09-22T10:00:00Z".to_owned())
+                    Some("1790000000".to_owned())
                 } else {
                     None
                 }

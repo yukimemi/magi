@@ -67,6 +67,9 @@ tokio-stream = "0.1.19"
 # syntax highlighting, which magi does not want: a fence is shown as plain
 # text, never colored, so there is nothing for a highlighter to do here.
 comrak = { version = "0.55.0", default-features = false }
+# Process liveness and start time (`proc`). Only the process table: no CPU,
+# disk, network or component probing, and no subprocess to shell out to.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
