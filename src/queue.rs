@@ -832,6 +832,32 @@ impl Task {
             return;
         }
         self.blocked_by.retain(|id| id != resolved_id);
+        self.restore_if_unblocked();
+    }
+
+    /// A dependency this task waited on was deleted on purpose
+    /// ([`Queue::remove`]): drop just that id from [`Task::blocked_by`] and,
+    /// once nothing is left, return to the status the block interrupted, the
+    /// same way [`Task::unblock`] does. Returns whether anything changed.
+    ///
+    /// Never a hold: the operator chose the deletion, so the dependent is not
+    /// in trouble. Touches nothing but a `Blocked` task that actually names
+    /// `deleted_id`, so a `Held` task (or a manual hold) is left exactly as it
+    /// was. A dependency that vanished *without* going through a deletion is
+    /// not this method's case - that stays a machine hold.
+    pub fn dependency_deleted(&mut self, deleted_id: &str) -> bool {
+        if self.status != TaskStatus::Blocked || !self.blocked_by.iter().any(|b| b == deleted_id) {
+            return false;
+        }
+        self.blocked_by.retain(|id| id != deleted_id);
+        self.restore_if_unblocked();
+        true
+    }
+
+    /// The shared tail of [`Task::unblock`] and [`Task::dependency_deleted`]:
+    /// with nothing left in `blocked_by`, restore the interrupted status and
+    /// clear the now-stale block bookkeeping.
+    fn restore_if_unblocked(&mut self) {
         if self.blocked_by.is_empty() {
             self.status = match self.blocked_from {
                 Some(TaskStatus::Running) => TaskStatus::Queued,
@@ -1470,30 +1496,152 @@ impl Queue {
     /// and leaving it would make a deleted task look claimed to
     /// [`Queue::claim`] and to whoever reads the directory.
     ///
-    /// Anything still `blocked` on the id just deleted is quarantined to a
-    /// machine hold in the same call - see [`Removal::quarantined`] - rather
-    /// than left to wait on a dependency that no longer exists. Best-effort:
-    /// a dependent claimed by something else right now, or one whose write
-    /// fails, is simply left for `crate::daemon::resolve_blockers`'s own poll
-    /// (or `crate::triage::run_once`) to catch on its own next pass, and does
-    /// not fail this removal.
+    /// A deletion is deliberate, so whatever was `blocked` on the id is
+    /// resolved, not held: a `<id>.removed` tombstone is written first (it
+    /// is what tells [`missing_blockers`] and the daemon's resolver that this
+    /// id was deleted on purpose, so a pass that races this call cannot
+    /// mistake it for a vanished dependency), the record is deleted (the
+    /// tombstone is taken back if that fails), and then each dependent is
+    /// rewritten under its claim - see [`Queue::release_dependents_of`].
+    /// Best-effort for the dependents: one claimed by something else right
+    /// now, or whose write fails, is released silently by
+    /// `crate::daemon::resolve_blockers` (or `crate::triage::run_once`) on
+    /// its next pass, because the tombstone is still there. It does not fail
+    /// this removal.
     ///
     /// `questions` is the store [`missing_blockers`] checks a `blocked_by` id
-    /// against before calling it gone - the same store the caller already
-    /// resolves `id`'s own home from, passed in rather than reopened here so
-    /// a test queue at an explicit root is never quarantined against the
-    /// operator's real questions directory.
+    /// against - the same store the caller already resolves `id`'s own home
+    /// from, passed in rather than reopened here so a test queue at an
+    /// explicit root never reads the operator's real questions directory.
     pub fn remove(&self, id: &str, in_flight: bool, questions: &Questions) -> Result<Removal> {
+        let _ = questions;
         let resolved = self.resolve_id(id)?;
         if in_flight {
             bail!("task {resolved} is being run by a live daemon right now");
         }
-        self.remove_record_with_attachments(&resolved, |p| std::fs::remove_file(p))?;
-        let quarantined = self.quarantine_dependents_of(&resolved, questions);
+        self.write_tombstone(&resolved)?;
+        if let Err(e) = self.remove_record_with_attachments(&resolved, |p| std::fs::remove_file(p))
+        {
+            // A record that is still there was not deleted: take the marker
+            // back. One already gone keeps it, so the deletion still reads
+            // as deliberate.
+            if self.path_of(&resolved).exists() {
+                let _ = std::fs::remove_file(self.tombstone_path(&resolved));
+            }
+            return Err(e);
+        }
+        let (released, still_blocked) = self.release_dependents_of(&resolved);
         Ok(Removal {
             id: resolved,
-            quarantined,
+            released,
+            still_blocked,
         })
+    }
+
+    /// Path of the marker saying task `id` was deleted on purpose. Not a
+    /// `*.json`, so [`Queue::list`] and [`Queue::revision`] never see it.
+    fn tombstone_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.removed"))
+    }
+
+    fn write_tombstone(&self, id: &str) -> Result<()> {
+        let path = self.tombstone_path(id);
+        let tmp = self.root.join(format!("{id}.removed.tmp"));
+        std::fs::write(&tmp, b"")
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .with_context(|| format!("write {}", path.display()))
+    }
+
+    /// Was `id` deleted through [`Queue::remove`] (and is its record gone)?
+    /// A live record always wins: a tombstone never makes an existing task
+    /// look deleted.
+    fn was_deleted(&self, id: &str) -> bool {
+        self.tombstone_path(id).is_file() && !self.path_of(id).exists()
+    }
+
+    /// Apply [`Task::dependency_deleted`] to `task` for every `blocked_by` id
+    /// that [`Queue::remove`] deleted. Returns those ids. The caller holds
+    /// the task's claim and saves it.
+    pub fn apply_deleted_blockers(&self, task: &mut Task) -> Vec<String> {
+        let deleted = deleted_blockers(self, &task.blocked_by);
+        deleted
+            .into_iter()
+            .filter(|id| task.dependency_deleted(id))
+            .collect()
+    }
+
+    /// Record, as a fixed-wording info notice, that `dependent` stopped
+    /// waiting on the deleted task `deleted`. Best-effort and beside the
+    /// queue, like the hold notice [`Queue::put`] files.
+    pub fn note_dependency_deleted(&self, dependent: &Task, deleted: &str) {
+        let Some(home) = self.root.parent().filter(|p| !p.as_os_str().is_empty()) else {
+            return;
+        };
+        let ja = crate::lang::is_japanese(&crate::lang::of_repo(&dependent.repo));
+        let waiting = dependent.status == TaskStatus::Blocked;
+        let message = match (ja, waiting) {
+            (true, false) => format!(
+                "タスク {} は、待っていた {} が削除されたため待機を解除し、元の状態に戻しました",
+                dependent.short(),
+                short(deleted)
+            ),
+            (true, true) => format!(
+                "タスク {} は、待っていた {} が削除されたため、残りの依存を待っています",
+                dependent.short(),
+                short(deleted)
+            ),
+            (false, false) => format!(
+                "Task {} stopped waiting on {} because it was deleted, and returned to its previous state",
+                dependent.short(),
+                short(deleted)
+            ),
+            (false, true) => format!(
+                "Task {} stopped waiting on {} because it was deleted, and is still waiting on its other dependencies",
+                dependent.short(),
+                short(deleted)
+            ),
+        };
+        crate::notices::raise_in(
+            home,
+            crate::notices::Notice::info(
+                &format!("unblocked:{}:{}", dependent.id, deleted),
+                message,
+            ),
+        );
+    }
+
+    /// Resolve every `blocked` task naming `dependency` (just deleted) with
+    /// [`Task::dependency_deleted`]. Returns the ids released to another
+    /// status and those that remain `blocked` on something else. Each
+    /// dependent is re-read inside its claim, never written from a stale copy.
+    fn release_dependents_of(&self, dependency: &str) -> (Vec<String>, Vec<String>) {
+        let (mut released, mut still_blocked) = (Vec::new(), Vec::new());
+        for listed in self.list() {
+            if listed.status != TaskStatus::Blocked
+                || !listed.blocked_by.iter().any(|b| b == dependency)
+            {
+                continue;
+            }
+            let Ok(_claim) = self.claim(&listed.id) else {
+                continue;
+            };
+            let Ok(mut task) = self.get(&listed.id) else {
+                continue;
+            };
+            if !task.dependency_deleted(dependency) {
+                continue;
+            }
+            if self.put(&mut task).is_err() {
+                continue;
+            }
+            self.note_dependency_deleted(&task, dependency);
+            if task.status == TaskStatus::Blocked {
+                still_blocked.push(task.id.clone());
+            } else {
+                released.push(task.id.clone());
+            }
+        }
+        (released, still_blocked)
     }
 
     /// The attachment-and-record half of [`Queue::remove`]. `remove_record` is
@@ -1564,42 +1712,43 @@ impl Queue {
                 }
             }
         }
+        self.sweep_tombstones();
     }
 
-    /// Move every `blocked` task naming `dependency` in its own `blocked_by`
-    /// to a machine hold, now that `dependency`'s own file is gone. See
-    /// [`Queue::remove`]'s own doc for why this is best-effort.
-    fn quarantine_dependents_of(&self, dependency: &str, questions: &Questions) -> Vec<String> {
-        let mut quarantined = Vec::new();
-        for listed in self.list() {
-            if listed.status != TaskStatus::Blocked
-                || !listed.blocked_by.iter().any(|b| b == dependency)
+    /// Delete `*.removed` markers that are no longer needed: the record is
+    /// gone, no task's `blocked_by` names the id, and the marker is older than
+    /// [`TOMBSTONE_GRACE`]. The age is what makes this safe against a
+    /// concurrent writer: the task list read here can be stale, so a dependent
+    /// that was just blocked on an id (a conductor applying a decision while a
+    /// removal is under way) would otherwise lose the marker and be held as a
+    /// vanished dependency. A marker whose record still exists belongs to a
+    /// removal in progress and is never touched.
+    fn sweep_tombstones(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return;
+        };
+        let tasks = self.list();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(id) = name.strip_suffix(".removed") else {
+                continue;
+            };
+            if self.path_of(id).exists()
+                || tasks.iter().any(|t| t.blocked_by.iter().any(|b| b == id))
             {
                 continue;
             }
-            let Ok(_claim) = self.claim(&listed.id) else {
-                continue;
-            };
-            let Ok(mut task) = self.get(&listed.id) else {
-                continue;
-            };
-            if task.status != TaskStatus::Blocked
-                || !task.blocked_by.iter().any(|b| b == dependency)
-            {
-                continue;
-            }
-            let missing = missing_blockers(self, questions, &task.blocked_by);
-            let language = crate::lang::of_repo(&task.repo);
-            task.hold_machine(Some(missing_blocker_hold_reason_in(
-                &task.blocked_by,
-                &missing,
-                &language,
-            )));
-            if self.put(&mut task).is_ok() {
-                quarantined.push(task.id.clone());
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age >= TOMBSTONE_GRACE);
+            if old {
+                let _ = std::fs::remove_file(entry.path());
             }
         }
-        quarantined
     }
 
     /// Path of the claim lock for a task. One definition, so `claim` and
@@ -1811,15 +1960,22 @@ impl Queue {
     }
 }
 
+/// How long a deletion marker is kept after its record is gone, even with
+/// nothing referencing it. See [`Queue::sweep_tombstones`].
+const TOMBSTONE_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// What [`Queue::remove`] did, beyond deleting the named task's own file.
 #[derive(Debug, Clone)]
 pub struct Removal {
     /// The id actually removed - `id` expanded from a prefix, if it was one.
     pub id: String,
-    /// Every `blocked` task that named [`Removal::id`] in its own
-    /// `blocked_by` and was moved to a machine hold as a result, rather than
-    /// left waiting on a dependency this call just erased.
-    pub quarantined: Vec<String>,
+    /// Every task that was `blocked` on [`Removal::id`] and left the block
+    /// (back to the status it interrupted) because that was its only
+    /// remaining dependency.
+    pub released: Vec<String>,
+    /// Every task that named [`Removal::id`] and is still `blocked` on
+    /// another dependency.
+    pub still_blocked: Vec<String>,
 }
 
 /// Exclusive ownership of a task, released on drop.
@@ -1899,7 +2055,23 @@ pub fn missing_blockers(
 ) -> Vec<String> {
     blocked_by
         .iter()
-        .filter(|id| !queue.path_of(id).is_file() && !questions.path_of(id).is_file())
+        .filter(|id| {
+            !queue.path_of(id).is_file()
+                && !questions.path_of(id).is_file()
+                && !queue.was_deleted(id)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Ids in `blocked_by` that [`Queue::remove`] deleted on purpose: tombstoned
+/// and with no record. A live task is never included, tombstone or not. These
+/// are resolved with [`Task::dependency_deleted`], not held; an id that
+/// vanished without a tombstone stays [`missing_blockers`]' to report.
+pub fn deleted_blockers(queue: &Queue, blocked_by: &[String]) -> Vec<String> {
+    blocked_by
+        .iter()
+        .filter(|id| queue.was_deleted(id))
         .cloned()
         .collect()
 }
@@ -3122,7 +3294,7 @@ mod tests {
         q.put(&mut t).unwrap();
         let removed = q.remove(t.short(), false, &questions).unwrap();
         assert_eq!(removed.id, t.id, "a prefix resolves before deleting");
-        assert!(removed.quarantined.is_empty(), "nothing was blocked on it");
+        assert!(removed.released.is_empty() && removed.still_blocked.is_empty());
         assert!(q.list().is_empty());
         assert!(
             q.remove(&t.id, false, &questions).is_err(),
@@ -3163,37 +3335,117 @@ mod tests {
         );
     }
 
+    fn notices_of(dir: &Path) -> Vec<crate::notices::Notice> {
+        crate::notices::Notices::at(dir.join("notifications")).list()
+    }
+
     #[test]
-    fn removing_a_task_quarantines_what_was_blocked_on_it() {
+    fn removing_a_sole_dependency_releases_the_dependent_without_a_hold() {
         let (dir, q) = queue();
         let questions = Questions::at(dir.path().join("questions"));
-
         let mut dep = task("dependency");
         q.put(&mut dep).unwrap();
+        let mut blocked = task("waiting");
+        blocked.block(vec![dep.id.clone()], Some("waits".to_owned()));
+        q.put(&mut blocked).unwrap();
 
-        let mut still_valid = task("still valid");
-        q.put(&mut still_valid).unwrap();
+        let removed = q.remove(&dep.id, false, &questions).unwrap();
+        assert_eq!(removed.released, [blocked.id.clone()]);
+        assert!(removed.still_blocked.is_empty());
 
+        let after = q.get(&blocked.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Queued);
+        assert!(after.blocked_by.is_empty());
+        assert!(after.block_reason.is_none());
+        let notes = notices_of(dir.path());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].severity, crate::notices::Severity::Info);
+    }
+
+    #[test]
+    fn removing_one_of_two_dependencies_keeps_the_other() {
+        let (dir, q) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut dep = task("dependency");
+        q.put(&mut dep).unwrap();
+        let mut other = task("other");
+        q.put(&mut other).unwrap();
         let mut blocked = task("waiting");
         blocked.block(
-            vec![dep.id.clone(), still_valid.id.clone()],
+            vec![dep.id.clone(), other.id.clone()],
             Some("waits on both".to_owned()),
         );
         q.put(&mut blocked).unwrap();
 
         let removed = q.remove(&dep.id, false, &questions).unwrap();
-        assert_eq!(removed.quarantined, [blocked.id.clone()]);
+        assert!(removed.released.is_empty());
+        assert_eq!(removed.still_blocked, [blocked.id.clone()]);
 
         let after = q.get(&blocked.id).unwrap();
-        assert_eq!(after.status, TaskStatus::Held);
-        assert_eq!(after.hold_source, Some(HoldSource::Machine));
-        assert!(after.blocked_by.is_empty());
-        let reason = after.hold_reason.as_deref().unwrap_or_default();
-        assert!(reason.contains(&dep.id), "{reason}");
-        assert!(
-            reason.contains(&still_valid.id),
-            "the still-valid dependency must survive in the reason text: {reason}"
+        assert_eq!(after.status, TaskStatus::Blocked);
+        assert_eq!(after.blocked_by, [other.id.clone()]);
+        // The tombstone stays while a task still names the id... only this
+        // one's dependency is gone, so nothing references it and it may go.
+        assert!(missing_blockers(&q, &questions, &after.blocked_by).is_empty());
+    }
+
+    #[test]
+    fn a_dependency_deleted_before_its_dependents_were_rewritten_is_released_later() {
+        let (dir, q) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut dep = task("dependency");
+        q.put(&mut dep).unwrap();
+        let mut blocked = task("waiting");
+        blocked.block(vec![dep.id.clone()], None);
+        q.put(&mut blocked).unwrap();
+
+        // The dependent is claimed elsewhere, so `remove` has to skip it.
+        let claim = q.claim(&blocked.id).unwrap();
+        let removed = q.remove(&dep.id, false, &questions).unwrap();
+        assert!(removed.released.is_empty());
+        drop(claim);
+
+        let mut task = q.get(&blocked.id).unwrap();
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert!(missing_blockers(&q, &questions, &task.blocked_by).is_empty());
+        assert_eq!(q.apply_deleted_blockers(&mut task), [dep.id.clone()]);
+        assert_eq!(task.status, TaskStatus::Queued);
+    }
+
+    #[test]
+    fn a_dependency_without_a_tombstone_is_still_missing() {
+        let (dir, q) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut dep = task("dependency");
+        q.put(&mut dep).unwrap();
+        std::fs::remove_file(q.path_of(&dep.id)).unwrap();
+        assert_eq!(
+            missing_blockers(&q, &questions, std::slice::from_ref(&dep.id)),
+            [dep.id.clone()]
         );
+        assert!(deleted_blockers(&q, std::slice::from_ref(&dep.id)).is_empty());
+    }
+
+    #[test]
+    fn a_held_dependent_is_left_alone_by_a_dependency_deletion() {
+        let mut t = task("held");
+        t.hold_machine(Some("because".to_owned()));
+        t.blocked_by = vec!["gone".to_owned()];
+        assert!(!t.dependency_deleted("gone"));
+        assert_eq!(t.status, TaskStatus::Held);
+    }
+
+    #[test]
+    fn a_failed_record_removal_takes_the_tombstone_back() {
+        let (_dir, q) = queue();
+        let mut t = task("stays");
+        q.put(&mut t).unwrap();
+        q.write_tombstone(&t.id).unwrap();
+        let err = q.remove_record_with_attachments(&t.id, |_| Err(std::io::Error::other("nope")));
+        assert!(err.is_err());
+        // `remove` is what withdraws the marker; a live record is never
+        // treated as deleted whatever is on disk.
+        assert!(!q.was_deleted(&t.id));
     }
 
     fn source_file(dir: &Path, name: &str, body: &str) -> PathBuf {

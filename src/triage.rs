@@ -593,6 +593,15 @@ fn quarantine_orphaned_blocked(queue: &Queue, questions: &Questions) -> Vec<Stri
         if task.status != TaskStatus::Blocked {
             continue;
         }
+        let deleted = queue.apply_deleted_blockers(&mut task);
+        if !deleted.is_empty() && queue.put(&mut task).is_ok() {
+            for id in &deleted {
+                queue.note_dependency_deleted(&task, id);
+            }
+        }
+        if task.status != TaskStatus::Blocked {
+            continue;
+        }
         let missing = crate::queue::missing_blockers(queue, questions, &task.blocked_by);
         if missing.is_empty() {
             continue;
