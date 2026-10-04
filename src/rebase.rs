@@ -331,7 +331,7 @@ async fn finish(
 /// Commits are matched by what a rebase preserves (author, author date,
 /// subject), not by patch-id: a commit the fixer resolved has a new patch-id
 /// by design. A commit whose patch already exists on the base is not expected
-/// in the result, and one with a patch twin in the result counts as present.
+/// in the result, and one with a patch twin in the result is verified by content like any other candidate.
 async fn dropped_commits(repo: &Path, onto_sha: &str, orig: &str, head: &str) -> Vec<String> {
     let Ok((unmatched, _)) = git::cherry(repo, onto_sha, orig).await else {
         return Vec::new();
@@ -350,12 +350,8 @@ async fn dropped_commits(repo: &Path, onto_sha: &str, orig: &str, head: &str) ->
         .filter(|c| unmatched.contains(&c.sha))
         .collect();
     let have: Vec<String> = result.into_iter().map(|c| c.key).collect();
-    let twins = git::cherry(repo, head, orig)
-        .await
-        .map(|(_, matched)| matched)
-        .unwrap_or_default();
     let mut lost = Vec::new();
-    for c in missing_commits(&expected, &have, &twins) {
+    for c in missing_commits(&expected, &have) {
         // Git also drops a commit on its own when its change is already on
         // the base under a different patch (e.g. folded into one upstream
         // commit). That is not a loss: every path it touched holds the same
@@ -444,18 +440,16 @@ async fn replay_is_noop(repo: &Path, sha: &str, head: &str) -> bool {
 
 /// The pure half of [`dropped_commits`]: the `expected` commits whose
 /// key is not left in `have` (a multiset: each result commit covers one
-/// expected commit) and whose sha is not in `twins`.
-fn missing_commits(
-    expected: &[git::CommitKey],
-    have: &[String],
-    twins: &[String],
-) -> Vec<git::CommitKey> {
+/// expected commit). A patch twin in the result is deliberately not excused
+/// here: with duplicate keys it could mask a skipped commit, so the caller
+/// verifies each candidate by content ([`already_in_result`]).
+fn missing_commits(expected: &[git::CommitKey], have: &[String]) -> Vec<git::CommitKey> {
     let mut pool: Vec<Option<&String>> = have.iter().map(Some).collect();
     let mut lost = Vec::new();
     for c in expected {
         if let Some(slot) = pool.iter_mut().find(|s| **s == Some(&c.key)) {
             *slot = None;
-        } else if !twins.contains(&c.sha) {
+        } else {
             lost.push(c.clone());
         }
     }
@@ -566,27 +560,28 @@ mod tests {
     fn nothing_is_missing_when_every_key_is_present() {
         let exp = [ck("a", "one"), ck("b", "two")];
         let have = vec![exp[1].key.clone(), exp[0].key.clone()];
-        assert!(missing_commits(&exp, &have, &[]).is_empty());
+        assert!(missing_commits(&exp, &have).is_empty());
     }
 
     #[test]
     fn a_dropped_commit_is_named_by_subject() {
         let exp = [ck("a", "one"), ck("b", "two")];
         let have = vec![exp[1].key.clone()];
-        assert_eq!(missing_commits(&exp, &have, &[]), vec![exp[0].clone()]);
+        assert_eq!(missing_commits(&exp, &have), vec![exp[0].clone()]);
     }
 
     #[test]
     fn duplicate_keys_are_counted_not_collapsed() {
         let exp = [ck("a", "same"), ck("b", "same")];
         let have = vec![exp[0].key.clone()];
-        assert_eq!(missing_commits(&exp, &have, &[]), vec![exp[1].clone()]);
+        assert_eq!(missing_commits(&exp, &have), vec![exp[1].clone()]);
     }
 
     #[test]
-    fn a_patch_twin_in_the_result_is_not_a_loss() {
-        let exp = [ck("a", "one")];
-        assert!(missing_commits(&exp, &[], &["a".to_owned()]).is_empty());
+    fn a_commit_without_a_key_match_is_a_candidate_even_if_a_twin_exists() {
+        let exp = [ck("a", "same"), ck("b", "same")];
+        let have = vec![exp[1].key.clone()];
+        assert_eq!(missing_commits(&exp, &have).len(), 1);
     }
 
     fn sh(dir: &Path, args: &[&str]) {
