@@ -1223,6 +1223,15 @@ pub struct ReviewRound {
     pub verdict: Option<ReviewVote>,
 }
 
+/// A merge-approval question and the head commit it was asked about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandApproval {
+    /// Id of the question that was filed for `head`.
+    pub question: String,
+    /// The commit the question's panel was built from.
+    pub head: String,
+}
+
 /// A review hand-off the panel did not agree to: findings that hold the merge
 /// are still open and at least one seat's final vote was reject. Recorded on
 /// [`RunState::contested_handoff`] so `land` can name them in its question.
@@ -1766,6 +1775,17 @@ pub struct RunState {
     /// taken at hand-off, never recomputed later.
     #[serde(default)]
     pub contested_handoff: Option<ContestedHandoff>,
+    /// The head commit `land` has armed (or is about to arm) GitHub auto-merge
+    /// on. Saved *before* the arm call, so a crash right after it still tells
+    /// a resume that the forge may be holding an armed merge. Cleared the
+    /// moment auto-merge is disabled or the pull request is done.
+    #[serde(default)]
+    pub land_armed_head: Option<String>,
+    /// The merge-approval question `land` last filed, and the head commit its
+    /// panel showed. An answer is only honoured for that exact commit: a fix
+    /// or rebase push makes a new head the owner has not seen.
+    #[serde(default)]
+    pub land_approval: Option<LandApproval>,
     /// Outcomes of the `verify.pre_gate` commands from the latest time they
     /// ran on the winner. Informational only: a failure here never blocks the
     /// run, the gate stays the single arbiter. Overwritten on each pass.
@@ -2006,6 +2026,8 @@ impl RunState {
             gate_fixes: Vec::new(),
             rebase_fixes: Vec::new(),
             contested_handoff: None,
+            land_armed_head: None,
+            land_approval: None,
             pre_gate: Vec::new(),
             pre_gate_commit: None,
             merge: None,
