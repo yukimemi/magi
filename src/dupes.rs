@@ -1463,8 +1463,10 @@ mod tests {
         assert!(parse_ruling(r#"{"ruling":"maybe","reason":"x"}"#).is_err());
         assert!(parse_ruling(r#"{"ruling":"mentions"}"#).is_err());
         assert!(parse_ruling(r#"{"ruling":"mentions","reason":"  "}"#).is_err());
-        let (r, why) =
-            parse_ruling("ok\n{\"ruling\":\"Mentions\",\"reason\":\"cites\\nit\"}").unwrap();
+        let two = "{\"ruling\":\"mentions\",\"reason\":\"c\"}\n{\"ruling\":\"owns\"}";
+        assert!(parse_ruling(two).is_err());
+        assert!(parse_ruling("ok {\"ruling\":\"mentions\",\"reason\":\"c\"}").is_err());
+        let (r, why) = parse_ruling("{\"ruling\":\"Mentions\",\"reason\":\"cites\\nit\"}").unwrap();
         assert_eq!((r, why.as_str()), (Ruling::Mentions, "cites it"));
     }
 
