@@ -1735,6 +1735,12 @@ impl Queue {
     /// moves the revision and notifies connected clients via the change stream.
     /// Returns 0 when the queue is completely empty.
     pub fn revision(&self) -> u64 {
+        self.revision_excluding(&std::collections::BTreeSet::new())
+    }
+
+    /// [`Queue::revision`] ignoring the files of the named task ids, for a
+    /// caller that tracks those tasks' content some other way.
+    pub fn revision_excluding(&self, skip: &std::collections::BTreeSet<String>) -> u64 {
         use std::hash::{Hash as _, Hasher as _};
 
         let mut entries: Vec<(String, u64)> = std::fs::read_dir(&self.root)
@@ -1742,6 +1748,12 @@ impl Queue {
             .flatten()
             .flatten()
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .filter(|e| {
+                let path = e.path();
+                !path
+                    .file_stem()
+                    .is_some_and(|stem| skip.contains(stem.to_string_lossy().as_ref()))
+            })
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
                 let mtime = e

@@ -40,7 +40,7 @@
 //! loop always falls through to its own `Queue::next_runnable` regardless of
 //! what happened here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -777,6 +777,26 @@ impl Drop for Busy {
 pub struct Conductor {
     seat: Option<SeatState>,
     last_seen: Option<(u64, BTreeSet<String>)>,
+    /// Content fingerprint of each held task the model was last shown, see
+    /// [`input_fingerprint`]. A held task whose fingerprint still matches is
+    /// settled: the conductor's own rewrites of it do not count as news.
+    considered: BTreeMap<String, String>,
+}
+
+/// What the conductor's decision about a held task is a function of: the task
+/// without the fields the conductor itself rewrites (`updated_at`,
+/// `hold_reason`, the recorded re-hold). Independent of how the model words a
+/// repeated decision.
+fn input_fingerprint(task: &Task) -> String {
+    let mut v = serde_json::to_value(task).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("updated_at");
+        o.remove("hold_reason");
+        if let Some(ro) = o.get_mut("resume_override").and_then(|r| r.as_object_mut()) {
+            ro.remove("conductor_rehold");
+        }
+    }
+    v.to_string()
 }
 
 impl Conductor {
@@ -786,13 +806,46 @@ impl Conductor {
         Self::default()
     }
 
-    fn snapshot(queue: &Queue, stalled: &[Task], finished: &[Task]) -> (u64, BTreeSet<String>) {
+    /// Held tasks among `stalled` / `finished` whose input is unchanged since
+    /// the model last saw them. Their files are left out of the revision, so
+    /// the conductor re-holding one (however it words it) is not news, while
+    /// an owner's answer changes the fingerprint and brings the file back in.
+    fn settled(
+        considered: &BTreeMap<String, String>,
+        stalled: &[Task],
+        finished: &[Task],
+    ) -> BTreeSet<String> {
+        stalled
+            .iter()
+            .chain(finished)
+            .filter(|t| t.status == TaskStatus::Held)
+            .filter(|t| considered.get(&t.id) == Some(&input_fingerprint(t)))
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    fn snapshot_with(
+        considered: &BTreeMap<String, String>,
+        queue: &Queue,
+        stalled: &[Task],
+        finished: &[Task],
+    ) -> (u64, BTreeSet<String>) {
         let ids = stalled
             .iter()
             .chain(finished)
             .map(|t| t.id.clone())
             .collect();
-        (queue.revision(), ids)
+        let skip = Self::settled(considered, stalled, finished);
+        (queue.revision_excluding(&skip), ids)
+    }
+
+    fn snapshot(
+        &self,
+        queue: &Queue,
+        stalled: &[Task],
+        finished: &[Task],
+    ) -> (u64, BTreeSet<String>) {
+        Self::snapshot_with(&self.considered, queue, stalled, finished)
     }
 
     /// Whether calling the conductor could possibly do anything different
@@ -813,7 +866,7 @@ impl Conductor {
     /// about whether there is anything to look at.
     #[must_use]
     pub fn worth_a_look(&self, queue: &Queue, stalled: &[Task], finished: &[Task]) -> bool {
-        self.last_seen.as_ref() != Some(&Self::snapshot(queue, stalled, finished))
+        self.last_seen.as_ref() != Some(&self.snapshot(queue, stalled, finished))
     }
 
     /// Call the conductor once, unless nothing has changed since the last
@@ -832,11 +885,18 @@ impl Conductor {
         finished: &[Task],
         max_attempts: usize,
     ) {
-        let snapshot = Self::snapshot(queue, stalled, finished);
-        if self.last_seen.as_ref() == Some(&snapshot) {
+        if self.last_seen.as_ref() == Some(&self.snapshot(queue, stalled, finished)) {
             return;
         }
-        self.last_seen = Some(snapshot);
+        // What the model is about to be shown becomes "considered" before the
+        // snapshot is taken, so its own re-hold writes land in the excluded set.
+        self.considered = stalled
+            .iter()
+            .chain(finished)
+            .filter(|t| t.status == TaskStatus::Held)
+            .map(|t| (t.id.clone(), input_fingerprint(t)))
+            .collect();
+        self.last_seen = Some(self.snapshot(queue, stalled, finished));
         if let Err(e) = self
             .run_once(
                 cfg,
@@ -2590,11 +2650,62 @@ mod tests {
                 .await;
         }
         let held = queue.get(&t.id).unwrap();
-        assert!(held.hold_reason.as_deref().unwrap().starts_with("keep held"));
+        assert!(
+            held.hold_reason
+                .as_deref()
+                .unwrap()
+                .starts_with("keep held")
+        );
         assert!(
             !conductor.worth_a_look(&queue, &[], &[held]),
             "an unchanged held task must stop being reconsidered"
         );
+    }
+
+    #[tokio::test]
+    async fn alternating_wording_does_not_keep_a_held_task_in_the_loop() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("held");
+        t.hold_machine(Some("first".to_owned()));
+        queue.put(&mut t).unwrap();
+        let reply = |note: &str| {
+            format!(
+                r#"{{"decisions":[{{"id":"{}","reason":"{note}","recovery":"hold"}}]}}"#,
+                t.id
+            )
+        };
+        let cfg_a = config(mock_agent(dir.path(), REPLY, env(&reply("keep held"))));
+        let cfg_b = config(mock_agent(dir.path(), REPLY, env(&reply("leave held"))));
+        let mut conductor = Conductor::new();
+        let mut writes = 0;
+        for i in 0..6 {
+            let held = queue.get(&t.id).unwrap();
+            let before = queue.revision();
+            conductor
+                .maybe_run(
+                    if i % 2 == 0 { &cfg_a } else { &cfg_b },
+                    dir.path(),
+                    &queue,
+                    &questions,
+                    dir.path(),
+                    &[],
+                    &[],
+                    &[held],
+                    2,
+                )
+                .await;
+            if queue.revision() != before {
+                writes += 1;
+            }
+        }
+        assert!(writes <= 2, "the loop must settle, saw {writes} writes");
+        let mut held = queue.get(&t.id).unwrap();
+        held.instruction.push_str(" (edited)");
+        queue.put(&mut held).unwrap();
+        let held = queue.get(&t.id).unwrap();
+        assert!(conductor.worth_a_look(&queue, &[], &[held]));
     }
 
     #[test]
@@ -2610,7 +2721,7 @@ mod tests {
             "a conductor that has never run has something to look at"
         );
 
-        conductor.last_seen = Some(Conductor::snapshot(&queue, &[], &[]));
+        conductor.last_seen = Some(conductor.snapshot(&queue, &[], &[]));
         assert!(
             !conductor.worth_a_look(&queue, &[], &[]),
             "nothing changed and nothing is stalled or finished"
