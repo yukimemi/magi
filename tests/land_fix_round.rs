@@ -57,9 +57,9 @@ async fn a_fixer_that_commits_for_itself_counts_as_progress() {
     let out = fix_round(&mut state, &pr, 1, 2, "a check is failing", "")
         .await
         .expect("fix round");
-    assert_eq!(out, Fixed::Committed);
-
     let head = git(&winner.worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(out, Fixed::Committed { head: head.clone() });
+
     let pushed = git(&remote, &["rev-parse", &format!("refs/heads/{}", winner.branch)]);
     assert_eq!(pushed, head, "the fixer's own commit must reach the remote");
     assert_eq!(

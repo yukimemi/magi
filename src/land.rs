@@ -2387,6 +2387,103 @@ async fn announce_red_merge(state: &mut RunState, pr: &PrState) {
 /// `graph.land` is on. Returns the last observation, so the caller can report
 /// what magi was looking at when it stopped.
 pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
+    land_with(state, pr_url, &GhForge).await
+}
+
+/// The forge calls whose timing the loop's decisions depend on, behind a seam
+/// so a test can script what the pull request looks like from one observation
+/// to the next. Comments, logs and rebases stay on `gh` and `git` directly.
+trait Forge {
+    async fn view(&self, repo: &Path, pr_url: &str) -> Result<Seen>;
+    async fn merge(&self, repo: &Path, argv: &[String]) -> Result<(bool, String)>;
+    async fn poll(&self);
+    #[allow(clippy::too_many_arguments)]
+    async fn fix(
+        &self,
+        state: &mut RunState,
+        pr: &PrState,
+        round: usize,
+        budget: usize,
+        reason: &str,
+        logs: &str,
+    ) -> Result<Fixed>;
+}
+
+struct GhForge;
+
+impl Forge for GhForge {
+    async fn view(&self, repo: &Path, pr_url: &str) -> Result<Seen> {
+        observe(repo, pr_url).await
+    }
+    async fn merge(&self, repo: &Path, argv: &[String]) -> Result<(bool, String)> {
+        gh(repo, argv).await
+    }
+    async fn poll(&self) {
+        tokio::time::sleep(POLL).await;
+    }
+    async fn fix(
+        &self,
+        state: &mut RunState,
+        pr: &PrState,
+        round: usize,
+        budget: usize,
+        reason: &str,
+        logs: &str,
+    ) -> Result<Fixed> {
+        fix_round(state, pr, round, budget, reason, logs).await
+    }
+}
+
+/// Is the observation older than the commit a fix round pushed?
+///
+/// The forge takes a few seconds to move the pull request to a new head and
+/// attach that head's check runs, and until it has, the rollup is the previous
+/// head's - all green, which is exactly what a merge decision must not read.
+/// An absent or different head counts as not yet: guessing "close enough"
+/// would reopen the hole.
+fn awaiting_new_head(awaiting: Option<&str>, observed: &str) -> bool {
+    awaiting.is_some_and(|want| !observed.eq_ignore_ascii_case(want))
+}
+
+/// What a refused `gh pr merge` means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    /// The branch policy is not satisfied *yet*: go back to waiting.
+    Pending,
+    /// Checks have settled and the merge state still says no, seen for the
+    /// first time. The forge updates `mergeStateStatus` a moment after the last
+    /// check finishes, so one more look is allowed before believing it.
+    Recheck,
+    /// Nothing is in flight and the policy still refuses: a person has to
+    /// supply what it asks for (a review, say).
+    Final,
+}
+
+/// Judged from the pull request's state after the refusal, never from the
+/// refusal's wording, which belongs to the forge and changes.
+fn classify_refusal(after: Option<&Seen>, rechecked: bool) -> Refused {
+    let Some(after) = after else {
+        // Unreadable is not evidence of anything; the next loop reads again.
+        return Refused::Pending;
+    };
+    if after.pr.state != PrLifecycle::Open {
+        return Refused::Final;
+    }
+    let state = after.merge_state.to_ascii_uppercase();
+    if matches!(after.pr.checks, Checks::Pending | Checks::Unknown)
+        || state.is_empty()
+        || state == "UNKNOWN"
+    {
+        return Refused::Pending;
+    }
+    if rechecked {
+        Refused::Final
+    } else {
+        Refused::Recheck
+    }
+}
+
+async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> Result<PrState> {
     let repo = state.repo.clone();
     let budget = state.config.graph.land_rounds;
     let mut round = 0usize;
@@ -2399,6 +2496,12 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
     // recorded decision, not an open question, and re-feeding it would loop the
     // budget away on a comment the fixer already declined with an argument.
     let mut shown: BTreeSet<String> = BTreeSet::new();
+    // The head a fix round pushed, until the pull request is seen on it. Memory
+    // only: a resume after a crash between the push and the next look can read
+    // the old head's green once more, and a refused merge then waits it out.
+    let mut awaiting_head: Option<String> = None;
+    // Whether a settled-checks refusal has already been given its one re-look.
+    let mut rechecked = false;
 
     // Marks the run resumable through exactly this function, not through a
     // fresh competition: `RunStatus::resumable` excludes only `Merged`,
@@ -2412,8 +2515,8 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
     state.save()?;
 
     loop {
-        let seen = observe(&repo, pr_url).await?;
-        let mut pr = seen.pr;
+        let seen = forge.view(&repo, pr_url).await?;
+        let mut pr = seen.pr.clone();
         pr.review_comments.retain(|c| !shown.contains(&c.body));
         state.pr = Some(crate::run::PrRecord {
             url: pr.url.clone(),
@@ -2426,6 +2529,34 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
         });
         state.save()?;
 
+        if pr.state == PrLifecycle::Open {
+            if awaiting_new_head(awaiting_head.as_deref(), &seen.head) {
+                if waited >= WAIT_CEILING {
+                    let why = format!(
+                        "the pull request was still not on the pushed commit {} after {} minutes \
+                         (it points at {}); someone may have pushed over it",
+                        awaiting_head.as_deref().unwrap_or_default(),
+                        WAIT_CEILING.as_secs() / 60,
+                        if seen.head.is_empty() {
+                            "nothing readable"
+                        } else {
+                            &seen.head
+                        },
+                    );
+                    stop(state, &repo, &pr, &why).await?;
+                    return Ok(pr);
+                }
+                waited += POLL;
+                forge.poll().await;
+                continue;
+            }
+            if awaiting_head.take().is_some() {
+                // The checks now being read belong to the new head; give them
+                // the same grace a fresh pull request gets.
+                waited = Duration::ZERO;
+            }
+        }
+
         match decide(&pr, round, budget, waited) {
             Step::Wait => {
                 if waited >= WAIT_CEILING {
@@ -2437,7 +2568,7 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                     return Ok(pr);
                 }
                 waited += POLL;
-                tokio::time::sleep(POLL).await;
+                forge.poll().await;
             }
             Step::Done { merged } => {
                 state.status = if merged {
@@ -2508,7 +2639,7 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                 let out = {
                     let merge_lock = repo_merge_lock(&repo);
                     let _merge_slot = merge_lock.lock().await;
-                    gh(&repo, &argv).await?
+                    forge.merge(&repo, &argv).await?
                 };
                 if out.0 {
                     pr.state = PrLifecycle::Merged;
@@ -2532,7 +2663,8 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                     write_pr_state_through(state, pr.state);
                     return Ok(pr);
                 }
-                let after = observe(&repo, pr_url).await.ok().map(|s| s.pr.state);
+                let after_seen = forge.view(&repo, pr_url).await.ok();
+                let after = after_seen.as_ref().map(|s| s.pr.state);
                 if let Some(outcome) = merged_after_all(&argv, &out.1, after) {
                     pr.state = PrLifecycle::Merged;
                     state.status = RunStatus::Merged;
@@ -2546,14 +2678,51 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                     write_pr_state_through(state, pr.state);
                     return Ok(pr);
                 }
-                stop(
-                    state,
-                    &repo,
-                    &pr,
-                    &format!("`gh pr merge` failed: {}", out.1),
-                )
-                .await?;
-                return Ok(pr);
+                match classify_refusal(after_seen.as_ref(), rechecked) {
+                    Refused::Final => {
+                        let merge_state = after_seen
+                            .as_ref()
+                            .map(|s| s.merge_state.as_str())
+                            .filter(|m| !m.is_empty())
+                            .unwrap_or("unknown");
+                        stop(
+                            state,
+                            &repo,
+                            &pr,
+                            &format!(
+                                "`gh pr merge` failed: {} (merge state: {merge_state})",
+                                out.1
+                            ),
+                        )
+                        .await?;
+                        return Ok(pr);
+                    }
+                    verdict => {
+                        // Back to the top, which re-decides and passes the
+                        // approval gate again, a poll later. `waited` is not
+                        // reset here: only a pushed fix restarts it, or a
+                        // standing refusal would wait forever.
+                        if waited >= WAIT_CEILING {
+                            let why = format!(
+                                "`gh pr merge` was still refused after {} minutes: {}",
+                                WAIT_CEILING.as_secs() / 60,
+                                out.1
+                            );
+                            stop(state, &repo, &pr, &why).await?;
+                            return Ok(pr);
+                        }
+                        if verdict == Refused::Recheck {
+                            rechecked = true;
+                        }
+                        state.event(
+                            "land",
+                            "merge refused while the branch policy is not satisfied yet; waiting",
+                        );
+                        state.save()?;
+                        waited += POLL;
+                        forge.poll().await;
+                    }
+                }
             }
             Step::Rebase => {
                 // Bounded by the same budget as a fix, because a rebase that
@@ -2654,8 +2823,15 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
 
                 let logs = failing_logs(&repo, &seen.failing_urls).await;
                 let was_red = pr.checks == Checks::Red;
-                match fix_round(state, &pr, round, budget, &reason, &logs).await? {
-                    Fixed::Committed => {}
+                match forge.fix(state, &pr, round, budget, &reason, &logs).await? {
+                    Fixed::Committed { head } => {
+                        // Whatever the next look shows may still be the
+                        // previous head; see `awaiting_new_head`.
+                        awaiting_head = Some(head);
+                        rechecked = false;
+                        waited = Duration::ZERO;
+                        forge.poll().await;
+                    }
                     Fixed::Declined if was_red => {
                         let why = format!(
                             "the fixer produced no commit while {} check(s) were failing \
@@ -2688,10 +2864,16 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
 /// One observation, plus the two things [`PrState`] deliberately does not carry:
 /// the title (needed for the squash subject) and where the failing checks'
 /// logs live.
+#[derive(Clone)]
 struct Seen {
     pr: PrState,
     title: String,
     failing_urls: Vec<(String, String)>,
+    /// `headRefOid`: the commit this observation, checks included, is about.
+    head: String,
+    /// `mergeStateStatus` as the forge spelled it. [`Blocking`] folds BLOCKED,
+    /// BEHIND and DRAFT together, and a stop reason has to say which.
+    merge_state: String,
 }
 
 /// Read the pull request: `gh pr view` for the rollup and the top-level thread,
@@ -2704,7 +2886,8 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
             "view".to_owned(),
             pr_url.to_owned(),
             "--json".to_owned(),
-            "url,number,state,title,statusCheckRollup,reviews,comments,mergeStateStatus".to_owned(),
+            "url,number,state,title,statusCheckRollup,reviews,comments,mergeStateStatus,headRefOid"
+                .to_owned(),
         ],
     )
     .await?;
@@ -2744,6 +2927,8 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
         pr,
         title: raw.title,
         failing_urls,
+        head: raw.head_ref_oid,
+        merge_state: raw.merge_state_status,
     })
 }
 
@@ -2751,8 +2936,11 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
 #[doc(hidden)]
 #[derive(Debug, PartialEq)]
 pub enum Fixed {
-    /// The fixer committed something.
-    Committed,
+    /// The fixer committed something, and this is the head that was pushed.
+    Committed {
+        /// The commit now at the tip of the pushed branch.
+        head: String,
+    },
     /// The fixer ran and chose to change nothing.
     Declined,
     /// The fixer could not run, or said nothing usable.
@@ -2872,7 +3060,7 @@ pub async fn fix_round(
         "land",
         format!("round {round}: pushed a fix to {}", winner.branch),
     );
-    Ok(Fixed::Committed)
+    Ok(Fixed::Committed { head: after })
 }
 
 /// Fetch or create a seat, keeping its conversation across nodes.
@@ -3119,6 +3307,11 @@ struct GhPr {
     /// [`Blocking`].
     #[serde(default)]
     merge_state_status: String,
+    /// The commit the pull request currently points at. Compared with the
+    /// commit a fix round pushed, it is how the loop knows the forge has moved
+    /// on and the rollup belongs to the new head.
+    #[serde(default)]
+    head_ref_oid: String,
     #[serde(default)]
     reviews: Vec<GhReview>,
     #[serde(default)]
@@ -5109,5 +5302,265 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(recorded(h, "20261004-100300-dddd"), "open");
         assert_eq!(recorded(h, "20261004-100400-eeee"), "open");
         assert_eq!(apply_pr_states(h, &known), 0);
+    }
+
+    // --- the land loop against a scripted forge -------------------------
+
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// Answers views from a script (the last one repeats), merges from a
+    /// queue, and records every call so a test can assert the order.
+    struct Scripted {
+        views: Mutex<VecDeque<Seen>>,
+        merges: Mutex<VecDeque<(bool, String)>>,
+        fix: Mutex<Option<Fixed>>,
+        log: Mutex<Vec<&'static str>>,
+    }
+
+    impl Scripted {
+        fn new(views: Vec<Seen>, merges: Vec<(bool, &str)>) -> Self {
+            Self {
+                views: Mutex::new(views.into()),
+                merges: Mutex::new(
+                    merges
+                        .into_iter()
+                        .map(|(ok, m)| (ok, m.to_owned()))
+                        .collect(),
+                ),
+                fix: Mutex::new(None),
+                log: Mutex::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> Vec<&'static str> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl Forge for Scripted {
+        async fn view(&self, _repo: &Path, _url: &str) -> Result<Seen> {
+            self.log.lock().unwrap().push("view");
+            let mut v = self.views.lock().unwrap();
+            Ok(if v.len() > 1 {
+                v.pop_front().unwrap()
+            } else {
+                v[0].clone()
+            })
+        }
+        async fn merge(&self, _repo: &Path, _argv: &[String]) -> Result<(bool, String)> {
+            self.log.lock().unwrap().push("merge");
+            Ok(self
+                .merges
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unscripted merge"))
+        }
+        async fn poll(&self) {
+            self.log.lock().unwrap().push("poll");
+        }
+        async fn fix(
+            &self,
+            _state: &mut RunState,
+            _pr: &PrState,
+            _round: usize,
+            _budget: usize,
+            _reason: &str,
+            _logs: &str,
+        ) -> Result<Fixed> {
+            self.log.lock().unwrap().push("fix");
+            Ok(self.fix.lock().unwrap().take().expect("unscripted fix"))
+        }
+    }
+
+    const REFUSED: &str =
+        "X Pull request #42 is not mergeable: the base branch policy prohibits the merge.";
+
+    fn seen(head: &str, checks: Checks, merge_state: &str, comments: bool) -> Seen {
+        let mut pr = green_pr();
+        pr.checks = checks;
+        pr.blocking = Blocking::of(merge_state);
+        if !comments {
+            pr.review_comments.clear();
+        }
+        Seen {
+            pr,
+            title: "feat: x".to_owned(),
+            failing_urls: Vec::new(),
+            head: head.to_owned(),
+            merge_state: merge_state.to_owned(),
+        }
+    }
+
+    fn landing_state() -> RunState {
+        crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
+        let mut state = run_state();
+        state.config.graph.land_approval = false;
+        // Tests run in parallel and `run_state` ids come from the clock, so two
+        // of them would otherwise share one run directory.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        state.id = format!(
+            "20261004-000000-{:04x}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        state
+    }
+
+    #[test]
+    fn a_pushed_head_is_awaited_case_insensitively_and_an_unreadable_one_is_not_a_match() {
+        assert!(!awaiting_new_head(None, "aaa"));
+        assert!(!awaiting_new_head(Some("abc123"), "ABC123"));
+        assert!(awaiting_new_head(Some("abc123"), "def456"));
+        assert!(awaiting_new_head(Some("abc123"), ""));
+    }
+
+    #[test]
+    fn a_refusal_is_judged_by_the_pull_requests_state_not_by_its_wording() {
+        let open = |c, m: &str| seen("a", c, m, false);
+        let table = [
+            (None, false, Refused::Pending),
+            (
+                Some(open(Checks::Pending, "BLOCKED")),
+                false,
+                Refused::Pending,
+            ),
+            (
+                Some(open(Checks::Unknown, "BLOCKED")),
+                false,
+                Refused::Pending,
+            ),
+            (
+                Some(open(Checks::Green, "UNKNOWN")),
+                false,
+                Refused::Pending,
+            ),
+            (Some(open(Checks::Green, "")), false, Refused::Pending),
+            (
+                Some(open(Checks::Green, "BLOCKED")),
+                false,
+                Refused::Recheck,
+            ),
+            (Some(open(Checks::Green, "BLOCKED")), true, Refused::Final),
+        ];
+        for (after, rechecked, want) in table {
+            assert_eq!(classify_refusal(after.as_ref(), rechecked), want);
+        }
+        let mut closed = open(Checks::Green, "CLEAN");
+        closed.pr.state = PrLifecycle::Closed;
+        assert_eq!(classify_refusal(Some(&closed), false), Refused::Final);
+    }
+
+    #[tokio::test]
+    async fn a_normal_landing_merges_on_the_first_look() {
+        let mut state = landing_state();
+        let forge = Scripted::new(
+            vec![seen("a", Checks::Green, "CLEAN", false)],
+            vec![(true, "")],
+        );
+        land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+            .await
+            .unwrap();
+        assert_eq!(forge.calls(), ["view", "merge"]);
+        assert_eq!(state.status, RunStatus::Merged);
+    }
+
+    #[tokio::test]
+    async fn after_a_pushed_fix_no_merge_is_tried_until_the_head_matches() {
+        let mut state = landing_state();
+        let forge = Scripted::new(
+            vec![
+                seen("old", Checks::Green, "CLEAN", true),
+                // The forge has not moved to the new head yet: still green.
+                seen("old", Checks::Green, "CLEAN", true),
+                seen("new", Checks::Pending, "BLOCKED", true),
+                seen("new", Checks::Green, "CLEAN", true),
+            ],
+            vec![(true, "")],
+        );
+        *forge.fix.lock().unwrap() = Some(Fixed::Committed {
+            head: "NEW".to_owned(),
+        });
+        land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+            .await
+            .unwrap();
+        assert_eq!(
+            forge.calls(),
+            [
+                "view", "fix", "poll", "view", "poll", "view", "poll", "view", "merge"
+            ]
+        );
+        assert_eq!(state.status, RunStatus::Merged);
+    }
+
+    #[tokio::test]
+    async fn a_head_that_never_arrives_stops_naming_both_commits() {
+        let mut state = landing_state();
+        let forge = Scripted::new(
+            vec![
+                seen("old", Checks::Green, "CLEAN", true),
+                seen("someone-elses", Checks::Green, "CLEAN", true),
+            ],
+            vec![],
+        );
+        *forge.fix.lock().unwrap() = Some(Fixed::Committed {
+            head: "mine".to_owned(),
+        });
+        land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+            .await
+            .unwrap();
+        assert!(!forge.calls().contains(&"merge"));
+        let why = state.merge.as_ref().unwrap().detail.clone();
+        assert!(
+            why.contains("mine") && why.contains("someone-elses"),
+            "{why}"
+        );
+        assert_eq!(state.status, RunStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn a_policy_refusal_while_checks_run_waits_and_then_merges() {
+        let mut state = landing_state();
+        let forge = Scripted::new(
+            vec![
+                seen("a", Checks::Green, "CLEAN", false),
+                seen("a", Checks::Pending, "BLOCKED", false),
+                seen("a", Checks::Pending, "BLOCKED", false),
+                seen("a", Checks::Green, "CLEAN", false),
+            ],
+            vec![(false, REFUSED), (true, "")],
+        );
+        land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+            .await
+            .unwrap();
+        assert_eq!(
+            forge.calls(),
+            [
+                "view", "merge", "view", "poll", "view", "poll", "view", "merge"
+            ]
+        );
+        assert_eq!(state.status, RunStatus::Merged);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_that_outlives_settled_checks_stops_with_the_merge_state() {
+        let mut state = landing_state();
+        let forge = Scripted::new(
+            vec![
+                seen("a", Checks::Green, "CLEAN", false),
+                seen("a", Checks::Green, "BLOCKED", false),
+            ],
+            vec![(false, REFUSED), (false, REFUSED)],
+        );
+        land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+            .await
+            .unwrap();
+        // One re-look is allowed for the forge's own lag, then it is final.
+        assert_eq!(forge.calls().iter().filter(|c| **c == "merge").count(), 2);
+        let why = state.merge.as_ref().unwrap().detail.clone();
+        assert!(
+            why.contains("policy prohibits") && why.contains("BLOCKED"),
+            "{why}"
+        );
+        assert_eq!(state.status, RunStatus::Blocked);
     }
 }
