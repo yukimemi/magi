@@ -125,3 +125,12 @@ Formatting is not a finding: `cargo fmt` runs in the gate. Spend the round on \
 correctness, on invariants the code claims and does not keep, and on tests that \
 assert plumbing rather than behaviour.
 """
+
+# Context-window sizes (tokens) the chat's usage meter divides by, keyed by the
+# model name an agent passes to its CLI. Merged over a built-in table; an exact
+# name wins, then the longest prefix. A model with no entry shows a raw token
+# count and no percentage. Example:
+#
+# [context_windows]
+# "claude-opus-4-1" = 200000
+# "my-local-model" = 32768

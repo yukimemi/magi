@@ -842,6 +842,61 @@ pub struct Config {
     pub talk: Talk,
     /// How many runs `magi serve`'s own loop drives at once.
     pub daemon: Daemon,
+    /// Context-window sizes in tokens, keyed by model name, merged over
+    /// [`BUILTIN_CONTEXT_WINDOWS`]. See [`Config::context_window`].
+    pub context_windows: BTreeMap<String, u64>,
+}
+
+/// Context windows of models magi commonly drives, in tokens.
+///
+/// A convenience, not a source of truth: vendors resize windows and ship new
+/// models faster than this table is edited, so an entry that is stale or
+/// missing is fixed by `[context_windows]` in `magi.toml`, which wins. Matched
+/// by [`Config::context_window`]: exact name first, then the longest key that
+/// prefixes the model name (so a dated or suffixed id such as
+/// `claude-sonnet-4-5-20250929` finds `claude-sonnet-4-5`). A model matching
+/// nothing has no percentage - the UI shows the raw count.
+const BUILTIN_CONTEXT_WINDOWS: &[(&str, u64)] = &[
+    ("claude-opus-4", 200_000),
+    ("claude-sonnet-4", 200_000),
+    ("claude-haiku-4", 200_000),
+    ("claude-3", 200_000),
+    ("opus", 200_000),
+    ("sonnet", 200_000),
+    ("haiku", 200_000),
+    ("gpt-5", 400_000),
+    ("gpt-4.1", 1_000_000),
+    ("gpt-4o", 128_000),
+    ("o3", 200_000),
+    ("o4-mini", 200_000),
+    ("gemini-2.5", 1_000_000),
+    ("deepseek", 128_000),
+];
+
+impl Config {
+    /// Context window in tokens for `model`: `[context_windows]` first, then
+    /// the built-in table; within each, an exact name beats the longest
+    /// prefix. `None` for an unknown model, which is a deliberate answer -
+    /// guessing a denominator would print a confident wrong percentage.
+    pub fn context_window(&self, model: &str) -> Option<u64> {
+        fn lookup<'a>(model: &str, entries: impl Iterator<Item = (&'a str, u64)>) -> Option<u64> {
+            let mut best: Option<(usize, u64)> = None;
+            for (key, window) in entries {
+                if key == model {
+                    return Some(window);
+                }
+                if model.starts_with(key) && best.is_none_or(|(len, _)| key.len() > len) {
+                    best = Some((key.len(), window));
+                }
+            }
+            best.map(|(_, w)| w)
+        }
+        lookup(
+            model,
+            self.context_windows.iter().map(|(k, w)| (k.as_str(), *w)),
+        )
+        .or_else(|| lookup(model, BUILTIN_CONTEXT_WINDOWS.iter().copied()))
+    }
 }
 
 /// How the daemon loop itself behaves, as opposed to what one run does.
@@ -1767,6 +1822,31 @@ fn find_program_in(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn context_window_prefers_exact_then_longest_prefix_and_user_over_builtin() {
+        let mut cfg = Config::default();
+        assert_eq!(
+            cfg.context_window("claude-sonnet-4-5-20250929"),
+            Some(200_000)
+        );
+        assert_eq!(cfg.context_window("gpt-4.1-mini"), Some(1_000_000));
+        assert_eq!(cfg.context_window("mystery-model"), None);
+        cfg.context_windows
+            .insert("claude-sonnet-4-5".into(), 1_000_000);
+        cfg.context_windows.insert("claude-sonnet-4".into(), 5);
+        cfg.context_windows.insert("mystery".into(), 32_768);
+        // Longest user prefix beats a shorter one and the built-in table.
+        assert_eq!(
+            cfg.context_window("claude-sonnet-4-5-20250929"),
+            Some(1_000_000)
+        );
+        // An exact name beats any prefix.
+        cfg.context_windows
+            .insert("claude-sonnet-4-5-20250929".into(), 7);
+        assert_eq!(cfg.context_window("claude-sonnet-4-5-20250929"), Some(7));
+        assert_eq!(cfg.context_window("mystery-model"), Some(32_768));
+    }
+
     use super::*;
 
     /// npm writes an extensionless `sh` script beside `codex.cmd`; on Windows
