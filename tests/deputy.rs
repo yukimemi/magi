@@ -336,3 +336,16 @@ async fn deputies_do_not_start_when_disabled() {
     assert!(log(&s).is_empty());
 }
 }
+
+common::e2e! {
+async fn an_unresolvable_deputy_agent_cannot_keep_a_question_open() {
+    let s = scene(home_lock().await);
+    age_unread(&s);
+    let mut bad = s.fx.config.clone();
+    bad.agents.clear();
+    assert!(!magi::deputy::can_start(Some(&bad), ""));
+    let mut waiter = Waiter::new(s.store.clone(), s.home.clone(), Some(bad));
+    waiter.tick(Timestamp::now(), &|| false).await;
+    assert_eq!(s.store.get(&s.q.id).unwrap().status, QuestionStatus::Abandoned);
+}
+}

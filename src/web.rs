@@ -4375,9 +4375,9 @@ impl QuestionView {
 }
 
 /// Can `magi serve` start a deputy under the config this repository resolves?
-fn deputies_enabled(repo: &std::path::Path) -> bool {
+fn deputies_enabled(repo: &std::path::Path, q: &Question) -> bool {
     let cfg = Config::discover(repo, None).ok().map(|(c, _)| c);
-    crate::deputy::can_start(cfg.as_ref())
+    crate::deputy::can_start(cfg.as_ref(), crate::deputy::agent_of(q))
 }
 
 /// Who is honestly waiting on an open question right now: `"asker"` (the
@@ -4415,7 +4415,10 @@ async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<Questio
             ui.questions
                 .list()
                 .into_iter()
-                .map(|q| QuestionView::of(q, &ui.questions, deputies_enabled(&ui.repo)))
+                .map(|q| {
+                    let on = deputies_enabled(&ui.repo, &q);
+                    QuestionView::of(q, &ui.questions, on)
+                })
                 .collect(),
         ))
     })
@@ -4520,7 +4523,8 @@ async fn question_answer(
             .questions
             .update(&q.id, |r| r.answer(answer))
             .map_err(ApiError::bad_request_from)?;
-        Ok(Json(QuestionView::of(q, &ui.questions, deputies_enabled(&ui.repo))))
+        let on = deputies_enabled(&ui.repo, &q);
+        Ok(Json(QuestionView::of(q, &ui.questions, on)))
     })
     .await
 }
@@ -4569,7 +4573,8 @@ async fn question_say(
             .questions
             .update(&q.id, |r| r.say(body.body))
             .map_err(ApiError::bad_request_from)?;
-        Ok(Json(QuestionView::of(q, &ui.questions, deputies_enabled(&ui.repo))))
+        let on = deputies_enabled(&ui.repo, &q);
+        Ok(Json(QuestionView::of(q, &ui.questions, on)))
     })
     .await
 }
@@ -5785,11 +5790,19 @@ mod tests {
     fn deputies_enabled_follows_the_config() {
         let dir = tempfile::tempdir().unwrap();
         // Nothing configured: the default allows deputies.
-        assert!(deputies_enabled(dir.path()));
+        let q = Question::new(
+            "t".to_owned(),
+            crate::conduct::NODE.to_owned(),
+            "conduct".to_owned(),
+            "which?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        assert!(deputies_enabled(dir.path(), &q));
         let mut off = Config::default();
         off.daemon.max_deputies = 0;
-        assert!(!crate::deputy::can_start(Some(&off)));
-        assert!(!crate::deputy::can_start(None));
+        assert!(!crate::deputy::can_start(Some(&off), ""));
+        assert!(!crate::deputy::can_start(None, ""));
     }
     use pretty_assertions::assert_eq;
     use serde_json::Value;

@@ -210,7 +210,10 @@ impl Waiter {
                         // question.
                         if crate::deputy::exhausted_past_deadline(
                             &q,
-                            crate::deputy::can_start(self.conduct_cfg.as_ref()),
+                            crate::deputy::can_start(
+                                self.conduct_cfg.as_ref(),
+                                crate::deputy::agent_of(&q),
+                            ),
                             self.default_timeout,
                             now,
                         ) {
@@ -242,7 +245,10 @@ impl Waiter {
         } else {
             self.default_timeout
         };
-        let startable = crate::deputy::can_start(self.conduct_cfg.as_ref());
+        let startable = crate::deputy::can_start(
+            self.conduct_cfg.as_ref(),
+            crate::deputy::agent_of(q),
+        );
         let why = format!("no answer within {}s of asking", secs.max(1));
         let done = self.store.update(&q.id, |r| {
             // Decided again on the record as it is now: the owner may have

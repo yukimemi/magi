@@ -123,8 +123,21 @@ pub fn brief(
 
 /// Can `magi serve` start a deputy at all under `cfg`? Not when deputies are
 /// switched off (`daemon.max_deputies = 0`) or the config could not be read.
-pub fn can_start(cfg: Option<&Config>) -> bool {
-    cfg.is_some_and(|c| c.daemon.max_deputies > 0)
+///
+/// Also false when the agent the deputy would run as cannot be resolved
+/// (`agent` is the deputy's recorded agent, empty when it has none): `turn`
+/// fails on that before it counts a start, so it would never reach
+/// [`MAX_STARTS`].
+pub fn can_start(cfg: Option<&Config>, agent: &str) -> bool {
+    cfg.is_some_and(|c| {
+        c.daemon.max_deputies > 0
+            && ((!agent.is_empty() && c.agent(agent).is_ok()) || c.resolve_roles().is_ok())
+    })
+}
+
+/// The agent a question's deputy records, empty when it has none yet.
+pub fn agent_of(q: &Question) -> &str {
+    q.deputy.as_ref().map_or("", |d| d.agent.as_str())
 }
 
 /// Has this question's deputy run out of starts, or can none ever start, with
@@ -273,7 +286,7 @@ impl Deputies {
             if now.as_second() > deadline && q.unread_from_owner().is_none() {
                 continue;
             }
-            if self.inflight.len() >= self.max || !can_start(self.cfg.as_ref()) {
+            if self.inflight.len() >= self.max || !can_start(self.cfg.as_ref(), dep.agent.as_str()) {
                 continue;
             }
             if matches!(self.memo.get(&q.id), Some(until) if Instant::now() < *until) {
