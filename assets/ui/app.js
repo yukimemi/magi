@@ -5333,13 +5333,8 @@ function renderRunDetail() {
   setText($("run-meta"),
     `${shortId(run.id)} \u00b7 ${repoName} \u00b7 ${run.base_branch || ""} \u00b7 started ${created.text} \u00b7 updated ${updated.text}`
     + (run.origin_label ? ` \u00b7 ${run.origin ? "from " : ""}${run.origin_label}` : ""));
-  /* The way back to the task whose attempt this is. */
-  const taskLink = $("run-task-link");
-  if (run.task && run.task.id) {
-    setAttr(taskLink, "href", `#/tasks/${encodeURIComponent(run.task.id)}`);
-    setText(taskLink, `Task ${run.task.short} \u2014 all attempts`);
-  }
-  show(taskLink, Boolean(run.task && run.task.id));
+  /* The way back to the task whose attempt this is, and how the task fared. */
+  taskLine(run);
   setAttr($("run-meta"), "title", `${run.id}\n${run.repo || ""}\nstarted ${created.title}\nupdated ${updated.title}`);
 
   const instructionEl = $("run-instruction");
@@ -5687,6 +5682,40 @@ async function deleteRun(id) {
 /* Every question this run has ever asked, open ones first: the answered ones
    are the record of the decisions that shaped the work below. They are
    answerable right here, so arriving from the runs list is not a detour. */
+/* One line under a run's header about its task. It leads with "Task" and the
+   task's own chip, so it never reads as this run's status. */
+function taskLine(run) {
+  const line = $("run-task-line");
+  const t = run.task;
+  if (!t || !t.id) { show(line, false); return; }
+  const runLink = (b) => el("a", { href: `#/runs/${encodeURIComponent(b.id)}`, text: b.short });
+  const kids = [
+    "Task ",
+    el("a", { href: `#/tasks/${encodeURIComponent(t.id)}`, text: t.short }),
+    ": ",
+    chip(t.status, TASK_STATUS),
+    " ",
+  ];
+  if (t.finished_by) {
+    kids.push("via run ", runLink(t.finished_by), ` (${t.finished_by.outcome})`);
+  } else if (t.closed_by_hand) {
+    kids.push("closed by hand");
+  } else if (!t.is_latest && t.latest) {
+    if (t.status === "queued" || t.status === "running") {
+      kids.push("re-queued, a newer run ", runLink(t.latest), ` is ${t.latest.status || "unreadable"}`);
+    } else {
+      kids.push("superseded by run ", runLink(t.latest), ` (${t.latest.outcome})`);
+    }
+  } else if (t.status === "held") {
+    kids.push(`this run was the last attempt (${t.attempts}/${t.max_attempts})`);
+  } else if (t.status === "queued" || t.status === "running") {
+    kids.push(`attempt ${t.attempts}/${t.max_attempts}`);
+  }
+  kids.push(" \u00b7 ", el("a", { href: `#/tasks/${encodeURIComponent(t.id)}`, text: "all attempts" }));
+  line.replaceChildren(...kids);
+  show(line, true);
+}
+
 function renderAsks(run) {
   const mine = (state.questions || []).filter((q) => q.run === run.id);
   show($("run-ask-panel"), mine.length > 0);

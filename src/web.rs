@@ -2518,6 +2518,74 @@ struct TaskRef {
     id: String,
     short: String,
     title: String,
+    /// The task's own status (`TaskStatus::as_str`), independent of this run's.
+    status: &'static str,
+    attempts: usize,
+    max_attempts: usize,
+    /// This run is the last entry of the task's run list.
+    is_latest: bool,
+    /// The task's newest run, when it is not this one.
+    latest: Option<RunBrief>,
+    /// The run that finished a `done` task (merged, or already in the base).
+    finished_by: Option<RunBrief>,
+    /// The task is `done` but no run on record finished it: closed by hand.
+    closed_by_hand: bool,
+}
+
+/// Another run of the same task, as named from a run's detail page.
+#[derive(Debug, Serialize)]
+struct RunBrief {
+    id: String,
+    short: String,
+    /// `None` when the run's record cannot be read.
+    status: Option<&'static str>,
+    /// The task-page wording for how that pass ended.
+    outcome: String,
+}
+
+/// The task's overall outcome as seen from `this_run`'s page, classified with
+/// the same exits the task page's flowchart uses.
+fn task_outcome(
+    task: &Task,
+    this_run: &str,
+    max_attempts: usize,
+    read: impl Fn(&str) -> Option<RunState>,
+) -> TaskRef {
+    let history = task_history(task, read);
+    let brief = |h: &TaskRunView| RunBrief {
+        id: h.id.clone(),
+        short: h.short.clone(),
+        status: h.status,
+        outcome: h.exit.edge_label(h.status),
+    };
+    let is_latest = task.runs.last().is_none_or(|r| r == this_run);
+    let latest = if is_latest {
+        None
+    } else {
+        history.last().map(brief)
+    };
+    let done = task.status == TaskStatus::Done;
+    let finished_by = done
+        .then(|| {
+            history
+                .iter()
+                .rev()
+                .find(|h| matches!(h.exit, RunExit::Merged | RunExit::AlreadyInBase))
+                .map(brief)
+        })
+        .flatten();
+    TaskRef {
+        short: task.short().to_owned(),
+        title: task.title.clone(),
+        id: task.id.clone(),
+        status: task.status.as_str(),
+        attempts: task.attempts,
+        max_attempts,
+        is_latest,
+        latest,
+        closed_by_hand: done && finished_by.is_none(),
+        finished_by,
+    }
 }
 
 /// The task's current attempt, as seen from an older one's detail page.
@@ -2584,16 +2652,13 @@ async fn run_detail(
                 id: head.id,
             })
         });
+        let max_attempts = daemon::Opts::default().max_attempts;
         let task = ui
             .queue
             .list()
             .into_iter()
             .find(|t| t.runs.contains(&id))
-            .map(|t| TaskRef {
-                short: t.short().to_owned(),
-                title: t.title.clone(),
-                id: t.id,
-            });
+            .map(|t| task_outcome(&t, &id, max_attempts, |r| read_run(&ui.runs, r).ok()));
         Ok(Json(RunDetailView::of(
             state,
             live,
@@ -11956,6 +12021,95 @@ mod tests {
         // Front end: the note has to be rendered, not just carried.
         assert!(APP_JS.contains("run.superseded_by"));
         assert!(APP_JS.contains("Superseded by"));
+    }
+
+    fn outcome_task(runs: &[&str], status: TaskStatus) -> Task {
+        let mut t = Task::new(
+            "one task".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        t.runs = runs.iter().map(|r| (*r).to_owned()).collect();
+        t.status = status;
+        t
+    }
+
+    #[tokio::test]
+    async fn a_blocked_run_reports_the_task_finishing_elsewhere() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let (old, new) = ("20260901-000000-aaaa", "20260901-000000-bbbb");
+        write_run(&runs, old, RunStatus::Blocked);
+        write_run(&runs, new, RunStatus::Merged);
+        let mut t = outcome_task(&[old, new], TaskStatus::Done);
+        fx.queue().put(&mut t).expect("put");
+
+        let view = fx.get(&format!("/api/runs/{old}")).await.json();
+        let task = &view["task"];
+        assert_eq!(task["status"], "done");
+        assert_eq!(task["is_latest"], false);
+        assert_eq!(task["latest"]["short"], "bbbb");
+        assert_eq!(task["finished_by"]["id"], new);
+        assert_eq!(task["finished_by"]["outcome"], "merged");
+        assert_eq!(task["closed_by_hand"], false);
+        assert_eq!(view["status"], "blocked", "the run keeps its own status");
+        assert!(APP_JS.contains("finished_by"));
+        assert!(APP_JS.contains("superseded by run"));
+    }
+
+    #[tokio::test]
+    async fn the_latest_run_reports_a_held_task_without_a_successor() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let (old, new) = ("20260901-000000-aaaa", "20260901-000000-bbbb");
+        write_run(&runs, old, RunStatus::Stalled);
+        write_run(&runs, new, RunStatus::Blocked);
+        let mut t = outcome_task(&[old, new], TaskStatus::Held);
+        fx.queue().put(&mut t).expect("put");
+
+        let task = fx.get(&format!("/api/runs/{new}")).await.json()["task"].clone();
+        assert_eq!(task["status"], "held");
+        assert_eq!(task["is_latest"], true);
+        assert!(task["latest"].is_null());
+        assert!(task["finished_by"].is_null());
+        assert_eq!(task["closed_by_hand"], false);
+    }
+
+    #[tokio::test]
+    async fn a_direct_run_has_no_task_outcome() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let id = "20260901-000000-aaaa";
+        write_run(&runs, id, RunStatus::Blocked);
+        let view = fx.get(&format!("/api/runs/{id}")).await.json();
+        assert!(view["task"].is_null());
+    }
+
+    #[test]
+    fn task_outcome_does_not_guess_a_finishing_run() {
+        let a = "20260901-000000-aaaa";
+        let b = "20260901-000000-bbbb";
+        let c = "20260901-000000-cccc";
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_run(dir.path(), a, RunStatus::Ready);
+        write_run(dir.path(), b, RunStatus::VerifiedNoop);
+        // `c` has no record: unreadable.
+        let read = |id: &str| read_run(dir.path(), id).ok();
+        // Neither Ready nor a no-op finished the task; the newest run is
+        // unreadable and still named.
+        let t = outcome_task(&[a, b, c], TaskStatus::Done);
+        let out = task_outcome(&t, a, 3, read);
+        assert!(out.finished_by.is_none());
+        assert!(out.closed_by_hand);
+        let latest = out.latest.expect("latest");
+        assert_eq!(latest.id, c);
+        assert_eq!(latest.status, None);
+        assert_eq!(latest.outcome, "record unreadable");
+
+        // A resumed run id repeats: it is still the latest by id.
+        let t = outcome_task(&[a, b, a], TaskStatus::Held);
+        assert!(task_outcome(&t, a, 3, read).is_latest);
     }
 
     #[tokio::test]
