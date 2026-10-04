@@ -1287,6 +1287,25 @@ impl Config {
         out
     }
 
+    /// Each layer rendered on its own, with the outcome per file: the
+    /// settings screen's way of saying which layer a value came from and which
+    /// layer is the one that does not parse. A **display aid only**, for the
+    /// same reason as [`Config::array_provenance`]: the effective config
+    /// always comes from the one joint [`Config::load_layers`].
+    pub(crate) fn layer_tables(paths: &[PathBuf]) -> Vec<(PathBuf, Result<toml::Table>)> {
+        let mut engine = teravars::Engine::default();
+        let ctx = Self::render_ctx(paths);
+        paths
+            .iter()
+            .map(|path| {
+                let one = teravars::load_merged([path], &mut engine, &ctx)
+                    .map(|m| m.config)
+                    .with_context(|| format!("rendering {}", path.display()));
+                (path.clone(), one)
+            })
+            .collect()
+    }
+
     /// Render a composed command list for `magi doctor`: the joined command
     /// line the run actually uses, plus - only when more than one layer
     /// contributed - which layer wrote which line.
@@ -1373,7 +1392,7 @@ impl Config {
     /// have no business being merged into it - least of all silently, on one
     /// machine, in a suite that is green everywhere else.
     #[cfg(test)]
-    fn machine_layer() -> Option<PathBuf> {
+    pub(crate) fn machine_layer() -> Option<PathBuf> {
         std::env::var(Self::CONFIG_DIR_ENV)
             .ok()
             .filter(|dir| !dir.trim().is_empty())
@@ -1382,7 +1401,7 @@ impl Config {
 
     /// The machine-wide layer's path, when there is one.
     #[cfg(not(test))]
-    fn machine_layer() -> Option<PathBuf> {
+    pub(crate) fn machine_layer() -> Option<PathBuf> {
         match std::env::var(Self::CONFIG_DIR_ENV) {
             // Named, and empty on purpose: no machine layer.
             Ok(dir) if dir.trim().is_empty() => None,

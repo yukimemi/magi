@@ -2012,3 +2012,15 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 .task-runs .task-run-desc, .task-runs .task-run-out { font-size: var(--t3); color: var(--ink-2); overflow-wrap: anywhere; }
 .card-title.is-link { cursor: pointer; }
 .back-task { font-size: var(--t3); }
+
+/* ---- settings ---------------------------------------------------------- */
+.set-note { color: var(--ink-2); font-size: var(--t3); max-width: 64ch; margin: 0 0 var(--s4); }
+.set-role { margin-bottom: var(--s4); }
+.set-meta { color: var(--ink-2); font-size: var(--t3); margin: var(--s2) 0; overflow-wrap: anywhere; }
+.set-seats { list-style: none; margin: var(--s3) 0; padding: 0; display: flex; flex-direction: column; gap: var(--s2); }
+.set-seat { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.set-seat-id { flex: 1; min-width: 6ch; font-family: var(--mono, monospace); }
+.set-add { display: flex; gap: var(--s2); flex-wrap: wrap; align-items: center; }
+.set-actions { display: flex; gap: var(--s3); align-items: center; flex-wrap: wrap; margin-top: var(--s4); }
+.set-agents { width: 100%; border-collapse: collapse; font-size: var(--t3); }
+.set-agents th, .set-agents td { text-align: left; padding: var(--s2) var(--s3); border-bottom: 1px solid var(--line-2); overflow-wrap: anywhere; }

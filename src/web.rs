@@ -108,7 +108,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt as _;
@@ -123,7 +123,7 @@ use crate::proc::Quiet as _;
 use crate::queue::{Queue, Task, TaskStatus, title_from};
 use crate::run::{RunState, RunStatus};
 use crate::talk::{Talk, Talks};
-use crate::{daemon, git, report, repos, run, stats, talk, updater};
+use crate::{daemon, git, report, repos, run, settings, stats, talk, updater};
 
 /// Default port. Chosen high and memorable; nothing else in the fleet uses it.
 pub const DEFAULT_PORT: u16 = 7878;
@@ -325,6 +325,10 @@ pub struct Ui {
     /// requests so polling `GET /api/repos` repeatedly does not repeat the
     /// filesystem walk every time - see [`repos::Cache`].
     repos_cache: repos::Cache,
+    /// The machine-config file the settings screen reads and writes: always
+    /// [`Config::machine_layer`], never anything a request names. A field so a
+    /// test can point it at its own temp directory instead of the operator's.
+    machine_config: Option<PathBuf>,
     /// Merge mode override handed to the loop this process starts.
     merge: Option<String>,
     /// The loop this process is running, if it is running one.
@@ -404,6 +408,7 @@ impl Ui {
             talk_turns: Arc::default(),
             resuming: Arc::default(),
             repos_cache: repos::Cache::new(),
+            machine_config: Config::machine_layer(),
             merge: None,
             looping: Arc::default(),
             launch: launch_daemon,
@@ -434,6 +439,15 @@ impl Ui {
     #[must_use]
     pub fn with_merge(mut self, merge: Option<String>) -> Self {
         self.merge = merge;
+        self
+    }
+
+    /// The machine-config file the settings screen writes, when it is not
+    /// [`Config::machine_layer`] (tests).
+    #[cfg(test)]
+    #[must_use]
+    fn with_machine_config(mut self, path: Option<PathBuf>) -> Self {
+        self.machine_config = path;
         self
     }
 
@@ -830,6 +844,8 @@ impl Ui {
             .route("/api/queue/{id}", get(task_detail).delete(queue_delete))
             .route("/api/stats", get(stats_get))
             .route("/api/repos", get(repos_list))
+            .route("/api/settings", get(settings_get))
+            .route("/api/settings/roles", put(settings_put_roles))
             .route("/api/queue/{id}/hold", post(queue_hold))
             .route("/api/queue/{id}/release", post(queue_release))
             .route("/api/queue/{id}/priority", post(queue_priority))
@@ -2986,6 +3002,53 @@ async fn repos_list(
             Duration::from_secs(cfg.repos.scan_ttl),
             refresh,
         )))
+    })
+    .await
+}
+
+/// `GET /api/settings` - the effective role assignments and roster, with the
+/// layer each came from. A config that fails to load answers 200 with an
+/// `error`, so the screen can say so instead of drawing empty lists.
+async fn settings_get(State(ui): State<Arc<Ui>>) -> ApiResult<Json<settings::SettingsView>> {
+    blocking(move || Ok(Json(settings::view(&ui.repo, ui.machine_config.as_deref())))).await
+}
+
+/// The body of `PUT /api/settings/roles`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RolesBody {
+    /// The `revision` the client last read.
+    revision: String,
+    /// Role key to its new ids; an empty list resets the key to its default.
+    roles: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// `PUT /api/settings/roles` - save role assignments to the machine config.
+///
+/// The write target is `ui.machine_config` and nothing in the body can change
+/// it. A stale `revision` is a 409; anything the re-loaded config rejects is a
+/// 422 with the reason in words.
+async fn settings_put_roles(
+    State(ui): State<Arc<Ui>>,
+    body: std::result::Result<Json<RolesBody>, JsonRejection>,
+) -> ApiResult<Json<settings::SettingsView>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    blocking(move || {
+        settings::save(
+            &ui.repo,
+            ui.machine_config.as_deref(),
+            &body.revision,
+            &body.roles,
+        )
+        .map(Json)
+        .map_err(|e| match e {
+            settings::SaveError::Conflict(m) => ApiError::conflict(m),
+            settings::SaveError::Refused(m) => ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: m,
+            },
+            settings::SaveError::Internal(m) => ApiError::internal(m),
+        })
     })
     .await
 }
@@ -5745,7 +5808,7 @@ mod tests {
         /// A fixture whose loop is `launch`.
         async fn with_loop(launch: Launch) -> Self {
             let home = TempDir::new().expect("temp home");
-            let addr = Self::serve(home.path(), PathBuf::from("/repo/magi"), launch).await;
+            let addr = Self::serve(home.path(), PathBuf::from("/repo/magi"), launch, None).await;
             Self { home, addr }
         }
 
@@ -5754,11 +5817,24 @@ mod tests {
         /// (`GET /api/repos`) and would otherwise have nothing to discover.
         async fn with_repo(repo: PathBuf) -> Self {
             let home = TempDir::new().expect("temp home");
-            let addr = Self::serve(home.path(), repo, launch_idle).await;
+            let addr = Self::serve(home.path(), repo, launch_idle, None).await;
             Self { home, addr }
         }
 
-        async fn serve(home: &FsPath, repo: PathBuf, launch: Launch) -> SocketAddr {
+        /// As [`Fixture::with_repo`], with the machine-config file the
+        /// settings screen reads and writes.
+        async fn with_repo_and_machine(repo: PathBuf, machine: PathBuf) -> Self {
+            let home = TempDir::new().expect("temp home");
+            let addr = Self::serve(home.path(), repo, launch_idle, Some(machine)).await;
+            Self { home, addr }
+        }
+
+        async fn serve(
+            home: &FsPath,
+            repo: PathBuf,
+            launch: Launch,
+            machine: Option<PathBuf>,
+        ) -> SocketAddr {
             let queue = Queue::at(home.join("queue"));
             let runs = home.join("runs");
             std::fs::create_dir_all(&runs).expect("runs dir");
@@ -5773,6 +5849,7 @@ mod tests {
                 repo,
             )
             .with_worktrees_root(worktrees)
+            .with_machine_config(machine)
             .with_launch(launch);
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
@@ -5822,6 +5899,10 @@ mod tests {
 
         async fn delete(&self, path: &str) -> Res {
             request(self.addr, "DELETE", path, None).await
+        }
+
+        async fn put(&self, path: &str, body: &str) -> Res {
+            request(self.addr, "PUT", path, Some(body)).await
         }
 
         /// `POST` a raw body with its own headers - see [`request_bytes`].
@@ -6737,6 +6818,140 @@ mod tests {
     fn make_checkout(root: &FsPath, host: &str, owner: &str, repo: &str) {
         std::fs::create_dir_all(root.join(host).join(owner).join(repo).join(".git"))
             .expect("checkout dir");
+    }
+
+    /// Two command agents, so a config needs no real CLI.
+    const SETTINGS_AGENTS: &str = "[[agents]]\nid = \"a\"\nkind = \"command\"\ncommand = [\"true\"]\n\n[[agents]]\nid = \"b\"\nkind = \"command\"\ncommand = [\"true\"]\n";
+
+    fn settings_dirs(repo_toml: &str, machine_toml: Option<&str>) -> (TempDir, PathBuf, PathBuf) {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::write(repo.join("magi.toml"), repo_toml).expect("repo toml");
+        let machine = tmp.path().join("cfg").join("magi").join("config.toml");
+        if let Some(text) = machine_toml {
+            std::fs::create_dir_all(machine.parent().expect("parent")).expect("cfg dir");
+            std::fs::write(&machine, text).expect("machine toml");
+        }
+        (tmp, repo, machine)
+    }
+
+    #[tokio::test]
+    async fn settings_get_reports_sources_and_the_advisors_fallback() {
+        let (_tmp, repo, machine) =
+            settings_dirs(SETTINGS_AGENTS, Some("[roles]\njudges = [\"b\"]\n"));
+        let f = Fixture::with_repo_and_machine(repo, machine).await;
+        let res = f.get("/api/settings").await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let v = res.json();
+        assert!(v["error"].is_null(), "{v}");
+        let role = |k: &str| {
+            v["roles"]
+                .as_array()
+                .and_then(|r| r.iter().find(|x| x["key"] == k))
+                .cloned()
+                .unwrap_or_else(|| panic!("no role {k}: {v}"))
+        };
+        assert_eq!(role("judges")["source"], "machine");
+        assert_eq!(role("judges")["editable"], true);
+        assert_eq!(role("implementers")["source"], "default");
+        let adv = role("advisors");
+        assert_eq!(adv["fallback"], "judges");
+        assert!(
+            adv["seats"]
+                .as_array()
+                .is_some_and(|s| s.iter().all(|x| x == "b")),
+            "{adv}"
+        );
+        assert_eq!(v["agents"].as_array().map(Vec::len), Some(2));
+        assert_eq!(v["agents"][0]["source"], "repo");
+    }
+
+    #[tokio::test]
+    async fn settings_get_reports_a_config_that_does_not_parse() {
+        let (_tmp, repo, machine) = settings_dirs("[roles\nbroken", None);
+        let f = Fixture::with_repo_and_machine(repo, machine).await;
+        let res = f.get("/api/settings").await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let v = res.json();
+        assert!(v["error"]["message"].is_string(), "{v}");
+        assert!(
+            v["error"]["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("magi.toml")),
+            "{v}"
+        );
+        assert_eq!(v["roles"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
+    async fn settings_put_saves_to_the_machine_file_and_keeps_comments() {
+        let (_tmp, repo, machine) = settings_dirs(
+            SETTINGS_AGENTS,
+            Some("# mine\n[roles]\n# seats\njudges = [\"a\"]  # note\n\n[vars]\nx = 1\n"),
+        );
+        let repo_before = std::fs::read(repo.join("magi.toml")).expect("read");
+        let f = Fixture::with_repo_and_machine(repo.clone(), machine.clone()).await;
+        let rev = f.get("/api/settings").await.json()["revision"]
+            .as_str()
+            .expect("revision")
+            .to_owned();
+        let body = serde_json::json!({
+            "revision": rev,
+            "roles": { "judges": ["b", "a"], "reviewers": ["a"] }
+        })
+        .to_string();
+        let res = f.put("/api/settings/roles", &body).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let text = std::fs::read_to_string(&machine).expect("machine");
+        assert_eq!(
+            text,
+            "# mine\n[roles]\n# seats\njudges = [\"b\", \"a\"]  # note\nreviewers = [\"a\"]\n\n[vars]\nx = 1\n"
+        );
+        assert_eq!(
+            std::fs::read(repo.join("magi.toml")).expect("read"),
+            repo_before
+        );
+        let again = f.get("/api/settings").await.json();
+        let judges = again["roles"]
+            .as_array()
+            .expect("roles")
+            .iter()
+            .find(|r| r["key"] == "judges")
+            .expect("judges")
+            .clone();
+        assert_eq!(judges["configured"], serde_json::json!(["b", "a"]));
+        // The old revision is now stale.
+        let stale = f.put("/api/settings/roles", &body).await;
+        assert_eq!(stale.status, 409, "{}", stale.body);
+    }
+
+    #[tokio::test]
+    async fn settings_put_refuses_without_touching_the_file() {
+        let machine_text = "# mine\n[roles]\njudges = [\"a\"]\n";
+        let (_tmp, repo, machine) = settings_dirs(
+            &format!("{SETTINGS_AGENTS}\n[roles]\nreviewers = [\"a\"]\n"),
+            Some(machine_text),
+        );
+        let f = Fixture::with_repo_and_machine(repo, machine.clone()).await;
+        let rev = f.get("/api/settings").await.json()["revision"]
+            .as_str()
+            .expect("revision")
+            .to_owned();
+        for roles in [
+            serde_json::json!({ "judges": ["nope"] }),
+            serde_json::json!({ "reviewers": ["b"] }),
+            serde_json::json!({ "bogus": ["a"] }),
+        ] {
+            let body = serde_json::json!({ "revision": rev, "roles": roles }).to_string();
+            let res = f.put("/api/settings/roles", &body).await;
+            assert_eq!(res.status, 422, "{roles}: {}", res.body);
+            assert!(res.json()["error"].as_str().is_some_and(|m| !m.is_empty()));
+            assert_eq!(
+                std::fs::read_to_string(&machine).expect("machine"),
+                machine_text
+            );
+        }
     }
 
     #[tokio::test]

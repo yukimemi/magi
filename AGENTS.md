@@ -631,6 +631,10 @@ upstream CRLF, not drift worth committing — normalise back to LF and
   `blind::commit_msg_hook`. Entries must stay plain literals, not regexes.
 - **`run::SCHEMA`** must be bumped whenever a `RunState` field changes meaning,
   or a resumed run will half-read someone else's state file.
+- **The settings screen writes the machine layer only** (`settings::save`, path
+  from `Config::machine_layer`, never from the request) and validates by
+  re-loading the layered config with the proposal standing in for that file.
+  It has no `toml_edit`: `settings::patch_role` is a line patch of `[roles]`.
 
 ### Invariants the blindness rests on
 

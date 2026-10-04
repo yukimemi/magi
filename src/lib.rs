@@ -54,6 +54,7 @@ pub mod repos;
 pub mod rng;
 pub mod run;
 pub mod scrub;
+pub mod settings;
 pub mod stats;
 pub mod talk;
 pub mod triage;

@@ -31,6 +31,8 @@ const API = {
   /* Aggregated over every readable run plus the live queue — the same
      numbers `magi stats` prints, reused rather than recomputed here. */
   stats: "/api/stats",
+  settings: "/api/settings",
+  settingsRoles: "/api/settings/roles",
   deleteTask: (id) => `/api/queue/${encodeURIComponent(id)}`,
   hold: (id) => `/api/queue/${encodeURIComponent(id)}/hold`,
   release: (id) => `/api/queue/${encodeURIComponent(id)}/release`,
@@ -4082,6 +4084,8 @@ function renderTitle() {
     ? "Backlog \u2014 magi"
     : state.route.name === "stats"
       ? "Stats \u2014 magi"
+      : state.route.name === "settings"
+      ? "Settings \u2014 magi"
       : state.route.name === "questions"
         ? "Questions \u2014 magi"
         : state.route.name === "talks"
@@ -6719,6 +6723,7 @@ function parseRoute() {
   if (parts[0] === "queue" && parts[1]) return { name: "queue", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "queue") return { name: "queue", id: null };
   if (parts[0] === "stats") return { name: "stats", id: null };
+  if (parts[0] === "settings") return { name: "settings", id: null };
   if (parts[0] === "questions") return { name: "questions", id: null };
   if (parts[0] === "notifications") return { name: "notifications", id: null };
   if (parts[0] === "chat" && parts[1]) return { name: "talk", id: decodeURIComponent(parts[1]) };
@@ -6737,6 +6742,7 @@ function applyRoute() {
   show($("view-queue"), route.name === "queue");
   show($("view-task"), route.name === "task");
   show($("view-stats"), route.name === "stats");
+  show($("view-settings"), route.name === "settings");
   show($("view-questions"), route.name === "questions");
   show($("view-notifications"), route.name === "notifications");
   show($("view-talks"), route.name === "talks");
@@ -6808,7 +6814,158 @@ function applyRoute() {
      so every visit re-reads the current numbers even if nothing changed on
      the stream since the last visit. */
   if (changed && route.name === "stats") loadStats();
+  if (changed && route.name === "settings") loadSettings();
   renderTitle();
+}
+
+/* ---- settings -----------------------------------------------------------
+ * GET /api/settings is the effective layered config; PUT /api/settings/roles
+ * writes the machine file only. `draft` holds unsaved edits per role key, so a
+ * reload from the server never throws away what the operator is arranging. */
+const settingsState = { data: null, draft: {}, busy: false, message: null };
+
+async function putJson(url, body) {
+  return request(url, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }).then((r) => r.json());
+}
+
+async function loadSettings() {
+  try {
+    settingsState.data = await getJson(API.settings);
+    settingsState.draft = {};
+    ok();
+  } catch (e) {
+    settingsState.data = null;
+    settingsState.message = { bad: true, text: `Could not load settings: ${e.message}` };
+  }
+  renderSettings();
+}
+
+function settingsIds(role) {
+  return settingsState.draft[role.key] ?? role.configured;
+}
+
+function settingsMove(role, from, to) {
+  const ids = [...settingsIds(role)];
+  if (to < 0 || to >= ids.length) return;
+  ids.splice(to, 0, ids.splice(from, 1)[0]);
+  settingsState.draft[role.key] = ids;
+  renderSettings();
+}
+
+function settingsSet(role, ids) {
+  settingsState.draft[role.key] = ids;
+  settingsState.message = null;
+  renderSettings();
+}
+
+async function saveSettings() {
+  const d = settingsState.data;
+  if (!d || settingsState.busy || !Object.keys(settingsState.draft).length) return;
+  settingsState.busy = true;
+  settingsState.message = null;
+  renderSettings();
+  try {
+    settingsState.data = await putJson(API.settingsRoles, {
+      revision: d.revision,
+      roles: settingsState.draft,
+    });
+    settingsState.draft = {};
+    settingsState.message = {
+      bad: false,
+      text: "Saved to the machine config. Runs started from now on use it; runs already in flight keep the settings they started with.",
+    };
+  } catch (e) {
+    settingsState.message = { bad: true, text: `Not saved: ${e.message}` };
+  }
+  settingsState.busy = false;
+  renderSettings();
+}
+
+function renderSettingsRole(d, role) {
+  const ids = settingsIds(role);
+  const dirty = role.key in settingsState.draft;
+  const locked = !role.editable;
+  const origin = role.source === "default"
+    ? "not set anywhere (built-in default)"
+    : `set in the ${role.source} config (${role.source_path})`;
+  const seats = role.seats.length
+    ? `A run now fills its seats with: ${role.seats.join(", ")}.`
+    : role.seats_error ? `Cannot resolve seats: ${role.seats_error}` : "";
+  const defined = d.agents.map((a) => a.id);
+  const addable = defined.filter((id) => !ids.includes(id) || role.key !== "synthesizer");
+  const select = el("select", { "aria-label": `Add an agent to ${role.key}` },
+    el("option", { value: "" }, "Add agent…"),
+    addable.map((id) => el("option", { value: id }, id)));
+  select.addEventListener("change", () => {
+    if (select.value) settingsSet(role, [...ids, select.value]);
+  });
+  return el("div", { class: "panel set-role" },
+    el("h2", { text: role.key }),
+    el("p", { class: "set-meta" }, origin,
+      role.fallback ? ` \u2014 unset, so it falls back to the ${role.fallback} roster` : "",
+      dirty ? " \u2014 unsaved change" : ""),
+    locked && el("p", { class: "set-meta", text: role.locked_reason }),
+    ids.length
+      ? el("ol", { class: "set-seats" }, ids.map((id, i) => el("li", { class: "set-seat" },
+          el("span", { class: "set-seat-id", text: id }),
+          el("button", { class: "btn btn-quiet", type: "button", disabled: locked || i === 0, "aria-label": `Move ${id} up`, onclick: () => settingsMove(role, i, i - 1) }, "\u2191"),
+          el("button", { class: "btn btn-quiet", type: "button", disabled: locked || i === ids.length - 1, "aria-label": `Move ${id} down`, onclick: () => settingsMove(role, i, i + 1) }, "\u2193"),
+          el("button", { class: "btn btn-quiet", type: "button", disabled: locked, "aria-label": `Remove ${id}`, onclick: () => settingsSet(role, ids.filter((_, j) => j !== i)) }, "\u00d7"))))
+      : el("p", { class: "set-meta", text: role.key === "advisors" ? "No seats named; the judge roster is used." : "No seats named; the whole roster rotates through." }),
+    !locked && el("div", { class: "set-add" }, select,
+      ids.length ? el("button", { class: "btn btn-quiet", type: "button", onclick: () => settingsSet(role, []) }, "Reset to default") : null),
+    role.skipped.length ? el("p", { class: "set-meta", text: `Cannot run here (not in the roster or not installed): ${role.skipped.join(", ")}.` }) : null,
+    seats && el("p", { class: "set-meta", text: seats }));
+}
+
+function renderSettings() {
+  const d = settingsState.data;
+  const body = $("settings-body");
+  clear(body);
+  const banner = $("settings-error");
+  const msg = settingsState.message;
+  if (!d) {
+    setText($("settings-sub"), "Unavailable");
+    setText($("settings-error-text"), msg ? msg.text : "Settings could not be loaded.");
+    show(banner, true);
+    return;
+  }
+  setText($("settings-sub"), `Roles for ${d.repo}`);
+  if (d.error) {
+    setText($("settings-error-text"),
+      `The config does not load, so nothing is shown and nothing can be edited: ${d.error.message}${d.error.path ? ` (${d.error.path})` : ""}`);
+    show(banner, true);
+    return;
+  }
+  if (msg && msg.bad) {
+    setText($("settings-error-text"), msg.text);
+    show(banner, true);
+  } else {
+    show(banner, false);
+  }
+  const dirty = Object.keys(settingsState.draft).length > 0;
+  body.append(
+    el("p", { class: "set-note" },
+      d.machine.path
+        ? `Changes are saved to the machine config (${d.machine.path}), which applies to every repository on this machine; comments and other settings in it are kept. The repository's own magi.toml is never written.`
+        : d.machine.unavailable),
+    el("p", { class: "set-note", text: "A change applies to runs started after it is saved. Runs already in flight keep the settings they started with." }),
+    ...d.roles.map((r) => renderSettingsRole(d, r)),
+    el("div", { class: "set-actions" },
+      el("button", { class: "btn btn-gold", type: "button", disabled: !dirty || settingsState.busy, onclick: saveSettings }, settingsState.busy ? "Saving…" : "Save"),
+      dirty && el("button", { class: "btn btn-quiet", type: "button", disabled: settingsState.busy, onclick: () => { settingsState.draft = {}; renderSettings(); } }, "Discard changes"),
+      msg && !msg.bad && el("span", { class: "set-meta", role: "status", text: msg.text })),
+    el("div", { class: "panel" },
+      el("h2", { text: "Agents" }),
+      el("table", { class: "set-agents" },
+        el("thead", null, el("tr", null, ["id", "kind", "model", "defined in"].map((h) => el("th", { text: h })))),
+        el("tbody", null, d.agents.map((a) => el("tr", null,
+          el("td", { text: a.id }), el("td", { text: a.kind }), el("td", { text: a.model || "\u2014" }),
+          el("td", { text: a.source === "detected" ? "found on PATH (not written anywhere)" : `${a.source}: ${a.source_path}` })))))));
 }
 
 /* ---- task detail --------------------------------------------------------
