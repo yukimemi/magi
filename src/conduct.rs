@@ -836,9 +836,8 @@ impl Conductor {
         if self.last_seen.as_ref() == Some(&snapshot) {
             return;
         }
-        let seen_rev = snapshot.0;
         self.last_seen = Some(snapshot);
-        match self
+        if let Err(e) = self
             .run_once(
                 cfg,
                 repo,
@@ -849,19 +848,15 @@ impl Conductor {
                 stalled,
                 finished,
                 max_attempts,
-                seen_rev,
             )
             .await
         {
-            // Our own writes moved the revision; absorbing them is what stops
-            // a held task being re-shown to the model every cycle.
-            Ok(Some(rev)) => {
-                if let Some(seen) = self.last_seen.as_mut() {
-                    seen.0 = rev;
-                }
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!("conductor: {e:#}"),
+            // The conductor's own write moves the revision, so one more cycle
+            // follows; a repeat decision writes nothing (see
+            // `reaffirmed_hold_reason`), which is what ends the loop. The
+            // revision is deliberately never re-read here: it cannot tell our
+            // write from an owner's concurrent update.
+            tracing::warn!("conductor: {e:#}");
         }
     }
 
@@ -877,10 +872,9 @@ impl Conductor {
         stalled: &[Task],
         finished: &[Task],
         max_attempts: usize,
-        seen_rev: u64,
-    ) -> Result<Option<u64>> {
+    ) -> Result<()> {
         if queued.is_empty() && stalled.is_empty() && finished.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
 
         let primary = cfg
@@ -986,11 +980,7 @@ impl Conductor {
         drop(busy);
         let mut verdict = result?;
         attach_facts(cfg, repo, queue, &mut verdict).await;
-        // Only when nothing else touched the queue while the model ran: an
-        // owner's answer arriving mid-turn must still be looked at.
-        let untouched = queue.revision() == seen_rev;
-        apply(queue, questions, &verdict)?;
-        Ok(untouched.then(|| queue.revision()))
+        apply(queue, questions, &verdict)
     }
 }
 
@@ -2568,7 +2558,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_conductors_own_hold_does_not_make_the_queue_worth_another_look() {
+    async fn a_repeated_hold_decision_settles_instead_of_looping() {
         let dir = tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let questions = Questions::at(dir.path().join("questions"));
@@ -2582,25 +2572,28 @@ mod tests {
             env(&reply.replace("ID", &t.id)),
         ));
         let mut conductor = Conductor::new();
-        let held = queue.get(&t.id).unwrap();
-        conductor
-            .maybe_run(
-                &cfg,
-                dir.path(),
-                &queue,
-                &questions,
-                dir.path(),
-                &[],
-                &[],
-                &[held],
-                2,
-            )
-            .await;
+        // Cycle 1 writes the new note; cycle 2 repeats it and writes nothing.
+        for _ in 0..2 {
+            let held = queue.get(&t.id).unwrap();
+            conductor
+                .maybe_run(
+                    &cfg,
+                    dir.path(),
+                    &queue,
+                    &questions,
+                    dir.path(),
+                    &[],
+                    &[],
+                    &[held],
+                    2,
+                )
+                .await;
+        }
         let held = queue.get(&t.id).unwrap();
         assert!(held.hold_reason.as_deref().unwrap().starts_with("keep held"));
         assert!(
             !conductor.worth_a_look(&queue, &[], &[held]),
-            "the conductor's own write must not re-trigger it"
+            "an unchanged held task must stop being reconsidered"
         );
     }
 
