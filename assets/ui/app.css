@@ -1144,6 +1144,9 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 }
 
 .run-status { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+/* `.phase` is `width:100%`, so as a flex item with no basis the rail collapses
+   to nothing beside the chip. Give it its own full-width row underneath. */
+.run-status .phases { flex: 1 0 100%; margin-top: 0; }
 .instruction { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--t4); color: var(--ink); }
 
 /* One question/answer pair per row, the question dimmed like a label and the
