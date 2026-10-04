@@ -981,7 +981,7 @@ fn language_of(task: &Task, fallback: &Path) -> String {
 /// The task an answered question speaks for: the one whose runs include the
 /// question's run, or - for a conductor question, filed under the task's own
 /// id - the task with that id.
-fn task_of_question<'a>(tasks: &'a [Task], q: &ask::Question) -> Option<&'a Task> {
+pub(crate) fn task_of_question<'a>(tasks: &'a [Task], q: &ask::Question) -> Option<&'a Task> {
     if q.node == crate::conduct::NODE {
         return tasks.iter().find(|t| t.id == q.run);
     }
@@ -1022,26 +1022,18 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
             decision,
             ActionDecision::Resume(_) | ActionDecision::Requeue | ActionDecision::Done
         );
-        if ran {
-            // Whoever delivers the answer first owns it: the waiter resuming
-            // the asking seat, or this. A delivery in flight keeps a fresh
-            // lease, and the flag is taken atomically *before* the task is
-            // touched, so the two can never both act on one answer.
-            if questions
-                .read_lease(&q.id)
-                .is_some_and(|l| l.fresh(Timestamp::now()))
-            {
-                continue;
-            }
-            let taken = questions.update(&q.id, |r| {
-                let free = !r.answer_delivered;
-                r.answer_delivered = true;
-                Ok(free)
-            });
-            if !matches!(taken, Ok((_, true))) {
-                continue;
-            }
+        if ran && asker_may_still_read(questions, &q, home) {
+            // The asking process or its seat can still take the word; act
+            // once it has gone quiet. Bound on the remaining window: the
+            // check is not atomic with the write below, so an asker that
+            // takes the word in between (at most one poll, never more than
+            // `ask::LEASE_TTL`) only prints it - it never touches the task,
+            // and `Task::actions_applied` under the claim keeps the action to
+            // one application. The waiter does not deliver an answer that
+            // carries an action (`waiter::decide_owned`), so it cannot race.
+            continue;
         }
+        let done = matches!(decision, ActionDecision::Done);
         match decision {
             ActionDecision::Skip => continue,
             ActionDecision::Resume(run) => {
@@ -1056,10 +1048,7 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
             }
             ActionDecision::Stale => {}
             ActionDecision::Requeue => task.requeue(),
-            ActionDecision::Done => {
-                task.succeed();
-                supersede_prior_runs(&task, home);
-            }
+            ActionDecision::Done => task.succeed(),
             ActionDecision::Refuse(why) => {
                 task.hold_machine(Some(why));
                 notices::raise(
@@ -1074,8 +1063,34 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
             }
         }
         task.mark_action_applied(&q.id);
+        // The applied id travels with the transition, so a failed save loses
+        // neither and the answer is acted on at the next poll.
         record(queue, &mut task);
+        if done && queue.get(&task.id).is_ok_and(|t| t.action_applied(&q.id)) {
+            supersede_prior_runs(&task, home);
+        }
+        // Delivery is only a note of who has read the answer; the task's own
+        // mark above is the authority. Best effort.
+        let _ = questions.update(&q.id, |r| {
+            r.answer_delivered = true;
+            Ok(())
+        });
     }
+}
+
+/// Whether something may still read the answer to `q`: a fresh lease, or the
+/// asking seat still listed as active in its run (its CLI can outlive the
+/// `magi ask` that was killed).
+fn asker_may_still_read(questions: &Questions, q: &ask::Question, home: &Path) -> bool {
+    let now = Timestamp::now();
+    if questions.read_lease(&q.id).is_some_and(|l| l.fresh(now)) {
+        return true;
+    }
+    q.node != crate::conduct::NODE
+        && RunState::load_under(&q.run, home).is_ok_and(|s| {
+            s.seats_active()
+                .any(|(k, a)| *k == q.seat && a.remaining_secs(now) > 0)
+        })
 }
 
 /// Retire an unanswered conductor question after its task no longer refers to
@@ -7944,7 +7959,7 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_the_waiter_already_delivered_is_not_acted_on_again() {
+    fn a_delivered_answer_is_still_acted_on_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let questions = Questions::at(dir.path().join("questions"));
@@ -7959,14 +7974,83 @@ mod tests {
         q.answer_delivered = true;
         questions.put(&mut q).unwrap();
 
+        // Delivered, and the agent then died: the task is still held, so the
+        // chosen action applies.
+        apply_choice_actions(&queue, &questions, &home);
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+        assert!(queue.get(&t.id).unwrap().action_applied(&q.id));
+
+        // Held again: the same answer does nothing a second time.
+        let mut again = queue.get(&t.id).unwrap();
+        again.hold_machine(Some("later".into()));
+        queue.put(&mut again).unwrap();
+        apply_choice_actions(&queue, &questions, &home);
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+    }
+
+    #[test]
+    fn a_fresh_asker_defers_the_action_until_it_goes_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let home = dir.path().join("home");
+        let mut state = run_state(RunStatus::Blocked);
+        state.id = "20260101-000000-act3".to_owned();
+        state.save_under(&home).unwrap();
+        let mut t = held_task_with(&state.id);
+        queue.put(&mut t).unwrap();
+        let mut q = action_question(&state.id, ask::ChoiceAction::Requeue);
+        questions.put(&mut q).unwrap();
+
+        questions.beat(&q.id, crate::ask::WaiterKind::Asker);
         apply_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
 
-        // Undelivered: the daemon takes the delivery itself, exactly once.
-        let mut q2 = action_question(&state.id, resume_action(&state.id));
-        questions.put(&mut q2).unwrap();
+        std::fs::remove_file(questions.root().join(format!("{}.lease", q.id))).unwrap();
         apply_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
-        assert!(questions.get(&q2.id).unwrap().answer_delivered);
+    }
+
+    #[test]
+    fn a_running_task_waits_and_a_dead_asker_with_a_cwd_is_still_actioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let home = dir.path().join("home");
+        let mut state = run_state(RunStatus::Blocked);
+        state.id = "20260101-000000-act4".to_owned();
+        state.save_under(&home).unwrap();
+        let mut t = held_task_with(&state.id);
+        t.status = TaskStatus::Running;
+        queue.put(&mut t).unwrap();
+        let mut q = action_question(&state.id, ask::ChoiceAction::Done);
+        q.cwd = Some(dir.path().display().to_string());
+        questions.put(&mut q).unwrap();
+
+        // The waiter leaves it alone (the task exists) ...
+        assert_eq!(
+            crate::waiter::decide_owned(
+                &q,
+                None,
+                false,
+                86_400,
+                Timestamp::now(),
+                true
+            ),
+            crate::waiter::Action::Idle
+        );
+        // ... and the daemon waits while the task runs, then applies once.
+        apply_choice_actions(&queue, &questions, &home);
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Running);
+        let mut back = queue.get(&t.id).unwrap();
+        back.hold_machine(Some("later".into()));
+        queue.put(&mut back).unwrap();
+        apply_choice_actions(&queue, &questions, &home);
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Done);
+        let mut again = queue.get(&t.id).unwrap();
+        again.hold_machine(Some("again".into()));
+        queue.put(&mut again).unwrap();
+        apply_choice_actions(&queue, &questions, &home);
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
     }
 }

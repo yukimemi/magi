@@ -766,6 +766,16 @@ whole of a run).
   do nothing, and a seat still listed in `RunState::active` (or the
   conductor's `busy` marker) is not resumed either: the CLI may outlive the
   `magi ask` that was killed.
+- **An answer that carries an action is the daemon's, not the waiter's.**
+  `waiter::decide_owned` returns `Idle` for it whenever the task exists
+  (no task: delivered as before), because resuming the dead seat while the
+  daemon requeues or resumes the same run would run it twice.
+  `daemon::apply_choice_actions` applies it once - idempotence is
+  `Task::actions_applied` under `queue.claim`, never `answer_delivered` - and
+  also when a live agent consumed the answer and then died. It defers while the
+  asker's lease is fresh or its seat is still active; that check is not atomic
+  with the write, but the asker only prints, so the bound is one poll
+  (`ask::LEASE_TTL` at most) and never a double application.
 - **Delivery is tracked in the record** (`delivered_turns`, `answer_delivered`),
   set by the asker as it prints and by the waiter after a resumed turn. Where
   the outcome is unknown the word stays undelivered: a repeat is better than a
