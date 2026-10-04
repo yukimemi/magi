@@ -352,17 +352,32 @@ async fn dropped_commits(repo: &Path, onto_sha: &str, orig: &str, head: &str) ->
     let have: Vec<String> = result.iter().map(|c| c.key.clone()).collect();
     let mut taken = vec![false; result.len()];
     let mut lost = Vec::new();
+    let mut unverified = Vec::new();
+    // Content-verified candidates first: one whose exact change is present as
+    // a result commit under its key has claimed that survivor, so it cannot
+    // also be taken as evidence for a different, unverified commit. (One
+    // absorbed upstream matches nothing and claims nothing.)
     for c in missing_commits(&expected, &have) {
         // Git also drops a commit on its own when its change is already on
         // the base under a different patch (e.g. folded into one upstream
         // commit). That is not a loss: every path it touched holds the same
         // content in the result.
-        if already_in_result(repo, &c.sha, orig, head).await {
+        if !already_in_result(repo, &c.sha, orig, head).await {
+            unverified.push(c);
             continue;
         }
-        // Otherwise it may have survived with a conflict-resolved (new)
-        // content. A result commit under the same key that touches one of its
-        // paths, and is not already accounted for, is that survivor.
+        let mine = change_lines(repo, &c.sha).await;
+        for (i, r) in result.iter().enumerate() {
+            if !taken[i] && r.key == c.key && change_lines(repo, &r.sha).await == mine {
+                taken[i] = true;
+                break;
+            }
+        }
+    }
+    // The rest may have survived with a conflict-resolved (new) content. A
+    // result commit under the same key that touches one of its paths, and is
+    // not already accounted for, is that survivor.
+    for c in unverified {
         let mine = commit_paths(repo, &c.sha).await;
         let mut found = false;
         for (i, r) in result.iter().enumerate() {
@@ -381,6 +396,30 @@ async fn dropped_commits(repo: &Path, onto_sha: &str, orig: &str, head: &str) ->
         }
     }
     lost
+}
+
+/// The added/removed lines of `sha`'s patch, headers and hunk positions left
+/// out, so a commit that was merely re-applied at a different offset compares
+/// equal to its original.
+async fn change_lines(repo: &Path, sha: &str) -> Vec<String> {
+    git::git(
+        repo,
+        &["diff-tree", "-p", "-U0", "--no-commit-id", "--root", sha],
+    )
+    .await
+    .map(|o| {
+        o.lines()
+            .filter(|l| {
+                !(l.starts_with("diff ")
+                    || l.starts_with("index ")
+                    || l.starts_with("@@")
+                    || l.starts_with("--- ")
+                    || l.starts_with("+++ "))
+            })
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Paths `sha` changes, NUL-separated from git so a quoted name is never
@@ -723,5 +762,36 @@ mod tests {
         std::fs::write(d.join("b.txt"), "other\nb\n").unwrap();
         let head = commit_dated(d, "same").await;
         assert!(dropped_commits(d, &onto, &orig, &head).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_skipped_commit_is_not_masked_by_a_surviving_one_in_the_same_file() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        sh(d, &["init", "-q", "-b", "main"]);
+        sh(d, &["config", "user.name", "t"]);
+        sh(d, &["config", "user.email", "t@example.com"]);
+        let body = "first\n1\n2\n3\n4\n5\n6\n7\n8\n9\nlast\n";
+        std::fs::write(d.join("f.txt"), body).unwrap();
+        let base = commit(d, "base").await;
+        std::fs::write(d.join("f.txt"), body.replacen("first", "mine", 1)).unwrap();
+        commit_dated(d, "same").await;
+        let two = body
+            .replacen("first", "mine", 1)
+            .replacen("last", "tail", 1);
+        std::fs::write(d.join("f.txt"), &two).unwrap();
+        let orig = commit_dated(d, "same").await;
+        sh(d, &["checkout", "-q", "-b", "up", &base]);
+        std::fs::write(d.join("f.txt"), body.replacen("first", "theirs", 1)).unwrap();
+        let onto = commit(d, "upstream").await;
+        // First commit skipped, second applied untouched.
+        std::fs::write(
+            d.join("f.txt"),
+            body.replacen("first", "theirs", 1)
+                .replacen("last", "tail", 1),
+        )
+        .unwrap();
+        let head = commit_dated(d, "same").await;
+        assert_eq!(dropped_commits(d, &onto, &orig, &head).await, vec!["same"]);
     }
 }
