@@ -447,6 +447,9 @@ function roundRail(pr) {
   const rounds = Number(pr.rounds) || 0;
   const round = Number(pr.round) || 0;
   if (rounds <= 0) return null;
+  // No fix round spent: an all-grey rail reads as "nothing happened", so the
+  // caller says it in words (landRoundNote) instead.
+  if (round <= 0) return null;
   const settled = pr.state !== "open";
   const rail = el("div", {
     class: "phases",
@@ -461,6 +464,18 @@ function roundRail(pr) {
     }));
   }
   return rail;
+}
+
+/* The heading above the round rail. With no fix round spent there is no rail,
+   so a settled PR says so in words; an open one leaves it to landNote(). */
+function landRoundNote(pr) {
+  const rounds = Number(pr.rounds) || 0;
+  const round = Number(pr.round) || 0;
+  if (rounds <= 0) return null;
+  if (round >= 1) return `Land round ${round} of ${rounds}.`;
+  if (pr.state === "open") return null;
+  if (pr.state === "merged") return `No fix rounds needed (0 of ${rounds} used).`;
+  return `No fix rounds spent (0 of ${rounds} used).`;
 }
 
 /* Declared ahead of `state` below on purpose: `state`'s own initializer calls
@@ -5687,7 +5702,7 @@ function renderLand(run) {
       el("span", { class: "tag", "data-tone": PR_TONE[pr.state] || "ink", text: pr.state || "unknown" }),
       checksChip(pr),
     ),
-    Number(pr.rounds) ? el("p", { class: "land-note", text: `Land round ${Number(pr.round) || 0} of ${pr.rounds}.` }) : null,
+    landRoundNote(pr) ? el("p", { class: "land-note", text: landRoundNote(pr) }) : null,
     roundRail(pr),
     el("p", { class: "land-note", text: landNote(pr) }),
   );
