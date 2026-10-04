@@ -698,6 +698,18 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
             record(queue, &mut task);
             continue;
         }
+        // A conductor question nobody answered in time is retired by the
+        // waiter, and nothing else would ever move the task it blocks.
+        if let Some(q) = task.blocked_by.iter().find_map(|id| {
+            questions.get(id).ok().filter(|q| {
+                q.node == crate::conduct::NODE && q.status == ask::QuestionStatus::Abandoned
+            })
+        }) {
+            let language = language_of(&task, Path::new("."));
+            task.hold_machine(Some(unanswered_question_hold_reason(&q, &language)));
+            record(queue, &mut task);
+            continue;
+        }
         let mut changed = false;
         for id in task.blocked_by.clone() {
             if let Ok(dep) = queue.get(&id) {
@@ -722,6 +734,23 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
         if changed {
             record(queue, &mut task);
         }
+    }
+}
+
+/// The `hold_reason` of a task whose conductor question went unanswered.
+fn unanswered_question_hold_reason(q: &ask::Question, language: &str) -> String {
+    if crate::lang::is_japanese(language) {
+        format!(
+            "質問 {} 「{}」 に期限内の回答がなく、取り下げられました - `magi task triage` を参照",
+            q.short(),
+            q.summary
+        )
+    } else {
+        format!(
+            "question {} \"{}\" went unanswered and was abandoned - see `magi task triage`",
+            q.short(),
+            q.summary
+        )
     }
 }
 
@@ -1646,6 +1675,24 @@ async fn drive(
         stop.clone(),
     ));
 
+    // The follow-up seats for the conductor's questions: the conductor files a
+    // question and moves on, and each open one gets a deputy that reads the
+    // owner's reply. Its own task for the same reason the waiter's is.
+    let deputies = tokio::spawn(crate::deputy::run(
+        crate::deputy::Deputies::new(
+            crate::ask::Questions::at(home.join("questions")),
+            home.to_path_buf(),
+            prepare(&opts.repo, opts).ok(),
+            opts.repo.clone(),
+            daemon_cfg.max_deputies,
+            {
+                let stop = stop.clone();
+                Arc::new(move || stop.parking())
+            },
+        ),
+        stop.clone(),
+    ));
+
     tracing::info!(
         "magi serve: queue {} (poll {}s, {} attempts per task, {} run(s) at once{})",
         queue.root().display(),
@@ -1680,6 +1727,7 @@ async fn drive(
 
     beat.abort();
     waiter.abort();
+    deputies.abort();
     clear_status_at(status_file);
     outcome
 }
@@ -6987,6 +7035,46 @@ mod tests {
         let instruction = instruction_for(&after);
         assert!(instruction.contains("Which backend?"));
         assert!(instruction.contains("SQLite"));
+    }
+
+    #[test]
+    fn resolve_blockers_holds_a_task_whose_conductor_question_was_abandoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = ask::Questions::at(dir.path().join("questions"));
+
+        let mut q = crate::ask::Question::new(
+            "20260101-000001-main".to_owned(),
+            crate::conduct::NODE.to_owned(),
+            "conduct".to_owned(),
+            "Is the setup done?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        q.abandon("no answer within 60s of asking");
+        questions.put(&mut q).unwrap();
+
+        let mut blocked = task();
+        blocked.id = "20260101-000001-main".to_owned();
+        blocked.block(vec![q.id.clone()], Some("setup?".to_owned()));
+        queue.put(&mut blocked).unwrap();
+
+        resolve_blockers(&queue, &questions);
+
+        let after = queue.get(&blocked.id).unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::Held,
+            "never left blocked on nothing"
+        );
+        assert!(!after.operator_held(), "a machine hold, for triage");
+        assert!(
+            after
+                .hold_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("went unanswered")
+        );
     }
 
     #[test]

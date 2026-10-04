@@ -47,7 +47,7 @@ use crate::rng::SplitMix64;
 
 /// Conversation state for one seat, persisted with the run so `magi run
 /// --resume` continues the same CLI conversations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatState {
     /// Stable seat name, e.g. `impl-A`, `judge-2`, `review-1`, `fix`.
     pub key: String,

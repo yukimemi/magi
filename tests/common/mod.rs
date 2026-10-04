@@ -225,6 +225,24 @@ if has "Your rebase stopped on a conflict"; then
   exit 0
 fi
 
+# A conductor question's deputy (`prompt::deputy`). Records each turn, and
+# whether it came back to its own earlier conversation. It answers the owner's
+# unread word in prose rather than through `magi ask --thread`, so the runner
+# has to keep the reply on the record itself.
+if has "You are the conductor's deputy"; then
+  if has "resuming your own earlier conversation"; then
+    echo "$seat resumed" >> deputy.log
+  else
+    echo "$seat started" >> deputy.log
+  fi
+  if has "nobody has answered yet"; then
+    printf 'mock deputy reply from %s\n' "$seat"
+  else
+    printf 'mock deputy standing by as %s\n' "$seat"
+  fi
+  exit 0
+fi
+
 # The daemon waiter resuming a seat whose `magi ask` is gone
 # (`prompt::question_resumed`). Records that the seat was resumed, and answers
 # in prose - not through `magi ask --thread` - so the waiter has to keep the

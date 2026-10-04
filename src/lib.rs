@@ -33,6 +33,7 @@ pub mod clean;
 pub mod conduct;
 pub mod config;
 pub mod daemon;
+pub mod deputy;
 pub mod disk;
 pub mod dupes;
 pub mod git;

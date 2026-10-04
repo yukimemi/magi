@@ -3822,21 +3822,36 @@ function updateAskCard(row, question, { compact = false } = {}) {
   show(r.thread, turns.length > 0);
 
   /* Who is honestly on the other end. `holder` comes from the lease beside the
-     question: "asker" is the agent's own `magi ask`, "daemon" is `magi serve`
-     resuming the agent's session, "nobody" means the asker is gone and nothing
-     has picked the question up yet. Only the first may claim the agent is
-     waiting. A question no `magi ask` filed carries no holder and keeps the
-     plain wording. */
+     question: "asker" is the agent's own `magi ask`, "deputy" is the follow-up
+     seat magi serve runs for a conductor question, "daemon" is `magi serve`
+     resuming the agent's session, "nobody" means nothing is listening right
+     now. "Waiting for the agent" is only said when one of the first three is
+     actually attached; otherwise the note names who is not listening. A
+     question no agent waits on at all (land's approval gate) carries no holder
+     and keeps the plain wording. */
   const holder = open ? question.holder : null;
+  const hasDeputy = Boolean(question.deputy);
   let waitingText = "";
-  if (holder === "nobody") {
+  if (holder === "nobody" && hasDeputy) {
+    waitingText = waitingOnAgent
+      ? "The follow-up agent for this question is not running right now. magi serve will wake it with your message; if it cannot, you will be told."
+      : "The follow-up agent for this question is not running right now. magi serve will wake it when you reply.";
+  } else if (holder === "nobody" && question.node === "conduct") {
+    waitingText = "No agent is listening on this question. Your message is recorded, but nothing will read it until magi serve attaches a follow-up agent. Tapping a choice still decides it.";
+  } else if (holder === "nobody") {
     waitingText = waitingOnAgent
       ? "The agent that asked is no longer waiting. magi will resume its session with your message when magi serve picks it up; if it cannot, you will be told."
       : "The agent that asked is no longer waiting. Your answer or message will be delivered by resuming its session when magi serve picks it up.";
   } else if (holder === "daemon") {
     waitingText = "magi is delivering this to the agent's session. There is nothing to decide until it replies.";
-  } else if (waitingOnAgent) {
+  } else if (holder === "deputy") {
+    waitingText = waitingOnAgent
+      ? "The follow-up agent for this question is reading your message. There is nothing to decide until it replies."
+      : "A follow-up agent is listening on this question for the conductor and will answer if you write back.";
+  } else if (waitingOnAgent && (holder === "asker")) {
     waitingText = "Waiting for the agent to reply. There is nothing to decide until it does.";
+  } else if (waitingOnAgent) {
+    waitingText = "Nobody is attached to this question to reply. Your message is recorded.";
   }
   setText(r.waitingNote, waitingText);
   show(r.waitingNote, waitingText !== "");
@@ -3983,9 +3998,13 @@ async function sayToQuestion(id, text, row) {
   r.sayText.disabled = true;
   r.saySend.disabled = true;
   try {
-    reflectQuestion(await postJson(API.questionSay(id), { body: value }));
+    const said = await postJson(API.questionSay(id), { body: value });
+    reflectQuestion(said);
     r.sayText.value = "";
-    announce("Sent. Waiting for the agent to reply.");
+    const heard = said && ["asker", "deputy", "daemon"].includes(said.holder);
+    announce(heard
+      ? "Sent. Waiting for the agent to reply."
+      : "Sent. It is recorded, but no agent is listening right now.");
     ok();
   } catch (error) {
     if (error.status === 409) {

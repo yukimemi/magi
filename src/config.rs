@@ -870,6 +870,13 @@ pub struct Daemon {
     /// it on - but an operator who does not want any run of theirs preempted,
     /// ever, should leave this `false`.
     pub pause_for_interrupts: bool,
+    /// How many deputies `magi serve` runs at once. A deputy is the short-lived
+    /// seat that waits on one open conductor question (see [`crate::deputy`]);
+    /// each is a live agent conversation, so this is bounded - **two by
+    /// default**, because the agent CLIs' quota is the scarce resource. A
+    /// question over the limit keeps its place and starts when a deputy
+    /// finishes; `0` runs none.
+    pub max_deputies: usize,
 }
 
 impl Default for Daemon {
@@ -877,6 +884,7 @@ impl Default for Daemon {
         Self {
             max_concurrent_runs: 1,
             pause_for_interrupts: false,
+            max_deputies: 2,
         }
     }
 }

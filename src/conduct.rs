@@ -28,7 +28,9 @@
 //! whole polling loop behind one task's question. Instead a decision that
 //! wants the operator's judgement carries a `question` field, and [`apply`]
 //! files it with [`Question::new`] and [`Questions::put`] and moves on in the
-//! same call.
+//! same call. Something still has to read the owner's reply: the question
+//! carries a [`Deputy`] brief, and `magi serve` starts a short-lived seat of
+//! its own for it ([`crate::deputy`]) - never this loop.
 //!
 //! # Fails soft, always
 //!
@@ -46,7 +48,7 @@ use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
 use crate::agent::{self, Invocation, SeatState};
-use crate::ask::{Question, Questions};
+use crate::ask::{Deputy, Question, Questions};
 use crate::config::Config;
 use crate::prompt;
 use crate::queue::{Queue, Task, TaskStatus};
@@ -585,6 +587,19 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
                     d.reason.clone().unwrap_or_default(),
                     d.choices.clone(),
                 );
+                // The wait is handed to a deputy (`crate::deputy`), so a
+                // free-text reply reaches an agent that knows why this was
+                // asked. The conductor still never blocks: this only records
+                // what the deputy will be told, and `serve` starts it.
+                q.deputy = Some(Deputy::new(crate::deputy::brief(
+                    &task.id,
+                    d.reason.as_deref().unwrap_or_default(),
+                    &q.choices,
+                    &q.actions,
+                )));
+                if task.repo.is_dir() && task.repo != Path::new(".") {
+                    q.cwd = Some(task.repo.to_string_lossy().into_owned());
+                }
                 questions.put(&mut q)?;
                 q.id
             }
@@ -1732,6 +1747,15 @@ mod tests {
         assert_eq!(
             filed[0].summary,
             "Branch conflicts with origin/main, how do we proceed?"
+        );
+        let deputy = filed[0]
+            .deputy
+            .as_ref()
+            .expect("the wait is handed to a deputy");
+        assert!(deputy.brief.contains(&t.id), "{}", deputy.brief);
+        assert_eq!(
+            deputy.starts, 0,
+            "filing never starts anything: the loop does not wait"
         );
         assert!(filed[0].status.open());
         assert_eq!(filed[0].node, NODE);

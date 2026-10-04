@@ -56,7 +56,7 @@ use crate::run::RunStatus;
 /// "no conversation yet" rather than "unreadable", and a strict equality check
 /// would turn every bump into an upgrade that breaks reading yesterday's
 /// question files.
-pub const SCHEMA: u32 = 4;
+pub const SCHEMA: u32 = 5;
 
 /// How often the wait re-reads the question file.
 ///
@@ -369,6 +369,55 @@ pub enum WaiterKind {
     /// The `magi serve` waiter ([`crate::waiter`]), resuming the asking seat's
     /// own session because the asker is gone.
     Daemon,
+    /// The question's deputy ([`crate::deputy`]): a short-lived seat that
+    /// `magi serve` runs for a question the conductor filed, so that something
+    /// which remembers why it was asked is on the other end.
+    Deputy,
+}
+
+/// The follow-up seat a conductor question hands its wait to.
+///
+/// The conductor itself never waits (see [`crate::conduct`]), so a free-text
+/// reply to its question would reach nobody. A deputy is a seat of its own -
+/// keyed `deputy-<question id>`, never the conductor's shared seat - that
+/// inherits what the conductor knew about this one question ([`Deputy::brief`])
+/// and blocks on it with `magi ask --wait`. Persisted on the question so a
+/// restarted daemon resumes the same CLI conversation instead of assuming it.
+///
+/// Written only through [`Questions::update`]: the owner's say and answer land
+/// on the same file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deputy {
+    /// Why the question was asked, what each choice leads to: the conductor's
+    /// context for this one question, handed to the deputy in its prompt.
+    pub brief: String,
+    /// The agent that holds the seat. Empty until the first start.
+    #[serde(default)]
+    pub agent: String,
+    /// The deputy's own conversation. `None` until the first start.
+    #[serde(default)]
+    pub seat: Option<crate::agent::SeatState>,
+    /// How many times a deputy turn was started for this question. Never reset
+    /// by a restart, so a deputy that keeps dying is bounded.
+    #[serde(default)]
+    pub starts: u32,
+}
+
+impl Deputy {
+    /// A deputy that has not started yet, holding `brief`.
+    pub fn new(brief: String) -> Self {
+        Self {
+            brief,
+            agent: String::new(),
+            seat: None,
+            starts: 0,
+        }
+    }
+}
+
+/// Seat name of the deputy for question `id`.
+pub fn deputy_seat_key(id: &str) -> String {
+    format!("deputy-{}", short(id))
 }
 
 /// The record's note of who was last known to be waiting.
@@ -508,6 +557,10 @@ pub struct Question {
     /// returns; the waiter delivers it when the asker was gone.
     #[serde(default)]
     pub answer_delivered: bool,
+    /// The follow-up seat waiting on this question, for a question the
+    /// conductor filed. `None` for every other question.
+    #[serde(default)]
+    pub deputy: Option<Deputy>,
 }
 
 impl Question {
@@ -543,6 +596,7 @@ impl Question {
             waiter: None,
             delivered_turns: 0,
             answer_delivered: false,
+            deputy: None,
         }
     }
 
@@ -663,6 +717,51 @@ impl Question {
             }
             _ => None,
         }
+    }
+
+    /// A deputy recording that the owner's own words settled the question.
+    ///
+    /// The owner decided in free text ("setup done") on a question that offers
+    /// choices, so no choice was ever tapped. This records `label` as the
+    /// answer - and nothing else: applying it is the daemon's existing path
+    /// for an answered conductor question. Refused unless the caller is this
+    /// question's deputy seat, `label` is one of the offered choices, and
+    /// `quote` appears verbatim in something the owner said; the quote is
+    /// kept in the thread as an agent turn so the record shows what the
+    /// decision rests on.
+    pub fn settle_by_deputy(&mut self, seat: &str, label: &str, quote: &str) -> Result<()> {
+        let Some(deputy) = &self.deputy else {
+            bail!("question {} has no deputy", self.short());
+        };
+        let own = deputy.seat.as_ref().map(|s| s.key.as_str());
+        if own != Some(seat) {
+            bail!("only the deputy of question {} may settle it", self.short());
+        }
+        if !self.choices.iter().any(|c| c == label) {
+            bail!(
+                "`{label}` is not one of the choices offered on question {}",
+                self.short()
+            );
+        }
+        let quote = quote.trim();
+        if quote.is_empty()
+            || !self
+                .thread
+                .iter()
+                .any(|t| t.who == Who::Operator && t.body.contains(quote))
+        {
+            bail!(
+                "the quote is not something the owner said on question {}",
+                self.short()
+            );
+        }
+        self.thread.push(Turn {
+            who: Who::Agent,
+            body: format!("Settled as `{label}` on the owner's words: \"{quote}\""),
+            at: Timestamp::now(),
+        });
+        self.delivered_turns = self.thread.len();
+        self.answer(Answer::Choice(label.to_owned()))
     }
 
     /// The owner speaking back without answering: a request for context, a
@@ -1838,6 +1937,7 @@ mod tests {
                 "choices",
                 "cwd",
                 "delivered_turns",
+                "deputy",
                 "detail",
                 "id",
                 "node",
@@ -1852,7 +1952,7 @@ mod tests {
             ],
             "the on-disk field set is a contract with the front end"
         );
-        assert_eq!(open["schema"], 4);
+        assert_eq!(open["schema"], 5);
         assert_eq!(open["thread"], serde_json::json!([]));
         assert_eq!(open["id"], "20260902-231501-ab12");
         assert_eq!(open["run"], "20260902-201256-9fb7");
@@ -2625,6 +2725,66 @@ mod tests {
         let agent_turn = serde_json::json!({"who": "agent", "body": "hi", "at": value["at"]});
         let parsed: Turn = serde_json::from_value(agent_turn).unwrap();
         assert_eq!(parsed.who, Who::Agent);
+    }
+
+    #[test]
+    fn a_deputy_settles_only_on_an_offered_choice_and_the_owners_own_words() {
+        let mut q = Question::new(
+            "task".to_owned(),
+            "conduct".to_owned(),
+            "conduct".to_owned(),
+            "Done?".to_owned(),
+            String::new(),
+            vec!["yes".to_owned(), "no".to_owned()],
+        );
+        let mut seat = crate::agent::SeatState::new("deputy-x", "alpha", 1);
+        seat.turns = 1;
+        let mut dep = Deputy::new("brief".to_owned());
+        dep.seat = Some(seat);
+        q.deputy = Some(dep);
+        q.say("setup done, go ahead").unwrap();
+
+        assert!(
+            q.settle_by_deputy("someone-else", "yes", "setup done")
+                .is_err()
+        );
+        assert!(
+            q.settle_by_deputy("deputy-x", "maybe", "setup done")
+                .is_err()
+        );
+        assert!(
+            q.settle_by_deputy("deputy-x", "yes", "never said this")
+                .is_err()
+        );
+        assert!(q.settle_by_deputy("deputy-x", "yes", "  ").is_err());
+        assert_eq!(q.status, QuestionStatus::Open);
+
+        q.settle_by_deputy("deputy-x", "yes", "setup done").unwrap();
+        assert_eq!(q.status, QuestionStatus::Answered);
+        assert_eq!(q.resolution().as_deref(), Some("yes"));
+        let last = q.thread.last().unwrap();
+        assert_eq!(last.who, Who::Agent);
+        assert!(
+            last.body.contains("setup done"),
+            "the quote stays on the record"
+        );
+    }
+
+    #[test]
+    fn a_question_written_before_deputies_still_reads() {
+        let mut q = Question::new(
+            "task".to_owned(),
+            "conduct".to_owned(),
+            "conduct".to_owned(),
+            "Done?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        q.schema = 4;
+        let mut v = serde_json::to_value(&q).unwrap();
+        v.as_object_mut().unwrap().remove("deputy");
+        let back: Question = serde_json::from_value(v).unwrap();
+        assert!(back.deputy.is_none());
     }
 
     #[test]
