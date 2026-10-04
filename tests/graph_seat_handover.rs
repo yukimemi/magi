@@ -180,9 +180,14 @@ fn judge_retry_artifacts(state: &RunState, seat: &str) -> usize {
 }
 
 async fn run_judges(fx: &common::Fixture) -> Runner {
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
-        .await
-        .expect("start");
+    let mut runner = Runner::start(
+        &fx.repo,
+        "create note.txt".to_owned(),
+        fx.config.clone(),
+        magi::run::Origin::operator(),
+    )
+    .await
+    .expect("start");
     runner.execute().await.expect("execute");
     runner
 }
