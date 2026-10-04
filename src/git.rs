@@ -50,11 +50,19 @@ pub async fn git_raw(cwd: &Path, args: &[&str]) -> Result<GitOut> {
     })
 }
 
-/// `git fetch origin` in `cwd`, bounded by `timeout`.
+/// Fetch `origin`'s branches into `refs/remotes/origin/*` in `cwd`, bounded by
+/// `timeout`.
 ///
-/// Touches only `refs/remotes/origin/*`: no branch, HEAD, index or working
-/// tree changes. A child still running at the deadline is killed on drop.
+/// The destination is fixed on the command line and the remote is addressed by
+/// its URL rather than its name. A plain `git fetch origin` follows the
+/// configured `remote.origin.fetch`, which can map onto local branches
+/// (`+refs/heads/main:refs/heads/main`) or a single branch, and even a fetch
+/// with an explicit refspec updates remote-tracking refs from that config
+/// when the remote is named. By URL, nothing but the refspec given here is
+/// written: no local branch, HEAD, index or working tree. A child still
+/// running at the deadline is killed on drop.
 pub async fn fetch_origin(cwd: &Path, timeout: std::time::Duration) -> Result<()> {
+    let url = git(cwd, &["remote", "get-url", "origin"]).await?;
     let fut = Command::new("git")
         .args([
             "fetch",
@@ -62,7 +70,9 @@ pub async fn fetch_origin(cwd: &Path, timeout: std::time::Duration) -> Result<()
             "--no-tags",
             "--no-recurse-submodules",
             "--no-write-fetch-head",
-            "origin",
+            "--",
+            url.as_str(),
+            "+refs/heads/*:refs/remotes/origin/*",
         ])
         .current_dir(cwd)
         .quiet()

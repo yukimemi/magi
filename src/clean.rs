@@ -976,6 +976,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_never_writes_a_local_branch_whatever_the_configured_refspec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        let bare = t.join("remote.git");
+        sh(
+            t,
+            &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
+        )
+        .await;
+        let dir = t.join("root/h/o/r");
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        sh(
+            t,
+            &["clone", "-q", bare.to_str().unwrap(), dir.to_str().unwrap()],
+        )
+        .await;
+        sh(&dir, &["checkout", "-q", "-b", "main"]).await;
+        commit(&dir, "a.txt", "one").await;
+        sh(&dir, &["push", "-q", "origin", "main"]).await;
+        sh(&dir, &["checkout", "-q", "--detach"]).await;
+        // A hostile mapping onto the local branch, and no origin/* at all.
+        sh(
+            &dir,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/main:refs/heads/main",
+            ],
+        )
+        .await;
+        let _ = crate::git::git_raw(&dir, &["update-ref", "-d", "refs/remotes/origin/main"]).await;
+
+        let other = t.join("other");
+        sh(
+            t,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        )
+        .await;
+        commit(&other, "b.txt", "two").await;
+        sh(&other, &["push", "-q", "origin", "HEAD:main"]).await;
+        let remote_tip = crate::git::git(&other, &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        let local_main = crate::git::git(&dir, &["rev-parse", "refs/heads/main"])
+            .await
+            .unwrap();
+
+        let r = fetch_origins(&[t.join("root")], LONG, || false).await;
+        assert_eq!(r.fetched, 1);
+        assert_eq!(
+            crate::git::git(&dir, &["rev-parse", "refs/remotes/origin/main"])
+                .await
+                .unwrap(),
+            remote_tip
+        );
+        assert_eq!(
+            crate::git::git(&dir, &["rev-parse", "refs/heads/main"])
+                .await
+                .unwrap(),
+            local_main
+        );
+    }
+
+    #[tokio::test]
     async fn fetch_skips_no_origin_and_survives_an_unreachable_origin() {
         let tmp = tempfile::tempdir().unwrap();
         let t = tmp.path();
