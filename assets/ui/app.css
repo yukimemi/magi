@@ -2012,7 +2012,13 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 .task-runs .task-run-desc, .task-runs .task-run-out { font-size: var(--t3); color: var(--ink-2); overflow-wrap: anywhere; }
 .card-title.is-link { cursor: pointer; }
 .back-task { font-size: var(--t3); }
-.run-task-line { margin: var(--s1) 0 0; overflow-wrap: anywhere; }
+.run-task-line { margin: var(--s1) 0 0; overflow-wrap: anywhere; display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1); }
+.task-chip-link {
+  display: inline-flex; align-items: center; min-height: 44px; padding: 0 var(--s3);
+  border: 1px solid var(--edge); border-radius: 999px; text-decoration: none;
+}
+#run-task-box { display: flex; flex-direction: column; gap: var(--s2); padding-bottom: var(--s3); border-bottom: 1px solid var(--edge); }
+.sheet-task-link { display: flex; align-items: center; justify-content: center; gap: var(--s2); min-height: 44px; text-decoration: none; }
 
 /* ---- settings ---------------------------------------------------------- */
 .set-note { color: var(--ink-2); font-size: var(--t3); max-width: 64ch; margin: 0 0 var(--s4); }
