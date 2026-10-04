@@ -2065,11 +2065,13 @@ function renderRuns() {
 
   const { heads, childrenOf } = foldRuns(runs);
 
-  show($("runs-state-chips"), runs.length > 0);
-  if (runs.length > 0) renderRunStateChips(runs);
   /* The box only makes sense once there is something to search; an empty
      history keeps its own "nothing has run yet" explanation. */
   const searchable = runs.length > 0 || unreadable > 0;
+  /* Chips follow the search box, not runs.length: a history of only
+     unreadable runs still finds hits, and those show only under "All". */
+  show($("runs-state-chips"), searchable);
+  if (searchable) renderRunStateChips(runs);
   show($("runs-search"), searchable);
   show($("runs-search-clear"), state.runsSearch !== "");
 
