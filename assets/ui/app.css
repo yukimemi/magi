@@ -2012,6 +2012,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 .task-runs .task-run-desc, .task-runs .task-run-out { font-size: var(--t3); color: var(--ink-2); overflow-wrap: anywhere; }
 .card-title.is-link { cursor: pointer; }
 .back-task { font-size: var(--t3); }
+.run-task-line { margin: var(--s1) 0 0; overflow-wrap: anywhere; }
 
 /* ---- settings ---------------------------------------------------------- */
 .set-note { color: var(--ink-2); font-size: var(--t3); max-width: 64ch; margin: 0 0 var(--s4); }
