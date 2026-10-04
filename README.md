@@ -683,15 +683,15 @@ kind = "claude"
 model = "sonnet"
 
 [[agents]]
-id = "oc"
+id = "opencode"
 kind = "opencode"
 
 # Leave a role empty to rotate through the roster. The judge seats are rotated
 # by one, so judge i is never the author of candidate i.
 [roles]
-implementers = ["opus", "sonnet", "oc"]
-judges = ["sonnet", "oc", "opus"]
-reviewers = ["opus", "oc"]
+implementers = ["opus", "sonnet", "opencode"]
+judges = ["sonnet", "opencode", "opus"]
+reviewers = ["opus", "opencode"]
 # fixer defaults to the winner's own author, continuing its own conversation.
 # chatter is who Chat asks; unset picks a claude seat, else the first
 # runnable agent in roster order. Name one explicitly if that agent is also a
