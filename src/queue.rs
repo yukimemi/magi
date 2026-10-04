@@ -1284,6 +1284,15 @@ impl Queue {
                         std::thread::sleep(std::time::Duration::from_millis(15));
                     }
                 }
+                // On Windows, `create_new` on a file whose delete is still
+                // pending fails with ERROR_ACCESS_DENIED, not `AlreadyExists`.
+                // Treat it as a race and retry until the deadline.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::PermissionDenied
+                        && started.elapsed() <= TASK_LOCK_STALE =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
                 Err(e) => return Err(e).with_context(|| format!("lock {}", path.display())),
             }
         }
