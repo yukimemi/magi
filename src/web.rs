@@ -2614,6 +2614,11 @@ struct LatestAttempt {
     /// in-flight status are excluded because they are exactly the
     /// unresolved states this field exists to tell apart from a real finish.
     resolved: bool,
+    /// The attempt's own recorded status, so the page can say where it
+    /// stands while it is not resolved yet.
+    status: RunStatus,
+    /// Whether that status is terminal (nothing is still running it).
+    done: bool,
 }
 
 impl RunDetailView {
@@ -2660,6 +2665,8 @@ async fn run_detail(
             read_run(&ui.runs, &head_id).ok().map(|head| LatestAttempt {
                 short: head.short().to_owned(),
                 resolved: matches!(head.status, RunStatus::Merged | RunStatus::Ready),
+                status: head.status,
+                done: head.status.done(),
                 id: head.id,
             })
         });
@@ -12382,6 +12389,25 @@ mod tests {
         q.put(&mut t1).expect("put");
         let view1 = fx.get(&format!("/api/runs/{still_blocked_a}")).await.json();
         assert_eq!(view1["latest_attempt"]["resolved"], false);
+        assert_eq!(view1["latest_attempt"]["status"], "blocked");
+        assert_eq!(view1["latest_attempt"]["done"], true);
+
+        // Still running: the successor exists and must be reported as such.
+        let (run_a, run_b) = ("20260901-000000-e005", "20260901-000000-e006");
+        write_run(&runs, run_a, RunStatus::Blocked);
+        write_run(&runs, run_b, RunStatus::Implementing);
+        let mut t3 = Task::new(
+            "retrying".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        t3.runs = vec![run_a.to_owned(), run_b.to_owned()];
+        q.put(&mut t3).expect("put");
+        let view3 = fx.get(&format!("/api/runs/{run_a}")).await.json();
+        assert_eq!(view3["latest_attempt"]["id"], run_b);
+        assert_eq!(view3["latest_attempt"]["resolved"], false);
+        assert_eq!(view3["latest_attempt"]["done"], false);
 
         // VerifiedNoop: a candidate's own unconfirmed claim, held for a human
         // to check - not a confirmed finish, so this must not read as
@@ -12407,6 +12433,12 @@ mod tests {
         // Front end: an unresolved successor must not carry the "finished
         // this work" note or the muted chip treatment.
         assert!(APP_JS.contains("latest.resolved"));
+        // ...but the link to it shows as soon as it exists, labelled by state
+        // and without the "finished" wording or the muted chip.
+        assert!(APP_JS.contains("successorNote(latest, inFlight)"));
+        assert!(APP_JS.contains("Latest attempt: "));
+        assert!(APP_JS.contains("in flight"));
+        assert!(APP_JS.contains("not resolved"));
     }
 
     #[tokio::test]

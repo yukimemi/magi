@@ -5290,6 +5290,24 @@ function viable(candidate) {
   return !candidate.failed && !candidate.empty;
 }
 
+/* The pointer from a run to its task's current attempt. The link shows as soon
+   as a successor exists; only a resolved one reads as having finished the
+   work (and mutes the chip, see `superseded`). An unresolved one is labelled
+   with its state and never called the outcome. */
+function successorNote(latest, inFlight) {
+  if (!latest) return null;
+  const link = el("a", { href: `#/runs/${latest.id}`, text: latest.short });
+  if (latest.resolved && !inFlight) {
+    return el("p", { class: "card-note card-superseded" },
+      "Superseded by ", link,
+      " — a later attempt at the same task finished this work.");
+  }
+  const state = latest.done === false
+    ? "in flight"
+    : `ended ${String(latest.status || "unknown").replace(/_/g, " ")} \u2014 not resolved`;
+  return el("p", { class: "card-note" }, "Latest attempt: ", link, ` (${state})`);
+}
+
 function renderRunDetail() {
   const run = state.detail.run;
   const report = state.detail.report;
@@ -5364,13 +5382,9 @@ function renderRunDetail() {
     ? phaseRail(status, parkedAt, activeNote(run))
     : null;
   if (rail) head.append(rail);
-  if (superseded) {
-    head.append(el("p", { class: "card-note card-superseded" },
-      "Superseded by ",
-      el("a", { href: `#/runs/${latest.id}`, text: latest.short }),
-      " — a later attempt at the same task finished this work.",
-    ));
-  } else if (meta.note) {
+  const note = successorNote(latest, inFlight);
+  if (note) head.append(note);
+  if (!superseded && meta.note) {
     head.append(el("p", { class: "card-note", text: meta.note }));
   }
 
