@@ -139,6 +139,10 @@ pub enum Source {
     },
 }
 
+/// The `node` a [`Source::Agent`] carries when the asker is a chat
+/// conversation (its `run` is then the conversation's id).
+pub const CHAT_NODE: &str = "chat";
+
 impl Source {
     /// Short human-facing label, for lists and the web UI.
     pub fn label(&self) -> String {

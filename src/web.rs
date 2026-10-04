@@ -120,7 +120,7 @@ use crate::config::{AgentKind, Config, Update, UpdateMode};
 use crate::md;
 use crate::notices::{Notice, Notices};
 use crate::proc::Quiet as _;
-use crate::queue::{Queue, Task, TaskStatus, title_from};
+use crate::queue::{Queue, Source, Task, TaskStatus, title_from};
 use crate::run::{RunState, RunStatus};
 use crate::talk::{Talk, Talks};
 use crate::{daemon, git, report, repos, run, settings, stats, talk, updater};
@@ -2523,6 +2523,10 @@ struct TaskRef {
     id: String,
     short: String,
     title: String,
+    /// [`Source::label`], e.g. `chat@a1b2`.
+    source_label: String,
+    /// Where the task came from, when that place has a page; see [`source_link`].
+    source_link: Option<SourceLink>,
     /// The task's own status (`TaskStatus::as_str`), independent of this run's.
     status: &'static str,
     attempts: usize,
@@ -2535,6 +2539,49 @@ struct TaskRef {
     finished_by: Option<RunBrief>,
     /// The task is `done` but no run on record finished it: closed by hand.
     closed_by_hand: bool,
+}
+
+/// The page that filed a task, as the UI links to it.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct SourceLink {
+    /// `chat` (a conversation) or `run` (a run's node).
+    kind: &'static str,
+    /// The full id, never the short one in the label.
+    id: String,
+    /// The hash route that opens it.
+    href: String,
+}
+
+/// Percent-encode everything outside the URL-unreserved set.
+fn encode_segment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The one place that decides where a task's source links to. A chat
+/// conversation opens `#/chat/<id>`, any other agent node `#/runs/<id>`;
+/// a person or an imported issue has no page, so no link.
+fn source_link(source: &Source) -> Option<SourceLink> {
+    let Source::Agent { run, node } = source else {
+        return None;
+    };
+    let (kind, route) = if node == crate::queue::CHAT_NODE {
+        ("chat", "chat")
+    } else {
+        ("run", "runs")
+    };
+    Some(SourceLink {
+        kind,
+        id: run.clone(),
+        href: format!("#/{route}/{}", encode_segment(run)),
+    })
 }
 
 /// Another run of the same task, as named from a run's detail page.
@@ -2588,6 +2635,8 @@ fn task_outcome(
         short: task.short().to_owned(),
         title: task.title.clone(),
         id: task.id.clone(),
+        source_label: task.source.label(),
+        source_link: source_link(&task.source),
         status: task.status.as_str(),
         attempts: task.attempts,
         max_attempts,
@@ -3016,6 +3065,7 @@ struct TaskView {
     #[serde(flatten)]
     task: Task,
     source_label: String,
+    source_link: Option<SourceLink>,
     status_str: &'static str,
     /// The instruction, parsed as markdown, for the Queue card's "Full
     /// instruction" panel. `task.instruction` is unchanged and still carries
@@ -3034,6 +3084,7 @@ impl From<Task> for TaskView {
     fn from(task: Task) -> Self {
         Self {
             source_label: task.source.label(),
+            source_link: source_link(&task.source),
             status_str: task.status.as_str(),
             instruction_md: md::to_nodes(&task.instruction, &md::ImageBase::None),
             waits_on: Vec::new(),
@@ -12237,6 +12288,86 @@ mod tests {
         t.runs = runs.iter().map(|r| (*r).to_owned()).collect();
         t.status = status;
         t
+    }
+
+    #[test]
+    fn source_link_picks_the_page_that_filed_the_task() {
+        let agent = |node: &str| Source::Agent {
+            run: "20260904-014455-ab12".to_owned(),
+            node: node.to_owned(),
+        };
+        let chat = source_link(&agent("chat")).expect("chat link");
+        assert_eq!(chat.kind, "chat");
+        assert_eq!(chat.id, "20260904-014455-ab12");
+        assert_eq!(chat.href, "#/chat/20260904-014455-ab12");
+        let run = source_link(&agent("implement")).expect("run link");
+        assert_eq!(
+            (run.kind, run.href.as_str()),
+            ("run", "#/runs/20260904-014455-ab12")
+        );
+        assert_eq!(source_link(&Source::Human), None);
+        assert_eq!(
+            source_link(&Source::Issue {
+                number: 3,
+                repo: "o/r".to_owned()
+            }),
+            None
+        );
+        let odd = source_link(&Source::Agent {
+            run: "a b/c".to_owned(),
+            node: "chat".to_owned(),
+        })
+        .expect("link");
+        assert_eq!(odd.href, "#/chat/a%20b%2Fc");
+    }
+
+    #[test]
+    fn the_ui_reads_the_source_link_instead_of_guessing_a_route() {
+        assert!(
+            !APP_JS.contains("src.node === \"chat\""),
+            "inline href rule is back"
+        );
+        assert!(
+            APP_JS.matches("sourceLinkOf(").count() >= 4,
+            "helper must serve every page"
+        );
+        assert!(APP_JS.matches("openChatLink(").count() >= 4);
+    }
+
+    #[test]
+    fn task_ref_carries_the_source_link_for_a_chat_task() {
+        let mut t = outcome_task(&["20260901-000000-aaaa"], TaskStatus::Held);
+        t.source = Source::Agent {
+            run: "20260904-014455-ab12".to_owned(),
+            node: "chat".to_owned(),
+        };
+        let out = task_outcome(&t, "20260901-000000-aaaa", 3, |_| None);
+        let v = serde_json::to_value(&out).expect("json");
+        assert_eq!(v["source_link"]["kind"], "chat", "{v}");
+        assert_eq!(v["source_link"]["href"], "#/chat/20260904-014455-ab12");
+        assert_eq!(v["source_label"], t.source.label());
+
+        let human = outcome_task(&["20260901-000000-aaaa"], TaskStatus::Held);
+        let v = serde_json::to_value(task_outcome(&human, "20260901-000000-aaaa", 3, |_| None))
+            .expect("json");
+        assert!(v["source_link"].is_null(), "{v}");
+    }
+
+    #[test]
+    fn task_view_serializes_source_link() {
+        let mut t = Task::new(
+            "t".to_owned(),
+            "t".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Agent {
+                run: "20260901-000000-aaaa".to_owned(),
+                node: "implement".to_owned(),
+            },
+        );
+        t.runs.clear();
+        let v = serde_json::to_value(TaskView::from(t)).expect("json");
+        assert_eq!(v["source_link"]["kind"], "run", "{v}");
+        assert_eq!(v["source_link"]["href"], "#/runs/20260901-000000-aaaa");
     }
 
     #[tokio::test]
