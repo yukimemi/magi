@@ -1715,9 +1715,14 @@ impl Queue {
         self.sweep_tombstones();
     }
 
-    /// Delete `*.removed` markers no task's `blocked_by` names any more. One
-    /// that is still referenced is kept: dropping it early would turn a
-    /// dependent the claim race skipped back into a "vanished" hold.
+    /// Delete `*.removed` markers that are no longer needed: the record is
+    /// gone, no task's `blocked_by` names the id, and the marker is older than
+    /// [`TOMBSTONE_GRACE`]. The age is what makes this safe against a
+    /// concurrent writer: the task list read here can be stale, so a dependent
+    /// that was just blocked on an id (a conductor applying a decision while a
+    /// removal is under way) would otherwise lose the marker and be held as a
+    /// vanished dependency. A marker whose record still exists belongs to a
+    /// removal in progress and is never touched.
     fn sweep_tombstones(&self) {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return;
@@ -1729,7 +1734,18 @@ impl Queue {
             let Some(id) = name.strip_suffix(".removed") else {
                 continue;
             };
-            if !tasks.iter().any(|t| t.blocked_by.iter().any(|b| b == id)) {
+            if self.path_of(id).exists()
+                || tasks.iter().any(|t| t.blocked_by.iter().any(|b| b == id))
+            {
+                continue;
+            }
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age >= TOMBSTONE_GRACE);
+            if old {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -1943,6 +1959,10 @@ impl Queue {
         if h == 0 { 1 } else { h }
     }
 }
+
+/// How long a deletion marker is kept after its record is gone, even with
+/// nothing referencing it. See [`Queue::sweep_tombstones`].
+const TOMBSTONE_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// What [`Queue::remove`] did, beyond deleting the named task's own file.
 #[derive(Debug, Clone)]
