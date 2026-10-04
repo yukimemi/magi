@@ -6868,12 +6868,16 @@ async function saveSettings() {
   settingsState.busy = true;
   settingsState.message = null;
   renderSettings();
+  const sent = { ...settingsState.draft };
   try {
     settingsState.data = await putJson(API.settingsRoles, {
       revision: d.revision,
-      roles: settingsState.draft,
+      roles: sent,
     });
-    settingsState.draft = {};
+    // Edits made while the save was in flight were not sent; keep them.
+    for (const k of Object.keys(sent)) {
+      if (settingsState.draft[k] === sent[k]) delete settingsState.draft[k];
+    }
     settingsState.message = {
       bad: false,
       text: "Saved to the machine config. Runs started from now on use it; runs already in flight keep the settings they started with.",

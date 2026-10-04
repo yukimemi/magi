@@ -480,16 +480,6 @@ pub(crate) fn save(
             ))));
         }
     }
-    for key in ROLE_KEYS {
-        if let Some(bad) = role_ids(&loaded, key)
-            .into_iter()
-            .find(|id| loaded.agent(id).is_err())
-        {
-            return Err(cleanup(SaveError::Refused(format!(
-                "`{key}` would name `{bad}`, which is not defined. Nothing was saved."
-            ))));
-        }
-    }
     std::fs::rename(&tmp, machine).map_err(|e| {
         cleanup(SaveError::Internal(format!(
             "replacing {}: {e}",
