@@ -625,6 +625,10 @@ struct OldSpan {
     end: usize,
     /// `(line, ids on the line, comment)` for each line that has a comment.
     notes: Vec<(usize, Vec<String>, String)>,
+    /// Every id in order of appearance (duplicates included), with the
+    /// comment on its line when it is the last id there - so a comment follows
+    /// one occurrence of an id, not every seat of the same agent.
+    seats: Vec<(String, Option<String>)>,
 }
 
 /// Patch one key of the `[roles]` table, leaving every other byte alone.
@@ -665,13 +669,16 @@ fn patch_role(text: &str, key: &str, ids: &[String]) -> Result<String, String> {
             let at = first.find('=').map_or(0, |p| p + 1);
             let mut end = i;
             let mut notes = Vec::new();
+            let mut seats: Vec<(String, Option<String>)> = Vec::new();
             let mut note = |line: usize, code: &str, hash: Option<usize>| {
-                if let Some(h) = hash {
-                    notes.push((
-                        line,
-                        quoted_ids(&code[..h]),
-                        code[h..].trim_end().to_owned(),
-                    ));
+                let ids = quoted_ids(&code[..hash.unwrap_or(code.len())]);
+                let comment = hash.map(|h| code[h..].trim_end().to_owned());
+                let last = ids.len().saturating_sub(1);
+                for (n, id) in ids.iter().enumerate() {
+                    seats.push((id.clone(), comment.clone().filter(|_| n == last)));
+                }
+                if let Some(c) = comment {
+                    notes.push((line, ids, c));
                 }
             };
             let code = &first[at..];
@@ -697,7 +704,12 @@ fn patch_role(text: &str, key: &str, ids: &[String]) -> Result<String, String> {
                              cannot edit without losing it. Change it by hand."
                         ));
                     }
-                    span = Some(OldSpan { start, end, notes });
+                    span = Some(OldSpan {
+                        start,
+                        end,
+                        notes,
+                        seats,
+                    });
                 }
             }
             i = end + 1;
@@ -761,12 +773,18 @@ fn patch_role(text: &str, key: &str, ids: &[String]) -> Result<String, String> {
                     for (_, _, c) in interior.iter().filter(|(_, l, _)| l.is_empty()) {
                         v.push(format!("{indent}  {c}{eol}"));
                     }
+                    let mut taken: std::collections::HashMap<&str, usize> = Default::default();
                     for id in ids {
-                        let note = interior
+                        let nth = taken.entry(id.as_str()).or_insert(0);
+                        let note = old
+                            .seats
                             .iter()
-                            .find(|(_, l, _)| l.last() == Some(id))
-                            .map(|(_, _, c)| format!("  {c}"))
+                            .filter(|(old_id, _)| old_id == id)
+                            .nth(*nth)
+                            .and_then(|(_, c)| c.as_ref())
+                            .map(|c| format!("  {c}"))
                             .unwrap_or_default();
+                        *nth += 1;
                         v.push(format!("{indent}  {},{note}{eol}", quote(id)));
                     }
                     v.push(format!(
@@ -835,6 +853,17 @@ mod tests {
         let out = patch_role(src, "judges", &ids(&["a"])).unwrap();
         assert!(out.starts_with(src), "{out}");
         assert!(out.ends_with("\n[roles]\njudges = [\"a\"]\n"), "{out}");
+    }
+
+    #[test]
+    fn duplicate_seats_keep_their_own_comments() {
+        let src =
+            "[roles]\njudges = [\n  \"a\", # first seat\n  \"a\", # second seat\n  \"b\",\n]\n";
+        let out = patch_role(src, "judges", &ids(&["b", "a", "a"])).unwrap();
+        assert_eq!(
+            out,
+            "[roles]\njudges = [\n  \"b\",\n  \"a\",  # first seat\n  \"a\",  # second seat\n]\n"
+        );
     }
 
     #[test]
