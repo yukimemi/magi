@@ -27,6 +27,7 @@ const API = {
   resumeRun: (id) => `/api/runs/${encodeURIComponent(id)}/resume`,
   report: (id) => `/api/runs/${encodeURIComponent(id)}/report`,
   queue: "/api/queue",
+  search: (scope, q) => `/api/search?scope=${scope}&q=${encodeURIComponent(q)}`,
   task: (id) => `/api/queue/${encodeURIComponent(id)}`,
   /* Aggregated over every readable run plus the live queue — the same
      numbers `magi stats` prints, reused rather than recomputed here. */
@@ -558,6 +559,15 @@ const state = {
   /* The Backlog's id search box. Lives only in memory, same reasoning as
      runsFilter above: a reload starts from the unfiltered backlog. */
   queueSearch: "",
+  /* Full-text search, one slot per page. `text` is what the box holds; the
+     rest describes the last request: `status` is idle | loading | ok | error,
+     `forText` the query the stored `hits` answer, `seq` the newest request
+     (an older reply is dropped), `timer` the debounce. */
+  runsSearch: "",
+  search: {
+    runs: { status: "idle", forText: "", seq: 0, timer: null, hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" },
+    tasks: { status: "idle", forText: "", seq: 0, timer: null, hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" },
+  },
   /* `${query}\0${id}` of the single-hit jump renderQueueSearch last actually
      performed, so a background poll that re-renders the same query without
      a new unique hit does not yank the operator back to the card mid-read -
@@ -1257,11 +1267,12 @@ function createRunCard() {
      status. */
   const superseded = el("p", { class: "card-note card-superseded" });
   const event = el("p", { class: "card-event" });
+  const snippet = el("p", { class: "card-snippet", hidden: true });
   const rail = el("div");
 
   const card = el("a", { class: "card" },
     el("div", { class: "card-top" }, chipSlot, whenSlot),
-    title, meta, note, superseded, event, rail,
+    title, meta, note, superseded, event, snippet, rail,
   );
 
   /* The card is one big anchor, which is the affordance the whole phone
@@ -1277,7 +1288,7 @@ function createRunCard() {
 
   const row = el("li", {}, card, tail);
   row.refs = { card, chipSlot, whenSlot, title, repo, counts, winner, reviews, note, superseded,
-               event, rail, tail, prLink, checks, prRound, tailGo, tailNote };
+               event, snippet, rail, tail, prLink, checks, prRound, tailGo, tailNote };
   return row;
 }
 
@@ -1293,6 +1304,7 @@ function updateRunCard(row, run) {
 
   r.card.setAttribute("href", `#/runs/${run.id}`);
   setAttr(r.card, "data-run-id", run.id);
+  renderSnippet(r.snippet, searchHit("runs", run.id));
   setAttr(r.card, "data-tone", tone);
   setAttr(row, "data-tone", tone);
 
@@ -2046,6 +2058,11 @@ function renderRuns() {
 
   show($("runs-state-chips"), runs.length > 0);
   if (runs.length > 0) renderRunStateChips(runs);
+  /* The box only makes sense once there is something to search; an empty
+     history keeps its own "nothing has run yet" explanation. */
+  const searchable = runs.length > 0 || unreadable > 0;
+  show($("runs-search"), searchable);
+  show($("runs-search-clear"), state.runsSearch !== "");
 
   /* Two hidings, on by default, both lifted by "all": a done run and an old
      attempt (isOrphanSuperseded, or a whole entry in childrenOf) are both
@@ -2066,7 +2083,22 @@ function renderRuns() {
      back in even though the tree is the desktop's whole point. */
   renderRunsTree(buildRunsTree(groupBySection(heads)));
   renderRunsFilterBar();
-  const visible = stateFiltered.filter(matchesFilter);
+  const searching = searchable && searchText("runs") !== "";
+  const searchKind = searching ? state.search.runs.status : "idle";
+  const filtered = stateFiltered.filter(matchesFilter);
+  /* The search composes with the chips and the tree: a row must pass all of
+     them. While a request is in flight the previous answer still applies; a
+     failed one hides the list rather than pretending it was filtered. */
+  /* While searching, rows are matched individually over every loaded run:
+     a match inside a run folded under a newer attempt must surface as its own
+     row, so nothing is folded for the duration. */
+  const searchHits = state.search.runs.hits;
+  const visible = !searching ? filtered
+    : searchKind === "error" ? []
+    : runs.filter((r) => searchHits.has(r.id) && matchesRunState(r)
+        && (state.runsStateFilter === "all" || !isOrphanSuperseded(r)) && matchesFilter(r));
+  const searchShown = searching ? runs.filter((r) => state.search.runs.hits.has(r.id)).length : 0;
+  renderSearchStatus("runs", $("runs-search-status"), "runs", searchShown);
 
   /* Every list in childrenOf exists only because foldRuns resolved a
      superseded_by to a head on this page (see foldRuns above) — it is
@@ -2078,7 +2110,14 @@ function renderRuns() {
   const foldedHidden = state.runsStateFilter === "all"
     ? 0
     : [...childrenOf.values()].reduce((sum, kids) => sum + kids.filter(matchesRunState).length, 0);
-  const childrenForRender = state.runsStateFilter === "all" ? childrenOf : new Map();
+  const childrenForRender = state.runsStateFilter === "all" && !searching ? childrenOf : new Map();
+  /* A hit outside the loaded window has no state, section or repository on
+     the client, so it cannot honour those filters; it is listed only while
+     none is narrowing the page, and the status line counts it as hidden
+     otherwise. */
+  const unfiltered = state.runsStateFilter === "all"
+    && !(state.runsFilter.section || state.runsFilter.repo || state.runsFilter.status);
+  renderSearchExtras(searching && searchKind !== "error" && unfiltered ? runs : null);
   syncRunSections(sectionsRoot, groupBySection(visible), childrenForRender);
 
   const supersededHidden = orphanHidden + foldedHidden;
@@ -2104,12 +2143,13 @@ function renderRuns() {
   // none of them are the state the operator picked — distinct from the tree
   // filter's empty state below, which only fires once the state filter has
   // already left something on the table for the tree to narrow further.
-  show($("runs-state-empty"), runs.length > 0 && stateFiltered.length === 0);
+  show($("runs-state-empty"), runs.length > 0 && stateFiltered.length === 0 && !searching);
   show(
     $("runs-filter-empty"),
     stateFiltered.length > 0
       && Boolean(state.runsFilter.section || state.runsFilter.status)
-      && visible.length === 0,
+      && filtered.length === 0
+      && !searching,
   );
   markSelected();
 }
@@ -2133,6 +2173,7 @@ function createTaskCard() {
   const outcome = el("span");
   const meta = el("div", { class: "card-meta" }, source, openChat, repo, attempts, outcome);
   const note = el("p", { class: "card-note" });
+  const snippet = el("p", { class: "card-snippet", hidden: true });
   const error = el("pre", { class: "err" });
   const instruction = el("details", { class: "advanced" },
     el("summary", { text: "Full instruction" }),
@@ -2161,7 +2202,7 @@ function createTaskCard() {
 
   const card = el("li", { class: "card" },
     el("div", { class: "card-top" }, chipSlot, priority, solo, permalink, whenSlot),
-    title, meta, note, error, instruction, answers, actions,
+    title, meta, note, snippet, error, instruction, answers, actions,
   );
   /* Tapping the card body opens the task page; anything interactive inside it
      (buttons, links, the details disclosures, selectable text) keeps its own
@@ -2188,7 +2229,7 @@ function createTaskCard() {
   });
   card.refs = {
     card, chipSlot, priority, solo, permalink, whenSlot, title, source, openChat, repo, attempts,
-    outcome, note, error, instruction, answers, answersList, runLink, historyLink,
+    outcome, note, snippet, error, instruction, answers, answersList, runLink, historyLink,
     priorityDown, priorityUp, editBtn, holdBox, doneBox, deleteBox,
   };
   return card;
@@ -2203,6 +2244,7 @@ function updateTaskCard(row, task) {
   /* The full id, a stable hook for jumpToTask() that does not depend on
      syncList's own data-key. */
   setAttr(r.card, "data-task-id", task.id);
+  renderSnippet(r.snippet, searchHit("tasks", task.id));
   setText(r.permalink, shortId(task.id));
   setAttr(r.permalink, "href", `#/queue/${encodeURIComponent(task.id)}`);
   setAttr(r.permalink, "aria-label", `Link to task ${task.id}`);
@@ -2663,6 +2705,151 @@ function syncQueueSections(root, bySection) {
   syncSections(root, QUEUE_SECTIONS, bySection, createQueueSection, updateQueueSection);
 }
 
+/* ---- full-text search --------------------------------------------------- *
+ * The server (GET /api/search) matches every term, case-insensitively, against
+ * all the text a run or task holds and answers with ids plus a snippet cut
+ * into plain pieces. Nothing here builds markup from them: pieces become text
+ * nodes, matches become <mark> elements. */
+const SEARCH_DEBOUNCE_MS = 250;
+
+function searchText(scope) {
+  return (scope === "runs" ? state.runsSearch : state.queueSearch).trim();
+}
+
+function resetSearch(scope) {
+  const s = state.search[scope];
+  clearTimeout(s.timer);
+  s.timer = null;
+  s.seq += 1;
+  Object.assign(s, { status: "idle", forText: "", hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" });
+}
+
+function renderSearchScope(scope) {
+  if (scope === "runs") renderRuns();
+  else renderQueue();
+}
+
+/* Called on every keystroke: debounces, and never touches the input itself, so
+   focus and the typed text survive every re-render. */
+function scheduleSearch(scope) {
+  const text = searchText(scope);
+  if (text === "") {
+    resetSearch(scope);
+    return;
+  }
+  const s = state.search[scope];
+  clearTimeout(s.timer);
+  s.status = "loading";
+  s.timer = setTimeout(() => runSearch(scope), SEARCH_DEBOUNCE_MS);
+}
+
+/* The previous hits stay on screen while a new request is in flight (and on
+   the periodic refresh), so the list does not flash empty between keystrokes. */
+async function runSearch(scope) {
+  const text = searchText(scope);
+  const s = state.search[scope];
+  if (text === "") return;
+  s.seq += 1;
+  const mine = s.seq;
+  s.timer = null;
+  try {
+    const found = await getJson(API.search(scope, text));
+    if (mine !== s.seq) return;
+    s.hits = new Map(found.hits.map((h) => [h.id, h]));
+    Object.assign(s, {
+      status: "ok", forText: text, total: found.total, truncated: found.truncated,
+      unreadable: found.unreadable || 0, error: "",
+    });
+  } catch (error) {
+    if (mine !== s.seq) return;
+    Object.assign(s, { status: "error", error: error.message || String(error), hits: new Map(), forText: "" });
+  }
+  renderSearchScope(scope);
+}
+
+/* After the list behind a search reloaded: ask again without debouncing. */
+function refreshSearch(scope) {
+  const s = state.search[scope];
+  if (searchText(scope) !== "" && s.status !== "idle" && s.timer === null) runSearch(scope);
+}
+
+function searchHit(scope, id) {
+  if (searchText(scope) === "") return null;
+  return state.search[scope].hits.get(id) || null;
+}
+
+/* Fills a card's snippet line; hidden when the row is not a hit. */
+function renderSnippet(node, hit) {
+  clear(node);
+  show(node, Boolean(hit));
+  if (!hit) return;
+  node.append(el("span", { class: "snippet-field", text: hit.field || "" }));
+  for (const part of hit.snippet) {
+    node.append(part.hit ? el("mark", { text: part.text }) : document.createTextNode(part.text));
+  }
+}
+
+/* Hits for runs the list did not load (older than the page window, or in a
+   shape the list view cannot read) still get a row: a link and the snippet. */
+function renderSearchExtras(loadedRuns) {
+  const box = $("runs-search-extra");
+  clear(box);
+  if (loadedRuns === null) {
+    show(box, false);
+    return;
+  }
+  const known = new Set(loadedRuns.map((r) => r.id));
+  const extra = [...state.search.runs.hits.values()].filter((h) => !known.has(h.id));
+  show(box, extra.length > 0);
+  for (const hit of extra) {
+    const snippet = el("p", { class: "card-snippet" });
+    renderSnippet(snippet, hit);
+    box.append(el("li", { class: "card" },
+      el("a", { class: "card-permalink", href: `#/runs/${encodeURIComponent(hit.id)}`, text: hit.id }),
+      snippet));
+  }
+}
+
+/* One sentence under the box saying what the search is doing. `shown` is how
+   many rows survived the page's other filters. Returns the sentence's kind so
+   the caller can decide what an empty list means. */
+function renderSearchStatus(scope, node, noun, shown) {
+  const s = state.search[scope];
+  const text = searchText(scope);
+  show(node, text !== "");
+  node.classList.toggle("search-error", s.status === "error");
+  if (text === "") return "idle";
+  const q = `“${text}”`;
+  let line;
+  let kind = s.status;
+  if (s.status === "error") {
+    line = `Search failed: ${s.error}`;
+  } else if (s.status !== "ok") {
+    line = "Searching…";
+  } else if (s.total === 0) {
+    line = `No ${noun} match ${q}.`;
+  } else {
+    line = `${s.total} ${s.total === 1 ? noun.replace(/s$/, "") + " matches" : noun + " match"} ${q}`;
+    if (s.truncated) line += ` (first ${s.hits.size} listed)`;
+    if (shown < s.hits.size) line += `; ${s.hits.size - shown} hidden by the other filters or not loaded`;
+    line += ".";
+  }
+  if (s.status === "ok" && s.unreadable > 0) {
+    line += ` ${plural(s.unreadable, "run", "runs")} could not be read and were not searched.`;
+  }
+  setText(node, line);
+  return kind;
+}
+
+function wireSearchBox(scope, input, clearBtn, onChange) {
+  input.addEventListener("input", () => onChange(input.value));
+  clearBtn.addEventListener("click", () => {
+    input.value = "";
+    onChange("");
+    input.focus({ preventScroll: true });
+  });
+}
+
 /* ---- queue: id search --------------------------------------------------- *
  * Mirrors the one prefix rule shared by `Queue::resolve_id` (the CLI's
  * `magi task show <prefix>`) and `web::pick`: a leading match on the id the
@@ -2677,7 +2864,14 @@ function matchesTaskId(id, query) {
 function setQueueSearch(value) {
   state.queueSearch = value;
   if (value.trim() === "") state.queueSearchJump = null;
+  scheduleSearch("tasks");
   renderQueue();
+}
+
+function setRunsSearch(value) {
+  state.runsSearch = value;
+  scheduleSearch("runs");
+  renderRuns();
 }
 
 /* Search results are a flat list rather than the sectioned view below: a
@@ -2685,17 +2879,17 @@ function setQueueSearch(value) {
    card the operator typed an id to find. */
 function renderQueueSearch(tasks, query) {
   const results = $("queue-search-results");
-  const matches = tasks.filter((t) => matchesTaskId(t.id, query));
+  const matches = tasks.filter((t) => state.search.tasks.hits.has(t.id) || matchesTaskId(t.id, query));
 
-  show(results, matches.length > 0);
-  show($("queue-search-empty"), matches.length === 0);
-  show($("queue-search-status"), true);
-  setText(
-    $("queue-search-status"),
-    matches.length === 0
-      ? `No task matches \u201c${query}\u201d.`
-      : `${plural(matches.length, "task matches", "tasks match")} \u201c${query}\u201d.`,
-  );
+  /* "Nothing matches" is only said once the search has actually answered; a
+     request still in flight or a failed one is its own sentence, never zero. */
+  const kind = renderSearchStatus("tasks", $("queue-search-status"), "tasks", matches.length);
+  show(results, matches.length > 0 && kind !== "error");
+  show($("queue-search-empty"), false);
+  if (kind === "error") {
+    syncList(results, [], (t) => t.id, createTaskCard, updateTaskCard);
+    return;
+  }
 
   syncList(results, matches, (t) => t.id, createTaskCard, updateTaskCard);
   /* A single hit is exactly the case a prefix/suffix search exists for -
@@ -6762,6 +6956,7 @@ async function loadRuns() {
   try {
     state.runs = await getJson(API.runs(RUN_LIMIT));
     renderRuns();
+    refreshSearch("runs");
     ok();
   } catch (error) {
     fail(`Could not load runs: ${error.message}`);
@@ -6772,6 +6967,7 @@ async function loadQueue() {
   try {
     state.queue = await getJson(API.queue);
     renderQueue();
+    refreshSearch("tasks");
     ok();
   } catch (error) {
     fail(`Could not load the queue: ${error.message}`);
@@ -7849,12 +8045,8 @@ function wire() {
 
   $("runs-filter-clear").addEventListener("click", clearRunsFilter);
 
-  $("queue-search-input").addEventListener("input", (event) => setQueueSearch(event.target.value));
-  $("queue-search-clear").addEventListener("click", () => {
-    $("queue-search-input").value = "";
-    setQueueSearch("");
-    $("queue-search-input").focus({ preventScroll: true });
-  });
+  wireSearchBox("tasks", $("queue-search-input"), $("queue-search-clear"), setQueueSearch);
+  wireSearchBox("runs", $("runs-search-input"), $("runs-search-clear"), setRunsSearch);
 
   $("theme-toggle").addEventListener("click", () => {
     const next = THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length];
