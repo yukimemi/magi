@@ -528,6 +528,16 @@
   </section>
 </main>
 
+<!-- TASK ACTIONS: the task detail's counterpart of the run actions button
+     below, shown only while the task detail route is on screen. -->
+<button class="run-actions-fab" type="button" id="task-actions-fab" aria-label="Task actions" hidden>
+  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <circle cx="12" cy="5" r="1.7" fill="currentColor"/>
+    <circle cx="12" cy="12" r="1.7" fill="currentColor"/>
+    <circle cx="12" cy="19" r="1.7" fill="currentColor"/>
+  </svg>
+</button>
+
 <!-- RUN ACTIONS: Resume / Fold / Delete used to sit at the bottom of the run
      detail's report, so reaching them cost a scroll past the whole write-up.
      This fixed button is the one entry point into them now, shown only while
@@ -591,6 +601,26 @@
     <span>Chat</span>
   </a>
 </nav>
+
+<!-- TASK ACTIONS SHEET -------------------------------------------------- -->
+<dialog class="sheet" id="task-actions-sheet" aria-labelledby="task-actions-h">
+  <div class="sheet-head">
+    <h2 id="task-actions-h">Task actions</h2>
+    <button class="icon-btn" type="button" id="task-actions-close" aria-label="Close">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <path d="M6 6l12 12M18 6L6 18"/>
+      </svg>
+    </button>
+  </div>
+  <div class="sheet-body">
+    <p class="form-error" id="task-actions-error" role="alert" hidden></p>
+    <div id="task-actions-priority"></div>
+    <div id="task-actions-edit"></div>
+    <div id="task-actions-hold"></div>
+    <div id="task-actions-done"></div>
+    <div id="task-actions-delete"></div>
+  </div>
+</dialog>
 
 <!-- RUN ACTIONS SHEET ---------------------------------------------------- -->
 <dialog class="sheet" id="run-actions-sheet" aria-labelledby="run-actions-h">

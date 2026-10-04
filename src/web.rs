@@ -11310,7 +11310,8 @@ mod tests {
         // 4. Two-step delete arming and focus on Cancel
         assert!(APP_JS.contains("cancel.focus"));
         assert!(APP_JS.contains("armedRunDelete"));
-        assert!(APP_JS.contains("armedDelete"));
+        assert!(APP_JS.contains("renderTaskDeleteBox"));
+        assert!(APP_JS.contains("armed${cap(key)}"));
 
         // 5. Running task has disabled delete
         assert!(APP_JS.contains("disabled: status === \"running\""));
@@ -12668,6 +12669,35 @@ mod tests {
             .await;
         assert_eq!(stale.status, 200, "an older build must be replaced");
         assert!(stale.body.contains("renderRunActions"));
+    }
+
+    #[test]
+    fn the_task_detail_has_an_actions_fab_and_sheet() {
+        assert!(INDEX_HTML.contains("id=\"task-actions-fab\""));
+        assert!(INDEX_HTML.contains("id=\"task-actions-sheet\""));
+        assert!(INDEX_HTML.contains("id=\"task-actions-error\" role=\"alert\""));
+        // Shown only on the task route, closed everywhere else.
+        assert!(APP_JS.contains("show($(\"task-actions-fab\"), route.name === \"task\")"));
+        assert!(APP_JS.contains("if (route.name !== \"task\") closeTaskActions();"));
+        // Refreshed whenever the detail redraws, including the loading state.
+        assert!(APP_JS.contains("renderTaskActions(task);"));
+        assert!(APP_JS.contains("renderTaskActions(null);"));
+        // Same renderers and routes as the Queue card, no new endpoint.
+        let sheet = APP_JS
+            .find("function renderTaskActions")
+            .expect("sheet renderer");
+        let body = &APP_JS[sheet..sheet + 3000];
+        assert!(body.contains("changePriority("));
+        assert!(body.contains("openTaskEdit(task)"));
+        assert!(body.contains("renderTaskHoldBox(host"));
+        assert!(body.contains("renderTaskDoneBox(host"));
+        assert!(body.contains("renderTaskDeleteBox(host"));
+        assert!(APP_JS.contains("API.priority(id)"));
+        assert!(APP_JS.contains("API.deleteTask(id)"));
+        // A deleted task sends the operator back to the queue.
+        assert!(APP_JS.contains("location.hash = \"#/queue\""));
+        // A refusal is shown inside the sheet.
+        assert!(APP_JS.contains("$(\"task-actions-error\")"));
     }
 
     #[test]
