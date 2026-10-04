@@ -154,6 +154,11 @@ const RUN_STATUS = {
      once a later attempt at the same task actually finished it \u2014 this run's
      own `blocked`/`stalled` no longer needs anyone's attention. Muted `ink`,
      same family as `unmerged`/`verified_noop`: nothing here is a failure. */
+  /* Written by `graph::Runner::sync_to_base` when every commit the winner
+     adds is already on the base under other commit ids (another task
+     re-landed it). Terminal and not a failure, and not "merged": this run
+     landed nothing. The run's events name the base commits. */
+  already_in_base: { glyph: "\u2296", tone: "ink", note: "This change is already in the base under other commits (another task landed it). Nothing is left to land, and any pull request for it was closed." },
   superseded:   { glyph: "\u2296", tone: "ink", note: "A later attempt at the same task already finished it. This run's own result no longer needs attention." },
   /* Derived from RunSummary.waiting rather than trusted from the status
      string: the run parked in some node and the summary still names it. */
@@ -1389,7 +1394,7 @@ const RUN_SECTIONS = [
 function isStale(run) {
   const status = String(run.status || "");
   return run.live === "dead" && !run.waiting
-    && !["merged", "ready", "stalled", "blocked", "failed", "verified_noop", "superseded"].includes(status);
+    && !["merged", "ready", "stalled", "blocked", "failed", "verified_noop", "superseded", "already_in_base"].includes(status);
 }
 
 /* A run that has not finished is never "an old attempt", whatever its
@@ -1415,7 +1420,7 @@ function runSection(run) {
   if (run.unmerged_by_design) return "ended";
   const status = String(run.status || "");
   if (status === "merged" || status === "ready") return "landed";
-  if (status === "stalled" || status === "blocked" || status === "failed" || status === "verified_noop" || status === "superseded") return "ended";
+  if (status === "stalled" || status === "blocked" || status === "failed" || status === "verified_noop" || status === "superseded" || status === "already_in_base") return "ended";
   return "flight";
 }
 
@@ -1480,6 +1485,7 @@ const REPRESENTATIVE_RUN_SHAPES = [
   { waiting: false, status: "failed" },
   { waiting: false, status: "verified_noop" },
   { waiting: false, status: "superseded" },
+  { waiting: false, status: "already_in_base" },
 ].map((shape) => ({ ...shape, done: !["implementing"].includes(shape.status) }));
 
 function sectionCompatibleWithStateFilter(sectionKey, filterKey) {

@@ -577,6 +577,19 @@ impl Task {
         self.blocked_from = None;
     }
 
+    /// Finish the task because the run's whole change turned out to be on the
+    /// base already ([`crate::run::RunStatus::AlreadyInBase`]): `Done`, with
+    /// `note` kept in [`Task::last_error`] so `magi task show` says why, and
+    /// the attempt refunded. Nothing went wrong and nothing was spent
+    /// misbehaving, so this is neither [`Task::fail`] nor
+    /// [`Task::handed_off`]; and unlike [`Task::succeed`] it does not pretend
+    /// the run landed anything.
+    pub fn already_landed(&mut self, note: impl Into<String>) {
+        self.succeed();
+        self.attempts = self.attempts.saturating_sub(1);
+        self.last_error = Some(note.into());
+    }
+
     /// Earlier attempts at this task that a later one has since made moot —
     /// empty unless the task is [`TaskStatus::Done`] *and* `last_run_succeeded`
     /// says `runs.last()` is actually why.
@@ -1703,6 +1716,18 @@ fn new_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_already_landed_task_is_done_with_its_attempt_refunded() {
+        let mut t = task("relanded");
+        t.attempts = 1;
+        t.status = TaskStatus::Running;
+        t.already_landed("already in main as 0e368de");
+        assert_eq!(t.status, TaskStatus::Done);
+        assert_eq!(t.attempts, 0);
+        assert!(t.hold_reason.is_none());
+        assert_eq!(t.last_error.as_deref(), Some("already in main as 0e368de"));
+    }
+
     #[test]
     fn missing_blocker_reason_follows_the_language() {
         let b = vec!["a".to_owned()];

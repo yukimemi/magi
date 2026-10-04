@@ -85,6 +85,9 @@ fn status_word(state: &RunState) -> String {
         // Muted, not `Blocked`'s yellow: nothing here needs a human's
         // attention any more, a later attempt already settled the task.
         RunStatus::Superseded => dim(text),
+        // Neither green nor red: this run landed nothing, and nothing is
+        // wrong - the change reached the base by another route.
+        RunStatus::AlreadyInBase => dim(text),
         _ => cyan(text),
     }
 }
@@ -830,7 +833,14 @@ pub fn run(state: &RunState) -> String {
 
     if let Some(bs) = &state.base_sync {
         let _ = writeln!(s, "\n{}", bold("base sync"));
-        let status = if let Some(c) = &bs.conflict {
+        let status = if let Some(a) = &bs.already_in {
+            dim(&format!(
+                "already in {} as {} ({} match) - nothing left to land",
+                state.base_branch,
+                a.names(),
+                a.proof.as_str()
+            ))
+        } else if let Some(c) = &bs.conflict {
             red(&format!("conflict: {}", first_line(c)))
         } else if bs.behind == 0 {
             green("in sync")

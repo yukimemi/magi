@@ -467,3 +467,36 @@ async fn a_remote_branch_with_someone_elses_commits_blocks_the_base_sync() {
     assert!(why.contains("does not contain"), "{why}");
 }
 }
+
+common::e2e! {
+async fn a_change_that_already_landed_under_another_commit_ends_the_run_without_a_conflict() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    let origin = wire_origin(&fx);
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
+        .await
+        .expect("start");
+    // Another task lands exactly what the candidate is about to write - a
+    // different commit, the same change.
+    land_on_origin(&origin.sideline, "note.txt", "content from impl-A\n");
+
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    assert_eq!(state.status, RunStatus::AlreadyInBase, "{:?}", state.events);
+    let sync = state.base_sync.as_ref().expect("base sync recorded");
+    assert!(sync.conflict.is_none(), "{:?}", sync.conflict);
+    let evidence = sync.already_in.as_ref().expect("evidence recorded");
+    assert!(!evidence.tip.is_empty());
+    assert!(state.reviews.is_empty(), "nothing left to review");
+    assert!(state.merge.is_none(), "this run merged nothing");
+    assert!(
+        state.events.iter().any(|e| e.message.contains("is already in")),
+        "{:?}",
+        state.events
+    );
+    assert!(!state.status.resumable());
+}
+}

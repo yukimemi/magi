@@ -1073,6 +1073,7 @@ pub struct Verdict {
 /// |---------------------------------------|---------------------|---------------|
 /// | parked at a boundary                  | `Failed` (requeued) | **no**        |
 /// | `Merged`, `Ready`                      | `Done`               | yes          |
+/// | `AlreadyInBase`                        | `Done`, with a note  | **no**        |
 /// | `Stalled`, quota hit                   | `Failed` (requeued) | **no**        |
 /// | `Failed`, quota hit, no viable cand.   | `Failed` (requeued) | **no**        |
 /// | `Stalled`, no quota                    | `Failed`, or `Held`  | yes          |
@@ -1135,6 +1136,7 @@ fn settle_in(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usiz
     }
     match verdict.status {
         RunStatus::Merged | RunStatus::Ready => task.succeed(),
+        RunStatus::AlreadyInBase => task.already_landed(detail),
         RunStatus::Stalled if verdict.quota_hit => task.stall(detail),
         RunStatus::Failed if verdict.quota_hit && verdict.no_viable_candidates => {
             task.stall(detail)
@@ -4870,6 +4872,21 @@ mod tests {
             parked: false,
             no_viable_candidates: false,
         }
+    }
+
+    #[test]
+    fn an_already_in_base_run_finishes_the_task_without_spending_an_attempt() {
+        let mut t = task();
+        t.attempts = 1;
+        settle_in(
+            &mut t,
+            unstarted_verdict(RunStatus::AlreadyInBase),
+            "already in main",
+            1,
+            phrases("en"),
+        );
+        assert_eq!(t.status, TaskStatus::Done);
+        assert_eq!(t.attempts, 0);
     }
 
     #[test]

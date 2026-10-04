@@ -3047,6 +3047,9 @@ enum RunExit {
     Merged,
     Ready,
     Superseded,
+    /// The change was already on the base under other commits: the task
+    /// finished without this run landing anything.
+    AlreadyInBase,
     /// Stalled without a rate limit to blame: no verdict, attempt spent.
     Stalled,
     /// Blocked / no-op with a pull request left open: held for a person.
@@ -3085,6 +3088,8 @@ impl RunExit {
             Self::Ready
         } else if matches!(status, RunStatus::Superseded) {
             Self::Superseded
+        } else if matches!(status, RunStatus::AlreadyInBase) {
+            Self::AlreadyInBase
         } else if matches!(status, RunStatus::Stalled) && !s.quota.is_empty()
             || matches!(status, RunStatus::Failed) && !s.quota.is_empty() && s.viable().is_empty()
         {
@@ -3114,6 +3119,7 @@ impl RunExit {
             | Self::NoopHeld
             | Self::Spent => AttemptCost::Spent,
             Self::InProgress => AttemptCost::None,
+            Self::AlreadyInBase => AttemptCost::Refunded,
             Self::Unreadable | Self::Superseded | Self::Interrupted | Self::ResumedQuotaStall => {
                 AttemptCost::Unknown
             }
@@ -3131,6 +3137,7 @@ impl RunExit {
             Self::Merged => "merged".to_owned(),
             Self::Ready => "ready, not merged".to_owned(),
             Self::Superseded => "superseded by a later attempt".to_owned(),
+            Self::AlreadyInBase => "already in the base, attempt refunded".to_owned(),
             Self::Stalled => "stalled, no verdict, attempt spent".to_owned(),
             Self::HeldWithPr => "blocked, PR left open".to_owned(),
             Self::NoopHeld => "verified no-op".to_owned(),
@@ -3143,7 +3150,7 @@ impl RunExit {
     /// somebody closed or held the task by hand.
     fn explains(self, end: TaskStatus) -> bool {
         match self {
-            Self::Merged => end == TaskStatus::Done,
+            Self::Merged | Self::AlreadyInBase => end == TaskStatus::Done,
             Self::HeldWithPr | Self::NoopHeld => end == TaskStatus::Held,
             Self::Unreadable | Self::Superseded | Self::Ready => true,
             _ => end != TaskStatus::Done,
@@ -3265,6 +3272,10 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
             RunStatus::Merged => "Merged.".to_owned(),
             RunStatus::Ready => "Ready: passed the gate, not merged.".to_owned(),
             RunStatus::Superseded => "Superseded: a later attempt finished the task.".to_owned(),
+            RunStatus::AlreadyInBase => {
+                "Already in the base: this change landed under other commits, nothing was left to land."
+                    .to_owned()
+            }
             RunStatus::Stalled => {
                 "Stalled: the judging panel never reached a quorum, so there is no verdict."
                     .to_owned()
@@ -3296,7 +3307,7 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
     } else if !status.done()
         || matches!(
             status,
-            RunStatus::Merged | RunStatus::Ready | RunStatus::Superseded
+            RunStatus::Merged | RunStatus::Ready | RunStatus::Superseded | RunStatus::AlreadyInBase
         )
     {
         String::new()
@@ -11779,13 +11790,15 @@ mod tests {
                         | "failed"
                         | "verified_noop"
                         | "superseded"
+                        | "already_in_base"
                 )
             {
                 return "stale";
             }
             match status {
                 "merged" | "ready" => "landed",
-                "stalled" | "blocked" | "failed" | "verified_noop" | "superseded" => "ended",
+                "stalled" | "blocked" | "failed" | "verified_noop" | "superseded"
+                | "already_in_base" => "ended",
                 _ => "flight",
             }
         }

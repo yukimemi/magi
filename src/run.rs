@@ -388,6 +388,14 @@ pub enum RunStatus {
     /// answer, and a fold is free to clean this run's worktree away without
     /// waiting on a human to confirm that first.
     Superseded,
+    /// The winner's whole change is already on the base under other commit
+    /// ids (a cherry-pick or squash by another task) — see
+    /// [`crate::already`]. Terminal and not a failure: nothing is left to
+    /// land, so unlike `Blocked` nobody has to look, and unlike `Merged` this
+    /// run did not land anything. Never resumable; `BaseSync::already_in`
+    /// names the base commits that carry the change. Added without a schema
+    /// bump, like `Superseded`: no record on disk can contain it yet.
+    AlreadyInBase,
 }
 
 impl RunStatus {
@@ -402,6 +410,7 @@ impl RunStatus {
                 | Self::Failed
                 | Self::VerifiedNoop
                 | Self::Superseded
+                | Self::AlreadyInBase
         )
     }
 
@@ -425,6 +434,7 @@ impl RunStatus {
             Self::Failed => "failed",
             Self::VerifiedNoop => "verified_noop",
             Self::Superseded => "superseded",
+            Self::AlreadyInBase => "already_in_base",
         }
     }
 
@@ -438,6 +448,7 @@ impl RunStatus {
     pub fn display_label(self) -> &'static str {
         match self {
             Self::VerifiedNoop => "agent-verified no-op",
+            Self::AlreadyInBase => "already in base",
             other => other.as_str(),
         }
     }
@@ -472,7 +483,12 @@ impl RunStatus {
     pub fn resumable(self) -> bool {
         !matches!(
             self,
-            Self::Merged | Self::Ready | Self::Failed | Self::VerifiedNoop | Self::Superseded
+            Self::Merged
+                | Self::Ready
+                | Self::Failed
+                | Self::VerifiedNoop
+                | Self::Superseded
+                | Self::AlreadyInBase
         )
     }
 }
@@ -1506,6 +1522,11 @@ pub struct BaseSync {
     /// retried again while this is set; a person has to look.
     #[serde(default)]
     pub conflict: Option<String>,
+    /// Set when the winner's whole change turned out to be on the base already
+    /// under other commit ids (see [`crate::already`]). Present exactly when the
+    /// run ended as [`RunStatus::AlreadyInBase`].
+    #[serde(default)]
+    pub already_in: Option<crate::already::Evidence>,
 }
 
 /// What the land loop saw last time it looked at the pull request.
@@ -2757,6 +2778,9 @@ mod tests {
         assert!(RunStatus::Superseded.done());
         assert!(!RunStatus::Superseded.resumable());
         assert_eq!(RunStatus::Superseded.as_str(), "superseded");
+        assert!(RunStatus::AlreadyInBase.done());
+        assert!(!RunStatus::AlreadyInBase.resumable());
+        assert_eq!(RunStatus::AlreadyInBase.as_str(), "already_in_base");
     }
 
     #[test]
