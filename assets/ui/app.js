@@ -452,7 +452,8 @@ function roundRail(pr) {
   // No fix round spent: an all-grey rail reads as "nothing happened", so the
   // caller says it in words (landRoundNote) instead.
   if (round <= 0) return null;
-  const settled = pr.state !== "open";
+  // A stale open (see landView) is not a round in progress either.
+  const settled = pr.state !== "open" || Boolean(pr.stale);
   const rail = el("div", {
     class: "phases",
     role: "img",
@@ -5205,6 +5206,10 @@ function landOf(run) {
    is spent. Saying which of those it is, in words, is the part that does not
    depend on colour or on a glyph. */
 function landNote(pr) {
+  if (pr.stale) {
+    return "Last seen open. This run has finished, so that is not live state: " +
+      "the pull request may have been merged or closed through another run.";
+  }
   const rounds = Number(pr.rounds) || 0;
   const left = Math.max(rounds - (Number(pr.round) || 0), 0);
   if (pr.state === "merged") {
@@ -5728,6 +5733,17 @@ function renderAsks(run) {
     (row, q) => updateAskCard(row, q, { compact: true }));
 }
 
+/* What the land panel paints for `raw`, the run's recorded pull request.
+   `run.status` wins over a stale record: a merged run is a merged PR, and a
+   finished run (superseded, blocked, ...) that still records "open" is only
+   "last seen open" - the record froze when the run stopped polling, and
+   another run may have landed the PR since. Never painted as landing. */
+function landView(run, raw) {
+  if (run.status === "merged" && raw.state !== "merged") return { ...raw, state: "merged" };
+  if (run.done && raw.state === "open") return { ...raw, stale: true };
+  return raw;
+}
+
 function renderLand(run) {
   const raw = landOf(run);
   show($("run-land-panel"), Boolean(raw));
@@ -5740,9 +5756,7 @@ function renderLand(run) {
   // disk forever. `run.status` is the more authoritative field once it
   // says merged, so the panel defers to it rather than repainting a
   // finished run as still landing.
-  const pr = run.status === "merged" && raw.state !== "merged"
-    ? { ...raw, state: "merged" }
-    : raw;
+  const pr = landView(run, raw);
 
   const box = $("run-land");
   clear(box);
@@ -5758,8 +5772,8 @@ function renderLand(run) {
             text: `PR #${pr.number}`,
           })
         : el("span", { class: "ask-seat", text: `PR #${pr.number}` }),
-      el("span", { class: "tag", "data-tone": PR_TONE[pr.state] || "ink", text: pr.state || "unknown" }),
-      checksChip(pr),
+      el("span", { class: "tag", "data-tone": PR_TONE[pr.state] || "ink", text: pr.stale ? "last seen open" : pr.state || "unknown" }),
+      pr.stale ? null : checksChip(pr),
     ),
     landRoundNote(pr) ? el("p", { class: "land-note", text: landRoundNote(pr) }) : null,
     roundRail(pr),

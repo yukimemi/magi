@@ -3045,6 +3045,12 @@ async fn janitor(repo: &Path, opts: &Opts, home: &Path, worktrees_root: &Path) {
             out.external_merges_recorded
         );
     }
+    if out.stale_pr_states_repaired > 0 {
+        tracing::info!(
+            "housekeep: rewrote {} run record(s) whose pull request had already settled",
+            out.stale_pr_states_repaired
+        );
+    }
     if out.cache_files > 0 {
         tracing::info!(
             "housekeep: pruned {} file(s) ({} bytes) from the shared cache",

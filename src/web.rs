@@ -10084,6 +10084,23 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_run_with_a_stale_open_pr_is_not_painted_as_landing() {
+        // The land panel defers to `run.status` for merged, and labels a
+        // recorded-open PR on any finished run (superseded, blocked, ...) as
+        // last seen, never as live state.
+        assert!(APP_JS.contains("function landView(run, raw) {"));
+        assert!(
+            APP_JS.contains(
+                "if (run.done && raw.state === \"open\") return { ...raw, stale: true };"
+            )
+        );
+        assert!(APP_JS.contains("const pr = landView(run, raw);"));
+        assert!(APP_JS.contains("pr.stale ? \"last seen open\""));
+        assert!(APP_JS.contains("pr.stale ? null : checksChip(pr)"));
+        assert!(APP_JS.contains("pr.state !== \"open\" || Boolean(pr.stale)"));
+    }
+
+    #[test]
     fn live_runs_are_never_hidden_or_folded_as_superseded() {
         assert!(APP_JS.contains("function isLiveAttempt(run) {\n  return !run.done;"));
         assert!(APP_JS.contains("if (isLiveAttempt(run)) return false;"));

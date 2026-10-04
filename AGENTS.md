@@ -1401,6 +1401,36 @@ check: they would collide with themselves. A PR number the text names that no
 record explains is asked of the forge (`gh pr view`, 5 s cap, any failure is
 "unknown" and ignored); tests inject that lookup via `dupes::check_with`.
 
+### A run record's `pr.state` is the last value *its own* land loop polled
+
+A run handed over (`released_to`) or left blocked while another run landed the
+same pull request never hears about it, so its record said `open` forever (7 of
+9 such records on one machine were merged on the forge). Three layers, cheapest
+first, none of them optional:
+
+- **Source.** `land::land` (merge, already-merged, closed) calls
+  `land::write_pr_state_through`, which rewrites `pr.state` on every *other
+  terminal* run of the same repository naming the same url / number (never a
+  non-terminal run, never one a live daemon claims, only a record still saying
+  `open`, only `merged` / `closed`), through `RunState::save_under`, best effort.
+  `magi fold --merged` goes through `land`, so it writes through as well.
+- **Repair.** `magi fold --repair-prs` (idempotent) asks the forge about each
+  distinct pull request a terminal run still records as open and rewrites the
+  merged / closed ones; an open one or an unreadable forge changes nothing. The
+  janitor (`clean::housekeep`) runs the same pass, capped at 5 lookups a pass.
+- **Guard.** `dupes::Staleness`: a recorded-open PR on a *terminal* run claims
+  only if its run was not released to a readable successor and the forge (one
+  lookup per number, at most 5, none after the first failure, 5 s each) does
+  not say merged / closed. Unreadable keeps the claim - claiming too much is
+  the cheap error. Records written before the repair stay safe through this.
+
+The web run page shows a finished run's recorded-open PR as "last seen open"
+(`landView` in `app.js`), never as live landing state.
+
+Remaining gap: the write-through only reaches runs under the same magi home, and
+a run that was *not* terminal when the PR landed keeps `open` until it ends and
+the repair / janitor pass reaches it.
+
 ### Task attachments live beside the task file, outside the worktree
 
 `magi task add|edit --attach <PATH>` copies a file into `<queue>/<id>.attachments/`
