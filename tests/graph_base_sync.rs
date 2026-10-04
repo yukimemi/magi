@@ -500,3 +500,111 @@ async fn a_change_that_already_landed_under_another_commit_ends_the_run_without_
     assert!(!state.status.resumable());
 }
 }
+
+fn rev(repo: &std::path::Path, r: &str) -> String {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", r])
+        .current_dir(repo)
+        .output()
+        .expect("rev-parse");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// Run to the end with the base moved and no remote copy of the branch, so the
+/// winner is rebased locally and nothing is pushed. Returns the runner, the
+/// branch, and a commit that carries the winner's patch on the *old* base
+/// (what an earlier published attempt of the branch would have looked like).
+async fn rebased_locally_only(
+    fx: &common::Fixture,
+    origin: &Origin,
+) -> (Runner, String, String) {
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
+        .await
+        .expect("start");
+    let base = runner.state.base_commit.clone();
+    land_on_origin(&origin.sideline, "upstream.txt", "landed meanwhile\n");
+    runner.execute().await.expect("execute");
+    let branch = runner.state.winner().expect("a winner").branch.clone();
+    assert!(runner.state.base_sync.as_ref().is_some_and(|s| s.conflict.is_none()));
+
+    // The pre-rebase twin: the winner's patch replayed on the old base.
+    run_git(&origin.sideline, &["fetch", "-q", fx.repo.to_str().unwrap(), &format!("refs/heads/{branch}")]);
+    run_git(&origin.sideline, &["checkout", "-q", "--detach", &base]);
+    run_git(&origin.sideline, &["cherry-pick", "FETCH_HEAD"]);
+    let twin = rev(&origin.sideline, "HEAD");
+    (runner, branch, twin)
+}
+
+common::e2e! {
+async fn a_resume_after_a_local_only_rebase_pushes_it_with_a_lease() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    let origin = wire_origin(&fx);
+    let (mut runner, branch, twin) = rebased_locally_only(&fx, &origin).await;
+    let bare = fx.tmp.path().join("origin.git");
+    run_git(&origin.sideline, &["push", "-q", "origin", &format!("{twin}:refs/heads/{branch}")]);
+    assert_ne!(rev(&bare, &format!("refs/heads/{branch}")), rev(&fx.repo, &format!("refs/heads/{branch}")));
+
+    runner.execute().await.expect("resume");
+    assert!(
+        runner.state.base_sync.as_ref().is_some_and(|s| s.conflict.is_none()),
+        "{:?}",
+        runner.state.base_sync
+    );
+    assert_eq!(
+        rev(&bare, &format!("refs/heads/{branch}")),
+        rev(&fx.repo, &format!("refs/heads/{branch}")),
+        "the locally rebased tip must reach the remote on resume"
+    );
+}
+}
+
+common::e2e! {
+async fn a_resume_with_nothing_to_push_pushes_nothing() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    let origin = wire_origin(&fx);
+    let (mut runner, branch, _twin) = rebased_locally_only(&fx, &origin).await;
+    let bare = fx.tmp.path().join("origin.git");
+    let pushed = |r: &Runner| r.state.events.iter().filter(|e| e.message.contains("pushed rebased")).count();
+
+    // No remote copy of the branch at all.
+    runner.execute().await.expect("resume");
+    assert_eq!(pushed(&runner), 0);
+
+    // The remote copy is already the local tip.
+    run_git(&fx.repo, &["push", "-q", "origin", &format!("refs/heads/{branch}:refs/heads/{branch}")]);
+    let before = rev(&bare, &format!("refs/heads/{branch}"));
+    runner.execute().await.expect("resume");
+    assert_eq!(pushed(&runner), 0);
+    assert_eq!(rev(&bare, &format!("refs/heads/{branch}")), before);
+    assert!(runner.state.base_sync.as_ref().is_some_and(|s| s.conflict.is_none()));
+}
+}
+
+common::e2e! {
+async fn a_resume_over_a_foreign_push_to_the_branch_stops_without_pushing() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    let origin = wire_origin(&fx);
+    let (mut runner, branch, twin) = rebased_locally_only(&fx, &origin).await;
+    let bare = fx.tmp.path().join("origin.git");
+
+    // A person's commit on top of the twin: not contained, not a patch twin.
+    std::fs::write(origin.sideline.join("theirs.txt"), "x\n").unwrap();
+    run_git(&origin.sideline, &["add", "-A"]);
+    run_git(&origin.sideline, &["commit", "-q", "-m", "a person's commit"]);
+    run_git(&origin.sideline, &["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")]);
+    let theirs = rev(&bare, &format!("refs/heads/{branch}"));
+    assert_ne!(theirs, twin);
+
+    runner.execute().await.expect("resume");
+    assert_eq!(runner.state.status, RunStatus::Blocked);
+    let why = runner.state.base_sync.as_ref().and_then(|s| s.conflict.clone()).expect("a reason");
+    assert!(why.contains("does not contain"), "{why}");
+    assert_eq!(rev(&bare, &format!("refs/heads/{branch}")), theirs, "their commit must survive");
+}
+}

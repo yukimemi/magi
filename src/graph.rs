@@ -3412,11 +3412,21 @@ impl Runner {
             {
                 git::sync_to_head(&winner.worktree).await?;
             }
+            // An earlier attempt may have rebased the branch locally and died
+            // before pushing it (only the fresh-rebase arm below pushes).
+            // Publish it now, so the plain push at PR time is not refused as
+            // a non-fast-forward. A run already holding a recorded conflict
+            // never reaches here; that case is out of scope.
+            let conflict = self.publish_resumed_rebase(&winner.branch, &head).await;
+            if let Some(why) = &conflict {
+                self.state.status = RunStatus::Blocked;
+                self.state.event("land", why.clone());
+            }
             self.state.base_sync = Some(BaseSync {
                 tip,
                 behind: 0,
                 attempts,
-                conflict: None,
+                conflict,
                 already_in: None,
             });
             self.state.save()?;
@@ -3580,6 +3590,51 @@ impl Runner {
         }
         self.state.save()?;
         Ok(())
+    }
+
+    /// Push a branch an earlier attempt rebased locally but never published,
+    /// pinned to the remote tip read right after a successful fetch. Returns
+    /// the reason when the run must stop; `None` when there was nothing to do
+    /// (no remote copy, the same tip, or a remote copy this branch already
+    /// contains, which the PR-time push fast-forwards) or the push succeeded.
+    async fn publish_resumed_rebase(&mut self, branch: &str, head: &str) -> Option<String> {
+        let repo = self.state.repo.clone();
+        let remote = self.state.config.merge.remote.clone();
+        let fetched = git::fetch(&repo, &remote, branch).await;
+        if !matches!(&fetched, Ok(o) if o.ok()) {
+            return None;
+        }
+        let branch_tracking = format!("{remote}/{branch}");
+        let theirs = git::rev_parse(&repo, &branch_tracking).await.ok()?;
+        if theirs == head || git::is_ancestor(&repo, &theirs, head).await {
+            return None;
+        }
+        if !crate::reconcile::origin_missing(&repo, head, &theirs)
+            .await
+            .is_ok_and(|missing| missing.is_empty())
+        {
+            return Some(format!(
+                "{branch_tracking} ({}) has commits {branch} does not contain; not pushing over \
+                 them",
+                short(&theirs)
+            ));
+        }
+        match git::push_pinned(&repo, &remote, branch, &theirs).await {
+            Ok(o) if o.ok() => {
+                self.state
+                    .event("land", format!("pushed rebased {branch} to {remote}"));
+                None
+            }
+            Ok(o) => Some(format!(
+                "{branch} is rebased locally but {remote} refused the push (it moved since {}; \
+                 someone may have pushed): {}",
+                short(&theirs),
+                o.stderr.chars().take(600).collect::<String>()
+            )),
+            Err(e) => Some(format!(
+                "{branch} is rebased locally but could not be pushed: {e:#}"
+            )),
+        }
     }
 
     /// End the run as [`RunStatus::AlreadyInBase`] when `head`'s whole change
