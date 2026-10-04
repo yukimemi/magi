@@ -1708,7 +1708,10 @@ mod tests {
         let cfg = ctx_config(&[("small-model", 1000)]);
         let t = ctx_talk(
             "small",
-            vec![reply(&"x".repeat(5000), Some((10, "small", Some("small-model"))))],
+            vec![reply(
+                &"x".repeat(5000),
+                Some((10, "small", Some("small-model"))),
+            )],
         );
         let u = context_usage(&t, Some(&cfg));
         assert_eq!((u.tokens, u.estimated), (Some(10), false));
