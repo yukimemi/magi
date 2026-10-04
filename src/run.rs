@@ -1203,7 +1203,64 @@ pub struct ReviewRound {
     pub verdict: Option<ReviewVote>,
 }
 
+/// A review hand-off the panel did not agree to: findings that hold the merge
+/// are still open and at least one seat's final vote was reject. Recorded on
+/// [`RunState::contested_handoff`] so `land` can name them in its question.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContestedHandoff {
+    /// Open findings of severity Major or above, in report order.
+    pub findings: Vec<Finding>,
+    /// Seats (1-based) whose final vote was reject, with the agent in the seat.
+    pub rejecters: Vec<(usize, String)>,
+}
+
 impl ReviewRound {
+    /// Each answering seat's final vote: its revote where reconsideration ran
+    /// and answered, its initial vote otherwise. The single place this is
+    /// decided, shared by the round's verdict and [`Self::contested_handoff`].
+    pub fn final_votes(&self) -> Vec<(usize, String, ReviewVote)> {
+        self.reviews
+            .iter()
+            .filter_map(|r| {
+                self.reconsideration
+                    .iter()
+                    .find(|rv| rv.reviewer == r.reviewer)
+                    .and_then(|rv| rv.vote)
+                    .or(r.vote)
+                    .map(|v| (r.reviewer, r.agent.clone(), v))
+            })
+            .collect()
+    }
+
+    /// Is this round's hand-off contested: a Major-or-above finding open and
+    /// at least one final vote of reject? `None` otherwise. Kept as one small
+    /// function so anything deciding on it reads the same answer.
+    pub fn contested_handoff(&self) -> Option<ContestedHandoff> {
+        let findings: Vec<Finding> = self
+            .reviews
+            .iter()
+            .flat_map(|r| r.findings.iter())
+            .filter(|f| f.severity.blocks())
+            .cloned()
+            .collect();
+        if findings.is_empty() {
+            return None;
+        }
+        let rejecters: Vec<(usize, String)> = self
+            .final_votes()
+            .into_iter()
+            .filter(|(_, _, v)| *v == ReviewVote::Reject)
+            .map(|(seat, agent, _)| (seat, agent))
+            .collect();
+        if rejecters.is_empty() {
+            return None;
+        }
+        Some(ContestedHandoff {
+            findings,
+            rejecters,
+        })
+    }
+
     /// Did at least one reviewer seat fail to answer this round?
     pub fn incomplete(&self) -> bool {
         self.answered < self.expected
@@ -1682,6 +1739,13 @@ pub struct RunState {
     /// each fixer call, so a resumed run spends only what is left.
     #[serde(default)]
     pub rebase_fixes: Vec<RebaseFixRecord>,
+    /// Set at the review loop's hand-off when the last round ended with a
+    /// blocking finding still open *and* a reviewer's final vote was reject
+    /// (see [`ReviewRound::contested_handoff`]). `land` reads it to ask the
+    /// owner before merging even with `graph.land_approval` off. A snapshot
+    /// taken at hand-off, never recomputed later.
+    #[serde(default)]
+    pub contested_handoff: Option<ContestedHandoff>,
     /// Outcomes of the `verify.pre_gate` commands from the latest time they
     /// ran on the winner. Informational only: a failure here never blocks the
     /// run, the gate stays the single arbiter. Overwritten on each pass.
@@ -1877,6 +1941,7 @@ impl RunState {
             gate_ran: false,
             gate_fixes: Vec::new(),
             rebase_fixes: Vec::new(),
+            contested_handoff: None,
             pre_gate: Vec::new(),
             pre_gate_commit: None,
             merge: None,
@@ -3278,6 +3343,88 @@ mod tests {
             reconsideration: Vec::new(),
             verdict: None,
         }
+    }
+
+    fn voted(
+        findings: Vec<crate::verdict::Finding>,
+        votes: &[ReviewVote],
+        revotes: &[Option<ReviewVote>],
+    ) -> ReviewRound {
+        let mut r = round(false, findings);
+        r.reviews = votes
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut rec = r.reviews[0].clone();
+                rec.reviewer = i + 1;
+                rec.vote = Some(*v);
+                if i > 0 {
+                    rec.findings = Vec::new();
+                }
+                rec
+            })
+            .collect();
+        r.reconsideration = revotes
+            .iter()
+            .enumerate()
+            .map(|(i, v)| ReviewRevoteRecord {
+                reviewer: i + 1,
+                agent: "a".to_owned(),
+                vote: *v,
+                reason: String::new(),
+                failed: None,
+            })
+            .collect();
+        r
+    }
+
+    #[test]
+    fn a_hand_off_is_contested_only_by_a_blocking_finding_and_a_reject_vote() {
+        use crate::verdict::Severity::{Major, Minor};
+        use ReviewVote::{Approve, Reject};
+        let major = || vec![finding("R1-1-1", Major)];
+        let minor = || vec![finding("R1-1-1", Minor)];
+
+        let c = voted(major(), &[Reject, Approve], &[])
+            .contested_handoff()
+            .expect("major + reject");
+        assert_eq!(c.findings.len(), 1);
+        assert_eq!(c.rejecters, vec![(1, "a".to_owned())]);
+
+        assert!(
+            voted(minor(), &[Reject, Approve], &[])
+                .contested_handoff()
+                .is_none()
+        );
+        assert!(
+            voted(major(), &[Approve, Approve], &[])
+                .contested_handoff()
+                .is_none()
+        );
+        assert!(
+            voted(Vec::new(), &[Reject], &[])
+                .contested_handoff()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_reject_withdrawn_in_the_revote_does_not_contest_and_an_unanswered_one_stands() {
+        use crate::verdict::Severity::Major;
+        use ReviewVote::{Approve, Reject};
+        let major = || vec![finding("R1-1-1", Major)];
+
+        let withdrawn = voted(major(), &[Reject, Approve], &[Some(Approve), Some(Approve)]);
+        assert!(withdrawn.contested_handoff().is_none());
+
+        let unanswered = voted(major(), &[Reject, Approve], &[None, Some(Approve)]);
+        assert!(
+            unanswered.contested_handoff().is_some(),
+            "no revote falls back to the initial reject"
+        );
+
+        let raised = voted(major(), &[Approve, Approve], &[Some(Reject), Some(Approve)]);
+        assert!(raised.contested_handoff().is_some());
     }
 
     #[test]

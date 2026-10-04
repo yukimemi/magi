@@ -4552,21 +4552,6 @@ impl Runner {
                 );
             }
 
-            // The final vote per seat is its revote where reconsideration
-            // ran and answered, its initial vote otherwise — the same
-            // fallback `tally` uses for a judge whose private vote failed.
-            let final_votes: Vec<ReviewVote> = records
-                .iter()
-                .filter_map(|r| {
-                    reconsideration
-                        .iter()
-                        .find(|rv| rv.reviewer == r.reviewer)
-                        .and_then(|rv| rv.vote)
-                        .or(r.vote)
-                })
-                .collect();
-            let round_verdict = ReviewVote::worst(final_votes);
-
             let blocking = all_findings.iter().filter(|f| f.severity.blocks()).count();
             let verify_timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
             // A round that already has a blocking finding and a round left to
@@ -4660,8 +4645,17 @@ impl Runner {
                 progressed: false,
                 vote_split,
                 reconsideration,
-                verdict: round_verdict,
+                verdict: None,
             };
+            // The final vote per seat is its revote where reconsideration
+            // ran and answered, its initial vote otherwise — the same
+            // fallback `tally` uses for a judge whose private vote failed.
+            round_record.verdict = ReviewVote::worst(
+                round_record
+                    .final_votes()
+                    .into_iter()
+                    .map(|(_, _, vote)| vote),
+            );
             // Which commit and when magi actually attempted to check —
             // known the moment a command was dispatched against `head`,
             // whether or not it finished: a resource-blocked attempt still
@@ -5154,6 +5148,24 @@ impl Runner {
                     "review",
                     format!("{why}; e2e is green — handing off with {open} finding(s) still open"),
                 );
+                // A hand-off over a blocking finding a reviewer rejected on
+                // is recorded for `land`, which asks the owner before
+                // merging even with `land_approval` off. A reentry keeps the
+                // first record.
+                if self.state.contested_handoff.is_none()
+                    && let Some(contested) = self.state.reviews[round_idx].contested_handoff()
+                {
+                    self.state.event(
+                        "review",
+                        format!(
+                            "{} blocking finding(s) open and {} reviewer(s) rejecting — the \
+                             merge will wait for the owner's approval",
+                            contested.findings.len(),
+                            contested.rejecters.len()
+                        ),
+                    );
+                    self.state.contested_handoff = Some(contested);
+                }
                 self.state.status = RunStatus::Gating;
             }
         }
@@ -9032,6 +9044,76 @@ mod tests {
         );
         assert!(runner.state.gate_ran);
         assert!(runner.state.gate.iter().all(CommandOutcome::ok));
+    }
+
+    /// The hand-off over a blocking finding a reviewer rejected on leaves a
+    /// record for `land`; one with only a Minor, or no reject, leaves none.
+    #[tokio::test]
+    async fn stop_reviewing_records_a_contested_hand_off_only_for_major_plus_reject() {
+        use crate::verdict::{Finding, ReviewVote, Severity};
+        crate::run::set_home(std::env::temp_dir().join("magi-graph-test-home"));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        for (severity, vote, expect) in [
+            (Severity::Major, ReviewVote::Reject, true),
+            (Severity::Minor, ReviewVote::Reject, false),
+            (Severity::Major, ReviewVote::Approve, false),
+        ] {
+            let mut round = review_round(false, 1, 1, 1, false, true);
+            round.reviews = vec![ReviewRecord {
+                reviewer: 1,
+                agent: "alpha".to_owned(),
+                summary: String::new(),
+                findings: vec![Finding {
+                    id: "R1-1-1".to_owned(),
+                    severity,
+                    file: None,
+                    line: None,
+                    title: "t".to_owned(),
+                    detail: String::new(),
+                }],
+                vote: Some(vote),
+                failed: None,
+                duration_ms: 0,
+                attempts: 0,
+            }];
+            let mut state = RunState::new(
+                repo.clone(),
+                "main".to_owned(),
+                "deadbeef".to_owned(),
+                "task".to_owned(),
+                Config::default(),
+            );
+            state.reviews = vec![round];
+            let mut runner = Runner {
+                state,
+                roles: ResolvedRoles {
+                    implementers: Vec::new(),
+                    judges: Vec::new(),
+                    reviewers: Vec::new(),
+                    fixer: None,
+                    conductor: conductor(),
+                    implementer_roster: Vec::new(),
+                },
+                sem: Arc::new(Semaphore::new(1)),
+                pause: Pause::new(),
+                interrupt: Pause::new(),
+            };
+            let shell = runner.state.config.shell();
+            runner
+                .stop_reviewing("round budget spent", &shell, &repo)
+                .await
+                .expect("stop_reviewing");
+            assert_eq!(runner.state.status, RunStatus::Gating);
+            assert_eq!(
+                runner.state.contested_handoff.is_some(),
+                expect,
+                "{severity:?} + {vote:?}"
+            );
+        }
     }
 
     /// The shape the incident this whole fix responds to actually had: the
