@@ -576,6 +576,61 @@ async fn a_resume_after_a_local_only_rebase_pushes_it_with_a_lease() {
 }
 }
 
+/// Two-commit winner: `note.txt` (conflicts with upstream's) then
+/// `second.txt` (does not).
+async fn two_commit_run(
+    fx: &mut common::Fixture,
+    skip_one: bool,
+    second_upstream: bool,
+    third_commit: bool,
+) -> Runner {
+    fx.config.graph.candidates = 1;
+    set_agent_env(fx, "MOCK_IMPL_TWO_COMMITS");
+    if third_commit {
+        set_agent_env(fx, "MOCK_IMPL_THIRD_COMMIT");
+    }
+    if skip_one {
+        set_agent_env(fx, "MOCK_REBASE_FIX_SKIP_ONE");
+    }
+    let origin = wire_origin(fx);
+    let mut runner = Runner::start(
+        &fx.repo,
+        "create note.txt".to_owned(),
+        fx.config.clone(),
+        magi::run::Origin::operator(),
+    )
+    .await
+    .expect("start");
+    if second_upstream {
+        std::fs::write(origin.sideline.join("second.txt"), "second\n").unwrap();
+    }
+    land_on_origin(&origin.sideline, "note.txt", "upstream\n");
+    runner.execute().await.expect("execute");
+    runner
+}
+
+common::e2e! {
+async fn a_fixer_that_skips_one_of_several_commits_is_a_failed_rebase() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    let runner = two_commit_run(&mut fx, true, false, false).await;
+    let state = &runner.state;
+    assert_eq!(state.status, RunStatus::Blocked, "{:?}", state.events);
+    let why = state
+        .base_sync
+        .as_ref()
+        .and_then(|s| s.conflict.clone())
+        .expect("a reason is recorded");
+    assert!(why.contains("dropped"), "{why}");
+    assert!(why.contains("add note from"), "{why}");
+    let winner = state.winner().expect("a winner");
+    assert!(
+        !is_ancestor(&fx.repo, "origin/main", &winner.branch),
+        "the branch keeps its own commits"
+    );
+}
+}
+
 common::e2e! {
 async fn a_resume_with_nothing_to_push_pushes_nothing() {
     let _home = home_lock().await;
@@ -601,6 +656,21 @@ async fn a_resume_with_nothing_to_push_pushes_nothing() {
 }
 
 common::e2e! {
+async fn resolving_every_commit_of_a_multi_commit_winner_is_applied() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    let runner = two_commit_run(&mut fx, false, false, false).await;
+    let state = &runner.state;
+    let sync = state.base_sync.as_ref().expect("base sync recorded");
+    assert!(sync.conflict.is_none(), "{:?}", sync.conflict);
+    assert_eq!(state.status, RunStatus::Ready, "{:?}", state.events);
+    let winner = state.winner().expect("a winner");
+    assert!(winner.worktree.join("second.txt").exists());
+    assert!(winner.worktree.join("note.txt").exists());
+}
+}
+
+common::e2e! {
 async fn a_resume_over_a_foreign_push_to_the_branch_stops_without_pushing() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
@@ -622,5 +692,32 @@ async fn a_resume_over_a_foreign_push_to_the_branch_stops_without_pushing() {
     let why = runner.state.base_sync.as_ref().and_then(|s| s.conflict.clone()).expect("a reason");
     assert!(why.contains("does not contain"), "{why}");
     assert_eq!(rev(&bare, &format!("refs/heads/{branch}")), theirs, "their commit must survive");
+}
+}
+
+common::e2e! {
+async fn a_commit_already_on_the_base_is_not_reported_as_dropped() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    let runner = two_commit_run(&mut fx, false, true, false).await;
+    let state = &runner.state;
+    let sync = state.base_sync.as_ref().expect("base sync recorded");
+    assert!(sync.conflict.is_none(), "{:?}", sync.conflict);
+    assert_eq!(state.status, RunStatus::Ready, "{:?}", state.events);
+}
+}
+
+common::e2e! {
+async fn an_upstream_commit_that_a_later_commit_revises_is_not_reported_as_dropped() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    let runner = two_commit_run(&mut fx, false, true, true).await;
+    let state = &runner.state;
+    let sync = state.base_sync.as_ref().expect("base sync recorded");
+    assert!(sync.conflict.is_none(), "{:?}", sync.conflict);
+    assert_eq!(state.status, RunStatus::Ready, "{:?}", state.events);
+    let winner = state.winner().expect("a winner");
+    let second = std::fs::read_to_string(winner.worktree.join("second.txt")).unwrap();
+    assert!(second.contains("revised"), "{second}");
 }
 }

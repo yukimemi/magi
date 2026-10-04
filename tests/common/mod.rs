@@ -208,7 +208,8 @@ fi
 # every unmerged file, stages them and continues the rebase, repeating while
 # git stops again. `MOCK_REBASE_FIX_NOOP` leaves the conflict standing, for a
 # fixer that cannot help; `MOCK_REBASE_FIX_ABORT` runs `git rebase --abort`,
-# which leaves a tidy tree with no base in it. Both count their calls in
+# which leaves a tidy tree with no base in it. `MOCK_REBASE_FIX_SKIP_ONE` runs
+# `git rebase --skip` once, on the first stop only, then resolves as usual. Both count their calls in
 # `rebase-fix.log` in the run's artifacts directory.
 if has "Your rebase stopped on a conflict"; then
   echo "$seat" >> "$(dirname "$p")/rebase-fix.log"
@@ -220,6 +221,10 @@ if has "Your rebase stopped on a conflict"; then
     git rebase --abort >/dev/null 2>&1 || true
     printf '{"addressed":[],"rejected":[],"notes":"aborted"}\n'
     exit 0
+  fi
+  if [ -n "$MOCK_REBASE_FIX_SKIP_ONE" ] && [ ! -f "$(dirname "$p")/skipped-once" ]; then
+    : > "$(dirname "$p")/skipped-once"
+    GIT_EDITOR=true git rebase --skip >/dev/null 2>&1 || true
   fi
   if [ -n "$MOCK_REBASE_FIX_SKIP" ]; then
     n=0
@@ -564,6 +569,16 @@ fi
 echo "content from $seat" > note.txt
 git add -A >/dev/null 2>&1
 git commit -q -m "add note from $seat" >/dev/null 2>&1
+if [ -n "$MOCK_IMPL_TWO_COMMITS" ]; then
+  echo "second" > second.txt
+  git add -A >/dev/null 2>&1
+  git commit -q -m "add second from $seat" >/dev/null 2>&1
+  if [ -n "$MOCK_IMPL_THIRD_COMMIT" ]; then
+    echo "second, revised" > second.txt
+    git add -A >/dev/null 2>&1
+    git commit -q -m "revise second from $seat" >/dev/null 2>&1
+  fi
+fi
 printf '## SUMMARY\nTITLE: feat(note): create note.txt\n- created note.txt\n- no risks\n'
 "##;
 

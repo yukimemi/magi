@@ -772,6 +772,41 @@ pub async fn cherry(repo: &Path, upstream: &str, head: &str) -> Result<(Vec<Stri
     Ok((unmatched, matched))
 }
 
+/// One commit as a rebase preserves it: the sha plus the attributes git keeps
+/// when it replays a commit (author name, email, author date, subject). A
+/// replayed commit changes sha and patch-id, but not these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitKey {
+    /// The commit id.
+    pub sha: String,
+    /// Author name, email, author date and subject, joined.
+    pub key: String,
+}
+
+/// The non-merge commits in `range`, oldest first, with their [`CommitKey`].
+pub async fn commit_keys(repo: &Path, range: &str) -> Result<Vec<CommitKey>> {
+    let out = git(
+        repo,
+        &[
+            "log",
+            "--no-merges",
+            "--reverse",
+            "--date=raw",
+            "--format=%H%x1f%an%x1f%ae%x1f%ad%x1f%s",
+            range,
+        ],
+    )
+    .await?;
+    Ok(out
+        .lines()
+        .filter_map(|l| l.split_once('\u{1f}'))
+        .map(|(sha, key)| CommitKey {
+            sha: sha.to_owned(),
+            key: key.to_owned(),
+        })
+        .collect())
+}
+
 /// How [`rebase_start`] ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebaseStart {
