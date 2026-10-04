@@ -1251,7 +1251,12 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   background: var(--tint-rust); color: var(--on-rust);
   border-radius: var(--radius-sm); padding: var(--s3) var(--s4);
   font-size: var(--t3);
+  display: flex; align-items: flex-start; gap: var(--s3);
 }
+.stats-banner > span { flex: 1; min-width: 0; }
+/* The close button keeps the full --tap target but is pulled into the
+   banner's own padding so it does not make the banner taller. */
+.stats-banner-close { color: inherit; margin: calc(var(--s3) * -1) calc(var(--s4) * -1) calc(var(--s3) * -1) 0; }
 
 /* The verdict breakdown: one segment per RunStatus bucket, width proportional
    to its share of total runs — a stacked bar, not a pie, because a phone-width
