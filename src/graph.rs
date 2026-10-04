@@ -45,9 +45,9 @@ use crate::queue;
 use crate::refs;
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
-    DeliberationRound, DeliberationTurn, E2eStatus, FixRecord, GateFixRecord, JobRecord, JobStatus,
-    Judgement, MergeOutcome, OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest, Origin,
-    QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, Tally,
+    DeliberationRound, DeliberationTurn, E2eStatus, FixRecord, GateFixRecord, Handover, JobRecord,
+    JobStatus, Judgement, MergeOutcome, OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest,
+    Origin, QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, Tally,
     VoteRecord, tail, write_artifact,
 };
 use crate::verdict::{
@@ -1323,10 +1323,12 @@ impl Runner {
             cache: cache.as_deref(),
             round: None,
         };
+        let advisor_roster = self.state.config.advisor_roster().unwrap_or_default();
         let results = ask_json_wave::<Proposal>(
             jobs,
             Arc::clone(&self.sem),
             self.state.config.graph.retries,
+            &advisor_roster,
             &ctx,
             &mut quota_losses,
             &mut self.state,
@@ -1588,7 +1590,7 @@ impl Runner {
             format!("{} candidates in parallel", jobs.len()),
         );
         // Kept so a seat whose CLI hung up can be asked again from the same
-        // job: `wave` consumes what it is given. Mutable so `resume_quota_losses`
+        // job: `wave` consumes what it is given. Mutable so `resume_seat_handovers`
         // can update a seat's own entry once a fallback agent takes it over —
         // `resume_unconfirmed_commands`, which reads `sent` afterward, must see
         // whichever agent actually answered, not the one that quota'd out.
@@ -1604,14 +1606,14 @@ impl Runner {
         let mut results = wave(jobs, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
         self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
             .await;
-        self.resume_quota_losses(&mut results, &mut sent, &prompts, &run_id)
+        self.resume_seat_handovers(&mut results, &mut sent, &prompts, &run_id)
             .await;
         self.resume_unconfirmed_commands(&mut results, &sent, &prompts, &run_id)
             .await;
 
         for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
             let seat_key = seat.key.clone();
-            // A quota fallback (`resume_quota_losses`) may have handed this
+            // A quota fallback (`resume_seat_handovers`) may have handed this
             // seat to a different agent than the one `prep` recorded on the
             // candidate; the stats tables and any later fixer-defaults-to-
             // winner's-author lookup must credit whoever actually answered —
@@ -1620,7 +1622,7 @@ impl Runner {
             // erase every earlier agent's own quota loss from the stats
             // tables instead of just this one seat's.
             let agent = seat.agent.clone();
-            let exhausted_the_fallback_chain = matches!(&out, AgentOutcome::Quota(_));
+            let exhausted_the_fallback_chain = FailClass::of(&out).is_some();
             self.state.seats.insert(seat.key.clone(), seat);
             let label = self.state.candidates[i].label;
             let worktree = self.state.candidates[i].worktree.clone();
@@ -1847,7 +1849,10 @@ impl Runner {
     }
 
     /// Fall an implement seat through to the next untried agent in the
-    /// implementer roster when it lost to quota, instead of leaving the
+    /// implementer roster when it lost to quota — or, since the handover was
+    /// generalised, to a timeout or an ordinary failure (see [`FailClass`] and
+    /// [`should_hand_over`] for when a non-quota failure stops the chain), the
+    /// quota path itself being unchanged — instead of leaving the
     /// seat's loss final the moment one agent's account runs dry.
     ///
     /// Solo runs (`graph.candidates = 1`, `daemon::apply_solo`'s forced shape)
@@ -1907,7 +1912,7 @@ impl Runner {
     /// the final, unrecovered `Quota` (once the roster runs out) ever reaches
     /// `self.state.quota`, via the ordinary `AgentOutcome::Quota` arm the
     /// outcome loop already has — this helper never pushes to it itself.
-    async fn resume_quota_losses(
+    async fn resume_seat_handovers(
         &mut self,
         results: &mut [(usize, SeatState, AgentOutcome)],
         sent: &mut [SeatJob],
@@ -1939,10 +1944,13 @@ impl Runner {
                 .unwrap_or(0);
             let mut tried: BTreeSet<String> = BTreeSet::from([job.spec.id.clone()]);
             let mut fallback_attempt = 0usize;
-            while matches!(&*out, AgentOutcome::Quota(_)) {
+            let mut prev: Option<FailClass> = None;
+            while let Some(cur) = FailClass::of(&*out) {
+                if !should_hand_over(prev.as_ref(), &cur) {
+                    break;
+                }
                 let Some(next) =
-                    next_untried_implementer(&self.roles.implementer_roster, start, &tried)
-                        .cloned()
+                    next_untried_in_roster(&self.roles.implementer_roster, start, &tried).cloned()
                 else {
                     break;
                 };
@@ -1952,8 +1960,13 @@ impl Runner {
                 if let Ok(r) = git::rescue_commit(
                     &job.cwd,
                     &format!(
-                        "magi: candidate {} (uncommitted work before quota fallback)",
-                        seat.key
+                        "magi: candidate {} (uncommitted work before {} fallback)",
+                        seat.key,
+                        if cur == FailClass::Quota {
+                            "quota"
+                        } else {
+                            "handover"
+                        }
                     ),
                 )
                 .await
@@ -1961,13 +1974,16 @@ impl Runner {
                     self.state.note_withheld("implement", &r.withheld);
                 }
 
-                self.state.event(
+                record_handover(
+                    &mut self.state,
                     "implement",
-                    format!(
-                        "{}: rate limited (quota) on {}; retrying with {}",
-                        seat.key, seat.agent, next.id
-                    ),
+                    &seat.key,
+                    &seat.agent,
+                    &next.id,
+                    &cur,
+                    &fail_reason(&*out),
                 );
+                prev = Some(cur.clone());
 
                 let new_seat = self.seat(&seat.key, &next.id);
                 // Kept in sync on `sent` itself, not just the local retry: a
@@ -1987,7 +2003,7 @@ impl Runner {
                     brief.as_deref(),
                     &attachments,
                 );
-                retry.stem = format!("{}-quota-{}", job.stem, next.id);
+                retry.stem = format!("{}-{}-{}", job.stem, cur.stem_word(), next.id);
                 let cache = self.state.config.cache_dir();
                 let ctx = WaveCtx {
                     run: run_id,
@@ -2445,6 +2461,7 @@ impl Runner {
             jobs,
             Arc::clone(&self.sem),
             self.state.config.graph.retries,
+            &self.roles.judge_roster,
             &ctx,
             &mut quota_losses,
             &mut self.state,
@@ -2552,6 +2569,7 @@ impl Runner {
                     continue;
                 }
                 let seat_key = format!("judge-{}", j + 1);
+                let spec = self.occupant(&seat_key, spec);
                 let mut seat = self.seat(&seat_key, &spec.id);
                 let transcript = self.transcript(&turns, j);
                 let context = if has_context(&spec, &seat, sessions) {
@@ -2699,6 +2717,7 @@ impl Runner {
                 continue;
             }
             let seat_key = format!("judge-{}", j + 1);
+            let spec = self.occupant(&seat_key, spec);
             let seat = self.seat(&seat_key, &spec.id);
             let mut text = prompt::final_vote(&viable, &language);
             if !has_context(&spec, &seat, sessions) {
@@ -2743,6 +2762,7 @@ impl Runner {
             jobs,
             Arc::clone(&self.sem),
             self.state.config.graph.retries,
+            &[],
             &ctx,
             &mut quota_losses,
             &mut self.state,
@@ -3084,6 +3104,7 @@ impl Runner {
             judge_jobs,
             Arc::clone(&self.sem),
             retries,
+            &[],
             &ctx,
             &mut judge_losses,
             &mut self.state,
@@ -3159,6 +3180,7 @@ impl Runner {
             vote_jobs,
             Arc::clone(&self.sem),
             vote_retries,
+            &[],
             &ctx,
             &mut vote_losses,
             &mut self.state,
@@ -4323,6 +4345,7 @@ impl Runner {
                 jobs,
                 Arc::clone(&self.sem),
                 review_retries,
+                &self.roles.reviewer_roster,
                 &ctx,
                 &mut quota_losses,
                 &mut self.state,
@@ -4453,6 +4476,7 @@ impl Runner {
                     }
                     let wt = root.join(format!("review-{}", r + 1));
                     let seat_key = format!("review-{}", r + 1);
+                    let spec = self.occupant(&seat_key, spec);
                     let seat = self.seat(&seat_key, &spec.id);
                     // A seat with no live session has already forgotten the
                     // initial review's prompt — restate the patch it is
@@ -4505,6 +4529,7 @@ impl Runner {
                     jobs,
                     Arc::clone(&self.sem),
                     review_retries,
+                    &[],
                     &recon_ctx,
                     &mut recon_quota_losses,
                     &mut self.state,
@@ -5920,6 +5945,20 @@ impl Runner {
         fresh
     }
 
+    /// The agent now holding seat `key`: `spec`, unless a handover moved the
+    /// seat to another roster agent, in which case that agent. Nodes that
+    /// continue a seat's conversation (deliberation, the votes, a reviewer's
+    /// reconsideration) must keep talking to whoever answered it, not slip
+    /// back to the agent that failed it.
+    fn occupant(&self, key: &str, spec: AgentSpec) -> AgentSpec {
+        match self.state.seats.get(key) {
+            Some(s) if s.agent != spec.id => {
+                self.state.config.agent(&s.agent).cloned().unwrap_or(spec)
+            }
+            _ => spec,
+        }
+    }
+
     /// A candidate rendered for judging, with the leak policy applied.
     fn view(&self, c: &Candidate) -> CandidateView {
         let raw = crate::run::read_artifact(&self.state, &format!("cand-{}.patch", c.label))
@@ -6021,10 +6060,10 @@ fn has_context(spec: &AgentSpec, seat: &SeatState, sessions: bool) -> bool {
 /// Matched by [`AgentSpec::id`], never the whole spec: a roster that names
 /// the same id twice (an operator's `roles.implementers` typo, or a
 /// `[[agents]]` list reused across roles) must not let
-/// [`Runner::resume_quota_losses`] retry that id forever — one forward pass
+/// [`Runner::resume_seat_handovers`] retry that id forever — one forward pass
 /// over `roster` either finds an untried id or runs out, so this always
 /// terminates regardless of duplicates.
-fn next_untried_implementer<'a>(
+fn next_untried_in_roster<'a>(
     roster: &'a [AgentSpec],
     start: usize,
     tried: &BTreeSet<String>,
@@ -6033,6 +6072,126 @@ fn next_untried_implementer<'a>(
         .get(start + 1..)?
         .iter()
         .find(|s| !tried.contains(&s.id))
+}
+
+/// What an agent's turn timed out as, in [`AgentOutcome::Failed`]. One const
+/// so the classifier below and the code that builds the message cannot drift.
+const TIMED_OUT: &str = "timed out";
+
+/// What kind of failure ended an agent's turn on a seat, for deciding whether
+/// the seat is worth handing to the next roster agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FailClass {
+    Quota,
+    Timeout,
+    /// Any other failure, with the message's shape ([`failure_signature`]).
+    Other(String),
+}
+
+impl FailClass {
+    /// `None` for an answer; otherwise how the turn failed.
+    fn of(out: &AgentOutcome) -> Option<Self> {
+        match out {
+            AgentOutcome::Ok(_) => None,
+            AgentOutcome::Quota(_) => Some(Self::Quota),
+            AgentOutcome::Dropped(_) => Some(Self::Other("dropped".to_owned())),
+            AgentOutcome::Failed(e) if e == TIMED_OUT => Some(Self::Timeout),
+            AgentOutcome::Failed(e) => Some(Self::Other(failure_signature(e))),
+        }
+    }
+
+    /// The word in a handover's artifact stem (`impl-A-quota-beta`).
+    fn stem_word(&self) -> &'static str {
+        match self {
+            Self::Quota => "quota",
+            _ => "handover",
+        }
+    }
+}
+
+/// The message's first line with its variable parts removed — digit runs and
+/// path-like tokens — so "exited with Some(2)" and "exited with Some(7)" read
+/// as one kind of failure.
+fn failure_signature(msg: &str) -> String {
+    let line = msg.lines().next().unwrap_or("").trim().to_lowercase();
+    let mut out = Vec::new();
+    for word in line.split_whitespace() {
+        if word.contains('/') || word.contains('\\') {
+            out.push("<path>".to_owned());
+            continue;
+        }
+        let mut w = String::new();
+        let mut in_digits = false;
+        for c in word.chars() {
+            if c.is_ascii_digit() {
+                if !in_digits {
+                    w.push('#');
+                }
+                in_digits = true;
+            } else {
+                in_digits = false;
+                w.push(c);
+            }
+        }
+        out.push(w);
+    }
+    out.join(" ").chars().take(120).collect()
+}
+
+/// Whether a seat that just failed with `cur` may go to the next roster agent.
+/// A quota or a timeout always may. Any other failure may not when the agent
+/// before it failed the same way: an error the prompt causes would otherwise
+/// walk the whole roster. `prev` is the class of the immediately preceding
+/// agent's failure, so a quota or timeout in between breaks the run of
+/// identical failures by itself.
+fn should_hand_over(prev: Option<&FailClass>, cur: &FailClass) -> bool {
+    match cur {
+        FailClass::Quota | FailClass::Timeout => true,
+        FailClass::Other(_) => prev != Some(cur),
+    }
+}
+
+/// A short human reason for a failed outcome, for the handover record.
+fn fail_reason(out: &AgentOutcome) -> String {
+    match out {
+        AgentOutcome::Ok(_) => String::new(),
+        AgentOutcome::Quota(_) => "rate limited (quota)".to_owned(),
+        AgentOutcome::Dropped(o) => format!(
+            "the CLI dropped the stream ({})",
+            o.dropped
+                .as_ref()
+                .map(|d| d.why.as_str())
+                .unwrap_or("it ended without delivering its answer")
+        ),
+        AgentOutcome::Failed(e) => e.lines().next().unwrap_or("").chars().take(160).collect(),
+    }
+}
+
+/// Note one handover in the run: the structured record and, in the timeline,
+/// the sentence a person reads. A quota keeps the wording it always had.
+fn record_handover(
+    state: &mut RunState,
+    node: &str,
+    seat: &str,
+    from: &str,
+    to: &str,
+    class: &FailClass,
+    reason: &str,
+) {
+    let message = if *class == FailClass::Quota {
+        format!("{seat}: rate limited (quota) on {from}; retrying with {to}")
+    } else {
+        format!("{seat}: handed over {from} -> {to} ({reason})")
+    };
+    state.event(node, message);
+    state.handovers.push(Handover {
+        at: Timestamp::now(),
+        node: node.to_owned(),
+        seat: seat.to_owned(),
+        from: from.to_owned(),
+        to: to.to_owned(),
+        reason: reason.to_owned(),
+    });
 }
 
 /// Did this reply report running a command whose own CLI never confirmed an
@@ -6264,7 +6423,7 @@ async fn wave(
                 // to be checked before the catch-all `Failed` below or the
                 // one shape this exists for is lost with the rest.
                 Ok(o) if o.work_undelivered() => AgentOutcome::Dropped(o),
-                Ok(o) if o.timed_out => AgentOutcome::Failed("timed out".to_owned()),
+                Ok(o) if o.timed_out => AgentOutcome::Failed(TIMED_OUT.to_owned()),
                 Ok(o) => AgentOutcome::Failed(format!(
                     "exited with {:?} and no usable output",
                     o.exit_code
@@ -6483,16 +6642,28 @@ fn retry_budget(full: Duration, nudged: bool) -> Duration {
 /// holds its conversation, which is the difference between a cheap retry and
 /// paying for the entire candidate set twice.
 ///
-/// A seat that hits a rate limit is **not** re-asked: the same call will fail
-/// the same way until the limit resets, so spending a retry attempt on it is
-/// pure waste. Its loss is recorded in `losses` and it is returned as a failure
-/// like any other absent seat — the caller decides whether the panel still has
-/// a quorum.
+/// A seat whose agent *fails* (rate limit, timeout, any other error) is handed
+/// to the next agent in `roster` instead of being re-asked: the same agent is
+/// known to fail the same way. Each roster agent is tried at most once per
+/// seat, walking forward from the seat's own position and never wrapping
+/// ([`next_untried_in_roster`]); a quota or timeout always hands over, any
+/// other failure stops the chain when the previous agent failed the same way
+/// ([`should_hand_over`]). The new agent takes a fresh [`SeatState`], so
+/// [`has_context`] is false and the job's own full prompt and full budget are
+/// sent. A seat whose chain ends on a quota records one [`QuotaLoss`] (the
+/// intermediate ones are not losses) and is returned as a failure like any
+/// other absent seat — the caller decides whether the panel still has a
+/// quorum. An empty `roster` disables handover: failures are nudged as they
+/// always were, and a quota is simply lost. A reply that fails to parse or
+/// validate is the prompt's doing and is only ever nudged, never handed over.
+///
+/// The returned [`SeatState`] names the agent that answered (or tried last).
 #[allow(clippy::too_many_arguments)]
 async fn ask_json_wave<T>(
     jobs: Vec<SeatJob>,
     sem: Arc<Semaphore>,
     retries: usize,
+    roster: &[AgentSpec],
     ctx: &WaveCtx<'_>,
     losses: &mut Vec<QuotaLoss>,
     state: &mut RunState,
@@ -6505,42 +6676,72 @@ where
     let originals: Vec<SeatJob> = jobs;
     let mut seats: Vec<SeatState> = originals.iter().map(|j| j.seat.clone()).collect();
     let mut done: Vec<Option<Result<(T, AgentOutput)>>> = (0..n).map(|_| None).collect();
-    // Which attempt each seat's `done[i]` reflects — 0 for a first-ask
+    // Nudges each seat's *current* agent has taken — 0 for a first-ask
     // answer, N once it has gone through N nudges. Read back once this
     // returns, so a caller building a history record (`ReviewRecord`) can
     // tell "never answered" (`failed: Some(_)`, `attempts == 0`) apart from
     // "recovered after a nudge" (`failed: None`, `attempts > 0`) — see that
     // field's own doc.
-    let mut attempts_used: Vec<usize> = vec![0; n];
+    let mut nudges: Vec<usize> = vec![0; n];
+    // The agent now occupying each seat, the ids it has already been through,
+    // where in the roster the walk began, the class of the last failure, and
+    // the stem word of a handover not yet asked (full prompt, full budget).
+    let mut specs: Vec<AgentSpec> = originals.iter().map(|j| j.spec.clone()).collect();
+    let mut tried: Vec<BTreeSet<String>> = specs
+        .iter()
+        .map(|s| BTreeSet::from([s.id.clone()]))
+        .collect();
+    let starts: Vec<usize> = specs
+        .iter()
+        .map(|s| roster.iter().position(|r| r.id == s.id).unwrap_or(0))
+        .collect();
+    let mut prev: Vec<Option<FailClass>> = vec![None; n];
+    let mut fresh: Vec<Option<String>> = vec![None; n];
+    let mut last_quota: Vec<Option<Option<String>>> = vec![None; n];
     let mut pending: Vec<usize> = (0..n).collect();
 
-    for attempt in 0..=retries {
+    // Per seat the work is bounded by its nudges and the roster's length; this
+    // only guarantees the loop's own termination whatever those say.
+    let max_rounds = (retries + 1) * roster.len().max(1) + 1;
+    for round in 0..max_rounds {
         if pending.is_empty() {
             break;
         }
         let mut batch = Vec::with_capacity(pending.len());
+        let mut renudged: Vec<&str> = Vec::new();
         for &i in &pending {
             let src = &originals[i];
             // The prompt and the budget are one decision: a nudge restates
             // finished work, a re-sent prompt redoes it.
-            let (prompt, timeout) = if attempt == 0 {
-                (src.prompt.clone(), src.timeout)
+            let (prompt, timeout, stem) = if let Some(word) = fresh[i].take() {
+                (
+                    src.prompt.clone(),
+                    src.timeout,
+                    format!("{}-{word}-{}", src.stem, specs[i].id),
+                )
+            } else if nudges[i] == 0 {
+                (src.prompt.clone(), src.timeout, src.stem.clone())
             } else {
+                renudged.push(src.seat.key.as_str());
                 let why = done[i]
                     .as_ref()
                     .and_then(|r| r.as_ref().err().map(ToString::to_string))
                     .unwrap_or_else(|| "no parsable answer".to_owned());
                 let nudge = prompt::nudge(&why);
-                let nudged = has_context(&src.spec, &seats[i], src.sessions);
+                let nudged = has_context(&specs[i], &seats[i], src.sessions);
                 let prompt = if nudged {
                     nudge
                 } else {
                     format!("{}\n\n---\n\n{}", src.prompt, nudge)
                 };
-                (prompt, retry_budget(src.timeout, nudged))
+                (
+                    prompt,
+                    retry_budget(src.timeout, nudged),
+                    format!("{}-retry{}", src.stem, nudges[i]),
+                )
             };
             batch.push(SeatJob {
-                spec: src.spec.clone(),
+                spec: specs[i].clone(),
                 seat: seats[i].clone(),
                 cwd: src.cwd.clone(),
                 prompt,
@@ -6548,84 +6749,112 @@ where
                 allow_write: src.allow_write,
                 sessions: src.sessions,
                 artifacts: src.artifacts.clone(),
-                stem: if attempt == 0 {
-                    src.stem.clone()
-                } else {
-                    format!("{}-retry{attempt}", src.stem)
-                },
+                stem,
             });
         }
 
-        if attempt > 0 {
-            let seats_out: Vec<&str> = pending
-                .iter()
-                .map(|&i| originals[i].seat.key.as_str())
-                .collect();
+        if !renudged.is_empty() {
             state.event(
                 ctx.node,
-                format!("retry {attempt}: re-asking {}", seats_out.join(", ")),
+                format!("retry {round}: re-asking {}", renudged.join(", ")),
             );
         }
-        let results = wave(batch, Arc::clone(&sem), ctx, state, attempt).await;
+        let results = wave(batch, Arc::clone(&sem), ctx, state, round).await;
         let mut still = Vec::new();
         for (&i, (_wi, seat, out)) in pending.iter().zip(results) {
             seats[i] = seat;
-            let (parsed, quota) = match out {
-                AgentOutcome::Ok(o) => (
-                    match verdict::extract_json::<T>(&o.text) {
-                        Ok(v) => match validate(&v) {
-                            Ok(()) => Ok((v, o)),
-                            Err(e) => Err(e),
-                        },
+            let class = FailClass::of(&out);
+            // A dropped stream is nudged first (the conversation is still
+            // there to pick up); only a seat whose nudges are spent hands over.
+            let nudge_first = matches!(out, AgentOutcome::Dropped(_))
+                && nudges[i] < retries
+                && !roster.is_empty();
+            if let Some(cur) = class.clone().filter(|_| !roster.is_empty() && !nudge_first) {
+                let next = should_hand_over(prev[i].as_ref(), &cur)
+                    .then(|| next_untried_in_roster(roster, starts[i], &tried[i]).cloned())
+                    .flatten();
+                if let Some(next) = next {
+                    record_handover(
+                        state,
+                        ctx.node,
+                        &originals[i].seat.key,
+                        &specs[i].id,
+                        &next.id,
+                        &cur,
+                        &fail_reason(&out),
+                    );
+                    tried[i].insert(next.id.clone());
+                    prev[i] = Some(cur.clone());
+                    seats[i] = SeatState::new(&originals[i].seat.key, &next.id, state.seed);
+                    specs[i] = next;
+                    fresh[i] = Some(cur.stem_word().to_owned());
+                    nudges[i] = 0;
+                    done[i] = Some(Err(anyhow::anyhow!(
+                        "handed over after: {}",
+                        fail_reason(&out)
+                    )));
+                    still.push(i);
+                    continue;
+                }
+            }
+            let parsed = match out {
+                AgentOutcome::Ok(o) => match verdict::extract_json::<T>(&o.text) {
+                    Ok(v) => match validate(&v) {
+                        Ok(()) => Ok((v, o)),
                         Err(e) => Err(e),
                     },
-                    false,
-                ),
+                    Err(e) => Err(e),
+                },
                 AgentOutcome::Quota(o) => {
-                    losses.push(QuotaLoss {
-                        seat: originals[i].seat.key.clone(),
-                        node: ctx.node.to_owned(),
-                        at: Timestamp::now(),
-                        reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                    });
-                    (
-                        Err(anyhow::anyhow!("rate limited (quota); not retrying now")),
-                        true,
-                    )
+                    last_quota[i] = Some(o.quota.as_ref().and_then(|q| q.reset.clone()));
+                    Err(anyhow::anyhow!("rate limited (quota); not retrying now"))
                 }
-                // Not a parseable answer, but also not worth a special-cased
-                // retry here: the nudge loop above already re-asks anything
-                // that fails to parse, which is exactly what a dropped stream
-                // needs. Just don't hand its raw error JSON to `extract_json`.
+                // Not a parseable answer: the nudge loop re-asks it, which is
+                // exactly what a dropped stream needs. Just don't hand its raw
+                // error JSON to `extract_json`.
                 AgentOutcome::Dropped(o) => {
                     let why = o
                         .dropped
                         .as_ref()
                         .map(|d| d.why.as_str())
                         .unwrap_or("the CLI ended the stream without delivering its answer");
-                    (
-                        Err(anyhow::anyhow!("the CLI dropped the stream ({why})")),
-                        false,
-                    )
+                    Err(anyhow::anyhow!("the CLI dropped the stream ({why})"))
                 }
-                AgentOutcome::Failed(e) => (Err(anyhow::anyhow!(e)), false),
+                AgentOutcome::Failed(e) => Err(anyhow::anyhow!(e)),
             };
+            let quota = class == Some(FailClass::Quota);
             let failed = parsed.is_err();
             done[i] = Some(parsed);
-            attempts_used[i] = attempt;
             // Do not re-ask a rate-limited seat (quota) — a retry is known to
             // fail the same way; and never re-ask a seat that already parsed.
-            if failed && !quota {
+            // With a roster, a failed agent is not re-asked either: handover
+            // was its only remedy and has just been refused or run out.
+            let agent_failure = class.is_some() && !roster.is_empty() && !nudge_first;
+            if failed && !quota && !agent_failure && nudges[i] < retries {
+                nudges[i] += 1;
                 still.push(i);
             }
         }
         pending = still;
     }
 
+    // One loss per seat whose chain ended on a quota: the intermediate ones
+    // were absorbed by a handover and are not losses.
+    for (i, q) in last_quota.into_iter().enumerate() {
+        if let Some(reset) = q {
+            losses.push(QuotaLoss {
+                seat: originals[i].seat.key.clone(),
+                node: ctx.node.to_owned(),
+                at: Timestamp::now(),
+                reset,
+            });
+        }
+    }
+
     seats
         .into_iter()
         .zip(done)
-        .zip(attempts_used)
+        .zip(nudges)
         .map(|((seat, res), attempts)| {
             (
                 seat,
@@ -7489,55 +7718,100 @@ mod tests {
         }
     }
 
-    // `next_untried_implementer` is the property `resume_quota_losses`'s own
+    // `next_untried_in_roster` is the property `resume_seat_handovers`'s own
     // fallback loop depends on to terminate: it must walk forward from the
     // seat's own position, never restart at the front of the roster, and it
     // must never hand back an id already tried, however many times that id
     // happens to appear.
 
     #[test]
-    fn next_untried_implementer_walks_forward_from_the_seats_own_position() {
+    fn failure_signature_ignores_numbers_and_paths() {
+        assert_eq!(
+            failure_signature("exited with Some(2) and no usable output"),
+            failure_signature("exited with Some(137) and no usable output")
+        );
+        assert_eq!(
+            failure_signature("cannot open /tmp/a/b.txt: denied\nsecond line"),
+            failure_signature("cannot open /var/x.txt: denied")
+        );
+        assert_ne!(failure_signature("boom"), failure_signature("bang"));
+    }
+
+    #[test]
+    fn quota_and_timeout_always_hand_over_other_failures_stop_on_a_repeat() {
+        let other = FailClass::Other("x".into());
+        assert!(should_hand_over(None, &FailClass::Quota));
+        assert!(should_hand_over(Some(&other), &FailClass::Quota));
+        assert!(should_hand_over(
+            Some(&FailClass::Timeout),
+            &FailClass::Timeout
+        ));
+        assert!(should_hand_over(None, &other));
+        assert!(!should_hand_over(Some(&other), &other));
+        assert!(should_hand_over(
+            Some(&other),
+            &FailClass::Other("y".into())
+        ));
+        // A quota or timeout in between ends the run of identical failures.
+        assert!(should_hand_over(Some(&FailClass::Timeout), &other));
+        assert!(should_hand_over(Some(&FailClass::Quota), &other));
+    }
+
+    #[test]
+    fn a_timeout_is_classified_apart_from_other_failures() {
+        assert_eq!(
+            FailClass::of(&AgentOutcome::Failed(TIMED_OUT.to_owned())),
+            Some(FailClass::Timeout)
+        );
+        assert!(matches!(
+            FailClass::of(&AgentOutcome::Failed("boom".to_owned())),
+            Some(FailClass::Other(_))
+        ));
+    }
+
+    #[test]
+    fn next_untried_in_roster_walks_forward_from_the_seats_own_position() {
         let roster = vec![spec("alpha"), spec("beta"), spec("gamma")];
         let tried = BTreeSet::from(["beta".to_owned()]);
         // beta sits at index 1; the next candidate is gamma, never alpha —
         // which is very likely a different candidate slot's own agent.
-        let next = next_untried_implementer(&roster, 1, &tried);
+        let next = next_untried_in_roster(&roster, 1, &tried);
         assert_eq!(next.map(|s| s.id.as_str()), Some("gamma"));
     }
 
     #[test]
-    fn next_untried_implementer_does_not_wrap_back_past_its_own_start() {
+    fn next_untried_in_roster_does_not_wrap_back_past_its_own_start() {
         let roster = vec![spec("alpha"), spec("beta")];
         let tried = BTreeSet::from(["beta".to_owned()]);
         // beta is the roster's last entry: nothing follows it, and alpha —
         // earlier in the roster, almost certainly a different candidate
         // slot's own agent — must not be reached by wrapping back to it.
-        assert!(next_untried_implementer(&roster, 1, &tried).is_none());
+        assert!(next_untried_in_roster(&roster, 1, &tried).is_none());
     }
 
     #[test]
-    fn next_untried_implementer_stops_once_the_tail_is_exhausted_even_if_earlier_ids_are_untried() {
+    fn next_untried_in_roster_stops_once_the_tail_is_exhausted_even_if_earlier_ids_are_untried() {
         let roster = vec![spec("alpha"), spec("beta"), spec("gamma")];
         let tried = BTreeSet::from(["beta".to_owned(), "gamma".to_owned()]);
         // beta (index 1) and gamma (index 2, the only entry after it) have
         // both been tried; alpha (index 0) never has, but it comes before
         // beta's own position, so there is nothing further for this seat.
-        assert!(next_untried_implementer(&roster, 1, &tried).is_none());
+        assert!(next_untried_in_roster(&roster, 1, &tried).is_none());
     }
 
     #[test]
-    fn next_untried_implementer_skips_ids_already_tried_even_when_duplicated() {
+    fn next_untried_in_roster_skips_ids_already_tried_even_when_duplicated() {
         let roster = vec![spec("a"), spec("a"), spec("b")];
         let tried = BTreeSet::from(["a".to_owned()]);
-        let next = next_untried_implementer(&roster, 0, &tried);
+        let next = next_untried_in_roster(&roster, 0, &tried);
         assert_eq!(next.map(|s| s.id.as_str()), Some("b"));
     }
 
     #[test]
-    fn next_untried_implementer_returns_none_once_every_id_is_tried() {
+    fn next_untried_in_roster_returns_none_once_every_id_is_tried() {
         let roster = vec![spec("a"), spec("b")];
         let tried = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
-        assert!(next_untried_implementer(&roster, 0, &tried).is_none());
+        assert!(next_untried_in_roster(&roster, 0, &tried).is_none());
     }
 
     #[test]
@@ -7961,6 +8235,8 @@ mod tests {
                 fixer: None,
                 conductor: conductor(),
                 implementer_roster: Vec::new(),
+                judge_roster: Vec::new(),
+                reviewer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -8543,6 +8819,8 @@ mod tests {
                 fixer: None,
                 conductor: conductor(),
                 implementer_roster: Vec::new(),
+                judge_roster: Vec::new(),
+                reviewer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -8654,6 +8932,8 @@ mod tests {
                 fixer: None,
                 conductor: conductor(),
                 implementer_roster: Vec::new(),
+                judge_roster: Vec::new(),
+                reviewer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -8754,6 +9034,8 @@ mod tests {
                 fixer: None,
                 conductor: conductor(),
                 implementer_roster: Vec::new(),
+                judge_roster: Vec::new(),
+                reviewer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -8889,6 +9171,8 @@ mod tests {
                 fixer: None,
                 conductor: conductor(),
                 implementer_roster: Vec::new(),
+                judge_roster: Vec::new(),
+                reviewer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -9008,6 +9292,8 @@ mod tests {
                 fixer: None,
                 conductor: conductor(),
                 implementer_roster: Vec::new(),
+                judge_roster: Vec::new(),
+                reviewer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -9113,6 +9399,8 @@ mod tests {
                     fixer: None,
                     conductor: conductor(),
                     implementer_roster: Vec::new(),
+                    judge_roster: Vec::new(),
+                    reviewer_roster: Vec::new(),
                 },
                 sem: Arc::new(Semaphore::new(1)),
                 pause: Pause::new(),
@@ -9252,6 +9540,8 @@ mod tests {
                 fixer: None,
                 conductor: conductor(),
                 implementer_roster: Vec::new(),
+                judge_roster: Vec::new(),
+                reviewer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -9447,6 +9737,8 @@ mod tests {
                 fixer: None,
                 conductor: conductor(),
                 implementer_roster: Vec::new(),
+                judge_roster: Vec::new(),
+                reviewer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
@@ -9592,6 +9884,8 @@ mod tests {
                 fixer: None,
                 conductor: conductor(),
                 implementer_roster: Vec::new(),
+                judge_roster: Vec::new(),
+                reviewer_roster: Vec::new(),
             },
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),

@@ -530,6 +530,22 @@ pub fn run(state: &RunState) -> String {
         let _ = writeln!(s, "  winner        {}", bold(&green(&t.winner.to_string())));
     }
 
+    if !state.handovers.is_empty() {
+        let _ = writeln!(s, "\n{}", bold("seats handed over"));
+        for h in &state.handovers {
+            let _ = writeln!(
+                s,
+                "  {} {}  {} -> {}  ({}: {})",
+                yellow("~"),
+                h.seat,
+                h.from,
+                h.to,
+                h.node,
+                h.reason
+            );
+        }
+    }
+
     if !state.withheld.is_empty() {
         let _ = writeln!(s, "\n{}", bold("withheld from commit"));
         for w in &state.withheld {

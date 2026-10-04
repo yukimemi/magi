@@ -5356,6 +5356,7 @@ function renderRunDetail() {
   renderCandidates(run);
   renderReviews(run);
   renderQuota(run);
+  renderHandovers(run);
   renderTimeline(run);
   renderRunActions(run);
   renderRunFoldMerged(run);
@@ -6371,6 +6372,23 @@ function renderQuota(run) {
       el("span", { text: `during ${loss.node || "?"}` }),
       el("span", { text: clock(loss.at) }),
       loss.reset ? el("span", { text: `resets ${loss.reset}` }) : null,
+    ));
+  }
+}
+
+function renderHandovers(run) {
+  const moves = Array.isArray(run.handovers) ? run.handovers : [];
+  show($("run-handovers-panel"), moves.length > 0);
+  if (moves.length === 0) return;
+
+  const list = $("run-handovers");
+  clear(list);
+  for (const move of moves) {
+    list.append(el("li", {},
+      el("span", { class: "seat", text: move.seat || "" }),
+      el("span", { text: `${move.from || "?"} \u2192 ${move.to || "?"}` }),
+      el("span", { text: `during ${move.node || "?"}: ${move.reason || ""}` }),
+      el("span", { text: clock(move.at) }),
     ));
   }
 }

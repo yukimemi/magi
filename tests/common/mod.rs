@@ -275,6 +275,19 @@ if [ -n "$MOCK_BLOCK_SEAT" ] && [ "$MAGI_NODE" = "${MOCK_BLOCK_NODE:-implement}"
   done
 fi
 
+# Ordinary-failure / hang simulation, scoped by the agent's own env so one
+# roster entry can fail a seat that the next one answers. `MOCK_FAIL_SEAT`
+# exits non-zero with nothing usable on every prompt for that seat;
+# `MOCK_HANG_SEAT` outlives any sane node timeout (the test shortens it), so
+# the CLI is killed and the turn reads as timed out.
+if [ -n "$MOCK_FAIL_SEAT" ] && { case ",$MOCK_FAIL_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+  echo "mock failure" >&2
+  exit 1
+fi
+if [ -n "$MOCK_HANG_SEAT" ] && { case ",$MOCK_HANG_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+  exec sleep 60
+fi
+
 # Rate-limit simulation: a matching seat reports the same error shape a real
 # claude prints on quota exhaustion, and exits non-zero. The graph must read
 # this as "rate limited" — not a normal failure, not retried.
@@ -373,8 +386,11 @@ if [ "$MAGI_NODE" = "review" ] && [ -n "$MOCK_REVIEW_RECOVERS_ON_RETRY_SEAT" ] &
   marker="retried-$seat"
   if [ ! -f "$marker" ]; then
     : > "$marker"
+    # Exit 0 on purpose: an unparsable answer is the prompt's doing and is
+    # nudged on the same agent. A non-zero exit is an agent failure, which is
+    # handed to the next roster agent instead (`graph::ask_json_wave`).
     echo 'not parsable the first time'
-    exit 1
+    exit 0
   fi
   printf '{"summary":"mock review: clean after a retry","vote":"approve","findings":[]}\n'
   exit 0
@@ -727,6 +743,31 @@ pub fn fixture_with_failure(home: HomeGuard, failed_seats: &[&str]) -> Fixture {
     let value = failed_seats.join(",");
     for a in &mut fx.config.agents {
         a.env.insert("MOCK_FAILED_SEAT".to_owned(), value.clone());
+    }
+    fx
+}
+
+/// Solo-run fixture where each named agent fails (`fail_agents`) or hangs past
+/// a one-second implement budget (`hang_agents`) on the given seats, and every
+/// other roster agent answers normally — the shape the seat handover needs: the
+/// same seat key must fail on one agent's turn and succeed on another's.
+pub fn fixture_with_handover_failures(
+    home: HomeGuard,
+    fail_agents: &[&str],
+    hang_agents: &[&str],
+    seats: &[&str],
+) -> Fixture {
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    let value = seats.join(",");
+    for a in &mut fx.config.agents {
+        if fail_agents.contains(&a.id.as_str()) {
+            a.env.insert("MOCK_FAIL_SEAT".to_owned(), value.clone());
+        }
+        if hang_agents.contains(&a.id.as_str()) {
+            a.env.insert("MOCK_HANG_SEAT".to_owned(), value.clone());
+            fx.config.graph.timeout_implement = 1;
+        }
     }
     fx
 }
