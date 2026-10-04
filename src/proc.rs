@@ -67,14 +67,11 @@ impl Quiet for tokio::process::Command {
     }
 }
 
-/// Best-effort liveness check for a process id, with no dependency beyond
-/// what the platform ships.
+/// Best-effort liveness check for a process id, read through `sysinfo`'s
+/// process table - read-only, and no helper process is spawned.
 ///
-/// There is no portable way in the standard library to ask "is this pid
-/// alive" - no `libc`, no `sysinfo`, nothing magi already depends on binds
-/// the signals API - so this shells out to whatever each platform already
-/// provides: `kill -0` on Unix, `tasklist` on Windows. Both are read-only:
-/// `kill -0` sends no signal, it only checks whether one *could* be sent.
+/// A pid the table does not list reads as dead. On a platform `sysinfo` does
+/// not support the query fails, which reads as alive.
 ///
 /// Every uncertain outcome reads as alive, on purpose. This exists so
 /// [`crate::daemon::sweep_stale_claims`] can reclaim a lock faster than its
@@ -142,9 +139,10 @@ where
 
 /// An opaque marker identifying *which* process currently holds `pid`, not
 /// merely whether the number is in use — the OS-reported moment it started.
-/// Compared only for equality by the caller, never parsed as a timestamp:
-/// the two platform formats are not on the same scale, and nothing here
-/// needs to be.
+/// A plain integer string (epoch seconds from `sysinfo`), so it does not
+/// depend on the locale of the process asking - an `lstart` string recorded
+/// under one locale never matched the same process read under another.
+/// Compared only for equality by the caller; see [`is_identity_marker`].
 ///
 /// A live pid alone never proves it is the process a caller thinks it is —
 /// pids get reused, sometimes within minutes on a busy machine — so
@@ -163,7 +161,7 @@ pub fn process_started_at(pid: u32) -> Option<String> {
 /// A per-request memo over [`pid_status`] and [`process_started_at`].
 ///
 /// A listing of hundreds of runs asks about the same few pids over and over,
-/// and on Windows every ask spawns a helper process. Asking once per pid is
+/// and every ask walks the platform's process table. Asking once per pid is
 /// enough within one request; the probe is meant to be dropped with it, never
 /// kept, so a stale answer cannot outlive the moment it was read.
 pub struct ProcProbe<S, I> {
@@ -211,169 +209,159 @@ where
     }
 }
 
-// `lstart` is `ps`'s own fixed-format wall-clock start time — POSIX portable
-// (unlike `/proc`, which does not exist on macOS/BSD), and a process never
-// reports a different one across its own lifetime, so two queries of the
-// same still-running process always agree byte for byte.
+/// Ask the platform for one process's start time (epoch seconds), without
+/// shelling out to anything.
+///
+/// `Ok(Some(t))` is a process present in the table, `Ok(None)` is a pid with
+/// no process, and `Err` is a platform `sysinfo` does not support or a
+/// process table that cannot be read (detected by this process's own absence). Only the
+/// requested pid is refreshed, never the whole table. `sysinfo` cannot tell
+/// "no such process" from "not visible to this account", so a pid owned by
+/// another user that the platform hides reads as absent; identity queries
+/// never turn that into a verdict (see [`platform_process_started_at`]).
+fn query_process(pid: u32) -> std::io::Result<Option<u64>> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    if !sysinfo::IS_SUPPORTED_SYSTEM {
+        return Err(std::io::Error::other(
+            "process queries are unavailable on this platform",
+        ));
+    }
+    // Start times are `boot_time + ticks`; when `/proc/stat` has no `btime`
+    // sysinfo substitutes a moving clock, so the same live pid would get a
+    // different identity on every query.
+    #[cfg(target_os = "linux")]
+    if !linux_boot_time_readable() {
+        return Err(std::io::Error::other(
+            "boot time is unreadable: start times would not be stable",
+        ));
+    }
+    let pid = Pid::from_u32(pid);
+    let own = Pid::from_u32(std::process::id());
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        // A duplicate pid in the list (querying this process itself) makes
+        // `sysinfo` drop the entry, so the target is only added when distinct.
+        ProcessesToUpdate::Some(&if pid == own {
+            vec![own]
+        } else {
+            vec![pid, own]
+        }),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    // A failed refresh (an unmounted or unreadable process table) looks
+    // exactly like an absent pid. This process is certainly alive, so if it
+    // is missing too the table cannot be trusted and nothing may be read
+    // from it - least of all "dead".
+    if system.process(own).is_none_or(|p| p.start_time() == 0) {
+        return Err(std::io::Error::other(
+            "process table is unreadable: this process is not listed",
+        ));
+    }
+    let found = system.process(pid).map(sysinfo::Process::start_time);
+    // This process being listed does not prove the target's own entry could
+    // be read: an unreadable `/proc/<pid>/stat` leaves a live pid out of the
+    // table. On Linux the directory itself is the independent witness - if it
+    // exists the pid is alive, so "not listed" is a failed read, not absence.
+    #[cfg(target_os = "linux")]
+    if found.is_none() && std::path::Path::new(&format!("/proc/{}", pid.as_u32())).exists() {
+        return Err(std::io::Error::other(
+            "process exists but its entry could not be read",
+        ));
+    }
+    // Other unixes have no `/proc` to consult, but `kill(pid, 0)` is an
+    // independent witness: anything but `ESRCH` means the pid exists, so a
+    // target `sysinfo` could not read (e.g. a denied `KERN_PROCARGS2` on
+    // macOS) is an unreadable entry, not an absent process.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if found.is_none() && unix_pid_exists(pid.as_u32()) {
+        return Err(std::io::Error::other(
+            "process exists but its entry could not be read",
+        ));
+    }
+    // A `/proc` mounted with `hidepid=1|2` hides other users' pids, so a miss
+    // is not proof of absence there; nor is one when the mount table cannot
+    // be read to tell.
+    #[cfg(target_os = "linux")]
+    if found.is_none() && !linux_proc_shows_all_pids() {
+        return Err(std::io::Error::other(
+            "absence is unprovable: /proc may hide other users' processes",
+        ));
+    }
+    Ok(found)
+}
+
+/// Whether `kill(pid, 0)` finds the pid: success or `EPERM` both mean it exists.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn unix_pid_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only checks for existence and delivers nothing.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Whether `/proc/stat` carries a non-zero `btime` line.
+#[cfg(target_os = "linux")]
+fn linux_boot_time_readable() -> bool {
+    std::fs::read_to_string("/proc/stat").is_ok_and(|s| stat_has_btime(&s))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn stat_has_btime(stat: &str) -> bool {
+    stat.lines().any(|l| {
+        l.strip_prefix("btime ")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .is_some_and(|v| v > 0)
+    })
+}
+
+/// Whether `/proc` is mounted without `hidepid`, judged from the mount table.
+/// An unreadable table or a missing `/proc` entry answers `false`.
+#[cfg(target_os = "linux")]
+fn linux_proc_shows_all_pids() -> bool {
+    std::fs::read_to_string("/proc/self/mountinfo").is_ok_and(|s| mountinfo_proc_unhidden(&s))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn mountinfo_proc_unhidden(mountinfo: &str) -> bool {
+    mountinfo
+        .lines()
+        .rfind(|l| l.split_whitespace().nth(4) == Some("/proc"))
+        .is_some_and(|l| {
+            // Only an explicit `hidepid=0` / `off` (or no option at all)
+            // shows every pid; `1`, `2`, `4`, their names and any value not
+            // known here all count as restricted.
+            l.split(|c: char| c.is_whitespace() || c == ',')
+                .filter_map(|o| o.strip_prefix("hidepid="))
+                .all(|v| matches!(v, "0" | "off"))
+        })
+}
+
+/// Whether the identity marker format is the current one: a plain integer
+/// (epoch seconds). Runs recorded before this format carried the locale
+/// dependent `ps -o lstart=` text, which can never be compared reliably.
+#[must_use]
+pub fn is_identity_marker(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The start time as a locale-independent integer string. Absence, a zero
+/// (what `sysinfo` reports when the platform would not say) and an
+/// unsupported platform are all errors, so a comparison can never be built
+/// on a guess.
 fn platform_process_started_at(pid: u32) -> std::io::Result<String> {
-    #[cfg(unix)]
-    {
-        let out = std::process::Command::new("ps")
-            .args(["-o", "lstart=", "-p", &pid.to_string()])
-            .output()?;
-        if !out.status.success() {
-            return Err(std::io::Error::other(format!(
-                "ps exited with {}",
-                out.status
-            )));
-        }
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        if text.is_empty() {
-            return Err(std::io::Error::other("ps reported no such process"));
-        }
-        Ok(text)
-    }
-    #[cfg(windows)]
-    {
-        // Round-trip ("o") format: sub-millisecond precision, so two
-        // processes started in the same second (`lstart`'s own granularity
-        // on the Unix side above) still do not collide here.
-        let script = format!("(Get-Process -Id {pid} -ErrorAction Stop).StartTime.ToString('o')");
-        let out = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .quiet()
-            .output()?;
-        if !out.status.success() {
-            return Err(std::io::Error::other(format!(
-                "PowerShell exited with {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        if text.is_empty() {
-            return Err(std::io::Error::other("PowerShell reported no start time"));
-        }
-        Ok(text)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        Err(std::io::Error::other(
-            "process start time is unavailable on this platform",
-        ))
+    match query_process(pid)? {
+        Some(0) => Err(std::io::Error::other("process start time is unavailable")),
+        Some(started) => Ok(started.to_string()),
+        None => Err(std::io::Error::other("no such process")),
     }
 }
 
 fn platform_pid_alive(pid: u32) -> std::io::Result<bool> {
-    #[cfg(unix)]
-    {
-        match std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .output()
-        {
-            Ok(o) => Ok(parse_unix_kill_output(o.status.success(), &o.stderr)),
-            Err(error) => Err(error),
-        }
-    }
-    #[cfg(windows)]
-    {
-        let out = std::process::Command::new("tasklist")
-            .quiet()
-            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-            .output();
-        match out {
-            Ok(o) => tasklist_result(
-                pid,
-                o.status.success(),
-                &o.stdout,
-                &o.stderr,
-                &o.status.to_string(),
-            ),
-            Err(error) => Err(error),
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        Ok(true)
-    }
-}
-
-/// 数値の PID から推測せず、`kill -0` の終了状態と診断を解釈する。
-/// 明示的な "no such process" 診断だけを死亡の証拠とする。
-#[cfg(any(unix, test))]
-fn parse_unix_kill_output(success: bool, stderr: &[u8]) -> bool {
-    if success {
-        return true;
-    }
-    !String::from_utf8_lossy(stderr)
-        .to_lowercase()
-        .contains("no such process")
-}
-
-/// `tasklist /FO CSV` の出力を解釈する。一致しない場合、要求した PID の
-/// フィールドを持つ行は存在しない。
-#[cfg(any(windows, test))]
-fn parse_windows_tasklist_output(pid: u32, stdout: &[u8]) -> std::io::Result<bool> {
-    if stdout.iter().all(u8::is_ascii_whitespace) {
-        return Err(std::io::Error::other("tasklist produced no output"));
-    }
-    let expected = pid.to_string();
-    let rows = String::from_utf8_lossy(stdout)
-        .lines()
-        .map(tasklist_csv_fields)
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| std::io::Error::other("could not parse tasklist CSV output"))?;
-    Ok(rows
-        .into_iter()
-        .any(|fields| fields.get(1).is_some_and(|field| field == &expected)))
-}
-
-/// `tasklist` が出す、二重引用符と `""` エスケープを持つ CSV の一行を分ける。
-/// 壊れた CSV は呼び出し側が利用不能として保持できるよう `None` を返す。
-#[cfg(any(windows, test))]
-fn tasklist_csv_fields(line: &str) -> Option<Vec<String>> {
-    let mut fields = Vec::new();
-    let mut field = String::new();
-    let mut quoted = false;
-    let mut chars = line.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if quoted && chars.peek() == Some(&'"') => {
-                field.push('"');
-                chars.next();
-            }
-            '"' => quoted = !quoted,
-            ',' if !quoted => fields.push(std::mem::take(&mut field)),
-            _ => field.push(ch),
-        }
-    }
-    (!quoted).then(|| {
-        fields.push(field);
-        fields
-    })
-}
-
-/// `tasklist` の失敗を、利用不能な問い合わせとして保持する。
-#[cfg(any(windows, test))]
-fn tasklist_result(
-    pid: u32,
-    success: bool,
-    stdout: &[u8],
-    stderr: &[u8],
-    status: &str,
-) -> std::io::Result<bool> {
-    if success {
-        parse_windows_tasklist_output(pid, stdout)
-    } else {
-        Err(std::io::Error::other(format!(
-            "tasklist exited {status}: {}",
-            String::from_utf8_lossy(stderr).trim()
-        )))
-    }
+    query_process(pid).map(|found| found.is_some())
 }
 
 #[cfg(test)]
@@ -477,6 +465,25 @@ mod tests {
     }
 
     #[test]
+    fn btime_and_hidepid_parsers_distrust_what_they_cannot_confirm() {
+        assert!(stat_has_btime("cpu 1 2\nbtime 1700000000\n"));
+        assert!(!stat_has_btime("cpu 1 2\n"));
+        assert!(!stat_has_btime("btime 0\n"));
+        let open = "25 1 0:5 / /proc rw,nosuid - proc proc rw";
+        let hidden = "25 1 0:5 / /proc rw,nosuid - proc proc rw,hidepid=2";
+        assert!(mountinfo_proc_unhidden(open));
+        assert!(!mountinfo_proc_unhidden(hidden));
+        for v in ["1", "4", "ptraceable", "noaccess", "future"] {
+            let line = format!("25 1 0:5 / /proc rw - proc proc rw,hidepid={v}");
+            assert!(!mountinfo_proc_unhidden(&line), "hidepid={v}");
+        }
+        assert!(mountinfo_proc_unhidden(
+            "25 1 0:5 / /proc rw - proc proc rw,hidepid=0"
+        ));
+        assert!(!mountinfo_proc_unhidden(""));
+    }
+
+    #[test]
     fn pid_liveness_policy_is_deterministic_without_an_os_process_query() {
         assert!(pid_alive_with(42, |_| Ok(true)));
         assert!(!pid_alive_with(42, |_| Ok(false)));
@@ -501,75 +508,6 @@ mod tests {
             pid_status_with(42, |_| Err(std::io::Error::other("access denied"))),
             None
         );
-    }
-
-    /// 本番パーサー用のコマンド出力フィクスチャであり、特定 PID の OS 上の
-    /// 死亡状態を主張するものではない。
-    #[test]
-    fn unix_kill_output_only_marks_no_such_process_as_dead() {
-        assert!(parse_unix_kill_output(true, b""));
-        assert!(!parse_unix_kill_output(
-            false,
-            b"kill: (12345) - No such process\n"
-        ));
-        assert!(parse_unix_kill_output(
-            false,
-            b"kill: (12345) - Operation not permitted\n"
-        ));
-    }
-
-    /// 本番パーサー用のコマンド出力フィクスチャであり、OS の生存照会ではない。
-    /// 失敗した `tasklist` は死亡ではなく利用不能のままとする。
-    #[test]
-    fn windows_tasklist_csv_parsing_handles_match_no_match_and_error() {
-        let pid = 12345;
-        assert!(
-            parse_windows_tasklist_output(
-                pid,
-                b"\"magi.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n"
-            )
-            .expect("整形式 CSV の一致行は生存を示す")
-        );
-        assert!(
-            parse_windows_tasklist_output(
-                pid,
-                b"\"magi,worker.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n"
-            )
-            .expect("カンマ入りイメージ名でも PID 列を読む")
-        );
-        assert!(
-            !parse_windows_tasklist_output(
-                pid,
-                b"INFO: No tasks are running which match the specified criteria.\r\n"
-            )
-            .expect("tasklist の no-match 出力は整形式である")
-        );
-        assert!(
-            parse_windows_tasklist_output(pid, b"\"magi.exe\",\"12345").is_err(),
-            "壊れた CSV は死亡ではなく利用不能である"
-        );
-        assert!(
-            parse_windows_tasklist_output(pid, b"").is_err(),
-            "空出力は死亡ではなく利用不能である"
-        );
-        assert!(
-            parse_windows_tasklist_output(pid, b"\r\n").is_err(),
-            "空白だけの出力は死亡ではなく利用不能である"
-        );
-        assert!(
-            tasklist_result(
-                pid,
-                true,
-                b"\"magi.exe\",\"12345\",\"Console\",\"1\",\"10 K\"\r\n",
-                b"",
-                "exit status: 0",
-            )
-            .expect("CSV の一致行は生存を示す")
-        );
-
-        let error = tasklist_result(pid, false, b"", b"Access is denied.\r\n", "exit status: 1")
-            .expect_err("tasklist の失敗は死亡ではなく利用不能である");
-        assert!(error.to_string().contains("Access is denied."));
     }
 
     /// このテスト自身の PID を OS に問い合わせるスモーク診断。
@@ -606,10 +544,13 @@ mod tests {
             platform_process_started_at(pid),
             platform_process_started_at(pid),
         ) {
-            (Ok(first), Ok(second)) => assert_eq!(
-                first, second,
-                "同一の生存プロセスへの二回の問い合わせが食い違った"
-            ),
+            (Ok(first), Ok(second)) => {
+                assert_eq!(
+                    first, second,
+                    "同一の生存プロセスへの二回の問い合わせが食い違った"
+                );
+                assert!(is_identity_marker(&first), "整数文字列でない: {first}");
+            }
             (Err(error), _) | (_, Err(error)) if std::env::var_os("CI").is_some() => {
                 panic!("CI で起動時刻の問い合わせを実行できない（テストプロセス {pid}）: {error}")
             }

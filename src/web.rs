@@ -9997,7 +9997,7 @@ mod tests {
         // standing in for the pid having since been reused by a different
         // process than the one that wrote `run.json`.
         state.driver_pid = Some(std::process::id());
-        state.driver_started_at = Some("not-this-processes-real-start-time".to_owned());
+        state.driver_started_at = Some("1".to_owned());
         let dir = f.runs().join(id);
         std::fs::create_dir_all(&dir).expect("run dir");
         std::fs::write(
@@ -10025,7 +10025,7 @@ mod tests {
             );
             s.id = id.to_owned();
             s.driver_pid = pid;
-            s.driver_started_at = Some("t0".to_owned());
+            s.driver_started_at = Some("1790000000".to_owned());
             s
         };
         let states = vec![
@@ -10051,7 +10051,7 @@ mod tests {
             },
             |_| {
                 identity_calls.set(identity_calls.get() + 1);
-                Some("t0".to_owned())
+                Some("1790000000".to_owned())
             },
         ));
         let rows = summarize(

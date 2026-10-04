@@ -1851,7 +1851,9 @@ pub struct RunState {
     pub driver_pid: Option<u32>,
     /// The OS-reported moment [`Self::driver_pid`] started, recorded in the
     /// same breath as the pid itself — an opaque marker
-    /// (`crate::proc::process_started_at`), compared only for equality.
+    /// (`crate::proc::process_started_at`, epoch seconds as an integer
+    /// string), compared only for equality. Older runs hold a locale-dependent
+    /// string here; those read as `Unknown`, never `Dead`.
     ///
     /// A pid alone never proves a live process is *this run's* driver: pids
     /// get reused, sometimes within minutes on a busy machine, and a killed
@@ -2253,7 +2255,10 @@ impl RunState {
     /// match [`Self::driver_started_at`] — the marker recorded at the same
     /// moment `driver_pid` was — before this reads `Live`. A mismatch means
     /// a *different* process now answers to that number, which is exactly as
-    /// good as proof the original driver is gone, so that reads `Dead`; no
+    /// good as proof the original driver is gone, so that reads `Dead`. The
+    /// marker is an epoch-seconds integer string; one that is not (a run
+    /// recorded when it was a locale-dependent `ps` string) reads
+    /// [`Liveness::Unknown`], never `Dead`. No
     /// marker to compare against (an old run, or a platform this build could
     /// not ask at record time) or a `None` from either query, and this
     /// cannot tell either way, so it reads [`Liveness::Unknown`] — never
@@ -2285,11 +2290,24 @@ impl RunState {
         match query(pid) {
             Some(false) => Liveness::Dead,
             None => Liveness::Unknown,
-            Some(true) => match (&self.driver_started_at, identity(pid)) {
-                (Some(recorded), Some(current)) if *recorded == current => Liveness::Live,
-                (Some(_), Some(_)) => Liveness::Dead,
-                _ => Liveness::Unknown,
-            },
+            Some(true) => {
+                let Some(recorded) = &self.driver_started_at else {
+                    return Liveness::Unknown;
+                };
+                // A marker in the old locale-dependent format can never be
+                // compared reliably, so it proves nothing either way.
+                if !crate::proc::is_identity_marker(recorded) {
+                    return Liveness::Unknown;
+                }
+                match identity(pid) {
+                    Some(current) if !crate::proc::is_identity_marker(&current) => {
+                        Liveness::Unknown
+                    }
+                    Some(current) if *recorded == current => Liveness::Live,
+                    Some(_) => Liveness::Dead,
+                    None => Liveness::Unknown,
+                }
+            }
         }
     }
 
@@ -3110,7 +3128,7 @@ mod tests {
     fn an_exited_driver_is_dead_even_when_its_pid_answers_alive() {
         let mut s = state();
         s.driver_pid = Some(4242);
-        s.driver_started_at = Some("2026-09-22T10:00:00Z".to_owned());
+        s.driver_started_at = Some("1790000000".to_owned());
         s.driver_exited = true;
         let never = |_| -> Option<bool> { panic!("the pid must not be asked") };
         assert_eq!(
@@ -3148,7 +3166,7 @@ mod tests {
     fn liveness_reads_live_from_a_confirmed_pid_with_a_matching_identity() {
         let mut s = state();
         s.driver_pid = Some(4242);
-        s.driver_started_at = Some("2026-09-22T10:00:00Z".to_owned());
+        s.driver_started_at = Some("1790000000".to_owned());
         assert_eq!(
             s.liveness_with(
                 false,
@@ -3158,7 +3176,7 @@ mod tests {
                 },
                 |pid| {
                     assert_eq!(pid, 4242);
-                    Some("2026-09-22T10:00:00Z".to_owned())
+                    Some("1790000000".to_owned())
                 }
             ),
             Liveness::Live
@@ -3193,13 +3211,9 @@ mod tests {
     fn liveness_reads_dead_when_a_live_pid_no_longer_matches_the_recorded_start_time() {
         let mut s = state();
         s.driver_pid = Some(4242);
-        s.driver_started_at = Some("2026-09-22T10:00:00Z".to_owned());
+        s.driver_started_at = Some("1790000000".to_owned());
         assert_eq!(
-            s.liveness_with(
-                false,
-                |_| Some(true),
-                |_| Some("2026-09-22T11:30:00Z".to_owned())
-            ),
+            s.liveness_with(false, |_| Some(true), |_| Some("1790005400".to_owned())),
             Liveness::Dead,
             "the pid is alive, but under a different process than the one this run recorded"
         );
@@ -3211,6 +3225,39 @@ mod tests {
     /// that field existed), and a live pid whose current identity this build
     /// could not re-query, all read as `Unknown` — never a guess in either
     /// direction.
+    #[test]
+    fn a_locale_format_marker_on_a_live_pid_reads_unknown_never_dead() {
+        let mut s = state();
+        s.driver_pid = Some(4242);
+        for old in ["日 10/ 4 17:27:03 2026", "Sun Oct  4 17:27:03 2026"] {
+            s.driver_started_at = Some(old.to_owned());
+            assert_eq!(
+                s.liveness_with(
+                    false,
+                    |_| Some(true),
+                    |_| panic!("an old-format marker needs no identity query")
+                ),
+                Liveness::Unknown,
+                "{old}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_markers_compare_live_on_match_and_dead_on_difference() {
+        let mut s = state();
+        s.driver_pid = Some(4242);
+        s.driver_started_at = Some("1790000000".to_owned());
+        assert_eq!(
+            s.liveness_with(false, |_| Some(true), |_| Some("1790000000".to_owned())),
+            Liveness::Live
+        );
+        assert_eq!(
+            s.liveness_with(false, |_| Some(true), |_| Some("1790000001".to_owned())),
+            Liveness::Dead
+        );
+    }
+
     #[test]
     fn liveness_never_guesses_out_of_missing_information() {
         let mut s = state();
@@ -3240,7 +3287,7 @@ mod tests {
              predating `driver_started_at`"
         );
 
-        s.driver_started_at = Some("2026-09-22T10:00:00Z".to_owned());
+        s.driver_started_at = Some("1790000000".to_owned());
         assert_eq!(
             s.liveness_with(false, |_| Some(true), |_| None),
             Liveness::Unknown,
