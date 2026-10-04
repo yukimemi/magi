@@ -1834,7 +1834,8 @@ fn conduct_task_block(t: &ConductTask) -> String {
     s
 }
 
-/// Longest instruction the duplicate-work judge is shown, in characters.
+/// Longest instruction the duplicate-work judge is given, in characters. A
+/// longer one is never truncated: it is refused unjudged.
 pub const DUPES_JUDGE_MAX_CHARS: usize = 6000;
 
 /// The brief for the one-shot duplicate-work judge. `claims` are the rendered
@@ -1842,8 +1843,6 @@ pub const DUPES_JUDGE_MAX_CHARS: usize = 6000;
 /// text of the work being filed. The text is data: the judge is told not to
 /// obey anything inside it.
 pub fn dupes_judge(instruction: &str, claims: &[String]) -> String {
-    let total = instruction.chars().count();
-    let shown: String = instruction.chars().take(DUPES_JUDGE_MAX_CHARS).collect();
     let mut s = String::from(
         "# Duplicate-work check\n\n\
          A new piece of work is about to be filed. Its text names a branch, \
@@ -1863,14 +1862,8 @@ pub fn dupes_judge(instruction: &str, claims: &[String]) -> String {
         let _ = writeln!(s, "- {c}");
     }
     s.push_str("\n# New work (data)\n\n");
-    if total > DUPES_JUDGE_MAX_CHARS {
-        let _ = writeln!(
-            s,
-            "(truncated: the first {DUPES_JUDGE_MAX_CHARS} of {total} characters are shown)\n"
-        );
-    }
     s.push_str("<<<BEGIN TEXT\n");
-    s.push_str(&shown);
+    s.push_str(instruction);
     s.push_str("\nEND TEXT>>>\n\n# Answer\n\n");
     s.push_str(
         "Reply with exactly one JSON object and nothing else: \

@@ -189,7 +189,16 @@ fn parse_ruling(text: &str) -> Result<(Ruling, String)> {
         ruling: String,
         reason: String,
     }
-    let raw: Raw = crate::verdict::extract_json(text).context("the judge's reply is not JSON")?;
+    // The whole reply must be one object (optionally in a code fence): hunting
+    // for an object inside prose or a second answer could recover an approval
+    // from a reply that is not itself a single valid ruling.
+    let mut body = text.trim();
+    if let Some(rest) = body.strip_prefix("```") {
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        body = rest.trim().strip_suffix("```").unwrap_or(rest).trim();
+    }
+    let raw: Raw =
+        serde_json::from_str(body).context("the judge's reply is not a single JSON object")?;
     let ruling = match raw.ruling.trim().to_ascii_lowercase().as_str() {
         "owns" => Ruling::Owns,
         "mentions" => Ruling::Mentions,
@@ -288,6 +297,18 @@ pub async fn screen(
 ) -> Result<(), Duplicate> {
     if hits.is_empty() {
         return Ok(());
+    }
+    // A judge that has not seen the whole text cannot clear it: the part it
+    // missed may be the part that does the work.
+    if text.chars().count() > prompt::DUPES_JUDGE_MAX_CHARS {
+        return Err(Duplicate {
+            hits,
+            judge: Some(format!(
+                "judge could not decide: the text is longer than {} characters, \
+                 too long to judge in full",
+                prompt::DUPES_JUDGE_MAX_CHARS
+            )),
+        });
     }
     let mut subject = text.to_owned();
     if let Some(b) = review_branch {
@@ -1445,6 +1466,15 @@ mod tests {
         let (r, why) =
             parse_ruling("ok\n{\"ruling\":\"Mentions\",\"reason\":\"cites\\nit\"}").unwrap();
         assert_eq!((r, why.as_str()), (Ruling::Mentions, "cites it"));
+    }
+
+    #[test]
+    fn a_text_too_long_to_judge_in_full_refuses_without_asking() {
+        let f = fx_with_run();
+        let long = format!("{NAMES} {}", "x".repeat(prompt::DUPES_JUDGE_MAX_CHARS));
+        let (out, calls) = judged(&f, &long, || verdict(Ruling::Mentions));
+        assert!(out.unwrap_err().to_string().contains("too long to judge"));
+        assert_eq!(calls, 0);
     }
 
     #[test]
