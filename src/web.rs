@@ -3313,7 +3313,12 @@ fn snippet_of(text: &str, terms: &[String]) -> Vec<SnippetPart> {
     let find = |from: usize, to: usize| -> Option<(usize, usize)> {
         let mut best: Option<(usize, usize)> = None;
         for n in needles.iter().filter(|n| !n.is_empty()) {
-            let last = to.saturating_sub(n.len());
+            // A term longer than the window cannot occur in it (it may live
+            // in another leaf of the document).
+            if n.len() > to.saturating_sub(from) {
+                continue;
+            }
+            let last = to - n.len();
             if let Some(i) = (from..=last).find(|&i| folded[i..i + n.len()] == n[..])
                 && best.is_none_or(|(b, _)| i < b)
             {
@@ -9845,6 +9850,19 @@ mod tests {
         assert_eq!(stmt["total"], 2, "{stmt}");
         let by_id = f.get("/api/search?scope=runs&q=140501-aaaa").await.json();
         assert_eq!(by_id["hits"][0]["id"], "20260902-140501-aaaa", "{by_id}");
+    }
+
+    #[test]
+    fn snippet_ignores_terms_longer_than_the_field() {
+        let terms = ["ok".to_owned(), "elephant".to_owned()];
+        let parts = snippet_of("ok", &terms);
+        assert_eq!(
+            parts,
+            vec![SnippetPart {
+                text: "ok".to_owned(),
+                hit: true
+            }]
+        );
     }
 
     #[tokio::test]

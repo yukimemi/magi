@@ -2088,9 +2088,14 @@ function renderRuns() {
   /* The search composes with the chips and the tree: a row must pass all of
      them. While a request is in flight the previous answer still applies; a
      failed one hides the list rather than pretending it was filtered. */
+  /* While searching, rows are matched individually over every loaded run:
+     a match inside a run folded under a newer attempt must surface as its own
+     row, so nothing is folded for the duration. */
+  const searchHits = state.search.runs.hits;
   const visible = !searching ? filtered
     : searchKind === "error" ? []
-    : filtered.filter((r) => state.search.runs.hits.has(r.id));
+    : runs.filter((r) => searchHits.has(r.id) && matchesRunState(r)
+        && (state.runsStateFilter === "all" || !isOrphanSuperseded(r)) && matchesFilter(r));
   const searchShown = searching ? runs.filter((r) => state.search.runs.hits.has(r.id)).length : 0;
   renderSearchStatus("runs", $("runs-search-status"), "runs", searchShown);
 
@@ -2104,7 +2109,8 @@ function renderRuns() {
   const foldedHidden = state.runsStateFilter === "all"
     ? 0
     : [...childrenOf.values()].reduce((sum, kids) => sum + kids.filter(matchesRunState).length, 0);
-  const childrenForRender = state.runsStateFilter === "all" ? childrenOf : new Map();
+  const childrenForRender = state.runsStateFilter === "all" && !searching ? childrenOf : new Map();
+  renderSearchExtras(searching && searchKind !== "error" ? runs : null);
   syncRunSections(sectionsRoot, groupBySection(visible), childrenForRender);
 
   const supersededHidden = orphanHidden + foldedHidden;
@@ -2773,6 +2779,27 @@ function renderSnippet(node, hit) {
   node.append(el("span", { class: "snippet-field", text: hit.field || "" }));
   for (const part of hit.snippet) {
     node.append(part.hit ? el("mark", { text: part.text }) : document.createTextNode(part.text));
+  }
+}
+
+/* Hits for runs the list did not load (older than the page window, or in a
+   shape the list view cannot read) still get a row: a link and the snippet. */
+function renderSearchExtras(loadedRuns) {
+  const box = $("runs-search-extra");
+  clear(box);
+  if (loadedRuns === null) {
+    show(box, false);
+    return;
+  }
+  const known = new Set(loadedRuns.map((r) => r.id));
+  const extra = [...state.search.runs.hits.values()].filter((h) => !known.has(h.id));
+  show(box, extra.length > 0);
+  for (const hit of extra) {
+    const snippet = el("p", { class: "card-snippet" });
+    renderSnippet(snippet, hit);
+    box.append(el("li", { class: "card" },
+      el("a", { class: "card-permalink", href: `#/runs/${encodeURIComponent(hit.id)}`, text: hit.id }),
+      snippet));
   }
 }
 
