@@ -687,6 +687,19 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
         if task.status != TaskStatus::Blocked {
             continue;
         }
+        // A dependency deleted on purpose is released, not held - and before
+        // the missing check, so a pass that races the delete (or a claim that
+        // made `Queue::remove` skip this task) settles it quietly.
+        let deleted = queue.apply_deleted_blockers(&mut task);
+        if !deleted.is_empty() {
+            record(queue, &mut task);
+            for id in &deleted {
+                queue.note_dependency_deleted(&task, id);
+            }
+            if task.status != TaskStatus::Blocked {
+                continue;
+            }
+        }
         let missing = crate::queue::missing_blockers(queue, questions, &task.blocked_by);
         if !missing.is_empty() {
             let language = language_of(&task, Path::new("."));
@@ -7304,6 +7317,30 @@ mod tests {
             after.answers[0].answer,
             "leave it held, a human will look at it later"
         );
+    }
+
+    #[test]
+    fn resolve_blockers_releases_a_task_whose_dependency_was_deleted_on_purpose() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = ask::Questions::at(dir.path().join("questions"));
+        let mut dep = task();
+        dep.id = "20260101-000001-gone".to_owned();
+        queue.put(&mut dep).unwrap();
+        let mut blocked = task();
+        blocked.id = "20260101-000003-main".to_owned();
+        blocked.block(vec![dep.id.clone()], None);
+        queue.put(&mut blocked).unwrap();
+
+        // Claimed, so `remove` cannot rewrite it and the resolver must.
+        let claim = queue.claim(&blocked.id).unwrap();
+        queue.remove(&dep.id, false, &questions).unwrap();
+        drop(claim);
+        resolve_blockers(&queue, &questions);
+
+        let after = queue.get(&blocked.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Queued);
+        assert!(after.blocked_by.is_empty());
     }
 
     #[test]

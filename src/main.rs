@@ -2776,11 +2776,18 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             );
             let removed = q.remove(&resolved, in_flight, &ask::Questions::open())?;
             println!("removed {}", removed.id);
-            if !removed.quarantined.is_empty() {
+            if !removed.released.is_empty() {
                 println!(
-                    "held {} task(s) that were blocked on it, no longer able to resolve: {}",
-                    removed.quarantined.len(),
-                    removed.quarantined.join(", ")
+                    "released {} task(s) that were only waiting on it: {}",
+                    removed.released.len(),
+                    removed.released.join(", ")
+                );
+            }
+            if !removed.still_blocked.is_empty() {
+                println!(
+                    "{} task(s) still wait on other dependencies: {}",
+                    removed.still_blocked.len(),
+                    removed.still_blocked.join(", ")
                 );
             }
             Ok(())
