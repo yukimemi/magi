@@ -213,7 +213,14 @@ impl Notice {
         let escalated = again.severity > self.severity;
         // A newer cause is news even when it reads the same; an old record
         // with no `since` just adopts one without lighting up again.
-        let newer_cause = matches!((self.since, again.since), (Some(old), Some(new)) if new > old);
+        // A legacy record that a question had silenced has no `since` to
+        // compare, but a stamped raise that no question covers any more is not
+        // the cause that question was filed for: it pages.
+        let newer_cause = match (self.since, again.since) {
+            (Some(old), Some(new)) => new > old,
+            (None, Some(_)) => self.covered_by.is_some() && again.covered_by.is_none(),
+            _ => false,
+        };
         if again.since.is_some() {
             self.since = again.since;
         }
@@ -1050,6 +1057,21 @@ mod tests {
             assert_eq!(n.covered_by, None, "{node} question {}", old.id);
             assert_eq!(s.count_unread(), 1);
         }
+    }
+
+    #[test]
+    fn a_legacy_covered_notice_pages_for_a_new_uncovered_hold() {
+        let (_d, s) = store();
+        let mut legacy = Notice::warn("task:x", "held");
+        legacy.covered_by = Some("q1".to_owned());
+        let id = legacy.id.clone();
+        s.raise(legacy).unwrap();
+        assert!(!s.get(&id).unwrap().unread());
+        s.raise(Notice::warn("task:x", "held").since(Some(Timestamp::now())))
+            .unwrap();
+        let n = s.get(&id).unwrap();
+        assert!(n.unread());
+        assert_eq!(n.covered_by, None);
     }
 
     #[test]
