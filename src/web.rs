@@ -2378,22 +2378,7 @@ async fn runs_list(
 ) -> ApiResult<Json<Vec<RunSummary>>> {
     let limit = q.limit.unwrap_or(LIST_DEFAULT).min(LIST_MAX);
     blocking(move || {
-        let superseded = ui.queue.superseded();
-        // Everything the per-run rows share is read once here. Asking per run
-        // re-read every question file and the daemon status file for each of
-        // hundreds of runs, and spawned a process probe per run on Windows.
-        let open_runs: HashSet<String> = ui
-            .questions
-            .list()
-            .into_iter()
-            .filter(|q| q.status.open())
-            .map(|q| q.run)
-            .collect();
-        let claimed: HashSet<String> =
-            crate::daemon::current_work(&ui.home, jiff::Timestamp::now())
-                .into_iter()
-                .map(|c| c.run)
-                .collect();
+        let (open_runs, claimed, superseded) = run_row_inputs(&ui);
         let states = run_ids(&ui.runs)
             .into_iter()
             // A run whose state cannot be read is skipped, not fatal: a run
@@ -2414,6 +2399,25 @@ async fn runs_list(
         Ok(Json(summaries))
     })
     .await
+}
+
+/// Everything the per-run rows share, read once: runs with an open question,
+/// runs a live daemon claims, and the superseded map. Asking per run re-read
+/// every question file and the daemon status file for each of hundreds of
+/// runs, and spawned a process probe per run on Windows.
+fn run_row_inputs(ui: &Ui) -> (HashSet<String>, HashSet<String>, HashMap<String, String>) {
+    let open_runs: HashSet<String> = ui
+        .questions
+        .list()
+        .into_iter()
+        .filter(|q| q.status.open())
+        .map(|q| q.run)
+        .collect();
+    let claimed: HashSet<String> = crate::daemon::current_work(&ui.home, jiff::Timestamp::now())
+        .into_iter()
+        .map(|c| c.run)
+        .collect();
+    (open_runs, claimed, ui.queue.superseded())
 }
 
 /// The rows of the run list, given everything that is shared between them.
@@ -3234,6 +3238,11 @@ struct SearchHit {
     /// The name of the field the snippet was cut from.
     field: String,
     snippet: Vec<SnippetPart>,
+    /// The run's list row, so the page can apply its state / section / repo
+    /// filters to a hit outside the loaded window. Absent for tasks and for a
+    /// run record the list view cannot read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run: Option<RunSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3298,6 +3307,7 @@ fn search_document(terms: &[String], leaves: &[(&str, &str)]) -> Option<SearchHi
         id: String::new(),
         field: field.to_owned(),
         snippet: snippet_of(text, terms),
+        run: None,
     })
 }
 
@@ -3466,6 +3476,23 @@ async fn search_get(
                 .collect();
             view.unreadable = unreadable;
             search_docs(&terms, docs, &mut view);
+            // Only the capped hits get a row: the filters need a run's state,
+            // and reading every match would be the whole history again.
+            let (open_runs, claimed, superseded) = run_row_inputs(&ui);
+            let probe = std::cell::RefCell::new(crate::proc::ProcProbe::real());
+            for hit in &mut view.hits {
+                if let Ok(state) = read_run(&ui.runs, &hit.id) {
+                    hit.run = summarize(
+                        [state],
+                        &open_runs,
+                        &claimed,
+                        &superseded,
+                        |p| probe.borrow_mut().status(p),
+                        |p| probe.borrow_mut().started_at(p),
+                    )
+                    .pop();
+                }
+            }
         } else {
             let docs = ui.queue.list().into_iter().filter_map(|t| {
                 let mut v = serde_json::to_value(&t).ok()?;
@@ -9901,6 +9928,14 @@ mod tests {
         assert_eq!(v["hits"].as_array().unwrap().len(), SEARCH_MAX_HITS);
         assert_eq!(v["total"], SEARCH_MAX_HITS + 5);
         assert_eq!(v["truncated"], true);
+        // Every listed run hit carries its list row for the page's filters.
+        assert!(
+            v["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|h| h["run"]["status"] == "merged")
+        );
 
         let long = format!("{}needle{}", "x".repeat(5000), "y".repeat(5000));
         let parts = snippet_of(&long, &["needle".to_owned()]);
