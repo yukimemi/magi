@@ -9904,11 +9904,13 @@ mod tests {
         assert_eq!(v["total"], SEARCH_MAX_HITS + 5);
         assert_eq!(v["truncated"], true);
         // Every listed run hit carries its list row for the page's filters.
-        assert!(v["hits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|h| h["run"]["status"] == "merged"));
+        assert!(
+            v["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|h| h["run"]["status"] == "merged")
+        );
 
         let long = format!("{}needle{}", "x".repeat(5000), "y".repeat(5000));
         let parts = snippet_of(&long, &["needle".to_owned()]);
