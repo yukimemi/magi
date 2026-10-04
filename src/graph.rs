@@ -665,6 +665,11 @@ impl Runner {
             }
         );
         state.instruction = instruction;
+        state.reviewed_commits = Some(
+            git::subjects(repo, &base_commit, branch)
+                .await
+                .unwrap_or_default(),
+        );
 
         // An attached worktree, so the fixer's commits land on the branch under
         // review rather than on a detached head nobody will look at again.
@@ -717,7 +722,7 @@ impl Runner {
             label: 'A',
             // Not an agent id on purpose: nothing in the roster wrote this, and
             // the stats tables must not credit anyone with a win for it.
-            agent: "(existing branch)".to_owned(),
+            agent: EXISTING_BRANCH.to_owned(),
             branch: branch.to_owned(),
             worktree,
             summary: String::new(),
@@ -7371,6 +7376,52 @@ fn summary_title(summary: &str) -> Option<String> {
     Some(title)
 }
 
+/// Marker `open_review` gives a candidate that nothing in the roster wrote.
+const EXISTING_BRANCH: &str = "(existing branch)";
+
+/// Does this run review work that already existed, rather than implement a
+/// task? Runs recorded before `reviewed_commits` existed carry only the
+/// candidate marker.
+fn is_review_run(state: &RunState) -> bool {
+    state.reviewed_commits.is_some() || state.candidates.iter().any(|c| c.agent == EXISTING_BRANCH)
+}
+
+/// The title of a review-only run: the subject of the oldest commit under
+/// review. Later commits are usually fixups, and `instruction` is the review
+/// prompt, which says nothing about the change. GitHub text is English, so a
+/// non-ASCII or blank subject yields `None` and the caller's neutral title.
+fn review_title(state: &RunState) -> Option<String> {
+    let raw = state.reviewed_commits.as_ref()?.first()?.trim();
+    if raw.is_empty() || !raw.is_ascii() || !raw.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let title = queue::title_from(raw, PR_TITLE_MAX);
+    let lower = title.to_ascii_lowercase();
+    if lower.starts_with("magi:") || lower.contains("(uncommitted work)") {
+        return None;
+    }
+    Some(title)
+}
+
+fn neutral_title(state: &RunState, winner: char) -> String {
+    format!(
+        "chore: land candidate {} of run {}",
+        winner.to_ascii_uppercase(),
+        state.id
+    )
+}
+
+/// What the squash subject falls back to when the pull request title is empty
+/// or candidate-shaped: for a review-only run the derived title, never the
+/// review prompt held in `instruction`.
+pub fn landing_subject_source(state: &RunState) -> String {
+    if is_review_run(state) {
+        let winner = state.candidates.first().map_or('A', |c| c.label);
+        return review_title(state).unwrap_or_else(|| neutral_title(state, winner));
+    }
+    state.instruction.clone()
+}
+
 /// `summary` without its `TITLE:` line, which the pull request title already
 /// carries.
 fn summary_without_title(summary: &str) -> String {
@@ -7403,18 +7454,19 @@ fn pr_message(state: &RunState, winner: char) -> PrMessage {
         .unwrap_or_default();
     // The fallback is the operator's own words and may not be English; GitHub
     // text always is, so a non-English task gets a neutral title instead.
-    let title = summary_title(summary).unwrap_or_else(|| {
-        let t = queue::title_from(&state.instruction, PR_TITLE_MAX);
-        if t.is_ascii() && t.chars().any(|c| c.is_ascii_alphabetic()) {
-            t
-        } else {
-            format!(
-                "chore: land candidate {} of run {}",
-                winner.to_ascii_uppercase(),
-                state.id
-            )
-        }
-    });
+    let review = is_review_run(state);
+    let title = if review {
+        review_title(state).unwrap_or_else(|| neutral_title(state, winner))
+    } else {
+        summary_title(summary).unwrap_or_else(|| {
+            let t = queue::title_from(&state.instruction, PR_TITLE_MAX);
+            if t.is_ascii() && t.chars().any(|c| c.is_ascii_alphabetic()) {
+                t
+            } else {
+                neutral_title(state, winner)
+            }
+        })
+    };
 
     let mut body = String::new();
     let what = summary_without_title(summary);
@@ -7452,16 +7504,35 @@ fn pr_message(state: &RunState, winner: char) -> PrMessage {
         body.push('\n');
     }
 
-    let task = state.instruction.trim();
-    let task = if task.is_empty() {
-        "(empty task)"
+    if review {
+        // The review prompt is not the task; list what the branch carries.
+        body.push_str("## Commits under review\n\n");
+        match &state.reviewed_commits {
+            Some(subjects) => {
+                for s in subjects {
+                    body.push_str(&format!("- {}\n", s.trim()));
+                }
+            }
+            None => {
+                // An older run kept only the prompt, with the commit list after
+                // its first paragraph.
+                let rest = state.instruction.split_once("\n\n").map_or("", |(_, r)| r);
+                body.push_str(rest.trim());
+                body.push('\n');
+            }
+        }
     } else {
-        task
-    };
-    body.push_str(&format!(
-        "<details>\n<summary>Original task</summary>\n\n{}\n\n</details>\n",
-        task.replace("</details>", "&lt;/details&gt;")
-    ));
+        let task = state.instruction.trim();
+        let task = if task.is_empty() {
+            "(empty task)"
+        } else {
+            task
+        };
+        body.push_str(&format!(
+            "<details>\n<summary>Original task</summary>\n\n{}\n\n</details>\n",
+            task.replace("</details>", "&lt;/details&gt;")
+        ));
+    }
 
     body.push_str(&format!(
         "\n---\nmagi:run/{} magi:candidate-{}\n",
@@ -10087,6 +10158,86 @@ mod tests {
             duration_ms: 0,
         });
         state
+    }
+
+    fn review_state(subjects: &[&str]) -> RunState {
+        let mut state = state_with_summary(
+            "Review the work already on branch `magi/x/A`. There is no task statement: what the change claims to do is whatever its commits say.\n\nfirst\nsecond",
+            "",
+        );
+        state.candidates[0].agent = EXISTING_BRANCH.to_owned();
+        state.reviewed_commits = Some(subjects.iter().map(|s| (*s).to_owned()).collect());
+        state
+    }
+
+    #[test]
+    fn pr_message_review_single_commit_uses_its_subject() {
+        let state = review_state(&["feat(nats): per-role user"]);
+        let m = pr_message(&state, 'A');
+        assert_eq!(m.title, "feat(nats): per-role user");
+        assert!(!m.body.contains("Review the work already"), "{}", m.body);
+        assert!(m.body.contains("## Commits under review"), "{}", m.body);
+    }
+
+    #[test]
+    fn pr_message_review_multi_commit_takes_the_oldest() {
+        let state = review_state(&["feat: the change", "fix: typo", "fix: again"]);
+        let m = pr_message(&state, 'A');
+        assert_eq!(m.title, "feat: the change");
+        for s in ["feat: the change", "fix: typo", "fix: again"] {
+            assert!(m.body.contains(&format!("- {s}\n")), "{}", m.body);
+        }
+    }
+
+    #[test]
+    fn pr_message_review_without_a_usable_first_subject_is_neutral() {
+        for first in ["日本語の件名", "", "magi: candidate A (uncommitted work)"] {
+            let state = review_state(&[first, "fix: later fixup"]);
+            let m = pr_message(&state, 'A');
+            assert!(
+                m.title.starts_with("chore: land candidate A of run"),
+                "{}",
+                m.title
+            );
+        }
+    }
+
+    #[test]
+    fn pr_message_review_bounds_a_long_english_subject() {
+        let long = format!("feat: {}", "word ".repeat(100));
+        let m = pr_message(&review_state(&[&long]), 'A');
+        assert!(m.title.starts_with("feat: word"), "{}", m.title);
+        assert!(m.title.chars().count() <= PR_TITLE_MAX, "{}", m.title);
+    }
+
+    #[test]
+    fn pr_message_implementation_run_is_unchanged_by_review_support() {
+        let state = state_with_summary("add retries\n\ndetails", "- did some things");
+        let m = pr_message(&state, 'A');
+        assert_eq!(m.title, "add retries");
+        assert!(m.body.contains("<summary>Original task</summary>"));
+        assert!(!m.body.contains("Commits under review"));
+        assert_eq!(landing_subject_source(&state), state.instruction);
+    }
+
+    #[test]
+    fn review_run_squash_subject_is_the_change_not_the_prompt() {
+        let state = review_state(&["feat: the change", "fix: typo"]);
+        let source = landing_subject_source(&state);
+        assert_eq!(land::merge_subject("", &source), "feat: the change");
+        assert_eq!(
+            land::merge_subject("magi: candidate A (uncommitted work)", &source),
+            "feat: the change"
+        );
+        // An operator's rename still wins.
+        assert_eq!(
+            land::merge_subject("feat: renamed by hand", &source),
+            "feat: renamed by hand"
+        );
+        let blank = review_state(&["日本語"]);
+        assert!(
+            land::merge_subject("", &landing_subject_source(&blank)).starts_with("chore: land")
+        );
     }
 
     #[test]
