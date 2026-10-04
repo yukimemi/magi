@@ -6992,7 +6992,8 @@ where
                     );
                     tried[i].insert(next.id.clone());
                     prev[i] = Some(cur.clone());
-                    seats[i] = handover_seat(&originals[i].seat.key, &next.id, state.next_seat_seed());
+                    seats[i] =
+                        handover_seat(&originals[i].seat.key, &next.id, state.next_seat_seed());
                     specs[i] = next;
                     fresh[i] = Some(cur.stem_word().to_owned());
                     nudges[i] = 0;
@@ -8218,7 +8219,7 @@ mod tests {
 
     #[test]
     fn re_handing_a_seat_to_the_same_agent_mints_a_new_session_id() {
-        let mut state = RunState::new_for_test();
+        let mut state = state_with_summary("x", "y");
         let a = handover_seat("review-1", "beta", state.next_seat_seed());
         let b = handover_seat("review-1", "beta", state.next_seat_seed());
         assert_ne!(a.claude_session, b.claude_session);

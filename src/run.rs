@@ -1787,14 +1787,14 @@ pub struct RunState {
     /// Additive, so `SCHEMA` is not bumped.
     #[serde(default)]
     pub handovers: Vec<Handover>,
-    /// Per reviewer seat, which roster agents already failed it and which one
-    /// last answered, carried across review rounds. Additive, so `SCHEMA` is
-    /// not bumped. See [`SeatHistory`].
     /// How many agent-change seats this run has minted; mixed into their
     /// session ids so re-handing a seat to an agent it already had never
     /// reuses that agent's earlier uuid. Additive.
     #[serde(default)]
     pub seat_epoch: u64,
+    /// Per reviewer seat, which roster agents already failed it and which one
+    /// last answered, carried across review rounds. Additive, so `SCHEMA` is
+    /// not bumped. See [`SeatHistory`].
     #[serde(default)]
     pub seat_history: BTreeMap<String, SeatHistory>,
     /// Stray foreign lockfiles a rescue commit left out, one entry per path.
