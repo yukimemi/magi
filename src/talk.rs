@@ -125,6 +125,100 @@ pub struct Turn {
     /// recorded before attachments existed still reads.
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    /// What the agent's CLI reported reading for this reply; only ever set on
+    /// an agent reply that carried usage. `#[serde(default)]` so a
+    /// conversation recorded before this field existed still reads, which is
+    /// why [`SCHEMA`] stays put: no existing field changed meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TurnUsage>,
+}
+
+/// Raw usage of one agent reply, stored as the CLI reported it.
+///
+/// Counts only, never a percentage: the window is configuration
+/// ([`Config::context_window`]) and the conversation's model can change, so a
+/// stored percentage would go stale the moment either did. `agent` and
+/// `model` record who read that many tokens, which is how [`context_usage`]
+/// notices the figure predates a switch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnUsage {
+    /// Input-side tokens the CLI reported - see `agent::context_tokens`.
+    pub context_tokens: u64,
+    /// Roster id that answered.
+    pub agent: String,
+    /// That agent's model at the time (`None`: the CLI's own default).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// How full the conversation's context window is, as the phone shows it.
+///
+/// Derived at read time and never persisted. `None` means unknown, which the
+/// UI says in words - it is never a made-up 0.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ContextUsage {
+    /// Tokens the last agent reply's turn read, if its CLI reported any.
+    pub tokens: Option<u64>,
+    /// Window of the conversation's *current* model, if one is configured.
+    pub window: Option<u64>,
+    /// `tokens / window`, rounded down, not capped (over 100 is real news).
+    pub percent: Option<u64>,
+    /// 80% or more, judged before rounding: the conversation is getting long.
+    pub warn: bool,
+    /// The conversation's agent or model is not the one that produced
+    /// `tokens`: the figure describes the old session and the next turn
+    /// re-measures it.
+    pub since_switch: bool,
+    /// The current model, if the roster names one.
+    pub model: Option<String>,
+}
+
+/// Fraction (in percent) of the window at which [`ContextUsage::warn`] fires.
+const CONTEXT_WARN_PERCENT: u64 = 80;
+
+/// Context usage of `talk`, measured against its current model.
+///
+/// Only the latest agent reply counts (magi's own notes are skipped) and a
+/// reply without usage makes the answer unknown - older replies are never
+/// consulted, since a stale count passed off as current is worse than "unknown".
+/// The window comes from the *current* agent's model, so switching model moves
+/// the denominator at once.
+///
+/// Switching agent (or model, which is an agent change) mints a fresh CLI
+/// session, so the next turn re-sends the whole transcript and the count
+/// resets or jumps. Until that turn lands, the old figure is reported with
+/// `since_switch` set. Deterministic: same talk and config, same answer.
+pub fn context_usage(talk: &Talk, cfg: Option<&Config>) -> ContextUsage {
+    let current = cfg.and_then(|c| c.agents.iter().find(|a| a.id == talk.agent));
+    let model = current.and_then(|a| a.model.clone());
+    let window = cfg
+        .zip(model.as_deref())
+        .and_then(|(c, m)| c.context_window(m))
+        .filter(|w| *w > 0);
+    let usage = talk
+        .turns
+        .iter()
+        .rev()
+        .find(|t| t.who == Who::Agent && !t.body.starts_with(MAGI_NOTE))
+        .and_then(|t| t.usage.as_ref());
+    let tokens = usage.map(|u| u.context_tokens);
+    let since_switch =
+        usage.is_some_and(|u| u.agent != talk.agent || (current.is_some() && u.model != model));
+    let (percent, warn) = match (tokens, window) {
+        (Some(t), Some(w)) => (
+            Some(t.saturating_mul(100) / w),
+            t.saturating_mul(100) >= w.saturating_mul(CONTEXT_WARN_PERCENT),
+        ),
+        _ => (None, false),
+    };
+    ContextUsage {
+        tokens,
+        window,
+        percent,
+        warn,
+        since_switch,
+        model,
+    }
 }
 
 /// Where a conversation is in its life: this conversation can file any
@@ -566,6 +660,7 @@ pub fn record(
         body: text.to_owned(),
         at: Timestamp::now(),
         attachments,
+        usage: None,
     });
     store.put(talk)?;
     Ok(text.to_owned())
@@ -624,6 +719,7 @@ pub fn drain(talk: &mut Talk, store: &Talks) -> Result<Option<String>> {
         body: text.clone(),
         at: Timestamp::now(),
         attachments,
+        usage: None,
     });
     store.put(&mut fresh)?;
     *talk = fresh;
@@ -730,6 +826,7 @@ pub fn switch_agent(talk: &mut Talk, store: &Talks, spec: &AgentSpec) -> Result<
         body: format!("{MAGI_NOTE}agent changed from {from} to {}", spec.id),
         at: Timestamp::now(),
         attachments: Vec::new(),
+        usage: None,
     });
     store.put(&mut fresh)?;
     *talk = fresh;
@@ -963,6 +1060,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         body: format!("{MAGI_NOTE}{why}"),
         at: Timestamp::now(),
         attachments: Vec::new(),
+        usage: None,
     };
     let (reply, failure) = match outcome {
         Err(e) => (
@@ -1005,6 +1103,17 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
                 body: out.text.trim().to_owned(),
                 at: Timestamp::now(),
                 attachments: Vec::new(),
+                // `talk.agent` is whoever actually answered: a fallback has
+                // already moved it, and an exhausted chain never reaches here.
+                usage: out.context_tokens.map(|context_tokens| TurnUsage {
+                    context_tokens,
+                    agent: talk.agent.clone(),
+                    model: cfg
+                        .agents
+                        .iter()
+                        .find(|a| a.id == talk.agent)
+                        .and_then(|a| a.model.clone()),
+                }),
             },
             None,
         ),
@@ -1409,6 +1518,158 @@ mod tests {
     use crate::queue::{Queue, Source, Task};
 
     use super::*;
+
+    fn ctx_agent(id: &str, model: Option<&str>) -> AgentSpec {
+        AgentSpec {
+            id: id.to_owned(),
+            kind: AgentKind::Command,
+            model: model.map(str::to_owned),
+            command: Vec::new(),
+            extra_args: Vec::new(),
+            env: BTreeMap::new(),
+            prompt_delivery: None,
+        }
+    }
+
+    fn ctx_talk(agent: &str, turns: Vec<Turn>) -> Talk {
+        Talk {
+            schema: SCHEMA,
+            id: "20260904-014455-ab12".to_owned(),
+            repo: PathBuf::from("."),
+            agent: agent.to_owned(),
+            status: TalkStatus::Open,
+            turns,
+            pending: String::new(),
+            pending_attachments: Vec::new(),
+            fallback: false,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            seat: SeatState::new(SEAT, agent, 1),
+        }
+    }
+
+    fn reply(body: &str, usage: Option<(u64, &str, Option<&str>)>) -> Turn {
+        Turn {
+            who: Who::Agent,
+            body: body.to_owned(),
+            at: Timestamp::now(),
+            attachments: Vec::new(),
+            usage: usage.map(|(t, a, m)| TurnUsage {
+                context_tokens: t,
+                agent: a.to_owned(),
+                model: m.map(str::to_owned),
+            }),
+        }
+    }
+
+    fn ctx_config(windows: &[(&str, u64)]) -> Config {
+        Config {
+            agents: vec![
+                ctx_agent("small", Some("small-model")),
+                ctx_agent("big", Some("big-model")),
+                ctx_agent("plain", None),
+            ],
+            context_windows: windows.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn context_usage_computes_percent_and_warns_at_eighty() {
+        let cfg = ctx_config(&[("small-model", 1000)]);
+        let at = |tokens| {
+            let t = ctx_talk(
+                "small",
+                vec![reply("hi", Some((tokens, "small", Some("small-model"))))],
+            );
+            context_usage(&t, Some(&cfg))
+        };
+        let u = at(799);
+        assert_eq!((u.percent, u.warn, u.window), (Some(79), false, Some(1000)));
+        let u = at(800);
+        assert_eq!((u.percent, u.warn), (Some(80), true));
+        let u = at(1500);
+        assert_eq!((u.percent, u.warn), (Some(150), true));
+        assert!(!u.since_switch);
+    }
+
+    #[test]
+    fn context_usage_is_unknown_without_usage_and_never_looks_back() {
+        let cfg = ctx_config(&[("small-model", 1000)]);
+        let t = ctx_talk(
+            "small",
+            vec![
+                reply("old", Some((900, "small", Some("small-model")))),
+                reply("new", None),
+            ],
+        );
+        let u = context_usage(&t, Some(&cfg));
+        assert_eq!((u.tokens, u.percent, u.warn), (None, None, false));
+        // A magi note after the reply neither hides nor replaces it.
+        let t = ctx_talk(
+            "small",
+            vec![
+                reply("old", Some((900, "small", Some("small-model")))),
+                reply("magi: could not run agent", None),
+            ],
+        );
+        assert_eq!(context_usage(&t, Some(&cfg)).tokens, Some(900));
+        assert_eq!(
+            context_usage(&ctx_talk("small", Vec::new()), Some(&cfg)).tokens,
+            None
+        );
+    }
+
+    #[test]
+    fn context_usage_without_a_window_shows_tokens_only() {
+        let cfg = ctx_config(&[]);
+        // No model at all, and a model nothing matches.
+        let t = ctx_talk("plain", vec![reply("hi", Some((5000, "plain", None)))]);
+        let u = context_usage(&t, Some(&cfg));
+        assert_eq!(
+            (u.tokens, u.window, u.percent, u.warn),
+            (Some(5000), None, None, false)
+        );
+        let t = ctx_talk(
+            "small",
+            vec![reply("hi", Some((5000, "small", Some("small-model"))))],
+        );
+        assert_eq!(context_usage(&t, Some(&cfg)).percent, None);
+        // No readable config: same, and no panic.
+        assert_eq!(context_usage(&t, None).window, None);
+    }
+
+    #[test]
+    fn context_usage_switching_model_changes_the_denominator() {
+        let cfg = ctx_config(&[("small-model", 1000), ("big-model", 10_000)]);
+        let used = reply("hi", Some((900, "small", Some("small-model"))));
+        let before = context_usage(&ctx_talk("small", vec![used.clone()]), Some(&cfg));
+        assert_eq!(
+            (before.percent, before.warn, before.since_switch),
+            (Some(90), true, false)
+        );
+        // Same turns, conversation now on the big model: new denominator, and
+        // the figure is flagged as describing the previous session.
+        let after = context_usage(&ctx_talk("big", vec![used]), Some(&cfg));
+        assert_eq!(after.window, Some(10_000));
+        assert_eq!(
+            (after.percent, after.warn, after.since_switch),
+            (Some(9), false, true)
+        );
+        assert_eq!(after.model.as_deref(), Some("big-model"));
+    }
+
+    #[test]
+    fn a_turn_recorded_before_usage_existed_still_reads() {
+        let old = r#"{"who":"agent","body":"hi","at":"2026-09-04T01:44:55Z"}"#;
+        let turn: Turn = serde_json::from_str(old).expect("old turn reads");
+        assert!(turn.usage.is_none());
+        let json = serde_json::to_string(&turn).expect("serialize");
+        assert!(
+            !json.contains("usage"),
+            "absent usage is not written: {json}"
+        );
+    }
 
     /// A store of its own, with no process-global state.
     fn store() -> (tempfile::TempDir, Talks) {

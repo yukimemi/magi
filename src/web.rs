@@ -4845,10 +4845,24 @@ struct TalkView {
     /// progress hint rather than proof a reply landed; the transcript remains
     /// the source of truth for that.
     thinking: bool,
+    /// Context-window usage, derived per request - see
+    /// [`talk::context_usage`]. Carried on every talk response (list, detail
+    /// and each mutation) so the phone needs no extra call or polling.
+    context: talk::ContextUsage,
 }
 
 impl TalkView {
+    /// Reads the talk's repository config itself; a config that cannot be
+    /// read leaves the window unknown but never fails the conversation.
     fn new(talk: Talk, thinking: bool) -> Self {
+        let cfg = Config::discover(&talk.repo, None).ok().map(|(cfg, _)| cfg);
+        Self::with_config(talk, thinking, cfg.as_ref())
+    }
+
+    /// As [`Self::new`], with the config already in hand (the list reads one
+    /// per repository, not one per conversation).
+    fn with_config(talk: Talk, thinking: bool, cfg: Option<&Config>) -> Self {
+        let context = talk::context_usage(&talk, cfg);
         let turn_bodies_md = talk
             .turns
             .iter()
@@ -4857,6 +4871,7 @@ impl TalkView {
         Self {
             turn_bodies_md,
             thinking,
+            context,
             talk,
         }
     }
@@ -4891,13 +4906,17 @@ struct RosterEntry {
 /// own order.
 async fn talks_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TalkView>>> {
     blocking(move || {
+        let mut configs: HashMap<PathBuf, Option<Config>> = HashMap::new();
         Ok(Json(
             ui.talks
                 .list()
                 .into_iter()
                 .map(|talk| {
                     let thinking = ui.is_thinking(&talk.id);
-                    TalkView::new(talk, thinking)
+                    let cfg = configs
+                        .entry(talk.repo.clone())
+                        .or_insert_with(|| Config::discover(&talk.repo, None).ok().map(|(c, _)| c));
+                    TalkView::with_config(talk, thinking, cfg.as_ref())
                 })
                 .collect(),
         ))
@@ -10539,6 +10558,7 @@ mod tests {
             body: "a new turn".to_owned(),
             at: Timestamp::now(),
             attachments: Vec::new(),
+            usage: None,
         });
         f.talks().put(&mut on_disk).expect("record a turn");
 

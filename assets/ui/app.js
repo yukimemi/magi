@@ -4346,6 +4346,36 @@ function sortTalks(list) {
   });
 }
 
+/* The context meter's words, from the server's `context` object - the
+   percentage is computed there against the conversation's current model, so
+   nothing here divides anything. Unknown tokens say "unknown" rather than a
+   number; an unknown window shows the count alone. After a model/agent switch
+   the figure still describes the old session until the next turn re-measures. */
+function formatTokens(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1).replace(/\.0$/, "")}M`;
+  if (n >= 1e3) return `${Math.round(n / 1e3)}k`;
+  return String(n);
+}
+
+function talkContextLabel(ctx) {
+  if (!ctx || typeof ctx.tokens !== "number") return null;
+  let text = typeof ctx.window === "number" && typeof ctx.percent === "number"
+    ? `${formatTokens(ctx.tokens)} / ${formatTokens(ctx.window)} (${ctx.percent}%)`
+    : `${formatTokens(ctx.tokens)} tokens`;
+  if (ctx.since_switch) text += " · re-measured next turn";
+  return { text, warn: Boolean(ctx.warn) };
+}
+
+function contextTag(ctx) {
+  const label = talkContextLabel(ctx);
+  const tag = el("span", { class: "tag", "data-tone": label && label.warn ? "rust" : "ink" });
+  setText(tag, label ? `context ${label.text}` : "context unknown");
+  setAttr(tag, "title", label && label.warn
+    ? "This conversation is getting long; consider starting a new one."
+    : "Input tokens the agent reported for its last reply, against the model's context window.");
+  return tag;
+}
+
 function createTalkCard() {
   const chipSlot = el("span");
   const thinking = el("span", { class: "tag", "data-tone": "blue", text: "thinking…" });
@@ -4355,7 +4385,8 @@ function createTalkCard() {
   const agent = el("span", { class: "repo" });
   const turns = el("span");
   const tasks = el("span", { class: "win" });
-  const meta = el("div", { class: "card-meta" }, agent, turns, tasks);
+  const context = el("span", { class: "win" });
+  const meta = el("div", { class: "card-meta" }, agent, turns, tasks, context);
   const last = el("p", { class: "card-event" });
 
   const card = el("a", { class: "card" },
@@ -4363,7 +4394,7 @@ function createTalkCard() {
     title, meta, last,
   );
   const row = el("li", {}, card);
-  row.refs = { card, chipSlot, thinking, whenSlot, unread, title, agent, turns, tasks, last };
+  row.refs = { card, chipSlot, thinking, whenSlot, unread, title, agent, turns, tasks, context, last };
   return row;
 }
 
@@ -4398,6 +4429,9 @@ function updateTalkCard(row, talk) {
   setText(r.title, firstLine(talkOpener(talk)) || `conversation ${shortId(talk.id)}`);
   setText(r.agent, talk.agent || "");
   show(r.agent, Boolean(talk.agent));
+  const ctxLabel = talkContextLabel(talk.context);
+  setText(r.context, ctxLabel ? `context ${ctxLabel.text}` : "context unknown");
+  setAttr(r.context, "data-warn", ctxLabel && ctxLabel.warn ? "1" : null);
   setText(r.turns, plural(turns.length, "turn", "turns"));
   const tasks = Array.isArray(talk.tasks) ? talk.tasks.length : 0;
   setText(r.tasks, tasks ? plural(tasks, "task filed", "tasks filed") : "");
@@ -4601,6 +4635,7 @@ function renderTalk() {
   const head = $("talk-status");
   clear(head);
   head.append(chip(status, TALK_STATUS));
+  head.append(contextTag(talk.context));
 
   setText($("talk-h"), firstLine(talkOpener(talk)) || `Conversation ${shortId(talk.id)}`);
   const started = when(talk.created_at);

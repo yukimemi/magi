@@ -2031,3 +2031,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 .set-actions { display: flex; gap: var(--s3); align-items: center; flex-wrap: wrap; margin-top: var(--s4); }
 .set-agents { width: 100%; border-collapse: collapse; font-size: var(--t3); }
 .set-agents th, .set-agents td { text-align: left; padding: var(--s2) var(--s3); border-bottom: 1px solid var(--line-2); overflow-wrap: anywhere; }
+
+/* A conversation at 80% or more of its context window. */
+.card-meta [data-warn="1"] { color: var(--rust); font-weight: 600; }

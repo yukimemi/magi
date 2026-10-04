@@ -219,6 +219,12 @@ pub struct AgentOutput {
     /// currently read structured job events from.
     #[serde(default)]
     pub commands: Vec<CommandEvidence>,
+    /// Input-side tokens the CLI reported for this turn - approximately the
+    /// size of the context the model just read. `None` when the CLI reports
+    /// no usage (or in a shape this build does not read): unknown, never 0.
+    /// See [`context_tokens`].
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
 }
 
 impl AgentOutput {
@@ -481,6 +487,7 @@ pub async fn invoke(
         quota: extracted.quota,
         dropped: extracted.dropped,
         commands: extracted.commands,
+        context_tokens: extracted.context_tokens,
     })
 }
 
@@ -810,10 +817,131 @@ struct Extracted {
     quota: Option<Quota>,
     dropped: Option<Dropped>,
     commands: Vec<CommandEvidence>,
+    context_tokens: Option<u64>,
 }
 
 /// Pull the agent's message (and any session id) out of a CLI's stdout.
 fn extract(kind: AgentKind, stdout: &str) -> Extracted {
+    let mut extracted = extract_answer(kind, stdout);
+    extracted.context_tokens = context_tokens(kind, stdout);
+    extracted
+}
+
+/// `v[key]` as an unsigned integer, or `None` when absent or not a number.
+fn uint(v: &serde_json::Value, key: &str) -> Option<u64> {
+    v.get(key).and_then(serde_json::Value::as_u64)
+}
+
+/// The input side of a usage object: `input` plus whatever the cache served
+/// or stored, each key read under the names the CLIs use. A missing cache
+/// counter is 0 (the CLI simply had no cache traffic to report) but a missing
+/// *input* counter makes the whole thing unknown - `None`, never a made-up 0.
+fn input_side(usage: &serde_json::Value, input: &[&str], cache: &[&str]) -> Option<u64> {
+    let first = |keys: &[&str]| keys.iter().find_map(|k| uint(usage, k));
+    let base = first(input)?;
+    let cached: u64 = cache.iter().filter_map(|k| uint(usage, k)).sum();
+    Some(base.saturating_add(cached))
+}
+
+/// The context size a CLI reported for its last turn: its input-side token
+/// count, which approximates how much of the model's window the conversation
+/// occupies. A pure function of stdout, so each CLI's shape is unit-testable.
+///
+/// Rules, all deliberate:
+/// - **Last report wins, never a sum.** A multi-event stream (opencode's
+///   `step_finish`, codex's `turn.completed`, omp's `message_end`) reports the
+///   input of each model call; the final one is the largest context the
+///   conversation reached this turn, and adding them would count the same
+///   prefix once per tool round-trip.
+/// - **Missing or mistyped usage is `None`**, which the UI shows as "unknown".
+/// - claude and agy report cache reads separately from `input_tokens`, so those
+///   are added; codex's `cached_input_tokens` is a subset of `input_tokens`
+///   and is *not* added.
+///
+/// agy's counters may be cumulative for the whole print-mode call rather than
+/// for one request, so for that CLI the number is an upper bound.
+fn context_tokens(kind: AgentKind, stdout: &str) -> Option<u64> {
+    use serde_json::Value;
+    let lines = || {
+        stdout
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
+    };
+    match kind {
+        AgentKind::Claude => {
+            let v = serde_json::from_str::<Value>(stdout.trim()).ok()?;
+            input_side(
+                v.get("usage")?,
+                &["input_tokens"],
+                &["cache_creation_input_tokens", "cache_read_input_tokens"],
+            )
+        }
+        AgentKind::Opencode => lines()
+            .filter(|v| {
+                // The event is `step_finish`; its part is `step-finish`.
+                v.get("type").and_then(|t| t.as_str()) == Some("step_finish")
+                    || v.get("part")
+                        .and_then(|p| p.get("type"))
+                        .and_then(|t| t.as_str())
+                        == Some("step-finish")
+            })
+            .filter_map(|v| {
+                let tokens = v.get("part")?.get("tokens")?;
+                let base = uint(tokens, "input")?;
+                let cache = tokens.get("cache");
+                let cached = ["read", "write"]
+                    .iter()
+                    .filter_map(|k| cache.and_then(|c| uint(c, k)))
+                    .sum::<u64>();
+                Some(base.saturating_add(cached))
+            })
+            .next_back(),
+        AgentKind::Antigravity => {
+            let v = stdout
+                .lines()
+                .rev()
+                .find_map(|l| serde_json::from_str::<Value>(l.trim()).ok())?;
+            input_side(v.get("usage")?, &["input_tokens"], &["cache_read_tokens"])
+        }
+        AgentKind::Codex => lines()
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("turn.completed"))
+            .filter_map(|v| uint(v.get("usage")?, "input_tokens"))
+            .next_back(),
+        AgentKind::Omp => lines()
+            .flat_map(|v| {
+                // Same walk as the answer: `agent_end` carries the thread,
+                // `turn_end` / `message_end` one message each.
+                match v.get("type").and_then(|t| t.as_str()) {
+                    Some("agent_end") => v
+                        .get("messages")
+                        .and_then(|m| m.as_array())
+                        .cloned()
+                        .unwrap_or_default(),
+                    Some("turn_end") | Some("message_end") => {
+                        v.get("message").cloned().into_iter().collect()
+                    }
+                    _ => Vec::new(),
+                }
+            })
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .filter_map(|m| {
+                input_side(
+                    m.get("usage")?,
+                    &["input", "input_tokens"],
+                    &[
+                        "cacheRead",
+                        "cacheWrite",
+                        "cache_read_tokens",
+                        "cache_write_tokens",
+                    ],
+                )
+            })
+            .next_back(),
+        AgentKind::Command => None,
+    }
+}
+
+fn extract_answer(kind: AgentKind, stdout: &str) -> Extracted {
     match kind {
         AgentKind::Claude => {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
@@ -844,6 +972,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 // shape `dropped_stream` keys on is agy's.
                 dropped: None,
                 commands: Vec::new(),
+                context_tokens: None,
             }
         }
         AgentKind::Opencode => {
@@ -877,6 +1006,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 quota: None,
                 dropped: None,
                 commands: Vec::new(),
+                context_tokens: None,
             }
         }
         AgentKind::Antigravity => {
@@ -907,6 +1037,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 quota: None,
                 dropped: dropped_stream(&v),
                 commands: Vec::new(),
+                context_tokens: None,
             }
         }
         AgentKind::Codex => {
@@ -972,6 +1103,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 quota: None,
                 dropped: None,
                 commands,
+                context_tokens: None,
             }
         }
         AgentKind::Omp => {
@@ -1046,6 +1178,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 quota: None,
                 dropped: None,
                 commands: Vec::new(),
+                context_tokens: None,
             }
         }
         AgentKind::Command => {
@@ -1065,6 +1198,7 @@ fn extract(kind: AgentKind, stdout: &str) -> Extracted {
                 quota,
                 dropped,
                 commands: Vec::new(),
+                context_tokens: None,
             }
         }
     }
@@ -2165,6 +2299,7 @@ mod tests {
             quota: out.quota,
             dropped: out.dropped,
             commands: out.commands,
+            context_tokens: None,
         };
         assert!(
             agent_out.usable(),
@@ -2324,6 +2459,7 @@ mod tests {
                 output_tokens: 14267,
             }),
             commands: Vec::new(),
+            context_tokens: None,
         };
         assert!(!out.usable());
         assert!(out.work_undelivered());
@@ -2702,6 +2838,7 @@ mod tests {
             quota: quota.then_some(Quota { reset: None }),
             dropped: None,
             commands: Vec::new(),
+            context_tokens: None,
         }
     }
 
@@ -2769,5 +2906,86 @@ mod tests {
         assert!(chain_advances(&Ok(output("", 0, false))));
         assert!(chain_advances(&Ok(output("x", 1, false))));
         assert!(!chain_advances(&Ok(output("answer", 0, false))));
+    }
+
+    #[test]
+    fn claude_context_tokens_add_cache_and_stay_unknown_without_usage() {
+        let full = r#"{"result":"ok","usage":{"input_tokens":10,"cache_creation_input_tokens":200,"cache_read_input_tokens":3000,"output_tokens":5}}"#;
+        assert_eq!(context_tokens(AgentKind::Claude, full), Some(3210));
+        let no_cache = r#"{"result":"ok","usage":{"input_tokens":10}}"#;
+        assert_eq!(context_tokens(AgentKind::Claude, no_cache), Some(10));
+        for missing in [
+            r#"{"result":"ok"}"#,
+            r#"{"result":"ok","usage":{"output_tokens":5}}"#,
+            r#"{"result":"ok","usage":{"input_tokens":"many"}}"#,
+            "not json",
+        ] {
+            assert_eq!(
+                context_tokens(AgentKind::Claude, missing),
+                None,
+                "{missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_context_tokens_take_the_last_step_finish() {
+        let out = concat!(
+            r#"{"type":"step_finish","sessionID":"s","part":{"type":"step-finish","tokens":{"input":100,"output":5,"cache":{"read":1000,"write":50}}}}"#,
+            "\n",
+            r#"{"type":"text","part":{"type":"text","text":"hi"}}"#,
+            "\n",
+            r#"{"type":"step_finish","sessionID":"s","part":{"type":"step-finish","tokens":{"input":120,"output":9,"cache":{"read":1500}}}}"#,
+            "\n"
+        );
+        assert_eq!(context_tokens(AgentKind::Opencode, out), Some(1620));
+        let none = r#"{"type":"step_finish","part":{"type":"step-finish"}}"#;
+        assert_eq!(context_tokens(AgentKind::Opencode, none), None);
+        assert_eq!(context_tokens(AgentKind::Opencode, ""), None);
+    }
+
+    #[test]
+    fn agy_context_tokens_add_cache_reads() {
+        let out = r#"{"conversation_id":"c","status":"OK","response":"x","usage":{"input_tokens":260113,"output_tokens":1,"cache_read_tokens":2200925}}"#;
+        assert_eq!(context_tokens(AgentKind::Antigravity, out), Some(2_461_038));
+        let bare = r#"{"conversation_id":"c","status":"OK","response":"x"}"#;
+        assert_eq!(context_tokens(AgentKind::Antigravity, bare), None);
+    }
+
+    #[test]
+    fn codex_context_tokens_take_last_turn_and_do_not_add_cached() {
+        let out = concat!(
+            "tracing noise\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":900}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":1500,"cached_input_tokens":1400}}"#,
+            "\n"
+        );
+        assert_eq!(context_tokens(AgentKind::Codex, out), Some(1500));
+        let none = r#"{"type":"turn.completed"}"#;
+        assert_eq!(context_tokens(AgentKind::Codex, none), None);
+    }
+
+    #[test]
+    fn omp_context_tokens_come_from_messages_without_an_agent_end() {
+        let out = concat!(
+            r#"{"type":"session","id":"s"}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":50,"cacheRead":400,"cacheWrite":10}}}"#,
+            "\n",
+            r#"{"type":"turn_end","message":{"role":"assistant","content":[],"usage":{"input":70,"cacheRead":500}}}"#,
+            "\n"
+        );
+        assert_eq!(context_tokens(AgentKind::Omp, out), Some(570));
+        let user_only = r#"{"type":"message_end","message":{"role":"user","usage":{"input":9}}}"#;
+        assert_eq!(context_tokens(AgentKind::Omp, user_only), None);
+        let no_usage = r#"{"type":"message_end","message":{"role":"assistant","content":[]}}"#;
+        assert_eq!(context_tokens(AgentKind::Omp, no_usage), None);
+    }
+
+    #[test]
+    fn command_agents_report_no_context_tokens() {
+        let out = r#"{"usage":{"input_tokens":5}}"#;
+        assert_eq!(context_tokens(AgentKind::Command, out), None);
     }
 }
