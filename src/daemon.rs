@@ -8029,14 +8029,7 @@ mod tests {
 
         // The waiter leaves it alone (the task exists) ...
         assert_eq!(
-            crate::waiter::decide_owned(
-                &q,
-                None,
-                false,
-                86_400,
-                Timestamp::now(),
-                true
-            ),
+            crate::waiter::decide_owned(&q, None, false, 86_400, Timestamp::now(), true),
             crate::waiter::Action::Idle
         );
         // ... and the daemon waits while the task runs, then applies once.

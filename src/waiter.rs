@@ -739,7 +739,9 @@ mod tests {
         // No action: delivered even when a task exists.
         let mut plain = asked(0);
         plain.choices = vec!["A".into()];
-        plain.answer(crate::ask::Answer::Choice("A".into())).unwrap();
+        plain
+            .answer(crate::ask::Answer::Choice("A".into()))
+            .unwrap();
         assert_eq!(
             decide_owned(&plain, None, false, 86_400, ts(10), true),
             Action::Deliver(Word::Answered("A".into()))
