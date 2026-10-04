@@ -9991,6 +9991,16 @@ mod tests {
         assert!(INDEX_HTML.contains("id=\"queue-search-input\""));
     }
 
+    #[test]
+    fn a_keystroke_invalidates_the_search_reply_still_in_flight() {
+        let start = APP_JS
+            .find("function scheduleSearch(")
+            .expect("scheduleSearch exists");
+        let body = &APP_JS[start..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        assert!(body.contains("s.seq += 1"));
+    }
+
     #[tokio::test]
     async fn stats_runs_unreadable_matches_health() {
         let f = Fixture::start().await;

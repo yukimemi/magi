@@ -563,7 +563,7 @@ const state = {
   /* Full-text search, one slot per page. `text` is what the box holds; the
      rest describes the last request: `status` is idle | loading | ok | error,
      `forText` the query the stored `hits` answer, `seq` the newest request
-     (an older reply is dropped), `timer` the debounce. */
+     or keystroke (an older reply is dropped), `timer` the debounce. */
   runsSearch: "",
   search: {
     runs: { status: "idle", forText: "", seq: 0, timer: null, hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" },
@@ -2740,6 +2740,7 @@ function scheduleSearch(scope) {
   const s = state.search[scope];
   clearTimeout(s.timer);
   s.status = "loading";
+  s.seq += 1; // a reply still in flight answers an older query
   s.timer = setTimeout(() => runSearch(scope), SEARCH_DEBOUNCE_MS);
 }
 
