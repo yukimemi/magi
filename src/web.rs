@@ -10000,12 +10000,12 @@ mod tests {
             |parts: &[SnippetPart]| -> usize { parts.iter().map(|p| p.text.chars().count()).sum() };
 
         let long = "a".repeat(120);
-        let parts = snippet_of(&long, &[long.clone()]);
+        let parts = snippet_of(&long, std::slice::from_ref(&long));
         assert!(hit_len(&parts) > 0, "{parts:?}");
         assert!(total(&parts) <= cap);
 
         let ja = "あ".repeat(130);
-        let parts = snippet_of(&ja, &[ja.clone()]);
+        let parts = snippet_of(&ja, std::slice::from_ref(&ja));
         assert!(hit_len(&parts) > 0, "{parts:?}");
         assert!(total(&parts) <= cap);
 
