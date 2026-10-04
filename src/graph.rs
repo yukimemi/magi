@@ -6837,10 +6837,11 @@ where
             // fail the same way; and never re-ask a seat that already parsed.
             // With a roster, a failed agent is not re-asked either: handover
             // was its only remedy and has just been refused or run out.
-            // A seat never handed over (nobody left to hand it to: a single-agent
-            // roster, the roster's tail) keeps the same-agent nudges it always had.
-            let agent_failure =
-                class.is_some() && !roster.is_empty() && !nudge_first && tried[i].len() > 1;
+            // With a roster, a failed agent is never re-asked, even when nobody
+            // is left to hand the seat to (a single-agent roster, the roster's
+            // tail): each roster agent is tried once per seat, and the roster's
+            // length is the retry bound.
+            let agent_failure = class.is_some() && !roster.is_empty() && !nudge_first;
             if failed && !quota && !agent_failure && nudges[i] < retries {
                 nudges[i] += 1;
                 still.push(i);
