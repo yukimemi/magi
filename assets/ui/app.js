@@ -5269,6 +5269,7 @@ function renderRunDetail() {
        their onclick closures still carry the old id, and Delete says itself
        "cannot be undone". Clearing here, before the new run's data arrives,
        is what used to happen for free when the whole panel was hidden. */
+    clear($("run-task-box"));
     clear($("run-actions-box"));
     clear($("run-fold-merged-box"));
     clear($("run-delete-box"));
@@ -5358,6 +5359,7 @@ function renderRunDetail() {
   renderQuota(run);
   renderHandovers(run);
   renderTimeline(run);
+  renderRunTaskEntry(run);
   renderRunActions(run);
   renderRunFoldMerged(run);
   renderRunDelete(run);
@@ -5687,6 +5689,30 @@ async function deleteRun(id) {
 /* Every question this run has ever asked, open ones first: the answered ones
    are the record of the decisions that shaped the work below. They are
    answerable right here, so arriving from the runs list is not a detour. */
+/* The first row of the run actions sheet: the way to the owning task, within
+   thumb reach. It lives in its own box so it neither depends on the run being
+   unfolded nor gets rebuilt by the fold confirmation. A plain link: the hash
+   change does the navigating, and nothing here touches location. */
+function renderRunTaskEntry(run) {
+  const box = $("run-task-box");
+  clear(box);
+  const t = run.task;
+  if (!t || !t.id) {
+    box.append(
+      el("button", { class: "btn sheet-task-link", type: "button", disabled: true, text: "Open task" }),
+      el("p", { class: "card-note", text: "This run was started directly, no task." }),
+    );
+    return;
+  }
+  const label = ["Open task ", t.short || t.id];
+  if (t.status) label.push(" ", chip(t.status, TASK_STATUS));
+  box.append(el("a", {
+    class: "btn sheet-task-link",
+    href: `#/tasks/${encodeURIComponent(t.id)}`,
+    onclick: () => closeRunActions(),
+  }, ...label));
+}
+
 /* One line under a run's header about its task. It leads with "Task" and the
    task's own chip, so it never reads as this run's status. */
 function taskLine(run) {
@@ -5716,7 +5742,7 @@ function taskLine(run) {
   } else if (t.status === "queued" || t.status === "running") {
     kids.push(`attempt ${t.attempts}/${t.max_attempts}`);
   }
-  kids.push(" \u00b7 ", el("a", { href: `#/tasks/${encodeURIComponent(t.id)}`, text: "all attempts" }));
+  kids.push(" \u00b7 ", el("a", { class: "task-chip-link", href: `#/tasks/${encodeURIComponent(t.id)}`, text: "all attempts" }));
   line.replaceChildren(...kids);
   show(line, true);
 }

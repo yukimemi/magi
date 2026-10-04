@@ -12362,6 +12362,19 @@ mod tests {
     }
 
     #[test]
+    fn the_run_actions_sheet_leads_with_a_way_to_the_task() {
+        let task = INDEX_HTML.find("id=\"run-task-box\"").expect("task box");
+        let actions = INDEX_HTML.find("id=\"run-actions-box\"").expect("actions box");
+        assert!(task < actions, "the task entry comes first in the sheet");
+        assert!(APP_JS.contains("renderRunTaskEntry"));
+        assert!(APP_JS.contains("\"Open task \""));
+        // A run without a task says why there is nothing to open.
+        assert!(APP_JS.contains("started directly, no task"));
+        assert!(APP_JS.contains("sheet-task-link"));
+        assert!(APP_JS.contains("task-chip-link"));
+    }
+
+    #[test]
     fn the_deck_never_sends_the_operator_to_a_terminal() {
         // The whole point of the phone UI is that a terminal is not needed.
         // The delete control used to answer with "Run `magi fold` first."
