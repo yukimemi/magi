@@ -514,13 +514,15 @@ fn rev(repo: &std::path::Path, r: &str) -> String {
 /// winner is rebased locally and nothing is pushed. Returns the runner, the
 /// branch, and a commit that carries the winner's patch on the *old* base
 /// (what an earlier published attempt of the branch would have looked like).
-async fn rebased_locally_only(
-    fx: &common::Fixture,
-    origin: &Origin,
-) -> (Runner, String, String) {
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
-        .await
-        .expect("start");
+async fn rebased_locally_only(fx: &common::Fixture, origin: &Origin) -> (Runner, String, String) {
+    let mut runner = Runner::start(
+        &fx.repo,
+        "create note.txt".to_owned(),
+        fx.config.clone(),
+        magi::run::Origin::operator(),
+    )
+    .await
+    .expect("start");
     let base = runner.state.base_commit.clone();
     land_on_origin(&origin.sideline, "upstream.txt", "landed meanwhile\n");
     runner.execute().await.expect("execute");
