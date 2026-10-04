@@ -1455,6 +1455,24 @@ pub fn closable(
     Ok(())
 }
 
+/// Does `remote` point at something a forge could host - a URL or an scp-style
+/// `user@host:path` - rather than a filesystem path or nothing at all? Judged
+/// from the URL alone, so it answers the same on every machine, whatever `gh`
+/// happens to be installed or logged in to.
+async fn remote_is_forge(repo: &Path, remote: &str) -> bool {
+    let Ok(url) = git::git(repo, &["remote", "get-url", remote]).await else {
+        return false;
+    };
+    is_forge_url(url.trim())
+}
+
+fn is_forge_url(url: &str) -> bool {
+    url.contains("://") && !url.starts_with("file://")
+        || url
+            .split_once(':')
+            .is_some_and(|(host, _)| host.contains('@') && !host.contains(['/', '\\']))
+}
+
 /// Does this `gh` failure mean there is no GitHub to ask, as opposed to a
 /// request that failed?
 fn forge_unavailable(message: &str) -> bool {
@@ -1509,6 +1527,11 @@ pub async fn close_superseded_pr(
         // GitHub remote, no `gh`) says nothing about this run, so that is
         // "none found"; any other lookup failure is an error, because "could
         // not look" is not "nothing there" and the caller must retry.
+        None if !remote_is_forge(&repo, &state.config.merge.remote).await => {
+            return Ok(Err(
+                "the remote is not a forge, so there is no pull request".to_owned(),
+            ));
+        }
         None => match find_open_pr(&repo, branch, &base).await {
             Err(e) if forge_unavailable(&format!("{e:#}")) => {
                 return Ok(Err(format!("no forge to ask: {e:#}")));
@@ -3010,6 +3033,11 @@ mod tests {
             .unwrap_err()
             .retry
         );
+        assert!(is_forge_url("https://github.com/o/r.git"));
+        assert!(is_forge_url("git@github.com:o/r.git"));
+        assert!(!is_forge_url("/tmp/origin.git"));
+        assert!(!is_forge_url("C:\\work\\origin.git"));
+        assert!(!is_forge_url("file:///tmp/origin.git"));
         assert!(forge_unavailable(
             "gh pr list failed: none of the git remotes configured for this repository point to a known GitHub host."
         ));
