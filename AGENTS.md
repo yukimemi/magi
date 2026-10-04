@@ -1136,6 +1136,19 @@ not move on a say.
   lease on a question with a deputy, and `nobody` for a conductor question that
   has no one; `app.js` says "Waiting for the agent" only for `asker` / `deputy` /
   `daemon`.
+- **A merge approval (`land::APPROVAL_NODE`) has a deputy too, and stays land's.**
+  `deputy::kind_of` picks the kind; a land deputy gets `land::deputy_brief` (PR,
+  run, base/winner, contested findings, "merge is irreversible, silence is a
+  hold"; a missing run record is named as missing, never reconstructed). It has
+  **no `cwd`**, so the waiter's `decide` stays `Idle` for it - the `q.deputy`
+  skip rule only ever matters for conductor questions. Its deadline is
+  `deputy::deadline`: `asked_at + answer_timeout`, never moved by a reply, the
+  same instant `daemon::land_resume_state` abandons the question; land is the
+  only thing that retires an approval. `--settle` on an approval accepts
+  `merge` / `hold` only when the owner's whole message is that word
+  (`settle_by_deputy`); anything else is answered back with `--thread`. The
+  operator-held check resolves the task through the run id. `holder_of` says
+  `nobody` for an approval with no live deputy, and `app.js` says so.
 - The mock agent in `tests/common/mod.rs` greps `prompt::DEPUTY_HEADING`; reword
   the heading and update both.
 

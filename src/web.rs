@@ -4836,17 +4836,21 @@ fn deputies_enabled(repo: &std::path::Path, q: &Question) -> bool {
 /// agent's own `magi ask`), `"deputy"` (the follow-up seat `magi serve` runs
 /// for a conductor question), `"daemon"` (`magi serve` resuming the asking
 /// seat's session), or `"nobody"` - the asker is gone and nothing has picked it
-/// up, or the question never had anyone listening (a conductor question from
-/// before deputies).
+/// up, or the question never had anyone listening (a conductor question or a
+/// merge approval from before deputies, or not yet given one).
 ///
 /// `None` for a question that is settled, and for one that is not an agent's
-/// to wait on at all (land's approval gate, a release notice).
+/// to wait on at all (a release notice).
 fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
     if !q.status.open() {
         return None;
     }
     if q.cwd.is_none() && q.deputy.is_none() {
-        return (q.node == crate::conduct::NODE).then_some("nobody");
+        return matches!(
+            q.node.as_str(),
+            crate::conduct::NODE | crate::land::APPROVAL_NODE
+        )
+        .then_some("nobody");
     }
     Some(match lease.filter(|l| l.fresh(jiff::Timestamp::now())) {
         Some(_) if q.deputy.is_some() => "deputy",
@@ -6255,6 +6259,27 @@ mod tests {
         let deputy = beat(ask::WaiterKind::Deputy, 1);
         assert_eq!(holder_of(&c, Some(&deputy)), Some("deputy"));
         assert_eq!(holder_of(&c, Some(&stale)), Some("nobody"));
+
+        // A merge approval is the same: nobody until a deputy is attached
+        // and alive, never a silent "no holder".
+        let mut m = Question::new(
+            "run".to_owned(),
+            crate::land::APPROVAL_NODE.to_owned(),
+            "land".to_owned(),
+            "merge?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        assert_eq!(holder_of(&m, None), Some("nobody"));
+        assert_eq!(
+            holder_of(&m, Some(&fresh)),
+            Some("nobody"),
+            "a lease with no deputy is not a listener"
+        );
+        m.deputy = Some(ask::Deputy::new("brief".to_owned()));
+        assert_eq!(holder_of(&m, Some(&deputy)), Some("deputy"));
+        assert_eq!(holder_of(&m, Some(&stale)), Some("nobody"));
+        assert_eq!(holder_of(&m, None), Some("nobody"));
     }
 
     #[test]

@@ -1406,6 +1406,8 @@ pub struct DeputyPrompt<'a> {
     pub resumed: bool,
     /// The short first turn that only lets the seat be saved: no waiting yet.
     pub handover: bool,
+    /// Is this the merge approval rather than a conductor question?
+    pub land: bool,
     /// Language the owner reads.
     pub language: &'a str,
 }
@@ -1422,6 +1424,7 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
         unread,
         resumed,
         handover,
+        land,
         language,
     } = *p;
     let mut s = format!(
@@ -1431,6 +1434,16 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
          question ({id}) and nothing else: you do not edit files, merge, or \
          touch the queue.\n\n"
     );
+    if land {
+        s.push_str(
+            "This question is the owner's approval to merge a pull request, which \
+             cannot be undone. You never merge, close or change anything - not with \
+             `gh`, not with git. A say is never a decision: settle `merge` only when \
+             the owner wrote the single word `merge`; for anything else - a \
+             question, a condition, \"merge but not X\", \"don't merge\" - answer \
+             with `magi ask --thread` and ask what they want. Silence is a hold.\n\n",
+        );
+    }
     if resumed {
         s.push_str(
             "You are resuming your own earlier conversation; what follows is \
@@ -1448,7 +1461,12 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
         }
     }
     s.push_str(&format!(
-        "\n## What the conductor knew\n\n{}\n",
+        "\n## {}\n\n{}\n",
+        if land {
+            "What magi knew when it asked"
+        } else {
+            "What the conductor knew"
+        },
         brief.trim()
     ));
     if !thread.is_empty() {

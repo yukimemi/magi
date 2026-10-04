@@ -1,5 +1,6 @@
 //! Deputies: the seat that waits on a conductor's question, so the conductor
-//! never has to.
+//! never has to - and on land's merge approval, whose free-text reply used to
+//! reach nobody either.
 //!
 //! [`crate::conduct`] files a question for the operator and moves on; it is
 //! non-blocking by construction, because one task's question must not park the
@@ -35,6 +36,11 @@
 //!   machine hold (`daemon::resolve_blockers`).
 //! - **Never a second agent on one question.** A fresh lease or the claim file
 //!   means somebody is already on it.
+//! - **A merge approval is served too, but stays land's.** Its deputy has no
+//!   `cwd` (so the waiter never touches it), its deadline is `asked_at +
+//!   answer_timeout` and never moves on a reply ([`deadline`]), and the only
+//!   thing that retires it is `daemon::land_resume_state`. A say alone never
+//!   merges: `--settle` accepts `merge` only for the owner's own word `merge`.
 //! - **No new authority.** A deputy does not edit, merge or touch the queue,
 //!   and `--settle` accepts only an offered label backed by a verbatim quote
 //!   of the owner, never on a task the operator holds.
@@ -121,6 +127,44 @@ pub fn brief(
     s
 }
 
+/// What a deputy serves: the question kinds it is attached to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A conductor's question ([`crate::conduct::NODE`]).
+    Conduct,
+    /// The merge approval ([`crate::land::APPROVAL_NODE`]).
+    Land,
+}
+
+/// The kind of question a deputy serves for `q`, `None` for every other.
+pub fn kind_of(q: &Question) -> Option<Kind> {
+    match q.node.as_str() {
+        crate::conduct::NODE => Some(Kind::Conduct),
+        crate::land::APPROVAL_NODE => Some(Kind::Land),
+        _ => None,
+    }
+}
+
+/// Second after which nobody is to be started or kept on `q`.
+///
+/// A conductor question runs from its last activity (`magi ask --thread`
+/// re-arms it, and the waiter retires it). A merge approval never moves: it
+/// runs from `asked_at`, exactly where `daemon::land_resume_state` abandons it,
+/// so a conversation cannot stretch the hold and land stays the only place that
+/// retires one.
+pub fn deadline(q: &Question, default_timeout: u64) -> i64 {
+    let secs = if q.answer_timeout > 0 {
+        q.answer_timeout
+    } else {
+        default_timeout
+    };
+    let from = match kind_of(q) {
+        Some(Kind::Land) => q.asked_at.as_second(),
+        _ => q.last_activity(),
+    };
+    from.saturating_add(secs as i64)
+}
+
 /// Can `magi serve` start a deputy at all under `cfg`? Not when deputies are
 /// switched off (`daemon.max_deputies = 0`) or the config could not be read.
 ///
@@ -152,16 +196,11 @@ pub fn exhausted_past_deadline(
     default_timeout: u64,
     now: Timestamp,
 ) -> bool {
-    let secs = if q.answer_timeout > 0 {
-        q.answer_timeout
-    } else {
-        default_timeout
-    };
     q.status.open()
         && q.deputy
             .as_ref()
             .is_some_and(|d| d.starts >= MAX_STARTS || !startable)
-        && now.as_second() > q.last_activity().saturating_add(secs as i64)
+        && now.as_second() > deadline(q, default_timeout)
 }
 
 /// The deputy runner: its own task inside `magi serve`, beside the waiter.
@@ -221,25 +260,40 @@ impl Deputies {
         }
     }
 
-    /// Give a conductor question the record a deputy needs: the deputy itself
-    /// (with a brief rebuilt from what the question stored, when it was filed
-    /// before deputies existed - a lost reason is not invented), the working
-    /// directory and the deadline the waiter and `magi ask --wait` enforce.
-    fn attach(&self, q: &Question) -> Option<Question> {
+    /// Give a question the record a deputy needs: the deputy itself (with a
+    /// brief rebuilt from what the question stored, when it was filed before
+    /// deputies existed - a lost reason is not invented) and the deadline.
+    ///
+    /// A conductor question also gets the working directory the waiter and
+    /// `magi ask --wait` use. A merge approval never gets one: `cwd` is what
+    /// makes a question the waiter's, and land's approval is not.
+    fn attach(&self, q: &Question, kind: Kind) -> Option<Question> {
         let default_timeout = self.default_timeout();
         let repo = self.fallback_repo.to_string_lossy().into_owned();
+        let state = match kind {
+            Kind::Land => crate::run::RunState::load(&q.run).ok(),
+            Kind::Conduct => None,
+        };
+        // The deadline land itself enforces for this run.
+        let timeout = state
+            .as_ref()
+            .map_or(default_timeout, |s| s.config.graph.answer_timeout);
         self.store
             .update(&q.id, |r| {
                 if r.deputy.is_none() {
-                    r.deputy = Some(Deputy::new(brief(
-                        &r.run, &r.detail, &r.choices, &r.actions,
-                    )));
+                    r.deputy = Some(Deputy::new(match kind {
+                        Kind::Conduct => brief(&r.run, &r.detail, &r.choices, &r.actions),
+                        Kind::Land => crate::land::deputy_brief(r, state.as_ref()),
+                    }));
                 }
-                if r.cwd.is_none() {
+                if kind == Kind::Conduct && r.cwd.is_none() {
                     r.cwd = Some(repo.clone());
                 }
                 if r.answer_timeout == 0 {
-                    r.answer_timeout = default_timeout;
+                    r.answer_timeout = match kind {
+                        Kind::Conduct => default_timeout,
+                        Kind::Land => timeout,
+                    };
                 }
                 Ok(())
             })
@@ -256,11 +310,15 @@ impl Deputies {
             if (self.halt)() {
                 return;
             }
-            if !q.status.open() || q.node != crate::conduct::NODE {
+            let Some(kind) = kind_of(&q) else {
+                continue;
+            };
+            if !q.status.open() {
                 continue;
             }
-            let q = if q.deputy.is_none() || q.cwd.is_none() || q.answer_timeout == 0 {
-                match self.attach(&q) {
+            let needs_cwd = kind == Kind::Conduct && q.cwd.is_none();
+            let q = if q.deputy.is_none() || needs_cwd || q.answer_timeout == 0 {
+                match self.attach(&q, kind) {
                     Some(q) => q,
                     None => continue,
                 }
@@ -281,8 +339,9 @@ impl Deputies {
             }
             // Past the deadline the waiter retires the question; a say that
             // arrived in time is still read first.
-            let deadline = q.last_activity().saturating_add(q.answer_timeout as i64);
-            if now.as_second() > deadline && q.unread_from_owner().is_none() {
+            if now.as_second() > deadline(&q, self.default_timeout())
+                && q.unread_from_owner().is_none()
+            {
                 continue;
             }
             if self.inflight.len() >= self.max || !can_start(self.cfg.as_ref(), dep.agent.as_str())
@@ -482,6 +541,7 @@ impl Job {
             unread: unread.as_deref(),
             resumed,
             handover: false,
+            land: kind_of(&q) == Some(Kind::Land),
             language: &cfg.graph.language,
         });
 
@@ -510,8 +570,7 @@ impl Job {
             if resumed { "resuming" } else { "starting" }
         );
 
-        let left = (q.last_activity().saturating_add(q.answer_timeout as i64) - now.as_second())
-            .max(0) as u64;
+        let left = (deadline(&q, cfg.graph.answer_timeout) - now.as_second()).max(0) as u64;
         let artifacts = self.store.root().join(format!("{}.deputy", q.id));
         let cache_dir = cfg.cache_dir();
         // `magi ask` writes the question record and its lock, which a read-only
@@ -558,6 +617,7 @@ impl Job {
                 unread: None,
                 resumed: false,
                 handover: true,
+                land: kind_of(&q) == Some(Kind::Land),
                 language: &cfg.graph.language,
             });
             let hstem = format!("handover-{starts}");
@@ -586,11 +646,7 @@ impl Job {
         let left = if early.is_none() && !resumed && cfg.graph.sessions {
             let now = Timestamp::now();
             let again = self.store.get(&q.id)?;
-            let left = (again
-                .last_activity()
-                .saturating_add(again.answer_timeout as i64)
-                - now.as_second())
-            .max(0) as u64;
+            let left = (deadline(&again, cfg.graph.answer_timeout) - now.as_second()).max(0) as u64;
             if !again.status.open() || (left == 0 && again.unread_from_owner().is_none()) {
                 self.park_quietly(&q.id);
                 return Ok(());
