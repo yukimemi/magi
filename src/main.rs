@@ -3097,7 +3097,7 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
                 "  chat         {}",
                 match magi::agent::pick(
                     &cfg.agents,
-                    cfg.roles.chatter.as_deref(),
+                    magi::config::primary(cfg.roles.chatter.as_ref()),
                     &magi::agent::installed,
                 ) {
                     Ok(s) => s.display(),
@@ -3110,7 +3110,7 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
                 "  conduct      {}",
                 match magi::agent::pick(
                     &cfg.agents,
-                    cfg.roles.conductor.as_deref(),
+                    magi::config::primary(cfg.roles.conductor.as_ref()),
                     &magi::agent::installed,
                 ) {
                     Ok(s) => s.display(),

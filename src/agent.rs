@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::Command;
 
-use crate::config::{AgentKind, AgentSpec, Delivery};
+use crate::config::{AgentChoice, AgentKind, AgentSpec, Delivery};
 use crate::proc::Quiet as _;
 use crate::rng::SplitMix64;
 
@@ -1339,6 +1339,56 @@ pub fn pick(
         })
 }
 
+/// Resolve a standalone seat's agent choice into the ordered chain to try.
+///
+/// Unset (or empty) is [`pick`]'s default order, one entry. Otherwise each
+/// named id is kept at its first appearance only - that is what bounds a
+/// chain to one attempt per agent - and an id that is not in the roster or
+/// not installed is skipped with a warning rather than failing the chain.
+/// Errors, naming `role`, only when nothing resolves.
+pub fn pick_chain(
+    agents: &[AgentSpec],
+    choice: Option<&AgentChoice>,
+    available: &dyn Fn(&AgentSpec) -> bool,
+    role: &str,
+) -> Result<Vec<AgentSpec>> {
+    let wanted = choice.map(AgentChoice::ids).unwrap_or_default();
+    if wanted.is_empty() {
+        return pick(agents, None, available)
+            .map(|s| vec![s])
+            .with_context(|| format!("choose an agent for the {role} role"));
+    }
+    let mut chain: Vec<AgentSpec> = Vec::new();
+    for id in wanted {
+        if chain.iter().any(|s| s.id == id) {
+            continue;
+        }
+        match pick(agents, Some(id), available) {
+            Ok(spec) => chain.push(spec),
+            Err(e) => tracing::warn!("[roles] {role}: skipping `{id}`: {e:#}"),
+        }
+    }
+    if chain.is_empty() {
+        bail!(
+            "[roles] {role} names no agent that can run here; the roster has {}",
+            ids(agents)
+        );
+    }
+    Ok(chain)
+}
+
+/// Should a chain move on to its next agent after this call?
+///
+/// The one place that decides it: an error, a quota hit (judged apart from
+/// `usable`, since a CLI can exit 0 with a quota message), or an unusable
+/// answer such as a timeout or empty reply.
+pub fn chain_advances(outcome: &Result<AgentOutput>) -> bool {
+    match outcome {
+        Err(_) => true,
+        Ok(out) => out.quota_exhausted() || !out.usable(),
+    }
+}
+
 fn ids(agents: &[AgentSpec]) -> String {
     if agents.is_empty() {
         return "no agents at all".to_owned();
@@ -2585,5 +2635,91 @@ mod tests {
             .to_string();
         assert!(msg.contains("opencode"), "{msg}");
         assert!(msg.contains("--agent"), "{msg}");
+    }
+
+    fn named(id: &str) -> AgentSpec {
+        AgentSpec {
+            id: id.to_owned(),
+            ..spec(AgentKind::Command, None)
+        }
+    }
+
+    fn output(text: &str, exit: i32, quota: bool) -> AgentOutput {
+        AgentOutput {
+            text: text.to_owned(),
+            exit_code: Some(exit),
+            timed_out: false,
+            duration_ms: 0,
+            artifacts: Vec::new(),
+            quota: quota.then_some(Quota { reset: None }),
+            dropped: None,
+            commands: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_chain_keeps_the_written_order_and_a_string_is_a_chain_of_one() {
+        let agents = [named("a"), named("b"), named("c")];
+        let all = |_: &AgentSpec| true;
+        let chain = AgentChoice::Chain(vec!["c".into(), "a".into()]);
+        let got = pick_chain(&agents, Some(&chain), &all, "synthesizer").unwrap();
+        assert_eq!(
+            got.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["c", "a"]
+        );
+
+        let one = AgentChoice::from("b");
+        let got = pick_chain(&agents, Some(&one), &all, "synthesizer").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "b");
+
+        let got = pick_chain(&agents, None, &all, "synthesizer").unwrap();
+        assert_eq!(got.len(), 1, "unset keeps pick's default");
+        assert_eq!(got[0].id, "a");
+        let empty = AgentChoice::Chain(Vec::new());
+        assert_eq!(
+            pick_chain(&agents, Some(&empty), &all, "x").unwrap()[0].id,
+            "a"
+        );
+    }
+
+    #[test]
+    fn a_chain_skips_unknown_and_uninstalled_ids_and_tries_each_once() {
+        let agents = [named("a"), named("b")];
+        let not_a = |s: &AgentSpec| s.id != "a";
+        let chain = AgentChoice::Chain(
+            ["a", "ghost", "b", "b"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        );
+        let got = pick_chain(&agents, Some(&chain), &not_a, "chatter").unwrap();
+        assert_eq!(got.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["b"]);
+
+        let dup = AgentChoice::Chain(vec!["b".into(), "a".into(), "b".into()]);
+        let got = pick_chain(&agents, Some(&dup), &|_| true, "chatter").unwrap();
+        assert_eq!(
+            got.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+    }
+
+    #[test]
+    fn a_chain_with_nothing_runnable_names_the_role() {
+        let agents = [named("a")];
+        let chain = AgentChoice::Chain(vec!["a".into(), "ghost".into()]);
+        let err = pick_chain(&agents, Some(&chain), &|_| false, "conductor")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("conductor"), "{err}");
+    }
+
+    #[test]
+    fn a_chain_advances_on_error_quota_or_an_unusable_answer_only() {
+        assert!(chain_advances(&Err(anyhow::anyhow!("spawn failed"))));
+        assert!(chain_advances(&Ok(output("limit", 0, true))));
+        assert!(chain_advances(&Ok(output("", 0, false))));
+        assert!(chain_advances(&Ok(output("x", 1, false))));
+        assert!(!chain_advances(&Ok(output("answer", 0, false))));
     }
 }

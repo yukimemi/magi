@@ -178,6 +178,12 @@ pub struct Talk {
     /// Attachments paired with [`Self::pending`].
     #[serde(default)]
     pub pending_attachments: Vec<Attachment>,
+    /// May a failed turn fall back through the rest of `[roles] chatter`?
+    /// True only while the agent was chosen by that chain; an explicit
+    /// `--agent` or an operator's switch pins the conversation to its agent
+    /// even when that agent also appears in the chain.
+    #[serde(default)]
+    pub fallback: bool,
     /// When the conversation was opened.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -480,8 +486,18 @@ pub fn begin(store: &Talks, cfg: &Config, repo: PathBuf, agent: Option<&str>) ->
     // Absolute: a relative path means the wrong repository once anything
     // other than this process reads it back.
     let repo = repo.canonicalize().unwrap_or(repo);
-    let want = agent.or(cfg.roles.chatter.as_deref());
-    let spec = agent::pick(&cfg.agents, want, &agent::installed)?;
+    // An explicit agent is a chain of one; otherwise the first id of
+    // `[roles] chatter` that can run here (later ones are `turn`'s fallbacks).
+    let spec = match agent {
+        Some(id) => agent::pick(&cfg.agents, Some(id), &agent::installed)?,
+        None => agent::pick_chain(
+            &cfg.agents,
+            cfg.roles.chatter.as_ref(),
+            &agent::installed,
+            "chatter",
+        )?
+        .remove(0),
+    };
 
     let now = Timestamp::now();
     let mut talk = Talk {
@@ -493,6 +509,7 @@ pub fn begin(store: &Talks, cfg: &Config, repo: PathBuf, agent: Option<&str>) ->
         turns: Vec::new(),
         pending: String::new(),
         pending_attachments: Vec::new(),
+        fallback: agent.is_none(),
         created_at: now,
         updated_at: now,
         seat: SeatState::new(SEAT, &spec.id, crate::rng::entropy()),
@@ -706,6 +723,8 @@ pub fn switch_agent(talk: &mut Talk, store: &Talks, spec: &AgentSpec) -> Result<
     }
     let from = std::mem::replace(&mut fresh.agent, spec.id.clone());
     fresh.seat = SeatState::new(SEAT, &spec.id, crate::rng::entropy());
+    // A deliberate switch pins the conversation to the agent chosen.
+    fresh.fallback = false;
     fresh.turns.push(Turn {
         who: Who::Agent,
         body: format!("{MAGI_NOTE}agent changed from {from} to {}", spec.id),
@@ -806,7 +825,6 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             )
         })?;
 
-    let resuming = agent::has_session(spec.kind, &talk.seat, cfg.graph.sessions);
     // The newest turn is always the operator message this call is answering
     // - `record` appended it before `turn` was ever called - so its own
     // attachments are what belong at the end of *this* prompt.
@@ -817,25 +835,6 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             .last()
             .map_or(&[][..], |t| t.attachments.as_slice()),
     );
-    let first_ever = talk.turns.len() <= 1;
-    let body = if talk.seat.turns == 0 && first_ever {
-        format!(
-            "{}\n\n# Operator\n\n{text}{last_note}",
-            briefing(&talk.repo, &cfg.graph.language, cfg.talk.allow_write)
-        )
-    } else if talk.seat.turns == 0 {
-        // A fresh seat on a conversation that already has history (the agent
-        // was switched): the briefing, then everything said so far.
-        format!(
-            "{}\n\n{}\n\n# Operator\n\n{text}{last_note}",
-            briefing(&talk.repo, &cfg.graph.language, cfg.talk.allow_write),
-            transcript(talk, store)
-        )
-    } else if resuming {
-        format!("{text}{last_note}")
-    } else {
-        format!("{}\n\n{text}{last_note}", transcript(talk, store))
-    };
 
     // Every attachment this conversation has ever held, not only this
     // turn's: a resumed session gets a fresh process every turn, so a CLI
@@ -857,27 +856,107 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // The chat's build cache is the same shared one the graph's seats get, so
     // a conversation that compiles does not mint another multi-GB target dir.
     let cache_dir = cfg.cache_dir();
-    let inv = Invocation {
-        cwd: &talk.repo,
-        prompt: &body,
-        timeout: turn_timeout(cfg),
-        // Off unless this repository's own config opts in - see
-        // `crate::config::Talk::allow_write` and this module's doc for why
-        // the default keeps a conversational edit from landing in a checkout
-        // no run or review can claim.
-        allow_write: cfg.talk.allow_write,
-        sessions: cfg.graph.sessions,
-        artifacts: &artifacts,
-        stem: &stem,
-        // The conversation's own id, so `magi task add` run from inside it is
-        // attributed to this conversation - see `Source::Agent`.
-        run: &talk.id,
-        node: "chat",
-        cache_dir: cache_dir.as_deref(),
-        attachments: &attachment_paths,
-    };
 
-    let outcome = agent::invoke(spec, &mut talk.seat, &inv).await;
+    // The agent holding the conversation, then - only when it came from
+    // `[roles] chatter` - the rest of that chain, each at most once.
+    let mut chain = vec![spec.clone()];
+    if let Some(choice) = cfg.roles.chatter.as_ref()
+        && talk.fallback
+    {
+        for id in choice.ids() {
+            if id == talk.agent || chain.iter().any(|s| s.id == id) {
+                continue;
+            }
+            match agent::pick(&cfg.agents, Some(id), &agent::installed) {
+                Ok(s) => chain.push(s),
+                Err(e) => tracing::warn!("[roles] chatter: skipping `{id}`: {e:#}"),
+            }
+        }
+    }
+
+    let mut outcome = None;
+    let mut fell_back_from: Option<String> = None;
+    // What the conversation looked like after the first agent's failed try,
+    // so an exhausted chain leaves exactly what a single failed seat would.
+    let mut first_try: Option<(String, SeatState)> = None;
+    for (n, spec) in chain.iter().enumerate() {
+        if n > 0 {
+            if first_try.is_none() {
+                first_try = Some((talk.agent.clone(), talk.seat.clone()));
+            }
+            tracing::warn!("chat: falling back from `{}` to `{}`", talk.agent, spec.id);
+            // A new CLI has none of the old one's conversation: a fresh seat
+            // puts `has_session` at false and the full transcript is re-sent.
+            fell_back_from.get_or_insert_with(|| talk.agent.clone());
+            talk.agent = spec.id.clone();
+            talk.seat = SeatState::new(SEAT, &spec.id, crate::rng::entropy());
+        }
+        let resuming = agent::has_session(spec.kind, &talk.seat, cfg.graph.sessions);
+        let first_ever = talk.turns.len() <= 1;
+        let body = if talk.seat.turns == 0 && first_ever {
+            format!(
+                "{}\n\n# Operator\n\n{text}{last_note}",
+                briefing(&talk.repo, &cfg.graph.language, cfg.talk.allow_write)
+            )
+        } else if talk.seat.turns == 0 {
+            // A fresh seat on a conversation that already has history (the
+            // agent was switched): the briefing, then everything said so far.
+            format!(
+                "{}\n\n{}\n\n# Operator\n\n{text}{last_note}",
+                briefing(&talk.repo, &cfg.graph.language, cfg.talk.allow_write),
+                transcript(talk, store)
+            )
+        } else if resuming {
+            format!("{text}{last_note}")
+        } else {
+            format!("{}\n\n{text}{last_note}", transcript(talk, store))
+        };
+        let attempt_stem = if n == 0 {
+            stem.clone()
+        } else {
+            format!("{stem}-{}", spec.id)
+        };
+        let inv = Invocation {
+            cwd: &talk.repo,
+            prompt: &body,
+            timeout: turn_timeout(cfg),
+            // Off unless this repository's own config opts in - see
+            // `crate::config::Talk::allow_write` and this module's doc for why
+            // the default keeps a conversational edit from landing in a checkout
+            // no run or review can claim.
+            allow_write: cfg.talk.allow_write,
+            sessions: cfg.graph.sessions,
+            artifacts: &artifacts,
+            stem: &attempt_stem,
+            // The conversation's own id, so `magi task add` run from inside it is
+            // attributed to this conversation - see `Source::Agent`.
+            run: &talk.id,
+            node: "chat",
+            cache_dir: cache_dir.as_deref(),
+            attachments: &attachment_paths,
+        };
+        let result = agent::invoke(spec, &mut talk.seat, &inv).await;
+        let advance = agent::chain_advances(&result);
+        if n == 0 || !advance {
+            outcome = Some(result);
+        } else {
+            // A later failure is only logged; the note describes the first.
+            tracing::warn!("chat: fallback agent `{}` also failed", spec.id);
+        }
+        if !advance {
+            break;
+        }
+    }
+    if outcome.as_ref().is_some_and(agent::chain_advances) {
+        // Exhausted: back to the agent the conversation had, so the note
+        // below names it and the next turn starts from it again.
+        if let Some((id, seat)) = first_try {
+            talk.agent = id;
+            talk.seat = seat;
+            fell_back_from = None;
+        }
+    }
+    let outcome = outcome.expect("a chain holds at least one agent");
     let note = |why: String| Turn {
         who: Who::Agent,
         body: format!("{MAGI_NOTE}{why}"),
@@ -956,6 +1035,14 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // would overwrite the durable draft when the reply is appended below.
     talk.pending = fresh.pending;
     talk.pending_attachments = fresh.pending_attachments;
+    if let Some(from) = fell_back_from.filter(|_| failure.is_none()) {
+        // The switch persists: quota coming back does not move the chat
+        // home, an operator's switch does.
+        talk.turns.push(note(format!(
+            "agent changed from {from} to {} (fallback)",
+            talk.agent
+        )));
+    }
     talk.turns.push(reply);
     if let Err(put_err) = store.put(talk) {
         // `Talks::put` already retried the write itself - reaching here
@@ -1317,7 +1404,7 @@ fn new_attachment_id() -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::config::{AgentKind, AgentSpec, Graph};
+    use crate::config::{AgentChoice, AgentKind, AgentSpec, Graph};
     use crate::queue::{Queue, Source, Task};
 
     use super::*;
@@ -1383,6 +1470,7 @@ mod tests {
             turns: Vec::new(),
             pending: String::new(),
             pending_attachments: Vec::new(),
+            fallback: false,
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, "sonnet", 7),
@@ -1450,7 +1538,7 @@ mod tests {
             },
             ..Config::default()
         };
-        cfg.roles.chatter = Some(chatter_spec.id.clone());
+        cfg.roles.chatter = Some(chatter_spec.id.as_str().into());
 
         let talk =
             begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin with chatter set");
@@ -1594,6 +1682,124 @@ mod tests {
         let saved = talks.get(&id).expect("reload");
         assert_eq!(saved.pending, "next");
         assert_eq!(saved.turns.len(), 2, "operator message and reply remain");
+    }
+
+    /// A mock whose script counts its own calls in `<dir>/<id>.calls` before
+    /// running `body`.
+    fn counting_agent(dir: &Path, id: &str, body: &str) -> AgentSpec {
+        let calls = dir.join(format!("{id}.calls"));
+        let script = format!(
+            "#!/bin/sh\necho x >> '{}'\n{body}\n",
+            calls.to_string_lossy()
+        );
+        let path = dir.join(format!("mock-{id}.sh"));
+        std::fs::write(&path, script).expect("write mock");
+        AgentSpec {
+            id: id.to_owned(),
+            kind: AgentKind::Command,
+            model: None,
+            command: vec!["sh".to_owned(), path.to_string_lossy().into_owned()],
+            extra_args: Vec::new(),
+            env: BTreeMap::new(),
+            prompt_delivery: None,
+        }
+    }
+
+    fn calls(dir: &Path, id: &str) -> usize {
+        std::fs::read_to_string(dir.join(format!("{id}.calls"))).map_or(0, |s| s.lines().count())
+    }
+
+    fn chain_config(specs: Vec<AgentSpec>, ids: &[&str]) -> Config {
+        let mut cfg = config(specs[0].clone());
+        cfg.agents = specs;
+        cfg.roles.chatter = Some(AgentChoice::Chain(
+            ids.iter().map(|s| (*s).to_owned()).collect(),
+        ));
+        cfg
+    }
+
+    #[tokio::test]
+    async fn a_chatter_chain_falls_back_resends_the_transcript_and_sticks() {
+        let (tmp, talks) = store();
+        let a = counting_agent(tmp.path(), "a", "cat >/dev/null\nexit 3");
+        let b = counting_agent(tmp.path(), "b", "cat");
+        let cfg = chain_config(vec![a, b], &["a", "b"]);
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        assert_eq!(talk.agent, "a");
+
+        say(&mut talk, &talks, &cfg, "hello there", Vec::new())
+            .await
+            .expect("turn");
+        assert_eq!(calls(tmp.path(), "a"), 1, "each id is tried once");
+        assert_eq!(calls(tmp.path(), "b"), 1);
+        assert_eq!(talk.agent, "b", "the switch persists");
+        assert!(talks.get(&talk.id).unwrap().agent == "b");
+        let reply = talk.turns.last().unwrap();
+        assert!(reply.body.contains("hello there"));
+        assert!(
+            reply.body.contains("magi task add --solo"),
+            "a fresh seat gets the full briefing"
+        );
+        assert!(
+            talk.turns
+                .iter()
+                .any(|t| t.body.contains("agent changed from a to b")),
+            "the switch is noted"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_chatter_chain_fails_like_a_single_seat_and_stays_put() {
+        let (tmp, talks) = store();
+        let a = counting_agent(tmp.path(), "a", "cat >/dev/null\nexit 3");
+        let b = counting_agent(tmp.path(), "b", "cat >/dev/null\nexit 4");
+        let cfg = chain_config(vec![a, b], &["a", "b", "a"]);
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+
+        let err = say(&mut talk, &talks, &cfg, "hi", Vec::new())
+            .await
+            .expect_err("every agent failed");
+        assert!(err.to_string().contains("`a`"), "{err:#}");
+        assert_eq!(calls(tmp.path(), "a"), 1);
+        assert_eq!(calls(tmp.path(), "b"), 1);
+        assert_eq!(talk.agent, "a", "an exhausted chain leaves the agent alone");
+    }
+
+    #[test]
+    fn a_chatter_chain_skips_an_unknown_id_at_begin() {
+        let (tmp, talks) = store();
+        let b = counting_agent(tmp.path(), "b", "cat");
+        let cfg = chain_config(vec![b], &["ghost", "b"]);
+        let talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        assert_eq!(talk.agent, "b");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_agent_inside_the_chatter_chain_stays_pinned() {
+        let (tmp, talks) = store();
+        let a = counting_agent(tmp.path(), "a", "cat >/dev/null\nexit 3");
+        let b = counting_agent(tmp.path(), "b", "cat");
+        let cfg = chain_config(vec![a, b], &["a", "b"]);
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), Some("a")).expect("begin");
+        say(&mut talk, &talks, &cfg, "hi", Vec::new())
+            .await
+            .expect_err("a alone, and it fails");
+        assert_eq!(calls(tmp.path(), "b"), 0);
+        assert_eq!(talk.agent, "a");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_agent_does_not_borrow_the_chatter_chain() {
+        let (tmp, talks) = store();
+        let a = counting_agent(tmp.path(), "a", "cat >/dev/null\nexit 3");
+        let b = counting_agent(tmp.path(), "b", "cat");
+        let c = counting_agent(tmp.path(), "c", "cat >/dev/null\nexit 3");
+        let cfg = chain_config(vec![a, b, c], &["a", "b"]);
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), Some("c")).expect("begin");
+        say(&mut talk, &talks, &cfg, "hi", Vec::new())
+            .await
+            .expect_err("c alone, and it fails");
+        assert_eq!(calls(tmp.path(), "b"), 0);
     }
 
     #[tokio::test]
@@ -2272,6 +2478,7 @@ mod tests {
                 turns: Vec::new(),
                 pending: String::new(),
                 pending_attachments: Vec::new(),
+                fallback: false,
                 created_at: Timestamp::now(),
                 updated_at: Timestamp::now(),
                 seat: SeatState::new(SEAT, "mock", 7),

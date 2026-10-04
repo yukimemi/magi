@@ -42,7 +42,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
 use crate::agent::{self, Invocation, SeatState};
@@ -828,15 +828,19 @@ impl Conductor {
             return Ok(());
         }
 
-        let spec = cfg
+        let primary = cfg
             .resolve_roles()
             .context("resolving the conductor seat")?
             .conductor;
-        let needs_new_seat = !matches!(&self.seat, Some(s) if s.agent == spec.id);
-        if needs_new_seat {
-            self.seat = Some(SeatState::new(SEAT, &spec.id, crate::rng::entropy()));
-        }
-        let seat = self.seat.as_mut().expect("just ensured a seat exists");
+        // A string keeps today's resolution exactly (no CLI preflight here;
+        // an unavailable CLI fails at invocation). Only a multi-id array
+        // builds a chain, whose members are each tried at most once.
+        let chain = match cfg.roles.conductor.as_ref() {
+            Some(c) if c.ids().len() > 1 => {
+                agent::pick_chain(&cfg.agents, Some(c), &agent::installed, "conductor")?
+            }
+            _ => vec![primary],
+        };
 
         let runnable_views: Vec<prompt::ConductTask> =
             queued.iter().map(|t| view(t, max_attempts)).collect();
@@ -858,48 +862,73 @@ impl Conductor {
         );
 
         let artifacts = home.join("conduct").join("artifacts");
-        let stem = format!("turn-{}", seat.turns + 1);
         // Bound to a local: `Invocation` only borrows the cache path, and the
         // `Option<PathBuf>` `cache_dir()` returns has to outlive that borrow.
         let cache_dir = cfg.cache_dir();
-        let inv = Invocation {
-            cwd: repo,
-            prompt: &body,
-            timeout: TURN_TIMEOUT,
-            // The conductor never edits anything - it only decides what
-            // blocks a task and what to do about one stuck or finished.
-            allow_write: false,
-            sessions: cfg.graph.sessions,
-            artifacts: &artifacts,
-            stem: &stem,
-            run: NODE,
-            node: NODE,
-            cache_dir: cache_dir.as_deref(),
-            attachments: &[],
-        };
 
+        // One marker for the whole chain: a fallback is still this turn.
         let busy = Busy::mark(home);
-        let out = agent::invoke(&spec, seat, &inv).await;
-        drop(busy);
-        // Kept after every turn, failed or not: the CLI-side conversation is
-        // what a resumed question needs, and it exists once the turn ran.
-        if let Ok(body) = serde_json::to_string(&*seat) {
-            let path = seat_path(home);
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
+        let mut result: Result<Verdict> = Err(anyhow::anyhow!("no conductor agent ran"));
+        for spec in &chain {
+            // The prompt carries the whole queue state every cycle, so a
+            // fallback agent needs no history - but its seat is its own.
+            let needs_new_seat = !matches!(&self.seat, Some(s) if s.agent == spec.id);
+            if needs_new_seat {
+                self.seat = Some(SeatState::new(SEAT, &spec.id, crate::rng::entropy()));
             }
-            let _ = std::fs::write(path, body);
+            let seat = self.seat.as_mut().expect("just ensured a seat exists");
+            // The first agent keeps the plain stem; a fallback's own artifacts
+            // must not overwrite it.
+            let stem = if std::ptr::eq(spec, &chain[0]) {
+                format!("turn-{}", seat.turns + 1)
+            } else {
+                format!("turn-{}-{}", seat.turns + 1, spec.id)
+            };
+            let inv = Invocation {
+                cwd: repo,
+                prompt: &body,
+                timeout: TURN_TIMEOUT,
+                // The conductor never edits anything - it only decides what
+                // blocks a task and what to do about one stuck or finished.
+                allow_write: false,
+                sessions: cfg.graph.sessions,
+                artifacts: &artifacts,
+                stem: &stem,
+                run: NODE,
+                node: NODE,
+                cache_dir: cache_dir.as_deref(),
+                attachments: &[],
+            };
+            let out = agent::invoke(spec, seat, &inv).await;
+            // Kept after every turn, failed or not: the CLI-side conversation is
+            // what a resumed question needs, and it exists once the turn ran.
+            if let Ok(body) = serde_json::to_string(&*seat) {
+                let path = seat_path(home);
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(path, body);
+            }
+            let advance = agent::chain_advances(&out);
+            result = match out {
+                Err(e) => Err(e.context("invoking the conductor")),
+                Ok(out) if advance => Err(anyhow::anyhow!(
+                    "no usable reply (exit {:?}, timed out {})",
+                    out.exit_code,
+                    out.timed_out
+                )),
+                Ok(out) => verdict::extract_json(&out.text)
+                    .context("the conductor's reply could not be parsed"),
+            };
+            if result.is_ok() {
+                break;
+            }
+            if chain.len() > 1 {
+                tracing::warn!("conductor: `{}` failed, trying the next agent", spec.id);
+            }
         }
-        let out = out.context("invoking the conductor")?;
-        if !out.usable() {
-            bail!(
-                "no usable reply (exit {:?}, timed out {})",
-                out.exit_code,
-                out.timed_out
-            );
-        }
-        let mut verdict: Verdict = verdict::extract_json(&out.text)
-            .context("the conductor's reply could not be parsed")?;
+        drop(busy);
+        let mut verdict = result?;
         attach_facts(cfg, repo, queue, &mut verdict).await;
         apply(queue, questions, &verdict)
     }
@@ -2148,6 +2177,78 @@ mod tests {
             .await;
 
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn a_conductor_chain_falls_to_the_next_agent_once_each() {
+        let dir = tempdir().unwrap();
+        let mut t = task("chained");
+        let reply = format!(
+            "{{\"decisions\":[{{\"id\":\"{}\",\"blocked_by\":[\"x\"],\"reason\":\"why\"}}]}}",
+            t.id
+        );
+        let counted = |id: &str, tail: &str| {
+            let calls = dir.path().join(format!("{id}.calls"));
+            let path = dir.path().join(format!("{id}.sh"));
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncat >/dev/null\necho x >> '{}'\n{tail}\n",
+                    calls.display()
+                ),
+            )
+            .unwrap();
+            AgentSpec {
+                id: id.to_owned(),
+                kind: AgentKind::Command,
+                model: None,
+                command: vec!["sh".to_owned(), path.to_string_lossy().into_owned()],
+                extra_args: Vec::new(),
+                env: BTreeMap::new(),
+                prompt_delivery: None,
+            }
+        };
+        let n_calls = |id: &str| {
+            std::fs::read_to_string(dir.path().join(format!("{id}.calls")))
+                .map_or(0, |s| s.lines().count())
+        };
+        let mut cfg = config(counted("a", "exit 3"));
+        cfg.agents = vec![
+            counted("a", "exit 3"),
+            counted("b", &format!("printf '%s' '{reply}'")),
+        ];
+        cfg.roles.conductor = Some(crate::config::AgentChoice::Chain(vec![
+            "a".into(),
+            "b".into(),
+            "a".into(),
+        ]));
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        queue.put(&mut t).unwrap();
+
+        let mut conductor = Conductor::new();
+        conductor
+            .maybe_run(
+                &cfg,
+                dir.path(),
+                &queue,
+                &questions,
+                dir.path(),
+                &[t.clone()],
+                &[],
+                &[],
+                2,
+            )
+            .await;
+
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Blocked);
+        assert_eq!(n_calls("a"), 1, "each id is tried once");
+        assert_eq!(n_calls("b"), 1);
+        let saved = std::fs::read_to_string(seat_path(dir.path())).unwrap();
+        assert!(
+            saved.contains("\"b\""),
+            "the seat on disk is the one that ran: {saved}"
+        );
     }
 
     #[tokio::test]
