@@ -10338,6 +10338,54 @@ mod tests {
         assert!(APP_JS.contains("jumpToTask(id)"));
     }
 
+    /// Wide screens get a master/detail layout built from the views a phone
+    /// drills into. These are string assertions: they pin the contract between
+    /// the three assets, not how it looks.
+    #[test]
+    fn wide_screens_show_list_and_preview_side_by_side() {
+        // One breakpoint, spelled the same in the script and the stylesheet.
+        assert!(APP_JS.contains("const SPLIT_QUERY = \"(min-width: 1080px)\";"));
+        assert!(APP_JS.contains("window.matchMedia(SPLIT_QUERY)"));
+        assert!(APP_CSS.contains("main[data-split]"));
+        assert!(APP_CSS.contains("body[data-split]"));
+
+        // The route -> panes table, and a narrow screen opting out of it.
+        assert!(APP_JS.contains("function splitPanes(route, wide) {\n  if (!wide) return null;"));
+        assert!(APP_JS.contains("case \"run\": return { list: \"runs\", detail: \"run\" };"));
+        assert!(APP_JS.contains("case \"task\": return { list: \"queue\", detail: \"task\" };"));
+        assert!(APP_JS.contains("case \"talk\": return { list: \"talks\", detail: \"talk\" };"));
+        assert!(INDEX_HTML.contains("id=\"split-empty\""));
+
+        // Selection is derived from the route, and only ever paints a row.
+        assert!(APP_JS.contains("function markSelected() {"));
+        assert!(APP_JS.contains("\"aria-current\", id && card.dataset[key] === id"));
+        assert!(APP_CSS.contains(".card[aria-current=\"true\"]"));
+        // The dense row must override the stacked card the 720px block sets up.
+        assert!(
+            APP_CSS.contains(
+                "display: flex; flex-direction: row; flex-wrap: wrap; align-items: center;"
+            )
+        );
+
+        // Independent scrolling: the page stops scrolling, each pane does.
+        assert!(APP_CSS.contains("height: 100dvh; padding-bottom: 0; overflow: hidden;"));
+        assert!(APP_CSS.contains("grid-column: 1; grid-row: 1; min-height: 0; overflow: auto;"));
+        assert!(APP_CSS.contains("grid-column: 2; grid-row: 1; min-height: 0; overflow: auto;"));
+        assert!(!APP_JS.contains("if (changed) window.scrollTo({ top: 0 });"));
+
+        // A refresh must never navigate: the loaders still check that their
+        // subject is the one on screen, and crossing the breakpoint only
+        // re-reads the hash.
+        assert!(APP_JS.contains("if (state.detail.id !== id) return;"));
+        assert!(APP_JS.contains("if (state.taskDetail.id !== id) return;"));
+        assert!(APP_JS.contains("if (state.talkDetail.id !== id) return;"));
+        assert!(APP_JS.contains("const relayout = () => applyRoute();"));
+
+        // The panel sandbox and its CSP are untouched by any of this.
+        assert!(APP_JS.contains("sandbox: \"\""));
+        assert!(!APP_JS.contains("sandbox: \"allow"));
+    }
+
     #[test]
     fn consuming_a_queue_focus_survives_clearing_a_stale_backlog_search() {
         // consumeQueueFocus() clears an active Backlog search before it can
