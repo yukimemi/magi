@@ -1076,7 +1076,15 @@ async fn dispatch(command: Command) -> Result<()> {
                 }
                 println!("config: {}", describe_layers(&from));
                 if !opts.force {
-                    refuse_duplicates(&Queue::open(), &magi::run::runs_root(), &repo, &task, None)?;
+                    refuse_duplicates(
+                        &Queue::open(),
+                        &magi::run::runs_root(),
+                        &repo,
+                        &task,
+                        None,
+                        Some(&cfg),
+                    )
+                    .await?;
                 }
                 // The same free-space gate the daemon obeys: a run that cannot
                 // finish must not start, and a held task must not spend an
@@ -1124,7 +1132,9 @@ async fn dispatch(command: Command) -> Result<()> {
                     &repo,
                     "",
                     Some(&branch),
-                )?;
+                    Some(&cfg),
+                )
+                .await?;
             }
             if let Some(n) = reviewers {
                 cfg.graph.reviewers = n;
@@ -2375,24 +2385,26 @@ fn answer_cmd(
 /// Refuse to start or file work that names a branch, commit or pull request
 /// unfinished work already owns. Runs before anything is written, so a refusal
 /// leaves no trace; `--force` skips it.
-fn refuse_duplicates(
+async fn refuse_duplicates(
     q: &Queue,
     runs: &Path,
     repo: &Path,
     text: &str,
     review_branch: Option<&str>,
+    cfg: Option<&Config>,
 ) -> Result<()> {
     let hits = magi::dupes::check(q, runs, repo, text, review_branch, None);
-    if hits.is_empty() {
-        return Ok(());
-    }
-    bail!(
-        "{}",
-        magi::dupes::Duplicate(hits).render(
-            "Nothing was filed. If it is not a duplicate, repeat the command with --force; \
-             an agent should tell the operator about this instead of forcing it."
-        )
-    )
+    magi::dupes::screen_with_config(hits, text, review_branch, repo, cfg)
+        .await
+        .map_err(|dup| {
+            anyhow::anyhow!(
+                "{}",
+                dup.render(
+                    "Nothing was filed. If it is not a duplicate, repeat the command with --force; \
+                     an agent should tell the operator about this instead of forcing it."
+                )
+            )
+        })
 }
 
 async fn task_cmd(command: TaskCmd) -> Result<()> {
@@ -2449,7 +2461,8 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                     .root()
                     .parent()
                     .map_or_else(PathBuf::new, Path::to_path_buf);
-                refuse_duplicates(&q, &home.join("runs"), &repo, &text, None)?;
+                let cfg = Config::discover(&repo, None).ok().map(|(c, _)| c);
+                refuse_duplicates(&q, &home.join("runs"), &repo, &text, None, cfg.as_ref()).await?;
             }
             let mut task = Task::new(title, text, repo, source);
             task.priority = priority;

@@ -4196,13 +4196,46 @@ async fn queue_edit(
     body: std::result::Result<Json<EditBody>, JsonRejection>,
 ) -> ApiResult<Json<TaskView>> {
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    let (queue, runs) = (ui.queue.clone(), ui.runs.clone());
+    // The judge is an agent call, so it is awaited here, outside the claim
+    // `mutate` holds: a daemon must not be kept waiting on it. What it saw is
+    // remembered, and the save refuses if the task moved underneath it.
+    let mut judged: Option<(String, PathBuf)> = None;
+    if !body.force {
+        let (queue, runs) = (ui.queue.clone(), ui.runs.clone());
+        let (id, text) = (id.clone(), body.instruction.clone());
+        let (seen, hits) = blocking(move || {
+            let id = resolve_task(&queue, &id)?;
+            let t = queue.get(&id)?;
+            if text == t.instruction {
+                return Ok((None, Vec::new()));
+            }
+            let hits = crate::dupes::check(&queue, &runs, &t.repo, &text, None, Some(&t.id));
+            Ok((Some((t.instruction, t.repo)), hits))
+        })
+        .await?;
+        if let Some((_, repo)) = &seen {
+            let cfg = crate::config::Config::discover(repo, None)
+                .ok()
+                .map(|(c, _)| c);
+            crate::dupes::screen_with_config(hits, &body.instruction, None, repo, cfg.as_ref())
+                .await
+                .map_err(|dup| {
+                    ApiError::conflict(dup.render(
+                        "Nothing was saved. If it is not a duplicate, repeat the request with \
+                         \"force\": true.",
+                    ))
+                })?;
+        }
+        judged = seen;
+    }
+    let force = body.force;
     mutate(ui, id, move |t| {
-        if !body.force && body.instruction != t.instruction {
-            let hits =
-                crate::dupes::check(&queue, &runs, &t.repo, &body.instruction, None, Some(&t.id));
-            if !hits.is_empty() {
-                return Err(crate::dupes::Duplicate(hits).into());
+        if !force && body.instruction != t.instruction {
+            match &judged {
+                Some((instruction, repo)) if *instruction == t.instruction && *repo == t.repo => {}
+                _ => {
+                    anyhow::bail!("the task changed while it was being checked; repeat the request")
+                }
             }
         }
         t.edit(body.title.clone(), body.instruction.clone())
