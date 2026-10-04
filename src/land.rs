@@ -3017,11 +3017,7 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
         title: raw.title,
         failing_urls,
         head: raw.head_ref_oid,
-        rollup_head: raw
-            .commits
-            .last()
-            .map(|c| c.oid.clone())
-            .unwrap_or_default(),
+        rollup_head,
         merge_state: raw.merge_state_status,
     })
 }
