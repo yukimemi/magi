@@ -8,7 +8,7 @@
 //!
 //! Patches and raw agent transcripts are *not* in `run.json` — they live beside
 //! it under `artifacts/`, so the state file stays small enough to read by hand.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
@@ -1787,6 +1787,11 @@ pub struct RunState {
     /// Additive, so `SCHEMA` is not bumped.
     #[serde(default)]
     pub handovers: Vec<Handover>,
+    /// Per reviewer seat, which roster agents already failed it and which one
+    /// last answered, carried across review rounds. Additive, so `SCHEMA` is
+    /// not bumped. See [`SeatHistory`].
+    #[serde(default)]
+    pub seat_history: BTreeMap<String, SeatHistory>,
     /// Stray foreign lockfiles a rescue commit left out, one entry per path.
     #[serde(default)]
     pub withheld: Vec<Withheld>,
@@ -2000,6 +2005,7 @@ impl RunState {
             leaks: Vec::new(),
             quota: Vec::new(),
             handovers: Vec::new(),
+            seat_history: BTreeMap::new(),
             withheld: Vec::new(),
             parked: false,
             released_to: None,
@@ -4279,4 +4285,37 @@ mod tests {
         s.candidates[0].folded = true;
         assert!(s.ensure_can_delete(false).is_ok());
     }
+}
+
+/// What kind of failure ended an agent's turn on a seat, for deciding whether
+/// the seat is worth handing to the next roster agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FailClass {
+    /// A CLI rate limit.
+    Quota,
+    /// The turn outlived its budget.
+    Timeout,
+    /// Any other failure, with the message's shape (`failure_signature`,
+    /// capped at 120 characters).
+    Other(String),
+}
+
+/// One reviewer seat's record across review rounds, so a round does not ask
+/// an agent that already failed the seat while another one is answering.
+///
+/// `failed` is a *priority* set, not a bound: the per-round `tried` set in
+/// `ask_json_wave` starts empty every round, so an agent that answered is
+/// never locked out. A failed id is only asked again once nothing else on the
+/// roster is left (once per round, and the rounds are `review_rounds`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatHistory {
+    /// Roster ids that failed this seat and have not answered it since.
+    #[serde(default)]
+    pub failed: BTreeSet<String>,
+    /// The agent that last answered this seat.
+    #[serde(default)]
+    pub last_ok: Option<String>,
+    /// The class of the seat's most recent failure; cleared by an answer.
+    #[serde(default)]
+    pub last_fail: Option<FailClass>,
 }

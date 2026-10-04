@@ -45,10 +45,10 @@ use crate::queue;
 use crate::refs;
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
-    DeliberationRound, DeliberationTurn, E2eStatus, FixRecord, GateFixRecord, Handover, JobRecord,
-    JobStatus, Judgement, MergeOutcome, OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest,
-    Origin, QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, Tally,
-    VoteRecord, tail, write_artifact,
+    DeliberationRound, DeliberationTurn, E2eStatus, FailClass, FixRecord, GateFixRecord, Handover,
+    JobRecord, JobStatus, Judgement, MergeOutcome, OperatorFixFinding, OperatorFixOutcome,
+    OperatorFixRequest, Origin, QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState,
+    RunStatus, SeatHistory, Tally, VoteRecord, tail, write_artifact,
 };
 use crate::verdict::{
     self, FinalVote, Finding, FixReport, Position, Proposal, Ranking, Review, ReviewRevote,
@@ -1322,6 +1322,7 @@ impl Runner {
         let mut quota_losses = Vec::new();
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
+            carry_seats: false,
             run: &run_id,
             node: "advise",
             prompts: &prompts,
@@ -1602,6 +1603,7 @@ impl Runner {
         let mut sent = jobs.clone();
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
+            carry_seats: false,
             run: &run_id,
             node: "implement",
             prompts: &prompts,
@@ -1840,6 +1842,7 @@ impl Runner {
             retry.stem = format!("{}-resume", job.stem);
             let cache = self.state.config.cache_dir();
             let ctx = WaveCtx {
+                carry_seats: false,
                 run: run_id,
                 node: "implement",
                 prompts,
@@ -2012,6 +2015,7 @@ impl Runner {
                 retry.stem = format!("{}-{}-{}", job.stem, cur.stem_word(), next.id);
                 let cache = self.state.config.cache_dir();
                 let ctx = WaveCtx {
+                    carry_seats: false,
                     run: run_id,
                     node: "implement",
                     prompts,
@@ -2098,6 +2102,7 @@ impl Runner {
             retry.stem = format!("{}-confirm", job.stem);
             let cache = self.state.config.cache_dir();
             let ctx = WaveCtx {
+                carry_seats: false,
                 run: run_id,
                 node: "implement",
                 prompts,
@@ -2209,6 +2214,7 @@ impl Runner {
             retry.stem = format!("{}-continue{attempts}", job.stem);
             let cache = self.state.config.cache_dir();
             let ctx = WaveCtx {
+                carry_seats: false,
                 run: run_id,
                 node: "fix",
                 prompts,
@@ -2457,6 +2463,7 @@ impl Runner {
         let mut quota_losses = Vec::new();
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
+            carry_seats: false,
             run: &run_id,
             node: "judge",
             prompts: &prompts,
@@ -2604,6 +2611,7 @@ impl Runner {
                 };
                 let cache = self.state.config.cache_dir();
                 let ctx = WaveCtx {
+                    carry_seats: false,
                     run: &run_id,
                     node: "deliberate",
                     prompts: &prompts,
@@ -2758,6 +2766,7 @@ impl Runner {
         let mut quota_losses = Vec::new();
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
+            carry_seats: false,
             run: &run_id,
             node: "vote",
             prompts: &prompts,
@@ -3100,6 +3109,7 @@ impl Runner {
         let retries = self.state.config.graph.retries;
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
+            carry_seats: false,
             run: &run_id,
             node: "judge",
             prompts: &prompts,
@@ -3176,6 +3186,7 @@ impl Runner {
         let vote_retries = self.state.config.graph.retries;
         let vote_cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
+            carry_seats: false,
             run: &run_id,
             node: "vote",
             prompts: &prompts,
@@ -4013,6 +4024,7 @@ impl Runner {
         };
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
+            carry_seats: false,
             run: &run_id,
             node: "fix",
             prompts: &prompts,
@@ -4355,6 +4367,13 @@ impl Runner {
                     git::worktree_add_detached(&repo, &wt, &head).await?;
                 }
                 let seat_key = format!("review-{}", r + 1);
+                // The seat starts the round on whoever answered it last, not
+                // on the agent the spec names, so a failure is not re-paid.
+                let spec = pick_start_spec(
+                    &self.roles.reviewer_roster,
+                    spec,
+                    self.state.seat_history.get(&seat_key),
+                );
                 let seat = self.seat(&seat_key, &spec.id);
                 jobs.push(SeatJob {
                     prompt: prompt::review(&prompt::ReviewCtx {
@@ -4396,6 +4415,7 @@ impl Runner {
             let review_retries = self.state.config.graph.retries;
             let review_cache = self.state.config.cache_dir();
             let ctx = WaveCtx {
+                carry_seats: true,
                 run: &run_id,
                 node: "review",
                 prompts: &prompts,
@@ -4580,6 +4600,7 @@ impl Runner {
                 let mut recon_quota_losses = Vec::new();
                 let recon_cache = self.state.config.cache_dir();
                 let recon_ctx = WaveCtx {
+                    carry_seats: false,
                     run: &run_id,
                     node: "review",
                     prompts: &prompts,
@@ -4897,6 +4918,7 @@ impl Runner {
             let before = git::rev_parse(&winner.worktree, "HEAD").await?;
             let cache = self.state.config.cache_dir();
             let ctx = WaveCtx {
+                carry_seats: false,
                 run: &run_id,
                 node: "fix",
                 prompts: &prompts,
@@ -5614,6 +5636,7 @@ impl Runner {
         let patch = git::diff(&winner.worktree, &base, "HEAD").await?;
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
+            carry_seats: false,
             run: &run_id,
             node: "gate-fix",
             prompts: &prompts,
@@ -6145,6 +6168,58 @@ fn next_untried_in_roster<'a>(
         .find(|s| !tried.contains(&s.id))
 }
 
+/// The next agent for a seat that carries its failure history across rounds
+/// (the review loop). `round_tried` is this round's own bound and starts
+/// empty every round; `carried_failed` only decides priority.
+///
+/// First: an id walking forward from `start`, never wrapping, that is neither
+/// tried this round nor failed in an earlier one. Only when that is exhausted
+/// does it rescue: the first roster id (in roster order, so this one *does*
+/// look before `start`) not yet tried this round, which is by then a carried
+/// failure. Each id is rescued at most once per round, so it cannot loop.
+fn next_for_seat<'a>(
+    roster: &'a [AgentSpec],
+    start: usize,
+    round_tried: &BTreeSet<String>,
+    carried_failed: &BTreeSet<String>,
+) -> Option<&'a AgentSpec> {
+    roster
+        .get(start + 1..)?
+        .iter()
+        .find(|s| !round_tried.contains(&s.id) && !carried_failed.contains(&s.id))
+        .or_else(|| roster.iter().find(|s| !round_tried.contains(&s.id)))
+}
+
+/// Where a reviewer seat starts a round: the agent that last answered it when
+/// it is still on the roster and not marked failed, else the spec's own agent
+/// unless it failed, else the next roster agent that has not failed, else the
+/// spec's own agent again (the whole roster failed). Ids no longer on the
+/// roster are ignored. An empty roster has no handover, so the spec stands.
+fn pick_start_spec(roster: &[AgentSpec], spec: AgentSpec, hist: Option<&SeatHistory>) -> AgentSpec {
+    let Some(h) = hist.filter(|_| !roster.is_empty()) else {
+        return spec;
+    };
+    let ok = |id: &str| !h.failed.contains(id);
+    if let Some(last) = h.last_ok.as_deref()
+        && ok(last)
+        && let Some(s) = roster.iter().find(|s| s.id == last)
+    {
+        return s.clone();
+    }
+    if ok(&spec.id) {
+        return spec;
+    }
+    let from = roster.iter().position(|s| s.id == spec.id).unwrap_or(0);
+    roster
+        .get(from + 1..)
+        .into_iter()
+        .flatten()
+        .chain(roster.iter())
+        .find(|s| ok(&s.id))
+        .cloned()
+        .unwrap_or(spec)
+}
+
 /// A fresh seat for the agent taking over `key`. Mixes the agent id into the
 /// seed so a CLI that mints its session id up front (`--session-id`) never
 /// reuses the uuid the previous agent already opened under the same seat key.
@@ -6155,16 +6230,6 @@ fn handover_seat(key: &str, agent: &str, run_seed: u64) -> SeatState {
 /// What an agent's turn timed out as, in [`AgentOutcome::Failed`]. One const
 /// so the classifier below and the code that builds the message cannot drift.
 const TIMED_OUT: &str = "timed out";
-
-/// What kind of failure ended an agent's turn on a seat, for deciding whether
-/// the seat is worth handing to the next roster agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FailClass {
-    Quota,
-    Timeout,
-    /// Any other failure, with the message's shape ([`failure_signature`]).
-    Other(String),
-}
 
 impl FailClass {
     /// `None` for an answer; otherwise how the turn failed.
@@ -6348,6 +6413,10 @@ struct WaveCtx<'a> {
     /// The review round this wave belongs to, for `"review"`/`"fix"` — see
     /// `JobRecord::round`. `None` for every other node.
     round: Option<usize>,
+    /// Carry each seat's failed-agent history across waves (the review loop
+    /// only): start-of-round priority and handover choice read
+    /// [`RunState::seat_history`], and every answer or failure writes it.
+    carry_seats: bool,
 }
 
 /// Run one job, honouring the parallelism budget.
@@ -6383,6 +6452,7 @@ async fn wave(
         prompts,
         cache,
         round,
+        carry_seats: _,
     } = *ctx;
     for job in &jobs {
         state.seat_started(node, &job.seat.key, job.timeout, attempt);
@@ -6778,7 +6848,37 @@ where
         .iter()
         .map(|s| roster.iter().position(|r| r.id == s.id).unwrap_or(0))
         .collect();
-    let mut prev: Vec<Option<FailClass>> = vec![None; n];
+    let carry = ctx.carry_seats && !roster.is_empty();
+    // Carried across rounds: ids that failed the seat earlier, and how the
+    // last failure went (so a repeat of it is not handed over again).
+    let carried: Vec<BTreeSet<String>> = originals
+        .iter()
+        .map(|j| {
+            state
+                .seat_history
+                .get(&j.seat.key)
+                .filter(|_| carry)
+                .map(|h| h.failed.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    let mut prev: Vec<Option<FailClass>> = originals
+        .iter()
+        .map(|j| {
+            state
+                .seat_history
+                .get(&j.seat.key)
+                .filter(|_| carry)
+                .and_then(|h| h.last_fail.clone())
+        })
+        .collect();
+    let next_agent = |i: usize, tried: &BTreeSet<String>| -> Option<AgentSpec> {
+        if carry {
+            next_for_seat(roster, starts[i], tried, &carried[i]).cloned()
+        } else {
+            next_untried_in_roster(roster, starts[i], tried).cloned()
+        }
+    };
     let mut fresh: Vec<Option<String>> = vec![None; n];
     let mut last_quota: Vec<Option<Option<String>>> = vec![None; n];
     let mut pending: Vec<usize> = (0..n).collect();
@@ -6856,8 +6956,24 @@ where
                 && !roster.is_empty();
             if let Some(cur) = class.clone().filter(|_| !roster.is_empty() && !nudge_first) {
                 let next = should_hand_over(prev[i].as_ref(), &cur)
-                    .then(|| next_untried_in_roster(roster, starts[i], &tried[i]).cloned())
+                    .then(|| next_agent(i, &tried[i]))
                     .flatten();
+                if carry {
+                    let h = state
+                        .seat_history
+                        .entry(originals[i].seat.key.clone())
+                        .or_default();
+                    h.failed.insert(specs[i].id.clone());
+                    h.last_fail = Some(cur.clone());
+                    if h.last_ok.as_deref() == Some(specs[i].id.as_str()) {
+                        h.last_ok = None;
+                    }
+                    // Saved before the next agent is asked, so a restart in
+                    // between does not forget who failed.
+                    if let Err(e) = state.save() {
+                        tracing::warn!("could not persist a seat's failure history: {e:#}");
+                    }
+                }
                 if let Some(next) = next {
                     record_handover(
                         state,
@@ -6881,6 +6997,18 @@ where
                     still.push(i);
                     continue;
                 }
+            }
+            if carry
+                && !nudge_first
+                && let Some(cur) = class.clone()
+            {
+                // The chain ended here (no successor, or a repeated failure).
+                let h = state
+                    .seat_history
+                    .entry(originals[i].seat.key.clone())
+                    .or_default();
+                h.failed.insert(specs[i].id.clone());
+                h.last_fail = Some(cur);
             }
             let parsed = match out {
                 AgentOutcome::Ok(o) => match verdict::extract_json::<T>(&o.text) {
@@ -6910,6 +7038,15 @@ where
             let quota = class == Some(FailClass::Quota);
             let failed = parsed.is_err();
             done[i] = Some(parsed);
+            if carry && !failed {
+                let h = state
+                    .seat_history
+                    .entry(originals[i].seat.key.clone())
+                    .or_default();
+                h.failed.remove(&specs[i].id);
+                h.last_ok = Some(specs[i].id.clone());
+                h.last_fail = None;
+            }
             // Do not re-ask a rate-limited seat (quota) — a retry is known to
             // fail the same way; and never re-ask a seat that already parsed.
             // A failed agent that still has a successor is not re-asked
@@ -6920,7 +7057,7 @@ where
             let agent_failure = class.is_some()
                 && !nudge_first
                 && !roster.is_empty()
-                && next_untried_in_roster(roster, starts[i], &tried[i]).is_some();
+                && next_agent(i, &tried[i]).is_some();
             if failed && !quota && !agent_failure && nudges[i] < retries {
                 nudges[i] += 1;
                 still.push(i);
@@ -8008,6 +8145,74 @@ mod tests {
             env: BTreeMap::new(),
             prompt_delivery: None,
         }
+    }
+
+    fn ids(xs: &[&str]) -> BTreeSet<String> {
+        xs.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn next_for_seat_prefers_an_agent_that_has_not_failed() {
+        let roster = [spec("a"), spec("b"), spec("c")];
+        let next = next_for_seat(&roster, 0, &ids(&["a"]), &ids(&["b"]));
+        assert_eq!(next.map(|s| s.id.as_str()), Some("c"));
+    }
+
+    #[test]
+    fn next_for_seat_rescues_a_failed_agent_only_when_nothing_else_is_left() {
+        let roster = [spec("a"), spec("b"), spec("c")];
+        let failed = ids(&["a", "b", "c"]);
+        // Rescue looks at the whole roster, once per id, then runs out.
+        let mut tried = ids(&["b"]);
+        let first = next_for_seat(&roster, 1, &tried, &failed).expect("rescue");
+        assert_eq!(first.id, "c");
+        tried.insert(first.id.clone());
+        let second = next_for_seat(&roster, 1, &tried, &failed).expect("rescue");
+        assert_eq!(second.id, "a");
+        tried.insert(second.id.clone());
+        assert!(next_for_seat(&roster, 1, &tried, &failed).is_none());
+    }
+
+    #[test]
+    fn next_for_seat_ignores_failed_ids_no_longer_on_the_roster() {
+        let roster = [spec("a"), spec("b")];
+        let next = next_for_seat(&roster, 0, &ids(&["a"]), &ids(&["gone"]));
+        assert_eq!(next.map(|s| s.id.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn pick_start_spec_starts_on_the_last_answerer_when_still_eligible() {
+        let roster = [spec("a"), spec("b"), spec("c")];
+        let h = SeatHistory {
+            failed: ids(&["a"]),
+            last_ok: Some("b".to_owned()),
+            last_fail: None,
+        };
+        assert_eq!(pick_start_spec(&roster, spec("a"), Some(&h)).id, "b");
+        // A last answerer that left the roster, or later failed, is ignored.
+        let gone = SeatHistory {
+            last_ok: Some("zzz".to_owned()),
+            ..h.clone()
+        };
+        assert_eq!(pick_start_spec(&roster, spec("a"), Some(&gone)).id, "b");
+        let failed = SeatHistory {
+            failed: ids(&["a", "b"]),
+            last_ok: Some("b".to_owned()),
+            last_fail: None,
+        };
+        assert_eq!(pick_start_spec(&roster, spec("a"), Some(&failed)).id, "c");
+    }
+
+    #[test]
+    fn pick_start_spec_falls_back_to_the_spec_when_the_whole_roster_failed() {
+        let roster = [spec("a"), spec("b")];
+        let h = SeatHistory {
+            failed: ids(&["a", "b"]),
+            ..SeatHistory::default()
+        };
+        assert_eq!(pick_start_spec(&roster, spec("b"), Some(&h)).id, "b");
+        assert_eq!(pick_start_spec(&roster, spec("b"), None).id, "b");
+        assert_eq!(pick_start_spec(&[], spec("b"), Some(&h)).id, "b");
     }
 
     // `next_untried_in_roster` is the property `resume_seat_handovers`'s own
