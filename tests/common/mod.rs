@@ -138,7 +138,7 @@ pub struct Fixture {
     _home: HomeGuard,
 }
 
-const MOCK: &str = r#"#!/bin/sh
+const MOCK: &str = r##"#!/bin/sh
 # Mock agent. Dispatches on the prompt magi generated for this seat.
 set -e
 p="$MAGI_PROMPT_FILE"
@@ -155,6 +155,26 @@ has() { case "$prompt" in *"$1"*) return 0 ;; esac; return 1; }
 # assert the plumbing from inside a real graph run.
 printf '%s %s %s\n' "$MAGI_RUN" "$MAGI_NODE" "$seat" \
   >> "$(dirname "$p")/attribution.log"
+
+# Context trail: which of the pieces a seat with no session of its own needs
+# this prompt carried. A seat resumed on its own conversation gets a short
+# prompt with none of them; a seat handed to another agent must get all.
+ctx=""
+if has "# Candidates"; then ctx="$ctx cands"; fi
+if has "Your own earlier ranking"; then ctx="$ctx own"; fi
+if has "(re-sent in full)"; then ctx="$ctx resent"; fi
+if has "# Patch under review"; then ctx="$ctx patch"; fi
+if has "What was argued before this vote"; then ctx="$ctx argued"; fi
+if has "# The panel's votes and findings"; then ctx="$ctx panel"; fi
+printf '%s %s%s\n' "$MAGI_NODE" "$seat" "$ctx" >> "$(dirname "$p")/prompts.log"
+
+# Failure knobs below fire only when this is satisfied: `MOCK_ONLY_NODE` names
+# the node, `MOCK_ONLY_HAS` a phrase the prompt must carry. Unset means always.
+only() {
+  if [ -n "$MOCK_ONLY_NODE" ] && [ "$MAGI_NODE" != "$MOCK_ONLY_NODE" ]; then return 1; fi
+  if [ -n "$MOCK_ONLY_HAS" ] && ! has "$MOCK_ONLY_HAS"; then return 1; fi
+  return 0
+}
 
 # The conductor (`conduct::NODE`). With `MOCK_CONDUCT_LOG` set it records that
 # it was consulted and answers the worst case: hold every task id it was shown.
@@ -280,11 +300,11 @@ fi
 # exits non-zero with nothing usable on every prompt for that seat;
 # `MOCK_HANG_SEAT` outlives any sane node timeout (the test shortens it), so
 # the CLI is killed and the turn reads as timed out.
-if [ -n "$MOCK_FAIL_SEAT" ] && { case ",$MOCK_FAIL_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+if [ -n "$MOCK_FAIL_SEAT" ] && { case ",$MOCK_FAIL_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && only; then
   echo "mock failure" >&2
   exit 1
 fi
-if [ -n "$MOCK_HANG_SEAT" ] && { case ",$MOCK_HANG_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+if [ -n "$MOCK_HANG_SEAT" ] && { case ",$MOCK_HANG_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && only; then
   exec sleep 60
 fi
 
@@ -298,7 +318,7 @@ fi
 # fall through to the implementation branch below, so a seat that had just been
 # rate limited answered a retry with a SUMMARY block claiming it created
 # note.txt — which looks like success, and hid the very retry this forbids.
-if [ -n "$MOCK_QUOTA_SEAT" ] && { case ",$MOCK_QUOTA_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
+if [ -n "$MOCK_QUOTA_SEAT" ] && { case ",$MOCK_QUOTA_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && only; then
   printf '{"is_error":true,"terminal_reason":"api_error","result":"You'\''ve hit your session limit","session_id":"quota-test"}\n'
   exit 1
 fi
@@ -544,7 +564,7 @@ echo "content from $seat" > note.txt
 git add -A >/dev/null 2>&1
 git commit -q -m "add note from $seat" >/dev/null 2>&1
 printf '## SUMMARY\nTITLE: feat(note): create note.txt\n- created note.txt\n- no risks\n'
-"#;
+"##;
 
 fn run_git(repo: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
