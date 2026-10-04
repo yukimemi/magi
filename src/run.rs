@@ -1923,6 +1923,13 @@ pub struct RunState {
     /// resumed run. Additive and `#[serde(default)]`, so `SCHEMA` stays put.
     #[serde(default)]
     pub attachments: Vec<PathBuf>,
+    /// Subjects of the commits a review-only run examines, oldest first, as
+    /// they stood when the run opened. `Some` marks the run as reviewing
+    /// existing work: the pull request title is taken from these rather than
+    /// from the review prompt in `instruction`. Additive and
+    /// `#[serde(default)]`, so `SCHEMA` stays put.
+    #[serde(default)]
+    pub reviewed_commits: Option<Vec<String>>,
     /// Who started this run and which task it serves — see [`Origin`] and
     /// `SCHEMA`'s doc for schema 13. `None` is a run recorded before origins
     /// existed, and is reported as unknown, never as an operator's.
@@ -1988,6 +1995,7 @@ impl RunState {
             advice: None,
             advise_attempted: false,
             attachments: Vec::new(),
+            reviewed_commits: None,
             origin: None,
             events: Vec::new(),
             jobs: Vec::new(),

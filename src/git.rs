@@ -273,6 +273,17 @@ pub async fn log_oneline(worktree: &Path, base: &str, head: &str) -> Result<Stri
     .await
 }
 
+/// Subjects of the commits in `base..head`, oldest first. NUL-terminated so an
+/// empty subject keeps its place instead of shifting the later ones forward.
+pub async fn subjects(worktree: &Path, base: &str, head: &str) -> Result<Vec<String>> {
+    let range = format!("{base}..{head}");
+    let out = git(worktree, &["log", "--reverse", "--format=%s%x00", &range]).await?;
+    let mut parts: Vec<String> = out.split('\0').map(|s| s.trim().to_owned()).collect();
+    // Whatever follows the last terminator is just the trailing newline.
+    parts.pop();
+    Ok(parts)
+}
+
 /// How many commits `head` is ahead of `base`.
 pub async fn commits_ahead(worktree: &Path, base: &str, head: &str) -> Result<usize> {
     let range = format!("{base}..{head}");
