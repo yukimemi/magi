@@ -6715,10 +6715,15 @@ fn retry_budget(full: Duration, nudged: bool) -> Duration {
 /// holds its conversation, which is the difference between a cheap retry and
 /// paying for the entire candidate set twice.
 ///
-/// A seat whose agent *fails* (rate limit, timeout, any other error) is handed
-/// to the next agent in `roster` instead of being re-asked: the same agent is
-/// known to fail the same way. Each roster agent is tried at most once per
-/// seat, walking forward from the seat's own position and never wrapping
+/// A seat whose agent *fails* (rate limit, timeout, any other error) and has a
+/// successor in `roster` is handed to it instead of being re-asked: the
+/// handover is the retry. A seat with no successor left (a single-agent
+/// roster, the roster's tail) is nudged as before, up to `retries` times. So
+/// the asks to one seat in one node number at most
+/// `roster.len().max(1) * (1 + retries)`; an agent that still has a successor
+/// is asked once (a dropped stream is nudged first), and only the last agent
+/// of the chain gets the `retries` same-agent nudges. Each roster agent is
+/// tried at most once per seat, walking forward from the seat's own position and never wrapping
 /// ([`next_untried_in_roster`]); a quota or timeout always hands over, any
 /// other failure stops the chain when the previous agent failed the same way
 /// ([`should_hand_over`]). The new agent takes a fresh [`SeatState`], so
@@ -6773,7 +6778,9 @@ where
     let mut last_quota: Vec<Option<Option<String>>> = vec![None; n];
     let mut pending: Vec<usize> = (0..n).collect();
 
-    // Per seat the work is bounded by its nudges and the roster's length; this
+    // Per seat the work is bounded by `roster.len().max(1) * (1 + retries)`
+    // asks: an agent with a successor is asked once and handed over, and only
+    // a seat with no successor spends `retries` nudges on the same agent. This
     // only guarantees the loop's own termination whatever those say.
     let max_rounds = (retries + 1) * roster.len().max(1) + 1;
     for round in 0..max_rounds {
@@ -6900,13 +6907,15 @@ where
             done[i] = Some(parsed);
             // Do not re-ask a rate-limited seat (quota) — a retry is known to
             // fail the same way; and never re-ask a seat that already parsed.
-            // With a roster, a failed agent is not re-asked either: handover
-            // was its only remedy and has just been refused or run out.
-            // With a roster, a failed agent is never re-asked, even when nobody
-            // is left to hand the seat to (a single-agent roster, the roster's
-            // tail): each roster agent is tried once per seat, and the roster's
-            // length is the retry bound.
-            let agent_failure = class.is_some() && !roster.is_empty() && !nudge_first;
+            // A failed agent that still has a successor is not re-asked
+            // either: the handover was its remedy and has just been refused
+            // (the chain stops on a repeated failure class). A seat with no
+            // successor left (a single-agent roster, the roster's tail, or an
+            // empty roster) keeps the same-agent nudge, bounded by `retries`.
+            let agent_failure = class.is_some()
+                && !nudge_first
+                && !roster.is_empty()
+                && next_untried_in_roster(roster, starts[i], &tried[i]).is_some();
             if failed && !quota && !agent_failure && nudges[i] < retries {
                 nudges[i] += 1;
                 still.push(i);

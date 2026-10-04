@@ -386,11 +386,8 @@ if [ "$MAGI_NODE" = "review" ] && [ -n "$MOCK_REVIEW_RECOVERS_ON_RETRY_SEAT" ] &
   marker="retried-$seat"
   if [ ! -f "$marker" ]; then
     : > "$marker"
-    # Exit 0 on purpose: an unparsable answer is the prompt's doing and is
-    # nudged on the same agent. A non-zero exit is an agent failure, which is
-    # handed to the next roster agent instead (`graph::ask_json_wave`).
     echo 'not parsable the first time'
-    exit 0
+    exit 1
   fi
   printf '{"summary":"mock review: clean after a retry","vote":"approve","findings":[]}\n'
   exit 0
