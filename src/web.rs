@@ -3434,13 +3434,16 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
         // A run is only picked up again while it is unfinished, so an earlier
         // pass of a repeated id stopped short; the record keeps only the run's
         // latest status, which is left to the pass that carried it on.
+        // Only the latest state is recorded: `parked` is cleared on resume
+        // and `quota` accumulates across passes, so neither says why *this*
+        // pass stopped, and the refund is as unknown as `AttemptCost` says.
         let cause = if s.quota.is_empty() {
-            "the operator parked it for an upgrade"
+            "the cause was not recorded: a park, a crash or a restart all look the same from here"
         } else {
-            "an agent hit its rate limit"
+            "the run has recorded an agent rate limit, which may or may not be why this pass stopped"
         };
         format!(
-            " This pass stopped before the run finished ({cause}), so the attempt was handed back; pass #{k} resumed the same run, and the status shown is the run's current one."
+            " This pass stopped before the run finished ({cause}); whether its attempt was handed back is unknown. Pass #{k} resumed the same run, and the status shown is the run's current one."
         )
     } else if s.parked {
         " Parked by the operator at a node boundary; the attempt was handed back and the run resumes."
@@ -8148,12 +8151,16 @@ mod tests {
             h[0]["outcome"]
                 .as_str()
                 .unwrap()
-                .contains("handed back; pass #2"),
+                .contains("unknown. Pass #2"),
             "an earlier pass of a resumed run must not claim the final outcome: {v}"
         );
         assert!(
-            !h[1]["outcome"].as_str().unwrap().contains("handed back."),
+            !h[1]["outcome"].as_str().unwrap().contains("unknown."),
             "{v}"
+        );
+        assert!(
+            !h[0]["outcome"].as_str().unwrap().contains("parked it"),
+            "an unrecorded cause must not be narrated as an operator park: {v}"
         );
         assert_eq!(h[2]["kind"], "review");
         assert!(
@@ -8409,6 +8416,72 @@ mod tests {
             &task,
         );
         assert!(v.outcome.contains("Parked"), "{}", v.outcome);
+    }
+
+    fn earlier_pass_view(edit: impl FnOnce(&mut RunState)) -> TaskRunView {
+        let mut s = flow_run(RunStatus::Implementing, edit);
+        s.parked = false;
+        let task = flow_task(&["20260902-140501-aaaa", "20260902-140501-aaaa"]);
+        task_run_view(
+            "20260902-140501-aaaa",
+            Some(&s),
+            RunSlot {
+                n: 1,
+                resumed: false,
+                resumed_later: Some(2),
+                prior: None,
+                last: false,
+            },
+            &task,
+        )
+    }
+
+    #[test]
+    fn an_earlier_pass_with_no_recorded_cause_is_unknown_not_parked() {
+        let v = earlier_pass_view(|_| {});
+        assert!(v.outcome.contains("not recorded"), "{}", v.outcome);
+        assert!(v.outcome.contains("unknown"), "{}", v.outcome);
+        assert!(!v.outcome.contains("parked it"), "{}", v.outcome);
+        assert!(!v.outcome.contains("handed back."), "{}", v.outcome);
+        assert_eq!(v.exit, RunExit::Interrupted);
+        assert_eq!(v.attempt, AttemptCost::Unknown);
+    }
+
+    #[test]
+    fn an_earlier_pass_with_a_recorded_rate_limit_does_not_claim_it_as_the_cause() {
+        let v = earlier_pass_view(|s| {
+            s.quota.push(crate::run::QuotaLoss {
+                seat: "judge-1".to_owned(),
+                node: "judge".to_owned(),
+                at: Timestamp::now(),
+                reset: None,
+            });
+        });
+        assert!(v.outcome.contains("may or may not"), "{}", v.outcome);
+        assert!(v.outcome.contains("unknown"), "{}", v.outcome);
+        assert_eq!(v.attempt, AttemptCost::Unknown);
+    }
+
+    #[test]
+    fn the_current_pass_states_its_recorded_cause_and_cost() {
+        let slot = || RunSlot {
+            n: 1,
+            resumed: false,
+            resumed_later: None,
+            prior: None,
+            last: true,
+        };
+        let task = flow_task(&["20260902-140501-aaaa"]);
+        let parked = flow_run(RunStatus::Implementing, |s| s.parked = true);
+        let v = task_run_view("20260902-140501-aaaa", Some(&parked), slot(), &task);
+        assert_eq!(
+            (v.exit, v.attempt),
+            (RunExit::Parked, AttemptCost::Refunded)
+        );
+        let spent = flow_run(RunStatus::Blocked, |_| {});
+        let v = task_run_view("20260902-140501-aaaa", Some(&spent), slot(), &task);
+        assert_eq!(v.attempt, AttemptCost::Spent);
+        assert!(v.outcome.contains("spent an attempt"), "{}", v.outcome);
     }
 
     #[tokio::test]
