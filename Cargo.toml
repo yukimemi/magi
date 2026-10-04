@@ -71,6 +71,10 @@ comrak = { version = "0.55.0", default-features = false }
 # disk, network or component probing, and no subprocess to shell out to.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
+# `kill(pid, 0)`: an existence witness independent of `sysinfo` (`proc`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 pretty_assertions = "1.4.1"
 tempfile = "3.27.0"

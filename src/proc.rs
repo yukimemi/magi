@@ -264,6 +264,16 @@ fn query_process(pid: u32) -> std::io::Result<Option<u64>> {
             "process exists but its entry could not be read",
         ));
     }
+    // Other unixes have no `/proc` to consult, but `kill(pid, 0)` is an
+    // independent witness: anything but `ESRCH` means the pid exists, so a
+    // target `sysinfo` could not read (e.g. a denied `KERN_PROCARGS2` on
+    // macOS) is an unreadable entry, not an absent process.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if found.is_none() && unix_pid_exists(pid.as_u32()) {
+        return Err(std::io::Error::other(
+            "process exists but its entry could not be read",
+        ));
+    }
     // A `/proc` mounted with `hidepid=1|2` hides other users' pids, so a miss
     // is not proof of absence there; nor is one when the mount table cannot
     // be read to tell.
@@ -274,6 +284,17 @@ fn query_process(pid: u32) -> std::io::Result<Option<u64>> {
         ));
     }
     Ok(found)
+}
+
+/// Whether `kill(pid, 0)` finds the pid: success or `EPERM` both mean it exists.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn unix_pid_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only checks for existence and delivers nothing.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// Whether `/proc/stat` carries a non-zero `btime` line.

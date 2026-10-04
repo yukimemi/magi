@@ -1725,6 +1725,7 @@ dependencies = [
  "dirs 7.0.0",
  "jiff",
  "kaishin",
+ "libc",
  "pretty_assertions",
  "ratatui",
  "serde",
