@@ -4622,20 +4622,30 @@ function formatTokens(n) {
 
 function talkContextLabel(ctx) {
   if (!ctx || typeof ctx.tokens !== "number") return null;
+  const approx = ctx.estimated ? "~" : "";
   let text = typeof ctx.window === "number" && typeof ctx.percent === "number"
-    ? `${formatTokens(ctx.tokens)} / ${formatTokens(ctx.window)} (${ctx.percent}%)`
-    : `${formatTokens(ctx.tokens)} tokens`;
+    ? `${approx}${formatTokens(ctx.tokens)} / ${formatTokens(ctx.window)} (${ctx.percent}%)`
+    : `${approx}${formatTokens(ctx.tokens)} tokens`;
   if (ctx.since_switch) text += " · re-measured next turn";
-  return { text, warn: Boolean(ctx.warn) };
+  return { text, warn: Boolean(ctx.warn), estimated: Boolean(ctx.estimated) };
+}
+
+/* One tooltip for the card and the detail tag, so they cannot disagree. */
+function contextTitle(label) {
+  const parts = [];
+  if (label && label.warn) parts.push("This conversation is getting long; consider starting a new one.");
+  if (label && label.estimated) {
+    parts.push("Estimated from the transcript at ~3.5 chars/token; ignores tool output and the CLI's own system prompt.");
+  }
+  if (!parts.length) parts.push("Input tokens the agent reported for its last reply, against the model's context window.");
+  return parts.join(" ");
 }
 
 function contextTag(ctx) {
   const label = talkContextLabel(ctx);
   const tag = el("span", { class: "tag", "data-tone": label && label.warn ? "rust" : "ink" });
   setText(tag, label ? `context ${label.text}` : "context unknown");
-  setAttr(tag, "title", label && label.warn
-    ? "This conversation is getting long; consider starting a new one."
-    : "Input tokens the agent reported for its last reply, against the model's context window.");
+  setAttr(tag, "title", contextTitle(label));
   return tag;
 }
 
@@ -4696,6 +4706,7 @@ function updateTalkCard(row, talk) {
   const ctxLabel = talkContextLabel(talk.context);
   setText(r.context, ctxLabel ? `context ${ctxLabel.text}` : "context unknown");
   setAttr(r.context, "data-warn", ctxLabel && ctxLabel.warn ? "1" : null);
+  setAttr(r.context, "title", contextTitle(ctxLabel));
   setText(r.turns, plural(turns.length, "turn", "turns"));
   const tasks = Array.isArray(talk.tasks) ? talk.tasks.length : 0;
   setText(r.tasks, tasks ? plural(tasks, "task filed", "tasks filed") : "");
