@@ -2771,27 +2771,9 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
     state.save()?;
 
     // An armed merge recorded by an earlier pass may or may not have reached
-    // the forge (the record is written before the call). Take it back; the
-    // normal path re-arms, and an approval already given for the same head is
-    // reused, so nothing is asked twice. A failed disable is not fatal here:
-    // the arm is pinned to a head and the loop watches for it moving.
-    if state.land_armed_head.is_some() {
-        let number = state
-            .pr
-            .as_ref()
-            .map(|p| p.number)
-            .filter(|n| *n != 0)
-            .or_else(|| pr_url.rsplit('/').next().and_then(|n| n.parse().ok()));
-        if let Some(number) = number {
-            if let Err(e) = disarm(forge, state, &repo, number).await {
-                tracing::warn!("could not disable a possibly armed auto-merge on resume: {e}");
-                state.land_armed_head = None;
-            }
-        } else {
-            state.land_armed_head = None;
-        }
-        state.save()?;
-    }
+    // the forge (the record is written before the call). It is taken back on
+    // the first observation, where a pull request is known to stop with.
+    let mut resumed_armed = state.land_armed_head.is_some();
 
     loop {
         let seen = forge.view(&repo, pr_url).await?;
@@ -2807,6 +2789,21 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
             red_at_merge: Vec::new(),
         });
         state.save()?;
+
+        if std::mem::take(&mut resumed_armed) && pr.state == PrLifecycle::Open {
+            // The normal path re-arms, and an approval already given for the
+            // same head is reused, so nothing is asked twice. A failed disable
+            // stops the run with the record kept: pushing on could change the
+            // head under an arm that is still live.
+            if let Err(e) = disarm(forge, state, &repo, pr.number).await {
+                let why = format!(
+                    "a previous pass may have armed auto-merge and it could not be disabled \
+                     on resume: {e}"
+                );
+                stop(state, &repo, &pr, &why).await?;
+                return Ok(pr);
+            }
+        }
 
         // The head moved away from the one auto-merge was armed on, by
         // someone other than this loop. The arm is pinned and would refuse to
@@ -2913,7 +2910,20 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 forge.poll().await;
             }
             Step::Done { merged } => {
-                state.land_armed_head = None;
+                // Auto-merge is pinned to the approved head, but the forge's
+                // own handling of a later push is not something magi can
+                // see: if the pull request merged on another commit, say so
+                // loudly rather than record a clean landing.
+                if let Some(armed) = state.land_armed_head.take() {
+                    if merged && !seen.head.is_empty() && !armed.eq_ignore_ascii_case(&seen.head) {
+                        let msg = format!(
+                            "{} merged on {} but the owner approved {armed}; review what landed",
+                            pr.url, seen.head
+                        );
+                        tracing::warn!("{msg}");
+                        state.event("land", msg);
+                    }
+                }
                 state.status = if merged {
                     RunStatus::Merged
                 } else {
@@ -2990,6 +3000,37 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 // The intent is saved first, so a crash around the call is
                 // still visible to a resume.
                 let observed_head = seen.head.clone();
+                // `gh` merges at once instead of arming when the pull request
+                // is already mergeable, so that case gets the same fresh,
+                // head-bound read the direct fallback does.
+                if matches!(
+                    seen.merge_state.to_ascii_uppercase().as_str(),
+                    "CLEAN" | "UNSTABLE" | "HAS_HOOKS"
+                ) {
+                    let fresh = forge.view(&repo, pr_url).await.ok();
+                    if !direct_merge_is_safe(
+                        fresh.as_ref(),
+                        &observed_head,
+                        &shown,
+                        round,
+                        budget,
+                        waited,
+                    ) {
+                        if waited >= WAIT_CEILING {
+                            let why = "the pull request did not settle on the approved head \
+                                       before it could be merged";
+                            stop(state, &repo, &pr, why).await?;
+                            return Ok(pr);
+                        }
+                        state.event(
+                            "land",
+                            "the pull request changed before merging; looking again",
+                        );
+                        waited += POLL;
+                        forge.poll().await;
+                        continue;
+                    }
+                }
                 let arm_argv = automerge_argv_at(pr.number, &subject, &observed_head);
                 state.land_armed_head = Some(observed_head.clone());
                 state.save()?;
@@ -6016,7 +6057,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .unwrap();
         // Already clean: auto-merge has nothing to wait for and is refused, so
         // the guarded direct merge goes ahead after a fresh read.
-        assert_eq!(forge.calls(), ["view", "merge", "view", "merge"]);
+        assert_eq!(forge.calls(), ["view", "view", "merge", "view", "merge"]);
         assert_eq!(state.status, RunStatus::Merged);
     }
 
@@ -6042,8 +6083,8 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(
             forge.calls(),
             [
-                "view", "fix", "poll", "view", "poll", "view", "poll", "view", "merge", "view",
-                "merge"
+                "view", "fix", "poll", "view", "poll", "view", "poll", "view", "view", "merge",
+                "view", "merge"
             ]
         );
         assert_eq!(state.status, RunStatus::Merged);
@@ -6080,6 +6121,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let forge = Scripted::new(
             vec![
                 seen("a", Checks::Green, "CLEAN", false),
+                seen("a", Checks::Green, "CLEAN", false),
                 seen("a", Checks::Pending, "BLOCKED", false),
                 seen("a", Checks::Pending, "BLOCKED", false),
                 seen("a", Checks::Green, "CLEAN", false),
@@ -6092,7 +6134,8 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(
             forge.calls(),
             [
-                "view", "merge", "view", "poll", "view", "poll", "view", "merge", "view", "merge"
+                "view", "view", "merge", "view", "poll", "view", "poll", "view", "view", "merge",
+                "view", "merge"
             ]
         );
         assert_eq!(state.status, RunStatus::Merged);
@@ -6247,7 +6290,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
             .await
             .unwrap();
-        assert_eq!(forge.calls(), ["view", "merge", "view", "merge"]);
+        assert_eq!(forge.calls(), ["view", "view", "merge", "view", "merge"]);
         assert_eq!(state.status, RunStatus::Merged);
     }
 
@@ -6256,6 +6299,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let mut state = landing_state();
         let forge = Scripted::new(
             vec![
+                seen("a", Checks::Green, "CLEAN", false),
                 seen("a", Checks::Green, "CLEAN", false),
                 // Re-viewed after the refusal: someone pushed.
                 seen("b", Checks::Green, "BLOCKED", false),
@@ -6269,7 +6313,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(
             forge.calls(),
             [
-                "view", "merge", "view", "poll", "view", "merge", "view", "merge"
+                "view", "view", "merge", "view", "poll", "view", "view", "merge", "view", "merge"
             ]
         );
         assert_eq!(state.status, RunStatus::Merged);
@@ -6298,6 +6342,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let forge = Scripted::new(
             vec![
                 seen("abc", Checks::Green, "CLEAN", false),
+                seen("abc", Checks::Green, "CLEAN", false),
                 seen("abc", Checks::Pending, "BLOCKED", false),
                 merged_view("abc"),
             ],
@@ -6306,7 +6351,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         land_with(&mut state, URL, &forge).await.unwrap();
         assert_eq!(
             forge.calls(),
-            ["view", "merge", "poll", "view", "poll", "view"]
+            ["view", "view", "merge", "poll", "view", "poll", "view"]
         );
         let argv = &forge.argvs()[0];
         assert!(has(argv, "--squash") && has(argv, "--auto") && has(argv, "--subject"));
@@ -6329,8 +6374,10 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let forge = Scripted::new(
             vec![
                 seen("a", Checks::Green, "CLEAN", false),
+                seen("a", Checks::Green, "CLEAN", false),
                 // A review comment arrives while armed.
                 seen("a", Checks::Green, "CLEAN", true),
+                seen("b", Checks::Green, "CLEAN", false),
                 seen("b", Checks::Green, "CLEAN", false),
                 merged_view("b"),
             ],
@@ -6343,8 +6390,8 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(
             forge.calls(),
             [
-                "view", "merge", "poll", "view", "merge", "fix", "poll", "view", "merge", "poll",
-                "view"
+                "view", "view", "merge", "poll", "view", "merge", "fix", "poll", "view", "view",
+                "merge", "poll", "view"
             ]
         );
         let argvs = forge.argvs();
@@ -6360,6 +6407,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let mut state = landing_state();
         let forge = Scripted::new(
             vec![
+                seen("a", Checks::Green, "CLEAN", false),
                 seen("a", Checks::Green, "CLEAN", false),
                 seen("a", Checks::Green, "CLEAN", true),
             ],
@@ -6434,6 +6482,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let forge = Scripted::new(
             vec![
                 seen("a", Checks::Green, "CLEAN", false),
+                seen("a", Checks::Green, "CLEAN", false),
                 // The fresh read before the direct merge: someone pushed.
                 seen("b", Checks::Green, "CLEAN", false),
             ],
@@ -6495,7 +6544,11 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             },
         ];
         let forge = Scripted::new(
-            vec![seen("a", Checks::Green, "CLEAN", false), waiting],
+            vec![
+                seen("a", Checks::Green, "CLEAN", false),
+                seen("a", Checks::Green, "CLEAN", false),
+                waiting,
+            ],
             vec![(true, ""), (true, "")],
         );
         land_with(&mut state, URL, &forge).await.unwrap();
@@ -6546,5 +6599,39 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(s.contexts[0].required, Some(true));
         let s = seen_from(&view_json("new"), Some(&node_json("new", "SUCCESS", false))).unwrap();
         assert_eq!(s.contexts[0].required, None);
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_cannot_disable_a_recorded_arm_stops_and_keeps_the_record() {
+        let mut state = landing_state();
+        state.land_armed_head = Some("a".to_owned());
+        let forge = Scripted::new(
+            vec![seen("a", Checks::Green, "CLEAN", true)],
+            vec![(false, "disable exploded")],
+        );
+        land_with(&mut state, URL, &forge).await.unwrap();
+        assert!(!forge.calls().contains(&"fix"));
+        assert_eq!(state.status, RunStatus::Blocked);
+        assert_eq!(state.land_armed_head.as_deref(), Some("a"));
+        let why = state.merge.as_ref().unwrap().detail.clone();
+        assert!(why.contains("disable exploded"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn an_immediately_mergeable_pull_request_is_not_armed_from_a_moved_head() {
+        let mut state = landing_state();
+        // The pre-arm read finds a different head: nothing is sent to the forge
+        // for the stale one.
+        let forge = Scripted::new(
+            vec![
+                seen("a", Checks::Green, "CLEAN", false),
+                seen("b", Checks::Pending, "BLOCKED", false),
+                merged_view("b"),
+            ],
+            vec![],
+        );
+        land_with(&mut state, URL, &forge).await.unwrap();
+        assert!(forge.argvs().is_empty());
+        assert_eq!(state.status, RunStatus::Merged);
     }
 }
