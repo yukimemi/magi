@@ -1985,7 +1985,8 @@ impl Runner {
                 );
                 prev = Some(cur.clone());
 
-                let new_seat = self.seat(&seat.key, &next.id);
+                let new_seat = handover_seat(&seat.key, &next.id, self.state.seed);
+                self.state.seats.insert(seat.key.clone(), new_seat.clone());
                 // Kept in sync on `sent` itself, not just the local retry: a
                 // later helper (`resume_unconfirmed_commands`) reads `sent`
                 // after this one returns and must see whichever agent is now
@@ -6074,6 +6075,13 @@ fn next_untried_in_roster<'a>(
         .find(|s| !tried.contains(&s.id))
 }
 
+/// A fresh seat for the agent taking over `key`. Mixes the agent id into the
+/// seed so a CLI that mints its session id up front (`--session-id`) never
+/// reuses the uuid the previous agent already opened under the same seat key.
+fn handover_seat(key: &str, agent: &str, run_seed: u64) -> SeatState {
+    SeatState::new(key, agent, run_seed ^ crate::rng::fnv1a(agent))
+}
+
 /// What an agent's turn timed out as, in [`AgentOutcome::Failed`]. One const
 /// so the classifier below and the code that builds the message cannot drift.
 const TIMED_OUT: &str = "timed out";
@@ -6785,7 +6793,7 @@ where
                     );
                     tried[i].insert(next.id.clone());
                     prev[i] = Some(cur.clone());
-                    seats[i] = SeatState::new(&originals[i].seat.key, &next.id, state.seed);
+                    seats[i] = handover_seat(&originals[i].seat.key, &next.id, state.seed);
                     specs[i] = next;
                     fresh[i] = Some(cur.stem_word().to_owned());
                     nudges[i] = 0;
@@ -6829,7 +6837,10 @@ where
             // fail the same way; and never re-ask a seat that already parsed.
             // With a roster, a failed agent is not re-asked either: handover
             // was its only remedy and has just been refused or run out.
-            let agent_failure = class.is_some() && !roster.is_empty() && !nudge_first;
+            // A seat never handed over (nobody left to hand it to: a single-agent
+            // roster, the roster's tail) keeps the same-agent nudges it always had.
+            let agent_failure =
+                class.is_some() && !roster.is_empty() && !nudge_first && tried[i].len() > 1;
             if failed && !quota && !agent_failure && nudges[i] < retries {
                 nudges[i] += 1;
                 still.push(i);
@@ -7755,6 +7766,14 @@ mod tests {
         // A quota or timeout in between ends the run of identical failures.
         assert!(should_hand_over(Some(&FailClass::Timeout), &other));
         assert!(should_hand_over(Some(&FailClass::Quota), &other));
+    }
+
+    #[test]
+    fn a_handover_seat_never_reuses_the_previous_agents_session_id() {
+        let a = SeatState::new("judge-1", "alpha", 7);
+        let b = handover_seat("judge-1", "beta", 7);
+        assert_ne!(a.claude_session, b.claude_session);
+        assert_eq!(b.turns, 0);
     }
 
     #[test]
