@@ -5788,22 +5788,29 @@ mod tests {
 
     #[test]
     fn deputies_enabled_follows_the_config() {
-        let dir = tempfile::tempdir().unwrap();
-        // Nothing configured: the default allows deputies.
-        let q = Question::new(
-            "t".to_owned(),
-            crate::conduct::NODE.to_owned(),
-            "conduct".to_owned(),
-            "which?".to_owned(),
-            String::new(),
-            Vec::new(),
-        );
-        assert!(deputies_enabled(dir.path(), &q));
-        let mut off = Config::default();
+        // An explicit roster, so the result never depends on which agent CLIs
+        // this machine has installed.
+        let mut on = Config::default();
+        on.agents = vec![crate::config::AgentSpec {
+            id: "stub".to_owned(),
+            kind: AgentKind::Command,
+            model: None,
+            command: vec!["true".to_owned()],
+            extra_args: Vec::new(),
+            env: Default::default(),
+            prompt_delivery: None,
+        }];
+        assert!(crate::deputy::can_start(Some(&on), ""));
+        assert!(crate::deputy::can_start(Some(&on), "stub"));
+        let mut off = on.clone();
         off.daemon.max_deputies = 0;
         assert!(!crate::deputy::can_start(Some(&off), ""));
+        let mut empty = on;
+        empty.agents.clear();
+        assert!(!crate::deputy::can_start(Some(&empty), ""));
         assert!(!crate::deputy::can_start(None, ""));
     }
+
     use pretty_assertions::assert_eq;
     use serde_json::Value;
     use tempfile::TempDir;
