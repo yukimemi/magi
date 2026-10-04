@@ -2725,22 +2725,19 @@ async fn attempt(
                 Starter::Review(branch) => Some(branch.clone()),
                 _ => None,
             };
-            task.hold_for_handover(branch, reason);
+            // The hold's own `task:<id>` notice (raised by `Queue::put`) is the
+            // one page; the guidance rides in the reason, fixed per state so a
+            // re-put never changes the wording and relights it.
+            task.hold_for_handover(
+                branch,
+                format!(
+                    "{reason} (clean up the other worktree, then release the task from the queue)"
+                ),
+            );
             record(queue, task);
             tracing::warn!(
                 "holding {} for a branch it cannot take over: {e:#}",
                 task.short()
-            );
-            // Stable wording; the specifics live in the task's hold reason.
-            notices::raise(
-                Notice::warn(
-                    &format!("handover:{}", task.id),
-                    "A task was held because its branch is still checked out in another worktree that magi would not remove by itself; see the task's hold reason, then release it from the queue.",
-                )
-                .link(Link::Task {
-                    id: task.id.clone(),
-                })
-                .about([task.id.clone()]),
             );
             return Vec::new();
         }

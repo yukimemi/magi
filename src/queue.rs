@@ -75,6 +75,10 @@ use crate::ask::Questions;
 /// [`Task::hold_source`], never cleared by [`Task::block`]) rather than
 /// guessing `Queued` outright — see [`Task::unblock`]'s own doc.
 ///
+/// 9: added [`Task::held_at`], the start of the current hold, so a notice can
+/// tell a question filed for this hold from one about an older cause.
+/// Field-only, `#[serde(default)]`.
+///
 /// 3: added [`HoldSource`] so conductor recovery cannot release a hold an
 /// operator deliberately placed. Old records default to `None` and are
 /// protected as operator-held until an explicit release; the safe direction
@@ -89,7 +93,7 @@ use crate::ask::Questions;
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 8;
+pub const SCHEMA: u32 = 9;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -422,6 +426,12 @@ pub struct Task {
     /// deep it is. `None` for every ordinary task. `#[serde(default)]`.
     #[serde(default)]
     pub followup: Option<FollowUp>,
+    /// When the current hold began. Set by the transitions into
+    /// [`TaskStatus::Held`] (a re-hold keeps it), cleared by
+    /// [`Task::release`]. `crate::notices` uses it as the identity of the
+    /// cause: a question filed before it is about something older.
+    #[serde(default)]
+    pub held_at: Option<Timestamp>,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -514,6 +524,7 @@ impl Task {
             urgent: false,
             attachments: Vec::new(),
             followup: None,
+            held_at: None,
             created_at: now,
             updated_at: now,
         }
@@ -673,6 +684,14 @@ impl Task {
         &self.runs
     }
 
+    /// Stamp [`Task::held_at`] on the way into [`TaskStatus::Held`]; a task
+    /// that is already held keeps the time its hold began.
+    fn note_held(&mut self) {
+        if self.status != TaskStatus::Held || self.held_at.is_none() {
+            self.held_at = Some(Timestamp::now());
+        }
+    }
+
     /// Record a failed attempt. Out of attempts means held for a human, rather
     /// than retried until the money runs out.
     ///
@@ -692,6 +711,7 @@ impl Task {
         let why = why.into();
         self.diagnostic = None;
         self.status = if self.attempts >= max_attempts {
+            self.note_held();
             self.hold_source = Some(HoldSource::Machine);
             self.hold_reason = Some(why.clone());
             TaskStatus::Held
@@ -736,6 +756,7 @@ impl Task {
     /// button is reachable on a blocked task, same as "Mark done" - kept
     /// reading as still waiting on a dependency it no longer had any claim on.
     pub fn hold_manual(&mut self, reason: Option<String>) {
+        self.note_held();
         self.status = TaskStatus::Held;
         if reason.is_some() {
             self.hold_reason = reason;
@@ -751,6 +772,7 @@ impl Task {
     /// Clears `blocked_by`/`block_reason` for the same reason
     /// [`Task::hold_manual`] does.
     pub fn hold_machine(&mut self, reason: Option<String>) {
+        self.note_held();
         self.status = TaskStatus::Held;
         if reason.is_some() {
             self.hold_reason = reason;
@@ -954,6 +976,7 @@ impl Task {
     pub fn handed_off(&mut self, why: impl Into<String>) {
         let why = why.into();
         self.diagnostic = None;
+        self.note_held();
         self.status = TaskStatus::Held;
         self.hold_source = Some(HoldSource::Machine);
         self.hold_reason = Some(why.clone());
@@ -968,6 +991,7 @@ impl Task {
             && self.hold_source == Some(HoldSource::Machine)
             && self.review_branch.is_some();
         self.status = TaskStatus::Queued;
+        self.held_at = None;
         self.attempts = 0;
         self.last_error = None;
         // Otherwise the next person who holds this task reads a reason that

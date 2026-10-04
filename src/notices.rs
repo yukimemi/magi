@@ -117,6 +117,11 @@ pub struct Notice {
     /// changed message or higher severity is unread again.
     #[serde(default)]
     pub covered_by: Option<String>,
+    /// When the cause this notice reports began (a task's `held_at`). A
+    /// question filed before it is about an older cause and does not cover
+    /// it; `None` keeps the broad coverage of notices without one.
+    #[serde(default)]
+    pub since: Option<Timestamp>,
     /// On-disk format version.
     #[serde(default = "schema")]
     pub schema: u32,
@@ -147,6 +152,7 @@ impl Notice {
             dismissed_at: None,
             subjects: Vec::new(),
             covered_by: None,
+            since: None,
             schema: SCHEMA,
         }
     }
@@ -176,6 +182,12 @@ impl Notice {
         Self::new(Severity::Error, key, message)
     }
 
+    /// Record when the reported cause began.
+    pub fn since(mut self, at: Option<Timestamp>) -> Self {
+        self.since = at;
+        self
+    }
+
     /// Attach a link.
     pub fn link(mut self, link: Link) -> Self {
         self.link = Some(link);
@@ -199,7 +211,20 @@ impl Notice {
             self.subjects = again.subjects.clone();
         }
         let escalated = again.severity > self.severity;
-        if again.message != self.message || escalated {
+        // A newer cause is news even when it reads the same; an old record
+        // with no `since` just adopts one without lighting up again.
+        // A legacy record that a question had silenced has no `since` to
+        // compare, but a stamped raise that no question covers any more is not
+        // the cause that question was filed for: it pages.
+        let newer_cause = match (self.since, again.since) {
+            (Some(old), Some(new)) => new > old,
+            (None, Some(_)) => self.covered_by.is_some() && again.covered_by.is_none(),
+            _ => false,
+        };
+        if again.since.is_some() {
+            self.since = again.since;
+        }
+        if again.message != self.message || escalated || newer_cause {
             self.message = again.message.clone();
             self.severity = self.severity.max(again.severity);
             self.read_at = None;
@@ -415,7 +440,9 @@ impl Notices {
         for n in self.all() {
             if n.unread() && covers(question, &n) {
                 let _ = self.update(&n.id, |n| {
-                    if n.unread() {
+                    // Re-checked under the lock: a newer cause may have
+                    // landed since `all()` read it.
+                    if n.unread() && covers(question, n) {
                         n.mark_read(Timestamp::now());
                         n.covered_by = Some(question.id.clone());
                     }
@@ -617,7 +644,8 @@ pub fn task_held(task: &crate::queue::Task) -> Option<Notice> {
         .link(Link::Task {
             id: task.id.clone(),
         })
-        .about([task.id.clone()]),
+        .about([task.id.clone()])
+        .since(task.held_at),
     )
 }
 
@@ -650,8 +678,17 @@ pub fn raise(notice: Notice) {
 /// `Question::run` (a task id for the former, a run id for the latter). The
 /// land approval and release questions are to-dos, not duplicates, and cover
 /// nothing.
+///
+/// A notice with a `since` (a task hold's start) is covered only by a question
+/// filed at or after it: one filed earlier is about an older cause, and
+/// letting it silence a new hold would hide a fresh failure behind a stale
+/// card. Missing a duplicate costs one extra page; hiding a failure costs the
+/// failure. A notice without `since` keeps the broad rule.
 pub fn covers(q: &crate::ask::Question, n: &Notice) -> bool {
     if !q.status.open() || !n.subjects.contains(&q.run) {
+        return false;
+    }
+    if n.since.is_some_and(|since| q.asked_at < since) {
         return false;
     }
     let about_task = n.key.starts_with("task:") || n.key.starts_with("handover:");
@@ -983,6 +1020,75 @@ mod tests {
         let n = s.list().pop().expect("the record is kept");
         assert_eq!(n.covered_by.as_deref(), Some(q.id.as_str()));
         assert!(n.message.contains("checked out"));
+    }
+
+    #[test]
+    fn a_refused_handover_without_a_question_pages_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = crate::queue::Queue::at(dir.path().join("queue"));
+        let mut t = held_task();
+        t.hold_for_handover(Some("magi/x/A".to_owned()), "checked out".to_owned());
+        q.put(&mut t).unwrap();
+        q.put(&mut t).unwrap();
+        let s = Notices::at(dir.path().join("notifications"));
+        assert_eq!(s.list().len(), 1);
+        assert_eq!(s.list()[0].key, format!("task:{}", t.id));
+        assert_eq!(s.count_unread(), 1);
+    }
+
+    #[test]
+    fn an_older_question_does_not_silence_a_new_hold() {
+        for node in ["deps", "conduct", "triage"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut t = crate::queue::Task::new(
+                "t".to_owned(),
+                "do it".to_owned(),
+                std::path::PathBuf::from("/repo"),
+                crate::queue::Source::Human,
+            );
+            let old = ask(dir.path(), &t.id, node);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            t.hold_machine(Some("new failure".to_owned()));
+            crate::queue::Queue::at(dir.path().join("queue"))
+                .put(&mut t)
+                .unwrap();
+            let s = Notices::at(dir.path().join("notifications"));
+            let n = s.list().pop().unwrap();
+            assert_eq!(n.covered_by, None, "{node} question {}", old.id);
+            assert_eq!(s.count_unread(), 1);
+        }
+    }
+
+    #[test]
+    fn a_legacy_covered_notice_pages_for_a_new_uncovered_hold() {
+        let (_d, s) = store();
+        let mut legacy = Notice::warn("task:x", "held");
+        legacy.covered_by = Some("q1".to_owned());
+        let id = legacy.id.clone();
+        s.raise(legacy).unwrap();
+        assert!(!s.get(&id).unwrap().unread());
+        s.raise(Notice::warn("task:x", "held").since(Some(Timestamp::now())))
+            .unwrap();
+        let n = s.get(&id).unwrap();
+        assert!(n.unread());
+        assert_eq!(n.covered_by, None);
+    }
+
+    #[test]
+    fn a_newer_cause_relights_a_dismissed_notice() {
+        let (_d, s) = store();
+        let t0 = Timestamp::now();
+        let first = Notice::warn("task:x", "held").since(Some(t0));
+        let id = first.id.clone();
+        s.raise(first).unwrap();
+        s.dismiss(&id).unwrap();
+        s.raise(Notice::warn("task:x", "held").since(Some(t0)))
+            .unwrap();
+        assert!(!s.get(&id).unwrap().unread(), "same cause stays dismissed");
+        let later = t0 + std::time::Duration::from_secs(1);
+        s.raise(Notice::warn("task:x", "held").since(Some(later)))
+            .unwrap();
+        assert!(s.get(&id).unwrap().unread());
     }
 
     #[test]
