@@ -1543,6 +1543,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
   transition: transform .18s var(--ease);
 }
 .advanced[open] > summary::before { transform: rotate(45deg); }
+/* Record panels fold into their own summary; keep the body clear of it. */
+details.panel > summary + * { margin-top: var(--s2); }
+.cand-reviews { margin-top: var(--s2); }
+.cand-reviews > .rounds { margin-top: var(--s2); }
 .form-error {
   padding: var(--s2) var(--s3);
   background: var(--tint-rust); color: var(--on-rust);
@@ -1948,8 +1952,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
     display: flex; flex-direction: column; gap: var(--s5);
     min-width: 0;
   }
-  .run-main { grid-column: 1; }
-  .run-side { grid-column: 2; position: sticky; top: 96px; }
+  .run-main { grid-column: 1 / -1; }
   .report { max-height: calc(100dvh - 260px); }
   .facts { grid-template-columns: 10rem 1fr; }
 
@@ -2087,11 +2090,9 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
   /* The run detail's two columns follow the viewport elsewhere; in a pane that
      is a column short, so they stack until the pane itself is wide. */
   main[data-split] #view-run { display: flex; }
-  main[data-split] .run-side { position: static; }
   main[data-split] .report { max-height: 60dvh; }
   @media (min-width: 1500px) {
     main[data-split] #view-run { display: grid; }
-    main[data-split] .run-side { position: sticky; top: 0; }
     main[data-split] .report { max-height: calc(100dvh - 220px); }
   }
   main[data-split] #view-talk { max-width: none; }

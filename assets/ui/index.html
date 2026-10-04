@@ -228,47 +228,50 @@
         <dl class="facts" id="tally-facts"></dl>
       </div>
 
-      <div class="panel" id="run-task-panel">
-        <h2>Task</h2>
-        <div class="instruction md" id="run-instruction"></div>
-      </div>
-
       <div class="panel" id="run-cands-panel" hidden>
         <h2>Candidates <span class="count" id="cand-count"></span></h2>
         <ol class="cands" id="run-cands"></ol>
       </div>
 
+      <!-- Reviews live inside the candidate they judged; this panel only
+           carries a record that cannot be attributed to any card. -->
       <div class="panel" id="run-reviews-panel" hidden>
-        <h2>Review rounds <span class="count" id="review-count"></span></h2>
+        <h2>Reviews, not attributed <span class="count" id="review-count"></span></h2>
         <ol class="rounds" id="run-reviews"></ol>
       </div>
 
-      <div class="panel" id="run-quota-panel" hidden>
-        <h2>Seats lost to quota</h2>
-        <p class="panel-note">A collapsed panel is a machine problem, not a verdict.</p>
-        <ul class="plain" id="run-quota"></ul>
-      </div>
+      <details class="panel advanced" id="run-task-panel" data-panel="task">
+        <summary>Task instruction <span class="count" id="run-task-count"></span></summary>
+        <div class="instruction md" id="run-instruction"></div>
+      </details>
 
-      <div class="panel" id="run-handovers-panel" hidden>
-        <h2>Seats handed over</h2>
+      <details class="panel advanced" id="run-handovers-panel" data-panel="handovers" hidden>
+        <summary>Seats handed over <span class="count" id="run-handovers-count"></span></summary>
         <p class="panel-note">A seat whose agent failed was given to the next agent in the roster.</p>
         <ul class="plain" id="run-handovers"></ul>
-      </div>
-    </div>
+      </details>
 
-    <div class="run-side">
-      <div class="panel" id="run-report-panel">
-        <div class="panel-bar">
-          <h2>Report</h2>
-          <button class="btn btn-quiet" type="button" id="wrap-toggle" aria-pressed="false">Wrap</button>
+      <details class="panel advanced" id="run-quota-panel" data-panel="quota" hidden>
+        <summary>Seats lost to quota <span class="count" id="run-quota-count"></span></summary>
+        <p class="panel-note">A collapsed panel is a machine problem, not a verdict.</p>
+        <ul class="plain" id="run-quota"></ul>
+      </details>
+
+      <details class="panel advanced" id="run-raw-panel" data-panel="raw">
+        <summary>Raw <span class="count" id="run-raw-count"></span></summary>
+        <div id="run-report-panel">
+          <div class="panel-bar">
+            <h2>Report</h2>
+            <button class="btn btn-quiet" type="button" id="wrap-toggle" aria-pressed="false">Wrap</button>
+          </div>
+          <pre class="report" id="run-report" tabindex="0" aria-label="Run report">Loading…</pre>
         </div>
-        <pre class="report" id="run-report" tabindex="0" aria-label="Run report">Loading…</pre>
-      </div>
 
-      <div class="panel" id="run-events-panel" hidden>
-        <h2>Timeline</h2>
-        <ol class="timeline" id="run-events"></ol>
-      </div>
+        <div id="run-events-panel" hidden>
+          <h2>Timeline</h2>
+          <ol class="timeline" id="run-events"></ol>
+        </div>
+      </details>
     </div>
   </section>
 
