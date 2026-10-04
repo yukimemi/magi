@@ -1443,3 +1443,47 @@ additive and `migrate_schema` would otherwise need another arm. The daemon
 refreshes `RunState::attachments` from the task on every start and resume, and
 the implementer prompt lists the absolute paths under `# Attachments`. `task
 done` does not delete them.
+
+### A merge must not take open findings with it
+
+`src/followup.rs` files the findings a run's last review round left open as
+queue tasks once the pull request is confirmed merged. The merge itself is
+never blocked or changed by it (`land_approval`, `review_rounds` untouched);
+`[graph] file_followups` (default on) switches it off.
+
+- **What is filed.** Read from the last `ReviewRound` directly, never from
+  `open_findings()` (empty on a clean round) or the fixer's report: every
+  Major-or-above finding, plus every finding of a seat whose *final* vote
+  (`final_votes()`) was reject - a vote has no per-finding reasoning, so that
+  seat's Minor/Nit come with it. **Other Minor/Nit are not filed**; they are
+  listed in the pull-request comment only.
+- **Grouping is deterministic, never an agent call.** Same file with lines
+  within 5 of each other, or, with no file, the same normalized title. One
+  task per group, carrying every finding's full text.
+- **Idempotent three ways.** The task id is derived from run id + the group's
+  finding ids and written with `Queue::create_new` (never `put`, which would
+  rewind a task that has since run); the queue is scanned for tasks whose
+  `FollowUp::run` is this run; and `RunState::followups` remembers what was
+  filed, so a completed or deleted follow-up is not recreated. Tasks found by
+  the queue scan are written back into `RunState::followups`, so a crash
+  between filing and the state save loses no record.
+- **Attribution.** `Source::Agent { run, node: "followup" }` plus
+  `Task::followup` (`queue::SCHEMA` 8). Anything counting agent-filed tasks
+  from `MAGI_RUN` must look at `node`. Filed `solo`, through the normal
+  attempts accounting. `dupes::check` is deliberately **not** run: the
+  instruction names the merged pull request, which it would refuse.
+- **Depth cap.** `Task::followup.generation` (ordinary task 0); a task of
+  generation `MAX_FOLLOWUP_GENERATION` (2) files nothing and the event says so.
+  The daemon records the task's generation in `RunState::followup_generation`
+  when it starts or resumes the run, so deleting the parent later cannot reset
+  it; a run with an origin task whose depth was never recorded and whose task
+  is gone is treated as at the cap (nothing filed), never as generation 0.
+- **Best-effort.** `followup::after_merge` returns `()`, records failures as
+  run events and never touches `status`. It is called from
+  `Runner::run_land` after `bump::after_merge`, independent of it, and from
+  `land::correct_merge`, so `magi fold --merged` and the janitor's external
+  merge reconciliation file follow-ups too.
+- **Visibility.** A `filed N follow-up task(s): ids ...` event, a "follow-ups"
+  section in `magi show`, task links on the web run page, and one English
+  comment on the pull request (marker `magi-followup run=<id>`), posted only
+  when something is filed, and retried by a re-entered `land` if it failed.

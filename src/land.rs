@@ -1909,7 +1909,8 @@ async fn repo_slug(repo: &Path) -> Result<String> {
 /// which this path never goes through. A release version bump the change
 /// might have earned is therefore not filed automatically and has to be
 /// requested by hand - recorded as an event on the run so the gap is visible
-/// to whoever reads it later, not just wherever this was called from.
+/// to whoever reads it later, not just wherever this was called from. Follow-up
+/// tasks for findings the merge left open (`crate::followup`) *are* filed here.
 ///
 /// Returns the status before and after, so every caller (CLI, janitor, web
 /// route) can build its own log line or response from the same pair rather
@@ -2130,6 +2131,11 @@ async fn correct_merge(state: &mut RunState, url: &str) -> Result<(RunStatus, Ru
          re-entered `land`, so `bump::after_merge` did not run for it - a release \
          bump this change might warrant has to be filed by hand",
     );
+    // Unlike the bump, the findings the merge left open are filed on this
+    // path too: nothing else would ever carry them forward.
+    if state.status == RunStatus::Merged {
+        crate::followup::after_merge(state, url).await;
+    }
     state.save()?;
     Ok((before, state.status))
 }

@@ -1574,7 +1574,7 @@ async fn report_problem_in(
     }
 }
 
-async fn gh_pr_comment(cwd: &Path, pr_url: &str, body: &str) -> Result<()> {
+pub(crate) async fn gh_pr_comment(cwd: &Path, pr_url: &str, body: &str) -> Result<()> {
     let out = tokio::process::Command::new("gh")
         .args(["pr", "comment", pr_url, "--body", body])
         .current_dir(cwd)

@@ -1935,6 +1935,27 @@ pub struct RunState {
     /// existed, and is reported as unknown, never as an operator's.
     #[serde(default)]
     pub origin: Option<Origin>,
+    /// Follow-up tasks filed from this run's open findings after it merged
+    /// (`crate::followup`). Additive and `#[serde(default)]`, so `SCHEMA`
+    /// stays put.
+    #[serde(default)]
+    pub followups: Vec<FollowupRecord>,
+    /// Follow-up depth of the task this run served, remembered the first
+    /// time it was read so deleting that task cannot reset the cap.
+    #[serde(default)]
+    pub followup_generation: Option<u32>,
+    /// The pull-request comment naming the filed follow-ups was posted.
+    #[serde(default)]
+    pub followup_commented: bool,
+}
+
+/// One follow-up task filed from a merged run. See [`RunState::followups`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FollowupRecord {
+    /// Queue task id.
+    pub task: String,
+    /// Finding ids it covers.
+    pub findings: Vec<String>,
 }
 
 impl RunState {
@@ -1997,6 +2018,9 @@ impl RunState {
             attachments: Vec::new(),
             reviewed_commits: None,
             origin: None,
+            followups: Vec::new(),
+            followup_generation: None,
+            followup_commented: false,
             events: Vec::new(),
             jobs: Vec::new(),
             operator_fixes: Vec::new(),
