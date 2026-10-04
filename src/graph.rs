@@ -5775,7 +5775,12 @@ impl Runner {
         let base = self.state.base_branch.clone();
         let mode = self.state.config.merge.mode;
         let style = self.state.config.merge.style;
-        let pr = pr_message(&self.state, winner.label);
+        let facts = if is_review_run(&self.state) {
+            branch_facts(&repo, &self.state.base_commit, &winner.branch).await
+        } else {
+            None
+        };
+        let pr = pr_message_with(&self.state, winner.label, facts.as_ref());
         let message = pr.commit_message();
 
         let outcome = match mode {
@@ -7463,7 +7468,13 @@ fn is_review_run(state: &RunState) -> bool {
 /// prompt, which says nothing about the change. GitHub text is English, so a
 /// non-ASCII or blank subject yields `None` and the caller's neutral title.
 fn review_title(state: &RunState) -> Option<String> {
-    let raw = state.reviewed_commits.as_ref()?.first()?.trim();
+    english_subject(state.reviewed_commits.as_ref()?.first()?)
+}
+
+/// `raw` as a pull request title, or `None` when it is blank, not English
+/// (GitHub text is), or one of magi's own candidate commit subjects.
+fn english_subject(raw: &str) -> Option<String> {
+    let raw = raw.trim();
     if raw.is_empty() || !raw.is_ascii() || !raw.chars().any(|c| c.is_ascii_alphabetic()) {
         return None;
     }
@@ -7473,6 +7484,50 @@ fn review_title(state: &RunState) -> Option<String> {
         return None;
     }
     Some(title)
+}
+
+/// What a review-only run's branch says about itself, read at the moment the
+/// pull request is opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchFacts {
+    /// `(subject, body)` of each commit, oldest first.
+    commits: Vec<(String, String)>,
+    /// Trimmed `git diff --stat`.
+    stat: String,
+}
+
+/// Longest diff stat shown: this many file lines plus the summary line.
+const STAT_FILE_LINES: usize = 25;
+/// Cap on the commit list, well inside GitHub's 65536-character body limit.
+const COMMITS_MAX_CHARS: usize = 20_000;
+
+/// Read the commits and diff stat of `base..branch`. `None` when git cannot
+/// say or finds nothing, so the caller falls back to what the run recorded.
+async fn branch_facts(repo: &Path, base: &str, branch: &str) -> Option<BranchFacts> {
+    let commits = git::commit_log(repo, base, branch).await.ok()?;
+    if commits.is_empty() {
+        return None;
+    }
+    let stat = git::diff_stat(repo, base, branch).await.unwrap_or_default();
+    let lines: Vec<&str> = stat.lines().collect();
+    let stat = if lines.len() > STAT_FILE_LINES + 1 {
+        let omitted = lines.len() - 1 - STAT_FILE_LINES;
+        let more = format!(" ... {omitted} more file(s)");
+        let mut kept: Vec<&str> = lines[..STAT_FILE_LINES].to_vec();
+        kept.push(&more);
+        kept.push(lines[lines.len() - 1]);
+        kept.join("\n")
+    } else {
+        lines.join("\n")
+    };
+    Some(BranchFacts { commits, stat })
+}
+
+/// Defang what would break the surrounding markdown: a closing `</details>`
+/// and a code fence.
+fn markdown_safe(text: &str) -> String {
+    text.replace("</details>", "&lt;/details&gt;")
+        .replace("\x60\x60\x60", "~~~")
 }
 
 fn neutral_title(state: &RunState, winner: char) -> String {
@@ -7531,6 +7586,12 @@ fn summary_without_title(summary: &str) -> String {
 /// footer repeats the run and candidate as plain tags for a reader holding
 /// only the merged commit or the PR body.
 fn pr_message(state: &RunState, winner: char) -> PrMessage {
+    pr_message_with(state, winner, None)
+}
+
+/// [`pr_message`] with what the branch of a review-only run says about itself.
+/// `facts` is ignored for a run that implements a task.
+fn pr_message_with(state: &RunState, winner: char, facts: Option<&BranchFacts>) -> PrMessage {
     let summary = state
         .candidates
         .iter()
@@ -7541,7 +7602,18 @@ fn pr_message(state: &RunState, winner: char) -> PrMessage {
     // text always is, so a non-English task gets a neutral title instead.
     let review = is_review_run(state);
     let title = if review {
-        review_title(state).unwrap_or_else(|| neutral_title(state, winner))
+        facts
+            .and_then(|f| english_subject(&f.commits.first()?.0))
+            .or_else(|| review_title(state))
+            .or_else(|| {
+                state
+                    .candidates
+                    .iter()
+                    .find(|c| c.label == winner)
+                    .filter(|c| !c.branch.starts_with("magi/"))
+                    .and_then(|c| english_subject(&c.branch))
+            })
+            .unwrap_or_else(|| neutral_title(state, winner))
     } else {
         summary_title(summary).unwrap_or_else(|| {
             let t = queue::title_from(&state.instruction, PR_TITLE_MAX);
@@ -7561,14 +7633,28 @@ fn pr_message(state: &RunState, winner: char) -> PrMessage {
         body.push_str("\n\n");
     }
 
-    let fix = state.reviews.last().and_then(|r| r.fix.as_ref());
-    if let Some(fix) = fix
-        && !fix.notes.trim().is_empty()
-    {
+    // The last round is usually a clean verification pass with no fix of its
+    // own, so every round's notes are read, not just the final one's.
+    let notes: Vec<(usize, &str)> = state
+        .reviews
+        .iter()
+        .filter_map(|r| {
+            let n = r.fix.as_ref()?.notes.trim();
+            (!n.is_empty()).then_some((r.round, n))
+        })
+        .collect();
+    if !notes.is_empty() {
         body.push_str("## Review fixes\n\n");
-        body.push_str(fix.notes.trim());
-        body.push_str("\n\n");
+        if let [(_, only)] = notes.as_slice() {
+            body.push_str(only);
+            body.push_str("\n\n");
+        } else {
+            for (round, n) in &notes {
+                body.push_str(&format!("### Round {round}\n\n{n}\n\n"));
+            }
+        }
     }
+    let fix = state.reviews.iter().rev().find_map(|r| r.fix.as_ref());
 
     let open = state.open_findings();
     if !open.is_empty() {
@@ -7592,18 +7678,43 @@ fn pr_message(state: &RunState, winner: char) -> PrMessage {
     if review {
         // The review prompt is not the task; list what the branch carries.
         body.push_str("## Commits under review\n\n");
-        match &state.reviewed_commits {
-            Some(subjects) => {
-                for s in subjects {
-                    body.push_str(&format!("- {}\n", s.trim()));
+        if let Some(facts) = facts {
+            let mut used = 0;
+            for (i, (subject, text)) in facts.commits.iter().enumerate() {
+                let mut entry = format!("- {}\n", markdown_safe(subject));
+                for l in markdown_safe(text).lines() {
+                    entry.push_str(format!("  {l}\n").trim_end_matches(' '));
                 }
+                used += entry.len();
+                if used > COMMITS_MAX_CHARS && i > 0 {
+                    body.push_str(&format!(
+                        "- ... {} more commit(s)\n",
+                        facts.commits.len() - i
+                    ));
+                    break;
+                }
+                body.push_str(&entry);
             }
-            None => {
-                // An older run kept only the prompt, with the commit list after
-                // its first paragraph.
-                let rest = state.instruction.split_once("\n\n").map_or("", |(_, r)| r);
-                body.push_str(rest.trim());
-                body.push('\n');
+            if !facts.stat.trim().is_empty() {
+                body.push_str(&format!(
+                    "\n## Diff stat\n\n```\n{}\n```\n",
+                    markdown_safe(facts.stat.trim())
+                ));
+            }
+        } else {
+            match &state.reviewed_commits {
+                Some(subjects) => {
+                    for s in subjects {
+                        body.push_str(&format!("- {}\n", s.trim()));
+                    }
+                }
+                None => {
+                    // An older run kept only the prompt, with the commit list
+                    // after its first paragraph.
+                    let rest = state.instruction.split_once("\n\n").map_or("", |(_, r)| r);
+                    body.push_str(rest.trim());
+                    body.push('\n');
+                }
             }
         }
     } else {
@@ -10277,7 +10388,8 @@ mod tests {
     #[test]
     fn pr_message_review_without_a_usable_first_subject_is_neutral() {
         for first in ["日本語の件名", "", "magi: candidate A (uncommitted work)"] {
-            let state = review_state(&[first, "fix: later fixup"]);
+            let mut state = review_state(&[first, "fix: later fixup"]);
+            state.candidates[0].branch = "機能/ログイン".to_owned();
             let m = pr_message(&state, 'A');
             assert!(
                 m.title.starts_with("chore: land candidate A of run"),
@@ -10285,6 +10397,136 @@ mod tests {
                 m.title
             );
         }
+    }
+
+    fn facts(commits: &[(&str, &str)], stat: &str) -> BranchFacts {
+        BranchFacts {
+            commits: commits
+                .iter()
+                .map(|(s, b)| ((*s).to_owned(), (*b).to_owned()))
+                .collect(),
+            stat: stat.to_owned(),
+        }
+    }
+
+    fn round_with_notes(round: usize, notes: Option<&str>) -> ReviewRound {
+        let mut r = review_round(true, 0, 1, 1, true, true);
+        r.round = round;
+        r.fix = notes.map(|n| FixRecord {
+            agent: "fixer".to_owned(),
+            addressed: Vec::new(),
+            rejected: Vec::new(),
+            notes: n.to_owned(),
+            committed: true,
+            failed: None,
+            duration_ms: 0,
+            continuation: None,
+        });
+        r
+    }
+
+    #[test]
+    fn pr_message_review_with_branch_facts_uses_commits_and_stat() {
+        let state = review_state(&["ignored"]);
+        let f = facts(
+            &[
+                (
+                    "fix(login): resolve PATH on macOS",
+                    "Login shells skip rc files.",
+                ),
+                ("fix: address review", ""),
+            ],
+            " src/a.rs | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)",
+        );
+        let m = pr_message_with(&state, 'A', Some(&f));
+        assert_eq!(m.title, "fix(login): resolve PATH on macOS");
+        assert!(
+            m.body
+                .contains("- fix(login): resolve PATH on macOS\n  Login shells skip rc files.\n"),
+            "{}",
+            m.body
+        );
+        assert!(m.body.contains("- fix: address review\n"), "{}", m.body);
+        assert!(m.body.contains("## Diff stat"), "{}", m.body);
+        assert!(m.body.contains("src/a.rs | 2 +-"), "{}", m.body);
+        for banned in [
+            "Review the work already",
+            "no task statement",
+            "Original task",
+        ] {
+            assert!(!m.body.contains(banned), "{banned}: {}", m.body);
+        }
+        assert!(m.body.ends_with("magi:candidate-a\n"), "{}", m.body);
+    }
+
+    #[test]
+    fn pr_message_review_without_facts_falls_back_to_recorded_subjects() {
+        let m = pr_message_with(&review_state(&["feat: x", "fix: y"]), 'A', None);
+        assert_eq!(m.title, "feat: x");
+        assert!(m.body.contains("- fix: y\n"), "{}", m.body);
+        assert!(!m.body.contains("Diff stat"), "{}", m.body);
+        assert!(!m.body.contains("no task statement"), "{}", m.body);
+    }
+
+    #[test]
+    fn pr_message_review_titles_from_the_branch_name_when_subjects_are_unusable() {
+        let mut state = review_state(&["日本語の件名"]);
+        state.candidates[0].branch = "fix/macos-login-path".to_owned();
+        assert_eq!(pr_message(&state, 'A').title, "fix/macos-login-path");
+        state.candidates[0].branch = "機能/ログイン".to_owned();
+        assert!(
+            pr_message(&state, 'A')
+                .title
+                .starts_with("chore: land candidate A")
+        );
+    }
+
+    #[test]
+    fn pr_message_review_fixes_survive_a_clean_final_round() {
+        let mut state = review_state(&["feat: x"]);
+        state.reviews = vec![
+            round_with_notes(1, Some("handled the PATH case")),
+            round_with_notes(2, None),
+        ];
+        let body = pr_message(&state, 'A').body;
+        assert!(
+            body.contains("## Review fixes\n\nhandled the PATH case\n"),
+            "{body}"
+        );
+        assert!(!body.contains("### Round"), "{body}");
+
+        state.reviews = vec![
+            round_with_notes(1, Some("first fix")),
+            round_with_notes(2, Some("")),
+            round_with_notes(3, Some("second fix")),
+            round_with_notes(4, None),
+        ];
+        let body = pr_message(&state, 'A').body;
+        assert!(body.contains("### Round 1\n\nfirst fix"), "{body}");
+        assert!(body.contains("### Round 3\n\nsecond fix"), "{body}");
+        assert!(!body.contains("### Round 2"), "{body}");
+    }
+
+    #[test]
+    fn pr_message_implementation_run_keeps_its_shape_and_marker() {
+        let state = state_with_summary(
+            "add retries to the client",
+            "TITLE: feat: retries\n\nDid it.",
+        );
+        let m = pr_message_with(&state, 'A', Some(&facts(&[("x", "")], "s")));
+        assert_eq!(m.title, "feat: retries");
+        assert!(
+            m.body.contains("<summary>Original task</summary>"),
+            "{}",
+            m.body
+        );
+        assert!(!m.body.contains("Commits under review"), "{}", m.body);
+        assert!(
+            m.body
+                .ends_with(&format!("magi:run/{} magi:candidate-a\n", state.id)),
+            "{}",
+            m.body
+        );
     }
 
     #[test]

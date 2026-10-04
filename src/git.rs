@@ -263,6 +263,35 @@ pub async fn changed_files(worktree: &Path, base: &str, head: &str) -> Result<Ve
     Ok(out.lines().map(str::to_owned).collect())
 }
 
+/// Subject and body of every commit in `base..head`, oldest first. Fields are
+/// split on control characters git never prints in a message, so an empty
+/// subject or a body full of separators cannot shift a record.
+pub async fn commit_log(worktree: &Path, base: &str, head: &str) -> Result<Vec<(String, String)>> {
+    let range = format!("{base}..{head}");
+    let out = git(
+        worktree,
+        &[
+            "log",
+            "--reverse",
+            "--no-color",
+            "--format=%s%x1f%b%x00",
+            &range,
+        ],
+    )
+    .await?;
+    Ok(out
+        .split('\0')
+        .filter_map(|rec| {
+            let rec = rec.trim_start_matches('\n');
+            if rec.trim().is_empty() {
+                return None;
+            }
+            let (subject, body) = rec.split_once('\x1f').unwrap_or((rec, ""));
+            Some((subject.trim().to_owned(), body.trim().to_owned()))
+        })
+        .collect())
+}
+
 /// One-line log of `base..head`, oldest first.
 pub async fn log_oneline(worktree: &Path, base: &str, head: &str) -> Result<String> {
     let range = format!("{base}..{head}");
