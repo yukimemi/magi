@@ -520,27 +520,78 @@ fn value_text(key: &str, ids: &[String]) -> String {
     format!("[{}]", items.join(", "))
 }
 
-/// Walk one line's value text, tracking bracket depth outside strings.
-/// Returns the byte offset of a trailing comment, if any.
-fn scan_line(line: &str, depth: &mut i32) -> Option<usize> {
-    let mut quote: Option<char> = None;
+/// Lexer state carried from one line to the next: bracket depth, and the
+/// delimiter of a multi-line string still open at the end of the last line.
+#[derive(Default)]
+struct Scan {
+    depth: i32,
+    multi: Option<&'static str>,
+}
+
+impl Scan {
+    fn open(&self) -> bool {
+        self.depth > 0 || self.multi.is_some()
+    }
+}
+
+/// Walk one line, tracking bracket depth outside strings and any multi-line
+/// string that opens or closes on it. Returns the byte offset of a trailing
+/// comment, if any.
+fn scan_line(line: &str, st: &mut Scan) -> Option<usize> {
+    let b = line.as_bytes();
+    let mut quote: Option<u8> = None;
     let mut escaped = false;
-    for (i, c) in line.char_indices() {
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(delim) = st.multi {
+            if b[i..].starts_with(delim.as_bytes()) {
+                st.multi = None;
+                i += 3;
+            } else if delim == "\"\"\"" && b[i] == b'\\' {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        let c = b[i];
         match quote {
-            Some('"') if escaped => escaped = false,
-            Some('"') if c == '\\' => escaped = true,
+            Some(b'"') if escaped => escaped = false,
+            Some(b'"') if c == b'\\' => escaped = true,
             Some(q) if c == q => quote = None,
             Some(_) => {}
-            None => match c {
-                '"' | '\'' => quote = Some(c),
-                '[' | '{' => *depth += 1,
-                ']' | '}' => *depth -= 1,
-                '#' => return Some(i),
-                _ => {}
-            },
+            None => {
+                if b[i..].starts_with(b"\"\"\"") {
+                    st.multi = Some("\"\"\"");
+                    i += 3;
+                    continue;
+                }
+                if b[i..].starts_with(b"'''") {
+                    st.multi = Some("'''");
+                    i += 3;
+                    continue;
+                }
+                match c {
+                    b'"' | b'\'' => quote = Some(c),
+                    b'[' | b'{' => st.depth += 1,
+                    b']' | b'}' => st.depth -= 1,
+                    b'#' => return Some(i),
+                    _ => {}
+                }
+            }
         }
+        i += 1;
     }
     None
+}
+
+/// The strings quoted on one line, outside its comment.
+fn quoted_ids(code: &str) -> Vec<String> {
+    code.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The key a `key = value` line assigns, bare or quoted.
@@ -567,22 +618,36 @@ fn is_roles_header(trimmed: &str) -> bool {
         .is_some_and(|n| n.trim().trim_matches(|c| c == '"' || c == '\'') == "roles")
 }
 
+/// What the old value's lines said besides the ids: per line, the ids on it
+/// and its comment, so a rewrite can carry the comments over.
+struct OldSpan {
+    start: usize,
+    end: usize,
+    /// `(line, ids on the line, comment)` for each line that has a comment.
+    notes: Vec<(usize, Vec<String>, String)>,
+}
+
 /// Patch one key of the `[roles]` table, leaving every other byte alone.
+///
+/// Comments inside the replaced value are kept: a comment on an id's line
+/// follows that id, standalone ones stay inside the array, and a trailing
+/// comment stays trailing. Only the comment of an id that is removed goes with
+/// it - and a reset keeps every comment of the key as plain comment lines.
 fn patch_role(text: &str, key: &str, ids: &[String]) -> Result<String, String> {
     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
 
     // Section bounds and the key's span, found in one pass that knows about
-    // multi-line arrays.
-    let mut depth = 0;
+    // multi-line arrays and multi-line strings.
+    let mut st = Scan::default();
     let mut in_roles = false;
     let mut header: Option<usize> = None;
     let mut last_key_end: Option<usize> = None;
-    let mut span: Option<(usize, usize, Option<String>)> = None;
+    let mut span: Option<OldSpan> = None;
     let mut i = 0;
     while i < lines.len() {
         let trimmed = lines[i].trim();
-        if depth == 0 && trimmed.starts_with('[') {
+        if !st.open() && trimmed.starts_with('[') {
             in_roles = header.is_none() && is_roles_header(trimmed);
             if in_roles {
                 header = Some(i);
@@ -592,53 +657,54 @@ fn patch_role(text: &str, key: &str, ids: &[String]) -> Result<String, String> {
             i += 1;
             continue;
         }
-        if depth == 0
+        if !st.open()
             && let Some((name, _)) = assigned_key(trimmed)
         {
             let start = i;
-            let mut comment = None;
             let first = lines[i].trim_start();
             let at = first.find('=').map_or(0, |p| p + 1);
             let mut end = i;
-            let mut hash = scan_line(&first[at..], &mut depth);
-            if in_roles
-                && name == key
-                && (first[at..].contains("\"\"\"") || first[at..].contains("'''"))
-            {
-                return Err(format!(
-                    "`{key}` uses a multi-line string; edit it by hand."
-                ));
-            }
-            while depth > 0 && end + 1 < lines.len() {
+            let mut notes = Vec::new();
+            let mut note = |line: usize, code: &str, hash: Option<usize>| {
+                if let Some(h) = hash {
+                    notes.push((
+                        line,
+                        quoted_ids(&code[..h]),
+                        code[h..].trim_end().to_owned(),
+                    ));
+                }
+            };
+            let code = &first[at..];
+            let hash = scan_line(code, &mut st);
+            note(start, code, hash);
+            while st.open() && end + 1 < lines.len() {
                 end += 1;
-                hash = scan_line(lines[end], &mut depth);
-            }
-            if let Some(h) = hash {
-                let line = if end == start {
-                    &first[at..]
-                } else {
-                    lines[end]
-                };
-                comment = Some(line[h..].trim_end().to_owned());
+                let hash = scan_line(lines[end], &mut st);
+                note(end, lines[end], hash);
             }
             if in_roles {
                 last_key_end = Some(end);
                 if name == key {
                     let body = lines[start..=end].concat();
+                    if body.contains("\"\"\"") || body.contains("'''") {
+                        return Err(format!(
+                            "`{key}` uses a multi-line string; edit it by hand."
+                        ));
+                    }
                     if body.contains("{{") || body.contains("{%") {
                         return Err(format!(
                             "`{key}` is written with a template expression, which this screen \
                              cannot edit without losing it. Change it by hand."
                         ));
                     }
-                    span = Some((start, end, comment));
+                    span = Some(OldSpan { start, end, notes });
                 }
             }
             i = end + 1;
             continue;
         }
-        if depth > 0 {
-            scan_line(lines[i], &mut depth);
+        if st.open() {
+            scan_line(lines[i], &mut st);
         }
         i += 1;
     }
@@ -654,15 +720,62 @@ fn patch_role(text: &str, key: &str, ids: &[String]) -> Result<String, String> {
         s
     };
     match (span, ids.is_empty()) {
-        (Some((start, end, _)), true) => {
-            out.drain(start..=end);
-        }
-        (Some((start, end, comment)), false) => {
-            let indent: String = lines[start]
+        (Some(old), true) => {
+            let indent: String = lines[old.start]
                 .chars()
                 .take_while(|c| c.is_whitespace())
                 .collect();
-            out.splice(start..=end, [new_line(&indent, comment.as_deref())]);
+            let kept: Vec<String> = old
+                .notes
+                .iter()
+                .map(|(_, _, c)| format!("{indent}{c}{eol}"))
+                .collect();
+            out.splice(old.start..=old.end, kept);
+        }
+        (Some(old), false) => {
+            let indent: String = lines[old.start]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect();
+            let single = old.start == old.end;
+            // A trailing comment is the last line's: always for a one-line
+            // value, otherwise only when that line holds no id (`]  # tail`).
+            let trailing = match old.notes.last() {
+                Some((line, on_line, c)) if *line == old.end && (single || on_line.is_empty()) => {
+                    Some(c.clone())
+                }
+                _ => None,
+            };
+            let interior = &old.notes[..old.notes.len() - usize::from(trailing.is_some())];
+            let replacement: Vec<String> =
+                if interior.is_empty() || (key == "synthesizer" && ids.len() == 1) {
+                    // One line. Comments that cannot ride on it stay above it.
+                    let mut v: Vec<String> = interior
+                        .iter()
+                        .map(|(_, _, c)| format!("{indent}{c}{eol}"))
+                        .collect();
+                    v.push(new_line(&indent, trailing.as_deref()));
+                    v
+                } else {
+                    let mut v = vec![format!("{indent}{key} = [{eol}")];
+                    for (_, _, c) in interior.iter().filter(|(_, l, _)| l.is_empty()) {
+                        v.push(format!("{indent}  {c}{eol}"));
+                    }
+                    for id in ids {
+                        let note = interior
+                            .iter()
+                            .find(|(_, l, _)| l.last() == Some(id))
+                            .map(|(_, _, c)| format!("  {c}"))
+                            .unwrap_or_default();
+                        v.push(format!("{indent}  {},{note}{eol}", quote(id)));
+                    }
+                    v.push(format!(
+                        "{indent}]{}{eol}",
+                        trailing.map(|c| format!("  {c}")).unwrap_or_default()
+                    ));
+                    v
+                };
+            out.splice(old.start..=old.end, replacement);
         }
         (None, true) => {}
         (None, false) => match (header, last_key_end) {
@@ -707,11 +820,50 @@ mod tests {
         let out = patch_role(src, "implementers", &ids(&["b", "a"])).unwrap();
         assert_eq!(
             out,
-            "# top comment\n[vars]\ncache = \"/x\"  # keep\n\n[roles]\n# why\nimplementers = [\"b\", \"a\"]  # tail\njudges = [\"a\"]\nfixer = \"a\"\n\n[graph]\ncandidates = 2\n"
+            "# top comment\n[vars]\ncache = \"/x\"  # keep\n\n[roles]\n# why\nimplementers = [\n  \"b\",\n  \"a\",  # first\n]  # tail\njudges = [\"a\"]\nfixer = \"a\"\n\n[graph]\ncandidates = 2\n"
         );
         let out = patch_role(&out, "judges", &[]).unwrap();
         assert!(!out.contains("judges"));
         assert!(out.contains("fixer = \"a\"") && out.contains("[graph]"));
+    }
+
+    #[test]
+    fn patch_does_not_read_a_role_table_out_of_a_multiline_string() {
+        let src = "[vars]\nexample = \'\'\'\n[roles]\njudges = [\"a\"]\n\'\'\'\nother = \"\"\"\n[roles]\n\"\"\"\n";
+        // No real [roles] table: removing is a no-op, adding creates one.
+        assert_eq!(patch_role(src, "judges", &[]).unwrap(), src);
+        let out = patch_role(src, "judges", &ids(&["a"])).unwrap();
+        assert!(out.starts_with(src), "{out}");
+        assert!(out.ends_with("\n[roles]\njudges = [\"a\"]\n"), "{out}");
+    }
+
+    #[test]
+    fn a_reset_keeps_the_comments_of_the_removed_key() {
+        let out = patch_role(
+            "[roles]\njudges = [\"a\"]  # why a\nfixer = \"a\"\n",
+            "judges",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out, "[roles]\n# why a\nfixer = \"a\"\n");
+        let out = patch_role(
+            "[roles]\njudges = [\n  # lead\n  \"a\", # why a\n]\n",
+            "judges",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out, "[roles]\n# lead\n# why a\n");
+    }
+
+    #[test]
+    fn a_comment_follows_its_id_through_a_reorder() {
+        let src =
+            "[roles]\njudges = [ # head\n  # lead\n  \"a\", # why a\n  \"b\", # why b\n]  # tail\n";
+        let out = patch_role(src, "judges", &ids(&["b", "c", "a"])).unwrap();
+        assert_eq!(
+            out,
+            "[roles]\njudges = [\n  # head\n  # lead\n  \"b\",  # why b\n  \"c\",\n  \"a\",  # why a\n]  # tail\n"
+        );
     }
 
     #[test]
