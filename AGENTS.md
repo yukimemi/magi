@@ -506,6 +506,37 @@ docs, and each is asserted in `src/agent.rs` tests:
 may rely on memory. If it says no, the node re-sends full context. Never assume
 a resume worked.
 
+### A reviewer seat remembers who failed it across review rounds
+
+`RunState::seat_history` (`run::SeatHistory`, `#[serde(default)]`, so
+`run::SCHEMA` is not bumped) records per `review-N` seat the roster ids that
+failed it (`failed`), the agent that last answered (`last_ok`) and the class of
+the last failure (`last_fail`, `run::FailClass`). Only the review loop carries
+it (`WaveCtx::carry_seats`; every other node passes `false`). Sessions stay
+keyed by seat, and an agent change always takes a fresh `SeatState`.
+
+- **Start of a round.** `pick_start_spec`: `last_ok` if still on the roster and
+  not failed, else the spec's own agent unless failed, else the next roster
+  agent that has not failed, else the spec's agent (the whole roster failed).
+  Ids no longer on the roster are ignored.
+- **Two sets, on purpose.** `failed` is only a *priority*. The bound is the
+  per-round `tried` set in `ask_json_wave`, which starts empty every round, so
+  an agent that answered is never locked out and a seat can always hand over.
+  Persisting `tried` itself would shut a seat once everyone had been tried.
+- **Handover inside a round** is `next_for_seat`: forward from the seat's
+  start, never wrapping, over ids neither tried this round nor failed earlier.
+  Only when that is exhausted does it *rescue* a carried failure, scanning the
+  whole roster in order - the one place the no-wrap rule is relaxed. Each id is
+  rescued at most once per round and rounds are bounded by `review_rounds`, so
+  it cannot loop. A failure is saved before the next agent is asked, so a
+  restart does not forget it. A repeated `Other` failure class still stops the
+  chain (`last_fail` seeds `prev`); a dropped stream that a nudge recovers is
+  never recorded as a failure.
+- **A review is still fresh each round**: the full prompt for the new patch is
+  sent. Trade-off accepted: an agent with a transient failure is not used again
+  in this run's reviews while another agent answers, so a persistent failure
+  (quota, auth, prompt-shaped error) is not re-billed every round.
+
 ### `[roles]` synthesizer / chatter / conductor take a fallback chain
 
 Each accepts a string (unchanged) or an ordered array of ids

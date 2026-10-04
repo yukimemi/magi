@@ -255,3 +255,42 @@ async fn a_seat_with_a_successor_is_handed_over_without_a_same_agent_nudge() {
     assert_eq!(asked(state, "judge", "judge-1"), 2);
 }
 }
+
+common::e2e! {
+async fn a_reviewer_seat_does_not_re_ask_an_agent_that_failed_it_in_an_earlier_round() {
+    let _home = common::home_lock().await;
+    let mut fx = common::fixture_that_never_clears(_home, 3);
+    fx.config.graph.retries = 0;
+    for a in &mut fx.config.agents {
+        if a.id == "alpha" {
+            a.env.insert("MOCK_FAIL_SEAT".to_owned(), "review-1".to_owned());
+        }
+    }
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    assert!(state.reviews.len() >= 2, "{}", state.reviews.len());
+    let review_moves: Vec<(&str, &str)> = state
+        .handovers
+        .iter()
+        .filter(|h| h.node == "review" && h.seat == "review-1")
+        .map(|h| (h.from.as_str(), h.to.as_str()))
+        .collect();
+    // One handover in round 1; later rounds start on the agent that answered.
+    assert_eq!(review_moves, [("alpha", "beta")], "{:?}", state.handovers);
+    assert_eq!(asked(state, "review", "review-1"), 1 + state.reviews.len());
+    for round in &state.reviews {
+        assert_eq!(round.reviews[0].agent, "beta");
+    }
+
+    // Persisted: a resume reads the same history.
+    let loaded = RunState::load(&state.id).expect("load");
+    let h = loaded.seat_history.get("review-1").expect("history");
+    assert_eq!(h.last_ok.as_deref(), Some("beta"));
+    assert!(h.failed.contains("alpha"));
+    assert_eq!(loaded.seat_history, state.seat_history);
+}
+}
