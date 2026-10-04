@@ -860,6 +860,22 @@ other seats had long finished. A retry that re-sends the whole prompt, because
 the seat kept no context, keeps the whole budget: that one really is the job
 again.
 
+### Known follow-ups from the takeover review (PR #322)
+
+- **R3-1-1 (race).** `Runner::execute_graph` loads `released_to`, then later
+  saves the whole in-memory `RunState`; a takeover that writes the release mark
+  in between is overwritten by the resume's `driver_pid` save, so the takeover
+  can delete a clean worktree under a run that just started driving. Intended
+  fix: compare-and-set on `released_to`, or a re-read under a lock.
+- **R3-1-3.** `Released::restore` runs an unconditional `git branch -f` unless
+  the current tip equals the saved tip, so a branch a third party moved is
+  overwritten. `Released` cannot tell a legitimate post-sync tip from a foreign
+  one; intended fix: refuse (or lease-check) when the branch moved to a third
+  value.
+- A refused handover keeps `Task::review_branch` (`Task::hold_for_handover`),
+  and `Task::release` keeps it only for a machine hold; releasing without
+  cleaning the old worktree re-holds the task without spending an attempt.
+
 ### Handing the address over: release, then spawn
 
 `POST /api/upgrade` ends the process it is serving from, and the order of the
