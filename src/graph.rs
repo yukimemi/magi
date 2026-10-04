@@ -7376,6 +7376,9 @@ fn summary_title(summary: &str) -> Option<String> {
     Some(title)
 }
 
+/// How `open_review`'s instruction begins; see [`landing_title`].
+const REVIEW_PROMPT_OPENING: &str = "Review the work already on branch";
+
 /// Marker `open_review` gives a candidate that nothing in the roster wrote.
 const EXISTING_BRANCH: &str = "(existing branch)";
 
@@ -7409,6 +7412,19 @@ fn neutral_title(state: &RunState, winner: char) -> String {
         winner.to_ascii_uppercase(),
         state.id
     )
+}
+
+/// The pull request title to hand to `land::merge_subject`. A review-only run
+/// opened by an earlier build titled its pull request with the review prompt;
+/// that title is dropped (empty, so the fallback applies) rather than landed.
+/// Any other title, including an operator's rename, passes through untouched,
+/// and so does every title of a run that implements a task.
+pub fn landing_title<'a>(state: &RunState, pr_title: &'a str) -> &'a str {
+    if is_review_run(state) && pr_title.trim_start().starts_with(REVIEW_PROMPT_OPENING) {
+        ""
+    } else {
+        pr_title
+    }
 }
 
 /// What the squash subject falls back to when the pull request title is empty
@@ -10238,6 +10254,20 @@ mod tests {
         assert!(
             land::merge_subject("", &landing_subject_source(&blank)).starts_with("chore: land")
         );
+    }
+
+    #[test]
+    fn review_run_drops_a_prompt_shaped_pr_title_at_landing() {
+        let state = review_state(&["feat: the change"]);
+        let source = landing_subject_source(&state);
+        let old = "Review the work already on branch `magi/x/A`. There is no task statement";
+        assert_eq!(
+            land::merge_subject(landing_title(&state, old), &source),
+            "feat: the change"
+        );
+        assert_eq!(landing_title(&state, "feat: renamed"), "feat: renamed");
+        let task = state_with_summary("add retries", "");
+        assert_eq!(landing_title(&task, old), old);
     }
 
     #[test]
