@@ -252,8 +252,9 @@ function sourceLinkOf(x) {
   return x && x.source_link && x.source_link.href ? x.source_link : null;
 }
 
-/* An explicit "Open chat" control, only for a chat-filed source. A plain
-   link: the hash change navigates, nothing here touches state or location. */
+/* An explicit "Open chat" control, only for a chat-filed source, for the
+   surfaces that show no source label to link (the run page). A plain link:
+   the hash change navigates, nothing here touches state or location. */
 function openChatLink(link, extra) {
   if (!link || link.kind !== "chat") return null;
   return el("a", { class: `btn btn-quiet open-chat ${extra || ""}`.trim(), href: link.href, text: "Open chat" });
@@ -2171,11 +2172,10 @@ function createTaskCard() {
   const whenSlot = el("time", { class: "card-when" });
   const title = el("h2", { class: "card-title" });
   const source = el("a", { class: "task-source" });
-  const openChat = el("a", { class: "btn btn-quiet open-chat", text: "Open chat", hidden: true });
   const repo = el("span", { class: "repo" });
   const attempts = el("span");
   const outcome = el("span");
-  const meta = el("div", { class: "card-meta" }, source, openChat, repo, attempts, outcome);
+  const meta = el("div", { class: "card-meta" }, source, repo, attempts, outcome);
   const note = el("p", { class: "card-note" });
   const snippet = el("p", { class: "card-snippet", hidden: true });
   const error = el("pre", { class: "err" });
@@ -2232,7 +2232,7 @@ function createTaskCard() {
     openTask();
   });
   card.refs = {
-    card, chipSlot, priority, solo, permalink, whenSlot, title, source, openChat, repo, attempts,
+    card, chipSlot, priority, solo, permalink, whenSlot, title, source, repo, attempts,
     outcome, note, snippet, error, instruction, answers, answersList, runLink, historyLink,
     priorityDown, priorityUp, editBtn, holdBox, doneBox, deleteBox,
   };
@@ -2273,15 +2273,11 @@ function updateTaskCard(row, task) {
   setText(r.title, task.title || task.instruction || task.id);
   setText(r.source, task.source_label || "");
   /* An agent-filed task names the run or chat that filed it right in its
-     label ("chat@a1b2", "implement@5dae"), so the label becomes the link; a
-     chat-filed one also gets an explicit "Open chat". The href rule lives in
-     the API (`source_link`). Both are cleared when the task has none, so a
-     recycled card never keeps another task's link. */
+     label ("chat@a1b2", "implement@5dae"), so the label becomes the link. The
+     href rule lives in the API (`source_link`). It is cleared when the task
+     has none, so a recycled card never keeps another task's link. */
   const link = sourceLinkOf(task);
   setAttr(r.source, "href", link ? link.href : null);
-  const chatLink = link && link.kind === "chat" ? link : null;
-  setAttr(r.openChat, "href", chatLink ? chatLink.href : null);
-  show(r.openChat, Boolean(chatLink));
   const repoName = typeof task.repo === "string" ? task.repo.split(/[\\/]/).filter(Boolean).pop() : "";
   setText(r.repo, repoName || "");
   setAttr(r.repo, "title", task.repo || "");
@@ -7679,10 +7675,8 @@ function renderTask() {
   metaBits.forEach((bit, i) => {
     if (i > 0) metaKids.push(" \u00b7 ");
     const link = bit === task.source_label ? sourceLinkOf(task) : null;
-    metaKids.push(link && link.kind !== "chat" ? el("a", { href: link.href, text: bit }) : bit);
+    metaKids.push(link ? el("a", { href: link.href, text: bit }) : bit);
   });
-  const chatBtn = openChatLink(sourceLinkOf(task));
-  if (chatBtn) metaKids.push(" ", chatBtn);
   $("task-meta").replaceChildren(...metaKids);
   setAttr($("task-meta"), "title", task.id);
 
