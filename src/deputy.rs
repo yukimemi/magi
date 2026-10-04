@@ -73,6 +73,12 @@ const RESTART_AFTER: Duration = Duration::from_secs(30);
 /// the deputy's own `magi ask --wait` reaches the deadline first.
 const SLACK_SECS: u64 = 120;
 
+/// A claim file older than this was left by a process that died.
+const CLAIM_STALE: Duration = Duration::from_secs(60);
+
+/// How long the context-handover turn may take.
+const HANDOVER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// Stops the deputy when true: the daemon is parking.
 pub type Halt = Arc<dyn Fn() -> bool + Send + Sync>;
 
@@ -113,6 +119,21 @@ pub fn brief(
         }
     }
     s
+}
+
+/// Has this question's deputy run out of starts with the deadline gone?
+///
+/// Then nothing will ever read an unread say, and the waiter must retire the
+/// question anyway instead of deferring to a deputy that no longer starts.
+pub fn exhausted_past_deadline(q: &Question, default_timeout: u64, now: Timestamp) -> bool {
+    let secs = if q.answer_timeout > 0 {
+        q.answer_timeout
+    } else {
+        default_timeout
+    };
+    q.status.open()
+        && q.deputy.as_ref().is_some_and(|d| d.starts >= MAX_STARTS)
+        && now.as_second() > q.last_activity().saturating_add(secs as i64)
 }
 
 /// The deputy runner: its own task inside `magi serve`, beside the waiter.
@@ -301,12 +322,57 @@ struct Job {
 }
 
 impl Job {
+    /// Run one invocation, beating the lease; `None` when the daemon is
+    /// parking and the turn was dropped.
+    async fn drive(
+        &self,
+        spec: &crate::config::AgentSpec,
+        seat: &mut SeatState,
+        inv: &Invocation<'_>,
+        id: &str,
+    ) -> Option<Result<agent::AgentOutput>> {
+        let fut = agent::invoke(spec, seat, inv);
+        tokio::pin!(fut);
+        let mut beat = tokio::time::interval(Duration::from_secs(1));
+        let mut beats = 0u32;
+        loop {
+            tokio::select! {
+                r = &mut fut => break Some(r),
+                _ = beat.tick() => {
+                    if (self.halt)() {
+                        break None;
+                    }
+                    beats += 1;
+                    if beats % 20 == 0 {
+                        self.store.beat(id, WaiterKind::Deputy);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parking: the turn is dropped and the start refunded. The seat stays as
+    /// last persisted - after the handover turn, resumable.
+    fn park(&self, id: &str) {
+        let _ = self.store.update(id, |r| {
+            if let Some(d) = r.deputy.as_mut() {
+                d.starts = d.starts.saturating_sub(1);
+            }
+            r.waiter = None;
+            Ok(())
+        });
+        self.store.drop_lease(id);
+    }
+
     async fn turn(&self, id: &str) -> Result<()> {
         let claim = self.store.root().join(format!("{id}.deputy-claim"));
-        if !crate::waiter::take_claim(&claim, Duration::from_secs(6 * 3600)) {
+        // The claim only covers the decision to start and the write that records
+        // it, so a daemon that dies holding it blocks a restart for a minute,
+        // not for a turn's length. The lease guards the turn itself.
+        if !crate::waiter::take_claim(&claim, CLAIM_STALE) {
             return Ok(());
         }
-        let _release = crate::waiter::Release(claim);
+        let release = crate::waiter::Release(claim);
 
         // Decided again under the claim, on the record as it is now.
         let q = self.store.get(id)?;
@@ -376,6 +442,7 @@ impl Job {
             thread: read,
             unread: unread.as_deref(),
             resumed,
+            handover: false,
             language: &cfg.graph.language,
         });
 
@@ -396,6 +463,7 @@ impl Job {
             });
             Ok(())
         })?;
+        drop(release);
         tracing::info!(
             "question {}: deputy seat {} {} (start {starts}/{MAX_STARTS})",
             q.short(),
@@ -406,57 +474,82 @@ impl Job {
         let left = (q.last_activity().saturating_add(q.answer_timeout as i64) - now.as_second())
             .max(0) as u64;
         let artifacts = self.store.root().join(format!("{}.deputy", q.id));
-        let stem = format!("turn-{starts}");
         let cache_dir = cfg.cache_dir();
-        let inv = Invocation {
-            cwd: &cwd,
-            prompt: &body,
-            timeout: Duration::from_secs(left.max(60) + SLACK_SECS),
-            allow_write: false,
-            sessions: cfg.graph.sessions,
-            artifacts: &artifacts,
-            stem: &stem,
-            // The question's own run key (the task id) is what lets this seat's
-            // `magi ask` pass the ownership check on a conductor question.
-            run: &q.run,
-            node: NODE,
-            cache_dir: cache_dir.as_deref(),
-            attachments: &[],
-        };
+        // `magi ask` writes the question record and its lock, which a read-only
+        // sandbox refuses, so the seat cannot be read-only. It is told never to
+        // edit anything; the daemon, not the deputy, applies outcomes.
+        let allow_write = true;
+        macro_rules! invocation {
+            ($prompt:expr, $stem:expr, $timeout:expr) => {
+                Invocation {
+                    cwd: &cwd,
+                    prompt: $prompt,
+                    timeout: $timeout,
+                    allow_write,
+                    sessions: cfg.graph.sessions,
+                    artifacts: &artifacts,
+                    stem: $stem,
+                    // The question's own run key (the task id) is what lets this
+                    // seat's `magi ask` pass the ownership check on a conductor
+                    // question.
+                    run: &q.run,
+                    node: NODE,
+                    cache_dir: cache_dir.as_deref(),
+                    attachments: &[],
+                }
+            };
+        }
 
-        let out = {
-            let fut = agent::invoke(&spec, &mut seat, &inv);
-            tokio::pin!(fut);
-            let mut beat = tokio::time::interval(Duration::from_secs(1));
-            let mut beats = 0u32;
-            loop {
-                tokio::select! {
-                    r = &mut fut => break Some(r),
-                    _ = beat.tick() => {
-                        if (self.halt)() {
-                            break None;
-                        }
-                        beats += 1;
-                        if beats % 20 == 0 {
-                            self.store.beat(&q.id, WaiterKind::Deputy);
-                        }
+        // A fresh seat first takes a short turn that ends: `agent::invoke` only
+        // learns the CLI's session id when it returns, and the real turn blocks
+        // in `magi ask` for hours, so a daemon stopped mid-wait would otherwise
+        // leave nothing to resume. This turn persists the seat before the wait.
+        let mut early = None;
+        if !resumed && cfg.graph.sessions {
+            let hbody = prompt::deputy(&prompt::DeputyPrompt {
+                id: &q.id,
+                summary: &q.summary,
+                detail: &q.detail,
+                brief: &dep.brief,
+                choices: &q.choices,
+                thread: read,
+                unread: None,
+                resumed: false,
+                handover: true,
+                language: &cfg.graph.language,
+            });
+            let hstem = format!("handover-{starts}");
+            let hinv = invocation!(&hbody, &hstem, HANDOVER_TIMEOUT);
+            let Some(done) = self.drive(&spec, &mut seat, &hinv, &q.id).await else {
+                self.park(&q.id);
+                return Ok(());
+            };
+            let kept = seat.clone();
+            self.store.update(&q.id, |r| {
+                if let Some(d) = r.deputy.as_mut() {
+                    d.seat = Some(kept);
+                }
+                Ok(())
+            })?;
+            if !matches!(&done, Ok(o) if o.usable()) {
+                early = Some(done);
+            }
+        }
+
+        let out = match early {
+            Some(done) => done,
+            None => {
+                let stem = format!("turn-{starts}");
+                let timeout = Duration::from_secs(left.max(60) + SLACK_SECS);
+                let inv = invocation!(&body, &stem, timeout);
+                match self.drive(&spec, &mut seat, &inv, &q.id).await {
+                    Some(out) => out,
+                    None => {
+                        self.park(&q.id);
+                        return Ok(());
                     }
                 }
             }
-        };
-
-        let Some(out) = out else {
-            // Parking: the turn is dropped, the start refunded, and the seat
-            // stays as it was before the turn - resumable.
-            let _ = self.store.update(&q.id, |r| {
-                if let Some(d) = r.deputy.as_mut() {
-                    d.starts = d.starts.saturating_sub(1);
-                }
-                r.waiter = None;
-                Ok(())
-            });
-            self.store.drop_lease(&q.id);
-            return Ok(());
         };
 
         let (text, why) = match out {

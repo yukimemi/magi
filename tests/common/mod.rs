@@ -230,6 +230,11 @@ fi
 # unread word in prose rather than through `magi ask --thread`, so the runner
 # has to keep the reply on the record itself.
 if has "You are the conductor's deputy"; then
+  if has "Do not run any command now"; then
+    echo "$seat" >> handover.log
+    printf 'ready\n'
+    exit 0
+  fi
   if has "resuming your own earlier conversation"; then
     echo "$seat resumed" >> deputy.log
   else

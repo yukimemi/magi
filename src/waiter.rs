@@ -204,7 +204,16 @@ impl Waiter {
                     // A question with a deputy is the deputy's to read
                     // (`crate::deputy`); resuming the conductor's own seat
                     // here would fork a conversation that is not its own.
-                    if q.deputy.is_some() || self.seat_busy(&q, now) {
+                    if q.deputy.is_some() {
+                        // Unless that deputy is spent: then nobody will read
+                        // the word, and the deadline still has to retire the
+                        // question.
+                        if crate::deputy::exhausted_past_deadline(&q, self.default_timeout, now) {
+                            self.expire(&q);
+                        }
+                        continue;
+                    }
+                    if self.seat_busy(&q, now) {
                         continue;
                     }
                     let key = format!("{}:{:?}", q.thread.len(), word);
@@ -235,7 +244,10 @@ impl Waiter {
             // delivered, not abandoned.
             let now = Timestamp::now();
             let lease = self.store.read_lease(&r.id);
-            if decide(r, lease.as_ref(), false, self.default_timeout, now) != Action::Expire {
+            if decide(r, lease.as_ref(), false, self.default_timeout, now) != Action::Expire
+                && !(lease.as_ref().is_none_or(|l| !l.fresh(now))
+                    && crate::deputy::exhausted_past_deadline(r, self.default_timeout, now))
+            {
                 return Ok(false);
             }
             r.abandon(&why);

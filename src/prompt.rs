@@ -1402,6 +1402,8 @@ pub struct DeputyPrompt<'a> {
     pub unread: Option<&'a str>,
     /// Is this the deputy's own session coming back?
     pub resumed: bool,
+    /// The short first turn that only lets the seat be saved: no waiting yet.
+    pub handover: bool,
     /// Language the owner reads.
     pub language: &'a str,
 }
@@ -1417,6 +1419,7 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
         thread,
         unread,
         resumed,
+        handover,
         language,
     } = *p;
     let mut s = format!(
@@ -1461,6 +1464,15 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
             "\n## The owner has said, and nobody has answered yet\n\n{}\n",
             said.trim()
         ));
+    }
+    if handover {
+        s.push_str(
+            "\n## Now\n\nDo not run any command now. This turn only hands you \
+             the context above. Reply with the single word `ready`; your next \
+             turn tells you to start waiting.\n",
+        );
+        s.push_str(&lang(language));
+        return s;
     }
     s.push_str(&format!(
         "\n## What to do\n\n\
