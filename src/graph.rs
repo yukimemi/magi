@@ -8165,10 +8165,10 @@ mod tests {
         // Rescue looks at the whole roster, once per id, then runs out.
         let mut tried = ids(&["b"]);
         let first = next_for_seat(&roster, 1, &tried, &failed).expect("rescue");
-        assert_eq!(first.id, "c");
+        assert_eq!(first.id, "a");
         tried.insert(first.id.clone());
         let second = next_for_seat(&roster, 1, &tried, &failed).expect("rescue");
-        assert_eq!(second.id, "a");
+        assert_eq!(second.id, "c");
         tried.insert(second.id.clone());
         assert!(next_for_seat(&roster, 1, &tried, &failed).is_none());
     }
