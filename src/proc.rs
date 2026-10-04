@@ -213,7 +213,8 @@ where
 /// shelling out to anything.
 ///
 /// `Ok(Some(t))` is a process present in the table, `Ok(None)` is a pid with
-/// no process, and `Err` is a platform `sysinfo` does not support. Only the
+/// no process, and `Err` is a platform `sysinfo` does not support or a
+/// process table that cannot be read (detected by this process's own absence). Only the
 /// requested pid is refreshed, never the whole table. `sysinfo` cannot tell
 /// "no such process" from "not visible to this account", so a pid owned by
 /// another user that the platform hides reads as absent; identity queries
@@ -227,12 +228,22 @@ fn query_process(pid: u32) -> std::io::Result<Option<u64>> {
         ));
     }
     let pid = Pid::from_u32(pid);
+    let own = Pid::from_u32(std::process::id());
     let mut system = System::new();
     system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
+        ProcessesToUpdate::Some(&[pid, own]),
         true,
         ProcessRefreshKind::nothing(),
     );
+    // A failed refresh (an unmounted or unreadable process table) looks
+    // exactly like an absent pid. This process is certainly alive, so if it
+    // is missing too the table cannot be trusted and nothing may be read
+    // from it - least of all "dead".
+    if system.process(own).is_none_or(|p| p.start_time() == 0) {
+        return Err(std::io::Error::other(
+            "process table is unreadable: this process is not listed",
+        ));
+    }
     Ok(system.process(pid).map(sysinfo::Process::start_time))
 }
 
