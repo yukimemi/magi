@@ -26,10 +26,18 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
+use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
+
+use crate::agent;
+use crate::config::Config;
+use crate::prompt;
 
 use crate::land::PrLifecycle;
 use crate::proc::Quiet as _;
@@ -100,15 +108,30 @@ impl fmt::Display for Hit {
 
 /// The refusal: one or more [`Hit`]s and nothing filed.
 #[derive(Debug, Clone)]
-pub struct Duplicate(pub Vec<Hit>);
+pub struct Duplicate {
+    /// What matched.
+    pub hits: Vec<Hit>,
+    /// The judge's word, when one was asked: a ready-made line for the
+    /// refusal text. `None` when no judge ran.
+    pub judge: Option<String>,
+}
 
 impl Duplicate {
+    /// A refusal on the identifier match alone.
+    pub fn new(hits: Vec<Hit>) -> Self {
+        Self { hits, judge: None }
+    }
+
     /// The refusal text, ending in how to override it.
     pub fn render(&self, override_hint: &str) -> String {
         let mut out = String::from("this looks like work that is already in flight:");
-        for h in &self.0 {
+        for h in &self.hits {
             out.push_str("\n  - ");
             out.push_str(&h.to_string());
+        }
+        if let Some(j) = &self.judge {
+            out.push('\n');
+            out.push_str(j);
         }
         out.push('\n');
         out.push_str(override_hint);
@@ -126,6 +149,223 @@ impl fmt::Display for Duplicate {
 }
 
 impl std::error::Error for Duplicate {}
+
+/// What the judge made of a match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ruling {
+    /// The new work would do work on the same branch / pull request / commit.
+    Owns,
+    /// The new work only cites it as context.
+    Mentions,
+    /// The judge could not tell.
+    Unsure,
+}
+
+/// The judge's answer, with the agent that gave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Judgement {
+    /// The verdict.
+    pub ruling: Ruling,
+    /// One line, as the agent wrote it.
+    pub reason: String,
+    /// Id of the agent that answered.
+    pub agent: String,
+}
+
+/// A judge: given the instruction and the matched claims, rules on them.
+/// Owned arguments, so a boxed future needs no borrow.
+pub type JudgeFuture = Pin<Box<dyn Future<Output = Result<Judgement>> + Send>>;
+
+/// Whole-chain wall-clock budget for the judge call.
+const JUDGE_BUDGET: Duration = Duration::from_secs(120);
+/// Per-agent cap inside that budget.
+const JUDGE_TURN: Duration = Duration::from_secs(90);
+
+/// Read the judge's reply. Strict: anything but one of the three rulings with a
+/// non-empty reason is an error, which the caller treats as a refusal.
+fn parse_ruling(text: &str) -> Result<(Ruling, String)> {
+    #[derive(Deserialize)]
+    struct Raw {
+        ruling: String,
+        reason: String,
+    }
+    // The whole reply must be one object (optionally in a code fence): hunting
+    // for an object inside prose or a second answer could recover an approval
+    // from a reply that is not itself a single valid ruling.
+    let mut body = text.trim();
+    if let Some(rest) = body.strip_prefix("```") {
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        body = rest.trim().strip_suffix("```").unwrap_or(rest).trim();
+    }
+    let raw: Raw =
+        serde_json::from_str(body).context("the judge's reply is not a single JSON object")?;
+    let ruling = match raw.ruling.trim().to_ascii_lowercase().as_str() {
+        "owns" => Ruling::Owns,
+        "mentions" => Ruling::Mentions,
+        "unsure" => Ruling::Unsure,
+        other => bail!("unknown ruling `{other}`"),
+    };
+    let reason = raw.reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if reason.is_empty() {
+        bail!("the judge gave no reason");
+    }
+    Ok((ruling, reason.chars().take(300).collect()))
+}
+
+/// Ask the `[roles] chatter` chain (or the default agent) once. Each agent is
+/// tried at most once; only an error, quota or unusable answer moves on. A
+/// usable answer that does not parse, or that rules `owns` / `unsure`, ends
+/// the chain.
+pub async fn chain_judge(
+    cfg: &Config,
+    repo: &Path,
+    instruction: String,
+    hits: Vec<Hit>,
+) -> Result<Judgement> {
+    let chain = agent::pick_chain(
+        &cfg.agents,
+        cfg.roles.chatter.as_ref(),
+        &agent::installed,
+        "dupes judge",
+    )?;
+    let claims: Vec<String> = hits.iter().map(ToString::to_string).collect();
+    let body = prompt::dupes_judge(&instruction, &claims);
+    let artifacts = std::env::temp_dir().join(format!("magi-dupes-{:016x}", crate::rng::entropy()));
+    let started = Instant::now();
+    let mut last: anyhow::Error = anyhow::anyhow!("no judge agent ran");
+    let mut result = None;
+    for spec in &chain {
+        let left = JUDGE_BUDGET.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        let mut seat = agent::SeatState::new("dupes", &spec.id, crate::rng::entropy());
+        let inv = agent::Invocation {
+            cwd: repo,
+            prompt: &body,
+            timeout: left.min(JUDGE_TURN),
+            allow_write: false,
+            sessions: false,
+            artifacts: &artifacts,
+            stem: &format!("judge-{}", spec.id),
+            run: "dupes",
+            node: "dupes",
+            cache_dir: None,
+            attachments: &[],
+            writable: &[],
+        };
+        let out = agent::invoke(spec, &mut seat, &inv).await;
+        if agent::chain_advances(&out) {
+            last = match out {
+                Err(e) => e.context(format!("judge `{}` failed", spec.id)),
+                Ok(o) => anyhow::anyhow!(
+                    "judge `{}` gave no usable reply (exit {:?}, timed out {}, quota {})",
+                    spec.id,
+                    o.exit_code,
+                    o.timed_out,
+                    o.quota_exhausted()
+                ),
+            };
+            continue;
+        }
+        result = Some(
+            out.and_then(|o| parse_ruling(&o.text))
+                .map(|(ruling, reason)| Judgement {
+                    ruling,
+                    reason,
+                    agent: spec.id.clone(),
+                }),
+        );
+        break;
+    }
+    let _ = std::fs::remove_dir_all(&artifacts);
+    result.unwrap_or(Err(last))
+}
+
+/// The one decision point every caller shares. `hits` is [`check`]'s output:
+/// empty passes without the judge being asked. Otherwise the judge is asked
+/// once, and only a clean `mentions` lets the work through; `owns`, `unsure`
+/// and every failure refuse, carrying the judge's reason when there is one.
+///
+/// For a review-only request `text` is empty, so `review_branch` is put in
+/// front of the judge as the thing the work is about.
+pub async fn screen(
+    hits: Vec<Hit>,
+    text: &str,
+    review_branch: Option<&str>,
+    judge: &(dyn Fn(String, Vec<Hit>) -> JudgeFuture + Sync),
+) -> Result<(), Duplicate> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    // A judge that has not seen the whole text cannot clear it: the part it
+    // missed may be the part that does the work.
+    if text.chars().count() > prompt::DUPES_JUDGE_MAX_CHARS {
+        return Err(Duplicate {
+            hits,
+            judge: Some(format!(
+                "judge could not decide: the text is longer than {} characters, \
+                 too long to judge in full",
+                prompt::DUPES_JUDGE_MAX_CHARS
+            )),
+        });
+    }
+    let mut subject = text.to_owned();
+    if let Some(b) = review_branch {
+        if !subject.is_empty() {
+            subject.push_str("\n\n");
+        }
+        subject.push_str(&format!(
+            "(This is a review-only request for branch `{b}`: it would do work on that branch.)"
+        ));
+    }
+    let note = match judge(subject, hits.clone()).await {
+        Ok(j) if j.ruling == Ruling::Mentions => {
+            tracing::info!(
+                agent = %j.agent,
+                reason = %j.reason,
+                hits = hits.len(),
+                "duplicate check: the judge says the work only mentions what is in flight"
+            );
+            return Ok(());
+        }
+        Ok(j) => {
+            let word = if j.ruling == Ruling::Owns {
+                "owns"
+            } else {
+                "unsure"
+            };
+            format!("judge ({}): {word} - {}", j.agent, j.reason)
+        }
+        Err(e) => format!("judge could not decide: {e:#}"),
+    };
+    Err(Duplicate {
+        hits,
+        judge: Some(note),
+    })
+}
+
+/// [`screen`] with the production judge: the `[roles] chatter` chain of `cfg`.
+/// No config (`None`) means no judge, so a hit refuses as it always did.
+pub async fn screen_with_config(
+    hits: Vec<Hit>,
+    text: &str,
+    review_branch: Option<&str>,
+    repo: &Path,
+    cfg: Option<&Config>,
+) -> Result<(), Duplicate> {
+    let judge = |instruction: String, hits: Vec<Hit>| -> JudgeFuture {
+        let cfg = cfg.cloned();
+        let repo = repo.to_path_buf();
+        Box::pin(async move {
+            match cfg {
+                Some(cfg) => chain_judge(&cfg, &repo, instruction, hits).await,
+                None => bail!("no readable configuration to resolve a judge agent from"),
+            }
+        })
+    };
+    screen(hits, text, review_branch, &judge).await
+}
 
 /// The slice of `run.json` this module needs. Every field is optional so a
 /// record from any schema still yields what it has.
@@ -831,7 +1071,7 @@ mod tests {
             && h.signal == Signal::Branch
             && h.token == "magi/aaaa/A"));
         assert!(hits.iter().any(|h| h.owner == Owner::Run && h.id == RID));
-        let msg = Duplicate(hits).to_string();
+        let msg = Duplicate::new(hits).to_string();
         assert!(
             msg.contains("--force") && msg.contains("magi/aaaa/A"),
             "{msg}"
@@ -1138,5 +1378,123 @@ mod tests {
             1,
             "an unreadable forge is asked once, not per PR"
         );
+    }
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn verdict(ruling: Ruling) -> Result<Judgement> {
+        Ok(Judgement {
+            ruling,
+            reason: "because".into(),
+            agent: "j".into(),
+        })
+    }
+
+    /// Run `screen` over `text` with a judge answering `answer`; returns the
+    /// outcome and how many times the judge was asked.
+    fn judged(
+        f: &Fx,
+        text: &str,
+        answer: impl Fn() -> Result<Judgement> + Send + Sync + 'static,
+    ) -> (Result<(), Duplicate>, usize) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let judge = move |_: String, _: Vec<Hit>| -> JudgeFuture {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let r = answer();
+            Box::pin(async move { r })
+        };
+        let hits = run(f, text, None);
+        let out = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(screen(hits, text, None, &judge));
+        (out, calls.load(Ordering::SeqCst))
+    }
+
+    const NAMES: &str = "seen on magi/aaaa/A, which does not touch this file";
+
+    fn fx_with_run() -> Fx {
+        let (f, base, _) = fx();
+        write_run(&f, RID, "reviewing", &base, None);
+        f
+    }
+
+    #[test]
+    fn a_mentions_ruling_lets_the_work_through() {
+        let f = fx_with_run();
+        let (out, calls) = judged(&f, NAMES, || verdict(Ruling::Mentions));
+        assert!(out.is_ok());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn an_owns_ruling_refuses_and_says_why() {
+        let f = fx_with_run();
+        let (out, _) = judged(&f, NAMES, || verdict(Ruling::Owns));
+        let msg = out.unwrap_err().to_string();
+        assert!(
+            msg.contains("owns - because") && msg.contains("--force"),
+            "{msg}"
+        );
+        assert!(msg.contains("magi/aaaa/A"), "{msg}");
+    }
+
+    #[test]
+    fn an_unsure_ruling_refuses() {
+        let f = fx_with_run();
+        let (out, _) = judged(&f, NAMES, || verdict(Ruling::Unsure));
+        assert!(out.unwrap_err().to_string().contains("unsure - because"));
+    }
+
+    #[test]
+    fn a_failing_judge_refuses() {
+        let f = fx_with_run();
+        let (out, calls) = judged(&f, NAMES, || Err(anyhow::anyhow!("quota")));
+        let msg = out.unwrap_err().to_string();
+        assert!(msg.contains("judge could not decide: quota"), "{msg}");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn garbage_and_unknown_rulings_do_not_parse() {
+        assert!(parse_ruling("sure, go ahead").is_err());
+        assert!(parse_ruling(r#"{"ruling":"maybe","reason":"x"}"#).is_err());
+        assert!(parse_ruling(r#"{"ruling":"mentions"}"#).is_err());
+        assert!(parse_ruling(r#"{"ruling":"mentions","reason":"  "}"#).is_err());
+        let two = "{\"ruling\":\"mentions\",\"reason\":\"c\"}\n{\"ruling\":\"owns\"}";
+        assert!(parse_ruling(two).is_err());
+        assert!(parse_ruling("ok {\"ruling\":\"mentions\",\"reason\":\"c\"}").is_err());
+        let (r, why) = parse_ruling("{\"ruling\":\"Mentions\",\"reason\":\"cites\\nit\"}").unwrap();
+        assert_eq!((r, why.as_str()), (Ruling::Mentions, "cites it"));
+    }
+
+    #[test]
+    fn a_text_too_long_to_judge_in_full_refuses_without_asking() {
+        let f = fx_with_run();
+        let long = format!("{NAMES} {}", "x".repeat(prompt::DUPES_JUDGE_MAX_CHARS));
+        let (out, calls) = judged(&f, &long, || verdict(Ruling::Mentions));
+        assert!(out.unwrap_err().to_string().contains("too long to judge"));
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn no_hit_never_asks_the_judge() {
+        let (f, _, _) = fx();
+        let (out, calls) = judged(&f, "nothing named here", || verdict(Ruling::Owns));
+        assert!(out.is_ok());
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn without_a_config_a_hit_still_refuses() {
+        let f = fx_with_run();
+        let hits = run(&f, NAMES, None);
+        let out = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(screen_with_config(hits, NAMES, None, &f.repo, None));
+        assert!(out.unwrap_err().judge.is_some());
     }
 }
