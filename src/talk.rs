@@ -178,6 +178,12 @@ pub struct Talk {
     /// Attachments paired with [`Self::pending`].
     #[serde(default)]
     pub pending_attachments: Vec<Attachment>,
+    /// May a failed turn fall back through the rest of `[roles] chatter`?
+    /// True only while the agent was chosen by that chain; an explicit
+    /// `--agent` or an operator's switch pins the conversation to its agent
+    /// even when that agent also appears in the chain.
+    #[serde(default)]
+    pub fallback: bool,
     /// When the conversation was opened.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -503,6 +509,7 @@ pub fn begin(store: &Talks, cfg: &Config, repo: PathBuf, agent: Option<&str>) ->
         turns: Vec::new(),
         pending: String::new(),
         pending_attachments: Vec::new(),
+        fallback: agent.is_none(),
         created_at: now,
         updated_at: now,
         seat: SeatState::new(SEAT, &spec.id, crate::rng::entropy()),
@@ -716,6 +723,8 @@ pub fn switch_agent(talk: &mut Talk, store: &Talks, spec: &AgentSpec) -> Result<
     }
     let from = std::mem::replace(&mut fresh.agent, spec.id.clone());
     fresh.seat = SeatState::new(SEAT, &spec.id, crate::rng::entropy());
+    // A deliberate switch pins the conversation to the agent chosen.
+    fresh.fallback = false;
     fresh.turns.push(Turn {
         who: Who::Agent,
         body: format!("{MAGI_NOTE}agent changed from {from} to {}", spec.id),
@@ -852,7 +861,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // `[roles] chatter` - the rest of that chain, each at most once.
     let mut chain = vec![spec.clone()];
     if let Some(choice) = cfg.roles.chatter.as_ref()
-        && choice.ids().contains(&talk.agent.as_str())
+        && talk.fallback
     {
         for id in choice.ids() {
             if id == talk.agent || chain.iter().any(|s| s.id == id) {
@@ -1461,6 +1470,7 @@ mod tests {
             turns: Vec::new(),
             pending: String::new(),
             pending_attachments: Vec::new(),
+            fallback: false,
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, "sonnet", 7),
@@ -1762,6 +1772,20 @@ mod tests {
         let cfg = chain_config(vec![b], &["ghost", "b"]);
         let talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
         assert_eq!(talk.agent, "b");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_agent_inside_the_chatter_chain_stays_pinned() {
+        let (tmp, talks) = store();
+        let a = counting_agent(tmp.path(), "a", "cat >/dev/null\nexit 3");
+        let b = counting_agent(tmp.path(), "b", "cat");
+        let cfg = chain_config(vec![a, b], &["a", "b"]);
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), Some("a")).expect("begin");
+        say(&mut talk, &talks, &cfg, "hi", Vec::new())
+            .await
+            .expect_err("a alone, and it fails");
+        assert_eq!(calls(tmp.path(), "b"), 0);
+        assert_eq!(talk.agent, "a");
     }
 
     #[tokio::test]
@@ -2454,6 +2478,7 @@ mod tests {
                 turns: Vec::new(),
                 pending: String::new(),
                 pending_attachments: Vec::new(),
+                fallback: false,
                 created_at: Timestamp::now(),
                 updated_at: Timestamp::now(),
                 seat: SeatState::new(SEAT, "mock", 7),
