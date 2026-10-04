@@ -2954,6 +2954,15 @@ struct Seen {
 /// Read the pull request: `gh pr view` for the rollup and the top-level thread,
 /// `gh api` for the inline review comments `gh pr view` does not report.
 async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
+    // Needs the number, which only the view yields; read it from the URL.
+    let before_oid = match pr_url
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.parse::<u64>().ok())
+    {
+        Some(number) => last_commit_oid(repo, number).await,
+        None => None,
+    };
     let view = gh(
         repo,
         &[
@@ -2991,18 +3000,25 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
         tracing::warn!("gh api pulls/{}/comments: {}", pr.number, inline.1);
     }
 
-    // The rollup is the pull request's last commit's. `gh pr view` lists only
-    // the first 100 commits, so on a long pull request its last entry is not
-    // that commit; ask for the last one directly and use the list only when it
-    // is certainly complete.
-    let rollup_head = match last_commit_oid(repo, pr.number).await {
-        Some(oid) => oid,
-        None if raw.commits.len() < 100 => raw
+    // The rollup is the pull request's last commit's, and `gh pr view` lists
+    // only the first 100 commits, so its last entry cannot name that commit on
+    // a long pull request. Ask for the last commit directly, once before and
+    // once after the view: commits only ever get appended, so the same oid on
+    // both sides proves it was the last one while the rollup was read. A
+    // differing pair (a push in between) leaves the head unbound and the loop
+    // looks again. The view's own list is used only when the forge cannot be
+    // asked and the list is certainly complete (it comes from the same
+    // response as the rollup).
+    let after_oid = last_commit_oid(repo, pr.number).await;
+    let rollup_head = match (before_oid, after_oid) {
+        (Some(a), Some(b)) if a.eq_ignore_ascii_case(&b) => a,
+        (Some(_), Some(_)) => String::new(),
+        _ if raw.commits.len() < 100 => raw
             .commits
             .last()
             .map(|c| c.oid.clone())
             .unwrap_or_default(),
-        None => String::new(),
+        _ => String::new(),
     };
 
     let failing_urls = raw
