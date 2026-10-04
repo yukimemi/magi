@@ -1225,6 +1225,34 @@ async fn approval_gate(
     })
 }
 
+/// Fold a rollup's entries into one verdict plus the failing checks' labels.
+/// No I/O. An empty rollup is `Unknown`, never green.
+fn rollup_verdict(rollup: &[GhCheck]) -> (Checks, Vec<String>) {
+    let mut failing = Vec::new();
+    let mut pending = false;
+    let mut unknown = false;
+    for check in rollup {
+        match check.verdict() {
+            Verdict::Pass => {}
+            Verdict::Pending => pending = true,
+            Verdict::Fail => failing.push(check.label()),
+            Verdict::Unknown => unknown = true,
+        }
+    }
+    let checks = if rollup.is_empty() {
+        Checks::Unknown
+    } else if pending {
+        Checks::Pending
+    } else if !failing.is_empty() {
+        Checks::Red
+    } else if unknown {
+        Checks::Unknown
+    } else {
+        Checks::Green
+    };
+    (checks, failing)
+}
+
 /// Parse `gh pr view --json url,number,state,statusCheckRollup,reviews,comments`
 /// output into a [`PrState`]. No I/O.
 pub fn parse_pr(json: &str) -> Result<PrState> {
@@ -1236,28 +1264,7 @@ pub fn parse_pr(json: &str) -> Result<PrState> {
         other => bail!("unknown pull request state `{other}`"),
     };
 
-    let mut failing = Vec::new();
-    let mut pending = false;
-    let mut unknown = false;
-    for check in &raw.status_check_rollup {
-        match check.verdict() {
-            Verdict::Pass => {}
-            Verdict::Pending => pending = true,
-            Verdict::Fail => failing.push(check.label()),
-            Verdict::Unknown => unknown = true,
-        }
-    }
-    let checks = if raw.status_check_rollup.is_empty() {
-        Checks::Unknown
-    } else if pending {
-        Checks::Pending
-    } else if !failing.is_empty() {
-        Checks::Red
-    } else if unknown {
-        Checks::Unknown
-    } else {
-        Checks::Green
-    };
+    let (checks, failing) = rollup_verdict(&raw.status_check_rollup);
 
     let mut review_comments = Vec::new();
     for r in raw.reviews {
@@ -2465,9 +2472,9 @@ fn awaiting_new_head(awaiting: Option<&str>, observed: &str) -> bool {
 /// `None` when a pushed commit is awaited and the pull request is not on it,
 /// when the head is unreadable, or when the rollup (`statusCheckRollup` is the
 /// last commit's) is not the head's: that is the previous commit's checks. The
-/// caller re-polls on `None`. `gh` caps `commits` at about a hundred entries,
-/// so on a very long pull request the rollup commit may never be visible and
-/// the wait runs to [`WAIT_CEILING`] and stops - a safe failure, never a merge.
+/// caller re-polls on `None`. A rollup that cannot be read (including one
+/// longer than a page) leaves `rollup_head` empty, so the wait runs to
+/// [`WAIT_CEILING`] and stops - a safe failure, never a merge.
 fn bound_head<'a>(
     seen_head: &'a str,
     rollup_head: &str,
@@ -2945,26 +2952,18 @@ struct Seen {
     failing_urls: Vec<(String, String)>,
     /// `headRefOid`: the commit this observation, checks included, is about.
     head: String,
-    /// The commit `statusCheckRollup` belongs to: the pull request's last
-    /// commit, as `commits` lists it. Empty when unreadable.
+    /// The commit the checks belong to, read from the same GraphQL node as
+    /// the checks themselves. Empty when unreadable.
     rollup_head: String,
     /// `mergeStateStatus` as the forge spelled it. [`Blocking`] folds BLOCKED,
     /// BEHIND and DRAFT together, and a stop reason has to say which.
     merge_state: String,
 }
 
-/// Read the pull request: `gh pr view` for the rollup and the top-level thread,
-/// `gh api` for the inline review comments `gh pr view` does not report.
+/// Read the pull request: `gh pr view` for the top-level thread and merge
+/// state, `gh api graphql` for the last commit and its checks, `gh api` for the
+/// inline review comments `gh pr view` does not report.
 async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
-    // Needs the number, which only the view yields; read it from the URL.
-    let before_oid = match pr_url
-        .rsplit('/')
-        .next()
-        .and_then(|n| n.parse::<u64>().ok())
-    {
-        Some(number) => last_commit_oid(repo, number).await,
-        None => None,
-    };
     let view = gh(
         repo,
         &[
@@ -2972,63 +2971,67 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
             "view".to_owned(),
             pr_url.to_owned(),
             "--json".to_owned(),
-            "url,number,state,title,statusCheckRollup,reviews,comments,mergeStateStatus,headRefOid,commits"
-                .to_owned(),
+            "url,number,state,title,reviews,comments,mergeStateStatus,headRefOid".to_owned(),
         ],
     )
     .await?;
     if !view.0 {
         bail!("gh pr view {pr_url}: {}", view.1);
     }
-    let mut pr = parse_pr(&view.1)?;
-    let raw: GhPr = serde_json::from_str(&view.1).context("re-read pull request json")?;
+    let number = parse_pr(&view.1)?.number;
+    let node = last_commit_node(repo, number).await;
+    let mut seen = seen_from(&view.1, node.as_deref())?;
 
     let inline = gh(
         repo,
         &[
             "api".to_owned(),
-            format!("repos/{{owner}}/{{repo}}/pulls/{}/comments", pr.number),
+            format!("repos/{{owner}}/{{repo}}/pulls/{}/comments", seen.pr.number),
         ],
     )
     .await?;
     if inline.0 {
         match parse_inline_comments(&inline.1) {
-            Ok(mut comments) => pr.review_comments.append(&mut comments),
+            Ok(mut comments) => seen.pr.review_comments.append(&mut comments),
             // An unreadable inline thread must not end a landing: the rollup
             // and the top-level thread are still real signal.
             Err(e) => tracing::warn!("inline review comments unreadable: {e}"),
         }
     } else {
-        tracing::warn!("gh api pulls/{}/comments: {}", pr.number, inline.1);
+        tracing::warn!("gh api pulls/{}/comments: {}", seen.pr.number, inline.1);
     }
+    Ok(seen)
+}
 
-    // The rollup is the pull request's last commit's, and `gh pr view` lists
-    // only the first 100 commits, so its last entry cannot name that commit on
-    // a long pull request. Ask for the last commit directly, once before and
-    // once after the view: commits only ever get appended, so the same oid on
-    // both sides proves it was the last one while the rollup was read. A
-    // differing pair (a push in between) leaves the head unbound and the loop
-    // looks again. The view's own list is used only when the forge cannot be
-    // asked and the list is certainly complete (it comes from the same
-    // response as the rollup).
-    let after_oid = last_commit_oid(repo, pr.number).await;
-    let rollup_head = match (before_oid, after_oid) {
-        (Some(a), Some(b)) if a.eq_ignore_ascii_case(&b) => a,
-        (Some(_), Some(_)) => String::new(),
-        _ if raw.commits.len() < 100 => raw
-            .commits
-            .last()
-            .map(|c| c.oid.clone())
-            .unwrap_or_default(),
-        _ => String::new(),
-    };
+/// Build a [`Seen`] from the `gh pr view` json and the last-commit node
+/// response. No I/O.
+///
+/// The commit oid and the checks are read from the *same* node, so the rollup
+/// is bound to the commit it belongs to by construction; two reads that agree
+/// before and after another response prove nothing about what that response
+/// held. The view's own rollup is never used. A node that is missing,
+/// unreadable, carries GraphQL errors, or whose checks run past the page
+/// leaves `rollup_head` empty and the checks `Unknown`, which the loop treats
+/// as "look again" and never as a reason to merge.
+fn seen_from(view_json: &str, node_json: Option<&str>) -> Result<Seen> {
+    let mut pr = parse_pr(view_json)?;
+    let raw: GhPr = serde_json::from_str(view_json).context("re-read pull request json")?;
 
-    let failing_urls = raw
-        .status_check_rollup
-        .iter()
-        .filter(|c| c.verdict() == Verdict::Fail)
-        .filter_map(|c| c.url().map(|u| (c.label(), u.to_owned())))
-        .collect();
+    let mut rollup_head = String::new();
+    let mut failing_urls = Vec::new();
+    let mut checks = Checks::Unknown;
+    let mut failing = Vec::new();
+    if let Some((oid, rollup)) = node_json.and_then(parse_last_commit_node) {
+        (checks, failing) = rollup_verdict(&rollup);
+        failing_urls = rollup
+            .iter()
+            .filter(|c| c.verdict() == Verdict::Fail)
+            .filter_map(|c| c.url().map(|u| (c.label(), u.to_owned())))
+            .collect();
+        rollup_head = oid;
+    }
+    pr.checks = checks;
+    pr.failing = failing;
 
     Ok(Seen {
         pr,
@@ -3040,9 +3043,35 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
     })
 }
 
-/// The oid of the pull request's last commit, whose checks the rollup lists.
-/// `None` when the forge could not be asked or answered unreadably.
-async fn last_commit_oid(repo: &Path, number: u64) -> Option<String> {
+/// The last commit's oid and its checks from one GraphQL response, `None`
+/// when anything about it cannot be trusted.
+fn parse_last_commit_node(json: &str) -> Option<(String, Vec<GhCheck>)> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    if v.get("errors").is_some_and(|e| !e.is_null()) {
+        return None;
+    }
+    let commit = v.pointer("/data/repository/pullRequest/commits/nodes/0/commit")?;
+    let oid = commit.get("oid")?.as_str().filter(|o| !o.is_empty())?;
+    let contexts = commit.pointer("/statusCheckRollup/contexts");
+    let Some(contexts) = contexts.filter(|c| !c.is_null()) else {
+        // No rollup at all: the commit has no checks.
+        return Some((oid.to_owned(), Vec::new()));
+    };
+    if contexts.pointer("/pageInfo/hasNextPage")?.as_bool()? {
+        return None;
+    }
+    let nodes = contexts.get("nodes")?.as_array()?;
+    let rollup = nodes
+        .iter()
+        .map(|n| serde_json::from_value::<GhCheck>(n.clone()))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some((oid.to_owned(), rollup))
+}
+
+/// The pull request's last commit and its checks, in one response. `None`
+/// when the forge could not be asked.
+async fn last_commit_node(repo: &Path, number: u64) -> Option<String> {
     let out = gh(
         repo,
         &[
@@ -3056,19 +3085,16 @@ async fn last_commit_oid(repo: &Path, number: u64) -> Option<String> {
             format!("number={number}"),
             "-f".to_owned(),
             "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,\
-             name:$repo){pullRequest(number:$number){commits(last:1){nodes{commit{oid}}}}}}"
+             name:$repo){pullRequest(number:$number){commits(last:1){nodes{commit{oid \
+             statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{\
+             ... on CheckRun{name status conclusion detailsUrl} \
+             ... on StatusContext{context state targetUrl}}}}}}}}}}"
                 .to_owned(),
         ],
     )
     .await
     .ok()?;
-    if !out.0 {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_str(&out.1).ok()?;
-    v.pointer("/data/repository/pullRequest/commits/nodes/0/commit/oid")
-        .and_then(|o| o.as_str())
-        .map(str::to_owned)
+    out.0.then_some(out.1)
 }
 
 /// What a fix round did.
@@ -3452,17 +3478,9 @@ struct GhPr {
     #[serde(default)]
     head_ref_oid: String,
     #[serde(default)]
-    commits: Vec<GhCommit>,
-    #[serde(default)]
     reviews: Vec<GhReview>,
     #[serde(default)]
     comments: Vec<GhComment>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhCommit {
-    #[serde(default)]
-    oid: String,
 }
 
 /// One rollup entry. `gh` mixes two GraphQL types in this array: a `CheckRun`
@@ -5725,6 +5743,64 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(bound_head("", "", None), None);
         assert_eq!(bound_head("", "", Some("new")), None);
         assert_eq!(bound_head("abc", "", None), None);
+    }
+
+    fn view_json(head: &str) -> String {
+        format!(
+            r#"{{"url":"https://github.com/o/r/pull/42","number":42,"state":"OPEN",
+            "title":"t","headRefOid":"{head}","mergeStateStatus":"CLEAN",
+            "reviews":[],"comments":[]}}"#
+        )
+    }
+
+    fn node_json(oid: &str, check: &str, has_next: bool) -> String {
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{"commits":{{"nodes":[{{"commit":
+            {{"oid":"{oid}","statusCheckRollup":{{"contexts":{{"pageInfo":{{"hasNextPage":{has_next}}},
+            "nodes":[{{"__typename":"CheckRun","name":"ci","status":"COMPLETED",
+            "conclusion":"{check}","detailsUrl":"https://example.test/1"}}]}}}}}}}}]}}}}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn rollup_is_bound_to_the_commit_in_the_same_node() {
+        // The view already points at the new head, but the node still answers
+        // for the old commit with its red check: the head stays unbound.
+        let s = seen_from(&view_json("new"), Some(&node_json("old", "FAILURE", false))).unwrap();
+        assert_eq!(s.rollup_head, "old");
+        assert_eq!(s.pr.checks, Checks::Red);
+        assert_eq!(bound_head(&s.head, &s.rollup_head, Some("new")), None);
+        assert_eq!(s.failing_urls.len(), 1);
+    }
+
+    #[test]
+    fn checks_come_from_the_node_not_the_view() {
+        let view = view_json("new").replace(
+            r#""reviews""#,
+            r#""statusCheckRollup":[{"name":"ci","status":"COMPLETED","conclusion":"FAILURE"}],"reviews""#,
+        );
+        let s = seen_from(&view, Some(&node_json("new", "SUCCESS", false))).unwrap();
+        assert_eq!(s.pr.checks, Checks::Green);
+        assert!(s.pr.failing.is_empty());
+        assert_eq!(
+            bound_head(&s.head, &s.rollup_head, Some("new")),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_or_paged_node_leaves_the_head_unbound() {
+        for node in [
+            None,
+            Some("not json".to_owned()),
+            Some(r#"{"errors":[{"message":"x"}]}"#.to_owned()),
+            Some(node_json("new", "SUCCESS", true)),
+        ] {
+            let s = seen_from(&view_json("new"), node.as_deref()).unwrap();
+            assert!(s.rollup_head.is_empty());
+            assert_eq!(s.pr.checks, Checks::Unknown);
+            assert_eq!(bound_head(&s.head, &s.rollup_head, None), None);
+        }
     }
 
     #[test]
