@@ -32,7 +32,7 @@ async fn a_fixer_that_commits_for_itself_counts_as_progress() {
     let mut fx = fixture(home, Judges::Unanimous, false);
     fx.config.graph.candidates = 1;
 
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone())
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
     runner.execute().await.expect("execute");
