@@ -857,6 +857,14 @@ struct Phrases {
     resume_not_latest: fn(&str, &str) -> String,
     resume_cannot_progress: fn(&str, &str) -> String,
     resume_unreadable: fn(&str, &str, &str) -> String,
+    /// A takeover refusal: the operator-facing text. English is the error's own
+    /// `Display`; a translation keeps the machine detail apart in parentheses.
+    handover_refused: fn(&crate::handover::Refused) -> String,
+    /// Appended to a refused handover's hold reason (leading space included).
+    handover_hint: &'static str,
+    /// (seats that never answered, review rounds) for the review loop's
+    /// "refusing to call it clean" stop.
+    reviewers_never_answered: fn(usize, usize) -> String,
 }
 
 const PHRASES_EN: Phrases = Phrases {
@@ -879,6 +887,14 @@ const PHRASES_EN: Phrases = Phrases {
     },
     resume_unreadable: |q, run, e| {
         format!("question {q} asked to resume run {run}, which could not be read: {e}")
+    },
+    handover_refused: |r| r.to_string(),
+    handover_hint: " (clean up the other worktree, then release the task from the queue)",
+    reviewers_never_answered: |missing, rounds| {
+        format!(
+            "{missing} reviewer seat(s) never answered after {rounds} rounds; \
+             refusing to call it clean"
+        )
     },
 };
 
@@ -904,6 +920,33 @@ const PHRASES_JA: Phrases = Phrases {
     },
     resume_unreadable: |q, run, e| {
         format!("質問 {q} は run {run} の再開を求めましたが、読み込めませんでした: {e}")
+    },
+    handover_refused: |r| {
+        use crate::handover::Refused;
+        match r {
+            Refused::Foreign { branch, path, why } => format!(
+                "ブランチ `{branch}` は {path} にチェックアウトされており、magi は自動では\
+                 削除しません。不要なら `git worktree remove` でその worktree を削除して\
+                 から、やり直してください（詳細: {why}）"
+            ),
+            Refused::Unsafe { branch, path, why } => format!(
+                "ブランチ `{branch}` は {path} にチェックアウトされています。そこの作業を\
+                 コミットか破棄したうえで `git worktree remove` で worktree を削除する\
+                 か、run を破棄してよいと伝えてから、やり直してください（詳細: {why}）"
+            ),
+            Refused::ReleaseFailed { branch, path, run } => format!(
+                "ブランチ `{branch}` は {path} で run {run} がチェックアウトしており、その\
+                 worktree の解放に失敗したか、変更が見つかりました（未コミットの変更が\
+                 ある worktree は git が削除を拒否します）。worktree はそのまま残しました"
+            ),
+        }
+    },
+    handover_hint: "（他の worktree を片付けてから、タスクをキューから解放してください）",
+    reviewers_never_answered: |missing, rounds| {
+        format!(
+            "{missing} 席のレビュアーが {rounds} ラウンドの間に一度も回答しなかったため、\
+             クリーンとは認めません"
+        )
     },
 };
 
@@ -2573,7 +2616,8 @@ async fn attempt(
         }
     };
     apply_solo(&mut config, task);
-    let start_failed = phrases(&config.graph.language).could_not_start;
+    let p = phrases(&config.graph.language);
+    let start_failed = p.could_not_start;
 
     // The free-space gate, checked *before* anything is minted: a task that
     // waits out a full disk costs nothing yet, and must not spend an attempt
@@ -2717,7 +2761,11 @@ async fn attempt(
         // by itself is the operator's call, not a failed attempt: hold the
         // task with the reason, spend nothing, and say so on the bell.
         Err(e) if e.downcast_ref::<crate::handover::Refused>().is_some() => {
-            let reason = format!("{start_failed}{e:#}");
+            let detail = match e.downcast_ref::<crate::handover::Refused>() {
+                Some(r) => (p.handover_refused)(r),
+                None => format!("{e:#}"),
+            };
+            let reason = format!("{start_failed}{detail}");
             task.last_error = Some(reason.clone());
             // Consumed above by `take`; keep it so the released task retries
             // as a review of this same branch.
@@ -2728,12 +2776,7 @@ async fn attempt(
             // The hold's own `task:<id>` notice (raised by `Queue::put`) is the
             // one page; the guidance rides in the reason, fixed per state so a
             // re-put never changes the wording and relights it.
-            task.hold_for_handover(
-                branch,
-                format!(
-                    "{reason} (clean up the other worktree, then release the task from the queue)"
-                ),
-            );
+            task.hold_for_handover(branch, format!("{reason}{}", p.handover_hint));
             record(queue, task);
             tracing::warn!(
                 "holding {} for a branch it cannot take over: {e:#}",
@@ -3677,7 +3720,31 @@ fn describe(state: &RunState) -> String {
         format!("{}{}", p.run_ended, state.status.display_label())
     };
     if let Some(last) = state.events.last() {
-        detail.push_str(&format!(" ({}: {})", last.node, last.message));
+        // The review loop's "never answered" stop is the one event worth
+        // translating; it is recognised from structured state, not by
+        // matching the English event text (which stays as recorded).
+        let unanswered = state
+            .reviews
+            .last()
+            .filter(|r| {
+                state.status == RunStatus::Blocked
+                    && last.node == "review"
+                    && r.incomplete()
+                    && r.blocking == 0
+                    && r.round == state.config.graph.review_rounds
+                    && r.e2e.iter().all(crate::run::CommandOutcome::ok)
+            })
+            .map(|r| (r.expected - r.answered, r.round));
+        match unanswered {
+            Some((missing, rounds)) if crate::lang::is_japanese(&state.config.graph.language) => {
+                detail.push_str(&format!(
+                    " ({}: {})",
+                    last.node,
+                    (p.reviewers_never_answered)(missing, rounds)
+                ));
+            }
+            _ => detail.push_str(&format!(" ({}: {})", last.node, last.message)),
+        }
     }
     detail.push_str(&format!(" [run {}]", state.id));
     detail
@@ -4986,6 +5053,82 @@ mod tests {
         de.id = "same".to_owned();
         en.id = "same".to_owned();
         assert_eq!(describe(&de), describe(&en));
+    }
+
+    #[test]
+    fn handover_refusals_follow_the_language_and_keep_the_detail_apart() {
+        use crate::handover::Refused;
+        let cases = [
+            Refused::Foreign {
+                branch: "b".into(),
+                path: "/w/x".into(),
+                why: "made by hand".into(),
+            },
+            Refused::Unsafe {
+                branch: "b".into(),
+                path: "/w/x".into(),
+                why: "its worktree has uncommitted changes (a.rs)".into(),
+            },
+            Refused::ReleaseFailed {
+                branch: "b".into(),
+                path: "/w/x".into(),
+                run: "ab12".into(),
+            },
+        ];
+        for r in &cases {
+            let en = (phrases("en").handover_refused)(r);
+            assert_eq!(en, r.to_string());
+            let ja = (phrases("ja").handover_refused)(r);
+            assert!(
+                !ja.contains("is checked out") && !ja.contains("try again"),
+                "{ja}"
+            );
+            assert!(ja.contains("`b`") && ja.contains("/w/x"), "{ja}");
+            if let Refused::Foreign { why, .. } | Refused::Unsafe { why, .. } = r {
+                assert!(ja.contains(&format!("（詳細: {why}）")), "{ja}");
+            }
+        }
+        assert!(phrases("en").handover_hint.contains("release the task"));
+        assert!(phrases("ja").handover_hint.contains("解放"));
+    }
+
+    #[test]
+    fn describe_translates_the_unanswered_reviewer_stop_only_in_ja() {
+        let build = |lang: &str| {
+            let mut s = run_state_in(RunStatus::Blocked, lang);
+            s.id = "same".to_owned();
+            s.config.graph.review_rounds = 3;
+            let mut r = review_round(3);
+            r.expected = 3;
+            r.answered = 1;
+            s.reviews.push(r);
+            s.event(
+                "review",
+                "2 reviewer seat(s) never answered after 3 rounds; refusing to call it clean",
+            );
+            s
+        };
+        let en = describe(&build("en"));
+        assert!(en.contains("(review: 2 reviewer seat(s) never answered after 3 rounds; refusing to call it clean)"), "{en}");
+        let ja = describe(&build("ja"));
+        assert!(ja.contains("2 席のレビュアーが 3 ラウンド"), "{ja}");
+        assert!(!ja.contains("never answered"), "{ja}");
+        assert!(ja.contains("[run "), "{ja}");
+
+        // An incomplete panel whose verification failed is a different stop:
+        // the real event must survive in ja too.
+        let mut failed = build("ja");
+        failed.reviews[0].e2e.push(crate::run::CommandOutcome {
+            command: "cargo test".to_owned(),
+            code: Some(1),
+            output_tail: String::new(),
+            duration_ms: 0,
+            resource_blocked: false,
+        });
+        failed.event("review", "stopped; e2e failed: cargo test");
+        let ja = describe(&failed);
+        assert!(ja.contains("stopped; e2e failed: cargo test"), "{ja}");
+        assert!(!ja.contains("席のレビュアー"), "{ja}");
     }
 
     #[test]
