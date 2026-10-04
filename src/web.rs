@@ -10305,24 +10305,27 @@ mod tests {
     }
 
     #[test]
-    fn a_task_notification_links_to_its_own_card_not_the_bare_backlog() {
-        // A `kind: "task"` notice link used to drop the id on the floor and
-        // point at `#/queue` outright, so every task notification landed on
-        // whatever happened to be first in the Backlog rather than the task
-        // it was actually about.
+    fn a_task_notification_links_to_the_task_page() {
+        // A task notice opens the task detail page, not the Backlog card.
+        let start = APP_JS.find("function noticeLink(").expect("noticeLink exists");
+        let body = &APP_JS[start..];
+        let body = &body[..body.find("\n}\n").expect("noticeLink ends")];
+        assert!(
+            body.contains("href: `#/tasks/${encodeURIComponent(link.id)}`"),
+            "a task notice's link must target the task page"
+        );
+        assert!(
+            !body.contains("#/queue/"),
+            "regression: the task link must not go back to the Backlog route"
+        );
         assert!(
             APP_JS.contains(
-                "el(\"a\", { href: `#/queue/${encodeURIComponent(link.id)}`, text: `Task ${shortId(link.id)}` })"
+                "if (parts[0] === \"tasks\" && parts[1]) return { name: \"task\", id: decodeURIComponent(parts[1]) };"
             ),
-            "a task notice's link must carry the task id into the hash, not just name the Backlog screen"
-        );
-        assert!(
-            !APP_JS.contains("el(\"a\", { href: \"#/queue\", text: `Task ${shortId(link.id)}` })"),
-            "regression: the task link must not go back to naming the bare Backlog route"
+            "`#/tasks/<id>` must parse into the task route"
         );
 
-        // The route parser has to read that id back out before applyRoute()
-        // can do anything with it.
+        // `#/queue/<id>` (card permalinks, old bookmarks) keeps working.
         assert!(
             APP_JS.contains(
                 "if (parts[0] === \"queue\" && parts[1]) return { name: \"queue\", id: decodeURIComponent(parts[1]) };"
