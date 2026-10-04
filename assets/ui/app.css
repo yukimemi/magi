@@ -702,6 +702,7 @@ a.card:active { background: var(--sunk); }
   overflow-wrap: anywhere;
 }
 .card-note { margin-top: var(--s2); font-size: var(--t2); color: var(--on-rust); font-weight: 600; }
+.card-note.note-clamp:not(.expanded) { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden; cursor: pointer; }
 
 .err {
   margin-top: var(--s2); padding: var(--s2) var(--s3);
