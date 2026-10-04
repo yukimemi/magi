@@ -10307,7 +10307,9 @@ mod tests {
     #[test]
     fn a_task_notification_links_to_the_task_page() {
         // A task notice opens the task detail page, not the Backlog card.
-        let start = APP_JS.find("function noticeLink(").expect("noticeLink exists");
+        let start = APP_JS
+            .find("function noticeLink(")
+            .expect("noticeLink exists");
         let body = &APP_JS[start..];
         let body = &body[..body.find("\n}\n").expect("noticeLink ends")];
         assert!(
