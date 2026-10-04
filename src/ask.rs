@@ -853,13 +853,22 @@ impl Question {
         if !self.status.open() {
             return None;
         }
+        let said = self.undelivered_owner_turns();
+        (!said.is_empty()).then(|| said.join("\n\n"))
+    }
+
+    /// Owner turns the agent has not been handed yet, oldest first, whatever
+    /// the question's status. [`Question::unread_from_owner`] adds the "still
+    /// open" guard the waiter and the deputy rely on; an answer being handed
+    /// over needs the says that came before it even though the question is
+    /// closed by then.
+    pub fn undelivered_owner_turns(&self) -> Vec<&str> {
         let from = self.delivered_turns.min(self.thread.len());
-        let said: Vec<&str> = self.thread[from..]
+        self.thread[from..]
             .iter()
             .filter(|t| t.who == Who::Operator)
             .map(|t| t.body.as_str())
-            .collect();
-        (!said.is_empty()).then(|| said.join("\n\n"))
+            .collect()
     }
 
     /// When the conversation last moved: the newest thread turn, or the asking
@@ -1530,6 +1539,34 @@ pub fn hand_over(store: &Questions, q: &mut Question) {
         Ok((fresh, ())) => *q = fresh,
         Err(e) => tracing::debug!("could not record the hand-over of {}: {e:#}", q.short()),
     }
+}
+
+/// What the agent is shown for an answer: the owner's says it has not read
+/// yet, in order, then the answer. With no such say it is `answer` itself,
+/// byte for byte.
+pub fn answer_for_agent(q: &Question, answer: &str) -> String {
+    let says = q.undelivered_owner_turns();
+    if says.is_empty() {
+        return answer.to_owned();
+    }
+    format!(
+        "the owner also said, before answering:\n\n{}\n\nthe owner answered:\n\n{answer}",
+        says.join("\n\n")
+    )
+}
+
+/// Print an answer (with any unread says before it) to `out`, flush, and only
+/// then record the hand-over. A failed write marks nothing delivered.
+pub fn deliver_answer(
+    store: &Questions,
+    q: &mut Question,
+    answer: &str,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    writeln!(out, "{}", answer_for_agent(q, answer))?;
+    out.flush()?;
+    hand_over(store, q);
+    Ok(())
 }
 
 /// The polling loop shared by a fresh wait and a resumed one.
@@ -2941,6 +2978,43 @@ mod tests {
         assert_eq!(q.unread_from_owner().as_deref(), Some("B"));
         q.delivered_turns = q.thread.len();
         assert_eq!(q.unread_from_owner(), None);
+    }
+
+    #[test]
+    fn a_say_before_the_answer_is_handed_over_ahead_of_it() {
+        let (_d, s) = store();
+        let mut q = choice_question();
+        s.put(&mut q).unwrap();
+        q.say("first").unwrap();
+        q.say("second").unwrap();
+        q.answer(Answer::Choice("SQLite".to_owned())).unwrap();
+        s.put(&mut q).unwrap();
+        assert_eq!(q.unread_from_owner(), None, "closed: the guard stays");
+        let mut out = Vec::new();
+        deliver_answer(&s, &mut q, "SQLite", &mut out).unwrap();
+        let shown = String::from_utf8(out).unwrap();
+        let (a, b, c) = (
+            shown.find("first").unwrap(),
+            shown.find("second").unwrap(),
+            shown.find("SQLite").unwrap(),
+        );
+        assert!(a < b && b < c, "{shown}");
+        assert_eq!(q.delivered_turns, q.thread.len());
+        assert!(q.answer_delivered);
+    }
+
+    #[test]
+    fn an_answer_alone_is_unchanged_and_delivered_says_are_not_repeated() {
+        let mut q = choice_question();
+        q.answer(Answer::Choice("SQLite".to_owned())).unwrap();
+        assert_eq!(answer_for_agent(&q, "SQLite"), "SQLite");
+        let mut q = choice_question();
+        q.say("old").unwrap();
+        q.delivered_turns = q.thread.len();
+        q.say("new").unwrap();
+        q.answer(Answer::Choice("SQLite".to_owned())).unwrap();
+        let shown = answer_for_agent(&q, "SQLite");
+        assert!(shown.contains("new") && !shown.contains("old"), "{shown}");
     }
 
     #[test]

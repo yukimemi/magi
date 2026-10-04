@@ -2073,8 +2073,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
 
     match ask::ask_and_wait(&mut q, &store, &cfg.notify, budget).await? {
         ask::Wait::Answered(answer) => {
-            println!("{answer}");
-            ask::hand_over(&store, &mut q);
+            ask::deliver_answer(&store, &mut q, &answer, &mut std::io::stdout())?;
             Ok(())
         }
         // Not an answer: the run can go on, but the decision the caller was
@@ -2179,8 +2178,7 @@ async fn ask_wait_cmd(
     // an error, and the answer must come out exactly as it would have if
     // this call's own wait had found it.
     if let Some(answer) = resolved_before_the_wait_even_starts(&q)? {
-        println!("{answer}");
-        ask::hand_over(store, &mut q);
+        ask::deliver_answer(store, &mut q, &answer, &mut std::io::stdout())?;
         return Ok(());
     }
 
@@ -2193,8 +2191,7 @@ async fn ask_wait_cmd(
     eprintln!("resuming the wait on {} — waiting for the owner", q.short());
     match ask::resume_wait(&mut q, store, remaining).await? {
         ask::Wait::Answered(answer) => {
-            println!("{answer}");
-            ask::hand_over(store, &mut q);
+            ask::deliver_answer(store, &mut q, &answer, &mut std::io::stdout())?;
             Ok(())
         }
         ask::Wait::Replied(said) => {
