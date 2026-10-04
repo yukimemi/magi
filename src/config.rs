@@ -382,6 +382,20 @@ pub struct Graph {
     /// Silence is a hold. An unanswered approval never merges, and neither
     /// does any answer other than the word `merge`.
     pub land_approval: bool,
+    /// Ask the owner before merging a run whose review loop handed off over a
+    /// contested finding: the last round ended with a Major-or-above finding
+    /// still open *and* at least one reviewer's final vote (after
+    /// reconsideration) was reject. Findings raised in the last round are
+    /// never fixed or re-reviewed, so this is the one case an unattended
+    /// merge would land over a reviewer's explicit objection.
+    ///
+    /// On. Interaction with [`Self::land_approval`]: when that is on, every
+    /// merge is asked about and this key changes nothing. When it is off,
+    /// this key alone decides whether a contested hand-off is asked about
+    /// (the question says why); every other run still merges unattended.
+    /// Read at land time, so turning it off restores the unattended merge at
+    /// once. The pull request is opened either way; only the merge waits.
+    pub hold_contested_merge: bool,
     /// How long to wait for an owner to answer a question before the run is
     /// abandoned, seconds. A parked run costs nothing, so this is generous;
     /// it exists so a forgotten question cannot pin a worktree forever.
@@ -451,6 +465,7 @@ impl Default for Graph {
             land: true,
             land_rounds: 4,
             land_approval: true,
+            hold_contested_merge: true,
             answer_timeout: 86_400,
             incomplete_review: IncompleteReviewPolicy::Block,
             e2e_every_round: false,
@@ -2343,6 +2358,10 @@ mod tests {
             "on-by-default land is only defensible while this is also on"
         );
         assert!(g.land_rounds > 0, "a loop with no budget never terminates");
+        assert!(
+            g.hold_contested_merge,
+            "a contested hand-off must still reach a human when approvals are off"
+        );
     }
     #[test]
     fn an_array_declared_in_two_layers_is_refused_instead_of_concatenated() {

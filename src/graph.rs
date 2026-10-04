@@ -4197,6 +4197,11 @@ impl Runner {
         // below runs an empty range once the budget is spent, and would
         // otherwise fall through without touching `status` at all.
         if let Some(status) = review_conclusion(&self.state.reviews, max_rounds) {
+            // A reentry after a crash between the last round's save and
+            // `stop_reviewing` reaches the hand-off here, not there.
+            if status == RunStatus::Gating {
+                self.record_contested_handoff();
+            }
             self.state.status = status;
             self.state.save()?;
             return Ok(());
@@ -4552,21 +4557,6 @@ impl Runner {
                 );
             }
 
-            // The final vote per seat is its revote where reconsideration
-            // ran and answered, its initial vote otherwise — the same
-            // fallback `tally` uses for a judge whose private vote failed.
-            let final_votes: Vec<ReviewVote> = records
-                .iter()
-                .filter_map(|r| {
-                    reconsideration
-                        .iter()
-                        .find(|rv| rv.reviewer == r.reviewer)
-                        .and_then(|rv| rv.vote)
-                        .or(r.vote)
-                })
-                .collect();
-            let round_verdict = ReviewVote::worst(final_votes);
-
             let blocking = all_findings.iter().filter(|f| f.severity.blocks()).count();
             let verify_timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
             // A round that already has a blocking finding and a round left to
@@ -4660,8 +4650,17 @@ impl Runner {
                 progressed: false,
                 vote_split,
                 reconsideration,
-                verdict: round_verdict,
+                verdict: None,
             };
+            // The final vote per seat is its revote where reconsideration
+            // ran and answered, its initial vote otherwise — the same
+            // fallback `tally` uses for a judge whose private vote failed.
+            round_record.verdict = ReviewVote::worst(
+                round_record
+                    .final_votes()
+                    .into_iter()
+                    .map(|(_, _, vote)| vote),
+            );
             // Which commit and when magi actually attempted to check —
             // known the moment a command was dispatched against `head`,
             // whether or not it finished: a resource-blocked attempt still
@@ -5049,6 +5048,34 @@ impl Runner {
     /// [`CommandOutcome::resource_blocked`]'s own doc), so a persistently
     /// blocked cache leaves this call without deciding rather than guessing
     /// — the caller retries on a later reentry.
+    /// Record, once, that the review loop handed off over a blocking finding
+    /// a reviewer rejected on (see [`ReviewRound::contested_handoff`]), so
+    /// `land` asks the owner even with `land_approval` off. Called from every
+    /// path that concludes `Gating`; a reentry keeps the first record.
+    fn record_contested_handoff(&mut self) {
+        if self.state.contested_handoff.is_some() {
+            return;
+        }
+        let Some(contested) = self
+            .state
+            .reviews
+            .last()
+            .and_then(ReviewRound::contested_handoff)
+        else {
+            return;
+        };
+        self.state.event(
+            "review",
+            format!(
+                "{} blocking finding(s) open and {} reviewer(s) rejecting — the merge will \
+                 wait for the owner's approval",
+                contested.findings.len(),
+                contested.rejecters.len()
+            ),
+        );
+        self.state.contested_handoff = Some(contested);
+    }
+
     async fn stop_reviewing(&mut self, why: &str, shell: &[String], worktree: &Path) -> Result<()> {
         let round_idx = self.state.reviews.len() - 1;
         // A deferred round and a resource-blocked one are the same shape
@@ -5154,6 +5181,7 @@ impl Runner {
                     "review",
                     format!("{why}; e2e is green — handing off with {open} finding(s) still open"),
                 );
+                self.record_contested_handoff();
                 self.state.status = RunStatus::Gating;
             }
         }
@@ -9032,6 +9060,76 @@ mod tests {
         );
         assert!(runner.state.gate_ran);
         assert!(runner.state.gate.iter().all(CommandOutcome::ok));
+    }
+
+    /// The hand-off over a blocking finding a reviewer rejected on leaves a
+    /// record for `land`; one with only a Minor, or no reject, leaves none.
+    #[tokio::test]
+    async fn stop_reviewing_records_a_contested_hand_off_only_for_major_plus_reject() {
+        use crate::verdict::{Finding, ReviewVote, Severity};
+        crate::run::set_home(std::env::temp_dir().join("magi-graph-test-home"));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        for (severity, vote, expect) in [
+            (Severity::Major, ReviewVote::Reject, true),
+            (Severity::Minor, ReviewVote::Reject, false),
+            (Severity::Major, ReviewVote::Approve, false),
+        ] {
+            let mut round = review_round(false, 1, 1, 1, false, true);
+            round.reviews = vec![ReviewRecord {
+                reviewer: 1,
+                agent: "alpha".to_owned(),
+                summary: String::new(),
+                findings: vec![Finding {
+                    id: "R1-1-1".to_owned(),
+                    severity,
+                    file: None,
+                    line: None,
+                    title: "t".to_owned(),
+                    detail: String::new(),
+                }],
+                vote: Some(vote),
+                failed: None,
+                duration_ms: 0,
+                attempts: 0,
+            }];
+            let mut state = RunState::new(
+                repo.clone(),
+                "main".to_owned(),
+                "deadbeef".to_owned(),
+                "task".to_owned(),
+                Config::default(),
+            );
+            state.reviews = vec![round];
+            let mut runner = Runner {
+                state,
+                roles: ResolvedRoles {
+                    implementers: Vec::new(),
+                    judges: Vec::new(),
+                    reviewers: Vec::new(),
+                    fixer: None,
+                    conductor: conductor(),
+                    implementer_roster: Vec::new(),
+                },
+                sem: Arc::new(Semaphore::new(1)),
+                pause: Pause::new(),
+                interrupt: Pause::new(),
+            };
+            let shell = runner.state.config.shell();
+            runner
+                .stop_reviewing("round budget spent", &shell, &repo)
+                .await
+                .expect("stop_reviewing");
+            assert_eq!(runner.state.status, RunStatus::Gating);
+            assert_eq!(
+                runner.state.contested_handoff.is_some(),
+                expect,
+                "{severity:?} + {vote:?}"
+            );
+        }
     }
 
     /// The shape the incident this whole fix responds to actually had: the

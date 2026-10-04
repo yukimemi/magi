@@ -791,6 +791,28 @@ Do not "simplify" them into one flag: the useful middle state - magi does the
 watching and the fixing, a human owns the irreversible step - is exactly the
 default, and one flag cannot express it.
 
+**A third, conditional reason to hold: a contested hand-off.** Both gates
+stay on by default, and `land_approval = false` still means an unattended
+merge for an ordinary run. The exception is a run whose review loop handed
+off over a finding the panel did not settle: the last round ended with a
+Major-or-above finding open *and* a reviewer's final vote (the revote where
+reconsideration answered, the initial vote otherwise) was reject. Findings
+raised in the budget's last round are never fixed or re-reviewed, so that is
+the one case an unattended merge would land over an explicit objection. Then
+`land` asks, with `approval_gate` unchanged (silence is a hold, only `merge`
+merges, a pending question parks the run), and the question says why it was
+filed and lists the findings and the rejecters. The PR is still opened; only
+the merge waits.
+
+- The decision is one function, `ReviewRound::contested_handoff`, and its
+  result is a snapshot stored on `RunState::contested_handoff` when
+  `stop_reviewing` hands off (a reentry keeps the first record). `land` only
+  reads it, through `land::contested_to_ask`.
+- `graph.hold_contested_merge` (default on) is evaluated at land time, so
+  turning it off restores the unattended merge at once. With `land_approval`
+  on it changes nothing.
+- A question already filed before the record existed is reused as it is.
+
 **A conflict is a rebase, not a fix round.** `Step::Rebase` is decided before
 the checks, because every check on a branch that cannot land is an answer
 about a state that cannot land. It is bounded by the same budget as a fix and

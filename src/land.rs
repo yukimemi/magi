@@ -54,7 +54,7 @@ use crate::config::{AgentSpec, MergeMode};
 use crate::git;
 use crate::proc::Quiet as _;
 use crate::prompt;
-use crate::run::{MergeOutcome, RunState, RunStatus, tail};
+use crate::run::{ContestedHandoff, MergeOutcome, RunState, RunStatus, tail};
 
 /// How often the pull request is re-read while its checks are still running.
 ///
@@ -677,8 +677,14 @@ impl Words {
     }
 
     /// The body under the summary, above the panel.
-    fn approval_detail(&self, url: &str, base: &str, subject: &str) -> String {
-        if self.html_lang == "ja" {
+    fn approval_detail(
+        &self,
+        url: &str,
+        base: &str,
+        subject: &str,
+        contested: Option<&ContestedHandoff>,
+    ) -> String {
+        let body = if self.html_lang == "ja" {
             format!(
                 "{url} はチェックが緑で、`{base}` へ `{subject}` として squash \
                  できる状態です。差分の要約・パッチ・squash されるコミットは\
@@ -689,7 +695,68 @@ impl Words {
                 "{url} is green and ready to squash into `{base}` as `{subject}`. \
                  The panel holds the diffstat, the patch and the commits being squashed."
             )
+        };
+        match contested {
+            Some(c) => format!("{}\n\n{body}", self.contested_reason(url, c)),
+            None => body,
         }
+    }
+
+    /// Why this question exists although merge approvals are off: the open
+    /// blocking findings and who rejected. Short enough for a phone.
+    fn contested_reason(&self, url: &str, c: &ContestedHandoff) -> String {
+        const SHOWN: usize = 5;
+        const TITLE_CHARS: usize = 100;
+        let ja = self.html_lang == "ja";
+        let mut out = if ja {
+            format!(
+                "{url} は、マージ承認がオフでも保留しています。レビューが予算切れで終わった\
+                 時点で、却下票を伴う重大な未解決の指摘が残っているためです。\n"
+            )
+        } else {
+            format!(
+                "{url} is held for approval although merge approvals are off: the \
+                 review ended with blocking findings still open and a reviewer \
+                 voting reject.\n"
+            )
+        };
+        for f in c.findings.iter().take(SHOWN) {
+            let at = match (&f.file, f.line) {
+                (Some(file), Some(line)) => format!("{file}:{line}"),
+                (Some(file), None) => file.clone(),
+                _ => (if ja { "場所未指定" } else { "no location" }).to_owned(),
+            };
+            let title: String = f.title.chars().take(TITLE_CHARS).collect();
+            let _ = writeln!(out, "- {} {:?} {at}: {title}", f.id, f.severity);
+        }
+        if c.findings.len() > SHOWN {
+            let more = c.findings.len() - SHOWN;
+            let _ = writeln!(
+                out,
+                "{}",
+                if ja {
+                    format!("- ほか {more} 件")
+                } else {
+                    format!("- and {more} more")
+                }
+            );
+        }
+        let seats: Vec<String> = c
+            .rejecters
+            .iter()
+            .map(|(seat, agent)| format!("#{seat} ({agent})"))
+            .collect();
+        let _ = write!(
+            out,
+            "{} {}",
+            if ja {
+                "却下したレビュアー:"
+            } else {
+                "Rejected by reviewer:"
+            },
+            seats.join(", ")
+        );
+        out
     }
 
     /// The truncation note, written whole in each language for the same reason.
@@ -1018,6 +1085,17 @@ pub fn approval_panel(
     h
 }
 
+/// The contested hand-off `land` must ask about, if any: recorded by the
+/// review loop and not switched off by `graph.hold_contested_merge`. The one
+/// place `land` reads that record.
+fn contested_to_ask(state: &RunState) -> Option<ContestedHandoff> {
+    if state.config.graph.hold_contested_merge {
+        state.contested_handoff.clone()
+    } else {
+        None
+    }
+}
+
 /// Ask the owner before merging, with the whole case attached as a panel.
 ///
 /// The evidence is gathered from the winner's own worktree with the `git` CLI,
@@ -1037,7 +1115,12 @@ pub fn approval_panel(
 /// rather than filing a second one - asking twice would double the
 /// notification for one decision, and leave the first question's panel an
 /// orphan nobody's answer ever reaches.
-async fn approval_gate(state: &mut RunState, pr: &PrState, subject: &str) -> Result<ApprovalGate> {
+async fn approval_gate(
+    state: &mut RunState,
+    pr: &PrState,
+    subject: &str,
+    contested: Option<&ContestedHandoff>,
+) -> Result<ApprovalGate> {
     let store = ask::Questions::open();
     let existing = store
         .list()
@@ -1086,7 +1169,7 @@ async fn approval_gate(state: &mut RunState, pr: &PrState, subject: &str) -> Res
                 APPROVAL_NODE.to_owned(),
                 "land".to_owned(),
                 w.approval_summary(pr.number, subject),
-                w.approval_detail(&pr.url, &base, subject),
+                w.approval_detail(&pr.url, &base, subject, contested),
                 vec![APPROVE.to_owned(), HOLD.to_owned()],
             );
             store
@@ -2219,8 +2302,13 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                 let subject = merge_subject(&seen.title, &state.instruction);
                 // The owner sees the panel before the one irreversible step,
                 // and an unanswered question is a hold: silence never merges.
-                if state.config.graph.land_approval {
-                    match approval_gate(state, &pr, &subject).await? {
+                //
+                // `land_approval` asks about every merge. With it off, a
+                // review hand-off the panel contested (a blocking finding
+                // open and a reject vote) is asked about all the same.
+                let contested = contested_to_ask(state);
+                if state.config.graph.land_approval || contested.is_some() {
+                    match approval_gate(state, &pr, &subject, contested.as_ref()).await? {
                         ApprovalGate::Approved => {}
                         ApprovalGate::Held => {
                             stop(
@@ -4266,7 +4354,9 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         state.config.graph.land_approval = true;
         let pr = green_pr();
 
-        let gate = approval_gate(&mut state, &pr, "feat: x").await.unwrap();
+        let gate = approval_gate(&mut state, &pr, "feat: x", None)
+            .await
+            .unwrap();
         assert_eq!(gate, ApprovalGate::Pending, "nobody has answered yet");
         assert!(
             !state.parked,
@@ -4287,7 +4377,9 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         // A second visit - standing in for a resumed run whose slot the
         // daemon handed to something else while nobody had answered - must
         // find the same question rather than filing a second one.
-        let again = approval_gate(&mut state, &pr, "feat: x").await.unwrap();
+        let again = approval_gate(&mut state, &pr, "feat: x", None)
+            .await
+            .unwrap();
         assert_eq!(again, ApprovalGate::Pending);
         let still_one = store
             .list()
@@ -4307,7 +4399,9 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         state.config.graph.land_approval = true;
         let pr = green_pr();
         assert_eq!(
-            approval_gate(&mut state, &pr, "feat: x").await.unwrap(),
+            approval_gate(&mut state, &pr, "feat: x", None)
+                .await
+                .unwrap(),
             ApprovalGate::Pending
         );
 
@@ -4321,7 +4415,9 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         store.put(&mut q).unwrap();
 
         assert_eq!(
-            approval_gate(&mut state, &pr, "feat: x").await.unwrap(),
+            approval_gate(&mut state, &pr, "feat: x", None)
+                .await
+                .unwrap(),
             ApprovalGate::Approved
         );
     }
@@ -4334,7 +4430,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let mut held_state = run_state();
         held_state.config.graph.land_approval = true;
         let pr = green_pr();
-        approval_gate(&mut held_state, &pr, "feat: x")
+        approval_gate(&mut held_state, &pr, "feat: x", None)
             .await
             .unwrap();
         let mut q = store
@@ -4345,7 +4441,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         q.answer(ask::Answer::Choice(HOLD.to_owned())).unwrap();
         store.put(&mut q).unwrap();
         assert_eq!(
-            approval_gate(&mut held_state, &pr, "feat: x")
+            approval_gate(&mut held_state, &pr, "feat: x", None)
                 .await
                 .unwrap(),
             ApprovalGate::Held
@@ -4353,7 +4449,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
 
         let mut abandoned_state = run_state();
         abandoned_state.config.graph.land_approval = true;
-        approval_gate(&mut abandoned_state, &pr, "feat: x")
+        approval_gate(&mut abandoned_state, &pr, "feat: x", None)
             .await
             .unwrap();
         let mut q = store
@@ -4364,11 +4460,111 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         q.abandon("no answer within the timeout");
         store.put(&mut q).unwrap();
         assert_eq!(
-            approval_gate(&mut abandoned_state, &pr, "feat: x")
+            approval_gate(&mut abandoned_state, &pr, "feat: x", None)
                 .await
                 .unwrap(),
             ApprovalGate::Held,
             "silence must never merge"
+        );
+    }
+
+    fn contested() -> ContestedHandoff {
+        let finding = |id: &str, n: u32| crate::verdict::Finding {
+            id: id.to_owned(),
+            severity: crate::verdict::Severity::Major,
+            file: Some("src/a.rs".to_owned()),
+            line: Some(n),
+            title: format!("problem {id}"),
+            detail: String::new(),
+        };
+        ContestedHandoff {
+            findings: (1..=7).map(|n| finding(&format!("R3-1-{n}"), n)).collect(),
+            rejecters: vec![(1, "alpha".to_owned())],
+        }
+    }
+
+    #[test]
+    fn the_contested_record_is_asked_about_unless_the_switch_is_off() {
+        let mut state = run_state();
+        assert!(contested_to_ask(&state).is_none(), "nothing recorded");
+        state.contested_handoff = Some(contested());
+        assert!(contested_to_ask(&state).is_some());
+        state.config.graph.hold_contested_merge = false;
+        assert!(
+            contested_to_ask(&state).is_none(),
+            "the switch restores today"
+        );
+    }
+
+    #[test]
+    fn the_contested_question_names_the_pr_the_findings_and_the_rejecter() {
+        for lang in ["en", "ja"] {
+            let mut cfg = crate::config::Config::default();
+            cfg.graph.language = lang.to_owned();
+            let w = words(&cfg.graph.language);
+            let text = w.approval_detail(
+                "https://github.com/yukimemi/magi/pull/42",
+                "main",
+                "feat: x",
+                Some(&contested()),
+            );
+            assert!(text.contains("pull/42"), "{text}");
+            assert!(
+                text.contains("R3-1-1 Major src/a.rs:1: problem R3-1-1"),
+                "{text}"
+            );
+            assert!(text.contains("R3-1-5"), "{text}");
+            assert!(!text.contains("R3-1-6"), "the list is capped: {text}");
+            assert!(text.contains("2"), "the rest are counted: {text}");
+            assert!(text.contains("#1 (alpha)"), "{text}");
+        }
+        let plain = words("en").approval_detail("u", "main", "s", None);
+        assert!(!plain.contains("reject"), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn a_contested_question_is_filed_once_and_a_resume_finds_the_same_one() {
+        crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
+        let mut state = run_state();
+        state.config.graph.land_approval = false;
+        state.contested_handoff = Some(contested());
+        let pr = green_pr();
+        let c = contested_to_ask(&state);
+        assert_eq!(
+            approval_gate(&mut state, &pr, "feat: x", c.as_ref())
+                .await
+                .unwrap(),
+            ApprovalGate::Pending,
+            "silence is a hold"
+        );
+        let store = ask::Questions::open();
+        let filed: Vec<_> = store
+            .list()
+            .into_iter()
+            .filter(|q| q.run == state.id)
+            .collect();
+        assert_eq!(filed.len(), 1);
+        assert!(filed[0].detail.contains("R3-1-1"), "{}", filed[0].detail);
+
+        assert_eq!(
+            approval_gate(&mut state, &pr, "feat: x", c.as_ref())
+                .await
+                .unwrap(),
+            ApprovalGate::Pending
+        );
+        let mut q = store
+            .list()
+            .into_iter()
+            .find(|q| q.run == state.id)
+            .unwrap();
+        assert_eq!(q.id, filed[0].id, "the same question after a resume");
+        q.answer(ask::Answer::Choice(APPROVE.to_owned())).unwrap();
+        store.put(&mut q).unwrap();
+        assert_eq!(
+            approval_gate(&mut state, &pr, "feat: x", c.as_ref())
+                .await
+                .unwrap(),
+            ApprovalGate::Approved
         );
     }
 
@@ -4404,7 +4600,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let w = words("ja");
         assert!(w.approval_summary(17, "feat: x").contains("マージ"));
         assert!(
-            w.approval_detail("http://x/1", "main", "feat: x")
+            w.approval_detail("http://x/1", "main", "feat: x", None)
                 .contains("パネル")
         );
 
