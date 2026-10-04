@@ -335,7 +335,14 @@
     <select class="stats-repo-select" id="stats-repo" hidden></select>
     <!-- Same reasoning as /api/health's own runs_unreadable: a skipped run
          must be counted, not silently dropped from the tallies below. -->
-    <p class="stats-banner" id="stats-unreadable-banner" hidden></p>
+    <div class="stats-banner" id="stats-unreadable-banner" role="status" hidden>
+      <span id="stats-unreadable-text"></span>
+      <button class="icon-btn stats-banner-close" type="button" id="stats-unreadable-close" aria-label="Dismiss unreadable-runs warning">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M6 6l12 12M18 6L6 18"/>
+        </svg>
+      </button>
+    </div>
     <div id="stats-body" hidden>
       <!-- Run-derived numbers only: a home with no runs yet has nothing to
            put in these, so this whole block is what stats-empty replaces.

@@ -472,6 +472,7 @@ function roundRail(pr) {
 const RUNS_COLLAPSE_KEY = "magi-runs-sections";
 const QUEUE_COLLAPSE_KEY = "magi-queue-sections";
 const TALK_READS_KEY = "magi-talk-reads";
+const STATS_UNREADABLE_DISMISSED_KEY = "magi-stats-unreadable-dismissed";
 
 /* ---- state ------------------------------------------------------------- */
 const state = {
@@ -1838,6 +1839,32 @@ function saveCollapsed(storageKey, collapsed) {
   }
 }
 
+/* The unreadable-runs banner is dismissible, but only for the count it was
+   dismissed at: a different count means something changed and it must warn
+   again. The count itself (subtitle, /api/health) is never hidden. The
+   in-memory copy keeps the dismissal for the tab when localStorage is denied. */
+let statsUnreadableDismissed = null;
+
+function loadUnreadableDismissed() {
+  try {
+    const n = Number(localStorage.getItem(STATS_UNREADABLE_DISMISSED_KEY));
+    if (Number.isInteger(n) && n > 0) return n;
+  } catch {
+    /* localStorage denied (private mode) */
+  }
+  return statsUnreadableDismissed;
+}
+
+function saveUnreadableDismissed(n) {
+  statsUnreadableDismissed = n;
+  try {
+    if (n > 0) localStorage.setItem(STATS_UNREADABLE_DISMISSED_KEY, String(n));
+    else localStorage.removeItem(STATS_UNREADABLE_DISMISSED_KEY);
+  } catch {
+    /* the dismissal just won't outlive the tab */
+  }
+}
+
 function isSectionOpen(collapsed, key, defaultOpen) {
   const saved = collapsed[key];
   return typeof saved === "boolean" ? saved : defaultOpen;
@@ -2653,10 +2680,12 @@ function renderStats() {
         s.runs_unreadable ? `${plural(s.runs_unreadable, "run", "runs")} unreadable` : null,
       ].filter(Boolean).join(" · "));
 
-  show($("stats-unreadable-banner"), s.runs_unreadable > 0);
+  const dismissed = loadUnreadableDismissed();
+  if (dismissed !== null && dismissed !== s.runs_unreadable) saveUnreadableDismissed(0);
+  show($("stats-unreadable-banner"), s.runs_unreadable > 0 && s.runs_unreadable !== dismissed);
   if (s.runs_unreadable > 0) {
     setText(
-      $("stats-unreadable-banner"),
+      $("stats-unreadable-text"),
       `${plural(s.runs_unreadable, "run", "runs")} on disk could not be read by this build ` +
       `and ${s.runs_unreadable === 1 ? "is" : "are"} not counted in the numbers below.`,
     );
@@ -7018,6 +7047,12 @@ function wireAttachments({ fileInput, say, turns, box, attach }) {
 
 /* ---- boot -------------------------------------------------------------- */
 function wire() {
+  $("stats-unreadable-close").addEventListener("click", () => {
+    if (state.stats) {
+      saveUnreadableDismissed(state.stats.runs_unreadable);
+      renderStats();
+    }
+  });
   $("run-actions-fab").addEventListener("click", openRunActions);
   $("run-actions-close").addEventListener("click", closeRunActions);
   /* Clicking the backdrop hits the dialog element itself, since nothing else

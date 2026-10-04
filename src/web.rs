@@ -9695,6 +9695,17 @@ mod tests {
     }
 
     #[test]
+    fn the_unreadable_banner_is_dismissible_per_count_and_the_count_stays() {
+        assert!(APP_JS.contains("magi-stats-unreadable-dismissed"));
+        assert!(APP_JS.contains("s.runs_unreadable > 0 && s.runs_unreadable !== dismissed"));
+        assert!(APP_JS.contains("setText(\n      $(\"stats-unreadable-text\")"));
+        assert!(INDEX_HTML.contains("id=\"stats-unreadable-close\""));
+        assert!(INDEX_HTML.contains("aria-label=\"Dismiss unreadable-runs warning\""));
+        // The subtitle still counts them whatever the banner does.
+        assert!(APP_JS.contains("unreadable` : null"));
+    }
+
+    #[test]
     fn live_runs_are_never_hidden_or_folded_as_superseded() {
         assert!(APP_JS.contains("function isLiveAttempt(run) {\n  return !run.done;"));
         assert!(APP_JS.contains("if (isLiveAttempt(run)) return false;"));
