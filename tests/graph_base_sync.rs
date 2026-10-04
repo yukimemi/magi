@@ -527,10 +527,24 @@ async fn rebased_locally_only(fx: &common::Fixture, origin: &Origin) -> (Runner,
     land_on_origin(&origin.sideline, "upstream.txt", "landed meanwhile\n");
     runner.execute().await.expect("execute");
     let branch = runner.state.winner().expect("a winner").branch.clone();
-    assert!(runner.state.base_sync.as_ref().is_some_and(|s| s.conflict.is_none()));
+    assert!(
+        runner
+            .state
+            .base_sync
+            .as_ref()
+            .is_some_and(|s| s.conflict.is_none())
+    );
 
     // The pre-rebase twin: the winner's patch replayed on the old base.
-    run_git(&origin.sideline, &["fetch", "-q", fx.repo.to_str().unwrap(), &format!("refs/heads/{branch}")]);
+    run_git(
+        &origin.sideline,
+        &[
+            "fetch",
+            "-q",
+            fx.repo.to_str().unwrap(),
+            &format!("refs/heads/{branch}"),
+        ],
+    );
     run_git(&origin.sideline, &["checkout", "-q", "--detach", &base]);
     run_git(&origin.sideline, &["cherry-pick", "FETCH_HEAD"]);
     let twin = rev(&origin.sideline, "HEAD");
