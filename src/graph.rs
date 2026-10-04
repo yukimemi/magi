@@ -6034,7 +6034,13 @@ impl Runner {
         {
             return existing.clone();
         }
-        let fresh = SeatState::new(key, agent, self.state.seed);
+        // A seat that changes agent mints its session id from the agent too,
+        // like a handover: the old agent's uuid is already taken by the CLI.
+        let fresh = if self.state.seats.contains_key(key) {
+            handover_seat(key, agent, self.state.seed)
+        } else {
+            SeatState::new(key, agent, self.state.seed)
+        };
         self.state.seats.insert(key.to_owned(), fresh.clone());
         fresh
     }
@@ -8201,6 +8207,13 @@ mod tests {
             last_fail: None,
         };
         assert_eq!(pick_start_spec(&roster, spec("a"), Some(&failed)).id, "c");
+    }
+
+    #[test]
+    fn handover_seat_mints_a_session_id_distinct_from_the_previous_agents() {
+        let first = SeatState::new("review-1", "alpha", 7);
+        let next = handover_seat("review-1", "gamma", 7);
+        assert_ne!(first.claude_session, next.claude_session);
     }
 
     #[test]
