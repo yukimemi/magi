@@ -349,18 +349,63 @@ async fn dropped_commits(repo: &Path, onto_sha: &str, orig: &str, head: &str) ->
         .into_iter()
         .filter(|c| unmatched.contains(&c.sha))
         .collect();
-    let have: Vec<String> = result.into_iter().map(|c| c.key).collect();
+    let have: Vec<String> = result.iter().map(|c| c.key.clone()).collect();
+    let mut taken = vec![false; result.len()];
     let mut lost = Vec::new();
     for c in missing_commits(&expected, &have) {
         // Git also drops a commit on its own when its change is already on
         // the base under a different patch (e.g. folded into one upstream
         // commit). That is not a loss: every path it touched holds the same
         // content in the result.
-        if !already_in_result(repo, &c.sha, orig, head).await {
+        if already_in_result(repo, &c.sha, orig, head).await {
+            continue;
+        }
+        // Otherwise it may have survived with a conflict-resolved (new)
+        // content. A result commit under the same key that touches one of its
+        // paths, and is not already accounted for, is that survivor.
+        let mine = commit_paths(repo, &c.sha).await;
+        let mut found = false;
+        for (i, r) in result.iter().enumerate() {
+            if taken[i] || r.key != c.key {
+                continue;
+            }
+            let theirs = commit_paths(repo, &r.sha).await;
+            if theirs.iter().any(|p| mine.contains(p)) {
+                taken[i] = true;
+                found = true;
+                break;
+            }
+        }
+        if !found {
             lost.push(c.key.rsplit('\u{1f}').next().unwrap_or(&c.key).to_owned());
         }
     }
     lost
+}
+
+/// Paths `sha` changes, NUL-separated from git so a quoted name is never
+/// misread. Empty when git cannot say.
+async fn commit_paths(repo: &Path, sha: &str) -> Vec<String> {
+    git::git(
+        repo,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "--root",
+            "-z",
+            sha,
+        ],
+    )
+    .await
+    .map(|o| {
+        o.split('\0')
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// `mode type blob` of `path` at `rev`, or `None` when it does not exist
@@ -385,23 +430,7 @@ async fn already_in_result(repo: &Path, sha: &str, orig: &str, head: &str) -> bo
     if replay_is_noop(repo, sha, head).await {
         return true;
     }
-    let Ok(paths) = git::git(
-        repo,
-        &[
-            "diff-tree",
-            "--no-commit-id",
-            "--name-only",
-            "-r",
-            "--root",
-            "-z",
-            sha,
-        ],
-    )
-    .await
-    else {
-        return false;
-    };
-    for p in paths.split('\0').filter(|l| !l.is_empty()) {
+    for p in &commit_paths(repo, sha).await {
         let got = entry(repo, head, p).await;
         if got != entry(repo, sha, p).await && got != entry(repo, orig, p).await {
             return false;
@@ -655,5 +684,44 @@ mod tests {
         std::fs::write(d.join("日本語.txt"), "x\n").unwrap();
         let c = commit(d, "c").await;
         assert!(!already_in_result(d, &c, &c, &base).await);
+    }
+
+    async fn commit_dated(d: &Path, msg: &str) -> String {
+        sh(d, &["add", "-A"]);
+        let st = std::process::Command::new("git")
+            .current_dir(d)
+            .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00+0000")
+            .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00+0000")
+            .args(["commit", "-q", "-m", msg])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        git::git(d, &["rev-parse", "HEAD"]).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_surviving_resolved_commit_sharing_a_key_with_an_absorbed_one_is_not_lost() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        sh(d, &["init", "-q", "-b", "main"]);
+        sh(d, &["config", "user.name", "t"]);
+        sh(d, &["config", "user.email", "t@example.com"]);
+        std::fs::write(d.join("z.txt"), "z\n").unwrap();
+        let base = commit(d, "base").await;
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        commit_dated(d, "same").await;
+        std::fs::write(d.join("b.txt"), "b\n").unwrap();
+        let orig = commit_dated(d, "same").await;
+        // Upstream folds the first change into a differently-shaped commit
+        // and adds a conflicting b.txt.
+        sh(d, &["checkout", "-q", "-b", "up", &base]);
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        std::fs::write(d.join("y.txt"), "y\n").unwrap();
+        std::fs::write(d.join("b.txt"), "other\n").unwrap();
+        let onto = commit(d, "upstream").await;
+        // The rebase result: first commit omitted as empty, second resolved.
+        std::fs::write(d.join("b.txt"), "other\nb\n").unwrap();
+        let head = commit_dated(d, "same").await;
+        assert!(dropped_commits(d, &onto, &orig, &head).await.is_empty());
     }
 }
