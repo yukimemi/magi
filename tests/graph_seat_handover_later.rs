@@ -75,7 +75,7 @@ fn assert_full_vote_handover(state: &RunState) {
     let seen = prompts(state, "vote", "judge-1");
     assert_eq!(seen.len(), 2, "{seen:?}");
     assert_eq!(seen[0], "", "the seat's own session gets the short prompt");
-    for needed in ["cands", "own", "argued"] {
+    for needed in ["task", "cands", "own", "argued"] {
         assert!(seen[1].contains(needed), "{needed} missing: {seen:?}");
     }
     let v = state.votes.iter().find(|v| v.judge == 1).expect("vote");
@@ -251,7 +251,10 @@ async fn a_judge_recovering_from_a_stall_is_handed_over_for_its_ranking_and_its_
 
     let seen = prompts(state, "vote", "judge-3");
     let last = seen.last().expect("a vote prompt");
-    assert!(last.contains("cands") && last.contains("own"), "{seen:?}");
+    assert!(
+        ["task", "cands", "own"].iter().all(|k| last.contains(k)),
+        "{seen:?}"
+    );
     assert_eq!(state.judgements[2].agent, "beta");
     assert!(state.judgements[2].failed.is_none());
     let v = state.votes.iter().find(|v| v.judge == 3).expect("vote");

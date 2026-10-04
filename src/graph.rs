@@ -6116,8 +6116,9 @@ impl Runner {
         base_short: &str,
     ) -> String {
         let mut text = format!(
-            "{}\n\n# Candidates\n\n{}",
+            "{}\n\n# The task the candidates were given\n\n{}\n\n# Candidates\n\n{}",
             prompt::final_vote(labels, language),
+            self.state.instruction,
             self.candidate_block(candidates, base_short)
         );
         if let Some(own) = self

@@ -161,6 +161,7 @@ printf '%s %s %s\n' "$MAGI_RUN" "$MAGI_NODE" "$seat" \
 # prompt with none of them; a seat handed to another agent must get all.
 ctx=""
 if has "# Candidates"; then ctx="$ctx cands"; fi
+if has "# The task the candidates were given"; then ctx="$ctx task"; fi
 if has "Your own earlier ranking"; then ctx="$ctx own"; fi
 if has "(re-sent in full)"; then ctx="$ctx resent"; fi
 if has "# Patch under review"; then ctx="$ctx patch"; fi
