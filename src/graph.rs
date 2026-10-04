@@ -4197,6 +4197,11 @@ impl Runner {
         // below runs an empty range once the budget is spent, and would
         // otherwise fall through without touching `status` at all.
         if let Some(status) = review_conclusion(&self.state.reviews, max_rounds) {
+            // A reentry after a crash between the last round's save and
+            // `stop_reviewing` reaches the hand-off here, not there.
+            if status == RunStatus::Gating {
+                self.record_contested_handoff();
+            }
             self.state.status = status;
             self.state.save()?;
             return Ok(());
@@ -5043,6 +5048,34 @@ impl Runner {
     /// [`CommandOutcome::resource_blocked`]'s own doc), so a persistently
     /// blocked cache leaves this call without deciding rather than guessing
     /// — the caller retries on a later reentry.
+    /// Record, once, that the review loop handed off over a blocking finding
+    /// a reviewer rejected on (see [`ReviewRound::contested_handoff`]), so
+    /// `land` asks the owner even with `land_approval` off. Called from every
+    /// path that concludes `Gating`; a reentry keeps the first record.
+    fn record_contested_handoff(&mut self) {
+        if self.state.contested_handoff.is_some() {
+            return;
+        }
+        let Some(contested) = self
+            .state
+            .reviews
+            .last()
+            .and_then(ReviewRound::contested_handoff)
+        else {
+            return;
+        };
+        self.state.event(
+            "review",
+            format!(
+                "{} blocking finding(s) open and {} reviewer(s) rejecting — the merge will \
+                 wait for the owner's approval",
+                contested.findings.len(),
+                contested.rejecters.len()
+            ),
+        );
+        self.state.contested_handoff = Some(contested);
+    }
+
     async fn stop_reviewing(&mut self, why: &str, shell: &[String], worktree: &Path) -> Result<()> {
         let round_idx = self.state.reviews.len() - 1;
         // A deferred round and a resource-blocked one are the same shape
@@ -5148,24 +5181,7 @@ impl Runner {
                     "review",
                     format!("{why}; e2e is green — handing off with {open} finding(s) still open"),
                 );
-                // A hand-off over a blocking finding a reviewer rejected on
-                // is recorded for `land`, which asks the owner before
-                // merging even with `land_approval` off. A reentry keeps the
-                // first record.
-                if self.state.contested_handoff.is_none()
-                    && let Some(contested) = self.state.reviews[round_idx].contested_handoff()
-                {
-                    self.state.event(
-                        "review",
-                        format!(
-                            "{} blocking finding(s) open and {} reviewer(s) rejecting — the \
-                             merge will wait for the owner's approval",
-                            contested.findings.len(),
-                            contested.rejecters.len()
-                        ),
-                    );
-                    self.state.contested_handoff = Some(contested);
-                }
+                self.record_contested_handoff();
                 self.state.status = RunStatus::Gating;
             }
         }
