@@ -377,10 +377,18 @@ async fn entry(repo: &Path, rev: &str, path: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Does `head` hold, for every path `sha` touched, what `sha` left there or
-/// what the branch's final tip `orig` has there (a later commit may have
-/// changed the path again)? Mode is part of the comparison.
+/// Is `sha`'s change represented in `head`?
+///
+/// First by merging: replaying `sha` onto `head` changes nothing when its
+/// change is already there, in whatever company (extra upstream edits in the
+/// same file included). Failing that, per touched path: `head` holds what
+/// `sha` left there, or what the branch's final tip `orig` has there (a later
+/// commit may have changed the path again). Mode is part of that comparison,
+/// and paths come NUL-separated so a quoted name is never misread.
 async fn already_in_result(repo: &Path, sha: &str, orig: &str, head: &str) -> bool {
+    if replay_is_noop(repo, sha, head).await {
+        return true;
+    }
     let Ok(paths) = git::git(
         repo,
         &[
@@ -389,6 +397,7 @@ async fn already_in_result(repo: &Path, sha: &str, orig: &str, head: &str) -> bo
             "--name-only",
             "-r",
             "--root",
+            "-z",
             sha,
         ],
     )
@@ -396,13 +405,41 @@ async fn already_in_result(repo: &Path, sha: &str, orig: &str, head: &str) -> bo
     else {
         return false;
     };
-    for p in paths.lines().filter(|l| !l.is_empty()) {
+    for p in paths.split('\0').filter(|l| !l.is_empty()) {
         let got = entry(repo, head, p).await;
         if got != entry(repo, sha, p).await && got != entry(repo, orig, p).await {
             return false;
         }
     }
     true
+}
+
+/// Does merging `sha` (against its parent) into `head` cleanly yield `head`'s
+/// own tree? False when it conflicts, changes anything, or git cannot say.
+async fn replay_is_noop(repo: &Path, sha: &str, head: &str) -> bool {
+    let base = format!("{sha}^");
+    let Ok(out) = git::git_raw(
+        repo,
+        &[
+            "merge-tree",
+            "--write-tree",
+            &format!("--merge-base={base}"),
+            head,
+            sha,
+        ],
+    )
+    .await
+    else {
+        return false;
+    };
+    if !out.ok() {
+        return false;
+    }
+    let merged = out.stdout.lines().next().unwrap_or("").trim();
+    match git::tree_of(repo, head).await {
+        Ok(t) => !merged.is_empty() && merged == t,
+        Err(_) => false,
+    }
 }
 
 /// The pure half of [`dropped_commits`]: the `expected` commits whose
@@ -583,5 +620,44 @@ mod tests {
         // The result is the base: same blob, lost mode.
         assert!(!already_in_result(d, &sha, &sha, &base).await);
         assert!(already_in_result(d, &sha, &sha, &sha).await);
+    }
+
+    async fn commit(d: &Path, msg: &str) -> String {
+        sh(d, &["add", "-A"]);
+        sh(d, &["commit", "-q", "-m", msg]);
+        git::git(d, &["rev-parse", "HEAD"]).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_change_inside_a_larger_upstream_edit_is_in_the_result() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        sh(d, &["init", "-q", "-b", "main"]);
+        sh(d, &["config", "user.name", "t"]);
+        sh(d, &["config", "user.email", "t@example.com"]);
+        let body = "old\n1\n2\n3\n4\n5\n6\n7\n8\n9\nend\n";
+        std::fs::write(d.join("f.txt"), body).unwrap();
+        commit(d, "base").await;
+        std::fs::write(d.join("f.txt"), body.replacen("old", "new", 1)).unwrap();
+        let c = commit(d, "c1").await;
+        sh(d, &["checkout", "-q", "-b", "up", "HEAD~1"]);
+        let up = body.replacen("old", "new", 1).replace("end", "end plus");
+        std::fs::write(d.join("f.txt"), up).unwrap();
+        let head = commit(d, "upstream").await;
+        assert!(already_in_result(d, &c, &c, &head).await);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_commit_on_a_non_ascii_path_is_still_noticed() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        sh(d, &["init", "-q", "-b", "main"]);
+        sh(d, &["config", "user.name", "t"]);
+        sh(d, &["config", "user.email", "t@example.com"]);
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        let base = commit(d, "base").await;
+        std::fs::write(d.join("日本語.txt"), "x\n").unwrap();
+        let c = commit(d, "c").await;
+        assert!(!already_in_result(d, &c, &c, &base).await);
     }
 }
