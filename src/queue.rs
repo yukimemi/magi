@@ -840,7 +840,24 @@ impl Task {
     /// operator release, this deliberately does not resume the old run.
     pub fn requeue(&mut self) {
         self.release();
+        // A fresh competition is the opposite of a review of the old branch.
+        self.review_branch = None;
         self.fresh_start = true;
+    }
+
+    /// Hold this task because a takeover of `branch` was refused, keeping
+    /// [`Task::review_branch`] so that once the operator has cleaned up and
+    /// released it, the retry is a review of the same branch rather than a
+    /// resume or a fresh competition. Spends no attempt.
+    ///
+    /// This is the only way a machine hold keeps a `review_branch`: the
+    /// daemon takes it at the start of every attempt, so [`Task::release`]
+    /// relies on that to tell this hold from every other.
+    pub fn hold_for_handover(&mut self, branch: Option<String>, reason: String) {
+        if branch.is_some() {
+            self.review_branch = branch;
+        }
+        self.hold_machine(Some(reason));
     }
 
     /// Change how urgently this task should run next.
@@ -947,6 +964,9 @@ impl Task {
     /// so a release is a real second chance rather than an instant re-hold.
     /// The run history is kept: attempts reset, evidence does not.
     pub fn release(&mut self) {
+        let refused_handover = self.status == TaskStatus::Held
+            && self.hold_source == Some(HoldSource::Machine)
+            && self.review_branch.is_some();
         self.status = TaskStatus::Queued;
         self.attempts = 0;
         self.last_error = None;
@@ -962,7 +982,12 @@ impl Task {
         self.blocked_by.clear();
         self.block_reason = None;
         self.blocked_from = None;
-        self.review_branch = None;
+        // A machine hold that still names a review branch is a refused
+        // handover (see [`Task::hold_for_handover`]): the retry must review
+        // that same branch. Any other release drops it.
+        if !refused_handover {
+            self.review_branch = None;
+        }
         self.fresh_start = false;
     }
 }
@@ -2411,6 +2436,31 @@ mod tests {
         // `runs`.
         t.release();
         assert_eq!(t.answers.len(), 1, "the answer is not lost on release");
+    }
+
+    #[test]
+    fn a_refused_handover_keeps_the_review_branch_across_release() {
+        let mut t = task("refused takeover");
+        t.start("run-1".to_owned());
+        t.hold_for_handover(Some("magi/eba2/A".to_owned()), "checked out".to_owned());
+        assert_eq!(t.status, TaskStatus::Held);
+        assert_eq!(t.attempts, 1);
+        t.release();
+        assert_eq!(t.status, TaskStatus::Queued);
+        assert_eq!(t.attempts, 0);
+        assert_eq!(t.review_branch.as_deref(), Some("magi/eba2/A"));
+
+        // A fresh competition chosen afterwards is not a review.
+        t.hold_for_handover(None, "again".to_owned());
+        t.requeue();
+        assert!(t.review_branch.is_none());
+
+        // A manual hold never keeps one.
+        let mut m = task("manual");
+        m.review_branch = Some("magi/x/A".to_owned());
+        m.hold_manual(None);
+        m.release();
+        assert!(m.review_branch.is_none());
     }
 
     #[test]

@@ -2719,7 +2719,13 @@ async fn attempt(
         Err(e) if e.downcast_ref::<crate::handover::Refused>().is_some() => {
             let reason = format!("{start_failed}{e:#}");
             task.last_error = Some(reason.clone());
-            task.hold_machine(Some(reason));
+            // Consumed above by `take`; keep it so the released task retries
+            // as a review of this same branch.
+            let branch = match &starter {
+                Starter::Review(branch) => Some(branch.clone()),
+                _ => None,
+            };
+            task.hold_for_handover(branch, reason);
             record(queue, task);
             tracing::warn!(
                 "holding {} for a branch it cannot take over: {e:#}",
@@ -7303,6 +7309,20 @@ mod tests {
             choose_starter(Some("magi/eba2/A"), false, Some("some-run")),
             Starter::Start,
             "a vanished review branch must not fall back to resuming the old run either"
+        );
+    }
+
+    #[test]
+    fn a_refused_handover_retries_as_a_review_of_the_same_branch() {
+        let mut t = task();
+        t.start("old-run".to_owned());
+        t.hold_for_handover(Some("magi/eba2/A".to_owned()), "checked out".to_owned());
+        t.release();
+        let branch = t.review_branch.take();
+        assert_eq!(
+            choose_starter(branch.as_deref(), true, Some("old-run")),
+            Starter::Review("magi/eba2/A".to_owned()),
+            "a review wins over resuming the old run"
         );
     }
 
