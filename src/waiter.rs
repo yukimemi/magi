@@ -245,10 +245,8 @@ impl Waiter {
         } else {
             self.default_timeout
         };
-        let startable = crate::deputy::can_start(
-            self.conduct_cfg.as_ref(),
-            crate::deputy::agent_of(q),
-        );
+        let startable =
+            crate::deputy::can_start(self.conduct_cfg.as_ref(), crate::deputy::agent_of(q));
         let why = format!("no answer within {}s of asking", secs.max(1));
         let done = self.store.update(&q.id, |r| {
             // Decided again on the record as it is now: the owner may have

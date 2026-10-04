@@ -158,8 +158,7 @@ pub fn exhausted_past_deadline(
         default_timeout
     };
     q.status.open()
-        && q
-            .deputy
+        && q.deputy
             .as_ref()
             .is_some_and(|d| d.starts >= MAX_STARTS || !startable)
         && now.as_second() > q.last_activity().saturating_add(secs as i64)
@@ -286,7 +285,8 @@ impl Deputies {
             if now.as_second() > deadline && q.unread_from_owner().is_none() {
                 continue;
             }
-            if self.inflight.len() >= self.max || !can_start(self.cfg.as_ref(), dep.agent.as_str()) {
+            if self.inflight.len() >= self.max || !can_start(self.cfg.as_ref(), dep.agent.as_str())
+            {
                 continue;
             }
             if matches!(self.memo.get(&q.id), Some(until) if Instant::now() < *until) {
