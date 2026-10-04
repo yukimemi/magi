@@ -844,6 +844,20 @@ the merge waits.
   on it changes nothing.
 - A question already filed before the record existed is reused as it is.
 
+**Every land decision is about the head magi observed, never an older one.**
+After a push (a fix round or a rebase) `land` remembers the pushed SHA and
+decides nothing until the pull request points at it *and* the rollup's commit
+(`commits`, last entry) is that same head; `bound_head` returns `None`
+otherwise and the loop re-polls, bounded by `WAIT_CEILING`, then stops naming
+both SHAs - never a merge. The merge itself is `gh pr merge
+--match-head-commit <observed sha>`, so a push between the look and the merge
+is refused by the forge, and a refusal after which the head differs goes back
+to observing without failing the run. The non-required-red policy is
+unchanged. Known limit: the awaited SHA is memory only, so a crash right after
+a push can bind the old head once on resume; `--match-head-commit` still stops
+that merge. `gh` truncates `commits` near 100 entries, so a very long pull
+request waits out the ceiling and stops (the safe direction).
+
 **A conflict is a rebase, not a fix round.** `Step::Rebase` is decided before
 the checks, because every check on a branch that cannot land is an answer
 about a state that cannot land. It is bounded by the same budget as a fix and
