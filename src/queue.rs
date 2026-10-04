@@ -1395,13 +1395,16 @@ impl Queue {
                     // Content first, then age: a lock replaced in between
                     // reads fresh, never stale.
                     let judged = std::fs::read_to_string(&path).ok();
-                    if let Some(judged) = judged.filter(|_| older_than_stale(&path)) {
-                        if !break_stale(&path, &judged) {
-                            std::thread::sleep(std::time::Duration::from_millis(15));
+                    let broken = judged
+                        .filter(|_| older_than_stale(&path))
+                        .is_some_and(|judged| break_stale(&path, &judged));
+                    // A break that does not happen (marker busy, recovery
+                    // exhausted) is a wait like any other, so it meets the
+                    // same deadline instead of spinning forever.
+                    if !broken {
+                        if started.elapsed() > TASK_LOCK_STALE {
+                            bail!("could not lock task {id}");
                         }
-                    } else if started.elapsed() > TASK_LOCK_STALE {
-                        bail!("could not lock task {id}");
-                    } else {
                         std::thread::sleep(std::time::Duration::from_millis(15));
                     }
                 }
