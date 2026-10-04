@@ -12364,7 +12364,9 @@ mod tests {
     #[test]
     fn the_run_actions_sheet_leads_with_a_way_to_the_task() {
         let task = INDEX_HTML.find("id=\"run-task-box\"").expect("task box");
-        let actions = INDEX_HTML.find("id=\"run-actions-box\"").expect("actions box");
+        let actions = INDEX_HTML
+            .find("id=\"run-actions-box\"")
+            .expect("actions box");
         assert!(task < actions, "the task entry comes first in the sheet");
         assert!(APP_JS.contains("renderRunTaskEntry"));
         assert!(APP_JS.contains("\"Open task \""));
