@@ -360,15 +360,27 @@ async fn dropped_commits(repo: &Path, onto_sha: &str, orig: &str, head: &str) ->
         // the base under a different patch (e.g. folded into one upstream
         // commit). That is not a loss: every path it touched holds the same
         // content in the result.
-        if !already_in_result(repo, &c.sha, head).await {
+        if !already_in_result(repo, &c.sha, orig, head).await {
             lost.push(c.key.rsplit('\u{1f}').next().unwrap_or(&c.key).to_owned());
         }
     }
     lost
 }
 
-/// Does `head` hold, for every path `sha` touched, exactly `sha`'s content?
-async fn already_in_result(repo: &Path, sha: &str, head: &str) -> bool {
+/// `mode type blob` of `path` at `rev`, or `None` when it does not exist
+/// there. Unlike `rev-parse rev:path` this carries the file mode.
+async fn entry(repo: &Path, rev: &str, path: &str) -> Option<String> {
+    let out = git::git(repo, &["ls-tree", rev, "--", path]).await.ok()?;
+    out.split('\t')
+        .next()
+        .filter(|e| !e.is_empty())
+        .map(str::to_owned)
+}
+
+/// Does `head` hold, for every path `sha` touched, what `sha` left there or
+/// what the branch's final tip `orig` has there (a later commit may have
+/// changed the path again)? Mode is part of the comparison.
+async fn already_in_result(repo: &Path, sha: &str, orig: &str, head: &str) -> bool {
     let Ok(paths) = git::git(
         repo,
         &[
@@ -385,13 +397,8 @@ async fn already_in_result(repo: &Path, sha: &str, head: &str) -> bool {
         return false;
     };
     for p in paths.lines().filter(|l| !l.is_empty()) {
-        let a = git::git(repo, &["rev-parse", &format!("{sha}:{p}")])
-            .await
-            .ok();
-        let b = git::git(repo, &["rev-parse", &format!("{head}:{p}")])
-            .await
-            .ok();
-        if a.is_none() || a != b {
+        let got = entry(repo, head, p).await;
+        if got != entry(repo, sha, p).await && got != entry(repo, orig, p).await {
             return false;
         }
     }
@@ -543,5 +550,38 @@ mod tests {
     fn a_patch_twin_in_the_result_is_not_a_loss() {
         let exp = [ck("a", "one")];
         assert!(missing_commits(&exp, &[], &["a".to_owned()]).is_empty());
+    }
+
+    fn sh(dir: &Path, args: &[&str]) {
+        let o = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_mode_change_is_not_already_in_the_result() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        sh(d, &["init", "-q", "-b", "main"]);
+        sh(d, &["config", "user.name", "t"]);
+        sh(d, &["config", "user.email", "t@example.com"]);
+        sh(d, &["config", "core.fileMode", "true"]);
+        std::fs::write(d.join("script.sh"), "echo\n").unwrap();
+        sh(d, &["add", "-A"]);
+        sh(d, &["commit", "-q", "-m", "base"]);
+        sh(d, &["update-index", "--chmod=+x", "script.sh"]);
+        sh(d, &["commit", "-q", "-m", "chmod"]);
+        let sha = git::git(d, &["rev-parse", "HEAD"]).await.unwrap();
+        let base = git::git(d, &["rev-parse", "HEAD~1"]).await.unwrap();
+        // The result is the base: same blob, lost mode.
+        assert!(!already_in_result(d, &sha, &sha, &base).await);
+        assert!(already_in_result(d, &sha, &sha, &sha).await);
     }
 }

@@ -573,6 +573,11 @@ if [ -n "$MOCK_IMPL_TWO_COMMITS" ]; then
   echo "second" > second.txt
   git add -A >/dev/null 2>&1
   git commit -q -m "add second from $seat" >/dev/null 2>&1
+  if [ -n "$MOCK_IMPL_THIRD_COMMIT" ]; then
+    echo "second, revised" > second.txt
+    git add -A >/dev/null 2>&1
+    git commit -q -m "revise second from $seat" >/dev/null 2>&1
+  fi
 fi
 printf '## SUMMARY\nTITLE: feat(note): create note.txt\n- created note.txt\n- no risks\n'
 "##;
