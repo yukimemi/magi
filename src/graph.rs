@@ -7585,6 +7585,7 @@ fn summary_without_title(summary: &str) -> String {
 /// `magi show` does. The task follows inside a collapsed block, and the
 /// footer repeats the run and candidate as plain tags for a reader holding
 /// only the merged commit or the PR body.
+#[cfg(test)]
 fn pr_message(state: &RunState, winner: char) -> PrMessage {
     pr_message_with(state, winner, None)
 }
