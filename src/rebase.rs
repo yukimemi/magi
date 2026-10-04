@@ -438,22 +438,23 @@ async fn replay_is_noop(repo: &Path, sha: &str, head: &str) -> bool {
     }
 }
 
-/// The pure half of [`dropped_commits`]: the `expected` commits whose
-/// key is not left in `have` (a multiset: each result commit covers one
-/// expected commit). A patch twin in the result is deliberately not excused
-/// here: with duplicate keys it could mask a skipped commit, so the caller
-/// verifies each candidate by content ([`already_in_result`]).
+/// The pure half of [`dropped_commits`]: the `expected` commits that may be
+/// missing from the result, judged by key. Keys are counted (a multiset); when
+/// the result holds fewer commits under a key than were expected, *every*
+/// expected commit with that key is a candidate, because the key cannot say
+/// which of them survived. The caller verifies each candidate by content
+/// ([`already_in_result`]); a patch twin in the result is not excused here for
+/// the same reason.
 fn missing_commits(expected: &[git::CommitKey], have: &[String]) -> Vec<git::CommitKey> {
-    let mut pool: Vec<Option<&String>> = have.iter().map(Some).collect();
-    let mut lost = Vec::new();
-    for c in expected {
-        if let Some(slot) = pool.iter_mut().find(|s| **s == Some(&c.key)) {
-            *slot = None;
-        } else {
-            lost.push(c.clone());
-        }
-    }
-    lost
+    expected
+        .iter()
+        .filter(|c| {
+            let want = expected.iter().filter(|e| e.key == c.key).count();
+            let got = have.iter().filter(|k| **k == c.key).count();
+            got < want
+        })
+        .cloned()
+        .collect()
 }
 
 /// Give up: abort whatever is standing, drop the worktree and put the branch
@@ -574,14 +575,14 @@ mod tests {
     fn duplicate_keys_are_counted_not_collapsed() {
         let exp = [ck("a", "same"), ck("b", "same")];
         let have = vec![exp[0].key.clone()];
-        assert_eq!(missing_commits(&exp, &have), vec![exp[1].clone()]);
+        assert_eq!(missing_commits(&exp, &have), exp.to_vec());
     }
 
     #[test]
     fn a_commit_without_a_key_match_is_a_candidate_even_if_a_twin_exists() {
         let exp = [ck("a", "same"), ck("b", "same")];
         let have = vec![exp[1].key.clone()];
-        assert_eq!(missing_commits(&exp, &have).len(), 1);
+        assert_eq!(missing_commits(&exp, &have).len(), 2);
     }
 
     fn sh(dir: &Path, args: &[&str]) {
