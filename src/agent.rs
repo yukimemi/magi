@@ -855,15 +855,14 @@ fn input_side(usage: &serde_json::Value, input: &[&str], cache: &[&str]) -> Opti
 ///   prefix once per tool round-trip.
 /// - **Missing or mistyped usage is `None`**, which the UI shows as "unknown".
 /// - **A cumulative total is not a context size, so it is `None`.** claude's
-///   result `usage` sums every model call of the turn, so it is trusted only
-///   when `num_turns` is 1 (a single call, where sum and last coincide).
-///   codex's `turn.completed.usage` is the session's running input total and
-///   repeats the same context on every resumed turn; it carries no per-call
-///   figure, so codex is always unknown rather than a made-up number.
-/// - agy reports cache reads separately from `input_tokens`, so those are added.
-///
-/// agy's counters may be cumulative for the whole print-mode call rather than
-/// for one request, so for that CLI the number is an upper bound.
+///   result `usage` sums every model call of the turn and, on a resumed
+///   session, carries the session's earlier usage too, so even `num_turns == 1`
+///   does not make it one call's context. codex's `turn.completed.usage` is the
+///   session's running input total, and agy's `usage` aggregates the whole
+///   print-mode call (the observed sample exceeds any window). None of the
+///   three carries a per-call figure, so each is unknown rather than made up.
+///   Only the streams that report each model call (opencode `step_finish`, omp
+///   message usage) yield a number.
 fn context_tokens(kind: AgentKind, stdout: &str) -> Option<u64> {
     use serde_json::Value;
     let lines = || {
@@ -872,17 +871,7 @@ fn context_tokens(kind: AgentKind, stdout: &str) -> Option<u64> {
             .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
     };
     match kind {
-        AgentKind::Claude => {
-            let v = serde_json::from_str::<Value>(stdout.trim()).ok()?;
-            if uint(&v, "num_turns") != Some(1) {
-                return None;
-            }
-            input_side(
-                v.get("usage")?,
-                &["input_tokens"],
-                &["cache_creation_input_tokens", "cache_read_input_tokens"],
-            )
-        }
+        AgentKind::Claude => None,
         AgentKind::Opencode => lines()
             .filter(|v| {
                 // The event is `step_finish`; its part is `step-finish`.
@@ -903,13 +892,7 @@ fn context_tokens(kind: AgentKind, stdout: &str) -> Option<u64> {
                 Some(base.saturating_add(cached))
             })
             .next_back(),
-        AgentKind::Antigravity => {
-            let v = stdout
-                .lines()
-                .rev()
-                .find_map(|l| serde_json::from_str::<Value>(l.trim()).ok())?;
-            input_side(v.get("usage")?, &["input_tokens"], &["cache_read_tokens"])
-        }
+        AgentKind::Antigravity => None,
         AgentKind::Codex => None,
         AgentKind::Omp => lines()
             .flat_map(|v| {
@@ -2913,25 +2896,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_context_tokens_add_cache_and_stay_unknown_without_usage() {
-        let full = r#"{"result":"ok","num_turns":1,"usage":{"input_tokens":10,"cache_creation_input_tokens":200,"cache_read_input_tokens":3000,"output_tokens":5}}"#;
-        assert_eq!(context_tokens(AgentKind::Claude, full), Some(3210));
-        let no_cache = r#"{"result":"ok","num_turns":1,"usage":{"input_tokens":10}}"#;
-        assert_eq!(context_tokens(AgentKind::Claude, no_cache), Some(10));
-        for missing in [
-            r#"{"result":"ok"}"#,
-            r#"{"result":"ok","num_turns":1,"usage":{"output_tokens":5}}"#,
-            r#"{"result":"ok","num_turns":1,"usage":{"input_tokens":"many"}}"#,
-            // Several model calls: the usage is a sum, not a context size.
+    fn claude_context_tokens_are_unknown_because_usage_is_aggregated() {
+        for out in [
+            r#"{"result":"ok","num_turns":1,"usage":{"input_tokens":10,"cache_read_input_tokens":3000}}"#,
             r#"{"result":"ok","num_turns":3,"usage":{"input_tokens":10}}"#,
-            r#"{"result":"ok","usage":{"input_tokens":10}}"#,
+            r#"{"result":"ok"}"#,
             "not json",
         ] {
-            assert_eq!(
-                context_tokens(AgentKind::Claude, missing),
-                None,
-                "{missing}"
-            );
+            assert_eq!(context_tokens(AgentKind::Claude, out), None, "{out}");
         }
     }
 
@@ -2952,11 +2924,9 @@ mod tests {
     }
 
     #[test]
-    fn agy_context_tokens_add_cache_reads() {
-        let out = r#"{"conversation_id":"c","status":"OK","response":"x","usage":{"input_tokens":260113,"output_tokens":1,"cache_read_tokens":2200925}}"#;
-        assert_eq!(context_tokens(AgentKind::Antigravity, out), Some(2_461_038));
-        let bare = r#"{"conversation_id":"c","status":"OK","response":"x"}"#;
-        assert_eq!(context_tokens(AgentKind::Antigravity, bare), None);
+    fn agy_context_tokens_are_unknown_because_usage_is_aggregated() {
+        let out = r#"{"conversation_id":"c","status":"OK","response":"x","usage":{"input_tokens":260113,"cache_read_tokens":2200925}}"#;
+        assert_eq!(context_tokens(AgentKind::Antigravity, out), None);
     }
 
     #[test]
