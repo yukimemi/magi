@@ -7680,19 +7680,31 @@ fn pr_message_with(state: &RunState, winner: char, facts: Option<&BranchFacts>) 
         // The review prompt is not the task; list what the branch carries.
         body.push_str("## Commits under review\n\n");
         if let Some(facts) = facts {
-            let mut used = 0;
+            let mut left = COMMITS_MAX_CHARS;
             for (i, (subject, text)) in facts.commits.iter().enumerate() {
                 let mut entry = format!("- {}\n", markdown_safe(subject));
                 for l in markdown_safe(text).lines() {
                     entry.push_str(format!("  {l}\n").trim_end_matches(' '));
                 }
-                used += entry.len();
-                if used > COMMITS_MAX_CHARS && i > 0 {
+                if left == 0 {
                     body.push_str(&format!(
                         "- ... {} more commit(s)\n",
                         facts.commits.len() - i
                     ));
                     break;
+                }
+                if entry.len() > left {
+                    // Even the first commit is cut: one huge body must not
+                    // push the whole description past GitHub's limit.
+                    let mut end = left;
+                    while !entry.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    entry.truncate(end);
+                    entry.push_str("\n  ... (truncated)\n");
+                    left = 0;
+                } else {
+                    left -= entry.len();
                 }
                 body.push_str(&entry);
             }
@@ -10458,6 +10470,24 @@ mod tests {
             assert!(!m.body.contains(banned), "{banned}: {}", m.body);
         }
         assert!(m.body.ends_with("magi:candidate-a\n"), "{}", m.body);
+    }
+
+    #[test]
+    fn pr_message_review_truncates_a_huge_first_commit_body() {
+        let state = review_state(&["ignored"]);
+        let f = facts(
+            &[("feat: big", &"x".repeat(70_000)), ("fix: later", "")],
+            "s",
+        );
+        let m = pr_message_with(&state, 'A', Some(&f));
+        assert!(m.body.len() < 30_000, "{}", m.body.len());
+        assert!(m.body.contains("(truncated)"), "{}", m.body.len());
+        assert!(
+            m.body.contains("- ... 1 more commit(s)"),
+            "{}",
+            m.body.len()
+        );
+        assert!(m.body.ends_with("magi:candidate-a\n"));
     }
 
     #[test]
