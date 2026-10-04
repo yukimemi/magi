@@ -1563,6 +1563,15 @@ function isOrphanSuperseded(run) {
   return typeof run.superseded_by === "string" && run.superseded_by !== "";
 }
 
+/* Every filter a row must pass to be listed: the state chip, the old-attempt
+   hiding that "all" lifts, and the section / repo / status filter. Shared by
+   the loaded rows and by search hits outside the loaded window. */
+function passesRunFilters(run) {
+  return matchesRunState(run)
+    && (state.runsStateFilter === "all" || !isOrphanSuperseded(run))
+    && matchesFilter(run);
+}
+
 /* Exactly one chip is ever selected, so picking the already-selected one is
    a no-op rather than clearing back to nothing — unlike the tree filter
    above, there is no "no filter" state here for the default to fall back to. */
@@ -2095,10 +2104,7 @@ function renderRuns() {
   const searchHits = state.search.runs.hits;
   const visible = !searching ? filtered
     : searchKind === "error" ? []
-    : runs.filter((r) => searchHits.has(r.id) && matchesRunState(r)
-        && (state.runsStateFilter === "all" || !isOrphanSuperseded(r)) && matchesFilter(r));
-  const searchShown = searching ? runs.filter((r) => state.search.runs.hits.has(r.id)).length : 0;
-  renderSearchStatus("runs", $("runs-search-status"), "runs", searchShown);
+    : runs.filter((r) => searchHits.has(r.id) && passesRunFilters(r));
 
   /* Every list in childrenOf exists only because foldRuns resolved a
      superseded_by to a head on this page (see foldRuns above) — it is
@@ -2111,13 +2117,9 @@ function renderRuns() {
     ? 0
     : [...childrenOf.values()].reduce((sum, kids) => sum + kids.filter(matchesRunState).length, 0);
   const childrenForRender = state.runsStateFilter === "all" && !searching ? childrenOf : new Map();
-  /* A hit outside the loaded window has no state, section or repository on
-     the client, so it cannot honour those filters; it is listed only while
-     none is narrowing the page, and the status line counts it as hidden
-     otherwise. */
-  const unfiltered = state.runsStateFilter === "all"
-    && !(state.runsFilter.section || state.runsFilter.repo || state.runsFilter.status);
-  renderSearchExtras(searching && searchKind !== "error" && unfiltered ? runs : null);
+  const extraShown = searching && searchKind !== "error" ? renderSearchExtras(runs) : (renderSearchExtras(null), 0);
+  const searchShown = searching ? visible.length + extraShown : 0;
+  renderSearchStatus("runs", $("runs-search-status"), "runs", searchShown);
   syncRunSections(sectionsRoot, groupBySection(visible), childrenForRender);
 
   const supersededHidden = orphanHidden + foldedHidden;
@@ -2796,10 +2798,16 @@ function renderSearchExtras(loadedRuns) {
   clear(box);
   if (loadedRuns === null) {
     show(box, false);
-    return;
+    return 0;
   }
+  /* A hit outside the loaded window is judged by the row the server attached
+     to it; one without a row has no state to judge, so it is listed only
+     while no filter is narrowing the page. */
+  const narrowing = state.runsStateFilter !== "all"
+    || !!(state.runsFilter.section || state.runsFilter.repo || state.runsFilter.status);
   const known = new Set(loadedRuns.map((r) => r.id));
-  const extra = [...state.search.runs.hits.values()].filter((h) => !known.has(h.id));
+  const extra = [...state.search.runs.hits.values()].filter((h) => !known.has(h.id)
+    && (h.run ? passesRunFilters(h.run) : !narrowing));
   show(box, extra.length > 0);
   for (const hit of extra) {
     const snippet = el("p", { class: "card-snippet" });
@@ -2808,6 +2816,7 @@ function renderSearchExtras(loadedRuns) {
       el("a", { class: "card-permalink", href: `#/runs/${encodeURIComponent(hit.id)}`, text: hit.id }),
       snippet));
   }
+  return extra.length;
 }
 
 /* One sentence under the box saying what the search is doing. `shown` is how
