@@ -275,6 +275,52 @@ pub async fn fold_due(
     Ok((folded, unreadable))
 }
 
+/// What one [`fetch_origins`] pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FetchReport {
+    /// Repos whose fetch succeeded.
+    pub fetched: usize,
+    /// Repos with no `origin` remote, skipped.
+    pub no_origin: usize,
+    /// Repos whose fetch failed or timed out.
+    pub failed: usize,
+}
+
+/// Run `git fetch origin` in every checkout under `roots` (the set `magi
+/// repos` lists), so `origin/main` stays current.
+///
+/// Fetch only: never a checkout, merge or fast-forward, so no HEAD, branch or
+/// working tree moves. Best-effort like [`fold_due`]: a repo with no `origin`
+/// is skipped silently, a failure or timeout is a warning, and the pass never
+/// errors. `stop` is checked between repos.
+pub async fn fetch_origins(
+    roots: &[PathBuf],
+    per_repo: std::time::Duration,
+    stop: impl Fn() -> bool,
+) -> FetchReport {
+    let mut report = FetchReport::default();
+    for repo in crate::repos::scan(roots) {
+        if stop() {
+            break;
+        }
+        match crate::git::git_raw(&repo.path, &["remote", "get-url", "origin"]).await {
+            Ok(out) if out.ok() => {}
+            _ => {
+                report.no_origin += 1;
+                continue;
+            }
+        }
+        match crate::git::fetch_origin(&repo.path, per_repo).await {
+            Ok(()) => report.fetched += 1,
+            Err(e) => {
+                tracing::warn!("fetch origin in {}: {e:#}", repo.name);
+                report.failed += 1;
+            }
+        }
+    }
+    report
+}
+
 /// Is `updated` old enough, measured against `now`, that the run may fold?
 ///
 /// Pure; the janitor compares against wallclock, tests inject both sides. The
@@ -835,6 +881,137 @@ pub fn cache_size(cache: &Path) -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    async fn sh(cwd: &Path, args: &[&str]) {
+        let out = crate::git::git_raw(cwd, args).await.expect("spawn git");
+        assert!(out.ok(), "git {args:?}: {}", out.stderr);
+    }
+
+    async fn commit(cwd: &Path, file: &str, body: &str) {
+        std::fs::write(cwd.join(file), body).unwrap();
+        sh(cwd, &["add", file]).await;
+        sh(
+            cwd,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "-m",
+                body,
+            ],
+        )
+        .await;
+    }
+
+    const LONG: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[tokio::test]
+    async fn fetch_advances_origin_main_and_leaves_the_checkout_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        let bare = t.join("remote.git");
+        sh(
+            t,
+            &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
+        )
+        .await;
+        let dir = t.join("root/h/o/r");
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        sh(
+            t,
+            &["clone", "-q", bare.to_str().unwrap(), dir.to_str().unwrap()],
+        )
+        .await;
+        sh(&dir, &["checkout", "-q", "-b", "main"]).await;
+        commit(&dir, "a.txt", "one").await;
+        sh(&dir, &["push", "-q", "origin", "main"]).await;
+        sh(&dir, &["checkout", "-q", "--detach"]).await;
+        std::fs::write(dir.join("a.txt"), "dirty").unwrap();
+
+        let other = t.join("other");
+        sh(
+            t,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        )
+        .await;
+        commit(&other, "b.txt", "two").await;
+        sh(&other, &["push", "-q", "origin", "HEAD:main"]).await;
+
+        let rev = |d: PathBuf, r: &'static str| async move {
+            crate::git::git(&d, &["rev-parse", r]).await.unwrap()
+        };
+        let head = rev(dir.clone(), "HEAD").await;
+        let before = rev(dir.clone(), "origin/main").await;
+        let status = crate::git::git(&dir, &["status", "--porcelain"])
+            .await
+            .unwrap();
+
+        let r = fetch_origins(&[t.join("root")], LONG, || false).await;
+        assert_eq!(
+            r,
+            FetchReport {
+                fetched: 1,
+                no_origin: 0,
+                failed: 0
+            }
+        );
+
+        assert_ne!(rev(dir.clone(), "origin/main").await, before);
+        assert_eq!(rev(dir.clone(), "HEAD").await, head);
+        assert_eq!(
+            crate::git::git(&dir, &["status", "--porcelain"])
+                .await
+                .unwrap(),
+            status
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "dirty");
+    }
+
+    #[tokio::test]
+    async fn fetch_skips_no_origin_and_survives_an_unreachable_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path();
+        let root = t.join("root");
+        let bare = t.join("remote.git");
+        sh(t, &["init", "-q", "--bare", bare.to_str().unwrap()]).await;
+
+        let none = root.join("h/o/none");
+        let dead = root.join("h/o/dead");
+        let good = root.join("h/o/good");
+        for d in [&none, &dead, &good] {
+            std::fs::create_dir_all(d).unwrap();
+            sh(d, &["init", "-q"]).await;
+        }
+        sh(
+            &dead,
+            &[
+                "remote",
+                "add",
+                "origin",
+                t.join("missing").to_str().unwrap(),
+            ],
+        )
+        .await;
+        sh(&good, &["remote", "add", "origin", bare.to_str().unwrap()]).await;
+
+        let r = fetch_origins(&[root], LONG, || false).await;
+        assert_eq!(
+            r,
+            FetchReport {
+                fetched: 1,
+                no_origin: 1,
+                failed: 1
+            }
+        );
+    }
     use super::*;
     use crate::config::Disk;
     use std::fs;

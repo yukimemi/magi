@@ -50,6 +50,40 @@ pub async fn git_raw(cwd: &Path, args: &[&str]) -> Result<GitOut> {
     })
 }
 
+/// `git fetch origin` in `cwd`, bounded by `timeout`.
+///
+/// Touches only `refs/remotes/origin/*`: no branch, HEAD, index or working
+/// tree changes. A child still running at the deadline is killed on drop.
+pub async fn fetch_origin(cwd: &Path, timeout: std::time::Duration) -> Result<()> {
+    let fut = Command::new("git")
+        .args([
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-recurse-submodules",
+            "--no-write-fetch-head",
+            "origin",
+        ])
+        .current_dir(cwd)
+        .quiet()
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("git fetch timed out after {}s", timeout.as_secs()))?
+        .context("spawn git fetch")?;
+    if !out.status.success() {
+        bail!(
+            "git fetch failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim_end()
+        );
+    }
+    Ok(())
+}
+
 /// Run `git`, failing on a non-zero exit status.
 pub async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let out = git_raw(cwd, args).await?;

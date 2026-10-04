@@ -1548,3 +1548,15 @@ never blocked or changed by it (`land_approval`, `review_rounds` untouched);
   section in `magi show`, task links on the web run page, and one English
   comment on the pull request (marker `magi-followup run=<id>`), posted only
   when something is filed, and retried by a re-entered `land` if it failed.
+
+### origin/main is kept fresh by its own task, and only refs/remotes move
+
+`daemon::fetch_loop` runs `clean::fetch_origins` every `[repos] fetch_interval`
+seconds (default 600, `0` disables) over the checkouts `magi repos` lists. It
+is `git fetch origin` and nothing else, so only `refs/remotes/origin/*`
+changes: never a branch, HEAD, index or working tree (primary checkouts are
+detached and often dirty). It is its own task rather than part of the janitor
+because the janitor only runs on idle ticks, so `origin/main` would go stale
+during a long run, and a slow remote must not hold up the poll loop. Failures
+and the 30 s per-repo timeout are warnings; `talk::briefing` tells the Chat to
+read code from `origin/main`.

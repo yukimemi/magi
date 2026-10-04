@@ -1736,6 +1736,10 @@ async fn drive(
         stop.clone(),
     ));
 
+    // Keeps every checkout's origin/main fresh; its own task so a slow remote
+    // never holds up the poll loop.
+    let fetcher = tokio::spawn(fetch_loop(opts.repo.clone(), opts.clone(), stop.clone()));
+
     tracing::info!(
         "magi serve: queue {} (poll {}s, {} attempts per task, {} run(s) at once{})",
         queue.root().display(),
@@ -1771,8 +1775,35 @@ async fn drive(
     beat.abort();
     waiter.abort();
     deputies.abort();
+    fetcher.abort();
     clear_status_at(status_file);
     outcome
+}
+
+/// Per-repo bound on one `git fetch`, so a dead remote cannot stall the pass.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run [`crate::clean::fetch_origins`] every `[repos] fetch_interval` seconds
+/// until `stop`. The config is re-read each lap; `0` (or an unreadable config)
+/// disables the fetch for that lap. Never fails.
+async fn fetch_loop(repo: PathBuf, opts: Opts, stop: Stop) {
+    while !stop.stopped() {
+        let (interval, roots) = match prepare(&repo, &opts) {
+            Ok(c) => (c.repos.fetch_interval, c.repos.roots),
+            Err(_) => (0, Vec::new()),
+        };
+        if interval > 0 && !roots.is_empty() {
+            let r = crate::clean::fetch_origins(&roots, FETCH_TIMEOUT, || stop.stopped()).await;
+            tracing::debug!("fetch origins: {r:?}");
+        }
+        // Sleep in slices so a stop or a config change is noticed promptly.
+        let wait = if interval > 0 { interval } else { 60 };
+        let mut slept = 0;
+        while slept < wait && !stop.stopped() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            slept += 1;
+        }
+    }
 }
 
 /// Refresh the status file on a fixed tick.
