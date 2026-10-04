@@ -304,12 +304,12 @@ fn mountinfo_proc_unhidden(mountinfo: &str) -> bool {
         .lines()
         .rfind(|l| l.split_whitespace().nth(4) == Some("/proc"))
         .is_some_and(|l| {
-            !l.split(|c: char| c.is_whitespace() || c == ',').any(|o| {
-                matches!(
-                    o,
-                    "hidepid=1" | "hidepid=2" | "hidepid=invisible" | "hidepid=noaccess"
-                )
-            })
+            // Only an explicit `hidepid=0` / `off` (or no option at all)
+            // shows every pid; `1`, `2`, `4`, their names and any value not
+            // known here all count as restricted.
+            l.split(|c: char| c.is_whitespace() || c == ',')
+                .filter_map(|o| o.strip_prefix("hidepid="))
+                .all(|v| matches!(v, "0" | "off"))
         })
 }
 
@@ -446,6 +446,13 @@ mod tests {
         let hidden = "25 1 0:5 / /proc rw,nosuid - proc proc rw,hidepid=2";
         assert!(mountinfo_proc_unhidden(open));
         assert!(!mountinfo_proc_unhidden(hidden));
+        for v in ["1", "4", "ptraceable", "noaccess", "future"] {
+            let line = format!("25 1 0:5 / /proc rw - proc proc rw,hidepid={v}");
+            assert!(!mountinfo_proc_unhidden(&line), "hidepid={v}");
+        }
+        assert!(mountinfo_proc_unhidden(
+            "25 1 0:5 / /proc rw - proc proc rw,hidepid=0"
+        ));
         assert!(!mountinfo_proc_unhidden(""));
     }
 
