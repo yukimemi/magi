@@ -7652,13 +7652,92 @@ fn manual_merge_command(style: MergeStyle, repo: &Path, branch: &str, message: &
 /// under the hood, rejects a `title` over 256 characters and the whole
 /// command fails — no PR at all, for a run whose body was otherwise fine
 /// (this is what happened to run 2963; see AGENTS.md). 240 leaves room below
-/// that limit: `title_from` counts `chars()` (Unicode scalars), which is not
-/// always how GitHub counts, plus one character for the trailing ellipsis
-/// `title_from` may add. It is a margin, not a guarantee — a title packed
+/// that limit: titles are counted in `chars()` (Unicode scalars), which is not
+/// always how GitHub counts. [`english_title`] keeps its trailing `...` inside
+/// this bound. It is a margin, not a guarantee — a title packed
 /// with multi-unit characters could still in principle land close to the
 /// edge, but a real task title's occasional emoji or accented letter fits
 /// comfortably inside it.
 const PR_TITLE_MAX: usize = 240;
+
+/// A pull request title from the opening line of `text`, or `None` when that
+/// line is not English (GitHub text is) or has no letters.
+///
+/// A line within `max` is kept as is. A longer one is cut at the end of its
+/// first sentence when that falls inside `max`, else at a word boundary with a
+/// plain `...` (ASCII, unlike the `…` `queue::title_from` appends, which would
+/// make every merely-truncated title look non-English). The language check
+/// runs on the kept text before any mark is added, so only what GitHub will
+/// show is judged: an English opening followed by non-ASCII far past the cut
+/// still passes.
+fn english_title(text: &str, max: usize) -> Option<String> {
+    let line = queue::first_line(text)?;
+    let chars: Vec<char> = line.chars().collect();
+    let (kept, mark) = if chars.len() <= max {
+        (line.to_owned(), "")
+    } else if let Some(end) = sentence_end(&chars, max) {
+        (chars[..end].iter().collect::<String>(), "")
+    } else {
+        let room = max.saturating_sub(3);
+        // Cut at the last space inside the room; when the char just past the
+        // room is a space the room already ends on a word.
+        let cut = if chars[room].is_whitespace() {
+            room
+        } else {
+            chars[..room]
+                .iter()
+                .rposition(|c| c.is_whitespace())
+                .unwrap_or(room)
+        };
+        let head: String = chars[..cut].iter().collect();
+        let head = head.trim_end_matches(|c: char| c.is_whitespace() || ",;:-".contains(c));
+        (head.to_owned(), "...")
+    };
+    if kept.is_empty() || !kept.is_ascii() || !kept.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(format!("{kept}{mark}"))
+}
+
+/// The char length of the first sentence of `chars` when it ends within `max`
+/// (the closing `.`/`!`/`?` dropped), skipping very short stubs and common
+/// abbreviations so `e.g. foo` does not end a title early.
+fn sentence_end(chars: &[char], max: usize) -> Option<usize> {
+    const MIN: usize = 20;
+    for i in MIN..max.min(chars.len()) {
+        if !matches!(chars[i], '.' | '!' | '?') {
+            continue;
+        }
+        let Some(&next) = chars.get(i + 1) else {
+            continue;
+        };
+        if !next.is_whitespace() {
+            continue;
+        }
+        let after = chars[i + 1..].iter().find(|c| !c.is_whitespace());
+        if after.is_some_and(|c| c.is_ascii_lowercase()) {
+            continue;
+        }
+        let word: String = chars[..i]
+            .iter()
+            .rev()
+            .take_while(|c| !c.is_whitespace())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let word = word.to_ascii_lowercase();
+        if matches!(word.as_str(), "e.g" | "i.e" | "etc" | "vs" | "cf") {
+            continue;
+        }
+        let end = chars[..i]
+            .iter()
+            .rposition(|c| !c.is_whitespace())
+            .map_or(i, |p| p + 1);
+        return Some(end);
+    }
+    None
+}
 
 /// What `merge = "pr"` (and the merge commit of the other modes) says about a
 /// change: a title and a body describing what was *implemented*, not the task
@@ -7871,12 +7950,8 @@ fn pr_message_with(state: &RunState, winner: char, facts: Option<&BranchFacts>) 
             .unwrap_or_else(|| neutral_title(state, winner))
     } else {
         summary_title(summary).unwrap_or_else(|| {
-            let t = queue::title_from(&state.instruction, PR_TITLE_MAX);
-            if t.is_ascii() && t.chars().any(|c| c.is_ascii_alphabetic()) {
-                t
-            } else {
-                neutral_title(state, winner)
-            }
+            english_title(&state.instruction, PR_TITLE_MAX)
+                .unwrap_or_else(|| neutral_title(state, winner))
         })
     };
 
@@ -11022,6 +11097,81 @@ mod tests {
         assert!(m.title.starts_with("feat: "));
         assert!(m.title.chars().count() <= PR_TITLE_MAX, "{}", m.title);
         assert_eq!(m.commit_message().lines().next(), Some(m.title.as_str()));
+    }
+
+    fn long_title_of(instruction: &str) -> String {
+        pr_message(&state_with_summary(instruction, "- nothing"), 'A').title
+    }
+
+    #[test]
+    fn pr_message_cuts_a_long_english_line_at_its_first_sentence() {
+        let first = "Make the landing path keep a readable title for long tasks";
+        let line = format!(
+            "{first}. {}",
+            "And then keep going with more words ".repeat(20)
+        );
+        let t = long_title_of(&line);
+        assert_eq!(t, first);
+        assert!(!t.starts_with("chore: land"));
+    }
+
+    #[test]
+    fn pr_message_cuts_a_sentenceless_long_line_at_a_word() {
+        let line = "word ".repeat(200);
+        let t = long_title_of(&line);
+        assert!(t.ends_with("word..."), "{t}");
+        assert!(t.is_ascii() && t.chars().count() <= PR_TITLE_MAX, "{t}");
+    }
+
+    #[test]
+    fn pr_message_long_non_english_or_letterless_line_is_neutral() {
+        for line in ["日本語のタスク ".repeat(80), "1234 ".repeat(100)] {
+            assert!(long_title_of(&line).starts_with("chore: land"), "{line}");
+        }
+    }
+
+    #[test]
+    fn pr_message_title_limit_is_exact() {
+        let at = "a".repeat(PR_TITLE_MAX);
+        assert_eq!(long_title_of(&at), at);
+        let over = long_title_of(&"a".repeat(PR_TITLE_MAX + 1));
+        assert!(over.ends_with("..."), "{over}");
+        assert_eq!(over.chars().count(), PR_TITLE_MAX);
+    }
+
+    #[test]
+    fn pr_message_judges_the_kept_text_not_what_follows_the_cut() {
+        let line = format!("{} \u{2014} tail", "alpha beta ".repeat(40));
+        let t = long_title_of(&line);
+        assert!(t.ends_with("..."), "{t}");
+        assert!(t.is_ascii(), "{t}");
+    }
+
+    #[test]
+    fn pr_message_sentence_cut_skips_abbreviations_and_decimals() {
+        let line = format!(
+            "Support several shells, e.g. bash and zsh, at version 1.5 or newer when it matters {}",
+            "plus more filler words ".repeat(20)
+        );
+        let t = long_title_of(&line);
+        assert!(t.contains("e.g. bash") && t.contains("1.5 or newer"), "{t}");
+    }
+
+    #[test]
+    fn pr_message_long_title_survives_a_blank_first_line_and_the_squash_subject() {
+        let line = format!("\n\n# {}", "title words ".repeat(40));
+        let state = state_with_summary(&line, "- nothing");
+        let m = pr_message(&state, 'A');
+        assert!(m.title.starts_with("title words"), "{}", m.title);
+        assert_eq!(
+            land::merge_subject(&m.title, &landing_subject_source(&state)),
+            m.title
+        );
+        // An operator's rename wins untouched.
+        assert_eq!(
+            land::merge_subject("feat: renamed by hand", &landing_subject_source(&state)),
+            "feat: renamed by hand"
+        );
     }
 
     #[test]
