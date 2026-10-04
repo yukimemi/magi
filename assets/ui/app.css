@@ -2035,3 +2035,118 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { border-color
 
 /* A conversation at 80% or more of its context window. */
 .card-meta [data-warn="1"] { color: var(--rust); font-weight: 600; }
+
+/* ---- two-pane master/detail (wide screens) ------------------------------ *
+ * Must stay in step with SPLIT_QUERY in app.js, which is what puts
+ * data-split on <main> and <body>. The page itself stops scrolling: the header
+ * keeps its height, <main> takes the rest, and the list and the preview each
+ * scroll inside their own column. */
+@media (min-width: 1080px) {
+  body[data-split] {
+    height: 100dvh; padding-bottom: 0; overflow: hidden;
+    display: flex; flex-direction: column;
+  }
+  main[data-split] {
+    flex: 1 1 0; min-height: 0; width: 100%; max-width: none; margin: 0; padding: 0;
+    display: grid;
+    grid-template-columns: minmax(360px, 30%) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+  /* The master column. */
+  main[data-split] > #view-runs,
+  main[data-split] > #view-queue,
+  main[data-split] > #view-talks {
+    grid-column: 1; grid-row: 1; min-height: 0; overflow: auto;
+    padding: var(--s3); gap: var(--s3);
+    border-right: 1px solid var(--line);
+  }
+  /* The preview column. */
+  main[data-split] > #view-run,
+  main[data-split] > #view-task,
+  main[data-split] > #view-talk,
+  main[data-split] > .split-empty {
+    grid-column: 2; grid-row: 1; min-height: 0; overflow: auto;
+    padding: var(--s4) var(--s5);
+  }
+  main[data-split] > .split-empty:not([hidden]) {
+    display: flex; align-items: center; justify-content: center;
+    color: var(--ink-3); font-size: var(--t3); text-align: center;
+  }
+  /* The row is the way back; a back link would only navigate away. */
+  main[data-split] #view-run > .back,
+  main[data-split] #view-task > .back,
+  main[data-split] #view-talk > .back { display: none; }
+  /* scrollIntoView and the jump helpers pad for the sticky header, which is
+     outside the panes here. */
+  main[data-split] * { scroll-margin-top: 0 !important; }
+
+  /* The run detail's two columns follow the viewport elsewhere; in a pane that
+     is a column short, so they stack until the pane itself is wide. */
+  main[data-split] #view-run { display: flex; }
+  main[data-split] .run-side { position: static; }
+  main[data-split] .report { max-height: 60dvh; }
+  @media (min-width: 1500px) {
+    main[data-split] #view-run { display: grid; }
+    main[data-split] .run-side { position: sticky; top: 0; }
+    main[data-split] .report { max-height: calc(100dvh - 220px); }
+  }
+  main[data-split] #view-talk { max-width: none; }
+  main[data-split] .say { bottom: 0; }
+  body[data-split] .run-actions-fab { bottom: var(--s4); }
+
+  /* Runs filters: one column, the tree folded into a short scroller. */
+  main[data-split] .runs-layout { display: block; }
+  main[data-split] .runs-tree { position: static; max-height: 30dvh; overflow: auto; margin-bottom: var(--s3); }
+
+  /* Dense rows: status, title and key meta on one line. Everything else a card
+     carries waits for the row to be selected. */
+  main[data-split] .cards { display: flex; flex-direction: column; gap: 2px; }
+  main[data-split] .cards > li { flex-direction: column; }
+  main[data-split] .card {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--s2);
+    padding: 6px var(--s3); border-radius: var(--radius-sm);
+    box-shadow: none; flex: none;
+  }
+  main[data-split] .cards > li > .card { flex: none; }
+  main[data-split] .card:hover { background: var(--sunk); }
+  main[data-split] .card[aria-current="true"] {
+    background: var(--sunk); border-color: var(--gold-line);
+    outline: 1px solid var(--gold-line);
+  }
+  main[data-split] .card-top { display: contents; }
+  main[data-split] .card-when { order: 3; margin-left: auto; }
+  main[data-split] .card-title {
+    order: 1; flex: 1 1 0; min-width: 0; margin: 0;
+    font-size: var(--t3); line-height: 1.3;
+    display: block; white-space: nowrap; text-overflow: ellipsis; overflow: hidden;
+  }
+  main[data-split] .card-meta {
+    order: 2; margin: 0; flex: 0 1 auto; min-width: 0; max-width: 40%;
+    flex-wrap: nowrap; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  main[data-split] .card > .card-note,
+  main[data-split] .card > .card-event,
+  main[data-split] .card > .err,
+  main[data-split] .card > details,
+  main[data-split] .card > .card-actions,
+  main[data-split] .card > div:not(.card-top):not(.card-meta),
+  main[data-split] .cards > li > .card-tail,
+  main[data-split] .cards > li > .run-folded { display: none; }
+  /* The selected row opens: the note, and the controls a task needs, stay in
+     reach without leaving the list. */
+  main[data-split] .card[aria-current="true"] > .card-note,
+  main[data-split] .card[aria-current="true"] > .card-event,
+  main[data-split] .card[aria-current="true"] > .err,
+  main[data-split] .card[aria-current="true"] > details,
+  main[data-split] .card[aria-current="true"] > .card-actions,
+  main[data-split] .card[aria-current="true"] > div:not(.card-top):not(.card-meta),
+  main[data-split] .cards > li:has(> .card[aria-current="true"]) > .card-tail,
+  main[data-split] .cards > li:has(> .card[aria-current="true"]) > .run-folded { display: block; }
+  main[data-split] .card[aria-current="true"] > .card-note,
+  main[data-split] .card[aria-current="true"] > .card-event,
+  main[data-split] .card[aria-current="true"] > .err,
+  main[data-split] .card[aria-current="true"] > details,
+  main[data-split] .card[aria-current="true"] > .card-actions { order: 9; flex: 1 1 100%; }
+  main[data-split] .card[aria-current="true"] > .card-actions { display: flex; }
+  main[data-split] .cards > li:has(> .card[aria-current="true"]) > .card-tail { display: flex; }
+}

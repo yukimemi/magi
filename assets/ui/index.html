@@ -133,6 +133,12 @@
 </div>
 
 <main id="main">
+  <!-- Two-pane layout only (see splitPanes in app.js): stands in for the right
+       pane while a list is open and nothing is selected. -->
+  <aside class="split-empty" id="split-empty" hidden>
+    <p>Select a run, task or conversation on the left to preview it here.</p>
+  </aside>
+
   <!-- RUNS -------------------------------------------------------------- -->
   <section class="view" id="view-runs" aria-labelledby="runs-h">
     <div class="view-head">

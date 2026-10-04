@@ -1278,6 +1278,7 @@ function updateRunCard(row, run) {
   const tone = toneOf(status, RUN_STATUS);
 
   r.card.setAttribute("href", `#/runs/${run.id}`);
+  setAttr(r.card, "data-run-id", run.id);
   setAttr(r.card, "data-tone", tone);
   setAttr(row, "data-tone", tone);
 
@@ -2096,6 +2097,7 @@ function renderRuns() {
       && Boolean(state.runsFilter.section || state.runsFilter.status)
       && visible.length === 0,
   );
+  markSelected();
 }
 
 /* ---- queue ------------------------------------------------------------- */
@@ -2150,8 +2152,24 @@ function createTaskCard() {
      (buttons, links, the details disclosures, selectable text) keeps its own
      behaviour. */
   title.classList.add("is-link");
-  title.addEventListener("click", () => {
+  const openTask = () => {
     if (card.dataset.taskId) location.hash = `#/tasks/${encodeURIComponent(card.dataset.taskId)}`;
+  };
+  title.addEventListener("click", openTask);
+  /* The keyboard's way in: in the two-pane layout the whole row selects, and
+     the title is the one element of it that can take focus. */
+  title.tabIndex = 0;
+  title.setAttribute("role", "link");
+  title.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") openTask();
+  });
+  /* Two-pane layout only: a dense row is one big target, like a run or chat
+     row. Anything interactive inside it keeps its own behaviour. */
+  card.addEventListener("click", (event) => {
+    if (!(splitMedia && splitMedia.matches)) return;
+    if (event.target.closest("a, button, input, select, textarea, summary, details, pre, label, .is-link")) return;
+    if (window.getSelection && String(window.getSelection())) return;
+    openTask();
   });
   card.refs = {
     card, chipSlot, priority, solo, permalink, whenSlot, title, source, repo, attempts,
@@ -3007,6 +3025,7 @@ const query = state.queueSearch.trim().toLowerCase();
   renderLoop();
   consumeQueueFocus();
   consumeQueueSectionFocus();
+  markSelected();
 }
 
 /* Stats-tile navigation into the Backlog: sets which QUEUE_SECTIONS key to
@@ -4413,6 +4432,7 @@ function updateTalkCard(row, talk) {
   const tone = toneOf(status, TALK_STATUS);
 
   r.card.setAttribute("href", `#/chat/${talk.id}`);
+  setAttr(r.card, "data-talk-id", talk.id);
   setAttr(r.card, "data-tone", tone);
   setAttr(row, "data-tone", tone);
 
@@ -4469,6 +4489,7 @@ function renderTalks() {
 
   show($("talks-empty"), talks.length === 0);
   syncList(list, sortTalks(talks), (t) => t.id, createTalkCard, updateTalkCard);
+  markSelected();
 }
 
 /* The rail and dock carry the total unread agent turns across every
@@ -6814,7 +6835,7 @@ async function applyRevisions_(source) {
     if (state.route.name === "run" && state.detail.id) jobs.push(loadRun(state.detail.id));
   }
   /* A task's page lists its runs' statuses, so either stream moving can stale it. */
-  if (taskStale && state.route.name === "task" && state.taskDetail.id) {
+  if (taskStale && state.taskDetail.id) {
     jobs.push(loadTask(state.taskDetail.id));
   }
   if (statsStale && state.route.name === "stats") jobs.push(loadStats());
@@ -6900,21 +6921,75 @@ function parseRoute() {
   return { name: "runs", id: null };
 }
 
+/* ---- two-pane layout (wide screens) --------------------------------------
+ * From SPLIT_QUERY up, Runs / Backlog / Chat keep their list on the left and
+ * show the selected run / task / conversation on the right, so the next row
+ * is one click away instead of a detail screen and a back button. The views
+ * are the same ones a phone drills into; only which of them are visible at
+ * once changes. What is displayed is still chosen by the hash alone:
+ * applyRoute() reads it and a row click writes it. Nothing that loads data
+ * may change the selection. */
+const SPLIT_QUERY = "(min-width: 1080px)";
+const splitMedia = typeof window.matchMedia === "function" ? window.matchMedia(SPLIT_QUERY) : null;
+
+/* Which list and which detail a route puts on screen in the two-pane layout,
+   or null when the route is not a master/detail one or the screen is narrow.
+   `#/queue/<id>` is a deep link to a task: a phone scrolls to its card, a wide
+   screen previews it. */
+function splitPanes(route, wide) {
+  if (!wide) return null;
+  switch (route.name) {
+    case "runs": return { list: "runs", detail: null };
+    case "run": return { list: "runs", detail: "run" };
+    case "queue": return { list: "queue", detail: route.id ? "task" : null };
+    case "task": return { list: "queue", detail: "task" };
+    case "talks": return { list: "talks", detail: null };
+    case "talk": return { list: "talks", detail: "talk" };
+    default: return null;
+  }
+}
+
+/* The selection is derived from the route every time, never stored: a row is
+   current when the hash names it. Safe to call from any render, because it
+   touches highlights only. */
+function markSelected() {
+  const route = state.route;
+  const selected = {
+    runId: route.name === "run" ? route.id : null,
+    taskId: route.name === "task" || route.name === "queue" ? route.id : null,
+    talkId: route.name === "talk" ? route.id : null,
+  };
+  const mark = (selector, key, id) => {
+    for (const card of document.querySelectorAll(selector)) {
+      setAttr(card, "aria-current", id && card.dataset[key] === id ? "true" : null);
+    }
+  };
+  mark("#view-runs .card[data-run-id]", "runId", selected.runId);
+  mark("#view-queue .card[data-task-id]", "taskId", selected.taskId);
+  mark("#view-talks .card[data-talk-id]", "talkId", selected.talkId);
+}
+
 function applyRoute() {
   const route = parseRoute();
   const changed = route.name !== state.route.name || route.id !== state.route.id;
   state.route = route;
 
-  show($("view-runs"), route.name === "runs");
-  show($("view-run"), route.name === "run");
-  show($("view-queue"), route.name === "queue");
-  show($("view-task"), route.name === "task");
+  const split = splitPanes(route, Boolean(splitMedia && splitMedia.matches));
+  const listShown = (name) => (split ? split.list === name : route.name === name);
+  const detailShown = (name) => (split ? split.detail === name : route.name === name);
+  show($("view-runs"), listShown("runs"));
+  show($("view-run"), detailShown("run"));
+  show($("view-queue"), listShown("queue"));
+  show($("view-task"), detailShown("task"));
   show($("view-stats"), route.name === "stats");
   show($("view-settings"), route.name === "settings");
   show($("view-questions"), route.name === "questions");
   show($("view-notifications"), route.name === "notifications");
-  show($("view-talks"), route.name === "talks");
-  show($("view-talk"), route.name === "talk");
+  show($("view-talks"), listShown("talks"));
+  show($("view-talk"), detailShown("talk"));
+  show($("split-empty"), Boolean(split) && !split.detail);
+  setAttr($("main"), "data-split", split ? "1" : null);
+  setAttr(document.body, "data-split", split ? "1" : null);
 
   /* The fab is the only entry point into Resume / Fold / Delete, so it must
      not survive a navigation away from the run it belongs to — nor stay
@@ -6936,8 +7011,9 @@ function applyRoute() {
     state.detail = { id: null, run: null, report: null };
   }
 
-  if (route.name === "task") {
-    if (state.taskDetail.id !== route.id) loadTask(route.id);
+  const taskId = route.name === "task" || (split && split.detail === "task") ? route.id : null;
+  if (taskId) {
+    if (state.taskDetail.id !== taskId) loadTask(taskId);
   } else {
     state.taskDetail = { id: null, task: null, error: null };
   }
@@ -6959,7 +7035,15 @@ function applyRoute() {
     state.talkDetail = { id: null, talk: null, roster: [] };
   }
 
-  if (changed) window.scrollTo({ top: 0 });
+  /* In the two-pane layout the page itself never scrolls: a new detail starts
+     at the top of its own pane and the list keeps its place. */
+  if (changed && split) {
+    const pane = split.detail ? $(`view-${split.detail}`) : null;
+    if (pane) pane.scrollTop = 0;
+  } else if (changed) {
+    window.scrollTo({ top: 0 });
+  }
+  markSelected();
   /* The operator arrived to answer one specific thing, so the caret goes on
      it rather than on the top of the document. */
   if (changed && route.name === "questions") focusFirstAsk();
@@ -6984,6 +7068,14 @@ function applyRoute() {
   if (changed && route.name === "stats") loadStats();
   if (changed && route.name === "settings") loadSettings();
   renderTitle();
+}
+
+/* Crossing the breakpoint only re-lays the screen out. applyRoute() reads the
+   same hash, so the same item stays selected and nothing is navigated. */
+if (splitMedia) {
+  const relayout = () => applyRoute();
+  if (typeof splitMedia.addEventListener === "function") splitMedia.addEventListener("change", relayout);
+  else if (typeof splitMedia.addListener === "function") splitMedia.addListener(relayout);
 }
 
 /* ---- settings -----------------------------------------------------------
