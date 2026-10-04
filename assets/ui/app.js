@@ -244,6 +244,20 @@ function el(tag, props, ...kids) {
   return node;
 }
 
+/* Where a task's source lives, as the API decided (`source_link`: `{kind,
+   id, href}` or null). The href rule is Rust's alone; this only reads it, so
+   the Queue card, the task page and the run page cannot disagree. */
+function sourceLinkOf(x) {
+  return x && x.source_link && x.source_link.href ? x.source_link : null;
+}
+
+/* An explicit "Open chat" control, only for a chat-filed source. A plain
+   link: the hash change navigates, nothing here touches state or location. */
+function openChatLink(link, extra) {
+  if (!link || link.kind !== "chat") return null;
+  return el("a", { class: `btn btn-quiet open-chat ${extra || ""}`.trim(), href: link.href, text: "Open chat" });
+}
+
 function svg(tag, props, ...kids) {
   const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
   if (props) {
@@ -2111,10 +2125,11 @@ function createTaskCard() {
   const whenSlot = el("time", { class: "card-when" });
   const title = el("h2", { class: "card-title" });
   const source = el("a", { class: "task-source" });
+  const openChat = el("a", { class: "btn btn-quiet open-chat", text: "Open chat", hidden: true });
   const repo = el("span", { class: "repo" });
   const attempts = el("span");
   const outcome = el("span");
-  const meta = el("div", { class: "card-meta" }, source, repo, attempts, outcome);
+  const meta = el("div", { class: "card-meta" }, source, openChat, repo, attempts, outcome);
   const note = el("p", { class: "card-note" });
   const error = el("pre", { class: "err" });
   const instruction = el("details", { class: "advanced" },
@@ -2154,7 +2169,7 @@ function createTaskCard() {
     if (card.dataset.taskId) location.hash = `#/tasks/${encodeURIComponent(card.dataset.taskId)}`;
   });
   card.refs = {
-    card, chipSlot, priority, solo, permalink, whenSlot, title, source, repo, attempts,
+    card, chipSlot, priority, solo, permalink, whenSlot, title, source, openChat, repo, attempts,
     outcome, note, error, instruction, answers, answersList, runLink, historyLink,
     priorityDown, priorityUp, editBtn, holdBox, doneBox, deleteBox,
   };
@@ -2194,15 +2209,15 @@ function updateTaskCard(row, task) {
   setText(r.title, task.title || task.instruction || task.id);
   setText(r.source, task.source_label || "");
   /* An agent-filed task names the run or chat that filed it right in its
-     label ("chat@a1b2", "implement@5dae") - that place still exists and is
-     one tap away, so the label becomes the link instead of leaving the
-     operator to go find it by hand. `node === "chat"` is how `Source::label`
-     spells a talk conversation; everything else agent-filed is a run node. */
-  const src = task.source || {};
-  const sourceHref = src.kind === "agent"
-    ? (src.node === "chat" ? `#/chat/${src.run}` : `#/runs/${src.run}`)
-    : null;
-  setAttr(r.source, "href", sourceHref);
+     label ("chat@a1b2", "implement@5dae"), so the label becomes the link; a
+     chat-filed one also gets an explicit "Open chat". The href rule lives in
+     the API (`source_link`). Both are cleared when the task has none, so a
+     recycled card never keeps another task's link. */
+  const link = sourceLinkOf(task);
+  setAttr(r.source, "href", link ? link.href : null);
+  const chatLink = link && link.kind === "chat" ? link : null;
+  setAttr(r.openChat, "href", chatLink ? chatLink.href : null);
+  show(r.openChat, Boolean(chatLink));
   const repoName = typeof task.repo === "string" ? task.repo.split(/[\\/]/).filter(Boolean).pop() : "";
   setText(r.repo, repoName || "");
   setAttr(r.repo, "title", task.repo || "");
@@ -5768,6 +5783,11 @@ function renderRunTaskEntry(run) {
     href: `#/tasks/${encodeURIComponent(t.id)}`,
     onclick: () => closeRunActions(),
   }, ...label));
+  const chatBtn = openChatLink(sourceLinkOf(t), "sheet-task-link");
+  if (chatBtn) {
+    chatBtn.addEventListener("click", () => closeRunActions());
+    box.append(chatBtn);
+  }
 }
 
 /* One line under a run's header about its task. It leads with "Task" and the
@@ -5800,6 +5820,8 @@ function taskLine(run) {
     kids.push(`attempt ${t.attempts}/${t.max_attempts}`);
   }
   kids.push(" \u00b7 ", el("a", { class: "task-chip-link", href: `#/tasks/${encodeURIComponent(t.id)}`, text: "all attempts" }));
+  const chatBtn = openChatLink(sourceLinkOf(t));
+  if (chatBtn) kids.push(" \u00b7 ", chatBtn);
   line.replaceChildren(...kids);
   show(line, true);
 }
@@ -7181,13 +7203,22 @@ function renderTask() {
   setText($("task-h"), task.title || shortId(task.id));
   const repoName = typeof task.repo === "string" ? task.repo.split(/[\\/]/).filter(Boolean).pop() : "";
   const spent = Number(task.attempts) || 0;
-  setText($("task-meta"), [
+  const metaBits = [
     shortId(task.id),
     task.source_label,
     repoName,
     task.solo ? "solo" : "",
     `${spent} of ${task.max_attempts} attempts used`,
-  ].filter(Boolean).join(" \u00b7 "));
+  ].filter(Boolean);
+  const metaKids = [];
+  metaBits.forEach((bit, i) => {
+    if (i > 0) metaKids.push(" \u00b7 ");
+    const link = bit === task.source_label ? sourceLinkOf(task) : null;
+    metaKids.push(link && link.kind !== "chat" ? el("a", { href: link.href, text: bit }) : bit);
+  });
+  const chatBtn = openChatLink(sourceLinkOf(task));
+  if (chatBtn) metaKids.push(" ", chatBtn);
+  $("task-meta").replaceChildren(...metaKids);
   setAttr($("task-meta"), "title", task.id);
 
   const waitingOn = task.hold_reason || task.block_reason;

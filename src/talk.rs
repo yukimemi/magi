@@ -1028,7 +1028,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             // The conversation's own id, so `magi task add` run from inside it is
             // attributed to this conversation - see `Source::Agent`.
             run: &talk.id,
-            node: "chat",
+            node: crate::queue::CHAT_NODE,
             cache_dir: cache_dir.as_deref(),
             attachments: &attachment_paths,
             writable: &[],

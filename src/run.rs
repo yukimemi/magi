@@ -287,7 +287,7 @@ impl Origin {
     /// operator. A node of `chat` is the talk layer, whose run is the talk id.
     pub fn from_agent_env(env: Option<(String, String)>, task: Option<String>) -> Self {
         let by = match env {
-            Some((run, node)) if node == "chat" => StartedBy::Chat { talk: run },
+            Some((run, node)) if node == crate::queue::CHAT_NODE => StartedBy::Chat { talk: run },
             Some((run, node)) => StartedBy::Seat { run, node },
             None => StartedBy::Operator,
         };
