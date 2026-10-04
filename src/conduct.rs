@@ -40,7 +40,7 @@
 //! loop always falls through to its own `Queue::next_runnable` regardless of
 //! what happened here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -256,7 +256,14 @@ fn surviving_branch(task: &Task) -> Option<String> {
 /// the decision this call was recording. Prepending (not appending) the new
 /// note keeps the old text as context without leaving the string starting
 /// with whatever pattern `crate::triage` matched before.
-fn reaffirmed_hold_reason(task: &Task, d: &Decision) -> String {
+///
+/// Two bounds keep the string from growing, which it once did without limit
+/// (every re-hold nested the whole previous reason one level deeper, and every
+/// change relit the task's notice): a note equal to the current reason - or to
+/// its outermost note - adds nothing, so the result is `None` and the caller
+/// writes nothing; and only ONE `(previously: ...)` level is ever kept, the
+/// prior being cut back to its outermost note before it is embedded.
+fn reaffirmed_hold_reason(task: &Task, d: &Decision) -> Option<String> {
     let note = match &d.reason {
         Some(reason) => reason.clone(),
         None => match task.answers.last() {
@@ -269,9 +276,26 @@ fn reaffirmed_hold_reason(task: &Task, d: &Decision) -> String {
         },
     };
     match task.hold_reason.as_deref() {
-        Some(prior) if !prior.is_empty() => format!("{note}\n\n(previously: {prior})"),
-        _ => note,
+        Some(prior) if !prior.is_empty() => {
+            let outer = outermost_hold_note(prior);
+            if note.trim() == prior.trim() || note.trim() == outer {
+                None
+            } else {
+                Some(format!("{note}\n\n(previously: {outer})"))
+            }
+        }
+        _ => Some(note),
     }
+}
+
+/// Separator [`reaffirmed_hold_reason`] puts between a note and the reason it
+/// replaced.
+const PREVIOUSLY: &str = "\n\n(previously: ";
+
+/// A hold reason without any `(previously: ...)` tail: the text before the
+/// first separator, trimmed.
+fn outermost_hold_note(reason: &str) -> &str {
+    reason.split(PREVIOUSLY).next().unwrap_or(reason).trim()
 }
 
 /// The conductor's stated reason for a hold, or a stand-in when it gave none.
@@ -646,9 +670,14 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
                 queue.put(&mut task)?;
             }
             Some(Recovery::Hold) => {
-                if may_hold(&mut task, &hold_note(d)) {
-                    task.hold_machine(Some(reaffirmed_hold_reason(&task, d)));
-                    queue.put(&mut task)?;
+                // Decided before `may_hold`, which spends the one override: a
+                // note that adds nothing writes nothing (and so raises no
+                // notice and moves no queue revision).
+                if let Some(reason) = reaffirmed_hold_reason(&task, d) {
+                    if may_hold(&mut task, &hold_note(d)) {
+                        task.hold_machine(Some(reason));
+                        queue.put(&mut task)?;
+                    }
                 }
             }
             Some(Recovery::Review) => {
@@ -748,6 +777,26 @@ impl Drop for Busy {
 pub struct Conductor {
     seat: Option<SeatState>,
     last_seen: Option<(u64, BTreeSet<String>)>,
+    /// Content fingerprint of each held task the model was last shown, see
+    /// [`input_fingerprint`]. A held task whose fingerprint still matches is
+    /// settled: the conductor's own rewrites of it do not count as news.
+    considered: BTreeMap<String, String>,
+}
+
+/// What the conductor's decision about a held task is a function of: the task
+/// without the fields the conductor itself rewrites (`updated_at`,
+/// `hold_reason`, the recorded re-hold). Independent of how the model words a
+/// repeated decision.
+fn input_fingerprint(task: &Task) -> String {
+    let mut v = serde_json::to_value(task).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("updated_at");
+        o.remove("hold_reason");
+        if let Some(ro) = o.get_mut("resume_override").and_then(|r| r.as_object_mut()) {
+            ro.remove("conductor_rehold");
+        }
+    }
+    v.to_string()
 }
 
 impl Conductor {
@@ -757,13 +806,46 @@ impl Conductor {
         Self::default()
     }
 
-    fn snapshot(queue: &Queue, stalled: &[Task], finished: &[Task]) -> (u64, BTreeSet<String>) {
+    /// Held tasks among `stalled` / `finished` whose input is unchanged since
+    /// the model last saw them. Their files are left out of the revision, so
+    /// the conductor re-holding one (however it words it) is not news, while
+    /// an owner's answer changes the fingerprint and brings the file back in.
+    fn settled(
+        considered: &BTreeMap<String, String>,
+        stalled: &[Task],
+        finished: &[Task],
+    ) -> BTreeSet<String> {
+        stalled
+            .iter()
+            .chain(finished)
+            .filter(|t| t.status == TaskStatus::Held)
+            .filter(|t| considered.get(&t.id) == Some(&input_fingerprint(t)))
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    fn snapshot_with(
+        considered: &BTreeMap<String, String>,
+        queue: &Queue,
+        stalled: &[Task],
+        finished: &[Task],
+    ) -> (u64, BTreeSet<String>) {
         let ids = stalled
             .iter()
             .chain(finished)
             .map(|t| t.id.clone())
             .collect();
-        (queue.revision(), ids)
+        let skip = Self::settled(considered, stalled, finished);
+        (queue.revision_excluding(&skip), ids)
+    }
+
+    fn snapshot(
+        &self,
+        queue: &Queue,
+        stalled: &[Task],
+        finished: &[Task],
+    ) -> (u64, BTreeSet<String>) {
+        Self::snapshot_with(&self.considered, queue, stalled, finished)
     }
 
     /// Whether calling the conductor could possibly do anything different
@@ -784,7 +866,7 @@ impl Conductor {
     /// about whether there is anything to look at.
     #[must_use]
     pub fn worth_a_look(&self, queue: &Queue, stalled: &[Task], finished: &[Task]) -> bool {
-        self.last_seen.as_ref() != Some(&Self::snapshot(queue, stalled, finished))
+        self.last_seen.as_ref() != Some(&self.snapshot(queue, stalled, finished))
     }
 
     /// Call the conductor once, unless nothing has changed since the last
@@ -803,11 +885,18 @@ impl Conductor {
         finished: &[Task],
         max_attempts: usize,
     ) {
-        let snapshot = Self::snapshot(queue, stalled, finished);
-        if self.last_seen.as_ref() == Some(&snapshot) {
+        if self.last_seen.as_ref() == Some(&self.snapshot(queue, stalled, finished)) {
             return;
         }
-        self.last_seen = Some(snapshot);
+        // What the model is about to be shown becomes "considered" before the
+        // snapshot is taken, so its own re-hold writes land in the excluded set.
+        self.considered = stalled
+            .iter()
+            .chain(finished)
+            .filter(|t| t.status == TaskStatus::Held)
+            .map(|t| (t.id.clone(), input_fingerprint(t)))
+            .collect();
+        self.last_seen = Some(self.snapshot(queue, stalled, finished));
         if let Err(e) = self
             .run_once(
                 cfg,
@@ -822,6 +911,11 @@ impl Conductor {
             )
             .await
         {
+            // The conductor's own write moves the revision, so one more cycle
+            // follows; a repeat decision writes nothing (see
+            // `reaffirmed_hold_reason`), which is what ends the loop. The
+            // revision is deliberately never re-read here: it cannot tell our
+            // write from an owner's concurrent update.
             tracing::warn!("conductor: {e:#}");
         }
     }
@@ -2448,6 +2542,172 @@ mod tests {
         );
     }
 
+    fn rehold(queue: &Queue, questions: &Questions, id: &str, note: &str) {
+        apply(
+            queue,
+            questions,
+            &Verdict {
+                decisions: vec![Decision {
+                    id: id.to_owned(),
+                    reason: Some(note.to_owned()),
+                    recovery: Some(Recovery::Hold),
+                    ..Decision::default()
+                }],
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reholding_with_an_identical_note_changes_nothing() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("held");
+        t.hold_machine(Some("waiting on a human".to_owned()));
+        queue.put(&mut t).unwrap();
+
+        rehold(&queue, &questions, &t.id, "owner said keep it held");
+        let first = queue.get(&t.id).unwrap();
+        let rev = queue.revision();
+        for _ in 0..5 {
+            rehold(&queue, &questions, &t.id, "owner said keep it held");
+        }
+        let after = queue.get(&t.id).unwrap();
+        assert_eq!(after.hold_reason, first.hold_reason);
+        assert_eq!(after.updated_at, first.updated_at);
+        assert_eq!(queue.revision(), rev, "nothing was written");
+    }
+
+    #[test]
+    fn reholding_with_different_notes_keeps_one_previously_level() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("held");
+        t.hold_machine(Some("original".to_owned()));
+        queue.put(&mut t).unwrap();
+
+        for i in 0..20 {
+            rehold(&queue, &questions, &t.id, &format!("note {}", i % 2));
+        }
+        let reason = queue.get(&t.id).unwrap().hold_reason.unwrap();
+        assert_eq!(reason.matches("(previously:").count(), 1, "{reason}");
+        assert!(reason.starts_with("note "), "the new note leads: {reason}");
+    }
+
+    #[test]
+    fn an_already_nested_reason_is_matched_by_its_outermost_note() {
+        let mut t = task("deep");
+        let nested = "same\n\n(previously: same\n\n(previously: same))";
+        t.hold_machine(Some(nested.to_owned()));
+        let d = Decision {
+            id: t.id.clone(),
+            reason: Some("same".to_owned()),
+            ..Decision::default()
+        };
+        assert_eq!(reaffirmed_hold_reason(&t, &d), None);
+        let d2 = Decision {
+            reason: Some("other".to_owned()),
+            ..d
+        };
+        assert_eq!(
+            reaffirmed_hold_reason(&t, &d2).as_deref(),
+            Some("other\n\n(previously: same)")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_hold_decision_settles_instead_of_looping() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let reply = r#"{"decisions":[{"id":"ID","reason":"keep held","recovery":"hold"}]}"#;
+        let mut t = task("held");
+        t.hold_machine(Some("first".to_owned()));
+        queue.put(&mut t).unwrap();
+        let cfg = config(mock_agent(
+            dir.path(),
+            REPLY,
+            env(&reply.replace("ID", &t.id)),
+        ));
+        let mut conductor = Conductor::new();
+        // Cycle 1 writes the new note; cycle 2 repeats it and writes nothing.
+        for _ in 0..2 {
+            let held = queue.get(&t.id).unwrap();
+            conductor
+                .maybe_run(
+                    &cfg,
+                    dir.path(),
+                    &queue,
+                    &questions,
+                    dir.path(),
+                    &[],
+                    &[],
+                    &[held],
+                    2,
+                )
+                .await;
+        }
+        let held = queue.get(&t.id).unwrap();
+        assert!(
+            held.hold_reason
+                .as_deref()
+                .unwrap()
+                .starts_with("keep held")
+        );
+        assert!(
+            !conductor.worth_a_look(&queue, &[], &[held]),
+            "an unchanged held task must stop being reconsidered"
+        );
+    }
+
+    #[tokio::test]
+    async fn alternating_wording_does_not_keep_a_held_task_in_the_loop() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("held");
+        t.hold_machine(Some("first".to_owned()));
+        queue.put(&mut t).unwrap();
+        let reply = |note: &str| {
+            format!(
+                r#"{{"decisions":[{{"id":"{}","reason":"{note}","recovery":"hold"}}]}}"#,
+                t.id
+            )
+        };
+        let cfg_a = config(mock_agent(dir.path(), REPLY, env(&reply("keep held"))));
+        let cfg_b = config(mock_agent(dir.path(), REPLY, env(&reply("leave held"))));
+        let mut conductor = Conductor::new();
+        let mut writes = 0;
+        for i in 0..6 {
+            let held = queue.get(&t.id).unwrap();
+            let before = queue.revision();
+            conductor
+                .maybe_run(
+                    if i % 2 == 0 { &cfg_a } else { &cfg_b },
+                    dir.path(),
+                    &queue,
+                    &questions,
+                    dir.path(),
+                    &[],
+                    &[],
+                    &[held],
+                    2,
+                )
+                .await;
+            if queue.revision() != before {
+                writes += 1;
+            }
+        }
+        assert!(writes <= 2, "the loop must settle, saw {writes} writes");
+        let mut held = queue.get(&t.id).unwrap();
+        held.instruction.push_str(" (edited)");
+        queue.put(&mut held).unwrap();
+        let held = queue.get(&t.id).unwrap();
+        assert!(conductor.worth_a_look(&queue, &[], &[held]));
+    }
+
     #[test]
     fn worth_a_look_is_config_free_and_matches_maybe_runs_own_gate() {
         let dir = tempdir().unwrap();
@@ -2461,7 +2721,7 @@ mod tests {
             "a conductor that has never run has something to look at"
         );
 
-        conductor.last_seen = Some(Conductor::snapshot(&queue, &[], &[]));
+        conductor.last_seen = Some(conductor.snapshot(&queue, &[], &[]));
         assert!(
             !conductor.worth_a_look(&queue, &[], &[]),
             "nothing changed and nothing is stalled or finished"

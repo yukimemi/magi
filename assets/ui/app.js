@@ -2251,6 +2251,14 @@ function updateTaskCard(row, task) {
   }
   setText(r.note, noteText);
   show(r.note, Boolean(noteText));
+  /* A very long note is clamped to a few lines; tapping it toggles the full
+     text. The class is only ever added here, so an expanded note stays
+     expanded across refreshes. */
+  r.note.classList.add("note-clamp");
+  if (!r.note.dataset.clampWired) {
+    r.note.dataset.clampWired = "1";
+    r.note.addEventListener("click", () => r.note.classList.toggle("expanded"));
+  }
 
   setText(r.error, task.last_error || "");
   show(r.error, Boolean(task.last_error));
