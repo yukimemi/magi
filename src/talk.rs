@@ -934,6 +934,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             node: "chat",
             cache_dir: cache_dir.as_deref(),
             attachments: &attachment_paths,
+            writable: &[],
         };
         let result = agent::invoke(spec, &mut talk.seat, &inv).await;
         let advance = agent::chain_advances(&result);

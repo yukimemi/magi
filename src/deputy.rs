@@ -351,6 +351,16 @@ impl Job {
         }
     }
 
+    /// The question settled or expired during the handover: release it without
+    /// starting the long turn. The start stays counted - the handover ran.
+    fn park_quietly(&self, id: &str) {
+        let _ = self.store.update(id, |r| {
+            r.waiter = None;
+            Ok(())
+        });
+        self.store.drop_lease(id);
+    }
+
     /// Parking: the turn is dropped and the start refunded. The seat stays as
     /// last persisted - after the handover turn, resumable.
     fn park(&self, id: &str) {
@@ -479,6 +489,8 @@ impl Job {
         // sandbox refuses, so the seat cannot be read-only. It is told never to
         // edit anything; the daemon, not the deputy, applies outcomes.
         let allow_write = true;
+        // The question store is outside the repository, and `magi ask` writes it.
+        let writable = [self.store.root().to_path_buf()];
         macro_rules! invocation {
             ($prompt:expr, $stem:expr, $timeout:expr) => {
                 Invocation {
@@ -496,6 +508,7 @@ impl Job {
                     node: NODE,
                     cache_dir: cache_dir.as_deref(),
                     attachments: &[],
+                    writable: &writable,
                 }
             };
         }
@@ -519,7 +532,10 @@ impl Job {
                 language: &cfg.graph.language,
             });
             let hstem = format!("handover-{starts}");
-            let hinv = invocation!(&hbody, &hstem, HANDOVER_TIMEOUT);
+            // Bounded by the question's own deadline, not only by its own cap: the
+            // lease it beats would otherwise keep an expired question alive.
+            let hlimit = HANDOVER_TIMEOUT.min(Duration::from_secs(left.max(1)));
+            let hinv = invocation!(&hbody, &hstem, hlimit);
             let Some(done) = self.drive(&spec, &mut seat, &hinv, &q.id).await else {
                 self.park(&q.id);
                 return Ok(());
@@ -536,6 +552,24 @@ impl Job {
             }
         }
 
+        // The handover may have been slow: look at the question again, and
+        // measure the long turn from what is left now.
+        let left = if early.is_none() && !resumed && cfg.graph.sessions {
+            let now = Timestamp::now();
+            let again = self.store.get(&q.id)?;
+            let left = (again
+                .last_activity()
+                .saturating_add(again.answer_timeout as i64)
+                - now.as_second())
+            .max(0) as u64;
+            if !again.status.open() || (left == 0 && again.unread_from_owner().is_none()) {
+                self.park_quietly(&q.id);
+                return Ok(());
+            }
+            left
+        } else {
+            left
+        };
         let out = match early {
             Some(done) => done,
             None => {

@@ -2567,6 +2567,7 @@ pub async fn fix_round(
             node: "land",
             cache_dir: state.config.cache_dir().as_deref(),
             attachments: &[],
+            writable: &[],
         },
     )
     .await;

@@ -436,6 +436,7 @@ impl Waiter {
             node: &q.node,
             cache_dir,
             attachments: &[],
+            writable: &[],
         };
 
         let store = self.store.clone();

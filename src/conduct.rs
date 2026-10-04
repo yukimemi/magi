@@ -913,6 +913,7 @@ impl Conductor {
                 node: NODE,
                 cache_dir: cache_dir.as_deref(),
                 attachments: &[],
+                writable: &[],
             };
             let out = agent::invoke(spec, seat, &inv).await;
             // Kept after every turn, failed or not: the CLI-side conversation is
