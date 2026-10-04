@@ -396,6 +396,13 @@ pub struct Graph {
     /// Read at land time, so turning it off restores the unattended merge at
     /// once. The pull request is opened either way; only the merge waits.
     pub hold_contested_merge: bool,
+    /// After a run's pull request merges, file the findings its last review
+    /// round left open as follow-up tasks (`crate::followup`) instead of
+    /// letting them vanish with the merge: every Major-or-above finding, and
+    /// every finding of a seat whose final vote was reject. Other Minor/Nit
+    /// findings are only listed in the pull-request comment. Does not affect
+    /// whether the merge happens. On; best-effort, a failure is a run event.
+    pub file_followups: bool,
     /// How long to wait for an owner to answer a question before the run is
     /// abandoned, seconds. A parked run costs nothing, so this is generous;
     /// it exists so a forgotten question cannot pin a worktree forever.
@@ -466,6 +473,7 @@ impl Default for Graph {
             land_rounds: 4,
             land_approval: true,
             hold_contested_merge: true,
+            file_followups: true,
             answer_timeout: 86_400,
             incomplete_review: IncompleteReviewPolicy::Block,
             e2e_every_round: false,

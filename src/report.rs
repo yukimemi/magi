@@ -985,6 +985,18 @@ pub fn run(state: &RunState) -> String {
         }
     }
 
+    if !state.followups.is_empty() {
+        let _ = writeln!(s, "\n{}", bold("follow-ups"));
+        for f in &state.followups {
+            let _ = writeln!(
+                s,
+                "  {} {}",
+                crate::queue::short(&f.task),
+                f.findings.join(", ")
+            );
+        }
+    }
+
     if let Some(b) = &state.release_bump {
         let _ = writeln!(s, "\n{}", bold("release bump"));
         if let Some(v) = &b.version {

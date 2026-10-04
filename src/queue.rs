@@ -58,6 +58,9 @@ use crate::ask::Questions;
 /// record reads as empty. A task already looping when this build arrives has
 /// no record, so it is released once more, recorded, and then stays held.
 ///
+/// 8: added [`Task::followup`], the origin of a task `crate::followup` filed
+/// from a merged run's leftover findings. Field-only bump, `#[serde(default)]`.
+///
 /// 4: added [`Task::blocked_from`], the status a task had the moment it
 /// became [`TaskStatus::Blocked`], so [`Task::unblock`] restores it instead
 /// of always landing on [`TaskStatus::Queued`]. Without it, a task a human
@@ -86,7 +89,7 @@ use crate::ask::Questions;
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 7;
+pub const SCHEMA: u32 = 8;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,10 +417,32 @@ pub struct Task {
     /// `#[serde(default)]` so an older record reads as empty.
     #[serde(default)]
     pub attachments: Vec<String>,
+    /// Set on a task `crate::followup` filed from the findings a merged run
+    /// left open: which run and findings it carries, and how many follow-ups
+    /// deep it is. `None` for every ordinary task. `#[serde(default)]`.
+    #[serde(default)]
+    pub followup: Option<FollowUp>,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
     pub updated_at: Timestamp,
+}
+
+/// What a follow-up task came from. See [`Task::followup`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FollowUp {
+    /// The merged run whose open findings this task carries.
+    pub run: String,
+    /// The queue task that run served, when it had one.
+    #[serde(default)]
+    pub origin_task: Option<String>,
+    /// The merged pull request.
+    pub pr: String,
+    /// Ids of the findings (e.g. `R3-1-1`) this task covers.
+    pub findings: Vec<String>,
+    /// Follow-up depth: 1 for a follow-up of an ordinary task's run, 2 for a
+    /// follow-up of that, and so on. An ordinary task is generation 0.
+    pub generation: u32,
 }
 
 /// A triage "resume" answer and what became of it. See
@@ -488,6 +513,7 @@ impl Task {
             interrupt: false,
             urgent: false,
             attachments: Vec::new(),
+            followup: None,
             created_at: now,
             updated_at: now,
         }
@@ -1139,6 +1165,19 @@ impl Queue {
     pub fn put(&self, task: &mut Task) -> Result<()> {
         let _lock = self.lock_task(&task.id)?;
         self.put_unlocked(task)
+    }
+
+    /// Write `task` only if no task with its id exists yet; `Ok(false)` when
+    /// one does. Unlike [`Queue::put`] it never replaces a record, so a
+    /// producer with a deterministic id cannot rewind a task that has since
+    /// started running or finished.
+    pub fn create_new(&self, task: &mut Task) -> Result<bool> {
+        let _lock = self.lock_task(&task.id)?;
+        if self.path_of(&task.id).exists() {
+            return Ok(false);
+        }
+        self.put_unlocked(task)?;
+        Ok(true)
     }
 
     /// [`Queue::put`] for a caller already holding [`Queue::lock_task`].

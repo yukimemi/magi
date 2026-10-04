@@ -5804,6 +5804,24 @@ function renderLand(run) {
     landRoundNote(pr) ? el("p", { class: "land-note", text: landRoundNote(pr) }) : null,
     roundRail(pr),
     el("p", { class: "land-note", text: landNote(pr) }),
+    followupList(run),
+  );
+}
+
+/* Tasks filed from the findings this run's merge left open. */
+function followupList(run) {
+  const items = Array.isArray(run.followups) ? run.followups : [];
+  if (!items.length) return null;
+  return el("p", { class: "land-note" },
+    "Follow-up tasks: ",
+    ...items.flatMap((f, i) => [
+      i ? ", " : "",
+      el("a", {
+        href: `#/tasks/${encodeURIComponent(f.task)}`,
+        title: (f.findings || []).join(", "),
+        text: `${f.task.split("-").pop()} (${(f.findings || []).join(", ")})`,
+      }),
+    ]),
   );
 }
 

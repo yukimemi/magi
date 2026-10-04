@@ -5926,6 +5926,11 @@ impl Runner {
                     self.state
                         .event("bump", format!("release bump skipped: {e:#}"));
                 }
+                // Independent of the bump, and best-effort in the same way:
+                // findings the merge left open become follow-up tasks.
+                if self.state.status == RunStatus::Merged {
+                    crate::followup::after_merge(&mut self.state, &pr.url).await;
+                }
                 self.state.save()?;
             }
             Err(e) => {

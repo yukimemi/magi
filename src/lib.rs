@@ -36,6 +36,7 @@ pub mod daemon;
 pub mod deputy;
 pub mod disk;
 pub mod dupes;
+pub mod followup;
 pub mod git;
 pub mod graph;
 pub mod handover;
