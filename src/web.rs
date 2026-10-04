@@ -10360,6 +10360,8 @@ mod tests {
         assert!(APP_JS.contains("function markSelected() {"));
         assert!(APP_JS.contains("\"aria-current\", id && card.dataset[key] === id"));
         assert!(APP_CSS.contains(".card[aria-current=\"true\"]"));
+        // The dense row must override the stacked card the 720px block sets up.
+        assert!(APP_CSS.contains("display: flex; flex-direction: row; flex-wrap: wrap; align-items: center;"));
 
         // Independent scrolling: the page stops scrolling, each pane does.
         assert!(APP_CSS.contains("height: 100dvh; padding-bottom: 0; overflow: hidden;"));
