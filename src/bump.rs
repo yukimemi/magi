@@ -1218,8 +1218,8 @@ async fn after_merge_inner(
     progress.pending_pr = pending.as_ref().map(|p| p.pr_url.clone());
     let title = pr_title(&repo, pr_url).await.unwrap_or_default();
     let subject = land::merge_subject(
-        crate::graph::landing_title(&state, &title),
-        &crate::graph::landing_subject_source(&state),
+        crate::graph::landing_title(state, &title),
+        &crate::graph::landing_subject_source(state),
     );
     let stat = git::diff_stat(&winner.worktree, &base, &winner.branch)
         .await

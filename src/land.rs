@@ -2301,7 +2301,7 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
             Step::Merge => {
                 let subject = merge_subject(
                     crate::graph::landing_title(state, &seen.title),
-                    &crate::graph::landing_subject_source(&state),
+                    &crate::graph::landing_subject_source(state),
                 );
                 // The owner sees the panel before the one irreversible step,
                 // and an unanswered question is a hold: silence never merges.
