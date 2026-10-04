@@ -10341,15 +10341,17 @@ mod tests {
             let start = APP_JS
                 .find("function updateTalkTaskRow")
                 .expect("updateTalkTaskRow");
-            let body = &APP_JS[start..start + 900];
-            assert!(body.contains("task.runs[") || body.contains("runs[runs.length - 1]"));
-            assert!(body.contains("setAttr(r.link, \"href\""));
-            assert!(body.contains(
-                "latest ? `#/runs/${latest}` : `#/queue/${encodeURIComponent(task.id)}`"
-            ));
+            let body = &APP_JS[start..];
+            let body = &body[..body.find("\n}\n").expect("updateTalkTaskRow ends")];
             assert!(
-                !body.contains(": \"#/queue\""),
-                "a task with no run must link to its own queue card, not the bare queue"
+                body.contains(
+                    "setAttr(r.link, \"href\", `#/tasks/${encodeURIComponent(task.id)}`)"
+                ),
+                "a chat-filed task row must link to the task page"
+            );
+            assert!(
+                !body.contains("#/runs/") && !body.contains("#/queue/"),
+                "the row must not branch to a run or the queue card"
             );
             assert!(APP_CSS.contains(".talk-task-link"));
         }

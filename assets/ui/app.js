@@ -4644,12 +4644,11 @@ function updateTalkTaskRow(row, task) {
   if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
   else r.chipSlot.append(next);
   setText(r.title, `${task.title || task.id} · ${shortId(task.id)}`);
-  /* A task with a run is followed on that run; one still waiting has none,
-     so it goes to its own queue card. Written on every update so the href moves when
-     a run appears without the row being rebuilt. */
-  const runs = Array.isArray(task.runs) ? task.runs : [];
-  const latest = runs.length ? runs[runs.length - 1] : null;
-  setAttr(r.link, "href", latest ? `#/runs/${latest}` : `#/queue/${encodeURIComponent(task.id)}`);
+  /* Every row opens the task detail page, whether or not a run exists yet:
+     it reaches all of the task's attempts and runs, and its target does not
+     change as the task progresses. task.id is immutable, so writing the href
+     on every update is harmless. */
+  setAttr(r.link, "href", `#/tasks/${encodeURIComponent(task.id)}`);
 }
 
 function renderTalk() {
