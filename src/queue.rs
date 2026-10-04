@@ -1077,10 +1077,18 @@ fn older_than_stale(path: &Path) -> bool {
         .is_some_and(|age| age > TASK_LOCK_STALE)
 }
 
+/// How many levels of "a stale marker guarding a stale marker" are recovered
+/// before giving up. Each level needs its own crashed remover, so the cap is
+/// never reached without several independent crashes.
+const MAX_MARKER_DEPTH: u8 = 3;
+
 /// Take the break marker for `token`, or `None` if another remover holds it.
-/// A marker older than [`TASK_LOCK_STALE`] was left by a remover that died and
-/// is cleared.
-fn take_marker(path: &Path, token: &str) -> Option<PathBuf> {
+/// The marker carries its own owner token. One older than [`TASK_LOCK_STALE`]
+/// was left by a remover that died; it is cleared by the same compare-and-
+/// remove discipline as a lock, guarded by a marker of its own, so a recoverer
+/// that judged it stale cannot delete a fresh marker that replaced it.
+fn take_marker(path: &Path, token: &str, depth: u8) -> Option<(PathBuf, String)> {
+    use std::io::Write;
     let marker = break_marker(path, token);
     for _ in 0..2 {
         match std::fs::OpenOptions::new()
@@ -1088,12 +1096,22 @@ fn take_marker(path: &Path, token: &str) -> Option<PathBuf> {
             .create_new(true)
             .open(&marker)
         {
-            Ok(_) => return Some(marker),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if older_than_stale(&marker) {
+            Ok(mut f) => {
+                let mine = owner_token();
+                if f.write_all(mine.as_bytes()).is_err() {
+                    drop(f);
                     let _ = std::fs::remove_file(&marker);
-                } else {
                     return None;
+                }
+                return Some((marker, mine));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let judged = std::fs::read_to_string(&marker).ok();
+                match judged.filter(|_| older_than_stale(&marker)) {
+                    Some(judged) if depth < MAX_MARKER_DEPTH => {
+                        remove_lock_if(&marker, &judged, true, depth + 1)?;
+                    }
+                    _ => return None,
                 }
             }
             Err(_) => return None,
@@ -1106,28 +1124,35 @@ fn take_marker(path: &Path, token: &str) -> Option<PathBuf> {
 /// `require_stale`, is still stale). Removal is serialized per token by the
 /// break marker, so a remover that judged an old lock cannot delete the fresh
 /// one that replaced it. `None` means the marker was busy: try again.
-fn remove_lock_if(path: &Path, token: &str, require_stale: bool) -> Option<bool> {
-    let marker = take_marker(path, token)?;
+fn remove_lock_if(path: &Path, token: &str, require_stale: bool, depth: u8) -> Option<bool> {
+    let (marker, mine) = take_marker(path, token, depth)?;
     let still = std::fs::read_to_string(path).is_ok_and(|c| c == token)
         && (!require_stale || older_than_stale(path));
     if still {
         let _ = std::fs::remove_file(path);
     }
-    let _ = std::fs::remove_file(&marker);
+    // Release the marker only if it is still ours.
+    if depth >= MAX_MARKER_DEPTH {
+        if std::fs::read_to_string(&marker).is_ok_and(|c| c == mine) {
+            let _ = std::fs::remove_file(&marker);
+        }
+    } else {
+        let _ = remove_lock_if(&marker, &mine, false, depth + 1);
+    }
     Some(still)
 }
 
 /// Break the lock judged stale while it held `judged`. Returns whether it was
 /// removed; a lock that has since been replaced is left alone.
 fn break_stale(path: &Path, judged: &str) -> bool {
-    remove_lock_if(path, judged, true).unwrap_or(false)
+    remove_lock_if(path, judged, true, 0).unwrap_or(false)
 }
 
 impl Drop for TaskLock {
     fn drop(&mut self) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            match remove_lock_if(&self.path, &self.token, false) {
+            match remove_lock_if(&self.path, &self.token, false, 0) {
                 Some(_) => return,
                 None if std::time::Instant::now() > deadline => return,
                 None => std::thread::sleep(std::time::Duration::from_millis(5)),
@@ -3540,5 +3565,23 @@ mod tests {
         age_lock(&lock);
         assert!(break_stale(&lock, "new-token"));
         assert!(!lock.exists());
+    }
+
+    #[test]
+    fn a_stale_break_marker_is_recovered_and_a_fresh_one_is_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("t.write-lock");
+        std::fs::write(&lock, "dead-1").unwrap();
+        age_lock(&lock);
+        let marker = break_marker(&lock, "dead-1");
+        std::fs::write(&marker, "crashed-remover").unwrap();
+        // Fresh marker: another remover is working, so nothing is broken.
+        assert!(!break_stale(&lock, "dead-1"));
+        assert!(lock.exists());
+        // Stale marker: recovered, then the lock is broken.
+        age_lock(&marker);
+        assert!(break_stale(&lock, "dead-1"));
+        assert!(!lock.exists());
+        assert!(!marker.exists());
     }
 }
