@@ -3833,8 +3833,14 @@ function updateAskCard(row, question, { compact = false } = {}) {
      and keeps the plain wording. */
   const holder = open ? question.holder : null;
   const hasDeputy = Boolean(question.deputy);
+  /* With follow-up agents off nobody will ever answer a say, so the choice
+     buttons must stay usable even while the thread says it is the agent's turn. */
+  const choicesLocked = waitingOnAgent
+    && !(holder === "nobody" && hasDeputy && question.deputies_enabled === false);
   let waitingText = "";
-  if (holder === "nobody" && hasDeputy) {
+  if (holder === "nobody" && hasDeputy && question.deputies_enabled === false) {
+    waitingText = "No agent is listening on this question: follow-up agents are disabled or the configuration cannot be read. Your message is recorded, but nothing will read it. Only choosing an option resolves this question.";
+  } else if (holder === "nobody" && hasDeputy) {
     waitingText = waitingOnAgent
       ? "The follow-up agent for this question is not running right now. magi serve will wake it with your message; if it cannot, you will be told."
       : "The follow-up agent for this question is not running right now. magi serve will wake it when you reply.";
@@ -3921,8 +3927,8 @@ function updateAskCard(row, question, { compact = false } = {}) {
   // disabled, with `waitingNote` above saying why.
   r.text.disabled = waitingOnAgent;
   r.send.disabled = waitingOnAgent;
-  for (const btn of r.choices.querySelectorAll("button")) btn.disabled = waitingOnAgent;
-  for (const btn of r.stakes.querySelectorAll("button")) btn.disabled = waitingOnAgent;
+  for (const btn of r.choices.querySelectorAll("button")) btn.disabled = choicesLocked;
+  for (const btn of r.stakes.querySelectorAll("button")) btn.disabled = choicesLocked;
 
   const given = question.answer && typeof question.answer === "object" ? question.answer : null;
   const value = given
