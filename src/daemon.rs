@@ -3731,6 +3731,8 @@ fn describe(state: &RunState) -> String {
                     && last.node == "review"
                     && r.incomplete()
                     && r.blocking == 0
+                    && r.round == state.config.graph.review_rounds
+                    && r.e2e.iter().all(crate::run::CommandOutcome::ok)
             })
             .map(|r| (r.expected - r.answered, r.round));
         match unanswered {
@@ -5095,6 +5097,7 @@ mod tests {
         let build = |lang: &str| {
             let mut s = run_state_in(RunStatus::Blocked, lang);
             s.id = "same".to_owned();
+            s.config.graph.review_rounds = 3;
             let mut r = review_round(3);
             r.expected = 3;
             r.answered = 1;
@@ -5111,6 +5114,21 @@ mod tests {
         assert!(ja.contains("2 席のレビュアーが 3 ラウンド"), "{ja}");
         assert!(!ja.contains("never answered"), "{ja}");
         assert!(ja.contains("[run "), "{ja}");
+
+        // An incomplete panel whose verification failed is a different stop:
+        // the real event must survive in ja too.
+        let mut failed = build("ja");
+        failed.reviews[0].e2e.push(crate::run::CommandOutcome {
+            command: "cargo test".to_owned(),
+            code: Some(1),
+            output_tail: String::new(),
+            duration_ms: 0,
+            resource_blocked: false,
+        });
+        failed.event("review", "stopped; e2e failed: cargo test");
+        let ja = describe(&failed);
+        assert!(ja.contains("stopped; e2e failed: cargo test"), "{ja}");
+        assert!(!ja.contains("席のレビュアー"), "{ja}");
     }
 
     #[test]
