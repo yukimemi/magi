@@ -1790,6 +1790,11 @@ pub struct RunState {
     /// Per reviewer seat, which roster agents already failed it and which one
     /// last answered, carried across review rounds. Additive, so `SCHEMA` is
     /// not bumped. See [`SeatHistory`].
+    /// How many agent-change seats this run has minted; mixed into their
+    /// session ids so re-handing a seat to an agent it already had never
+    /// reuses that agent's earlier uuid. Additive.
+    #[serde(default)]
+    pub seat_epoch: u64,
     #[serde(default)]
     pub seat_history: BTreeMap<String, SeatHistory>,
     /// Stray foreign lockfiles a rescue commit left out, one entry per path.
@@ -2005,6 +2010,7 @@ impl RunState {
             leaks: Vec::new(),
             quota: Vec::new(),
             handovers: Vec::new(),
+            seat_epoch: 0,
             seat_history: BTreeMap::new(),
             withheld: Vec::new(),
             parked: false,
@@ -4284,6 +4290,14 @@ mod tests {
         // 4. Folded and nobody working on it.
         s.candidates[0].folded = true;
         assert!(s.ensure_can_delete(false).is_ok());
+    }
+}
+
+impl RunState {
+    /// A seed for a seat that changes agent, distinct on every call.
+    pub fn next_seat_seed(&mut self) -> u64 {
+        self.seat_epoch += 1;
+        self.seed ^ self.seat_epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15)
     }
 }
 

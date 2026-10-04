@@ -1993,7 +1993,7 @@ impl Runner {
                 );
                 prev = Some(cur.clone());
 
-                let new_seat = handover_seat(&seat.key, &next.id, self.state.seed);
+                let new_seat = handover_seat(&seat.key, &next.id, self.state.next_seat_seed());
                 self.state.seats.insert(seat.key.clone(), new_seat.clone());
                 // Kept in sync on `sent` itself, not just the local retry: a
                 // later helper (`resume_unconfirmed_commands`) reads `sent`
@@ -6037,7 +6037,7 @@ impl Runner {
         // A seat that changes agent mints its session id from the agent too,
         // like a handover: the old agent's uuid is already taken by the CLI.
         let fresh = if self.state.seats.contains_key(key) {
-            handover_seat(key, agent, self.state.seed)
+            handover_seat(key, agent, self.state.next_seat_seed())
         } else {
             SeatState::new(key, agent, self.state.seed)
         };
@@ -6992,7 +6992,7 @@ where
                     );
                     tried[i].insert(next.id.clone());
                     prev[i] = Some(cur.clone());
-                    seats[i] = handover_seat(&originals[i].seat.key, &next.id, state.seed);
+                    seats[i] = handover_seat(&originals[i].seat.key, &next.id, state.next_seat_seed());
                     specs[i] = next;
                     fresh[i] = Some(cur.stem_word().to_owned());
                     nudges[i] = 0;
@@ -8214,6 +8214,14 @@ mod tests {
         let first = SeatState::new("review-1", "alpha", 7);
         let next = handover_seat("review-1", "gamma", 7);
         assert_ne!(first.claude_session, next.claude_session);
+    }
+
+    #[test]
+    fn re_handing_a_seat_to_the_same_agent_mints_a_new_session_id() {
+        let mut state = RunState::new_for_test();
+        let a = handover_seat("review-1", "beta", state.next_seat_seed());
+        let b = handover_seat("review-1", "beta", state.next_seat_seed());
+        assert_ne!(a.claude_session, b.claude_session);
     }
 
     #[test]
