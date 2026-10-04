@@ -3317,7 +3317,9 @@ impl Runner {
         // branch whose change reached the base under other commit ids has
         // nothing to rebase and nothing to conflict with, and a run that
         // already stopped on that phantom conflict recovers here on resume.
-        if behind > 0
+        // `behind == 0` with a recorded conflict is a branch the base has since
+        // taken in whole (head == tip): the ancestry proof must still run.
+        if (behind > 0 || conflicted)
             && self
                 .settle_already_in(&winner.branch, &tip, &head, attempts, behind)
                 .await?

@@ -10,7 +10,8 @@
 //! [`already_in`] is the pure decision and [`classify`] feeds it from git.
 //! Two proofs are accepted, and nothing else:
 //!
-//! - **patch-id**: every commit the branch adds has a `-` line in
+//! - **patch-id**: (together with the tree check below, so a later revert on
+//!   the base is not mistaken for presence) every commit the branch adds has a `-` line in
 //!   `git cherry <base> <branch>`, i.e. the base carries a commit with the
 //!   same diff. A merge commit has no patch-id, so a branch with one is never
 //!   proven this way.
@@ -86,13 +87,16 @@ pub fn already_in(
     let untested = added
         .iter()
         .any(|c| !unmatched.contains(c) && !matched.contains(c));
+    // A twin on the base says the change landed once, not that it is still
+    // there: a later revert keeps every twin and drops the work. The tree
+    // check is what says it is present now, so it gates both proofs.
+    if !tree_unchanged {
+        return AlreadyIn::No;
+    }
     if unmatched.is_empty() && !matched.is_empty() && !untested {
         return AlreadyIn::Yes(Proof::PatchId);
     }
-    if tree_unchanged {
-        return AlreadyIn::Yes(Proof::Tree);
-    }
-    AlreadyIn::No
+    AlreadyIn::Yes(Proof::Tree)
 }
 
 /// Where the branch's change lives on the base.
@@ -274,8 +278,16 @@ mod tests {
     #[test]
     fn every_commit_matched_is_already_in() {
         assert_eq!(
-            already_in(&v(&["a", "b"]), &[], &v(&["a", "b"]), false),
+            already_in(&v(&["a", "b"]), &[], &v(&["a", "b"]), true),
             AlreadyIn::Yes(Proof::PatchId)
+        );
+    }
+
+    #[test]
+    fn a_reverted_twin_is_not_already_in() {
+        assert_eq!(
+            already_in(&v(&["a", "b"]), &[], &v(&["a", "b"]), false),
+            AlreadyIn::No
         );
     }
 
