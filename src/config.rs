@@ -1259,9 +1259,17 @@ impl Config {
         // `[vars]` is teravars' own input, already resolved into the render
         // context; `deny_unknown_fields` must not trip over it.
         table.remove("vars");
-        toml::Value::Table(table)
+        // No layer says anything about `agents`: the roster is whatever is on
+        // `PATH` now, exactly as when no layer exists at all. An explicit
+        // `agents = []` is a statement and is kept.
+        let detect_agents = !table.contains_key("agents");
+        let mut cfg: Self = toml::Value::Table(table)
             .try_into()
-            .context("deserializing magi config")
+            .context("deserializing magi config")?;
+        if detect_agents {
+            cfg.agents = Self::autodetected().agents;
+        }
+        Ok(cfg)
     }
 
     /// Refuse an array that two layers both declare, unless
