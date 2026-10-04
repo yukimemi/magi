@@ -2374,10 +2374,12 @@ async fn announce_red_merge(state: &mut RunState, pr: &PrState) {
         rec.red_at_merge = pr.failing.clone();
     }
     state.event("land", summary.clone());
-    crate::notices::raise(crate::notices::merged_red(&state.id, &summary));
-    if let Err(e) = ask::notify_text(&state.config.notify, &state.id, &summary).await {
-        tracing::warn!("could not notify about a merge with red checks: {e:#}");
-    }
+    // The notice pages through `[notify]` itself, once, unless a question
+    // already carries the cause.
+    crate::notices::raise_with(
+        crate::notices::merged_red(&state.id, &summary),
+        &state.config.notify,
+    );
 }
 
 /// Run the loop against a real pull request until it merges or the budget runs

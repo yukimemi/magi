@@ -201,7 +201,11 @@ impl Notice {
 
     /// Fold a repeat of this notice into it. Always counts; only a changed
     /// message or a higher severity makes it unread and visible again.
-    pub fn raise_again(&mut self, again: &Notice, now: Timestamp) {
+    ///
+    /// Returns whether this raise should page the operator: it relit the
+    /// notice (new message, higher severity, newer cause) and no open question
+    /// already carries it. This is the only place that decides.
+    pub fn raise_again(&mut self, again: &Notice, now: Timestamp) -> bool {
         self.count = self.count.saturating_add(1);
         self.last_at = now;
         if again.link.is_some() {
@@ -224,7 +228,8 @@ impl Notice {
         if again.since.is_some() {
             self.since = again.since;
         }
-        if again.message != self.message || escalated || newer_cause {
+        let relit = again.message != self.message || escalated || newer_cause;
+        if relit {
             self.message = again.message.clone();
             self.severity = self.severity.max(again.severity);
             self.read_at = None;
@@ -240,6 +245,7 @@ impl Notice {
             self.read_at = Some(now);
             self.covered_by = Some(q.clone());
         }
+        relit && self.covered_by.is_none()
     }
 
     /// Mark read, keeping the first read time.
@@ -412,26 +418,32 @@ impl Notices {
 
     /// File a notice, folding it into an existing one with the same key.
     pub fn raise(&self, incoming: Notice) -> Result<Notice> {
-        let stored = self.locked(&incoming.id.clone(), || {
+        self.raise_paged(incoming).map(|(n, _)| n)
+    }
+
+    /// [`Notices::raise`], also saying whether the raise should page.
+    pub fn raise_paged(&self, incoming: Notice) -> Result<(Notice, bool)> {
+        let out = self.locked(&incoming.id.clone(), || {
             let now = Timestamp::now();
-            let stored = match read_path(&self.path_of(&incoming.id)) {
+            let (stored, page) = match read_path(&self.path_of(&incoming.id)) {
                 Ok(mut existing) => {
-                    existing.raise_again(&incoming, now);
-                    existing
+                    let page = existing.raise_again(&incoming, now);
+                    (existing, page)
                 }
                 Err(_) => {
                     let mut fresh = incoming;
                     if fresh.covered_by.is_some() {
                         fresh.read_at = Some(now);
                     }
-                    fresh
+                    let page = fresh.covered_by.is_none();
+                    (fresh, page)
                 }
             };
             self.put(&stored)?;
-            Ok(stored)
+            Ok((stored, page))
         })?;
         self.prune();
-        Ok(stored)
+        Ok(out)
     }
 
     /// Mark every unread notice about `subject` read, recording `question` as
@@ -659,12 +671,85 @@ pub fn run_stopped(id: &str, state: &crate::run::RunState) -> Notice {
     .about([id.to_owned()])
 }
 
+/// One page for the operator's `[notify]` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    /// The run id when the notice links to a run, else empty.
+    pub run: String,
+    /// The notice message.
+    pub summary: String,
+}
+
+/// Set once by `main`: until then no notice fires the command, so a unit or
+/// integration test that pins a home never reaches the operator's real config.
+static PAGER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Let notices fire the `[notify]` command in this process.
+pub fn install_pager() {
+    let _ = PAGER.set(());
+}
+
+/// The production sender. Fire and forget on its own thread with its own
+/// runtime, so it works with or without an ambient one and never blocks the
+/// producer; `ask::notify_text` bounds the command by `NOTIFY_TIMEOUT`.
+/// `notify` is the producer's own config, else the machine layer's.
+fn send_page(page: Page, notify: Option<crate::config::Notify>) {
+    if PAGER.get().is_none() {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("notice-pager".into())
+        .spawn(move || {
+            let notify = notify.unwrap_or_else(machine_notify);
+            if notify.command.is_empty() {
+                return;
+            }
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => return tracing::warn!("could not page about a notification: {e:#}"),
+            };
+            if let Err(e) = rt.block_on(crate::ask::notify_text(&notify, &page.run, &page.summary))
+            {
+                tracing::warn!("could not page about a notification: {e:#}");
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("could not page about a notification: {e:#}");
+    }
+}
+
+/// `[notify]` from the machine layer alone; a producer with no repo config
+/// cannot name a better one. Unreadable is no command, with a warning.
+fn machine_notify() -> crate::config::Notify {
+    let layers: Vec<PathBuf> = crate::config::Config::machine_layer()
+        .into_iter()
+        .filter(|p| p.is_file())
+        .collect();
+    match crate::config::Config::load_layers(&layers) {
+        Ok(c) => c.notify,
+        Err(e) => {
+            tracing::warn!("could not read [notify] for a notification: {e:#}");
+            Default::default()
+        }
+    }
+}
+
 /// The one function producers call. Best-effort by construction: a notice that
 /// cannot be filed is a `tracing::warn`, never a reason to fail the run, the
 /// loop or the request that wanted to mention it.
 pub fn raise(notice: Notice) {
     if let Some(home) = crate::run::try_home() {
         raise_in(&home, notice);
+    }
+}
+
+/// [`raise`] for a producer that already holds the repo's `[notify]`.
+pub fn raise_with(notice: Notice, notify: &crate::config::Notify) {
+    if let Some(home) = crate::run::try_home() {
+        raise_in_with(&home, notice, &|page| send_page(page, Some(notify.clone())));
     }
 }
 
@@ -718,12 +803,26 @@ pub fn quiet_for(home: &Path, question: &crate::ask::Question) {
 
 /// [`raise`] into an explicit magi home, for callers that already carry one
 /// (the janitor) and so must not reach for the process-global.
-pub fn raise_in(home: &Path, mut notice: Notice) {
+pub fn raise_in(home: &Path, notice: Notice) {
+    raise_in_with(home, notice, &|page| send_page(page, None));
+}
+
+/// [`raise_in`] with the pager injected. `send` is called only when the raise
+/// should page (see [`Notice::raise_again`]); it must not block.
+pub fn raise_in_with(home: &Path, mut notice: Notice, send: &dyn Fn(Page)) {
     if let Some(q) = covering_question(home, &notice) {
         notice.covered_by = Some(q);
     }
-    if let Err(e) = Notices::at(home.join("notifications")).raise(notice) {
-        tracing::warn!("could not file a notification: {e:#}");
+    match Notices::at(home.join("notifications")).raise_paged(notice) {
+        Ok((n, true)) => send(Page {
+            run: match &n.link {
+                Some(Link::Run { id }) => id.clone(),
+                _ => String::new(),
+            },
+            summary: n.message.clone(),
+        }),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("could not file a notification: {e:#}"),
     }
 }
 
@@ -1201,5 +1300,96 @@ mod tests {
             .unwrap();
         raise_in(dir.path(), Notice::warn("task:t1", "held").about(["t1"]));
         assert_eq!(unread(dir.path()), 0);
+    }
+
+    fn pages(home: &Path, n: Notice) -> Vec<Page> {
+        let sent = std::cell::RefCell::new(Vec::new());
+        raise_in_with(home, n, &|p| sent.borrow_mut().push(p));
+        sent.into_inner()
+    }
+
+    #[test]
+    fn a_page_fires_on_new_changed_and_escalated_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = dir.path();
+        let n = || Notice::warn("run:p1", "stopped").link(Link::Run { id: "p1".into() });
+        let first = pages(h, n());
+        assert_eq!(
+            first,
+            vec![Page {
+                run: "p1".into(),
+                summary: "stopped".into()
+            }]
+        );
+        assert!(pages(h, n()).is_empty(), "identical re-raise is silent");
+        assert_eq!(pages(h, Notice::warn("run:p1", "stopped again")).len(), 1);
+        assert_eq!(pages(h, Notice::error("run:p1", "stopped again")).len(), 1);
+        assert!(pages(h, Notice::error("run:p1", "stopped again")).is_empty());
+    }
+
+    #[test]
+    fn a_non_run_link_leaves_run_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = Notice::warn("task:t1", "held").link(Link::Task { id: "t1".into() });
+        assert_eq!(pages(dir.path(), n)[0].run, "");
+    }
+
+    #[test]
+    fn a_dismissed_tombstone_stays_silent_until_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = dir.path();
+        pages(h, Notice::warn("disk:r", "low"));
+        Notices::at(h.join("notifications"))
+            .dismiss(&id_of("disk:r"))
+            .unwrap();
+        assert!(pages(h, Notice::warn("disk:r", "low")).is_empty());
+        assert_eq!(pages(h, Notice::warn("disk:r", "lower")).len(), 1);
+    }
+
+    #[test]
+    fn a_newer_cause_pages_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = dir.path();
+        let at = |s: i64| Some(Timestamp::from_second(s).unwrap());
+        let n = |s| Notice::warn("task:t2", "held").since(at(s));
+        assert_eq!(pages(h, n(100)).len(), 1);
+        assert!(pages(h, n(100)).is_empty());
+        assert_eq!(pages(h, n(200)).len(), 1);
+    }
+
+    #[test]
+    fn a_covered_notice_does_not_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = dir.path();
+        let q = ask(h, "r9", "implement");
+        let n = || Notice::error("run:r9", "ended").about(["r9".to_owned()]);
+        assert!(pages(h, n()).is_empty());
+        let stored = Notices::at(h.join("notifications"))
+            .get(&id_of("run:r9"))
+            .unwrap();
+        assert_eq!(stored.covered_by.as_deref(), Some(q.id.as_str()));
+        assert!(pages(h, n()).is_empty());
+    }
+
+    #[test]
+    fn a_failing_sender_path_never_propagates() {
+        // A pager that cannot run its command only warns.
+        let notify = crate::config::Notify {
+            command: vec!["magi-no-such-program-xyz".into()],
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let r = rt.block_on(crate::ask::notify_text(&notify, "", "x"));
+        assert!(r.is_err());
+        // `send_page` without an installed pager is a no-op and cannot panic.
+        send_page(
+            Page {
+                run: String::new(),
+                summary: "x".into(),
+            },
+            Some(notify),
+        );
     }
 }

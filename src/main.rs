@@ -792,6 +792,7 @@ fn run() -> Result<()> {
 async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
+    magi::notices::install_pager();
     let interactive = std::io::stdout().is_terminal();
     if cli.no_color || std::env::var_os("NO_COLOR").is_some() || !interactive {
         report::set_color(false);

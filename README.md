@@ -460,6 +460,34 @@ comes from `MAGI_WEB_URL`, which `magi web` prints at startup — a run cannot
 discover the address another process bound. A notification that fails is logged
 and ignored: a broken webhook is not a reason to throw away an implementation.
 
+The same command also fires for the web UI's notices (the header bell): a run
+that ended badly, a held task, a failed release bump, a merge with red checks.
+It fires when a notice is new, its message changed or its severity rose - not
+for an identical repeat, a dismissed notice, or one an open question already
+pages for - with the notice's message as `{summary}` and, when it links to a
+run, that id as `{run}` (empty otherwise).
+
+A placeholder is replaced verbatim inside one argv element: nothing escapes it
+for JSON or anything else. For a Discord webhook, a naive
+`-d '{"content":"{summary}"}'` breaks on a summary containing a quote or a
+newline, so build the body in a wrapper that takes the summary as an argument:
+
+```sh
+#!/bin/sh
+# discord-notify.sh <summary> - Discord rejects content over 2000 characters
+body=$(jq -n --arg content "$1" '{content: $content}') || exit 1
+exec curl -sS -H 'Content-Type: application/json' -d "$body" "$DISCORD_WEBHOOK_URL"
+```
+
+```toml
+[notify]
+command = ["/path/to/discord-notify.sh", "{summary}"]
+```
+
+`curl --form-string "content={summary}"` also avoids hand-written JSON (unlike
+`-F`, it never reads a file for a value starting with `@` or `<`); that form
+has not been verified against Discord here.
+
 ## Landing it
 
 With `merge = "pr"`, magi opens the pull request and then keeps going: watches
