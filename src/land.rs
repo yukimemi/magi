@@ -3001,12 +3001,11 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 // still visible to a resume.
                 let observed_head = seen.head.clone();
                 // `gh` merges at once instead of arming when the pull request
-                // is already mergeable, so that case gets the same fresh,
-                // head-bound read the direct fallback does.
-                if matches!(
-                    seen.merge_state.to_ascii_uppercase().as_str(),
-                    "CLEAN" | "UNSTABLE" | "HAS_HOOKS"
-                ) {
+                // is mergeable by the time it looks, and the state seen here
+                // can be a moment older than that - BLOCKED now, CLEAN when
+                // `gh` asks. So every arm gets the same fresh, head-bound read
+                // the direct fallback does, whatever the merge state was.
+                {
                     let fresh = forge.view(&repo, pr_url).await.ok();
                     if !direct_merge_is_safe(
                         fresh.as_ref(),
