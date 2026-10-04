@@ -565,8 +565,8 @@ const state = {
      cleared, so the next search starts a fresh jump. */
   queueSearchJump: null,
   /* A task id to scroll to and flash the moment the Backlog can show it -
-     set by applyRoute() when the hash names one (see noticeLink's task
-     links) and consumed once by consumeQueueFocus(), which renderQueue()
+     set by applyRoute() when the hash names one (a Backlog card's
+     permalink, or an existing `#/queue/<id>` bookmark) and consumed once by consumeQueueFocus(), which renderQueue()
      calls on every pass. Stays set across calls until state.queue has
      actually loaded, so a notification tapped before boot finishes still
      lands on its card once loadQueue() comes back. */
@@ -3060,7 +3060,8 @@ function openQueueSectionFocus(sectionKey) {
 }
 
 /* Lands on the task named by state.queueFocus, set by applyRoute() from a
-   `#/queue/<id>` hash - a task notification's own link. Runs from the tail
+   `#/queue/<id>` hash - a Backlog card's permalink or an old bookmark
+   (task notifications link to the task page instead). Runs from the tail
    of renderQueue(), which is called from every path that can make the
    target findable: loadQueue() once state.queue has actually loaded, and
    the recursive renderQueue() call below once a stale search from a
@@ -6697,7 +6698,7 @@ function renderBell() {
 function noticeLink(link) {
   if (!link) return null;
   if (link.kind === "run") return el("a", { href: `#/runs/${encodeURIComponent(link.id)}`, text: `Run ${shortId(link.id)}` });
-  if (link.kind === "task") return el("a", { href: `#/queue/${encodeURIComponent(link.id)}`, text: `Task ${shortId(link.id)}` });
+  if (link.kind === "task") return el("a", { href: `#/tasks/${encodeURIComponent(link.id)}`, text: `Task ${shortId(link.id)}` });
   if (link.kind === "url") {
     const href = forgeUrl(link.url);
     return href ? el("a", { href, target: "_blank", rel: "noopener noreferrer", text: "Open link" }) : null;
@@ -7069,8 +7070,8 @@ function applyRoute() {
   /* The operator arrived to answer one specific thing, so the caret goes on
      it rather than on the top of the document. */
   if (changed && route.name === "questions") focusFirstAsk();
-  /* A task notification's link names the card it is about (see noticeLink);
-     land on it the same way a single-hit search does, rather than leaving
+  /* A `#/queue/<id>` hash (a card permalink or an old bookmark) names the
+     card it is about; land on it the same way a single-hit search does, rather than leaving
      the operator to scroll the whole Backlog by hand. Queued rather than
      jumped to directly, since the Backlog may still be loading or mid a
      stale search - see consumeQueueFocus(), which renderQueue() calls on
