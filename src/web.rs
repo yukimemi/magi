@@ -2481,6 +2481,11 @@ struct RunDetailView {
     /// `RunState` has no business knowing which of its own methods a caller
     /// wants serialized.
     unmerged_by_design: bool,
+    /// Same field and meaning as [`RunSummary::done`]: whether the status is
+    /// terminal. The client's `landView` keys on it, and the flattened state
+    /// has no such field, so without it a finished run's stale `open` PR
+    /// would be painted as live on the detail page.
+    done: bool,
     /// Same field and meaning as [`RunSummary::superseded_by`] — the list
     /// route fills it from [`Queue::superseded`], the detail route from
     /// [`Queue::superseded_by`], and both read the same underlying task
@@ -2624,6 +2629,7 @@ impl RunDetailView {
             origin_label: crate::run::origin_label(state.origin.as_ref()),
             live,
             unmerged_by_design: state.unmerged_by_design(),
+            done: state.status.done(),
             superseded_by,
             latest_attempt,
             task,
@@ -10081,6 +10087,34 @@ mod tests {
         assert!(INDEX_HTML.contains("aria-label=\"Dismiss unreadable-runs warning\""));
         // The subtitle still counts them whatever the banner does.
         assert!(APP_JS.contains("unreadable` : null"));
+    }
+
+    #[test]
+    fn the_run_detail_payload_says_whether_the_run_is_done() {
+        // `landView` reads `run.done`; the detail response must carry it.
+        for (status, done) in [
+            (RunStatus::Superseded, true),
+            (RunStatus::Blocked, true),
+            (RunStatus::Landing, false),
+        ] {
+            let mut state = RunState::new(
+                std::path::PathBuf::from("/repo"),
+                "main".to_owned(),
+                "abc".to_owned(),
+                "x".to_owned(),
+                crate::config::Config::default(),
+            );
+            state.status = status;
+            let v = serde_json::to_value(RunDetailView::of(
+                state,
+                crate::run::Liveness::Unknown,
+                None,
+                None,
+                None,
+            ))
+            .unwrap();
+            assert_eq!(v["done"], done, "{status:?}");
+        }
     }
 
     #[test]
