@@ -1993,26 +1993,29 @@ impl Drop for Claim {
 /// The first line of a task, trimmed to a title. Used when the caller gives a
 /// body but no title, which is the normal case for an agent piping a file in.
 pub fn title_from(instruction: &str, max: usize) -> String {
-    // The first non-blank line, whatever it is. A markdown heading is the
-    // task's own summary - agents pipe in `# Rework the config loader` and mean
-    // exactly that - so it is preferred over the prose beneath it rather than
-    // skipped as decoration. Leading list and heading markers are stripped
-    // because they are syntax, not words.
-    let line = instruction
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("(empty task)")
-        .trim_start_matches(['#', '-', '*', '>', ' '])
-        .trim();
-    if line.is_empty() {
+    let Some(line) = first_line(instruction) else {
         return "(empty task)".to_owned();
-    }
+    };
     if line.chars().count() <= max {
         return line.to_owned();
     }
     let head: String = line.chars().take(max.saturating_sub(1)).collect();
     format!("{head}…")
+}
+
+/// The first non-blank line, whatever it is. A markdown heading is the
+/// task's own summary - agents pipe in `# Rework the config loader` and mean
+/// exactly that - so it is preferred over the prose beneath it rather than
+/// skipped as decoration. Leading list and heading markers are stripped
+/// because they are syntax, not words. `None` when nothing is left.
+pub(crate) fn first_line(instruction: &str) -> Option<&str> {
+    let line = instruction
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())?
+        .trim_start_matches(['#', '-', '*', '>', ' '])
+        .trim();
+    (!line.is_empty()).then_some(line)
 }
 
 fn read_path(path: &Path) -> Result<Task> {
