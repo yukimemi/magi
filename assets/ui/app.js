@@ -5360,6 +5360,57 @@ function successorNote(latest, inFlight) {
   return el("p", { class: "card-note" }, "Latest attempt: ", link, ` (${state})`);
 }
 
+/* ---- run detail: which record panels the operator opened --------------- *
+ * One storage key, { runId: { panelKey: bool } }, newest 50 runs. The panels
+ * are static elements updated in place, so a redraw never closes one; the
+ * state is only restored when the displayed run changes. */
+const RUN_PANELS_STORAGE_KEY = "magi.runPanelsOpen";
+const RUN_PANELS_KEEP = 50;
+let restoringRunPanels = false;
+
+function runPanelOpen(runId, key) {
+  const entry = loadCollapsed(RUN_PANELS_STORAGE_KEY)[runId];
+  return Boolean(entry && typeof entry === "object" && entry[key] === true);
+}
+
+function setRunPanelOpen(runId, key, open) {
+  if (restoringRunPanels) return;
+  const all = loadCollapsed(RUN_PANELS_STORAGE_KEY);
+  const entry = all[runId] && typeof all[runId] === "object" ? all[runId] : {};
+  if (entry[key] === open || (!open && entry[key] === undefined)) return;
+  entry[key] = open;
+  delete all[runId];
+  all[runId] = entry;
+  for (const id of Object.keys(all).slice(0, Math.max(0, Object.keys(all).length - RUN_PANELS_KEEP))) delete all[id];
+  saveCollapsed(RUN_PANELS_STORAGE_KEY, all);
+}
+
+function syncRunPanels(run) {
+  const panels = document.querySelectorAll("#view-run details[data-panel]");
+  for (const panel of panels) {
+    if (panel.dataset.forRun === run.id) continue;
+    panel.dataset.forRun = run.id;
+    restoringRunPanels = true;
+    panel.open = runPanelOpen(run.id, panel.dataset.panel);
+    /* toggle fires asynchronously; hold the guard past it. */
+    setTimeout(() => { restoringRunPanels = false; }, 0);
+  }
+  const lines = String(run.instruction || "").split("\n").length;
+  setText($("run-task-count"), plural(lines, "line", "lines"));
+  const events = Array.isArray(run.events) ? run.events.length : 0;
+  setText($("run-raw-count"), events ? `report \u00b7 ${plural(events, "event", "events")}` : "report");
+}
+
+function wireRunPanels() {
+  for (const panel of document.querySelectorAll("#view-run details[data-panel]")) {
+    panel.addEventListener("toggle", () => {
+      const runId = panel.dataset.forRun;
+      if (!runId || !state.detail.run || state.detail.run.id !== runId) return;
+      setRunPanelOpen(runId, panel.dataset.panel, panel.open);
+    });
+  }
+}
+
 function renderRunDetail() {
   const run = state.detail.run;
   const report = state.detail.report;
@@ -5458,6 +5509,7 @@ function renderRunDetail() {
     renderMd(instructionEl, run.instruction_md);
   }
 
+  syncRunPanels(run);
   renderAsks(run);
   renderLand(run);
   renderActive(run);
@@ -6242,6 +6294,15 @@ function renderCandidates(run) {
   setText($("cand-count"), `${candidates.filter(viable).length} viable of ${candidates.length}`);
 
   const list = $("run-cands");
+  const rounds = Array.isArray(run.reviews) ? run.reviews : [];
+  const gate = Array.isArray(run.gate) ? run.gate : [];
+  const target = reviewTarget(run);
+  /* A redraw that changes nothing must not touch the DOM: the 5 s refresh
+     would otherwise rebuild the cards under a reader's scroll position and
+     fold the review disclosures they opened. */
+  const sig = JSON.stringify([run.id, candidates, winner, decided, target, rounds, gate]);
+  if (list.dataset.sig === sig) return;
+  list.dataset.sig = sig;
   clear(list);
   candidates.forEach((candidate, i) => {
     const dead = !viable(candidate);
@@ -6251,6 +6312,10 @@ function renderCandidates(run) {
     const took = seconds(candidate.duration_ms);
     if (took) facts.push(took);
     if (candidate.branch) facts.push(candidate.branch);
+
+    const reviews = (candidate.label || "?") === target && (rounds.length > 0 || gate.length > 0)
+      ? candidateReviews(run.id, candidate.label || "?", rounds, gate)
+      : null;
 
     list.append(el("li", {
       class: "cand",
@@ -6278,8 +6343,23 @@ function renderCandidates(run) {
         : null,
       candidate.summary ? el("p", { class: "cand-summary", text: candidate.summary }) : null,
       candidate.stat ? el("pre", { class: "stat", text: candidate.stat }) : null,
+      reviews,
     ));
   });
+}
+
+/* A candidate's reviews, folded by default. The open state is remembered per
+   run and label; it is written from this element's own toggle, which knows
+   its run, so a late event cannot file it under a different run. */
+function candidateReviews(runId, label, rounds, gate) {
+  const key = `rev:${label}`;
+  const details = el("details", { class: "advanced cand-reviews" },
+    el("summary", {}, "Reviews ", el("span", { class: "count", text: reviewGist(rounds, gate) })),
+    el("ol", { class: "rounds" }, buildReviewRounds(rounds, gate)),
+  );
+  details.open = runPanelOpen(runId, key);
+  details.addEventListener("toggle", () => setRunPanelOpen(runId, key, details.open));
+  return details;
 }
 
 /* `ReviewVote` on the wire: "approve" | "approve_with_findings" | "reject".
@@ -6303,19 +6383,10 @@ function voteLabel(vote) {
   }
 }
 
-function renderReviews(run) {
-  /* On the wire this is Vec<ReviewRound>, each round holding the reviewers'
-     records. */
-  const rounds = Array.isArray(run.reviews) ? run.reviews : [];
-  const gate = Array.isArray(run.gate) ? run.gate : [];
-  show($("run-reviews-panel"), rounds.length > 0 || gate.length > 0);
-  if (rounds.length === 0 && gate.length === 0) return;
-
-  setText($("review-count"), rounds.length ? plural(rounds.length, "round", "rounds") : "gate only");
-
-  const list = $("run-reviews");
-  clear(list);
-
+/* The review rounds as DOM nodes, shared by the candidate card they belong to
+   and the unattributed fallback panel. */
+function buildReviewRounds(rounds, gate) {
+  const nodes = [];
   for (const round of rounds) {
     const blocking = Number(round.blocking) || 0;
     const records = Array.isArray(round.reviews) ? round.reviews : [];
@@ -6447,10 +6518,51 @@ function renderReviews(run) {
       ));
     }
 
-    list.append(node);
+    nodes.push(node);
   }
 
-  if (gate.length) list.append(el("li", { class: "round" }, commandList("Gate", gate)));
+  if (gate.length) nodes.push(el("li", { class: "round" }, commandList("Gate", gate)));
+  return nodes;
+}
+
+/* One line for a reviews summary. "open" is the last round's blocking count
+   only: earlier rounds' blockers were fixed or carried into that round. */
+function reviewGist(rounds, gate) {
+  if (rounds.length === 0) return gate.length ? "gate only" : "";
+  const last = rounds[rounds.length - 1];
+  const blocking = Number(last.blocking) || 0;
+  const tail = last.clean ? "clean" : blocking > 0 ? `${blocking} open` : "";
+  return plural(rounds.length, "round", "rounds") + (tail ? `, ${tail}` : "");
+}
+
+/* Which candidate the run's reviews belong to: the winner, or the only
+   candidate. Never several: copying them would make an unreviewed candidate
+   look reviewed. Null means the record has no card to live in. */
+function reviewTarget(run) {
+  const candidates = Array.isArray(run.candidates) ? run.candidates : [];
+  const winner = run.tally ? run.tally.winner : null;
+  if (winner && candidates.some((c) => c.label === winner)) return winner;
+  if (candidates.length === 1) return candidates[0].label || "?";
+  return null;
+}
+
+function renderReviews(run) {
+  /* On the wire this is Vec<ReviewRound>, each round holding the reviewers'
+     records. This panel is only the fallback for a record no card can hold. */
+  const rounds = Array.isArray(run.reviews) ? run.reviews : [];
+  const gate = Array.isArray(run.gate) ? run.gate : [];
+  const orphan = reviewTarget(run) === null && (rounds.length > 0 || gate.length > 0);
+  show($("run-reviews-panel"), orphan);
+  if (!orphan) return;
+
+  setText($("review-count"), reviewGist(rounds, gate));
+
+  const list = $("run-reviews");
+  const sig = JSON.stringify([run.id, rounds, gate]);
+  if (list.dataset.sig === sig) return;
+  list.dataset.sig = sig;
+  clear(list);
+  list.append(...buildReviewRounds(rounds, gate));
 }
 
 function commandList(heading, commands) {
@@ -6567,6 +6679,7 @@ function renderQuota(run) {
   show($("run-quota-panel"), losses.length > 0);
   if (losses.length === 0) return;
 
+  setText($("run-quota-count"), plural(losses.length, "seat", "seats"));
   const list = $("run-quota");
   clear(list);
   for (const loss of losses) {
@@ -6584,6 +6697,7 @@ function renderHandovers(run) {
   show($("run-handovers-panel"), moves.length > 0);
   if (moves.length === 0) return;
 
+  setText($("run-handovers-count"), plural(moves.length, "seat", "seats"));
   const list = $("run-handovers");
   clear(list);
   for (const move of moves) {
@@ -7738,6 +7852,7 @@ function wire() {
   $("talk-close-go").addEventListener("click", closeTalk);
   $("talk-agent").addEventListener("change", switchTalkAgent);
   $("talk-reopen-go").addEventListener("click", reopenTalk);
+  wireRunPanels();
   $("talk-tasks-panel").addEventListener("toggle", () => {
     const panel = $("talk-tasks-panel");
     const talkId = panel.dataset.talkId;
