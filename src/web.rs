@@ -3861,7 +3861,7 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
 struct FlowNode {
     /// Unique by position: a resumed run id appears once per pass.
     key: String,
-    /// `start`, `run` or `end`.
+    /// `chat`, `start`, `run` or `end`.
     kind: &'static str,
     label: String,
     /// Run status (or the task's, for `end`); `None` when it is not a fact
@@ -3909,8 +3909,25 @@ fn task_flow(task: &Task, history: &[TaskRunView], max_attempts: usize) -> FlowV
         readable: true,
         href: None,
     };
-    let mut nodes = vec![node("start", "start", "Task queued".to_owned())];
+    let mut nodes = Vec::new();
     let mut edges: Vec<FlowEdge> = Vec::new();
+    // A task queued from a chat opens the flow with that conversation.
+    if let Some(link) = source_link(&task.source).filter(|l| l.kind == "chat") {
+        let mut n = node(
+            "chat",
+            "chat",
+            format!("Chat {}", crate::queue::short(&link.id)),
+        );
+        n.href = Some(link.href);
+        nodes.push(n);
+        edges.push(FlowEdge {
+            from: "chat".to_owned(),
+            to: "start".to_owned(),
+            label: "queued from chat".to_owned(),
+            attempt: AttemptCost::None,
+        });
+    }
+    nodes.push(node("start", "start", "Task queued".to_owned()));
     let mut prev = "start".to_owned();
     let mut prev_exit: Option<(RunExit, Option<&str>)> = None;
     for (i, h) in history.iter().enumerate() {
@@ -8645,6 +8662,55 @@ mod tests {
                 .and_then(|(_, s)| s.clone())
         });
         task_flow(task, &h, 5)
+    }
+
+    #[test]
+    fn flow_opens_with_the_chat_that_queued_the_task() {
+        let mut t = flow_task(&[]);
+        t.source = Source::Agent {
+            run: "a b/c".to_owned(),
+            node: crate::queue::CHAT_NODE.to_owned(),
+        };
+        let f = flow_for(&t, &[]);
+        assert_eq!(f.nodes[0].key, "chat");
+        assert_eq!(f.nodes[0].kind, "chat");
+        assert_eq!(
+            f.nodes[0].label,
+            format!("Chat {}", crate::queue::short("a b/c"))
+        );
+        assert_eq!(f.nodes[0].href.as_deref(), Some("#/chat/a%20b%2Fc"));
+        assert_eq!(f.nodes[1].key, "start");
+        assert_eq!(
+            f.edges[0],
+            FlowEdge {
+                from: "chat".to_owned(),
+                to: "start".to_owned(),
+                label: "queued from chat".to_owned(),
+                attempt: AttemptCost::None,
+            }
+        );
+    }
+
+    #[test]
+    fn flow_has_no_chat_box_for_other_sources() {
+        for source in [
+            Source::Human,
+            Source::Issue {
+                number: 3,
+                repo: "o/r".to_owned(),
+            },
+            Source::Agent {
+                run: "20260904-014455-ab12".to_owned(),
+                node: "implement".to_owned(),
+            },
+        ] {
+            let mut t = flow_task(&[]);
+            t.source = source;
+            let f = flow_for(&t, &[]);
+            assert_eq!(f.nodes[0].key, "start");
+            assert!(f.nodes.iter().all(|n| n.kind != "chat"));
+            assert!(f.edges.iter().all(|e| e.from != "chat"));
+        }
     }
 
     const FA: &str = "20260902-140501-aaaa";

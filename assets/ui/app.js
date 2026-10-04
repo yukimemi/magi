@@ -7765,6 +7765,7 @@ function renderTaskFlow(flow) {
     if (n.status) top.append(chip(n.status, n.kind === "end" ? TASK_STATUS : RUN_STATUS));
     if (n.note) top.append(el("span", { class: "tag", "data-tone": n.note === "no verdict" ? "rust" : "ink", text: n.note }));
     if (n.run_kind && n.run_kind !== "unknown") top.append(el("span", { class: "tag", "data-tone": "ink", text: n.run_kind }));
+    if (n.kind === "chat") top.append(el("span", { class: "tag", "data-tone": "ink", text: "chat" }));
     const attrs = { class: "flow-node", "data-kind": n.kind };
     if (n.kind === "run" && !n.decided && n.readable) attrs["data-undecided"] = "";
     if (!n.readable) attrs["data-unreadable"] = "";

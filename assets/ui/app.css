@@ -2010,6 +2010,7 @@ details.panel > summary + * { margin-top: var(--s2); }
 .task-flow .flow-node { display: flex; flex-direction: column; gap: var(--s1); padding: var(--s3); background: var(--surface); border: 1px solid var(--line-2); border-radius: var(--radius-sm); color: var(--ink); text-decoration: none; min-width: 0; overflow-wrap: anywhere; }
 .task-flow a.flow-node { min-height: var(--tap); }
 .task-flow .flow-node[data-kind="start"], .task-flow .flow-node[data-kind="end"] { background: var(--sunk); }
+.task-flow .flow-node[data-kind="chat"] { background: var(--sunk); border-left: 3px solid var(--gold); }
 .task-flow .flow-node[data-undecided] { border-style: dashed; border-color: var(--rust); }
 .task-flow .flow-node[data-unreadable] { border-style: dashed; border-color: var(--line-2); color: var(--ink-3); }
 .task-flow .flow-top { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
