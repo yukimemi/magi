@@ -8474,7 +8474,10 @@ mod tests {
         let task = flow_task(&["20260902-140501-aaaa"]);
         let parked = flow_run(RunStatus::Implementing, |s| s.parked = true);
         let v = task_run_view("20260902-140501-aaaa", Some(&parked), slot(), &task);
-        assert_eq!((v.exit, v.attempt), (RunExit::Parked, AttemptCost::Refunded));
+        assert_eq!(
+            (v.exit, v.attempt),
+            (RunExit::Parked, AttemptCost::Refunded)
+        );
         let spent = flow_run(RunStatus::Blocked, |_| {});
         let v = task_run_view("20260902-140501-aaaa", Some(&spent), slot(), &task);
         assert_eq!(v.attempt, AttemptCost::Spent);
