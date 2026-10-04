@@ -5359,26 +5359,52 @@ async fn talk_agent(
         blocking(move || Ok(ui.talks.get(&id)?.repo)).await?
     };
     let cfg = config_for(&repo).await?;
-    let Some(_turn_guard) = ui.begin_talk_turn(&id)? else {
+    let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
         return Err(ApiError::conflict(
             "a talk turn is running; change the agent once it has answered",
         ));
     };
-    blocking(move || {
-        let spec = agent::pick(&cfg.agents, Some(&body.agent), &agent::installed)
-            .map_err(ApiError::bad_request_from)?;
-        let mut talk = ui.talks.get(&id)?;
-        if !talk.status.open() {
-            return Err(ApiError::conflict(format!(
-                "talk {} is {} and takes no more turns",
-                talk.short(),
-                talk.status.as_str()
-            )));
+    let switched = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        let cfg = cfg.clone();
+        blocking(move || {
+            let spec = agent::pick(&cfg.agents, Some(&body.agent), &agent::installed)
+                .map_err(ApiError::bad_request_from)?;
+            let mut talk = ui.talks.get(&id)?;
+            if !talk.status.open() {
+                return Err(ApiError::conflict(format!(
+                    "talk {} is {} and takes no more turns",
+                    talk.short(),
+                    talk.status.as_str()
+                )));
+            }
+            talk::switch_agent(&mut talk, &ui.talks, &spec)?;
+            Ok(talk)
+        })
+        .await
+    };
+    // A `/say` that landed while this held the claim saw the talk busy and
+    // left a durable draft, trusting the claim's owner to drain it. So the
+    // claim goes to `drain_loop` whatever the outcome - it releases at once
+    // when nothing is queued - rather than being dropped here.
+    let fresh = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || Ok(ui.talks.get(&id)?)).await
+    };
+    let draining = match fresh {
+        Ok(talk) => {
+            let draining = talk.status.open()
+                && (!talk.pending.is_empty() || !talk.pending_attachments.is_empty());
+            let talks = ui.talks.clone();
+            tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+            draining
         }
-        talk::switch_agent(&mut talk, &ui.talks, &spec)?;
-        Ok(Json(TalkView::new(talk, false)))
-    })
-    .await
+        Err(_) => false,
+    };
+    let talk = switched?;
+    Ok(Json(TalkView::new(talk, draining)))
 }
 
 /// `POST /api/talks/{id}/close`.
@@ -6846,7 +6872,17 @@ mod tests {
         );
 
         {
-            let _busy = ui.begin_talk_turn(&id).expect("claim").expect("free");
+            // The refused call hands its claim to a drain loop that releases
+            // it a moment later.
+            let mut claimed = None;
+            for _ in 0..200 {
+                claimed = ui.begin_talk_turn(&id).expect("claim");
+                if claimed.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let _busy = claimed.expect("free");
             let busy = call("second").await.expect_err("busy talk");
             assert_eq!(busy.status, StatusCode::CONFLICT, "{}", busy.message);
         }
