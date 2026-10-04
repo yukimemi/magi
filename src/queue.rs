@@ -1040,12 +1040,124 @@ fn copy_new(dir: &Path, src: &Path, name: &str) -> Result<(String, PathBuf)> {
 /// a writer that died.
 const TASK_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Guard for [`Queue::lock_task`]; removes the lock file on drop.
-struct TaskLock(PathBuf);
+/// Guard for [`Queue::lock_task`]; removes the lock file on drop, but only
+/// while the file still carries this guard's owner token.
+struct TaskLock {
+    path: PathBuf,
+    token: String,
+}
+
+/// A token no other holder shares: pid, then a mix of entropy and a process
+/// counter so threads born in the same nanosecond still differ.
+fn owner_token() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut r = crate::rng::SplitMix64::new(crate::rng::entropy() ^ n.rotate_left(32));
+    format!("{}-{:016x}", std::process::id(), r.next_u64())
+}
+
+/// The marker that serializes everyone removing the lock that carries `token`.
+/// Hashed (FNV-1a) so an empty or foreign token is still a valid file name.
+fn break_marker(path: &Path, token: &str) -> PathBuf {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in token.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".break-{h:016x}"));
+    PathBuf::from(name)
+}
+
+fn older_than_stale(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age > TASK_LOCK_STALE)
+}
+
+/// How many levels of "a stale marker guarding a stale marker" are recovered
+/// before giving up. Each level needs its own crashed remover, so the cap is
+/// never reached without several independent crashes.
+const MAX_MARKER_DEPTH: u8 = 3;
+
+/// Take the break marker for `token`, or `None` if another remover holds it.
+/// The marker carries its own owner token. One older than [`TASK_LOCK_STALE`]
+/// was left by a remover that died; it is cleared by the same compare-and-
+/// remove discipline as a lock, guarded by a marker of its own, so a recoverer
+/// that judged it stale cannot delete a fresh marker that replaced it.
+fn take_marker(path: &Path, token: &str, depth: u8) -> Option<(PathBuf, String)> {
+    use std::io::Write;
+    let marker = break_marker(path, token);
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(mut f) => {
+                let mine = owner_token();
+                if f.write_all(mine.as_bytes()).is_err() {
+                    drop(f);
+                    let _ = std::fs::remove_file(&marker);
+                    return None;
+                }
+                return Some((marker, mine));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let judged = std::fs::read_to_string(&marker).ok();
+                match judged.filter(|_| older_than_stale(&marker)) {
+                    Some(judged) if depth < MAX_MARKER_DEPTH => {
+                        remove_lock_if(&marker, &judged, true, depth + 1)?;
+                    }
+                    _ => return None,
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Remove the lock at `path` if it still carries `token` (and, when
+/// `require_stale`, is still stale). Removal is serialized per token by the
+/// break marker, so a remover that judged an old lock cannot delete the fresh
+/// one that replaced it. `None` means the marker was busy: try again.
+fn remove_lock_if(path: &Path, token: &str, require_stale: bool, depth: u8) -> Option<bool> {
+    let (marker, mine) = take_marker(path, token, depth)?;
+    let still = std::fs::read_to_string(path).is_ok_and(|c| c == token)
+        && (!require_stale || older_than_stale(path));
+    if still {
+        let _ = std::fs::remove_file(path);
+    }
+    // Release the marker only if it is still ours.
+    if depth >= MAX_MARKER_DEPTH {
+        if std::fs::read_to_string(&marker).is_ok_and(|c| c == mine) {
+            let _ = std::fs::remove_file(&marker);
+        }
+    } else {
+        let _ = remove_lock_if(&marker, &mine, false, depth + 1);
+    }
+    Some(still)
+}
+
+/// Break the lock judged stale while it held `judged`. Returns whether it was
+/// removed; a lock that has since been replaced is left alone.
+fn break_stale(path: &Path, judged: &str) -> bool {
+    remove_lock_if(path, judged, true, 0).unwrap_or(false)
+}
 
 impl Drop for TaskLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match remove_lock_if(&self.path, &self.token, false, 0) {
+                Some(_) => return,
+                None if std::time::Instant::now() > deadline => return,
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
     }
 }
 
@@ -1269,18 +1381,30 @@ impl Queue {
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Ok(TaskLock(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .is_some_and(|age| age > TASK_LOCK_STALE);
-                    if stale {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    let token = owner_token();
+                    if let Err(e) = file.write_all(token.as_bytes()) {
+                        drop(file);
                         let _ = std::fs::remove_file(&path);
-                    } else if started.elapsed() > TASK_LOCK_STALE {
-                        bail!("could not lock task {id}");
-                    } else {
+                        return Err(e).with_context(|| format!("lock {}", path.display()));
+                    }
+                    return Ok(TaskLock { path, token });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Content first, then age: a lock replaced in between
+                    // reads fresh, never stale.
+                    let judged = std::fs::read_to_string(&path).ok();
+                    let broken = judged
+                        .filter(|_| older_than_stale(&path))
+                        .is_some_and(|judged| break_stale(&path, &judged));
+                    // A break that does not happen (marker busy, recovery
+                    // exhausted) is a wait like any other, so it meets the
+                    // same deadline instead of spinning forever.
+                    if !broken {
+                        if started.elapsed() > TASK_LOCK_STALE {
+                            bail!("could not lock task {id}");
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(15));
                     }
                 }
@@ -3373,5 +3497,94 @@ mod tests {
             stored.attempts, 10,
             "linking never rewinds the daemon's work"
         );
+    }
+
+    fn age_lock(path: &Path) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_stale_takeover_yields_one_holder() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        for _ in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let q = Queue::at(dir.path().to_path_buf());
+            let lock = dir.path().join("t.write-lock");
+            std::fs::write(&lock, "dead-0000").unwrap();
+            age_lock(&lock);
+            let n = 6;
+            let barrier = Arc::new(Barrier::new(n));
+            let (now, max) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let handles: Vec<_> = (0..n)
+                .map(|_| {
+                    let (q, b, now, max) = (q.clone(), barrier.clone(), now.clone(), max.clone());
+                    std::thread::spawn(move || {
+                        b.wait();
+                        let g = q.lock_task("t").unwrap();
+                        let held = now.fetch_add(1, Ordering::SeqCst) + 1;
+                        max.fetch_max(held, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        now.fetch_sub(1, Ordering::SeqCst);
+                        drop(g);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(max.load(Ordering::SeqCst), 1);
+            assert!(!lock.exists());
+        }
+    }
+
+    #[test]
+    fn dropping_a_stolen_lock_leaves_the_new_holders_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().to_path_buf());
+        let lock = dir.path().join("t.write-lock");
+        let a = q.lock_task("t").unwrap();
+        age_lock(&lock);
+        let b = q.lock_task("t").unwrap();
+        assert_ne!(a.token, b.token);
+        drop(a);
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), b.token);
+        drop(b);
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn break_stale_leaves_a_lock_that_replaced_the_one_judged() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("t.write-lock");
+        std::fs::write(&lock, "new-token").unwrap();
+        assert!(!break_stale(&lock, "old-token"));
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), "new-token");
+        // Same token but fresh: not stale any more, so also left alone.
+        assert!(!break_stale(&lock, "new-token"));
+        assert!(lock.exists());
+        age_lock(&lock);
+        assert!(break_stale(&lock, "new-token"));
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn a_stale_break_marker_is_recovered_and_a_fresh_one_is_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("t.write-lock");
+        std::fs::write(&lock, "dead-1").unwrap();
+        age_lock(&lock);
+        let marker = break_marker(&lock, "dead-1");
+        std::fs::write(&marker, "crashed-remover").unwrap();
+        // Fresh marker: another remover is working, so nothing is broken.
+        assert!(!break_stale(&lock, "dead-1"));
+        assert!(lock.exists());
+        // Stale marker: recovered, then the lock is broken.
+        age_lock(&marker);
+        assert!(break_stale(&lock, "dead-1"));
+        assert!(!lock.exists());
+        assert!(!marker.exists());
     }
 }
