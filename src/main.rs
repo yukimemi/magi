@@ -2082,6 +2082,13 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         }
     };
 
+    // A merge approval's deadline is fixed at `asked_at + answer_timeout` (the
+    // instant land abandons it), whatever this process's config or a reply says.
+    let budget = if q.node == magi::land::APPROVAL_NODE && q.answer_timeout > 0 {
+        remaining_answer_budget(q.asked_at, q.answer_timeout)
+    } else {
+        budget
+    };
     match ask::ask_and_wait(&mut q, &store, &cfg.notify, budget).await? {
         ask::Wait::Answered(answer) => {
             ask::deliver_answer(&store, &mut q, &answer, &mut std::io::stdout())?;
@@ -2201,10 +2208,13 @@ async fn ask_wait_cmd(
     }
 
     let total = answer_timeout_for_wait(&q, timeout.unwrap_or(cfg.graph.answer_timeout));
-    let remaining = remaining_answer_budget(
-        jiff::Timestamp::from_second(q.last_activity()).unwrap_or(q.asked_at),
-        total,
-    );
+    // A merge approval's clock never restarts on a reply (see `deputy::deadline`).
+    let from = if q.node == magi::land::APPROVAL_NODE {
+        q.asked_at
+    } else {
+        jiff::Timestamp::from_second(q.last_activity()).unwrap_or(q.asked_at)
+    };
+    let remaining = remaining_answer_budget(from, total);
 
     eprintln!("resuming the wait on {} — waiting for the owner", q.short());
     match ask::resume_wait(&mut q, store, remaining).await? {

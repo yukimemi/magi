@@ -767,11 +767,15 @@ impl Question {
                 None
             };
             let exact = word.is_some_and(|w| {
+                // The owner's latest message must be the word: an earlier one
+                // may since have been qualified or withdrawn.
                 quote.eq_ignore_ascii_case(w)
                     && self
                         .thread
                         .iter()
-                        .any(|t| t.who == Who::Operator && t.body.trim().eq_ignore_ascii_case(w))
+                        .rev()
+                        .find(|t| t.who == Who::Operator)
+                        .is_some_and(|t| t.body.trim().eq_ignore_ascii_case(w))
             });
             if !exact {
                 bail!(
@@ -2822,6 +2826,27 @@ mod tests {
         );
         q.settle_by_deputy("deputy-x", "merge", "Merge").unwrap();
         assert_eq!(q.resolution().as_deref(), Some("merge"));
+    }
+
+    #[test]
+    fn a_later_owner_message_supersedes_an_earlier_merge() {
+        let mut q = Question::new(
+            "run".into(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Merge?".into(),
+            String::new(),
+            vec!["merge".into(), "hold".into()],
+        );
+        let mut dep = Deputy::new("brief".into());
+        dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
+        q.deputy = Some(dep);
+        q.say("merge").unwrap();
+        q.reply("sure?", vec!["merge".into(), "hold".into()])
+            .unwrap();
+        q.say("wait, don't merge").unwrap();
+        assert!(q.settle_by_deputy("deputy-x", "merge", "merge").is_err());
+        assert_eq!(q.status, QuestionStatus::Open);
     }
 
     #[test]
