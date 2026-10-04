@@ -1046,6 +1046,12 @@ pub struct ResolvedRoles {
     /// quota fallback needs the *whole* list to walk forward through when
     /// that one slot's agent runs out of quota mid-run.
     pub implementer_roster: Vec<AgentSpec>,
+    /// [`Self::implementer_roster`]'s counterpart for judge seats: the whole
+    /// `[roles] judges` list (or every agent), untruncated and unrotated, for
+    /// the per-seat handover when a judge's agent fails.
+    pub judge_roster: Vec<AgentSpec>,
+    /// Likewise for reviewer seats.
+    pub reviewer_roster: Vec<AgentSpec>,
 }
 
 /// Every array-valued key in a config table, as a dotted path.
@@ -1545,6 +1551,8 @@ impl Config {
                     .unwrap_or_else(|_| self.agents[0].clone()),
             },
             implementer_roster: self.full_roster(&self.roles.implementers)?,
+            judge_roster: self.full_roster(&self.roles.judges)?,
+            reviewer_roster: self.full_roster(&self.roles.reviewers)?,
         })
     }
 
@@ -1581,6 +1589,17 @@ impl Config {
             return self.rotate(&self.roles.advisors, self.graph.advisors, 0);
         }
         self.rotate(&self.roles.judges, self.graph.advisors, 1)
+    }
+
+    /// The untruncated roster advisor seats hand over along: `[roles]
+    /// advisors` when set, otherwise the judges' roster, exactly as
+    /// [`Self::advisors`] chooses its own list.
+    pub fn advisor_roster(&self) -> Result<Vec<AgentSpec>> {
+        if self.roles.advisors.is_empty() {
+            self.full_roster(&self.roles.judges)
+        } else {
+            self.full_roster(&self.roles.advisors)
+        }
     }
 
     /// Shell prefix for [`Verify`] commands.

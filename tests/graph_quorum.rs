@@ -219,27 +219,36 @@ async fn a_plain_failure_collapse_stalls_and_recovers_on_resume() {
     runner.execute().await.expect("execute");
     let state = &runner.state;
 
-    // A plain failure is retried (records a retry artifact) but not mistaken for
-    // quota.
+    // A plain failure is not mistaken for quota, and is not nudged on the same
+    // agent: the seat is handed to the next roster agent instead (judge-1 is
+    // `beta`, so `gamma`), and the chain stops there because `gamma` fails it
+    // the same way. judge-2 is `gamma` itself, the roster's tail.
     let art = state.dir().join("artifacts");
     assert!(
-        art.join("judge-1-retry1.out").exists(),
-        "a plain failure is retried like any other unusable reply"
+        !art.join("judge-1-retry1.out").exists(),
+        "a failed agent is handed over, not re-asked"
     );
     assert!(
         state.quota.is_empty(),
         "a plain failure is not a quota loss"
     );
-    // The retry itself is a fact in the timeline, not only an artifact on
-    // disk: an operator staring at a stalled run needs to see that a nudge
-    // was sent without going digging in `artifacts/`.
+    // The handover is a fact in the timeline and in the structured record, not
+    // only an artifact on disk.
     assert!(
         state
             .events
             .iter()
-            .any(|e| e.node == "judge" && e.message.contains("retry 1")),
-        "no retry event recorded: {:?}",
+            .any(|e| e.node == "judge" && e.message.contains("handed over beta -> gamma")),
+        "no handover event recorded: {:?}",
         state.events
+    );
+    assert_eq!(
+        state
+            .handovers
+            .iter()
+            .map(|h| (h.seat.as_str(), h.from.as_str(), h.to.as_str()))
+            .collect::<Vec<_>>(),
+        [("judge-1", "beta", "gamma")]
     );
     // Every seat this run ever marked as answering was cleared once it did,
     // whatever the outcome — a stalled run must not still claim a seat is

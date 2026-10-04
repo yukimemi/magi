@@ -636,6 +636,26 @@ pub struct QuotaLoss {
     pub reset: Option<String>,
 }
 
+/// A seat handed from one roster agent to the next after the first failed it
+/// (rate limit, timeout or an ordinary failure), recorded so the answer's
+/// author is never a mystery and a run that recovered on its second agent
+/// still says what it cost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Handover {
+    /// When the seat changed hands.
+    pub at: Timestamp,
+    /// Node that was running, e.g. `implement`, `judge`, `review`.
+    pub node: String,
+    /// Seat key, e.g. `impl-A` or `judge-2`.
+    pub seat: String,
+    /// Agent id that failed the seat.
+    pub from: String,
+    /// Agent id that took it over.
+    pub to: String,
+    /// Why: `rate limited (quota)`, `timed out`, or the failure's own message.
+    pub reason: String,
+}
+
 /// A newly created lockfile of a package manager the directory does not use,
 /// which a rescue commit left untracked instead of committing. Recorded so the
 /// omission is visible: the file may be one the task really wanted.
@@ -1763,6 +1783,10 @@ pub struct RunState {
     /// Seats lost to a CLI rate limit / quota, in the order they hit.
     #[serde(default)]
     pub quota: Vec<QuotaLoss>,
+    /// Seats handed to the next roster agent after a failure, in order.
+    /// Additive, so `SCHEMA` is not bumped.
+    #[serde(default)]
+    pub handovers: Vec<Handover>,
     /// Stray foreign lockfiles a rescue commit left out, one entry per path.
     #[serde(default)]
     pub withheld: Vec<Withheld>,
@@ -1947,6 +1971,7 @@ impl RunState {
             merge: None,
             leaks: Vec::new(),
             quota: Vec::new(),
+            handovers: Vec::new(),
             withheld: Vec::new(),
             parked: false,
             released_to: None,
