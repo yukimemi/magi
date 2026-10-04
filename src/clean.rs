@@ -64,6 +64,10 @@ pub struct Housekeeping {
     /// opening one itself — and corrected automatically. See
     /// [`reconcile_external_merges`].
     pub external_merges_recorded: usize,
+    /// Run records that still called their pull request open after it was
+    /// merged or closed, and were rewritten (see
+    /// [`crate::land::repair_stale_pr_states`]).
+    pub stale_pr_states_repaired: usize,
 }
 
 /// Run the janitor: fold due runs, reclaim orphaned worktrees, prune stale
@@ -111,6 +115,9 @@ pub async fn housekeep(
             tracing::warn!("housekeep: prune worktree registrations: {e:#}");
         }
         out.external_merges_recorded = reconcile_external_merges(&runs, home, &cfg.disk, now).await;
+        // Bounded: a handful of forge lookups a pass keeps this cheap, and the
+        // pass is idempotent, so a backlog drains over several passes.
+        out.stale_pr_states_repaired = crate::land::repair_stale_pr_states(home, 5).await.0;
     }
     match prune_cache_if_over_limit(cfg, home) {
         Ok(Some(pruned)) => {

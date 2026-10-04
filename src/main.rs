@@ -280,6 +280,15 @@ enum Command {
         /// land loop would have written them itself.
         #[arg(long, value_name = "PR_URL", requires = "id")]
         merged: Option<String>,
+        /// Repair run records that froze an `open` pull request: for every
+        /// finished run still recording one, ask the forge, and rewrite the
+        /// merged / closed ones (a run that was handed over or left blocked
+        /// while another run landed the pull request never learns of it). A
+        /// pull request still open, or one the forge cannot be asked about, is
+        /// left untouched. Safe to repeat; the daemon's janitor does a bounded
+        /// version of the same pass on its own.
+        #[arg(long, conflicts_with_all = ["id", "all", "merged"])]
+        repair_prs: bool,
     },
     /// Inspect and shrink the shared build cache.
     ///
@@ -1288,7 +1297,22 @@ async fn dispatch(command: Command) -> Result<()> {
             Ok(())
         }
 
-        Command::Fold { id, all, merged } => {
+        Command::Fold {
+            repair_prs: true, ..
+        } => {
+            let (fixed, failed) = land::repair_stale_pr_states(&magi::run::home(), 200).await;
+            println!("rewrote {fixed} run record(s) to the pull request's real state");
+            if failed > 0 {
+                println!(
+                    "{failed} pull request(s) could not be read from the forge; left as recorded"
+                );
+            }
+            Ok(())
+        }
+
+        Command::Fold {
+            id, all, merged, ..
+        } => {
             // clap's own `requires = "id"` on `--merged` rejects this at parse
             // time already; this is the belt to that suspenders for any
             // caller that builds a `Command::Fold` directly rather than

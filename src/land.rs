@@ -1946,6 +1946,162 @@ pub(crate) async fn correct_confirmed_external_merge(
     correct_merge(state, url).await
 }
 
+/// Same pull request, same repository: the url, or the number within one repo.
+fn names_same_pr(a: &RunState, url: &str, number: u64, repo: &Path) -> bool {
+    let Some(pr) = a.pr.as_ref() else {
+        return false;
+    };
+    if !url.is_empty()
+        && pr
+            .url
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(url.trim_end_matches('/'))
+    {
+        return true;
+    }
+    number > 0
+        && pr.number == number
+        && match (a.repo.canonicalize(), repo.canonicalize()) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => a.repo == repo,
+        }
+}
+
+/// Rewrite `pr.state` to a final state on every run record under `home` that
+/// `decide` picks, and report how many were rewritten.
+///
+/// This is the one place a run other than the driver changes another run's
+/// record, so it is deliberately narrow: only a **terminal** run (never one a
+/// driver may still be writing), never one a live daemon claims, only a record
+/// whose `pr.state` is still `open`, and only `merged` / `closed` ever goes in.
+/// The record is read as folding reads it (no schema check: every bump so far
+/// only added fields, and the whole struct round-trips) and written through
+/// [`RunState::save_under`], the path every record uses, so nothing but
+/// `pr.state` and an event line changes (and `updated_at`, as for any save).
+/// A run that cannot be read or written is skipped with a warning.
+fn rewrite_open_prs(
+    home: &Path,
+    decide: &mut dyn FnMut(&RunState) -> Option<PrLifecycle>,
+) -> usize {
+    let now = Timestamp::now();
+    let mut changed = 0;
+    for id in crate::run::list_ids_in(&home.join("runs")) {
+        let path = home.join("runs").join(&id).join("run.json");
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut state) = serde_json::from_str::<RunState>(&body) else {
+            continue;
+        };
+        if !state.status.done()
+            || state.pr.as_ref().is_none_or(|p| p.state != "open")
+            || crate::daemon::is_working_on(home, &id, now)
+        {
+            continue;
+        }
+        let Some(to @ (PrLifecycle::Merged | PrLifecycle::Closed)) = decide(&state) else {
+            continue;
+        };
+        if let Some(pr) = state.pr.as_mut() {
+            pr.state = to.as_str().to_owned();
+        }
+        let url = state.pr.as_ref().map(|p| p.url.clone()).unwrap_or_default();
+        state.event(
+            "land",
+            format!("recorded {url} as {}: another run settled it", to.as_str()),
+        );
+        match state.save_under(home) {
+            Ok(()) => changed += 1,
+            Err(e) => tracing::warn!("write pr state through to run {id}: {e:#}"),
+        }
+    }
+    changed
+}
+
+/// A run reached a final state for its pull request: tell every other terminal
+/// run in the same repository that names the same pull request (handed-over
+/// predecessors, blocked attempts, anything), so their records stop saying
+/// `open`. Best effort; `run`'s own record is the caller's.
+pub(crate) fn write_pr_state_through(run: &RunState, to: PrLifecycle) {
+    if to == PrLifecycle::Open {
+        return;
+    }
+    let Some(home) = crate::run::try_home() else {
+        return;
+    };
+    write_pr_state_through_in(&home, run, to);
+}
+
+pub(crate) fn write_pr_state_through_in(home: &Path, run: &RunState, to: PrLifecycle) -> usize {
+    let Some(pr) = run.pr.as_ref() else {
+        return 0;
+    };
+    let (url, number) = (pr.url.clone(), pr.number);
+    rewrite_open_prs(home, &mut |other| {
+        (other.id != run.id && names_same_pr(other, &url, number, &run.repo)).then_some(to)
+    })
+}
+
+/// Terminal runs whose record still says their pull request is open, as
+/// `(run id, repo, url)`, for [`repair_stale_pr_states`].
+pub(crate) fn stale_open_prs(home: &Path) -> Vec<(String, PathBuf, String)> {
+    let now = Timestamp::now();
+    let mut out = Vec::new();
+    for id in crate::run::list_ids_in(&home.join("runs")) {
+        let path = home.join("runs").join(&id).join("run.json");
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(state) = serde_json::from_str::<RunState>(&body) else {
+            continue;
+        };
+        if let Some(pr) = state.pr.as_ref()
+            && state.status.done()
+            && pr.state == "open"
+            && !pr.url.is_empty()
+            && !crate::daemon::is_working_on(home, &id, now)
+        {
+            out.push((id, state.repo.clone(), pr.url.clone()));
+        }
+    }
+    out
+}
+
+/// Apply forge answers (`pr url -> state`) to every stale terminal record.
+/// A url with no answer (the forge was unreadable) changes nothing.
+pub(crate) fn apply_pr_states(home: &Path, known: &BTreeMap<String, PrLifecycle>) -> usize {
+    rewrite_open_prs(home, &mut |s| {
+        s.pr.as_ref().and_then(|p| known.get(&p.url)).copied()
+    })
+}
+
+/// One-time (and idempotent) repair of records that froze an `open` pull
+/// request: ask the forge about each distinct pull request that a terminal run
+/// still calls open - at most `max_lookups` of them - and rewrite the merged
+/// and closed ones. A genuinely open pull request is left alone, and a lookup
+/// that fails is "unknown, change nothing". Returns `(records rewritten,
+/// lookups that failed)`.
+pub async fn repair_stale_pr_states(home: &Path, max_lookups: usize) -> (usize, usize) {
+    let mut known = BTreeMap::new();
+    let mut failed = 0;
+    let mut seen = BTreeSet::new();
+    for (_, repo, url) in stale_open_prs(home) {
+        if known.len() + failed >= max_lookups || !seen.insert(url.clone()) {
+            continue;
+        }
+        match lifecycle(&repo, &url).await {
+            Ok(state) => {
+                known.insert(url, state);
+            }
+            Err(e) => {
+                tracing::warn!("repair pr state of {url}: {e:#}");
+                failed += 1;
+            }
+        }
+    }
+    (apply_pr_states(home, &known), failed)
+}
+
 async fn correct_merge(state: &mut RunState, url: &str) -> Result<(RunStatus, RunStatus)> {
     match lifecycle(&state.repo, url).await? {
         PrLifecycle::Merged => {}
@@ -2296,6 +2452,7 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                 });
                 state.event("land", detail);
                 state.save()?;
+                write_pr_state_through(state, pr.state);
                 return Ok(pr);
             }
             Step::Merge => {
@@ -2366,6 +2523,7 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                     state.event("land", format!("merged {} as `{subject}`", pr.url));
                     announce_red_merge(state, &pr).await;
                     state.save()?;
+                    write_pr_state_through(state, pr.state);
                     return Ok(pr);
                 }
                 let after = observe(&repo, pr_url).await.ok().map(|s| s.pr.state);
@@ -2379,6 +2537,7 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
                     state.event("land", format!("merged {} as `{subject}`", pr.url));
                     announce_red_merge(state, &pr).await;
                     state.save()?;
+                    write_pr_state_through(state, pr.state);
                     return Ok(pr);
                 }
                 stop(
@@ -4773,5 +4932,176 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             crate::config::Config::default(),
         );
         assert_eq!(find_external_merge(&state).await.unwrap(), None);
+    }
+
+    fn pr_run(home: &Path, id: &str, repo: &str, status: RunStatus, url: &str, state: &str) {
+        let mut run = RunState::new(
+            PathBuf::from(repo),
+            "main".to_owned(),
+            "abcdef1234".to_owned(),
+            "x".to_owned(),
+            crate::config::Config::default(),
+        );
+        run.id = id.to_owned();
+        run.status = status;
+        run.pr = Some(crate::run::PrRecord {
+            number: url.rsplit('/').next().unwrap().parse().unwrap(),
+            url: url.to_owned(),
+            state: state.to_owned(),
+            checks: "red".to_owned(),
+            round: 0,
+            rounds: 2,
+            red_at_merge: Vec::new(),
+        });
+        run.save_under(home).unwrap();
+    }
+
+    fn recorded(home: &Path, id: &str) -> String {
+        let body = std::fs::read_to_string(home.join("runs").join(id).join("run.json")).unwrap();
+        serde_json::from_str::<RunState>(&body)
+            .unwrap()
+            .pr
+            .unwrap()
+            .state
+    }
+
+    const PR: &str = "https://github.com/o/r/pull/7";
+
+    #[test]
+    fn write_through_updates_predecessors_and_siblings_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = tmp.path();
+        pr_run(
+            h,
+            "20261004-100000-aaaa",
+            "/repo/r",
+            RunStatus::Superseded,
+            PR,
+            "open",
+        );
+        pr_run(
+            h,
+            "20261004-100100-bbbb",
+            "/repo/r",
+            RunStatus::Blocked,
+            PR,
+            "open",
+        );
+        // Not terminal: a driver may be writing it.
+        pr_run(
+            h,
+            "20261004-100200-cccc",
+            "/repo/r",
+            RunStatus::Landing,
+            PR,
+            "open",
+        );
+        // Another repository's pull request with the same number.
+        pr_run(
+            h,
+            "20261004-100300-dddd",
+            "/repo/other",
+            RunStatus::Blocked,
+            "https://github.com/o/other/pull/7",
+            "open",
+        );
+        // A different pull request of the same repository.
+        pr_run(
+            h,
+            "20261004-100400-eeee",
+            "/repo/r",
+            RunStatus::Blocked,
+            "https://github.com/o/r/pull/8",
+            "open",
+        );
+        pr_run(
+            h,
+            "20261004-100500-ffff",
+            "/repo/r",
+            RunStatus::Merged,
+            PR,
+            "open",
+        );
+        let source = RunState::load_under("20261004-100500-ffff", h).unwrap();
+
+        assert_eq!(
+            write_pr_state_through_in(h, &source, PrLifecycle::Merged),
+            2
+        );
+        assert_eq!(recorded(h, "20261004-100000-aaaa"), "merged");
+        assert_eq!(recorded(h, "20261004-100100-bbbb"), "merged");
+        assert_eq!(recorded(h, "20261004-100200-cccc"), "open");
+        assert_eq!(recorded(h, "20261004-100300-dddd"), "open");
+        assert_eq!(recorded(h, "20261004-100400-eeee"), "open");
+        // The source's own record is the caller's to write.
+        assert_eq!(recorded(h, "20261004-100500-ffff"), "open");
+        // Idempotent.
+        assert_eq!(
+            write_pr_state_through_in(h, &source, PrLifecycle::Merged),
+            0
+        );
+        let hit = RunState::load_under("20261004-100000-aaaa", h).unwrap();
+        assert!(hit.events.iter().any(|e| e.message.contains("merged")));
+    }
+
+    #[test]
+    fn repair_rewrites_merged_and_closed_and_leaves_open_and_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = tmp.path();
+        let url = |n: u32| format!("https://github.com/o/r/pull/{n}");
+        pr_run(
+            h,
+            "20261004-100000-aaaa",
+            "/repo/r",
+            RunStatus::Superseded,
+            &url(1),
+            "open",
+        );
+        pr_run(
+            h,
+            "20261004-100100-bbbb",
+            "/repo/r",
+            RunStatus::Blocked,
+            &url(2),
+            "open",
+        );
+        pr_run(
+            h,
+            "20261004-100200-cccc",
+            "/repo/r",
+            RunStatus::Ready,
+            &url(3),
+            "open",
+        );
+        pr_run(
+            h,
+            "20261004-100300-dddd",
+            "/repo/r",
+            RunStatus::Ready,
+            &url(4),
+            "open",
+        );
+        pr_run(
+            h,
+            "20261004-100400-eeee",
+            "/repo/r",
+            RunStatus::Implementing,
+            &url(1),
+            "open",
+        );
+        assert_eq!(stale_open_prs(h).len(), 4);
+
+        let mut known = BTreeMap::new();
+        known.insert(url(1), PrLifecycle::Merged);
+        known.insert(url(2), PrLifecycle::Closed);
+        known.insert(url(3), PrLifecycle::Open);
+        // #4: the forge could not be read, so it has no answer.
+        assert_eq!(apply_pr_states(h, &known), 2);
+        assert_eq!(recorded(h, "20261004-100000-aaaa"), "merged");
+        assert_eq!(recorded(h, "20261004-100100-bbbb"), "closed");
+        assert_eq!(recorded(h, "20261004-100200-cccc"), "open");
+        assert_eq!(recorded(h, "20261004-100300-dddd"), "open");
+        assert_eq!(recorded(h, "20261004-100400-eeee"), "open");
+        assert_eq!(apply_pr_states(h, &known), 0);
     }
 }

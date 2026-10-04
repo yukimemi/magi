@@ -31,6 +31,7 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
+use crate::land::PrLifecycle;
 use crate::proc::Quiet as _;
 use crate::queue::{Queue, Task, TaskStatus};
 use crate::run::RunStatus;
@@ -142,6 +143,9 @@ struct RunView {
     candidates: Vec<CandView>,
     #[serde(default)]
     pr: Option<PrView>,
+    /// The run that took this one's worktree (and pull request) over.
+    #[serde(default)]
+    released_to: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -179,6 +183,80 @@ impl RunView {
     }
 }
 
+/// Decides whether the pull request a run's record still calls open is in fact
+/// settled, so a stale record stops claiming it.
+///
+/// A record freezes the last state its land loop polled. A run that was handed
+/// over (`released_to`) or left blocked while another run landed the same pull
+/// request keeps saying `open` forever, so the record alone cannot be trusted
+/// to *keep* a claim alive. Two answers, cheapest first:
+///
+/// 1. a released run does not own the pull request any more: ownership follows
+///    `released_to`, and the successor's own record (read like any other run's)
+///    decides - provided that record is readable;
+/// 2. otherwise the forge is asked, once per number, at most
+///    [`MAX_FORGE_LOOKUPS`] numbers, and never again after one lookup failed
+///    (offline stays fast). Merged or closed means no claim; open, an error or
+///    a skipped lookup means the claim stands. Claiming too much is the cheap
+///    error.
+struct Staleness<'a> {
+    runs_root: &'a Path,
+    lookup: &'a dyn Fn(&Path, u64) -> Option<PrLifecycle>,
+    cache: HashMap<u64, bool>,
+    asked: usize,
+    failed: bool,
+}
+
+/// How many pull requests one invocation may put to the forge on behalf of
+/// stale records.
+const MAX_FORGE_LOOKUPS: usize = 5;
+
+impl<'a> Staleness<'a> {
+    fn new(runs_root: &'a Path, lookup: &'a dyn Fn(&Path, u64) -> Option<PrLifecycle>) -> Self {
+        Self {
+            runs_root,
+            lookup,
+            cache: HashMap::new(),
+            asked: 0,
+            failed: false,
+        }
+    }
+
+    /// `true` when `view`'s recorded-open pull request is known not to be this
+    /// run's to claim any more.
+    fn pr_released(&mut self, repo: &Path, view: &RunView) -> bool {
+        let Some(pr) = view.pr.as_ref().filter(|p| p.state == "open") else {
+            return false;
+        };
+        if let Some(next) = &view.released_to
+            && next != &view.id
+            && RunView::read(self.runs_root, next).is_some()
+        {
+            return true;
+        }
+        if pr.number == 0 {
+            return false;
+        }
+        if let Some(known) = self.cache.get(&pr.number) {
+            return *known;
+        }
+        if self.failed || self.asked >= MAX_FORGE_LOOKUPS {
+            return false;
+        }
+        self.asked += 1;
+        let settled = match (self.lookup)(repo, pr.number) {
+            Some(PrLifecycle::Merged | PrLifecycle::Closed) => true,
+            Some(PrLifecycle::Open) => false,
+            None => {
+                self.failed = true;
+                false
+            }
+        };
+        self.cache.insert(pr.number, settled);
+        settled
+    }
+}
+
 /// Something an unfinished piece of work owns.
 #[derive(Debug, Clone)]
 struct Claim {
@@ -212,6 +290,7 @@ pub fn check(
         review_branch,
         ignore_task,
         &gh_open_pr,
+        &gh_pr_state,
     )
 }
 
@@ -219,6 +298,9 @@ pub fn check(
 /// pull request `n` of `repo` is open (`Some(url)`) or not / unknown (`None`).
 /// It is asked only about numbers the text names that no local record already
 /// explained, so a PR magi never produced (opened by hand) still collides.
+/// `pr_state(repo, n)` is the forge's word on a pull request a run record calls
+/// open (`None` = unreadable, which keeps the claim); see [`Staleness`].
+#[allow(clippy::too_many_arguments)]
 pub fn check_with(
     queue: &Queue,
     runs_root: &Path,
@@ -227,7 +309,9 @@ pub fn check_with(
     review_branch: Option<&str>,
     ignore_task: Option<&str>,
     open_pr: &dyn Fn(&Path, u64) -> Option<String>,
+    pr_state: &dyn Fn(&Path, u64) -> Option<PrLifecycle>,
 ) -> Vec<Hit> {
+    let mut stale = Staleness::new(runs_root, pr_state);
     let mut idents = Idents::default();
     let here = idents.of(repo);
     let tasks = queue.list();
@@ -250,7 +334,7 @@ pub fn check_with(
         .filter(|t| t.status != TaskStatus::Done && Some(t.id.as_str()) != ignore_task)
         .filter(|t| idents.of(&t.repo) == here)
     {
-        claims.extend(task_claims(t, runs_root, &mut from_task));
+        claims.extend(task_claims(t, runs_root, &mut from_task, repo, &mut stale));
     }
     for id in crate::run::list_ids_in(runs_root) {
         if own_runs.contains(&id) {
@@ -262,7 +346,19 @@ pub fn check_with(
         if (view.terminal() && !view.pr_open()) || idents.of(&view.repo) != here {
             continue;
         }
-        claims.extend(run_claims(&view, Owner::Run, None, "its own run"));
+        let released = stale.pr_released(repo, &view);
+        // A terminal run held up only by a pull request that is not its own
+        // (any more) claims nothing at all.
+        if view.terminal() && released {
+            continue;
+        }
+        claims.extend(run_claims(
+            &view,
+            Owner::Run,
+            None,
+            "its own run",
+            !released,
+        ));
     }
 
     let mut hits: Vec<Hit> = Vec::new();
@@ -336,6 +432,24 @@ pub fn check_with(
 /// today's behaviour. `GH_REPO` is dropped so the PR is looked up in `repo`'s
 /// own remote, not whatever the environment points at.
 fn gh_open_pr(repo: &Path, n: u64) -> Option<String> {
+    let v = gh_pr_view(repo, n)?;
+    (v["state"] == "OPEN")
+        .then(|| v["url"].as_str().map(str::to_owned))
+        .flatten()
+}
+
+/// [`gh_open_pr`]'s question asked of a pull request a run record names: its
+/// lifecycle, or `None` when the forge cannot say.
+fn gh_pr_state(repo: &Path, n: u64) -> Option<PrLifecycle> {
+    match gh_pr_view(repo, n)?["state"].as_str()? {
+        "OPEN" => Some(PrLifecycle::Open),
+        "MERGED" => Some(PrLifecycle::Merged),
+        "CLOSED" => Some(PrLifecycle::Closed),
+        _ => None,
+    }
+}
+
+fn gh_pr_view(repo: &Path, n: u64) -> Option<serde_json::Value> {
     let mut child = Command::new("gh")
         .quiet()
         .args(["pr", "view", &n.to_string(), "--json", "state,url"])
@@ -362,13 +476,16 @@ fn gh_open_pr(repo: &Path, n: u64) -> Option<String> {
     }
     let mut raw = String::new();
     std::io::Read::read_to_string(&mut child.stdout.take()?, &mut raw).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    (v["state"] == "OPEN")
-        .then(|| v["url"].as_str().map(str::to_owned))
-        .flatten()
+    serde_json::from_str(&raw).ok()
 }
 
-fn task_claims(t: &Task, runs_root: &Path, seen: &mut BTreeSet<String>) -> Vec<Claim> {
+fn task_claims(
+    t: &Task,
+    runs_root: &Path,
+    seen: &mut BTreeSet<String>,
+    repo: &Path,
+    stale: &mut Staleness<'_>,
+) -> Vec<Claim> {
     let status = t.status.as_str().to_owned();
     let mut out = Vec::new();
     if let Some(b) = &t.review_branch {
@@ -387,11 +504,13 @@ fn task_claims(t: &Task, runs_root: &Path, seen: &mut BTreeSet<String>) -> Vec<C
             seen.insert(rid.clone());
             // A merged or closed pull request is not in flight, even when the
             // task that owns it is.
+            let live_pr = !(view.terminal() && stale.pr_released(repo, &view));
             out.extend(run_claims(
                 &view,
                 Owner::Task,
                 Some((&t.id, &status)),
                 &format!("produced by its run {}", crate::queue::short(rid)),
+                live_pr,
             ));
         }
     }
@@ -399,7 +518,16 @@ fn task_claims(t: &Task, runs_root: &Path, seen: &mut BTreeSet<String>) -> Vec<C
 }
 
 /// The claims of one run, attributed to `owner` (the task, when there is one).
-fn run_claims(view: &RunView, owner: Owner, task: Option<(&str, &str)>, via: &str) -> Vec<Claim> {
+///
+/// `live_pr` is false when the record's open pull request is known to be
+/// settled or somebody else's (see [`Staleness`]); it then names no PR.
+fn run_claims(
+    view: &RunView,
+    owner: Owner,
+    task: Option<(&str, &str)>,
+    via: &str,
+    live_pr: bool,
+) -> Vec<Claim> {
     let (id, status) = match task {
         Some((id, status)) => (id.to_owned(), status.to_owned()),
         None => (view.id.clone(), view.status.clone()),
@@ -407,7 +535,7 @@ fn run_claims(view: &RunView, owner: Owner, task: Option<(&str, &str)>, via: &st
     let pr = view
         .pr
         .as_ref()
-        .filter(|p| p.state == "open" && p.number > 0)
+        .filter(|p| live_pr && p.state == "open" && p.number > 0)
         .map(|p| (p.number, p.url.clone()));
     let via_pr = |extra: &str| match &pr {
         Some((n, _)) => format!("{via} (PR #{n} open){extra}"),
@@ -680,7 +808,16 @@ mod tests {
     const RID: &str = "20260901-100000-aaaa";
 
     fn run(f: &Fx, text: &str, review: Option<&str>) -> Vec<Hit> {
-        check_with(&f.q, &f.runs, &f.repo, text, review, None, &|_, _| None)
+        check_with(
+            &f.q,
+            &f.runs,
+            &f.repo,
+            text,
+            review,
+            None,
+            &|_, _| None,
+            &|_, _| None,
+        )
     }
 
     #[test]
@@ -753,6 +890,10 @@ mod tests {
 
     #[test]
     fn terminal_run_with_open_pr_or_open_task_still_claims() {
+        // Changed deliberately: a terminal run's recorded-open PR now claims
+        // only while the forge says open or cannot be read (`run` passes an
+        // unreadable forge). A merged / closed answer or a released run no
+        // longer claims; see the `stale_open_*` tests below.
         let (f, base, _) = fx();
         write_run(&f, RID, "ready", &base, Some((48, "open")));
         assert!(!run(&f, "magi/aaaa/A", None).is_empty());
@@ -788,9 +929,16 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         sh(&other, &["init", "-q"]);
         assert!(
-            check_with(&f.q, &f.runs, &other, "magi/aaaa/A", None, None, &|_, _| {
-                None
-            })
+            check_with(
+                &f.q,
+                &f.runs,
+                &other,
+                "magi/aaaa/A",
+                None,
+                None,
+                &|_, _| None,
+                &|_, _| None,
+            )
             .is_empty()
         );
         // Editing the task that owns the run never collides with itself.
@@ -802,7 +950,8 @@ mod tests {
                 "magi/aaaa/A",
                 None,
                 Some(&t.id),
-                &|_, _| None
+                &|_, _| None,
+                &|_, _| None,
             )
             .is_empty()
         );
@@ -818,7 +967,17 @@ mod tests {
             &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "other"],
         );
         assert!(
-            !check_with(&f.q, &f.runs, &wt, "magi/aaaa/A", None, None, &|_, _| None).is_empty()
+            !check_with(
+                &f.q,
+                &f.runs,
+                &wt,
+                "magi/aaaa/A",
+                None,
+                None,
+                &|_, _| None,
+                &|_, _| None,
+            )
+            .is_empty()
         );
     }
 
@@ -826,7 +985,11 @@ mod tests {
     fn an_open_pr_without_a_run_record_matches_through_the_forge() {
         let (f, _, _) = fx();
         let open = |_: &Path, n: u64| (n == 48).then(|| "https://example.test/pull/48".to_owned());
-        let hit = |text: &str| check_with(&f.q, &f.runs, &f.repo, text, None, None, &open);
+        let hit = |text: &str| {
+            check_with(&f.q, &f.runs, &f.repo, text, None, None, &open, &|_, _| {
+                None
+            })
+        };
         let hits = hit("finish PR #48");
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].owner, Owner::Pr);
@@ -841,7 +1004,9 @@ mod tests {
         let (f, base, _) = fx();
         write_run(&f, RID, "ready", &base, Some((48, "open")));
         let open = |_: &Path, _: u64| Some("u".to_owned());
-        let hits = check_with(&f.q, &f.runs, &f.repo, "#48", None, None, &open);
+        let hits = check_with(&f.q, &f.runs, &f.repo, "#48", None, None, &open, &|_, _| {
+            None
+        });
         assert!(hits.iter().all(|h| h.owner != Owner::Pr), "{hits:?}");
         assert!(!hits.is_empty());
     }
@@ -852,7 +1017,126 @@ mod tests {
         write_run(&f, RID, "ready", &base, Some((48, "open")));
         let t = file_task(&f, TaskStatus::Running, &[RID]);
         let open = |_: &Path, _: u64| Some("u".to_owned());
-        let hits = check_with(&f.q, &f.runs, &f.repo, "#48", None, Some(&t.id), &open);
+        let hits = check_with(
+            &f.q,
+            &f.runs,
+            &f.repo,
+            "#48",
+            None,
+            Some(&t.id),
+            &open,
+            &|_, _| None,
+        );
         assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    fn with_forge(f: &Fx, text: &str, state: Option<PrLifecycle>) -> Vec<Hit> {
+        check_with(
+            &f.q,
+            &f.runs,
+            &f.repo,
+            text,
+            None,
+            None,
+            &|_, _| None,
+            &move |_, _| state,
+        )
+    }
+
+    fn release(f: &Fx, id: &str, to: &str) {
+        let path = f.runs.join(id).join("run.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["released_to"] = serde_json::json!(to);
+        std::fs::write(path, v.to_string()).unwrap();
+    }
+
+    #[test]
+    fn stale_open_pr_that_the_forge_says_is_merged_or_closed_does_not_claim() {
+        for state in [PrLifecycle::Merged, PrLifecycle::Closed] {
+            let (f, base, _) = fx();
+            write_run(&f, RID, "superseded", &base, Some((48, "open")));
+            assert!(with_forge(&f, "follow up on #48", Some(state)).is_empty());
+            assert!(with_forge(&f, "magi/aaaa/A", Some(state)).is_empty());
+            // Same through an owning, still-live task: the PR is not its claim.
+            file_task(&f, TaskStatus::Held, &[RID]);
+            let hits = with_forge(&f, "follow up on #48", Some(state));
+            assert!(hits.iter().all(|h| h.signal != Signal::Pr), "{hits:?}");
+        }
+    }
+
+    #[test]
+    fn stale_open_pr_with_an_unreadable_forge_still_claims() {
+        let (f, base, _) = fx();
+        write_run(&f, RID, "superseded", &base, Some((48, "open")));
+        let hits = with_forge(&f, "follow up on #48", None);
+        assert!(hits.iter().any(|h| h.signal == Signal::Pr), "{hits:?}");
+    }
+
+    #[test]
+    fn a_genuinely_open_pr_still_claims() {
+        let (f, base, _) = fx();
+        write_run(&f, RID, "blocked", &base, Some((48, "open")));
+        let hits = with_forge(&f, "follow up on #48", Some(PrLifecycle::Open));
+        assert!(hits.iter().any(|h| h.signal == Signal::Pr), "{hits:?}");
+    }
+
+    #[test]
+    fn a_released_run_defers_to_its_successor_without_asking_the_forge() {
+        let (f, base, _) = fx();
+        let next = "20260901-110000-bbbb";
+        write_run(&f, RID, "superseded", &base, Some((48, "open")));
+        write_run(&f, next, "merged", &base, Some((48, "merged")));
+        release(&f, RID, next);
+        let asked = std::cell::Cell::new(0);
+        let hits = check_with(
+            &f.q,
+            &f.runs,
+            &f.repo,
+            "follow up on #48",
+            None,
+            None,
+            &|_, _| None,
+            &|_, _| {
+                asked.set(asked.get() + 1);
+                None
+            },
+        );
+        assert!(hits.is_empty(), "{hits:?}");
+        assert_eq!(asked.get(), 0);
+        // A successor that cannot be read decides nothing: claim stands.
+        std::fs::remove_dir_all(f.runs.join(next)).unwrap();
+        let hits = with_forge(&f, "follow up on #48", None);
+        assert!(hits.iter().any(|h| h.signal == Signal::Pr), "{hits:?}");
+    }
+
+    #[test]
+    fn forge_lookups_are_cached_and_stop_after_a_failure() {
+        let (f, base, _) = fx();
+        for (i, id) in ["20260901-100000-aaa1", "20260901-100000-aaa2"]
+            .iter()
+            .enumerate()
+        {
+            write_run(&f, id, "blocked", &base, Some((48 + i as u64, "open")));
+        }
+        let asked = std::cell::Cell::new(0);
+        check_with(
+            &f.q,
+            &f.runs,
+            &f.repo,
+            "x",
+            None,
+            None,
+            &|_, _| None,
+            &|_, _| {
+                asked.set(asked.get() + 1);
+                None
+            },
+        );
+        assert_eq!(
+            asked.get(),
+            1,
+            "an unreadable forge is asked once, not per PR"
+        );
     }
 }
