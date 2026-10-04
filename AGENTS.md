@@ -1464,7 +1464,9 @@ never blocked or changed by it (`land_approval`, `review_rounds` untouched);
   finding ids and written with `Queue::create_new` (never `put`, which would
   rewind a task that has since run); the queue is scanned for tasks whose
   `FollowUp::run` is this run; and `RunState::followups` remembers what was
-  filed, so a completed or deleted follow-up is not recreated.
+  filed, so a completed or deleted follow-up is not recreated. Tasks found by
+  the queue scan are written back into `RunState::followups`, so a crash
+  between filing and the state save loses no record.
 - **Attribution.** `Source::Agent { run, node: "followup" }` plus
   `Task::followup` (`queue::SCHEMA` 8). Anything counting agent-filed tasks
   from `MAGI_RUN` must look at `node`. Filed `solo`, through the normal
@@ -1472,8 +1474,10 @@ never blocked or changed by it (`land_approval`, `review_rounds` untouched);
   instruction names the merged pull request, which it would refuse.
 - **Depth cap.** `Task::followup.generation` (ordinary task 0); a task of
   generation `MAX_FOLLOWUP_GENERATION` (2) files nothing and the event says so.
-  The parent's generation is remembered in `RunState::followup_generation` so
-  deleting the parent cannot reset it.
+  The daemon records the task's generation in `RunState::followup_generation`
+  when it starts or resumes the run, so deleting the parent later cannot reset
+  it; a run with an origin task whose depth was never recorded and whose task
+  is gone is treated as at the cap (nothing filed), never as generation 0.
 - **Best-effort.** `followup::after_merge` returns `()`, records failures as
   run events and never touches `status`. It is called from
   `Runner::run_land` after `bump::after_merge`, independent of it, and from

@@ -94,16 +94,20 @@ pub fn file(state: &mut RunState, pr_url: &str, queue: &Queue) -> Result<Outcome
     }
 
     let origin_task = state.origin.as_ref().and_then(|o| o.task.clone());
-    let parent_gen = match origin_task
-        .as_deref()
-        .and_then(|t| queue.get(t).ok())
-        .map(|t| t.followup.map_or(0, |f| f.generation))
-    {
-        Some(g) => {
-            state.followup_generation = Some(g);
-            g
-        }
-        None => state.followup_generation.unwrap_or(0),
+    // The depth recorded when the run started wins; the queue is only a
+    // fallback for runs that predate it, and an unknown depth is read as
+    // unbounded-until-proven-otherwise only when there is no origin task.
+    let parent_gen = match state.followup_generation {
+        Some(g) => g,
+        None => match origin_task.as_deref().map(|t| queue.get(t)) {
+            Some(Ok(t)) => {
+                let g = t.followup.map_or(0, |f| f.generation);
+                state.followup_generation = Some(g);
+                g
+            }
+            Some(Err(_)) => MAX_FOLLOWUP_GENERATION,
+            None => 0,
+        },
     };
     if parent_gen >= MAX_FOLLOWUP_GENERATION {
         out.capped = chosen.iter().map(|f| f.id.clone()).collect();
@@ -126,7 +130,13 @@ pub fn file(state: &mut RunState, pr_url: &str, queue: &Queue) -> Result<Outcome
         if let Some(f) = t.followup
             && f.run == state.id
         {
-            done.extend(f.findings);
+            done.extend(f.findings.iter().cloned());
+            if !state.followups.iter().any(|r| r.task == t.id) {
+                state.followups.push(FollowupRecord {
+                    task: t.id,
+                    findings: f.findings,
+                });
+            }
         }
     }
 
@@ -461,6 +471,7 @@ mod tests {
         let third = file(&mut s, "u", &q).unwrap();
         assert!(third.filed.is_empty());
         assert_eq!(q.list().len(), 2);
+        assert_eq!(s.followups.len(), 2, "records are restored from the queue");
     }
 
     #[test]
@@ -519,6 +530,11 @@ mod tests {
             by: crate::run::StartedBy::Operator,
             task: Some(parent.id.clone()),
         });
+        s.origin = Some(Origin {
+            by: crate::run::StartedBy::Operator,
+            task: Some("gone".to_owned()),
+        });
+        s.followup_generation = Some(MAX_FOLLOWUP_GENERATION);
         let out = file(&mut s, "u", &q).unwrap();
         assert!(out.filed.is_empty());
         assert!(!out.capped.is_empty());
