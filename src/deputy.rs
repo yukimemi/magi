@@ -121,18 +121,34 @@ pub fn brief(
     s
 }
 
-/// Has this question's deputy run out of starts with the deadline gone?
+/// Can `magi serve` start a deputy at all under `cfg`? Not when deputies are
+/// switched off (`daemon.max_deputies = 0`) or the config could not be read.
+pub fn can_start(cfg: Option<&Config>) -> bool {
+    cfg.is_some_and(|c| c.daemon.max_deputies > 0)
+}
+
+/// Has this question's deputy run out of starts, or can none ever start, with
+/// the deadline gone?
 ///
 /// Then nothing will ever read an unread say, and the waiter must retire the
 /// question anyway instead of deferring to a deputy that no longer starts.
-pub fn exhausted_past_deadline(q: &Question, default_timeout: u64, now: Timestamp) -> bool {
+/// `startable` is [`can_start`]; a fresh lease is the caller's to check.
+pub fn exhausted_past_deadline(
+    q: &Question,
+    startable: bool,
+    default_timeout: u64,
+    now: Timestamp,
+) -> bool {
     let secs = if q.answer_timeout > 0 {
         q.answer_timeout
     } else {
         default_timeout
     };
     q.status.open()
-        && q.deputy.as_ref().is_some_and(|d| d.starts >= MAX_STARTS)
+        && q
+            .deputy
+            .as_ref()
+            .is_some_and(|d| d.starts >= MAX_STARTS || !startable)
         && now.as_second() > q.last_activity().saturating_add(secs as i64)
 }
 
@@ -257,7 +273,7 @@ impl Deputies {
             if now.as_second() > deadline && q.unread_from_owner().is_none() {
                 continue;
             }
-            if self.inflight.len() >= self.max {
+            if self.inflight.len() >= self.max || !can_start(self.cfg.as_ref()) {
                 continue;
             }
             if matches!(self.memo.get(&q.id), Some(until) if Instant::now() < *until) {

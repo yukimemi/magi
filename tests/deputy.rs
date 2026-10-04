@@ -277,3 +277,62 @@ async fn a_spent_deputy_does_not_keep_an_expired_question_open() {
     assert_eq!(s.store.get(&s.q.id).unwrap().status, QuestionStatus::Abandoned);
 }
 }
+
+/// An unread say far past the deadline, with no deputy ever started.
+fn age_unread(s: &Scene) {
+    s.store
+        .update(&s.q.id, |q| {
+            q.answer_timeout = 60;
+            q.say("anyone there?")?;
+            q.thread[0].at = Timestamp::from_second(Timestamp::now().as_second() - 3600).unwrap();
+            q.asked_at = q.thread[0].at;
+            assert_eq!(q.deputy.as_ref().unwrap().starts, 0);
+            Ok(())
+        })
+        .unwrap();
+}
+
+common::e2e! {
+async fn an_unread_say_cannot_keep_a_question_open_when_no_deputy_can_start() {
+    let s = scene(home_lock().await);
+    age_unread(&s);
+    let mut off = s.fx.config.clone();
+    off.daemon.max_deputies = 0;
+    let mut waiter = Waiter::new(s.store.clone(), s.home.clone(), Some(off));
+    waiter.tick(Timestamp::now(), &|| false).await;
+    assert_eq!(s.store.get(&s.q.id).unwrap().status, QuestionStatus::Abandoned);
+}
+}
+
+common::e2e! {
+async fn an_unread_say_cannot_keep_a_question_open_when_the_config_is_unavailable() {
+    let s = scene(home_lock().await);
+    age_unread(&s);
+    let mut waiter = Waiter::new(s.store.clone(), s.home.clone(), None);
+    waiter.tick(Timestamp::now(), &|| false).await;
+    assert_eq!(s.store.get(&s.q.id).unwrap().status, QuestionStatus::Abandoned);
+}
+}
+
+common::e2e! {
+async fn a_live_deputy_within_its_deadline_keeps_the_question_open() {
+    let s = scene(home_lock().await);
+    s.store
+        .update(&s.q.id, |q| q.say("still here"))
+        .unwrap();
+    s.store.beat(&s.q.id, WaiterKind::Deputy);
+    let mut waiter = Waiter::new(s.store.clone(), s.home.clone(), Some(s.fx.config.clone()));
+    waiter.tick(Timestamp::now(), &|| false).await;
+    assert_eq!(s.store.get(&s.q.id).unwrap().status, QuestionStatus::Open);
+}
+}
+
+common::e2e! {
+async fn deputies_do_not_start_when_disabled() {
+    let s = scene(home_lock().await);
+    s.store.update(&s.q.id, |q| q.say("hello")).unwrap();
+    let mut d = deputies(&s, 0);
+    turn(&mut d).await;
+    assert!(log(&s).is_empty());
+}
+}

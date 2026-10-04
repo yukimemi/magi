@@ -4349,13 +4349,17 @@ struct QuestionView {
     /// from `waiting_on_agent`, which is whose *turn* it is, not whether
     /// anyone is there to take it.
     holder: Option<&'static str>,
+    /// Whether `magi serve` can start a follow-up agent for a conductor
+    /// question at all: false when `daemon.max_deputies = 0` or the config is
+    /// unreadable. Separate from `holder`, which says who is listening now.
+    deputies_enabled: bool,
 }
 
 impl QuestionView {
     /// The view of `question`, reading who is waiting on it from `store`.
     ///
     /// `holder` needs the lease sidecar, which is why this is not a `From`.
-    fn of(question: Question, store: &ask::Questions) -> Self {
+    fn of(question: Question, store: &ask::Questions, deputies_enabled: bool) -> Self {
         let base = md::ImageBase::QuestionPanel {
             id: question.id.clone(),
         };
@@ -4364,9 +4368,16 @@ impl QuestionView {
             detail_md: md::to_nodes(&question.detail, &base),
             waiting_on_agent: question.waiting_on_agent(),
             holder,
+            deputies_enabled,
             question,
         }
     }
+}
+
+/// Can `magi serve` start a deputy under the config this repository resolves?
+fn deputies_enabled(repo: &std::path::Path) -> bool {
+    let cfg = Config::discover(repo, None).ok().map(|(c, _)| c);
+    crate::deputy::can_start(cfg.as_ref())
 }
 
 /// Who is honestly waiting on an open question right now: `"asker"` (the
@@ -4404,7 +4415,7 @@ async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<Questio
             ui.questions
                 .list()
                 .into_iter()
-                .map(|q| QuestionView::of(q, &ui.questions))
+                .map(|q| QuestionView::of(q, &ui.questions, deputies_enabled(&ui.repo)))
                 .collect(),
         ))
     })
@@ -4509,7 +4520,7 @@ async fn question_answer(
             .questions
             .update(&q.id, |r| r.answer(answer))
             .map_err(ApiError::bad_request_from)?;
-        Ok(Json(QuestionView::of(q, &ui.questions)))
+        Ok(Json(QuestionView::of(q, &ui.questions, deputies_enabled(&ui.repo))))
     })
     .await
 }
@@ -4558,7 +4569,7 @@ async fn question_say(
             .questions
             .update(&q.id, |r| r.say(body.body))
             .map_err(ApiError::bad_request_from)?;
-        Ok(Json(QuestionView::of(q, &ui.questions)))
+        Ok(Json(QuestionView::of(q, &ui.questions, deputies_enabled(&ui.repo))))
     })
     .await
 }
@@ -5768,6 +5779,17 @@ mod tests {
         let deputy = beat(ask::WaiterKind::Deputy, 1);
         assert_eq!(holder_of(&c, Some(&deputy)), Some("deputy"));
         assert_eq!(holder_of(&c, Some(&stale)), Some("nobody"));
+    }
+
+    #[test]
+    fn deputies_enabled_follows_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing configured: the default allows deputies.
+        assert!(deputies_enabled(dir.path()));
+        let mut off = Config::default();
+        off.daemon.max_deputies = 0;
+        assert!(!crate::deputy::can_start(Some(&off)));
+        assert!(!crate::deputy::can_start(None));
     }
     use pretty_assertions::assert_eq;
     use serde_json::Value;

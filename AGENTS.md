@@ -1063,6 +1063,7 @@ not move on a say.
   the question's `answer_timeout` from `last_activity`: the waiter retires the
   question, and `daemon::resolve_blockers` then moves a task blocked on an
   abandoned conductor question to a machine hold.
+- **An unread say extends the deadline only for a deputy that can read it**: one with a fresh lease, or one that can still start (`deputy::can_start`: `daemon.max_deputies > 0` and a readable config) with starts left. Past the deadline with none of those, the waiter retires the question. `QuestionView::deputies_enabled` tells the UI, which then says nobody listens and only a choice resolves it.
 - **A say is not a decision.** The deputy answers it with `magi ask --thread`
   (repeating the choices, which a reply replaces). `magi ask --settle` records an
   answer only for `MAGI_NODE=deputy` with the seat recorded on the question, an

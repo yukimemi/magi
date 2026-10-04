@@ -208,7 +208,12 @@ impl Waiter {
                         // Unless that deputy is spent: then nobody will read
                         // the word, and the deadline still has to retire the
                         // question.
-                        if crate::deputy::exhausted_past_deadline(&q, self.default_timeout, now) {
+                        if crate::deputy::exhausted_past_deadline(
+                            &q,
+                            crate::deputy::can_start(self.conduct_cfg.as_ref()),
+                            self.default_timeout,
+                            now,
+                        ) {
                             self.expire(&q);
                         }
                         continue;
@@ -237,6 +242,7 @@ impl Waiter {
         } else {
             self.default_timeout
         };
+        let startable = crate::deputy::can_start(self.conduct_cfg.as_ref());
         let why = format!("no answer within {}s of asking", secs.max(1));
         let done = self.store.update(&q.id, |r| {
             // Decided again on the record as it is now: the owner may have
@@ -246,7 +252,12 @@ impl Waiter {
             let lease = self.store.read_lease(&r.id);
             if decide(r, lease.as_ref(), false, self.default_timeout, now) != Action::Expire
                 && !(lease.as_ref().is_none_or(|l| !l.fresh(now))
-                    && crate::deputy::exhausted_past_deadline(r, self.default_timeout, now))
+                    && crate::deputy::exhausted_past_deadline(
+                        r,
+                        startable,
+                        self.default_timeout,
+                        now,
+                    ))
             {
                 return Ok(false);
             }
