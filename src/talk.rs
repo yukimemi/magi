@@ -171,10 +171,41 @@ pub struct ContextUsage {
     pub since_switch: bool,
     /// The current model, if the roster names one.
     pub model: Option<String>,
+    /// `tokens` is a transcript-length estimate, not a CLI measurement (see
+    /// [`estimate_context_tokens`]). A measured figure is never overridden.
+    #[serde(default)]
+    pub estimated: bool,
 }
 
 /// Fraction (in percent) of the window at which [`ContextUsage::warn`] fires.
 const CONTEXT_WARN_PERCENT: u64 = 80;
+
+/// Allowance for the standing prompt when no config is readable to render
+/// the real [`briefing`].
+const STANDING_PROMPT_FALLBACK_CHARS: u64 = 7000;
+
+/// Rough estimate of the context a conversation occupies, for CLIs whose usage
+/// is cumulative and so is never measured (claude / codex / agy).
+///
+/// Counts the characters (not bytes) of every operator and agent turn, skips
+/// magi's own notes (never sent to the agent), adds `standing_chars` for the
+/// standing prompt, and divides by ~3.5 chars per token, rounding up. `None`
+/// when no turn counts: an empty conversation stays unknown.
+///
+/// Known biases: CJK runs near one token per character, and tool output,
+/// images and the CLI's own system prompt are not counted, so this tends to
+/// under-estimate (the 80% warning comes late); a compacted session is still
+/// counted in full, which over-estimates.
+pub fn estimate_context_tokens(talk: &Talk, standing_chars: u64) -> Option<u64> {
+    let mut counted = false;
+    let mut chars = standing_chars;
+    for t in talk.turns.iter().filter(|t| !t.body.starts_with(MAGI_NOTE)) {
+        counted = true;
+        chars += t.body.chars().count() as u64;
+    }
+    // chars / 3.5, rounded up, in integers.
+    counted.then(|| (chars * 2).div_ceil(7))
+}
 
 /// Context usage of `talk`, measured against its current model.
 ///
@@ -201,7 +232,16 @@ pub fn context_usage(talk: &Talk, cfg: Option<&Config>) -> ContextUsage {
         .rev()
         .find(|t| t.who == Who::Agent && !t.body.starts_with(MAGI_NOTE))
         .and_then(|t| t.usage.as_ref());
-    let tokens = usage.map(|u| u.context_tokens);
+    let measured = usage.map(|u| u.context_tokens);
+    let tokens = measured.or_else(|| {
+        let standing = cfg.map_or(STANDING_PROMPT_FALLBACK_CHARS, |c| {
+            briefing(&talk.repo, &c.graph.language, c.talk.allow_write)
+                .chars()
+                .count() as u64
+        });
+        estimate_context_tokens(talk, standing)
+    });
+    let estimated = measured.is_none() && tokens.is_some();
     let since_switch =
         usage.is_some_and(|u| u.agent != talk.agent || (current.is_some() && u.model != model));
     let (percent, warn) = match (tokens, window) {
@@ -218,6 +258,7 @@ pub fn context_usage(talk: &Talk, cfg: Option<&Config>) -> ContextUsage {
         warn,
         since_switch,
         model,
+        estimated,
     }
 }
 
@@ -1618,7 +1659,10 @@ mod tests {
             ],
         );
         let u = context_usage(&t, Some(&cfg));
-        assert_eq!((u.tokens, u.percent, u.warn), (None, None, false));
+        // No measurement in the latest reply: an estimate, never the stale 900.
+        assert!(u.estimated);
+        assert_ne!(u.tokens, Some(900));
+        assert!(u.tokens.is_some());
         // A magi note after the reply neither hides nor replaces it.
         let t = ctx_talk(
             "small",
@@ -1632,6 +1676,50 @@ mod tests {
             context_usage(&ctx_talk("small", Vec::new()), Some(&cfg)).tokens,
             None
         );
+    }
+
+    #[test]
+    fn estimate_counts_chars_both_sides_and_standing_prompt() {
+        let mut t = ctx_talk("small", vec![reply("abcdefg", None)]);
+        assert_eq!(estimate_context_tokens(&t, 0), Some(2)); // 7 chars -> 2
+        let op = Turn {
+            who: Who::Operator,
+            ..reply("abcdefg", None)
+        };
+        t.turns.push(op);
+        assert_eq!(estimate_context_tokens(&t, 0), Some(4));
+        assert!(
+            estimate_context_tokens(&t, 700).unwrap() > estimate_context_tokens(&t, 0).unwrap()
+        );
+        // Characters, not bytes: 7 kanji are 7 chars.
+        let ja = ctx_talk("small", vec![reply("日本語日本語日", None)]);
+        assert_eq!(estimate_context_tokens(&ja, 0), Some(2));
+        // magi notes are not sent to the agent; with nothing else, unknown.
+        let note = ctx_talk("small", vec![reply("magi: could not run agent", None)]);
+        assert_eq!(estimate_context_tokens(&note, 1000), None);
+        assert_eq!(
+            estimate_context_tokens(&ctx_talk("small", Vec::new()), 1000),
+            None
+        );
+    }
+
+    #[test]
+    fn context_usage_measured_wins_and_estimate_gets_percent_and_warn() {
+        let cfg = ctx_config(&[("small-model", 1000)]);
+        let t = ctx_talk(
+            "small",
+            vec![reply(&"x".repeat(5000), Some((10, "small", Some("small-model"))))],
+        );
+        let u = context_usage(&t, Some(&cfg));
+        assert_eq!((u.tokens, u.estimated), (Some(10), false));
+        let t = ctx_talk("small", vec![reply(&"x".repeat(5000), None)]);
+        let u = context_usage(&t, Some(&cfg));
+        assert!(u.estimated && !u.since_switch);
+        assert_eq!(u.window, Some(1000));
+        assert!(u.warn && u.percent.unwrap() >= 80);
+        let t = ctx_talk("small", vec![reply("hi", None)]);
+        let u = context_usage(&t, Some(&cfg));
+        assert!(u.estimated && u.percent.is_some());
     }
 
     #[test]
