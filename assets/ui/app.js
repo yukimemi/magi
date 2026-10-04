@@ -6834,8 +6834,9 @@ async function putJson(url, body) {
 
 async function loadSettings() {
   try {
+    // The draft survives a reload: leaving the screen and coming back must
+    // not throw away what the operator was arranging.
     settingsState.data = await getJson(API.settings);
-    settingsState.draft = {};
     ok();
   } catch (e) {
     settingsState.data = null;
