@@ -1337,6 +1337,14 @@ pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
          nothing matches or more than one checkout shares that name, ask the \
          operator which repository they mean (or run `magi repos` yourself \
          to see the candidates) rather than guessing.\n\n\
+         The current state of the code is whatever origin/main holds, not \
+         whatever a working tree shows: a primary checkout often lags \
+         upstream, sits on a detached HEAD and carries uncommitted changes. \
+         Before answering about code, run `git fetch origin` in that \
+         repository if it is cheap, then read through \
+         `git show origin/main:<path>` or `git grep <pattern> origin/main`. \
+         If the working tree differs, say so; if the fetch fails, say that \
+         too, so the operator knows the answer may be stale.\n\n\
          If the operator attached an image (a screenshot, say) that the task \
          is about, pass it with `--attach <path>`, using the absolute path \
          the turn's attachment note gives; repeat the flag for several. \
@@ -1512,6 +1520,12 @@ fn new_attachment_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_briefing_points_at_origin_main_not_the_working_tree() {
+        let b = briefing(Path::new("/r"), "en", false);
+        assert!(b.contains("origin/main"));
+        assert!(b.contains("git show origin/main:"));
+    }
     use std::collections::BTreeMap;
 
     use crate::config::{AgentChoice, AgentKind, AgentSpec, Graph};

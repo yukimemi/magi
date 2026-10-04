@@ -743,6 +743,7 @@ mode = "notify"          # off | notify | install
 # machine config.
 roots = ["~/src/github.com"]   # scanned as <root>/<host>/<owner>/<repo>
 scan_ttl = 86400                # seconds a scan is trusted before re-scanning
+fetch_interval = 600            # seconds between `git fetch origin` in every checkout (0 = off)
 ```
 
 `mode = "none"` is the default on purpose: magi prints the merge command and

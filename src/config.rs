@@ -992,6 +992,11 @@ pub struct Repos {
     /// a session, so there is little to gain from scanning more often than
     /// that, and an explicit refresh exists for the moment one does.
     pub scan_ttl: u64,
+    /// How often `magi serve` runs `git fetch origin` in every checkout under
+    /// `roots`, seconds, so `origin/main` stays fresh whatever state the
+    /// working tree is in. Fetch only: no branch, HEAD or working tree is
+    /// touched. `0` disables it.
+    pub fetch_interval: u64,
 }
 
 impl Default for Repos {
@@ -999,6 +1004,7 @@ impl Default for Repos {
         Self {
             roots: Vec::new(),
             scan_ttl: 86_400,
+            fetch_interval: 600,
         }
     }
 }
@@ -2234,6 +2240,7 @@ mod tests {
     fn repos_default_to_no_roots_and_a_day_of_trust() {
         assert_eq!(Config::default().repos.roots, Vec::<PathBuf>::new());
         assert_eq!(Config::default().repos.scan_ttl, 86_400);
+        assert_eq!(Config::default().repos.fetch_interval, 600);
     }
 
     #[test]
