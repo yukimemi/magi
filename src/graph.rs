@@ -146,6 +146,11 @@ struct SeatJob {
     sessions: bool,
     artifacts: PathBuf,
     stem: String,
+    /// The prompt for a seat that has been handed to another roster agent
+    /// (a fresh session): everything the original seat would have
+    /// remembered. `None` when `prompt` already carries it, as the first
+    /// ranking and the implement prompt do. Never a resume-style prompt.
+    handover: Option<String>,
 }
 
 /// How the graph reads one agent invocation.
@@ -1309,6 +1314,7 @@ impl Runner {
                 sessions: false,
                 artifacts: artifacts.clone(),
                 stem: seat_key,
+                handover: None,
             });
         }
 
@@ -1588,6 +1594,7 @@ impl Runner {
                 sessions,
                 artifacts: artifacts.clone(),
                 stem: format!("impl-{label}"),
+                handover: None,
             });
         }
 
@@ -2448,6 +2455,7 @@ impl Runner {
                 sessions,
                 artifacts: artifacts.clone(),
                 stem: format!("judge-{}", j + 1),
+                handover: None,
             });
         }
 
@@ -2585,19 +2593,23 @@ impl Runner {
                 let spec = self.occupant(&seat_key, spec);
                 let mut seat = self.seat(&seat_key, &spec.id);
                 let transcript = self.transcript(&turns, j);
-                let context = if has_context(&spec, &seat, sessions) {
-                    None
-                } else {
-                    Some(self.candidate_block(&viable, &base_short))
+                let build = |context: Option<&str>| {
+                    prompt::deliberate(
+                        &self.state.instruction,
+                        context,
+                        &transcript,
+                        round,
+                        rounds,
+                        &language,
+                    )
                 };
-                let text = prompt::deliberate(
-                    &self.state.instruction,
-                    context.as_deref(),
-                    &transcript,
-                    round,
-                    rounds,
-                    &language,
-                );
+                let block = self.candidate_block(&viable, &base_short);
+                let full = build(Some(&block));
+                let text = if has_context(&spec, &seat, sessions) {
+                    build(None)
+                } else {
+                    full.clone()
+                };
                 let job = SeatJob {
                     spec,
                     seat: seat.clone(),
@@ -2608,6 +2620,7 @@ impl Runner {
                     sessions,
                     artifacts: artifacts.clone(),
                     stem: format!("delib-{round}-judge-{}", j + 1),
+                    handover: Some(full),
                 };
                 let cache = self.state.config.cache_dir();
                 let ctx = WaveCtx {
@@ -2618,45 +2631,33 @@ impl Runner {
                     cache: cache.as_deref(),
                     round: None,
                 };
-                let (updated, out) =
-                    run_one(job, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
+                // A turn is never nudged (`retries` 0): a failed seat is
+                // handed to the next roster agent, which gets the full
+                // context. An empty answer is a turn, not a failure.
+                let mut losses = Vec::new();
+                let mut results = ask_wave_with::<String>(
+                    vec![job],
+                    Arc::clone(&self.sem),
+                    0,
+                    &self.roles.judge_roster,
+                    &ctx,
+                    &mut losses,
+                    &mut self.state,
+                    &|text: &str| {
+                        Ok(verdict::section(text, "position").unwrap_or_else(|| text.to_owned()))
+                    },
+                )
+                .await;
+                self.state.quota.extend(losses);
+                let (updated, res, _) = results.pop().expect("one job in, one result out");
                 seat = updated;
                 let agent_id = seat.agent.clone();
-                let seat_key = seat.key.clone();
                 self.state.seats.insert(seat.key.clone(), seat);
-                let body = match out {
-                    AgentOutcome::Ok(o) => verdict::section(&o.text, "position").unwrap_or(o.text),
-                    // Never read the CLI's raw error JSON as this judge's
-                    // position — skip the seat instead, the same as any other
-                    // failed turn.
-                    AgentOutcome::Dropped(o) => {
-                        let why =
-                            o.dropped.as_ref().map(|d| d.why.as_str()).unwrap_or(
-                                "the CLI ended the stream without delivering its answer",
-                            );
-                        self.state.event(
-                            "deliberate",
-                            format!(
-                                "judge {} skipped: the CLI dropped the stream ({why})",
-                                j + 1
-                            ),
-                        );
-                        continue;
-                    }
-                    AgentOutcome::Quota(o) => {
-                        self.state.quota.push(QuotaLoss {
-                            seat: seat_key,
-                            node: "deliberate".to_owned(),
-                            at: Timestamp::now(),
-                            reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                        });
-                        self.state.event(
-                            "deliberate",
-                            format!("judge {} skipped: rate limited (quota)", j + 1),
-                        );
-                        continue;
-                    }
-                    AgentOutcome::Failed(e) => {
+                let body = match res {
+                    Ok((body, _)) => body,
+                    // Skip the seat; a CLI's raw error JSON is never read as
+                    // this judge's position.
+                    Err(e) => {
                         self.state
                             .event("deliberate", format!("judge {} skipped: {e}", j + 1));
                         continue;
@@ -2733,14 +2734,12 @@ impl Runner {
             let seat_key = format!("judge-{}", j + 1);
             let spec = self.occupant(&seat_key, spec);
             let seat = self.seat(&seat_key, &spec.id);
-            let mut text = prompt::final_vote(&viable, &language);
-            if !has_context(&spec, &seat, sessions) {
-                text = format!(
-                    "{}\n\n# Candidates\n\n{}",
-                    text,
-                    self.candidate_block(&candidates, &base_short)
-                );
-            }
+            let full = self.vote_prompt_full(j, &viable, &language, &candidates, &base_short);
+            let text = if has_context(&spec, &seat, sessions) {
+                prompt::final_vote(&viable, &language)
+            } else {
+                full.clone()
+            };
             jobs.push(SeatJob {
                 spec,
                 seat,
@@ -2751,6 +2750,7 @@ impl Runner {
                 sessions,
                 artifacts: artifacts.clone(),
                 stem: format!("vote-judge-{}", j + 1),
+                handover: Some(full),
             });
             seats_at.push(j);
         }
@@ -2777,7 +2777,7 @@ impl Runner {
             jobs,
             Arc::clone(&self.sem),
             self.state.config.graph.retries,
-            &[],
+            &self.roles.judge_roster,
             &ctx,
             &mut quota_losses,
             &mut self.state,
@@ -3083,7 +3083,7 @@ impl Runner {
             let order = blind::presentation_order(viable.len(), j, self.state.seed);
             let views: Vec<CandidateView> = order.iter().map(|&k| self.view(&viable[k])).collect();
             let seat_key = format!("judge-{}", j + 1);
-            let spec = self.roles.judges[j].clone();
+            let spec = self.occupant(&seat_key, self.roles.judges[j].clone());
             let seat = self.seat(&seat_key, &spec.id);
             judge_jobs.push(SeatJob {
                 spec,
@@ -3101,6 +3101,7 @@ impl Runner {
                 sessions,
                 artifacts: artifacts.clone(),
                 stem: format!("judge-{}-recover", j + 1),
+                handover: None,
             });
         }
 
@@ -3120,7 +3121,7 @@ impl Runner {
             judge_jobs,
             Arc::clone(&self.sem),
             retries,
-            &[],
+            &self.roles.judge_roster,
             &ctx,
             &mut judge_losses,
             &mut self.state,
@@ -3131,10 +3132,12 @@ impl Runner {
         // Refresh the judgement of every seat that ranked again.
         let mut recovered: BTreeSet<usize> = BTreeSet::new();
         for (&j, (seat, res, _attempts)) in positions.iter().zip(results) {
+            let agent_id = seat.agent.clone();
             self.state.seats.insert(seat.key.clone(), seat);
             let record = &mut self.state.judgements[j];
             match res {
                 Ok((ranking, out)) => {
+                    record.agent = agent_id;
                     record.ranking = ranking.normalized();
                     record.reasons = ranking.reasons;
                     record.confidence = ranking.confidence;
@@ -3158,16 +3161,14 @@ impl Runner {
         let mut vote_pos: Vec<usize> = Vec::new();
         for &j in &recovered {
             let seat_key = format!("judge-{}", j + 1);
-            let spec = self.roles.judges[j].clone();
+            let spec = self.occupant(&seat_key, self.roles.judges[j].clone());
             let seat = self.seat(&seat_key, &spec.id);
-            let mut text = prompt::final_vote(&labels, &language);
-            if !has_context(&spec, &seat, sessions) {
-                text = format!(
-                    "{}\n\n# Candidates\n\n{}",
-                    text,
-                    self.candidate_block(&candidates, &base_short)
-                );
-            }
+            let full = self.vote_prompt_full(j, &labels, &language, &candidates, &base_short);
+            let text = if has_context(&spec, &seat, sessions) {
+                prompt::final_vote(&labels, &language)
+            } else {
+                full.clone()
+            };
             vote_jobs.push(SeatJob {
                 spec,
                 seat,
@@ -3178,6 +3179,7 @@ impl Runner {
                 sessions,
                 artifacts: artifacts.clone(),
                 stem: format!("vote-judge-{}-recover", j + 1),
+                handover: Some(full),
             });
             vote_pos.push(j);
         }
@@ -3197,7 +3199,7 @@ impl Runner {
             vote_jobs,
             Arc::clone(&self.sem),
             vote_retries,
-            &[],
+            &self.roles.judge_roster,
             &ctx,
             &mut vote_losses,
             &mut self.state,
@@ -4021,6 +4023,7 @@ impl Runner {
             sessions,
             artifacts: artifacts.clone(),
             stem: "operator-fix".to_owned(),
+            handover: None,
         };
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
@@ -4400,6 +4403,7 @@ impl Runner {
                     sessions,
                     artifacts: artifacts.clone(),
                     stem: format!("review-{round}-{}", r + 1),
+                    handover: None,
                 });
             }
 
@@ -4563,26 +4567,32 @@ impl Runner {
                     // initial review's prompt — restate the patch it is
                     // voting on, the same as `deliberate`/`vote` do for a
                     // judge in the same position.
-                    let patch_ctx = if has_context(&spec, &seat, sessions) {
-                        None
-                    } else {
-                        Some(ReviewPatch {
-                            branch: &winner.branch,
-                            base_short: &base_short,
-                            stat: &stat,
-                            patch: &patch,
+                    // The panel already carries this seat's own review and
+                    // vote, so restating the patch makes the prompt whole for
+                    // a seat handed to another agent.
+                    let build = |with_patch: bool| {
+                        prompt::review_reconsider(&ReviewReconsiderCtx {
+                            instruction: &self.state.instruction,
+                            reviewer: r + 1,
+                            lens: Lens::for_seat(r),
+                            panel: &panel,
+                            patch: with_patch.then_some(ReviewPatch {
+                                branch: &winner.branch,
+                                base_short: &base_short,
+                                stat: &stat,
+                                patch: &patch,
+                            }),
+                            round,
+                            rounds: max_rounds,
+                            language: &language,
                         })
                     };
-                    let prompt = prompt::review_reconsider(&ReviewReconsiderCtx {
-                        instruction: &self.state.instruction,
-                        reviewer: r + 1,
-                        lens: Lens::for_seat(r),
-                        panel: &panel,
-                        patch: patch_ctx,
-                        round,
-                        rounds: max_rounds,
-                        language: &language,
-                    });
+                    let full = build(true);
+                    let prompt = if has_context(&spec, &seat, sessions) {
+                        build(false)
+                    } else {
+                        full.clone()
+                    };
                     jobs.push(SeatJob {
                         prompt,
                         spec,
@@ -4593,6 +4603,7 @@ impl Runner {
                         sessions,
                         artifacts: artifacts.clone(),
                         stem: format!("review-{round}-reconsider-{}", r + 1),
+                        handover: Some(full),
                     });
                     seats_at.push(r);
                 }
@@ -4600,7 +4611,7 @@ impl Runner {
                 let mut recon_quota_losses = Vec::new();
                 let recon_cache = self.state.config.cache_dir();
                 let recon_ctx = WaveCtx {
-                    carry_seats: false,
+                    carry_seats: true,
                     run: &run_id,
                     node: "review",
                     prompts: &prompts,
@@ -4611,7 +4622,7 @@ impl Runner {
                     jobs,
                     Arc::clone(&self.sem),
                     review_retries,
-                    &[],
+                    &self.roles.reviewer_roster,
                     &recon_ctx,
                     &mut recon_quota_losses,
                     &mut self.state,
@@ -4914,6 +4925,7 @@ impl Runner {
                 sessions,
                 artifacts: artifacts.clone(),
                 stem: format!("fix-{round}"),
+                handover: None,
             };
             let before = git::rev_parse(&winner.worktree, "HEAD").await?;
             let cache = self.state.config.cache_dir();
@@ -5627,6 +5639,7 @@ impl Runner {
             sessions: self.state.config.graph.sessions,
             artifacts: agent::artifacts_dir(&self.state.dir()),
             stem: format!("gate-fix-{attempt}"),
+            handover: None,
         };
         self.state.event(
             "gate",
@@ -6087,6 +6100,61 @@ impl Runner {
             base_short,
             "en",
         )
+    }
+
+    /// The final-vote prompt with everything a seat that has no session of its
+    /// own needs: the candidates, the seat's own ranking and reasons, and the
+    /// anonymised deliberation it took part in (only when there was one, so a
+    /// handed-over seat never sees more than the seat it replaces did). The
+    /// `Final vote` heading stays first.
+    fn vote_prompt_full(
+        &self,
+        j: usize,
+        labels: &[char],
+        language: &str,
+        candidates: &[Candidate],
+        base_short: &str,
+    ) -> String {
+        let mut text = format!(
+            "{}\n\n# The task the candidates were given\n\n{}\n\n# Candidates\n\n{}",
+            prompt::final_vote(labels, language),
+            self.state.instruction,
+            self.candidate_block(candidates, base_short)
+        );
+        if let Some(own) = self
+            .state
+            .judgements
+            .get(j)
+            .filter(|r| !r.ranking.is_empty())
+        {
+            let reasons = own
+                .reasons
+                .iter()
+                .map(|(k, v)| format!("- {k}: {v}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            text.push_str(&format!(
+                "\n\n# Your own earlier ranking\n\nYou ranked {}{}{reasons}\n",
+                own.ranking.iter().collect::<String>(),
+                if reasons.is_empty() {
+                    ""
+                } else {
+                    ", because:\n"
+                }
+            ));
+        }
+        if !self.state.deliberation.is_empty() {
+            text.push_str("\n# What was argued before this vote\n");
+            for t in self.transcript(&[], j) {
+                text.push_str(&format!(
+                    "\n## {}{}\n\n{}\n",
+                    t.who,
+                    if t.is_self { " (you)" } else { "" },
+                    t.body.trim()
+                ));
+            }
+        }
+        text
     }
 
     /// Anonymised transcript for judge `self_idx`.
@@ -6831,6 +6899,45 @@ async fn ask_json_wave<T>(
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
+    ask_wave_with(
+        jobs,
+        sem,
+        retries,
+        roster,
+        ctx,
+        losses,
+        state,
+        &|text: &str| {
+            let v = verdict::extract_json::<T>(text)?;
+            validate(&v)?;
+            Ok(v)
+        },
+    )
+    .await
+}
+
+/// [`ask_json_wave`] with the reading of an answer supplied by the caller, so
+/// a node whose answer is prose (deliberation) shares the same handover,
+/// failure classification, quota bookkeeping and bounds instead of a copy.
+///
+/// A seat handed to another roster agent is sent the job's `handover` prompt
+/// (when it has one) rather than `prompt`: the new agent has no session, so a
+/// resume-style prompt would be incomplete. That holds for the handover ask
+/// and for every nudge to that agent whose `has_context` is false.
+#[allow(clippy::too_many_arguments)]
+async fn ask_wave_with<T>(
+    jobs: Vec<SeatJob>,
+    sem: Arc<Semaphore>,
+    retries: usize,
+    roster: &[AgentSpec],
+    ctx: &WaveCtx<'_>,
+    losses: &mut Vec<QuotaLoss>,
+    state: &mut RunState,
+    parse: &(dyn Fn(&str) -> Result<T> + Send + Sync),
+) -> Vec<(SeatState, Result<(T, AgentOutput)>, usize)>
+where
+    T: Send + 'static,
+{
     let n = jobs.len();
     let originals: Vec<SeatJob> = jobs;
     let mut seats: Vec<SeatState> = originals.iter().map(|j| j.seat.clone()).collect();
@@ -6902,16 +7009,24 @@ where
         let mut renudged: Vec<&str> = Vec::new();
         for &i in &pending {
             let src = &originals[i];
+            // A seat now held by another agent than the job named has no
+            // session of its own: it gets the full-context prompt whenever
+            // it is asked in full (the handover ask, a nudge it cannot
+            // resume).
+            let full: &str = match &src.handover {
+                Some(h) if specs[i].id != src.spec.id => h,
+                _ => &src.prompt,
+            };
             // The prompt and the budget are one decision: a nudge restates
             // finished work, a re-sent prompt redoes it.
             let (prompt, timeout, stem) = if let Some(word) = fresh[i].take() {
                 (
-                    src.prompt.clone(),
+                    full.to_owned(),
                     src.timeout,
                     format!("{}-{word}-{}", src.stem, specs[i].id),
                 )
             } else if nudges[i] == 0 {
-                (src.prompt.clone(), src.timeout, src.stem.clone())
+                (full.to_owned(), src.timeout, src.stem.clone())
             } else {
                 renudged.push(src.seat.key.as_str());
                 let why = done[i]
@@ -6923,7 +7038,7 @@ where
                 let prompt = if nudged {
                     nudge
                 } else {
-                    format!("{}\n\n---\n\n{}", src.prompt, nudge)
+                    format!("{full}\n\n---\n\n{nudge}")
                 };
                 (
                     prompt,
@@ -6941,6 +7056,7 @@ where
                 sessions: src.sessions,
                 artifacts: src.artifacts.clone(),
                 stem,
+                handover: None,
             });
         }
 
@@ -7018,13 +7134,7 @@ where
                 h.last_fail = Some(cur);
             }
             let parsed = match out {
-                AgentOutcome::Ok(o) => match verdict::extract_json::<T>(&o.text) {
-                    Ok(v) => match validate(&v) {
-                        Ok(()) => Ok((v, o)),
-                        Err(e) => Err(e),
-                    },
-                    Err(e) => Err(e),
-                },
+                AgentOutcome::Ok(o) => parse(&o.text).map(|v| (v, o)),
                 AgentOutcome::Quota(o) => {
                     last_quota[i] = Some(o.quota.as_ref().and_then(|q| q.reset.clone()));
                     Err(anyhow::anyhow!("rate limited (quota); not retrying now"))
