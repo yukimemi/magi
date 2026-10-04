@@ -12854,7 +12854,18 @@ mod tests {
             APP_JS.matches("sourceLinkOf(").count() >= 4,
             "helper must serve every page"
         );
-        assert!(APP_JS.matches("openChatLink(").count() >= 4);
+        assert!(
+            APP_JS.matches("openChatLink(").count() >= 3,
+            "the run page still needs its explicit chat link"
+        );
+        assert!(
+            !APP_JS.contains("const openChat = el("),
+            "the Queue card duplicates its source label link again"
+        );
+        assert!(
+            APP_JS.contains("metaKids.push(link ? el(\"a\""),
+            "the task page must link a chat source label too"
+        );
     }
 
     #[test]
