@@ -420,6 +420,18 @@ pub fn merge_argv(number: u64, subject: &str) -> Vec<String> {
     ]
 }
 
+/// [`merge_argv`] pinned to the commit the decision was made about.
+///
+/// `--match-head-commit` makes the forge refuse the merge if the branch moved
+/// after it was observed, so a push landing between the look and the merge is
+/// never merged unseen.
+pub fn merge_argv_at(number: u64, subject: &str, head: &str) -> Vec<String> {
+    let mut argv = merge_argv(number, subject);
+    argv.push("--match-head-commit".to_owned());
+    argv.push(head.to_owned());
+    argv
+}
+
 /// The squash subject to merge under.
 ///
 /// The pull request title, unless it is empty or is a candidate branch's commit
@@ -2447,6 +2459,29 @@ fn awaiting_new_head(awaiting: Option<&str>, observed: &str) -> bool {
     awaiting.is_some_and(|want| !observed.eq_ignore_ascii_case(want))
 }
 
+/// The commit an observation may be decided on, or `None` while it cannot be
+/// trusted to describe one.
+///
+/// `None` when a pushed commit is awaited and the pull request is not on it,
+/// when the head is unreadable, or when the rollup (`statusCheckRollup` is the
+/// last commit's) is not the head's: that is the previous commit's checks. The
+/// caller re-polls on `None`. `gh` caps `commits` at about a hundred entries,
+/// so on a very long pull request the rollup commit may never be visible and
+/// the wait runs to [`WAIT_CEILING`] and stops - a safe failure, never a merge.
+fn bound_head<'a>(
+    seen_head: &'a str,
+    rollup_head: &str,
+    awaiting: Option<&str>,
+) -> Option<&'a str> {
+    if seen_head.is_empty()
+        || awaiting_new_head(awaiting, seen_head)
+        || !rollup_head.eq_ignore_ascii_case(seen_head)
+    {
+        return None;
+    }
+    Some(seen_head)
+}
+
 /// What a refused `gh pr merge` means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refused {
@@ -2463,13 +2498,22 @@ enum Refused {
 
 /// Judged from the pull request's state after the refusal, never from the
 /// refusal's wording, which belongs to the forge and changes.
-fn classify_refusal(after: Option<&Seen>, rechecked: bool) -> Refused {
+fn classify_refusal(after: Option<&Seen>, rechecked: bool, observed_head: &str) -> Refused {
     let Some(after) = after else {
         // Unreadable is not evidence of anything; the next loop reads again.
         return Refused::Pending;
     };
     if after.pr.state != PrLifecycle::Open {
         return Refused::Final;
+    }
+    // The branch moved after it was observed (the forge refuses a merge pinned
+    // to the old commit): not a verdict on anything, look again.
+    if !after.head.eq_ignore_ascii_case(observed_head) {
+        return Refused::Pending;
+    }
+    // The same binding the loop applies: checks of another commit say nothing.
+    if bound_head(&after.head, &after.rollup_head, None).is_none() {
+        return Refused::Pending;
     }
     let state = after.merge_state.to_ascii_uppercase();
     if matches!(after.pr.checks, Checks::Pending | Checks::Unknown)
@@ -2532,17 +2576,24 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
         state.save()?;
 
         if pr.state == PrLifecycle::Open {
-            if awaiting_new_head(awaiting_head.as_deref(), &seen.head) {
+            if bound_head(&seen.head, &seen.rollup_head, awaiting_head.as_deref()).is_none() {
                 if waited >= WAIT_CEILING {
+                    let want = awaiting_head.as_deref().unwrap_or_default();
                     let why = format!(
-                        "the pull request was still not on the pushed commit {} after {} minutes \
-                         (it points at {}); someone may have pushed over it",
-                        awaiting_head.as_deref().unwrap_or_default(),
+                        "the pull request's checks were still not about one readable head after \
+                         {} minutes (expected {}, pull request points at {}, checks are for {}); \
+                         someone may have pushed over it",
                         WAIT_CEILING.as_secs() / 60,
+                        if want.is_empty() { "any" } else { want },
                         if seen.head.is_empty() {
                             "nothing readable"
                         } else {
                             &seen.head
+                        },
+                        if seen.rollup_head.is_empty() {
+                            "nothing readable"
+                        } else {
+                            &seen.rollup_head
                         },
                     );
                     stop(state, &repo, &pr, &why).await?;
@@ -2552,6 +2603,8 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 forge.poll().await;
                 continue;
             }
+            // Reset once, when the awaited head first shows up; resetting on
+            // every re-observation would let a standing refusal wait forever.
             if awaiting_head.take().is_some() {
                 // The checks now being read belong to the new head; give them
                 // the same grace a fresh pull request gets.
@@ -2637,7 +2690,10 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                         }
                     }
                 }
-                let argv = merge_argv(pr.number, &subject);
+                // Open and past the gate above, so `seen.head` is the commit
+                // the checks were bound to.
+                let observed_head = seen.head.clone();
+                let argv = merge_argv_at(pr.number, &subject, &observed_head);
                 let out = {
                     let merge_lock = repo_merge_lock(&repo);
                     let _merge_slot = merge_lock.lock().await;
@@ -2680,7 +2736,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                     write_pr_state_through(state, pr.state);
                     return Ok(pr);
                 }
-                match classify_refusal(after_seen.as_ref(), rechecked) {
+                match classify_refusal(after_seen.as_ref(), rechecked, &observed_head) {
                     Refused::Final => {
                         let merge_state = after_seen
                             .as_ref()
@@ -2785,6 +2841,22 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                             stop(state, &repo, &pr, &why).await?;
                             return Ok(pr);
                         }
+                        // Bind to what was pushed: until the pull request is
+                        // seen on it, the rollup is the old head's.
+                        let head =
+                            match git::rev_parse(&repo, &format!("refs/heads/{branch}")).await {
+                                Ok(head) => head,
+                                Err(e) => {
+                                    let why = format!(
+                                        "rebased and pushed {branch} but could not read the pushed \
+                                     commit: {e:#}"
+                                    );
+                                    stop(state, &repo, &pr, &why).await?;
+                                    return Ok(pr);
+                                }
+                            };
+                        awaiting_head = Some(head);
+                        rechecked = false;
                         state.event("land", format!("rebased {branch} onto {base}"));
                         state.save()?;
                         // The forge has to re-run its checks against the
@@ -2873,6 +2945,9 @@ struct Seen {
     failing_urls: Vec<(String, String)>,
     /// `headRefOid`: the commit this observation, checks included, is about.
     head: String,
+    /// The commit `statusCheckRollup` belongs to: the pull request's last
+    /// commit, as `commits` lists it. Empty when unreadable.
+    rollup_head: String,
     /// `mergeStateStatus` as the forge spelled it. [`Blocking`] folds BLOCKED,
     /// BEHIND and DRAFT together, and a stop reason has to say which.
     merge_state: String,
@@ -2881,6 +2956,15 @@ struct Seen {
 /// Read the pull request: `gh pr view` for the rollup and the top-level thread,
 /// `gh api` for the inline review comments `gh pr view` does not report.
 async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
+    // Needs the number, which only the view yields; read it from the URL.
+    let before_oid = match pr_url
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.parse::<u64>().ok())
+    {
+        Some(number) => last_commit_oid(repo, number).await,
+        None => None,
+    };
     let view = gh(
         repo,
         &[
@@ -2888,7 +2972,7 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
             "view".to_owned(),
             pr_url.to_owned(),
             "--json".to_owned(),
-            "url,number,state,title,statusCheckRollup,reviews,comments,mergeStateStatus,headRefOid"
+            "url,number,state,title,statusCheckRollup,reviews,comments,mergeStateStatus,headRefOid,commits"
                 .to_owned(),
         ],
     )
@@ -2918,6 +3002,27 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
         tracing::warn!("gh api pulls/{}/comments: {}", pr.number, inline.1);
     }
 
+    // The rollup is the pull request's last commit's, and `gh pr view` lists
+    // only the first 100 commits, so its last entry cannot name that commit on
+    // a long pull request. Ask for the last commit directly, once before and
+    // once after the view: commits only ever get appended, so the same oid on
+    // both sides proves it was the last one while the rollup was read. A
+    // differing pair (a push in between) leaves the head unbound and the loop
+    // looks again. The view's own list is used only when the forge cannot be
+    // asked and the list is certainly complete (it comes from the same
+    // response as the rollup).
+    let after_oid = last_commit_oid(repo, pr.number).await;
+    let rollup_head = match (before_oid, after_oid) {
+        (Some(a), Some(b)) if a.eq_ignore_ascii_case(&b) => a,
+        (Some(_), Some(_)) => String::new(),
+        _ if raw.commits.len() < 100 => raw
+            .commits
+            .last()
+            .map(|c| c.oid.clone())
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+
     let failing_urls = raw
         .status_check_rollup
         .iter()
@@ -2930,8 +3035,40 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
         title: raw.title,
         failing_urls,
         head: raw.head_ref_oid,
+        rollup_head,
         merge_state: raw.merge_state_status,
     })
+}
+
+/// The oid of the pull request's last commit, whose checks the rollup lists.
+/// `None` when the forge could not be asked or answered unreadably.
+async fn last_commit_oid(repo: &Path, number: u64) -> Option<String> {
+    let out = gh(
+        repo,
+        &[
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-F".to_owned(),
+            "owner={owner}".to_owned(),
+            "-F".to_owned(),
+            "repo={repo}".to_owned(),
+            "-F".to_owned(),
+            format!("number={number}"),
+            "-f".to_owned(),
+            "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,\
+             name:$repo){pullRequest(number:$number){commits(last:1){nodes{commit{oid}}}}}}"
+                .to_owned(),
+        ],
+    )
+    .await
+    .ok()?;
+    if !out.0 {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&out.1).ok()?;
+    v.pointer("/data/repository/pullRequest/commits/nodes/0/commit/oid")
+        .and_then(|o| o.as_str())
+        .map(str::to_owned)
 }
 
 /// What a fix round did.
@@ -3315,9 +3452,17 @@ struct GhPr {
     #[serde(default)]
     head_ref_oid: String,
     #[serde(default)]
+    commits: Vec<GhCommit>,
+    #[serde(default)]
     reviews: Vec<GhReview>,
     #[serde(default)]
     comments: Vec<GhComment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhCommit {
+    #[serde(default)]
+    oid: String,
 }
 
 /// One rollup entry. `gh` mixes two GraphQL types in this array: a `CheckRun`
@@ -5390,6 +5535,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             title: "feat: x".to_owned(),
             failing_urls: Vec::new(),
             head: head.to_owned(),
+            rollup_head: head.to_owned(),
             merge_state: merge_state.to_owned(),
         }
     }
@@ -5445,11 +5591,11 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             (Some(open(Checks::Green, "BLOCKED")), true, Refused::Final),
         ];
         for (after, rechecked, want) in table {
-            assert_eq!(classify_refusal(after.as_ref(), rechecked), want);
+            assert_eq!(classify_refusal(after.as_ref(), rechecked, "a"), want);
         }
         let mut closed = open(Checks::Green, "CLEAN");
         closed.pr.state = PrLifecycle::Closed;
-        assert_eq!(classify_refusal(Some(&closed), false), Refused::Final);
+        assert_eq!(classify_refusal(Some(&closed), false, "a"), Refused::Final);
     }
 
     #[tokio::test]
@@ -5564,5 +5710,96 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             "{why}"
         );
         assert_eq!(state.status, RunStatus::Blocked);
+    }
+
+    #[test]
+    fn a_decision_is_bound_to_a_head_only_when_every_signal_agrees() {
+        assert_eq!(bound_head("abc", "abc", None), Some("abc"));
+        assert_eq!(bound_head("abc", "ABC", Some("abc")), Some("abc"));
+        // The pull request is still on the commit before the push.
+        assert_eq!(bound_head("old", "old", Some("new")), None);
+        // The checks are the previous commit's.
+        assert_eq!(bound_head("new", "old", Some("new")), None);
+        assert_eq!(bound_head("new", "old", None), None);
+        // Nothing readable.
+        assert_eq!(bound_head("", "", None), None);
+        assert_eq!(bound_head("", "", Some("new")), None);
+        assert_eq!(bound_head("abc", "", None), None);
+    }
+
+    #[test]
+    fn the_merge_command_is_pinned_to_the_observed_head() {
+        let argv = merge_argv_at(7, "feat: x", "deadbeef");
+        let at = argv
+            .iter()
+            .position(|a| a == "--match-head-commit")
+            .unwrap();
+        assert_eq!(argv[at + 1], "deadbeef");
+    }
+
+    #[tokio::test]
+    async fn stale_checks_after_a_fix_push_never_reach_a_merge() {
+        let mut state = landing_state();
+        // The pull request is on the pushed head but the rollup is still the
+        // previous commit's red, non-required result.
+        let mut stale = seen("new", Checks::Red, "CLEAN", false);
+        stale.rollup_head = "old".to_owned();
+        let forge = Scripted::new(
+            vec![seen("old", Checks::Green, "CLEAN", true), stale],
+            vec![],
+        );
+        *forge.fix.lock().unwrap() = Some(Fixed::Committed {
+            head: "new".to_owned(),
+        });
+        land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+            .await
+            .unwrap();
+        assert!(!forge.calls().contains(&"merge"));
+        assert_eq!(state.status, RunStatus::Blocked);
+        let why = state.merge.as_ref().unwrap().detail.clone();
+        assert!(why.contains("new") && why.contains("old"), "{why}");
+    }
+
+    #[test]
+    fn a_refusal_read_against_another_commits_checks_is_pending() {
+        let mut after = seen("a", Checks::Green, "BLOCKED", false);
+        after.rollup_head = "old".to_owned();
+        assert_eq!(classify_refusal(Some(&after), true, "a"), Refused::Pending);
+    }
+
+    #[tokio::test]
+    async fn a_matching_head_with_red_non_required_checks_still_merges() {
+        let mut state = landing_state();
+        let forge = Scripted::new(
+            vec![seen("a", Checks::Red, "CLEAN", false)],
+            vec![(true, "")],
+        );
+        land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+            .await
+            .unwrap();
+        assert_eq!(forge.calls(), ["view", "merge"]);
+        assert_eq!(state.status, RunStatus::Merged);
+    }
+
+    #[tokio::test]
+    async fn a_merge_refused_because_the_head_moved_looks_again_instead_of_failing() {
+        let mut state = landing_state();
+        let forge = Scripted::new(
+            vec![
+                seen("a", Checks::Green, "CLEAN", false),
+                // Re-viewed after the refusal: someone pushed.
+                seen("b", Checks::Green, "BLOCKED", false),
+                seen("b", Checks::Green, "CLEAN", false),
+            ],
+            vec![(false, REFUSED), (true, "")],
+        );
+        land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+            .await
+            .unwrap();
+        assert_eq!(
+            forge.calls(),
+            ["view", "merge", "view", "poll", "view", "merge"]
+        );
+        assert_eq!(state.status, RunStatus::Merged);
     }
 }
