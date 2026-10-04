@@ -49,12 +49,62 @@ pub struct Takeover {
 ///
 /// A distinct type so the queue loop can hold the task for a person instead
 /// of spending an attempt on it (see `daemon::attempt`).
+///
+/// Structured so the operator-facing hold reason can be rendered in the run's
+/// language (`daemon::refused_text`); `Display` is the English text, unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Refused(pub String);
+pub enum Refused {
+    /// The branch is held by a path magi cannot prove it made.
+    Foreign {
+        /// The contested branch.
+        branch: String,
+        /// The worktree that holds it.
+        path: String,
+        /// Machine detail of why it was refused (English).
+        why: String,
+    },
+    /// A magi worktree holds the branch, and releasing it is not safe.
+    Unsafe {
+        /// The contested branch.
+        branch: String,
+        /// The worktree that holds it.
+        path: String,
+        /// Machine detail of why it was refused (English).
+        why: String,
+    },
+    /// Releasing the earlier run's worktree failed and was undone.
+    ReleaseFailed {
+        /// The contested branch.
+        branch: String,
+        /// The worktree that holds it.
+        path: String,
+        /// Short id of the run that owned the worktree.
+        run: String,
+    },
+}
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Refused::Foreign { branch, path, why } => write!(
+                f,
+                "branch `{branch}` is checked out in {path}, which magi will not remove by \
+                 itself: {why}. Remove that worktree (`git worktree remove`) if it is not \
+                 needed, and try again."
+            ),
+            Refused::Unsafe { branch, path, why } => write!(
+                f,
+                "branch `{branch}` is checked out in {path}: {why}. Commit or discard the work \
+                 there and remove that worktree (`git worktree remove`), or say the run may be \
+                 discarded, and try again."
+            ),
+            Refused::ReleaseFailed { branch, path, run } => write!(
+                f,
+                "branch `{branch}` is checked out in {path} by run {run}, and releasing that \
+                 worktree failed or found it changed (git refuses to remove a worktree with \
+                 uncommitted changes); it was left as it was"
+            ),
+        }
     }
 }
 
@@ -250,11 +300,11 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 fn foreign(branch: &str, path: &Path, why: &str) -> anyhow::Error {
-    Refused(format!(
-        "branch `{branch}` is checked out in {}, which magi will not remove by itself: {why}. \
-         Remove that worktree (`git worktree remove`) if it is not needed, and try again.",
-        path.display()
-    ))
+    Refused::Foreign {
+        branch: branch.to_owned(),
+        path: path.display().to_string(),
+        why: why.to_owned(),
+    }
     .into()
 }
 
@@ -365,12 +415,11 @@ pub async fn release(
 
     let holder = inspect(repo, branch, &path, &state, &takeover.home).await?;
     if let Decision::Refuse(why) = decide(&kind, &holder) {
-        return Err(Refused(format!(
-            "branch `{branch}` is checked out in {}: {why}. Commit or discard the work \
-             there and remove that worktree (`git worktree remove`), or say the run may be \
-             discarded, and try again.",
-            path.display()
-        ))
+        return Err(Refused::Unsafe {
+            branch: branch.to_owned(),
+            path: path.display().to_string(),
+            why,
+        }
         .into());
     }
     let audit = format!(
@@ -426,13 +475,11 @@ pub async fn release(
             ),
         );
         state.save_under(&takeover.home)?;
-        return Err(Refused(format!(
-            "branch `{branch}` is checked out in {} by run {}, and releasing that worktree \
-             failed or found it changed (git refuses to remove a worktree with uncommitted \
-             changes); it was left as it was",
-            path.display(),
-            crate::run::short_of(&old_id)
-        ))
+        return Err(Refused::ReleaseFailed {
+            branch: branch.to_owned(),
+            path: path.display().to_string(),
+            run: crate::run::short_of(&old_id).to_owned(),
+        }
         .into());
     }
     Ok(Some(Released {
@@ -447,6 +494,20 @@ pub async fn release(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn refused_display_is_the_english_text() {
+        let r = Refused::Foreign {
+            branch: "b".into(),
+            path: "/w".into(),
+            why: "w".into(),
+        };
+        assert_eq!(
+            r.to_string(),
+            "branch `b` is checked out in /w, which magi will not remove by itself: w. Remove \
+             that worktree (`git worktree remove`) if it is not needed, and try again."
+        );
+    }
+
     use super::*;
 
     fn holder() -> Holder {
