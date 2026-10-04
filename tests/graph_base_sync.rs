@@ -578,20 +578,21 @@ async fn a_resume_after_a_local_only_rebase_pushes_it_with_a_lease() {
 
 /// Two-commit winner: `note.txt` (conflicts with upstream's) then
 /// `second.txt` (does not).
-async fn two_commit_run(
-    fx: &mut common::Fixture,
-    skip_one: bool,
-    second_upstream: bool,
-) -> Runner {
+async fn two_commit_run(fx: &mut common::Fixture, skip_one: bool, second_upstream: bool) -> Runner {
     fx.config.graph.candidates = 1;
     set_agent_env(fx, "MOCK_IMPL_TWO_COMMITS");
     if skip_one {
         set_agent_env(fx, "MOCK_REBASE_FIX_SKIP_ONE");
     }
     let origin = wire_origin(fx);
-    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
-        .await
-        .expect("start");
+    let mut runner = Runner::start(
+        &fx.repo,
+        "create note.txt".to_owned(),
+        fx.config.clone(),
+        magi::run::Origin::operator(),
+    )
+    .await
+    .expect("start");
     if second_upstream {
         std::fs::write(origin.sideline.join("second.txt"), "second\n").unwrap();
     }
