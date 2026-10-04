@@ -2060,7 +2060,8 @@ function renderRuns() {
   if (runs.length > 0) renderRunStateChips(runs);
   /* The box only makes sense once there is something to search; an empty
      history keeps its own "nothing has run yet" explanation. */
-  show($("runs-search"), runs.length > 0);
+  const searchable = runs.length > 0 || unreadable > 0;
+  show($("runs-search"), searchable);
   show($("runs-search-clear"), state.runsSearch !== "");
 
   /* Two hidings, on by default, both lifted by "all": a done run and an old
@@ -2082,7 +2083,7 @@ function renderRuns() {
      back in even though the tree is the desktop's whole point. */
   renderRunsTree(buildRunsTree(groupBySection(heads)));
   renderRunsFilterBar();
-  const searching = runs.length > 0 && searchText("runs") !== "";
+  const searching = searchable && searchText("runs") !== "";
   const searchKind = searching ? state.search.runs.status : "idle";
   const filtered = stateFiltered.filter(matchesFilter);
   /* The search composes with the chips and the tree: a row must pass all of
@@ -2110,7 +2111,13 @@ function renderRuns() {
     ? 0
     : [...childrenOf.values()].reduce((sum, kids) => sum + kids.filter(matchesRunState).length, 0);
   const childrenForRender = state.runsStateFilter === "all" && !searching ? childrenOf : new Map();
-  renderSearchExtras(searching && searchKind !== "error" ? runs : null);
+  /* A hit outside the loaded window has no state, section or repository on
+     the client, so it cannot honour those filters; it is listed only while
+     none is narrowing the page, and the status line counts it as hidden
+     otherwise. */
+  const unfiltered = state.runsStateFilter === "all"
+    && !(state.runsFilter.section || state.runsFilter.repo || state.runsFilter.status);
+  renderSearchExtras(searching && searchKind !== "error" && unfiltered ? runs : null);
   syncRunSections(sectionsRoot, groupBySection(visible), childrenForRender);
 
   const supersededHidden = orphanHidden + foldedHidden;
