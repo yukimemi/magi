@@ -1392,14 +1392,28 @@ something to answer, so it does not reuse `ask::Questions`.
   is about) and `covered_by`. When an open question whose `run` equals a
   subject exists and is about the same kind of cause (a conduct / triage question
   covers that task's hold and handover notices, a question from inside a run
-  covers that run's ended / stopped notices, and the two never cross; time
-  proximity is not used) - at raise time (`notices::raise_in`) or is filed afterwards
+  covers that run's ended / stopped notices, and the two never cross) - at raise time (`notices::raise_in`) or is filed afterwards
   (`Questions::put`, first write only, via `notices::quiet_for`) - the notice is
   still written, but already read and pointing at the question. Dedupe is
   expressed as read state, never as a tombstone, so a recurrence with a changed
   message or higher severity pages again; `Task::hold_reason` is untouched, so
   `magi task show` keeps the reason. The release / land question
   (`bump::NOTICE_NODE`) never covers anything.
+- **`Notice::since` identifies the cause.** A task hold's notice carries
+  `Task::held_at` (stamped on entering `Held`, kept by a re-hold, cleared by
+  `release`; `queue::SCHEMA` 9). `notices::covers` ignores a question filed
+  before `since`: it is about an older cause, and silencing a new hold or
+  handover failure behind it would hide the failure. A question filed after the
+  hold still covers it however late. Missing a duplicate costs one extra page;
+  hiding a failure costs the failure, so the rule errs towards paging. A notice
+  with no `since` keeps the old broad rule. `Notices::cover` re-checks under
+  the lock. A later `since` on the same key relights the notice - the one
+  exception to the tombstone rule: hold, release, hold again pages again.
+- **A refused handover is one page.** `daemon` no longer raises a separate
+  `handover:<id>`; the hold's own `task:<id>` notice (from `Queue::put`) is the
+  page, and the release guidance rides in the hold reason with fixed wording.
+  `covers` still matches a `handover:` key for records written earlier. A page
+  already delivered cannot be retracted when a question arrives later.
 
 ### Duplicate-work claims are gathered from several places
 
