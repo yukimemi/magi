@@ -9695,6 +9695,21 @@ mod tests {
     }
 
     #[test]
+    fn a_land_with_no_fix_rounds_says_so_instead_of_an_empty_rail() {
+        let body = |name: &str| {
+            let at = APP_JS.find(name).unwrap_or_else(|| panic!("{name} missing"));
+            &APP_JS[at..at + 2500.min(APP_JS.len() - at)]
+        };
+        assert!(body("function roundRail").contains("if (round <= 0) return null;"));
+        let note = body("function landRoundNote");
+        assert!(note.contains("No fix rounds needed (0 of ${rounds} used)."));
+        assert!(note.contains("Land round ${round}"));
+        let land = body("function renderLand");
+        let note_at = land.find("landRoundNote(pr)").expect("renderLand uses the note");
+        assert!(note_at < land.find("roundRail(pr)").expect("renderLand uses the rail"));
+    }
+
+    #[test]
     fn the_unreadable_banner_is_dismissible_per_count_and_the_count_stays() {
         assert!(APP_JS.contains("magi-stats-unreadable-dismissed"));
         assert!(APP_JS.contains("s.runs_unreadable > 0 && s.runs_unreadable !== dismissed"));
