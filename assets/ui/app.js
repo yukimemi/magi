@@ -6293,73 +6293,102 @@ function renderCandidates(run) {
   const decided = Boolean(run.tally && run.tally.met_quorum);
   setText($("cand-count"), `${candidates.filter(viable).length} viable of ${candidates.length}`);
 
-  const list = $("run-cands");
   const rounds = Array.isArray(run.reviews) ? run.reviews : [];
   const gate = Array.isArray(run.gate) ? run.gate : [];
   const target = reviewTarget(run);
-  /* A redraw that changes nothing must not touch the DOM: the 5 s refresh
-     would otherwise rebuild the cards under a reader's scroll position and
-     fold the review disclosures they opened. */
-  const sig = JSON.stringify([run.id, candidates, winner, decided, target, rounds, gate]);
-  if (list.dataset.sig === sig) return;
-  list.dataset.sig = sig;
-  clear(list);
-  candidates.forEach((candidate, i) => {
-    const dead = !viable(candidate);
-    const facts = [];
-    if (candidate.commits) facts.push(plural(candidate.commits, "commit", "commits"));
-    if (candidate.files) facts.push(plural(candidate.files, "file", "files"));
-    const took = seconds(candidate.duration_ms);
-    if (took) facts.push(took);
-    if (candidate.branch) facts.push(candidate.branch);
 
-    const reviews = (candidate.label || "?") === target && (rounds.length > 0 || gate.length > 0)
-      ? candidateReviews(run.id, candidate.label || "?", rounds, gate)
-      : null;
-
-    list.append(el("li", {
-      class: "cand",
-      "data-winner": winner && candidate.label === winner && decided ? "1" : null,
-      style: `--cand-tone: ${candTone(i)}`,
+  /* Cards are reconciled by run and label, never rebuilt wholesale: the
+     reviews disclosure inside a card keeps its element, so the 5 s refresh
+     cannot drop the focus, scroll position or open state of one the operator
+     is reading. Only a part whose own data changed is rewritten. */
+  const items = candidates.map((candidate, i) => ({ candidate, i }));
+  syncList($("run-cands"), items, ({ candidate }) => `${run.id}:${candidate.label || "?"}`,
+    () => {
+      const body = el("div", { class: "cand-body" });
+      const slot = el("div", { class: "cand-reviews-slot" });
+      const card = el("li", { class: "cand" }, body, slot);
+      card.refs = { body, slot };
+      return card;
     },
-      el("div", { class: "cand-head" },
-        el("span", { class: "cand-label", text: candidate.label || "?" }),
-        el("span", { class: "cand-agent", text: candidate.agent || "" }),
-        winner && candidate.label === winner
-          ? el("span", {
-              class: "crown",
-              "data-provisional": decided ? null : "1",
-              text: decided ? "winner" : "provisional",
-            })
-          : null,
-      ),
-      facts.length ? numbers(facts) : null,
-      dead
-        ? el("p", {
-            class: "card-note",
-            text: candidate.failed
-              || (candidate.verified_noop ? `Agent-verified no-op: ${candidate.verified_noop}` : "Produced no change at all."),
+    (card, { candidate, i }) => {
+      const label = candidate.label || "?";
+      const r = card.refs;
+      setAttr(card, "data-winner", winner && candidate.label === winner && decided ? "1" : null);
+      setAttr(card, "style", `--cand-tone: ${candTone(i)}`);
+
+      const bodySig = JSON.stringify([candidate, winner, decided]);
+      if (r.body.dataset.sig !== bodySig) {
+        r.body.dataset.sig = bodySig;
+        clear(r.body);
+        append(r.body, candidateBody(candidate, winner, decided));
+      }
+
+      const mine = label === target && (rounds.length > 0 || gate.length > 0);
+      if (!mine) {
+        clear(r.slot);
+        delete r.slot.dataset.sig;
+        r.reviews = null;
+        return;
+      }
+      if (!r.reviews) {
+        r.reviews = candidateReviews(run.id, label);
+        r.slot.append(r.reviews.details);
+      }
+      const reviewSig = JSON.stringify([rounds, gate]);
+      if (r.slot.dataset.sig !== reviewSig) {
+        r.slot.dataset.sig = reviewSig;
+        setText(r.reviews.count, reviewGist(rounds, gate));
+        clear(r.reviews.list);
+        r.reviews.list.append(...buildReviewRounds(rounds, gate));
+      }
+    });
+}
+
+function candidateBody(candidate, winner, decided) {
+  const dead = !viable(candidate);
+  const facts = [];
+  if (candidate.commits) facts.push(plural(candidate.commits, "commit", "commits"));
+  if (candidate.files) facts.push(plural(candidate.files, "file", "files"));
+  const took = seconds(candidate.duration_ms);
+  if (took) facts.push(took);
+  if (candidate.branch) facts.push(candidate.branch);
+  return [
+    el("div", { class: "cand-head" },
+      el("span", { class: "cand-label", text: candidate.label || "?" }),
+      el("span", { class: "cand-agent", text: candidate.agent || "" }),
+      winner && candidate.label === winner
+        ? el("span", {
+            class: "crown",
+            "data-provisional": decided ? null : "1",
+            text: decided ? "winner" : "provisional",
           })
         : null,
-      candidate.summary ? el("p", { class: "cand-summary", text: candidate.summary }) : null,
-      candidate.stat ? el("pre", { class: "stat", text: candidate.stat }) : null,
-      reviews,
-    ));
-  });
+    ),
+    facts.length ? numbers(facts) : null,
+    dead
+      ? el("p", {
+          class: "card-note",
+          text: candidate.failed
+            || (candidate.verified_noop ? `Agent-verified no-op: ${candidate.verified_noop}` : "Produced no change at all."),
+        })
+      : null,
+    candidate.summary ? el("p", { class: "cand-summary", text: candidate.summary }) : null,
+    candidate.stat ? el("pre", { class: "stat", text: candidate.stat }) : null,
+  ];
 }
 
 /* A candidate's reviews, folded by default. The open state is remembered per
    run and label; it is written from this element's own toggle, which knows
    its run, so a late event cannot file it under a different run. */
-function candidateReviews(runId, label, rounds, gate) {
+function candidateReviews(runId, label) {
   const key = `rev:${label}`;
+  const count = el("span", { class: "count" });
+  const list = el("ol", { class: "rounds" });
   const details = el("details", { class: "advanced cand-reviews" },
-    el("summary", {}, "Reviews ", el("span", { class: "count", text: reviewGist(rounds, gate) })),
-    el("ol", { class: "rounds" }, buildReviewRounds(rounds, gate)),
-  );
+    el("summary", {}, "Reviews ", count), list);
   details.open = runPanelOpen(runId, key);
   details.addEventListener("toggle", () => setRunPanelOpen(runId, key, details.open));
-  return details;
+  return { details, count, list };
 }
 
 /* `ReviewVote` on the wire: "approve" | "approve_with_findings" | "reject".
