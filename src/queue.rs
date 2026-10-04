@@ -3492,8 +3492,7 @@ mod tests {
             let (now, max) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
             let handles: Vec<_> = (0..n)
                 .map(|_| {
-                    let (q, b, now, max) =
-                        (q.clone(), barrier.clone(), now.clone(), max.clone());
+                    let (q, b, now, max) = (q.clone(), barrier.clone(), now.clone(), max.clone());
                     std::thread::spawn(move || {
                         b.wait();
                         let g = q.lock_task("t").unwrap();
