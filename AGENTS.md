@@ -1440,6 +1440,16 @@ something to answer, so it does not reuse `ask::Questions`.
   with no `since` keeps the old broad rule. `Notices::cover` re-checks under
   the lock. A later `since` on the same key relights the notice - the one
   exception to the tombstone rule: hold, release, hold again pages again.
+- **A notice also fires `[notify]`, decided in one place.** `Notice::raise_again`
+  returns whether the raise pages (relit and not covered; a brand-new
+  uncovered notice pages too); `notices::raise_in_with` sends a `Page` through
+  an injected closure. The real sender runs on its own thread and runtime and
+  is a no-op until `notices::install_pager()` (called in `async_main`), so a
+  test that pins a home never reaches the operator's config. A producer with a
+  repo config passes it via `notices::raise_with`; every other one gets the
+  machine layer's `[notify]`. `land::announce_red_merge` must not call
+  `ask::notify_text` itself: the notice already pages, and a second call would
+  page a merged-red twice (and ignore `covered_by`).
 - **A refused handover is one page.** `daemon` no longer raises a separate
   `handover:<id>`; the hold's own `task:<id>` notice (from `Queue::put`) is the
   page, and the release guidance rides in the hold reason with fixed wording.
