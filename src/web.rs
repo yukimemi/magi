@@ -2570,7 +2570,12 @@ fn task_outcome(
             history
                 .iter()
                 .rev()
-                .find(|h| matches!(h.exit, RunExit::Merged | RunExit::AlreadyInBase))
+                .find(|h| {
+                    matches!(
+                        h.exit,
+                        RunExit::Merged | RunExit::Ready | RunExit::AlreadyInBase
+                    )
+                })
                 .map(brief)
         })
         .flatten();
@@ -12092,11 +12097,11 @@ mod tests {
         let b = "20260901-000000-bbbb";
         let c = "20260901-000000-cccc";
         let dir = tempfile::tempdir().expect("tempdir");
-        write_run(dir.path(), a, RunStatus::Ready);
+        write_run(dir.path(), a, RunStatus::Blocked);
         write_run(dir.path(), b, RunStatus::VerifiedNoop);
         // `c` has no record: unreadable.
         let read = |id: &str| read_run(dir.path(), id).ok();
-        // Neither Ready nor a no-op finished the task; the newest run is
+        // Neither a blocked run nor a no-op finished the task; the newest run is
         // unreadable and still named.
         let t = outcome_task(&[a, b, c], TaskStatus::Done);
         let out = task_outcome(&t, a, 3, read);
@@ -12106,6 +12111,13 @@ mod tests {
         assert_eq!(latest.id, c);
         assert_eq!(latest.status, None);
         assert_eq!(latest.outcome, "record unreadable");
+
+        // A Ready run settles the task as done, so it is named as the finisher.
+        write_run(dir.path(), c, RunStatus::Ready);
+        let t = outcome_task(&[a, c], TaskStatus::Done);
+        let out = task_outcome(&t, a, 3, |id| read_run(dir.path(), id).ok());
+        assert_eq!(out.finished_by.expect("finisher").id, c);
+        assert!(!out.closed_by_hand);
 
         // A resumed run id repeats: it is still the latest by id.
         let t = outcome_task(&[a, b, a], TaskStatus::Held);
