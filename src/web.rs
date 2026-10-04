@@ -9990,11 +9990,14 @@ mod tests {
     fn snippet_marks_matches_longer_than_the_window() {
         let cap = SNIPPET_BEFORE + SNIPPET_AFTER + 2;
         let hit_len = |parts: &[SnippetPart]| -> usize {
-            parts.iter().filter(|p| p.hit).map(|p| p.text.chars().count()).sum()
+            parts
+                .iter()
+                .filter(|p| p.hit)
+                .map(|p| p.text.chars().count())
+                .sum()
         };
-        let total = |parts: &[SnippetPart]| -> usize {
-            parts.iter().map(|p| p.text.chars().count()).sum()
-        };
+        let total =
+            |parts: &[SnippetPart]| -> usize { parts.iter().map(|p| p.text.chars().count()).sum() };
 
         let long = "a".repeat(120);
         let parts = snippet_of(&long, &[long.clone()]);
