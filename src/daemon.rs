@@ -2706,7 +2706,7 @@ async fn attempt(
         repo.display()
     );
 
-    let mut config = match prepare(&repo, opts) {
+    let mut config = match prepare_for(&repo, opts, task) {
         Ok(c) => c,
         Err(e) => {
             // A setup failure spends an attempt even though no run was minted.
@@ -2782,11 +2782,17 @@ async fn attempt(
             .unwrap_or(false),
         None => false,
     };
-    let starter = choose_starter(
-        review_branch.as_deref(),
-        branch_exists,
-        unfinished.as_deref(),
-    );
+    // An explicit `magi review <branch>` is reviewed whatever happens to the
+    // branch: it never falls back to a competition (`Task::review_of`). An
+    // unfinished run of the same task still wins, so a retry resumes.
+    let starter = match (&review_branch, &unfinished, &task.review_of) {
+        (None, None, Some(branch)) => Starter::Review(branch.clone()),
+        _ => choose_starter(
+            review_branch.as_deref(),
+            branch_exists,
+            unfinished.as_deref(),
+        ),
+    };
     // Absolute paths of the files the task was filed with, re-read from the
     // task now so a file attached while it was held reaches a resumed run
     // too. A stored name whose file has gone is an error before any agent is
@@ -2831,6 +2837,16 @@ async fn attempt(
                     r.state.instruction = instruction;
                 }
                 r.state.attachments = attachments.clone();
+                // The merge choice of a hand-started task still holds when the
+                // run it resumes was started under another one.
+                if let Some(mode) = task
+                    .overrides
+                    .as_ref()
+                    .and_then(|o| o.merge.as_deref())
+                    .and_then(|m| merge_mode(m).ok())
+                {
+                    r.state.config.merge.mode = mode;
+                }
                 r
             })
         }
@@ -2964,16 +2980,39 @@ async fn attempt(
     // `RunState::quota` is the run's whole history across every resume, so
     // only what this execution added may arm the cooldown or earn a refund.
     let quota_before = runner.state.quota.clone();
-    let detail = match runner.execute().await {
-        Ok(()) => describe(&runner.state),
+    let result = runner.execute().await;
+    finish_attempt(
+        opts.max_attempts,
+        queue,
+        task,
+        &runner.state,
+        &quota_before,
+        result,
+    )
+}
+
+/// Settle `task` after its run executed: the verdict, the diagnosis, the
+/// supersession of earlier attempts and the save. Shared by the loop and by
+/// `magi run --resume`, so an attempt is counted one way wherever it ran.
+/// Returns the quota losses this execution added to the run.
+pub fn finish_attempt(
+    max_attempts: usize,
+    queue: &Queue,
+    task: &mut Task,
+    state: &RunState,
+    quota_before: &[QuotaLoss],
+    result: Result<()>,
+) -> Vec<QuotaLoss> {
+    let detail = match result {
+        Ok(()) => describe(state),
         Err(e) => format!("{e:#}"),
     };
-    let fresh = losses_this_attempt(&quota_before, &runner.state.quota);
+    let fresh = losses_this_attempt(quota_before, &state.quota);
     let verdict = Verdict {
-        status: runner.state.status,
+        status: state.status,
         // A run that opened a pull request handed its work over, whatever the
         // gate then decided about merging it.
-        left_pr: runner.state.pr.is_some(),
+        left_pr: state.pr.is_some(),
         // Only a rate limit earns the task its attempt back - and only one
         // suffered now: a refund justified by a previous session's loss is
         // the same mistake as re-arming the cooldown from it. A stalled run
@@ -2983,12 +3022,12 @@ async fn attempt(
         // A run that parked was asked to stop; that is not a failure and must
         // not spend an attempt, or replacing the binary a few times would
         // exhaust a task's budget without an agent ever misbehaving.
-        parked: runner.state.parked,
+        parked: state.parked,
         // A quota loss that left nothing viable is the same machine fact as a
         // `Stalled` quota loss; see `settle`'s doc table.
-        no_viable_candidates: runner.state.viable().is_empty(),
+        no_viable_candidates: state.viable().is_empty(),
     };
-    settle_and_diagnose(task, verdict, &detail, opts.max_attempts, &runner.state);
+    settle_and_diagnose(task, verdict, &detail, max_attempts, state);
     if task.status == TaskStatus::Done {
         supersede_prior_runs(task, &crate::run::home());
     }
@@ -2997,10 +3036,86 @@ async fn attempt(
         "task {} is {} after run {} ({})",
         task.short(),
         task.status.as_str(),
-        runner.state.short(),
-        label(runner.state.status)
+        state.short(),
+        label(state.status)
     );
     fresh
+}
+
+/// A task a hand-started run leaves runnable (failed with attempts to spare,
+/// or requeued) is **held**: nobody asked for a retry, and a loop starting
+/// later must not spend agent calls on it. `magi task release` retries.
+pub fn hold_if_runnable(queue: &Queue, task: &mut Task) {
+    if task.status.runnable() {
+        let why = task.last_error.clone().map_or_else(
+            || "the run did not finish".to_owned(),
+            |e| format!("the run did not finish: {e}"),
+        );
+        task.hold_manual(Some(format!(
+            "{why}. It was started by hand, so it is not retried \
+             automatically; `magi task release` retries it."
+        )));
+        record(queue, task);
+    }
+}
+
+/// Whether an attempt at a task whose newest run is `run` would resume that
+/// run rather than start a fresh competition. `magi run --resume` hands a run
+/// to a live loop only when this holds.
+#[must_use]
+pub fn loop_would_resume(run: &str) -> bool {
+    unfinished_run(&[run.to_owned()], crate::run::short_of(run)).is_some()
+}
+
+/// A loop in another process that is alive right now: a fresh heartbeat in
+/// `<home>/daemon.json` published by a pid that is not `own_pid`. `Some(pid)`
+/// carries the pid it published (`None` inside when it published none - a
+/// fresh heartbeat is still evidence of a live loop).
+///
+/// The one judgement of "is somebody else serving this queue", shared by the
+/// web UI's refusal to start a second loop and by `magi run` / `magi review`
+/// deciding whether to hand a task to the loop. A claim file proves nothing
+/// here: whether a claim succeeds says nothing about whether its owner lives.
+#[must_use]
+pub fn foreign_loop(
+    reading: Option<&Reading>,
+    now: Timestamp,
+    own_pid: u32,
+) -> Option<Option<u32>> {
+    let reading = reading.filter(|r| r.running(now))?;
+    match reading.pid {
+        Some(pid) if pid == own_pid => None,
+        pid => Some(pid),
+    }
+}
+
+/// Run one task this process has claimed, in this process, through exactly the
+/// attempt a daemon would make: the same starter choice (start, resume,
+/// review), the same `Task::start` / `settle` transitions, attempt counting,
+/// quota refund and parking. No second dispatcher - `magi run` and `magi
+/// review` call this when no daemon is alive.
+///
+/// The caller holds the [`Queue::claim`] for the whole call, which is what
+/// keeps a daemon that starts meanwhile from taking the task.
+///
+/// The one deliberate difference from the loop: a task the attempt leaves
+/// runnable (failed with attempts to spare, or requeued) is **held** instead.
+/// Nobody asked for a retry, and a daemon starting later must not spend agent
+/// calls re-running a hand-started task behind the operator's back;
+/// `magi task release` is the explicit retry.
+pub async fn run_claimed(opts: &Opts, queue: &Queue, task: &mut Task) {
+    let status = Arc::new(Mutex::new(Status::new()));
+    let stop = Stop::new();
+    attempt(
+        opts,
+        queue,
+        &status,
+        &stop,
+        crate::graph::Pause::new(),
+        task,
+    )
+    .await;
+    hold_if_runnable(queue, task);
 }
 
 /// The quota losses `after` holds that `before` did not: what one execution
@@ -3049,6 +3164,27 @@ fn apply_solo(config: &mut Config, task: &Task) {
     if task.solo {
         config.graph.candidates = 1;
     }
+}
+
+/// [`prepare`] for one task: its own `--config` and command-line overrides
+/// (`Task::overrides`, filed by `magi run` / `magi review`) take precedence
+/// over the loop's, so handing a hand-started task to a daemon changes nothing
+/// about what it does.
+fn prepare_for(repo: &Path, opts: &Opts, task: &Task) -> Result<Config> {
+    let Some(o) = &task.overrides else {
+        return prepare(repo, opts);
+    };
+    // A task filed by `magi run` / `magi review` was configured by that
+    // command line alone: the loop's own `--config` / `--merge` must not leak
+    // in, or the same command would behave differently with a loop alive.
+    let own = Opts {
+        config: o.config.clone(),
+        merge: None,
+        ..opts.clone()
+    };
+    let mut config = prepare(repo, &own)?;
+    o.apply(&mut config);
+    Ok(config)
 }
 
 /// Load the config for a task's repository, with the merge override applied.
@@ -3556,8 +3692,8 @@ where
     let id = runs.last()?;
     match load(id) {
         // A run some process is driving right now is not "unfinished" in the
-        // sense of waiting to be picked up: `magi run --task` links a direct
-        // run into `runs` while it is still executing, and resuming it here
+        // sense of waiting to be picked up: a run started by hand is in
+        // `runs` while it is still executing, and resuming it here
         // would put a second driver on the same worktrees.
         Ok(s)
             if s.status.resumable()
@@ -3949,7 +4085,7 @@ fn label(status: RunStatus) -> &'static str {
 }
 
 /// Parse a merge mode override.
-fn merge_mode(mode: &str) -> Result<MergeMode> {
+pub(crate) fn merge_mode(mode: &str) -> Result<MergeMode> {
     match mode {
         "none" => Ok(MergeMode::None),
         "local" => Ok(MergeMode::Local),

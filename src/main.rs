@@ -99,7 +99,7 @@ struct RunOpts {
     /// request that unfinished work already owns.
     #[arg(long)]
     force: bool,
-    /// The queue task this run serves; the run is added to that task's runs.
+    /// Run an existing queue task instead of filing a new one.
     #[arg(long, value_name = "TASK_ID")]
     task: Option<String>,
 }
@@ -148,6 +148,13 @@ enum RunCmd {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run a competition for one task.
+    ///
+    /// Every run is a task: this files one in the queue (like `magi task add`)
+    /// and prints its id; open it with `magi task show <id>`. When a `magi
+    /// serve` / `magi web` loop is alive the task is filed urgent and that
+    /// loop runs it - this command follows it and exits with its outcome.
+    /// Otherwise this process runs it, holding the task's claim so a loop
+    /// started meanwhile leaves it alone.
     Run {
         #[command(subcommand)]
         command: Option<RunCmd>,
@@ -168,6 +175,10 @@ enum Command {
     /// Run only the review + verification + gate loop, on work that already
     /// exists on a branch. Nothing competes: no implementation, no judging, no
     /// vote. This is the cheap half of the graph, for hand-written changes.
+    ///
+    /// Like `magi run`, this files a task first (its id is printed; open it
+    /// with `magi task show <id>`), then runs it here or - when a loop is
+    /// alive - hands it over as an urgent task and follows it.
     Review {
         /// Branch holding the work to review.
         branch: String,
@@ -190,8 +201,7 @@ enum Command {
         /// branch.
         #[arg(long)]
         force: bool,
-        /// The queue task this review serves; the run is added to that
-        /// task's runs.
+        /// Run an existing queue task instead of filing a new one.
         #[arg(long, value_name = "TASK_ID")]
         task: Option<String>,
     },
@@ -1049,70 +1059,75 @@ async fn dispatch(command: Command) -> Result<()> {
             ) {
                 bail!(why);
             }
-            let repo = opts.repo.unwrap_or_else(|| PathBuf::from("."));
-            let mut runner = if let Some(id) = resume {
-                let runner = Runner::resume(&id)?;
-                println!(
-                    "{}",
-                    format_args!("resuming {} ({:?})", runner.state.id, runner.state.status)
-                );
-                runner
-            } else {
-                let task = task_text(&instruction, file.as_deref(), issue).await?;
-                let (mut cfg, from) = Config::discover(&repo, opts.config.as_deref())?;
-                if let Some(n) = opts.candidates {
-                    cfg.graph.candidates = n;
-                }
-                if let Some(n) = opts.judges {
-                    cfg.graph.judges = n;
-                }
-                if let Some(n) = opts.review_rounds {
-                    cfg.graph.review_rounds = n;
-                }
-                if let Some(m) = opts.merge {
-                    cfg.merge.mode = m.into();
-                }
-                if let Some(s) = opts.seed {
-                    cfg.blind.seed = Some(s);
-                }
-                println!("config: {}", describe_layers(&from));
-                if !opts.force {
-                    refuse_duplicates(
-                        &Queue::open(),
-                        &magi::run::runs_root(),
-                        &repo,
-                        &task,
-                        None,
-                        Some(&cfg),
-                    )
-                    .await?;
-                }
-                // The same free-space gate the daemon obeys: a run that cannot
-                // finish must not start, and a held task must not spend an
-                // attempt on the way in.
-                let min = cfg.disk.min_free_bytes;
-                if min > 0 {
-                    let free = magi::disk::free_bytes(&repo)
-                        .with_context(|| format!("measure free space on {}", repo.display()))?;
-                    if let Some(reason) = magi::disk::gate(free, min) {
-                        bail!("{reason}");
-                    }
-                }
-                let (origin, serves) = direct_origin(opts.task.as_deref())?;
-                let runner = Runner::start(&repo, task, cfg, origin).await?;
-                link_to_task(&runner, serves)?;
-                runner
-            };
-
-            if opts.dry_run {
-                print!("{}", report::run(&runner.state));
-                println!("\ndry run: stopping before the first agent call");
-                return Ok(());
+            let repo = opts.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+            if let Some(id) = resume {
+                return resume_run(&id, opts.dry_run).await;
             }
-
-            let result = runner.execute().await;
-            print!("{}", report::run(&runner.state));
-            exit_status(result, runner.state.status, runner.state.pr.is_some())
+            let queue = Queue::open();
+            if let Some(task_id) = opts.task.as_deref() {
+                // An existing task: nothing is filed, it is the one that runs.
+                if !instruction.is_empty() || file.is_some() || issue.is_some() {
+                    bail!(
+                        "--task runs the task as stored; drop the instruction (edit the task \
+                         with `magi task edit` to change it)"
+                    );
+                }
+                if opts.dry_run {
+                    bail!("--dry-run cannot be combined with --task");
+                }
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let patch = magi::queue::RunOverrides {
+                    merge: opts.merge.map(|m| merge_arg_name(m).to_owned()),
+                    candidates: opts.candidates,
+                    judges: opts.judges,
+                    reviewers: None,
+                    review_rounds: opts.review_rounds,
+                    seed: opts.seed,
+                    config: opts.config.as_deref().map(|c| absolute_path(c, &cwd)),
+                };
+                return run_existing_task(&queue, task_id, patch, None).await;
+            }
+            let text = task_text(&instruction, file.as_deref(), issue).await?;
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let overrides = magi::queue::RunOverrides {
+                merge: opts.merge.map(|m| merge_arg_name(m).to_owned()),
+                candidates: opts.candidates,
+                judges: opts.judges,
+                reviewers: None,
+                review_rounds: opts.review_rounds,
+                seed: opts.seed,
+                config: opts.config.as_deref().map(|c| absolute_path(c, &cwd)),
+            };
+            let repo = resolve_repo(&repo, &cwd, Some(&text)).await?;
+            let (mut cfg, from) = Config::discover(&repo, overrides.config.as_deref())?;
+            overrides.apply(&mut cfg);
+            println!("config: {}", describe_layers(&from));
+            if !opts.force {
+                refuse_duplicates(
+                    &queue,
+                    &magi::run::runs_root(),
+                    &repo,
+                    &text,
+                    None,
+                    Some(&cfg),
+                )
+                .await?;
+            }
+            // The same free-space gate the daemon obeys: a run that cannot
+            // finish must not start, and a held task must not spend an
+            // attempt on the way in.
+            disk_precheck(&repo, &cfg)?;
+            let source = task_source(issue).await;
+            let filing = magi::direct::Filing {
+                title: queue::title_from(&text, 72),
+                instruction: text,
+                repo,
+                source,
+                solo: false,
+                overrides,
+                review_of: None,
+            };
+            run_as_task(&queue, filing, opts.dry_run).await
         }
 
         Command::Review {
@@ -1125,10 +1140,34 @@ async fn dispatch(command: Command) -> Result<()> {
             force,
             task,
         } => {
-            let (mut cfg, from) = Config::discover(&repo, config.as_deref())?;
+            let queue = Queue::open();
+            if let Some(task_id) = task.as_deref() {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let patch = magi::queue::RunOverrides {
+                    merge: merge.map(|m| merge_arg_name(m).to_owned()),
+                    candidates: None,
+                    judges: None,
+                    reviewers,
+                    review_rounds,
+                    seed: None,
+                    config: config.as_deref().map(|c| absolute_path(c, &cwd)),
+                };
+                return run_existing_task(&queue, task_id, patch, Some(branch)).await;
+            }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let overrides = magi::queue::RunOverrides {
+                merge: merge.map(|m| merge_arg_name(m).to_owned()),
+                candidates: None,
+                judges: None,
+                reviewers,
+                review_rounds,
+                seed: None,
+                config: config.as_deref().map(|c| absolute_path(c, &cwd)),
+            };
+            let (mut cfg, from) = Config::discover(&repo, overrides.config.as_deref())?;
             if !force {
                 refuse_duplicates(
-                    &Queue::open(),
+                    &queue,
                     &magi::run::runs_root(),
                     &repo,
                     "",
@@ -1137,34 +1176,26 @@ async fn dispatch(command: Command) -> Result<()> {
                 )
                 .await?;
             }
-            if let Some(n) = reviewers {
-                cfg.graph.reviewers = n;
-            }
-            if let Some(n) = review_rounds {
-                cfg.graph.review_rounds = n;
-            }
-            if let Some(m) = merge {
-                cfg.merge.mode = m.into();
-            }
+            overrides.apply(&mut cfg);
             println!("config: {}", describe_layers(&from));
             // The same free-space gate `magi run` and the daemon obey: a
             // review-only run still drives worktrees and the shared verify
             // cache through this repository, so it must not start blind on a
             // disk that is already too full to finish it.
-            let min = cfg.disk.min_free_bytes;
-            if min > 0 {
-                let free = magi::disk::free_bytes(&repo)
-                    .with_context(|| format!("measure free space on {}", repo.display()))?;
-                if let Some(reason) = magi::disk::gate(free, min) {
-                    bail!("{reason}");
-                }
-            }
-            let (origin, serves) = direct_origin(task.as_deref())?;
-            let mut runner = Runner::review(&repo, &branch, cfg, origin).await?;
-            link_to_task(&runner, serves)?;
-            let result = runner.execute().await;
-            print!("{}", report::run(&runner.state));
-            exit_status(result, runner.state.status, runner.state.pr.is_some())
+            disk_precheck(&repo, &cfg)?;
+            let repo = resolve_repo(&repo, &cwd, None).await?;
+            let filing = magi::direct::Filing {
+                title: format!("review {branch}"),
+                instruction: format!(
+                    "Review the branch `{branch}` (review-only: no implementation, no judging)."
+                ),
+                repo,
+                source: task_source(None).await,
+                solo: false,
+                overrides,
+                review_of: Some(branch),
+            };
+            run_as_task(&queue, filing, false).await
         }
 
         Command::Fix {
@@ -3130,30 +3161,318 @@ fn agent_env() -> Option<(String, String)> {
     Some((run, node))
 }
 
-/// The origin of a run started from this command line, and the full id of the
-/// queue task it names with `--task`. The task is looked up *before* anything
-/// is minted, so a mistyped id starts nothing.
-fn direct_origin(task: Option<&str>) -> Result<(magi::run::Origin, Option<String>)> {
-    let serves = task
-        .map(|t| Queue::open().resolve_id(t))
-        .transpose()
-        .context("--task")?;
-    Ok((
-        magi::run::Origin::from_agent_env(agent_env(), serves.clone()),
-        serves,
-    ))
+/// The `--merge` value as it is stored on a task.
+fn merge_arg_name(m: MergeArg) -> &'static str {
+    match m {
+        MergeArg::None => "none",
+        MergeArg::Local => "local",
+        MergeArg::Pr => "pr",
+    }
 }
 
-/// Add a freshly started run to the runs of the task it serves. Failing is
-/// loud and happens before the graph runs: a run the task cannot see is
-/// exactly what `--task` exists to prevent.
-fn link_to_task(runner: &Runner, serves: Option<String>) -> Result<()> {
-    if let Some(task) = serves {
-        Queue::open()
-            .link_run(&task, &runner.state.id)
-            .with_context(|| format!("link run {} to task {task}", runner.state.short()))?;
+fn absolute_path(p: &Path, cwd: &Path) -> PathBuf {
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
+    std::path::absolute(&joined).unwrap_or(joined)
+}
+
+/// Refuse to start on a disk too full to finish a run; see the daemon's gate.
+fn disk_precheck(repo: &Path, cfg: &Config) -> Result<()> {
+    let min = cfg.disk.min_free_bytes;
+    if min > 0 {
+        let free = magi::disk::free_bytes(repo)
+            .with_context(|| format!("measure free space on {}", repo.display()))?;
+        if let Some(reason) = magi::disk::gate(free, min) {
+            bail!("{reason}");
+        }
     }
     Ok(())
+}
+
+/// The `daemon::Opts` a standalone run executes under: the task's own repo and
+/// config, the loop's default attempt budget.
+fn standalone_opts(task: &magi::queue::Task) -> magi::daemon::Opts {
+    magi::daemon::Opts {
+        repo: task.repo.clone(),
+        config: task.overrides.as_ref().and_then(|o| o.config.clone()),
+        ..magi::daemon::Opts::default()
+    }
+}
+
+/// Every run is a task: file `filing`, then either hand it to the live loop
+/// that owns the queue and follow it, or run it here against the claimed task
+/// record. See [`magi::direct`].
+async fn run_as_task(queue: &Queue, filing: magi::direct::Filing, dry_run: bool) -> Result<()> {
+    let home = magi::run::home();
+    let filed = magi::direct::file(
+        queue,
+        &home,
+        jiff::Timestamp::now(),
+        std::process::id(),
+        filing,
+        dry_run,
+    )?;
+    match filed {
+        magi::direct::Filed::Daemon { task, pid } => {
+            println!(
+                "task {} filed (urgent) for the running magi loop{}; follow it with `magi task show {}`",
+                task.short(),
+                pid.map_or_else(String::new, |p| format!(" (pid {p})")),
+                task.short()
+            );
+            follow_task(queue, &home, &task.id).await
+        }
+        magi::direct::Filed::Standalone { mut task, claim } => {
+            println!(
+                "task {} filed; this process runs it (open it with `magi task show {}`)",
+                task.short(),
+                task.short()
+            );
+            if dry_run {
+                let cfg = magi::direct::config_for(&task, &task.repo)?;
+                let origin = magi::run::Origin::queue(&task.id);
+                let runner = Runner::start_naming(
+                    &task.repo,
+                    task.instruction.clone(),
+                    &task.title,
+                    cfg,
+                    origin,
+                )
+                .await?;
+                print!("{}", report::run(&runner.state));
+                println!("\ndry run: stopping before the first agent call");
+                task.hold_manual(Some(
+                    "dry run: no agent was called; `magi task release` runs it".to_owned(),
+                ));
+                queue.put(&mut task)?;
+                drop(claim);
+                return Ok(());
+            }
+            let opts = standalone_opts(&task);
+            magi::daemon::run_claimed(&opts, queue, &mut task).await;
+            drop(claim);
+            report_task_outcome(&task)
+        }
+    }
+}
+
+/// Print the newest run of `task` and turn its outcome into this command's
+/// exit status, exactly as `magi run` always did.
+fn report_task_outcome(task: &magi::queue::Task) -> Result<()> {
+    let Some(run) = task.runs.last() else {
+        bail!(
+            "no run was started for task {}: {}",
+            task.short(),
+            task.last_error.as_deref().unwrap_or("see `magi task show`")
+        );
+    };
+    let state = RunState::load(run)?;
+    print!("{}", report::run(&state));
+    let result = if state.status.done() && state.status != RunStatus::Failed {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "{}",
+            task.last_error
+                .clone()
+                .unwrap_or_else(|| format!("run ended {}", state.status.as_str()))
+        ))
+    };
+    exit_status(result, state.status, state.pr.is_some())
+}
+
+/// How long an agent seat follows the loop's run before handing control back:
+/// the shell tool it runs in kills a longer wait, and a seat whose own run
+/// holds the loop's urgent lane could otherwise wait for itself. Same slice
+/// as `magi ask --wait`.
+const AGENT_FOLLOW: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// Follow a task the live loop runs until it finishes, then report its run.
+/// An operator follows to the end; an agent seat stops after
+/// [`AGENT_FOLLOW`] with exit 0 and the task id, like a pending `magi ask`.
+async fn follow_task(queue: &Queue, home: &Path, id: &str) -> Result<()> {
+    let followed = magi::direct::follow(
+        queue,
+        home,
+        id,
+        std::time::Duration::from_secs(2),
+        agent_env().map(|_| AGENT_FOLLOW),
+        |run| println!("run {run}"),
+        |line| println!("{line}"),
+    )
+    .await?;
+    if !followed.finished {
+        println!(
+            "still running under the loop; read the outcome with `magi task show {}`",
+            followed.task.short()
+        );
+        return Ok(());
+    }
+    report_task_outcome(&followed.task)
+}
+
+/// Is a loop in another process serving this machine's queue?
+fn live_loop(home: &Path) -> bool {
+    magi::daemon::foreign_loop(
+        magi::daemon::read_status(home).as_ref(),
+        jiff::Timestamp::now(),
+        std::process::id(),
+    )
+    .is_some()
+}
+
+/// `--task <id>` on `run` / `review`: nothing new is filed; the named task is
+/// the one that runs - on the live loop when there is one, here otherwise.
+/// `patch` (the command line's choices) and `review` (the branch of `magi
+/// review`) are laid onto the task first, so the flags given are the flags
+/// that act. A held or finished task is released for the run: naming it is the
+/// explicit request.
+async fn run_existing_task(
+    queue: &Queue,
+    id: &str,
+    patch: magi::queue::RunOverrides,
+    review: Option<String>,
+) -> Result<()> {
+    let id = queue.resolve_id(id).context("--task")?;
+    let home = magi::run::home();
+    let live = live_loop(&home);
+    // Under the claim when we run it ourselves, so the edit and the run see one
+    // task; with a live loop the put is what hands it over.
+    let claim = if live { None } else { Some(queue.claim(&id)?) };
+    let mut task = queue.get(&id)?;
+    match task.status {
+        TaskStatus::Running | TaskStatus::Blocked => bail!(
+            "task {} is {}; it cannot be run now",
+            task.short(),
+            task.status.as_str()
+        ),
+        TaskStatus::Held | TaskStatus::Done => task.release(),
+        TaskStatus::Queued | TaskStatus::Failed => {}
+    }
+    let mut overrides = task.overrides.take().unwrap_or_default();
+    overrides.merge_over(&patch);
+    task.overrides = Some(overrides);
+    if let Some(branch) = review {
+        task.review_of = Some(branch);
+        // An explicit review is not a retry of earlier work: it must not be
+        // swallowed by resuming an unfinished run of this task.
+        task.fresh_start = true;
+    }
+    if live {
+        task.urgent = true;
+        queue.put(&mut task)?;
+        println!(
+            "task {} marked urgent for the running magi loop",
+            task.short()
+        );
+        return follow_task(queue, &home, &id).await;
+    }
+    queue.put(&mut task)?;
+    println!("task {} is run by this process", task.short());
+    let opts = standalone_opts(&task);
+    magi::daemon::run_claimed(&opts, queue, &mut task).await;
+    drop(claim);
+    report_task_outcome(&task)
+}
+
+/// `magi run --resume <run>`: the run's owning task is claimed for the
+/// duration (so no loop resumes it too), and filed first when the run never
+/// had one. A live loop that would resume the run itself is handed the task.
+async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
+    let mut runner = Runner::resume(id)?;
+    println!(
+        "{}",
+        format_args!("resuming {} ({:?})", runner.state.id, runner.state.status)
+    );
+    let queue = Queue::open();
+    let home = magi::run::home();
+    let run_id = runner.state.id.clone();
+    // Find-or-create of the owner is serialised per run: two `--resume` of an
+    // ownerless run must not each file a task and then drive one run twice.
+    let guard = queue.claim(&format!("resume-{run_id}")).with_context(|| {
+        format!(
+            "another `magi run --resume` of {} is starting",
+            runner.state.short()
+        )
+    })?;
+    let owner = queue.list().into_iter().find(|t| t.runs.contains(&run_id));
+    let mut task = match owner {
+        Some(t) => t,
+        None => {
+            let mut t = magi::queue::Task::new(
+                queue::title_from(&runner.state.instruction, 72),
+                runner.state.instruction.clone(),
+                runner.state.repo.clone(),
+                task_source(None).await,
+            );
+            t.link_run(&run_id);
+            queue.put(&mut t)?;
+            t
+        }
+    };
+    // The loop picks `task.runs.last()`, so it only resumes *this* run when it
+    // is that one and nothing else steers the attempt elsewhere.
+    let loop_resumes = task.runs.last() == Some(&run_id)
+        && !task.fresh_start
+        && task.review_branch.is_none()
+        && magi::daemon::loop_would_resume(&run_id);
+    let claim = if !dry_run && live_loop(&home) && loop_resumes {
+        None
+    } else {
+        Some(queue.claim(&task.id).with_context(|| {
+            format!(
+                "task {} owns run {}, and something else is already running it",
+                task.short(),
+                runner.state.short()
+            )
+        })?)
+    };
+    drop(guard);
+    println!(
+        "task {} (open it with `magi task show {}`)",
+        task.short(),
+        task.short()
+    );
+    if dry_run {
+        print!("{}", report::run(&runner.state));
+        println!("\ndry run: stopping before the first agent call");
+        return Ok(());
+    }
+    if claim.is_none() {
+        // The loop resumes it: an attempt at a task whose newest run is
+        // unfinished resumes that run (`Runner::resume`), never competes again.
+        if matches!(task.status, TaskStatus::Held | TaskStatus::Done) {
+            task.release();
+        }
+        task.urgent = true;
+        queue.put(&mut task)?;
+        println!(
+            "task {} marked urgent for the running magi loop",
+            task.short()
+        );
+        return follow_task(&queue, &home, &task.id).await;
+    }
+    task.start(run_id);
+    queue.put(&mut task)?;
+    let quota_before = runner.state.quota.clone();
+    let result = runner.execute().await;
+    print!("{}", report::run(&runner.state));
+    let (status, left_pr) = (runner.state.status, runner.state.pr.is_some());
+    let outcome = result.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"));
+    let outcome = outcome.map(|_| ());
+    magi::daemon::finish_attempt(
+        magi::daemon::Opts::default().max_attempts,
+        &queue,
+        &mut task,
+        &runner.state,
+        &quota_before,
+        result,
+    );
+    drop(claim);
+    exit_status(outcome, status, left_pr)
 }
 
 async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
