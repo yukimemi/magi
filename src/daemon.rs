@@ -3032,6 +3032,14 @@ pub fn finish_attempt(
     fresh
 }
 
+/// Whether an attempt at a task whose newest run is `run` would resume that
+/// run rather than start a fresh competition. `magi run --resume` hands a run
+/// to a live loop only when this holds.
+#[must_use]
+pub fn loop_would_resume(run: &str) -> bool {
+    unfinished_run(&[run.to_owned()], crate::run::short_of(run)).is_some()
+}
+
 /// A loop in another process that is alive right now: a fresh heartbeat in
 /// `<home>/daemon.json` published by a pid that is not `own_pid`. `Some(pid)`
 /// carries the pid it published (`None` inside when it published none - a
@@ -3149,10 +3157,14 @@ fn prepare_for(repo: &Path, opts: &Opts, task: &Task) -> Result<Config> {
     let Some(o) = &task.overrides else {
         return prepare(repo, opts);
     };
-    let mut own = opts.clone();
-    if o.config.is_some() {
-        own.config.clone_from(&o.config);
-    }
+    // A task filed by `magi run` / `magi review` was configured by that
+    // command line alone: the loop's own `--config` / `--merge` must not leak
+    // in, or the same command would behave differently with a loop alive.
+    let own = Opts {
+        config: o.config.clone(),
+        merge: None,
+        ..opts.clone()
+    };
     let mut config = prepare(repo, &own)?;
     o.apply(&mut config);
     Ok(config)

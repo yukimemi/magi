@@ -488,6 +488,26 @@ pub struct RunOverrides {
 }
 
 impl RunOverrides {
+    /// Lay `other` over these: every choice `other` made wins, the rest stay.
+    pub fn merge_over(&mut self, other: &RunOverrides) {
+        macro_rules! take {
+            ($($f:ident),*) => {$(
+                if other.$f.is_some() {
+                    self.$f.clone_from(&other.$f);
+                }
+            )*};
+        }
+        take!(
+            merge,
+            candidates,
+            judges,
+            reviewers,
+            review_rounds,
+            seed,
+            config
+        );
+    }
+
     /// Apply these on top of `config`.
     pub fn apply(&self, config: &mut crate::config::Config) {
         if let Some(n) = self.candidates {
@@ -2201,6 +2221,23 @@ fn new_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn merge_over_lets_the_later_choice_win_and_keeps_the_rest() {
+        let mut base = RunOverrides {
+            merge: Some("pr".to_owned()),
+            candidates: Some(3),
+            ..RunOverrides::default()
+        };
+        base.merge_over(&RunOverrides {
+            merge: Some("none".to_owned()),
+            seed: Some(7),
+            ..RunOverrides::default()
+        });
+        assert_eq!(base.merge.as_deref(), Some("none"));
+        assert_eq!(base.candidates, Some(3));
+        assert_eq!(base.seed, Some(7));
+    }
+
     #[test]
     fn an_already_landed_task_is_done_with_its_attempt_refunded() {
         let mut t = task("relanded");
