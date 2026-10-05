@@ -2205,5 +2205,29 @@ details.panel > summary + * { margin-top: var(--s2); }
   main[data-split] .card[aria-current="true"] > details,
   main[data-split] .card[aria-current="true"] > .card-actions { order: 9; flex: 1 1 100%; }
   main[data-split] .card[aria-current="true"] > .card-actions { display: flex; }
+  /* A Queue row is the one list row where the <li> itself is the card (Runs
+     and Chat put an <a class="card"> inside the <li>), so the generic
+     `.cards > li { flex-direction: column }` above outranks `.card` and would
+     stack the chips in a centred column with the title squeezed to nothing.
+     This selector outranks both and gives the row the same two lines as Runs
+     and Chat: the title alone on line 1, chips / id / meta / time on line 2.
+     Gaps are margins so a hidden chip leaves no track behind. */
+  main[data-split] .cards > li.card.task-card {
+    display: grid; grid-template-columns: auto auto auto auto minmax(0, 1fr) auto;
+    align-items: center; gap: 0;
+  }
+  main[data-split] .task-card .card-title {
+    grid-row: 1; grid-column: 1 / -1; order: 0; flex: none;
+  }
+  main[data-split] .task-card .card-top > :nth-child(1) { grid-row: 2; grid-column: 1; margin: var(--s2) var(--s2) 0 0; }
+  main[data-split] .task-card .card-top > :nth-child(2) { grid-row: 2; grid-column: 2; margin: var(--s2) var(--s2) 0 0; }
+  main[data-split] .task-card .card-top > :nth-child(3) { grid-row: 2; grid-column: 3; margin: var(--s2) var(--s2) 0 0; }
+  main[data-split] .task-card .card-top > :nth-child(4) { grid-row: 2; grid-column: 4; margin: var(--s2) var(--s2) 0 0; }
+  main[data-split] .task-card .card-meta {
+    grid-row: 2; grid-column: 5; max-width: none; margin: var(--s2) 0 0;
+    display: block;
+  }
+  main[data-split] .task-card .card-when { grid-row: 2; grid-column: 6; margin: var(--s2) 0 0 var(--s2); }
+  main[data-split] .task-card > :not(.card-top):not(.card-title):not(.card-meta) { grid-column: 1 / -1; }
   main[data-split] .cards > li:has(> .card[aria-current="true"]) > .card-tail { display: flex; }
 }
