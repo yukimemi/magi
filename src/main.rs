@@ -3378,6 +3378,37 @@ async fn run_existing_task(
     report_task_outcome(&task)
 }
 
+/// The task owning `run`, if any. With none, `file` decides: `true` files and
+/// links a new Queued task, `false` returns `None` and touches nothing.
+fn resume_owner(
+    queue: &Queue,
+    run_id: &str,
+    instruction: &str,
+    repo: &Path,
+    source: Source,
+    file: bool,
+) -> Result<Option<Task>> {
+    if let Some(t) = queue
+        .list()
+        .into_iter()
+        .find(|t| t.runs.iter().any(|r| r == run_id))
+    {
+        return Ok(Some(t));
+    }
+    if !file {
+        return Ok(None);
+    }
+    let mut t = Task::new(
+        queue::title_from(instruction, 72),
+        instruction.to_owned(),
+        repo.to_path_buf(),
+        source,
+    );
+    t.link_run(run_id);
+    queue.put(&mut t)?;
+    Ok(Some(t))
+}
+
 /// `magi run --resume <run>`: the run's owning task is claimed for the
 /// duration (so no loop resumes it too), and filed first when the run never
 /// had one. A live loop that would resume the run itself is handed the task.
@@ -3390,6 +3421,31 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
     let queue = Queue::open();
     let home = magi::run::home();
     let run_id = runner.state.id.clone();
+    if dry_run {
+        // A dry run writes nothing to the queue: filing a task for an ownerless
+        // run would leave a Queued task a live loop then executes, and a
+        // filed-then-held or filed-then-removed task would still race that
+        // loop. (`run_as_task`'s dry run does file a Held task; this path
+        // adopts an existing run, so it only reports what a real resume does.)
+        match resume_owner(
+            &queue,
+            &run_id,
+            &runner.state.instruction,
+            &runner.state.repo,
+            Source::Human,
+            false,
+        )? {
+            Some(t) => println!(
+                "task {} owns this run ({})",
+                t.short(),
+                format!("{:?}", t.status).to_lowercase()
+            ),
+            None => println!("no task owns this run; a real `--resume` would file one"),
+        }
+        print!("{}", report::run(&runner.state));
+        println!("\ndry run: stopping before the first agent call");
+        return Ok(());
+    }
     // Find-or-create of the owner is serialised per run: two `--resume` of an
     // ownerless run must not each file a task and then drive one run twice.
     let guard = queue.claim(&format!("resume-{run_id}")).with_context(|| {
@@ -3398,28 +3454,22 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
             runner.state.short()
         )
     })?;
-    let owner = queue.list().into_iter().find(|t| t.runs.contains(&run_id));
-    let mut task = match owner {
-        Some(t) => t,
-        None => {
-            let mut t = magi::queue::Task::new(
-                queue::title_from(&runner.state.instruction, 72),
-                runner.state.instruction.clone(),
-                runner.state.repo.clone(),
-                task_source(None).await,
-            );
-            t.link_run(&run_id);
-            queue.put(&mut t)?;
-            t
-        }
-    };
+    let mut task = resume_owner(
+        &queue,
+        &run_id,
+        &runner.state.instruction,
+        &runner.state.repo,
+        task_source(None).await,
+        true,
+    )?
+    .expect("file = true always yields an owner");
     // The loop picks `task.runs.last()`, so it only resumes *this* run when it
     // is that one and nothing else steers the attempt elsewhere.
     let loop_resumes = task.runs.last() == Some(&run_id)
         && !task.fresh_start
         && task.review_branch.is_none()
         && magi::daemon::loop_would_resume(&run_id);
-    let claim = if !dry_run && live_loop(&home) && loop_resumes {
+    let claim = if live_loop(&home) && loop_resumes {
         None
     } else {
         Some(queue.claim(&task.id).with_context(|| {
@@ -3436,11 +3486,6 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
         task.short(),
         task.short()
     );
-    if dry_run {
-        print!("{}", report::run(&runner.state));
-        println!("\ndry run: stopping before the first agent call");
-        return Ok(());
-    }
     if claim.is_none() {
         // The loop resumes it: an attempt at a task whose newest run is
         // unfinished resumes that run (`Runner::resume`), never competes again.
@@ -3751,6 +3796,27 @@ async fn probe(program: &str, args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_owner_files_only_when_asked_and_never_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let repo = Path::new("/repo");
+        let own = |file| resume_owner(&queue, "run-1", "do it", repo, Source::Human, file);
+
+        assert!(own(false).unwrap().is_none());
+        assert!(queue.list().is_empty());
+
+        let filed = own(true).unwrap().expect("filed");
+        assert_eq!(filed.status, TaskStatus::Queued);
+        assert_eq!(filed.runs, vec!["run-1".to_owned()]);
+        assert_eq!(queue.list().len(), 1);
+
+        for file in [false, true] {
+            assert_eq!(own(file).unwrap().expect("owner").id, filed.id);
+            assert_eq!(queue.list().len(), 1);
+        }
+    }
 
     #[test]
     fn cli_definition_is_valid() {
