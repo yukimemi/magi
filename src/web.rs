@@ -10987,6 +10987,18 @@ mod tests {
         assert!(APP_JS.contains("jumpToTask(id)"));
     }
 
+    /// Chat rows are two lines at every width: the title alone, then the
+    /// shrinkable secondary info.
+    #[test]
+    fn chat_rows_put_the_title_alone_on_the_first_line() {
+        assert!(APP_CSS.contains("#talks-list .card-title {\n  grid-row: 1; grid-column: 1 / -1;"));
+        assert!(APP_CSS.contains(
+            "display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"
+        ));
+        assert!(APP_CSS.contains("#talks-list .card-when { grid-row: 2;"));
+        assert!(APP_JS.contains("class: \"badge talk-unread\""));
+    }
+
     /// Wide screens get a master/detail layout built from the views a phone
     /// drills into. These are string assertions: they pin the contract between
     /// the three assets, not how it looks.
