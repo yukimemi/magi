@@ -5002,13 +5002,26 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     /// falls back to the repository - which keeps these tests free of a
     /// worktree, a `git` invocation and a network.
     fn run_state() -> RunState {
-        RunState::new(
+        let mut state = RunState::new(
             std::path::PathBuf::from("/repo/magi"),
             "main".to_owned(),
             "abcdef1234".to_owned(),
             "add retries to the uploader".to_owned(),
             crate::config::Config::default(),
-        )
+        );
+        // Tests run in parallel against one persistent home and the ids
+        // `RunState::new` draws from the clock can repeat, so two tests would
+        // share a run's questions. The home also outlives the process, so the
+        // counter alone would reuse an earlier run's ids.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos() % 1_000_000);
+        state.id = format!(
+            "20261004-{nanos:06}-{:04x}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        state
     }
 
     fn green_pr() -> PrState {
@@ -6148,13 +6161,6 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
         let mut state = run_state();
         state.config.graph.land_approval = false;
-        // Tests run in parallel and `run_state` ids come from the clock, so two
-        // of them would otherwise share one run directory.
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        state.id = format!(
-            "20261004-000000-{:04x}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
         state
     }
 
