@@ -104,12 +104,33 @@ pub fn decide(
     default_timeout: u64,
     now: Timestamp,
 ) -> Action {
+    decide_owned(q, lease, seat_busy, default_timeout, now, false)
+}
+
+/// [`decide`], told whether the daemon owns the answer's action.
+///
+/// `daemon_owns_action` is true when the daemon will apply the action (the
+/// task exists and is in a state `daemon::decide_action` acts on). An answer
+/// that carries a [`crate::ask::ChoiceAction`] is then the daemon's alone
+/// (`daemon::apply_choice_actions`, idempotent through `Task::actions_applied`
+/// under the task's claim): resuming the dead seat here as well would run the
+/// same seat twice when the action is a resume or a requeue. With no task
+/// there is no one to apply it, so the words are delivered as before.
+pub fn decide_owned(
+    q: &Question,
+    lease: Option<&Lease>,
+    seat_busy: bool,
+    default_timeout: u64,
+    now: Timestamp,
+    daemon_owns_action: bool,
+) -> Action {
     if q.cwd.is_none() || lease.is_some_and(|l| l.fresh(now)) {
         return Action::Idle;
     }
     match q.status {
         QuestionStatus::Abandoned => Action::Idle,
         QuestionStatus::Answered => match q.resolution() {
+            _ if daemon_owns_action && q.chosen_action().is_some() => Action::Idle,
             Some(a) if !q.answer_delivered && !seat_busy => Action::Deliver(Word::Answered(a)),
             _ => Action::Idle,
         },
@@ -187,6 +208,13 @@ impl Waiter {
         })
     }
 
+    /// Whether the daemon applies this question's chosen action, so the
+    /// waiter must not deliver the answer (see [`decide_owned`]).
+    fn daemon_owns_action(&self, q: &Question) -> bool {
+        crate::daemon::task_of_question(&crate::queue::Queue::at(self.home.join("queue")).list(), q)
+            .is_some_and(|t| crate::daemon::daemon_will_act(t, q))
+    }
+
     /// Look at every question once and act on what needs acting on. `halt` is
     /// asked between questions and during a delivery: true means the daemon is
     /// parking, and whatever is in flight is dropped, undelivered and
@@ -197,7 +225,8 @@ impl Waiter {
                 return;
             }
             let lease = self.store.read_lease(&q.id);
-            match decide(&q, lease.as_ref(), false, self.default_timeout, now) {
+            let owned = self.daemon_owns_action(&q);
+            match decide_owned(&q, lease.as_ref(), false, self.default_timeout, now, owned) {
                 Action::Idle => {}
                 Action::Expire => self.expire(&q),
                 Action::Deliver(word) => {
@@ -383,13 +412,42 @@ impl Waiter {
         let q = self.store.get(&q.id)?;
         let now = Timestamp::now();
         let lease = self.store.read_lease(&q.id);
-        let Action::Deliver(word) = decide(&q, lease.as_ref(), false, self.default_timeout, now)
+        let owned = self.daemon_owns_action(&q);
+        let Action::Deliver(word) =
+            decide_owned(&q, lease.as_ref(), false, self.default_timeout, now, owned)
         else {
             return Ok(());
         };
         let snapshot = q.thread.len();
 
+        // Ownership of an action answer is settled against the daemon's task
+        // claim: hold it while the lease goes up, so the daemon either sees the
+        // fresh lease or has already applied the action (and we step aside).
+        // A claim held by a running competition is not the daemon applying an
+        // action; that case is delivered, with the re-check below.
+        let queue = crate::queue::Queue::at(self.home.join("queue"));
+        let task_id = crate::daemon::task_of_question(&queue.list(), &q).map(|t| t.id.clone());
+        let _task_claim = match (&task_id, q.chosen_action()) {
+            (Some(id), Some(_)) => queue.claim(id).ok(),
+            _ => None,
+        };
+        let task_still_ours = || match &task_id {
+            Some(id) => queue
+                .get(id)
+                .map(|t| !crate::daemon::daemon_will_act(&t, &q))
+                .unwrap_or(true),
+            None => true,
+        };
+        if !task_still_ours() {
+            return Ok(());
+        }
+
         self.store.beat(&q.id, WaiterKind::Daemon);
+        // Re-check after the lease is up: a daemon that decided before it
+        // existed has by now written its mark (or is blocked on our claim).
+        if !task_still_ours() {
+            return Ok(());
+        }
         self.store.update(&q.id, |r| {
             r.waiter = Some(Note {
                 kind: WaiterKind::Daemon,
@@ -679,18 +737,38 @@ mod tests {
     }
 
     #[test]
-    fn an_action_answer_is_delivered_until_the_daemon_marks_it_handled() {
+    fn an_action_answer_is_left_to_the_daemon() {
         let mut q = asked(0);
         q.choices = vec!["A".into()];
         q.actions
             .insert("A".into(), crate::ask::ChoiceAction::Requeue);
         q.answer(crate::ask::Answer::Choice("A".into())).unwrap();
         assert_eq!(
-            decide(&q, None, false, 86_400, ts(10)),
-            Action::Deliver(Word::Answered("A".into())),
-            "an action nobody applied must not swallow the answer"
+            decide_owned(&q, None, false, 86_400, ts(10), true),
+            Action::Idle,
+            "the daemon applies the action; the waiter must not also resume the seat"
         );
+        // Delivered or not, a stale lease changes nothing.
         q.answer_delivered = true;
-        assert_eq!(decide(&q, None, false, 86_400, ts(10)), Action::Idle);
+        assert_eq!(
+            decide_owned(&q, None, false, 86_400, ts(10), true),
+            Action::Idle
+        );
+        // No task to apply it: the words are delivered as before.
+        q.answer_delivered = false;
+        assert_eq!(
+            decide_owned(&q, None, false, 86_400, ts(10), false),
+            Action::Deliver(Word::Answered("A".into()))
+        );
+        // No action: delivered even when a task exists.
+        let mut plain = asked(0);
+        plain.choices = vec!["A".into()];
+        plain
+            .answer(crate::ask::Answer::Choice("A".into()))
+            .unwrap();
+        assert_eq!(
+            decide_owned(&plain, None, false, 86_400, ts(10), true),
+            Action::Deliver(Word::Answered("A".into()))
+        );
     }
 }
