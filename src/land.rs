@@ -3220,20 +3220,22 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                     // Exit 0 is not proof of a merge: with a merge queue `gh`
                     // enqueues (or reports the pull request already queued)
                     // and succeeds while it is still open. Ask the forge; an
-                    // unreadable answer keeps trusting the exit code.
-                    let confirm = forge.view(&repo, pr_url).await.ok();
-                    if let Some(c) = confirm.as_ref()
-                        && c.pr.state != PrLifecycle::Merged
-                    {
+                    // unreadable answer is not a confirmation either, so it
+                    // is looked at again rather than recorded as merged.
+                    let confirmed = forge
+                        .view(&repo, pr_url)
+                        .await
+                        .is_ok_and(|c| c.pr.state == PrLifecycle::Merged);
+                    if !confirmed {
                         if waited >= WAIT_CEILING {
                             let why = "the merge request succeeded but the pull request \
-                                       was still not merged after waiting";
+                                       could not be confirmed merged after waiting";
                             stop(state, &repo, &pr, why).await?;
                             return Ok(pr);
                         }
                         state.event(
                             "land",
-                            "merge accepted but the pull request is not merged yet; waiting",
+                            "merge accepted but the pull request is not confirmed merged yet; waiting",
                         );
                         state.save()?;
                         waited += POLL;
@@ -6096,6 +6098,8 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         /// unless `queued` says the merge only entered a queue.
         merged: Mutex<bool>,
         queued: Mutex<bool>,
+        /// Views fail once a merge answered ok.
+        unreadable_after_merge: Mutex<bool>,
     }
 
     impl Scripted {
@@ -6114,6 +6118,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 required: Mutex::new(None),
                 merged: Mutex::new(false),
                 queued: Mutex::new(false),
+                unreadable_after_merge: Mutex::new(false),
             }
         }
         fn argvs(&self) -> Vec<Vec<String>> {
@@ -6127,6 +6132,11 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     impl Forge for Scripted {
         async fn view(&self, _repo: &Path, _url: &str) -> Result<Seen> {
             self.log.lock().unwrap().push("view");
+            if *self.unreadable_after_merge.lock().unwrap()
+                && !self.argvs.lock().unwrap().is_empty()
+            {
+                anyhow::bail!("forge unreachable");
+            }
             let mut v = self.views.lock().unwrap();
             let mut seen = if v.len() > 1 {
                 v.pop_front().unwrap()
@@ -6277,6 +6287,20 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         // Still open after the command succeeded: it keeps watching and
         // never records a merge (it stops at the wait ceiling instead).
         task.await;
+        assert_ne!(state.status, RunStatus::Merged);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_forge_after_a_merge_command_is_not_a_confirmation() {
+        let mut state = landing_state();
+        let forge = Scripted::new(
+            vec![seen("a", Checks::Green, "CLEAN", false)],
+            std::iter::repeat_n((true, ""), 100).collect(),
+        );
+        *forge.unreadable_after_merge.lock().unwrap() = true;
+        land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+            .await
+            .ok();
         assert_ne!(state.status, RunStatus::Merged);
     }
 
