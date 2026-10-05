@@ -974,6 +974,11 @@ pub async fn fetch(repo: &Path, remote: &str, branch: &str) -> Result<GitOut> {
     git_raw(repo, &["fetch", "--quiet", remote, &refspec]).await
 }
 
+/// The best common ancestor of `a` and `b`, or an error when there is none.
+pub async fn merge_base(repo: &Path, a: &str, b: &str) -> Result<String> {
+    Ok(git(repo, &["merge-base", a, b]).await?.trim().to_owned())
+}
+
 /// Is `ancestor` an ancestor of (or equal to) `of`?
 pub async fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> bool {
     git_raw(repo, &["merge-base", "--is-ancestor", ancestor, of])
