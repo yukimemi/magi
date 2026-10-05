@@ -38,6 +38,9 @@ pub struct Outcome {
     pub capped: Vec<String>,
     /// Minor/Nit findings of the last round that were only listed.
     pub unfiled: Vec<String>,
+    /// Findings not filed because another task already covers them, as
+    /// `(finding id, covering task id)`. Recomputed from the queue each pass.
+    pub covered: Vec<(String, String)>,
 }
 
 /// File follow-ups for a run that just merged, and comment on the pull
@@ -54,7 +57,9 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) {
             return;
         }
     };
-    if outcome.filed.is_empty() && (state.followups.is_empty() || state.followup_commented) {
+    if outcome.filed.is_empty()
+        && (state.followup_commented || (state.followups.is_empty() && outcome.covered.is_empty()))
+    {
         return;
     }
     let body = comment_body(state, &outcome);
@@ -140,9 +145,25 @@ pub fn file(state: &mut RunState, pr_url: &str, queue: &Queue) -> Result<Outcome
         }
     }
 
+    let tasks = queue.list();
     let mut failure = None;
     for group in group_findings(chosen) {
         let ids: Vec<String> = group.iter().map(|f| f.id.clone()).collect();
+        let own = task_id(&state.id, &ids);
+        let covers: Vec<Option<String>> = ids
+            .iter()
+            .map(|id| covering_task(&tasks, &own, &state.id, pr_url, id))
+            .collect();
+        if covers.iter().all(Option::is_some) {
+            for (id, by) in ids.iter().zip(covers.into_iter().flatten()) {
+                state.event(
+                    NODE,
+                    format!("not filing follow-up for {id}: already covered by task {by}"),
+                );
+                out.covered.push((id.clone(), by));
+            }
+            continue;
+        }
         if ids.iter().any(|id| done.contains(id)) {
             continue;
         }
@@ -177,6 +198,66 @@ pub fn file(state: &mut RunState, pr_url: &str, queue: &Queue) -> Result<Outcome
         state.event(NODE, format!("follow-up filing stopped: {e:#}"));
     }
     Ok(out)
+}
+
+/// The id of a task, other than `own`, that already covers finding `id` of
+/// run `run` merged as `pr_url`, whatever its status. Concrete identifiers
+/// only: a follow-up of the same run listing the finding, or an instruction
+/// naming both the finding id and the pull request (URL or `#<number>`).
+fn covering_task(tasks: &[Task], own: &str, run: &str, pr_url: &str, id: &str) -> Option<String> {
+    tasks
+        .iter()
+        .find(|t| {
+            t.id != own
+                && (t
+                    .followup
+                    .as_ref()
+                    .is_some_and(|f| f.run == run && f.findings.iter().any(|x| x == id))
+                    || (names_word(&t.instruction, id) && names_pr(&t.instruction, pr_url)))
+        })
+        .map(|t| t.id.clone())
+}
+
+/// ASCII only: an id is often followed directly by prose in another script
+/// (`R3-1-1を修正`), which must not read as part of the id.
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-')
+}
+
+/// `needle` in `text` with no name character on either side.
+fn names_word(text: &str, needle: &str) -> bool {
+    !needle.is_empty()
+        && text.match_indices(needle).any(|(i, _)| {
+            let before = text[..i].chars().next_back();
+            let after = text[i + needle.len()..].chars().next();
+            before.is_none_or(|c| !is_name_char(c)) && after.is_none_or(|c| !is_name_char(c))
+        })
+}
+
+/// Does `text` name the pull request by its URL or its `#<number>` form,
+/// with no further digit (or name character before `#`) so `#47` is not `#473`?
+fn names_pr(text: &str, pr_url: &str) -> bool {
+    let url = pr_url.trim_end_matches('/');
+    let digit_after = |rest: &str| rest.chars().next().is_some_and(|c| c.is_ascii_digit());
+    if !url.is_empty()
+        && text
+            .match_indices(url)
+            .any(|(i, _)| !digit_after(&text[i + url.len()..]))
+    {
+        return true;
+    }
+    let Some(n) = url
+        .rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    else {
+        return false;
+    };
+    let tag = format!("#{n}");
+    text.match_indices(&tag).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        before.is_none_or(|c| !is_name_char(c)) && !digit_after(&text[i + tag.len()..])
+    })
 }
 
 /// Group findings that are the same defect: same file with lines within
@@ -304,12 +385,25 @@ fn build_task(
 
 fn comment_body(state: &RunState, out: &Outcome) -> String {
     let mut s = format!(
-        "<!-- magi-followup run={} -->\nThis pull request merged with review findings still \
-         open. They were filed as follow-up tasks:\n\n",
+        "<!-- magi-followup run={} -->\nThis pull request merged with review findings still open.",
         state.id
     );
-    for r in &state.followups {
-        s.push_str(&format!("- `{}`: {}\n", r.task, r.findings.join(", ")));
+    if state.followups.is_empty() {
+        s.push_str(" Each is already covered by another task:\n");
+    } else {
+        s.push_str(" They were filed as follow-up tasks:\n\n");
+        for r in &state.followups {
+            s.push_str(&format!("- `{}`: {}\n", r.task, r.findings.join(", ")));
+        }
+        if !out.covered.is_empty() {
+            s.push_str("\nNot filed, already covered:\n");
+        }
+    }
+    if !out.covered.is_empty() {
+        s.push('\n');
+    }
+    for (id, by) in &out.covered {
+        s.push_str(&format!("- {id}: already covered by task `{by}`\n"));
     }
     if !out.unfiled.is_empty() {
         s.push_str(&format!(
@@ -565,5 +659,115 @@ mod tests {
         file(&mut s, "u", &q).unwrap();
         let t = q.list().into_iter().find(|t| t.followup.is_some()).unwrap();
         assert_eq!(t.followup.unwrap().origin_task, Some(parent.id));
+    }
+
+    const PR: &str = "https://github.com/o/r/pull/473";
+
+    fn manual(text: &str) -> Task {
+        Task::new(
+            "manual".to_owned(),
+            text.to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        )
+    }
+
+    /// File follow-ups with one manual task already in the queue.
+    fn filed_with(text: &str) -> (Outcome, RunState, Queue, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = manual(text);
+        t.status = crate::queue::TaskStatus::Done;
+        q.put(&mut t).unwrap();
+        let mut s = merged(two_seats());
+        let out = file(&mut s, PR, &q).unwrap();
+        (out, s, q, t.id, dir)
+    }
+
+    #[test]
+    fn a_task_naming_the_pr_url_and_ids_covers_the_group() {
+        let (out, s, _q, id, _d) = filed_with(&format!("Fix R3-1-1 and R3-2-1 from {PR}"));
+        // the waiter.rs group is covered; the other seat-1 Minor is still filed
+        assert_eq!(out.filed.len(), 1, "{out:?}");
+        assert_eq!(
+            out.covered,
+            vec![
+                ("R3-1-1".to_owned(), id.clone()),
+                ("R3-2-1".to_owned(), id.clone())
+            ]
+        );
+        assert!(out.capped.is_empty());
+        assert!(
+            s.events
+                .iter()
+                .any(|e| e.message.contains("already covered"))
+        );
+        let body = comment_body(&s, &out);
+        assert!(body.contains(&format!("R3-1-1: already covered by task `{id}`")));
+    }
+
+    #[test]
+    fn the_hash_form_covers_but_a_prefix_number_does_not() {
+        let (out, ..) = filed_with("R3-1-1 R3-2-1 fixed in PR #473");
+        assert_eq!(out.covered.len(), 2);
+        let (out, ..) = filed_with("R3-1-1 R3-2-1 fixed in #47");
+        assert!(out.covered.is_empty());
+        assert_eq!(out.filed.len(), 2);
+        let (out, ..) = filed_with("R3-1-1 R3-2-1 fixed in #4731");
+        assert!(out.covered.is_empty());
+    }
+
+    #[test]
+    fn an_id_without_the_pr_does_not_cover() {
+        let (out, ..) = filed_with("R3-1-1 and R3-2-1 are bad");
+        assert!(out.covered.is_empty());
+        assert_eq!(out.filed.len(), 2);
+    }
+
+    #[test]
+    fn an_id_prefix_does_not_cover() {
+        let (out, ..) = filed_with(&format!("R3-1-10 R3-2-10 in {PR}"));
+        assert!(out.covered.is_empty());
+    }
+
+    #[test]
+    fn partial_coverage_still_files() {
+        let (out, ..) = filed_with(&format!("R3-1-1 in {PR}"));
+        assert!(out.covered.is_empty());
+        assert_eq!(out.filed.len(), 2);
+    }
+
+    #[test]
+    fn another_followups_findings_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        let mut other = manual("x");
+        other.followup = Some(FollowUp {
+            run: s.id.clone(),
+            origin_task: None,
+            pr: PR.to_owned(),
+            findings: vec!["R3-1-1".to_owned(), "R3-2-1".to_owned()],
+            generation: 1,
+        });
+        q.put(&mut other).unwrap();
+        let out = file(&mut s, PR, &q).unwrap();
+        assert_eq!(out.covered.len(), 2, "{out:?}");
+        assert_eq!(out.filed.len(), 1);
+    }
+
+    #[test]
+    fn a_fully_covered_comment_lists_only_the_covered() {
+        let (out, mut s, ..) = filed_with(&format!("R3-1-1 R3-2-1 {PR}"));
+        s.followups.clear();
+        let body = comment_body(&s, &out);
+        assert!(body.contains("already covered by task"));
+        assert!(!body.contains("filed as follow-up"));
+    }
+
+    #[test]
+    fn an_id_next_to_japanese_prose_still_covers() {
+        let (out, ..) = filed_with("PR #473 の R3-1-1を修正、R3-2-1も対応");
+        assert_eq!(out.covered.len(), 2, "{out:?}");
     }
 }
