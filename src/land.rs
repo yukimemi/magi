@@ -585,35 +585,27 @@ pub const HOLD: &str = "hold";
 ///
 /// The merge is the one irreversible step, so this is a mechanical check and
 /// not the agent's reading alone: the quote must be a verbatim part of the
-/// message and name the merge; neither the quote nor the sentence around it may
-/// carry a hedge, a condition, a negation or a question; and no sentence of
-/// the message may retract (`wait`, `やっぱり`). Anything doubtful is `false`,
-/// which is a hold. Other sentences may ask for other things (follow-up tasks,
-/// say) - only wording that overturns the whole message is read from all of it.
+/// message and name the merge; and nothing in the whole message may carry a
+/// hedge, a condition, a negation, a question or a retraction. Anything
+/// doubtful is `false`, which is a hold. Other sentences may ask for other
+/// things (follow-up tasks), but must say so plainly: the owner is asked back
+/// rather than guessed at.
 pub fn merge_intent(message: &str, quote: &str) -> bool {
     let quote = quote.trim();
     if quote.is_empty() {
         return false;
     }
-    let Some(at) = message.find(quote) else {
+    if !message.contains(quote) {
         return false;
-    };
+    }
     let lower = quote.to_lowercase();
     if !(lower.contains("merge") || quote.contains("マージ")) {
         return false;
     }
-    const STOPS: [char; 9] = ['。', '.', '!', '！', '?', '？', '\n', ';', '；'];
-    let start = message[..at].rfind(STOPS).map_or(0, |i| {
-        i + message[i..].chars().next().map_or(1, char::len_utf8)
-    });
-    let end = message[at + quote.len()..]
-        .find(STOPS)
-        .map_or(message.len(), |i| {
-            let i = at + quote.len() + i;
-            i + message[i..].chars().next().map_or(1, char::len_utf8)
-        });
-    let sentence = &message[start..end.max(at + quote.len())];
-    if hedged(sentence) || hedged(quote) {
+    // The whole message is read, not just the quote's sentence: a condition or
+    // a second thought in another sentence ("Merge it. Only if CI passes.") makes
+    // the approval conditional all the same. Doubt anywhere is a hold.
+    if hedged(message) {
         return false;
     }
     !retracts(message)
@@ -627,7 +619,7 @@ fn hedged(text: &str) -> bool {
         "cancel", "but", "think", "guess", "suppose", "unsure", "yet", "except", "only", "cannot",
         "should",
     ];
-    const JA: [&str; 22] = [
+    const JA: [&str; 25] = [
         "かも",
         "たぶん",
         "多分",
@@ -650,6 +642,9 @@ fn hedged(text: &str) -> bool {
         "でしょう",
         "思う",
         "ほしい",
+        "でも",
+        "けど",
+        "ただ",
     ];
     if text.contains(['?', '？']) || JA.iter().any(|w| text.contains(w)) {
         return true;
@@ -5766,10 +5761,6 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 "Merge it. Please file the remaining findings as follow-ups.",
                 "Merge it",
             ),
-            (
-                "merge is fine; the leftover findings are not urgent",
-                "merge is fine",
-            ),
             ("Note the findings and merge now", "merge now"),
         ];
         for (msg, quote) in yes {
@@ -5792,6 +5783,15 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             ("merge it. wait, actually hold on", "merge it"),
             ("マージして。やっぱりやめた", "マージして"),
             ("please file follow-ups", "follow-ups"),
+            (
+                "Merge it. Only if CI passes. Queue the remaining findings.",
+                "Merge it",
+            ),
+            ("マージして。CIが通ったらね。", "マージして"),
+            ("Merge it. Don't.", "Merge it"),
+            ("Merge it. Hold on a sec.", "Merge it"),
+            ("マージして。でも保留で", "マージして"),
+            ("マージしていいよ、でもdocsは触らないで", "マージしていいよ"),
             ("merge it", "go ahead"),
             ("merge it", "merge it please"),
             ("merge it", "  "),

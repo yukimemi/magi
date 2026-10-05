@@ -1444,7 +1444,9 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
              requests. Read their latest message:\n\n\
              - **A clear instruction to merge** (\"merge it\", \"マージしていいよ\"), \
              alone or together with other requests: first do the other requests \
-             (below), then record it with `magi ask --settle` - choice `merge`, \
+             (below), then record it with `magi ask --settle` as your LAST \
+             command: a settled question is answered, so never run `--thread` \
+             after it (it would wait for a reply nobody will give) - choice `merge`, \
              `--quote` a verbatim part of their message that is the merge \
              instruction itself. magi re-checks the quote and refuses a hedge.\n\
              - **Anything doubtful** - \"maybe\", \"probably\", \"いいかも\", \"たぶん\", any \
@@ -1460,9 +1462,10 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
              finding id and `file:line`, the change wanted, how to tell it is \
              done. Do not put the pull request number or branch name in the \
              text (put them in the `--hold` reason), and never pass `--force`. \
-             Run `magi task list` first so a request is not filed twice. Say in \
-             `--thread` which task ids you filed. A follow-up request alone is \
-             not a merge: file the tasks and settle nothing.\n\
+             Run `magi task list` first so a request is not filed twice. A follow-up request alone is \
+             not a merge: file the tasks, then tell the owner the task ids with \
+             `--thread` and settle nothing. When you also settle, name the ids \
+             in your final plain-text answer instead.\n\
              - `hold` settles only when the owner's whole message is that word.\n\n",
         );
     }
