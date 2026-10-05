@@ -279,18 +279,36 @@ async fn review_base(
     base_commit: &str,
     branch: &str,
 ) -> String {
+    review_base_checked(repo, remote, base_branch, base_commit, branch)
+        .await
+        .0
+}
+
+/// [`review_base`] plus whether the base was read from a freshly fetched
+/// tracking ref. A failed fetch still uses whatever tracking ref exists (it is
+/// never older than `base_commit`'s view of the base), but the answer is then
+/// not trusted to rewrite a pull request's title.
+async fn review_base_checked(
+    repo: &Path,
+    remote: &str,
+    base_branch: &str,
+    base_commit: &str,
+    branch: &str,
+) -> (String, bool) {
     let tracking = format!("{remote}/{base_branch}");
-    if matches!(git::fetch(repo, remote, base_branch).await, Ok(o) if o.ok())
+    let fresh = matches!(git::fetch(repo, remote, base_branch).await, Ok(o) if o.ok());
+    if git::rev_exists(repo, &tracking).await
         && let Ok(mb) = git::merge_base(repo, &tracking, branch).await
         && !mb.is_empty()
     {
-        return mb;
+        return (mb, fresh);
     }
-    git::merge_base(repo, base_commit, branch)
+    let mb = git::merge_base(repo, base_commit, branch)
         .await
         .ok()
         .filter(|mb| !mb.is_empty())
-        .unwrap_or_else(|| base_commit.to_owned())
+        .unwrap_or_else(|| base_commit.to_owned());
+    (mb, false)
 }
 
 /// Recompute `reviewed_commits` from the branch's own commits. Left as it was
@@ -320,8 +338,8 @@ pub(crate) async fn refresh_reviewed_commits(state: &mut RunState, branch: &str)
 /// Subjects of the base's commits between the recorded start and the branch's
 /// merge base: what a stale `base_commit..branch` would have mistaken for the
 /// branch's own work.
-async fn leaked_subjects(state: &RunState, branch: &str) -> Vec<String> {
-    let base = review_base(
+async fn leaked_subjects(state: &RunState, branch: &str) -> Option<Vec<String>> {
+    let (base, trusted) = review_base_checked(
         &state.repo,
         &state.config.merge.remote,
         &state.base_branch,
@@ -329,9 +347,12 @@ async fn leaked_subjects(state: &RunState, branch: &str) -> Vec<String> {
         branch,
     )
     .await;
+    if !trusted {
+        return None;
+    }
     git::subjects(&state.repo, &state.base_commit, &base)
         .await
-        .unwrap_or_default()
+        .ok()
 }
 
 /// May an adopted pull request's title be replaced with `computed`? Only when
@@ -5916,10 +5937,12 @@ impl Runner {
         } else {
             None
         };
+        // `None` when the base could not be freshly read: then an adopted
+        // pull request's title is left alone.
         let leaked = if is_review_run(&self.state) {
             leaked_subjects(&self.state, &winner.branch).await
         } else {
-            Vec::new()
+            Some(Vec::new())
         };
         let pr = pr_message_with(&self.state, winner.label, facts.as_ref());
         let message = pr.commit_message();
@@ -6012,7 +6035,9 @@ impl Runner {
                                 .event("merge", format!("Pr: adopted open pull request {url}"));
                             if title != pr.title
                                 && (!is_review_run(&self.state)
-                                    || should_retitle(&title, &pr.title, &leaked))
+                                    || leaked
+                                        .as_deref()
+                                        .is_some_and(|l| should_retitle(&title, &pr.title, l)))
                                 && let Err(e) =
                                     land::set_pr_title(&winner.worktree, &url, &pr.title).await
                             {
@@ -11003,8 +11028,12 @@ mod tests {
         );
         assert_eq!(
             leaked_subjects(&state, "feat/own").await,
-            vec!["chore(deps): update a crate".to_owned()]
+            Some(vec!["chore(deps): update a crate".to_owned()])
         );
+        // A stale tracking ref is still used when the fetch fails, but the
+        // leak list is withheld.
+        state.config.merge.remote = "nowhere".to_owned();
+        assert_eq!(leaked_subjects(&state, "feat/own").await, None);
     }
 
     #[test]
