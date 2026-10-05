@@ -767,18 +767,48 @@ fn unanswered_question_hold_reason(q: &ask::Question, language: &str) -> String 
     }
 }
 
-/// Whether the daemon will act on `q`'s chosen action for `task` (not applied
-/// yet, task not running / blocked / done, and not about an earlier attempt).
-/// The waiter yields an action answer only when this holds; otherwise nobody
-/// else would deliver it.
-pub(crate) fn daemon_will_act(task: &Task, q: &ask::Question) -> bool {
-    q.chosen_action().is_some()
-        && !task.action_applied(&q.id)
-        && !matches!(
-            task.status,
-            TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Done
-        )
-        && (q.node == crate::conduct::NODE || task.runs.last() == Some(&q.run))
+/// Where `q`'s chosen action stands for `task`. `daemon_will_act` is false
+/// for several unrelated reasons, and the waiter must not read them alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActionStanding {
+    /// The answer carries no action: the waiter delivers it as before.
+    NoAction,
+    /// The daemon will apply it (not applied, task idle, current attempt).
+    Pending,
+    /// Already applied (`Task::actions_applied`): the daemon has acted, so
+    /// delivering the word to the old seat would run it beside the new work.
+    Applied,
+    /// The question is about an earlier attempt than the task's latest.
+    Stale,
+    /// The task is running / blocked / done: the daemon defers for now.
+    Busy,
+}
+
+impl ActionStanding {
+    /// The daemon has acted or will act: the waiter must not deliver.
+    pub(crate) fn daemon_owns(self) -> bool {
+        matches!(self, Self::Pending | Self::Applied | Self::Stale)
+    }
+}
+
+/// Classify `q`'s chosen action against `task`. `Stale` is judged before
+/// `Busy`: a question about an earlier attempt must be stopped even while a
+/// newer competition is running.
+pub(crate) fn action_standing(task: &Task, q: &ask::Question) -> ActionStanding {
+    if q.chosen_action().is_none() {
+        ActionStanding::NoAction
+    } else if task.action_applied(&q.id) {
+        ActionStanding::Applied
+    } else if q.node != crate::conduct::NODE && task.runs.last() != Some(&q.run) {
+        ActionStanding::Stale
+    } else if matches!(
+        task.status,
+        TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Done
+    ) {
+        ActionStanding::Busy
+    } else {
+        ActionStanding::Pending
+    }
 }
 
 /// What [`decide_action`] concluded about one answered question.
@@ -8026,6 +8056,36 @@ mod tests {
     }
 
     #[test]
+    fn action_standing_tells_the_reasons_apart() {
+        let mut t = held_task_with("r1");
+        let q = action_question("r1", ask::ChoiceAction::Requeue);
+        assert_eq!(action_standing(&t, &q), ActionStanding::Pending);
+        let mut plain = q.clone();
+        plain.actions.clear();
+        assert_eq!(action_standing(&t, &plain), ActionStanding::NoAction);
+
+        // Applied wins over everything, even a running task.
+        t.mark_action_applied(&q.id);
+        assert_eq!(action_standing(&t, &q), ActionStanding::Applied);
+
+        // A newer attempt running: the old question is Stale, not Busy.
+        let mut t = held_task_with("r1");
+        t.start("r2".to_owned());
+        assert_eq!(action_standing(&t, &q), ActionStanding::Stale);
+        // The same question about the latest run just waits.
+        let q2 = action_question("r2", ask::ChoiceAction::Requeue);
+        assert_eq!(action_standing(&t, &q2), ActionStanding::Busy);
+        t.status = TaskStatus::Blocked;
+        assert_eq!(action_standing(&t, &q2), ActionStanding::Busy);
+
+        // A conductor question is keyed by the task, never stale.
+        let mut c = action_question("r0", ask::ChoiceAction::Requeue);
+        c.node = crate::conduct::NODE.to_owned();
+        assert_eq!(action_standing(&t, &c), ActionStanding::Busy);
+        assert!(!ActionStanding::Busy.daemon_owns());
+    }
+
+    #[test]
     fn a_running_task_waits_and_a_dead_asker_with_a_cwd_is_still_actioned() {
         let dir = tempfile::tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
@@ -8044,7 +8104,7 @@ mod tests {
         // While the task runs the daemon will not act, so the waiter still
         // delivers the word to the dead asker's seat ...
         let running = queue.get(&t.id).unwrap();
-        assert!(!daemon_will_act(&running, &q));
+        assert_eq!(action_standing(&running, &q), ActionStanding::Busy);
         assert!(matches!(
             crate::waiter::decide_owned(&q, None, false, 86_400, Timestamp::now(), false),
             crate::waiter::Action::Deliver(_)

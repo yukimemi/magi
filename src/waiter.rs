@@ -212,7 +212,7 @@ impl Waiter {
     /// waiter must not deliver the answer (see [`decide_owned`]).
     fn daemon_owns_action(&self, q: &Question) -> bool {
         crate::daemon::task_of_question(&crate::queue::Queue::at(self.home.join("queue")).list(), q)
-            .is_some_and(|t| crate::daemon::daemon_will_act(t, q))
+            .is_some_and(|t| crate::daemon::action_standing(t, q).daemon_owns())
     }
 
     /// Look at every question once and act on what needs acting on. `halt` is
@@ -427,14 +427,28 @@ impl Waiter {
         // action; that case is delivered, with the re-check below.
         let queue = crate::queue::Queue::at(self.home.join("queue"));
         let task_id = crate::daemon::task_of_question(&queue.list(), &q).map(|t| t.id.clone());
+        // Never go on without the claim: a failed claim means an attempt (or
+        // the daemon) holds the task, and whatever it does next decides who
+        // owns this answer. Step aside; the next tick judges it afresh.
         let _task_claim = match (&task_id, q.chosen_action()) {
-            (Some(id), Some(_)) => queue.claim(id).ok(),
+            (Some(id), Some(_)) => match queue.claim(id) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::debug!(
+                        "question {}: task claim not available ({e:#}), deferring delivery",
+                        q.short()
+                    );
+                    return Ok(());
+                }
+            },
             _ => None,
         };
+        // Applied, stale and pending are all stop conditions; only a busy task
+        // (or no action at all) is delivered to.
         let task_still_ours = || match &task_id {
             Some(id) => queue
                 .get(id)
-                .map(|t| !crate::daemon::daemon_will_act(&t, &q))
+                .map(|t| !crate::daemon::action_standing(&t, &q).daemon_owns())
                 .unwrap_or(true),
             None => true,
         };
