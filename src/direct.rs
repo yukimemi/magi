@@ -529,12 +529,16 @@ mod tests {
         let running = q.get(&parent.id).unwrap();
         assert_eq!(running.status, TaskStatus::Running);
         assert_eq!(running.attempts, parent.attempts + 1);
-        assert_eq!(running.runs, [state.id.clone()]);
+        assert_eq!(running.runs, std::slice::from_ref(&state.id));
         assert!(q.claim(&parent.id).is_err(), "exclusive while it runs");
         adopted.finish(&state, Err(anyhow::anyhow!("boom")));
         let settled = q.get(&parent.id).unwrap();
         assert_eq!(settled.status, TaskStatus::Held, "{settled:?}");
-        assert_eq!(settled.runs, [state.id.clone()], "no duplicate run");
+        assert_eq!(
+            settled.runs,
+            std::slice::from_ref(&state.id),
+            "no duplicate run"
+        );
         assert!(q.claim(&parent.id).is_ok(), "claim released");
         assert_eq!(q.list().len(), 1, "no second owner was filed");
     }
@@ -550,7 +554,7 @@ mod tests {
         let after = q.get(&parent.id).unwrap();
         assert_eq!(after.status, parent.status);
         assert_eq!(after.attempts, parent.attempts);
-        assert_eq!(after.runs, [state.id.clone()]);
+        assert_eq!(after.runs, std::slice::from_ref(&state.id));
         assert_eq!(q.list().len(), 1, "no second owner was filed");
     }
 
@@ -566,7 +570,7 @@ mod tests {
         let after = q.get(&parent.id).unwrap();
         assert_eq!(after.status, TaskStatus::Done);
         assert_eq!(after.attempts, parent.attempts);
-        assert_eq!(after.runs, [state.id.clone()]);
+        assert_eq!(after.runs, std::slice::from_ref(&state.id));
         assert!(q.claim(&parent.id).is_ok(), "claim released");
     }
 
@@ -592,7 +596,7 @@ mod tests {
                 .contains("fresh failure"),
             "{after:?}"
         );
-        assert_eq!(after.runs, [state.id.clone()]);
+        assert_eq!(after.runs, std::slice::from_ref(&state.id));
         assert!(q.claim(&parent.id).is_ok(), "claim released");
     }
 }
