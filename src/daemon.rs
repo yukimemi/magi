@@ -1877,6 +1877,23 @@ fn release_watch_settings(repo: &Path, opts: &Opts) -> (Vec<PathBuf>, u64) {
         .into_iter()
         .map(|r| r.path)
         .collect();
+    // Repositories the daemon has worked in, wherever they live: a task may
+    // name one outside `[repos] roots`, and its release PR must be watched too.
+    let mut known: Vec<PathBuf> = Queue::open().list().into_iter().map(|t| t.repo).collect();
+    let runs = crate::run::home().join("runs");
+    for id in crate::run::list_ids_in(&runs) {
+        let repo = std::fs::read_to_string(runs.join(&id).join("run.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("repo")?.as_str().map(PathBuf::from));
+        known.extend(repo);
+    }
+    for k in known {
+        let k = k.canonicalize().unwrap_or(k);
+        if k.join(".git").exists() && !paths.contains(&k) {
+            paths.push(k);
+        }
+    }
     let own = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     if !paths.contains(&own) {
         paths.push(own);

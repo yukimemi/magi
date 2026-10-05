@@ -338,7 +338,7 @@ impl Watcher {
             .unwrap_or_default()
     }
 
-    fn save(&self, pr: &str, st: &WatchState) {
+    fn save(&self, pr: &str, st: &WatchState) -> bool {
         let write = || -> Result<()> {
             std::fs::create_dir_all(self.dir())?;
             let path = self.state_path(pr);
@@ -347,8 +347,12 @@ impl Watcher {
             std::fs::rename(&tmp, &path)?;
             Ok(())
         };
-        if let Err(e) = write() {
-            tracing::warn!("could not save the release watch for {pr}: {e:#}");
+        match write() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("could not save the release watch for {pr}: {e:#}");
+                false
+            }
         }
     }
 
@@ -382,7 +386,15 @@ impl Watcher {
         halt: &(dyn Fn() -> bool + Sync),
     ) {
         let stored = self.stored();
-        for repo in repos {
+        // A repo with a watch record is covered even when nothing else names it.
+        let mut repos = repos.to_vec();
+        for s in &stored {
+            let p = PathBuf::from(&s.repo);
+            if !s.repo.is_empty() && !repos.contains(&p) {
+                repos.push(p);
+            }
+        }
+        for repo in &repos {
             if halt() {
                 return;
             }
@@ -466,8 +478,9 @@ impl Watcher {
                 for r in &runs {
                     st.reruns.insert(r.clone(), now);
                 }
-                self.save(&pr, &st);
-                if halt() {
+                // Without a durable record the call must not happen: a restart
+                // would rerun the same run again.
+                if !self.save(&pr, &st) || halt() {
                     return;
                 }
                 let mut ok = false;
@@ -899,6 +912,17 @@ mod tests {
         assert!(fake.reruns.lock().unwrap().is_empty());
         assert!(w.questions().list().is_empty());
         assert!(!d.path().join("release-watch").exists());
+    }
+
+    #[tokio::test]
+    async fn no_rerun_when_the_record_cannot_be_saved() {
+        let (d, fake, w) = rig();
+        *fake.snap.lock().unwrap() = Some(red());
+        // A file where the directory should be makes every save fail.
+        std::fs::write(d.path().join("release-watch"), "x").unwrap();
+        w.lap(&[PathBuf::from("/nowhere")], 3600, 1000, &(|| false))
+            .await;
+        assert!(fake.reruns.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
