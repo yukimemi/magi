@@ -208,29 +208,77 @@ pub async fn follow(
 #[derive(Debug)]
 pub struct Adopted {
     queue: Queue,
-    /// The task created for an ownerless run; `None` when an existing task
-    /// only gained the run.
+    /// The task this process claimed and started for the run; `None` when the
+    /// claim could not be taken and the run was only linked.
     task: Option<Task>,
     claim: Option<Claim>,
     quota_before: Vec<crate::run::QuotaLoss>,
 }
 
 /// Give a run this process is about to execute an owning task. A parent task
-/// that exists just gains the run in `runs`; with none, a task is filed and
-/// claimed for the duration, and [`Adopted::finish`] settles it as the daemon
-/// would. A no-op (`None`) when no magi home is pinned.
+/// that exists and is queued, failed or held is claimed, started with the
+/// run and settled by [`Adopted::finish`] exactly like an ownerless run's; if
+/// somebody else holds its claim, or the task is Done, blocked or running, the run is only linked and nothing is settled. With no such
+/// parent, a task is filed and claimed for the duration. A no-op (`None`) when
+/// no magi home is pinned.
 pub fn adopt(state: &crate::run::RunState, parent_task: Option<&str>) -> Option<Adopted> {
     crate::run::try_home()?;
-    let queue = Queue::open();
+    adopt_in(Queue::open(), state, parent_task)
+}
+
+fn adopt_in(
+    queue: Queue,
+    state: &crate::run::RunState,
+    parent_task: Option<&str>,
+) -> Option<Adopted> {
     if let Some(parent) = parent_task
-        && queue.link_run(parent, &state.id).is_ok()
+        && let Ok(id) = queue.resolve_id(parent)
     {
-        return Some(Adopted {
-            queue,
-            task: None,
-            claim: None,
-            quota_before: Vec::new(),
-        });
+        // The parent exists: never file a second owner for this run.
+        return match queue.claim(&id) {
+            Ok(claim) => {
+                let started = queue.get(&id).and_then(|mut task| {
+                    // A task the daemon could pick up, or one a failed
+                    // hand-started run left held (that is what a requested
+                    // follow-up review re-verifies), is this run's to settle.
+                    // A Done, blocked or running one is settled already or
+                    // owned by somebody else: restarting it would let a
+                    // follow-up review overwrite its outcome, so it only
+                    // gains the run.
+                    if !(task.status.runnable() || task.status == TaskStatus::Held) {
+                        return Ok(None);
+                    }
+                    task.start(state.id.clone());
+                    queue.put(&mut task)?;
+                    Ok(Some(task))
+                });
+                match started {
+                    Ok(None) => {
+                        drop(claim);
+                        let _ = queue.link_run(&id, &state.id);
+                        None
+                    }
+                    Ok(Some(task)) => Some(Adopted {
+                        queue,
+                        task: Some(task),
+                        claim: Some(claim),
+                        quota_before: state.quota.clone(),
+                    }),
+                    Err(e) => {
+                        tracing::warn!("could not start task {id} for run {}: {e:#}", state.id);
+                        drop(claim);
+                        let _ = queue.link_run(&id, &state.id);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                // Another driver owns the task; do not settle over its result.
+                tracing::warn!("task {id} is claimed elsewhere ({e:#}); linking run only");
+                let _ = queue.link_run(&id, &state.id);
+                None
+            }
+        };
     }
     let mut task = Task::new(
         crate::queue::title_from(&state.instruction, 72),
@@ -453,5 +501,102 @@ mod tests {
         .unwrap();
         assert_eq!(done.task.status, TaskStatus::Done);
         assert_eq!(runs, ["20260101-000000-abcd"]);
+    }
+
+    fn parent_in(q: &Queue, dir: &Path) -> Task {
+        let mut t = filing(dir).into_task();
+        q.put(&mut t).unwrap();
+        t
+    }
+
+    fn follow_up_state(dir: &Path) -> crate::run::RunState {
+        crate::run::RunState::new(
+            dir.to_path_buf(),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            "review the branch".to_owned(),
+            Config::default(),
+        )
+    }
+
+    #[test]
+    fn an_adopted_review_claims_starts_and_settles_a_runnable_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let parent = parent_in(&q, dir.path());
+        let state = follow_up_state(dir.path());
+        let adopted = adopt_in(q.clone(), &state, Some(&parent.id)).expect("adopted");
+        let running = q.get(&parent.id).unwrap();
+        assert_eq!(running.status, TaskStatus::Running);
+        assert_eq!(running.attempts, parent.attempts + 1);
+        assert_eq!(running.runs, std::slice::from_ref(&state.id));
+        assert!(q.claim(&parent.id).is_err(), "exclusive while it runs");
+        adopted.finish(&state, Err(anyhow::anyhow!("boom")));
+        let settled = q.get(&parent.id).unwrap();
+        assert_eq!(settled.status, TaskStatus::Held, "{settled:?}");
+        assert_eq!(
+            settled.runs,
+            std::slice::from_ref(&state.id),
+            "no duplicate run"
+        );
+        assert!(q.claim(&parent.id).is_ok(), "claim released");
+        assert_eq!(q.list().len(), 1, "no second owner was filed");
+    }
+
+    #[test]
+    fn a_task_claimed_elsewhere_only_gains_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let parent = parent_in(&q, dir.path());
+        let _theirs = q.claim(&parent.id).unwrap();
+        let state = follow_up_state(dir.path());
+        assert!(adopt_in(q.clone(), &state, Some(&parent.id)).is_none());
+        let after = q.get(&parent.id).unwrap();
+        assert_eq!(after.status, parent.status);
+        assert_eq!(after.attempts, parent.attempts);
+        assert_eq!(after.runs, std::slice::from_ref(&state.id));
+        assert_eq!(q.list().len(), 1, "no second owner was filed");
+    }
+
+    #[test]
+    fn a_done_task_only_gains_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut parent = parent_in(&q, dir.path());
+        parent.succeed();
+        q.put(&mut parent).unwrap();
+        let state = follow_up_state(dir.path());
+        assert!(adopt_in(q.clone(), &state, Some(&parent.id)).is_none());
+        let after = q.get(&parent.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Done);
+        assert_eq!(after.attempts, parent.attempts);
+        assert_eq!(after.runs, std::slice::from_ref(&state.id));
+        assert!(q.claim(&parent.id).is_ok(), "claim released");
+    }
+
+    #[test]
+    fn a_held_task_is_claimed_and_settled_by_its_follow_up_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut parent = parent_in(&q, dir.path());
+        parent.hold_manual(Some("the run did not finish: stale".to_owned()));
+        q.put(&mut parent).unwrap();
+        let state = follow_up_state(dir.path());
+        let adopted = adopt_in(q.clone(), &state, Some(&parent.id)).expect("adopted");
+        assert_eq!(q.get(&parent.id).unwrap().status, TaskStatus::Running);
+        assert!(q.claim(&parent.id).is_err(), "claimed while it runs");
+        adopted.finish(&state, Err(anyhow::anyhow!("fresh failure")));
+        let after = q.get(&parent.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Held);
+        assert!(
+            after
+                .hold_reason
+                .as_deref()
+                .unwrap()
+                .contains("fresh failure"),
+            "{after:?}"
+        );
+        assert_eq!(after.runs, std::slice::from_ref(&state.id));
+        assert!(q.claim(&parent.id).is_ok(), "claim released");
     }
 }
