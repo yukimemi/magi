@@ -11001,9 +11001,11 @@ mod tests {
 
     #[test]
     fn run_rows_put_the_title_alone_on_the_first_line() {
-        assert!(APP_CSS.contains(
-            ".cards .card.run-card .card-title {\n  grid-row: 1; grid-column: 1 / -1;"
-        ));
+        assert!(
+            APP_CSS.contains(
+                ".cards .card.run-card .card-title {\n  grid-row: 1; grid-column: 1 / -1;"
+            )
+        );
         assert!(APP_CSS.contains(".cards .card.run-card .card-when { grid-row: 2;"));
         assert!(APP_JS.contains("class: \"card run-card\""));
         assert!(APP_JS.contains("class: \"repo run-id\""));
