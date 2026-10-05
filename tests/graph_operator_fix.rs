@@ -297,7 +297,6 @@ async fn a_follow_up_review_claims_and_settles_the_task_that_owns_the_run() {
         fx.repo.clone(),
         Source::Human,
     );
-    task.hold_manual(Some("parked".to_owned()));
     q.put(&mut task).unwrap();
     let id = task.id.clone();
 

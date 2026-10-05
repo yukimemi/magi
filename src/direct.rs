@@ -216,9 +216,10 @@ pub struct Adopted {
 }
 
 /// Give a run this process is about to execute an owning task. A parent task
-/// that exists is claimed, started with the run and settled by
-/// [`Adopted::finish`] exactly like an ownerless run's; if somebody else holds
-/// its claim the run is only linked and nothing is settled. With no such
+/// that exists and is runnable (queued or failed) is claimed, started with the
+/// run and settled by [`Adopted::finish`] exactly like an ownerless run's; if
+/// somebody else holds its claim, or the task is Done, held, blocked or
+/// running, the run is only linked and nothing is settled. With no such
 /// parent, a task is filed and claimed for the duration. A no-op (`None`) when
 /// no magi home is pinned.
 pub fn adopt(state: &crate::run::RunState, parent_task: Option<&str>) -> Option<Adopted> {
@@ -238,12 +239,25 @@ fn adopt_in(
         return match queue.claim(&id) {
             Ok(claim) => {
                 let started = queue.get(&id).and_then(|mut task| {
+                    // Only a task the daemon could pick up is this run's to
+                    // settle. A Done, held, blocked or running one is settled
+                    // already (or deliberately parked): restarting it would let
+                    // a follow-up review overwrite its outcome, so it only
+                    // gains the run.
+                    if !task.status.runnable() {
+                        return Ok(None);
+                    }
                     task.start(state.id.clone());
                     queue.put(&mut task)?;
-                    Ok(task)
+                    Ok(Some(task))
                 });
                 match started {
-                    Ok(task) => Some(Adopted {
+                    Ok(None) => {
+                        drop(claim);
+                        let _ = queue.link_run(&id, &state.id);
+                        None
+                    }
+                    Ok(Some(task)) => Some(Adopted {
                         queue,
                         task: Some(task),
                         claim: Some(claim),
@@ -490,7 +504,6 @@ mod tests {
 
     fn parent_in(q: &Queue, dir: &Path) -> Task {
         let mut t = filing(dir).into_task();
-        t.hold_manual(Some("waiting".to_owned()));
         q.put(&mut t).unwrap();
         t
     }
@@ -506,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn an_adopted_review_claims_starts_and_settles_the_existing_task() {
+    fn an_adopted_review_claims_starts_and_settles_a_runnable_task() {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::at(dir.path().join("queue"));
         let parent = parent_in(&q, dir.path());
@@ -538,5 +551,27 @@ mod tests {
         assert_eq!(after.attempts, parent.attempts);
         assert_eq!(after.runs, [state.id.clone()]);
         assert_eq!(q.list().len(), 1, "no second owner was filed");
+    }
+
+    #[test]
+    fn a_done_or_held_task_only_gains_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut done = parent_in(&q, dir.path());
+        done.succeed();
+        q.put(&mut done).unwrap();
+        let mut held = parent_in(&q, dir.path());
+        held.hold_manual(Some("waiting for approval".to_owned()));
+        q.put(&mut held).unwrap();
+        for parent in [&done, &held] {
+            let state = follow_up_state(dir.path());
+            assert!(adopt_in(q.clone(), &state, Some(&parent.id)).is_none());
+            let after = q.get(&parent.id).unwrap();
+            assert_eq!(after.status, parent.status);
+            assert_eq!(after.attempts, parent.attempts);
+            assert_eq!(after.hold_reason, parent.hold_reason);
+            assert_eq!(after.runs, [state.id.clone()]);
+            assert!(q.claim(&parent.id).is_ok(), "claim released");
+        }
     }
 }
