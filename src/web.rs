@@ -3323,12 +3323,16 @@ fn snippet_of(text: &str, terms: &[String]) -> Vec<SnippetPart> {
     let find = |from: usize, to: usize| -> Option<(usize, usize)> {
         let mut best: Option<(usize, usize)> = None;
         for n in needles.iter().filter(|n| !n.is_empty()) {
-            // A term longer than the window cannot occur in it (it may live
-            // in another leaf of the document).
-            if n.len() > to.saturating_sub(from) {
+            // `to` bounds where a match may start; it may run past `to` (the
+            // caller clips what it shows). A term longer than the field cannot
+            // occur in it (it may live in another leaf of the document).
+            if n.len() > chars.len() || to == 0 {
                 continue;
             }
-            let last = to - n.len();
+            let last = (to - 1).min(chars.len() - n.len());
+            if from > last {
+                continue;
+            }
             if let Some(i) = (from..=last).find(|&i| folded[i..i + n.len()] == n[..])
                 && best.is_none_or(|(b, _)| i < b)
             {
@@ -3366,8 +3370,10 @@ fn snippet_of(text: &str, terms: &[String]) -> Vec<SnippetPart> {
         match find(at, hi) {
             Some((s, e)) => {
                 push(&chars[at..s], false);
-                push(&chars[s..e], true);
-                at = e;
+                // A match running past the window is shown up to its edge.
+                let shown = e.min(hi);
+                push(&chars[s..shown], true);
+                at = shown;
             }
             None => {
                 push(&chars[at..hi], false);
@@ -9978,6 +9984,42 @@ mod tests {
                 hit: true
             }]
         );
+    }
+
+    #[test]
+    fn snippet_marks_matches_longer_than_the_window() {
+        let cap = SNIPPET_BEFORE + SNIPPET_AFTER + 2;
+        let hit_len = |parts: &[SnippetPart]| -> usize {
+            parts
+                .iter()
+                .filter(|p| p.hit)
+                .map(|p| p.text.chars().count())
+                .sum()
+        };
+        let total =
+            |parts: &[SnippetPart]| -> usize { parts.iter().map(|p| p.text.chars().count()).sum() };
+
+        let long = "a".repeat(120);
+        let parts = snippet_of(&long, std::slice::from_ref(&long));
+        assert!(hit_len(&parts) > 0, "{parts:?}");
+        assert!(total(&parts) <= cap);
+
+        let ja = "あ".repeat(130);
+        let parts = snippet_of(&ja, std::slice::from_ref(&ja));
+        assert!(hit_len(&parts) > 0, "{parts:?}");
+        assert!(total(&parts) <= cap);
+
+        // A short hit, then one straddling the window's end.
+        let text = format!("ab {} ab{}", "x".repeat(90), "c".repeat(100));
+        let term = format!("ab{}", "c".repeat(100));
+        let parts = snippet_of(&text, &["ab ".to_owned(), term]);
+        assert!(parts.iter().filter(|p| p.hit).count() >= 2, "{parts:?}");
+        assert!(total(&parts) <= cap);
+
+        // Only the head matches: not highlighted.
+        let text = format!("{}z", "a".repeat(119));
+        let parts = snippet_of(&text, &["a".repeat(120)]);
+        assert_eq!(hit_len(&parts), 0, "{parts:?}");
     }
 
     #[tokio::test]
