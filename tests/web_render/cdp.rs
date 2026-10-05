@@ -2,7 +2,7 @@
 //! goes with it.
 //!
 //! Only what `web_render` needs: start one headless Chrome, open a page, send
-//! commands, collect events, evaluate an expression. No retries and no
+//! commands, collect events, evaluate an expression. A failed launch is retried, but there are no
 //! reconnects; every wait carries a deadline so a wedged browser fails the test
 //! instead of hanging CI.
 
@@ -19,7 +19,13 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 /// How long one command may take to answer.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a fresh Chrome may take to publish its debugging port.
-const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// How many times a failed launch is tried in all.
+const LAUNCH_ATTEMPTS: usize = 3;
+/// How much of Chrome's stderr a failed launch reports.
+const STDERR_LINES: usize = 20;
+/// Upper bound on the bytes of that tail.
+const STDERR_BYTES: usize = 4096;
 
 /// Where a Chrome/Chromium binary is, if this machine has one.
 ///
@@ -76,8 +82,20 @@ pub struct Browser {
 }
 
 impl Browser {
+    /// Start Chrome, trying up to `LAUNCH_ATTEMPTS` times. Every attempt gets a
+    /// fresh profile directory and the failed child is reaped first, so a
+    /// cold start that is merely slow on a loaded runner does not fail the
+    /// test, and one that keeps failing says why.
     pub async fn launch(chrome: &Path) -> Result<Self, String> {
+        retry_launch(LAUNCH_ATTEMPTS, |_| Self::launch_once(chrome)).await
+    }
+
+    async fn launch_once(chrome: &Path) -> Result<Self, String> {
         let profile = tempfile::tempdir().map_err(|e| e.to_string())?;
+        // stderr goes to a file, not a pipe: nobody reads a pipe while Chrome
+        // starts, and a full one would block it.
+        let log_path = profile.path().join("chrome-stderr.log");
+        let log = std::fs::File::create(&log_path).map_err(|e| format!("create log: {e}"))?;
         let mut cmd = Command::new(chrome);
         cmd.arg("--headless=new")
             // CI runners run as root in a container; Chrome refuses to start
@@ -95,13 +113,49 @@ impl Browser {
             .arg("about:blank")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(log))
             .kill_on_drop(true);
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("start {}: {e}", chrome.display()))?;
+        // `cmd` still holds the log handle; drop it so the file can be removed
+        // with the profile on Windows once Chrome is gone.
+        drop(cmd);
 
-        let marker = profile.path().join("DevToolsActivePort");
+        let outcome = Self::connect(&mut child, profile.path()).await;
+        match outcome {
+            Ok(ws) => Ok(Self {
+                _child: child,
+                _profile: profile,
+                ws,
+                next_id: 0,
+                events: Vec::new(),
+            }),
+            Err(why) => {
+                let _ = child.start_kill();
+                let reaped = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
+                let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+                let mut msg = why;
+                if reaped.is_err() {
+                    msg.push_str(" (the failed Chrome could not be reaped)");
+                }
+                let tail = tail_lines(&stderr, STDERR_LINES);
+                if tail.trim().is_empty() {
+                    msg.push_str("; Chrome wrote nothing to stderr");
+                } else {
+                    msg.push_str("; Chrome stderr tail: ");
+                    msg.push_str(&tail);
+                }
+                drop(child);
+                drop(profile);
+                Err(msg)
+            }
+        }
+    }
+
+    /// Wait for the debugging port and open the browser-level connection.
+    async fn connect(child: &mut Child, profile: &Path) -> Result<Socket, String> {
+        let marker = profile.join("DevToolsActivePort");
         let deadline = Instant::now() + LAUNCH_TIMEOUT;
         let url = loop {
             if let Ok(text) = std::fs::read_to_string(&marker) {
@@ -110,8 +164,15 @@ impl Browser {
                     break format!("ws://127.0.0.1:{}{}", port.trim(), path.trim());
                 }
             }
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(format!(
+                    "Chrome exited with {status} before publishing DevToolsActivePort"
+                ));
+            }
             if Instant::now() > deadline {
-                return Err("Chrome did not publish DevToolsActivePort in time".to_owned());
+                return Err(format!(
+                    "Chrome did not publish DevToolsActivePort within {LAUNCH_TIMEOUT:?}"
+                ));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
@@ -119,13 +180,7 @@ impl Browser {
             .await
             .map_err(|_| "DevTools connect timed out".to_owned())?
             .map_err(|e| format!("DevTools connect: {e}"))?;
-        Ok(Self {
-            _child: child,
-            _profile: profile,
-            ws,
-            next_id: 0,
-            events: Vec::new(),
-        })
+        Ok(ws)
     }
 
     /// Send one command and wait for its answer, keeping any events that
@@ -301,4 +356,83 @@ impl Browser {
 pub struct Page {
     pub session: String,
     target_id: String,
+}
+
+/// Run `attempt(n)` (1-based) until it succeeds or `attempts` runs are spent.
+/// All failures are kept, in order, in the final error.
+async fn retry_launch<T, F, Fut>(attempts: usize, mut attempt: F) -> Result<T, String>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut failures = Vec::new();
+    for n in 1..=attempts {
+        match attempt(n).await {
+            Ok(v) => return Ok(v),
+            Err(e) => failures.push(format!("attempt {n}/{attempts}: {e}")),
+        }
+    }
+    Err(failures.join("; "))
+}
+
+/// The last `n` lines of `text`, also capped to `STDERR_BYTES` from the end.
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let joined = lines[lines.len().saturating_sub(n)..].join("\n");
+    if joined.len() <= STDERR_BYTES {
+        return joined;
+    }
+    let mut start = joined.len() - STDERR_BYTES;
+    while !joined.is_char_boundary(start) {
+        start += 1;
+    }
+    joined[start..].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retry_stops_at_the_first_success() {
+        let mut calls = 0;
+        let got = retry_launch(3, |n| {
+            calls += 1;
+            async move { if n < 3 { Err(format!("e{n}")) } else { Ok(n) } }
+        })
+        .await;
+        assert_eq!(got, Ok(3));
+        assert_eq!(calls, 3);
+        let mut calls = 0;
+        let got = retry_launch(3, |n| {
+            calls += 1;
+            async move { Ok::<_, String>(n) }
+        })
+        .await;
+        assert_eq!((got, calls), (Ok(1), 1));
+    }
+
+    #[tokio::test]
+    async fn retry_reports_every_failure_and_stops_at_the_bound() {
+        let mut calls = 0;
+        let got: Result<(), String> = retry_launch(3, |n| {
+            calls += 1;
+            async move { Err(format!("e{n}")) }
+        })
+        .await;
+        assert_eq!(calls, 3);
+        assert_eq!(
+            got.unwrap_err(),
+            "attempt 1/3: e1; attempt 2/3: e2; attempt 3/3: e3"
+        );
+    }
+
+    #[test]
+    fn tail_lines_keeps_the_end() {
+        assert_eq!(tail_lines("", 3), "");
+        assert_eq!(tail_lines("a\nb", 3), "a\nb");
+        assert_eq!(tail_lines("a\nb\nc\nd", 2), "c\nd");
+        let long = "é".repeat(STDERR_BYTES);
+        assert!(tail_lines(&long, 1).len() <= STDERR_BYTES);
+    }
 }
