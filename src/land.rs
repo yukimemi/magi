@@ -612,7 +612,8 @@ pub fn merge_intent(message: &str, quote: &str) -> bool {
 }
 
 /// Hedging, conditional, negated or interrogative wording. ASCII words are
-/// matched as whole words so `note` is not `not`.
+/// matched as whole words so `note` is not `not`. A bare negation or stop word
+/// (`no`, `stop`, `nope`, ...) anywhere in the message voids the approval.
 fn hedged(text: &str) -> bool {
     const WORDS: &[&str] = &[
         "maybe",
@@ -622,6 +623,13 @@ fn hedged(text: &str) -> bool {
         "if",
         "unless",
         "not",
+        "no",
+        "nope",
+        "stop",
+        "dont",
+        "abort",
+        "revert",
+        "undo",
         "never",
         "wait",
         "hold",
@@ -664,6 +672,7 @@ fn hedged(text: &str) -> bool {
         "まだ",
         "ただし",
         "やめ",
+        "いや",
         "止め",
         "だめ",
         "ダメ",
@@ -694,7 +703,8 @@ fn hedged(text: &str) -> bool {
         .any(|w| WORDS.contains(&w) || w.ends_with("n't"))
 }
 
-/// Wording that takes back what the rest of the message said.
+/// Wording that takes back what the rest of the message said. Bare negation
+/// and stop words are `hedged`'s whole-word list, not substrings here.
 fn retracts(message: &str) -> bool {
     let lower = message.to_lowercase();
     [
@@ -5800,6 +5810,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 "Merge it",
             ),
             ("Note the findings and merge now", "merge now"),
+            ("I know the risk, merge it", "merge it"),
         ];
         for (msg, quote) in yes {
             assert!(merge_intent(msg, quote), "{msg:?} / {quote:?}");
@@ -5836,6 +5847,20 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             ),
             ("Merge provided CI passes.", "Merge provided CI passes"),
             ("CIが通り次第マージして", "マージして"),
+            ("Merge it. No, stop.", "Merge it"),
+            ("Merge it. Stop.", "Merge it"),
+            ("Merge it. Nope.", "Merge it"),
+            ("merge it, don't", "merge it"),
+            ("merge it, dont", "merge it"),
+            ("マージして。いや、やめて", "マージして"),
+            // Deliberately held: `after` may time the follow-up or condition the
+            // merge, and word order cannot tell them apart without weakening
+            // "Do it after CI passes". An over-hold costs one more word; a
+            // wrong merge cannot be undone.
+            (
+                "Merge now. File a follow-up task to fix R1-1 after this PR merges.",
+                "Merge now",
+            ),
             ("merge it", "go ahead"),
             ("merge it", "merge it please"),
             ("merge it", "  "),
