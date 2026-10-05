@@ -268,6 +268,109 @@ pub struct Runner {
     interrupt: Pause,
 }
 
+/// Where the branch's own commits start: its merge base with the base branch
+/// as the remote has it now, else with the recorded `base_commit`. A branch
+/// rebased onto a base that moved past `base_commit` would otherwise count
+/// the base's commits as its own under `base_commit..branch`.
+async fn review_base(
+    repo: &Path,
+    remote: &str,
+    base_branch: &str,
+    base_commit: &str,
+    branch: &str,
+) -> String {
+    review_base_checked(repo, remote, base_branch, base_commit, branch)
+        .await
+        .0
+}
+
+/// [`review_base`] plus whether the base was read from a freshly fetched
+/// tracking ref. A failed fetch still uses whatever tracking ref exists (it is
+/// never older than `base_commit`'s view of the base), but the answer is then
+/// not trusted to rewrite a pull request's title.
+async fn review_base_checked(
+    repo: &Path,
+    remote: &str,
+    base_branch: &str,
+    base_commit: &str,
+    branch: &str,
+) -> (String, bool) {
+    let tracking = format!("{remote}/{base_branch}");
+    let fresh = matches!(git::fetch(repo, remote, base_branch).await, Ok(o) if o.ok());
+    if git::rev_exists(repo, &tracking).await
+        && let Ok(mb) = git::merge_base(repo, &tracking, branch).await
+        && !mb.is_empty()
+    {
+        return (mb, fresh);
+    }
+    let mb = git::merge_base(repo, base_commit, branch)
+        .await
+        .ok()
+        .filter(|mb| !mb.is_empty())
+        .unwrap_or_else(|| base_commit.to_owned());
+    (mb, false)
+}
+
+/// Recompute `reviewed_commits` from the branch's own commits. Left as it was
+/// when git cannot say or finds nothing: a stale list is better than a wrong
+/// or empty one.
+pub(crate) async fn refresh_reviewed_commits(state: &mut RunState, branch: &str) {
+    if !is_review_run(state) {
+        return;
+    }
+    let base = review_base(
+        &state.repo,
+        &state.config.merge.remote,
+        &state.base_branch,
+        &state.base_commit,
+        branch,
+    )
+    .await;
+    if let Ok(subjects) = git::subjects(&state.repo, &base, branch).await
+        && !subjects.is_empty()
+        && state.reviewed_commits.as_ref() != Some(&subjects)
+    {
+        state.reviewed_commits = Some(subjects);
+        state.save().ok();
+    }
+}
+
+/// Subjects of the base's commits between the recorded start and the branch's
+/// merge base: what a stale `base_commit..branch` would have mistaken for the
+/// branch's own work.
+async fn leaked_subjects(state: &RunState, branch: &str) -> Option<Vec<String>> {
+    let (base, trusted) = review_base_checked(
+        &state.repo,
+        &state.config.merge.remote,
+        &state.base_branch,
+        &state.base_commit,
+        branch,
+    )
+    .await;
+    if !trusted {
+        return None;
+    }
+    git::subjects(&state.repo, &state.base_commit, &base)
+        .await
+        .ok()
+}
+
+/// May an adopted pull request's title be replaced with `computed`? Only when
+/// it is empty, magi's own shape, or a base commit's subject that leaked in;
+/// a title a person wrote stays. Never when `computed` is itself a leak.
+fn should_retitle(current: &str, computed: &str, leaked: &[String]) -> bool {
+    let is_leak = |t: &str| leaked.iter().any(|l| l.trim() == t.trim());
+    if is_leak(computed) {
+        return false;
+    }
+    let cur = current.trim();
+    cur.is_empty()
+        || cur.starts_with(REVIEW_PROMPT_OPENING)
+        || cur.starts_with("chore: land candidate")
+        || cur.starts_with("magi: candidate")
+        || is_leak(cur)
+}
+
 /// The commit a run branches from: the base branch as the remote has it.
 ///
 /// Two failures this replaces. A run used to branch off `HEAD` and so refused
@@ -656,7 +759,15 @@ impl Runner {
         sync_review_branch(repo, branch, &state.config.merge.remote, &base_commit).await?;
         // The commit subjects are the closest thing to a task statement that
         // existing work carries, and the reviewers are told as much.
-        let log = git::log_oneline(repo, &base_commit, branch)
+        let start = review_base(
+            repo,
+            &state.config.merge.remote,
+            &state.base_branch,
+            &base_commit,
+            branch,
+        )
+        .await;
+        let log = git::log_oneline(repo, &start, branch)
             .await
             .unwrap_or_default();
         let instruction = format!(
@@ -671,7 +782,7 @@ impl Runner {
         );
         state.instruction = instruction;
         state.reviewed_commits = Some(
-            git::subjects(repo, &base_commit, branch)
+            git::subjects(repo, &start, branch)
                 .await
                 .unwrap_or_default(),
         );
@@ -3534,6 +3645,7 @@ impl Runner {
                 // checked out (the winner's) was not told; sync its index and
                 // files before anything reads them.
                 git::sync_to_head(&winner.worktree).await?;
+                refresh_reviewed_commits(&mut self.state, &winner.branch).await;
                 let mut conflict = None;
                 if let Some(pinned) = &remote_tip {
                     let pushed = git::push_pinned(&repo, &remote, &winner.branch, pinned).await;
@@ -5812,9 +5924,25 @@ impl Runner {
         let mode = self.state.config.merge.mode;
         let style = self.state.config.merge.style;
         let facts = if is_review_run(&self.state) {
-            branch_facts(&repo, &self.state.base_commit, &winner.branch).await
+            refresh_reviewed_commits(&mut self.state, &winner.branch).await;
+            let start = review_base(
+                &repo,
+                &self.state.config.merge.remote,
+                &base,
+                &self.state.base_commit,
+                &winner.branch,
+            )
+            .await;
+            branch_facts(&repo, &start, &winner.branch).await
         } else {
             None
+        };
+        // `None` when the base could not be freshly read: then an adopted
+        // pull request's title is left alone.
+        let leaked = if is_review_run(&self.state) {
+            leaked_subjects(&self.state, &winner.branch).await
+        } else {
+            Some(Vec::new())
         };
         let pr = pr_message_with(&self.state, winner.label, facts.as_ref());
         let message = pr.commit_message();
@@ -5906,6 +6034,10 @@ impl Runner {
                             self.state
                                 .event("merge", format!("Pr: adopted open pull request {url}"));
                             if title != pr.title
+                                && (!is_review_run(&self.state)
+                                    || leaked
+                                        .as_deref()
+                                        .is_some_and(|l| should_retitle(&title, &pr.title, l)))
                                 && let Err(e) =
                                     land::set_pr_title(&winner.worktree, &url, &pr.title).await
                             {
@@ -8285,6 +8417,31 @@ pub fn worst_open(state: &RunState) -> Option<Severity> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn should_retitle_only_replaces_magi_shaped_or_leaked_titles() {
+        let leaked = vec!["chore(deps): update a crate".to_owned()];
+        let own = "fix(daemon): apply a chosen action";
+        assert!(should_retitle("", own, &leaked));
+        assert!(should_retitle(
+            &format!("{REVIEW_PROMPT_OPENING} `x`"),
+            own,
+            &leaked
+        ));
+        assert!(should_retitle(
+            "chore: land candidate A of run 1",
+            own,
+            &leaked
+        ));
+        assert!(should_retitle(
+            "magi: candidate A (uncommitted work)",
+            own,
+            &leaked
+        ));
+        assert!(should_retitle("chore(deps): update a crate", own, &leaked));
+        assert!(!should_retitle("feat: renamed by hand", own, &leaked));
+        assert!(!should_retitle("", "chore(deps): update a crate", &leaked));
+    }
+
     #[test]
     fn pr_merge_plan_creates_adopts_or_stops() {
         assert_eq!(pr_merge_plan(Ok(land::OpenPr::None)), PrPlan::Create);
@@ -10789,6 +10946,94 @@ mod tests {
         state.candidates[0].agent = EXISTING_BRANCH.to_owned();
         state.reviewed_commits = Some(subjects.iter().map(|s| (*s).to_owned()).collect());
         state
+    }
+
+    /// A branch rebased onto a main that moved past the recorded
+    /// `base_commit` is titled from its own first commit, never main's.
+    #[tokio::test]
+    async fn a_rebased_review_branch_is_titled_from_its_own_commits() {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let origin = tmp.path().join("origin.git");
+        let g = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .quiet()
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        g(
+            tmp.path(),
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                repo.to_str().unwrap(),
+                origin.to_str().unwrap(),
+            ],
+        );
+        g(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        let c1 = git::rev_parse(&repo, "main").await.unwrap();
+
+        // Main moves on; the branch is built on top of the new main.
+        std::fs::write(repo.join("dep.txt"), "bump\n").unwrap();
+        g(&repo, &["add", "-A"]);
+        g(
+            &repo,
+            &["commit", "-q", "-m", "chore(deps): update a crate"],
+        );
+        g(&repo, &["push", "-q", "origin", "main"]);
+        g(&repo, &["checkout", "-q", "-b", "feat/own"]);
+        std::fs::write(repo.join("own.txt"), "own\n").unwrap();
+        g(&repo, &["add", "-A"]);
+        g(
+            &repo,
+            &["commit", "-q", "-m", "fix(daemon): apply a chosen action"],
+        );
+        g(&repo, &["checkout", "-q", "main"]);
+
+        let start = review_base(&repo, "origin", "main", &c1, "feat/own").await;
+        assert_eq!(start, git::rev_parse(&repo, "main").await.unwrap());
+        // Without a readable tracking ref the recorded base's merge base is used.
+        let fallback = review_base(&repo, "nowhere", "main", &c1, "feat/own").await;
+        assert_eq!(fallback, c1);
+
+        let mut state = review_state(&[
+            "chore(deps): update a crate",
+            "fix(daemon): apply a chosen action",
+        ]);
+        state.repo = repo.clone();
+        state.base_branch = "main".to_owned();
+        state.base_commit = c1;
+        refresh_reviewed_commits(&mut state, "feat/own").await;
+        assert_eq!(
+            state.reviewed_commits,
+            Some(vec!["fix(daemon): apply a chosen action".to_owned()])
+        );
+        assert_eq!(
+            review_title(&state).as_deref(),
+            Some("fix(daemon): apply a chosen action")
+        );
+        assert_eq!(
+            leaked_subjects(&state, "feat/own").await,
+            Some(vec!["chore(deps): update a crate".to_owned()])
+        );
+        // A stale tracking ref is still used when the fetch fails, but the
+        // leak list is withheld.
+        state.config.merge.remote = "nowhere".to_owned();
+        assert_eq!(leaked_subjects(&state, "feat/own").await, None);
     }
 
     #[test]

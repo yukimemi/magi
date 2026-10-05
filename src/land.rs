@@ -3396,6 +3396,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                                     return Ok(pr);
                                 }
                             };
+                        crate::graph::refresh_reviewed_commits(state, &branch).await;
                         awaiting_head = Some(head);
                         rechecked = false;
                         state.event("land", format!("rebased {branch} onto {base}"));
