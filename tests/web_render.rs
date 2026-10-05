@@ -620,6 +620,11 @@ async fn run_detail_tabs_landing_and_strip_hold_at_both_widths_and_themes() {
                 .open_page(&format!("{base}#/runs/{id}"), width, height, mobile)
                 .await
                 .unwrap_or_else(|e| panic!("{tag}: open: {e}"));
+            // The page may still be mid-navigation, with no root element yet.
+            browser
+                .wait_for(&page, "!!document.documentElement", w)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: document never ready: {e}"));
             browser
                 .eval(
                     &page,
