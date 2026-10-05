@@ -1012,6 +1012,10 @@ pub fn run(state: &RunState) -> String {
                 green("enabled")
             } else if b.merged_directly {
                 green("not needed (CI was already green; merged directly)")
+            } else if b.local {
+                dim(
+                    "not used (release.mode = local: merged on your approval, released by magi serve)",
+                )
             } else if b.problem.is_some() {
                 bold(&red("FAILED"))
             } else {

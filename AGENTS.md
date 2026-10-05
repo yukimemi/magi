@@ -942,6 +942,75 @@ again.
   and `Task::release` keeps it only for a machine hold; releasing without
   cleaning the old worktree re-holds the task without spending an attempt.
 
+### Releasing without GitHub Actions (`[release] mode = "local"`)
+
+For repositories whose Actions never run (private, no minutes): the release
+PR's checks never report, so nothing merges it and `auto-tag.yml` /
+`release.yml` never fire. `[release]` in `magi.toml` is opt-in per repository;
+**the default `mode = "actions"` changes nothing**.
+
+```toml
+[release]
+mode = "local"                      # actions (default) | local
+commands = ["cargo build --release", "gh release create \"$MAGI_RELEASE_TAG\" --generate-notes"]
+timeout_minutes = 30                # per command
+```
+
+- **Land gate.** `bump::open_bump_pr` arms no automerge and never merges
+  directly (that would skip the approval): it returns
+  `AutomergeOutcome::LocalGate`, records `ReleaseBump::local`, and registers
+  the PR with the release watcher. `land::decide_with(.., CiExpectation::Absent)`
+  is the "no CI will ever exist" reading of `land::decide` (`Expected`, what
+  `decide` always passes, is unchanged); the watcher's own `decide_local` is
+  pure and applies the same rule to a `RollupView`. A conflict is not a check
+  and still stops.
+- **The owner approves, bound to the head.** The watcher files a
+  `bump::NOTICE_NODE` question (`merge` / `hold`, no run, no `cwd`) recording
+  the head it observed; `merge` runs `gh pr merge --match-head-commit <head>`
+  and the forge decides whether it merged (`land::merged_after_all`). An answer
+  about an older head asks again; silence and `hold` stay put until the head
+  moves. CI rerun and stall escalation do not apply to a local PR.
+- **After the merge** `release_local::run_job` runs from a clean detached
+  checkout of the merge commit: the Cargo.toml version there must equal the
+  release version; the tag is created (annotated) and pushed with an explicit
+  refspec, no force, and **only if neither the remote nor this checkout has it**
+  (`tag_step`: a remote tag at the merge commit is "already done", anywhere else
+  is `Foreign`, an unreadable remote is `Unreadable` - never "absent"). Then
+  `commands` run one at a time through `Config::shell()`; the first failure
+  stops the list. Output goes to `<home>/release-local/<id>/release-<n>.out`
+  and its tail into the record (`WatchState::job`), not into a run: the release
+  PR's own run is long finished.
+- **Environment, not templates**: `MAGI_RELEASE_VERSION`, `MAGI_RELEASE_TAG`,
+  `MAGI_RELEASE_COMMIT`, `MAGI_RELEASE_PR`. `{{ version }}` cannot work:
+  teravars renders the whole file before any release exists.
+- **A failure holds, and nothing retries blind.** A failed command, a
+  `Foreign` tag or an unreadable remote raises a notice and one question
+  (`retry` / `leave it`); silence is a hold. `retry` resumes from the recorded
+  progress: the tag is not recreated and finished commands are skipped.
+  Progress is saved *before* every step, so a step that was started and never
+  finished (crash, kill) is **unfinished, not failed**: magi cannot know whether
+  `gh release create` reached the forge, so it holds with that wording and the
+  owner decides. Write the commands to be safe to repeat.
+- **Needs `magi serve`** (the watcher is a task inside it) and
+  `[daemon] release_stall_minutes > 0` (`0` switches the watcher off, local
+  releases included). The per-repo config is read with `Config::discover(repo,
+  None)`; if it cannot be read the PR is watched as an Actions release and a
+  `tracing::warn` says so. Releases are driven one at a time (the watcher is a
+  single sequential task), which is the per-repository exclusion.
+- **Branch protection.** magi never uses `--admin`. If the base branch
+  requires checks that never report, the merge is refused and the watcher
+  raises a notice; merge by hand (the next lap releases it) or relax the rule.
+- **Do not also publish from a workflow.** With `auto-tag.yml` /
+  `release.yml` present and Actions running, the same tag or publish would
+  happen twice. Local mode is for repositories where they cannot run.
+- **Known gap.** The merge commit is read from the forge after the merge; if
+  the forge has not recorded it yet the job is created on a later lap. A PR
+  merged by hand is released by the watcher too, but one that was never
+  registered or watched (opened by hand, not by magi) is not.
+- Tests: `release_local` (real temp git repo + bare remote, `true` / `false`
+  commands) and `release_watch` (fake forge) for the flow; `config` for the
+  keys and defaults.
+
 ### Handing the address over: release, then spawn
 
 `POST /api/upgrade` ends the process it is serving from, and the order of the

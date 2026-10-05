@@ -10356,6 +10356,7 @@ mod tests {
             version: Some("1.0.0".to_owned()),
             automerge_enabled: true,
             merged_directly: false,
+            local: false,
             problem: None,
             action_required: None,
         });
@@ -10374,6 +10375,7 @@ mod tests {
             version: Some("1.0.1".to_owned()),
             automerge_enabled: false,
             merged_directly: false,
+            local: false,
             problem: Some("checks red".to_owned()),
             action_required: Some("look at the PR".to_owned()),
         });

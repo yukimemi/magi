@@ -583,7 +583,7 @@ fn version_in_table(toml: &str, table: &str) -> Option<String> {
 /// one, else from `[workspace.package]` - see [`rewrite_cargo_version`] for
 /// why both exist and which wins. No I/O: the caller fetches the blob (`git
 /// show <remote>/<base>:Cargo.toml`).
-fn current_version(toml: &str) -> Result<String> {
+pub(crate) fn current_version(toml: &str) -> Result<String> {
     version_in_table(toml, "[package]")
         .or_else(|| version_in_table(toml, "[workspace.package]"))
         .context("no `version` field found under `[package]` or `[workspace.package]`")
@@ -1366,8 +1366,9 @@ async fn after_merge_inner(
             },
         )
         .await?;
+    let local = outcome == AutomergeOutcome::LocalGate;
     let (automerge_warning, merged_detail) = match outcome {
-        AutomergeOutcome::Enabled => (None, None),
+        AutomergeOutcome::Enabled | AutomergeOutcome::LocalGate => (None, None),
         AutomergeOutcome::MergedDirectly { detail } => (None, Some(detail)),
         AutomergeOutcome::Failed { reason } => (Some(reason), None),
     };
@@ -1410,8 +1411,9 @@ async fn after_merge_inner(
     state.release_bump = Some(run::ReleaseBump {
         pr_url: Some(pr_url_opened.clone()),
         version: Some(next.clone()),
-        automerge_enabled: automerge_warning.is_none() && merged_detail.is_none(),
+        automerge_enabled: automerge_warning.is_none() && merged_detail.is_none() && !local,
         merged_directly: merged_detail.is_some(),
+        local,
         ..run::ReleaseBump::default()
     });
     if let Some(detail) = merged_detail {
@@ -2012,6 +2014,15 @@ async fn open_bump_pr(
         crate::scrub::scrub(&body, &who),
     );
     let url = gh_pr_create(worktree, &state.base_branch, branch, &title, &body).await?;
+    // Without Actions nothing would ever merge it on green, and a direct merge
+    // here would skip the owner's approval: leave it open for the release
+    // watcher, which asks and then releases.
+    if state.config.release.is_local() {
+        // Watched from now on, so a pull request merged before the watcher's
+        // first lap still gets released.
+        crate::release_watch::register(&crate::run::home(), &state.repo, &url);
+        return Ok((url, AutomergeOutcome::LocalGate));
+    }
     let outcome = match gh_enable_automerge(worktree, &url).await {
         Ok(()) => AutomergeOutcome::Enabled,
         Err(e) => {
@@ -2033,6 +2044,8 @@ enum AutomergeOutcome {
     Enabled,
     /// CI beat us to it, so magi merged the pull request itself.
     MergedDirectly { detail: String },
+    /// `[release] mode = "local"`: automerge was deliberately not armed.
+    LocalGate,
     /// Neither worked; a human has to merge it.
     Failed { reason: String },
 }
@@ -2049,7 +2062,7 @@ fn is_clean_status_refusal(reason: &str) -> bool {
 
 /// The direct merge, in the same shape [`land::merge_argv`] uses but addressed
 /// by URL: squash under the pull request's own title, delete the branch.
-fn bump_merge_argv(pr_url: &str, subject: &str) -> Vec<String> {
+pub(crate) fn bump_merge_argv(pr_url: &str, subject: &str) -> Vec<String> {
     [
         "pr",
         "merge",
@@ -2813,6 +2826,25 @@ mod tests {
                 other => panic!("expected Failed, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_local_mode_bump_reads_back_and_old_records_are_not_local() {
+        let old: run::ReleaseBump =
+            serde_json::from_str(r#"{"pr_url":"u","automerge_enabled":true}"#).unwrap();
+        assert!(!old.local);
+        let mut state = merged_state();
+        state.release_bump = Some(run::ReleaseBump {
+            pr_url: Some("https://github.com/o/r/pull/9".to_owned()),
+            version: Some("1.0.0".to_owned()),
+            local: true,
+            ..run::ReleaseBump::default()
+        });
+        // Not a failure: nothing was supposed to be armed.
+        assert!(!state.needs_attention());
+        let text = crate::report::run(&state);
+        assert!(text.contains("release.mode = local"), "{text}");
+        assert!(!text.contains("FAILED"), "{text}");
     }
 
     #[test]

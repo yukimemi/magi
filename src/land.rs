@@ -332,6 +332,33 @@ pub(crate) fn merged_after_all(
 ///    not been given its workflow runs yet. Past the grace they are treated as
 ///    genuinely missing and magi stops rather than merge on a guess.
 pub fn decide(pr: &PrState, round: usize, budget: usize, waited: Duration) -> Step {
+    decide_with(pr, round, budget, waited, CiExpectation::Expected)
+}
+
+/// Whether the repository's CI is expected to report on this pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiExpectation {
+    /// Checks will come: wait for them, judge them (the default, and what
+    /// [`decide`] always uses).
+    Expected,
+    /// No check will ever report (`[release] mode = "local"` on a repository
+    /// whose Actions never run). Waiting out [`CHECKS_GRACE`] or reading
+    /// `unknown` as a refusal would stall forever, so the checks are read as
+    /// absent and the pull request is ready as soon as it merges cleanly.
+    Absent,
+}
+
+/// [`decide`] with the CI expectation made explicit. `Expected` is exactly
+/// [`decide`]; `Absent` reads the absence of CI as the reason to proceed, and
+/// still stops for a conflict (the base moved), which a rebase cures and no
+/// check state does.
+pub fn decide_with(
+    pr: &PrState,
+    round: usize,
+    budget: usize,
+    waited: Duration,
+    ci: CiExpectation,
+) -> Step {
     match pr.state {
         PrLifecycle::Merged => return Step::Done { merged: true },
         PrLifecycle::Closed => return Step::Done { merged: false },
@@ -342,6 +369,10 @@ pub fn decide(pr: &PrState, round: usize, budget: usize, waited: Duration) -> St
     // answer about a state that cannot land.
     if pr.blocking == Blocking::Conflict {
         return Step::Rebase;
+    }
+
+    if ci == CiExpectation::Absent {
+        return Step::Merge;
     }
 
     let spent = round >= budget;
@@ -4766,6 +4797,36 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn expected_ci_is_exactly_decide_and_absent_ci_never_waits_for_checks() {
+        use CiExpectation::{Absent, Expected};
+        for checks in [Checks::Pending, Checks::Unknown, Checks::Green, Checks::Red] {
+            let p = pr(checks, &["x"], 0);
+            for waited in [Duration::ZERO, CHECKS_GRACE] {
+                assert_eq!(
+                    decide_with(&p, 0, 4, waited, Expected),
+                    decide(&p, 0, 4, waited)
+                );
+            }
+        }
+        // Nothing will ever report: no wait, no give-up, no fix round.
+        for checks in [Checks::Pending, Checks::Unknown, Checks::Red] {
+            let p = pr(checks, &["x"], 0);
+            assert_eq!(decide_with(&p, 0, 4, Duration::ZERO, Absent), Step::Merge);
+            assert_eq!(decide_with(&p, 4, 4, CHECKS_GRACE, Absent), Step::Merge);
+        }
+        // A conflict is not a check: it still wants the rebase.
+        let mut p = pr(Checks::Unknown, &[], 0);
+        p.blocking = Blocking::Conflict;
+        assert_eq!(decide_with(&p, 0, 4, Duration::ZERO, Absent), Step::Rebase);
+        // And a pull request that left our hands is still done.
+        p.state = PrLifecycle::Merged;
+        assert_eq!(
+            decide_with(&p, 0, 4, Duration::ZERO, Absent),
+            Step::Done { merged: true }
+        );
     }
 
     #[test]

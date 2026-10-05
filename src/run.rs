@@ -1666,6 +1666,11 @@ pub struct ReleaseBump {
     /// from `automerge_enabled`, which stays the plain fact it says it is.
     #[serde(default)]
     pub merged_directly: bool,
+    /// `[release] mode = "local"`: no automerge was armed; the pull request is
+    /// merged on the owner's approval and released by `magi serve`
+    /// ([`crate::release_local`]).
+    #[serde(default)]
+    pub local: bool,
     /// What went wrong, verbatim from the tool that said it.
     #[serde(default)]
     pub problem: Option<String>,

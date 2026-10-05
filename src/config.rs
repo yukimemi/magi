@@ -811,6 +811,55 @@ impl Default for Update {
     }
 }
 
+/// Who performs the release after a `chore/release-vX.Y.Z` pull request merges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseMode {
+    /// The repository's own workflows do (`auto-tag.yml` then `release.yml`),
+    /// and the release pull request merges on its checks.
+    #[default]
+    Actions,
+    /// magi does, from this machine: no CI is awaited, the owner approves the
+    /// merge, and magi then tags and runs [`Release::commands`]. See
+    /// [`crate::release_local`].
+    Local,
+}
+
+/// `[release]`: releasing without GitHub Actions. Opt-in per repository.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Release {
+    /// [`ReleaseMode::Actions`] (default: nothing changes) or
+    /// [`ReleaseMode::Local`].
+    pub mode: ReleaseMode,
+    /// Shell commands run in order, from a clean checkout of the merge commit,
+    /// once the tag is pushed. The first failure stops the list. They see
+    /// `MAGI_RELEASE_VERSION`, `MAGI_RELEASE_TAG`, `MAGI_RELEASE_COMMIT` and
+    /// `MAGI_RELEASE_PR` in the environment; `{{ ... }}` cannot carry the
+    /// version because teravars renders the whole file before any release
+    /// exists. Only read when `mode = "local"`.
+    pub commands: Vec<String>,
+    /// Minutes each command may run before it is killed and counted as failed.
+    pub timeout_minutes: u64,
+}
+
+impl Default for Release {
+    fn default() -> Self {
+        Self {
+            mode: ReleaseMode::Actions,
+            commands: Vec::new(),
+            timeout_minutes: 30,
+        }
+    }
+}
+
+impl Release {
+    /// Is this repository released by magi rather than by its workflows?
+    pub fn is_local(&self) -> bool {
+        self.mode == ReleaseMode::Local
+    }
+}
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
@@ -842,6 +891,8 @@ pub struct Config {
     pub talk: Talk,
     /// How many runs `magi serve`'s own loop drives at once.
     pub daemon: Daemon,
+    /// Who tags and publishes after a release pull request merges.
+    pub release: Release,
     /// Context-window sizes in tokens, keyed by model name, merged over
     /// [`BUILTIN_CONTEXT_WINDOWS`]. See [`Config::context_window`].
     pub context_windows: BTreeMap<String, u64>,
@@ -1794,7 +1845,21 @@ impl Config {
              # no new commit and no check changing state before `magi serve`\n\
              # notices and asks you. A failed check is rerun once on its own;\n\
              # still red after that escalates at once. 0 turns the watcher off.\n\
-             # release_stall_minutes = 60\n",
+             # release_stall_minutes = 60\n\n\
+             [release]\n\
+             # actions (default) | local. \"local\" is for repositories whose GitHub\n\
+             # Actions never run (private, no minutes): the release pull request\n\
+             # does not wait for CI, you approve the merge in magi, and then\n\
+             # `magi serve` pushes the vX.Y.Z tag (never over an existing one) and\n\
+             # runs `commands` from a clean checkout of the merge commit. A\n\
+             # failure holds the release with a notice; it is never retried blind.\n\
+             # Needs `magi serve` running and [daemon] release_stall_minutes > 0.\n\
+             # mode = \"actions\"\n\
+             # Run in order; the first failure stops. They see MAGI_RELEASE_VERSION,\n\
+             # MAGI_RELEASE_TAG, MAGI_RELEASE_COMMIT and MAGI_RELEASE_PR. Make them\n\
+             # safe to repeat: a crash mid-command is treated as unfinished.\n\
+             # commands = [\"cargo build --release\", \"gh release create \\\"$MAGI_RELEASE_TAG\\\" --generate-notes\"]\n\
+             # timeout_minutes = 30\n",
         );
         s
     }
@@ -2315,6 +2380,38 @@ mod tests {
         assert_eq!(parsed.graph.timeout_review, 1200);
         assert_eq!(parsed.graph.verify_timeout(), 1200);
         assert_eq!(parsed.update.mode, UpdateMode::Notify);
+    }
+
+    #[test]
+    fn release_defaults_to_actions_and_the_starter_documents_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        std::fs::write(&path, Config::starter_toml()).unwrap();
+        let r = Config::load(&path).unwrap().release;
+        assert_eq!(r.mode, ReleaseMode::Actions);
+        assert!(!r.is_local());
+        assert!(r.commands.is_empty());
+        assert_eq!(r.timeout_minutes, 30);
+        assert!(Config::starter_toml().contains("# mode = \"actions\""));
+    }
+
+    #[test]
+    fn release_local_parses_and_unknown_keys_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        std::fs::write(
+            &path,
+            "[release]\nmode = \"local\"\ncommands = [\"true\", \"echo $MAGI_RELEASE_TAG\"]\ntimeout_minutes = 5\n",
+        )
+        .unwrap();
+        let r = Config::load(&path).unwrap().release;
+        assert!(r.is_local());
+        assert_eq!(r.commands.len(), 2);
+        assert_eq!(r.timeout_minutes, 5);
+        std::fs::write(&path, "[release]\nmode = \"local\"\nbogus = 1\n").unwrap();
+        assert!(Config::load(&path).is_err());
+        std::fs::write(&path, "[release]\nmode = \"gha\"\n").unwrap();
+        assert!(Config::load(&path).is_err());
     }
 
     #[test]
