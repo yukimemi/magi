@@ -995,8 +995,12 @@ timeout_minutes = 30                # per command
   command look retryable. A held job **keeps its checkout** (a resumed
   `gh release create` needs what `cargo build --release` made); only a finished
   release removes it. The task that opened the PR (found through the run id
-  recorded at registration) is held with `hold_machine`, since the daemon
-  marked it Done at the merge.
+  recorded at registration) is held with `hold_machine` (reason prefixed
+  `[release] `), since the daemon marked it Done at the merge. The hold is
+  reconciled on every lap while the job is failed or interrupted (so a restart
+  between saving the failure and holding cannot lose it), recorded in
+  `WatchState::held_task`, and given back (`Task::succeed`) when a retry
+  finishes - only if the task is still a machine hold with that prefix.
 - **Needs `magi serve`** (the watcher is a task inside it) and
   `[daemon] release_stall_minutes > 0` (`0` switches the watcher off, local
   releases included). The per-repo config is read with `Config::discover(repo,

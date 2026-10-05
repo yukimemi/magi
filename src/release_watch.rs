@@ -121,6 +121,9 @@ pub(crate) struct WatchState {
     /// Local mode: the run that opened this release PR, so a failed release can
     /// hold the task that run finished (the daemon marks it Done at the merge).
     pub run: Option<String>,
+    /// Local mode: the task this watcher put on hold for a failed release, so a
+    /// successful retry can give it back (and a restart does not hold it twice).
+    pub held_task: Option<String>,
     /// Local mode: the release after the merge.
     pub job: Option<Job>,
 }
@@ -342,6 +345,10 @@ pub(crate) fn register(home: &Path, repo: &Path, url: &str, run: &str) {
     };
     w.save(&pr, &st);
 }
+
+/// Starts the hold reason of a task held for a failed release, so only that
+/// hold is undone when the release later succeeds.
+const HOLD_PREFIX: &str = "[release] ";
 
 fn approval_message(pr: &str) -> String {
     format!("Release PR {pr} is waiting for your approval to merge")
@@ -858,7 +865,10 @@ impl Watcher {
                 job.running.clone().unwrap_or_default()
             ));
         }
-        if job.failed.is_some() {
+        if let Some(why) = job.failed.clone() {
+            // Reconcile first: a stop between saving the failure and holding
+            // the task (or an interrupted step) must not leave the task Done.
+            self.hold_task(&mut st, &format!("release {} is on hold: {why}", job.tag()));
             // Held: only the owner's `retry` runs it again.
             let retry = self.settle_job_question(pr, &mut st, &mut job);
             if !retry {
@@ -887,12 +897,13 @@ impl Watcher {
         match result {
             Ok(()) => {
                 self.raise_released(pr, &job);
+                self.unhold_task(&mut st);
                 st.job = Some(job);
                 self.finish(pr, &st);
             }
             Err(e) => {
                 job.failed = Some(format!("{e:#}"));
-                self.hold_task(&st, &format!("release {} failed: {e:#}", job.tag()));
+                self.hold_task(&mut st, &format!("release {} failed: {e:#}", job.tag()));
                 self.raise(pr, failed_message(pr));
                 self.file_job_question(pr, &mut st, &job);
                 st.job = Some(job);
@@ -904,20 +915,48 @@ impl Watcher {
     /// Hold the task whose run opened this release PR: the daemon marked it
     /// Done when the change merged, but the release is not done. Best-effort;
     /// a task the owner already holds or that cannot be found is left alone.
-    fn hold_task(&self, st: &WatchState, reason: &str) {
-        let Some(run) = &st.run else {
+    fn hold_task(&self, st: &mut WatchState, reason: &str) {
+        if st.held_task.is_some() {
+            return;
+        }
+        let Some(run) = st.run.clone() else {
             return;
         };
         let q = crate::queue::Queue::at(self.home.join("queue"));
         for mut t in q.list() {
-            if t.runs.iter().any(|r| r == run) {
+            if t.runs.contains(&run) {
                 if t.status != crate::queue::TaskStatus::Held {
-                    t.hold_machine(Some(reason.to_owned()));
-                    if let Err(e) = q.put(&mut t) {
-                        tracing::warn!("could not hold task {} for {run}: {e:#}", t.id);
+                    t.hold_machine(Some(format!("{HOLD_PREFIX}{reason}")));
+                    match q.put(&mut t) {
+                        Ok(()) => st.held_task = Some(t.id.clone()),
+                        Err(e) => tracing::warn!("could not hold task {} for {run}: {e:#}", t.id),
                     }
                 }
                 return;
+            }
+        }
+    }
+
+    /// Give back the hold [`Watcher::hold_task`] put on a task, once the
+    /// release succeeded. Only a machine hold carrying our marker is undone: a
+    /// task the owner has since re-held or changed is left alone.
+    fn unhold_task(&self, st: &mut WatchState) {
+        let Some(id) = st.held_task.take() else {
+            return;
+        };
+        let q = crate::queue::Queue::at(self.home.join("queue"));
+        let Ok(mut t) = q.get(&id) else {
+            return;
+        };
+        let ours = t.status == crate::queue::TaskStatus::Held
+            && t.hold_source == Some(crate::queue::HoldSource::Machine)
+            && t.hold_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with(HOLD_PREFIX));
+        if ours {
+            t.succeed();
+            if let Err(e) = q.put(&mut t) {
+                tracing::warn!("could not restore task {id} after the release: {e:#}");
             }
         }
     }
@@ -1586,6 +1625,71 @@ mod tests {
                 .unwrap_or_default()
                 .contains("release v1.0.0")
         );
+    }
+
+    #[tokio::test]
+    async fn unhold_gives_the_task_back_only_when_the_hold_is_ours() {
+        let (d, _fake, w) = rig();
+        let q = crate::queue::Queue::at(d.path().join("queue"));
+        let mut t = crate::queue::Task::new(
+            "t".to_owned(),
+            "i".to_owned(),
+            PathBuf::from("/r"),
+            crate::queue::Source::Human,
+        );
+        t.runs.push("run1".to_owned());
+        t.status = crate::queue::TaskStatus::Done;
+        q.put(&mut t).unwrap();
+        let mut st = WatchState {
+            run: Some("run1".to_owned()),
+            ..WatchState::default()
+        };
+        w.hold_task(&mut st, "failed");
+        assert_eq!(q.get(&t.id).unwrap().status, crate::queue::TaskStatus::Held);
+        // A restart reconciling again does not hold twice.
+        w.hold_task(&mut st, "failed again");
+        w.unhold_task(&mut st);
+        assert_eq!(q.get(&t.id).unwrap().status, crate::queue::TaskStatus::Done);
+        assert!(st.held_task.is_none());
+
+        // The owner re-held it by hand with their own reason: left alone.
+        let mut h = q.get(&t.id).unwrap();
+        st.held_task = Some(h.id.clone());
+        h.hold_manual(Some("mine".to_owned()));
+        q.put(&mut h).unwrap();
+        w.unhold_task(&mut st);
+        assert_eq!(q.get(&t.id).unwrap().status, crate::queue::TaskStatus::Held);
+    }
+
+    #[tokio::test]
+    async fn a_restart_after_the_failure_was_saved_still_holds_the_task() {
+        let (d, fake, w) = rig();
+        *fake.local.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Merged, "h1", vec![]));
+        let repo = d.path().join("nowhere");
+        let q = crate::queue::Queue::at(d.path().join("queue"));
+        let mut t = crate::queue::Task::new(
+            "t".to_owned(),
+            "i".to_owned(),
+            repo.clone(),
+            crate::queue::Source::Human,
+        );
+        t.runs.push("run1".to_owned());
+        t.status = crate::queue::TaskStatus::Done;
+        q.put(&mut t).unwrap();
+        // The state a crash leaves: failure persisted, task never held.
+        let mut job = Job::new("1.0.0", URL, "deadbeef");
+        job.failed = Some("command 1 exited 3".to_owned());
+        let st = WatchState {
+            repo: repo.to_string_lossy().into_owned(),
+            url: URL.to_owned(),
+            run: Some("run1".to_owned()),
+            job: Some(job),
+            ..WatchState::default()
+        };
+        w.save("o/r#7", &st);
+        w.lap(std::slice::from_ref(&repo), 60, 1, &(|| false)).await;
+        assert_eq!(q.get(&t.id).unwrap().status, crate::queue::TaskStatus::Held);
     }
 
     #[tokio::test]
