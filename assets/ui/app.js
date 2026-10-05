@@ -1249,14 +1249,15 @@ async function loadLoop() {
 
 /* ---- runs list --------------------------------------------------------- */
 function createRunCard() {
-  const chipSlot = el("span");
+  const chipSlot = el("span", { class: "run-chip" });
   const whenSlot = el("time", { class: "card-when" });
   const title = el("h2", { class: "card-title" });
+  const runId = el("span", { class: "repo run-id" });
   const repo = el("span", { class: "repo" });
   const counts = el("span");
   const winner = el("span", { class: "win" });
   const reviews = el("span");
-  const meta = el("div", { class: "card-meta" }, repo, counts, winner, reviews);
+  const meta = el("div", { class: "card-meta" }, runId, repo, counts, winner, reviews);
   const note = el("p", { class: "card-note" });
   /* Two attempts at one task are two cards with the same title, and the deck
      used to give no hint which was which - "why are there two of the same,
@@ -1269,7 +1270,7 @@ function createRunCard() {
   const snippet = el("p", { class: "card-snippet", hidden: true });
   const rail = el("div");
 
-  const card = el("a", { class: "card" },
+  const card = el("a", { class: "card run-card" },
     el("div", { class: "card-top" }, chipSlot, whenSlot),
     title, meta, note, superseded, event, snippet, rail,
   );
@@ -1286,7 +1287,7 @@ function createRunCard() {
   const tail = el("div", { class: "card-tail" }, prLink, checks, prRound, tailGo, tailNote);
 
   const row = el("li", {}, card, tail);
-  row.refs = { card, chipSlot, whenSlot, title, repo, counts, winner, reviews, note, superseded,
+  row.refs = { card, chipSlot, whenSlot, title, runId, repo, counts, winner, reviews, note, superseded,
                event, snippet, rail, tail, prLink, checks, prRound, tailGo, tailNote };
   return row;
 }
@@ -1319,6 +1320,8 @@ function updateRunCard(row, run) {
   setAttr(r.whenSlot, "title", `updated ${at.title}`);
 
   setText(r.title, run.title || run.instruction || run.id);
+  setText(r.runId, shortId(run.id));
+  setAttr(r.runId, "title", run.id);
   setText(r.repo, run.repo_name || "");
   setAttr(r.repo, "title", run.repo || "");
 

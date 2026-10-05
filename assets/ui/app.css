@@ -731,6 +731,27 @@ a.card:active { background: var(--sunk); }
 }
 #talks-list .card-when { grid-row: 2; grid-column: 5; margin: var(--s2) 0 0 var(--s2); }
 #talks-list .card > .card-event { grid-row: 3; grid-column: 1 / -1; }
+/* Runs list rows: the same two-line treatment as the chat list above. Line 1
+   is the title alone on the full row; line 2 is the status chip, the
+   shrinkable meta text (run id, repo, counts) and the time. Everything else
+   (note, superseded, event, snippet, rail) takes a full-width row below.
+   `.cards .card.run-card` outranks the generic and `main[data-split]` rules. */
+.cards .card.run-card {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center; gap: 0;
+}
+.cards .card.run-card .card-top { display: contents; }
+.cards .card.run-card .card-title {
+  grid-row: 1; grid-column: 1 / -1; min-width: 0; margin: 0;
+  display: block; white-space: nowrap; text-overflow: ellipsis; overflow: hidden;
+}
+.cards .card.run-card .run-chip { grid-row: 2; grid-column: 1; margin: var(--s2) var(--s2) 0 0; }
+.cards .card.run-card .card-meta {
+  grid-row: 2; grid-column: 2; min-width: 0; max-width: none; margin: var(--s2) 0 0;
+  display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cards .card.run-card .card-when { grid-row: 2; grid-column: 3; margin: var(--s2) 0 0 var(--s2); }
+.cards .card.run-card > :not(.card-top):not(.card-title):not(.card-meta) { grid-column: 1 / -1; }
 .card-note { margin-top: var(--s2); font-size: var(--t2); color: var(--on-rust); font-weight: 600; }
 .card-note.note-clamp:not(.expanded) { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden; cursor: pointer; }
 
