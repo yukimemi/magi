@@ -311,7 +311,17 @@ if [ -n "$MOCK_FAIL_SEAT" ] && { case ",$MOCK_FAIL_SEAT," in *",$seat,"*) true ;
   exit 1
 fi
 if [ -n "$MOCK_HANG_SEAT" ] && { case ",$MOCK_HANG_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && only; then
-  exec sleep 60
+  # A polling loop in this shell, never `exec sleep 60`: on Windows (MSYS)
+  # `exec` spawns a child, so killing the shell leaves the sleeper alive and
+  # holding the inherited stdout. Here the shell is the only long-lived
+  # process; once it is killed an orphan lives at most one 0.1s sleep. The cap
+  # is far above `HANDOVER_BUDGET`, so only the kill ends the hang.
+  hang=0
+  while [ "$hang" -lt 600 ]; do
+    sleep 0.1
+    hang=$((hang + 1))
+  done
+  exit 1
 fi
 
 # Rate-limit simulation: a matching seat reports the same error shape a real
@@ -780,8 +790,16 @@ pub fn fixture_with_failure(home: HomeGuard, failed_seats: &[&str]) -> Fixture {
     fx
 }
 
+/// Node budget, in seconds, for tests whose mock hangs until killed. The node
+/// budget is shared by the whole seat chain, so the agent that takes over after
+/// the hang must also finish inside it: a one-second budget made a slow runner
+/// time the successor out too and hand over once more than the test expects.
+/// The hang only ends by being killed, so a generous value costs wall-clock
+/// time, never correctness.
+pub const HANDOVER_BUDGET: u64 = 20;
+
 /// Solo-run fixture where each named agent fails (`fail_agents`) or hangs past
-/// a one-second implement budget (`hang_agents`) on the given seats, and every
+/// the [`HANDOVER_BUDGET`] implement budget (`hang_agents`) on the given seats, and every
 /// other roster agent answers normally — the shape the seat handover needs: the
 /// same seat key must fail on one agent's turn and succeed on another's.
 pub fn fixture_with_handover_failures(
@@ -799,7 +817,7 @@ pub fn fixture_with_handover_failures(
         }
         if hang_agents.contains(&a.id.as_str()) {
             a.env.insert("MOCK_HANG_SEAT".to_owned(), value.clone());
-            fx.config.graph.timeout_implement = 1;
+            fx.config.graph.timeout_implement = HANDOVER_BUDGET;
         }
     }
     fx
