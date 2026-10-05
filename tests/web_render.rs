@@ -358,6 +358,16 @@ async fn pages_render_with_visible_titles_and_no_console_errors() {
                 )
                 .await
                 .unwrap_or_else(|e| panic!("{tag}: settle: {e}"));
+            // Sections such as Held default to collapsed on a fresh profile and
+            // a collapsed row has no layout; open them so every seeded row is
+            // measured, not just the ones that happen to be expanded.
+            browser
+                .eval(
+                    &page,
+                    "document.querySelectorAll('details.list-section').forEach((d) => { d.open = true; })",
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: expand: {e}"));
             browser.settle(Duration::from_millis(300)).await.unwrap();
 
             let script = MEASURE
