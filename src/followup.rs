@@ -218,8 +218,10 @@ fn covering_task(tasks: &[Task], own: &str, run: &str, pr_url: &str, id: &str) -
         .map(|t| t.id.clone())
 }
 
+/// ASCII only: an id is often followed directly by prose in another script
+/// (`R3-1-1を修正`), which must not read as part of the id.
 fn is_name_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '-')
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-')
 }
 
 /// `needle` in `text` with no name character on either side.
@@ -761,5 +763,11 @@ mod tests {
         let body = comment_body(&s, &out);
         assert!(body.contains("already covered by task"));
         assert!(!body.contains("filed as follow-up"));
+    }
+
+    #[test]
+    fn an_id_next_to_japanese_prose_still_covers() {
+        let (out, ..) = filed_with("PR #473 の R3-1-1を修正、R3-2-1も対応");
+        assert_eq!(out.covered.len(), 2, "{out:?}");
     }
 }
