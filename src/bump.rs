@@ -974,6 +974,53 @@ fn parse_open_release_pr(json: &str) -> Result<Option<(String, String)>> {
         .map(|p| (p.head_ref_name, p.url)))
 }
 
+/// Every open pull request on one of this module's own branches, as
+/// `(branch, url)`. No I/O.
+pub(crate) fn parse_open_release_prs(json: &str) -> Result<Vec<(String, String)>> {
+    #[derive(Deserialize)]
+    struct Pr {
+        url: String,
+        #[serde(rename = "headRefName")]
+        head_ref_name: String,
+    }
+    let list: Vec<Pr> =
+        serde_json::from_str(json).context("parse `gh pr list --json url,headRefName` output")?;
+    Ok(list
+        .into_iter()
+        .filter(|p| p.head_ref_name.starts_with("chore/release-v"))
+        .map(|p| (p.head_ref_name, p.url))
+        .collect())
+}
+
+/// [`find_open_release_pr`], but every match rather than the first.
+pub(crate) async fn list_open_release_prs(repo: &Path) -> Result<Vec<(String, String)>> {
+    let out = tokio::process::Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            "url,headRefName",
+        ])
+        .current_dir(repo)
+        .env_remove("GH_REPO")
+        .quiet()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("spawn gh pr list")?;
+    if !out.status.success() {
+        bail!(
+            "gh pr list: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    parse_open_release_prs(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// Ask the forge directly whether a release bump is already open, for a host
 /// that has never seen it.
 ///

@@ -1812,6 +1812,20 @@ async fn drive(
     // never holds up the poll loop.
     let fetcher = tokio::spawn(fetch_loop(opts.repo.clone(), opts.clone(), stop.clone()));
 
+    // Watches the release-bump pull requests until they land; its own task, not
+    // tied to any run, because a pending bump outlives the run that opened it.
+    let release_watch = tokio::spawn(crate::release_watch::run(
+        crate::release_watch::Watcher::new(
+            Box::new(crate::release_watch::GhForge),
+            home.to_path_buf(),
+        ),
+        {
+            let (repo, opts) = (opts.repo.clone(), opts.clone());
+            move || release_watch_settings(&repo, &opts)
+        },
+        stop.clone(),
+    ));
+
     tracing::info!(
         "magi serve: queue {} (poll {}s, {} attempts per task, {} run(s) at once{})",
         queue.root().display(),
@@ -1848,8 +1862,26 @@ async fn drive(
     waiter.abort();
     deputies.abort();
     fetcher.abort();
+    release_watch.abort();
     clear_status_at(status_file);
     outcome
+}
+
+/// The checkouts the release watcher covers and `[daemon] release_stall_minutes`,
+/// re-read each lap. An unreadable config yields `0` minutes: the watcher idles.
+fn release_watch_settings(repo: &Path, opts: &Opts) -> (Vec<PathBuf>, u64) {
+    let Ok(cfg) = prepare(repo, opts) else {
+        return (Vec::new(), 0);
+    };
+    let mut paths: Vec<PathBuf> = crate::repos::scan(&cfg.repos.roots)
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    let own = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    if !paths.contains(&own) {
+        paths.push(own);
+    }
+    (paths, cfg.daemon.release_stall_minutes)
 }
 
 /// Per-repo bound on one `git fetch`, so a dead remote cannot stall the pass.
