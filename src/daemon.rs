@@ -767,6 +767,20 @@ fn unanswered_question_hold_reason(q: &ask::Question, language: &str) -> String 
     }
 }
 
+/// Whether the daemon will act on `q`'s chosen action for `task` (not applied
+/// yet, task not running / blocked / done, and not about an earlier attempt).
+/// The waiter yields an action answer only when this holds; otherwise nobody
+/// else would deliver it.
+pub(crate) fn daemon_will_act(task: &Task, q: &ask::Question) -> bool {
+    q.chosen_action().is_some()
+        && !task.action_applied(&q.id)
+        && !matches!(
+            task.status,
+            TaskStatus::Running | TaskStatus::Blocked | TaskStatus::Done
+        )
+        && (q.node == crate::conduct::NODE || task.runs.last() == Some(&q.run))
+}
+
 /// What [`decide_action`] concluded about one answered question.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ActionDecision {
@@ -8027,11 +8041,14 @@ mod tests {
         q.cwd = Some(dir.path().display().to_string());
         questions.put(&mut q).unwrap();
 
-        // The waiter leaves it alone (the task exists) ...
-        assert_eq!(
-            crate::waiter::decide_owned(&q, None, false, 86_400, Timestamp::now(), true),
-            crate::waiter::Action::Idle
-        );
+        // While the task runs the daemon will not act, so the waiter still
+        // delivers the word to the dead asker's seat ...
+        let running = queue.get(&t.id).unwrap();
+        assert!(!daemon_will_act(&running, &q));
+        assert!(matches!(
+            crate::waiter::decide_owned(&q, None, false, 86_400, Timestamp::now(), false),
+            crate::waiter::Action::Deliver(_)
+        ));
         // ... and the daemon waits while the task runs, then applies once.
         apply_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Running);

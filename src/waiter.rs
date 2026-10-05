@@ -109,7 +109,8 @@ pub fn decide(
 
 /// [`decide`], told whether the daemon owns the answer's action.
 ///
-/// `daemon_owns_action` is true when the task behind `q` exists. An answer
+/// `daemon_owns_action` is true when the daemon will apply the action (the
+/// task exists and is in a state `daemon::decide_action` acts on). An answer
 /// that carries a [`crate::ask::ChoiceAction`] is then the daemon's alone
 /// (`daemon::apply_choice_actions`, idempotent through `Task::actions_applied`
 /// under the task's claim): resuming the dead seat here as well would run the
@@ -210,12 +211,8 @@ impl Waiter {
     /// Whether the daemon applies this question's chosen action, so the
     /// waiter must not deliver the answer (see [`decide_owned`]).
     fn daemon_owns_action(&self, q: &Question) -> bool {
-        q.chosen_action().is_some()
-            && crate::daemon::task_of_question(
-                &crate::queue::Queue::at(self.home.join("queue")).list(),
-                q,
-            )
-            .is_some()
+        crate::daemon::task_of_question(&crate::queue::Queue::at(self.home.join("queue")).list(), q)
+            .is_some_and(|t| crate::daemon::daemon_will_act(&t, q))
     }
 
     /// Look at every question once and act on what needs acting on. `halt` is
