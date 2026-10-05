@@ -2205,7 +2205,7 @@ function createTaskCard() {
   const actions = el("div", { class: "card-actions" },
     historyLink, runLink, priorityBox, editBtn, holdBox, doneBox, deleteBox);
 
-  const card = el("li", { class: "card" },
+  const card = el("li", { class: "card task-card" },
     el("div", { class: "card-top" }, chipSlot, priority, solo, permalink, whenSlot),
     title, meta, note, snippet, error, instruction, answers, actions,
   );
@@ -2228,7 +2228,11 @@ function createTaskCard() {
      row. Anything interactive inside it keeps its own behaviour. */
   card.addEventListener("click", (event) => {
     if (!(splitMedia && splitMedia.matches)) return;
-    if (event.target.closest("a, button, input, select, textarea, summary, details, pre, label, .is-link")) return;
+    /* `closest` walks past the card: a row sits inside its section's own
+       <details>, which would match every click. Only what is inside the card
+       counts. */
+    const inner = event.target.closest("a, button, input, select, textarea, summary, details, pre, label, .is-link");
+    if (inner && inner !== card && card.contains(inner)) return;
     if (window.getSelection && String(window.getSelection())) return;
     openTask();
   });

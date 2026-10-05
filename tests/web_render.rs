@@ -80,7 +80,8 @@ const CASES: [Case; 3] = [
 ];
 
 /// `(width, height, mobile)`.
-const VIEWPORTS: [(u32, u32, bool); 2] = [(1280, 900, false), (390, 844, true)];
+const VIEWPORTS: [(u32, u32, bool); 3] =
+    [(1280, 900, false), (1950, 1000, false), (390, 844, true)];
 
 /// Assertions that are known to fail today because another task is already
 /// fixing the layout they describe. Matched as `(page, check)`; `*` is any
@@ -88,22 +89,7 @@ const VIEWPORTS: [(u32, u32, bool); 2] = [(1280, 900, false), (390, 844, true)];
 /// entry no longer fires so it gets removed.
 ///
 /// Keep this to the specific assertion: no page-wide exclusion, no `#[ignore]`.
-const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
-    // Queue task-row layout: the row's title is missing or lands under the
-    // chips (task 717c / 2e42, the two-line list rows).
-    (
-        "queue",
-        "title-visible",
-        "queue task rows, tasks 717c / 2e42",
-    ),
-    // Same layout: at desktop width the title and time of a row overflow the
-    // list pane.
-    (
-        "queue",
-        "pane-overflow",
-        "queue task rows, tasks 717c / 2e42",
-    ),
-];
+const KNOWN_FAILURES: &[(&str, &str, &str)] = &[];
 
 /// The measurement, run inside the page. Returns `{ rows, failures: [[check,
 /// detail]] }`. `ROWS`, `PANE` and `HEAD` are substituted as JSON strings.
@@ -137,6 +123,9 @@ const MEASURE: &str = r##"(() => {
       continue;
     }
     const tr = title.getBoundingClientRect();
+    // Line 1 of a row is the title on the full row width, never a sliver.
+    if (tr.width < rr.width * 0.5)
+      fails.push(["title-narrow", `${label}: title ${Math.round(tr.width)}px of a ${Math.round(rr.width)}px row`]);
     for (const other of row.querySelectorAll(".card-top > *, .card-meta > *")) {
       if (other.contains(title) || title.contains(other) || !shown(other)) continue;
       if (hit(tr, other.getBoundingClientRect()))
@@ -227,6 +216,57 @@ async fn serve(
     base
 }
 
+/// Seed the Queue: the first five tasks (in this order) are what the layout
+/// test waits for; the rest cover the other sections and row shapes (blocked,
+/// done, agent-filed from a chat, solo, attempts, no title).
+fn seed_tasks(queue: &Queue, repo: &std::path::Path, run_id: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let long =
+        "A task whose title is long enough to wrap onto several lines on a narrow phone screen";
+    for (title, status) in [
+        ("Running task", TaskStatus::Running),
+        ("Queued task", TaskStatus::Queued),
+        ("Held task", TaskStatus::Held),
+        ("Failed task", TaskStatus::Failed),
+        (long, TaskStatus::Queued),
+        ("Blocked task", TaskStatus::Blocked),
+        ("Done task", TaskStatus::Done),
+        ("Solo task from a chat", TaskStatus::Queued),
+        ("Task that was tried twice", TaskStatus::Running),
+        ("", TaskStatus::Queued),
+    ] {
+        let source = if title.starts_with("Solo") {
+            Source::Agent {
+                run: "7dd7aaaa".to_owned(),
+                node: magi::queue::CHAT_NODE.to_owned(),
+            }
+        } else {
+            Source::Human
+        };
+        let mut t = Task::new(
+            title.to_owned(),
+            format!("Instruction for: {title}"),
+            repo.to_path_buf(),
+            source,
+        );
+        t.status = status;
+        t.solo = title.starts_with("Solo");
+        if title.contains("twice") {
+            t.attempts = 2;
+        }
+        match status {
+            // A run that exists, so the page does not chase a missing id.
+            TaskStatus::Running => t.runs = vec![run_id.to_owned()],
+            TaskStatus::Held => t.hold_reason = Some("held by hand".to_owned()),
+            TaskStatus::Failed => t.last_error = Some("the gate failed".to_owned()),
+            _ => {}
+        }
+        queue.put(&mut t).expect("seed task");
+        ids.push(t.id.clone());
+    }
+    ids
+}
+
 #[tokio::test]
 async fn pages_render_with_visible_titles_and_no_console_errors() {
     let Some(chrome) = cdp::find_chrome() else {
@@ -274,34 +314,7 @@ async fn pages_render_with_visible_titles_and_no_console_errors() {
         run_ids.push(id.to_owned());
     }
 
-    let mut task_ids = Vec::new();
-    for (title, status) in [
-        ("Running task", TaskStatus::Running),
-        ("Queued task", TaskStatus::Queued),
-        ("Held task", TaskStatus::Held),
-        ("Failed task", TaskStatus::Failed),
-        (
-            "A task whose title is long enough to wrap onto several lines on a narrow phone screen",
-            TaskStatus::Queued,
-        ),
-    ] {
-        let mut t = Task::new(
-            title.to_owned(),
-            format!("Instruction for: {title}"),
-            fx.repo.clone(),
-            Source::Human,
-        );
-        t.status = status;
-        match status {
-            // A run that exists, so the page does not chase a missing id.
-            TaskStatus::Running => t.runs = vec![run_ids[0].clone()],
-            TaskStatus::Held => t.hold_reason = Some("held by hand".to_owned()),
-            TaskStatus::Failed => t.last_error = Some("the gate failed".to_owned()),
-            _ => {}
-        }
-        queue.put(&mut t).expect("seed task");
-        task_ids.push(t.id.clone());
-    }
+    let task_ids = seed_tasks(&queue, &fx.repo, &run_ids[0]);
 
     let agent = fx.config.agents[0].id.clone();
     let mut talk_ids = Vec::new();
@@ -540,4 +553,156 @@ async fn runs_search_counts_extra_rows_as_shown_and_never_parses_hit_text() {
         "snippet should show the markup literally: {out}"
     );
     browser.close_page(&page).await;
+}
+
+/// In the two-pane layout a Queue row is one big target: clicking a part of it
+/// that is not a link or a button opens the task in the right pane. The click
+/// is a real mouse event at the row's status chip, so an ancestor that wrongly
+/// swallows it (the section's `<details>`) shows up here.
+#[tokio::test]
+async fn queue_row_click_previews_task_in_split_pane() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+
+    let mut run = RunState::new(
+        fx.repo.clone(),
+        "main".to_owned(),
+        "0000000".to_owned(),
+        "A run".to_owned(),
+        fx.config.clone(),
+    );
+    run.id = "20260901-000001-aa01".to_owned();
+    run.status = RunStatus::Reviewing;
+    run.save_under(&home).expect("seed run");
+    let ids = seed_tasks(&queue, &fx.repo, &run.id);
+
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome)
+        .await
+        .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
+    let w = Duration::from_secs(30);
+    let mut failures: Vec<String> = Vec::new();
+
+    for width in [1280u32, 1950] {
+        let tag = format!("queue click @{width}px");
+        let page = browser
+            .open_page(&format!("{base}#/queue"), width, 900, false)
+            .await
+            .expect("open");
+        let all = ids
+            .iter()
+            .map(|id| format!("!!document.querySelector('a[href=\"#/queue/{id}\"]')"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        browser.wait_for(&page, &all, w).await.expect("rows");
+        browser
+            .eval(
+                &page,
+                "document.querySelectorAll('details.list-section').forEach((d) => { d.open = true; })",
+            )
+            .await
+            .expect("expand");
+        browser
+            .wait_for(&page, "!!document.querySelector('main[data-split]')", w)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: not in the two-pane layout: {e}"));
+        browser.settle(Duration::from_millis(300)).await.unwrap();
+
+        for id in &ids {
+            // Bring the row into view, then aim at its status chip: part of
+            // the row, but not a link, a button or the title.
+            let point = browser
+                .eval(
+                    &page,
+                    &format!(
+                        "(() => {{ const row = document.querySelector('li.card[data-task-id=\"{id}\"]'); \
+                         if (!row) return null; row.scrollIntoView({{ block: 'center' }}); \
+                         const c = row.querySelector('.card-top .chip, .card-top > span'); \
+                         if (!c) return null; const r = c.getBoundingClientRect(); \
+                         const x = r.left + r.width / 2, y = r.top + r.height / 2; \
+                         const t = document.elementFromPoint(x, y); \
+                         return {{ x, y, inRow: !!t && row.contains(t), title: row.querySelector('.card-title').innerText }}; }})()"
+                    ),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: locate {id}: {e}"));
+            if point.is_null() || point["inRow"] != true {
+                failures.push(format!(
+                    "{tag}: {id}: no clickable chip inside the row: {point}"
+                ));
+                continue;
+            }
+            for kind in ["mousePressed", "mouseReleased"] {
+                browser
+                    .call(
+                        Some(&page.session),
+                        "Input.dispatchMouseEvent",
+                        serde_json::json!({
+                            "type": kind, "x": point["x"], "y": point["y"],
+                            "button": "left", "clickCount": 1,
+                        }),
+                    )
+                    .await
+                    .expect("mouse");
+            }
+            let want = format!("#/tasks/{id}");
+            // The previous task's heading stays until this one's detail
+            // arrives, so wait for this task's own title when it has one.
+            let title = point["title"].as_str().unwrap_or_default();
+            let own = if title.is_empty() || title.starts_with("Instruction for") {
+                "true".to_owned()
+            } else {
+                format!(
+                    "document.getElementById('task-h').textContent.includes({})",
+                    Value::from(title)
+                )
+            };
+            let shown = format!(
+                "location.hash === {want:?} \
+                 && !document.getElementById('view-task').hidden \
+                 && document.getElementById('split-empty').hidden \
+                 && !document.getElementById('task-h').textContent.includes('Loading task') \
+                 && !document.getElementById('task-h').textContent.includes('could not be loaded') \
+                 && document.getElementById('task-h').textContent.trim() !== '' \
+                 && {own}"
+            );
+            if browser
+                .wait_for(&page, &shown, Duration::from_secs(5))
+                .await
+                .is_err()
+            {
+                let seen = browser
+                    .eval(
+                        &page,
+                        "({ hash: location.hash, task: document.getElementById('view-task').hidden, \
+                           empty: document.getElementById('split-empty').hidden, \
+                           h: document.getElementById('task-h').textContent })",
+                    )
+                    .await
+                    .unwrap_or_default();
+                failures.push(format!(
+                    "{tag}: {id}: clicking the row did not open it: {seen}"
+                ));
+                continue;
+            }
+        }
+        browser.close_page(&page).await;
+    }
+    assert!(
+        failures.is_empty(),
+        "queue row clicks:\n  {}",
+        failures.join("\n  ")
+    );
 }
