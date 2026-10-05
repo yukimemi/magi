@@ -133,6 +133,23 @@ pub struct Followed {
     pub finished: bool,
 }
 
+impl Followed {
+    /// The error a caller must exit with when the wait ran out before the
+    /// task finished: that is not a success, and the outcome is not known.
+    /// `None` once the task finished (whatever its outcome).
+    pub fn unfinished(&self) -> Option<anyhow::Error> {
+        if self.finished {
+            return None;
+        }
+        Some(anyhow::anyhow!(
+            "task {id} has not finished: it is still running under the loop. \
+             This is not a success; the outcome is not known yet. Read it with \
+             `magi task show {id}`. The loop keeps the task, so do not run it again.",
+            id = self.task.short()
+        ))
+    }
+}
+
 /// Watch `id` until the loop that owns it is done with it, calling `seen` with
 /// each run id the first time it appears on the task, and `progress` with a
 /// line whenever the newest run's status changes.
@@ -484,6 +501,11 @@ mod tests {
         .await
         .unwrap();
         assert!(!waited.finished, "the wait ran out, the loop still owns it");
+        let err = waited.unfinished().expect("an unfinished wait is an error").to_string();
+        assert!(err.contains(t.short()), "{err}");
+        assert!(err.contains("not finished") || err.contains("not a success"), "{err}");
+        assert!(err.contains("magi task show"), "{err}");
+        assert_eq!(q.get(&t.id).unwrap().status, TaskStatus::Queued, "the queue is untouched");
         t.link_run("20260101-000000-abcd");
         t.succeed();
         q.put(&mut t).unwrap();
@@ -500,6 +522,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(done.task.status, TaskStatus::Done);
+        assert!(done.unfinished().is_none());
         assert_eq!(runs, ["20260101-000000-abcd"]);
     }
 
