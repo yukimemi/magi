@@ -485,7 +485,15 @@ async fn runs_search_counts_extra_rows_as_shown_and_never_parses_hit_text() {
         .expect("open");
     let w = Duration::from_secs(30);
     browser
-        .wait_for(&page, "!!document.querySelector('#runs-search-input')", w)
+        // The input is in the static HTML, so it exists before the module
+        // script has wired its listener; `#runs-search` is un-hidden only by
+        // `renderRuns`, which runs after `wire()`.
+        .wait_for(
+            &page,
+            "(() => { const b = document.getElementById('runs-search'); \
+             return !!b && !b.hidden; })()",
+            w,
+        )
         .await
         .expect("search box");
     browser
