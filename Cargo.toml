@@ -78,3 +78,8 @@ libc = "0.2.189"
 [dev-dependencies]
 pretty_assertions = "1.4.1"
 tempfile = "3.27.0"
+# `tests/web_render.rs` drives headless Chrome over the DevTools protocol with a
+# small hand-written client (`tests/web_render/cdp.rs`). Dev-only: the shipped
+# binary gains no dependency and no browser requirement.
+tokio-tungstenite = "0.29.0"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }

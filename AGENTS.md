@@ -1597,3 +1597,41 @@ because the janitor only runs on idle ticks, so `origin/main` would go stale
 during a long run, and a slow remote must not hold up the poll loop. Failures
 and the 30 s per-repo timeout are warnings; `talk::briefing` tells the Chat to
 read code from `origin/main`.
+
+### The web UI is checked in a real browser (`tests/web_render.rs`)
+
+`web.rs`'s own tests cannot see a layout: a Queue row that lost its title, or
+two labels on top of each other, only exists once CSS has run.
+`tests/web_render.rs` starts the real router on `127.0.0.1:0` over a seeded temp
+home (tasks in every state, runs, chats), opens Queue / Runs / Chat in headless
+Chrome at 1280px and 390px (mobile), and asserts structure, not pixels: every
+visible row has a visible non-empty `.card-title`, titles do not overlap the
+chips beside them, nothing spills out of the list pane, the sticky header does
+not cover the `<h1>` (`elementFromPoint` at its centre), and the console is
+clean (exceptions, `console.error`, `Log.entryAdded` errors such as CSP
+violations; only a favicon request is tolerated).
+
+```sh
+RUSTUP_TOOLCHAIN=stable cargo test --locked --test web_render -- --nocapture
+MAGI_CHROME=/path/to/chrome cargo test --test web_render   # name a binary explicitly
+```
+
+- **No Chrome, no failure — locally.** Without `MAGI_CHROME`, a Chrome/Chromium
+  on `PATH`, or a default macOS/Windows install, the test prints `SKIP` and
+  passes. With `CI` set a missing browser is a **failure**: a check that quietly
+  stops running is worse than a red one. `ubuntu-latest` ships Chrome;
+  `ci.yml` is kata-managed and is not edited for this. A Chrome that is found but
+  will not start is a failure, never a skip.
+- **No dependency for the shipped binary.** The DevTools client is
+  `tests/web_render/cdp.rs` over the dev-only `tokio-tungstenite`; Chrome gets
+  `--no-sandbox` (CI containers run as root) and `--remote-debugging-port=0`.
+  The server binds port 0 too. Never hard-code a port in this test (see "Never
+  take a port you did not check").
+- **Known failures are per assertion.** `KNOWN_FAILURES` lists `(page, check,
+  reason)` for layouts another task is already fixing. A hit is reported, not
+  failed; an entry that no longer fires prints `NOTE: ... remove it`. Do not
+  add page-wide exclusions or `#[ignore]`; when you fix the layout, delete the
+  entry.
+- The Runs page keeps finished runs in a collapsed section that renders no rows
+  until opened, so the harness seeds one in-flight run and only requires that
+  one (`Case::expect`).
