@@ -5416,8 +5416,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
 
     #[tokio::test]
     async fn a_first_visit_to_the_merge_gate_files_a_question_and_returns_pending_at_once() {
-        crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
-        let mut state = run_state();
+        let mut state = landing_state();
         state.config.graph.land_approval = true;
         let pr = green_pr();
 
