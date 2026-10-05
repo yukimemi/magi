@@ -1172,8 +1172,9 @@ not move on a say.
   pure `land::merge_intent`). The owner chose this loosening on purpose - the
   single-word rule made "merge, and queue the leftover findings as follow-ups"
   a dead end - and a wrong merge is recoverable by revert. The gate is still
-  mechanical, not the agent's reading: the quote and the sentence around it
-  must carry no hedge, condition, negation or question (`maybe`, `probably`,
+  mechanical, not the agent's reading: the owner's message
+  must carry no hedge, condition, negation or question - the whole message is read, so a
+  condition in another sentence holds too - (`maybe`, `probably`,
   `if`, `not`, `but`, `いいかも`, `たぶん`, `なら`, `たら`, `?`...), and a retraction
   anywhere in the message (`wait`, `やっぱり`) voids it. Anything doubtful is a
   hold: the agent asks back with `--thread`. The word lists are deliberately
