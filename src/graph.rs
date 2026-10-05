@@ -8924,7 +8924,7 @@ mod tests {
     // same directory whichever call won, and each gets its own run id from
     // `RunState::new`, so they never collide there.
     fn ask_test_home() {
-        crate::run::set_home(std::env::temp_dir().join("magi-graph-ask-tests-home"));
+        crate::run::pin_test_home();
     }
 
     /// A minimal, git-free `Runner` at a given status — `settle_questions`
@@ -8961,7 +8961,7 @@ mod tests {
     /// interrupt-driven park from an ordinary shutdown park.
     #[test]
     fn park_here_folds_the_interrupt_reason_into_the_park_event() {
-        crate::run::set_home(std::env::temp_dir().join("magi-graph-interrupt-tests-home"));
+        crate::run::pin_test_home();
         let mut runner = runner_at(RunStatus::Implementing);
         let interrupt = Pause::new();
         runner.watch_interrupt(interrupt.clone());
@@ -8988,7 +8988,7 @@ mod tests {
     /// one it meant to interrupt.
     #[test]
     fn the_stop_level_pause_and_a_runs_interrupt_pause_do_not_leak_into_each_other() {
-        crate::run::set_home(std::env::temp_dir().join("magi-graph-interrupt-tests-home"));
+        crate::run::pin_test_home();
         let mut runner = runner_at(RunStatus::Implementing);
         let shutdown = Pause::new();
         runner.on_pause(shutdown.clone());
@@ -9020,7 +9020,7 @@ mod tests {
     /// in `execute`.
     #[tokio::test]
     async fn a_park_request_made_mid_node_only_takes_effect_at_the_next_boundary() {
-        crate::run::set_home(std::env::temp_dir().join("magi-graph-interrupt-tests-home"));
+        crate::run::pin_test_home();
         let mut runner = runner_at(RunStatus::Implementing);
         let interrupt = Pause::new();
         runner.watch_interrupt(interrupt.clone());
@@ -9067,7 +9067,7 @@ mod tests {
     /// this is what proves it rather than assuming it.
     #[test]
     fn a_run_parked_for_an_interrupt_resumes_with_nothing_lost() {
-        crate::run::set_home(std::env::temp_dir().join("magi-graph-interrupt-tests-home"));
+        crate::run::pin_test_home();
         let mut runner = runner_at(RunStatus::Judging);
         // `Runner::resume` re-resolves roles from the saved config, which
         // refuses an empty roster - give it the same minimal one `conductor`
@@ -9227,7 +9227,7 @@ mod tests {
     /// must not.
     #[tokio::test]
     async fn fold_run_keeps_only_the_winner_when_the_winner_is_not_dropped() {
-        crate::run::set_home(std::env::temp_dir().join("magi-graph-fold-run-tests-home"));
+        crate::run::pin_test_home();
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -9787,7 +9787,7 @@ mod tests {
     /// before it ever asks for the lease.
     #[tokio::test]
     async fn gate_never_asks_for_the_cache_lease_when_it_has_no_commands_to_run() {
-        crate::run::set_home(std::env::temp_dir().join("magi-graph-test-home"));
+        crate::run::pin_test_home();
         let home = crate::run::home();
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -9920,7 +9920,7 @@ mod tests {
     /// on its own release marker.
     #[tokio::test]
     async fn gate_records_a_running_task_entry_while_its_command_is_still_in_flight() {
-        crate::run::set_home(std::env::temp_dir().join("magi-graph-test-home"));
+        crate::run::pin_test_home();
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
@@ -10065,7 +10065,7 @@ mod tests {
     #[tokio::test]
     async fn stop_reviewing_records_a_contested_hand_off_only_for_major_plus_reject() {
         use crate::verdict::{Finding, ReviewVote, Severity};
-        crate::run::set_home(std::env::temp_dir().join("magi-graph-test-home"));
+        crate::run::pin_test_home();
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -10146,7 +10146,7 @@ mod tests {
     /// past acquiring it into anything that would need a real workspace.
     #[tokio::test]
     async fn stop_reviewing_retries_a_resource_blocked_e2e_instead_of_reading_it_as_red() {
-        crate::run::set_home(std::env::temp_dir().join("magi-graph-test-home"));
+        crate::run::pin_test_home();
         let home = crate::run::home();
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -10337,7 +10337,7 @@ mod tests {
     /// retry logic in isolation.
     #[tokio::test]
     async fn a_resumed_review_loop_retries_a_last_round_left_resource_blocked() {
-        crate::run::set_home(std::env::temp_dir().join("magi-graph-test-home"));
+        crate::run::pin_test_home();
         let home = crate::run::home();
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -10491,7 +10491,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_resumed_mid_landing_reenters_land_instead_of_opening_a_second_pull_request() {
-        crate::run::set_home(std::env::temp_dir().join("magi-graph-test-home"));
+        crate::run::pin_test_home();
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();

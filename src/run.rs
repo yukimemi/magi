@@ -2764,6 +2764,28 @@ pub fn set_home(dir: PathBuf) {
     let _ = HOME.set(dir);
 }
 
+/// A temp directory unique to this test process, created once and kept.
+/// `set_home` is a first-wins `OnceLock`, so a fixed `temp_dir().join(..)`
+/// would be shared by every concurrent `cargo test` process on the machine.
+#[cfg(test)]
+pub(crate) fn test_home() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("magi-unit-home-")
+            .tempdir()
+            .expect("create the unit-test home")
+            .keep()
+    })
+    .clone()
+}
+
+/// [`set_home`] on [`test_home`]; the one way a unit test pins the home.
+#[cfg(test)]
+pub(crate) fn pin_test_home() {
+    set_home(test_home());
+}
+
 static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// `<home>/runs`.
@@ -2935,6 +2957,60 @@ pub fn read_artifact(run: &RunState, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::proc::Quiet as _;
+
+    #[test]
+    fn test_home_is_private_stable_and_unique_per_process() {
+        // Child mode: report this process's home and stop.
+        if std::env::var_os("MAGI_HOME_PROBE").is_some() {
+            println!("HOME={}", super::test_home().display());
+            return;
+        }
+        let a = super::test_home();
+        assert_eq!(a, super::test_home());
+        assert!(a.is_dir() && a.starts_with(std::env::temp_dir()));
+        let probe = || {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "run::tests::test_home_is_private_stable_and_unique_per_process",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("MAGI_HOME_PROBE", "1")
+                .quiet()
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|l| l.split_once("HOME=").map(|(_, h)| h.to_owned()))
+                .expect("child reported a home")
+        };
+        let (b, c) = (probe(), probe());
+        assert_ne!(b, c, "two processes must never share a unit-test home");
+        assert_ne!(b, a.display().to_string());
+    }
+
+    #[test]
+    fn no_test_pins_a_fixed_temp_path_as_the_home() {
+        let root = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let needle = ["set_home(std::env::temp_dir()", ".join(\"magi-"].concat();
+        for e in std::fs::read_dir(root.join("src")).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap();
+            assert!(
+                !text.contains(&needle),
+                "{} pins a fixed temp home; use run::pin_test_home()",
+                p.display()
+            );
+        }
+    }
+
     use super::*;
 
     fn state() -> RunState {

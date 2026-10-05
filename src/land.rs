@@ -5498,7 +5498,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
 
     #[tokio::test]
     async fn approving_the_existing_question_is_read_back_as_approved() {
-        crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
+        crate::run::pin_test_home();
         let mut state = run_state();
         state.config.graph.land_approval = true;
         let pr = green_pr();
@@ -5528,7 +5528,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
 
     #[tokio::test]
     async fn holding_or_abandoning_the_existing_question_is_read_back_as_held() {
-        crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
+        crate::run::pin_test_home();
         let store = ask::Questions::open();
 
         let mut held_state = run_state();
@@ -5661,7 +5661,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
 
     #[tokio::test]
     async fn a_contested_question_is_filed_once_and_a_resume_finds_the_same_one() {
-        crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
+        crate::run::pin_test_home();
         let mut state = run_state();
         state.config.graph.land_approval = false;
         state.contested_handoff = Some(contested());
@@ -6206,7 +6206,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     }
 
     fn landing_state() -> RunState {
-        crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
+        crate::run::pin_test_home();
         let mut state = run_state();
         state.config.graph.land_approval = false;
         state
@@ -6615,7 +6615,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
 
     #[tokio::test]
     async fn an_approval_never_carries_over_to_a_new_head() {
-        crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
+        crate::run::pin_test_home();
         let mut state = run_state();
         state.config.graph.land_approval = true;
         let pr = green_pr();

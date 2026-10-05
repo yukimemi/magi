@@ -412,7 +412,13 @@ mod tests {
     /// bleeds into an unrelated spawn's exemption.
     #[test]
     fn every_spawn_in_the_crate_is_quiet_or_documented_as_exempt() {
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Read at run time: a shared target dir can hand this binary to a
+        // different worktree, and the compile-time path would then scan
+        // another tree's sources.
+        let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let src_dir = manifest.join("src");
         let mut offenders = Vec::new();
         for entry in std::fs::read_dir(&src_dir).expect("read src dir") {
             let path = entry.expect("dir entry").path();
