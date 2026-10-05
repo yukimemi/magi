@@ -4651,10 +4651,10 @@ function contextTag(ctx) {
 }
 
 function createTalkCard() {
-  const chipSlot = el("span");
-  const thinking = el("span", { class: "tag", "data-tone": "blue", text: "thinking…" });
+  const chipSlot = el("span", { class: "talk-chip" });
+  const thinking = el("span", { class: "tag talk-thinking", "data-tone": "blue", text: "thinking…" });
   const whenSlot = el("time", { class: "card-when" });
-  const unread = el("span", { class: "badge" });
+  const unread = el("span", { class: "badge talk-unread" });
   const title = el("h2", { class: "card-title" });
   const agent = el("span", { class: "repo" });
   const turns = el("span");

@@ -708,6 +708,29 @@ a.card:active { background: var(--sunk); }
   font-size: var(--t2); color: var(--ink-2); font-style: italic;
   overflow-wrap: anywhere;
 }
+/* Chat list rows: two lines at every width. Line 1 is the title alone on the
+   full row; line 2 carries the status chip, unread badge, thinking tag, the
+   shrinkable meta text and the time. Items are placed explicitly so a hidden
+   one leaves a zero-width track, and the gaps are margins for the same reason.
+   The id beats the generic and `main[data-split]` card rules. */
+#talks-list .card {
+  display: grid; grid-template-columns: auto auto auto minmax(0, 1fr) auto;
+  align-items: center; gap: 0;
+}
+#talks-list .card-top { display: contents; }
+#talks-list .card-title {
+  grid-row: 1; grid-column: 1 / -1; min-width: 0; margin: 0;
+  display: block; white-space: nowrap; text-overflow: ellipsis; overflow: hidden;
+}
+#talks-list .talk-chip { grid-row: 2; grid-column: 1; margin: var(--s2) var(--s2) 0 0; }
+#talks-list .talk-unread { grid-row: 2; grid-column: 2; margin: var(--s2) var(--s2) 0 0; }
+#talks-list .talk-thinking { grid-row: 2; grid-column: 3; margin: var(--s2) var(--s2) 0 0; }
+#talks-list .card-meta {
+  grid-row: 2; grid-column: 4; min-width: 0; max-width: none; margin: var(--s2) 0 0;
+  display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#talks-list .card-when { grid-row: 2; grid-column: 5; margin: var(--s2) 0 0 var(--s2); }
+#talks-list .card > .card-event { grid-row: 3; grid-column: 1 / -1; }
 .card-note { margin-top: var(--s2); font-size: var(--t2); color: var(--on-rust); font-weight: 600; }
 .card-note.note-clamp:not(.expanded) { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden; cursor: pointer; }
 
