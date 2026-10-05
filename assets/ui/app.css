@@ -887,40 +887,34 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .list-section-count { margin-left: auto; }
 .list-section .cards { margin-top: var(--s3); }
 
-/* ---- runs: tree ---------------------------------------------------------- *
- * The Runs list additionally gets (wide screens only) a two-level tree
- * beside it that narrows the cards to one section or one repo within it.
- * The tree is a list of real <button>s, for the same free keyboard
- * behaviour <details> gives the sections above. */
+/* ---- runs: toolbar -------------------------------------------------------- *
+ * Search, scope (a native select) and the state segmented control, in one
+ * static block above the list. Nothing here scrolls on its own. */
 .runs-layout { display: block; }
 .runs-main { display: flex; flex-direction: column; gap: var(--s4); }
 
 .runs-filter {
   display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap;
-  padding: var(--s2) var(--s3);
+  padding: var(--s1) var(--s3);
   background: var(--sunk); border: 1px solid var(--line); border-radius: var(--radius-sm);
-  font-size: var(--t3); color: var(--ink-2);
+  font-size: var(--t2); color: var(--ink-2);
 }
 #runs-filter-text { flex: 1; min-width: 0; }
 
 /* ---- runs: state chips --------------------------------------------------- *
- * The tree above is desktop-only (see .runs-tree below), so on a phone this
- * row is the only way to narrow the list at all. It wraps rather than
- * scrolling — five chips is not enough to need a scroller, and a scroller
- * hides the very chips (like "Done") a wrap keeps in view without a swipe.
- * Selected styling reuses .runs-tree-node's own sunk/edge pair rather than a
- * new colour, and the pill shape is .tag's, so this introduces no vocabulary
- * the rest of the page doesn't already use. */
-.state-chips { display: flex; flex-wrap: wrap; gap: var(--s2); }
+ * One segmented control on every width. It wraps rather than scrolling: six
+ * segments fit in two rows on a phone, and a scroller would hide the very
+ * segment ("Done") a wrap keeps in view. */
+.state-chips { display: flex; flex-wrap: wrap; gap: 2px; }
 .state-chip {
   display: flex; align-items: center; gap: var(--s2);
   min-height: var(--tap); padding: 0 var(--s3);
-  background: none; border: 1px solid var(--line); border-radius: 999px;
+  background: none; border: 1px solid transparent; border-radius: var(--radius-sm);
   font: 600 var(--t3)/1.3 var(--sans); color: var(--ink-2); cursor: pointer;
 }
-.state-chip:hover { background: var(--sunk); }
-.state-chip[aria-checked="true"] { color: var(--ink); background: var(--sunk); border-color: var(--edge); }
-.state-chip-count { font-size: var(--t1); color: var(--ink-3); }
+.state-chip:hover { background: var(--surface); }
+.state-chip[aria-checked="true"] { color: var(--ink); background: var(--surface); border-color: var(--edge); box-shadow: var(--shadow); }
+.state-chip-count { font: 500 var(--t1) var(--mono); color: var(--ink-3); }
 
 /* An older attempt at the same task, folded under the card that replaced it.
    `.advanced` (see the queue card's "Full instruction" disclosure) already
@@ -941,25 +935,6 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .run-folded-id { font-family: var(--mono); color: var(--ink-3); }
 .run-folded-status { font-size: var(--t1); color: var(--ink-3); text-transform: uppercase; letter-spacing: .04em; }
 .run-folded-when { margin-left: auto; font-size: var(--t1); color: var(--ink-3); white-space: nowrap; }
-
-/* The filter tree. Hidden below the width where the runs list itself is
-   still a single column — see the 1080px override in the wide-screens block
-   — because a phone has no room to spare for a nav that is a shortcut, not
-   the only way to reach anything. */
-.runs-tree { display: none; }
-.runs-tree-list, .runs-tree-sub { display: flex; flex-direction: column; gap: 2px; }
-.runs-tree-sub { padding-left: var(--s4); margin-top: 2px; }
-.runs-tree-node {
-  display: flex; align-items: center; gap: var(--s2); width: 100%;
-  min-height: var(--tap); padding: 0 var(--s2);
-  background: none; border: 1px solid transparent; border-radius: var(--radius-sm);
-  font: 600 var(--t3)/1.3 var(--sans); color: var(--ink-2); text-align: left; cursor: pointer;
-}
-.runs-tree-node:hover { background: var(--sunk); }
-.runs-tree-node[aria-current="true"] { color: var(--ink); background: var(--sunk); border-color: var(--edge); }
-.runs-tree-repo { font-weight: 500; font-size: var(--t2); }
-.runs-tree-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.runs-tree-count { flex: none; font-size: var(--t1); color: var(--ink-3); }
 
 /* ---- landing ----------------------------------------------------------- */
 .land { display: flex; flex-direction: column; gap: var(--s3); }
@@ -2008,14 +1983,6 @@ details.panel > summary + * { margin-top: var(--s2); }
   .report { max-height: calc(100dvh - 260px); }
   .facts { grid-template-columns: 10rem 1fr; }
 
-  /* The Runs tree gets the same width this breakpoint already gives the run
-     detail's side column, so the two screens do not disagree about how much
-     room a sidebar is worth. */
-  .runs-layout {
-    display: grid; grid-template-columns: 220px minmax(0, 1fr);
-    align-items: start; gap: var(--s5);
-  }
-  .runs-tree { display: block; position: sticky; top: 96px; }
 }
 
 /* ---- motion ------------------------------------------------------------ */
@@ -2152,9 +2119,7 @@ details.panel > summary + * { margin-top: var(--s2); }
   main[data-split] .say { bottom: 0; }
   body[data-split] .run-actions-fab { bottom: var(--s4); }
 
-  /* Runs filters: one column, the tree folded into a short scroller. */
-  main[data-split] .runs-layout { display: block; }
-  main[data-split] .runs-tree { position: static; max-height: 30dvh; overflow: auto; margin-bottom: var(--s3); }
+  /* The list pane is the one scroll region; the toolbar scrolls with it. */
 
   /* Dense rows: status, title and key meta on one line. Everything else a card
      carries waits for the row to be selected. */
@@ -2231,4 +2196,105 @@ details.panel > summary + * { margin-top: var(--s2); }
   main[data-split] .task-card .card-when { grid-row: 2; grid-column: 6; margin: var(--s2) 0 0 var(--s2); }
   main[data-split] .task-card > :not(.card-top):not(.card-title):not(.card-meta) { grid-column: 1 / -1; }
   main[data-split] .cards > li:has(> .card[aria-current="true"]) > .card-tail { display: flex; }
+}
+
+
+/* ---- Runs page: toolbar, tabs, timeline, deliberation strip ---------------- *
+ * Scoped to #view-runs / #view-run so Queue and Chat keep the shared rules. */
+#view-runs .runs-main { gap: var(--s3); }
+#view-runs .runs-toolbar {
+  display: flex; flex-direction: column; gap: var(--s2);
+  padding: var(--s2);
+  background: var(--sunk); border: 1px solid var(--line); border-radius: var(--radius);
+}
+#view-runs .runs-toolbar-row { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
+#view-runs .runs-toolbar .queue-search { flex: 1 1 14rem; margin: 0; min-width: 0; }
+#view-runs .runs-scope { flex: 1 1 10rem; min-width: 0; }
+#view-runs .runs-scope select {
+  width: 100%; min-height: var(--tap); margin: 0; padding: 0 var(--s3);
+  font: 600 var(--t3)/1.3 var(--sans); color: var(--ink-2);
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  text-overflow: ellipsis;
+}
+#view-runs .runs-scope select[data-active] { color: var(--ink); border-color: var(--edge); }
+#view-runs .runs-toolbar .state-chips { background: transparent; }
+#view-runs .runs-toolbar .runs-filter { border: 0; }
+
+/* Tabs: an underlined row, one tab per hash route. */
+#view-run .run-tabs {
+  display: flex; gap: var(--s1);
+  border-bottom: 1px solid var(--line);
+}
+#view-run .run-tab {
+  display: inline-flex; align-items: center; gap: var(--s2);
+  min-height: var(--tap); padding: 0 var(--s4);
+  margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  font: 700 var(--t2)/1 var(--sans); letter-spacing: .08em; text-transform: uppercase;
+  color: var(--ink-3); text-decoration: none;
+}
+#view-run .run-tab:hover { color: var(--ink); }
+#view-run .run-tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--gold-line); }
+#view-run .run-tab .count { font: 500 var(--t1) var(--mono); letter-spacing: 0; }
+#view-run .run-tabpanel { display: flex; flex-direction: column; gap: var(--s4); min-width: 0; }
+#view-run .run-main { display: flex; flex-direction: column; gap: var(--s4); min-width: 0; }
+#view-run .run-main > .run-tabpanel { width: 100%; }
+
+/* Timeline: one block per run of same-node events. */
+#view-run .tl { display: flex; flex-direction: column; gap: var(--s2); }
+#view-run .tl-group {
+  padding: var(--s2) var(--s3);
+  border-left: 2px solid var(--line-2);
+  background: var(--sunk); border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+#view-run .tl-group:last-child { border-left-color: var(--gold-line); }
+#view-run .tl-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s2) var(--s3); }
+#view-run .tl-node {
+  font: 700 var(--t2)/1.2 var(--sans); letter-spacing: .08em; text-transform: uppercase; color: var(--ink);
+  overflow-wrap: anywhere;
+}
+#view-run .tl-span, #view-run .tl-n { font: 500 var(--t1) var(--mono); color: var(--ink-3); }
+#view-run .tl-span { margin-left: auto; }
+#view-run .tl-events { display: flex; flex-direction: column; gap: 2px; margin-top: var(--s1); }
+#view-run .tl-events li {
+  display: grid; grid-template-columns: 4.75rem minmax(0, 1fr); gap: var(--s2);
+  font-size: var(--t3); align-items: baseline;
+}
+#view-run .tl-events .event-msg { overflow-wrap: anywhere; }
+
+/* Report: monospace box, the one thing on its tab. */
+#view-run #run-report { font: 400 var(--t2)/1.55 var(--mono); max-height: calc(100dvh - 18rem); min-height: 12rem; }
+
+/* Design deliberation: one slim strip instead of a diagram. */
+#view-run .advise-strip {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2);
+  min-height: 2.5rem;
+}
+#view-run .advise-chip {
+  display: inline-flex; align-items: center; gap: var(--s2);
+  min-height: 1.75rem; padding: 0 var(--s3);
+  border: 1px solid var(--chip-tone, var(--line-2)); border-radius: 999px;
+  font-size: var(--t2); color: var(--ink-2); max-width: 100%;
+}
+#view-run .advise-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--chip-tone, var(--line-2)); }
+#view-run .advise-seat { font: 700 var(--t2) var(--mono); color: var(--ink); }
+#view-run .advise-agent { color: var(--ink-3); }
+#view-run .advise-reflect { font-size: var(--t1); color: var(--ink-3); }
+#view-run .advise-chip[data-reflection="absent"] { border-style: dashed; }
+#view-run .advise-chip[data-reflection="absent"] .advise-dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--chip-tone, var(--line-2)); }
+#view-run .advise-chip[data-reflection="faint"] { opacity: .8; }
+#view-run .advise-link { flex: 1 1 1rem; min-width: .75rem; height: 1px; background: var(--line-2); }
+#view-run .advise-brief {
+  display: inline-flex; align-items: center; min-height: 1.75rem; padding: 0 var(--s3);
+  border-radius: 999px; font: 700 var(--t1) var(--sans); letter-spacing: .08em; text-transform: uppercase;
+}
+#view-run .advise-brief[data-state="filled"] { background: var(--gold-line); color: #241d05; }
+#view-run .advise-brief[data-state="empty"] { border: 1px dashed var(--line-2); color: var(--ink-3); }
+#view-run .advise-proposals { margin-top: var(--s3); }
+#view-run .advise-proposals > summary { cursor: pointer; font: 700 var(--t2) var(--sans); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); min-height: 32px; }
+#view-run .advise-proposals[open] > summary { margin-bottom: var(--s2); }
+@media (max-width: 600px) {
+  #view-run .advise-strip { gap: var(--s1) var(--s2); }
+  #view-run .advise-agent, #view-run .advise-link { display: none; }
+  #view-run .advise-chip { padding: 0 var(--s2); min-height: 1.625rem; }
 }
