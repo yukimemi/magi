@@ -3217,6 +3217,29 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                     forge.merge(&repo, &argv).await?
                 };
                 if out.0 {
+                    // Exit 0 is not proof of a merge: with a merge queue `gh`
+                    // enqueues (or reports the pull request already queued)
+                    // and succeeds while it is still open. Ask the forge; an
+                    // unreadable answer keeps trusting the exit code.
+                    let confirm = forge.view(&repo, pr_url).await.ok();
+                    if let Some(c) = confirm.as_ref()
+                        && c.pr.state != PrLifecycle::Merged
+                    {
+                        if waited >= WAIT_CEILING {
+                            let why = "the merge request succeeded but the pull request \
+                                       was still not merged after waiting";
+                            stop(state, &repo, &pr, why).await?;
+                            return Ok(pr);
+                        }
+                        state.event(
+                            "land",
+                            "merge accepted but the pull request is not merged yet; waiting",
+                        );
+                        state.save()?;
+                        waited += POLL;
+                        forge.poll().await;
+                        continue;
+                    }
                     pr.state = PrLifecycle::Merged;
                     state.status = RunStatus::Merged;
                     state.merge = Some(MergeOutcome {
@@ -6069,6 +6092,10 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         log: Mutex<Vec<&'static str>>,
         argvs: Mutex<Vec<Vec<String>>>,
         required: Mutex<Option<BTreeSet<String>>>,
+        /// Set once a merge answered ok: the forge then reports `merged`,
+        /// unless `queued` says the merge only entered a queue.
+        merged: Mutex<bool>,
+        queued: Mutex<bool>,
     }
 
     impl Scripted {
@@ -6085,6 +6112,8 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 log: Mutex::new(Vec::new()),
                 argvs: Mutex::new(Vec::new()),
                 required: Mutex::new(None),
+                merged: Mutex::new(false),
+                queued: Mutex::new(false),
             }
         }
         fn argvs(&self) -> Vec<Vec<String>> {
@@ -6099,21 +6128,30 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         async fn view(&self, _repo: &Path, _url: &str) -> Result<Seen> {
             self.log.lock().unwrap().push("view");
             let mut v = self.views.lock().unwrap();
-            Ok(if v.len() > 1 {
+            let mut seen = if v.len() > 1 {
                 v.pop_front().unwrap()
             } else {
                 v[0].clone()
-            })
+            };
+            if *self.merged.lock().unwrap() {
+                seen.pr.state = PrLifecycle::Merged;
+            }
+            Ok(seen)
         }
         async fn merge(&self, _repo: &Path, argv: &[String]) -> Result<(bool, String)> {
             self.log.lock().unwrap().push("merge");
             self.argvs.lock().unwrap().push(argv.to_vec());
-            Ok(self
+            let out = self
                 .merges
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("unscripted merge"))
+                .expect("unscripted merge");
+            if out.0 && !*self.queued.lock().unwrap() && !argv.iter().any(|a| a == "--disable-auto")
+            {
+                *self.merged.lock().unwrap() = true;
+            }
+            Ok(out)
         }
         async fn poll(&self) {
             self.log.lock().unwrap().push("poll");
@@ -6219,8 +6257,27 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .await
             .unwrap();
         // One fresh read, then the head-bound merge.
-        assert_eq!(forge.calls(), ["view", "view", "merge"]);
+        assert_eq!(forge.calls(), ["view", "view", "merge", "view"]);
         assert_eq!(state.status, RunStatus::Merged);
+    }
+
+    #[tokio::test]
+    async fn a_successful_merge_command_that_only_queued_is_not_a_merge() {
+        let mut state = landing_state();
+        let forge = Scripted::new(
+            vec![seen("a", Checks::Green, "CLEAN", false)],
+            std::iter::repeat_n((true, ""), 100).collect(),
+        );
+        *forge.queued.lock().unwrap() = true;
+        let task = async {
+            land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+                .await
+                .unwrap();
+        };
+        // Still open after the command succeeded: it keeps watching and
+        // never records a merge (it stops at the wait ceiling instead).
+        task.await;
+        assert_ne!(state.status, RunStatus::Merged);
     }
 
     #[tokio::test]
@@ -6245,7 +6302,8 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(
             forge.calls(),
             [
-                "view", "fix", "poll", "view", "poll", "view", "poll", "view", "view", "merge"
+                "view", "fix", "poll", "view", "poll", "view", "poll", "view", "view", "merge",
+                "view"
             ]
         );
         assert_eq!(state.status, RunStatus::Merged);
@@ -6295,7 +6353,8 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(
             forge.calls(),
             [
-                "view", "view", "merge", "view", "poll", "view", "poll", "view", "view", "merge"
+                "view", "view", "merge", "view", "poll", "view", "poll", "view", "view", "merge",
+                "view"
             ]
         );
         assert_eq!(state.status, RunStatus::Merged);
@@ -6447,7 +6506,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
             .await
             .unwrap();
-        assert_eq!(forge.calls(), ["view", "view", "merge"]);
+        assert_eq!(forge.calls(), ["view", "view", "merge", "view"]);
         assert_eq!(state.status, RunStatus::Merged);
     }
 
@@ -6470,7 +6529,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(
             forge.calls(),
             [
-                "view", "view", "merge", "view", "poll", "view", "view", "merge"
+                "view", "view", "merge", "view", "poll", "view", "view", "merge", "view"
             ]
         );
         assert_eq!(state.status, RunStatus::Merged);
@@ -6504,7 +6563,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             vec![(true, "")],
         );
         land_with(&mut state, URL, &forge).await.unwrap();
-        assert_eq!(forge.calls(), ["view", "view", "merge"]);
+        assert_eq!(forge.calls(), ["view", "view", "merge", "view"]);
         let argv = &forge.argvs()[0];
         assert!(has(argv, "--squash") && has(argv, "--subject"));
         assert!(!has(argv, "--auto") && !has(argv, "--admin"));
