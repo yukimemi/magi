@@ -198,6 +198,35 @@ fn known(page: &str, check: &str) -> Option<&'static str> {
         .map(|(_, _, why)| *why)
 }
 
+/// Start the real router on an OS-chosen loopback port and return its URL.
+async fn serve(
+    home: &std::path::Path,
+    queue: Queue,
+    talks: Talks,
+    runs_root: std::path::PathBuf,
+    repo: &std::path::Path,
+) -> String {
+    let worktrees = home.join("wt").join("magi");
+    std::fs::create_dir_all(&worktrees).unwrap();
+    let ui = magi::web::Ui::new(
+        queue,
+        magi::ask::Questions::at(home.join("questions")),
+        talks,
+        runs_root,
+        home.to_path_buf(),
+        repo.to_path_buf(),
+    )
+    .with_worktrees_root(worktrees);
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind loopback");
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, ui.router()).await;
+    });
+    base
+}
+
 #[tokio::test]
 async fn pages_render_with_visible_titles_and_no_console_errors() {
     let Some(chrome) = cdp::find_chrome() else {
@@ -289,24 +318,7 @@ async fn pages_render_with_visible_titles_and_no_console_errors() {
     }
 
     // --- serve on an OS-chosen port ---------------------------------------
-    let worktrees = home.join("wt").join("magi");
-    std::fs::create_dir_all(&worktrees).unwrap();
-    let ui = magi::web::Ui::new(
-        queue,
-        magi::ask::Questions::at(home.join("questions")),
-        talks,
-        runs_root,
-        home.clone(),
-        fx.repo.clone(),
-    )
-    .with_worktrees_root(worktrees);
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind loopback");
-    let base = format!("http://{}/", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, ui.router()).await;
-    });
+    let base = serve(&home, queue, talks, runs_root, &fx.repo).await;
 
     // --- drive ------------------------------------------------------------
     let mut browser = cdp::Browser::launch(&chrome)
@@ -419,4 +431,105 @@ async fn pages_render_with_visible_titles_and_no_console_errors() {
         "web UI rendering regressions:\n  {}",
         failures.join("\n  ")
     );
+}
+
+/// The Runs search over a history longer than the loaded window: a match that
+/// only the server saw is listed as an extra row and must not be counted as
+/// hidden, and a run whose text is markup must be shown as text, not parsed.
+#[tokio::test]
+async fn runs_search_counts_extra_rows_as_shown_and_never_parses_hit_text() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+
+    // The page loads the newest RUN_LIMIT (50) runs; the oldest of 51 is
+    // outside that window, and so is only reachable through the search.
+    const WINDOW: usize = 50;
+    let markup = "<img src=x id=pwn>";
+    for n in 1..=WINDOW + 1 {
+        let text = match n {
+            1 => format!("zebrafruit outside the window {markup}"),
+            n if n == WINDOW + 1 => "zebrafruit inside the window".to_owned(),
+            n => format!("ordinary run {n}"),
+        };
+        let mut run = RunState::new(
+            fx.repo.clone(),
+            "main".to_owned(),
+            "0000000".to_owned(),
+            text,
+            fx.config.clone(),
+        );
+        run.id = format!("20260901-{n:06}-bb{n:02}");
+        run.status = RunStatus::Reviewing;
+        run.save_under(&home).expect("seed run");
+    }
+
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome)
+        .await
+        .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
+    let page = browser
+        .open_page(&format!("{base}#/runs"), 1280, 900, false)
+        .await
+        .expect("open");
+    let w = Duration::from_secs(30);
+    browser
+        .wait_for(&page, "!!document.querySelector('#runs-search-input')", w)
+        .await
+        .expect("search box");
+    browser
+        .eval(
+            &page,
+            "(() => { const i = document.getElementById('runs-search-input'); \
+             i.value = 'zebrafruit'; i.dispatchEvent(new Event('input', { bubbles: true })); \
+             return true; })()",
+        )
+        .await
+        .expect("type");
+    browser
+        .wait_for(
+            &page,
+            "(document.getElementById('runs-search-status').textContent || '').includes('match')",
+            w,
+        )
+        .await
+        .expect("search answered");
+
+    let out = browser
+        .eval(
+            &page,
+            "({ status: document.getElementById('runs-search-status').textContent, \
+               extra: document.querySelectorAll('#runs-search-extra li').length, \
+               pwn: document.querySelectorAll('#pwn').length, \
+               snippet: [...document.querySelectorAll('.card-snippet')].map((e) => e.textContent).join('\\n') })",
+        )
+        .await
+        .expect("read");
+    let status = out["status"].as_str().unwrap_or_default();
+    assert!(status.starts_with("2 runs match"), "status: {status}");
+    assert!(
+        !status.contains("hidden"),
+        "extra rows counted as hidden: {status}"
+    );
+    assert_eq!(
+        out["extra"], 1,
+        "the out-of-window hit is one extra row: {out}"
+    );
+    assert_eq!(out["pwn"], 0, "hit text was parsed as markup: {out}");
+    assert!(
+        out["snippet"].as_str().unwrap_or_default().contains(markup),
+        "snippet should show the markup literally: {out}"
+    );
+    browser.close_page(&page).await;
 }

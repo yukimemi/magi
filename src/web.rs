@@ -3461,21 +3461,21 @@ async fn search_get(
         };
         if scope == "runs" {
             let mut unreadable = 0;
-            let docs: Vec<(String, serde_json::Value)> = run_ids(&ui.runs)
-                .into_iter()
-                .filter_map(|id| {
-                    let body = std::fs::read_to_string(ui.runs.join(&id).join("run.json")).ok();
-                    match body.and_then(|b| serde_json::from_str(&b).ok()) {
-                        Some(v) => Some((id, v)),
-                        None => {
-                            unreadable += 1;
-                            None
-                        }
+            // One run.json is read, matched and dropped at a time; nothing
+            // holds the whole history. The scan runs to the end even past the
+            // hit cap so `total` and `unreadable` stay exact.
+            let docs = run_ids(&ui.runs).into_iter().filter_map(|id| {
+                let body = std::fs::read_to_string(ui.runs.join(&id).join("run.json")).ok();
+                match body.and_then(|b| serde_json::from_str(&b).ok()) {
+                    Some(v) => Some((id, v)),
+                    None => {
+                        unreadable += 1;
+                        None
                     }
-                })
-                .collect();
-            view.unreadable = unreadable;
+                }
+            });
             search_docs(&terms, docs, &mut view);
+            view.unreadable = unreadable;
             // Only the capped hits get a row: the filters need a run's state,
             // and reading every match would be the whole history again.
             let (open_runs, claimed, superseded) = run_row_inputs(&ui);
@@ -9905,10 +9905,7 @@ mod tests {
         assert_eq!(health.json()["runs_unreadable"], 1);
     }
 
-    /// The dashboard reads every run's state itself rather than trusting a
-    /// separately-maintained count, so an unreadable run must be counted the
-    /// same way `/api/health` counts it - never silently dropped the way the
-    /// CLI's own `stats::load_all` drops it.
+    /// Search matches nested run text, ANDs its terms and counts unreadable runs.
     #[tokio::test]
     async fn search_finds_nested_run_text_ands_terms_and_counts_unreadable() {
         let f = Fixture::start().await;
@@ -10050,14 +10047,6 @@ mod tests {
     }
 
     #[test]
-    fn the_search_ui_never_renders_hits_with_inner_html() {
-        assert!(APP_JS.contains("/api/search"));
-        assert!(APP_JS.contains("el(\"mark\""));
-        assert!(INDEX_HTML.contains("id=\"runs-search-input\""));
-        assert!(INDEX_HTML.contains("id=\"queue-search-input\""));
-    }
-
-    #[test]
     fn a_keystroke_invalidates_the_search_reply_still_in_flight() {
         let start = APP_JS
             .find("function scheduleSearch(")
@@ -10067,6 +10056,10 @@ mod tests {
         assert!(body.contains("s.seq += 1"));
     }
 
+    /// The dashboard reads every run's state itself rather than trusting a
+    /// separately-maintained count, so an unreadable run must be counted the
+    /// same way `/api/health` counts it - never silently dropped the way the
+    /// CLI's own `stats::load_all` drops it.
     #[tokio::test]
     async fn stats_runs_unreadable_matches_health() {
         let f = Fixture::start().await;
