@@ -955,6 +955,13 @@ pub struct Daemon {
     /// question over the limit keeps its place and starts when a deputy
     /// finishes; `0` runs none.
     pub max_deputies: usize,
+    /// Minutes a release-bump pull request may make no progress before
+    /// `magi serve` raises a notice and asks the owner (see
+    /// [`crate::release_watch`]). Progress is a change of head commit or of any
+    /// check's verdict. A required check that stays red after the one rerun the
+    /// watcher is allowed escalates at once, whatever this says. **Sixty by
+    /// default**; `0` turns the watcher off.
+    pub release_stall_minutes: u64,
 }
 
 impl Default for Daemon {
@@ -963,6 +970,7 @@ impl Default for Daemon {
             max_concurrent_runs: 1,
             pause_for_interrupts: false,
             max_deputies: 2,
+            release_stall_minutes: 60,
         }
     }
 }
@@ -1780,7 +1788,13 @@ impl Config {
              [update]\n\
              # off | notify | install — checked in the background, throttled.\n\
              mode = \"notify\"\n\
-             # interval = \"24h\"\n",
+             # interval = \"24h\"\n\n\
+             [daemon]\n\
+             # Minutes a release-bump pull request (chore/release-v*) may sit with\n\
+             # no new commit and no check changing state before `magi serve`\n\
+             # notices and asks you. A failed check is rerun once on its own;\n\
+             # still red after that escalates at once. 0 turns the watcher off.\n\
+             # release_stall_minutes = 60\n",
         );
         s
     }

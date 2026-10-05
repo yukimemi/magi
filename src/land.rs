@@ -1520,6 +1520,57 @@ pub fn parse_pr(json: &str) -> Result<PrState> {
     })
 }
 
+/// One rollup entry as the release watcher reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckView {
+    pub name: String,
+    pub verdict: Verdict,
+    /// Workflow run behind the check, when its url names one.
+    pub run: Option<String>,
+    pub url: Option<String>,
+}
+
+/// A pull request's lifecycle, head commit and per-check verdicts, without
+/// [`rollup_verdict`]'s aggregation (a pending check anywhere hides a failure
+/// from it, which is exactly what the release watcher must not inherit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RollupView {
+    pub url: String,
+    pub number: u64,
+    pub state: PrLifecycle,
+    pub head: String,
+    pub checks: Vec<CheckView>,
+}
+
+/// Parse `gh pr view --json url,number,state,headRefOid,statusCheckRollup`
+/// output. No I/O.
+pub(crate) fn parse_rollup(json: &str) -> Result<RollupView> {
+    let raw: GhPr = serde_json::from_str(json).context("parse `gh pr view --json ...` output")?;
+    let state = match raw.state.to_ascii_uppercase().as_str() {
+        "OPEN" => PrLifecycle::Open,
+        "MERGED" => PrLifecycle::Merged,
+        "CLOSED" => PrLifecycle::Closed,
+        other => bail!("unknown pull request state `{other}`"),
+    };
+    let checks = raw
+        .status_check_rollup
+        .iter()
+        .map(|c| CheckView {
+            name: c.label(),
+            verdict: c.verdict(),
+            run: c.url().and_then(run_of),
+            url: c.url().map(str::to_owned),
+        })
+        .collect();
+    Ok(RollupView {
+        url: raw.url,
+        number: raw.number,
+        state,
+        head: raw.head_ref_oid,
+        checks,
+    })
+}
+
 /// Read just a pull request's lifecycle state - open, merged, or closed -
 /// with none of the checks/reviews/comments [`land`] itself needs to decide
 /// what to do next.
@@ -3918,7 +3969,7 @@ fn job_of(details_url: &str) -> Option<String> {
 }
 
 /// Workflow run id out of a check's `detailsUrl`.
-fn run_of(details_url: &str) -> Option<String> {
+pub(crate) fn run_of(details_url: &str) -> Option<String> {
     let after = details_url.split("/actions/runs/").nth(1)?;
     let id: String = after.chars().take_while(char::is_ascii_digit).collect();
     (!id.is_empty()).then_some(id)
@@ -3983,7 +4034,7 @@ async fn stop(state: &mut RunState, repo: &Path, pr: &PrState, why: &str) -> Res
 /// for the same-repo guard in [`correct_manual_merge`] would mean the check
 /// could be made to agree with whatever repository a forged `--merged` URL
 /// claims, defeating it entirely.
-async fn gh(cwd: &Path, args: &[String]) -> Result<(bool, String)> {
+pub(crate) async fn gh(cwd: &Path, args: &[String]) -> Result<(bool, String)> {
     let out = tokio::process::Command::new("gh")
         .args(args)
         .current_dir(cwd)
@@ -4005,7 +4056,7 @@ async fn gh(cwd: &Path, args: &[String]) -> Result<(bool, String)> {
 
 /// Verdict of one entry in the status rollup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verdict {
+pub(crate) enum Verdict {
     Pass,
     Fail,
     Pending,

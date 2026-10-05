@@ -1502,6 +1502,52 @@ something to answer, so it does not reuse `ask::Questions`.
   `covers` still matches a `handover:` key for records written earlier. A page
   already delivered cannot be retracted when a question arrives later.
 
+### A release PR is watched until it lands
+
+`src/release_watch.rs` runs inside `magi serve` as its own task (like the
+waiter and the deputies; not a queue step, not tied to a run), because a
+pending bump is coalesced across runs and outlives the run that opened it.
+Before it, a `chore/release-v*` pull request whose required check went red
+sat for hours with auto-merge waiting and nobody told.
+
+- **The forge is the truth.** Every open pull request whose head branch starts
+  with `chore/release-v`, in the checkouts under `[repos] roots` plus the
+  serve repo. The pending marker is not read, so a missing one changes
+  nothing. A pull request that leaves the open list stays watched until
+  `land`'s lifecycle read confirms merged / closed; only then are its notice
+  dismissed, its question abandoned and its record deleted.
+- **`release_watch::decide` is pure.** An unreadable forge answer is
+  `Unknown`: nothing moves, not even the stall clock. It deliberately does not
+  reuse `land::rollup_verdict`, whose pending-anywhere rule would let another
+  run's pending job hide a failure; a failed check is judged by its own
+  workflow run (`land::run_of`) being complete. A failure with no run id (an
+  external status context) cannot be rerun and escalates once nothing is
+  pending.
+- **A failed run is rerun at most once.** The run id is written to
+  `<home>/release-watch/<id>.json` *before* `gh run rerun <id> --failed`, so a
+  restart cannot rerun twice; if the call itself fails the cost is an
+  escalation, never a retry loop. Reruns are keyed by run id and forgotten
+  when the head moves. The forge keeps reporting the old failure for a moment
+  after a rerun, so `RERUN_GRACE` (180 s) must pass before "still red" is
+  believed (trade-off: a very slow flip costs one early question).
+- **Escalation is a notice plus a question**: still red after the rerun, or no
+  new head / check state for `[daemon] release_stall_minutes` (default 60, `0`
+  turns the watcher off). The notice key is `release-pr:<owner/repo>#<n>` and
+  its text is fixed per stage (no counts, times or job names, so a poll never
+  relights it); job names and links ride in the question. The question uses
+  `bump::NOTICE_NODE`, no run and no `cwd`, so `settle_run`, the waiter, the
+  deputies and `notices::covers` ignore it (a test pins that), and it pages
+  once, through the notice.
+- **The owner's choice is applied by the watcher on its next lap**, not by the
+  daemon's task-bound action path: `rerun again` clears the failed runs'
+  records for one more rerun, `hold` (and silence or an abandoned question)
+  holds the current fingerprint until a check or the head changes, `leave it`
+  stops watching and dismisses the notice. `WatchState::applied` makes an
+  answer count once. The watcher never merges, closes or pushes.
+- Every side effect is best-effort (`tracing::warn`), and every forge access
+  goes through `ReleaseForge`, so tests inject a fake and never touch `gh`,
+  a port or the real home.
+
 ### Duplicate-work claims are gathered from several places
 
 `src/dupes.rs` refuses (`--force` overrides) a `magi task add`, `magi run` or
