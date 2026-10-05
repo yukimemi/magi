@@ -1190,7 +1190,7 @@ mod tests {
 
     #[test]
     fn outcome_for_carries_every_rounds_findings_and_the_branch_head() {
-        crate::run::set_home(std::env::temp_dir().join("magi-conduct-tests-home"));
+        crate::run::pin_test_home();
         let dir = tempdir().unwrap();
         let default_repo = dir.path().join("default");
         let task_repo = dir.path().join("task");
@@ -2175,7 +2175,7 @@ mod tests {
         // race the first time it runs in the binary; every other test still
         // reaches the same directory whichever call won, and this test's own
         // run id never collides with another test's.
-        crate::run::set_home(std::env::temp_dir().join("magi-conduct-tests-home"));
+        crate::run::pin_test_home();
         let dir = tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let questions = Questions::at(dir.path().join("questions"));

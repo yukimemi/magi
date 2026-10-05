@@ -4960,7 +4960,7 @@ mod tests {
         // touches `run::home()`; the first call anywhere in this binary wins,
         // so this is a no-op if another test already pinned one, and either
         // way the run id below is never written under it.
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        crate::run::pin_test_home();
         let dir = tempfile::tempdir().unwrap();
         let queue = Queue::at(dir.path().to_path_buf());
         let mut t = task();
@@ -5397,7 +5397,7 @@ mod tests {
         // `magi ask` question settled Held with `hold_reason: null`, so the
         // notification said nothing actionable. `note_open_question` should
         // append the question id to whatever `handed_off` already wrote.
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        crate::run::pin_test_home();
         let home = crate::run::home();
         let state = run_state(RunStatus::VerifiedNoop);
         let mut q = ask::Question::new(
@@ -5435,7 +5435,7 @@ mod tests {
 
     #[test]
     fn a_held_task_with_no_open_question_keeps_its_plain_reason() {
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        crate::run::pin_test_home();
         let state = run_state(RunStatus::VerifiedNoop);
 
         let verdict = Verdict {
@@ -5459,7 +5459,7 @@ mod tests {
 
     #[test]
     fn supersede_prior_runs_rewrites_an_earlier_blocked_attempt_once_a_later_one_lands() {
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        crate::run::pin_test_home();
         let mut first = run_state(RunStatus::Blocked);
         first.id = "20260101-000000-sup1".to_owned();
         first.save().unwrap();
@@ -5492,7 +5492,7 @@ mod tests {
         // `daemon.json` at all, so it would look identical to a genuinely
         // idle run without also consulting `RunState::liveness`, which reads
         // this run's own recorded `driver_pid` instead.
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        crate::run::pin_test_home();
         let mut first = run_state(RunStatus::Blocked);
         first.id = "20260101-000000-sup9".to_owned();
         // This test process's own pid: guaranteed alive without needing a
@@ -5576,7 +5576,7 @@ mod tests {
 
     #[test]
     fn supersede_prior_runs_leaves_concurrent_blocked_attempts_alone_while_the_task_is_not_done() {
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        crate::run::pin_test_home();
         let mut first = run_state(RunStatus::Blocked);
         first.id = "20260101-000000-sup3".to_owned();
         first.save().unwrap();
@@ -5608,7 +5608,7 @@ mod tests {
         // `magi task done` (or the API's equivalent) can close a task with no
         // run of its own ever having succeeded - there is nothing here that
         // counts as "the attempt that finished it", so nothing is rewritten.
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        crate::run::pin_test_home();
         let mut first = run_state(RunStatus::Blocked);
         first.id = "20260101-000000-sup5".to_owned();
         first.save().unwrap();
@@ -5634,7 +5634,7 @@ mod tests {
         // never watched, say. `runs.last()` being `Done`-adjacent is not
         // proof it actually succeeded, so nothing earlier may be relabelled
         // on its say-so alone.
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        crate::run::pin_test_home();
         let mut first = run_state(RunStatus::Blocked);
         first.id = "20260101-000000-supb".to_owned();
         first.save().unwrap();
@@ -5661,7 +5661,7 @@ mod tests {
         // Only `Blocked`/`Stalled` mean "sitting there waiting for a human
         // to look" - `Failed` and `VerifiedNoop` are already their own
         // terminal answers and must not be relabelled into a third one.
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        crate::run::pin_test_home();
         let mut failed = run_state(RunStatus::Failed);
         failed.id = "20260101-000000-sup6".to_owned();
         failed.save().unwrap();
@@ -5701,7 +5701,7 @@ mod tests {
 
     #[test]
     fn land_resume_state_leaves_a_fresh_open_question_waiting() {
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        crate::run::pin_test_home();
         let mut state = run_state(RunStatus::Landing);
         state.id = "20260101-000000-fre1".to_owned();
         state.parked = true;
@@ -5725,7 +5725,7 @@ mod tests {
         // nobody answered; land's approval bypasses that wait (see
         // `land::approval_gate`), so this is now the only place
         // `graph.answer_timeout` is enforced for a land approval at all.
-        crate::run::set_home(std::env::temp_dir().join("magi-daemon-test-home"));
+        crate::run::pin_test_home();
         let mut state = run_state(RunStatus::Landing);
         state.id = "20260101-000000-exp1".to_owned();
         state.parked = true;

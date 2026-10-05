@@ -2698,7 +2698,7 @@ mod tests {
     fn merged_state() -> RunState {
         // `report::run` prints `state.dir()`; pin the global home like the
         // report tests do so nothing reaches the operator's real one.
-        run::set_home(std::env::temp_dir().join("magi-report-test-home"));
+        run::pin_test_home();
         let mut s = RunState::new(
             PathBuf::from("/no/such/repo"),
             "main".to_owned(),

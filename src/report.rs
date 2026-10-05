@@ -1411,7 +1411,7 @@ mod tests {
         // pinning it here keeps this test off the operator's real one. The
         // directory itself is never read, only its path printed, so nothing
         // needs to create or clean it up.
-        crate::run::set_home(std::env::temp_dir().join("magi-report-test-home"));
+        crate::run::pin_test_home();
         let mut s = RunState::new(
             PathBuf::from("/repo"),
             "main".to_owned(),
