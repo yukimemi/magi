@@ -93,7 +93,7 @@ common::e2e! {
 async fn a_judge_that_times_out_voting_is_handed_over_with_full_context() {
     let _home = common::home_lock().await;
     let mut fx = common::fixture(_home, Judges::Split, false);
-    fx.config.graph.timeout_judge = 1;
+    fx.config.graph.timeout_judge = common::HANDOVER_BUDGET;
     set_env(&mut fx, "beta", &[("MOCK_HANG_SEAT", "judge-1"), ("MOCK_ONLY_NODE", "vote")]);
     let runner = run(&fx).await;
     assert_full_vote_handover(&runner.state);
