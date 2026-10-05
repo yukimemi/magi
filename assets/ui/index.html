@@ -6,9 +6,8 @@
      reach the notch and the home indicator; without it iOS letterboxes the
      page and the bottom dock sits in dead space. -->
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#f7f5f1" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#191817" media="(prefers-color-scheme: dark)">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#050504">
 <meta name="description" content="magi observation deck — watch blind multi-agent implementation competitions and file new tasks.">
 <title>magi — observation deck</title>
 <!-- The favicon is the logo, inlined as a data URI. Nothing outside the magi
@@ -198,6 +197,7 @@
   <section class="view" id="view-run" aria-labelledby="run-h" hidden>
     <a class="back" href="#/runs">Runs</a>
     <div class="view-head">
+      <div class="alert-banner" id="run-alert" role="alert" hidden></div>
       <div class="run-status" id="run-status"></div>
       <h1 id="run-h">Loading run…</h1>
       <p class="view-sub" id="run-meta"></p>
@@ -244,6 +244,8 @@
 
       <div class="panel" id="run-verdict" hidden>
         <h2>Verdict</h2>
+        <div class="verdict-stamp-row" id="verdict-stamp" hidden></div>
+        <div class="magi-seats" id="magi-seats" hidden></div>
         <div class="converge" id="converge"></div>
         <dl class="facts" id="tally-facts"></dl>
       </div>
