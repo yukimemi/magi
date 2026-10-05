@@ -236,10 +236,17 @@ pub struct Adopted {
 /// that exists and is queued, failed or held is claimed, started with the
 /// run and settled by [`Adopted::finish`] exactly like an ownerless run's; if
 /// somebody else holds its claim, or the task is Done, blocked or running, the run is only linked and nothing is settled. With no such
-/// parent, a task is filed and claimed for the duration. A no-op (`None`) when
-/// no magi home is pinned.
-pub fn adopt(state: &crate::run::RunState, parent_task: Option<&str>) -> Option<Adopted> {
-    crate::run::try_home()?;
+/// parent, a task is filed and claimed for the duration. `Ok(None)` when no
+/// magi home is pinned, or when the run was only linked to its parent. An
+/// error means the run has no owner and must not be executed: filing or
+/// claiming the new task failed.
+pub fn adopt(
+    state: &crate::run::RunState,
+    parent_task: Option<&str>,
+) -> anyhow::Result<Option<Adopted>> {
+    if crate::run::try_home().is_none() {
+        return Ok(None);
+    }
     adopt_in(Queue::open(), state, parent_task)
 }
 
@@ -247,12 +254,13 @@ fn adopt_in(
     queue: Queue,
     state: &crate::run::RunState,
     parent_task: Option<&str>,
-) -> Option<Adopted> {
+) -> anyhow::Result<Option<Adopted>> {
+    use anyhow::Context as _;
     if let Some(parent) = parent_task
         && let Ok(id) = queue.resolve_id(parent)
     {
         // The parent exists: never file a second owner for this run.
-        return match queue.claim(&id) {
+        return Ok(match queue.claim(&id) {
             Ok(claim) => {
                 let started = queue.get(&id).and_then(|mut task| {
                     // A task the daemon could pick up, or one a failed
@@ -295,7 +303,7 @@ fn adopt_in(
                 let _ = queue.link_run(&id, &state.id);
                 None
             }
-        };
+        });
     }
     let mut task = Task::new(
         crate::queue::title_from(&state.instruction, 72),
@@ -303,15 +311,19 @@ fn adopt_in(
         state.repo.clone(),
         Source::Human,
     );
-    let claim = queue.claim(&task.id).ok()?;
+    let claim = queue
+        .claim(&task.id)
+        .with_context(|| format!("could not claim a new task for run {}", state.id))?;
     task.start(state.id.clone());
-    queue.put(&mut task).ok()?;
-    Some(Adopted {
+    queue
+        .put(&mut task)
+        .with_context(|| format!("could not file a new task for run {}", state.id))?;
+    Ok(Some(Adopted {
         queue,
         task: Some(task),
         claim: Some(claim),
         quota_before: state.quota.clone(),
-    })
+    }))
 }
 
 impl Adopted {
@@ -558,7 +570,9 @@ mod tests {
         let q = Queue::at(dir.path().join("queue"));
         let parent = parent_in(&q, dir.path());
         let state = follow_up_state(dir.path());
-        let adopted = adopt_in(q.clone(), &state, Some(&parent.id)).expect("adopted");
+        let adopted = adopt_in(q.clone(), &state, Some(&parent.id))
+            .unwrap()
+            .expect("adopted");
         let running = q.get(&parent.id).unwrap();
         assert_eq!(running.status, TaskStatus::Running);
         assert_eq!(running.attempts, parent.attempts + 1);
@@ -577,13 +591,29 @@ mod tests {
     }
 
     #[test]
+    fn an_ownerless_run_whose_task_cannot_be_filed_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // The queue root sits under a regular file, so claiming cannot create it.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let q = Queue::at(blocker.join("q"));
+        let state = follow_up_state(dir.path());
+        let err = adopt_in(q, &state, None).expect_err("must not be swallowed");
+        assert!(format!("{err:#}").contains(&state.id), "{err:#}");
+    }
+
+    #[test]
     fn a_task_claimed_elsewhere_only_gains_the_run() {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::at(dir.path().join("queue"));
         let parent = parent_in(&q, dir.path());
         let _theirs = q.claim(&parent.id).unwrap();
         let state = follow_up_state(dir.path());
-        assert!(adopt_in(q.clone(), &state, Some(&parent.id)).is_none());
+        assert!(
+            adopt_in(q.clone(), &state, Some(&parent.id))
+                .unwrap()
+                .is_none()
+        );
         let after = q.get(&parent.id).unwrap();
         assert_eq!(after.status, parent.status);
         assert_eq!(after.attempts, parent.attempts);
@@ -599,7 +629,11 @@ mod tests {
         parent.succeed();
         q.put(&mut parent).unwrap();
         let state = follow_up_state(dir.path());
-        assert!(adopt_in(q.clone(), &state, Some(&parent.id)).is_none());
+        assert!(
+            adopt_in(q.clone(), &state, Some(&parent.id))
+                .unwrap()
+                .is_none()
+        );
         let after = q.get(&parent.id).unwrap();
         assert_eq!(after.status, TaskStatus::Done);
         assert_eq!(after.attempts, parent.attempts);
@@ -615,7 +649,9 @@ mod tests {
         parent.hold_manual(Some("the run did not finish: stale".to_owned()));
         q.put(&mut parent).unwrap();
         let state = follow_up_state(dir.path());
-        let adopted = adopt_in(q.clone(), &state, Some(&parent.id)).expect("adopted");
+        let adopted = adopt_in(q.clone(), &state, Some(&parent.id))
+            .unwrap()
+            .expect("adopted");
         assert_eq!(q.get(&parent.id).unwrap().status, TaskStatus::Running);
         assert!(q.claim(&parent.id).is_err(), "claimed while it runs");
         adopted.finish(&state, Err(anyhow::anyhow!("fresh failure")));

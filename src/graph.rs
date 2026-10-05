@@ -4332,10 +4332,24 @@ impl Runner {
                     let follow_up_id = follow_up.state.id.clone();
                     // The follow-up is a run like any other: it belongs to the
                     // task of the run it follows, or to one filed for it.
-                    let adopted = crate::direct::adopt(
+                    let adopted = match crate::direct::adopt(
                         &follow_up.state,
                         self.state.origin.as_ref().and_then(|o| o.task.as_deref()),
-                    );
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            // An ownerless run must not spend agent calls; it
+                            // stays saved, and `magi run --resume` adopts it.
+                            self.state.event(
+                                "fix",
+                                format!(
+                                    "follow-up review {follow_up_id} got no owning task and was not executed: {e:#}"
+                                ),
+                            );
+                            self.state.save()?;
+                            return Ok(());
+                        }
+                    };
                     let executed = follow_up.execute().await;
                     let failure = executed.as_ref().err().map(|e| format!("{e:#}"));
                     if let Some(a) = adopted {
