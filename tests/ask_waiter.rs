@@ -10,6 +10,7 @@ use jiff::Timestamp;
 use magi::agent::SeatState;
 use magi::ask::{Answer, Question, QuestionStatus, Questions, WaiterKind, Who};
 use magi::notices::Notices;
+use magi::queue::{Queue, Source, Task, TaskStatus};
 use magi::run::{RunState, RunStatus};
 use magi::waiter::Waiter;
 
@@ -180,5 +181,58 @@ async fn an_answer_the_asker_never_read_is_delivered_by_the_daemon() {
     let q = s.store.get(&s.q.id).unwrap();
     assert!(q.answer_delivered);
     assert_eq!(q.status, QuestionStatus::Answered);
+}
+}
+
+common::e2e! {
+async fn an_applied_action_is_never_delivered_after_a_claim_collision() {
+    let mut s = scene(home_lock().await, 1);
+    let queue = Queue::at(s.home.join("queue"));
+    let mut task = Task::new(
+        "t".to_owned(),
+        "t".to_owned(),
+        s.fx.repo.clone(),
+        Source::Human,
+    );
+    task.start(s.q.run.clone());
+    queue.put(&mut task).unwrap();
+    s.store
+        .update(&s.q.id, |q| {
+            q.choices = vec!["again".to_owned()];
+            q.actions
+                .insert("again".to_owned(), magi::ask::ChoiceAction::Requeue);
+            q.answer(Answer::Choice("again".to_owned()))
+        })
+        .unwrap();
+
+    // An in-flight attempt holds the task's claim while the waiter looks: the
+    // task reads Running, so the word would be delivered - but not claimless.
+    let attempt = queue.claim(&task.id).unwrap();
+    tick(&mut s).await;
+    assert_eq!(resumes(&s), 0, "no delivery without the task claim");
+    assert!(!s.store.root().join(format!("{}.delivery", s.q.id)).exists());
+    assert!(s.store.read_lease(&s.q.id).is_none());
+    assert!(s.store.get(&s.q.id).unwrap().waiter.is_none());
+
+    // The attempt ends held and releases; the daemon applies the requeue
+    // (exactly once, through `actions_applied`) and a new competition starts.
+    let mut t = queue.get(&task.id).unwrap();
+    t.hold_machine(Some("blocked".to_owned()));
+    queue.put(&mut t).unwrap();
+    drop(attempt);
+    let mut t = queue.get(&task.id).unwrap();
+    t.release();
+    t.mark_action_applied(&s.q.id);
+    queue.put(&mut t).unwrap();
+    let mut t = queue.get(&task.id).unwrap();
+    t.start("20260101-000000-new1".to_owned());
+    queue.put(&mut t).unwrap();
+
+    tick(&mut s).await;
+    assert_eq!(resumes(&s), 0, "an applied action is a stop condition");
+    let t = queue.get(&task.id).unwrap();
+    assert_eq!(t.status, TaskStatus::Running);
+    assert_eq!(t.actions_applied, vec![s.q.id.clone()], "applied once");
+    assert!(!s.store.get(&s.q.id).unwrap().answer_delivered);
 }
 }

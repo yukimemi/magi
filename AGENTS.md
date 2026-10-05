@@ -776,6 +776,11 @@ whole of a run).
   asker's lease is fresh or its seat is still active; that check is not atomic
   with the write, but the asker only prints, so the bound is one poll
   (`ask::LEASE_TTL` at most) and never a double application.
+  `daemon::action_standing` tells "the daemon will not act" apart: `Applied`
+  and `Stale` (a question about an earlier attempt, judged before `Busy`) stop
+  the waiter's delivery for good; only `Busy` (running / blocked / done) still
+  defers to it. The waiter never delivers an action answer without the task's
+  claim: if `queue.claim` fails it steps aside and the next tick re-judges.
 - **Delivery is tracked in the record** (`delivered_turns`, `answer_delivered`),
   set by the asker as it prints and by the waiter after a resumed turn. Where
   the outcome is unknown the word stays undelivered: a repeat is better than a
