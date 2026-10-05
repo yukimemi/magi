@@ -73,7 +73,7 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system"] 
 
 # `kill(pid, 0)`: an existence witness independent of `sysinfo` (`proc`).
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.189"
+libc = "0.2.190"
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
