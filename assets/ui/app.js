@@ -5670,6 +5670,10 @@ function renderRunDetail() {
 
   const head = $("run-status");
   clear(head);
+  const alertBox = $("run-alert");
+  const stalledNow = status === "stalled";
+  show(alertBox, stalledNow);
+  setText(alertBox, stalledNow ? `\u7dca\u6025 \u00b7 ALERT \u2014 ${(RUN_STATUS.stalled || {}).note || ""}` : "");
   /* A run whose task moved on is not the one to act on anymore, however its
      own chip reads: the list route already says so on the card, but the
      detail page — what an operator actually opens off a notification about a
@@ -6332,6 +6336,8 @@ function renderVerdict(run) {
      still records the one ranking it got, so the diamond is only drawn as
      decided when the quorum backs it. */
   const decided = Boolean(tally && tally.met_quorum);
+  renderVerdictStamp(run, tally, decided);
+  renderMagiSeats(run, tally);
   converge.append(convergeDiagram(candidates, tally ? tally.winner : null, decided));
 
   const facts = $("tally-facts");
@@ -6378,6 +6384,60 @@ function renderVerdict(run) {
   for (const [term, value] of rows) {
     facts.append(el("dt", { text: term }), el("dd", { text: value }));
   }
+}
+
+/* The verdict as an Eva-style stamp. 承認 appears only when the quorum backs a
+   winner (`decided`, i.e. tally.met_quorum). A winner without a quorum is a
+   dashed, faded 暫定 / PROVISIONAL stamp, and a stalled run gets no stamp at
+   all: it must never look decided. The English words stay in the DOM. */
+function renderVerdictStamp(run, tally, decided) {
+  const box = $("verdict-stamp");
+  clear(box);
+  const winner = tally ? tally.winner : null;
+  const stalled = displayedRunStatus(run) === "stalled" || run.status === "stalled";
+  if (!winner || stalled) {
+    show(box, false);
+    return;
+  }
+  if (decided) {
+    box.append(el("span", { class: "stamp stamp-approved", lang: "ja", "aria-label": `Approved: candidate ${winner}` },
+      el("span", { class: "stamp-ja", text: "\u627f\u8a8d" }),
+      el("span", { class: "stamp-en", lang: "en", text: `Candidate ${winner}` })));
+  } else {
+    box.append(el("span", { class: "stamp stamp-provisional", lang: "ja", "aria-label": `Provisional: candidate ${winner} leads, no quorum` },
+      el("span", { class: "stamp-ja", text: "\u66ab\u5b9a" }),
+      el("span", { class: "stamp-en", lang: "en", text: "PROVISIONAL" })));
+  }
+  show(box, true);
+}
+
+/* One panel per judge seat, MAGI style. Only what the run record already says
+   about a seat is shown: mid-answer (`run.active`) or out of quota
+   (`run.quota`). A seat in neither is not claimed to be present or to have
+   approved anything; the present count and quorum stay in the Panel row. */
+const MAGI_NAMES = ["MELCHIOR-1", "BALTHASAR-2", "CASPER-3"];
+
+function renderMagiSeats(run, tally) {
+  const box = $("magi-seats");
+  const judges = tally && !tally.uncontested ? Math.max(Number(tally.judges) || 0, 0) : 0;
+  if (judges === 0) {
+    clear(box);
+    show(box, false);
+    return;
+  }
+  const active = run.active && typeof run.active === "object" ? run.active : {};
+  const quota = new Set((Array.isArray(run.quota) ? run.quota : []).map((q) => q && q.seat));
+  clear(box);
+  for (let n = 1; n <= judges; n += 1) {
+    const seat = `judge-${n}`;
+    const state = quota.has(seat) ? "quota" : seat in active ? "active" : "none";
+    const note = state === "quota" ? "\u6b20\u5e2d \u00b7 QUOTA" : state === "active" ? "\u5be9\u8b70\u4e2d \u00b7 deliberating" : "";
+    box.append(el("div", { class: "magi-seat", "data-state": state, "data-seat": seat },
+      el("span", { class: "magi-name", text: n <= MAGI_NAMES.length ? MAGI_NAMES[n - 1] : `JUDGE-${n}` }),
+      el("span", { class: "magi-id", text: seat }),
+      el("span", { class: "magi-state", lang: "ja", text: note })));
+  }
+  show(box, true);
 }
 
 /* The mark, drawn from the real candidate list: independent bodies at the top,
@@ -6579,6 +6639,18 @@ function voteTone(vote) {
   }
 }
 
+/* A review vote as a tag. Only a `reject` vote carries the 否決 stamp; nothing
+   else (a failed or blocked run included) is ever read as a rejection, and
+   `approve_with_findings` keeps its own gold tone, apart from a plain approve.
+   The English label stays in the DOM beside the stamp. */
+function voteTag(vote, prefix) {
+  const tag = el("span", { class: "tag", "data-tone": voteTone(vote), text: `${prefix || ""}${voteLabel(vote)}` });
+  if (vote === "reject") {
+    tag.append(" ", el("span", { class: "stamp-ja", lang: "ja", "aria-label": "rejected", text: "\u5426\u6c7a" }));
+  }
+  return tag;
+}
+
 function voteLabel(vote) {
   switch (vote) {
     case "approve": return "approve";
@@ -6612,7 +6684,7 @@ function buildReviewRounds(rounds, gate) {
           ? el("span", { class: "tag", "data-tone": "gold", text: "e2e could not run (cache unavailable)" })
           : null,
         round.verdict
-          ? el("span", { class: "tag", "data-tone": voteTone(round.verdict), text: `verdict: ${voteLabel(round.verdict)}` })
+          ? voteTag(round.verdict, "verdict: ")
           : null,
         round.vote_split
           ? el("span", { class: "tag", "data-tone": "gold", text: "votes split" })
@@ -6639,7 +6711,7 @@ function buildReviewRounds(rounds, gate) {
         el("p", {},
           el("span", { class: "reviewer-name", text: `reviewer ${record.reviewer} \u00b7 ${record.agent || ""}` }),
           record.vote
-            ? el("span", { class: "tag", "data-tone": voteTone(record.vote), text: voteLabel(record.vote) })
+            ? voteTag(record.vote)
             : null,
         ),
         record.failed ? el("p", { class: "card-note", text: record.failed }) : null,
@@ -6673,7 +6745,7 @@ function buildReviewRounds(rounds, gate) {
             el("div", { class: "finding-top" },
               el("span", { class: "finding-id", text: `reviewer ${rv.reviewer}` }),
               rv.vote
-                ? el("span", { class: "tag", "data-tone": voteTone(rv.vote), text: voteLabel(rv.vote) })
+                ? voteTag(rv.vote)
                 : el("span", { class: "tag", "data-tone": "rust", text: "no revote" }),
             ),
             rv.reason ? el("p", { class: "finding-detail", text: rv.reason }) : null,
