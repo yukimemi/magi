@@ -432,19 +432,9 @@ pub fn merge_argv_at(number: u64, subject: &str, head: &str) -> Vec<String> {
     argv
 }
 
-/// Arm GitHub auto-merge on the commit the owner approved.
-///
-/// The forge then waits for the required checks against its own view and
-/// merges only while the head is still exactly `head`, so a stale observation
-/// on magi's side can never become an unverified merge. Same squash and
-/// subject as [`merge_argv`]; `--admin` is deliberately never passed.
-pub fn automerge_argv_at(number: u64, subject: &str, head: &str) -> Vec<String> {
-    let mut argv = merge_argv_at(number, subject, head);
-    argv.push("--auto".to_owned());
-    argv
-}
-
-/// Take auto-merge back. Run before anything that changes the head, so an
+/// Take auto-merge back. magi no longer arms auto-merge, but a run recorded by
+/// an older build may still have one standing on the forge, so the disarm
+/// paths (and `RunState::land_armed_head`) stay. Run before anything that changes the head, so an
 /// armed merge never outlives the commit that was approved for it.
 pub fn disable_automerge_argv(number: u64) -> Vec<String> {
     ["pr", "merge", &number.to_string(), "--disable-auto"]
@@ -452,23 +442,7 @@ pub fn disable_automerge_argv(number: u64) -> Vec<String> {
         .to_vec()
 }
 
-/// Is this refusal to arm auto-merge "not available here" rather than "the
-/// requirements are not met"?
-///
-/// Only wordings known to mean that: the repository has auto-merge switched
-/// off, or the base branch has no requirements so the pull request is already
-/// clean and there is nothing to wait for. Anything else - including every
-/// message not recognised - is treated as unmet requirements, because reading
-/// an unknown refusal as "unavailable" would turn it into a direct merge.
-fn automerge_unavailable(msg: &str) -> bool {
-    let m = msg.to_lowercase();
-    m.contains("auto merge is not allowed")
-        || m.contains("auto-merge is not allowed")
-        || m.contains("is in clean status")
-        || (m.contains("protected branch rules") && m.contains("not configured"))
-}
-
-/// May the direct-merge fallback go ahead, judged from a fresh read?
+/// May the direct merge go ahead, judged from a fresh read?
 ///
 /// The pull request must still be open on the approved head, the checks must
 /// have been read for that very head, and the policy must still say merge.
@@ -2980,8 +2954,8 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
         state.save()?;
 
         if std::mem::take(&mut resumed_armed) && pr.state == PrLifecycle::Open {
-            // The normal path re-arms, and an approval already given for the
-            // same head is reused, so nothing is asked twice. A failed disable
+            // An approval already given for the same head is reused, so
+            // nothing is asked twice. A failed disable
             // stops the run with the record kept: pushing on could change the
             // head under an arm that is still live.
             if let Err(e) = disarm(forge, state, &repo, pr.number).await {
@@ -3116,6 +3090,20 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                         );
                         tracing::warn!("{msg}");
                         state.event("land", msg);
+                        // Only an arm left by an older build can get here.
+                        // The wording is fixed so a repeat does not relight
+                        // the notice.
+                        crate::notices::raise_with(
+                            crate::notices::Notice::warn(
+                                &format!("merged-unapproved-head:{}", state.id),
+                                "A pull request merged on a commit the owner did not approve; \
+                                 review what landed",
+                            )
+                            .link(crate::notices::Link::Run {
+                                id: state.id.clone(),
+                            }),
+                            &state.config.notify,
+                        );
                     }
                 }
                 state.status = if merged {
@@ -3187,18 +3175,16 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 // Open and past the gate above, so `seen.head` is the commit
                 // the checks were bound to and the owner approved.
                 //
-                // Arm auto-merge on that commit rather than merging now: the
-                // forge waits for the required checks against its own view and
-                // merges only while the head is still this one, so an
-                // observation that is a moment stale cannot become a merge.
-                // The intent is saved first, so a crash around the call is
-                // still visible to a resume.
+                // Merge directly, bound to that commit. Auto-merge is not
+                // armed any more: the forge checks `--match-head-commit` only
+                // when the request is made, so an arm outlives the head it
+                // was made for, and a push of another commit whose
+                // requirements are met first would merge without approval.
+                // A direct merge is checked by the forge at the moment it
+                // happens, so only the approved head can land.
                 let observed_head = seen.head.clone();
-                // `gh` merges at once instead of arming when the pull request
-                // is mergeable by the time it looks, and the state seen here
-                // can be a moment older than that - BLOCKED now, CLEAN when
-                // `gh` asks. So every arm gets the same fresh, head-bound read
-                // the direct fallback does, whatever the merge state was.
+                // Read the pull request again just before: the state seen
+                // above can be a moment old.
                 {
                     let fresh = forge.view(&repo, pr_url).await.ok();
                     if !direct_merge_is_safe(
@@ -3224,64 +3210,38 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                         continue;
                     }
                 }
-                let arm_argv = automerge_argv_at(pr.number, &subject, &observed_head);
-                state.land_armed_head = Some(observed_head.clone());
-                state.save()?;
-                let arm_out = {
+                let argv = merge_argv_at(pr.number, &subject, &observed_head);
+                let out = {
                     let merge_lock = repo_merge_lock(&repo);
                     let _merge_slot = merge_lock.lock().await;
-                    forge.merge(&repo, &arm_argv).await?
-                };
-                if arm_out.0 {
-                    state.event(
-                        "land",
-                        format!("auto-merge armed on {observed_head} for {}", pr.url),
-                    );
-                    state.save()?;
-                    // The ceiling counts from here: what is awaited now is
-                    // the forge's merge, not the checks magi was waiting on.
-                    waited = Duration::ZERO;
-                    forge.poll().await;
-                    continue;
-                }
-                state.land_armed_head = None;
-                state.save()?;
-
-                let unavailable = automerge_unavailable(&arm_out.1);
-                let arm_msg = arm_out.1.clone();
-                let (argv, out, forced_verdict) = if unavailable {
-                    // Nothing to wait on or no way to wait: merge directly, but
-                    // only on the approved head and only after reading the
-                    // pull request again and finding that head, its checks
-                    // and the policy all still say merge.
-                    let fresh = forge.view(&repo, pr_url).await.ok();
-                    if direct_merge_is_safe(
-                        fresh.as_ref(),
-                        &observed_head,
-                        &shown,
-                        round,
-                        budget,
-                        waited,
-                    ) {
-                        let argv = merge_argv_at(pr.number, &subject, &observed_head);
-                        let out = {
-                            let merge_lock = repo_merge_lock(&repo);
-                            let _merge_slot = merge_lock.lock().await;
-                            forge.merge(&repo, &argv).await?
-                        };
-                        (argv, out, None)
-                    } else {
-                        state.event(
-                            "land",
-                            "auto-merge is unavailable and the pull request changed before a \
-                             direct merge; looking again",
-                        );
-                        (arm_argv, (false, arm_msg.clone()), Some(Refused::Pending))
-                    }
-                } else {
-                    (arm_argv, arm_out, None)
+                    forge.merge(&repo, &argv).await?
                 };
                 if out.0 {
+                    // Exit 0 is not proof of a merge: with a merge queue `gh`
+                    // enqueues (or reports the pull request already queued)
+                    // and succeeds while it is still open. Ask the forge; an
+                    // unreadable answer is not a confirmation either, so it
+                    // is looked at again rather than recorded as merged.
+                    let confirmed = forge
+                        .view(&repo, pr_url)
+                        .await
+                        .is_ok_and(|c| c.pr.state == PrLifecycle::Merged);
+                    if !confirmed {
+                        if waited >= WAIT_CEILING {
+                            let why = "the merge request succeeded but the pull request \
+                                       could not be confirmed merged after waiting";
+                            stop(state, &repo, &pr, why).await?;
+                            return Ok(pr);
+                        }
+                        state.event(
+                            "land",
+                            "merge accepted but the pull request is not confirmed merged yet; waiting",
+                        );
+                        state.save()?;
+                        waited += POLL;
+                        forge.poll().await;
+                        continue;
+                    }
                     pr.state = PrLifecycle::Merged;
                     state.status = RunStatus::Merged;
                     state.merge = Some(MergeOutcome {
@@ -3318,9 +3278,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                     write_pr_state_through(state, pr.state);
                     return Ok(pr);
                 }
-                let verdict = forced_verdict.unwrap_or_else(|| {
-                    classify_refusal(after_seen.as_ref(), rechecked, &observed_head)
-                });
+                let verdict = classify_refusal(after_seen.as_ref(), rechecked, &observed_head);
                 match verdict {
                     Refused::Final => {
                         let merge_state = after_seen
@@ -3331,19 +3289,10 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                         // Which refusal this was decides what a person has to
                         // do about it, so the two are worded apart; both carry
                         // the forge's own message.
-                        let why = if unavailable {
-                            format!(
-                                "auto-merge is not available for this pull request ({arm_msg}) \
-                                 and the direct merge was refused: {} (merge state: {merge_state})",
-                                out.1
-                            )
-                        } else {
-                            format!(
-                                "auto-merge could not be armed because the requirements are not \
-                                 met: {} (merge state: {merge_state})",
-                                out.1
-                            )
-                        };
+                        let why = format!(
+                            "the merge was refused: {} (merge state: {merge_state})",
+                            out.1
+                        );
                         stop(state, &repo, &pr, &why).await?;
                         return Ok(pr);
                     }
@@ -5078,13 +5027,26 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     /// falls back to the repository - which keeps these tests free of a
     /// worktree, a `git` invocation and a network.
     fn run_state() -> RunState {
-        RunState::new(
+        let mut state = RunState::new(
             std::path::PathBuf::from("/repo/magi"),
             "main".to_owned(),
             "abcdef1234".to_owned(),
             "add retries to the uploader".to_owned(),
             crate::config::Config::default(),
-        )
+        );
+        // Tests run in parallel against one persistent home and the ids
+        // `RunState::new` draws from the clock can repeat, so two tests would
+        // share a run's questions. The home also outlives the process, so the
+        // counter alone would reuse an earlier run's ids.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos() % 1_000_000);
+        state.id = format!(
+            "20261004-{nanos:06}-{:04x}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        state
     }
 
     fn green_pr() -> PrState {
@@ -5492,8 +5454,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
 
     #[tokio::test]
     async fn a_first_visit_to_the_merge_gate_files_a_question_and_returns_pending_at_once() {
-        crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
-        let mut state = run_state();
+        let mut state = landing_state();
         state.config.graph.land_approval = true;
         let pr = green_pr();
 
@@ -6133,6 +6094,12 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         log: Mutex<Vec<&'static str>>,
         argvs: Mutex<Vec<Vec<String>>>,
         required: Mutex<Option<BTreeSet<String>>>,
+        /// Set once a merge answered ok: the forge then reports `merged`,
+        /// unless `queued` says the merge only entered a queue.
+        merged: Mutex<bool>,
+        queued: Mutex<bool>,
+        /// Views fail once a merge answered ok.
+        unreadable_after_merge: Mutex<bool>,
     }
 
     impl Scripted {
@@ -6149,6 +6116,9 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 log: Mutex::new(Vec::new()),
                 argvs: Mutex::new(Vec::new()),
                 required: Mutex::new(None),
+                merged: Mutex::new(false),
+                queued: Mutex::new(false),
+                unreadable_after_merge: Mutex::new(false),
             }
         }
         fn argvs(&self) -> Vec<Vec<String>> {
@@ -6162,22 +6132,36 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     impl Forge for Scripted {
         async fn view(&self, _repo: &Path, _url: &str) -> Result<Seen> {
             self.log.lock().unwrap().push("view");
+            if *self.unreadable_after_merge.lock().unwrap()
+                && !self.argvs.lock().unwrap().is_empty()
+            {
+                anyhow::bail!("forge unreachable");
+            }
             let mut v = self.views.lock().unwrap();
-            Ok(if v.len() > 1 {
+            let mut seen = if v.len() > 1 {
                 v.pop_front().unwrap()
             } else {
                 v[0].clone()
-            })
+            };
+            if *self.merged.lock().unwrap() {
+                seen.pr.state = PrLifecycle::Merged;
+            }
+            Ok(seen)
         }
         async fn merge(&self, _repo: &Path, argv: &[String]) -> Result<(bool, String)> {
             self.log.lock().unwrap().push("merge");
             self.argvs.lock().unwrap().push(argv.to_vec());
-            Ok(self
+            let out = self
                 .merges
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("unscripted merge"))
+                .expect("unscripted merge");
+            if out.0 && !*self.queued.lock().unwrap() && !argv.iter().any(|a| a == "--disable-auto")
+            {
+                *self.merged.lock().unwrap() = true;
+            }
+            Ok(out)
         }
         async fn poll(&self) {
             self.log.lock().unwrap().push("poll");
@@ -6199,10 +6183,6 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         }
     }
 
-    const CLEAN_REFUSAL: &str =
-        "GraphQL: Pull request is in clean status (enablePullRequestAutoMerge)";
-    const UNAVAILABLE: &str =
-        "GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)";
     const REFUSED: &str =
         "X Pull request #42 is not mergeable: the base branch policy prohibits the merge.";
 
@@ -6229,13 +6209,6 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         crate::run::set_home(std::env::temp_dir().join("magi-land-approval-test-home"));
         let mut state = run_state();
         state.config.graph.land_approval = false;
-        // Tests run in parallel and `run_state` ids come from the clock, so two
-        // of them would otherwise share one run directory.
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        state.id = format!(
-            "20261004-000000-{:04x}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
         state
     }
 
@@ -6288,15 +6261,47 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let mut state = landing_state();
         let forge = Scripted::new(
             vec![seen("a", Checks::Green, "CLEAN", false)],
-            vec![(false, CLEAN_REFUSAL), (true, "")],
+            vec![(true, "")],
         );
         land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
             .await
             .unwrap();
-        // Already clean: auto-merge has nothing to wait for and is refused, so
-        // the guarded direct merge goes ahead after a fresh read.
-        assert_eq!(forge.calls(), ["view", "view", "merge", "view", "merge"]);
+        // One fresh read, then the head-bound merge.
+        assert_eq!(forge.calls(), ["view", "view", "merge", "view"]);
         assert_eq!(state.status, RunStatus::Merged);
+    }
+
+    #[tokio::test]
+    async fn a_successful_merge_command_that_only_queued_is_not_a_merge() {
+        let mut state = landing_state();
+        let forge = Scripted::new(
+            vec![seen("a", Checks::Green, "CLEAN", false)],
+            std::iter::repeat_n((true, ""), 100).collect(),
+        );
+        *forge.queued.lock().unwrap() = true;
+        let task = async {
+            land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+                .await
+                .unwrap();
+        };
+        // Still open after the command succeeded: it keeps watching and
+        // never records a merge (it stops at the wait ceiling instead).
+        task.await;
+        assert_ne!(state.status, RunStatus::Merged);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_forge_after_a_merge_command_is_not_a_confirmation() {
+        let mut state = landing_state();
+        let forge = Scripted::new(
+            vec![seen("a", Checks::Green, "CLEAN", false)],
+            std::iter::repeat_n((true, ""), 100).collect(),
+        );
+        *forge.unreadable_after_merge.lock().unwrap() = true;
+        land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+            .await
+            .ok();
+        assert_ne!(state.status, RunStatus::Merged);
     }
 
     #[tokio::test]
@@ -6310,7 +6315,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 seen("new", Checks::Pending, "BLOCKED", true),
                 seen("new", Checks::Green, "CLEAN", true),
             ],
-            vec![(false, CLEAN_REFUSAL), (true, "")],
+            vec![(true, "")],
         );
         *forge.fix.lock().unwrap() = Some(Fixed::Committed {
             head: "NEW".to_owned(),
@@ -6322,7 +6327,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             forge.calls(),
             [
                 "view", "fix", "poll", "view", "poll", "view", "poll", "view", "view", "merge",
-                "view", "merge"
+                "view"
             ]
         );
         assert_eq!(state.status, RunStatus::Merged);
@@ -6364,7 +6369,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 seen("a", Checks::Pending, "BLOCKED", false),
                 seen("a", Checks::Green, "CLEAN", false),
             ],
-            vec![(false, REFUSED), (false, CLEAN_REFUSAL), (true, "")],
+            vec![(false, REFUSED), (true, "")],
         );
         land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
             .await
@@ -6373,7 +6378,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             forge.calls(),
             [
                 "view", "view", "merge", "view", "poll", "view", "poll", "view", "view", "merge",
-                "view", "merge"
+                "view"
             ]
         );
         assert_eq!(state.status, RunStatus::Merged);
@@ -6396,10 +6401,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(forge.calls().iter().filter(|c| **c == "merge").count(), 2);
         let why = state.merge.as_ref().unwrap().detail.clone();
         assert!(
-            why.contains("policy prohibits")
-                && why.contains("BLOCKED")
-                && why.contains("requirements are not met")
-                && !why.contains("not available"),
+            why.contains("policy prohibits") && why.contains("BLOCKED") && why.contains("refused"),
             "{why}"
         );
         assert_eq!(state.status, RunStatus::Blocked);
@@ -6523,12 +6525,12 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let mut state = landing_state();
         let forge = Scripted::new(
             vec![seen("a", Checks::Red, "CLEAN", false)],
-            vec![(false, CLEAN_REFUSAL), (true, "")],
+            vec![(true, "")],
         );
         land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
             .await
             .unwrap();
-        assert_eq!(forge.calls(), ["view", "view", "merge", "view", "merge"]);
+        assert_eq!(forge.calls(), ["view", "view", "merge", "view"]);
         assert_eq!(state.status, RunStatus::Merged);
     }
 
@@ -6543,7 +6545,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 seen("b", Checks::Green, "BLOCKED", false),
                 seen("b", Checks::Green, "CLEAN", false),
             ],
-            vec![(false, REFUSED), (false, CLEAN_REFUSAL), (true, "")],
+            vec![(false, REFUSED), (true, "")],
         );
         land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
             .await
@@ -6551,7 +6553,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(
             forge.calls(),
             [
-                "view", "view", "merge", "view", "poll", "view", "view", "merge", "view", "merge"
+                "view", "view", "merge", "view", "poll", "view", "view", "merge", "view"
             ]
         );
         assert_eq!(state.status, RunStatus::Merged);
@@ -6575,87 +6577,40 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     const URL: &str = "https://github.com/o/r/pull/42";
 
     #[tokio::test]
-    async fn the_merge_step_arms_auto_merge_on_the_observed_head_and_keeps_watching() {
+    async fn the_merge_step_merges_directly_on_the_observed_head_and_never_arms() {
         let mut state = landing_state();
         let forge = Scripted::new(
             vec![
                 seen("abc", Checks::Green, "CLEAN", false),
                 seen("abc", Checks::Green, "CLEAN", false),
-                seen("abc", Checks::Pending, "BLOCKED", false),
-                merged_view("abc"),
             ],
             vec![(true, "")],
         );
         land_with(&mut state, URL, &forge).await.unwrap();
-        assert_eq!(
-            forge.calls(),
-            ["view", "view", "merge", "poll", "view", "poll", "view"]
-        );
+        assert_eq!(forge.calls(), ["view", "view", "merge", "view"]);
         let argv = &forge.argvs()[0];
-        assert!(has(argv, "--squash") && has(argv, "--auto") && has(argv, "--subject"));
-        assert!(!has(argv, "--admin"));
+        assert!(has(argv, "--squash") && has(argv, "--subject"));
+        assert!(!has(argv, "--auto") && !has(argv, "--admin"));
         assert_eq!(value_of(argv, "--match-head-commit"), Some("abc"));
         assert_eq!(state.status, RunStatus::Merged);
         assert!(state.land_armed_head.is_none());
-        assert!(
-            state
-                .events
-                .iter()
-                .any(|e| e.message.contains("auto-merge armed on abc")),
-            "the arm is recorded with its head"
-        );
     }
 
     #[tokio::test]
-    async fn a_fix_round_after_arming_disables_auto_merge_before_it_runs() {
+    async fn a_resume_disables_an_arm_left_by_an_older_build_before_merging() {
         let mut state = landing_state();
+        state.land_armed_head = Some("a".to_owned());
         let forge = Scripted::new(
-            vec![
-                seen("a", Checks::Green, "CLEAN", false),
-                seen("a", Checks::Green, "CLEAN", false),
-                // A review comment arrives while armed.
-                seen("a", Checks::Green, "CLEAN", true),
-                seen("b", Checks::Green, "CLEAN", false),
-                seen("b", Checks::Green, "CLEAN", false),
-                merged_view("b"),
-            ],
-            vec![(true, ""), (true, ""), (true, "")],
+            vec![seen("a", Checks::Green, "CLEAN", false)],
+            vec![(true, ""), (true, "")],
         );
-        *forge.fix.lock().unwrap() = Some(Fixed::Committed {
-            head: "b".to_owned(),
-        });
         land_with(&mut state, URL, &forge).await.unwrap();
-        assert_eq!(
-            forge.calls(),
-            [
-                "view", "view", "merge", "poll", "view", "merge", "fix", "poll", "view", "view",
-                "merge", "poll", "view"
-            ]
-        );
         let argvs = forge.argvs();
-        assert!(has(&argvs[1], "--disable-auto"));
-        // Re-armed afterwards, on the new head only.
-        assert!(has(&argvs[2], "--auto"));
-        assert_eq!(value_of(&argvs[2], "--match-head-commit"), Some("b"));
+        assert!(has(&argvs[0], "--disable-auto"));
+        assert!(!has(&argvs[1], "--auto"));
+        assert_eq!(value_of(&argvs[1], "--match-head-commit"), Some("a"));
         assert_eq!(state.status, RunStatus::Merged);
-    }
-
-    #[tokio::test]
-    async fn a_failed_disable_stops_before_the_fix_pushes_anything() {
-        let mut state = landing_state();
-        let forge = Scripted::new(
-            vec![
-                seen("a", Checks::Green, "CLEAN", false),
-                seen("a", Checks::Green, "CLEAN", false),
-                seen("a", Checks::Green, "CLEAN", true),
-            ],
-            vec![(true, ""), (false, "disable exploded")],
-        );
-        land_with(&mut state, URL, &forge).await.unwrap();
-        assert!(!forge.calls().contains(&"fix"));
-        assert_eq!(state.status, RunStatus::Blocked);
-        let why = state.merge.as_ref().unwrap().detail.clone();
-        assert!(why.contains("disable exploded"), "{why}");
+        assert!(state.land_armed_head.is_none());
     }
 
     #[tokio::test]
@@ -6715,49 +6670,22 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     }
 
     #[tokio::test]
-    async fn the_fallback_merges_only_on_the_approved_head() {
+    async fn the_merge_is_bound_to_the_head_it_was_decided_on() {
         let mut state = landing_state();
         let forge = Scripted::new(
             vec![
                 seen("a", Checks::Green, "CLEAN", false),
-                seen("a", Checks::Green, "CLEAN", false),
-                // The fresh read before the direct merge: someone pushed.
+                // The fresh read before the merge: someone pushed.
                 seen("b", Checks::Green, "CLEAN", false),
             ],
-            vec![(false, UNAVAILABLE), (false, UNAVAILABLE), (true, "")],
+            vec![(true, "")],
         );
         land_with(&mut state, URL, &forge).await.unwrap();
-        let direct: Vec<_> = forge
-            .argvs()
-            .into_iter()
-            .filter(|a| !has(a, "--auto"))
-            .collect();
-        assert_eq!(direct.len(), 1, "no merge was tried on the moved head");
-        assert_eq!(value_of(&direct[0], "--match-head-commit"), Some("b"));
+        let argvs = forge.argvs();
+        assert_eq!(argvs.len(), 1, "no merge was tried on the moved head");
+        assert!(!has(&argvs[0], "--auto"));
+        assert_eq!(value_of(&argvs[0], "--match-head-commit"), Some("b"));
         assert_eq!(state.status, RunStatus::Merged);
-    }
-
-    #[tokio::test]
-    async fn an_unavailable_auto_merge_and_unmet_requirements_stop_differently() {
-        let mut state = landing_state();
-        let forge = Scripted::new(
-            vec![seen("a", Checks::Green, "CLEAN", false)],
-            vec![
-                (false, UNAVAILABLE),
-                (false, REFUSED),
-                (false, UNAVAILABLE),
-                (false, REFUSED),
-            ],
-        );
-        land_with(&mut state, URL, &forge).await.unwrap();
-        let why = state.merge.as_ref().unwrap().detail.clone();
-        assert!(
-            why.contains("not available")
-                && why.contains("Auto merge is not allowed")
-                && why.contains("policy prohibits")
-                && !why.contains("requirements are not met"),
-            "{why}"
-        );
     }
 
     fn passing(label: &str) -> CheckInfo {
@@ -6816,59 +6744,6 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(encode_path_segment("release/1.x"), "release%2F1.x");
     }
 
-    #[tokio::test]
-    async fn an_armed_merge_that_never_happens_stops_naming_what_github_waits_for() {
-        let mut state = landing_state();
-        let mut waiting = seen("a", Checks::Pending, "BLOCKED", false);
-        waiting.contexts = vec![
-            CheckInfo {
-                label: "build".to_owned(),
-                verdict: Verdict::Pending,
-                required: Some(true),
-            },
-            CheckInfo {
-                label: "lint".to_owned(),
-                verdict: Verdict::Fail,
-                required: None,
-            },
-            CheckInfo {
-                label: "docs".to_owned(),
-                verdict: Verdict::Pending,
-                required: Some(false),
-            },
-        ];
-        let forge = Scripted::new(
-            vec![
-                seen("a", Checks::Green, "CLEAN", false),
-                seen("a", Checks::Green, "CLEAN", false),
-                waiting,
-            ],
-            vec![(true, ""), (true, "")],
-        );
-        land_with(&mut state, URL, &forge).await.unwrap();
-        assert_eq!(state.status, RunStatus::Blocked);
-        let why = state.merge.as_ref().unwrap().detail.clone();
-        assert!(
-            why.contains("BLOCKED")
-                && why.contains("build (pending)")
-                && why.contains("could not be read")
-                && why.contains("lint (failed)")
-                && !why.contains("docs"),
-            "{why}"
-        );
-        assert!(has(forge.argvs().last().unwrap(), "--disable-auto"));
-        assert!(state.land_armed_head.is_none());
-    }
-
-    #[test]
-    fn only_known_wordings_mean_auto_merge_is_unavailable() {
-        assert!(automerge_unavailable(UNAVAILABLE));
-        assert!(automerge_unavailable(CLEAN_REFUSAL));
-        assert!(!automerge_unavailable(REFUSED));
-        assert!(!automerge_unavailable("Head branch was modified"));
-        assert!(!automerge_unavailable(""));
-    }
-
     #[test]
     fn the_direct_merge_guard_needs_the_approved_head_bound_to_its_checks() {
         let shown = BTreeSet::new();
@@ -6909,23 +6784,5 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(state.land_armed_head.as_deref(), Some("a"));
         let why = state.merge.as_ref().unwrap().detail.clone();
         assert!(why.contains("disable exploded"), "{why}");
-    }
-
-    #[tokio::test]
-    async fn an_immediately_mergeable_pull_request_is_not_armed_from_a_moved_head() {
-        let mut state = landing_state();
-        // The pre-arm read finds a different head: nothing is sent to the forge
-        // for the stale one.
-        let forge = Scripted::new(
-            vec![
-                seen("a", Checks::Green, "CLEAN", false),
-                seen("b", Checks::Pending, "BLOCKED", false),
-                merged_view("b"),
-            ],
-            vec![],
-        );
-        land_with(&mut state, URL, &forge).await.unwrap();
-        assert!(forge.argvs().is_empty());
-        assert_eq!(state.status, RunStatus::Merged);
     }
 }
