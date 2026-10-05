@@ -990,7 +990,13 @@ timeout_minutes = 30                # per command
   Progress is saved *before* every step, so a step that was started and never
   finished (crash, kill) is **unfinished, not failed**: magi cannot know whether
   `gh release create` reached the forge, so it holds with that wording and the
-  owner decides. Write the commands to be safe to repeat.
+  owner decides. Write the commands to be safe to repeat. The failure is saved
+  together with the cleared step, so a stop in between cannot make a failed
+  command look retryable. A held job **keeps its checkout** (a resumed
+  `gh release create` needs what `cargo build --release` made); only a finished
+  release removes it. The task that opened the PR (found through the run id
+  recorded at registration) is held with `hold_machine`, since the daemon
+  marked it Done at the merge.
 - **Needs `magi serve`** (the watcher is a task inside it) and
   `[daemon] release_stall_minutes > 0` (`0` switches the watcher off, local
   releases included). The per-repo config is read with `Config::discover(repo,

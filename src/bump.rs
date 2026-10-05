@@ -2020,7 +2020,7 @@ async fn open_bump_pr(
     if state.config.release.is_local() {
         // Watched from now on, so a pull request merged before the watcher's
         // first lap still gets released.
-        crate::release_watch::register(&crate::run::home(), &state.repo, &url);
+        crate::release_watch::register(&crate::run::home(), &state.repo, &url, &state.id);
         return Ok((url, AutomergeOutcome::LocalGate));
     }
     let outcome = match gh_enable_automerge(worktree, &url).await {

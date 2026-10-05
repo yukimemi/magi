@@ -225,8 +225,13 @@ pub async fn run_job(env: &Env<'_>, job: &mut Job, save: Save<'_>) -> Result<()>
     let dir = job_dir(env.home, env.key);
     let wt = dir.join("wt");
     let result = drive(env, &dir, &wt, job, save).await;
-    // Best effort: a leftover worktree is replaced on the next attempt.
-    let _ = git::worktree_remove(env.repo, &wt).await;
+    // A held job keeps its checkout: a resumed command (say `gh release
+    // create`) needs what an earlier one built (`target/release/...`), and a
+    // fresh checkout would skip the build and attach nothing. Only a finished
+    // release cleans up.
+    if job.finished {
+        let _ = git::worktree_remove(env.repo, &wt).await;
+    }
     result
 }
 
@@ -235,32 +240,40 @@ async fn drive(env: &Env<'_>, dir: &Path, wt: &Path, job: &mut Job, save: Save<'
     if job.commit.is_empty() {
         bail!("the merge commit of {} is unknown", job.pr_url);
     }
-    if wt.exists() {
-        let _ = git::worktree_remove(repo, wt).await;
-        let _ = std::fs::remove_dir_all(wt);
-    }
-    // The merge commit exists on the remote; this checkout may not have it yet.
-    // A failed fetch is only fatal if the commit is still missing.
-    let fetched = git::git_raw(repo, &["fetch", "--quiet", remote]).await?;
-    if !git::rev_exists(repo, &format!("{}^{{commit}}", job.commit)).await {
-        bail!(
-            "the merge commit {} is not available locally (git fetch {remote}: {})",
-            job.commit,
-            fetched.stderr
-        );
-    }
-    git::worktree_add_detached(repo, wt, &job.commit)
-        .await
-        .context("check out the merge commit")?;
-    let head = git::rev_parse(wt, "HEAD").await?;
-    if head != job.commit {
-        bail!(
-            "the release checkout is at {head}, not the merge commit {}",
-            job.commit
-        );
-    }
-    if !git::is_clean(wt).await? {
-        bail!("the release checkout is not clean");
+    // Resuming after progress reuses the checkout the finished steps ran in
+    // (it is no longer "clean": their output is there, which is the point).
+    let progressed = job.tag_done || job.done > 0;
+    let reusable = progressed
+        && wt.exists()
+        && git::rev_parse(wt, "HEAD").await.ok().as_deref() == Some(job.commit.as_str());
+    if !reusable {
+        if wt.exists() {
+            let _ = git::worktree_remove(repo, wt).await;
+            let _ = std::fs::remove_dir_all(wt);
+        }
+        // The merge commit exists on the remote; this checkout may not have it
+        // yet. A failed fetch is only fatal if the commit is still missing.
+        let fetched = git::git_raw(repo, &["fetch", "--quiet", remote]).await?;
+        if !git::rev_exists(repo, &format!("{}^{{commit}}", job.commit)).await {
+            bail!(
+                "the merge commit {} is not available locally (git fetch {remote}: {})",
+                job.commit,
+                fetched.stderr
+            );
+        }
+        git::worktree_add_detached(repo, wt, &job.commit)
+            .await
+            .context("check out the merge commit")?;
+        let head = git::rev_parse(wt, "HEAD").await?;
+        if head != job.commit {
+            bail!(
+                "the release checkout is at {head}, not the merge commit {}",
+                job.commit
+            );
+        }
+        if !git::is_clean(wt).await? {
+            bail!("the release checkout is not clean");
+        }
     }
     if let Ok(toml) = std::fs::read_to_string(wt.join("Cargo.toml")) {
         match crate::bump::current_version(&toml) {
@@ -308,7 +321,6 @@ async fn drive(env: &Env<'_>, dir: &Path, wt: &Path, job: &mut Job, save: Save<'
             code,
             tail: tail(&output, TAIL),
         });
-        job.running = None;
         if code != Some(0) {
             let why = match code {
                 Some(c) => format!("command {} `{command}` exited {c}", n + 1),
@@ -318,9 +330,14 @@ async fn drive(env: &Env<'_>, dir: &Path, wt: &Path, job: &mut Job, save: Save<'
                     release.timeout_minutes
                 ),
             };
+            // `failed` is saved together with the cleared step: a stop between
+            // the two must never read as an unmarked, retryable job.
+            job.failed = Some(why.clone());
+            job.running = None;
             let _ = save(job);
             bail!("{why}");
         }
+        job.running = None;
         job.done += 1;
         if !save(job) {
             bail!(
@@ -613,6 +630,43 @@ mod tests {
         assert_eq!(job.done, 3);
         assert_eq!(tags_before, g(&f.remote, &["tag", "-l"]));
         assert_eq!(job.log.iter().filter(|l| l.name == "true").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_never_saved_as_a_plain_unmarked_job_and_the_checkout_survives() {
+        let f = fixture();
+        let mut job = Job::new("1.0.0", "u", &f.commit);
+        let rel = release(&["touch built.txt", "exit 1"]);
+        let shell = vec!["sh".to_owned(), "-c".to_owned()];
+        let env = Env {
+            repo: &f.repo,
+            home: &f.home,
+            key: "o/r#1",
+            remote: "origin",
+            shell: &shell,
+            release: &rel,
+        };
+        let mut seen: Vec<Job> = Vec::new();
+        run_job(&env, &mut job, &mut |j: &Job| {
+            seen.push(j.clone());
+            true
+        })
+        .await
+        .unwrap_err();
+        // Every saved state either is mid-step or carries the failure.
+        assert!(
+            seen.iter()
+                .all(|j| j.running.is_some() || j.failed.is_some() || j.done > 0 || j.tag_done)
+        );
+        assert!(seen.last().unwrap().failed.is_some());
+        // The first command's output is still there for the resumed one.
+        let wt = job_dir(&f.home, "o/r#1").join("wt");
+        assert!(wt.join("built.txt").exists());
+        job.resume();
+        let rel = release(&["touch built.txt", "test -f built.txt"]);
+        go(&f, &rel, &mut job).await.unwrap();
+        assert!(job.finished);
+        assert!(!wt.exists(), "a finished release removes its checkout");
     }
 
     #[tokio::test]

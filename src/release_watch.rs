@@ -118,6 +118,9 @@ pub(crate) struct WatchState {
     /// Local mode: the head the owner held or whose merge was refused; no new
     /// approval question until the head moves.
     pub held_head: Option<String>,
+    /// Local mode: the run that opened this release PR, so a failed release can
+    /// hold the task that run finished (the daemon marks it Done at the merge).
+    pub run: Option<String>,
     /// Local mode: the release after the merge.
     pub job: Option<Job>,
 }
@@ -323,7 +326,7 @@ pub(crate) fn decide_local(head: &str, st: &WatchState, approved: Approved) -> L
 
 /// Start watching a release pull request before the first lap sees it, so one
 /// merged within a lap of being opened still gets released. Never overwrites.
-pub(crate) fn register(home: &Path, repo: &Path, url: &str) {
+pub(crate) fn register(home: &Path, repo: &Path, url: &str, run: &str) {
     let Some(pr) = pr_key(url) else {
         return;
     };
@@ -334,6 +337,7 @@ pub(crate) fn register(home: &Path, repo: &Path, url: &str) {
     let st = WatchState {
         repo: repo.to_string_lossy().into_owned(),
         url: url.to_owned(),
+        run: Some(run.to_owned()),
         ..WatchState::default()
     };
     w.save(&pr, &st);
@@ -888,10 +892,32 @@ impl Watcher {
             }
             Err(e) => {
                 job.failed = Some(format!("{e:#}"));
+                self.hold_task(&st, &format!("release {} failed: {e:#}", job.tag()));
                 self.raise(pr, failed_message(pr));
                 self.file_job_question(pr, &mut st, &job);
                 st.job = Some(job);
                 self.save(pr, &st);
+            }
+        }
+    }
+
+    /// Hold the task whose run opened this release PR: the daemon marked it
+    /// Done when the change merged, but the release is not done. Best-effort;
+    /// a task the owner already holds or that cannot be found is left alone.
+    fn hold_task(&self, st: &WatchState, reason: &str) {
+        let Some(run) = &st.run else {
+            return;
+        };
+        let q = crate::queue::Queue::at(self.home.join("queue"));
+        for mut t in q.list() {
+            if t.runs.iter().any(|r| r == run) {
+                if t.status != crate::queue::TaskStatus::Held {
+                    t.hold_machine(Some(reason.to_owned()));
+                    if let Err(e) = q.put(&mut t) {
+                        tracing::warn!("could not hold task {} for {run}: {e:#}", t.id);
+                    }
+                }
+                return;
             }
         }
     }
@@ -1531,9 +1557,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_release_holds_the_task_whose_run_opened_the_pr() {
+        let (d, fake, w) = rig();
+        *fake.local.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Merged, "h1", vec![]));
+        *fake.info.lock().unwrap() = Some(PrInfo {
+            branch: "chore/release-v1.0.0".to_owned(),
+            merge_commit: Some("deadbeef".to_owned()),
+            title: "t".to_owned(),
+        });
+        let repo = d.path().join("nowhere");
+        let q = crate::queue::Queue::at(d.path().join("queue"));
+        let mut t = crate::queue::Task::new(
+            "t".to_owned(),
+            "i".to_owned(),
+            repo.clone(),
+            crate::queue::Source::Human,
+        );
+        t.runs.push("run1".to_owned());
+        t.status = crate::queue::TaskStatus::Done;
+        q.put(&mut t).unwrap();
+        register(d.path(), &repo, URL, "run1");
+        w.lap(std::slice::from_ref(&repo), 60, 1, &(|| false)).await;
+        let held = q.get(&t.id).unwrap();
+        assert_eq!(held.status, crate::queue::TaskStatus::Held);
+        assert!(
+            held.hold_reason
+                .unwrap_or_default()
+                .contains("release v1.0.0")
+        );
+    }
+
+    #[tokio::test]
     async fn a_pull_request_registered_at_open_is_picked_up_even_if_unlisted() {
         let (d, _fake, w) = rig();
-        register(d.path(), Path::new("/r"), URL);
+        register(d.path(), Path::new("/r"), URL, "run1");
         let st = w.load("o/r#7");
         assert_eq!(st.url, URL);
         assert_eq!(st.repo, "/r");
@@ -1541,7 +1599,7 @@ mod tests {
         let mut live = st.clone();
         live.head = "keep".to_owned();
         w.save("o/r#7", &live);
-        register(d.path(), Path::new("/r"), URL);
+        register(d.path(), Path::new("/r"), URL, "run1");
         assert_eq!(w.load("o/r#7").head, "keep");
     }
 }
