@@ -3290,12 +3290,13 @@ fn report_task_outcome(task: &magi::queue::Task) -> Result<()> {
 /// How long an agent seat follows the loop's run before handing control back:
 /// the shell tool it runs in kills a longer wait, and a seat whose own run
 /// holds the loop's urgent lane could otherwise wait for itself. Same slice
-/// as `magi ask --wait`.
+/// as `magi ask --wait`. Running out is reported as an error, never as exit 0.
 const AGENT_FOLLOW: std::time::Duration = std::time::Duration::from_secs(240);
 
 /// Follow a task the live loop runs until it finishes, then report its run.
 /// An operator follows to the end; an agent seat stops after
-/// [`AGENT_FOLLOW`] with exit 0 and the task id, like a pending `magi ask`.
+/// [`AGENT_FOLLOW`] and exits non-zero: the outcome is unknown, so it must not
+/// read as a success. The error names the task id and `magi task show`.
 async fn follow_task(queue: &Queue, home: &Path, id: &str) -> Result<()> {
     let followed = magi::direct::follow(
         queue,
@@ -3307,12 +3308,8 @@ async fn follow_task(queue: &Queue, home: &Path, id: &str) -> Result<()> {
         |line| println!("{line}"),
     )
     .await?;
-    if !followed.finished {
-        println!(
-            "still running under the loop; read the outcome with `magi task show {}`",
-            followed.task.short()
-        );
-        return Ok(());
+    if let Some(err) = followed.unfinished() {
+        return Err(err);
     }
     report_task_outcome(&followed.task)
 }
