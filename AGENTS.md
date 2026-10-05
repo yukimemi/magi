@@ -1650,3 +1650,19 @@ MAGI_CHROME=/path/to/chrome cargo test --test web_render   # name a binary expli
 - The Runs page keeps finished runs in a collapsed section that renders no rows
   until opened, so the harness seeds one in-flight run and only requires that
   one (`Case::expect`).
+
+### Every run belongs to a task
+
+`magi run` / `magi review` file a task first (`direct::file`), then either hand
+it to a live foreign loop as `urgent` and follow it (`direct::follow`; it never
+takes the task over if the loop dies), or claim it *before writing it* and run
+it in-process through `daemon::run_claimed` - the daemon's own `attempt`, so
+attempts, quota refunds and parking are counted one way. Liveness is
+`daemon::foreign_loop` (fresh heartbeat, pid not ours), shared with the web UI;
+a claim's success says nothing about whether a loop lives. CLI choices
+(`--merge`, `-c`, ...) live in `Task::overrides`; `Task::review_of` is an
+explicit review that fails on a missing branch instead of falling back to a
+competition (unlike the conductor's `review_branch`). A standalone run that
+leaves its task runnable **holds** it: nobody asked for an automatic retry.
+`--dry-run` never hands over. There is no run without a task: `--resume` files
+one when the run has none.

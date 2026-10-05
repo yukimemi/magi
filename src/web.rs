@@ -1952,17 +1952,10 @@ impl Foreign {
     /// Another process's live loop, or `None` when this process is free to
     /// run one.
     fn of(reading: Option<&daemon::Reading>) -> Option<Self> {
-        let reading = reading?;
-        if !reading.running(Timestamp::now()) {
-            return None;
-        }
-        match reading.pid {
-            Some(pid) if pid == std::process::id() => None,
-            // A fresh heartbeat with no pid in it is still evidence of a live
-            // daemon. "Some other process" is the honest answer, and refusing
-            // to start beside it is the safe one.
-            pid => Some(Self { pid }),
-        }
+        // A fresh heartbeat with no pid in it is still evidence of a live
+        // daemon. "Some other process" is the honest answer, and refusing
+        // to start beside it is the safe one.
+        daemon::foreign_loop(reading, Timestamp::now(), std::process::id()).map(|pid| Self { pid })
     }
 
     /// How a conflict names it. The pid is the whole point of the message: it

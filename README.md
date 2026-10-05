@@ -166,6 +166,16 @@ by resume: magi preserves the recorded command output, reports the run as
 follow-up run instead; this avoids presenting an old failed command as a new
 verification attempt.
 
+**Every run is a task.** `magi run` and `magi review` first file a task in the
+queue (the same path as `magi task add`) and print its id - open it with
+`magi task show <id>`. If a `magi serve` / `magi web` loop is alive on this
+machine the task is filed `urgent` (its own one-slot lane, other runs are not
+paused) and the command follows the loop's run and exits with its outcome;
+otherwise the command runs the task itself, holding its claim so a loop that
+starts meanwhile cannot take it. `--merge`, `-c`, `-j`, `--review-rounds`,
+`--seed` and `--config` ride on the task, so they hold either way. A run that
+fails standalone leaves its task `held` (`magi task release` retries it).
+
 `magi run` starts spending money, so an instruction whose first word names a
 subcommand is refused as a probable typo: there is no `magi run show`, and
 without the guard `magi run show 3cbf` opens worktrees and pays agents to

@@ -79,6 +79,10 @@ use crate::ask::Questions;
 /// tell a question filed for this hold from one about an older cause.
 /// Field-only, `#[serde(default)]`.
 ///
+/// 10: added [`Task::overrides`] and [`Task::review_of`], so a run started by
+/// hand (`magi run` / `magi review`) is carried by a task without losing its
+/// command-line choices. Field-only.
+///
 /// 3: added [`HoldSource`] so conductor recovery cannot release a hold an
 /// operator deliberately placed. Old records default to `None` and are
 /// protected as operator-held until an explicit release; the safe direction
@@ -93,7 +97,7 @@ use crate::ask::Questions;
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 9;
+pub const SCHEMA: u32 = 10;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,6 +434,21 @@ pub struct Task {
     /// deep it is. `None` for every ordinary task. `#[serde(default)]`.
     #[serde(default)]
     pub followup: Option<FollowUp>,
+    /// The command-line choices (`--merge`, `-c`, `--seed`, ...) of the
+    /// `magi run` / `magi review` that filed this task, applied on top of the
+    /// repository's config by whoever executes it - a daemon included - so
+    /// handing the task over does not change what it does. `None` for every
+    /// task filed any other way. `#[serde(default)]`.
+    #[serde(default)]
+    pub overrides: Option<RunOverrides>,
+    /// The branch an explicit `magi review <branch>` asked to review. Unlike
+    /// [`Task::review_branch`] (a recovery choice the daemon consumes and
+    /// drops back to a competition when the branch is gone), this is the whole
+    /// request: it is never consumed, and a missing branch fails the attempt
+    /// rather than paying for an implementation nobody asked for.
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub review_of: Option<String>,
     /// When the current hold began. Set by the transitions into
     /// [`TaskStatus::Held`] (a re-hold keeps it), cleared by
     /// [`Task::release`]. `crate::notices` uses it as the identity of the
@@ -440,6 +459,58 @@ pub struct Task {
     pub created_at: Timestamp,
     /// Last change to this file.
     pub updated_at: Timestamp,
+}
+
+/// Command-line choices carried by a task. See [`Task::overrides`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOverrides {
+    /// `--merge`: `none`, `local` or `pr`.
+    #[serde(default)]
+    pub merge: Option<String>,
+    /// `-c`: parallel implementations.
+    #[serde(default)]
+    pub candidates: Option<usize>,
+    /// `-j`: independent judges.
+    #[serde(default)]
+    pub judges: Option<usize>,
+    /// `--reviewers`: reviewers per round.
+    #[serde(default)]
+    pub reviewers: Option<usize>,
+    /// `--review-rounds`.
+    #[serde(default)]
+    pub review_rounds: Option<usize>,
+    /// `--seed`.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// `--config`, absolute: the daemon's own working directory differs.
+    #[serde(default)]
+    pub config: Option<PathBuf>,
+}
+
+impl RunOverrides {
+    /// Apply these on top of `config`.
+    pub fn apply(&self, config: &mut crate::config::Config) {
+        if let Some(n) = self.candidates {
+            config.graph.candidates = n;
+        }
+        if let Some(n) = self.judges {
+            config.graph.judges = n;
+        }
+        if let Some(n) = self.reviewers {
+            config.graph.reviewers = n;
+        }
+        if let Some(n) = self.review_rounds {
+            config.graph.review_rounds = n;
+        }
+        if let Some(m) = &self.merge
+            && let Ok(mode) = crate::daemon::merge_mode(m)
+        {
+            config.merge.mode = mode;
+        }
+        if let Some(s) = self.seed {
+            config.blind.seed = Some(s);
+        }
+    }
 }
 
 /// What a follow-up task came from. See [`Task::followup`].
@@ -528,6 +599,8 @@ impl Task {
             urgent: false,
             attachments: Vec::new(),
             followup: None,
+            overrides: None,
+            review_of: None,
             held_at: None,
             created_at: now,
             updated_at: now,
