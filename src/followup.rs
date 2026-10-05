@@ -675,7 +675,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::at(dir.path().join("queue"));
         let mut t = manual(text);
-        t.status = crate::queue::Status::Done;
+        t.status = crate::queue::TaskStatus::Done;
         q.put(&mut t).unwrap();
         let mut s = merged(two_seats());
         let out = file(&mut s, PR, &q).unwrap();
