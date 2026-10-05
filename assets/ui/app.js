@@ -1478,11 +1478,8 @@ function runSection(run) {
 
 /* ---- runs: state chips -------------------------------------------------- *
  * A second, independent lens on the same heads RUN_SECTIONS groups. The tree
- * above (runs-tree) narrows by section/repo but is desktop-only — see the
- * width gate on .runs-tree in app.css — so a phone, the primary way this
- * deck gets read, has never had a way to ask for anything but the full flood
- * of every run ever competed. These chips are that control, and unlike the
- * tree they render everywhere.
+ * The toolbar's scope select narrows by section/repo; these chips narrow by
+ * state. Both render everywhere, a phone included.
  *
  * Defaulting to "active" (in flight + waiting) rather than "all" is the
  * point: a finished run needs nobody's attention, and piling every merged,
@@ -1507,8 +1504,8 @@ function matchesRunState(run) {
 }
 
 /* runSection() and RUN_STATE_FILTERS read two different fields of a run
-   (status/waiting vs. done/waiting) and are picked independently — the tree
-   on the left and the chips on top — but renderRuns() ANDs them together.
+   (status/waiting vs. done/waiting) and are picked independently — the scope
+   select and the chips — but renderRuns() ANDs them together.
    Some pairings can never both be true for any run: every "landed"/"ended"
    run is done by construction, so pairing either with "Active" or "In
    flight" always yields zero cards, and "flight" (not done, not waiting)
@@ -1742,8 +1739,8 @@ function matchesFilter(run) {
   return !repo || repoLabel(run) === repo;
 }
 
-function selectRunsFilter(section, repo) {
-  const same = state.runsFilter.section === section && state.runsFilter.repo === (repo || null)
+function selectRunsFilter(section, repo, force) {
+  const same = !force && state.runsFilter.section === section && state.runsFilter.repo === (repo || null)
     && !state.runsFilter.status;
   state.runsFilter = same
     ? { section: null, repo: null, status: null }
@@ -1791,88 +1788,63 @@ function clearRunsFilter() {
   renderRuns();
 }
 
-function renderRunsTree(sections) {
-  const nav = $("runs-tree");
-  show(nav, sections.length > 0);
-
-  /* The tree is rebuilt from scratch below rather than reconciled node by
-     node — it is small, at most four sections and a handful of repos each —
-     but a full rebuild would otherwise drop keyboard focus on every poll, so
-     whichever node has it is found again afterwards by the (section, repo)
-     it names rather than by identity. */
-  const active = document.activeElement;
-  const focused = nav.contains(active)
-    ? { section: active.dataset.section, repo: active.dataset.repo || null }
-    : null;
-
+/* The scope control: one native <select>, a group per section with the
+   section itself first and its repositories under it. Rebuilt only when its
+   options change, so a live refresh never closes an open picker or moves
+   focus; the selection is then derived from state.runsFilter every time. */
+function renderRunsScope(sections) {
+  const wrap = $("runs-scope-wrap");
+  const select = $("runs-scope");
+  show(wrap, sections.length > 0);
   if (sections.length === 0) {
-    clear(nav);
+    clear(select);
     return;
   }
-  const root = el("ul", { class: "runs-tree-list" });
+  const options = [["", "All sections and repositories"]];
+  const groups = [];
   for (const section of sections) {
-    const on = state.runsFilter.section === section.key && !state.runsFilter.repo;
-    const sub = el("ul", { class: "runs-tree-sub" });
+    const items = [[JSON.stringify([section.key, null]), `${section.label} (${section.count})`]];
     for (const r of section.repos) {
-      const repoOn = state.runsFilter.section === section.key && state.runsFilter.repo === r.repo;
-      sub.append(el("li", {},
-        el("button", {
-          class: "runs-tree-node runs-tree-repo",
-          type: "button",
-          "data-section": section.key,
-          "data-repo": r.repo,
-          "aria-current": repoOn ? "true" : null,
-          onclick: () => selectRunsFilter(section.key, r.repo),
-        },
-          el("span", { class: "runs-tree-label", text: r.repo }),
-          el("span", { class: "runs-tree-count", text: String(r.count) }),
-        ),
-      ));
+      items.push([JSON.stringify([section.key, r.repo]), `\u2003${r.repo} (${r.count})`]);
     }
-    root.append(el("li", {},
-      el("button", {
-        class: "runs-tree-node",
-        type: "button",
-        "data-section": section.key,
-        "aria-current": on ? "true" : null,
-        onclick: () => selectRunsFilter(section.key, null),
-      },
-        el("span", { class: "runs-tree-label", text: section.label }),
-        el("span", { class: "runs-tree-count", text: String(section.count) }),
-      ),
-      sub,
-    ));
+    groups.push({ label: section.label, items });
   }
-  clear(nav);
-  nav.append(root);
-
-  if (focused) {
-    const match = [...nav.querySelectorAll(".runs-tree-node")].find((node) =>
-      node.dataset.section === focused.section && (node.dataset.repo || null) === focused.repo);
-    if (match) match.focus();
+  const signature = JSON.stringify([options, groups]);
+  if (select.dataset.signature !== signature) {
+    select.dataset.signature = signature;
+    clear(select);
+    select.append(el("option", { value: "", text: options[0][1] }));
+    for (const group of groups) {
+      select.append(el("optgroup", { label: group.label },
+        ...group.items.map(([value, text]) => el("option", { value, text }))));
+    }
   }
+  const { section, repo } = state.runsFilter;
+  const want = section ? JSON.stringify([section, repo || null]) : "";
+  if (select.value !== want) select.value = want;
+  setAttr(select, "data-active", want ? "1" : null);
 }
 
+function clearRunsScope() {
+  state.runsFilter = { ...state.runsFilter, section: null, repo: null };
+  renderRuns();
+}
+
+/* The section / repository scope is shown by the select itself; this line
+   only exists for the exact-status lens a stats tile sets, which nothing else
+   on the toolbar would name. */
 function renderRunsFilterBar() {
   const bar = $("runs-filter");
-  const { section, repo, status } = state.runsFilter;
-  if (!section && !status) {
+  const { status } = state.runsFilter;
+  if (!status) {
     show(bar, false);
     return;
-  }
-  const parts = [];
-  if (section) {
-    const label = (RUN_SECTIONS.find((s) => s.key === section) || {}).label || section;
-    parts.push(repo ? `${label} \u203a ${repo}` : label);
   }
   // STATS_VERDICT_BUCKETS is declared further down the file, but this only
   // ever runs from a render call, by which point the whole module has
   // already been evaluated once.
-  if (status) {
-    const bucket = STATS_VERDICT_BUCKETS.find((b) => b.key === status);
-    parts.push(bucket ? bucket.label : status);
-  }
-  setText($("runs-filter-text"), `Showing ${parts.join(" + ")}.`);
+  const bucket = STATS_VERDICT_BUCKETS.find((b) => b.key === status);
+  setText($("runs-filter-text"), `Status: ${bucket ? bucket.label : status}`);
   show(bar, true);
 }
 
@@ -2039,7 +2011,7 @@ function renderRuns() {
 
   if (runs === null) {
     setText($("runs-count"), "Loading\u2026");
-    show($("runs-tree"), false);
+    show($("runs-scope-wrap"), false);
     show($("runs-filter"), false);
     show($("runs-state-chips"), false);
     if (!sectionsRoot.dataset.skeleton) {
@@ -2097,7 +2069,7 @@ function renderRuns() {
      that empties "Landed" out of the visible cards must not also erase the
      tree's own way of reaching Landed, or "all"/"done" become the only way
      back in even though the tree is the desktop's whole point. */
-  renderRunsTree(buildRunsTree(groupBySection(heads)));
+  renderRunsScope(buildRunsTree(groupBySection(heads)));
   renderRunsFilterBar();
   const searching = searchable && searchText("runs") !== "";
   const searchKind = searching ? state.search.runs.status : "idle";
@@ -5645,8 +5617,6 @@ function syncRunPanels(run) {
   }
   const lines = String(run.instruction || "").split("\n").length;
   setText($("run-task-count"), plural(lines, "line", "lines"));
-  const events = Array.isArray(run.events) ? run.events.length : 0;
-  setText($("run-raw-count"), events ? `report \u00b7 ${plural(events, "event", "events")}` : "report");
 }
 
 function wireRunPanels() {
@@ -5664,6 +5634,7 @@ function renderRunDetail() {
   const report = state.detail.report;
 
   $("run-report").dataset.wrap = state.wrap ? "1" : "0";
+  applyRunTab();
 
   if (!run) {
     setText($("run-h"), "Loading run\u2026");
@@ -6205,7 +6176,10 @@ function renderLand(run) {
   // Same reasoning as the card link: an untrusted scheme is rendered as plain
   // text rather than as something tappable.
   const prHref = forgeUrl(pr.url);
-  box.append(
+  /* append() drops null / undefined / false / "" children; the native
+     Node.append would print the literal text "null" for a rail or a
+     follow-up list that has nothing to show. */
+  append(box, [
     el("div", { class: "land-top" },
       prHref
         ? el("a", {
@@ -6221,7 +6195,7 @@ function renderLand(run) {
     roundRail(pr),
     el("p", { class: "land-note", text: landNote(pr) }),
     followupList(run),
-  );
+  ]);
 }
 
 /* Tasks filed from the findings this run's merge left open. */
@@ -6274,84 +6248,37 @@ function reflectionLabel(reflection) {
   }
 }
 
-/* The design-deliberation stage's own convergence diagram. Deliberately not
-   `convergeDiagram`: that one draws a single gold diamond at the point where
-   one candidate is chosen over the others, and this stage does the opposite
-   — it blends every seat's proposal into one brief, so the merge point is a
-   plain filled circle, never a diamond, and every advisor line that produced
-   a proposal survives into it (only a failed seat's line fades to dashed). */
-function adviseConvergeDiagram(records, hasSynthesis) {
-  const width = 320;
-  const height = 132;
-  const midX = width / 2;
-  const knot = 96;
-  const count = Math.max(records.length, 1);
-
-  const labels = records.map((r) => r.seat).filter(Boolean).join(", ");
-  const root = svg("svg", {
-    viewBox: `0 0 ${width} ${height}`,
-    role: "img",
-    "aria-label": records.length
-      ? `${plural(records.length, "advisor", "advisors")} ${labels}${hasSynthesis ? "; blended into a synthesis brief" : "; no synthesis brief produced"}`
-      : "No advisor seats",
-  });
-
-  const span = Math.min(96, (width - 68) / Math.max(count - 1, 1));
-  const xs = records.map((_, i) => midX + (i - (count - 1) / 2) * span);
-
+/* The design-deliberation stage as one slim row: a chip per advisor seat
+   (tone dot, seat, agent, and how much of its proposal survived, in words as
+   well as colour), a hairline running to a "brief" marker. The marker is
+   filled when a synthesis exists and hollow when none came of it. */
+function adviseStrip(records, hasSynthesis) {
+  const nodes = [];
   records.forEach((record, i) => {
-    const x = xs[i];
-    const tone = candTone(i);
     const reflection = record.reflection || "absent";
-    const strong = reflection === "strong";
-    const absent = reflection === "absent";
-    const path = x === midX
-      ? `M ${x} 44 L ${x} ${knot}`
-      : `M ${x} 44 C ${x} ${knot - 22}, ${(x + midX) / 2} ${knot - 8}, ${midX} ${knot}`;
-
-    root.append(svg("path", {
-      d: path,
-      fill: "none",
-      stroke: tone,
-      "stroke-width": strong ? 4 : 2.5,
-      "stroke-linecap": "round",
-      "stroke-dasharray": absent ? "3 5" : null,
-      opacity: strong ? 1 : absent ? 0.35 : 0.6,
-    }));
-    root.append(svg("circle", {
-      cx: x, cy: 26, r: 13,
-      fill: absent ? "var(--sunk)" : tone,
-      stroke: tone,
-      "stroke-width": 2,
-      "stroke-dasharray": absent ? "3 3" : null,
-    }));
-    root.append(svg("text", {
-      x, y: 31,
-      "text-anchor": "middle",
-      fill: absent ? tone : "var(--surface)",
-      text: String(i + 1),
-    }));
+    nodes.push(el("span", {
+      class: "advise-chip",
+      role: "listitem",
+      "data-reflection": reflection,
+      style: `--chip-tone: ${candTone(i)}`,
+      title: `${record.seat || "?"}${record.agent ? ` (${record.agent})` : ""}: ${reflectionLabel(reflection)}`,
+    },
+      el("span", { class: "advise-dot", "aria-hidden": "true" }),
+      el("span", { class: "advise-seat", text: record.seat || "?" }),
+      el("span", { class: "advise-agent", text: record.agent || "" }),
+      el("span", { class: "advise-reflect", text: reflectionLabel(reflection) }),
+    ));
   });
-
-  if (hasSynthesis) {
-    root.append(svg("circle", {
-      cx: midX, cy: knot, r: 11,
-      fill: "var(--gold-line)",
-    }));
-    root.append(svg("path", {
-      d: `M ${midX} ${knot + 15} L ${midX} ${height - 8}`,
-      stroke: "var(--gold-line)", "stroke-width": 5, "stroke-linecap": "round",
-    }));
-  } else {
-    /* No brief came of it: the merge point stays hollow, same convention
-       `convergeDiagram` uses for "no verdict yet". */
-    root.append(svg("circle", {
-      cx: midX, cy: knot, r: 10,
-      fill: "none", stroke: "var(--line-2)", "stroke-width": 2, "stroke-dasharray": "3 3",
-    }));
-  }
-
-  return root;
+  nodes.push(
+    el("span", { class: "advise-link", "aria-hidden": "true" }),
+    el("span", {
+      class: "advise-brief",
+      role: "listitem",
+      "data-state": hasSynthesis ? "filled" : "empty",
+      text: hasSynthesis ? "brief" : "no brief",
+    }),
+  );
+  return nodes;
 }
 
 function renderAdvise(run) {
@@ -6363,9 +6290,10 @@ function renderAdvise(run) {
   const proposed = records.filter((r) => r.proposal).length;
   setText($("advise-count"), `${proposed} of ${plural(records.length, "advisor", "advisors")} proposed`);
 
-  const converge = $("advise-converge");
-  clear(converge);
-  converge.append(adviseConvergeDiagram(records, Boolean(advice.synthesis)));
+  const strip = $("advise-strip");
+  clear(strip);
+  append(strip, adviseStrip(records, Boolean(advice.synthesis)));
+  setText($("advise-proposals-count"), plural(records.length, "seat", "seats"));
 
   const synthesisEl = $("advise-synthesis");
   show(synthesisEl, Boolean(advice.synthesis));
@@ -6987,22 +6915,92 @@ function renderHandovers(run) {
   }
 }
 
+/* "1m 05s", "2h 03m", "<1s": an elapsed span for the timeline. */
+function spanText(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  const sec = Math.round(ms / 1000);
+  if (sec < 1) return "<1s";
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ${String(sec % 60).padStart(2, "0")}s`;
+  return `${Math.floor(min / 60)}h ${String(min % 60).padStart(2, "0")}m`;
+}
+
+/* Consecutive events of one node become one group. The run record has no
+   measured duration per node, so a group's span is "until the next group
+   began" and is labelled as an estimate: parallel nodes interleave their
+   events, and a measured figure would claim more than the record knows. */
+function groupEvents(events) {
+  const groups = [];
+  for (const event of events) {
+    const last = groups[groups.length - 1];
+    if (last && last.node === (event.node || "")) last.events.push(event);
+    else groups.push({ node: event.node || "", events: [event] });
+  }
+  groups.forEach((g, i) => {
+    const start = Date.parse(g.events[0].at);
+    const next = groups[i + 1] ? Date.parse(groups[i + 1].events[0].at) : NaN;
+    g.span = Number.isNaN(start) || Number.isNaN(next) ? "" : spanText(next - start);
+  });
+  return groups;
+}
+
 function renderTimeline(run) {
   const events = Array.isArray(run.events) ? run.events : [];
-  show($("run-events-panel"), events.length > 0);
-  if (events.length === 0) return;
+  setText($("run-events-count"), events.length ? plural(events.length, "event", "events") : "");
+  setText($("run-tab-timeline-count"), events.length ? String(events.length) : "");
+  show($("run-events-empty"), events.length === 0);
+  show($("run-events-note"), events.length > 0);
 
   const list = $("run-events");
   clear(list);
-  for (const event of events) {
-    list.append(el("li", {},
-      el("span", { class: "event-at", text: clock(event.at) }),
-      el("div", { class: "event-body" },
-        el("p", { class: "event-node", text: event.node || "" }),
-        el("p", { class: "event-msg", text: event.message || "" }),
+  for (const group of groupEvents(events)) {
+    list.append(el("li", { class: "tl-group" },
+      el("div", { class: "tl-head" },
+        el("span", { class: "tl-node", text: group.node || "\u2014" }),
+        group.span ? el("span", { class: "tl-span", title: "Estimated: time until the next event", text: `~${group.span}` }) : null,
+        group.events.length > 1 ? el("span", { class: "tl-n", text: `${group.events.length} events` }) : null,
+      ),
+      el("ul", { class: "tl-events" },
+        ...group.events.map((event) => el("li", {},
+          el("span", { class: "event-at", text: clock(event.at) }),
+          el("span", { class: "event-msg", text: event.message || "" }),
+        )),
       ),
     ));
   }
+}
+
+/* ---- run detail tabs ----------------------------------------------------- *
+ * The tab is part of the hash (#/runs/<id>/<tab>), so a deep link, back and
+ * forward and a live refresh all agree without any stored state. Nothing that
+ * loads data writes the hash. */
+const RUN_TABS = ["overview", "timeline", "report"];
+
+function applyRunTab() {
+  const tab = state.route.name === "run" ? state.route.tab : "overview";
+  const id = state.route.name === "run" ? state.route.id : "";
+  for (const name of RUN_TABS) {
+    const link = $(`run-tab-${name}`);
+    setAttr(link, "aria-selected", name === tab ? "true" : "false");
+    setAttr(link, "tabindex", name === tab ? null : "-1");
+    setAttr(link, "href", `#/runs/${encodeURIComponent(id)}/${name}`);
+    show($(`run-tabpanel-${name}`), name === tab);
+  }
+}
+
+function wireRunTabs() {
+  $("run-tabs").addEventListener("keydown", (event) => {
+    const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+    const home = event.key === "Home" ? 0 : event.key === "End" ? RUN_TABS.length - 1 : null;
+    if (!step && home === null) return;
+    event.preventDefault();
+    const at = RUN_TABS.indexOf(state.route.tab);
+    const next = home !== null ? home : (at + step + RUN_TABS.length) % RUN_TABS.length;
+    const link = $(`run-tab-${RUN_TABS[next]}`);
+    location.hash = link.getAttribute("href");
+    link.focus();
+  });
 }
 
 /* ---- loading ----------------------------------------------------------- */
@@ -7348,7 +7346,10 @@ function parseRoute() {
   if (parts[0] === "notifications") return { name: "notifications", id: null };
   if (parts[0] === "chat" && parts[1]) return { name: "talk", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "chat") return { name: "talks", id: null };
-  if (parts[0] === "runs" && parts[1]) return { name: "run", id: decodeURIComponent(parts[1]) };
+  if (parts[0] === "runs" && parts[1]) {
+    const tab = RUN_TABS.includes(parts[2]) ? parts[2] : "overview";
+    return { name: "run", id: decodeURIComponent(parts[1]), tab };
+  }
   return { name: "runs", id: null };
 }
 
@@ -7440,6 +7441,7 @@ function applyRoute() {
   }
 
   if (route.name === "run") {
+    applyRunTab();
     if (state.detail.id !== route.id) loadRun(route.id);
   } else {
     state.detail = { id: null, run: null, report: null };
@@ -8128,6 +8130,12 @@ function wire() {
   $("talk-agent").addEventListener("change", switchTalkAgent);
   $("talk-reopen-go").addEventListener("click", reopenTalk);
   wireRunPanels();
+  wireRunTabs();
+  $("runs-scope").addEventListener("change", (event) => {
+    const [section, repo] = event.target.value ? JSON.parse(event.target.value) : [null, null];
+    if (!section) clearRunsScope();
+    else selectRunsFilter(section, repo, true);
+  });
   $("talk-tasks-panel").addEventListener("toggle", () => {
     const panel = $("talk-tasks-panel");
     const talkId = panel.dataset.talkId;

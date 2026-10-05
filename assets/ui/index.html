@@ -146,29 +146,32 @@
       <p class="view-sub" id="runs-count">Loading…</p>
     </div>
     <div class="runs-layout">
-      <!-- Wide screens only; hidden by CSS on a phone, which also removes it
-           from the tab order, so a narrow viewport never has to skip past it. -->
-      <nav class="runs-tree" id="runs-tree" aria-label="Filter runs by state and repository" hidden></nav>
       <div class="runs-main">
-        <!-- The state chips, unlike the tree beside them, work on a phone too
-             (the tree is desktop-only, see .runs-tree in app.css) — this is
-             the only per-state control a phone gets, which is why it sits
-             above everything else rather than beside it. -->
-        <!-- Full-text search over everything a run recorded (statement,
-             candidates, reviews, verdicts, events, PR info, ids). Several
-             words are ANDed. Static, so refreshes never touch focus. -->
-        <div class="queue-search" id="runs-search" hidden>
-          <label class="sr-only" for="runs-search-input">Search runs</label>
-          <input type="search" id="runs-search-input" placeholder="Search runs… (all words must match)" autocomplete="off" spellcheck="false" enterkeyhint="search">
-          <button class="btn btn-quiet" type="button" id="runs-search-clear" hidden>Clear</button>
+        <!-- One static toolbar: search, scope (section / repository) and the
+             state segmented control. Built once and updated in place, so a
+             live refresh never moves focus. The scope is a native <select>,
+             which a scrolling pane cannot clip and a phone renders with its
+             own picker. -->
+        <div class="runs-toolbar" id="runs-toolbar">
+          <div class="runs-toolbar-row">
+            <div class="queue-search" id="runs-search" hidden>
+              <label class="sr-only" for="runs-search-input">Search runs</label>
+              <input type="search" id="runs-search-input" placeholder="Search runs… (all words must match)" autocomplete="off" spellcheck="false" enterkeyhint="search">
+              <button class="btn btn-quiet" type="button" id="runs-search-clear" hidden>Clear</button>
+            </div>
+            <div class="runs-scope" id="runs-scope-wrap" hidden>
+              <label class="sr-only" for="runs-scope">Section and repository</label>
+              <select id="runs-scope"></select>
+            </div>
+          </div>
+          <div class="state-chips" id="runs-state-chips" role="radiogroup" aria-label="Filter runs by state" hidden></div>
+          <div class="runs-filter" id="runs-filter" hidden>
+            <p id="runs-filter-text"></p>
+            <button class="btn btn-quiet" type="button" id="runs-filter-clear">Clear filter</button>
+          </div>
         </div>
         <p class="queue-search-status" id="runs-search-status" role="status" hidden></p>
         <ol class="cards" id="runs-search-extra" hidden></ol>
-        <div class="state-chips" id="runs-state-chips" role="radiogroup" aria-label="Filter runs by state" hidden></div>
-        <div class="runs-filter" id="runs-filter" hidden>
-          <p id="runs-filter-text"></p>
-          <button class="btn btn-quiet" type="button" id="runs-filter-clear">Clear filter</button>
-        </div>
         <div id="runs-sections"></div>
         <p class="empty" id="runs-state-empty" hidden>
           Nothing matches this state filter. Try "All".
@@ -201,10 +204,14 @@
       <p class="card-note run-task-line" id="run-task-line" hidden></p>
     </div>
 
-    <!-- On a phone both wrappers are display:contents, so these panels flow in
-         one column in source order. On a wide screen they become the analysis
-         column and the sticky report column. -->
+    <div class="run-tabs" id="run-tabs" role="tablist" aria-label="Run sections">
+      <a class="run-tab" role="tab" id="run-tab-overview" data-tab="overview" aria-controls="run-tabpanel-overview" href="#/runs">Overview</a>
+      <a class="run-tab" role="tab" id="run-tab-timeline" data-tab="timeline" aria-controls="run-tabpanel-timeline" href="#/runs">Timeline <span class="count" id="run-tab-timeline-count"></span></a>
+      <a class="run-tab" role="tab" id="run-tab-report" data-tab="report" aria-controls="run-tabpanel-report" href="#/runs">Report</a>
+    </div>
+
     <div class="run-main">
+     <div class="run-tabpanel" id="run-tabpanel-overview" role="tabpanel" aria-labelledby="run-tab-overview">
       <!-- First in the column: while a question is open nothing below it is
            going to change, so the operator should not have to scroll past a
            verdict that will not arrive to find the thing blocking it. -->
@@ -227,9 +234,12 @@
       <div class="panel" id="run-advise-panel" hidden>
         <h2>Design deliberation <span class="count" id="advise-count"></span></h2>
         <p class="panel-note">Advisor seats sketched a design each, read-only, before any implementer began — the record below is what fed the brief they were given.</p>
-        <div class="converge" id="advise-converge"></div>
+        <div class="advise-strip" id="advise-strip"></div>
         <p class="advise-synthesis" id="advise-synthesis" hidden></p>
-        <ol class="cands" id="run-advisors"></ol>
+        <details class="advise-proposals" id="advise-proposals" data-panel="advisors">
+          <summary>Proposals <span class="count" id="advise-proposals-count"></span></summary>
+          <ol class="cands" id="run-advisors"></ol>
+        </details>
       </div>
 
       <div class="panel" id="run-verdict" hidden>
@@ -266,22 +276,26 @@
         <p class="panel-note">A collapsed panel is a machine problem, not a verdict.</p>
         <ul class="plain" id="run-quota"></ul>
       </details>
+     </div>
 
-      <details class="panel advanced" id="run-raw-panel" data-panel="raw">
-        <summary>Raw <span class="count" id="run-raw-count"></span></summary>
-        <div id="run-report-panel">
-          <div class="panel-bar">
-            <h2>Report</h2>
-            <button class="btn btn-quiet" type="button" id="wrap-toggle" aria-pressed="false">Wrap</button>
-          </div>
-          <pre class="report" id="run-report" tabindex="0" aria-label="Run report">Loading…</pre>
-        </div>
+     <div class="run-tabpanel" id="run-tabpanel-timeline" role="tabpanel" aria-labelledby="run-tab-timeline" hidden>
+      <div class="panel" id="run-events-panel">
+        <h2>Timeline <span class="count" id="run-events-count"></span></h2>
+        <p class="panel-note" id="run-events-note">Durations are estimates: the time until the next recorded event, not a measured span.</p>
+        <ol class="tl" id="run-events"></ol>
+        <p class="empty" id="run-events-empty" hidden>No events recorded yet.</p>
+      </div>
+     </div>
 
-        <div id="run-events-panel" hidden>
-          <h2>Timeline</h2>
-          <ol class="timeline" id="run-events"></ol>
+     <div class="run-tabpanel" id="run-tabpanel-report" role="tabpanel" aria-labelledby="run-tab-report" hidden>
+      <div class="panel" id="run-report-panel">
+        <div class="panel-bar">
+          <h2>Report</h2>
+          <button class="btn btn-quiet" type="button" id="wrap-toggle" aria-pressed="false">Wrap</button>
         </div>
-      </details>
+        <pre class="report" id="run-report" tabindex="0" aria-label="Run report">Loading…</pre>
+      </div>
+     </div>
     </div>
   </section>
 

@@ -555,6 +555,232 @@ async fn runs_search_counts_extra_rows_as_shown_and_never_parses_hit_text() {
     browser.close_page(&page).await;
 }
 
+/// The run detail: tabs live in the hash and survive a live refresh, the
+/// landing panel never prints a null child, the deliberation strip is slim and
+/// the list pane has no nested scroller. Checked at both widths, in both themes.
+#[tokio::test]
+async fn run_detail_tabs_landing_and_strip_hold_at_both_widths_and_themes() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+
+    let id = "20260901-000009-cc09";
+    let mut run = RunState::new(
+        fx.repo.clone(),
+        "main".to_owned(),
+        "0000000".to_owned(),
+        "Merged run with no fix round and no follow-up".to_owned(),
+        fx.config.clone(),
+    );
+    run.id = id.to_owned();
+    run.status = RunStatus::Merged;
+    run.pr = Some(magi::run::PrRecord {
+        url: "https://github.com/example/repo/pull/7".to_owned(),
+        number: 7,
+        state: "merged".to_owned(),
+        checks: "green".to_owned(),
+        round: 0,
+        rounds: 3,
+        red_at_merge: Vec::new(),
+    });
+    run.event("implement", "candidate A started");
+    run.event("implement", "candidate B started");
+    run.event("judge", "ranking in");
+    run.advice = Some(magi::advise::Advice {
+        records: (1..=3)
+            .map(|n| {
+                magi::advise::AdvisorRecord::failed(n, format!("agent-{n}"), "no proposal".into())
+            })
+            .collect(),
+        synthesis: Some("A blended brief.".to_owned()),
+    });
+    run.save_under(&home).expect("seed run");
+
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome)
+        .await
+        .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
+    let w = Duration::from_secs(30);
+
+    for (width, height, mobile) in [(1280u32, 900u32, false), (390, 844, true)] {
+        for theme in ["light", "dark"] {
+            let tag = format!("run detail @{width}px {theme}");
+            let page = browser
+                .open_page(&format!("{base}#/runs/{id}"), width, height, mobile)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: open: {e}"));
+            browser
+                .eval(
+                    &page,
+                    &format!("document.documentElement.dataset.theme = '{theme}'; true"),
+                )
+                .await
+                .unwrap();
+            browser
+                .wait_for(&page, "!!document.querySelector('#run-land .land-top')", w)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: land never rendered: {e}"));
+
+            // No text node anywhere in the landing panel may be a bare
+            // null / undefined.
+            let bare = browser
+                .eval(
+                    &page,
+                    "(() => { const out = []; const walk = document.createTreeWalker(\
+                     document.getElementById('run-land'), NodeFilter.SHOW_TEXT); \
+                     while (walk.nextNode()) { const t = walk.currentNode.textContent.trim(); \
+                     if (t === 'null' || t === 'undefined') out.push(t); } return out; })()",
+                )
+                .await
+                .unwrap();
+            assert_eq!(bare, serde_json::json!([]), "{tag}: stringified child");
+
+            // The deliberation strip is slim.
+            let strip = browser
+                .eval(
+                    &page,
+                    "document.getElementById('advise-strip').getBoundingClientRect().height",
+                )
+                .await
+                .unwrap();
+            let strip = strip.as_f64().unwrap_or(f64::MAX);
+            assert!(strip > 0.0 && strip < 120.0, "{tag}: strip height {strip}");
+            assert_eq!(
+                browser
+                    .eval(
+                        &page,
+                        "document.querySelectorAll('#view-run svg.advise, #advise-converge').length"
+                    )
+                    .await
+                    .unwrap(),
+                0
+            );
+
+            // The Report tab shows the report and hides the overview.
+            browser
+                .eval(
+                    &page,
+                    &format!("location.hash = '#/runs/{id}/report'; true"),
+                )
+                .await
+                .unwrap();
+            browser
+                .wait_for(
+                    &page,
+                    "(() => { const r = document.getElementById('run-report'); \
+                     return !!r && r.offsetParent !== null; })()",
+                    w,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: report tab: {e}"));
+            assert_eq!(
+                browser
+                    .eval(
+                        &page,
+                        "document.getElementById('run-tabpanel-overview').hidden"
+                    )
+                    .await
+                    .unwrap(),
+                true,
+                "{tag}"
+            );
+
+            // A live refresh must leave the tab alone.
+            browser
+                .eval(&page, "fetch('/api/runs').then(() => true)")
+                .await
+                .unwrap();
+            browser.settle(Duration::from_millis(400)).await.unwrap();
+            let after = browser
+                .eval(
+                    &page,
+                    "({ hash: location.hash, report: !document.getElementById('run-tabpanel-report').hidden, \
+                        sel: document.getElementById('run-tab-report').getAttribute('aria-selected') })",
+                )
+                .await
+                .unwrap();
+            assert_eq!(after["hash"], format!("#/runs/{id}/report"), "{tag}");
+            assert_eq!(after["report"], true, "{tag}");
+            assert_eq!(after["sel"], "true", "{tag}");
+
+            // Timeline: grouped by node.
+            browser
+                .eval(
+                    &page,
+                    &format!("location.hash = '#/runs/{id}/timeline'; true"),
+                )
+                .await
+                .unwrap();
+            browser
+                .wait_for(
+                    &page,
+                    "document.querySelectorAll('#run-events .tl-group').length === 2",
+                    w,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: timeline groups: {e}"));
+            browser.close_page(&page).await;
+        }
+    }
+
+    // The list pane: no nested scroller inside it.
+    let page = browser
+        .open_page(&format!("{base}#/runs"), 1280, 900, false)
+        .await
+        .expect("open");
+    // A merged run is hidden by the default "Active" segment.
+    browser
+        .wait_for(
+            &page,
+            "!!document.querySelector('.state-chip[data-key=all]')",
+            w,
+        )
+        .await
+        .expect("segmented control");
+    browser
+        .eval(
+            &page,
+            "document.querySelector('.state-chip[data-key=all]').click(); true",
+        )
+        .await
+        .unwrap();
+    browser
+        .wait_for(
+            &page,
+            "!!document.querySelector('#view-runs a.card.run-card')",
+            w,
+        )
+        .await
+        .expect("rows");
+    let nested = browser
+        .eval(
+            &page,
+            "(() => [...document.querySelectorAll('#view-runs *')].filter((e) => { \
+             const o = getComputedStyle(e).overflowY; \
+             return (o === 'auto' || o === 'scroll') && e.scrollHeight > e.clientHeight + 1; \
+             }).map((e) => e.className || e.tagName))()",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        nested,
+        serde_json::json!([]),
+        "nested scroller in the list pane"
+    );
+    browser.close_page(&page).await;
+}
+
 /// In the two-pane layout a Queue row is one big target: clicking a part of it
 /// that is not a link or a button opens the task in the right pane. The click
 /// is a real mouse event at the row's status chip, so an ancestor that wrongly

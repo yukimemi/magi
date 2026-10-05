@@ -10984,6 +10984,50 @@ mod tests {
     }
 
     #[test]
+    fn the_runs_page_redesign_keeps_its_guards() {
+        let body = |name: &str| {
+            let at = APP_JS
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            &APP_JS[at..at + 2500.min(APP_JS.len() - at)]
+        };
+        // A null child must never reach the native append (it prints "null").
+        let land = body("function renderLand");
+        let land = &land[..land.find("function followupList").unwrap_or(land.len())];
+        assert!(
+            !land.contains("box.append("),
+            "renderLand must use append()"
+        );
+        assert!(land.contains("append(box, ["));
+        // Tabs are hash routes; the run id alone decides a reload.
+        assert!(body("function parseRoute").contains("RUN_TABS.includes(parts[2])"));
+        assert!(
+            body("function applyRoute")
+                .contains("route.name !== state.route.name || route.id !== state.route.id")
+        );
+        // The decorative diagram is gone, the strip and its guards stay.
+        assert!(!APP_JS.contains("adviseConvergeDiagram"));
+        assert!(!INDEX_HTML.contains("advise-converge"));
+        assert!(INDEX_HTML.contains("id=\"advise-strip\""));
+        assert!(APP_JS.contains("provisional"));
+        for id in [
+            "run-tab-overview",
+            "run-tab-timeline",
+            "run-tab-report",
+            "run-report",
+            "runs-scope",
+        ] {
+            assert!(INDEX_HTML.contains(&format!("id=\"{id}\"")), "{id}");
+        }
+        assert!(!INDEX_HTML.contains("runs-tree"));
+        assert!(!INDEX_HTML.contains("run-raw-panel"));
+        // Fold still says it cannot be resumed.
+        assert!(APP_JS.contains("resume"));
+        // The unreadable-runs count stays on the page.
+        assert!(APP_JS.contains("unreadable"));
+    }
+
+    #[test]
     fn the_unreadable_banner_is_dismissible_per_count_and_the_count_stays() {
         assert!(APP_JS.contains("magi-stats-unreadable-dismissed"));
         assert!(APP_JS.contains("s.runs_unreadable > 0 && s.runs_unreadable !== dismissed"));
