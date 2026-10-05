@@ -6395,7 +6395,14 @@ function renderVerdictStamp(run, tally, decided) {
   clear(box);
   const winner = tally ? tally.winner : null;
   const stalled = displayedRunStatus(run) === "stalled" || run.status === "stalled";
-  if (!winner || stalled) {
+  /* The quorum approves a candidate *selection*, not the change. A review-only
+     or uncontested run carries a winner and met_quorum before any review
+     happens, and its review may then reject: no approval stamp unless a panel
+     actually sat (not uncontested) and the last review round did not reject. */
+  const rounds = Array.isArray(run.reviews) ? run.reviews : [];
+  const lastRound = rounds.length ? rounds[rounds.length - 1] : null;
+  const reviewRejected = Boolean(lastRound && lastRound.verdict === "reject");
+  if (!winner || stalled || (decided && (tally.uncontested || reviewRejected))) {
     show(box, false);
     return;
   }
