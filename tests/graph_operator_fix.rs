@@ -5,6 +5,7 @@ mod common;
 
 use common::fixture_with_split_review_vote;
 use magi::graph::Runner;
+use magi::queue::{Queue, Source, Task, TaskStatus};
 use magi::run::{OperatorFixOutcome, RunState, RunStatus};
 
 /// Both reviewer seats agree `approve_with_findings` with one non-blocking
@@ -282,5 +283,52 @@ async fn a_stale_finding_is_refused_unless_the_operator_allows_it() {
     assert!(request.stale);
     assert!(request.allow_stale);
     assert_eq!(request.findings[0].id, id);
+}
+}
+
+common::e2e! {
+async fn a_follow_up_review_claims_and_settles_the_task_that_owns_the_run() {
+    let home = common::home_lock().await;
+    let fx = fixture_with_split_review_vote(home, "review-1,review-2");
+    let q = Queue::open();
+    let mut task = Task::new(
+        "add retries".to_owned(),
+        "add retries".to_owned(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    task.hold_manual(Some("parked".to_owned()));
+    q.put(&mut task).unwrap();
+    let id = task.id.clone();
+
+    let mut runner = Runner::start(
+        &fx.repo,
+        "add retries".to_owned(),
+        fx.config.clone(),
+        magi::run::Origin::operator().serving(Some(id.clone())),
+    )
+    .await
+    .expect("start");
+    runner.execute().await.expect("execute");
+    let picked = runner.state.last_round_findings()[0].id.clone();
+    runner
+        .fix_selected(std::slice::from_ref(&picked), "operator: fix it", false)
+        .await
+        .expect("fix_selected");
+
+    let follow_up = runner.state.operator_fixes[0]
+        .follow_up_review_run
+        .clone()
+        .expect("a follow-up review ran");
+    let after = q.get(&id).unwrap();
+    assert_eq!(after.runs.last(), Some(&follow_up), "{after:?}");
+    assert_ne!(after.status, TaskStatus::Running, "settled, not left running");
+    assert_eq!(after.status, TaskStatus::Done, "{after:?}");
+    assert_eq!(
+        after.runs.iter().filter(|r| **r == follow_up).count(),
+        1,
+        "linked once"
+    );
+    assert!(q.claim(&id).is_ok(), "the claim was released");
 }
 }
