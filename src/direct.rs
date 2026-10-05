@@ -501,11 +501,21 @@ mod tests {
         .await
         .unwrap();
         assert!(!waited.finished, "the wait ran out, the loop still owns it");
-        let err = waited.unfinished().expect("an unfinished wait is an error").to_string();
+        let err = waited
+            .unfinished()
+            .expect("an unfinished wait is an error")
+            .to_string();
         assert!(err.contains(t.short()), "{err}");
-        assert!(err.contains("not finished") || err.contains("not a success"), "{err}");
+        assert!(
+            err.contains("not finished") || err.contains("not a success"),
+            "{err}"
+        );
         assert!(err.contains("magi task show"), "{err}");
-        assert_eq!(q.get(&t.id).unwrap().status, TaskStatus::Queued, "the queue is untouched");
+        assert_eq!(
+            q.get(&t.id).unwrap().status,
+            TaskStatus::Queued,
+            "the queue is untouched"
+        );
         t.link_run("20260101-000000-abcd");
         t.succeed();
         q.put(&mut t).unwrap();
