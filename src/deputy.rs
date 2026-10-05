@@ -578,7 +578,12 @@ impl Job {
         // edit anything; the daemon, not the deputy, applies outcomes.
         let allow_write = true;
         // The question store is outside the repository, and `magi ask` writes it.
-        let writable = [self.store.root().to_path_buf()];
+        // A merge approval's deputy also files follow-up tasks with `magi task
+        // add`, which writes the queue; that is the one other place it writes.
+        let writable = [
+            self.store.root().to_path_buf(),
+            crate::queue::Queue::open().root().to_path_buf(),
+        ];
         macro_rules! invocation {
             ($prompt:expr, $stem:expr, $timeout:expr) => {
                 Invocation {

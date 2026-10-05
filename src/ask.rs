@@ -756,31 +756,37 @@ impl Question {
             );
         }
         if self.node == crate::land::APPROVAL_NODE {
-            // The merge is irreversible and a say is not a decision: only the
-            // owner's whole message being the answer word counts, so "don't
-            // merge" or "merge, but ..." can never be quoted into a merge.
-            let word = if label == crate::land::APPROVE {
-                Some(crate::land::APPROVE)
+            // The merge is irreversible and a say is not a decision. The
+            // owner's latest message is what counts (an earlier one may since
+            // have been qualified or withdrawn). `hold` must be that message
+            // exactly; `merge` may sit among other requests, but only as a
+            // clear, unhedged instruction quoted verbatim - see
+            // `land::merge_intent`, which holds on anything doubtful.
+            let latest = self
+                .thread
+                .iter()
+                .rev()
+                .find(|t| t.who == Who::Operator)
+                .map(|t| t.body.trim());
+            let ok = if label == crate::land::APPROVE {
+                latest.is_some_and(|m| crate::land::merge_intent(m, quote))
             } else if label == crate::land::HOLD {
-                Some(crate::land::HOLD)
+                latest.is_some_and(|m| {
+                    quote.eq_ignore_ascii_case(label) && m.eq_ignore_ascii_case(label)
+                })
             } else {
-                None
+                false
             };
-            let exact = word.is_some_and(|w| {
-                // The owner's latest message must be the word: an earlier one
-                // may since have been qualified or withdrawn.
-                quote.eq_ignore_ascii_case(w)
-                    && self
-                        .thread
-                        .iter()
-                        .rev()
-                        .find(|t| t.who == Who::Operator)
-                        .is_some_and(|t| t.body.trim().eq_ignore_ascii_case(w))
-            });
-            if !exact {
+            if !ok {
                 bail!(
-                    "on a merge approval only an owner message that is exactly `{label}` \
-                     settles it; ask what they mean with `--thread` instead"
+                    "on a merge approval `{label}` settles it only when the owner's latest \
+                     message clearly says so, unhedged and quoted verbatim ({}); ask what \
+                     they mean with `--thread` instead",
+                    if label == crate::land::HOLD {
+                        "for `hold`, the whole message"
+                    } else {
+                        "no maybe / if / not / question"
+                    }
                 );
             }
         }
@@ -2794,7 +2800,7 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_approval_settles_only_on_the_owners_exact_word() {
+    fn a_merge_approval_settles_only_on_a_clear_unhedged_merge() {
         let mut q = Question::new(
             "run".into(),
             crate::land::APPROVAL_NODE.into(),
@@ -2825,6 +2831,44 @@ mod tests {
             "a fragment is not the word"
         );
         q.settle_by_deputy("deputy-x", "merge", "Merge").unwrap();
+        assert_eq!(q.resolution().as_deref(), Some("merge"));
+    }
+
+    #[test]
+    fn a_clear_merge_among_other_requests_settles_but_a_hedge_does_not() {
+        let mut q = Question::new(
+            "run".into(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Merge?".into(),
+            String::new(),
+            vec!["merge".into(), "hold".into()],
+        );
+        let mut dep = Deputy::new("brief".into());
+        dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
+        q.deputy = Some(dep);
+        q.say("たぶんマージでいい。残りの指摘はフォローアップに積んで")
+            .unwrap();
+        assert!(
+            q.settle_by_deputy("deputy-x", "merge", "たぶんマージでいい")
+                .is_err()
+        );
+        q.reply("merge?", vec!["merge".into(), "hold".into()])
+            .unwrap();
+        q.say("マージしていいよ。残りのレビュー指摘はフォローアップタスクとして積んで")
+            .unwrap();
+        assert!(
+            q.settle_by_deputy("deputy-x", "merge", "どこかの言葉")
+                .is_err(),
+            "the quote must be the owner's"
+        );
+        assert!(
+            q.settle_by_deputy("deputy-x", "hold", "マージしていいよ")
+                .is_err(),
+            "`hold` still needs the whole message"
+        );
+        q.settle_by_deputy("deputy-x", "merge", "マージしていいよ")
+            .unwrap();
         assert_eq!(q.resolution().as_deref(), Some("merge"));
     }
 
