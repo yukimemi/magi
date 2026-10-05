@@ -395,6 +395,92 @@ async fn a_say_on_a_merge_approval_gets_a_deputy_and_never_the_waiter() {
 }
 }
 
+/// What the mock deputy runs on its real turn: the actual CLI, as the seat
+/// would, against this scene's home.
+fn script(s: &Scene, lines: &[&str]) {
+    let bin = env!("CARGO_BIN_EXE_magi");
+    let mut body = format!("export MAGI_HOME='{}'\n", s.home.display());
+    for l in lines {
+        body.push_str(&l.replace("MAGI", &format!("'{bin}'")));
+        body.push_str(" || true\n");
+    }
+    std::fs::write(s.fx.repo.join("deputy-actions.sh"), body).unwrap();
+}
+
+const FOLLOW_UP: &str = "MAGI task add --hold 'applies after the pull request merges' \
+     --title 'Fix R1-1' 'Applies after the pull request merges. R1-1 at src/a.rs:10: the \
+     loop skips the last item; fix it and add a test that covers the final element.'";
+
+fn follow_ups(s: &Scene) -> Vec<magi::queue::Task> {
+    magi::queue::Queue::at(s.home.join("queue")).list()
+}
+
+common::e2e! {
+async fn a_clear_merge_with_a_follow_up_request_merges_and_files_the_tasks() {
+    let s = scene(home_lock().await);
+    let land = file_land(&s.store, "Merge #7?");
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    let say = "マージしていいよ。残りのレビュー指摘はフォローアップタスクとして積んで";
+    s.store.update(&land.id, |q| q.say(say)).unwrap();
+    script(&s, &[
+        FOLLOW_UP,
+        "MAGI ask --settle \"$qid\" --choice merge --quote 'マージしていいよ'",
+    ]);
+
+    turn(&mut deputies(&s, 2)).await;
+
+    let q = s.store.get(&land.id).unwrap();
+    assert_eq!(q.status, QuestionStatus::Answered, "{:?}", q.thread);
+    assert_eq!(q.resolution().as_deref(), Some("merge"));
+    let tasks = follow_ups(&s);
+    assert_eq!(tasks.len(), 1, "one follow-up filed: {tasks:?}");
+    let t = &tasks[0];
+    assert_eq!(t.status, magi::queue::TaskStatus::Held, "it must not run before the merge");
+    assert!(t.hold_reason.as_deref().unwrap().contains("after the pull request merges"));
+    assert_eq!(
+        t.source,
+        magi::queue::Source::Agent { run: land.run.clone(), node: "deputy".to_owned() }
+    );
+}
+}
+
+common::e2e! {
+async fn a_hedged_merge_stays_a_hold_and_the_question_stays_open() {
+    let s = scene(home_lock().await);
+    let land = file_land(&s.store, "Merge #7?");
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    s.store.update(&land.id, |q| q.say("たぶんマージでいいよ。残りの指摘はフォローアップにして")).unwrap();
+    script(&s, &[
+        "MAGI ask --settle \"$qid\" --choice merge --quote 'たぶんマージでいいよ'",
+    ]);
+
+    turn(&mut deputies(&s, 2)).await;
+
+    let q = s.store.get(&land.id).unwrap();
+    assert_eq!(q.status, QuestionStatus::Open, "a hedge is not a decision: {:?}", q.thread);
+    assert!(q.answer.is_none());
+    assert!(follow_ups(&s).is_empty());
+}
+}
+
+common::e2e! {
+async fn a_follow_up_request_alone_files_the_tasks_without_merging() {
+    let s = scene(home_lock().await);
+    let land = file_land(&s.store, "Merge #7?");
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    s.store.update(&land.id, |q| q.say("残りのレビュー指摘はフォローアップタスクとして積んで")).unwrap();
+    script(&s, &[FOLLOW_UP]);
+
+    turn(&mut deputies(&s, 2)).await;
+
+    let q = s.store.get(&land.id).unwrap();
+    assert_eq!(q.status, QuestionStatus::Open, "no merge was asked for");
+    let tasks = follow_ups(&s);
+    assert_eq!(tasks.len(), 1, "{tasks:?}");
+    assert_eq!(tasks[0].status, magi::queue::TaskStatus::Held);
+}
+}
+
 #[test]
 fn a_merge_approvals_deadline_never_moves_on_a_reply() {
     let mut land = Question::new(

@@ -834,7 +834,9 @@ redundant:
 - `land` decides whether magi keeps watching the pull request after opening it.
   It only engages for `merge = "pr"`.
 - `land_approval` decides whether a human sees the panel before the merge.
-  Silence is a hold, and nothing but the word `merge` merges.
+  Silence is a hold. Only the button, or the owner's own clear, unhedged
+  instruction to merge (see the deputy section: it no longer has to be the
+  single word), merges.
 
 An unattended merge requires flipping both, which is two deliberate choices.
 Do not "simplify" them into one flag: the useful middle state - magi does the
@@ -1164,8 +1166,30 @@ not move on a say.
   `deputy::deadline`: `asked_at + answer_timeout`, never moved by a reply, the
   same instant `daemon::land_resume_state` abandons the question; land is the
   only thing that retires an approval. `--settle` on an approval accepts
-  `merge` / `hold` only when the owner's whole message is that word
-  (`settle_by_deputy`); anything else is answered back with `--thread`. The
+  `hold` only when the owner's whole message is that word, and `merge` when the
+  owner's **latest** message holds a clear instruction to merge, quoted
+  verbatim, possibly among other requests (`settle_by_deputy`, decided by the
+  pure `land::merge_intent`). The owner chose this loosening on purpose - the
+  single-word rule made "merge, and queue the leftover findings as follow-ups"
+  a dead end - and a wrong merge is recoverable by revert. The gate is still
+  mechanical, not the agent's reading: the owner's message
+  must carry no hedge, condition, negation or question - the whole message is read, so a
+  condition in another sentence holds too - (`maybe`, `probably`,
+  `if`, `not`, `but`, `いいかも`, `たぶん`, `なら`, `たら`, `?`...), and a retraction
+  anywhere in the message (`wait`, `やっぱり`) voids it. Anything doubtful is a
+  hold: the agent asks back with `--thread`. The word lists are deliberately
+  short and lean towards holding; a missed hedge costs a revert, a refused
+  merge costs one more word, and the button always works. Silence is still a
+  hold, and `operator_held` tasks still refuse a settle. A reply that asks for
+  **follow-up tasks** is carried out by the deputy with `magi task add --hold
+  <reason>` (the task is filed already held by hand, so nothing runs before the
+  pull request lands, and it says so; only `magi task release` runs it). There
+  is no automatic release after the merge: that stays a human step. The deputy
+  seat now also gets the queue directory as a writable root, so - as for
+  opencode / omp seats - its being limited to those two writes rests on the
+  prompt, not on the sandbox. `magi task add` from `MAGI_NODE=deputy` leaves
+  the claims of the approved run's own task out of the `dupes` check (never
+  `--force`); every other claim still refuses. The
   operator-held check resolves the task through the run id. `holder_of` says
   `nobody` for an approval with no live deputy, and `app.js` says so.
 - The mock agent in `tests/common/mod.rs` greps `prompt::DEPUTY_HEADING`; reword
