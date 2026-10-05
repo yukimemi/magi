@@ -580,6 +580,105 @@ pub const APPROVE: &str = "merge";
 /// The choice that leaves the pull request open.
 pub const HOLD: &str = "hold";
 
+/// Whether `quote` is a clear, unhedged instruction to merge, said inside the
+/// owner's `message`.
+///
+/// The merge is the one irreversible step, so this is a mechanical check and
+/// not the agent's reading alone: the quote must be a verbatim part of the
+/// message and name the merge; neither the quote nor the sentence around it may
+/// carry a hedge, a condition, a negation or a question; and no sentence of
+/// the message may retract (`wait`, `やっぱり`). Anything doubtful is `false`,
+/// which is a hold. Other sentences may ask for other things (follow-up tasks,
+/// say) - only wording that overturns the whole message is read from all of it.
+pub fn merge_intent(message: &str, quote: &str) -> bool {
+    let quote = quote.trim();
+    if quote.is_empty() {
+        return false;
+    }
+    let Some(at) = message.find(quote) else {
+        return false;
+    };
+    let lower = quote.to_lowercase();
+    if !(lower.contains("merge") || quote.contains("マージ")) {
+        return false;
+    }
+    const STOPS: [char; 9] = ['。', '.', '!', '！', '?', '？', '\n', ';', '；'];
+    let start = message[..at].rfind(STOPS).map_or(0, |i| {
+        i + message[i..].chars().next().map_or(1, char::len_utf8)
+    });
+    let end = message[at + quote.len()..]
+        .find(STOPS)
+        .map_or(message.len(), |i| {
+            let i = at + quote.len() + i;
+            i + message[i..].chars().next().map_or(1, char::len_utf8)
+        });
+    let sentence = &message[start..end.max(at + quote.len())];
+    if hedged(sentence) || hedged(quote) {
+        return false;
+    }
+    !retracts(message)
+}
+
+/// Hedging, conditional, negated or interrogative wording. ASCII words are
+/// matched as whole words so `note` is not `not`.
+fn hedged(text: &str) -> bool {
+    const WORDS: [&str; 21] = [
+        "maybe", "probably", "perhaps", "might", "if", "unless", "not", "never", "wait", "hold",
+        "cancel", "but", "think", "guess", "suppose", "unsure", "yet", "except", "only", "cannot",
+        "should",
+    ];
+    const JA: [&str; 22] = [
+        "かも",
+        "たぶん",
+        "多分",
+        "なら",
+        "たら",
+        "ちょっと待",
+        "しないで",
+        "しない",
+        "保留",
+        "まだ",
+        "ただし",
+        "やめ",
+        "止め",
+        "だめ",
+        "ダメ",
+        "じゃない",
+        "ではない",
+        "ですか",
+        "かな",
+        "でしょう",
+        "思う",
+        "ほしい",
+    ];
+    if text.contains(['?', '？']) || JA.iter().any(|w| text.contains(w)) {
+        return true;
+    }
+    text.to_lowercase()
+        .replace('\u{2019}', "'")
+        .split(|c: char| !(c.is_alphanumeric() || c == '\'') || !c.is_ascii())
+        .filter(|w| !w.is_empty())
+        .any(|w| WORDS.contains(&w) || w.ends_with("n't"))
+}
+
+/// Wording that takes back what the rest of the message said.
+fn retracts(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    [
+        "やっぱ",
+        "待って",
+        "撤回",
+        "never mind",
+        "actually",
+        "on second thought",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
+        || lower
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .any(|w| w == "wait")
+}
+
 /// Graph node recorded on the approval question.
 ///
 /// The phone keys its high-stakes card off this rather than off the choice
@@ -1245,8 +1344,10 @@ pub fn deputy_brief(q: &ask::Question, state: Option<&RunState>) -> String {
          own text above names the pull request. Answering `{APPROVE}` squash-merges \
          it into the base branch, which cannot be undone; `{HOLD}` leaves the pull \
          request open. Silence is a hold: the owner not answering never merges. Only \
-         the owner choosing `{APPROVE}`, or writing the single word `{APPROVE}`, \
-         merges; no other wording is a decision.\n\n\
+         the owner choosing `{APPROVE}`, or clearly telling you to merge in their \
+         own words, merges. Hedged, conditional, negated or questioning wording \
+         (\"maybe\", \"probably\", \"if\", \"いいかも\", \"たぶん\") is not a decision \
+         and stays a hold.\n\n\
          This brief is a snapshot from when you were attached: check `magi show {run}` \
          and `gh pr view` (read-only) before telling the owner anything current. \
          You run with permission to write the question record, and what keeps you \
@@ -5650,6 +5751,54 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             contested_to_ask(&state).is_none(),
             "the switch restores today"
         );
+    }
+
+    #[test]
+    fn merge_intent_wants_a_clear_unhedged_quote_and_holds_on_doubt() {
+        let yes = [
+            ("merge", "merge"),
+            (" Merge ", "Merge"),
+            (
+                "マージしていいよ。残りのレビュー指摘はフォローアップタスクとして積んで",
+                "マージしていいよ",
+            ),
+            (
+                "Merge it. Please file the remaining findings as follow-ups.",
+                "Merge it",
+            ),
+            (
+                "merge is fine; the leftover findings are not urgent",
+                "merge is fine",
+            ),
+            ("Note the findings and merge now", "merge now"),
+        ];
+        for (msg, quote) in yes {
+            assert!(merge_intent(msg, quote), "{msg:?} / {quote:?}");
+        }
+        let no = [
+            ("たぶんマージでいい", "たぶんマージでいい"),
+            (
+                "マージしていいかも。フォローアップ積んで",
+                "マージしていいかも",
+            ),
+            ("maybe merge it", "merge it"),
+            ("probably fine to merge", "merge"),
+            ("merge if CI is green", "merge"),
+            ("CIが通ったらマージして", "マージして"),
+            ("merge, but not the docs change", "merge"),
+            ("don't merge", "merge"),
+            ("merge?", "merge"),
+            ("マージしていい？", "マージしていい"),
+            ("merge it. wait, actually hold on", "merge it"),
+            ("マージして。やっぱりやめた", "マージして"),
+            ("please file follow-ups", "follow-ups"),
+            ("merge it", "go ahead"),
+            ("merge it", "merge it please"),
+            ("merge it", "  "),
+        ];
+        for (msg, quote) in no {
+            assert!(!merge_intent(msg, quote), "{msg:?} / {quote:?}");
+        }
     }
 
     #[test]

@@ -1437,11 +1437,33 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
     if land {
         s.push_str(
             "This question is the owner's approval to merge a pull request, which \
-             cannot be undone. You never merge, close or change anything - not with \
-             `gh`, not with git. A say is never a decision: settle `merge` only when \
-             the owner wrote the single word `merge`; for anything else - a \
-             question, a condition, \"merge but not X\", \"don't merge\" - answer \
-             with `magi ask --thread` and ask what they want. Silence is a hold.\n\n",
+             cannot be undone. You never merge, close or change anything yourself - \
+             not with `gh`, not with git - and the only thing you may add to the \
+             queue is the follow-up tasks described here. Silence is a hold.\n\n\
+             The owner may answer in their own words, alone or mixed with other \
+             requests. Read their latest message:\n\n\
+             - **A clear instruction to merge** (\"merge it\", \"マージしていいよ\"), \
+             alone or together with other requests: first do the other requests \
+             (below), then record it with `magi ask --settle` - choice `merge`, \
+             `--quote` a verbatim part of their message that is the merge \
+             instruction itself. magi re-checks the quote and refuses a hedge.\n\
+             - **Anything doubtful** - \"maybe\", \"probably\", \"いいかも\", \"たぶん\", any \
+             condition (\"if CI passes\", \"merge but not X\"), a negation, a \
+             question: not a decision. Settle nothing; answer with `magi ask \
+             --thread` (repeat the choices) and ask what they want.\n\
+             - **A request for follow-up tasks** (\"queue the remaining findings \
+             as follow-ups\"): file each with `magi task add --hold \"<why it \
+             waits>\" --title \"...\" \"<text>\"`. The pull request has not landed, \
+             so the task says it applies after that pull request merges, and \
+             `--hold` keeps it from running before then. Write it for an \
+             implementer who never saw this conversation: the problem, the \
+             finding id and `file:line`, the change wanted, how to tell it is \
+             done. Do not put the pull request number or branch name in the \
+             text (put them in the `--hold` reason), and never pass `--force`. \
+             Run `magi task list` first so a request is not filed twice. Say in \
+             `--thread` which task ids you filed. A follow-up request alone is \
+             not a merge: file the tasks and settle nothing.\n\
+             - `hold` settles only when the owner's whole message is that word.\n\n",
         );
     }
     if resumed {

@@ -545,6 +545,12 @@ enum TaskCmd {
         /// Repository the task applies to.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// File the task already held, with this reason, so it cannot run
+        /// before someone releases it - for work that waits on something (a
+        /// pull request that has not merged yet). Held by hand, so only
+        /// `magi task release` lets it run.
+        #[arg(long, value_name = "REASON")]
+        hold: Option<String>,
         /// Run this task alone: one implementer, straight into review, rather
         /// than the usual multi-candidate competition. For work whose design
         /// is already settled and only needs building - the shape a standing
@@ -1109,6 +1115,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     &repo,
                     &text,
                     None,
+                    None,
                     Some(&cfg),
                 )
                 .await?;
@@ -1172,6 +1179,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     &repo,
                     "",
                     Some(&branch),
+                    None,
                     Some(&cfg),
                 )
                 .await?;
@@ -2440,9 +2448,10 @@ async fn refuse_duplicates(
     repo: &Path,
     text: &str,
     review_branch: Option<&str>,
+    ignore_task: Option<&str>,
     cfg: Option<&Config>,
 ) -> Result<()> {
-    let hits = magi::dupes::check(q, runs, repo, text, review_branch, None);
+    let hits = magi::dupes::check(q, runs, repo, text, review_branch, ignore_task);
     magi::dupes::screen_with_config(hits, text, review_branch, repo, cfg)
         .await
         .map_err(|dup| {
@@ -2474,6 +2483,7 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             title,
             priority,
             repo,
+            hold,
             solo,
             urgent,
             attach,
@@ -2511,9 +2521,24 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                     .parent()
                     .map_or_else(PathBuf::new, Path::to_path_buf);
                 let cfg = Config::discover(&repo, None).ok().map(|(c, _)| c);
-                refuse_duplicates(&q, &home.join("runs"), &repo, &text, None, cfg.as_ref()).await?;
+                // A merge approval's deputy files follow-ups of the very run
+                // that approval is about: that run's own claims are not a rival.
+                let own = deputy_own_task(&q, &source);
+                refuse_duplicates(
+                    &q,
+                    &home.join("runs"),
+                    &repo,
+                    &text,
+                    None,
+                    own.as_deref(),
+                    cfg.as_ref(),
+                )
+                .await?;
             }
             let mut task = Task::new(title, text, repo, source);
+            if let Some(reason) = hold {
+                task.hold_manual(Some(reason));
+            }
             task.priority = priority;
             task.solo = solo;
             task.urgent = urgent;
@@ -3146,6 +3171,20 @@ async fn task_source(issue: Option<u64>) -> Source {
     match agent_env() {
         Some((run, node)) => Source::Agent { run, node },
         None => Source::Human,
+    }
+}
+
+/// The task whose own claims a merge approval's deputy never collides with:
+/// the one the approved run belongs to. `None` for anyone else, so every other
+/// filer is checked against everything as before.
+fn deputy_own_task(q: &Queue, source: &Source) -> Option<String> {
+    match source {
+        Source::Agent { run, node } if node == magi::deputy::NODE => q
+            .list()
+            .into_iter()
+            .find(|t| t.runs.contains(run))
+            .map(|t| t.id),
+        _ => None,
     }
 }
 
@@ -4524,6 +4563,7 @@ mod tests {
                 priority: 0,
                 repo: PathBuf::from("."),
                 solo: true,
+                hold: None,
                 urgent: false,
                 attach: vec![shot.clone()],
                 force: false,
@@ -4591,6 +4631,7 @@ mod tests {
                 priority: 0,
                 repo: PathBuf::from("."),
                 solo: false,
+                hold: None,
                 urgent: true,
                 attach: Vec::new(),
                 force: false,
@@ -4610,6 +4651,7 @@ mod tests {
                 priority: 0,
                 repo: PathBuf::from("."),
                 solo: false,
+                hold: None,
                 urgent: false,
                 attach: Vec::new(),
                 force: false,
@@ -4646,6 +4688,7 @@ mod tests {
                 priority: 0,
                 repo: PathBuf::from("."),
                 solo: true,
+                hold: None,
                 urgent: false,
                 attach: Vec::new(),
                 force: false,
@@ -4665,6 +4708,7 @@ mod tests {
                 priority: 0,
                 repo: PathBuf::from("."),
                 solo: false,
+                hold: None,
                 urgent: false,
                 attach: Vec::new(),
                 force: false,
@@ -4705,6 +4749,7 @@ mod tests {
                 priority: 0,
                 repo: PathBuf::from("."),
                 solo: false,
+                hold: None,
                 urgent: false,
                 attach: Vec::new(),
                 force: false,
@@ -4726,6 +4771,7 @@ mod tests {
                 priority: 0,
                 repo: PathBuf::from("."),
                 solo: false,
+                hold: None,
                 urgent: false,
                 attach: Vec::new(),
                 force: false,
@@ -4763,6 +4809,7 @@ mod tests {
                 priority: 0,
                 repo: PathBuf::from("."),
                 solo: false,
+                hold: None,
                 urgent: false,
                 attach: Vec::new(),
                 force: false,
@@ -5089,6 +5136,7 @@ mod tests {
                 priority: 0,
                 repo: missing,
                 solo: false,
+                hold: None,
                 urgent: false,
                 attach: Vec::new(),
                 force: false,
@@ -5117,6 +5165,7 @@ mod tests {
                 priority: 0,
                 repo: repo.clone(),
                 solo: false,
+                hold: None,
                 urgent: false,
                 attach: Vec::new(),
                 force: false,
@@ -5153,6 +5202,7 @@ mod tests {
             priority: 0,
             repo: repo.clone(),
             solo: false,
+            hold: None,
             urgent: false,
             attach: Vec::new(),
             force,
