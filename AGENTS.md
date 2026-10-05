@@ -660,6 +660,10 @@ upstream CRLF, not drift worth committing — normalise back to LF and
 - **`blind.strip_lines` is consumed twice**: as case-insensitive substrings by
   `blind::strip_attribution`, and as generated `sed` addresses by
   `blind::commit_msg_hook`. Entries must stay plain literals, not regexes.
+- **A conversation's list title is derived in two places**: `talkOpener` /
+  `firstLine` in `assets/ui/app.js` and `web::talk_search_doc`, which feeds
+  `GET /api/search?scope=chats`. Both take the first non-empty line of the first
+  operator turn, trimmed, cut to 96 characters; change them together.
 - **`run::SCHEMA`** must be bumped whenever a `RunState` field changes meaning,
   or a resumed run will half-read someone else's state file.
 - **The settings screen writes the machine layer only** (`settings::save`, path

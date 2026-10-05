@@ -525,19 +525,32 @@ impl Talks {
     /// Every conversation on disk: open first, then newest first, so what the
     /// operator is still using belongs above what they are done with.
     pub fn list(&self) -> Vec<Talk> {
+        self.list_counting_unreadable().0
+    }
+
+    /// [`Talks::list`], plus how many `*.json` files could not be read, so a
+    /// caller that reports to the operator can say what it skipped.
+    pub fn list_counting_unreadable(&self) -> (Vec<Talk>, usize) {
+        let mut unreadable = 0;
         let mut all: Vec<Talk> = std::fs::read_dir(&self.root)
             .into_iter()
             .flatten()
             .flatten()
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .filter_map(|p| read_path(&p).ok())
+            .filter_map(|p| {
+                let talk = read_path(&p).ok();
+                if talk.is_none() {
+                    unreadable += 1;
+                }
+                talk
+            })
             .collect();
         all.sort_unstable_by(|a, b| {
             let rank = |t: &Talk| u8::from(!t.status.open());
             rank(a).cmp(&rank(b)).then_with(|| b.id.cmp(&a.id))
         });
-        all
+        (all, unreadable)
     }
 
     /// Expand an id prefix to exactly one conversation id.

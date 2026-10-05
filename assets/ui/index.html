@@ -477,6 +477,15 @@
       <button class="btn btn-quiet" type="button" id="talks-mark-all-read">Mark all as read</button>
     </div>
 
+    <!-- Full-text search over conversation titles and transcripts. Several
+         words are ANDed. Static, so refreshes never touch focus. -->
+    <div class="queue-search" id="talks-search" hidden>
+      <label class="sr-only" for="talks-search-input">Search conversations</label>
+      <input type="search" id="talks-search-input" placeholder="Search conversations… (all words must match)" autocomplete="off" spellcheck="false" enterkeyhint="search">
+      <button class="btn btn-quiet" type="button" id="talks-search-clear" hidden>Clear</button>
+    </div>
+    <p class="queue-search-status" id="talks-search-status" role="status" hidden></p>
+
     <ol class="cards" id="talks-list"></ol>
     <p class="empty" id="talks-empty" hidden>
       No conversations yet. Open one to ask a question, look something up, or

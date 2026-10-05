@@ -731,6 +731,7 @@ a.card:active { background: var(--sunk); }
 }
 #talks-list .card-when { grid-row: 2; grid-column: 5; margin: var(--s2) 0 0 var(--s2); }
 #talks-list .card > .card-event { grid-row: 3; grid-column: 1 / -1; }
+#talks-list .card > .card-snippet { grid-row: 4; grid-column: 1 / -1; }
 /* Runs list rows: the same two-line treatment as the chat list above. Line 1
    is the title alone on the full row; line 2 is the status chip, the
    shrinkable meta text (run id, repo, counts) and the time. Everything else
