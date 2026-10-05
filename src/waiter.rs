@@ -420,7 +420,34 @@ impl Waiter {
         };
         let snapshot = q.thread.len();
 
+        // Ownership of an action answer is settled against the daemon's task
+        // claim: hold it while the lease goes up, so the daemon either sees the
+        // fresh lease or has already applied the action (and we step aside).
+        // A claim held by a running competition is not the daemon applying an
+        // action; that case is delivered, with the re-check below.
+        let queue = crate::queue::Queue::at(self.home.join("queue"));
+        let task_id = crate::daemon::task_of_question(&queue.list(), &q).map(|t| t.id.clone());
+        let _task_claim = match (&task_id, q.chosen_action()) {
+            (Some(id), Some(_)) => queue.claim(id).ok(),
+            _ => None,
+        };
+        let task_still_ours = || match &task_id {
+            Some(id) => queue
+                .get(id)
+                .map(|t| !crate::daemon::daemon_will_act(&t, &q))
+                .unwrap_or(true),
+            None => true,
+        };
+        if !task_still_ours() {
+            return Ok(());
+        }
+
         self.store.beat(&q.id, WaiterKind::Daemon);
+        // Re-check after the lease is up: a daemon that decided before it
+        // existed has by now written its mark (or is blocked on our claim).
+        if !task_still_ours() {
+            return Ok(());
+        }
         self.store.update(&q.id, |r| {
             r.waiter = Some(Note {
                 kind: WaiterKind::Daemon,
