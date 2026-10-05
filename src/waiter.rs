@@ -212,7 +212,7 @@ impl Waiter {
     /// waiter must not deliver the answer (see [`decide_owned`]).
     fn daemon_owns_action(&self, q: &Question) -> bool {
         crate::daemon::task_of_question(&crate::queue::Queue::at(self.home.join("queue")).list(), q)
-            .is_some_and(|t| crate::daemon::daemon_will_act(&t, q))
+            .is_some_and(|t| crate::daemon::daemon_will_act(t, q))
     }
 
     /// Look at every question once and act on what needs acting on. `halt` is
