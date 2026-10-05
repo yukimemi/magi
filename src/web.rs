@@ -3428,7 +3428,40 @@ where
     view.truncated = view.total > view.hits.len();
 }
 
-/// Read-only full-text search over every run's `run.json` or every task.
+/// What a conversation is searched by: its list title and each turn's text,
+/// under `operator` / `agent` so the snippet says who spoke. Nothing else
+/// (session ids, repo paths, usage, drafts) is part of the document.
+///
+/// The title rule mirrors `talkOpener` / `firstLine` in `app.js`: the first
+/// non-empty line of the first operator turn, trimmed and cut to 96 chars.
+fn talk_search_doc(talk: &Talk) -> serde_json::Value {
+    let opener = talk
+        .turns
+        .iter()
+        .find(|t| t.who == crate::talk::Who::Operator)
+        .and_then(|t| t.body.lines().map(str::trim).find(|l| !l.is_empty()))
+        .unwrap_or("");
+    let title: String = if opener.chars().count() > 96 {
+        opener.chars().take(95).chain(['\u{2026}']).collect()
+    } else {
+        opener.to_owned()
+    };
+    let turns: Vec<serde_json::Value> = talk
+        .turns
+        .iter()
+        .map(|t| {
+            let who = match t.who {
+                crate::talk::Who::Operator => "operator",
+                crate::talk::Who::Agent => "agent",
+            };
+            serde_json::json!({ who: t.body })
+        })
+        .collect();
+    serde_json::json!({ "title": title, "turns": turns })
+}
+
+/// Read-only full-text search over every run's `run.json`, every task or every
+/// conversation (title and transcript).
 ///
 /// Documents are read as plain JSON rather than `RunState` / `Task`, so a
 /// record from an older schema still searches; only a file that is not JSON
@@ -3453,8 +3486,8 @@ async fn search_get(
         )));
     }
     let scope = q.scope;
-    if scope != "runs" && scope != "tasks" {
-        return Err(ApiError::bad_request("scope must be runs or tasks"));
+    if scope != "runs" && scope != "tasks" && scope != "chats" {
+        return Err(ApiError::bad_request("scope must be runs, tasks or chats"));
     }
     blocking(move || {
         let mut view = SearchView {
@@ -3499,6 +3532,14 @@ async fn search_get(
                     .pop();
                 }
             }
+        } else if scope == "chats" {
+            let (talks, unreadable) = ui.talks.list_counting_unreadable();
+            view.unreadable = unreadable;
+            search_docs(
+                &terms,
+                talks.iter().map(|t| (t.id.clone(), talk_search_doc(t))),
+                &mut view,
+            );
         } else {
             let docs = ui.queue.list().into_iter().filter_map(|t| {
                 let mut v = serde_json::to_value(&t).ok()?;
@@ -10081,11 +10122,106 @@ mod tests {
         for bad in [
             "/api/search?scope=tasks&q=",
             "/api/search?scope=tasks&q=%20",
+            "/api/search?scope=chats&q=",
+            "/api/search?scope=chats&q=%20",
             "/api/search?scope=nope&q=a",
             "/api/search?q=a",
         ] {
             assert_eq!(f.get(bad).await.status, 400, "{bad}");
         }
+    }
+
+    /// Write one conversation file the way the store reads it back.
+    fn write_talk(f: &Fixture, id: &str, status: &str, turns: &[(&str, &str)]) {
+        let seat = serde_json::to_value(crate::agent::SeatState::new("talk", "claude", 1))
+            .expect("seat value");
+        let turns: Vec<serde_json::Value> = turns
+            .iter()
+            .map(|(who, body)| {
+                serde_json::json!({"who": who, "body": body, "at": "2026-09-01T00:00:00Z"})
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "schema": 1, "id": id, "repo": "/SecretRepoPath", "agent": "claude-agent",
+            "status": status, "turns": turns,
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z",
+            "seat": seat,
+        });
+        let dir = f.home.path().join("talks");
+        std::fs::create_dir_all(&dir).expect("talks dir");
+        std::fs::write(dir.join(format!("{id}.json")), doc.to_string()).expect("write talk");
+    }
+
+    #[tokio::test]
+    async fn search_chats_reads_title_and_turns_and_counts_unreadable() {
+        let f = Fixture::start().await;
+        write_talk(
+            &f,
+            "20260901-000001-aaaa",
+            "open",
+            &[
+                (
+                    "operator",
+                    "\n  Why does the Pangolin cache expire?\nsecond line",
+                ),
+                ("agent", "Because the TTL is thirty seconds."),
+            ],
+        );
+        write_talk(
+            &f,
+            "20260901-000002-bbbb",
+            "closed",
+            &[("operator", "unrelated"), ("agent", "The Zebra moved on.")],
+        );
+        std::fs::write(f.home.path().join("talks/broken.json"), "{ nope").expect("broken");
+
+        let search = |q: &'static str| {
+            let f = &f;
+            async move {
+                f.get(&format!("/api/search?scope=chats&q={q}"))
+                    .await
+                    .json()
+            }
+        };
+
+        let v = search("PANGOLIN").await;
+        assert_eq!(v["scope"], "chats");
+        assert_eq!(v["total"], 1, "{v}");
+        assert_eq!(v["hits"][0]["id"], "20260901-000001-aaaa");
+        assert_eq!(v["hits"][0]["field"], "title");
+        assert_eq!(v["unreadable"], 1, "{v}");
+        let marked: Vec<&str> = v["hits"][0]["snippet"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["hit"] == true)
+            .map(|p| p["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(marked, ["Pangolin"]);
+
+        // An agent turn, in a closed conversation.
+        let v = search("zebra").await;
+        assert_eq!(v["total"], 1, "{v}");
+        assert_eq!(v["hits"][0]["field"], "agent");
+        // Words may sit in different turns; all must be present.
+        assert_eq!(search("pangolin%20thirty").await["total"], 1);
+        assert_eq!(search("pangolin%20zebra").await["total"], 0);
+        // Bookkeeping is not searched.
+        for q in ["claude-agent", "SecretRepoPath", "open", "closed"] {
+            assert_eq!(search(q).await["total"], 0, "{q}");
+        }
+        // The first line only is the title; the second line is still a turn.
+        assert_eq!(search("second").await["hits"][0]["field"], "operator");
+        // Open conversations are listed before closed ones.
+        assert_eq!(search("the").await["hits"][0]["id"], "20260901-000001-aaaa");
+
+        let v = f.get("/api/search?scope=nope&q=a").await;
+        assert_eq!(v.status, 400);
+        assert!(
+            v.body.contains("scope must be runs, tasks or chats"),
+            "{}",
+            v.body
+        );
     }
 
     #[test]

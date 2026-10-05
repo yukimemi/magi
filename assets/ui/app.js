@@ -565,9 +565,12 @@ const state = {
      `forText` the query the stored `hits` answer, `seq` the newest request
      or keystroke (an older reply is dropped), `timer` the debounce. */
   runsSearch: "",
+  /* The Chat list's search box; same reasoning as queueSearch. */
+  talksSearch: "",
   search: {
     runs: { status: "idle", forText: "", seq: 0, timer: null, hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" },
     tasks: { status: "idle", forText: "", seq: 0, timer: null, hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" },
+    chats: { status: "idle", forText: "", seq: 0, timer: null, hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" },
   },
   /* `${query}\0${id}` of the last single-hit jump, so the immediate id
      match and the full-text reply for the same input do not jump twice.
@@ -2718,7 +2721,10 @@ function syncQueueSections(root, bySection) {
 const SEARCH_DEBOUNCE_MS = 250;
 
 function searchText(scope) {
-  return (scope === "runs" ? state.runsSearch : state.queueSearch).trim();
+  const text = scope === "runs" ? state.runsSearch
+    : scope === "chats" ? state.talksSearch
+    : state.queueSearch;
+  return text.trim();
 }
 
 function resetSearch(scope) {
@@ -2731,6 +2737,7 @@ function resetSearch(scope) {
 
 function renderSearchScope(scope, allowSearchJump = false) {
   if (scope === "runs") renderRuns();
+  else if (scope === "chats") renderTalks();
   else renderQueue(allowSearchJump);
 }
 
@@ -2848,7 +2855,8 @@ function renderSearchStatus(scope, node, noun, shown) {
     line += ".";
   }
   if (s.status === "ok" && s.unreadable > 0) {
-    line += ` ${plural(s.unreadable, "run", "runs")} could not be read and were not searched.`;
+    const item = noun.replace(/s$/, "");
+    line += ` ${plural(s.unreadable, item, noun)} could not be read and were not searched.`;
   }
   setText(node, line);
   return kind;
@@ -2879,6 +2887,12 @@ function setQueueSearch(value) {
   if (value.trim() === "") state.queueSearchJump = null;
   scheduleSearch("tasks");
   renderQueue(true);
+}
+
+function setTalksSearch(value) {
+  state.talksSearch = value;
+  scheduleSearch("chats");
+  renderTalks();
 }
 
 function setRunsSearch(value) {
@@ -4665,13 +4679,14 @@ function createTalkCard() {
   const context = el("span", { class: "win" });
   const meta = el("div", { class: "card-meta" }, agent, turns, tasks, context);
   const last = el("p", { class: "card-event" });
+  const snippet = el("p", { class: "card-snippet" });
 
   const card = el("a", { class: "card" },
     el("div", { class: "card-top" }, chipSlot, thinking, whenSlot, unread),
-    title, meta, last,
+    title, meta, last, snippet,
   );
   const row = el("li", {}, card);
-  row.refs = { card, chipSlot, thinking, whenSlot, unread, title, agent, turns, tasks, context, last };
+  row.refs = { card, chipSlot, thinking, whenSlot, unread, title, agent, turns, tasks, context, last, snippet };
   return row;
 }
 
@@ -4720,6 +4735,7 @@ function updateTalkCard(row, talk) {
   const tail = turns.length ? turns[turns.length - 1] : null;
   setText(r.last, tail && tail.who === "agent" ? firstLine(tail.body) : "");
   show(r.last, Boolean(tail && tail.who === "agent"));
+  renderSnippet(r.snippet, searchHit("chats", talk.id));
 }
 
 function renderTalks() {
@@ -4739,7 +4755,19 @@ function renderTalks() {
     : open ? `${plural(open, "conversation open", "conversations open")}` : "nothing open");
 
   show($("talks-empty"), talks.length === 0);
-  syncList(list, sortTalks(talks), (t) => t.id, createTalkCard, updateTalkCard);
+  /* The box only makes sense once there is a conversation to search. While
+     searching, the list is the server's hits within the loaded conversations. */
+  show($("talks-search"), talks.length > 0);
+  show($("talks-search-clear"), state.talksSearch !== "");
+  const searching = talks.length > 0 && searchText("chats") !== "";
+  const kind = searching
+    ? renderSearchStatus("chats", $("talks-search-status"), "conversations",
+      talks.filter((t) => state.search.chats.hits.has(t.id)).length)
+    : (show($("talks-search-status"), false), "idle");
+  const visible = !searching ? talks
+    : kind === "error" ? []
+    : talks.filter((t) => state.search.chats.hits.has(t.id));
+  syncList(list, sortTalks(visible), (t) => t.id, createTalkCard, updateTalkCard);
   markSelected();
 }
 
@@ -4779,6 +4807,7 @@ async function loadTalks() {
     state.talks = Array.isArray(list) ? list : [];
     for (const talk of state.talks) trackTalkThinking(talk, observed.get(talk.id));
     renderTalks();
+    refreshSearch("chats");
     ok();
   } catch (error) {
     fail(`Could not load conversations: ${error.message}`);
@@ -8071,6 +8100,7 @@ function wire() {
 
   wireSearchBox("tasks", $("queue-search-input"), $("queue-search-clear"), setQueueSearch);
   wireSearchBox("runs", $("runs-search-input"), $("runs-search-clear"), setRunsSearch);
+  wireSearchBox("chats", $("talks-search-input"), $("talks-search-clear"), setTalksSearch);
 
   $("theme-toggle").addEventListener("click", () => {
     const next = THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length];
