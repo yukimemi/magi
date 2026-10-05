@@ -504,7 +504,11 @@ fn direct_merge_is_safe(
 /// Required checks that are pending or failing are named. A check whose
 /// required-ness could not be read is never assumed optional: every unsettled
 /// check is listed and the reason says so.
-fn waiting_on(merge_state: &str, contexts: &[CheckInfo]) -> String {
+fn waiting_on(
+    merge_state: &str,
+    contexts: &[CheckInfo],
+    required_set: Option<&BTreeSet<String>>,
+) -> String {
     let state = if merge_state.is_empty() {
         "unknown"
     } else {
@@ -528,7 +532,25 @@ fn waiting_on(merge_state: &str, contexts: &[CheckInfo]) -> String {
         .filter(|c| c.required.is_none())
         .map(|c| format!("{} ({})", c.label, tag(c)))
         .collect();
+    // Required contexts the rollup never listed: nothing reported them, so no
+    // pending/failing entry exists to name. Matched case-insensitively against
+    // the labels as the rollup spells them, and no further.
+    let never: Vec<&str> = required_set
+        .map(|set| {
+            set.iter()
+                .filter(|name| !contexts.iter().any(|c| c.label.eq_ignore_ascii_case(name)))
+                .map(String::as_str)
+                .collect()
+        })
+        .unwrap_or_default();
     let mut out = format!("merge state: {state}");
+    if !never.is_empty() {
+        let _ = write!(
+            out,
+            "; required checks never reported: {}",
+            never.join(", ")
+        );
+    }
     if !required.is_empty() {
         let _ = write!(
             out,
@@ -543,11 +565,18 @@ fn waiting_on(merge_state: &str, contexts: &[CheckInfo]) -> String {
             unknown.join(", ")
         );
     }
-    if required.is_empty() && unknown.is_empty() {
-        out.push_str(
-            "; no required check is pending or failing, so GitHub is probably waiting for a \
-             review or another branch rule",
-        );
+    if required.is_empty() && unknown.is_empty() && never.is_empty() {
+        if required_set.is_some() {
+            out.push_str(
+                "; no required check is pending, failing or unreported, so GitHub is probably \
+                 waiting for a review or another branch rule",
+            );
+        } else {
+            out.push_str(
+                "; the required check list could not be read, so a required check that was \
+                 never reported cannot be ruled out",
+            );
+        }
     }
     out
 }
@@ -2634,6 +2663,9 @@ trait Forge {
     async fn view(&self, repo: &Path, pr_url: &str) -> Result<Seen>;
     async fn merge(&self, repo: &Path, argv: &[String]) -> Result<(bool, String)>;
     async fn poll(&self);
+    /// The check contexts the base branch requires, for a stop reason only.
+    /// `None` when they could not be read, which is not the same as none.
+    async fn required_contexts(&self, repo: &Path, base: &str) -> Option<BTreeSet<String>>;
     #[allow(clippy::too_many_arguments)]
     async fn fix(
         &self,
@@ -2658,6 +2690,9 @@ impl Forge for GhForge {
     async fn poll(&self) {
         tokio::time::sleep(POLL).await;
     }
+    async fn required_contexts(&self, repo: &Path, base: &str) -> Option<BTreeSet<String>> {
+        required_contexts_of(repo, base).await
+    }
     async fn fix(
         &self,
         state: &mut RunState,
@@ -2669,6 +2704,97 @@ impl Forge for GhForge {
     ) -> Result<Fixed> {
         fix_round(state, pr, round, budget, reason, logs).await
     }
+}
+
+/// Percent-encode a branch name for a URL path segment (`/` included).
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// Read the required contexts of `base` from classic branch protection and
+/// from rulesets, once, for a stop reason. Organisation-level rulesets that
+/// these two endpoints do not list are missed. Any unreadable source makes the
+/// whole answer `None`: a partial set would read as a complete one.
+async fn required_contexts_of(repo: &Path, base: &str) -> Option<BTreeSet<String>> {
+    let enc = encode_path_segment(base);
+    let mut all = BTreeSet::new();
+    // Classic protection answers 404 for an unprotected branch, which is
+    // "nothing required here", not a failure to read.
+    let classic = gh(
+        repo,
+        &[
+            "api".to_owned(),
+            format!("repos/{{owner}}/{{repo}}/branches/{enc}/protection/required_status_checks"),
+        ],
+    )
+    .await
+    .ok()?;
+    if classic.0 {
+        all.extend(parse_classic_required(&classic.1)?);
+    } else if !classic.1.contains("404") {
+        return None;
+    }
+    let rules = gh(
+        repo,
+        &[
+            "api".to_owned(),
+            format!("repos/{{owner}}/{{repo}}/rules/branches/{enc}"),
+        ],
+    )
+    .await
+    .ok()?;
+    if !rules.0 {
+        return None;
+    }
+    all.extend(parse_ruleset_required(&rules.1)?);
+    Some(all)
+}
+
+/// `required_status_checks` of classic protection: `contexts` plus the
+/// `checks[].context` form.
+fn parse_classic_required(json: &str) -> Option<BTreeSet<String>> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let mut out = BTreeSet::new();
+    for c in v.get("contexts")?.as_array()? {
+        out.insert(c.as_str()?.to_owned());
+    }
+    for c in v
+        .get("checks")
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(name) = c.get("context").and_then(|n| n.as_str()) {
+            out.insert(name.to_owned());
+        }
+    }
+    Some(out)
+}
+
+/// `rules/branches/<base>`: every `required_status_checks` rule's contexts.
+fn parse_ruleset_required(json: &str) -> Option<BTreeSet<String>> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let mut out = BTreeSet::new();
+    for rule in v.as_array()? {
+        if rule.get("type").and_then(|t| t.as_str()) != Some("required_status_checks") {
+            continue;
+        }
+        let checks = rule
+            .pointer("/parameters/required_status_checks")?
+            .as_array()?;
+        for c in checks {
+            out.insert(c.get("context")?.as_str()?.to_owned());
+        }
+    }
+    Some(out)
 }
 
 /// Is the observation older than the commit a fix round pushed?
@@ -2936,12 +3062,17 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
             .is_some_and(|armed| armed.eq_ignore_ascii_case(&seen.head));
         if armed_here && matches!(step, Step::Merge | Step::Wait) {
             if waited >= WAIT_CEILING {
+                let required = if seen.base.is_empty() {
+                    None
+                } else {
+                    forge.required_contexts(&repo, &seen.base).await
+                };
                 let why = format!(
                     "auto-merge was armed on {} but the pull request did not merge within {} \
                      minutes ({})",
                     seen.head,
                     WAIT_CEILING.as_secs() / 60,
-                    waiting_on(&seen.merge_state, &seen.contexts)
+                    waiting_on(&seen.merge_state, &seen.contexts, required.as_ref())
                 );
                 stop_disarmed(forge, state, &repo, &pr, &why).await?;
                 return Ok(pr);
@@ -3414,6 +3545,8 @@ struct Seen {
     merge_state: String,
     /// Every check of the rollup, for naming what an armed merge waits on.
     contexts: Vec<CheckInfo>,
+    /// `baseRefName`, to look up which contexts the base requires.
+    base: String,
 }
 
 /// One check of the rollup as far as a stop reason needs it.
@@ -3435,7 +3568,8 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
             "view".to_owned(),
             pr_url.to_owned(),
             "--json".to_owned(),
-            "url,number,state,title,reviews,comments,mergeStateStatus,headRefOid".to_owned(),
+            "url,number,state,title,reviews,comments,mergeStateStatus,headRefOid,baseRefName"
+                .to_owned(),
         ],
     )
     .await?;
@@ -3514,6 +3648,7 @@ fn seen_from(view_json: &str, node_json: Option<&str>) -> Result<Seen> {
         rollup_head,
         merge_state: raw.merge_state_status,
         contexts,
+        base: raw.base_ref_name,
     })
 }
 
@@ -3953,6 +4088,8 @@ struct GhPr {
     /// on and the rollup belongs to the new head.
     #[serde(default)]
     head_ref_oid: String,
+    #[serde(default)]
+    base_ref_name: String,
     #[serde(default)]
     reviews: Vec<GhReview>,
     #[serde(default)]
@@ -5995,6 +6132,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         fix: Mutex<Option<Fixed>>,
         log: Mutex<Vec<&'static str>>,
         argvs: Mutex<Vec<Vec<String>>>,
+        required: Mutex<Option<BTreeSet<String>>>,
     }
 
     impl Scripted {
@@ -6010,6 +6148,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 fix: Mutex::new(None),
                 log: Mutex::new(Vec::new()),
                 argvs: Mutex::new(Vec::new()),
+                required: Mutex::new(None),
             }
         }
         fn argvs(&self) -> Vec<Vec<String>> {
@@ -6042,6 +6181,9 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         }
         async fn poll(&self) {
             self.log.lock().unwrap().push("poll");
+        }
+        async fn required_contexts(&self, _repo: &Path, _base: &str) -> Option<BTreeSet<String>> {
+            self.required.lock().unwrap().clone()
         }
         async fn fix(
             &self,
@@ -6079,6 +6221,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             rollup_head: head.to_owned(),
             merge_state: merge_state.to_owned(),
             contexts: Vec::new(),
+            base: "main".to_owned(),
         }
     }
 
@@ -6615,6 +6758,62 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 && !why.contains("requirements are not met"),
             "{why}"
         );
+    }
+
+    fn passing(label: &str) -> CheckInfo {
+        CheckInfo {
+            label: label.to_owned(),
+            verdict: Verdict::Pass,
+            required: Some(false),
+        }
+    }
+
+    fn names(xs: &[&str]) -> BTreeSet<String> {
+        xs.iter().map(|x| (*x).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_required_check_the_rollup_never_listed_is_named() {
+        let req = names(&["build"]);
+        let why = waiting_on("BLOCKED", &[passing("review")], Some(&req));
+        assert!(why.contains("never reported: build"), "{why}");
+        assert!(!why.contains("probably waiting for a review"), "{why}");
+    }
+
+    #[test]
+    fn an_unreadable_required_list_is_not_read_as_a_review_wait() {
+        let why = waiting_on("BLOCKED", &[passing("review")], None);
+        assert!(why.contains("could not be read"), "{why}");
+        assert!(!why.contains("probably waiting for a review"), "{why}");
+    }
+
+    #[test]
+    fn all_required_reported_keeps_the_review_guess() {
+        let req = names(&["build"]);
+        let why = waiting_on("BLOCKED", &[passing("build")], Some(&req));
+        assert!(why.contains("probably waiting for a review"), "{why}");
+        assert!(!why.contains("never reported"), "{why}");
+    }
+
+    #[test]
+    fn required_names_match_the_rollup_ignoring_case_only() {
+        let req = names(&["Build"]);
+        let why = waiting_on("BLOCKED", &[passing("build")], Some(&req));
+        assert!(!why.contains("never reported"), "{why}");
+    }
+
+    #[test]
+    fn required_contexts_are_read_from_protection_and_rulesets() {
+        let classic = r#"{"contexts":["build"],"checks":[{"context":"lint","app_id":1}]}"#;
+        assert_eq!(
+            parse_classic_required(classic),
+            Some(names(&["build", "lint"]))
+        );
+        let rules = r#"[{"type":"pull_request","parameters":{}},
+            {"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"test"}]}}]"#;
+        assert_eq!(parse_ruleset_required(rules), Some(names(&["test"])));
+        assert_eq!(parse_ruleset_required("nope"), None);
+        assert_eq!(encode_path_segment("release/1.x"), "release%2F1.x");
     }
 
     #[tokio::test]
