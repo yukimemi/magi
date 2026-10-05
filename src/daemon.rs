@@ -2837,6 +2837,16 @@ async fn attempt(
                     r.state.instruction = instruction;
                 }
                 r.state.attachments = attachments.clone();
+                // The merge choice of a hand-started task still holds when the
+                // run it resumes was started under another one.
+                if let Some(mode) = task
+                    .overrides
+                    .as_ref()
+                    .and_then(|o| o.merge.as_deref())
+                    .and_then(|m| merge_mode(m).ok())
+                {
+                    r.state.config.merge.mode = mode;
+                }
                 r
             })
         }
@@ -3032,6 +3042,23 @@ pub fn finish_attempt(
     fresh
 }
 
+/// A task a hand-started run leaves runnable (failed with attempts to spare,
+/// or requeued) is **held**: nobody asked for a retry, and a loop starting
+/// later must not spend agent calls on it. `magi task release` retries.
+pub fn hold_if_runnable(queue: &Queue, task: &mut Task) {
+    if task.status.runnable() {
+        let why = task.last_error.clone().map_or_else(
+            || "the run did not finish".to_owned(),
+            |e| format!("the run did not finish: {e}"),
+        );
+        task.hold_manual(Some(format!(
+            "{why}. It was started by hand, so it is not retried \
+             automatically; `magi task release` retries it."
+        )));
+        record(queue, task);
+    }
+}
+
 /// Whether an attempt at a task whose newest run is `run` would resume that
 /// run rather than start a fresh competition. `magi run --resume` hands a run
 /// to a live loop only when this holds.
@@ -3088,17 +3115,7 @@ pub async fn run_claimed(opts: &Opts, queue: &Queue, task: &mut Task) {
         task,
     )
     .await;
-    if task.status.runnable() {
-        let why = task.last_error.clone().map_or_else(
-            || "the run did not finish".to_owned(),
-            |e| format!("the run did not finish: {e}"),
-        );
-        task.hold_manual(Some(format!(
-            "{why}. It was started by hand, so it is not retried \
-             automatically; `magi task release` retries it."
-        )));
-        record(queue, task);
-    }
+    hold_if_runnable(queue, task);
 }
 
 /// The quota losses `after` holds that `before` did not: what one execution

@@ -3223,9 +3223,6 @@ async fn run_as_task(queue: &Queue, filing: magi::direct::Filing, dry_run: bool)
                 pid.map_or_else(String::new, |p| format!(" (pid {p})")),
                 task.short()
             );
-            if agent_env().is_some() {
-                return detach_note(&task);
-            }
             follow_task(queue, &home, &task.id).await
         }
         magi::direct::Filed::Standalone { mut task, claim } => {
@@ -3287,32 +3284,34 @@ fn report_task_outcome(task: &magi::queue::Task) -> Result<()> {
     exit_status(result, state.status, state.pr.is_some())
 }
 
+/// How long an agent seat follows the loop's run before handing control back:
+/// the shell tool it runs in kills a longer wait, and a seat whose own run
+/// holds the loop's urgent lane could otherwise wait for itself. Same slice
+/// as `magi ask --wait`.
+const AGENT_FOLLOW: std::time::Duration = std::time::Duration::from_secs(240);
+
 /// Follow a task the live loop runs until it finishes, then report its run.
+/// An operator follows to the end; an agent seat stops after
+/// [`AGENT_FOLLOW`] with exit 0 and the task id, like a pending `magi ask`.
 async fn follow_task(queue: &Queue, home: &Path, id: &str) -> Result<()> {
     let followed = magi::direct::follow(
         queue,
         home,
         id,
         std::time::Duration::from_secs(2),
-        None,
+        agent_env().map(|_| AGENT_FOLLOW),
         |run| println!("run {run}"),
         |line| println!("{line}"),
     )
     .await?;
+    if !followed.finished {
+        println!(
+            "still running under the loop; read the outcome with `magi task show {}`",
+            followed.task.short()
+        );
+        return Ok(());
+    }
     report_task_outcome(&followed.task)
-}
-
-/// An agent seat does not wait for the loop's run: its own run may hold the
-/// loop's single urgent lane (a wait that can never end), and the shell tool it
-/// runs in kills a long wait anyway. The task is filed; the seat reads its
-/// outcome with `magi task show`.
-fn detach_note(task: &magi::queue::Task) -> Result<()> {
-    println!(
-        "not waiting (called from an agent seat): the loop runs it; read the outcome with \
-         `magi task show {}`",
-        task.short()
-    );
-    Ok(())
 }
 
 /// Is a loop in another process serving this machine's queue?
@@ -3358,6 +3357,9 @@ async fn run_existing_task(
     task.overrides = Some(overrides);
     if let Some(branch) = review {
         task.review_of = Some(branch);
+        // An explicit review is not a retry of earlier work: it must not be
+        // swallowed by resuming an unfinished run of this task.
+        task.fresh_start = true;
     }
     if live {
         task.urgent = true;
@@ -3366,9 +3368,6 @@ async fn run_existing_task(
             "task {} marked urgent for the running magi loop",
             task.short()
         );
-        if agent_env().is_some() {
-            return detach_note(&task);
-        }
         return follow_task(queue, &home, &id).await;
     }
     queue.put(&mut task)?;
@@ -3414,7 +3413,13 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
             t
         }
     };
-    let claim = if !dry_run && live_loop(&home) && magi::daemon::loop_would_resume(&run_id) {
+    // The loop picks `task.runs.last()`, so it only resumes *this* run when it
+    // is that one and nothing else steers the attempt elsewhere.
+    let loop_resumes = task.runs.last() == Some(&run_id)
+        && !task.fresh_start
+        && task.review_branch.is_none()
+        && magi::daemon::loop_would_resume(&run_id);
+    let claim = if !dry_run && live_loop(&home) && loop_resumes {
         None
     } else {
         Some(queue.claim(&task.id).with_context(|| {
@@ -3448,9 +3453,6 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
             "task {} marked urgent for the running magi loop",
             task.short()
         );
-        if agent_env().is_some() {
-            return detach_note(&task);
-        }
         return follow_task(&queue, &home, &task.id).await;
     }
     task.start(run_id);

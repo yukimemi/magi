@@ -4330,7 +4330,18 @@ impl Runner {
                     );
                     follow_up.state.save()?;
                     let follow_up_id = follow_up.state.id.clone();
-                    if let Err(e) = follow_up.execute().await {
+                    // The follow-up is a run like any other: it belongs to the
+                    // task of the run it follows, or to one filed for it.
+                    let adopted = crate::direct::adopt(
+                        &follow_up.state,
+                        self.state.origin.as_ref().and_then(|o| o.task.as_deref()),
+                    );
+                    let executed = follow_up.execute().await;
+                    let failure = executed.as_ref().err().map(|e| format!("{e:#}"));
+                    if let Some(a) = adopted {
+                        a.finish(&follow_up.state, executed);
+                    }
+                    if let Some(e) = failure {
                         self.state.event(
                             "fix",
                             format!(

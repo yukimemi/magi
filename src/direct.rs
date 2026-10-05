@@ -128,6 +128,9 @@ pub fn config_for(task: &Task, repo: &Path) -> Result<Config> {
 pub struct Followed {
     /// The task as last read.
     pub task: Task,
+    /// False when `max_wait` ran out first: the loop still owns the task and
+    /// nothing is known of its outcome yet.
+    pub finished: bool,
 }
 
 /// Watch `id` until the loop that owns it is done with it, calling `seen` with
@@ -138,7 +141,8 @@ pub struct Followed {
 /// loop's to retry. A task that stays unfinished while no loop is alive, or
 /// past `max_wait`, is an error - never taken over here, because the loop may
 /// merely be slow to heartbeat and a second driver would race it. Recovery is
-/// the loop's own claim reclaim and `Runner::resume`.
+/// the loop's own claim reclaim and `Runner::resume`. Running out of
+/// `max_wait` is not an error: it returns with `finished: false`.
 pub async fn follow(
     queue: &Queue,
     home: &Path,
@@ -171,7 +175,10 @@ pub async fn follow(
             task.status,
             TaskStatus::Done | TaskStatus::Held | TaskStatus::Blocked
         ) {
-            return Ok(Followed { task });
+            return Ok(Followed {
+                task,
+                finished: true,
+            });
         }
         let reading = crate::daemon::read_status(home);
         if crate::daemon::foreign_loop(reading.as_ref(), Timestamp::now(), std::process::id())
@@ -187,14 +194,76 @@ pub async fn follow(
             );
         }
         if max_wait.is_some_and(|m| began.elapsed() >= m) {
-            bail!(
-                "gave up following task {} ({}); it is still the loop's - see `magi task show {}`",
-                task.short(),
-                task.status.as_str(),
-                task.short()
-            );
+            return Ok(Followed {
+                task,
+                finished: false,
+            });
         }
         tokio::time::sleep(poll).await;
+    }
+}
+
+/// A run opened inside this process (the follow-up review of `magi fix`) and
+/// the task that owns it. See [`adopt`].
+#[derive(Debug)]
+pub struct Adopted {
+    queue: Queue,
+    /// The task created for an ownerless run; `None` when an existing task
+    /// only gained the run.
+    task: Option<Task>,
+    claim: Option<Claim>,
+    quota_before: Vec<crate::run::QuotaLoss>,
+}
+
+/// Give a run this process is about to execute an owning task. A parent task
+/// that exists just gains the run in `runs`; with none, a task is filed and
+/// claimed for the duration, and [`Adopted::finish`] settles it as the daemon
+/// would. A no-op (`None`) when no magi home is pinned.
+pub fn adopt(state: &crate::run::RunState, parent_task: Option<&str>) -> Option<Adopted> {
+    crate::run::try_home()?;
+    let queue = Queue::open();
+    if let Some(parent) = parent_task
+        && queue.link_run(parent, &state.id).is_ok()
+    {
+        return Some(Adopted {
+            queue,
+            task: None,
+            claim: None,
+            quota_before: Vec::new(),
+        });
+    }
+    let mut task = Task::new(
+        crate::queue::title_from(&state.instruction, 72),
+        state.instruction.clone(),
+        state.repo.clone(),
+        Source::Human,
+    );
+    let claim = queue.claim(&task.id).ok()?;
+    task.start(state.id.clone());
+    queue.put(&mut task).ok()?;
+    Some(Adopted {
+        queue,
+        task: Some(task),
+        claim: Some(claim),
+        quota_before: state.quota.clone(),
+    })
+}
+
+impl Adopted {
+    /// Settle the task of an adopted ownerless run after it executed.
+    pub fn finish(mut self, state: &crate::run::RunState, result: Result<()>) {
+        if let Some(task) = &mut self.task {
+            crate::daemon::finish_attempt(
+                crate::daemon::Opts::default().max_attempts,
+                &self.queue,
+                task,
+                state,
+                &self.quota_before,
+                result,
+            );
+            crate::daemon::hold_if_runnable(&self.queue, task);
+        }
+        drop(self.claim.take());
     }
 }
 
@@ -355,7 +424,7 @@ mod tests {
         heartbeat(dir.path(), 4242, 0);
         let mut t = filing(dir.path()).into_task();
         q.put(&mut t).unwrap();
-        let err = follow(
+        let waited = follow(
             &q,
             dir.path(),
             &t.id,
@@ -365,8 +434,8 @@ mod tests {
             |_| {},
         )
         .await
-        .unwrap_err();
-        assert!(format!("{err}").contains("gave up"), "{err}");
+        .unwrap();
+        assert!(!waited.finished, "the wait ran out, the loop still owns it");
         t.link_run("20260101-000000-abcd");
         t.succeed();
         q.put(&mut t).unwrap();
