@@ -3244,6 +3244,9 @@ async fn run_as_task(queue: &Queue, filing: magi::direct::Filing, dry_run: bool)
                 .await?;
                 print!("{}", report::run(&runner.state));
                 println!("\ndry run: stopping before the first agent call");
+                // Link the prepared run (not `start`: no attempt was spent) so
+                // `task show` lists it and a release resumes it.
+                task.link_run(&runner.state.id);
                 task.hold_manual(Some(
                     "dry run: no agent was called; `magi task release` runs it".to_owned(),
                 ));
