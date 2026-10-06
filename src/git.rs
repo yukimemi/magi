@@ -134,6 +134,98 @@ pub async fn current_branch(repo: &Path) -> Result<Option<String>> {
     })
 }
 
+/// The branch a `refs/remotes/<remote>/HEAD` symref names, e.g.
+/// `refs/remotes/origin/main` -> `main`. Pure, and shared with
+/// `Config::discover` so the branch magi reads its config from and the branch
+/// a run starts from can never come from two different readings.
+pub fn remote_head_branch(remote: &str, symref: &str) -> Option<String> {
+    symref
+        .trim()
+        .strip_prefix(&format!("refs/remotes/{remote}/"))
+        .filter(|b| !b.is_empty() && *b != "HEAD")
+        .map(str::to_owned)
+}
+
+/// Record `refs/remotes/<remote>/HEAD` -> `<remote>/<base>` when it is absent,
+/// so a later read of the remote's default (`Config::discover`) agrees with
+/// the branch just resolved even when git did not create the symref on fetch
+/// (`followRemoteHEAD=never`, old git). Moves only `refs/remotes`; an existing
+/// symref is left alone. Best effort.
+pub async fn ensure_remote_head(repo: &Path, remote: &str, base: &str) {
+    let head = format!("refs/remotes/{remote}/HEAD");
+    if git_raw(repo, &["symbolic-ref", "--quiet", &head])
+        .await
+        .is_ok_and(|o| o.ok())
+    {
+        return;
+    }
+    let target = format!("refs/remotes/{remote}/{base}");
+    let _ = git_raw(repo, &["symbolic-ref", &head, &target]).await;
+}
+
+/// The branch in `git ls-remote --symref <remote> HEAD` output
+/// (`ref: refs/heads/main\tHEAD`).
+fn symref_branch(out: &str) -> Option<String> {
+    out.lines()
+        .find_map(|l| l.strip_prefix("ref: refs/heads/"))
+        .and_then(|l| l.split_whitespace().next())
+        .map(str::to_owned)
+}
+
+/// Which branch of `remote` is the base: `explicit` (`[merge] base`) wins,
+/// else the remote's default branch as recorded in `refs/remotes/<remote>/HEAD`.
+/// When that ref is missing (a checkout that was never cloned from it), ask the
+/// remote once with `git remote set-head <remote> -a`, which moves only
+/// `refs/remotes`. Never the checked-out branch: a detached or stale primary
+/// checkout must not decide what a run branches off.
+pub async fn merge_base_branch(
+    repo: &Path,
+    remote: &str,
+    explicit: Option<&str>,
+) -> Result<String> {
+    if let Some(b) = explicit.map(str::trim).filter(|b| !b.is_empty()) {
+        return Ok(b.to_owned());
+    }
+    let head = format!("refs/remotes/{remote}/HEAD");
+    let read = || async {
+        let out = git_raw(repo, &["symbolic-ref", "--quiet", &head])
+            .await
+            .ok()?;
+        if out.ok() {
+            remote_head_branch(remote, &out.stdout)
+        } else {
+            None
+        }
+    };
+    if let Some(b) = read().await {
+        return Ok(b);
+    }
+    let set = git_raw(repo, &["remote", "set-head", remote, "-a"]).await;
+    if let Some(b) = read().await {
+        return Ok(b);
+    }
+    // `set-head -a` insists the tracking ref already exists, which it does not
+    // for a remote that was never fetched (or a single-branch clone of another
+    // branch). Ask the remote for its HEAD symref instead: that only names the
+    // branch, and the fetch that follows (`resolve_base`) creates the ref.
+    if let Ok(o) = git_raw(repo, &["ls-remote", "--symref", remote, "HEAD"]).await
+        && o.ok()
+        && let Some(b) = symref_branch(&o.stdout)
+    {
+        return Ok(b);
+    }
+    let why = match set {
+        Ok(o) if !o.ok() => o.stderr.lines().next().unwrap_or("").trim().to_owned(),
+        Ok(_) => "the remote reported no default branch".to_owned(),
+        Err(e) => e.to_string(),
+    };
+    bail!(
+        "cannot tell which branch of `{remote}` is the base ({why}): set [merge] base \
+         (and remote) in magi.toml, or run `git remote set-head {remote} -a`. magi does \
+         not fall back to the checked-out branch, which may be detached or stale"
+    )
+}
+
 /// Is the working tree free of tracked modifications and untracked files?
 pub async fn is_clean(repo: &Path) -> Result<bool> {
     Ok(git(repo, &["status", "--porcelain"]).await?.is_empty())
@@ -1559,5 +1651,115 @@ mod tests {
         let path = repo.join(".git/info/exclude");
         let body = tokio::fs::read_to_string(&path).await.unwrap();
         assert_eq!(body.matches("/.magi/").count(), 1);
+    }
+
+    fn sh(cwd: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .quiet()
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A checkout whose `origin` is a local bare repository holding `trunk`,
+    /// with `origin/HEAD` unset (as after `git remote add` + push).
+    async fn with_remote() -> (tempfile::TempDir, PathBuf) {
+        let (g, repo) = scratch().await;
+        let bare = g.path().join("bare.git");
+        sh(g.path(), &["init", "--bare", "-b", "trunk", "bare.git"]);
+        sh(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        sh(&repo, &["push", "origin", "HEAD:refs/heads/trunk"]);
+        sh(&repo, &["fetch", "origin"]);
+        (g, repo)
+    }
+
+    #[test]
+    fn remote_head_branch_strips_only_the_matching_remote() {
+        assert_eq!(
+            remote_head_branch("origin", "refs/remotes/origin/main\n").as_deref(),
+            Some("main")
+        );
+        assert_eq!(remote_head_branch("up", "refs/remotes/origin/main"), None);
+        assert_eq!(remote_head_branch("origin", "refs/remotes/origin/"), None);
+    }
+
+    #[tokio::test]
+    async fn merge_base_branch_reads_origin_head_when_present() {
+        let (_g, repo) = with_remote().await;
+        sh(&repo, &["remote", "set-head", "origin", "trunk"]);
+        assert_eq!(
+            merge_base_branch(&repo, "origin", None).await.unwrap(),
+            "trunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_base_branch_recovers_a_missing_origin_head() {
+        let (_g, repo) = with_remote().await;
+        // Newer git sets it on fetch; make the precondition true everywhere.
+        sh(&repo, &["remote", "set-head", "origin", "-d"]);
+        let head = git_raw(
+            &repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+        )
+        .await
+        .unwrap();
+        assert!(!head.ok(), "precondition: no origin/HEAD");
+        assert_eq!(
+            merge_base_branch(&repo, "origin", None).await.unwrap(),
+            "trunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_base_branch_errors_without_a_remote_and_never_uses_head() {
+        let (_g, repo) = scratch().await;
+        let err = merge_base_branch(&repo, "origin", None).await.unwrap_err();
+        assert!(format!("{err:#}").contains("[merge] base"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn merge_base_branch_prefers_the_explicit_base() {
+        let (_g, repo) = with_remote().await;
+        assert_eq!(
+            merge_base_branch(&repo, "origin", Some("release"))
+                .await
+                .unwrap(),
+            "release"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_base_branch_names_an_unfetched_default_branch() {
+        // A remote added after the fact, never fetched: no tracking refs, so
+        // `set-head -a` cannot work, but the remote's own HEAD still names it.
+        let (g, repo) = scratch().await;
+        let bare = g.path().join("bare.git");
+        sh(g.path(), &["init", "--bare", "-b", "trunk", "bare.git"]);
+        sh(
+            &repo,
+            &["push", &bare.to_string_lossy(), "HEAD:refs/heads/trunk"],
+        );
+        sh(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        assert!(!rev_exists(&repo, "refs/remotes/origin/trunk").await);
+        assert_eq!(
+            merge_base_branch(&repo, "origin", None).await.unwrap(),
+            "trunk"
+        );
+    }
+
+    #[test]
+    fn symref_branch_reads_ls_remote_output() {
+        assert_eq!(
+            symref_branch("ref: refs/heads/main\tHEAD\nabc\tHEAD\n").as_deref(),
+            Some("main")
+        );
+        assert_eq!(symref_branch("abc\tHEAD\n"), None);
     }
 }

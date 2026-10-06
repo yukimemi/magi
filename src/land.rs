@@ -1537,32 +1537,52 @@ async fn approval_gate(
             } else {
                 head.to_owned()
             };
-            let base = state.base_branch.clone();
+            // The diff is against what the remote's base holds, never the
+            // local branch of that name; unreadable means less evidence.
+            let remote = &state.config.merge.remote;
+            let tracking = format!("{remote}/{}", state.base_branch);
+            let base = if git::rev_exists(&worktree, &tracking).await {
+                tracking
+            } else {
+                String::new()
+            };
             let range = format!("{base}...{head}");
             // A failed `git` must not decide the merge: the panel degrades to
             // less evidence and the owner still chooses. Merging because the
             // diff could not be read would be the worst of both.
-            let numstat = git::git_raw(&worktree, &["diff", "--numstat", "-M", &range])
+            let numstat = if base.is_empty() {
+                String::new()
+            } else {
+                git::git_raw(&worktree, &["diff", "--numstat", "-M", &range])
+                    .await
+                    .map(|o| o.stdout)
+                    .unwrap_or_default()
+            };
+            let diff = if base.is_empty() {
+                String::new()
+            } else {
+                git::diff(&worktree, &base, &head).await.unwrap_or_default()
+            };
+            let commits: Vec<String> = if base.is_empty() {
+                Vec::new()
+            } else {
+                git::git_raw(
+                    &worktree,
+                    &[
+                        "log",
+                        "--reverse",
+                        "--format=%s",
+                        &format!("{base}..{head}"),
+                    ],
+                )
                 .await
                 .map(|o| o.stdout)
-                .unwrap_or_default();
-            let diff = git::diff(&worktree, &base, &head).await.unwrap_or_default();
-            let commits: Vec<String> = git::git_raw(
-                &worktree,
-                &[
-                    "log",
-                    "--reverse",
-                    "--format=%s",
-                    &format!("{base}..{head}"),
-                ],
-            )
-            .await
-            .map(|o| o.stdout)
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(str::to_owned)
-            .collect();
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(str::to_owned)
+                .collect()
+            };
 
             let w = words(&state.config.graph.language);
             let html = approval_panel(state, pr, &numstat, &diff, &commits, subject);
@@ -1571,7 +1591,7 @@ async fn approval_gate(
                 APPROVAL_NODE.to_owned(),
                 "land".to_owned(),
                 w.approval_summary(pr.number, subject),
-                w.approval_detail(&pr.url, &base, subject, contested),
+                w.approval_detail(&pr.url, &state.base_branch, subject, contested),
                 vec![APPROVE.to_owned(), HOLD.to_owned()],
             );
             store

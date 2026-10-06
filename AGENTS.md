@@ -502,11 +502,38 @@ checkout is often stale or detached: nagi's run ce6e failed its gate on a step
   same commit. The cache directory is built under a temp name and renamed in:
   never write into it in place, concurrent `discover`s read it. Settings
   (`view` / `save`) propagate an unreadable ref as an error instead of an empty
-  layer list. Out of scope, still local-checkout reads:
-  `current_branch` base selection, the `is_clean` warning, `release_local`'s
+  layer list. Out of scope, still local-checkout reads: `release_local`'s
   `Cargo.toml`.
 - Tests that start a run need a remote: `tests/common::fixture` pushes `main` to
   a local bare `origin`.
+
+### The base branch is the remote's default, never the checkout's
+
+`git::merge_base_branch` is the one place that names the base. Order: an explicit
+`[merge] base`; else the branch `refs/remotes/<remote>/HEAD` names; else one
+`git remote set-head <remote> -a` (moves only `refs/remotes`) and a re-read; else
+an error telling the operator to set `[merge] base`. **Never `current_branch`**:
+jj keeps the primary HEAD detached and a checkout can be arbitrarily stale.
+`Config::discover` shares the pure `git::remote_head_branch`, and
+`discover_fetched` calls the same resolver first, so the branch magi reads its
+config from and the one a run branches off cannot disagree. A repo whose default
+branch is not the intended base must set `[merge] base`.
+
+- Everything that acts (`start_naming`, `review_taking_over`, `resolve_base`, the
+  approval panel's diff and log, PR-mode `merge_is_empty`, the conductor's
+  "already in the base?" fact) reads `<remote>/<base>` and treats an unreadable
+  one as unknown (a hold, an error, or "less evidence"), never as the local
+  branch. Display of history uses the SHAs the run stored.
+- The `is_clean` warning in `start_naming` is gone: nothing reads the working
+  tree any more, so "uncommitted work is not part of this run" informed nobody
+  and a failing `git status` could only block a start.
+- **Exceptions that are not fallbacks**: `MergeMode::Local` (really writes to the
+  primary checkout, so its `current_branch` / `is_clean` guards stay) and
+  `refs::commit_for` (reads a *named* local `magi/...` candidate branch).
+  `release_local` / `bump` read a worktree pinned to a commit.
+- Test fixtures: `tests/common::fixture` pushes `main` to a bare `origin`
+  without setting `origin/HEAD`; the resolver recovers it, so leave it unset to
+  keep that path covered.
 
 ### Agent CLIs are the only backend
 

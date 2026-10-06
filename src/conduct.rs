@@ -465,10 +465,9 @@ async fn attach_facts(cfg: &Config, repo: &Path, queue: &Queue, verdict: &mut Ve
         }
         let repo = repo_for(&task, repo);
         let remote = &cfg.merge.remote;
-        let base = match cfg.merge.base.clone() {
-            Some(b) => Some(b),
-            None => crate::git::current_branch(&repo).await.ok().flatten(),
-        };
+        let base = crate::git::merge_base_branch(&repo, remote, cfg.merge.base.as_deref())
+            .await
+            .ok();
         let facts = match base {
             Some(base) => {
                 let base_name = base.clone();
@@ -478,11 +477,9 @@ async fn attach_facts(cfg: &Config, repo: &Path, queue: &Queue, verdict: &mut Ve
                 let refreshed = crate::git::fetch(&repo, remote, &base)
                     .await
                     .is_ok_and(|o| o.ok());
-                let against = if crate::git::rev_exists(&repo, &tracking).await {
-                    tracking
-                } else {
-                    base
-                };
+                // Only the remote's tip counts: a local branch of the same
+                // name is whatever the checkout happens to hold.
+                let against = tracking;
                 match crate::git::rev_parse(&repo, &against).await {
                     Ok(tip) => crate::refs::describe(
                         &crate::refs::resolve(&repo, &tip, remote, &text).await,
@@ -493,12 +490,15 @@ async fn attach_facts(cfg: &Config, repo: &Path, queue: &Queue, verdict: &mut Ve
                         } else {
                             format!(
                                 "{facts}\n(could not fetch {remote}/{base_name}: this is \
-                                 against the local `{against}`, which may be behind the \
-                                 remote)"
+                                 against the last fetched `{against}`, which may be behind \
+                                 the remote)"
                             )
                         }
                     }),
-                    Err(e) => Some(format!("could not check the repository: {e:#}")),
+                    Err(_) => Some(format!(
+                        "could NOT be checked against the repository: {against} is not \
+                         available here, so whether the work is in the base is unknown"
+                    )),
                 }
             }
             None => Some("could not check the repository: no base branch known".to_owned()),

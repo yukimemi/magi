@@ -1552,7 +1552,11 @@ impl Config {
         explicit: Option<&Path>,
     ) -> Result<(Self, Vec<PathBuf>)> {
         if explicit.is_none() && is_git_worktree(repo) {
-            let (remote, base) = resolve_remote_base(repo)?;
+            // A checkout that was never cloned from the remote has no
+            // `<remote>/HEAD`; learn it here (refs/remotes only) so an
+            // ordinary start recovers instead of failing in `discover`.
+            let (remote, cfg_base) = probe_remote_base(repo);
+            let base = crate::git::merge_base_branch(repo, &remote, cfg_base.as_deref()).await?;
             let out = crate::git::fetch(repo, &remote, &base)
                 .await
                 .with_context(|| format!("fetching {remote}/{base} to read magi.toml"))?;
@@ -1561,6 +1565,9 @@ impl Config {
                     "cannot read magi.toml: `git fetch {remote} {base}` failed ({});                      refusing to use the local checkout's copy, which may be stale",
                     out.stderr.lines().next().unwrap_or("").trim()
                 );
+            }
+            if cfg_base.is_none() {
+                crate::git::ensure_remote_head(repo, &remote, &base).await;
             }
         }
         Self::discover(repo, explicit)
@@ -2061,8 +2068,8 @@ fn probe_merge(path: &Path, repo: &Path) -> Option<ProbeMerge> {
     toml::from_str::<Probe>(&text).ok()?.merge
 }
 
-/// Where the remote ref is: see the module doc for the order.
-fn resolve_remote_base(repo: &Path) -> Result<(String, String)> {
+/// The `[merge] remote` / `base` the layers name, before any git lookup.
+fn probe_remote_base(repo: &Path) -> (String, Option<String>) {
     let mut remote = None;
     let mut base = None;
     let mut sources: Vec<PathBuf> = Config::machine_layer().into_iter().collect();
@@ -2074,17 +2081,18 @@ fn resolve_remote_base(repo: &Path) -> Result<(String, String)> {
             base = base.or(m.base.filter(|s| !s.trim().is_empty()));
         }
     }
-    let remote = remote.unwrap_or_else(|| "origin".to_owned());
+    (remote.unwrap_or_else(|| "origin".to_owned()), base)
+}
+
+/// Where the remote ref is: see the module doc for the order.
+fn resolve_remote_base(repo: &Path) -> Result<(String, String)> {
+    let (remote, base) = probe_remote_base(repo);
     let base = match base {
         Some(b) => b,
         None => {
             let head = format!("refs/remotes/{remote}/HEAD");
-            git_out(repo, &["symbolic-ref", "--short", &head])
-                .and_then(|s| {
-                    s.trim()
-                        .strip_prefix(&format!("{remote}/"))
-                        .map(str::to_owned)
-                })
+            git_out(repo, &["symbolic-ref", "--quiet", &head])
+                .and_then(|s| crate::git::remote_head_branch(&remote, &s))
                 .with_context(|| {
                     format!(
                         "cannot tell which branch of `{remote}` holds magi.toml: \
@@ -3242,6 +3250,25 @@ mod tests {
                 .block_on(Config::discover_fetched(&repo, None))
                 .unwrap_err();
             assert!(format!("{err:#}").contains("fetch"), "{err:#}");
+        }
+
+        #[test]
+        fn discover_fetched_survives_a_fetch_that_leaves_no_origin_head() {
+            // Never-fetched remote + followRemoteHEAD=never: fetch creates
+            // origin/trunk but not origin/HEAD, which discovery then re-reads.
+            let (_t, repo) = fixture("[graph]\ncandidates = 2\n", "");
+            git(&repo, &["remote", "set-head", "origin", "-d"]);
+            git(&repo, &["update-ref", "-d", "refs/remotes/origin/trunk"]);
+            git(
+                &repo,
+                &["config", "remote.origin.followRemoteHEAD", "never"],
+            );
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (cfg, _) = rt.block_on(Config::discover_fetched(&repo, None)).unwrap();
+            assert_eq!(cfg.graph.candidates, 2);
         }
 
         #[test]
