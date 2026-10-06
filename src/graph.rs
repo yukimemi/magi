@@ -9570,6 +9570,28 @@ mod tests {
         run(&["commit", "-q", "-m", "work"]);
         run(&["checkout", "-q", "main"]);
 
+        // A pull request is compared against the remote's base, so the
+        // fixture needs one. Before it exists nothing can be read, and the
+        // answer must be "not empty".
+        let probe = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            "deadbeef".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        );
+        assert!(!merge_is_empty(&repo, &probe, "magi/x/A", MergeMode::Pr).await);
+        let bare = tmp.path().join("origin.git");
+        let out = std::process::Command::new("git")
+            .quiet()
+            .args(["init", "-q", "--bare"])
+            .arg(&bare)
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git init --bare");
+        run(&["remote", "add", "origin", bare.to_str().unwrap()]);
+        run(&["push", "-q", "origin", "main"]);
+
         let mut state = RunState::new(
             repo.clone(),
             "main".to_owned(),
