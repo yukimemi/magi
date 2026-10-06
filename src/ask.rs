@@ -774,12 +774,12 @@ impl Question {
             .map(|t| t.body.trim());
         if crate::deputy::merge_gated(self) {
             // The merge is irreversible and a say is not a decision. `hold` must
-            // be the latest message exactly; `merge` may sit among other
-            // requests, but only as a clear, unhedged instruction quoted
-            // verbatim - see `land::merge_intent`, which holds on anything
-            // doubtful.
+            // be the latest message exactly. For `merge`, whether the words are
+            // a clear, unhedged instruction is the deputy's judgement alone;
+            // all magi checks is that the quote is a verbatim part of that
+            // latest message.
             let ok = if label == crate::land::APPROVE {
-                latest.is_some_and(|m| crate::land::merge_intent(m, quote))
+                latest.is_some_and(|m| m.contains(quote))
             } else if label == crate::land::HOLD {
                 latest.is_some_and(|m| {
                     quote.eq_ignore_ascii_case(label) && m.eq_ignore_ascii_case(label)
@@ -789,13 +789,13 @@ impl Question {
             };
             if !ok {
                 bail!(
-                    "on a merge approval `{label}` settles it only when the owner's latest \
-                     message clearly says so, unhedged and quoted verbatim ({}); ask what \
-                     they mean with `--thread` instead",
+                    "on a merge approval `{label}` settles it only when the quote is a \
+                     verbatim part of the owner's latest message ({}); if the wording is \
+                     doubtful, ask what they mean with `--thread` instead",
                     if label == crate::land::HOLD {
                         "for `hold`, the whole message"
                     } else {
-                        "no maybe / if / not / question"
+                        "the quote must be the instruction itself"
                     }
                 );
             }
@@ -2834,8 +2834,7 @@ mod tests {
         assert_eq!(parsed.who, Who::Agent);
     }
 
-    #[test]
-    fn a_merge_approval_settles_only_on_a_clear_unhedged_merge() {
+    fn approval_question() -> Question {
         let mut q = Question::new(
             "run".into(),
             crate::land::APPROVAL_NODE.into(),
@@ -2847,25 +2846,27 @@ mod tests {
         let mut dep = Deputy::new("brief".into());
         dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
         q.deputy = Some(dep);
-        q.say("please don't merge yet").unwrap();
-        assert!(q.settle_by_deputy("deputy-x", "merge", "merge").is_err());
+        q
+    }
+
+    #[test]
+    fn a_merge_approval_settles_on_a_verbatim_quote_of_the_latest_message() {
+        let mut q = approval_question();
+        q.say("merge").unwrap();
+        q.reply("sure?", vec!["merge".into(), "hold".into()])
+            .unwrap();
+        q.say(" Merge it please ").unwrap();
         assert!(
-            q.settle_by_deputy("deputy-x", "merge", "don't merge")
-                .is_err()
+            q.settle_by_deputy("deputy-x", "merge", "   ").is_err(),
+            "an empty quote is refused"
         );
         assert!(
-            q.settle_by_deputy("deputy-x", "hold", "don't merge")
-                .is_err()
+            q.settle_by_deputy("deputy-x", "merge", "ship it").is_err(),
+            "a quote the owner never said is refused"
         );
         assert_eq!(q.status, QuestionStatus::Open);
-        q.reply("do you mean hold?", vec!["merge".into(), "hold".into()])
+        q.settle_by_deputy("deputy-x", "merge", "Merge it please")
             .unwrap();
-        q.say(" Merge ").unwrap();
-        assert!(
-            q.settle_by_deputy("deputy-x", "merge", "erge").is_err(),
-            "a fragment is not the word"
-        );
-        q.settle_by_deputy("deputy-x", "merge", "Merge").unwrap();
         assert_eq!(q.resolution().as_deref(), Some("merge"));
     }
 
@@ -2887,14 +2888,13 @@ mod tests {
         };
         let mut approval = mk(vec!["merge".into(), "hold".into()]);
         assert!(crate::deputy::merge_gated(&approval));
-        approval.say("たぶんマージでいい").unwrap();
+        approval.say("マージしていいよ").unwrap();
         assert!(
             approval
-                .settle_by_deputy("deputy-x", "merge", "たぶんマージでいい")
+                .settle_by_deputy("deputy-x", "merge", "ぜひマージして")
                 .is_err(),
-            "a hedge never merges"
+            "a quote the owner never said is refused"
         );
-        approval.say("マージしていいよ").unwrap();
         approval
             .settle_by_deputy("deputy-x", "merge", "マージしていいよ")
             .unwrap();
@@ -2908,26 +2908,8 @@ mod tests {
     }
 
     #[test]
-    fn a_clear_merge_among_other_requests_settles_but_a_hedge_does_not() {
-        let mut q = Question::new(
-            "run".into(),
-            crate::land::APPROVAL_NODE.into(),
-            "land".into(),
-            "Merge?".into(),
-            String::new(),
-            vec!["merge".into(), "hold".into()],
-        );
-        let mut dep = Deputy::new("brief".into());
-        dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
-        q.deputy = Some(dep);
-        q.say("たぶんマージでいい。残りの指摘はフォローアップに積んで")
-            .unwrap();
-        assert!(
-            q.settle_by_deputy("deputy-x", "merge", "たぶんマージでいい")
-                .is_err()
-        );
-        q.reply("merge?", vec!["merge".into(), "hold".into()])
-            .unwrap();
+    fn a_merge_among_other_requests_settles_but_hold_needs_the_whole_message() {
+        let mut q = approval_question();
         q.say("マージしていいよ。残りのレビュー指摘はフォローアップタスクとして積んで")
             .unwrap();
         assert!(
@@ -2946,22 +2928,12 @@ mod tests {
     }
 
     #[test]
-    fn a_later_owner_message_supersedes_an_earlier_merge() {
-        let mut q = Question::new(
-            "run".into(),
-            crate::land::APPROVAL_NODE.into(),
-            "land".into(),
-            "Merge?".into(),
-            String::new(),
-            vec!["merge".into(), "hold".into()],
-        );
-        let mut dep = Deputy::new("brief".into());
-        dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
-        q.deputy = Some(dep);
+    fn a_quote_from_an_earlier_owner_message_does_not_settle_a_merge() {
+        let mut q = approval_question();
         q.say("merge").unwrap();
         q.reply("sure?", vec!["merge".into(), "hold".into()])
             .unwrap();
-        q.say("wait, don't merge").unwrap();
+        q.say("wait, hold off").unwrap();
         assert!(q.settle_by_deputy("deputy-x", "merge", "merge").is_err());
         assert_eq!(q.status, QuestionStatus::Open);
     }

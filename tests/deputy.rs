@@ -445,21 +445,49 @@ async fn a_clear_merge_with_a_follow_up_request_merges_and_files_the_tasks() {
 }
 
 common::e2e! {
-async fn a_hedged_merge_stays_a_hold_and_the_question_stays_open() {
+async fn a_non_verbatim_quote_is_refused_and_the_question_stays_open() {
     let s = scene(home_lock().await);
     let land = file_land(&s.store, "Merge #7?");
     s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
-    s.store.update(&land.id, |q| q.say("たぶんマージでいいよ。残りの指摘はフォローアップにして")).unwrap();
+    s.store.update(&land.id, |q| q.say("マージしていいよ")).unwrap();
     script(&s, &[
-        "MAGI ask --settle \"$qid\" --choice merge --quote 'たぶんマージでいいよ'",
+        "MAGI ask --settle \"$qid\" --choice merge --quote 'ぜひマージしてください'",
     ]);
 
     turn(&mut deputies(&s, 2)).await;
 
     let q = s.store.get(&land.id).unwrap();
-    assert_eq!(q.status, QuestionStatus::Open, "a hedge is not a decision: {:?}", q.thread);
+    assert_eq!(q.status, QuestionStatus::Open, "an invented quote is no basis: {:?}", q.thread);
     assert!(q.answer.is_none());
     assert!(follow_ups(&s).is_empty());
+}
+}
+
+common::e2e! {
+async fn an_operator_held_task_refuses_a_verbatim_merge_settle() {
+    let s = scene(home_lock().await);
+    let land = file_land(&s.store, "Merge #7?");
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    s.store.update(&land.id, |q| q.say("マージしていいよ")).unwrap();
+    let queue = magi::queue::Queue::at(s.home.join("queue"));
+    let mut task = magi::queue::Task::new(
+        "held by the operator".to_owned(),
+        "instruction".to_owned(),
+        s.fx.repo.clone(),
+        magi::queue::Source::Human,
+    );
+    task.runs.push(land.run.clone());
+    task.hold_manual(Some("operator says wait".to_owned()));
+    queue.put(&mut task).unwrap();
+    script(&s, &[
+        "MAGI ask --settle \"$qid\" --choice merge --quote 'マージしていいよ'",
+    ]);
+
+    turn(&mut deputies(&s, 2)).await;
+
+    let q = s.store.get(&land.id).unwrap();
+    assert_eq!(q.status, QuestionStatus::Open, "{:?}", q.thread);
+    assert!(q.answer.is_none());
 }
 }
 

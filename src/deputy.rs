@@ -221,10 +221,10 @@ pub fn destructive(q: &Question, label: &str) -> bool {
     }
 }
 
-/// Does `--settle` hold `q` to the merge-approval rules (`land::merge_intent`
-/// for `merge`, the whole message for `hold`)? A merge approval, and any other
-/// served question that offers `merge` (the release watcher's local-mode
-/// approval merges just as irreversibly).
+/// Does `--settle` hold `q` to the merge-approval rules (the verbatim quote of
+/// the latest message for `merge`, the whole message for `hold`)? A merge
+/// approval, and any other served question that offers `merge` (the release
+/// watcher's local-mode approval merges just as irreversibly).
 pub fn merge_gated(q: &Question) -> bool {
     q.node == crate::land::APPROVAL_NODE
         || (kind_of(q).is_some_and(|k| k != Kind::Conduct)

@@ -1461,11 +1461,14 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
              command: a settled question is answered, so never run `--thread` \
              after it (it would wait for a reply nobody will give) - choice `merge`, \
              `--quote` a verbatim part of their message that is the merge \
-             instruction itself. magi re-checks the quote and refuses a hedge.\n\
+             instruction itself, never an unrelated sentence. magi checks only that the \
+             quote is verbatim from their latest message; whether it is a clear, \
+             unconditional instruction to merge is your judgement alone.\n\
              - **Anything doubtful** - \"maybe\", \"probably\", \"いいかも\", \"たぶん\", any \
              condition (\"if CI passes\", \"merge but not X\"), a negation, a \
-             question: not a decision. Settle nothing; answer with `magi ask \
-             --thread` (repeat the choices) and ask what they want.\n\
+             question, or a retraction: not a decision. Settle nothing; answer with \
+             `magi ask --thread` (repeat the choices) and ask what they want. \
+             Doubt and silence are a hold.\n\
              - **A request for follow-up tasks** (\"queue the remaining findings \
              as follow-ups\"): file each with `magi task add --hold \"<why it \
              waits>\" --title \"...\" \"<text>\"`. The pull request has not landed, \

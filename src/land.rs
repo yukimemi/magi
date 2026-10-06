@@ -611,35 +611,9 @@ pub const APPROVE: &str = "merge";
 /// The choice that leaves the pull request open.
 pub const HOLD: &str = "hold";
 
-/// Whether `quote` is a clear, unhedged instruction to merge, said inside the
-/// owner's `message`.
-///
-/// The merge is the one irreversible step, so this is a mechanical check and
-/// not the agent's reading alone: the quote must be a verbatim part of the
-/// message and name the merge; and nothing in the whole message may carry a
-/// hedge, a condition, a negation, a question or a retraction. Anything
-/// doubtful is `false`, which is a hold. Other sentences may ask for other
-/// things (follow-up tasks), but must say so plainly: the owner is asked back
-/// rather than guessed at.
-pub fn merge_intent(message: &str, quote: &str) -> bool {
-    let quote = quote.trim();
-    if quote.is_empty() {
-        return false;
-    }
-    if !message.contains(quote) {
-        return false;
-    }
-    let lower = quote.to_lowercase();
-    if !(lower.contains("merge") || quote.contains("マージ")) {
-        return false;
-    }
-    unhedged(message, quote)
-}
-
 /// Whether `quote` is a verbatim part of the owner's `message` and nothing in
 /// the whole message carries a hedge, a condition, a negation, a question or a
-/// retraction. The part of [`merge_intent`] that does not depend on what is
-/// being approved, shared with `deputy::destructive`.
+/// retraction. Used by `deputy::destructive`.
 ///
 /// The whole message is read, not just the quote's sentence: a condition or a
 /// second thought in another sentence ("Merge it. Only if CI passes.") makes
@@ -1426,9 +1400,10 @@ pub fn deputy_brief(q: &ask::Question, state: Option<&RunState>) -> String {
          it into the base branch, which cannot be undone; `{HOLD}` leaves the pull \
          request open. Silence is a hold: the owner not answering never merges. Only \
          the owner choosing `{APPROVE}`, or clearly telling you to merge in their \
-         own words, merges. Hedged, conditional, negated or questioning wording \
-         (\"maybe\", \"probably\", \"if\", \"いいかも\", \"たぶん\") is not a decision \
-         and stays a hold.\n\n\
+         own words, merges. Whether their wording is a clear, unconditional instruction \
+         is your judgement alone: if it is doubtful, conditional, retracted or a \
+         question, do not settle - ask back with `magi ask --thread`. Doubt and \
+         silence are a hold.\n\n\
          This brief is a snapshot from when you were attached: check `magi show {run}` \
          and `gh pr view` (read-only) before telling the owner anything current. \
          You run with permission to write the question record, and what keeps you \
@@ -5882,80 +5857,6 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             contested_to_ask(&state).is_none(),
             "the switch restores today"
         );
-    }
-
-    #[test]
-    fn merge_intent_wants_a_clear_unhedged_quote_and_holds_on_doubt() {
-        let yes = [
-            ("merge", "merge"),
-            (" Merge ", "Merge"),
-            (
-                "マージしていいよ。残りのレビュー指摘はフォローアップタスクとして積んで",
-                "マージしていいよ",
-            ),
-            (
-                "Merge it. Please file the remaining findings as follow-ups.",
-                "Merge it",
-            ),
-            ("Note the findings and merge now", "merge now"),
-            ("I know the risk, merge it", "merge it"),
-        ];
-        for (msg, quote) in yes {
-            assert!(merge_intent(msg, quote), "{msg:?} / {quote:?}");
-        }
-        let no = [
-            ("たぶんマージでいい", "たぶんマージでいい"),
-            (
-                "マージしていいかも。フォローアップ積んで",
-                "マージしていいかも",
-            ),
-            ("maybe merge it", "merge it"),
-            ("probably fine to merge", "merge"),
-            ("merge if CI is green", "merge"),
-            ("CIが通ったらマージして", "マージして"),
-            ("merge, but not the docs change", "merge"),
-            ("don't merge", "merge"),
-            ("merge?", "merge"),
-            ("マージしていい？", "マージしていい"),
-            ("merge it. wait, actually hold on", "merge it"),
-            ("マージして。やっぱりやめた", "マージして"),
-            ("please file follow-ups", "follow-ups"),
-            (
-                "Merge it. Only if CI passes. Queue the remaining findings.",
-                "Merge it",
-            ),
-            ("マージして。CIが通ったらね。", "マージして"),
-            ("Merge it. Don't.", "Merge it"),
-            ("Merge it. Hold on a sec.", "Merge it"),
-            ("マージして。でも保留で", "マージして"),
-            ("マージしていいよ、でもdocsは触らないで", "マージしていいよ"),
-            (
-                "Merge once CI passes. Queue the remaining findings.",
-                "Merge once CI passes",
-            ),
-            ("Merge provided CI passes.", "Merge provided CI passes"),
-            ("CIが通り次第マージして", "マージして"),
-            ("Merge it. No, stop.", "Merge it"),
-            ("Merge it. Stop.", "Merge it"),
-            ("Merge it. Nope.", "Merge it"),
-            ("merge it, don't", "merge it"),
-            ("merge it, dont", "merge it"),
-            ("マージして。いや、やめて", "マージして"),
-            // Deliberately held: `after` may time the follow-up or condition the
-            // merge, and word order cannot tell them apart without weakening
-            // "Do it after CI passes". An over-hold costs one more word; a
-            // wrong merge cannot be undone.
-            (
-                "Merge now. File a follow-up task to fix R1-1 after this PR merges.",
-                "Merge now",
-            ),
-            ("merge it", "go ahead"),
-            ("merge it", "merge it please"),
-            ("merge it", "  "),
-        ];
-        for (msg, quote) in no {
-            assert!(!merge_intent(msg, quote), "{msg:?} / {quote:?}");
-        }
     }
 
     #[test]
