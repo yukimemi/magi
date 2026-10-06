@@ -6806,7 +6806,7 @@ function renderMagiSeats(run, tally) {
    full weight; the others recede, and a candidate that never produced work is
    dashed. `decided` is the quorum: without it the convergence point stays
    hollow, because a stalled run reached no verdict however its ranking read. */
-function convergeDiagram(candidates, winner, decided) {
+function convergeDiagramSingle(candidates, winner, decided) {
   const width = 320;
   const height = 132;
   const midX = width / 2;
@@ -6877,6 +6877,131 @@ function convergeDiagram(candidates, winner, decided) {
       fill: "none", stroke: "var(--line-2)", "stroke-width": 2, "stroke-dasharray": "3 3",
     }));
   }
+
+  return root;
+}
+
+/* The mark, drawn from the real candidate list in the MAGI panel idiom:
+   hexagonal candidate nodes at the top, angular wiring, one hexagonal verdict
+   node at the convergence point and a chamfered plate naming its state. The
+   winner's stroke survives at full weight; the others recede, and a candidate
+   that never produced work is dashed. `decided` is the quorum: without it the
+   convergence node is never filled, because a stalled run reached no verdict
+   however its ranking read. */
+function convergeDiagram(candidates, winner, decided) {
+  /* The MAGI-panel drawing is for a competition only; a single candidate
+     keeps its original drawing. */
+  if (candidates.length < 2) return convergeDiagramSingle(candidates, winner, decided);
+  const width = 320;
+  const height = 160;
+  const midX = width / 2;
+  const knot = 96;
+  const count = Math.max(candidates.length, 1);
+
+  const labels = candidates.map((c) => c.label).filter(Boolean).join(", ");
+  const root = svg("svg", {
+    class: "cv-duel",
+    viewBox: `0 0 ${width} ${height}`,
+    role: "img",
+    "aria-label": candidates.length
+      ? `${plural(candidates.length, "candidate", "candidates")} ${labels}${winner && decided ? `; ${winner} won` : winner ? `; ${winner} leads but the panel reached no quorum` : "; no verdict yet"}`
+      : "No candidates yet",
+  });
+
+  /* flat-top hexagon around (cx, cy) with circumradius r */
+  const hex = (cx, cy, r) => {
+    const h = r * 0.866;
+    return [[cx - r, cy], [cx - r / 2, cy - h], [cx + r / 2, cy - h],
+      [cx + r, cy], [cx + r / 2, cy + h], [cx - r / 2, cy + h]]
+      .map(([px, py]) => `${px.toFixed(1)},${py.toFixed(1)}`).join(" ");
+  };
+
+  /* Fills for the states that have no verdict. The ids are namespaced so they
+     cannot collide with any other document-level pattern. */
+  const hatch = (id, color) => svg("pattern", {
+    id, width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)",
+  }, svg("rect", { width: 6, height: 6, fill: "var(--sunk)" }),
+    svg("rect", { width: 2, height: 6, fill: color }));
+  root.append(svg("defs", null,
+    hatch("verdict-hatch", "var(--hatch)"),
+    hatch("verdict-hatch-gold", "var(--hatch-gold)")));
+
+  const span = Math.min(96, (width - 68) / Math.max(count - 1, 1));
+  const xs = candidates.map((_, i) => midX + (i - (count - 1) / 2) * span);
+
+  candidates.forEach((candidate, i) => {
+    const x = xs[i];
+    const won = winner && candidate.label === winner && decided;
+    const dead = !viable(candidate);
+    const tone = candTone(i);
+    const path = x === midX
+      ? `M ${x} 40 L ${x} ${knot - 15}`
+      : `M ${x} 40 L ${x} 52 L ${midX} ${knot - 15}`;
+
+    root.append(svg("path", {
+      d: path,
+      fill: "none",
+      stroke: tone,
+      "stroke-width": won ? 3 : 1.5,
+      "stroke-linejoin": "miter",
+      "stroke-dasharray": dead ? "3 4" : null,
+      opacity: won ? 1 : dead ? 0.35 : 0.55,
+    }));
+    root.append(svg("polygon", {
+      points: hex(x, 26, 14),
+      fill: dead ? "var(--sunk)" : tone,
+      stroke: tone,
+      "stroke-width": 1.5,
+      "stroke-dasharray": dead ? "3 3" : null,
+    }));
+    root.append(svg("text", {
+      class: "cv-label",
+      x, y: 31,
+      "text-anchor": "middle",
+      fill: dead ? tone : "var(--surface)",
+      text: (candidate.label || "?").toUpperCase(),
+    }));
+  });
+
+  const known = Boolean(winner);
+  if (known && decided) {
+    root.append(svg("polygon", {
+      points: hex(midX, knot, 15), fill: "var(--gold-line)", stroke: "var(--gold-line)", "stroke-width": 1.5,
+    }));
+    root.append(svg("text", {
+      class: "cv-label", x: midX, y: knot + 5, "text-anchor": "middle",
+      fill: "var(--surface)", text: String(winner).toUpperCase(),
+    }));
+  } else {
+    /* No verdict: the node is dashed and hatched, never solid, so an
+       unfinished or collapsed run does not display a decided verdict. */
+    root.append(svg("polygon", {
+      points: hex(midX, knot, 15),
+      fill: known ? "url(#verdict-hatch-gold)" : "url(#verdict-hatch)",
+      stroke: known ? "var(--gold-line)" : "var(--line-2)",
+      "stroke-width": 1.5, "stroke-dasharray": "3 3",
+    }));
+  }
+
+  const word = known && decided ? `SELECTED · ${String(winner).toUpperCase()}`
+    : known ? `PROVISIONAL · ${String(winner).toUpperCase()}` : "PENDING";
+  const plateW = 200;
+  const px = midX - plateW / 2;
+  const py = 122;
+  const ph = 26;
+  const c = 7;
+  root.append(svg("polygon", {
+    class: "cv-plate-frame",
+    points: `${px + c},${py} ${px + plateW - c},${py} ${px + plateW},${py + c} ${px + plateW},${py + ph - c} ${px + plateW - c},${py + ph} ${px + c},${py + ph} ${px},${py + ph - c} ${px},${py + c}`,
+    fill: "var(--sunk)",
+    stroke: known && decided ? "var(--gold-line)" : "var(--line-2)",
+    "stroke-width": 1.5,
+    "stroke-dasharray": known && decided ? null : "4 3",
+  }));
+  root.append(svg("text", {
+    class: "cv-plate", x: midX, y: py + 17, "text-anchor": "middle",
+    fill: known && decided ? "var(--gold-line)" : "var(--ink-3)", text: word,
+  }));
 
   return root;
 }
