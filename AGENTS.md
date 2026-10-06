@@ -899,9 +899,9 @@ redundant:
 - `land` decides whether magi keeps watching the pull request after opening it.
   It only engages for `merge = "pr"`.
 - `land_approval` decides whether a human sees the panel before the merge.
-  Silence is a hold. Only the button, or the owner's own clear, unhedged
-  instruction to merge (see the deputy section: it no longer has to be the
-  single word), merges.
+  Silence is a hold. Only the button, or the owner's own clear
+  instruction to merge as the approval agent judges it (see the deputy
+  section: it no longer has to be the single word), merges.
 
 An unattended merge requires flipping both, which is two deliberate choices.
 Do not "simplify" them into one flag: the useful middle state - magi does the
@@ -1311,19 +1311,18 @@ not move on a say.
   same instant `daemon::land_resume_state` abandons the question; land is the
   only thing that retires an approval. `--settle` on an approval accepts
   `hold` only when the owner's whole message is that word, and `merge` when the
-  owner's **latest** message holds a clear instruction to merge, quoted
-  verbatim, possibly among other requests (`settle_by_deputy`, decided by the
-  pure `land::merge_intent`). The owner chose this loosening on purpose - the
-  single-word rule made "merge, and queue the leftover findings as follow-ups"
-  a dead end - and a wrong merge is recoverable by revert. The gate is still
-  mechanical, not the agent's reading: the owner's message
-  must carry no hedge, condition, negation or question - the whole message is read, so a
-  condition in another sentence holds too - (`maybe`, `probably`,
-  `if`, `not`, `but`, `いいかも`, `たぶん`, `なら`, `たら`, `?`...), and a retraction
-  anywhere in the message (`wait`, `やっぱり`) voids it. Anything doubtful is a
-  hold: the agent asks back with `--thread`. The word lists are deliberately
-  short and lean towards holding; a missed hedge costs a revert, a refused
-  merge costs one more word, and the button always works. Silence is still a
+  quote is a verbatim part of the owner's **latest** message, possibly among
+  other requests (`Question::settle_by_deputy`). Whether that wording is a
+  clear, unconditional instruction to merge is the approval agent's judgement
+  alone: there is no word list. The only mechanical guards are not judgements -
+  the quote is non-empty and verbatim from the latest message (so the agent
+  cannot invent a basis), the label is an offered one, the seat is the
+  deputy's, and `operator_held` tasks refuse a settle. The owner chose this on
+  purpose - a keyword check refused real instructions and could not read
+  intent anyway - and a wrong merge is recoverable by revert. The prompt and
+  `land::deputy_brief` tell the agent that doubtful, conditional, retracted or
+  questioning wording is not to be settled: it asks back with `--thread`
+  (doubt and silence are a hold), and the button always works. Silence is still a
   hold, and `operator_held` tasks still refuse a settle. A reply that asks for
   **follow-up tasks** is carried out by the deputy with `magi task add --hold
   <reason>` (the task is filed already held by hand, so nothing runs before the
@@ -1351,7 +1350,7 @@ not move on a say.
   closes, reruns or pushes: `--settle` records a choice and the watcher applies it
   on its next lap (`WatchState::applied` makes that once). `deputy::merge_gated`
   puts a local approval's `merge` / `hold` under the merge-approval rules
-  (`land::merge_intent`); `ask_settle_cmd` finds the task for the
+  (verbatim quote for `merge`, whole message for `hold`); `ask_settle_cmd` finds the task for the
   `operator_held` check through `WatchState::run` and, when the record or run is
   unknown, lets the settle through (nothing here releases a task). As for
   opencode / omp seats, the deputy runs with `allow_write` and its read-only-ness
