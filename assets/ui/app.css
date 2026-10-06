@@ -1757,7 +1757,7 @@ details.panel > summary + * { margin-top: var(--s2); }
   border: 1px dashed currentColor;
   font-weight: 600;
 }
-.turn-at { display: block; margin-top: var(--s1); font-size: var(--t1); opacity: .75; }
+.turn-at { display: block; margin-top: var(--s1); font-size: var(--t1); }
 
 /* Images attached to a turn, already sent - a row of squares that wraps
    rather than one that scrolls sideways, so a narrow phone never has to pan
@@ -2009,7 +2009,9 @@ details.panel > summary + * { margin-top: var(--s2); }
 }
 .notice[data-sev="warn"] { border-left-color: var(--gold); }
 .notice[data-sev="error"] { border-left-color: var(--rust); }
-.notice[data-read="1"] { opacity: .68; }
+/* Read is shown by a sunk ground and the lighter weight below, never by
+   opacity: dimming text drops it under AA on paper. */
+.notice[data-read="1"] { background: var(--sunk); }
 .notice-msg { font-size: var(--t3); overflow-wrap: anywhere; }
 .notice[data-read="0"] .notice-msg { font-weight: 600; }
 .notice-meta { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: center; font-size: var(--t2); color: var(--ink-3); }
