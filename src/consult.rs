@@ -122,22 +122,28 @@ pub enum Handled {
 pub async fn answer_in_chat(
     talks: &Talks,
     cfg: &crate::config::Config,
-    q: &Question,
     talk_id: &str,
 ) -> Result<Handled> {
     let mut talk = talks.get(talk_id)?;
-    let own = crate::prompt::chat_consult(q);
+    // A saved draft is not evidence of a running turn; an operator turn with
+    // no agent answer yet is.
     let waiting = talk
         .turns
         .last()
         .is_some_and(|t| t.who == talk::Who::Operator);
-    if waiting || talk.pending.trim() != own.trim() || !talk.pending_attachments.is_empty() {
+    if waiting {
         return Ok(Handled::LeftQueued);
     }
-    let Some(text) = talk::drain(&mut talk, talks)? else {
+    // Like the web's drain loop: whatever was queued while the turn ran
+    // (another consultation, a say) gets its own turn before this returns.
+    let mut ran = false;
+    while let Some(text) = talk::drain(&mut talk, talks)? {
+        talk::respond(&mut talk, talks, cfg, &text).await?;
+        ran = true;
+    }
+    if !ran {
         return Ok(Handled::LeftQueued);
-    };
-    talk::respond(&mut talk, talks, cfg, &text).await?;
+    }
     Ok(Handled::Ran)
 }
 
@@ -347,7 +353,7 @@ mod tests {
         assert!(begin(&questions, &store, &q, &talk).unwrap());
 
         let cfg = Config::default();
-        let got = answer_in_chat(&store, &cfg, &q, &talk.id).await.unwrap();
+        let got = answer_in_chat(&store, &cfg, &talk.id).await.unwrap();
         assert_eq!(got, Handled::LeftQueued);
         let after = store.get(&talk.id).unwrap();
         assert!(is_consult_text(&after.pending));

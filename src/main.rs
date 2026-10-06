@@ -2468,7 +2468,7 @@ async fn answer_cmd(
             return Ok(());
         }
         let (cfg, _) = magi::config::Config::discover(&talk.repo, None)?;
-        match magi::consult::answer_in_chat(&talks, &cfg, &q, &talk.id).await? {
+        match magi::consult::answer_in_chat(&talks, &cfg, &talk.id).await? {
             magi::consult::Handled::Ran => {
                 let reply = talks
                     .get(&talk.id)?
