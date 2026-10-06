@@ -2498,16 +2498,18 @@ html:root[data-theme="dark"] {
 body {
   background-color: var(--bg);
   background-image:
+    repeating-linear-gradient(transparent 0 2px, var(--nerv-scan) 2px 3px),
     linear-gradient(var(--nerv-grid) 1px, transparent 1px),
     linear-gradient(90deg, var(--nerv-grid) 1px, transparent 1px);
-  background-size: 32px 32px;
+  background-size: auto, 32px 32px, 32px 32px;
 }
 @supports (background: conic-gradient(#000, #fff)) {
   .top {
-    background-image: conic-gradient(from 30deg at 50% 50%, var(--nerv-hex) 0 60deg, transparent 60deg 120deg,
+    background-image: repeating-linear-gradient(transparent 0 2px, var(--nerv-scan) 2px 3px),
+      conic-gradient(from 30deg at 50% 50%, var(--nerv-hex) 0 60deg, transparent 60deg 120deg,
       var(--nerv-hex) 120deg 180deg, transparent 180deg 240deg,
       var(--nerv-hex) 240deg 300deg, transparent 300deg 360deg);
-    background-size: 28px 48px;
+    background-size: auto, 28px 48px;
   }
 }
 .top { border-bottom: 2px solid var(--gold-line); }
@@ -2541,10 +2543,6 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 @media (prefers-reduced-motion: no-preference) {
   .alert-banner { animation: nerv-blink 1.4s steps(2, jump-none) infinite; }
   @keyframes nerv-blink { 0% { filter: none; } 100% { filter: brightness(1.45); } }
-  body::after {
-    content: ""; position: fixed; inset: 0; z-index: 1; pointer-events: none;
-    background: repeating-linear-gradient(transparent 0 2px, var(--nerv-scan) 2px 3px);
-  }
 }
 
 /* ---- verdict stamps ------------------------------------------------------ */
