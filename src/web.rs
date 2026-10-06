@@ -14763,7 +14763,10 @@ mod tests {
             let var = format!("--verdict-{key}:");
             // Light, OS-dark and pinned-dark blocks each define it.
             assert_eq!(APP_CSS.matches(&var).count(), 3, "{var}");
-            assert!(APP_CSS.contains(&format!("[data-verdict=\"{key}\"]")), "{key}");
+            assert!(
+                APP_CSS.contains(&format!("[data-verdict=\"{key}\"]")),
+                "{key}"
+            );
         }
     }
 }
