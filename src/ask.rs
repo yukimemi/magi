@@ -564,6 +564,15 @@ pub struct Question {
 }
 
 impl Question {
+    /// Does `run` hold a task id rather than a run id? True for the
+    /// conductor's and the triage questions, which are filed about a task.
+    pub fn run_names_task(&self) -> bool {
+        matches!(
+            self.node.as_str(),
+            crate::conduct::NODE | crate::triage::NODE | crate::triage::DEPS_NODE
+        )
+    }
+
     /// Ask something. Persist it with [`Questions::put`], or hand it to
     /// [`ask_and_wait`], which files it and waits.
     pub fn new(
@@ -1886,6 +1895,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Questions::at(dir.path().join("questions"));
         (dir, s)
+    }
+
+    #[test]
+    fn run_names_task_only_for_task_questions() {
+        for (node, want) in [
+            (crate::conduct::NODE, true),
+            (crate::triage::NODE, true),
+            (crate::triage::DEPS_NODE, true),
+            (crate::land::APPROVAL_NODE, false),
+            (crate::bump::NOTICE_NODE, false),
+            ("implement", false),
+        ] {
+            let mut q = choice_question();
+            q.node = node.to_owned();
+            assert_eq!(q.run_names_task(), want, "{node}");
+        }
     }
 
     #[test]

@@ -4047,8 +4047,12 @@ function updateAskCard(row, question, { compact = false } = {}) {
 
   setText(r.summary, question.summary || firstLine(question.detail) || `question ${shortId(question.id)}`);
 
-  setAttr(r.runLink, "href", `#/runs/${question.run}`);
-  setText(r.runLink, `run ${shortId(question.run)}`);
+  // A conductor / triage question's `run` is a task id: link the task page.
+  const runIsTask = Boolean(question.run_is_task);
+  setAttr(r.runLink, "href", runIsTask
+    ? `#/tasks/${encodeURIComponent(question.run)}`
+    : `#/runs/${question.run}`);
+  setText(r.runLink, `${runIsTask ? "task" : "run"} ${shortId(question.run)}`);
   show(r.runLink, Boolean(question.run) && !compact);
   setText(r.node, question.node ? `node ${question.node}` : "");
   show(r.node, Boolean(question.node));
