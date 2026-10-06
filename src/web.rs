@@ -5524,12 +5524,23 @@ async fn question_consult(
                     q.short()
                 )));
             };
+            // Read the config before `begin` saves anything: a failure here
+            // must leave no consult record or draft behind, or a retry would
+            // see `fresh == false` and never start the turn.
+            let cfg = if q.consult.is_none() {
+                Some(Config::discover(&talk.repo, None)?.0)
+            } else {
+                None
+            };
             let fresh = crate::consult::begin(&ui.questions, &ui.talks, &q, &talk)?;
             let claim = if fresh {
                 match ui.begin_queued_talk_turn(&talk.id)? {
                     Some(turn_guard) => {
                         let talk = ui.talks.get(&talk.id)?;
-                        let (cfg, _) = Config::discover(&talk.repo, None)?;
+                        let cfg = match cfg {
+                            Some(cfg) => cfg,
+                            None => Config::discover(&talk.repo, None)?.0,
+                        };
                         Some((talk, cfg, turn_guard))
                     }
                     None => None,
@@ -7791,6 +7802,52 @@ mod tests {
             "the hand-over is never a choice"
         );
         let _ = id;
+    }
+
+    #[tokio::test]
+    async fn a_consult_that_cannot_read_its_config_leaves_nothing_to_retry_around() {
+        let fx = Fixture::start().await;
+        let id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+        let cfg = Config {
+            agents: vec![crate::config::AgentSpec {
+                id: "mock".to_owned(),
+                kind: crate::config::AgentKind::Command,
+                model: None,
+                command: vec!["true".to_owned()],
+                extra_args: Vec::new(),
+                env: Default::default(),
+                prompt_delivery: None,
+            }],
+            ..Config::default()
+        };
+        // Not a git working tree, so its `magi.toml` is read from disk.
+        let repo = fx.home.path().join("chat-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let toml = repo.join("magi.toml");
+        std::fs::write(&toml, "this is = = not toml").unwrap();
+        let talk = crate::talk::begin(&fx.talks(), &cfg, repo.clone(), Some("mock")).unwrap();
+        let mut task = Task::new(
+            "t".to_owned(),
+            "Do it".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Agent {
+                run: talk.id.clone(),
+                node: crate::queue::CHAT_NODE.to_owned(),
+            },
+        );
+        task.start("20260902-000000-beef".to_owned());
+        fx.queue().put(&mut task).unwrap();
+
+        let path = format!("/api/questions/{id}/consult");
+        let res = fx.post(&path, None).await;
+        assert!(res.status >= 400, "{}", res.body);
+        assert!(fx.questions().get(&id).unwrap().consult.is_none());
+        assert!(fx.talks().get(&talk.id).unwrap().pending.is_empty());
+
+        std::fs::write(&toml, "").unwrap();
+        let res = fx.post(&path, None).await;
+        assert_eq!(res.status, 202, "{}", res.body);
+        assert!(fx.questions().get(&id).unwrap().consult.is_some());
     }
 
     #[tokio::test]
