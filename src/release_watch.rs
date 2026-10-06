@@ -951,10 +951,16 @@ impl Watcher {
             return true;
         };
         let q = crate::queue::Queue::at(self.home.join("queue"));
-        // An unreadable task is treated as gone: a record kept forever for a
-        // deleted task is worse than the rare transient read error.
-        let Ok(mut t) = q.get(&id) else {
-            return true;
+        let mut t = match q.get(&id) {
+            Ok(t) => t,
+            // Only a task file that is really gone is "nothing to restore";
+            // any other failure may be transient, so keep the record.
+            Err(_) if !q.path_of(&id).exists() => return true,
+            Err(e) => {
+                tracing::warn!("could not read task {id} to restore it after the release: {e:#}");
+                st.held_task = Some(id);
+                return false;
+            }
         };
         let ours = t.status == crate::queue::TaskStatus::Held
             && t.hold_source == Some(crate::queue::HoldSource::Machine)
