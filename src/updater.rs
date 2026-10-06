@@ -296,6 +296,8 @@ impl Progress {
     pub fn advance(&mut self, stage: Stage) {
         self.stage = stage;
         self.updated_at = Timestamp::now();
+        // A note belongs to the stage it was written for.
+        self.detail = None;
     }
 
     /// Stop at [`Stage::Failed`], with a reason a human can read.
@@ -335,6 +337,276 @@ pub fn write_progress(home: &Path, progress: &Progress) -> Result<()> {
 pub fn read_progress(home: &Path) -> Option<Progress> {
     let body = std::fs::read_to_string(progress_path(home)).ok()?;
     serde_json::from_str(&body).ok()
+}
+
+/// Where every handover step is appended, beside `upgrade.json`. Written by
+/// this module directly, so no supervisor redirection of stderr can orphan it.
+#[must_use]
+pub fn log_path(home: &Path) -> PathBuf {
+    home.join("upgrade.log")
+}
+
+/// The log is rotated to `upgrade.log.1` (one generation) past this size.
+pub const LOG_MAX_BYTES: u64 = 256 * 1024;
+
+/// A non-terminal `replaced` / `restarting` stage older than this is stuck.
+pub const STALL_AFTER_SECS: i64 = 120;
+
+/// `parking` waits for the node in flight, up to an implement wave (an hour by
+/// default), so it is only called stuck past that plus a margin.
+pub const PARKING_STALL_AFTER_SECS: i64 = 70 * 60;
+
+/// How often the watchdog repeats itself for one stage.
+pub const HEARTBEAT_SECS: i64 = 60;
+
+/// How often the watchdog thread looks at `upgrade.json`.
+pub const WATCHDOG_POLL: Duration = Duration::from_secs(30);
+
+/// Append `line` to `path`, rotating to `<path>.1` first when the file has
+/// reached `max` bytes. Open-append-close every time, so a rename or a
+/// deleted file never leaves a stale handle.
+pub fn append_bounded(path: &Path, line: &str, max: u64) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if std::fs::metadata(path).is_ok_and(|m| m.len() >= max) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        std::fs::rename(path, PathBuf::from(old))?;
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")
+}
+
+/// One handover step: to `tracing` at INFO and to `<home>/upgrade.log`, with
+/// a UTC timestamp and this process's pid. Best-effort - a failed write is a
+/// warning, never a failed upgrade.
+pub fn log_step(home: &Path, msg: &str) {
+    tracing::info!("handover: {msg}");
+    log_line(home, "INFO", msg);
+}
+
+/// Like [`log_step`], at WARN.
+pub fn log_warn(home: &Path, msg: &str) {
+    tracing::warn!("handover: {msg}");
+    log_line(home, "WARN", msg);
+}
+
+fn log_line(home: &Path, level: &str, msg: &str) {
+    let line = format!(
+        "{} pid={} {level} {msg}",
+        Timestamp::now(),
+        std::process::id()
+    );
+    if let Err(e) = append_bounded(&log_path(home), &line, LOG_MAX_BYTES) {
+        tracing::warn!("could not append to {}: {e}", log_path(home).display());
+    }
+}
+
+/// [`write_progress`] that says so when it fails, instead of dropping the
+/// error: a progress file that silently stops moving is the symptom this
+/// module exists to explain.
+pub fn write_progress_logged(home: &Path, progress: &Progress) {
+    if let Err(e) = write_progress(home, progress) {
+        log_warn(home, &format!("could not write upgrade.json: {e:#}"));
+    }
+}
+
+/// A non-terminal stage that has outlived what it should take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stall {
+    /// The stage that is stuck.
+    pub stage: Stage,
+    /// How long it has been in that stage.
+    pub age_secs: i64,
+    /// What it is waiting on, in words.
+    pub waiting_on: String,
+}
+
+/// Seconds `progress` has been in its stage at `now`. A clock that went
+/// backwards counts as zero, never as a negative age.
+#[must_use]
+pub fn stage_age_secs(progress: &Progress, now: Timestamp) -> i64 {
+    (now.as_second() - progress.updated_at.as_second()).max(0)
+}
+
+/// What a stage is waiting on, in words.
+fn waiting_on(progress: &Progress) -> String {
+    match progress.stage {
+        Stage::Replaced => "serve() observing the handover signal and calling hand_over \
+                            (hand_over has not recorded `parking`)"
+            .to_owned(),
+        Stage::Parking => match &progress.parked_run {
+            Some(run) => format!("the loop to finish run {run} at its next node boundary"),
+            None => "the loop to stop (no run was recorded as in flight)".to_owned(),
+        },
+        Stage::Restarting => "spawn_successor returning and this process exiting".to_owned(),
+        Stage::Downloading => "the release download and binary replacement".to_owned(),
+        Stage::Done | Stage::Failed => String::new(),
+    }
+}
+
+/// Pure: whether `progress` is stuck at `now`.
+#[must_use]
+pub fn stall(progress: &Progress, now: Timestamp) -> Option<Stall> {
+    let limit = match progress.stage {
+        Stage::Replaced | Stage::Restarting => STALL_AFTER_SECS,
+        Stage::Parking => PARKING_STALL_AFTER_SECS,
+        Stage::Downloading | Stage::Done | Stage::Failed => return None,
+    };
+    let age_secs = stage_age_secs(progress, now);
+    (age_secs > limit).then(|| Stall {
+        stage: progress.stage,
+        age_secs,
+        waiting_on: waiting_on(progress),
+    })
+}
+
+/// What the watchdog wants said this tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Beat {
+    /// The stage this beat is about.
+    pub stage: Stage,
+    /// Whether to say it as a warning (stuck) rather than a heartbeat.
+    pub warn: bool,
+    /// The line to log and to persist as `detail`.
+    pub message: String,
+}
+
+/// Decides when the watchdog speaks. Pure: the caller supplies `now`.
+#[derive(Debug, Default)]
+pub struct Watchdog {
+    last: Option<(Stage, Timestamp)>,
+}
+
+impl Watchdog {
+    /// Look at the record at `now`. `None` means stay quiet: terminal, too
+    /// early, or already spoken within [`HEARTBEAT_SECS`] for this stage.
+    pub fn tick(&mut self, progress: &Progress, now: Timestamp) -> Option<Beat> {
+        if progress.stage.terminal() {
+            self.last = None;
+            return None;
+        }
+        if self.last.is_some_and(|(stage, _)| stage != progress.stage) {
+            self.last = None;
+        }
+        let stalled = stall(progress, now);
+        // `parking` is allowed to be long, but says what it waits on; the
+        // other stages are silent until they are stalled.
+        if stalled.is_none() && progress.stage != Stage::Parking {
+            return None;
+        }
+        if let Some((_, at)) = self.last
+            && now.as_second() - at.as_second() < HEARTBEAT_SECS
+        {
+            return None;
+        }
+        self.last = Some((progress.stage, now));
+        let age = stage_age_secs(progress, now);
+        let (warn, message) = match &stalled {
+            Some(s) => (
+                true,
+                format!(
+                    "stuck in {:?} for {} min {} s, waiting on {}",
+                    s.stage,
+                    s.age_secs / 60,
+                    s.age_secs % 60,
+                    s.waiting_on
+                ),
+            ),
+            None => (
+                false,
+                format!(
+                    "parking for {} min {} s, waiting on {}",
+                    age / 60,
+                    age % 60,
+                    waiting_on(progress)
+                ),
+            ),
+        };
+        Some(Beat {
+            stage: progress.stage,
+            warn,
+            message,
+        })
+    }
+}
+
+/// The watchdog's latest message, kept apart from `upgrade.json` so a
+/// diagnostic write can never race a stage transition.
+#[derive(Debug, Serialize, Deserialize)]
+struct Note {
+    stage: Stage,
+    stage_since: Timestamp,
+    message: String,
+}
+
+fn note_path(home: &Path) -> PathBuf {
+    home.join("upgrade.note.json")
+}
+
+fn write_note(home: &Path, progress: &Progress, message: &str) {
+    let note = Note {
+        stage: progress.stage,
+        stage_since: progress.updated_at,
+        message: message.to_owned(),
+    };
+    let path = note_path(home);
+    let tmp = path.with_extension("json.tmp");
+    let written = serde_json::to_string(&note)
+        .map_err(std::io::Error::other)
+        .and_then(|body| std::fs::write(&tmp, body))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = written {
+        tracing::warn!("could not write {}: {e}", path.display());
+    }
+}
+
+/// The watchdog's message for exactly this stage of this upgrade, if any;
+/// a note from another stage or another upgrade is ignored.
+#[must_use]
+pub fn read_note(home: &Path, progress: &Progress) -> Option<String> {
+    let body = std::fs::read_to_string(note_path(home)).ok()?;
+    let note: Note = serde_json::from_str(&body).ok()?;
+    (note.stage == progress.stage && note.stage_since == progress.updated_at)
+        .then_some(note.message)
+}
+
+/// Run the watchdog on a thread of its own, so a blocked runtime, or a
+/// process half-way through dropping one, still speaks. It never ends; it is
+/// a daemon thread and dies with the process.
+pub fn spawn_watchdog(home: PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("upgrade-watchdog".to_owned())
+        .spawn(move || {
+            let mut dog = Watchdog::default();
+            loop {
+                std::thread::sleep(WATCHDOG_POLL);
+                let Some(progress) = read_progress(&home) else {
+                    continue;
+                };
+                let Some(beat) = dog.tick(&progress, Timestamp::now()) else {
+                    continue;
+                };
+                if beat.warn {
+                    log_warn(&home, &beat.message);
+                } else {
+                    log_step(&home, &beat.message);
+                }
+                // Never rewrites upgrade.json: a read-modify-write here could
+                // overwrite a stage the handover or the successor saved in
+                // between. The note goes to its own file, which only this
+                // thread writes, and is matched to the record when read.
+                write_note(&home, &progress, &beat.message);
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("could not start the upgrade watchdog: {e}");
+    }
 }
 
 /// Reconcile a leftover progress record on startup, before the server starts
@@ -377,7 +649,7 @@ pub fn reconcile_after_restart(home: &Path) {
              not have replaced the binary"
         ));
     }
-    let _ = write_progress(home, &progress);
+    write_progress_logged(home, &progress);
 }
 
 /// Spawn the background check for `cfg`, unless it is switched off.
@@ -653,5 +925,102 @@ mod tests {
         let home = tempfile::tempdir().expect("temp home");
         reconcile_after_restart(home.path());
         assert!(read_progress(home.path()).is_none());
+    }
+
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(secs).expect("timestamp")
+    }
+
+    fn staged(stage: Stage, since: i64) -> Progress {
+        let mut p = Progress::new("0.1.0".to_owned(), "v0.2.0".to_owned());
+        p.stage = stage;
+        p.updated_at = at(since);
+        p
+    }
+
+    #[test]
+    fn stall_has_a_threshold_per_stage_and_is_silent_when_terminal() {
+        let p = staged(Stage::Replaced, 1000);
+        assert!(stall(&p, at(1000 + STALL_AFTER_SECS)).is_none());
+        let s = stall(&p, at(1000 + STALL_AFTER_SECS + 1)).expect("stalled");
+        assert_eq!(s.stage, Stage::Replaced);
+        assert_eq!(s.age_secs, STALL_AFTER_SECS + 1);
+        assert!(s.waiting_on.contains("hand_over"), "{}", s.waiting_on);
+
+        let p = staged(Stage::Restarting, 1000);
+        assert!(stall(&p, at(1000 + STALL_AFTER_SECS + 1)).is_some());
+
+        let p = staged(Stage::Parking, 1000);
+        assert!(
+            stall(&p, at(1000 + 3600)).is_none(),
+            "an hour of parking is normal"
+        );
+        assert!(stall(&p, at(1000 + PARKING_STALL_AFTER_SECS + 1)).is_some());
+
+        for stage in [Stage::Done, Stage::Failed, Stage::Downloading] {
+            assert!(stall(&staged(stage, 0), at(1_000_000)).is_none());
+        }
+    }
+
+    #[test]
+    fn a_clock_that_went_backwards_is_age_zero() {
+        let p = staged(Stage::Replaced, 5000);
+        assert_eq!(stage_age_secs(&p, at(100)), 0);
+        assert!(stall(&p, at(100)).is_none());
+    }
+
+    #[test]
+    fn a_note_is_kept_beside_the_record_and_matches_only_its_own_stage() {
+        let home = tempfile::tempdir().expect("temp home");
+        let p = staged(Stage::Replaced, 1000);
+        write_progress(home.path(), &p).expect("write");
+        write_note(home.path(), &p, "stuck");
+        assert_eq!(read_note(home.path(), &p).as_deref(), Some("stuck"));
+        assert_eq!(read_progress(home.path()).unwrap().updated_at, at(1000));
+        assert!(read_note(home.path(), &staged(Stage::Parking, 1000)).is_none());
+        assert!(read_note(home.path(), &staged(Stage::Replaced, 2000)).is_none());
+    }
+
+    #[test]
+    fn the_watchdog_speaks_once_a_minute_and_resets_on_a_new_stage() {
+        let mut dog = Watchdog::default();
+        let p = staged(Stage::Replaced, 1000);
+        assert!(dog.tick(&p, at(1060)).is_none(), "not stalled yet");
+        let beat = dog.tick(&p, at(1200)).expect("stalled");
+        assert!(beat.warn);
+        assert!(dog.tick(&p, at(1230)).is_none(), "spoke 30 s ago");
+        assert!(dog.tick(&p, at(1260)).is_some(), "a minute later");
+
+        let parking = staged(Stage::Parking, 1260);
+        let beat = dog
+            .tick(&parking, at(1270))
+            .expect("parking heartbeat at once");
+        assert!(!beat.warn, "a short park is not a warning");
+        assert!(dog.tick(&parking, at(1300)).is_none());
+        let late = dog
+            .tick(&parking, at(1260 + PARKING_STALL_AFTER_SECS + 1))
+            .expect("past the parking ceiling");
+        assert!(late.warn);
+
+        let done = staged(Stage::Done, 0);
+        assert!(dog.tick(&done, at(9_999_999)).is_none());
+    }
+
+    #[test]
+    fn the_upgrade_log_appends_and_rotates_to_one_generation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("upgrade.log");
+        append_bounded(&path, "one", 16).expect("append");
+        append_bounded(&path, "two", 16).expect("append");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        append_bounded(&path, "three-and-more", 16).expect("append");
+        append_bounded(&path, "four", 16).expect("append");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "four\n");
+        let old = dir.path().join("upgrade.log.1");
+        assert!(
+            std::fs::read_to_string(old)
+                .unwrap()
+                .contains("three-and-more")
+        );
     }
 }

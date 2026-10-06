@@ -1904,3 +1904,38 @@ competition (unlike the conductor's `review_branch`). A standalone run that
 leaves its task runnable **holds** it: nobody asked for an automatic retry.
 `--dry-run` never hands over. There is no run without a task: `--resume` files
 one when the run has none.
+
+### A stuck handover must be diagnosable from files alone
+
+An upgrade that stalled once left only `upgrade.json` at `replaced` and no
+log from the old process. Three files now carry the evidence, none of them
+depending on a supervisor's redirection:
+
+- **`<home>/upgrade.log`** - every handover step (`upgrade_and_restart`
+  signalling `HANDOVER`, `serve`'s `select!` waking, `hand_over` entering,
+  `finish_loop` and how long it waited, the listener release, the successor's
+  pid or error, `serve` returning, the runtime shutting down) with a UTC
+  timestamp and pid, through `updater::log_step`. Open-append-close each time;
+  rotated to `upgrade.log.1` past `updater::LOG_MAX_BYTES` (256 KiB), one
+  generation. Last line seen is where it stuck.
+- **`<home>/web.log`** - the successor's stdout and stderr (`spawn_successor`
+  used to send them to null, so every generation after the first logged
+  nowhere). `magi web` stderr lines now carry a timestamp.
+- **`upgrade.note.json`** (surfaced as `upgrade.detail`) - the watchdog thread (`updater::spawn_watchdog`,
+  every 30 s, off the runtime) warns and records what a non-terminal stage
+  waits on: `replaced` / `restarting` past 120 s, `parking` past 70 min
+  (an implement wave can take an hour), heartbeat every minute. `/api/health`
+  reports the same as `upgrade.stuck_for_secs`; the deck banner says
+  "Handover stuck in <stage>". Stage age is measured from `updated_at`. The
+  watchdog never rewrites `upgrade.json` (that read-modify-write could revert a
+  stage the handover or the successor saved in between); its note lives in its
+  own file and is shown only while stage and `updated_at` still match.
+
+Supervisor redirection (launchd, NSSM, systemd...) only ever holds the first
+generation's descriptors, and a rename of its log files at start does not
+change what an already-running process writes to. So `magi-web.err.log` can
+legitimately lack a long-running process's output; read `upgrade.log` and
+`web.log` instead, and restart the supervised process to reattach its
+redirection. These values (256 KiB, 120 s, 70 min, 30 s poll, 10 s runtime
+shutdown bound in `main::run`) live in `updater.rs` / `main.rs`; keep this
+section aligned with them.

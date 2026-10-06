@@ -798,16 +798,33 @@ fn main() -> Result<()> {
 /// join it - that is safe to run on the OS's own small stack; see
 /// [`STACK_SIZE`] for why that split exists at all.
 fn run() -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("build the tokio runtime")?
-        .block_on(async_main())
+        .context("build the tokio runtime")?;
+    let result = runtime.block_on(async_main());
+    if !IS_WEB.load(std::sync::atomic::Ordering::Relaxed) {
+        return result;
+    }
+    // `magi web` hands itself over by returning from `serve` and exiting.
+    // Dropping a runtime waits for blocking tasks forever, so a process that
+    // returned but never exited would look exactly like a stuck handover;
+    // say so, and bound the wait (this ends our own process, it kills nothing).
+    let home = magi::run::home();
+    updater::log_step(&home, "main: serve returned; shutting the runtime down");
+    runtime.shutdown_timeout(std::time::Duration::from_secs(10));
+    updater::log_step(&home, "main: the runtime is down; exiting");
+    result
 }
+
+/// Set once the command is known to be `magi web`.
+static IS_WEB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 async fn async_main() -> Result<()> {
     let cli = Cli::parse();
-    init_logging(cli.verbose);
+    let is_web = matches!(cli.command, Some(Command::Web { .. }));
+    IS_WEB.store(is_web, std::sync::atomic::Ordering::Relaxed);
+    init_logging(cli.verbose, is_web);
     magi::notices::install_pager();
     let interactive = std::io::stdout().is_terminal();
     if cli.no_color || std::env::var_os("NO_COLOR").is_some() || !interactive {
@@ -1893,7 +1910,9 @@ fn describe_layers(layers: &[PathBuf]) -> String {
         .join(" < ")
 }
 
-fn init_logging(verbose: u8) {
+/// `with_time` is for the long-lived web process, whose log has to be
+/// readable after the fact; the one-shot commands stay terse.
+fn init_logging(verbose: u8, with_time: bool) {
     let default = match verbose {
         0 => "magi=info",
         1 => "magi=debug",
@@ -1901,12 +1920,15 @@ fn init_logging(verbose: u8) {
     };
     let filter = tracing_subscriber::EnvFilter::try_from_env("MAGI_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .without_time()
-        .with_writer(std::io::stderr)
-        .init();
+        .with_writer(std::io::stderr);
+    if with_time {
+        builder.init();
+    } else {
+        builder.without_time().init();
+    }
 }
 
 /// Resolve the task text from argv, a file, or a GitHub issue.
