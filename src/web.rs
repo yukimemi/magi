@@ -5182,11 +5182,7 @@ fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
         return None;
     }
     if q.cwd.is_none() && q.deputy.is_none() {
-        return (matches!(
-            q.node.as_str(),
-            crate::conduct::NODE | crate::land::APPROVAL_NODE
-        ) || crate::deputy::kind_of(q) == Some(crate::deputy::Kind::Release))
-        .then_some("nobody");
+        return crate::deputy::kind_of(q).map(|_| "nobody");
     }
     Some(match lease.filter(|l| l.fresh(jiff::Timestamp::now())) {
         Some(_) if q.deputy.is_some() => "deputy",

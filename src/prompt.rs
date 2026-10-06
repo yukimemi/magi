@@ -1429,11 +1429,23 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
     } = *p;
     let land = kind == crate::deputy::Kind::Land;
     let mut s = format!(
-        "# {DEPUTY_HEADING}\n\n\
-         The conductor asked the owner a question and may not wait for the \
-         answer itself, so you are the one that does. You hold this one \
+        "# {DEPUTY_HEADING}\n\n{} You hold this one \
          question ({id}) and nothing else: you do not edit files, merge, or \
-         touch the queue.\n\n"
+         touch the queue.\n\n",
+        match kind {
+            crate::deputy::Kind::Triage | crate::deputy::Kind::Generic => {
+                "Magi asked the owner a question and nothing is waiting for the \
+                 answer, so you are the one that does. You apply nothing and \
+                 never push or merge; you add nothing to the queue and have no \
+                 authority to file follow-up tasks. Silence is a hold. Settle a \
+                 choice only when the owner's own words clearly pick it and its \
+                 effect is spelled out below; otherwise ask them with `--thread`."
+            }
+            _ => {
+                "The conductor asked the owner a question and may not wait for \
+                 the answer itself, so you are the one that does."
+            }
+        }
     );
     if land {
         s.push_str(

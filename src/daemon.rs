@@ -2977,8 +2977,8 @@ async fn attempt(
                 .expect("checked by the guard");
             let mut q = ask::Question::new(
                 task.id.clone(),
-                "review".to_owned(),
-                "sync".to_owned(),
+                crate::reconcile::NODE.to_owned(),
+                crate::reconcile::SEAT.to_owned(),
                 d.summary(),
                 d.detail(),
                 d.choices(),

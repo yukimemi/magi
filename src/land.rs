@@ -633,13 +633,20 @@ pub fn merge_intent(message: &str, quote: &str) -> bool {
     if !(lower.contains("merge") || quote.contains("マージ")) {
         return false;
     }
-    // The whole message is read, not just the quote's sentence: a condition or
-    // a second thought in another sentence ("Merge it. Only if CI passes.") makes
-    // the approval conditional all the same. Doubt anywhere is a hold.
-    if hedged(message) {
-        return false;
-    }
-    !retracts(message)
+    unhedged(message, quote)
+}
+
+/// Whether `quote` is a verbatim part of the owner's `message` and nothing in
+/// the whole message carries a hedge, a condition, a negation, a question or a
+/// retraction. The part of [`merge_intent`] that does not depend on what is
+/// being approved, shared with `deputy::destructive`.
+///
+/// The whole message is read, not just the quote's sentence: a condition or a
+/// second thought in another sentence ("Merge it. Only if CI passes.") makes
+/// the approval conditional all the same. Doubt anywhere is `false`.
+pub fn unhedged(message: &str, quote: &str) -> bool {
+    let quote = quote.trim();
+    !quote.is_empty() && message.contains(quote) && !hedged(message) && !retracts(message)
 }
 
 /// Hedging, conditional, negated or interrogative wording. ASCII words are

@@ -2213,22 +2213,20 @@ fn ask_settle_cmd(store: &ask::Questions, id: &str, choices: &[String], quote: &
     let resolved = store.resolve_id(id)?;
     let queue = magi::queue::Queue::open();
     store.update(&resolved, |q| {
-        // A conductor question's `run` is the task id; a merge approval's is
-        // the run id, so the task is the one that run belongs to.
+        // A conductor's or triage question's `run` is the task id; a merge
+        // approval's is the run id, so the task is the one that run belongs to
+        // (as for any other kind that names a run).
         // A release-watch question has no run; its watch record names the run
         // that opened the pull request, when it knows one.
-        let task = queue.get(&q.run).ok().or_else(|| {
-            (q.node == magi::land::APPROVAL_NODE)
-                .then(|| queue.list().into_iter().find(|t| t.runs.contains(&q.run)))
-                .flatten()
-                .or_else(|| {
-                    (magi::deputy::kind_of(q) == Some(magi::deputy::Kind::Release))
-                        .then(|| {
-                            magi::release_watch::task_of_question(&magi::run::home(), q, &queue)
-                        })
-                        .flatten()
-                })
-        });
+        let task = queue
+            .get(&q.run)
+            .ok()
+            .or_else(|| queue.list().into_iter().find(|t| t.runs.contains(&q.run)))
+            .or_else(|| {
+                (magi::deputy::kind_of(q) == Some(magi::deputy::Kind::Release))
+                    .then(|| magi::release_watch::task_of_question(&magi::run::home(), q, &queue))
+                    .flatten()
+            });
         if let Some(task) = task
             && task.operator_held()
         {

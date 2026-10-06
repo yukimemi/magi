@@ -561,6 +561,63 @@ fn file_question(
     Some(q)
 }
 
+/// What a deputy is told about a triage question: the task, why it is held and
+/// what each position does, in the words [`interpret_answer`] /
+/// [`interpret_deps_answer`] apply them. Written from the stored record; a task
+/// that no longer exists is said to be missing, never reconstructed.
+pub(crate) fn deputy_brief(q: &Question, queue: &Queue) -> String {
+    let task = queue.get(&q.run).ok();
+    let mut s = match &task {
+        Some(t) => format!(
+            "Task {} (`magi task show {}`), \"{}\", is {}. Hold source: {}. Reason: {}.",
+            t.id,
+            t.id,
+            t.title,
+            t.status.as_str(),
+            match t.hold_source {
+                Some(HoldSource::Machine) => "machine (an automatic hold)",
+                Some(HoldSource::Manual) => "manual (an operator held it)",
+                None => "unknown (an old record, treated as the operator's)",
+            },
+            t.hold_reason
+                .as_deref()
+                .or(t.last_error.as_deref())
+                .unwrap_or("(none recorded)")
+        ),
+        None => format!("Task {} no longer exists (its record is gone).", q.run),
+    };
+    s.push_str("\n\nWhat each option does, by position (the owner taps a button; you only read their words):");
+    let n = q.choices.len();
+    for (i, c) in q.choices.iter().enumerate() {
+        let effect = if q.node == DEPS_NODE {
+            match i {
+                0 => "the dependency is released so the loop runs it",
+                1 => {
+                    "the dependants are detached and the dependency task is DELETED; this cannot be undone"
+                }
+                2 => "the dependants are detached; the dependency stays as it is",
+                _ => "nothing is applied",
+            }
+        } else {
+            match i {
+                0 => "the task is released and requeued",
+                2 if n > 2 => "the task is DELETED; this cannot be undone",
+                _ => "the task stays held, with the answer noted",
+            }
+        };
+        s.push_str(&format!("\n- `{c}`: {effect}"));
+    }
+    s.push_str(
+        "\n\nThe daemon applies the answer on its next pass; you apply nothing. \
+         `magi ask --settle` is refused while the task is held by the operator (a \
+         manual hold, or an old record): an answer must not release or delete \
+         something a person parked. In that case do not retry it - ask the owner \
+         with `--thread` to tap the button themselves. The destructive option is \
+         accepted only for an unhedged, verbatim instruction.",
+    );
+    s
+}
+
 /// Move every `blocked` task whose `blocked_by` names a task or question id
 /// that no longer exists to a machine hold, before the per-`held` walk
 /// [`run_once`] does gets a look at it.

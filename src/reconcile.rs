@@ -14,6 +14,13 @@
 //! that needed conflict resolution changes the patch-id and is therefore
 //! [`Divergence::Genuine`] - the safe side of every doubt.
 
+/// Node the daemon records on the divergence question (`daemon`'s `Diverged`
+/// arm). There is no agent behind it, so `crate::deputy::destructive` names it.
+pub const NODE: &str = "review";
+
+/// Seat recorded on the divergence question, with [`NODE`].
+pub const SEAT: &str = "sync";
+
 use std::path::Path;
 
 use anyhow::Result;

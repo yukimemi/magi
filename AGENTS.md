@@ -1356,6 +1356,38 @@ not move on a say.
   unknown, lets the settle through (nothing here releases a task). As for
   opencode / omp seats, the deputy runs with `allow_write` and its read-only-ness
   rests on the prompt. It is given no follow-up-task authority.
+- **Every open question the owner can say something to has a deputy.**
+  `deputy::Kind::Triage` serves `triage::NODE` / `triage::DEPS_NODE` (brief:
+  `triage::deputy_brief`, which lists each position as `interpret_answer` /
+  `interpret_deps_answer` apply it); `Kind::Generic` is the fallback for any
+  other question with **no `cwd` and at least one choice** (the divergence
+  question, node `reconcile::NODE` / seat `reconcile::SEAT`, today). The
+  fallback is decided by the missing `cwd`, **never by node name**: a
+  `magi ask` from inside a run records its `cwd` and keeps its asker / waiter,
+  and a seat's node is its own name (a reviewer's `review` is also the
+  divergence node). A choice-less question and `bump`'s own notices stay
+  unserved. `generic_brief` states only what the question stored and tells the
+  seat to ask back (`--thread`) rather than guess an effect it cannot read.
+- **Only a conductor question is ever given a `cwd`** (`Deputies::attach`).
+  Any other kind with one would be resumed and expired by the waiter beside its
+  deputy. Triage / Generic deputies run in the task's repo (`Question::run` as a
+  task id) or the serve repo, on a last-activity clock like a conductor's; the
+  waiter never retires a `cwd`-less question, so an expired one stays open (as it
+  did before) and only an unread say starts a deputy after the deadline.
+- **`--settle` gates were widened, not loosened.** `ask_settle_cmd` resolves the
+  task through `run` as a task id *or* as a run id for every kind, so the
+  `operator_held` refusal covers Triage and Generic (most triage holds are
+  operator's, so their deputy asks the owner to tap the button).
+  `deputy::merge_gated` applies to any served non-conductor kind that offers
+  `merge`. `deputy::destructive` (triage discard, the divergence answers) needs
+  the owner's latest message to pass `land::unhedged`, the hedge / negation /
+  retraction check `land::merge_intent` is built on.
+- **A new question node must be added to `unasked_questions()` in
+  `tests/deputy.rs`**, which asserts `deputy::kind_of` is `Some` for each node
+  filed without an asker; a node that is not listed there can ship unheard.
+  Deputies share `daemon.max_deputies`, and a triage question can occupy a slot
+  (no priority between kinds); the UI says a deputy *can* be attached
+  (`deputies_enabled`), not that one is running.
 - The mock agent in `tests/common/mod.rs` greps `prompt::DEPUTY_HEADING`; reword
   the heading and update both.
 
