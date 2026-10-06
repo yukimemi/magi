@@ -4819,6 +4819,20 @@ async function loadTalk(id) {
     renderTalk();
     ok();
   } catch (error) {
+    /* 404 means the conversation is gone: nothing will ever end its wait by
+       growing the transcript, so settle it here. Other errors keep the wait
+       and are retried. */
+    if (error.status === 404) {
+      endTalkTurn(id);
+      if (state.talkDetail.id === id) {
+        state.talkDetail.talk = null;
+        state.talkDetail.roster = [];
+        state.talkDetail.gone = true;
+        ok();
+        renderTalk();
+      }
+      return;
+    }
     if (state.talkDetail.id === id) {
       fail(`Could not load conversation ${shortId(id)}: ${error.message}`);
     }
@@ -4894,8 +4908,12 @@ function renderTalk() {
   const busy = Boolean(wait) || Boolean(talk && talk.thinking);
 
   if (!talk) {
-    setText($("talk-h"), "Loading conversation…");
-    setText($("talk-meta"), "");
+    const gone = Boolean(state.talkDetail.gone);
+    setText($("talk-h"), gone ? "This conversation no longer exists." : "Loading conversation…");
+    setText(
+      $("talk-meta"),
+      gone ? `${shortId(state.talkDetail.id)} · It was deleted. Pick another conversation from the list.` : "",
+    );
     clear($("talk-status"));
     clear($("talk-turns"));
     show($("talk-tasks-panel"), false);
@@ -7381,7 +7399,7 @@ async function applyRevisions_(source) {
   if (talksRev !== state.rev.talks) {
     state.rev.talks = talksRev;
     jobs.push(loadTalks());
-    if (state.route.name === "talk" && state.talkDetail.id) jobs.push(loadTalk(state.talkDetail.id));
+    if (state.route.name === "talk" && state.talkDetail.id && !state.talkDetail.gone) jobs.push(loadTalk(state.talkDetail.id));
   }
   /* Bumped by this process whenever the loop it owns starts, stops, claims or
      finishes, so a phone learns about a tap it did not make. Guarded on the
