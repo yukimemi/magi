@@ -1732,8 +1732,15 @@ async fn run_update_recheck(repo: PathBuf, home: PathBuf) {
 /// never a live check. `[update] mode = "off"` answers "unknown" the same as
 /// no cached state at all, which is correct: an operator who turned checking
 /// off gets no opinion, not a stale one.
-fn cached_update_view(repo: &FsPath) -> UpdateView {
-    let (cfg, _) = Config::discover(repo, None).unwrap_or_default();
+fn cached_update_view(cfg: Option<&Config>) -> UpdateView {
+    let default;
+    let cfg = match cfg {
+        Some(cfg) => cfg,
+        None => {
+            default = Config::default();
+            &default
+        }
+    };
     let latest = updater::Checker::new(&cfg.update).and_then(|c| c.cached_update());
     match latest {
         Some(latest) => UpdateView {
@@ -1795,10 +1802,9 @@ struct DiskView {
 
 impl DiskView {
     /// Measure the three directories and re-read the config's cache.
-    fn of(ui: &Ui) -> Self {
-        let cache_bytes = Config::discover(&ui.repo, None)
-            .ok()
-            .and_then(|(cfg, _)| cfg.cache_dir())
+    fn of(ui: &Ui, cfg: Option<&Config>) -> Self {
+        let cache_bytes = cfg
+            .and_then(|cfg| cfg.cache_dir())
             .map(|dir| crate::disk::dir_size(&dir));
         Self {
             free_bytes: crate::disk::free_bytes(&ui.runs).ok(),
@@ -1861,7 +1867,10 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
         // is not reentrant, and a guard taken as a temporary there would still
         // be held when `loop_view` took it again.
         let loop_rev = ui.lock_loop().rev;
-        let update = cached_update_view(&ui.repo);
+        // One discover for both views: each is a few git processes plus a
+        // config render, and neither depends on anything the other reads.
+        let cfg = deputy_config(&ui.repo);
+        let update = cached_update_view(cfg.as_ref());
         let upgrade = updater::read_progress(&ui.home).map(|p| upgrade_progress_view(&ui, p));
         Ok(Json(HealthView {
             version: env!("CARGO_PKG_VERSION"),
@@ -1878,7 +1887,7 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             questions_needs_owner: ui.questions.count_needs_owner(),
             daemon: DaemonView::of(reading.clone()),
             looping: ui.loop_view(reading),
-            disk: DiskView::of(&ui),
+            disk: DiskView::of(&ui, cfg.as_ref()),
             update,
             upgrade,
         }))
@@ -5007,10 +5016,35 @@ impl QuestionView {
     }
 }
 
-/// Can `magi serve` start a deputy under the config this repository resolves?
-fn deputies_enabled(repo: &std::path::Path, q: &Question) -> bool {
-    let cfg = Config::discover(repo, None).ok().map(|(c, _)| c);
-    crate::deputy::can_start(cfg.as_ref(), crate::deputy::agent_of(q))
+/// The config this repository resolves, or `None` when it cannot be read.
+/// Discovering is git processes plus a config render, so a request that needs
+/// it for many items takes it once and passes it down.
+fn deputy_config(repo: &std::path::Path) -> Option<Config> {
+    Config::discover(repo, None).ok().map(|(c, _)| c)
+}
+
+/// Can `magi serve` start a deputy for this question under `cfg`?
+fn deputies_enabled(cfg: Option<&Config>, q: &Question) -> bool {
+    crate::deputy::can_start(cfg, crate::deputy::agent_of(q))
+}
+
+/// The views `GET /api/questions` answers. `load` runs at most once, however
+/// many questions there are, and not at all when there are none.
+fn question_views(
+    qs: Vec<Question>,
+    store: &ask::Questions,
+    load: impl FnOnce() -> Option<Config>,
+) -> Vec<QuestionView> {
+    if qs.is_empty() {
+        return Vec::new();
+    }
+    let cfg = load();
+    qs.into_iter()
+        .map(|q| {
+            let on = deputies_enabled(cfg.as_ref(), &q);
+            QuestionView::of(q, store, on)
+        })
+        .collect()
 }
 
 /// Who is honestly waiting on an open question right now: `"asker"` (the
@@ -5048,16 +5082,11 @@ fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
 /// told an agent at 3am. `ask::Questions::list` already ranks open first.
 async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<QuestionView>>> {
     blocking(move || {
-        Ok(Json(
-            ui.questions
-                .list()
-                .into_iter()
-                .map(|q| {
-                    let on = deputies_enabled(&ui.repo, &q);
-                    QuestionView::of(q, &ui.questions, on)
-                })
-                .collect(),
-        ))
+        Ok(Json(question_views(
+            ui.questions.list(),
+            &ui.questions,
+            || deputy_config(&ui.repo),
+        )))
     })
     .await
 }
@@ -5160,7 +5189,7 @@ async fn question_answer(
             .questions
             .update(&q.id, |r| r.answer(answer))
             .map_err(ApiError::bad_request_from)?;
-        let on = deputies_enabled(&ui.repo, &q);
+        let on = deputies_enabled(deputy_config(&ui.repo).as_ref(), &q);
         Ok(Json(QuestionView::of(q, &ui.questions, on)))
     })
     .await
@@ -5210,7 +5239,7 @@ async fn question_say(
             .questions
             .update(&q.id, |r| r.say(body.body))
             .map_err(ApiError::bad_request_from)?;
-        let on = deputies_enabled(&ui.repo, &q);
+        let on = deputies_enabled(deputy_config(&ui.repo).as_ref(), &q);
         Ok(Json(QuestionView::of(q, &ui.questions, on)))
     })
     .await
@@ -6480,11 +6509,10 @@ mod tests {
         assert_eq!(holder_of(&m, None), Some("nobody"));
     }
 
-    #[test]
-    fn deputies_enabled_follows_the_config() {
+    fn stub_config() -> Config {
         // An explicit roster, so the result never depends on which agent CLIs
         // this machine has installed.
-        let on = Config {
+        Config {
             agents: vec![crate::config::AgentSpec {
                 id: "stub".to_owned(),
                 kind: AgentKind::Command,
@@ -6495,7 +6523,23 @@ mod tests {
                 prompt_delivery: None,
             }],
             ..Config::default()
-        };
+        }
+    }
+
+    fn plain_question(seat: &str) -> Question {
+        Question::new(
+            String::new(),
+            "n".to_owned(),
+            seat.to_owned(),
+            "s".to_owned(),
+            String::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn deputies_enabled_follows_the_config() {
+        let on = stub_config();
         assert!(crate::deputy::can_start(Some(&on), ""));
         assert!(crate::deputy::can_start(Some(&on), "stub"));
         let mut off = on.clone();
@@ -6505,6 +6549,40 @@ mod tests {
         empty.agents.clear();
         assert!(!crate::deputy::can_start(Some(&empty), ""));
         assert!(!crate::deputy::can_start(None, ""));
+    }
+
+    #[test]
+    fn question_views_load_the_config_once() {
+        let dir = TempDir::new().unwrap();
+        let store = ask::Questions::at(dir.path().to_path_buf());
+        let mut with_deputy = plain_question("b");
+        with_deputy.deputy = Some(ask::Deputy::new("brief".to_owned()));
+        let qs = vec![plain_question("a"), with_deputy, plain_question("c")];
+
+        let calls = std::cell::Cell::new(0usize);
+        let views = question_views(qs.clone(), &store, || {
+            calls.set(calls.get() + 1);
+            Some(stub_config())
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(views.len(), 3);
+        for (v, q) in views.iter().zip(&qs) {
+            assert_eq!(
+                v.deputies_enabled,
+                crate::deputy::can_start(Some(&stub_config()), crate::deputy::agent_of(q))
+            );
+        }
+
+        let views = question_views(qs, &store, || None);
+        assert!(views.iter().all(|v| !v.deputies_enabled));
+
+        let calls = std::cell::Cell::new(0usize);
+        let views = question_views(Vec::new(), &store, || {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert!(views.is_empty());
+        assert_eq!(calls.get(), 0);
     }
 
     use pretty_assertions::assert_eq;
