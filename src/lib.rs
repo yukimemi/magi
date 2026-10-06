@@ -51,6 +51,7 @@ pub mod queue;
 pub mod rebase;
 pub mod reconcile;
 pub mod refs;
+pub mod release_local;
 pub mod release_watch;
 pub mod report;
 pub mod repos;

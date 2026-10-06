@@ -25,6 +25,13 @@
 //!   only reruns jobs. Silence is a hold. The owner's choice is applied by the
 //!   watcher itself on its next lap, recorded in `WatchState::applied` so an
 //!   answer is applied once.
+//! - **`[release] mode = "local"` replaces all of the above for that
+//!   repository's release pull requests.** No check is awaited, reran or
+//!   stalled on. The watcher asks the owner (`merge` / `hold`, bound to the
+//!   head it observed), merges with `--match-head-commit`, and after the merge
+//!   drives [`crate::release_local`] - tag, then the configured commands - with
+//!   its progress in the watch record. A failure is a notice and a question
+//!   (`retry` / `leave it`), never a blind retry. See [`decide_local`].
 //! - **Notice wording is fixed per stage** and carries only the pull request,
 //!   so a repeated poll never relights it; everything that varies (job names,
 //!   links) rides in the question.
@@ -41,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use crate::ask::{Answer, Question, Questions};
 use crate::land::{self, PrLifecycle, RollupView, Verdict};
 use crate::notices::{self, Notice, Notices};
+use crate::release_local::{self, Job};
 
 /// Pause between laps.
 const LAP: Duration = Duration::from_secs(300);
@@ -57,6 +65,8 @@ pub const RERUN_AGAIN: &str = "rerun again";
 pub const HOLD: &str = "hold";
 /// Choice: stop watching this pull request.
 pub const LEAVE_IT: &str = "leave it";
+/// Choice (local mode): run the failed release again from where it stopped.
+pub const RETRY: &str = "retry";
 
 /// What one look at one pull request concludes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +113,19 @@ pub(crate) struct WatchState {
     pub ignored: bool,
     /// Question ids whose answer was already applied.
     pub applied: Vec<String>,
+    /// Local mode: the head the open (or last) approval question was about.
+    pub asked_head: Option<String>,
+    /// Local mode: the head the owner held or whose merge was refused; no new
+    /// approval question until the head moves.
+    pub held_head: Option<String>,
+    /// Local mode: the run that opened this release PR, so a failed release can
+    /// hold the task that run finished (the daemon marks it Done at the merge).
+    pub run: Option<String>,
+    /// Local mode: the task this watcher put on hold for a failed release, so a
+    /// successful retry can give it back (and a restart does not hold it twice).
+    pub held_task: Option<String>,
+    /// Local mode: the release after the merge.
+    pub job: Option<Job>,
 }
 
 fn is_failed(v: Verdict) -> bool {
@@ -260,6 +283,85 @@ fn question_detail(snap: &RollupView, why: Why, st: &WatchState) -> String {
     s
 }
 
+/// Where the owner's approval stands, as far as [`decide_local`] cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Approved {
+    /// No question was filed (or it is gone).
+    NoQuestion,
+    /// Filed, not answered.
+    Open,
+    /// The owner said `merge`.
+    Merge,
+    /// The owner said anything else, or it was abandoned: silence is a hold.
+    Hold,
+}
+
+/// What one look at an open local-mode release pull request concludes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalStep {
+    /// Nothing to do now.
+    Wait,
+    /// Ask the owner whether to merge this head.
+    Ask,
+    /// Merge, pinned to this head.
+    Merge(String),
+    /// Remember the owner's no for this head and stay quiet until it moves.
+    Hold(String),
+}
+
+/// Decide an *open* local-mode pull request. No I/O, and no CI: nothing is
+/// awaited, rerun or stalled on, because nothing will ever report. The head is
+/// what the owner approved: an answer about an older head asks again.
+pub(crate) fn decide_local(head: &str, st: &WatchState, approved: Approved) -> LocalStep {
+    if st.ignored || st.held_head.as_deref() == Some(head) {
+        return LocalStep::Wait;
+    }
+    let about_this_head = st.asked_head.as_deref() == Some(head);
+    match approved {
+        Approved::Open => LocalStep::Wait,
+        Approved::NoQuestion => LocalStep::Ask,
+        Approved::Merge if about_this_head => LocalStep::Merge(head.to_owned()),
+        Approved::Hold if about_this_head => LocalStep::Hold(head.to_owned()),
+        // The head moved after the question was filed.
+        Approved::Merge | Approved::Hold => LocalStep::Ask,
+    }
+}
+
+/// Start watching a release pull request before the first lap sees it, so one
+/// merged within a lap of being opened still gets released. Never overwrites.
+pub(crate) fn register(home: &Path, repo: &Path, url: &str, run: &str) {
+    let Some(pr) = pr_key(url) else {
+        return;
+    };
+    let w = Watcher::new(Box::new(GhForge), home.to_path_buf());
+    if w.state_path(&pr).exists() {
+        return;
+    }
+    let st = WatchState {
+        repo: repo.to_string_lossy().into_owned(),
+        url: url.to_owned(),
+        run: Some(run.to_owned()),
+        ..WatchState::default()
+    };
+    w.save(&pr, &st);
+}
+
+/// Starts the hold reason of a task held for a failed release, so only that
+/// hold is undone when the release later succeeds.
+const HOLD_PREFIX: &str = "[release] ";
+
+fn approval_message(pr: &str) -> String {
+    format!("Release PR {pr} is waiting for your approval to merge")
+}
+
+fn failed_message(pr: &str) -> String {
+    format!("Release PR {pr} merged but the release is on hold")
+}
+
+fn released_key(pr: &str) -> String {
+    format!("release-done:{pr}")
+}
+
 type Fut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Every forge access, so tests inject a fake instead of `gh`.
@@ -268,6 +370,51 @@ pub(crate) trait ReleaseForge: Send + Sync {
     fn list<'a>(&'a self, repo: &'a Path) -> Fut<'a, Result<Vec<(String, String)>>>;
     fn snapshot<'a>(&'a self, repo: &'a Path, url: &'a str) -> Fut<'a, Result<RollupView>>;
     fn rerun<'a>(&'a self, repo: &'a Path, run: &'a str) -> Fut<'a, Result<()>>;
+    /// The repository's config, to read `[release]` and `[merge] remote`.
+    fn config<'a>(&'a self, _repo: &'a Path) -> Fut<'a, Result<crate::config::Config>> {
+        Box::pin(async { Ok(crate::config::Config::default()) })
+    }
+    /// Head branch and merge commit of a pull request (local mode).
+    fn info<'a>(&'a self, _repo: &'a Path, url: &'a str) -> Fut<'a, Result<PrInfo>> {
+        Box::pin(async move { bail!("no pull request info for {url}") })
+    }
+    /// Merge `url` (squash, delete branch) pinned to `head`. `Ok(true)` once
+    /// the forge says it merged, `Ok(false)` when it did not.
+    fn merge<'a>(&'a self, _repo: &'a Path, url: &'a str, _head: &'a str) -> Fut<'a, Result<bool>> {
+        Box::pin(async move { bail!("cannot merge {url}") })
+    }
+}
+
+/// What the forge says about a pull request's branch and merge.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PrInfo {
+    /// Head branch name, e.g. `chore/release-v1.2.3`.
+    pub branch: String,
+    /// The commit the pull request merged as, once merged.
+    pub merge_commit: Option<String>,
+    /// Pull request title.
+    pub title: String,
+}
+
+/// Parse `gh pr view --json headRefName,mergeCommit,title`. No I/O.
+pub(crate) fn parse_info(json: &str) -> Result<PrInfo> {
+    let v: serde_json::Value = serde_json::from_str(json)?;
+    let text = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    Ok(PrInfo {
+        branch: text("headRefName"),
+        title: text("title"),
+        merge_commit: v
+            .get("mergeCommit")
+            .and_then(|m| m.get("oid"))
+            .and_then(|o| o.as_str())
+            .filter(|o| !o.is_empty())
+            .map(str::to_owned),
+    })
 }
 
 /// The real forge: `gh`.
@@ -308,6 +455,58 @@ impl ReleaseForge for GhForge {
                 bail!("gh run rerun {run}: {out}");
             }
             Ok(())
+        })
+    }
+
+    fn config<'a>(&'a self, repo: &'a Path) -> Fut<'a, Result<crate::config::Config>> {
+        Box::pin(async move { Ok(crate::config::Config::discover(repo, None)?.0) })
+    }
+
+    fn info<'a>(&'a self, repo: &'a Path, url: &'a str) -> Fut<'a, Result<PrInfo>> {
+        Box::pin(async move {
+            let args = [
+                "pr".to_owned(),
+                "view".to_owned(),
+                url.to_owned(),
+                "--json".to_owned(),
+                "headRefName,mergeCommit,title".to_owned(),
+            ];
+            let (ok, out) = land::gh(repo, &args).await?;
+            if !ok {
+                bail!("gh pr view {url}: {out}");
+            }
+            parse_info(&out)
+        })
+    }
+
+    fn merge<'a>(&'a self, repo: &'a Path, url: &'a str, head: &'a str) -> Fut<'a, Result<bool>> {
+        Box::pin(async move {
+            let title = self
+                .info(repo, url)
+                .await
+                .map(|i| i.title)
+                .unwrap_or_default();
+            let title = if title.trim().is_empty() {
+                "chore: release".to_owned()
+            } else {
+                title
+            };
+            // Same shape as the direct merge in `bump`, pinned to the head the
+            // owner approved: a push in between is refused by the forge.
+            let mut argv = crate::bump::bump_merge_argv(url, &title);
+            argv.push("--match-head-commit".to_owned());
+            argv.push(head.to_owned());
+            let (ok, out) = land::gh(repo, &argv).await?;
+            if ok {
+                return Ok(true);
+            }
+            // jj keeps HEAD detached, so `--delete-branch` exits non-zero after
+            // the merge happened: the forge decides.
+            let after = land::lifecycle(repo, url).await.ok();
+            if land::merged_after_all(&argv, &out, after).is_some() {
+                return Ok(true);
+            }
+            bail!("gh pr merge {url}: {out}")
         })
     }
 }
@@ -449,6 +648,17 @@ impl Watcher {
                 None
             }
         };
+        match self.forge.config(repo).await {
+            Ok(cfg) if cfg.release.is_local() => {
+                self.watch_local(repo, &pr, st, snap, &cfg).await;
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                "could not read the config of {}: {e:#}; watching {url} as an Actions release",
+                repo.display()
+            ),
+        }
         if decide(snap.as_ref(), &st, now, stall_secs) == Step::Done {
             self.finish(&pr, &st);
             return;
@@ -511,6 +721,317 @@ impl Watcher {
             }
         }
         self.save(&pr, &st);
+    }
+
+    /// The local-mode path of [`Watcher::watch`]: approval, merge, release.
+    async fn watch_local(
+        &self,
+        repo: &Path,
+        pr: &str,
+        mut st: WatchState,
+        snap: Option<RollupView>,
+        cfg: &crate::config::Config,
+    ) {
+        let Some(snap) = snap else {
+            return;
+        };
+        match snap.state {
+            PrLifecycle::Closed => self.finish(pr, &st),
+            PrLifecycle::Merged => self.release_merged(repo, pr, st, cfg).await,
+            PrLifecycle::Open => {
+                let approved = match st.question.clone() {
+                    None => Approved::NoQuestion,
+                    Some(id) => match self.questions().get(&id) {
+                        Ok(q) if q.status.open() => Approved::Open,
+                        Ok(q) => match &q.answer {
+                            Some(Answer::Choice(c))
+                                if land::approval(Some(c)) == land::Approval::Merge =>
+                            {
+                                Approved::Merge
+                            }
+                            _ => Approved::Hold,
+                        },
+                        Err(_) => Approved::NoQuestion,
+                    },
+                };
+                let step = decide_local(&snap.head, &st, approved);
+                if matches!(
+                    step,
+                    LocalStep::Merge(_) | LocalStep::Hold(_) | LocalStep::Ask
+                ) {
+                    // A settled (or stale) question is consumed exactly once.
+                    st.question = None;
+                }
+                match step {
+                    LocalStep::Wait => {}
+                    LocalStep::Hold(head) => st.held_head = Some(head),
+                    LocalStep::Ask => {
+                        st.held_head = None;
+                        st.asked_head = Some(snap.head.clone());
+                        self.raise(pr, approval_message(pr));
+                        let mut q = Question::new(
+                            String::new(),
+                            crate::bump::NOTICE_NODE.to_owned(),
+                            "release-watch".to_owned(),
+                            format!("Release PR {pr}: merge it and release?"),
+                            format!(
+                                "Pull request: {}\nHead: {}\n\n\
+                                 `[release] mode = \"local\"`: no CI is awaited. `{}` merges \
+                                 exactly this head, then magi tags the merge commit and runs the \
+                                 configured release commands. `{}` leaves the pull request \
+                                 open. Silence is a hold.\n",
+                                snap.url,
+                                snap.head,
+                                land::APPROVE,
+                                land::HOLD
+                            ),
+                            vec![land::APPROVE.to_owned(), land::HOLD.to_owned()],
+                        );
+                        match self.questions().put(&mut q) {
+                            Ok(()) => st.question = Some(q.id.clone()),
+                            Err(e) => tracing::warn!("could not file the question for {pr}: {e:#}"),
+                        }
+                    }
+                    LocalStep::Merge(head) => {
+                        match self.forge.merge(repo, &snap.url, &head).await {
+                            Ok(_) => {
+                                // Release at once rather than a lap later.
+                                self.save(pr, &st);
+                                self.release_merged(repo, pr, st, cfg).await;
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::warn!("could not merge {}: {e:#}", snap.url);
+                                st.held_head = Some(head);
+                                self.raise(
+                                    pr,
+                                    format!(
+                                        "Release PR {pr} could not be merged; merge it by hand"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                self.save(pr, &st);
+            }
+        }
+    }
+
+    /// The pull request is merged: create the job once, then drive it.
+    async fn release_merged(
+        &self,
+        repo: &Path,
+        pr: &str,
+        mut st: WatchState,
+        cfg: &crate::config::Config,
+    ) {
+        if st.ignored {
+            return self.finish(pr, &st);
+        }
+        if st.job.is_none() {
+            let info = match self.forge.info(repo, &st.url).await {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::warn!("could not read the merged {}: {e:#}", st.url);
+                    return;
+                }
+            };
+            let (Some(version), Some(commit)) = (
+                release_local::version_from_branch(&info.branch),
+                info.merge_commit,
+            ) else {
+                // Not a release branch, or the forge has not recorded the merge
+                // commit yet: nothing to release (yet).
+                if release_local::version_from_branch(&info.branch).is_none() {
+                    self.finish(pr, &st);
+                }
+                return;
+            };
+            st.job = Some(Job::new(&version, &st.url, &commit));
+            if !self.save(pr, &st) {
+                return;
+            }
+        }
+        let Some(mut job) = st.job.take() else {
+            return;
+        };
+        if job.finished {
+            return self.finish(pr, &st);
+        }
+        if job.interrupted() {
+            job.failed = Some(format!(
+                "magi stopped while `{}` was running; it may have partly run, so it is not repeated on its own",
+                job.running.clone().unwrap_or_default()
+            ));
+        }
+        if let Some(why) = job.failed.clone() {
+            // Reconcile first: a stop between saving the failure and holding
+            // the task (or an interrupted step) must not leave the task Done.
+            self.hold_task(&mut st, &format!("release {} is on hold: {why}", job.tag()));
+            // Held: only the owner's `retry` runs it again.
+            let retry = self.settle_job_question(pr, &mut st, &mut job);
+            if !retry {
+                st.job = Some(job);
+                self.save(pr, &st);
+                return;
+            }
+        }
+        let shell = cfg.shell();
+        let env = release_local::Env {
+            repo,
+            home: &self.home,
+            key: pr,
+            remote: &cfg.merge.remote,
+            shell: &shell,
+            release: &cfg.release,
+        };
+        let result = {
+            let mut save = |j: &Job| {
+                let mut copy = st.clone();
+                copy.job = Some(j.clone());
+                self.save(pr, &copy)
+            };
+            release_local::run_job(&env, &mut job, &mut save).await
+        };
+        match result {
+            Ok(()) => {
+                self.raise_released(pr, &job);
+                self.unhold_task(&mut st);
+                st.job = Some(job);
+                self.finish(pr, &st);
+            }
+            Err(e) => {
+                job.failed = Some(format!("{e:#}"));
+                self.hold_task(&mut st, &format!("release {} failed: {e:#}", job.tag()));
+                self.raise(pr, failed_message(pr));
+                self.file_job_question(pr, &mut st, &job);
+                st.job = Some(job);
+                self.save(pr, &st);
+            }
+        }
+    }
+
+    /// Hold the task whose run opened this release PR: the daemon marked it
+    /// Done when the change merged, but the release is not done. Best-effort;
+    /// a task the owner already holds or that cannot be found is left alone.
+    fn hold_task(&self, st: &mut WatchState, reason: &str) {
+        if st.held_task.is_some() {
+            return;
+        }
+        let Some(run) = st.run.clone() else {
+            return;
+        };
+        let q = crate::queue::Queue::at(self.home.join("queue"));
+        for mut t in q.list() {
+            if t.runs.contains(&run) {
+                if t.status != crate::queue::TaskStatus::Held {
+                    t.hold_machine(Some(format!("{HOLD_PREFIX}{reason}")));
+                    match q.put(&mut t) {
+                        Ok(()) => st.held_task = Some(t.id.clone()),
+                        Err(e) => tracing::warn!("could not hold task {} for {run}: {e:#}", t.id),
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /// Give back the hold [`Watcher::hold_task`] put on a task, once the
+    /// release succeeded. Only a machine hold carrying our marker is undone: a
+    /// task the owner has since re-held or changed is left alone.
+    fn unhold_task(&self, st: &mut WatchState) {
+        let Some(id) = st.held_task.take() else {
+            return;
+        };
+        let q = crate::queue::Queue::at(self.home.join("queue"));
+        let Ok(mut t) = q.get(&id) else {
+            return;
+        };
+        let ours = t.status == crate::queue::TaskStatus::Held
+            && t.hold_source == Some(crate::queue::HoldSource::Machine)
+            && t.hold_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with(HOLD_PREFIX));
+        if ours {
+            t.succeed();
+            if let Err(e) = q.put(&mut t) {
+                tracing::warn!("could not restore task {id} after the release: {e:#}");
+            }
+        }
+    }
+
+    fn raise_released(&self, pr: &str, job: &Job) {
+        notices::raise_in(
+            &self.home,
+            Notice::info(&released_key(pr), format!("Released {} ({pr})", job.tag())),
+        );
+    }
+
+    /// Ask what to do about a held job. One question per failure.
+    fn file_job_question(&self, pr: &str, st: &mut WatchState, job: &Job) {
+        let last = job
+            .log
+            .last()
+            .map(|l| format!("\nLast step: {}\n\n{}\n", l.name, l.tail))
+            .unwrap_or_default();
+        let mut q = Question::new(
+            String::new(),
+            crate::bump::NOTICE_NODE.to_owned(),
+            "release-watch".to_owned(),
+            format!("Release {} of {pr} is on hold: retry?", job.tag()),
+            format!(
+                "Pull request: {}\nWhy it stopped: {}\n{last}\n\
+                 Full output is under the magi home's release-local directory.\n\n\
+                 - `{RETRY}`: run it again from where it stopped (the tag is not \
+                 recreated and finished commands are skipped).\n\
+                 - `{LEAVE_IT}`: stop watching; release by hand.\n\n\
+                 Nothing is retried on its own; silence is a hold.\n",
+                job.pr_url,
+                job.failed.clone().unwrap_or_default()
+            ),
+            vec![RETRY.to_owned(), LEAVE_IT.to_owned()],
+        );
+        match self.questions().put(&mut q) {
+            Ok(()) => st.question = Some(q.id.clone()),
+            Err(e) => tracing::warn!("could not file the question for {pr}: {e:#}"),
+        }
+    }
+
+    /// Read the owner's word on a held job. `true` means `retry`: the job was
+    /// resumed. Files the question when there is none yet and the owner has not
+    /// already held this exact failure.
+    fn settle_job_question(&self, pr: &str, st: &mut WatchState, job: &mut Job) -> bool {
+        let why = job.failed.clone().unwrap_or_default();
+        if let Some(id) = st.question.clone() {
+            match self.questions().get(&id) {
+                Ok(q) if q.status.open() => return false,
+                Ok(q) => {
+                    st.question = None;
+                    match &q.answer {
+                        Some(Answer::Choice(c)) if c == RETRY => {
+                            job.resume();
+                            st.held = None;
+                            return true;
+                        }
+                        Some(Answer::Choice(c)) if c == LEAVE_IT => {
+                            st.ignored = true;
+                            let _ = Notices::at(self.home.join("notifications"))
+                                .dismiss(&notices::id_of(&notice_key(pr)));
+                        }
+                        // Abandoned or anything else: this failure stays held.
+                        _ => st.held = Some(why),
+                    }
+                    return false;
+                }
+                Err(_) => st.question = None,
+            }
+        }
+        if !st.ignored && st.held.as_deref() != Some(why.as_str()) {
+            self.raise(pr, failed_message(pr));
+            self.file_job_question(pr, st, job);
+        }
+        false
     }
 
     /// Apply a settled question's outcome to the record, once.
@@ -767,6 +1288,9 @@ mod tests {
     struct Fake {
         snap: Mutex<Option<RollupView>>,
         reruns: Mutex<Vec<String>>,
+        local: Mutex<bool>,
+        info: Mutex<Option<PrInfo>>,
+        merges: Mutex<Vec<String>>,
     }
 
     impl ReleaseForge for std::sync::Arc<Fake> {
@@ -780,6 +1304,22 @@ mod tests {
         fn rerun<'a>(&'a self, _: &'a Path, run: &'a str) -> Fut<'a, Result<()>> {
             self.reruns.lock().unwrap().push(run.to_owned());
             Box::pin(async { Ok(()) })
+        }
+        fn config<'a>(&'a self, _: &'a Path) -> Fut<'a, Result<crate::config::Config>> {
+            let mut c = crate::config::Config::default();
+            if *self.local.lock().unwrap() {
+                c.release.mode = crate::config::ReleaseMode::Local;
+                c.release.commands = vec!["true".to_owned()];
+            }
+            Box::pin(async move { Ok(c) })
+        }
+        fn info<'a>(&'a self, _: &'a Path, _: &'a str) -> Fut<'a, Result<PrInfo>> {
+            let i = self.info.lock().unwrap().clone();
+            Box::pin(async move { i.context("no info") })
+        }
+        fn merge<'a>(&'a self, _: &'a Path, _: &'a str, head: &'a str) -> Fut<'a, Result<bool>> {
+            self.merges.lock().unwrap().push(head.to_owned());
+            Box::pin(async { Ok(true) })
         }
     }
 
@@ -932,5 +1472,238 @@ mod tests {
         w.lap(&[PathBuf::from("/nowhere")], 60, 1000, &(|| true))
             .await;
         assert!(fake.reruns.lock().unwrap().is_empty());
+    }
+
+    // ---- [release] mode = "local" ----
+
+    fn local_st(asked: Option<&str>, held: Option<&str>) -> WatchState {
+        WatchState {
+            asked_head: asked.map(str::to_owned),
+            held_head: held.map(str::to_owned),
+            ..WatchState::default()
+        }
+    }
+
+    #[test]
+    fn local_decisions_never_wait_on_ci_and_bind_approval_to_the_head() {
+        use Approved::*;
+        let none = local_st(None, None);
+        assert_eq!(decide_local("h1", &none, NoQuestion), LocalStep::Ask);
+        assert_eq!(decide_local("h1", &none, Open), LocalStep::Wait);
+        let asked = local_st(Some("h1"), None);
+        assert_eq!(
+            decide_local("h1", &asked, Merge),
+            LocalStep::Merge("h1".to_owned())
+        );
+        assert_eq!(
+            decide_local("h1", &asked, Hold),
+            LocalStep::Hold("h1".to_owned())
+        );
+        // The head moved after the owner answered: ask again, never merge.
+        assert_eq!(decide_local("h2", &asked, Merge), LocalStep::Ask);
+        assert_eq!(decide_local("h2", &asked, Hold), LocalStep::Ask);
+        // A held head stays quiet until it moves; ignored stays quiet.
+        let held = local_st(Some("h1"), Some("h1"));
+        assert_eq!(decide_local("h1", &held, NoQuestion), LocalStep::Wait);
+        assert_eq!(decide_local("h2", &held, NoQuestion), LocalStep::Ask);
+        let mut ign = local_st(None, None);
+        ign.ignored = true;
+        assert_eq!(decide_local("h1", &ign, NoQuestion), LocalStep::Wait);
+    }
+
+    #[test]
+    fn pr_info_is_read_from_gh_json() {
+        let i = parse_info(
+            r#"{"headRefName":"chore/release-v1.2.3","title":"chore: release v1.2.3","mergeCommit":{"oid":"abc"}}"#,
+        )
+        .unwrap();
+        assert_eq!(i.branch, "chore/release-v1.2.3");
+        assert_eq!(i.merge_commit.as_deref(), Some("abc"));
+        let open = parse_info(r#"{"headRefName":"b","title":"t","mergeCommit":null}"#).unwrap();
+        assert_eq!(open.merge_commit, None);
+    }
+
+    #[tokio::test]
+    async fn a_local_release_asks_once_without_ci_reruns_or_stall_escalation() {
+        let (_d, fake, w) = rig();
+        *fake.local.lock().unwrap() = true;
+        // Red checks that would rerun in Actions mode, and a stall clock far
+        // past the limit: neither matters here.
+        *fake.snap.lock().unwrap() = Some(red());
+        let repo = PathBuf::from("/nowhere");
+        let no = || false;
+        w.lap(std::slice::from_ref(&repo), 60, 1_000_000, &no).await;
+        w.lap(std::slice::from_ref(&repo), 60, 2_000_000, &no).await;
+        assert!(fake.reruns.lock().unwrap().is_empty());
+        let qs = w.questions().list();
+        assert_eq!(qs.len(), 1, "one approval question, not one per lap");
+        assert_eq!(qs[0].choices, vec![land::APPROVE, land::HOLD]);
+        assert!(fake.merges.lock().unwrap().is_empty(), "silence is a hold");
+    }
+
+    #[tokio::test]
+    async fn merge_is_pinned_to_the_approved_head_and_a_moved_head_asks_again() {
+        let (_d, fake, w) = rig();
+        *fake.local.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(open(vec![]));
+        let repo = PathBuf::from("/nowhere");
+        let no = || false;
+        w.lap(std::slice::from_ref(&repo), 60, 1, &no).await;
+        let id = w.questions().list()[0].id.clone();
+        // The head moves before the owner answers.
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Open, "h2", vec![]));
+        answer(&w, &id, land::APPROVE);
+        w.lap(std::slice::from_ref(&repo), 60, 2, &no).await;
+        assert!(fake.merges.lock().unwrap().is_empty());
+        assert_eq!(w.questions().list().len(), 2, "asked again about h2");
+        // Answering the new question merges exactly h2.
+        let id2 = w
+            .questions()
+            .list()
+            .into_iter()
+            .find(|q| q.status.open())
+            .unwrap()
+            .id;
+        answer(&w, &id2, land::APPROVE);
+        w.lap(std::slice::from_ref(&repo), 60, 3, &no).await;
+        assert_eq!(*fake.merges.lock().unwrap(), vec!["h2".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_release_holds_with_one_notice_and_one_question_and_never_retries() {
+        let (d, fake, w) = rig();
+        *fake.local.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Merged, "h1", vec![]));
+        *fake.info.lock().unwrap() = Some(PrInfo {
+            branch: "chore/release-v1.0.0".to_owned(),
+            merge_commit: Some("deadbeef".to_owned()),
+            title: "chore: release v1.0.0".to_owned(),
+        });
+        // The checkout is not a repository, so the release cannot start.
+        let repo = d.path().join("nowhere");
+        let no = || false;
+        w.lap(std::slice::from_ref(&repo), 60, 1, &no).await;
+        let st = w.load("o/r#7");
+        let job = st.job.expect("the job is recorded");
+        assert!(job.failed.is_some() && !job.tag_done && !job.finished);
+        let qs = w.questions().list();
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].choices, vec![RETRY, LEAVE_IT]);
+        // Later laps change nothing: no retry, no second question.
+        w.lap(std::slice::from_ref(&repo), 60, 2, &no).await;
+        assert_eq!(w.questions().list().len(), 1);
+        assert_eq!(Notices::at(d.path().join("notifications")).list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_release_holds_the_task_whose_run_opened_the_pr() {
+        let (d, fake, w) = rig();
+        *fake.local.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Merged, "h1", vec![]));
+        *fake.info.lock().unwrap() = Some(PrInfo {
+            branch: "chore/release-v1.0.0".to_owned(),
+            merge_commit: Some("deadbeef".to_owned()),
+            title: "t".to_owned(),
+        });
+        let repo = d.path().join("nowhere");
+        let q = crate::queue::Queue::at(d.path().join("queue"));
+        let mut t = crate::queue::Task::new(
+            "t".to_owned(),
+            "i".to_owned(),
+            repo.clone(),
+            crate::queue::Source::Human,
+        );
+        t.runs.push("run1".to_owned());
+        t.status = crate::queue::TaskStatus::Done;
+        q.put(&mut t).unwrap();
+        register(d.path(), &repo, URL, "run1");
+        w.lap(std::slice::from_ref(&repo), 60, 1, &(|| false)).await;
+        let held = q.get(&t.id).unwrap();
+        assert_eq!(held.status, crate::queue::TaskStatus::Held);
+        assert!(
+            held.hold_reason
+                .unwrap_or_default()
+                .contains("release v1.0.0")
+        );
+    }
+
+    #[tokio::test]
+    async fn unhold_gives_the_task_back_only_when_the_hold_is_ours() {
+        let (d, _fake, w) = rig();
+        let q = crate::queue::Queue::at(d.path().join("queue"));
+        let mut t = crate::queue::Task::new(
+            "t".to_owned(),
+            "i".to_owned(),
+            PathBuf::from("/r"),
+            crate::queue::Source::Human,
+        );
+        t.runs.push("run1".to_owned());
+        t.status = crate::queue::TaskStatus::Done;
+        q.put(&mut t).unwrap();
+        let mut st = WatchState {
+            run: Some("run1".to_owned()),
+            ..WatchState::default()
+        };
+        w.hold_task(&mut st, "failed");
+        assert_eq!(q.get(&t.id).unwrap().status, crate::queue::TaskStatus::Held);
+        // A restart reconciling again does not hold twice.
+        w.hold_task(&mut st, "failed again");
+        w.unhold_task(&mut st);
+        assert_eq!(q.get(&t.id).unwrap().status, crate::queue::TaskStatus::Done);
+        assert!(st.held_task.is_none());
+
+        // The owner re-held it by hand with their own reason: left alone.
+        let mut h = q.get(&t.id).unwrap();
+        st.held_task = Some(h.id.clone());
+        h.hold_manual(Some("mine".to_owned()));
+        q.put(&mut h).unwrap();
+        w.unhold_task(&mut st);
+        assert_eq!(q.get(&t.id).unwrap().status, crate::queue::TaskStatus::Held);
+    }
+
+    #[tokio::test]
+    async fn a_restart_after_the_failure_was_saved_still_holds_the_task() {
+        let (d, fake, w) = rig();
+        *fake.local.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Merged, "h1", vec![]));
+        let repo = d.path().join("nowhere");
+        let q = crate::queue::Queue::at(d.path().join("queue"));
+        let mut t = crate::queue::Task::new(
+            "t".to_owned(),
+            "i".to_owned(),
+            repo.clone(),
+            crate::queue::Source::Human,
+        );
+        t.runs.push("run1".to_owned());
+        t.status = crate::queue::TaskStatus::Done;
+        q.put(&mut t).unwrap();
+        // The state a crash leaves: failure persisted, task never held.
+        let mut job = Job::new("1.0.0", URL, "deadbeef");
+        job.failed = Some("command 1 exited 3".to_owned());
+        let st = WatchState {
+            repo: repo.to_string_lossy().into_owned(),
+            url: URL.to_owned(),
+            run: Some("run1".to_owned()),
+            job: Some(job),
+            ..WatchState::default()
+        };
+        w.save("o/r#7", &st);
+        w.lap(std::slice::from_ref(&repo), 60, 1, &(|| false)).await;
+        assert_eq!(q.get(&t.id).unwrap().status, crate::queue::TaskStatus::Held);
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_registered_at_open_is_picked_up_even_if_unlisted() {
+        let (d, _fake, w) = rig();
+        register(d.path(), Path::new("/r"), URL, "run1");
+        let st = w.load("o/r#7");
+        assert_eq!(st.url, URL);
+        assert_eq!(st.repo, "/r");
+        // Never overwrites a live record.
+        let mut live = st.clone();
+        live.head = "keep".to_owned();
+        w.save("o/r#7", &live);
+        register(d.path(), Path::new("/r"), URL, "run1");
+        assert_eq!(w.load("o/r#7").head, "keep");
     }
 }

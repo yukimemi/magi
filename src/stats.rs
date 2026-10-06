@@ -1385,6 +1385,7 @@ mod tests {
             version: Some("1.2.3".to_owned()),
             automerge_enabled: true,
             merged_directly: false,
+            local: false,
             problem: None,
             action_required: None,
         });
@@ -1398,6 +1399,7 @@ mod tests {
             version: Some("1.2.4".to_owned()),
             automerge_enabled: false,
             merged_directly: true,
+            local: false,
             problem: None,
             action_required: None,
         });
@@ -1409,6 +1411,7 @@ mod tests {
             version: Some("1.2.5".to_owned()),
             automerge_enabled: false,
             merged_directly: false,
+            local: false,
             problem: Some("checks red".to_owned()),
             action_required: Some("look at the PR".to_owned()),
         });
@@ -1420,6 +1423,7 @@ mod tests {
             version: Some("1.2.6".to_owned()),
             automerge_enabled: false,
             merged_directly: false,
+            local: false,
             problem: Some("gh pr create failed".to_owned()),
             action_required: Some("open the PR by hand".to_owned()),
         });
@@ -1456,6 +1460,7 @@ mod tests {
             version: Some("9.9.9".to_owned()),
             automerge_enabled: true,
             merged_directly: false,
+            local: false,
             problem: None,
             action_required: None,
         });
