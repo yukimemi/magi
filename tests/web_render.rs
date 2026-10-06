@@ -786,6 +786,146 @@ async fn run_detail_tabs_landing_and_strip_hold_at_both_widths_and_themes() {
     browser.close_page(&page).await;
 }
 
+fn seed_candidate(
+    label: char,
+    agent: &str,
+    failed: Option<&str>,
+    repo: &std::path::Path,
+) -> magi::run::Candidate {
+    magi::run::Candidate {
+        index: (label as usize) - ('A' as usize),
+        label,
+        agent: agent.to_owned(),
+        branch: format!("magi/seed/{label}"),
+        worktree: repo.to_path_buf(),
+        summary: String::new(),
+        stat: String::new(),
+        files: 1,
+        commits: 1,
+        empty: false,
+        failed: failed.map(str::to_owned),
+        verified_noop: None,
+        duration_ms: 0,
+        folded: false,
+    }
+}
+
+/// A run with one candidate shows the compact solo strip in the Verdict panel
+/// and no diagram; a run with two candidates keeps the diagram even when one
+/// of them failed (the rule is the candidate count, not the viable count).
+#[tokio::test]
+async fn verdict_panel_is_a_solo_strip_only_for_one_candidate() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+
+    let seed = |id: &str, cands: Vec<magi::run::Candidate>| {
+        let mut run = RunState::new(
+            fx.repo.clone(),
+            "main".to_owned(),
+            "0000000".to_owned(),
+            "verdict panel shape".to_owned(),
+            fx.config.clone(),
+        );
+        run.id = id.to_owned();
+        run.status = RunStatus::Merged;
+        run.candidates = cands;
+        run.save_under(&home).expect("seed run");
+    };
+    let solo_id = "20260901-000010-cc10";
+    let pair_id = "20260901-000011-cc11";
+    seed(solo_id, vec![seed_candidate('A', "alpha", None, &fx.repo)]);
+    seed(
+        pair_id,
+        vec![
+            seed_candidate('A', "alpha", None, &fx.repo),
+            seed_candidate('B', "beta", Some("quota"), &fx.repo),
+        ],
+    );
+
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome)
+        .await
+        .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
+    let w = Duration::from_secs(30);
+
+    for (width, height, mobile) in [(1280u32, 900u32, false), (390, 844, true)] {
+        let tag = format!("verdict solo @{width}px");
+        let page = browser
+            .open_page(&format!("{base}#/runs/{solo_id}"), width, height, mobile)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: open: {e}"));
+        browser
+            .wait_for(
+                &page,
+                "!!document.querySelector('#verdict-solo .advise-brief')",
+                w,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: solo strip never rendered: {e}"));
+        let got = browser
+            .eval(
+                &page,
+                "(() => { const s = document.getElementById('verdict-solo'); \
+                 return { svgs: document.querySelectorAll('#converge svg').length, \
+                 shown: !s.hidden, \
+                 pill: s.querySelector('.advise-brief').textContent, \
+                 chip: s.querySelector('.advise-chip').textContent, \
+                 agent: getComputedStyle(s.querySelector('.advise-agent')).display, \
+                 height: s.getBoundingClientRect().height, \
+                 facts: document.getElementById('tally-facts').hidden }; })()",
+            )
+            .await
+            .unwrap();
+        assert_eq!(got["svgs"], 0, "{tag}: diagram drawn for a solo run");
+        assert_eq!(got["shown"], true, "{tag}: strip hidden");
+        assert_eq!(got["pill"], "solo", "{tag}: pill");
+        let chip = got["chip"].as_str().unwrap_or_default();
+        assert!(
+            chip.contains('A') && chip.contains("alpha"),
+            "{tag}: chip {chip}"
+        );
+        assert_ne!(got["agent"], "none", "{tag}: agent name hidden");
+        assert!(
+            got["height"].as_f64().unwrap_or(999.0) < 120.0,
+            "{tag}: strip tall"
+        );
+        assert_eq!(got["facts"], true, "{tag}: facts shown");
+        browser.close_page(&page).await;
+
+        let tag = format!("verdict pair @{width}px");
+        let page = browser
+            .open_page(&format!("{base}#/runs/{pair_id}"), width, height, mobile)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: open: {e}"));
+        browser
+            .wait_for(
+                &page,
+                "document.querySelectorAll('#converge svg').length > 0",
+                w,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: diagram never rendered: {e}"));
+        let hidden = browser
+            .eval(&page, "document.getElementById('verdict-solo').hidden")
+            .await
+            .unwrap();
+        assert_eq!(hidden, true, "{tag}: solo strip shown");
+        browser.close_page(&page).await;
+    }
+}
+
 /// In the two-pane layout a Queue row is one big target: clicking a part of it
 /// that is not a link or a button opens the task in the right pane. The click
 /// is a real mouse event at the row's status chip, so an ancestor that wrongly
