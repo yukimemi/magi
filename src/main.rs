@@ -2123,9 +2123,10 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         }
     };
 
-    // A merge approval's deadline is fixed at `asked_at + answer_timeout` (the
-    // instant land abandons it), whatever this process's config or a reply says.
-    let budget = if q.node == magi::land::APPROVAL_NODE && q.answer_timeout > 0 {
+    // A merge approval's or release-watch question's deadline is fixed at
+    // `asked_at + answer_timeout` (the instant land / the watcher abandons it),
+    // whatever this process's config or a reply says.
+    let budget = if magi::deputy::fixed_clock(&q) && q.answer_timeout > 0 {
         remaining_answer_budget(q.asked_at, q.answer_timeout)
     } else {
         budget
