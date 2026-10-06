@@ -41,6 +41,14 @@
 //!   answer_timeout` and never moves on a reply ([`deadline`]), and the only
 //!   thing that retires it is `daemon::land_resume_state`. A say alone never
 //!   merges: `--settle` accepts `merge` only for the owner's own word `merge`.
+//! - **A release-watch question is served too, and stays the watcher's.** The
+//!   escalation, local-mode approval and failed-release questions
+//!   ([`crate::release_watch`], node `release-bump`, seat `release-watch`) have
+//!   no asker, so a say reached nobody. Its deputy has no `cwd` either, a
+//!   fixed `asked_at + answer_timeout` deadline ([`deadline`]), and applies
+//!   nothing: `--settle` records a choice and the watcher applies it on its next
+//!   lap. A local approval's `merge` / `hold` go through the merge-approval
+//!   rules ([`merge_gated`]). A deputy never closes or merges the pull request.
 //! - **No new authority.** A deputy does not edit, merge or touch the queue,
 //!   and `--settle` accepts only an offered label backed by a verbatim quote
 //!   of the owner, never on a task the operator holds.
@@ -134,6 +142,8 @@ pub enum Kind {
     Conduct,
     /// The merge approval ([`crate::land::APPROVAL_NODE`]).
     Land,
+    /// A question the release watcher filed ([`crate::release_watch`]).
+    Release,
 }
 
 /// The kind of question a deputy serves for `q`, `None` for every other.
@@ -141,8 +151,27 @@ pub fn kind_of(q: &Question) -> Option<Kind> {
     match q.node.as_str() {
         crate::conduct::NODE => Some(Kind::Conduct),
         crate::land::APPROVAL_NODE => Some(Kind::Land),
+        // The seat matters: `bump` files choice-less notices on the same node,
+        // which nobody can answer and which must not cost a deputy.
+        crate::bump::NOTICE_NODE if q.seat == "release-watch" => Some(Kind::Release),
         _ => None,
     }
+}
+
+/// Does `--settle` hold `q` to the merge-approval rules (`land::merge_intent`
+/// for `merge`, the whole message for `hold`)? A merge approval, and the release
+/// watcher's local-mode approval, which merges just as irreversibly.
+pub fn merge_gated(q: &Question) -> bool {
+    q.node == crate::land::APPROVAL_NODE
+        || (kind_of(q) == Some(Kind::Release)
+            && q.choices.iter().any(|c| c == crate::land::APPROVE))
+}
+
+/// Does `q`'s clock run from `asked_at` and never move on a reply? True for the
+/// questions that something other than the waiter retires: a merge approval
+/// (land) and a release-watch question (the watcher, by silence being a hold).
+pub fn fixed_clock(q: &Question) -> bool {
+    matches!(kind_of(q), Some(Kind::Land | Kind::Release))
 }
 
 /// Second after which nobody is to be started or kept on `q`.
@@ -158,9 +187,10 @@ pub fn deadline(q: &Question, default_timeout: u64) -> i64 {
     } else {
         default_timeout
     };
-    let from = match kind_of(q) {
-        Some(Kind::Land) => q.asked_at.as_second(),
-        _ => q.last_activity(),
+    let from = if fixed_clock(q) {
+        q.asked_at.as_second()
+    } else {
+        q.last_activity()
     };
     from.saturating_add(secs as i64)
 }
@@ -265,14 +295,15 @@ impl Deputies {
     /// deputies existed - a lost reason is not invented) and the deadline.
     ///
     /// A conductor question also gets the working directory the waiter and
-    /// `magi ask --wait` use. A merge approval never gets one: `cwd` is what
+    /// `magi ask --wait` use. A release-watch question never does either (it has
+    /// no asker for the waiter to resume). A merge approval never gets one: `cwd` is what
     /// makes a question the waiter's, and land's approval is not.
     fn attach(&self, q: &Question, kind: Kind) -> Option<Question> {
         let default_timeout = self.default_timeout();
         let repo = self.fallback_repo.to_string_lossy().into_owned();
         let state = match kind {
             Kind::Land => crate::run::RunState::load(&q.run).ok(),
-            Kind::Conduct => None,
+            Kind::Conduct | Kind::Release => None,
         };
         // The deadline land itself enforces for this run.
         let timeout = state
@@ -284,6 +315,7 @@ impl Deputies {
                     r.deputy = Some(Deputy::new(match kind {
                         Kind::Conduct => brief(&r.run, &r.detail, &r.choices, &r.actions),
                         Kind::Land => crate::land::deputy_brief(r, state.as_ref()),
+                        Kind::Release => crate::release_watch::deputy_brief(r, &self.home),
                     }));
                 }
                 if kind == Kind::Conduct && r.cwd.is_none() {
@@ -293,6 +325,7 @@ impl Deputies {
                     r.answer_timeout = match kind {
                         Kind::Conduct => default_timeout,
                         Kind::Land => timeout,
+                        Kind::Release => default_timeout,
                     };
                 }
                 Ok(())
@@ -507,8 +540,15 @@ impl Job {
             }
             _ => (SeatState::new(&key, &spec.id, crate::rng::entropy()), false),
         };
-        let cwd = q
-            .cwd
+        // A release-watch question has no `cwd`; its watch record names the
+        // checkout the pull request belongs to.
+        let recorded = q.cwd.clone().or_else(|| {
+            (kind_of(&q) == Some(Kind::Release))
+                .then(|| crate::release_watch::state_for_question(&self.home, &q.id))
+                .flatten()
+                .map(|st| st.repo)
+        });
+        let cwd = recorded
             .as_deref()
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
@@ -541,7 +581,7 @@ impl Job {
             unread: unread.as_deref(),
             resumed,
             handover: false,
-            land: kind_of(&q) == Some(Kind::Land),
+            kind: kind_of(&q).unwrap_or(Kind::Conduct),
             language: &cfg.graph.language,
         });
 
@@ -622,7 +662,7 @@ impl Job {
                 unread: None,
                 resumed: false,
                 handover: true,
-                land: kind_of(&q) == Some(Kind::Land),
+                kind: kind_of(&q).unwrap_or(Kind::Conduct),
                 language: &cfg.graph.language,
             });
             let hstem = format!("handover-{starts}");

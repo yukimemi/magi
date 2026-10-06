@@ -1406,8 +1406,8 @@ pub struct DeputyPrompt<'a> {
     pub resumed: bool,
     /// The short first turn that only lets the seat be saved: no waiting yet.
     pub handover: bool,
-    /// Is this the merge approval rather than a conductor question?
-    pub land: bool,
+    /// Which kind of question this deputy serves.
+    pub kind: crate::deputy::Kind,
     /// Language the owner reads.
     pub language: &'a str,
 }
@@ -1424,9 +1424,10 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
         unread,
         resumed,
         handover,
-        land,
+        kind,
         language,
     } = *p;
+    let land = kind == crate::deputy::Kind::Land;
     let mut s = format!(
         "# {DEPUTY_HEADING}\n\n\
          The conductor asked the owner a question and may not wait for the \
@@ -1469,6 +1470,31 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
              - `hold` settles only when the owner's whole message is that word.\n\n",
         );
     }
+    if kind == crate::deputy::Kind::Release {
+        s.push_str(
+            "This question is about a release pull request magi is watching. \
+             The owner's choices only change what magi's release watcher does \
+             next; you apply nothing. You never merge, close, rerun, push or \
+             change anything yourself - not with `gh`, not with git - and you \
+             add nothing to the queue. Closing the pull request, if the owner \
+             wants it, is theirs to do by hand. Silence is a hold.\n\n\
+             Read the owner's latest message:\n\n\
+             - **Words that clearly pick one offered choice** (for `leave it`: \
+             \"stop watching\", \"ignore it\", \"クローズしていいよ\" meaning stop \
+             tracking this pull request - the brief says exactly what each choice \
+             does): record it with `magi ask --settle` as your LAST command, \
+             `--quote` a verbatim part of their message. A settled question is \
+             answered, so never run `--thread` after it.\n\
+             - **Anything doubtful or open to two readings** - a hedge, a \
+             condition, a question, or wording that could mean closing the pull \
+             request itself rather than choosing one of the offered options: \
+             settle nothing; answer with `magi ask --thread` (repeat the choices) \
+             and ask which they mean.\n\
+             - If the choices include `merge`, it is irreversible and is accepted \
+             only for a clear, unhedged instruction to merge; `hold` only when the \
+             owner's whole message is that word.\n\n",
+        );
+    }
     if resumed {
         s.push_str(
             "You are resuming your own earlier conversation; what follows is \
@@ -1487,7 +1513,7 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
     }
     s.push_str(&format!(
         "\n## {}\n\n{}\n",
-        if land {
+        if kind != crate::deputy::Kind::Conduct {
             "What magi knew when it asked"
         } else {
             "What the conductor knew"
