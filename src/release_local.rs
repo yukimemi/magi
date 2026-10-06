@@ -395,7 +395,18 @@ async fn tag(wt: &Path, remote: &str, job: &Job) -> Result<String> {
         TagStep::Foreign(why) | TagStep::Unreadable(why) => bail!("{why}"),
         TagStep::Create | TagStep::PushExisting => {
             if step == TagStep::Create {
-                let out = git::git_raw(wt, &["tag", "-a", &name, "-m", &name, &job.commit]).await?;
+                // An annotated tag needs a committer. Use the operator's own
+                // identity; only when git has none (a bare service account) fall
+                // back to a neutral one rather than failing the release.
+                let has_ident = git::git_raw(wt, &["var", "GIT_COMMITTER_IDENT"])
+                    .await?
+                    .ok();
+                let mut args = vec![];
+                if !has_ident {
+                    args.extend(["-c", "user.name=magi", "-c", "user.email=magi@localhost"]);
+                }
+                args.extend(["tag", "-a", name.as_str(), "-m", name.as_str(), &job.commit]);
+                let out = git::git_raw(wt, &args).await?;
                 if !out.ok() {
                     bail!("git tag {name}: {}", out.stderr);
                 }
