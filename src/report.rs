@@ -1025,6 +1025,22 @@ pub fn run(state: &RunState) -> String {
         if let Some(p) = &b.problem {
             let _ = writeln!(s, "  {}", p.lines().next().unwrap_or(""));
         }
+        if let Some(j) = &b.release {
+            let state = if j.finished {
+                "finished"
+            } else {
+                j.failed.as_deref().unwrap_or("unfinished")
+            };
+            let _ = writeln!(s, "  release {} at {}: {state}", j.tag(), j.commit);
+            for l in &j.log {
+                let code = l.code.map_or("none".to_owned(), |c| c.to_string());
+                let _ = write!(s, "    {} (exit {code})", l.name);
+                if let Some(o) = &l.output {
+                    let _ = write!(s, " output {o}");
+                }
+                let _ = writeln!(s);
+            }
+        }
         if let Some(a) = &b.action_required {
             let _ = writeln!(s, "  {} {a}", bold(&yellow("action required:")));
         }

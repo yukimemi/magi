@@ -50,6 +50,8 @@ pub struct StepLog {
     pub code: Option<i32>,
     /// Last bytes of the combined output.
     pub tail: String,
+    /// Absolute path of the file holding the whole output, when one was kept.
+    pub output: Option<String>,
 }
 
 /// One release of one merged pull request, resumable.
@@ -296,6 +298,7 @@ async fn drive(env: &Env<'_>, dir: &Path, wt: &Path, job: &mut Job, save: Save<'
             name: "tag".to_owned(),
             code: Some(0),
             tail: note,
+            output: None,
         });
         job.tag_done = true;
         job.running = None;
@@ -315,11 +318,13 @@ async fn drive(env: &Env<'_>, dir: &Path, wt: &Path, job: &mut Job, save: Save<'
         }
         let (code, output) = run_command(wt, env.shell, command, job, timeout).await;
         let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(dir.join(format!("release-{}.out", n + 1)), &output);
+        let out_path = dir.join(format!("release-{}.out", n + 1));
+        let kept = std::fs::write(&out_path, &output).is_ok();
         job.log.push(StepLog {
             name: command.clone(),
             code,
             tail: tail(&output, TAIL),
+            output: kept.then(|| out_path.display().to_string()),
         });
         if code != Some(0) {
             let why = match code {
