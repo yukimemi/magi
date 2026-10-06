@@ -4977,6 +4977,9 @@ struct QuestionView {
     /// question at all: false when `daemon.max_deputies = 0` or the config is
     /// unreadable. Separate from `holder`, which says who is listening now.
     deputies_enabled: bool,
+    /// `question.run` is a task id (conductor / triage questions), not a run
+    /// id, so the UI links it to the task page.
+    run_is_task: bool,
 }
 
 impl QuestionView {
@@ -4998,6 +5001,7 @@ impl QuestionView {
             waiting_on_agent: question.waiting_on_agent(),
             holder,
             deputies_enabled,
+            run_is_task: question.run_names_task(),
             question,
         }
     }
@@ -10308,6 +10312,19 @@ mod tests {
             "{}",
             v.body
         );
+    }
+
+    #[test]
+    fn a_question_card_links_a_task_id_to_the_task_page() {
+        let start = APP_JS
+            .find("function updateAskCard(")
+            .expect("updateAskCard exists");
+        let body = &APP_JS[start..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        assert!(body.contains("question.run_is_task"));
+        assert!(body.contains("`#/tasks/${encodeURIComponent(question.run)}`"));
+        assert!(body.contains("`#/runs/${question.run}`"));
+        assert!(body.contains("\"task\" : \"run\""));
     }
 
     #[test]

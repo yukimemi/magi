@@ -780,7 +780,7 @@ pub fn covers(q: &crate::ask::Question, n: &Notice) -> bool {
     let about_run = n.key.starts_with("run:");
     match q.node.as_str() {
         crate::bump::NOTICE_NODE | crate::land::APPROVAL_NODE => false,
-        crate::conduct::NODE | crate::triage::NODE | crate::triage::DEPS_NODE => about_task,
+        _ if q.run_names_task() => about_task,
         _ => about_run,
     }
 }
