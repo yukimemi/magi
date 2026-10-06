@@ -1883,6 +1883,10 @@ fn upgrade_progress_view(ui: &Ui, progress: updater::Progress) -> UpgradeProgres
                 run.status.as_str()
             )
         });
+    let detail = progress
+        .detail
+        .clone()
+        .or_else(|| updater::read_note(&ui.home, &progress));
     let stalled = updater::stall(&progress, Timestamp::now());
     let waiting_on = waiting_on.or_else(|| stalled.as_ref().map(|s| s.waiting_on.clone()));
     UpgradeProgressView {
@@ -1893,7 +1897,7 @@ fn upgrade_progress_view(ui: &Ui, progress: updater::Progress) -> UpgradeProgres
         waiting_on,
         started_at: progress.started_at,
         updated_at: progress.updated_at,
-        detail: progress.detail,
+        detail,
     }
 }
 

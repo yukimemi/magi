@@ -1921,14 +1921,15 @@ depending on a supervisor's redirection:
 - **`<home>/web.log`** - the successor's stdout and stderr (`spawn_successor`
   used to send them to null, so every generation after the first logged
   nowhere). `magi web` stderr lines now carry a timestamp.
-- **`upgrade.json` `detail`** - the watchdog thread (`updater::spawn_watchdog`,
+- **`upgrade.note.json`** (surfaced as `upgrade.detail`) - the watchdog thread (`updater::spawn_watchdog`,
   every 30 s, off the runtime) warns and records what a non-terminal stage
   waits on: `replaced` / `restarting` past 120 s, `parking` past 70 min
   (an implement wave can take an hour), heartbeat every minute. `/api/health`
   reports the same as `upgrade.stuck_for_secs`; the deck banner says
-  "Handover stuck in <stage>". Stage age is measured from `updated_at`, which a
-  note never moves. The watchdog's write is not atomic against the handover's
-  own; the next stage write restores it.
+  "Handover stuck in <stage>". Stage age is measured from `updated_at`. The
+  watchdog never rewrites `upgrade.json` (that read-modify-write could revert a
+  stage the handover or the successor saved in between); its note lives in its
+  own file and is shown only while stage and `updated_at` still match.
 
 Supervisor redirection (launchd, NSSM, systemd...) only ever holds the first
 generation's descriptors, and a rename of its log files at start does not

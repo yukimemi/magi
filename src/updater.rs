@@ -300,13 +300,6 @@ impl Progress {
         self.detail = None;
     }
 
-    /// Record a short note about the current stage without moving
-    /// `updated_at`: the stage's age is what [`stall`] measures, and a note
-    /// must not reset it.
-    pub fn note(&mut self, detail: impl Into<String>) {
-        self.detail = Some(detail.into());
-    }
-
     /// Stop at [`Stage::Failed`], with a reason a human can read.
     pub fn fail(&mut self, detail: impl Into<String>) {
         self.stage = Stage::Failed;
@@ -543,6 +536,46 @@ impl Watchdog {
     }
 }
 
+/// The watchdog's latest message, kept apart from `upgrade.json` so a
+/// diagnostic write can never race a stage transition.
+#[derive(Debug, Serialize, Deserialize)]
+struct Note {
+    stage: Stage,
+    stage_since: Timestamp,
+    message: String,
+}
+
+fn note_path(home: &Path) -> PathBuf {
+    home.join("upgrade.note.json")
+}
+
+fn write_note(home: &Path, progress: &Progress, message: &str) {
+    let note = Note {
+        stage: progress.stage,
+        stage_since: progress.updated_at,
+        message: message.to_owned(),
+    };
+    let path = note_path(home);
+    let tmp = path.with_extension("json.tmp");
+    let written = serde_json::to_string(&note)
+        .map_err(std::io::Error::other)
+        .and_then(|body| std::fs::write(&tmp, body))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = written {
+        tracing::warn!("could not write {}: {e}", path.display());
+    }
+}
+
+/// The watchdog's message for exactly this stage of this upgrade, if any;
+/// a note from another stage or another upgrade is ignored.
+#[must_use]
+pub fn read_note(home: &Path, progress: &Progress) -> Option<String> {
+    let body = std::fs::read_to_string(note_path(home)).ok()?;
+    let note: Note = serde_json::from_str(&body).ok()?;
+    (note.stage == progress.stage && note.stage_since == progress.updated_at)
+        .then_some(note.message)
+}
+
 /// Run the watchdog on a thread of its own, so a blocked runtime, or a
 /// process half-way through dropping one, still speaks. It never ends; it is
 /// a daemon thread and dies with the process.
@@ -564,16 +597,11 @@ pub fn spawn_watchdog(home: PathBuf) {
                 } else {
                     log_step(&home, &beat.message);
                 }
-                // Re-read just before writing and only touch the record when
-                // the stage is still the one judged. Not atomic against the
-                // handover's own write: a stage change in that instant can be
-                // overwritten by the stale record. Known limit.
-                if let Some(mut fresh) = read_progress(&home)
-                    && fresh.stage == beat.stage
-                {
-                    fresh.note(beat.message);
-                    write_progress_logged(&home, &fresh);
-                }
+                // Never rewrites upgrade.json: a read-modify-write here could
+                // overwrite a stage the handover or the successor saved in
+                // between. The note goes to its own file, which only this
+                // thread writes, and is matched to the record when read.
+                write_note(&home, &progress, &beat.message);
             }
         });
     if let Err(e) = spawned {
@@ -942,13 +970,15 @@ mod tests {
     }
 
     #[test]
-    fn a_note_does_not_move_the_stage_clock_but_a_new_stage_clears_it() {
-        let mut p = staged(Stage::Replaced, 1000);
-        p.note("stuck");
-        assert_eq!(p.updated_at, at(1000));
-        assert_eq!(p.detail.as_deref(), Some("stuck"));
-        p.advance(Stage::Parking);
-        assert!(p.detail.is_none());
+    fn a_note_is_kept_beside_the_record_and_matches_only_its_own_stage() {
+        let home = tempfile::tempdir().expect("temp home");
+        let p = staged(Stage::Replaced, 1000);
+        write_progress(home.path(), &p).expect("write");
+        write_note(home.path(), &p, "stuck");
+        assert_eq!(read_note(home.path(), &p).as_deref(), Some("stuck"));
+        assert_eq!(read_progress(home.path()).unwrap().updated_at, at(1000));
+        assert!(read_note(home.path(), &staged(Stage::Parking, 1000)).is_none());
+        assert!(read_note(home.path(), &staged(Stage::Replaced, 2000)).is_none());
     }
 
     #[test]
