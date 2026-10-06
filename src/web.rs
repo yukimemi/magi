@@ -2459,6 +2459,11 @@ struct RunDetailView {
     #[serde(flatten)]
     state: RunState,
     instruction_md: Vec<md::Node>,
+    /// Agent-written prose of the run, parsed to markdown nodes. Shapes
+    /// mirror the records they come from, index for index; the raw strings
+    /// stay in `state` and decide whether a block is shown at all.
+    #[serde(flatten)]
+    prose_md: RunProseMd,
     /// Whether a process is actually still driving this run: `"live"`,
     /// `"dead"`, or `"unknown"` — see [`crate::run::Liveness`].
     ///
@@ -2668,6 +2673,86 @@ struct LatestAttempt {
     done: bool,
 }
 
+/// Markdown for the free-text prose of a run, parallel to `RunState`.
+#[derive(Debug, Default, Serialize)]
+struct RunProseMd {
+    /// `None` when the run has no design deliberation.
+    advice_md: Option<AdviceMd>,
+    /// One entry per candidate: the summary.
+    candidate_summaries_md: Vec<Vec<md::Node>>,
+    /// One entry per review round, in `reviews` order.
+    reviews_md: Vec<RoundMd>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct AdviceMd {
+    synthesis: Vec<md::Node>,
+    /// One per record; empty for a seat with no proposal.
+    approaches: Vec<Vec<md::Node>>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct RoundMd {
+    /// One per reviewer record.
+    reviewers: Vec<ReviewerMd>,
+    /// One per `reconsideration` entry: the reason.
+    reconsideration: Vec<Vec<md::Node>>,
+    fix: Option<FixMd>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct ReviewerMd {
+    summary: Vec<md::Node>,
+    /// One per finding, in recorded order (not the display order).
+    findings: Vec<Vec<md::Node>>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct FixMd {
+    notes: Vec<md::Node>,
+    /// One per rejection: the argument.
+    rejected: Vec<Vec<md::Node>>,
+}
+
+/// Parse a run's agent-written prose; a pure function of the state.
+fn run_prose_md(state: &RunState) -> RunProseMd {
+    let nodes = |t: &str| md::to_nodes(t, &md::ImageBase::None);
+    RunProseMd {
+        advice_md: state.advice.as_ref().map(|a| AdviceMd {
+            synthesis: nodes(a.synthesis.as_deref().unwrap_or("")),
+            approaches: a
+                .records
+                .iter()
+                .map(|r| nodes(r.proposal.as_ref().map_or("", |p| p.approach.as_str())))
+                .collect(),
+        }),
+        candidate_summaries_md: state.candidates.iter().map(|c| nodes(&c.summary)).collect(),
+        reviews_md: state
+            .reviews
+            .iter()
+            .map(|round| RoundMd {
+                reviewers: round
+                    .reviews
+                    .iter()
+                    .map(|rec| ReviewerMd {
+                        summary: nodes(&rec.summary),
+                        findings: rec.findings.iter().map(|f| nodes(&f.detail)).collect(),
+                    })
+                    .collect(),
+                reconsideration: round
+                    .reconsideration
+                    .iter()
+                    .map(|rv| nodes(&rv.reason))
+                    .collect(),
+                fix: round.fix.as_ref().map(|fix| FixMd {
+                    notes: nodes(&fix.notes),
+                    rejected: fix.rejected.iter().map(|r| nodes(&r.why)).collect(),
+                }),
+            })
+            .collect(),
+    }
+}
+
 impl RunDetailView {
     fn of(
         state: RunState,
@@ -2678,6 +2763,7 @@ impl RunDetailView {
     ) -> Self {
         Self {
             instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
+            prose_md: run_prose_md(&state),
             origin_label: crate::run::origin_label(state.origin.as_ref()),
             live,
             unmerged_by_design: state.unmerged_by_design(),
@@ -4871,6 +4957,8 @@ struct QuestionView {
     #[serde(flatten)]
     question: Question,
     detail_md: Vec<md::Node>,
+    /// Each thread turn's body, parsed; same order as `question.thread`.
+    thread_bodies_md: Vec<Vec<md::Node>>,
     /// Is the ball in the agent's court right now?
     ///
     /// [`QuestionStatus`] stays `Open` for the whole of a round trip - see
@@ -4902,6 +4990,11 @@ impl QuestionView {
         let holder = holder_of(&question, store.read_lease(&question.id).as_ref());
         Self {
             detail_md: md::to_nodes(&question.detail, &base),
+            thread_bodies_md: question
+                .thread
+                .iter()
+                .map(|t| md::to_nodes(&t.body, &base))
+                .collect(),
             waiting_on_agent: question.waiting_on_agent(),
             holder,
             deputies_enabled,
@@ -11066,6 +11159,128 @@ mod tests {
             .unwrap();
             assert_eq!(v["done"], done, "{status:?}");
         }
+    }
+
+    /// The first node of a markdown block holds a `strong` somewhere.
+    fn has_strong(nodes: &[md::Node]) -> bool {
+        serde_json::to_string(nodes).unwrap().contains("strong")
+    }
+
+    #[test]
+    fn the_run_detail_payload_carries_markdown_for_agent_prose() {
+        let mut state = RunState::new(
+            std::path::PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "x".to_owned(),
+            crate::config::Config::default(),
+        );
+        let proposal = |approach: &str| {
+            serde_json::json!({
+                "approach": approach, "key_tradeoff": "t", "why_not_naive": "w",
+            })
+        };
+        state.advice = Some(
+            serde_json::from_value(serde_json::json!({
+                "records": [
+                    {"seat": "advisor-1", "agent": "a", "duration_ms": 1,
+                     "proposal": proposal("do **this**")},
+                    {"seat": "advisor-2", "agent": "b", "duration_ms": 1, "error": "no"},
+                ],
+                "synthesis": "- one\n- **two**\n\n`code`",
+            }))
+            .unwrap(),
+        );
+        state.candidates = serde_json::from_value(serde_json::json!([
+            {"index": 0, "label": "A", "agent": "a", "branch": "b", "worktree": "/w",
+             "summary": "did **it**"},
+            {"index": 1, "label": "B", "agent": "a", "branch": "b", "worktree": "/w"},
+        ]))
+        .unwrap();
+        // Recorded in ascending severity, the reverse of how the page sorts
+        // them: the arrays must follow the record, not the display.
+        state.reviews = serde_json::from_value(serde_json::json!([{
+            "round": 1, "head": "h",
+            "reviews": [{
+                "reviewer": 1, "agent": "a", "summary": "sum **mary**",
+                "findings": [
+                    {"severity": "nit", "title": "t1", "detail": "plain nit"},
+                    {"severity": "blocker", "title": "t2", "detail": "bad **blocker**"},
+                ],
+            }],
+            "reconsideration": [{"reviewer": 1, "agent": "a", "reason": "because **so**"}],
+            "fix": {"agent": "a", "notes": "fixed **it**",
+                    "rejected": [{"id": "R1-1-1", "why": "no **way**"}]},
+        }, {"round": 2, "head": "h2", "reviews": []}]))
+        .unwrap();
+
+        let v = serde_json::to_value(RunDetailView::of(
+            state,
+            crate::run::Liveness::Unknown,
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+
+        let strong = |p: &str| {
+            let n = v.pointer(p).unwrap_or_else(|| panic!("missing {p}"));
+            assert!(n.to_string().contains("strong"), "{p}: {n}");
+        };
+        strong("/advice_md/synthesis");
+        assert!(v["advice_md"]["synthesis"].to_string().contains("code"));
+        assert!(v["advice_md"]["synthesis"].to_string().contains("list"));
+        strong("/advice_md/approaches/0");
+        assert_eq!(v["advice_md"]["approaches"][1], serde_json::json!([]));
+        strong("/candidate_summaries_md/0");
+        assert_eq!(v["candidate_summaries_md"][1], serde_json::json!([]));
+        strong("/reviews_md/0/reviewers/0/summary");
+        let f = &v["reviews_md"][0]["reviewers"][0]["findings"];
+        assert!(!f[0].to_string().contains("strong"), "recorded order kept");
+        assert!(f[1].to_string().contains("strong"));
+        strong("/reviews_md/0/reconsideration/0");
+        strong("/reviews_md/0/fix/notes");
+        strong("/reviews_md/0/fix/rejected/0");
+        assert_eq!(v["reviews_md"][1]["fix"], serde_json::Value::Null);
+        assert_eq!(v["reviews_md"][1]["reviewers"], serde_json::json!([]));
+        // The raw strings stay, and no schema moved.
+        assert_eq!(v["candidates"][0]["summary"], "did **it**");
+        assert!(has_strong(&md::to_nodes("**x**", &md::ImageBase::None)));
+    }
+
+    #[test]
+    fn a_run_without_advice_has_no_advice_md() {
+        let state = RunState::new(
+            std::path::PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "x".to_owned(),
+            crate::config::Config::default(),
+        );
+        let p = run_prose_md(&state);
+        assert!(p.advice_md.is_none());
+        assert!(p.candidate_summaries_md.is_empty() && p.reviews_md.is_empty());
+    }
+
+    #[test]
+    fn a_question_view_carries_markdown_for_each_thread_turn() {
+        let home = TempDir::new().unwrap();
+        let store = ask::Questions::at(home.path().join("questions"));
+        let mut q = Question::new(
+            "run".to_owned(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            "which?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        q.say("plain words").unwrap();
+        q.reply("use **this**", Vec::new()).unwrap();
+        let v = serde_json::to_value(QuestionView::of(q, &store, false)).unwrap();
+        let bodies = &v["thread_bodies_md"];
+        assert_eq!(bodies.as_array().unwrap().len(), 2);
+        assert!(!bodies[0].to_string().contains("strong"));
+        assert!(bodies[1].to_string().contains("strong"));
     }
 
     #[test]

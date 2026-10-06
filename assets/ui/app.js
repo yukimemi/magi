@@ -3749,6 +3749,14 @@ function renderMd(container, nodes) {
   append(container, (Array.isArray(nodes) ? nodes : []).map(buildMd));
 }
 
+/* A prose block rendered from a server-sent markdown tree. `cls` keeps the
+   surface's own class; `md` brings the shared markdown styling. */
+function mdBlock(cls, nodes) {
+  const box = el("div", { class: `${cls} md` });
+  renderMd(box, nodes);
+  return box;
+}
+
 /* ---- agent-authored panels --------------------------------------------- *
  * A question may hand over a whole HTML page instead of a paragraph: a table
  * of changed files, a coloured diff, an inline image. This client otherwise
@@ -4068,7 +4076,7 @@ function updateAskCard(row, question, { compact = false } = {}) {
       r.thread.append(el("li", { class: "ask-turn", "data-who": isAgent ? "agent" : "operator" },
         el("span", { class: "ask-turn-who", text: isAgent ? "Agent" : "You" }),
         el("time", { class: "ask-turn-when", datetime: turn.at, title: at.title, text: at.text }),
-        el("p", { class: "ask-turn-body", text: turn.body || "" }),
+        mdBlock("ask-turn-body", (question.thread_bodies_md || [])[turns.indexOf(turn)]),
       ));
     }
   }
@@ -6301,7 +6309,7 @@ function renderAdvise(run) {
 
   const synthesisEl = $("advise-synthesis");
   show(synthesisEl, Boolean(advice.synthesis));
-  setText(synthesisEl, advice.synthesis || "");
+  renderMd(synthesisEl, run.advice_md ? run.advice_md.synthesis : []);
 
   const list = $("run-advisors");
   clear(list);
@@ -6317,7 +6325,7 @@ function renderAdvise(run) {
         }),
       ),
       record.proposal
-        ? el("p", { class: "cand-summary", text: record.proposal.approach || "" })
+        ? mdBlock("cand-summary", run.advice_md && run.advice_md.approaches ? run.advice_md.approaches[i] : [])
         : el("p", { class: "card-note", text: record.error || "No proposal." }),
     ));
   });
@@ -6559,11 +6567,12 @@ function renderCandidates(run) {
       setAttr(card, "data-winner", winner && candidate.label === winner && decided ? "1" : null);
       setAttr(card, "style", `--cand-tone: ${candTone(i)}`);
 
-      const bodySig = JSON.stringify([candidate, winner, decided]);
+      const summaryMd = Array.isArray(run.candidate_summaries_md) ? run.candidate_summaries_md[i] : [];
+      const bodySig = JSON.stringify([candidate, winner, decided, summaryMd]);
       if (r.body.dataset.sig !== bodySig) {
         r.body.dataset.sig = bodySig;
         clear(r.body);
-        append(r.body, candidateBody(candidate, winner, decided));
+        append(r.body, candidateBody(candidate, winner, decided, summaryMd));
       }
 
       const mine = label === target && (rounds.length > 0 || gate.length > 0);
@@ -6577,17 +6586,17 @@ function renderCandidates(run) {
         r.reviews = candidateReviews(run.id, label);
         r.slot.append(r.reviews.details);
       }
-      const reviewSig = JSON.stringify([rounds, gate]);
+      const reviewSig = JSON.stringify([rounds, gate, run.reviews_md]);
       if (r.slot.dataset.sig !== reviewSig) {
         r.slot.dataset.sig = reviewSig;
         setText(r.reviews.count, reviewGist(rounds, gate));
         clear(r.reviews.list);
-        r.reviews.list.append(...buildReviewRounds(rounds, gate));
+        r.reviews.list.append(...buildReviewRounds(rounds, gate, run.reviews_md));
       }
     });
 }
 
-function candidateBody(candidate, winner, decided) {
+function candidateBody(candidate, winner, decided, summaryMd) {
   const dead = !viable(candidate);
   const facts = [];
   if (candidate.commits) facts.push(plural(candidate.commits, "commit", "commits"));
@@ -6615,7 +6624,7 @@ function candidateBody(candidate, winner, decided) {
             || (candidate.verified_noop ? `Agent-verified no-op: ${candidate.verified_noop}` : "Produced no change at all."),
         })
       : null,
-    candidate.summary ? el("p", { class: "cand-summary", text: candidate.summary }) : null,
+    candidate.summary ? mdBlock("cand-summary", summaryMd) : null,
     candidate.stat ? el("pre", { class: "stat", text: candidate.stat }) : null,
   ];
 }
@@ -6669,9 +6678,12 @@ function voteLabel(vote) {
 
 /* The review rounds as DOM nodes, shared by the candidate card they belong to
    and the unattributed fallback panel. */
-function buildReviewRounds(rounds, gate) {
+function buildReviewRounds(rounds, gate, roundsMd) {
   const nodes = [];
-  for (const round of rounds) {
+  const mdRounds = Array.isArray(roundsMd) ? roundsMd : [];
+  for (const [roundIdx, round] of rounds.entries()) {
+    const roundMd = mdRounds[roundIdx] || {};
+    const reviewersMd = roundMd.reviewers || [];
     const blocking = Number(round.blocking) || 0;
     const records = Array.isArray(round.reviews) ? round.reviews : [];
 
@@ -6712,8 +6724,12 @@ function buildReviewRounds(rounds, gate) {
       ),
     );
 
-    for (const record of records) {
+    for (const [recIdx, record] of records.entries()) {
+      const recMd = reviewersMd[recIdx] || {};
       const findings = Array.isArray(record.findings) ? record.findings : [];
+      /* Pair each finding with its markdown before the severity sort: the
+         server's array follows the recorded order, not the display order. */
+      const paired = findings.map((f, k) => ({ f, md: (recMd.findings || [])[k] }));
       node.append(el("div", { class: "reviewer" },
         el("p", {},
           el("span", { class: "reviewer-name", text: `reviewer ${record.reviewer} \u00b7 ${record.agent || ""}` }),
@@ -6722,11 +6738,10 @@ function buildReviewRounds(rounds, gate) {
             : null,
         ),
         record.failed ? el("p", { class: "card-note", text: record.failed }) : null,
-        record.summary ? el("p", { class: "cand-summary", text: record.summary }) : null,
-        findings.length ? el("div", { class: "findings" }, findings
-          .slice()
-          .sort((a, b) => (SEV_RANK[b.severity] || 0) - (SEV_RANK[a.severity] || 0))
-          .map((finding) => el("div", { class: "finding", "data-sev": finding.severity },
+        record.summary ? mdBlock("cand-summary", recMd.summary) : null,
+        findings.length ? el("div", { class: "findings" }, paired
+          .sort((a, b) => (SEV_RANK[b.f.severity] || 0) - (SEV_RANK[a.f.severity] || 0))
+          .map(({ f: finding, md: detailMd }) => el("div", { class: "finding", "data-sev": finding.severity },
             el("div", { class: "finding-top" },
               el("span", { class: "finding-sev", text: finding.severity || "" }),
               el("span", { class: "finding-title", text: finding.title || "" }),
@@ -6735,7 +6750,7 @@ function buildReviewRounds(rounds, gate) {
             finding.file
               ? el("p", { class: "finding-where", text: `${finding.file}${finding.line ? `:${finding.line}` : ""}` })
               : null,
-            finding.detail ? el("p", { class: "finding-detail", text: finding.detail }) : null,
+            finding.detail ? mdBlock("finding-detail", detailMd) : null,
           ))) : null,
       ));
     }
@@ -6747,7 +6762,7 @@ function buildReviewRounds(rounds, gate) {
     if (reconsideration.length) {
       node.append(el("div", { class: "reviewer" },
         el("p", {}, el("span", { class: "reviewer-name", text: "reconsideration" })),
-        el("div", { class: "findings" }, reconsideration.map((rv) =>
+        el("div", { class: "findings" }, reconsideration.map((rv, rvIdx) =>
           el("div", { class: "finding" },
             el("div", { class: "finding-top" },
               el("span", { class: "finding-id", text: `reviewer ${rv.reviewer}` }),
@@ -6755,7 +6770,7 @@ function buildReviewRounds(rounds, gate) {
                 ? voteTag(rv.vote)
                 : el("span", { class: "tag", "data-tone": "rust", text: "no revote" }),
             ),
-            rv.reason ? el("p", { class: "finding-detail", text: rv.reason }) : null,
+            rv.reason ? mdBlock("finding-detail", (roundMd.reconsideration || [])[rvIdx]) : null,
             rv.failed ? el("p", { class: "card-note", text: rv.failed }) : null,
           ))),
       ));
@@ -6775,6 +6790,7 @@ function buildReviewRounds(rounds, gate) {
 
     if (round.fix) {
       const fix = round.fix;
+      const fixMd = roundMd.fix || {};
       const addressed = Array.isArray(fix.addressed) ? fix.addressed : [];
       const rejected = Array.isArray(fix.rejected) ? fix.rejected : [];
       node.append(el("div", { class: "reviewer" },
@@ -6790,14 +6806,14 @@ function buildReviewRounds(rounds, gate) {
               fix.committed ? "committed" : "no commit",
             ]),
         fix.failed ? el("p", { class: "card-note", text: `adoption report lost: ${fix.failed}` }) : null,
-        fix.notes ? el("p", { class: "cand-summary", text: fix.notes }) : null,
-        rejected.length ? el("div", { class: "findings" }, rejected.map((r) =>
+        fix.notes ? mdBlock("cand-summary", fixMd.notes) : null,
+        rejected.length ? el("div", { class: "findings" }, rejected.map((r, rjIdx) =>
           el("div", { class: "finding" },
             el("div", { class: "finding-top" },
               el("span", { class: "finding-id", text: r.id || "" }),
               el("span", { class: "finding-title", text: "declined" }),
             ),
-            r.why ? el("p", { class: "finding-detail", text: r.why }) : null,
+            r.why ? mdBlock("finding-detail", (fixMd.rejected || [])[rjIdx]) : null,
           ))) : null,
       ));
     }
@@ -6846,7 +6862,7 @@ function renderReviews(run) {
   if (list.dataset.sig === sig) return;
   list.dataset.sig = sig;
   clear(list);
-  list.append(...buildReviewRounds(rounds, gate));
+  list.append(...buildReviewRounds(rounds, gate, run.reviews_md));
 }
 
 function commandList(heading, commands) {

@@ -1033,7 +1033,7 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 }
 .ask-turn-who { font-weight: 700; text-transform: uppercase; font-size: var(--t1); letter-spacing: .04em; margin-right: var(--s2); }
 .ask-turn-when { font-size: var(--t1); color: var(--ink-3); }
-.ask-turn-body { margin: var(--s1) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ask-turn-body { margin: var(--s1) 0 0; overflow-wrap: anywhere; }
 .ask-turn[data-who="operator"] { background: var(--tint-blue); color: var(--on-blue); }
 .ask-turn[data-who="agent"] { background: var(--surface); color: var(--ink); border: 1px solid var(--line); }
 
@@ -1207,7 +1207,6 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   border-radius: var(--radius);
   font-size: var(--t3);
   color: var(--ink-2);
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
@@ -1351,6 +1350,9 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .crown[data-provisional]::before { content: "\25c7"; }
 .cand-nums { display: flex; flex-wrap: wrap; gap: 0 var(--s2); font-size: var(--t2); color: var(--ink-2); }
 .cand-summary { font-size: var(--t3); color: var(--ink-2); overflow-wrap: anywhere; }
+.cand-summary.md, .finding-detail.md, .ask-turn-body.md, .advise-synthesis.md { min-width: 0; max-width: 100%; }
+.cand-summary.md { margin-top: var(--s2); }
+.cand-summary.md pre, .finding-detail.md pre, .advise-synthesis.md pre { max-width: 100%; overflow-x: auto; }
 
 .stat, .report {
   margin: 0;
@@ -1395,6 +1397,7 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .finding-title { font-weight: 600; color: var(--ink); }
 .finding-where { font-family: var(--mono); font-size: var(--t1); color: var(--ink-3); }
 .finding-detail { color: var(--ink-2); margin-top: 2px; overflow-wrap: anywhere; }
+.finding-detail.md { font-size: inherit; gap: var(--s1); }
 .reviewer { margin-top: var(--s3); font-size: var(--t3); }
 .reviewer-name { font-family: var(--mono); font-size: var(--t2); color: var(--ink-3); }
 
