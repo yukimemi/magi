@@ -10864,10 +10864,7 @@ mod tests {
         assert!(body.contains("statsAgentTone(row.agent)"));
         assert!(!body.contains("candTone(i)"));
         assert!(APP_JS.contains("const STATS_LOW_N = 10;"));
-        for root in [
-            "stats-agents-bars",
-            "stats-reviewers-bars",
-        ] {
+        for root in ["stats-agents-bars", "stats-reviewers-bars"] {
             assert!(APP_JS.contains(&format!("statsBarRows($(\"{root}\")")));
         }
     }
