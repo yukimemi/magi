@@ -7386,12 +7386,12 @@ async function applyRevisions_(source) {
     jobs.push(loadLoop());
   }
   if (jobs.length) {
-    const saidBefore = saidCount;
+    const saidBefore = saidAt;
     await Promise.allSettled(jobs);
     /* Only the generic word, and only when nothing better was said: a job in
        this batch may have announced the loop stopping, and overwriting that
        with "Updated." would be the one sentence the operator needed lost. */
-    if (saidCount === saidBefore) announce("Updated.");
+    if (saidAt === saidBefore) announce("Updated.");
   }
 }
 
