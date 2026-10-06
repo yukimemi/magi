@@ -56,7 +56,7 @@ use crate::run::RunStatus;
 /// "no conversation yet" rather than "unreadable", and a strict equality check
 /// would turn every bump into an upgrade that breaks reading yesterday's
 /// question files.
-pub const SCHEMA: u32 = 5;
+pub const SCHEMA: u32 = 6;
 
 /// How often the wait re-reads the question file.
 ///
@@ -561,6 +561,20 @@ pub struct Question {
     /// conductor filed. `None` for every other question.
     #[serde(default)]
     pub deputy: Option<Deputy>,
+    /// Set once the owner handed this question to the chat it came from
+    /// ([`crate::consult::begin`]). The question stays open; this only records
+    /// that the chat was asked, so a second tap does not post it twice.
+    #[serde(default)]
+    pub consult: Option<ChatConsult>,
+}
+
+/// A question the owner passed to the chat conversation its task came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatConsult {
+    /// The conversation the question was posted into.
+    pub talk: String,
+    /// When it was posted.
+    pub at: Timestamp,
 }
 
 impl Question {
@@ -606,6 +620,7 @@ impl Question {
             delivered_turns: 0,
             answer_delivered: false,
             deputy: None,
+            consult: None,
         }
     }
 
@@ -2042,6 +2057,7 @@ mod tests {
                 "asked_at",
                 "assets",
                 "choices",
+                "consult",
                 "cwd",
                 "delivered_turns",
                 "deputy",
@@ -2059,7 +2075,7 @@ mod tests {
             ],
             "the on-disk field set is a contract with the front end"
         );
-        assert_eq!(open["schema"], 5);
+        assert_eq!(open["schema"], 6);
         assert_eq!(open["thread"], serde_json::json!([]));
         assert_eq!(open["id"], "20260902-231501-ab12");
         assert_eq!(open["run"], "20260902-201256-9fb7");

@@ -856,6 +856,7 @@ impl Ui {
             .route("/api/questions", get(questions_list))
             .route("/api/questions/{id}/answer", post(question_answer))
             .route("/api/questions/{id}/say", post(question_say))
+            .route("/api/questions/{id}/consult", post(question_consult))
             .route("/api/questions/{id}/panel", get(question_panel))
             // The same asset, reachable from inside the panel by its bare
             // filename. A document served at `.../panel` resolves `shot.png`
@@ -5215,6 +5216,11 @@ struct QuestionView {
     /// `question.run` is a task id (conductor / triage questions), not a run
     /// id, so the UI links it to the task page.
     run_is_task: bool,
+    /// The chat conversation this question's task came from, when the owner
+    /// may hand the question to it - see [`crate::consult::origin_talk`]. The
+    /// UI offers "Ask the chat agent" only when this is set; it is never one
+    /// of `question.choices`.
+    origin_chat: Option<String>,
 }
 
 impl QuestionView {
@@ -5237,8 +5243,15 @@ impl QuestionView {
             holder,
             deputies_enabled,
             run_is_task: question.run_names_task(),
+            origin_chat: None,
             question,
         }
+    }
+
+    /// Fill `origin_chat` from the queue and the talks.
+    fn with_origin(mut self, tasks: &[crate::queue::Task], talks: &[Talk]) -> Self {
+        self.origin_chat = crate::consult::origin_talk(tasks, talks, &self.question).map(|t| t.id);
+        self
     }
 }
 
@@ -5304,11 +5317,15 @@ fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
 /// told an agent at 3am. `ask::Questions::list` already ranks open first.
 async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<QuestionView>>> {
     blocking(move || {
-        Ok(Json(question_views(
-            ui.questions.list(),
-            &ui.questions,
-            || deputy_config(&ui.repo),
-        )))
+        let (tasks, talks) = (ui.queue.list(), ui.talks.list());
+        Ok(Json(
+            question_views(ui.questions.list(), &ui.questions, || {
+                deputy_config(&ui.repo)
+            })
+            .into_iter()
+            .map(|v| v.with_origin(&tasks, &talks))
+            .collect(),
+        ))
     })
     .await
 }
@@ -5412,7 +5429,10 @@ async fn question_answer(
             .update(&q.id, |r| r.answer(answer))
             .map_err(ApiError::bad_request_from)?;
         let on = deputies_enabled(deputy_config(&ui.repo).as_ref(), &q);
-        Ok(Json(QuestionView::of(q, &ui.questions, on)))
+        let (tasks, talks) = (ui.queue.list(), ui.talks.list());
+        Ok(Json(
+            QuestionView::of(q, &ui.questions, on).with_origin(&tasks, &talks),
+        ))
     })
     .await
 }
@@ -5462,9 +5482,74 @@ async fn question_say(
             .update(&q.id, |r| r.say(body.body))
             .map_err(ApiError::bad_request_from)?;
         let on = deputies_enabled(deputy_config(&ui.repo).as_ref(), &q);
-        Ok(Json(QuestionView::of(q, &ui.questions, on)))
+        let (tasks, talks) = (ui.queue.list(), ui.talks.list());
+        Ok(Json(
+            QuestionView::of(q, &ui.questions, on).with_origin(&tasks, &talks),
+        ))
     })
     .await
+}
+
+/// `POST /api/questions/{id}/consult` - hand the question to the chat its task
+/// came from. The question stays open: the chat agent answers it with `magi
+/// answer`, or puts the decision to the owner in the conversation.
+///
+/// Answers 202 and runs the turn in the background, like every route that
+/// spends agent calls. The text is queued as a draft of the existing talk, and
+/// the turn goes through the talk's own gate and session; no seat or waiter is
+/// started here.
+async fn question_consult(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<(StatusCode, Json<QuestionView>)> {
+    let (view, reclaimed) = blocking({
+        let ui = Arc::clone(&ui);
+        move || {
+            let id = resolve_question(&ui.questions, &id)?;
+            let q = ui
+                .questions
+                .get(&id)
+                .map_err(|e| ApiError::from(e).with_status(StatusCode::INTERNAL_SERVER_ERROR))?;
+            if !q.status.open() {
+                return Err(ApiError::conflict(format!(
+                    "question {} is already {}",
+                    q.short(),
+                    q.status.as_str()
+                )));
+            }
+            let (tasks, talks) = (ui.queue.list(), ui.talks.list());
+            let Some(talk) = crate::consult::origin_talk(&tasks, &talks, &q) else {
+                return Err(ApiError::conflict(format!(
+                    "question {} has no open chat to ask",
+                    q.short()
+                )));
+            };
+            let fresh = crate::consult::begin(&ui.questions, &ui.talks, &q, &talk)?;
+            let claim = if fresh {
+                match ui.begin_queued_talk_turn(&talk.id)? {
+                    Some(turn_guard) => {
+                        let talk = ui.talks.get(&talk.id)?;
+                        let (cfg, _) = Config::discover(&talk.repo, None)?;
+                        Some((talk, cfg, turn_guard))
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let q = ui.questions.get(&q.id)?;
+            let on = deputies_enabled(deputy_config(&ui.repo).as_ref(), &q);
+            let view = QuestionView::of(q, &ui.questions, on).with_origin(&tasks, &talks);
+            Ok((view, claim))
+        }
+    })
+    .await?;
+    if let Some((talk, cfg, turn_guard)) = reclaimed {
+        let talks = ui.talks.clone();
+        let id = talk.id.clone();
+        tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+    }
+    Ok((StatusCode::ACCEPTED, Json(view)))
 }
 
 /// Expand an id or short id to exactly one question id.
@@ -7646,6 +7731,66 @@ mod tests {
         assert_eq!(body["waiting_on_agent"], true);
         // Still open, still counted, still exactly one question.
         assert_eq!(fx.get("/api/health").await.json()["questions_open"], 1);
+    }
+
+    #[tokio::test]
+    async fn consulting_a_question_with_no_chat_is_refused_and_it_stays_open() {
+        let fx = Fixture::start().await;
+        let id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+
+        let list = fx.get("/api/questions").await.json();
+        assert_eq!(list[0]["origin_chat"], Value::Null, "{list}");
+
+        let res = fx.post(&format!("/api/questions/{id}/consult"), None).await;
+        assert_eq!(res.status, 409, "{}", res.body);
+        let q = fx.questions().get(&id).unwrap();
+        assert!(q.status.open());
+        assert!(q.consult.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_question_from_a_chat_task_names_its_chat_in_the_view() {
+        let fx = Fixture::start().await;
+        let id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+        let cfg = Config {
+            agents: vec![crate::config::AgentSpec {
+                id: "mock".to_owned(),
+                kind: crate::config::AgentKind::Command,
+                model: None,
+                command: vec!["true".to_owned()],
+                extra_args: Vec::new(),
+                env: Default::default(),
+                prompt_delivery: None,
+            }],
+            ..Config::default()
+        };
+        let talk = crate::talk::begin(
+            &fx.talks(),
+            &cfg,
+            fx.home.path().to_path_buf(),
+            Some("mock"),
+        )
+        .unwrap();
+        let mut task = Task::new(
+            "t".to_owned(),
+            "Do it".to_owned(),
+            PathBuf::from("/repo/magi"),
+            Source::Agent {
+                run: talk.id.clone(),
+                node: crate::queue::CHAT_NODE.to_owned(),
+            },
+        );
+        task.start("20260902-000000-beef".to_owned());
+        fx.queue().put(&mut task).unwrap();
+
+        let list = fx.get("/api/questions").await.json();
+        assert_eq!(list[0]["origin_chat"], talk.id.as_str(), "{list}");
+        assert_eq!(
+            list[0]["choices"],
+            serde_json::json!(["SQLite", "Redis"]),
+            "the hand-over is never a choice"
+        );
+        let _ = id;
     }
 
     #[tokio::test]

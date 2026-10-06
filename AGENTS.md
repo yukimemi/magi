@@ -1970,3 +1970,27 @@ legitimately lack a long-running process's output; read `upgrade.log` and
 redirection. These values (256 KiB, 120 s, 70 min, 30 s poll, 10 s runtime
 shutdown bound in `main::run`) live in `updater.rs` / `main.rs`; keep this
 section aligned with them.
+
+### Handing a question to the chat it came from
+
+`src/consult.rs`. A task filed by the standing chat (`Source::Agent` with
+`queue::CHAT_NODE`, `run` = the talk id) can raise a question the owner would
+rather talk through there. `POST /api/questions/{id}/consult` and `magi answer
+<id> --ask-chat` queue the question (id, summary, detail, choices, instructions
+from `prompt::chat_consult`) as a draft of that talk; the chat agent answers it
+with `magi answer` or puts the decision points to the owner in the chat.
+
+- **One judge.** `consult::origin_talk` is the only place that decides a
+  question has a chat to ask (open question, task from a chat, talk still
+  open, and never `land::APPROVAL_NODE` / `bump::NOTICE_NODE`, whose answers
+  are gated by `land::merge_intent`). `QuestionView::origin_chat` is its
+  result; `app.js` shows "Ask the chat agent" only when it is set.
+- **Never a choice.** Nothing is added to `Question::choices` and
+  `Question::answer` is untouched. The question stays `Open`; `Question::consult`
+  (`ask::SCHEMA` 6, `#[serde(default)]`) only records that the chat was asked, so
+  a second tap is a no-op. Written through `Questions::update`.
+- **Write access is for the consult turn only.** `talk::turn` lets the turn whose newest message is a hand-over write, with the question store as a writable root; later turns are read-only again, and the prompt tells the chat to hand the owner the exact `magi answer` command.
+- **No new seat, no new waiter.** The text goes in through `talk::queue`, and
+  the talk's own turn gate and session run it. The web route starts the drain
+  when the turn slot is free; the CLI only leaves the draft, which the owner
+  resumes in the chat. The question's `answer_timeout` is not extended.

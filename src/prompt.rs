@@ -1412,6 +1412,51 @@ pub struct DeputyPrompt<'a> {
     pub language: &'a str,
 }
 
+/// Heading of the turn that hands a question to the chat it came from.
+pub const CHAT_CONSULT_HEADING: &str = "A question was handed to you";
+
+/// The operator turn that puts an open question in front of the chat agent.
+///
+/// The question's id is in the text on purpose: it is what `magi answer <id>`
+/// takes, and what lets the chat see that the same question was posted twice.
+pub fn chat_consult(q: &crate::ask::Question) -> String {
+    let mut s = format!(
+        "# {CHAT_CONSULT_HEADING}\n\n\
+         The operator passed you a question that one of the tasks filed from \
+         this conversation is waiting on (question `{id}`). It is still open.\n\n\
+         ## {summary}\n\n",
+        id = q.id,
+        summary = q.summary,
+    );
+    if !q.detail.trim().is_empty() {
+        s.push_str(q.detail.trim());
+        s.push_str("\n\n");
+    }
+    if q.free_text() {
+        s.push_str("This question wants free text.\n\n");
+    } else {
+        s.push_str("Choices:\n\n");
+        for c in &q.choices {
+            s.push_str(&format!("- {c}\n"));
+        }
+        s.push('\n');
+    }
+    s.push_str(&format!(
+        "What to do:\n\n\
+         - If one answer is simple and clearly decidable from what you already \
+         know, answer it yourself with `magi answer {id} --reply <choice or text>`, \
+         then say in this conversation what you answered and why.\n\
+         - If it needs the operator's judgement, do not answer. Reply here with \
+         the question and the decision points spelled out, so they can decide in \
+         this conversation. You can only write while answering this one turn, so \
+         end your reply with the exact command for their decision, `magi answer \
+         {id} --reply <choice or text>`, for them to run or to tap on the \
+         question's card.\n",
+        id = q.id,
+    ));
+    s
+}
+
 /// See [`DeputyPrompt`].
 pub fn deputy(p: &DeputyPrompt<'_>) -> String {
     let DeputyPrompt {
