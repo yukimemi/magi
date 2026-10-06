@@ -1321,6 +1321,9 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .bar-row-head { display: flex; justify-content: space-between; gap: var(--s3); font-size: var(--t3); }
 .bar-row-name { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
 .bar-row-value { color: var(--ink-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bar-row-n { margin-left: var(--s2); }
+.bar-row-tag { margin-left: var(--s2); padding: 0 var(--s2); border: 1px solid var(--line); border-radius: 4px; color: var(--ink-3); font-size: var(--t4, 0.75em); font-weight: 400; white-space: nowrap; }
+.bar-row[data-low-n] .bar-fill { opacity: 0.4; }
 .bar-track { height: 10px; border-radius: 5px; background: var(--sunk); overflow: hidden; }
 .bar-fill { height: 100%; border-radius: 5px; }
 
