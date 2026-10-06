@@ -1000,17 +1000,16 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         .collect();
 
     // A question handed to this conversation is answered with `magi answer`,
-    // which writes the question store; a read-only sandbox refuses that. So the
-    // turn that answers a hand-over - and only that turn, never the rest of
-    // the conversation - may write, with the question store as a writable
-    // root. As for the deputy, what the seat may touch beyond that rests on
-    // the prompt, not the sandbox.
-    let consulted = talk
-        .turns
-        .last()
-        .is_some_and(|t| t.who == Who::Operator && crate::consult::is_consult_text(&t.body));
+    // which writes the question store; a read-only sandbox refuses that. So
+    // while such a question is still open - the hand-over turn and the turns
+    // in which the owner decides - the turn may write, with the question store
+    // as a writable root. It goes back to read-only once the question is
+    // answered or abandoned. As for the deputy, what the seat may touch beyond
+    // that rests on the prompt, not the sandbox.
+    let questions = crate::ask::Questions::open();
+    let consulted = crate::consult::pending_consults(&questions, &talk.id);
     let consult_roots: Vec<PathBuf> = if consulted {
-        vec![crate::ask::Questions::open().root().to_path_buf()]
+        vec![questions.root().to_path_buf()]
     } else {
         Vec::new()
     };
