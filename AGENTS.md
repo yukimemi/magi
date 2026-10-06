@@ -1359,6 +1359,32 @@ not move on a say.
 - The mock agent in `tests/common/mod.rs` greps `prompt::DEPUTY_HEADING`; reword
   the heading and update both.
 
+- **Every question without an asker has a deputy (`Kind::Generic`).**
+  `deputy::kind_of` returns `Generic` for any question with no `cwd`, after the
+  conduct / land / release-watch arms: triage (`triage::NODE`, `DEPS_NODE`), the
+  divergence question (node `review`, seat `daemon::DIVERGED_SEAT`) and any
+  filer added later. The rule is the absence of `cwd`, never the node name
+  (`review` is also a run's own seat). A `magi ask` question has a `cwd` and
+  keeps its asker and the waiter; `bump`'s choice-less notices (seat `bump`)
+  get none. Like release-watch, a Generic deputy never writes `cwd` (that would
+  hand the question to the waiter), runs on the fixed `asked_at +
+  answer_timeout` clock (`deputy::fixed_clock`), starts in its task's checkout
+  (`Question::run` names the task), and a `merge` choice is held to the
+  merge-approval rules (`deputy::merge_gated`). `generic_brief` states node,
+  seat, task, what each choice does and that the deputy applies nothing;
+  `triage::deputy_note` adds the triage specifics. The prompt heading is
+  unchanged (`prompt::DEPUTY_HEADING`), so the mock agent needs no edit. Every
+  existing bound (`max_deputies`, `MAX_STARTS`, lease, `--settle` rules,
+  `operator_held`) applies as is. "Nobody is attached" (web `holder_of`) now
+  appears only while a deputy-eligible question is still unattended; a question
+  with a `cwd` and a choice-less bump notice show no holder. **A new question
+  filer must be added to `known_filers()` in `tests/deputy.rs`**: a scan of
+  `src/` fails on a `Question::new` node it does not know. Slots: `tick` visits
+  Generic questions last and a Generic deputy never takes the last slot
+  (`max_deputies - 1`, at least 1), so triage questions cannot starve an
+  approval / conductor / release-watch deputy. A turn already running is not
+  preempted.
+
 ### The web UI: one binary, no authentication, and no lying empty states
 
 `src/web.rs` serves `assets/ui/{index.html,app.css,app.js}` through

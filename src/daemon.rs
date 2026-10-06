@@ -2978,7 +2978,7 @@ async fn attempt(
             let mut q = ask::Question::new(
                 task.id.clone(),
                 "review".to_owned(),
-                "sync".to_owned(),
+                DIVERGED_SEAT.to_owned(),
                 d.summary(),
                 d.detail(),
                 d.choices(),
@@ -4167,6 +4167,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+/// Seat on the divergence question (node `review`, no `cwd`). Node `review` is
+/// also what a run's own seat uses, so the deputy tells them apart by `cwd`.
+pub const DIVERGED_SEAT: &str = "sync";
 
 #[cfg(test)]
 mod tests {
