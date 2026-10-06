@@ -1429,10 +1429,22 @@ async fn stats_bars_are_stable_per_agent_and_honest_about_sample_size() {
         )
         .await
         .unwrap();
-    assert_eq!(out["order"], serde_json::json!(["c", "sonnet", "b", "a", "z"]));
-    assert_eq!(out["low"], serde_json::json!([false, false, true, true, false]));
-    assert_eq!(out["tags"], serde_json::json!([false, false, true, true, false]));
-    assert_eq!(out["tracks"], serde_json::json!([true, true, true, true, false]));
+    assert_eq!(
+        out["order"],
+        serde_json::json!(["c", "sonnet", "b", "a", "z"])
+    );
+    assert_eq!(
+        out["low"],
+        serde_json::json!([false, false, true, true, false])
+    );
+    assert_eq!(
+        out["tags"],
+        serde_json::json!([false, false, true, true, false])
+    );
+    assert_eq!(
+        out["tracks"],
+        serde_json::json!([true, true, true, true, false])
+    );
     assert_eq!(out["n719"], true);
     assert_eq!(out["stable"], true);
     assert_eq!(out["spill"], true);
