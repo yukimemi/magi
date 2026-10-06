@@ -1034,10 +1034,42 @@ fn resume_requested(value: Option<std::ffi::OsString>) -> bool {
 /// process inherited from its own predecessor cannot leak into a generation
 /// that should not resume. The successor's own environment keeps the variable
 /// (and so do the agent CLIs it starts); `serve` reads it once at startup.
-fn spawn_successor(resume: bool) -> Result<()> {
+///
+/// The successor's stdout and stderr are appended to `<home>/web.log` rather
+/// than sent to null: a supervisor's redirection only ever held the first
+/// generation's descriptors, so every later generation logged nowhere. The
+/// pid of the child is returned so the handover log can name it.
+fn spawn_successor(home: &FsPath, resume: bool) -> Result<u32> {
     let exe = std::env::current_exe().context("find this binary")?;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    tracing::info!("restarting: {} {}", exe.display(), args.join(" "));
+    updater::log_step(
+        home,
+        &format!("restarting: {} {}", exe.display(), args.join(" ")),
+    );
+    let log_path = home.join(WEB_LOG);
+    let open_log = || {
+        std::fs::create_dir_all(home)?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+    };
+    let (out, err) = match open_log().and_then(|f| Ok((f.try_clone()?, f))) {
+        Ok(pair) => (
+            std::process::Stdio::from(pair.0),
+            std::process::Stdio::from(pair.1),
+        ),
+        Err(e) => {
+            updater::log_warn(
+                home,
+                &format!(
+                    "could not open {}: {e}; the successor logs nowhere",
+                    log_path.display()
+                ),
+            );
+            (std::process::Stdio::null(), std::process::Stdio::null())
+        }
+    };
 
     let mut cmd = std::process::Command::new(&exe);
     if resume {
@@ -1047,8 +1079,8 @@ fn spawn_successor(resume: bool) -> Result<()> {
     }
     cmd.args(&args)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(out)
+        .stderr(err);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -1056,8 +1088,18 @@ fn spawn_successor(resume: bool) -> Result<()> {
         // and Ctrl-C in the old terminal must not reach the successor.
         cmd.creation_flags(0x0000_0008 | 0x0000_0200);
     }
-    cmd.spawn().context("start the successor")?;
-    Ok(())
+    let child = cmd.spawn().context("start the successor")?;
+    Ok(child.id())
+}
+
+/// File under `<home>` the successor's output is appended to.
+const WEB_LOG: &str = "web.log";
+
+/// Resolves when [`HANDOVER`] is signalled. The only waiter on it: a permit
+/// stored by an earlier `notify_one` is consumed by the first poll, so the
+/// signal is never missed and never wakes a second time.
+async fn wait_for_handover(signal: &Notify) {
+    signal.notified().await;
 }
 
 /// Serve the UI until Ctrl-C, finishing a run the loop has in flight.
@@ -1110,6 +1152,16 @@ pub async fn serve(opts: Opts) -> Result<()> {
     // died mid-handover. Before the router starts answering, so the very
     // first `/api/health` a phone gets from this process already reflects it.
     updater::reconcile_after_restart(&home);
+    updater::log_step(
+        &home,
+        &format!(
+            "web process started (version {}); handover log {}, successor output {}",
+            env!("CARGO_PKG_VERSION"),
+            updater::log_path(&home).display(),
+            home.join(WEB_LOG).display()
+        ),
+    );
+    updater::spawn_watchdog(home.clone());
     // `magi web` can stay up for days, and the one-time check `main.rs`'s
     // `spawn_update_check` does at startup only ever runs once: after that,
     // `/api/health`'s `update` field - and the phone's "Update & restart"
@@ -1156,22 +1208,34 @@ pub async fn serve(opts: Opts) -> Result<()> {
             std::future::pending::<()>().await;
         }
     };
-    let handover = HANDOVER.notified();
-    tokio::select! {
+    let handover = wait_for_handover(&HANDOVER);
+    let outcome = tokio::select! {
         joined = &mut served => match joined {
             Ok(outcome) => outcome.context("serve the web UI"),
             Err(e) => Err(e).context("the task serving the web UI ended"),
         },
         () = interrupted => {
             tracing::info!("shutting down the web UI");
-            finish_loop(&looping).await;
+            finish_loop(&home, &looping).await;
             Ok(())
         }
         () = handover => {
-            tracing::info!("upgraded - handing this address to the successor");
-            hand_over(&home, &looping, served, spawn_successor).await
+            updater::log_step(&home, "serve: the select! woke on the handover signal");
+            let successor_home = home.clone();
+            hand_over(&home, &looping, served, move |resume| {
+                spawn_successor(&successor_home, resume)
+            })
+            .await
         }
-    }
+    };
+    updater::log_step(
+        &home,
+        &match &outcome {
+            Ok(()) => "serve: returning Ok; the process should exit now".to_owned(),
+            Err(e) => format!("serve: returning an error: {e:#}"),
+        },
+    );
+    outcome
 }
 
 /// `opts.repo`, or - when it is still `--repo`'s own default (`.`) and the
@@ -1254,23 +1318,54 @@ async fn hand_over(
     home: &FsPath,
     looping: &Mutex<LoopState>,
     served: tokio::task::JoinHandle<std::io::Result<()>>,
-    successor: impl FnOnce(bool) -> Result<()>,
+    successor: impl FnOnce(bool) -> Result<u32>,
 ) -> Result<()> {
-    if let Some(mut progress) = updater::read_progress(home) {
-        progress.advance(updater::Stage::Parking);
-        let _ = updater::write_progress(home, &progress);
+    updater::log_step(home, "hand_over: entered; writing the parking stage");
+    match updater::read_progress(home) {
+        Some(mut progress) => {
+            progress.advance(updater::Stage::Parking);
+            updater::write_progress_logged(home, &progress);
+        }
+        None => updater::log_warn(
+            home,
+            "hand_over: upgrade.json is unreadable; no parking stage",
+        ),
     }
-    finish_loop(looping).await;
+    finish_loop(home, looping).await;
+    updater::log_step(home, "hand_over: releasing the listener (abort and await)");
     served.abort();
     let _ = served.await;
+    updater::log_step(home, "hand_over: listener released");
     // Read last: the deck answers for the whole park, so an operator's stop
     // during the wait must still be honoured by the successor.
     let resume = lock_or_recover(looping).resume_after_handover;
-    if let Some(mut progress) = updater::read_progress(home) {
-        progress.advance(updater::Stage::Restarting);
-        let _ = updater::write_progress(home, &progress);
+    match updater::read_progress(home) {
+        Some(mut progress) => {
+            progress.advance(updater::Stage::Restarting);
+            updater::write_progress_logged(home, &progress);
+        }
+        None => updater::log_warn(
+            home,
+            "hand_over: upgrade.json is unreadable; no restarting stage",
+        ),
     }
-    successor(resume)
+    updater::log_step(
+        home,
+        &format!("hand_over: starting the successor (resume={resume})"),
+    );
+    match successor(resume) {
+        Ok(pid) => {
+            updater::log_step(home, &format!("hand_over: successor started, pid {pid}"));
+            Ok(())
+        }
+        Err(e) => {
+            updater::log_warn(
+                home,
+                &format!("hand_over: the successor did not start: {e:#}"),
+            );
+            Err(e)
+        }
+    }
 }
 
 /// Ask the loop to stop and wait for it, on the way out of [`serve`].
@@ -1279,15 +1374,29 @@ async fn hand_over(
 /// mid-node ends the process with worktrees, branches and agent sessions left
 /// behind and every agent call in that run paid for and thrown away, which is
 /// exactly what the daemon's own shutdown refuses to do.
-async fn finish_loop(state: &Mutex<LoopState>) {
+async fn finish_loop(home: &FsPath, state: &Mutex<LoopState>) {
     let live = lock_or_recover(state).live.take();
-    let Some(live) = live else { return };
+    let Some(live) = live else {
+        updater::log_step(home, "finish_loop: no loop running; nothing to wait for");
+        return;
+    };
     live.stop.stop();
     lock_or_recover(state).rev += 1;
-    tracing::info!("waiting for the loop to finish the run in flight");
+    updater::log_step(
+        home,
+        "finish_loop: waiting for the loop to finish the run in flight",
+    );
+    let waited = std::time::Instant::now();
     // The task records its own outcome and logs it, so there is nothing to do
     // with a join error here but stop waiting.
     let _ = live.handle.await;
+    updater::log_step(
+        home,
+        &format!(
+            "finish_loop: the loop ended after {:.1}s",
+            waited.elapsed().as_secs_f32()
+        ),
+    );
 }
 
 /// Resolve `--bind` to an address, plus a warning when the answer is not what
@@ -1638,6 +1747,9 @@ struct UpgradeProgressView {
     started_at: Timestamp,
     updated_at: Timestamp,
     detail: Option<String>,
+    /// Seconds the stage has outlived its allowance, when it has - see
+    /// [`updater::stall`]. `null` while the stage is moving normally.
+    stuck_for_secs: Option<i64>,
 }
 
 /// Whether [`run_update_recheck`] may act at all this tick.
@@ -1771,7 +1883,10 @@ fn upgrade_progress_view(ui: &Ui, progress: updater::Progress) -> UpgradeProgres
                 run.status.as_str()
             )
         });
+    let stalled = updater::stall(&progress, Timestamp::now());
+    let waiting_on = waiting_on.or_else(|| stalled.as_ref().map(|s| s.waiting_on.clone()));
     UpgradeProgressView {
+        stuck_for_secs: stalled.map(|s| s.age_secs),
         stage: progress.stage,
         from: progress.from,
         to: progress.to,
@@ -2260,12 +2375,14 @@ async fn upgrade_and_restart(home: PathBuf) -> Result<()> {
     // `yes` and non-interactive: nobody is at a terminal, and a prompt would
     // hang the upgrade for as long as the process lives.
     crate::updater::run_self_update(true, false, true).await?;
-    tracing::info!("binary replaced - asking the server to hand over");
+    updater::log_step(&home, "binary replaced - recording the replaced stage");
     if let Some(mut progress) = updater::read_progress(&home) {
         progress.advance(updater::Stage::Replaced);
-        let _ = updater::write_progress(&home, &progress);
+        updater::write_progress_logged(&home, &progress);
     }
+    updater::log_step(&home, "upgrade_and_restart: signalling HANDOVER");
     HANDOVER.notify_one();
+    updater::log_step(&home, "upgrade_and_restart: HANDOVER signalled");
     Ok(())
 }
 
@@ -10054,7 +10171,7 @@ mod tests {
                 }
             };
             *bound.lock().expect("bound") = Some(attempt);
-            Ok(())
+            Ok(1)
         })
         .await
         .expect("hand over");
@@ -13133,7 +13250,7 @@ mod tests {
         let progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
         crate::updater::write_progress(home.path(), &progress).expect("seed progress");
 
-        hand_over(home.path(), &looping, served, |_| Ok(()))
+        hand_over(home.path(), &looping, served, |_| Ok(1))
             .await
             .expect("hand over");
 
@@ -13144,6 +13261,97 @@ mod tests {
             "hand_over owns the record through parking and up to restarting; \
              the successor is what finishes it"
         );
+    }
+
+    /// The successor is started exactly once on success, and exactly once on
+    /// failure too (a failed start is reported, never retried).
+    #[tokio::test]
+    async fn hand_over_calls_the_successor_exactly_once_and_logs_the_steps() {
+        for fail in [false, true] {
+            let home = TempDir::new().expect("temp home");
+            let ui = idle_ui(&home);
+            let looping = ui.looping();
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind loopback");
+            let served = tokio::spawn(axum::serve(listener, ui.router()).into_future());
+            let progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
+            crate::updater::write_progress(home.path(), &progress).expect("seed progress");
+
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let outcome = hand_over(home.path(), &looping, served, |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if fail {
+                    anyhow::bail!("no exec")
+                } else {
+                    Ok(4242)
+                }
+            })
+            .await;
+            assert_eq!(outcome.is_err(), fail);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+            let log = std::fs::read_to_string(crate::updater::log_path(home.path()))
+                .expect("upgrade.log is written under the home");
+            for step in [
+                "entered",
+                "finish_loop",
+                "listener released",
+                "starting the successor",
+            ] {
+                assert!(log.contains(step), "missing `{step}` in:\n{log}");
+            }
+            assert!(
+                log.contains(if fail { "did not start" } else { "pid 4242" }),
+                "{log}"
+            );
+        }
+    }
+
+    /// The handover signal is seen however the race falls, and wakes its one
+    /// waiter once per signal - nothing here can spin.
+    #[tokio::test]
+    async fn the_handover_signal_wakes_one_waiter_once() {
+        let signal = Notify::new();
+        // Signalled before anyone waits: the stored permit is not lost.
+        signal.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), wait_for_handover(&signal))
+            .await
+            .expect("an early signal is still seen");
+        // One signal, one wake-up: a second wait does not resolve by itself.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), wait_for_handover(&signal))
+                .await
+                .is_err(),
+            "a consumed signal must not wake a second time"
+        );
+        // Signalled while waiting.
+        let signal = std::sync::Arc::new(signal);
+        let waiter = tokio::spawn({
+            let signal = std::sync::Arc::clone(&signal);
+            async move { wait_for_handover(&signal).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "nothing was signalled yet");
+        signal.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("a late signal wakes the waiter")
+            .expect("join");
+    }
+
+    #[tokio::test]
+    async fn health_says_how_long_a_handover_has_been_stuck() {
+        let fx = Fixture::start().await;
+        let mut progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
+        progress.advance(crate::updater::Stage::Replaced);
+        progress.updated_at = Timestamp::now() - Duration::from_secs(600);
+        crate::updater::write_progress(fx.home.path(), &progress).expect("write upgrade.json");
+
+        let health = fx.get("/api/health").await.json();
+        let stuck = health["upgrade"]["stuck_for_secs"].as_i64().expect("stuck");
+        assert!(stuck >= 600, "{stuck}");
+        assert!(health["upgrade"]["waiting_on"].as_str().is_some());
     }
 
     fn idle_ui(home: &TempDir) -> Ui {
@@ -13170,7 +13378,7 @@ mod tests {
         let told = std::sync::Mutex::new(None);
         hand_over(home.path(), &looping, served, |resume| {
             *told.lock().unwrap() = Some(resume);
-            Ok(())
+            Ok(1)
         })
         .await
         .expect("hand over");

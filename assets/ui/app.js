@@ -911,14 +911,19 @@ function renderLoop() {
   const upgradeStage = upgradeInfo ? upgradeInfo.stage : null;
 
   if (upgradeStage && UPGRADE_BUSY_STAGES.has(upgradeStage)) {
-    const overdue = upgradeOverdue(upgradeInfo);
+    const stuckSecs = Number.isFinite(upgradeInfo.stuck_for_secs) ? upgradeInfo.stuck_for_secs : null;
+    const overdue = upgradeOverdue(upgradeInfo) || stuckSecs !== null;
     setAttr(box, "data-state", overdue ? "failed" : "upgrading");
     setAttr(box, "data-owned", null);
     clear(text);
     text.append(el("b", {
-      text: overdue ? "The upgrade is taking longer than expected." : upgradeStageLabel(upgradeStage),
+      text: stuckSecs !== null
+        ? `Handover stuck in ${upgradeStage} for ${Math.floor(stuckSecs / 60)} min.`
+        : (overdue ? "The upgrade is taking longer than expected." : upgradeStageLabel(upgradeStage)),
     }));
-    quiet(overdue
+    quiet(stuckSecs !== null
+      ? `${upgradeInfo.waiting_on || "Nothing is moving."} The old process may need to be restarted by hand; see upgrade.log under the magi home. (Once the address is released this page cannot reach the deck, so this is the last value it saw.)`
+      : overdue
       ? `Asked for ${upgradeInfo.to || "an update"} more than an hour ago and has not come back. Check on it by hand.`
       : (upgradeInfo.waiting_on || upgradeStageDetail(upgradeStage)));
     state.lastUpgradeStage = upgradeStage;
