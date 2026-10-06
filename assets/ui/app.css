@@ -2669,3 +2669,11 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 .converge svg.cv-duel text { font-family: var(--mono); font-weight: 700; }
 .converge svg.cv-duel .cv-label { font-size: 13px; letter-spacing: .06em; }
 .converge svg.cv-duel .cv-plate { font-size: 11px; letter-spacing: .14em; }
+
+/* Review precision scatter: inline SVG, log x. */
+.precision-scatter { max-width: 100%; margin-top: var(--s3); }
+.scatter-svg { display: block; width: 100%; max-width: 480px; height: auto; }
+.scatter-tick { font: 10px var(--sans); fill: var(--ink-3); font-variant-numeric: tabular-nums; }
+.scatter-axis { font: 10px var(--sans); fill: var(--ink-3); text-transform: uppercase; letter-spacing: .05em; }
+.scatter-label { font: 11px var(--sans); fill: var(--ink-2); }
+.scatter-whisker { stroke-width: 2; opacity: .35; }
