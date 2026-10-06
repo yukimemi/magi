@@ -5082,9 +5082,11 @@ fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
 /// told an agent at 3am. `ask::Questions::list` already ranks open first.
 async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<QuestionView>>> {
     blocking(move || {
-        Ok(Json(question_views(ui.questions.list(), &ui.questions, || {
-            deputy_config(&ui.repo)
-        })))
+        Ok(Json(question_views(
+            ui.questions.list(),
+            &ui.questions,
+            || deputy_config(&ui.repo),
+        )))
     })
     .await
 }
