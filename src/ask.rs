@@ -764,7 +764,7 @@ impl Question {
                 self.short()
             );
         }
-        if self.node == crate::land::APPROVAL_NODE {
+        if crate::deputy::merge_gated(self) {
             // The merge is irreversible and a say is not a decision. The
             // owner's latest message is what counts (an earlier one may since
             // have been qualified or withdrawn). `hold` must be that message
@@ -2857,6 +2857,44 @@ mod tests {
         );
         q.settle_by_deputy("deputy-x", "merge", "Merge").unwrap();
         assert_eq!(q.resolution().as_deref(), Some("merge"));
+    }
+
+    #[test]
+    fn a_local_release_approval_is_held_to_the_merge_rules_but_an_escalation_is_not() {
+        let mk = |choices: Vec<String>| {
+            let mut q = Question::new(
+                String::new(),
+                crate::bump::NOTICE_NODE.into(),
+                "release-watch".into(),
+                "Release?".into(),
+                String::new(),
+                choices,
+            );
+            let mut dep = Deputy::new("brief".into());
+            dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
+            q.deputy = Some(dep);
+            q
+        };
+        let mut approval = mk(vec!["merge".into(), "hold".into()]);
+        assert!(crate::deputy::merge_gated(&approval));
+        approval.say("たぶんマージでいい").unwrap();
+        assert!(
+            approval
+                .settle_by_deputy("deputy-x", "merge", "たぶんマージでいい")
+                .is_err(),
+            "a hedge never merges"
+        );
+        approval.say("マージしていいよ").unwrap();
+        approval
+            .settle_by_deputy("deputy-x", "merge", "マージしていいよ")
+            .unwrap();
+
+        let mut esc = mk(vec!["rerun again".into(), "hold".into(), "leave it".into()]);
+        assert!(!crate::deputy::merge_gated(&esc));
+        esc.say("もう監視はいらない").unwrap();
+        esc.settle_by_deputy("deputy-x", "leave it", "監視はいらない")
+            .unwrap();
+        assert_eq!(esc.resolution().as_deref(), Some("leave it"));
     }
 
     #[test]

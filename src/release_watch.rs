@@ -347,6 +347,81 @@ pub(crate) fn register(home: &Path, repo: &Path, url: &str, run: &str) {
     w.save(&pr, &st);
 }
 
+/// The watch record whose open question is `question_id`, read from the magi
+/// `home`. `None` when no record names it (never guessed from the text).
+pub(crate) fn state_for_question(home: &Path, question_id: &str) -> Option<WatchState> {
+    Watcher::new(Box::new(GhForge), home.to_path_buf())
+        .stored()
+        .into_iter()
+        .find(|s| s.question.as_deref() == Some(question_id))
+}
+
+/// The task a release-watch question's answer could touch: the one that
+/// finished the run which opened the release pull request (`WatchState::run`).
+/// `None` when the record or the run is not known - then there is nothing to
+/// check, and the settle goes on (an answer here never releases a task).
+pub fn task_of_question(
+    home: &Path,
+    q: &Question,
+    queue: &crate::queue::Queue,
+) -> Option<crate::queue::Task> {
+    let run = state_for_question(home, &q.id)?.run?;
+    queue.list().into_iter().find(|t| t.runs.contains(&run))
+}
+
+/// What a deputy is told about a release-watch question: which pull request,
+/// and what each offered choice really does - matched to [`Watcher::apply_answer`]
+/// and [`Watcher::settle_job_question`]. A missing watch record is said to be
+/// missing, never reconstructed.
+pub(crate) fn deputy_brief(q: &Question, home: &Path) -> String {
+    let mut s = String::from(
+        "This question was filed by magi's release watcher about a release pull \
+         request. Whatever the owner picks, only the watcher acts on it, on its \
+         next lap; you apply nothing and never close, merge, rerun or push \
+         anything. Silence is a hold.",
+    );
+    match state_for_question(home, &q.id) {
+        Some(st) => {
+            s.push_str(&format!(
+                "\n\nPull request: {}\nCheckout: {}",
+                st.url, st.repo
+            ));
+        }
+        None => s.push_str(
+            "\n\nThe watcher's record for this question could not be found, so the \
+             pull request is known to you only through the question's own text. \
+             Say so to the owner rather than guessing.",
+        ),
+    }
+    s.push_str("\n\nWhat each option does:");
+    for c in &q.choices {
+        let what = match c.as_str() {
+            RERUN_AGAIN => "forget the reruns already made and rerun the failed jobs once more",
+            HOLD if q.choices.iter().any(|c| c == land::APPROVE) => {
+                "leave the pull request open and unmerged; ask again only when the head moves"
+            }
+            HOLD => "stay quiet until a check or the head changes",
+            LEAVE_IT => {
+                "stop watching this pull request and dismiss its notice. It does NOT \
+                 close the pull request"
+            }
+            RETRY => "run the failed release again from where it stopped",
+            land::APPROVE => {
+                "squash-merge exactly the head the question names - irreversible - \
+                 then tag and release"
+            }
+            _ => "recorded as the answer",
+        };
+        s.push_str(&format!("\n- `{c}`: {what}"));
+    }
+    s.push_str(
+        "\n\nIf the owner's words ask for the pull request itself to be closed, that \
+         is something only they can do by hand; do not read it as a choice unless \
+         it plainly means stop watching.",
+    );
+    s
+}
+
 /// Starts the hold reason of a task held for a failed release, so only that
 /// hold is undone when the release later succeeds.
 const HOLD_PREFIX: &str = "[release] ";
@@ -1362,9 +1437,17 @@ mod tests {
             String::new(),
             vec![HOLD.into()],
         );
-        assert_eq!(crate::deputy::kind_of(&q), None);
+        // The watcher's question is served by a deputy, but still covers nothing.
+        assert_eq!(
+            crate::deputy::kind_of(&q),
+            Some(crate::deputy::Kind::Release)
+        );
         let n = Notice::warn("release-pr:o/r#7", "m").about([String::new()]);
         assert!(!notices::covers(&q, &n));
+        // A choice-less notice on the same node (seat `bump`) gets no deputy.
+        let mut plain = q.clone();
+        plain.seat = "bump".into();
+        assert_eq!(crate::deputy::kind_of(&plain), None);
     }
 
     #[derive(Default)]
@@ -1509,6 +1592,98 @@ mod tests {
         let ns = Notices::at(d2.path().join("notifications")).list();
         assert!(ns.is_empty(), "dismissed notices are hidden");
         drop(d);
+    }
+
+    /// Give the question a deputy seat the way `Deputies::attach` + a turn do.
+    fn with_deputy(w: &Watcher, id: &str, home: &Path) -> String {
+        let seat = crate::agent::SeatState::new(&crate::ask::deputy_seat_key(id), "a", 1);
+        let key = seat.key.clone();
+        let brief = deputy_brief(&w.questions().get(id).unwrap(), home);
+        w.questions()
+            .update(id, |q| {
+                let mut d = crate::ask::Deputy::new(brief);
+                d.seat = Some(seat);
+                q.deputy = Some(d);
+                Ok(())
+            })
+            .unwrap();
+        key
+    }
+
+    #[tokio::test]
+    async fn the_brief_names_the_pull_request_and_what_leave_it_really_does() {
+        let (d, _f, w, id) = escalated().await;
+        let q = w.questions().get(&id).unwrap();
+        let b = deputy_brief(&q, d.path());
+        assert!(b.contains(URL), "{b}");
+        assert!(
+            b.contains("`leave it`") && b.contains("does NOT close"),
+            "{b}"
+        );
+        assert!(b.contains("`rerun again`") && b.contains("`hold`"), "{b}");
+        assert!(!b.contains("`merge`"), "no merge on an escalation: {b}");
+
+        // No record naming the question: said, not invented.
+        let empty = tempfile::tempdir().unwrap();
+        let b = deputy_brief(&q, empty.path());
+        assert!(b.contains("could not be found") && !b.contains(URL), "{b}");
+    }
+
+    #[tokio::test]
+    async fn a_settled_leave_it_is_applied_once_by_the_watcher_and_closes_nothing() {
+        let (d, fake, w, id) = escalated().await;
+        let seat = with_deputy(&w, &id, d.path());
+        let say = "クローズしていいよ。private repo だから、何回やっても失敗しちゃうから";
+        w.questions().update(&id, |q| q.say(say)).unwrap();
+        w.questions()
+            .update(&id, |q| {
+                q.settle_by_deputy(&seat, LEAVE_IT, "クローズしていいよ")
+            })
+            .unwrap();
+        let q = w.questions().get(&id).unwrap();
+        assert_eq!(q.answer, Some(Answer::Choice(LEAVE_IT.to_owned())));
+
+        let repo = PathBuf::from("/nowhere");
+        let no = || false;
+        for t in [3000, 3100] {
+            w.lap(std::slice::from_ref(&repo), 3600, t, &no).await;
+        }
+        let st = w.stored().pop().unwrap();
+        assert!(st.ignored, "watching stopped");
+        assert_eq!(st.applied, vec![id.clone()], "applied exactly once");
+        assert!(
+            Notices::at(d.path().join("notifications"))
+                .list()
+                .is_empty()
+        );
+        assert_eq!(fake.reruns.lock().unwrap().len(), 1, "no extra rerun");
+        assert_eq!(w.questions().list().len(), 1, "no second question");
+    }
+
+    #[tokio::test]
+    async fn the_task_of_a_release_question_comes_from_the_watch_record() {
+        let (d, _f, w, id) = escalated().await;
+        let q = w.questions().get(&id).unwrap();
+        let queue = crate::queue::Queue::at(d.path().join("queue"));
+        assert!(
+            task_of_question(d.path(), &q, &queue).is_none(),
+            "no run known"
+        );
+        assert!(task_of_question(d.path(), &q, &queue).is_none());
+        let mut st = w.stored().pop().unwrap();
+        st.run = Some("run-1".into());
+        w.save("o/r#7", &st);
+        // A known run with no task is still nothing to refuse on.
+        assert!(task_of_question(d.path(), &q, &queue).is_none());
+        let mut t = crate::queue::Task::new(
+            "t".into(),
+            "i".into(),
+            PathBuf::from("/nowhere"),
+            crate::queue::Source::Human,
+        );
+        t.runs.push("run-1".into());
+        queue.put(&mut t).unwrap();
+        assert_eq!(task_of_question(d.path(), &q, &queue).unwrap().id, t.id);
     }
 
     #[tokio::test]

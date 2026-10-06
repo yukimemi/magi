@@ -508,3 +508,59 @@ fn a_merge_approvals_deadline_never_moves_on_a_reply() {
     c.node = "implement".to_owned();
     assert_eq!(magi::deputy::kind_of(&c), None);
 }
+
+fn file_release(store: &Questions, seat: &str, choices: &[&str]) -> Question {
+    let mut q = Question::new(
+        String::new(),
+        magi::bump::NOTICE_NODE.to_owned(),
+        seat.to_owned(),
+        "Release PR o/r#7 is stuck: what now?".to_owned(),
+        "Pull request: https://example.test/pull/7".to_owned(),
+        choices.iter().map(|c| (*c).to_owned()).collect(),
+    );
+    store.put(&mut q).expect("file the release question");
+    q
+}
+
+common::e2e! {
+async fn a_say_on_a_release_watch_question_gets_a_deputy_without_a_cwd() {
+    let s = scene(home_lock().await);
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    let rel = file_release(&s.store, "release-watch", &["rerun again", "hold", "leave it"]);
+    let plain = file_release(&s.store, "bump", &[]);
+    s.store.update(&rel.id, |q| q.say("what is failing?")).unwrap();
+    s.store.update(&plain.id, |q| q.say("hello")).unwrap();
+    let mut d = deputies(&s, 2);
+
+    turn(&mut d).await;
+
+    let q = s.store.get(&rel.id).unwrap();
+    assert_eq!(q.status, QuestionStatus::Open, "a say never settles it");
+    assert!(q.cwd.is_none(), "a cwd would make it the waiter's");
+    assert!(q.answer_timeout > 0);
+    let dep = q.deputy.as_ref().expect("a deputy was attached");
+    assert_eq!(dep.starts, 1);
+    assert!(dep.brief.contains("does NOT close"), "{}", dep.brief);
+    assert_eq!(q.thread.last().unwrap().who, Who::Agent, "the say was answered");
+    assert_eq!(log(&s).len(), 1, "only the watcher's question costs a deputy");
+    assert!(s.store.get(&plain.id).unwrap().deputy.is_none());
+}
+}
+
+#[test]
+fn a_release_questions_deadline_never_moves_on_a_reply() {
+    let mut q = Question::new(
+        String::new(),
+        magi::bump::NOTICE_NODE.to_owned(),
+        "release-watch".to_owned(),
+        "stuck?".to_owned(),
+        String::new(),
+        vec!["hold".to_owned()],
+    );
+    q.answer_timeout = 1000;
+    let base = q.asked_at.as_second();
+    q.say("why?").unwrap();
+    q.thread[0].at = Timestamp::from_second(base + 900).unwrap();
+    assert_eq!(magi::deputy::deadline(&q, 5), base + 1000);
+    assert_eq!(magi::deputy::kind_of(&q), Some(magi::deputy::Kind::Release));
+}

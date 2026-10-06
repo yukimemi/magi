@@ -1309,6 +1309,26 @@ not move on a say.
   `--force`); every other claim still refuses. The
   operator-held check resolves the task through the run id. `holder_of` says
   `nobody` for an approval with no live deputy, and `app.js` says so.
+- **A release-watch question has a deputy too, and stays the watcher's.**
+  `deputy::kind_of` returns `Kind::Release` only for `node == bump::NOTICE_NODE`
+  *and* `seat == "release-watch"` (bump files choice-less notices on the same
+  node; those get none). It covers all three questions `release_watch` files
+  (escalation: `rerun again` / `hold` / `leave it`; local approval: `merge` /
+  `hold`; failed release: `retry` / `leave it`). Like land's approval it has no
+  `cwd` (so the waiter ignores it; it runs in the checkout the watch record names,
+  else the serve repo) and a fixed `asked_at + answer_timeout` deadline
+  (`deputy::fixed_clock`); an expired question is left to "silence is a hold".
+  `release_watch::deputy_brief` says what each choice does, matched to
+  `apply_answer`: `leave it` stops watching and dismisses the notice, it does
+  **not** close the pull request. The deputy applies nothing and never merges,
+  closes, reruns or pushes: `--settle` records a choice and the watcher applies it
+  on its next lap (`WatchState::applied` makes that once). `deputy::merge_gated`
+  puts a local approval's `merge` / `hold` under the merge-approval rules
+  (`land::merge_intent`); `ask_settle_cmd` finds the task for the
+  `operator_held` check through `WatchState::run` and, when the record or run is
+  unknown, lets the settle through (nothing here releases a task). As for
+  opencode / omp seats, the deputy runs with `allow_write` and its read-only-ness
+  rests on the prompt. It is given no follow-up-task authority.
 - The mock agent in `tests/common/mod.rs` greps `prompt::DEPUTY_HEADING`; reword
   the heading and update both.
 

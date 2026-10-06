@@ -2123,9 +2123,10 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         }
     };
 
-    // A merge approval's deadline is fixed at `asked_at + answer_timeout` (the
-    // instant land abandons it), whatever this process's config or a reply says.
-    let budget = if q.node == magi::land::APPROVAL_NODE && q.answer_timeout > 0 {
+    // A merge approval's or release-watch question's deadline is fixed at
+    // `asked_at + answer_timeout` (the instant land / the watcher abandons it),
+    // whatever this process's config or a reply says.
+    let budget = if magi::deputy::fixed_clock(&q) && q.answer_timeout > 0 {
         remaining_answer_budget(q.asked_at, q.answer_timeout)
     } else {
         budget
@@ -2192,10 +2193,19 @@ fn ask_settle_cmd(store: &ask::Questions, id: &str, choices: &[String], quote: &
     store.update(&resolved, |q| {
         // A conductor question's `run` is the task id; a merge approval's is
         // the run id, so the task is the one that run belongs to.
+        // A release-watch question has no run; its watch record names the run
+        // that opened the pull request, when it knows one.
         let task = queue.get(&q.run).ok().or_else(|| {
             (q.node == magi::land::APPROVAL_NODE)
                 .then(|| queue.list().into_iter().find(|t| t.runs.contains(&q.run)))
                 .flatten()
+                .or_else(|| {
+                    (magi::deputy::kind_of(q) == Some(magi::deputy::Kind::Release))
+                        .then(|| {
+                            magi::release_watch::task_of_question(&magi::run::home(), q, &queue)
+                        })
+                        .flatten()
+                })
         });
         if let Some(task) = task
             && task.operator_held()
@@ -2250,7 +2260,7 @@ async fn ask_wait_cmd(
 
     let total = answer_timeout_for_wait(&q, timeout.unwrap_or(cfg.graph.answer_timeout));
     // A merge approval's clock never restarts on a reply (see `deputy::deadline`).
-    let from = if q.node == magi::land::APPROVAL_NODE {
+    let from = if magi::deputy::fixed_clock(&q) {
         q.asked_at
     } else {
         jiff::Timestamp::from_second(q.last_activity()).unwrap_or(q.asked_at)

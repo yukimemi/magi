@@ -5027,10 +5027,10 @@ fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
         return None;
     }
     if q.cwd.is_none() && q.deputy.is_none() {
-        return matches!(
+        return (matches!(
             q.node.as_str(),
             crate::conduct::NODE | crate::land::APPROVAL_NODE
-        )
+        ) || crate::deputy::kind_of(q) == Some(crate::deputy::Kind::Release))
         .then_some("nobody");
     }
     Some(match lease.filter(|l| l.fresh(jiff::Timestamp::now())) {
@@ -6440,6 +6440,23 @@ mod tests {
         let deputy = beat(ask::WaiterKind::Deputy, 1);
         assert_eq!(holder_of(&c, Some(&deputy)), Some("deputy"));
         assert_eq!(holder_of(&c, Some(&stale)), Some("nobody"));
+
+        // A release-watch question: nobody until a deputy is attached.
+        let mut r = Question::new(
+            String::new(),
+            crate::bump::NOTICE_NODE.to_owned(),
+            "release-watch".to_owned(),
+            "stuck?".to_owned(),
+            String::new(),
+            vec!["hold".to_owned()],
+        );
+        assert_eq!(holder_of(&r, None), Some("nobody"));
+        r.deputy = Some(ask::Deputy::new("brief".to_owned()));
+        assert_eq!(holder_of(&r, Some(&fresh)), Some("deputy"));
+        // A choice-less bump notice is nobody's question at all.
+        r.deputy = None;
+        r.seat = "bump".to_owned();
+        assert_eq!(holder_of(&r, None), None);
 
         // A merge approval is the same: nobody until a deputy is attached
         // and alive, never a silent "no holder".
