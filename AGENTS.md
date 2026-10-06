@@ -482,9 +482,10 @@ checkout is often stale or detached: nagi's run ce6e failed its gate on a step
 `origin/main` had already dropped.
 
 - **Order for locating the ref**, first hit wins: `[merge] base` / `remote` in
-  the machine layer; then the same keys probed (plain `toml`, no render, no other
-  key, unreadable ignored) from the checkout's `magi.toml` and
-  `.magi/config.toml`; then `remote = origin` and `base` from
+  the machine layer (rendered like a real load, so env templates and includes
+  count); then the same keys probed (rendered when possible, else plain `toml`;
+  nothing but `[merge]` is read, unreadable ignored) from the checkout's
+  `magi.toml` and `.magi/config.toml`; then `remote = origin` and `base` from
   `refs/remotes/<remote>/HEAD`. None of them: an error naming `[merge] base`.
 - **`discover` does not fetch** (it is sync and called per web request); it
   reads the tracking ref `daemon::fetch_loop` keeps fresh, so a display can be
@@ -496,8 +497,12 @@ checkout is often stale or detached: nagi's run ce6e failed its gate on a step
 - **Exceptions that are not fallbacks**: an explicit `--config` is read as
   named, and a directory that is not a git working tree (no branch to be stale
   against) reads its files from disk.
-- `include = [...]` is refused in a repository layer (a relative include would
-  resolve beside the extracted copy). Out of scope, still local-checkout reads:
+- A repository layer that mentions `include` gets the whole commit tree
+  extracted (`git archive | tar -x`) so relative includes resolve against the
+  same commit. The cache directory is built under a temp name and renamed in:
+  never write into it in place, concurrent `discover`s read it. Settings
+  (`view` / `save`) propagate an unreadable ref as an error instead of an empty
+  layer list. Out of scope, still local-checkout reads:
   `current_branch` base selection, the `is_clean` warning, `release_local`'s
   `Cargo.toml`.
 - Tests that start a run need a remote: `tests/common::fixture` pushes `main` to

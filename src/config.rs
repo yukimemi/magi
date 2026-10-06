@@ -18,10 +18,11 @@
 //! `remote` and `base` are themselves in the file, so they are resolved in a
 //! fixed order, first hit wins:
 //!
-//! 1. `[merge] base` / `remote` of the machine layer;
-//! 2. the same keys, read minimally (no render, no other key) from the
-//!    checkout's `magi.toml`, then `.magi/config.toml` - only to *locate* the
-//!    ref; an unreadable file is ignored;
+//! 1. `[merge] base` / `remote` of the machine layer, rendered as a real load
+//!    would (env templates, includes);
+//! 2. the same keys, read minimally (only `[merge]`, nothing deserialized into
+//!    `Config`) from the checkout's `magi.toml`, then `.magi/config.toml` -
+//!    only to *locate* the ref; an unreadable file is ignored;
 //! 3. `remote` defaults to `origin`, `base` to what
 //!    `refs/remotes/<remote>/HEAD` points at.
 //!
@@ -33,8 +34,10 @@
 //! that: an explicit `--config`, and a `repo` that is not a git working tree
 //! at all (no branch exists, so nothing can be stale).
 //!
-//! `include = [...]` is refused in a repository layer: a relative include
-//! would resolve beside the extracted copy, not the repository.
+//! A repository layer that declares `include = [...]` gets the whole tree of
+//! that commit extracted, so relative includes resolve against the same
+//! commit. The directory is built beside its name and renamed in, so a
+//! concurrent `discover` never reads a half-written layer.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -2030,9 +2033,23 @@ struct Probe {
     merge: Option<ProbeMerge>,
 }
 
-/// `[merge]` base / remote from one file, nothing else: no render, no other
-/// key, so an old file's unknown keys cannot fail it. Unreadable is `None`.
+/// `[merge]` base / remote from one file, nothing else. The file is rendered
+/// (env templates, includes) exactly as a real load would, so a machine layer
+/// saying `base = "{{ env.X }}"` locates the same ref; when rendering fails
+/// (a checkout file that needs its own repo context) the plain TOML is read
+/// instead. Unreadable is `None`: the real load reports it.
 fn probe_merge(path: &Path) -> Option<ProbeMerge> {
+    if !path.is_file() {
+        return None;
+    }
+    let paths = [path.to_path_buf()];
+    let mut engine = teravars::Engine::default();
+    let ctx = Config::render_ctx(&paths);
+    if let Ok(merged) = teravars::load_merged(&paths, &mut engine, &ctx)
+        && let Ok(probe) = toml::Value::Table(merged.config).try_into::<Probe>()
+    {
+        return probe.merge;
+    }
     let text = std::fs::read_to_string(path).ok()?;
     toml::from_str::<Probe>(&text).ok()?.merge
 }
@@ -2081,20 +2098,45 @@ fn fnv_hex(text: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// A line-level look for a top-level `include` key (before any table).
+/// Does the text mention an `include` directive (root or `[teravars]`)?
+/// Over-detecting only costs an extra extraction.
 fn declares_include(text: &str) -> bool {
-    for line in text.lines() {
-        let t = line.trim_start();
-        if t.starts_with('[') {
-            return false;
-        }
-        if let Some(rest) = t.strip_prefix("include")
-            && rest.trim_start().starts_with('=')
-        {
-            return true;
-        }
+    text.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("include")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    })
+}
+
+/// Unpack the whole tree of `sha` into `dest`, so relative `include`s of a
+/// repository layer resolve against the same commit.
+fn extract_tree(repo: &Path, sha: &str, dest: &Path) -> Result<()> {
+    use crate::proc::Quiet as _;
+    let mut archive = std::process::Command::new("git")
+        .args(["archive", "--format=tar", sha])
+        .quiet()
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("running git archive")?;
+    let tar = std::process::Command::new("tar")
+        .arg("-x")
+        .arg("-C")
+        .arg(dest)
+        .quiet()
+        .stdin(archive.stdout.take().context("git archive has no stdout")?)
+        .output()
+        .context("running tar")?;
+    let status = archive.wait().context("waiting for git archive")?;
+    if !status.success() || !tar.status.success() {
+        bail!(
+            "cannot unpack {sha} for the config's includes: {}",
+            String::from_utf8_lossy(&tar.stderr).trim()
+        );
     }
-    false
+    Ok(())
 }
 
 /// The repository layers (`.magi/config.toml`, `magi.toml`; lowest first) of
@@ -2113,49 +2155,74 @@ fn remote_layers(repo: &Path) -> Result<Vec<PathBuf>> {
                  a possibly stale local magi.toml instead"
             )
         })?;
-    let dir = git_out(
-        repo,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .map(|s| PathBuf::from(s.trim()).join("magi").join("config"))
-    .filter(|d| std::fs::create_dir_all(d).is_ok())
-    .unwrap_or_else(|| std::env::temp_dir().join("magi-config"));
     let key = format!("{sha}-{}", fnv_hex(&repo.to_string_lossy()));
-    let mut out = Vec::new();
-    for rel in [".magi/config.toml", "magi.toml"] {
+    let rels = [".magi/config.toml", "magi.toml"];
+    let mut texts: Vec<(&str, String)> = Vec::new();
+    for rel in rels {
         let object = format!("{sha}:{rel}");
         if git_out(repo, &["cat-file", "-e", &object]).is_none() {
-            // `cat-file -e` is silent on success; `git_out` reports status.
             continue;
         }
         let Some(text) = git_out(repo, &["show", &object]) else {
             bail!("cannot read {rel} from {remote}/{base} ({sha})");
         };
-        if declares_include(&text) {
-            bail!(
-                "{rel} on {remote}/{base} uses `include`, which is not supported in a \
-                 repository layer (it would resolve beside an extracted copy, not the repository)"
-            );
-        }
-        let mut target = dir.join(&key);
-        let write = |target: &Path| -> std::io::Result<PathBuf> {
-            let file = target.join(rel);
-            let parent = file.parent().unwrap_or(target);
-            std::fs::create_dir_all(parent)?;
-            std::fs::write(&file, &text)?;
-            std::fs::write(parent.join(REPO_MARKER), repo.to_string_lossy().as_bytes())?;
-            Ok(file)
-        };
-        let file = match write(&target) {
-            Ok(f) => f,
-            Err(_) => {
-                target = std::env::temp_dir().join("magi-config").join(&key);
-                write(&target).with_context(|| format!("writing {}", target.display()))?
-            }
-        };
-        out.push(file);
+        texts.push((rel, text));
     }
-    Ok(out)
+    let wants_tree = texts.iter().any(|(_, t)| declares_include(t));
+    // Content-addressed and built beside the final name, then renamed in: a
+    // concurrent `discover` sees the whole directory or none of it, never a
+    // half-written file.
+    let build = |root: &Path| -> Result<PathBuf> {
+        let final_dir = root.join(&key);
+        if !final_dir.is_dir() {
+            std::fs::create_dir_all(root)?;
+            let tmp = root.join(format!(
+                "{key}.tmp-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default()
+            ));
+            let filled = (|| -> Result<()> {
+                std::fs::create_dir_all(&tmp)?;
+                if wants_tree {
+                    extract_tree(repo, &sha, &tmp)?;
+                }
+                for (rel, text) in &texts {
+                    let file = tmp.join(rel);
+                    let parent = file.parent().unwrap_or(&tmp);
+                    std::fs::create_dir_all(parent)?;
+                    std::fs::write(&file, text)?;
+                    std::fs::write(parent.join(REPO_MARKER), repo.to_string_lossy().as_bytes())?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = filled {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(e);
+            }
+            if std::fs::rename(&tmp, &final_dir).is_err() {
+                // Lost the race to another process building the same commit.
+                let _ = std::fs::remove_dir_all(&tmp);
+                if !final_dir.is_dir() {
+                    bail!("cannot place {}", final_dir.display());
+                }
+            }
+        }
+        Ok(final_dir)
+    };
+    let common = git_out(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(|s| PathBuf::from(s.trim()).join("magi").join("config"));
+    let dir = match common.map(|c| build(&c)) {
+        Some(Ok(d)) => d,
+        _ => build(&std::env::temp_dir().join("magi-config"))
+            .with_context(|| format!("extracting config from {remote}/{base}"))?,
+    };
+    Ok(texts.iter().map(|(rel, _)| dir.join(rel)).collect())
 }
 
 #[cfg(test)]
@@ -3091,10 +3158,35 @@ mod tests {
         }
 
         #[test]
-        fn include_in_a_repository_layer_is_refused() {
-            let (_t, repo) = fixture("include = [\"x.toml\"]\n", "");
-            let err = format!("{:#}", Config::discover(&repo, None).unwrap_err());
-            assert!(err.contains("include"), "{err}");
+        fn an_include_in_a_repository_layer_resolves_against_the_same_commit() {
+            let (_t, repo) = fixture("include = [\"gate.toml\"]\n", "");
+            std::fs::write(repo.join("magi.toml"), "include = [\"gate.toml\"]\n").unwrap();
+            std::fs::write(repo.join("gate.toml"), "[graph]\ncandidates = 2\n").unwrap();
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-m", "inc"]);
+            git(&repo, &["push", "origin", "trunk"]);
+            git(&repo, &["fetch", "origin"]);
+            // The working tree's copy differs and must not be used.
+            std::fs::write(repo.join("gate.toml"), "[graph]\ncandidates = 9\n").unwrap();
+            let (cfg, _) = Config::discover(&repo, None).unwrap();
+            assert_eq!(cfg.graph.candidates, 2);
+        }
+
+        #[test]
+        fn a_machine_layer_base_is_rendered_before_locating_the_ref() {
+            let (t, repo) = fixture("[graph]\ncandidates = 2\n", "[merge]\nbase = \"nope\"\n");
+            let m = t.path().join("machine.toml");
+            std::fs::write(
+                &m,
+                "[merge]\nbase = \"{{ env.MAGI_TEST_NO_SUCH | default(value='trunk') }}\"\n",
+            )
+            .unwrap();
+            let (remote, base) = {
+                let probe = probe_merge(&m).unwrap();
+                (probe.remote, probe.base)
+            };
+            assert_eq!((remote, base), (None, Some("trunk".to_owned())));
+            let _ = repo;
         }
 
         #[test]

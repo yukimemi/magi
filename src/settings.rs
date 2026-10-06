@@ -137,8 +137,22 @@ fn repo_layers(repo: &Path) -> Vec<PathBuf> {
     })
 }
 
+/// Every layer that applies to `repo` itself, machine first; an unreadable
+/// remote ref is an error, never an empty list (settings for an unknown config
+/// must not be editable).
+fn layer_paths_strict(repo: &Path, machine: Option<&Path>) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths: Vec<PathBuf> = machine
+        .filter(|m| m.is_file())
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    paths.extend(Config::repo_layers(repo)?);
+    Ok(paths)
+}
+
 /// Every layer that applies, machine first - [`Config::layers`] with the
-/// machine path injected.
+/// machine path injected. Lenient: for *other* checkouts, whose own failures
+/// are not this screen's business.
 fn layer_paths(repo: &Path, machine: Option<&Path>) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = machine
         .filter(|m| m.is_file())
@@ -205,7 +219,16 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
         roles: Vec::new(),
         agents: Vec::new(),
     };
-    let paths = layer_paths(repo, machine);
+    let paths = match layer_paths_strict(repo, machine) {
+        Ok(p) => p,
+        Err(e) => {
+            out.error = Some(ConfigError {
+                message: format!("{e:#}"),
+                path: None,
+            });
+            return out;
+        }
+    };
     let cfg = match effective(&paths) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -463,7 +486,14 @@ pub(crate) fn save(
     // Validate the real thing: the layered load with the proposal standing in
     // for the machine file.
     let mut layers = vec![tmp.clone()];
-    layers.extend(repo_layers(repo));
+    match Config::repo_layers(repo) {
+        Ok(l) => layers.extend(l),
+        Err(e) => {
+            return Err(cleanup(SaveError::Refused(format!(
+                "The repository's config cannot be read, so nothing was saved: {e:#}"
+            ))));
+        }
+    }
     let loaded = Config::load_layers(&layers).map_err(|e| {
         cleanup(SaveError::Refused(format!(
             "The change would leave the config unloadable, so nothing was saved: {e:#}"
