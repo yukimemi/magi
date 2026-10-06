@@ -146,6 +146,23 @@ pub fn remote_head_branch(remote: &str, symref: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Record `refs/remotes/<remote>/HEAD` -> `<remote>/<base>` when it is absent,
+/// so a later read of the remote's default (`Config::discover`) agrees with
+/// the branch just resolved even when git did not create the symref on fetch
+/// (`followRemoteHEAD=never`, old git). Moves only `refs/remotes`; an existing
+/// symref is left alone. Best effort.
+pub async fn ensure_remote_head(repo: &Path, remote: &str, base: &str) {
+    let head = format!("refs/remotes/{remote}/HEAD");
+    if git_raw(repo, &["symbolic-ref", "--quiet", &head])
+        .await
+        .is_ok_and(|o| o.ok())
+    {
+        return;
+    }
+    let target = format!("refs/remotes/{remote}/{base}");
+    let _ = git_raw(repo, &["symbolic-ref", &head, &target]).await;
+}
+
 /// The branch in `git ls-remote --symref <remote> HEAD` output
 /// (`ref: refs/heads/main\tHEAD`).
 fn symref_branch(out: &str) -> Option<String> {

@@ -1555,8 +1555,8 @@ impl Config {
             // A checkout that was never cloned from the remote has no
             // `<remote>/HEAD`; learn it here (refs/remotes only) so an
             // ordinary start recovers instead of failing in `discover`.
-            let (remote, explicit) = probe_remote_base(repo);
-            let base = crate::git::merge_base_branch(repo, &remote, explicit.as_deref()).await?;
+            let (remote, cfg_base) = probe_remote_base(repo);
+            let base = crate::git::merge_base_branch(repo, &remote, cfg_base.as_deref()).await?;
             let out = crate::git::fetch(repo, &remote, &base)
                 .await
                 .with_context(|| format!("fetching {remote}/{base} to read magi.toml"))?;
@@ -1565,6 +1565,9 @@ impl Config {
                     "cannot read magi.toml: `git fetch {remote} {base}` failed ({});                      refusing to use the local checkout's copy, which may be stale",
                     out.stderr.lines().next().unwrap_or("").trim()
                 );
+            }
+            if cfg_base.is_none() {
+                crate::git::ensure_remote_head(repo, &remote, &base).await;
             }
         }
         Self::discover(repo, explicit)
@@ -3247,6 +3250,25 @@ mod tests {
                 .block_on(Config::discover_fetched(&repo, None))
                 .unwrap_err();
             assert!(format!("{err:#}").contains("fetch"), "{err:#}");
+        }
+
+        #[test]
+        fn discover_fetched_survives_a_fetch_that_leaves_no_origin_head() {
+            // Never-fetched remote + followRemoteHEAD=never: fetch creates
+            // origin/trunk but not origin/HEAD, which discovery then re-reads.
+            let (_t, repo) = fixture("[graph]\ncandidates = 2\n", "");
+            git(&repo, &["remote", "set-head", "origin", "-d"]);
+            git(&repo, &["update-ref", "-d", "refs/remotes/origin/trunk"]);
+            git(
+                &repo,
+                &["config", "remote.origin.followRemoteHEAD", "never"],
+            );
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (cfg, _) = rt.block_on(Config::discover_fetched(&repo, None)).unwrap();
+            assert_eq!(cfg.graph.candidates, 2);
         }
 
         #[test]
