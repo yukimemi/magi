@@ -356,7 +356,7 @@ mod tests {
         let got = answer_in_chat(&store, &cfg, &talk.id).await.unwrap();
         assert_eq!(got, Handled::LeftQueued);
         let after = store.get(&talk.id).unwrap();
-        assert!(is_consult_text(&after.pending));
+        assert!(after.pending.contains(crate::prompt::CHAT_CONSULT_HEADING));
         assert_eq!(after.turns.len(), 1, "no agent turn was started");
     }
 }
