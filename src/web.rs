@@ -14748,6 +14748,9 @@ mod tests {
     fn stats_verdict_donut_has_fixed_colours_and_a_minimum_arc() {
         assert!(APP_JS.contains("function statsDonutArcs"));
         assert!(APP_JS.contains("STATS_DONUT_MIN_DEG"));
+        // A bucket click filters by the statuses src/stats.rs counts in it.
+        assert!(APP_JS.contains("function statusInBucket"));
+        assert!(APP_JS.contains("statuses: [\"superseded\", \"already_in_base\"]"));
         assert!(INDEX_HTML.contains("id=\"stats-verdict-donut\""));
         let buckets = [
             "merged",

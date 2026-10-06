@@ -1561,10 +1561,18 @@ function sectionCompatibleWithStateFilter(sectionKey, filterKey) {
    stats tile can set (see openRunsFiltered): "Merged" is done by
    construction, so pairing it with "Active" or "In flight" always yields
    zero cards the same way "Landed" does. */
+/* A stats bucket is not always one RunStatus: "In flight" is every active
+   status and "Superseded" also takes already_in_base (mirroring src/stats.rs).
+   A filter that is not a bucket key is an exact status. */
+function statusInBucket(runStatus, filterStatus) {
+  const bucket = STATS_VERDICT_BUCKETS.find((b) => b.key === filterStatus);
+  return bucket ? bucket.statuses.includes(runStatus) : runStatus === filterStatus;
+}
+
 function statusCompatibleWithStateFilter(status, filterKey) {
   const filter = RUN_STATE_FILTERS.find((f) => f.key === filterKey);
   if (!filter) return true;
-  return REPRESENTATIVE_RUN_SHAPES.some((run) => run.status === status && filter.match(run));
+  return REPRESENTATIVE_RUN_SHAPES.some((run) => statusInBucket(run.status, status) && filter.match(run));
 }
 
 /* A head that still names a `superseded_by` (see foldRuns below) is one
@@ -1747,7 +1755,7 @@ function buildRunsTree(bySection) {
    screen, not a place worth deep-linking to. */
 function matchesFilter(run) {
   const { section, repo, status } = state.runsFilter;
-  if (status && String(run.status || "") !== status) return false;
+  if (status && !statusInBucket(String(run.status || ""), status)) return false;
   if (!section) return true;
   if (runSection(run) !== section) return false;
   return !repo || repoLabel(run) === repo;
@@ -3082,14 +3090,14 @@ function renderStatsTiles(t) {
    tiles. `blocked` and `stalled` are deliberately different colours now: see
    RunStatus::Stalled's own doc for why a stall must never read as decided. */
 const STATS_VERDICT_BUCKETS = [
-  { key: "merged", label: "Merged" },
-  { key: "ready", label: "Ready" },
-  { key: "in_progress", label: "In flight" },
-  { key: "blocked", label: "Blocked" },
-  { key: "stalled", label: "Stalled" },
-  { key: "failed", label: "Failed" },
-  { key: "verified_noop", label: "Verified no-op" },
-  { key: "superseded", label: "Superseded" },
+  { key: "merged", label: "Merged", statuses: ["merged"] },
+  { key: "ready", label: "Ready", statuses: ["ready"] },
+  { key: "in_progress", label: "In flight", statuses: ["prep", "implementing", "judging", "deliberating", "voting", "reviewing", "gating", "landing"] },
+  { key: "blocked", label: "Blocked", statuses: ["blocked"] },
+  { key: "stalled", label: "Stalled", statuses: ["stalled"] },
+  { key: "failed", label: "Failed", statuses: ["failed"] },
+  { key: "verified_noop", label: "Verified no-op", statuses: ["verified_noop"] },
+  { key: "superseded", label: "Superseded", statuses: ["superseded", "already_in_base"] },
 ];
 
 /* Pure: degrees per slice for `counts` (zeros are dropped, so the result
