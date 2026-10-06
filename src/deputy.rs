@@ -311,6 +311,8 @@ pub struct Deputies {
     halt: Halt,
     tasks: JoinSet<String>,
     inflight: HashSet<String>,
+    /// The subset of `inflight` serving a [`Kind::Generic`] question.
+    generic: HashSet<String>,
     /// Earliest next start per question.
     memo: HashMap<String, Instant>,
 }
@@ -334,6 +336,7 @@ impl Deputies {
             halt,
             tasks: JoinSet::new(),
             inflight: HashSet::new(),
+            generic: HashSet::new(),
             memo: HashMap::new(),
         }
     }
@@ -350,10 +353,12 @@ impl Deputies {
         while let Some(done) = self.tasks.try_join_next() {
             if let Ok(id) = done {
                 self.inflight.remove(&id);
+                self.generic.remove(&id);
             }
         }
         if self.tasks.is_empty() {
             self.inflight.clear();
+            self.generic.clear();
         }
     }
 
@@ -407,7 +412,11 @@ impl Deputies {
     /// that has none, within the limits. Returns without waiting for them.
     pub fn tick(&mut self, now: Timestamp) {
         self.reap();
-        for q in self.store.list() {
+        // Generic questions go last, so on a tick that starts several deputies
+        // the approvals, conductor and release-watch questions get the slots first.
+        let mut open = self.store.list();
+        open.sort_by_key(|q| kind_of(q) == Some(Kind::Generic));
+        for q in open {
             if (self.halt)() {
                 return;
             }
@@ -445,8 +454,25 @@ impl Deputies {
             {
                 continue;
             }
-            if self.inflight.len() >= self.max || !can_start(self.cfg.as_ref(), dep.agent.as_str())
-            {
+            // A generic deputy never takes the last slot (unless that is the only
+            // one), so a pile of triage questions cannot keep an approval's
+            // deputy from starting.
+            let cap = if kind == Kind::Generic {
+                self.max.saturating_sub(1).max(1)
+            } else {
+                self.max
+            };
+            let generic_running = self
+                .inflight
+                .iter()
+                .filter(|id| self.generic.contains(*id))
+                .count();
+            let full = if kind == Kind::Generic {
+                generic_running >= cap || self.inflight.len() >= self.max
+            } else {
+                self.inflight.len() >= self.max
+            };
+            if full || !can_start(self.cfg.as_ref(), dep.agent.as_str()) {
                 continue;
             }
             if matches!(self.memo.get(&q.id), Some(until) if Instant::now() < *until) {
@@ -455,6 +481,9 @@ impl Deputies {
             self.memo
                 .insert(q.id.clone(), Instant::now() + RESTART_AFTER);
             self.inflight.insert(q.id.clone());
+            if kind == Kind::Generic {
+                self.generic.insert(q.id.clone());
+            }
             let job = Job {
                 store: self.store.clone(),
                 home: self.home.clone(),
@@ -478,9 +507,11 @@ impl Deputies {
         while let Some(done) = self.tasks.join_next().await {
             if let Ok(id) = done {
                 self.inflight.remove(&id);
+                self.generic.remove(&id);
             }
         }
         self.inflight.clear();
+        self.generic.clear();
     }
 
     /// Say once that nobody is listening any more.

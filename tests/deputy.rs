@@ -724,3 +724,35 @@ fn a_generic_question_runs_on_a_fixed_clock_and_is_merge_gated() {
     assert_eq!(magi::deputy::deadline(&q, 999), 1100);
     assert!(magi::deputy::merge_gated(&q));
 }
+
+common::e2e! {
+async fn generic_deputies_leave_a_slot_for_the_others() {
+    let s = scene(home_lock().await);
+    let mut d = deputies(&s, 2);
+    let mut ids = Vec::new();
+    for n in 0..2 {
+        let mut g = q_with(magi::triage::NODE, "triage", &["resume", "discard"]);
+        g.summary = format!("stale task {n}");
+        s.store.put(&mut g).unwrap();
+        s.store.update(&g.id, |q| q.say("hello")).unwrap();
+        ids.push(g.id);
+    }
+    s.store.update(&s.q.id, |q| q.say("setup done")).unwrap();
+
+    turn(&mut d).await;
+
+    let started = |id: &str| {
+        s.store
+            .get(id)
+            .unwrap()
+            .deputy
+            .is_some_and(|dep| dep.starts > 0)
+    };
+    assert!(started(&s.q.id), "the conductor's deputy starts first");
+    assert_eq!(
+        ids.iter().filter(|id| started(id)).count(),
+        1,
+        "only one generic deputy fits beside it"
+    );
+}
+}

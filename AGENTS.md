@@ -1379,8 +1379,11 @@ not move on a say.
   appears only while a deputy-eligible question is still unattended; a question
   with a `cwd` and a choice-less bump notice show no holder. **A new question
   filer must be added to `known_filers()` in `tests/deputy.rs`**: a scan of
-  `src/` fails on a `Question::new` node it does not know. Known limit: when
-  triage questions fill `max_deputies`, an approval's deputy waits for a slot.
+  `src/` fails on a `Question::new` node it does not know. Slots: `tick` visits
+  Generic questions last and a Generic deputy never takes the last slot
+  (`max_deputies - 1`, at least 1), so triage questions cannot starve an
+  approval / conductor / release-watch deputy. A turn already running is not
+  preempted.
 
 ### The web UI: one binary, no authentication, and no lying empty states
 
