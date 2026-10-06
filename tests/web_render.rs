@@ -1133,7 +1133,7 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
       window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
-        return { state, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows };
+        return { state, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
     })()"#,
@@ -1450,5 +1450,69 @@ async fn stats_bars_are_stable_per_agent_and_honest_about_sample_size() {
     assert_eq!(out["spill"], true);
     assert_eq!(out["n9"], 1);
     assert_eq!(out["n10"], 0);
+    browser.close_page(&page).await;
+}
+
+#[tokio::test]
+async fn stats_scatter_plots_reviewers_on_a_log_axis() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP stats scatter: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let base = serve(
+        &home,
+        queue.clone(),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser
+        .open_page(&format!("{base}#/stats"), 390, 800, true)
+        .await
+        .expect("page");
+    client_harness(&mut browser, &page).await;
+    let out = browser
+        .eval(
+            &page,
+            r#"(() => {
+      const r = (agent, adopted, submitted) => ({ agent, adopted, submitted });
+      const root = document.getElementById('stats-reviewers-scatter');
+      const one = deck.statsScatterPlan([r('a', 1, 1)]);
+      deck.renderStatsReviewerScatter([r('a', 1, 1)]);
+      const hiddenOne = root.hidden;
+      const rows = [r('tiny', 3, 3), r('big', 74, 160), r('mid', 20, 40)];
+      const plan = deck.statsScatterPlan(rows);
+      const by = Object.fromEntries(plan.dots.map(d => [d.agent, d]));
+      deck.renderStatsReviewerScatter(rows);
+      const ys = plan.dots.map(d => d.labelY).sort((x, y) => x - y);
+      return {
+        one: one === null, hiddenOne,
+        shown: !root.hidden, dots: root.querySelectorAll('.scatter-dot').length,
+        logX: (by.big.x - by.mid.x) < (by.mid.x - by.tiny.x) * 2,
+        whisker: (by.tiny.yLo - by.tiny.yHi) > (by.big.yLo - by.big.yHi),
+        hollow: [by.tiny.low, by.big.low],
+        gaps: ys.every((y, i) => i === 0 || y - ys[i - 1] >= 10.99),
+        spill: root.scrollWidth <= root.clientWidth + 1,
+      };
+    })()"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out["one"], true);
+    assert_eq!(out["hiddenOne"], true);
+    assert_eq!(out["shown"], true);
+    assert_eq!(out["dots"], 3);
+    assert_eq!(out["logX"], true);
+    assert_eq!(out["whisker"], true);
+    assert_eq!(out["hollow"], serde_json::json!([true, false]));
+    assert_eq!(out["gaps"], true);
+    assert_eq!(out["spill"], true);
     browser.close_page(&page).await;
 }

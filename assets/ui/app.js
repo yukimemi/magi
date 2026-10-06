@@ -3276,6 +3276,97 @@ function renderStatsReviewers(reviewers) {
     fraction: `${r.adopted}/${r.submitted} adopted`,
     rate: r.precision,
   })));
+  renderStatsReviewerScatter(reviewers);
+}
+
+const STATS_SCATTER = { w: 360, h: 230, l: 42, r: 12, t: 12, b: 36, gap: 11 };
+
+/* Wilson 95% interval of a/s, as fractions. */
+function statsWilson(a, s) {
+  const z = 1.96, p = a / s, d = 1 + (z * z) / s;
+  const mid = (p + (z * z) / (2 * s)) / d;
+  const half = (z * Math.sqrt((p * (1 - p)) / s + (z * z) / (4 * s * s))) / d;
+  return [Math.max(0, mid - half), Math.min(1, mid + half)];
+}
+
+/* Pure: reviewers with `submitted > 0` as dots - x log10(submitted), y the
+   adoption rate - plus each dot's Wilson interval and a label position pushed
+   apart vertically. null when fewer than two reviewers have data. */
+function statsScatterPlan(reviewers) {
+  const rows = reviewers.filter((r) => r.submitted > 0);
+  if (rows.length < 2) return null;
+  const g = STATS_SCATTER;
+  const pw = g.w - g.l - g.r, ph = g.h - g.t - g.b;
+  const maxS = Math.max(...rows.map((r) => r.submitted));
+  const decades = Math.max(1, Math.ceil(Math.log10(maxS)));
+  const X = (n) => g.l + (Math.log10(n) / decades) * pw;
+  const Y = (f) => g.t + (1 - f) * ph;
+  const ticks = [];
+  for (let i = 0; i <= decades; i++) ticks.push({ n: 10 ** i, x: X(10 ** i) });
+  const dots = rows.map((r) => {
+    const [lo, hi] = statsWilson(r.adopted, r.submitted);
+    const flip = X(r.submitted) > g.l + pw * 0.6;
+    return {
+      agent: r.agent, submitted: r.submitted, adopted: r.adopted,
+      pct: (100 * r.adopted) / r.submitted,
+      x: X(r.submitted), y: Y(r.adopted / r.submitted),
+      yLo: Y(lo), yHi: Y(hi), low: r.submitted < STATS_LOW_N,
+      flip, labelX: X(r.submitted) + (flip ? -7 : 7), labelY: 0,
+    };
+  });
+  /* Labels: top to bottom, each at least `gap` below the previous one. */
+  const byY = [...dots].sort((p, q) => p.y - q.y || (p.agent < q.agent ? -1 : 1));
+  let prev = -Infinity;
+  for (const d of byY) {
+    d.labelY = Math.max(d.y + 3, prev + g.gap);
+    prev = d.labelY;
+  }
+  return { w: g.w, h: g.h, l: g.l, r: g.w - g.r, t: g.t, b: g.t + ph, ticks, dots };
+}
+
+function renderStatsReviewerScatter(reviewers) {
+  const root = $("stats-reviewers-scatter");
+  clear(root);
+  const plan = statsScatterPlan(reviewers);
+  show(root, plan !== null);
+  if (!plan) return;
+  const axis = { stroke: "var(--line-2)", "stroke-width": 1 };
+  const kids = [];
+  for (const [f, label] of [[0, "0%"], [0.5, "50%"], [1, "100%"]]) {
+    const y = plan.t + (1 - f) * (plan.b - plan.t);
+    kids.push(
+      svg("line", { class: "scatter-grid", x1: plan.l, x2: plan.r, y1: y, y2: y, ...axis }),
+      svg("text", { class: "scatter-tick", x: plan.l - 5, y: y + 3, "text-anchor": "end", text: label }),
+    );
+  }
+  for (const t of plan.ticks) {
+    kids.push(
+      svg("line", { class: "scatter-grid", x1: t.x, x2: t.x, y1: plan.t, y2: plan.b, ...axis }),
+      svg("text", { class: "scatter-tick", x: t.x, y: plan.b + 13, "text-anchor": "middle", text: String(t.n) }),
+    );
+  }
+  kids.push(
+    svg("text", { class: "scatter-axis", x: (plan.l + plan.r) / 2, y: plan.h - 4, "text-anchor": "middle", text: "findings submitted (log)" }),
+    svg("text", { class: "scatter-axis", x: 10, y: (plan.t + plan.b) / 2, "text-anchor": "middle", transform: `rotate(-90 10 ${(plan.t + plan.b) / 2})`, text: "adoption rate" }),
+  );
+  for (const d of plan.dots) {
+    const tone = statsAgentTone(d.agent);
+    const tip = `${d.agent}: ${d.adopted}/${d.submitted} adopted (${d.pct.toFixed(0)}%)${d.low ? " - low n" : ""}`;
+    kids.push(svg(
+      "g", { class: "scatter-dot", "data-agent": d.agent },
+      svg("title", { text: tip }),
+      svg("line", { class: "scatter-whisker", x1: d.x, x2: d.x, y1: d.yHi, y2: d.yLo, stroke: tone }),
+      svg("circle", {
+        cx: d.x, cy: d.y, r: 4.5, stroke: tone, "stroke-width": 2,
+        fill: d.low ? "var(--sunk)" : tone, "data-low-n": d.low ? "" : null,
+      }),
+      svg("text", { class: "scatter-label", x: d.labelX, y: d.labelY, "text-anchor": d.flip ? "end" : "start", text: d.agent }),
+    ));
+  }
+  const svgNode = svg("svg", { viewBox: `0 0 ${plan.w} ${plan.h}`, class: "scatter-svg", "aria-hidden": "true" }, kids);
+  root.append(svgNode);
+  setAttr(root, "aria-label", `Review precision by findings submitted: ${plan.dots
+    .map((d) => `${d.agent} ${d.adopted}/${d.submitted} (${d.pct.toFixed(0)}%)`).join(", ")}`);
 }
 
 function renderStatsAdvisors(advisors) {

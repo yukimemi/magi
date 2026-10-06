@@ -10874,6 +10874,24 @@ mod tests {
     }
 
     #[test]
+    fn the_precision_scatter_is_a_pure_plan_in_the_agents_colour() {
+        let start = APP_JS
+            .find("function renderStatsReviewerScatter(")
+            .expect("renderStatsReviewerScatter exists");
+        let body = &APP_JS[start..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        assert!(body.contains("statsScatterPlan(reviewers)"));
+        assert!(body.contains("statsAgentTone(d.agent)"));
+        assert!(APP_JS.contains("function statsScatterPlan("));
+        assert!(
+            APP_JS.contains("d.submitted < STATS_LOW_N")
+                || APP_JS.contains("r.submitted < STATS_LOW_N")
+        );
+        assert!(INDEX_HTML.contains("id=\"stats-reviewers-scatter\""));
+        assert!(APP_CSS.contains(".precision-scatter"));
+    }
+
+    #[test]
     fn a_keystroke_invalidates_the_search_reply_still_in_flight() {
         let start = APP_JS
             .find("function scheduleSearch(")
