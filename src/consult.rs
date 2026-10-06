@@ -50,9 +50,17 @@ pub fn origin_talk(tasks: &[Task], talks: &[Talk], q: &Question) -> Option<Talk>
         .cloned()
 }
 
-/// Is `body` a turn [`crate::prompt::chat_consult`] wrote?
-pub fn is_consult_text(body: &str) -> bool {
-    body.contains(&format!("# {}\n", crate::prompt::CHAT_CONSULT_HEADING))
+/// Is any question handed to talk `talk_id` still open?
+///
+/// Decided from the question store, not from the newest turn's wording: the
+/// owner's decision usually arrives in a later turn that carries no hand-over
+/// heading, and `magi answer` still has to be able to write then. Answered or
+/// abandoned questions stop counting, so the turn goes back to read-only.
+pub fn pending_consults(questions: &Questions, talk_id: &str) -> bool {
+    questions
+        .list()
+        .iter()
+        .any(|q| q.status.open() && q.consult.as_ref().is_some_and(|c| c.talk == talk_id))
 }
 
 /// Record the hand-over and queue the question as the chat's next message.
@@ -204,6 +212,31 @@ mod tests {
         let mut q = question(crate::conduct::NODE);
         q.run = chat.id.clone();
         assert!(origin_talk(&[chat], &[talk], &q).is_some());
+    }
+
+    #[test]
+    fn pending_consults_follow_the_store_not_the_turn_text() {
+        let (tmp, store, talk) = talks();
+        let questions = Questions::at(tmp.path().join("questions"));
+        assert!(!pending_consults(&questions, &talk.id), "empty store");
+
+        let mut plain = question("implement");
+        questions.put(&mut plain).unwrap();
+        assert!(!pending_consults(&questions, &talk.id), "no consult record");
+
+        let mut q = question("implement");
+        questions.put(&mut q).unwrap();
+        begin(&questions, &store, &q, &talk).unwrap();
+        assert!(pending_consults(&questions, &talk.id));
+        assert!(!pending_consults(&questions, "other-talk"));
+
+        questions
+            .update(&q.id, |q| {
+                q.abandon("test");
+                Ok(())
+            })
+            .unwrap();
+        assert!(!pending_consults(&questions, &talk.id), "closed question");
     }
 
     #[test]

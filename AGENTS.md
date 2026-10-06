@@ -1989,7 +1989,7 @@ with `magi answer` or puts the decision points to the owner in the chat.
   `Question::answer` is untouched. The question stays `Open`; `Question::consult`
   (`ask::SCHEMA` 6, `#[serde(default)]`) only records that the chat was asked, so
   a second tap is a no-op. Written through `Questions::update`.
-- **Write access is for the consult turn only.** `talk::turn` lets the turn whose newest message is a hand-over write, with the question store as a writable root; later turns are read-only again, and the prompt tells the chat to hand the owner the exact `magi answer` command.
+- **Write access lasts while a handed-over question is open.** `talk::turn` lets a turn write, with the question store as a writable root, whenever `consult::pending_consults` finds an open question whose `Question::consult` names this talk - so the owner's later decision turn can still run `magi answer`. Answered or abandoned questions stop counting and the chat is read-only again. The prompt limits the write to `magi answer`; the sandbox does not.
 - **No new seat, no new waiter.** The text goes in through `talk::queue`, and
   the talk's own turn gate and session run it. The web route starts the drain
   when the turn slot is free; the CLI only leaves the draft, which the owner

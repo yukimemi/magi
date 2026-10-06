@@ -1447,11 +1447,14 @@ pub fn chat_consult(q: &crate::ask::Question) -> String {
          know, answer it yourself with `magi answer {id} --reply <choice or text>`, \
          then say in this conversation what you answered and why.\n\
          - If it needs the operator's judgement, do not answer. Reply here with \
-         the question and the decision points spelled out, so they can decide in \
-         this conversation. You can only write while answering this one turn, so \
-         end your reply with the exact command for their decision, `magi answer \
-         {id} --reply <choice or text>`, for them to run or to tap on the \
-         question's card.\n",
+         the question and the decision points spelled out, then wait for their \
+         decision. They can also answer on the question's card. When they \
+         clearly decide it in this conversation - in a later turn too - run \
+         `magi answer {id} --reply <choice or text>` yourself and report what \
+         you saved. Never take a vague remark for a decision, and if several \
+         consultations are unanswered and it is unclear which one a reply is \
+         for, ask instead of guessing. `magi answer` is the only write you may \
+         make: do not edit the repository.\n",
         id = q.id,
     ));
     s
