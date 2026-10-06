@@ -1133,7 +1133,7 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
       window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
-        return { state, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads };
+        return { state, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
     })()"#,
@@ -1372,5 +1372,83 @@ async fn delta_list_benchmark() {
             .expect("benchmark scenario");
         eprintln!("DELTA_BENCH {results}");
     }
+    browser.close_page(&page).await;
+}
+
+#[tokio::test]
+async fn stats_bars_are_stable_per_agent_and_honest_about_sample_size() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP stats bars: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let base = serve(
+        &home,
+        queue.clone(),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser
+        .open_page(&format!("{base}#/stats"), 390, 800, true)
+        .await
+        .expect("page");
+    client_harness(&mut browser, &page).await;
+    let out = browser
+        .eval(
+            &page,
+            r#"(() => {
+      const r = (agent, num, den) => ({ agent, fraction: `${num}/${den} won`,
+        rate: den ? { pct: 100 * num / den, denominator: den } : null });
+      const root = document.createElement('div');
+      document.body.append(root);
+      deck.statsBarRows(root, [r('a', 0, 2), r('sonnet', 56, 719), r('b', 1, 3), r('z', 0, 0), r('c', 9, 10)]);
+      const rows = [...root.querySelectorAll('.bar-row')];
+      const other = document.createElement('div');
+      deck.statsBarRows(other, [r('sonnet', 1, 1), r('x', 5, 9)]);
+      const tone = el => el.querySelector('.bar-fill').style.background;
+      const sonnet = rows.find(x => x.textContent.includes('sonnet'));
+      return {
+        order: rows.map(x => x.querySelector('.bar-row-name').firstChild.textContent),
+        low: rows.map(x => x.hasAttribute('data-low-n')),
+        tags: rows.map(x => !!x.querySelector('.bar-row-tag')),
+        tracks: rows.map(x => !!x.querySelector('.bar-track')),
+        n719: sonnet.textContent.includes('n=719'),
+        stable: tone(sonnet) === tone(other.querySelector('.bar-row')),
+        spill: root.scrollWidth <= root.clientWidth + 1,
+        n9: deck.statsBarPlan([r('q', 1, 9)])[0].tier,
+        n10: deck.statsBarPlan([r('q', 1, 10)])[0].tier,
+      };
+    })()"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out["order"],
+        serde_json::json!(["c", "sonnet", "b", "a", "z"])
+    );
+    assert_eq!(
+        out["low"],
+        serde_json::json!([false, false, true, true, false])
+    );
+    assert_eq!(
+        out["tags"],
+        serde_json::json!([false, false, true, true, false])
+    );
+    assert_eq!(
+        out["tracks"],
+        serde_json::json!([true, true, true, true, false])
+    );
+    assert_eq!(out["n719"], true);
+    assert_eq!(out["stable"], true);
+    assert_eq!(out["spill"], true);
+    assert_eq!(out["n9"], 1);
+    assert_eq!(out["n10"], 0);
     browser.close_page(&page).await;
 }

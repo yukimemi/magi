@@ -10652,6 +10652,26 @@ mod tests {
     }
 
     #[test]
+    fn stats_bars_share_one_id_keyed_plan() {
+        let start = APP_JS
+            .find("function statsBarRows(")
+            .expect("statsBarRows exists");
+        let body = &APP_JS[start..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        assert!(body.contains("statsBarPlan(rows)"));
+        assert!(body.contains("statsAgentTone(row.agent)"));
+        assert!(!body.contains("candTone(i)"));
+        assert!(APP_JS.contains("const STATS_LOW_N = 10;"));
+        for root in [
+            "stats-agents-bars",
+            "stats-reviewers-bars",
+            "stats-advisors-bars",
+        ] {
+            assert!(APP_JS.contains(&format!("statsBarRows($(\"{root}\")")));
+        }
+    }
+
+    #[test]
     fn a_keystroke_invalidates_the_search_reply_still_in_flight() {
         let start = APP_JS
             .find("function scheduleSearch(")

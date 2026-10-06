@@ -3116,32 +3116,67 @@ function renderStatsVerdictBar(t) {
   setAttr(bar, "aria-label", `Verdict breakdown of ${t.runs} runs: ${described.join(", ")}`);
 }
 
-/* Shared by the agent win-rate bars and the reviewer precision bars: a name,
-   a fraction, a percentage, and a track filled to that share of whichever
-   row in the table scored highest - so the tallest bar is always full width
-   rather than the tracks being scaled against 100% and every one of them
-   looking short on a workload where nobody wins often. */
+/* A rate over fewer than this many samples swings by 30 points or more on a
+   single outcome, so such a row is drawn dimmed and sorted below the rest. */
+const STATS_LOW_N = 10;
+
+/* A colour keyed by the agent id (FNV-1a over its UTF-16 units), never by row
+   position, so one agent keeps one colour in every section of the page. */
+function statsAgentTone(id) {
+  let h = 0x811c9dc5;
+  for (const c of String(id)) {
+    for (let i = 0; i < c.length; i++) {
+      h ^= c.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+  }
+  return candTone(h % 5);
+}
+
+/* Pure: sorts a copy of `rows` (tier - enough samples, low n, no rate - then
+   rate descending, denominator descending, agent id) and gives each row its
+   tier and bar width. The widest bar is scaled against the best row with
+   enough samples, so a lucky 1/1 does not shrink the rows that mean something;
+   only when no row has enough samples do all rows set the scale. */
+function statsBarPlan(rows) {
+  const tierOf = (r) => !r.rate || r.rate.denominator === 0 ? 2
+    : r.rate.denominator < STATS_LOW_N ? 1 : 0;
+  const planned = rows.map((row) => ({ row, tier: tierOf(row) }));
+  const pct = (p) => p.row.rate ? p.row.rate.pct : 0;
+  planned.sort((x, y) => x.tier - y.tier
+    || pct(y) - pct(x)
+    || (y.row.rate ? y.row.rate.denominator : 0) - (x.row.rate ? x.row.rate.denominator : 0)
+    || (x.row.agent < y.row.agent ? -1 : x.row.agent > y.row.agent ? 1 : 0));
+  const sure = planned.filter((p) => p.tier === 0);
+  const scale = Math.max(...(sure.length ? sure : planned.filter((p) => p.tier === 1)).map(pct), 1);
+  for (const p of planned) {
+    p.width = p.tier === 2 ? 0 : Math.min(100, (100 * pct(p)) / scale);
+  }
+  return planned;
+}
+
+/* Shared by the agent win-rate bars, the reviewer precision bars and the
+   advisor reflection bars: a name, a fraction, a percentage with its
+   denominator, and a track filled relative to the best well-sampled row. */
 function statsBarRows(root, rows) {
   clear(root);
-  const max = Math.max(...rows.map((r) => r.rate ? r.rate.pct : 0), 1);
-  rows.forEach((row, i) => {
-    const width = row.rate ? (100 * row.rate.pct) / max : 0;
-    root.append(el(
-      "div",
-      { class: "bar-row" },
-      el(
-        "div",
-        { class: "bar-row-head" },
-        el("span", { class: "bar-row-name", text: row.agent }),
-        el("span", { class: "bar-row-value", text: `${row.fraction} · ${statsPct(row.rate)}` }),
-      ),
-      el(
+  for (const { row, tier, width } of statsBarPlan(rows)) {
+    const name = el("span", { class: "bar-row-name", text: row.agent });
+    if (tier === 1) name.append(el("span", { class: "bar-row-tag", text: "low n" }));
+    const value = el("span", { class: "bar-row-value", text: `${row.fraction} · ${statsPct(row.rate)}` });
+    const n = row.rate ? row.rate.denominator : 0;
+    value.append(el("span", { class: "bar-row-n", text: tier === 2 ? "n=0" : `n=${n}` }));
+    const item = el("div", { class: "bar-row" }, el("div", { class: "bar-row-head" }, name, value));
+    if (tier === 1) setAttr(item, "data-low-n", "");
+    if (tier !== 2) {
+      item.append(el(
         "div",
         { class: "bar-track" },
-        el("div", { class: "bar-fill", style: `width: ${width.toFixed(1)}%; background: ${candTone(i)}` }),
-      ),
-    ));
-  });
+        el("div", { class: "bar-fill", style: `width: ${width.toFixed(1)}%; background: ${statsAgentTone(row.agent)}` }),
+      ));
+    }
+    root.append(item);
+  }
 }
 
 function renderStatsAgents(agents) {
