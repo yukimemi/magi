@@ -474,16 +474,13 @@ async fn resolve_base(repo: &Path, base_branch: &str, remote: &str) -> Result<St
         Ok(_) => format!("{remote} has no {base_branch}"),
         Err(e) => e.to_string(),
     };
-    tracing::warn!(
-        "could not read {tracking} ({why}); branching off the local \
-         {base_branch} instead, which may be behind"
-    );
-    git::rev_parse(repo, base_branch).await.with_context(|| {
-        format!(
-            "cannot resolve `{base_branch}`; set [merge] base in magi.toml to a \
-             branch that exists"
-        )
-    })
+    // No fallback to the local branch: it may be behind, and branching off an
+    // old commit is the stale-checkout bug this check exists to prevent.
+    bail!(
+        "cannot read {tracking} ({why}); refusing to branch off the local \
+         `{base_branch}`, which may be behind. Fix the remote, or set [merge] \
+         base / remote in magi.toml"
+    )
 }
 
 /// Exclusive claim on one run's `magi fix` step, released on drop — including

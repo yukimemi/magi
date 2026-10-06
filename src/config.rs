@@ -1,14 +1,43 @@
 //! Run configuration: the agent roster, the shape of the graph, and the
 //! blindness / verification policy.
 //!
-//! Discovery order (first hit wins):
+//! Layers, lowest precedence first: `<config_dir>/magi/config.toml` (machine),
+//! `.magi/config.toml`, `magi.toml`. With none, built-in defaults apply, the
+//! agent roster derived from the agent CLIs actually installed on this
+//! machine. `--config <path>` replaces the whole stack with that one file.
 //!
-//! 1. `--config <path>`
-//! 2. `<repo>/magi.toml`
-//! 3. `<repo>/.magi/config.toml`
-//! 4. `<config_dir>/magi/config.toml`
-//! 5. built-in defaults, with the agent roster derived from the agent CLIs
-//!    actually installed on this machine
+//! **The repository layers are read from `<remote>/<base>`, never from the
+//! working tree.** A primary checkout is often stale or on a detached HEAD, so
+//! a gate read from it can be older than the one the branch under review is
+//! cut from (run ce6e failed on a gate step `origin/main` had already
+//! dropped). `git show <sha>:magi.toml` of the remote-tracking ref's commit is
+//! written to a content-addressed directory under the git common dir
+//! (`<common>/magi/config/<sha>-<hash of repo>/`, temp dir when that is not
+//! writable) and loaded from there.
+//!
+//! `remote` and `base` are themselves in the file, so they are resolved in a
+//! fixed order, first hit wins:
+//!
+//! 1. `[merge] base` / `remote` of the machine layer, rendered as a real load
+//!    would (env templates, includes);
+//! 2. the same keys, read minimally (only `[merge]`, nothing deserialized into
+//!    `Config`) from the checkout's `magi.toml`, then `.magi/config.toml` -
+//!    only to *locate* the ref; an unreadable file is ignored;
+//! 3. `remote` defaults to `origin`, `base` to what
+//!    `refs/remotes/<remote>/HEAD` points at.
+//!
+//! [`Config::discover`] is synchronous and reads the remote-tracking ref as it
+//! is (`daemon::fetch_loop` keeps it fresh); [`Config::discover_fetched`] runs
+//! `git fetch` first and is what every path that starts work uses. A failed
+//! fetch, a missing ref or an unresolvable base is an **error**, never a
+//! silent fall back to the working tree or a local branch. Two cases are not
+//! that: an explicit `--config`, and a `repo` that is not a git working tree
+//! at all (no branch exists, so nothing can be stale).
+//!
+//! A repository layer that declares `include = [...]` gets the whole tree of
+//! that commit extracted, so relative includes resolve against the same
+//! commit. The directory is built beside its name and renamed in, so a
+//! concurrent `discover` never reads a half-written layer.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -1288,6 +1317,11 @@ impl Config {
         if let Some(last) = paths.last()
             && let Some(dir) = last.parent()
         {
+            // A layer extracted from `<remote>/<base>` records the checkout it
+            // stands for beside itself; its own directory is a cache path.
+            let dir = std::fs::read_to_string(dir.join(REPO_MARKER))
+                .map(|s| PathBuf::from(s.trim()))
+                .unwrap_or_else(|_| dir.to_path_buf());
             ctx.insert("repo", &dir.to_string_lossy());
             ctx.insert(
                 "repo_name",
@@ -1496,18 +1530,70 @@ impl Config {
     /// Resolve the config for `repo`, honouring an explicit `--config` path.
     ///
     /// Returns the config and the layers it came from, empty for built-in
-    /// defaults.
+    /// defaults. The repository layers come from the remote-tracking ref as it
+    /// stands (see the module doc); use [`Config::discover_fetched`] where a
+    /// stale ref would matter.
     pub fn discover(repo: &Path, explicit: Option<&Path>) -> Result<(Self, Vec<PathBuf>)> {
         if let Some(p) = explicit {
             let paths = vec![p.to_path_buf()];
             return Ok((Self::load_layers(&paths)?, paths));
         }
-        let paths = Self::layers(repo);
+        let paths = Self::layers_checked(repo)?;
         if paths.is_empty() {
             return Ok((Self::autodetected(), paths));
         }
         Ok((Self::load_layers(&paths)?, paths))
     }
+
+    /// [`Config::discover`] after `git fetch <remote> <base>`: for every path
+    /// that is about to start work. A failed fetch is an error.
+    pub async fn discover_fetched(
+        repo: &Path,
+        explicit: Option<&Path>,
+    ) -> Result<(Self, Vec<PathBuf>)> {
+        if explicit.is_none() && is_git_worktree(repo) {
+            let (remote, base) = resolve_remote_base(repo)?;
+            let out = crate::git::fetch(repo, &remote, &base)
+                .await
+                .with_context(|| format!("fetching {remote}/{base} to read magi.toml"))?;
+            if !out.ok() {
+                bail!(
+                    "cannot read magi.toml: `git fetch {remote} {base}` failed ({});                      refusing to use the local checkout's copy, which may be stale",
+                    out.stderr.lines().next().unwrap_or("").trim()
+                );
+            }
+        }
+        Self::discover(repo, explicit)
+    }
+
+    /// [`Config::layers`], but an unreadable remote ref is an error.
+    fn layers_checked(repo: &Path) -> Result<Vec<PathBuf>> {
+        if !is_git_worktree(repo) {
+            return Ok(Self::layers(repo));
+        }
+        let mut paths: Vec<PathBuf> = Self::machine_layer()
+            .into_iter()
+            .filter(|p| p.is_file())
+            .collect();
+        paths.extend(Self::repo_layers(repo)?);
+        Ok(paths)
+    }
+
+    /// Only the repository layers (lowest first), from `<remote>/<base>` in a
+    /// git working tree and from disk elsewhere.
+    pub(crate) fn repo_layers(repo: &Path) -> Result<Vec<PathBuf>> {
+        if !is_git_worktree(repo) {
+            return Ok([
+                repo.join(".magi").join("config.toml"),
+                repo.join("magi.toml"),
+            ]
+            .into_iter()
+            .filter(|p| p.is_file())
+            .collect());
+        }
+        remote_layers(repo)
+    }
+
     /// Environment variable that relocates the machine-wide config layer.
     ///
     /// Set it to a directory and magi reads `<dir>/magi/config.toml` instead
@@ -1911,6 +1997,247 @@ fn find_program_in(
         }
         None => Some(dir.join(program)).filter(|c| c.is_file()),
     })
+}
+
+/// Sidecar naming the checkout an extracted layer stands for.
+const REPO_MARKER: &str = ".magi-repo";
+
+fn git_out(repo: &Path, args: &[&str]) -> Option<String> {
+    use crate::proc::Quiet as _;
+    let out = std::process::Command::new("git")
+        .args(args)
+        .quiet()
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Is `repo` inside a git working tree? A directory that is not has no branch
+/// to be stale against, so its files are read as they are.
+fn is_git_worktree(repo: &Path) -> bool {
+    git_out(repo, &["rev-parse", "--git-dir"]).is_some()
+}
+
+#[derive(Deserialize, Default)]
+struct ProbeMerge {
+    base: Option<String>,
+    remote: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct Probe {
+    merge: Option<ProbeMerge>,
+}
+
+/// `[merge]` base / remote from one file, nothing else. The file is rendered
+/// (env templates, includes) exactly as a real load would, so a machine layer
+/// saying `base = "{{ env.X }}"` locates the same ref; when rendering fails
+/// (a checkout file that needs its own repo context) the plain TOML is read
+/// instead. Unreadable is `None`: the real load reports it.
+fn probe_merge(path: &Path, repo: &Path) -> Option<ProbeMerge> {
+    if !path.is_file() {
+        return None;
+    }
+    let paths = [path.to_path_buf()];
+    let mut engine = teravars::Engine::default();
+    let mut ctx = Config::render_ctx(&paths);
+    // The layered load renders every layer for the checkout being resolved;
+    // so does this, or `{{ repo_name }}` would name the file's own directory.
+    ctx.insert("repo", &repo.to_string_lossy());
+    ctx.insert(
+        "repo_name",
+        &repo.file_name().unwrap_or_default().to_string_lossy(),
+    );
+    if let Ok(merged) = teravars::load_merged(&paths, &mut engine, &ctx)
+        && let Ok(probe) = toml::Value::Table(merged.config).try_into::<Probe>()
+    {
+        return probe.merge;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    toml::from_str::<Probe>(&text).ok()?.merge
+}
+
+/// Where the remote ref is: see the module doc for the order.
+fn resolve_remote_base(repo: &Path) -> Result<(String, String)> {
+    let mut remote = None;
+    let mut base = None;
+    let mut sources: Vec<PathBuf> = Config::machine_layer().into_iter().collect();
+    sources.push(repo.join("magi.toml"));
+    sources.push(repo.join(".magi").join("config.toml"));
+    for path in sources {
+        if let Some(m) = probe_merge(&path, repo) {
+            remote = remote.or(m.remote.filter(|s| !s.trim().is_empty()));
+            base = base.or(m.base.filter(|s| !s.trim().is_empty()));
+        }
+    }
+    let remote = remote.unwrap_or_else(|| "origin".to_owned());
+    let base = match base {
+        Some(b) => b,
+        None => {
+            let head = format!("refs/remotes/{remote}/HEAD");
+            git_out(repo, &["symbolic-ref", "--short", &head])
+                .and_then(|s| {
+                    s.trim()
+                        .strip_prefix(&format!("{remote}/"))
+                        .map(str::to_owned)
+                })
+                .with_context(|| {
+                    format!(
+                        "cannot tell which branch of `{remote}` holds magi.toml: \
+                         set [merge] base, or run `git remote set-head {remote} -a`"
+                    )
+                })?
+        }
+    };
+    Ok((remote, base))
+}
+
+fn fnv_hex(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Does the text declare an `include` directive in any form teravars accepts
+/// (root `include`, bare or quoted, or `[teravars] include`, as a table or an
+/// inline table)? Parsed as TOML when it parses; a templated file that does
+/// not parse is judged by a plain search for the word, because over-detecting
+/// only costs an extra extraction while missing one fails the load.
+fn declares_include(text: &str) -> bool {
+    match toml::from_str::<toml::Table>(text) {
+        Ok(table) => {
+            table.contains_key("include")
+                || table
+                    .get("teravars")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|t| t.contains_key("include"))
+        }
+        Err(_) => text.contains("include"),
+    }
+}
+
+/// Unpack the whole tree of `sha` into `dest`, so relative `include`s of a
+/// repository layer resolve against the same commit.
+fn extract_tree(repo: &Path, sha: &str, dest: &Path) -> Result<()> {
+    use crate::proc::Quiet as _;
+    let mut archive = std::process::Command::new("git")
+        .args(["archive", "--format=tar", sha])
+        .quiet()
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("running git archive")?;
+    let tar = std::process::Command::new("tar")
+        .arg("-x")
+        .arg("-C")
+        .arg(dest)
+        .quiet()
+        .stdin(archive.stdout.take().context("git archive has no stdout")?)
+        .output()
+        .context("running tar")?;
+    let status = archive.wait().context("waiting for git archive")?;
+    if !status.success() || !tar.status.success() {
+        bail!(
+            "cannot unpack {sha} for the config's includes: {}",
+            String::from_utf8_lossy(&tar.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// The repository layers (`.magi/config.toml`, `magi.toml`; lowest first) of
+/// `<remote>/<base>`, extracted from one commit so both files agree.
+fn remote_layers(repo: &Path) -> Result<Vec<PathBuf>> {
+    let (remote, base) = resolve_remote_base(repo)?;
+    let tracking = format!("refs/remotes/{remote}/{base}");
+    let spec = format!("{tracking}^{{commit}}");
+    let sha = git_out(repo, &["rev-parse", "--verify", "--quiet", &spec])
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .with_context(|| {
+            format!(
+                "`{remote}/{base}` does not exist in this checkout; fetch it \
+                 (`git fetch {remote} {base}`) or set [merge] base/remote. magi will not read \
+                 a possibly stale local magi.toml instead"
+            )
+        })?;
+    let key = format!("{sha}-{}", fnv_hex(&repo.to_string_lossy()));
+    let rels = [".magi/config.toml", "magi.toml"];
+    let mut texts: Vec<(&str, String)> = Vec::new();
+    for rel in rels {
+        let object = format!("{sha}:{rel}");
+        if git_out(repo, &["cat-file", "-e", &object]).is_none() {
+            continue;
+        }
+        let Some(text) = git_out(repo, &["show", &object]) else {
+            bail!("cannot read {rel} from {remote}/{base} ({sha})");
+        };
+        texts.push((rel, text));
+    }
+    let wants_tree = texts.iter().any(|(_, t)| declares_include(t));
+    // Content-addressed and built beside the final name, then renamed in: a
+    // concurrent `discover` sees the whole directory or none of it, never a
+    // half-written file.
+    let build = |root: &Path| -> Result<PathBuf> {
+        let final_dir = root.join(&key);
+        if !final_dir.is_dir() {
+            std::fs::create_dir_all(root)?;
+            let tmp = root.join(format!(
+                "{key}.tmp-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default()
+            ));
+            let filled = (|| -> Result<()> {
+                std::fs::create_dir_all(&tmp)?;
+                if wants_tree {
+                    extract_tree(repo, &sha, &tmp)?;
+                }
+                for (rel, text) in &texts {
+                    let file = tmp.join(rel);
+                    let parent = file.parent().unwrap_or(&tmp);
+                    std::fs::create_dir_all(parent)?;
+                    std::fs::write(&file, text)?;
+                    std::fs::write(parent.join(REPO_MARKER), repo.to_string_lossy().as_bytes())?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = filled {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(e);
+            }
+            if std::fs::rename(&tmp, &final_dir).is_err() {
+                // Lost the race to another process building the same commit.
+                let _ = std::fs::remove_dir_all(&tmp);
+                if !final_dir.is_dir() {
+                    bail!("cannot place {}", final_dir.display());
+                }
+            }
+        }
+        Ok(final_dir)
+    };
+    let common = git_out(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(|s| PathBuf::from(s.trim()).join("magi").join("config"));
+    let dir = match common.map(|c| build(&c)) {
+        Some(Ok(d)) => d,
+        _ => build(&std::env::temp_dir().join("magi-config"))
+            .with_context(|| format!("extracting config from {remote}/{base}"))?,
+    };
+    Ok(texts.iter().map(|(rel, _)| dir.join(rel)).collect())
 }
 
 #[cfg(test)]
@@ -2763,5 +3090,166 @@ mod tests {
         let solo_described =
             Config::describe_composed(&single, &solo_cfg.verify.gate, "verify.gate", "(none)");
         assert_eq!(solo_described, "cargo make check");
+    }
+
+    mod remote_layers {
+        use super::*;
+
+        fn git(dir: &Path, args: &[&str]) {
+            use crate::proc::Quiet as _;
+            let out = std::process::Command::new("git")
+                .args(args)
+                .quiet()
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+
+        /// A checkout whose origin/main carries `remote` as magi.toml and whose
+        /// working tree carries `disk`.
+        fn fixture(remote: &str, disk: &str) -> (tempfile::TempDir, PathBuf) {
+            let tmp = tempfile::tempdir().unwrap();
+            let bare = tmp.path().join("o.git");
+            git(tmp.path(), &["init", "--bare", "-b", "trunk", "o.git"]);
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git(&repo, &["init", "-b", "trunk"]);
+            git(&repo, &["config", "user.name", "t"]);
+            git(&repo, &["config", "user.email", "t@example.com"]);
+            std::fs::write(repo.join("magi.toml"), remote).unwrap();
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-m", "x"]);
+            git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+            git(&repo, &["push", "origin", "trunk"]);
+            git(&repo, &["fetch", "origin"]);
+            git(&repo, &["remote", "set-head", "origin", "trunk"]);
+            std::fs::write(repo.join("magi.toml"), disk).unwrap();
+            (tmp, repo)
+        }
+
+        #[test]
+        fn reads_the_remote_blob_not_the_working_tree() {
+            let (_t, repo) = fixture("[graph]\ncandidates = 2\n", "[graph]\ncandidates = 5\n");
+            let (cfg, _) = Config::discover(&repo, None).unwrap();
+            assert_eq!(cfg.graph.candidates, 2);
+        }
+
+        #[test]
+        fn detached_head_still_reads_the_remote() {
+            let (_t, repo) = fixture("[graph]\ncandidates = 2\n", "[graph]\ncandidates = 5\n");
+            git(&repo, &["checkout", "--detach"]);
+            let (cfg, _) = Config::discover(&repo, None).unwrap();
+            assert_eq!(cfg.graph.candidates, 2);
+        }
+
+        #[test]
+        fn a_missing_ref_is_an_error_not_a_fallback() {
+            let (_t, repo) = fixture("[graph]\ncandidates = 2\n", "[graph]\ncandidates = 5\n");
+            git(&repo, &["update-ref", "-d", "refs/remotes/origin/trunk"]);
+            let err = format!("{:#}", Config::discover(&repo, None).unwrap_err());
+            assert!(err.contains("origin"), "{err}");
+        }
+
+        #[test]
+        fn merge_base_in_the_checkout_locates_the_ref() {
+            let (_t, repo) = fixture("[graph]\ncandidates = 2\n", "[merge]\nbase = \"nope\"\n");
+            assert!(Config::discover(&repo, None).is_err());
+        }
+
+        #[test]
+        fn the_magi_dir_layer_is_read_too() {
+            let (_t, repo) = fixture("[graph]\ncandidates = 2\n", "");
+            std::fs::write(repo.join("magi.toml"), "[graph]\ncandidates = 2\n").unwrap();
+            std::fs::create_dir_all(repo.join(".magi")).unwrap();
+            std::fs::write(repo.join(".magi/config.toml"), "[graph]\njudges = 3\n").unwrap();
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-m", "y"]);
+            git(&repo, &["push", "origin", "trunk"]);
+            git(&repo, &["fetch", "origin"]);
+            let (cfg, layers) = Config::discover(&repo, None).unwrap();
+            assert_eq!((cfg.graph.candidates, cfg.graph.judges), (2, 3));
+            assert_eq!(layers.len(), 2);
+        }
+
+        #[test]
+        fn an_include_in_a_repository_layer_resolves_against_the_same_commit() {
+            let (_t, repo) = fixture("include = [\"gate.toml\"]\n", "");
+            std::fs::write(repo.join("magi.toml"), "include = [\"gate.toml\"]\n").unwrap();
+            std::fs::write(repo.join("gate.toml"), "[graph]\ncandidates = 2\n").unwrap();
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-m", "inc"]);
+            git(&repo, &["push", "origin", "trunk"]);
+            git(&repo, &["fetch", "origin"]);
+            // The working tree's copy differs and must not be used.
+            std::fs::write(repo.join("gate.toml"), "[graph]\ncandidates = 9\n").unwrap();
+            let (cfg, _) = Config::discover(&repo, None).unwrap();
+            assert_eq!(cfg.graph.candidates, 2);
+        }
+
+        #[test]
+        fn a_machine_layer_base_is_rendered_before_locating_the_ref() {
+            let (t, repo) = fixture("[graph]\ncandidates = 2\n", "[merge]\nbase = \"nope\"\n");
+            let m = t.path().join("machine.toml");
+            std::fs::write(
+                &m,
+                "[merge]\nbase = \"{{ env.MAGI_TEST_NO_SUCH | default(value='trunk') }}\"\n",
+            )
+            .unwrap();
+            let (remote, base) = {
+                let probe = probe_merge(&m, &repo).unwrap();
+                (probe.remote, probe.base)
+            };
+            assert_eq!((remote, base), (None, Some("trunk".to_owned())));
+        }
+
+        #[test]
+        fn a_machine_layer_base_sees_the_checkouts_repo_name() {
+            let (t, repo) = fixture("[graph]\ncandidates = 2\n", "");
+            let m = t.path().join("machine.toml");
+            std::fs::write(&m, "[merge]\nbase = \"{{ repo_name }}\"\n").unwrap();
+            let probe = probe_merge(&m, &repo).unwrap();
+            assert_eq!(probe.base.as_deref(), Some("repo"));
+        }
+
+        #[test]
+        fn every_include_form_is_recognised() {
+            assert!(declares_include("include = [\"a.toml\"]\n"));
+            assert!(declares_include("\"include\" = [\"a.toml\"]\n"));
+            assert!(declares_include("teravars = { include = [\"a.toml\"] }\n"));
+            assert!(declares_include("[teravars]\ninclude = [\"a.toml\"]\n"));
+            assert!(!declares_include("[graph]\ncandidates = 2\n"));
+        }
+
+        #[test]
+        fn an_explicit_config_is_read_as_named() {
+            let (t, repo) = fixture("[graph]\ncandidates = 2\n", "");
+            let own = t.path().join("own.toml");
+            std::fs::write(&own, "[graph]\ncandidates = 4\n").unwrap();
+            let (cfg, _) = Config::discover(&repo, Some(&own)).unwrap();
+            assert_eq!(cfg.graph.candidates, 4);
+        }
+
+        #[test]
+        fn discover_fetched_fails_when_the_fetch_does() {
+            let (t, repo) = fixture("[graph]\ncandidates = 2\n", "");
+            std::fs::remove_dir_all(t.path().join("o.git")).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let err = rt
+                .block_on(Config::discover_fetched(&repo, None))
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("fetch"), "{err:#}");
+        }
+
+        #[test]
+        fn a_non_git_directory_reads_its_files() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("magi.toml"), "[graph]\ncandidates = 4\n").unwrap();
+            let (cfg, _) = Config::discover(dir.path(), None).unwrap();
+            assert_eq!(cfg.graph.candidates, 4);
+        }
     }
 }

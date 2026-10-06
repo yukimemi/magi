@@ -1105,7 +1105,8 @@ async fn dispatch(command: Command) -> Result<()> {
                 config: opts.config.as_deref().map(|c| absolute_path(c, &cwd)),
             };
             let repo = resolve_repo(&repo, &cwd, Some(&text)).await?;
-            let (mut cfg, from) = Config::discover(&repo, overrides.config.as_deref())?;
+            let (mut cfg, from) =
+                Config::discover_fetched(&repo, overrides.config.as_deref()).await?;
             overrides.apply(&mut cfg);
             println!("config: {}", describe_layers(&from));
             if !opts.force {
@@ -1171,7 +1172,8 @@ async fn dispatch(command: Command) -> Result<()> {
                 seed: None,
                 config: config.as_deref().map(|c| absolute_path(c, &cwd)),
             };
-            let (mut cfg, from) = Config::discover(&repo, overrides.config.as_deref())?;
+            let (mut cfg, from) =
+                Config::discover_fetched(&repo, overrides.config.as_deref()).await?;
             if !force {
                 refuse_duplicates(
                     &queue,
