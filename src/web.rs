@@ -837,6 +837,7 @@ impl Ui {
             .route("/api/runs", get(runs_list))
             .route("/api/runs/{id}", get(run_detail).delete(run_delete))
             .route("/api/runs/{id}/report", get(run_report))
+            .route("/api/runs/{id}/report.json", get(run_report_json))
             .route("/api/runs/{id}/fold", post(run_fold))
             .route("/api/runs/{id}/fold-merged", post(run_fold_merged))
             .route("/api/runs/{id}/resume", post(run_resume))
@@ -3278,6 +3279,26 @@ async fn run_report(
     })
     .await?;
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text))
+}
+
+/// The structured twin of [`run_report`]: the same state, as sections the UI
+/// draws as cards. An unreadable run answers with the same error the text
+/// route does; it is never turned into an empty report.
+async fn run_report_json(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<crate::report_view::RunReportView>> {
+    let view = blocking(move || {
+        let id = resolve_run(&ui.runs, &id)?;
+        let state = read_run(&ui.runs, &id)?;
+        let daemon_claims = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
+        Ok(crate::report_view::build(
+            &state,
+            state.liveness(daemon_claims),
+        ))
+    })
+    .await?;
+    Ok(Json(view))
 }
 
 /// A task as the UI sees it.
@@ -11355,6 +11376,84 @@ mod tests {
             res.body.contains("20260902-140501-a1b2"),
             "the report is about the run that was asked for: {}",
             res.body
+        );
+    }
+
+    #[tokio::test]
+    async fn the_report_json_route_serves_sections_and_never_hides_an_unreadable_run() {
+        // The view names the run's state directory, which reads the process-global home.
+        crate::run::pin_test_home();
+        let f = Fixture::start().await;
+        let id = "20260902-140501-a1b2";
+        write_run(&f.runs(), id, RunStatus::Stalled);
+        // A stalled panel and one review round, written through the real
+        // state file so the route reads what a run really leaves behind.
+        let path = f.runs().join(id).join("run.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["tally"] = serde_json::json!({
+            "first_choice": {"A": 1}, "borda": {"A": 2}, "winner": "A",
+            "unanimous_initial": true, "deliberated": false, "changed_votes": 0,
+            "unanimous_final": true, "judges": 3, "present": 1, "quorum": 2,
+            "met_quorum": false, "rankings": 1
+        });
+        v["reviews"] = serde_json::json!([{
+            "round": 1, "head": "abcdef0123", "answered": 1, "expected": 1, "blocking": 1,
+            "e2e_deferred": true,
+            "reviews": [{"reviewer": 1, "agent": "a", "findings": [
+                {"id": "R1-1-1", "severity": "major", "title": "t", "file": "src/a.rs", "line": 3}
+            ]}]
+        }]);
+        std::fs::write(&path, v.to_string()).unwrap();
+        write_run(&f.runs(), "20260902-140502-dead", RunStatus::Blocked);
+        std::fs::write(
+            f.runs().join("20260902-140502-dead").join("run.json"),
+            "{not json",
+        )
+        .unwrap();
+
+        let res = f.get(&format!("/api/runs/{id}/report.json")).await;
+
+        assert_eq!(res.status, 200, "{}", res.body);
+        assert!(res.headers.contains("content-type: application/json"));
+        let j = res.json();
+        assert_eq!(j["schema"], 1);
+        assert_eq!(j["header"]["id"], id);
+        assert_eq!(j["header"]["tone"], "warn", "a stalled run is never ok");
+        let kinds: Vec<&str> = j["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["candidates", "tally", "review"]);
+        let tally = &j["sections"][1]["tally"];
+        assert_eq!(
+            (tally["decided"].clone(), tally["provisional"].clone()),
+            (false.into(), true.into())
+        );
+        let round = &j["sections"][2]["rounds"][0];
+        assert_eq!(round["e2e"]["state"], "deferred");
+        assert_eq!(round["findings"][0]["severity"], "major");
+        assert_eq!(round["findings"][0]["blocking"], true);
+        assert_eq!(round["findings"][0]["state"], "open");
+
+        // The raw route keeps working beside it.
+        assert_eq!(f.get(&format!("/api/runs/{id}/report")).await.status, 200);
+
+        // An unreadable run is an error, as on the text route, and is counted.
+        let bad = f.get("/api/runs/20260902-140502-dead/report.json").await;
+        assert_ne!(bad.status, 200, "{}", bad.body);
+        assert_eq!(
+            bad.status,
+            f.get("/api/runs/20260902-140502-dead/report").await.status
+        );
+        assert_eq!(f.get("/api/health").await.json()["runs_unreadable"], 1);
+        assert_eq!(
+            f.get("/api/runs/20260902-999999-ffff/report.json")
+                .await
+                .status,
+            404
         );
     }
 
