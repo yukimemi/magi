@@ -1994,10 +1994,10 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
         Ok(Json(HealthView {
             version: env!("CARGO_PKG_VERSION"),
             home: ui.home.display().to_string(),
-            queue_rev: ui.queue.revision(),
+            queue_rev: stamps_revision(&store_stamps(ui.queue.root(), false)),
             runs_rev: runs_revision(&ui.runs),
             questions_rev: ui.questions.revision(),
-            talks_rev: ui.talks.revision(),
+            talks_rev: stamps_revision(&store_stamps(ui.talks.root(), false)),
             notifications_rev: ui.notices.revision(),
             notifications_unread: ui.notices.count_unread(),
             loop_rev,
@@ -2493,6 +2493,16 @@ fn status_word(status: RunStatus) -> String {
 struct ListQuery {
     #[serde(default)]
     limit: Option<usize>,
+    /// Exact ids only; an empty value requests no rows (except queue blockers).
+    ids: Option<String>,
+}
+
+impl ListQuery {
+    fn contains(&self, id: &str) -> bool {
+        self.ids
+            .as_ref()
+            .is_none_or(|ids| ids.split(',').any(|wanted| wanted == id))
+    }
 }
 
 async fn runs_list(
@@ -2509,7 +2519,8 @@ async fn runs_list(
             // The detail route still explains it, which is where an operator
             // asking "what happened to that run" ends up.
             .filter_map(|id| read_run(&ui.runs, &id).ok())
-            .take(limit);
+            .take(limit)
+            .filter(|run| q.contains(&run.id));
         let probe = std::cell::RefCell::new(crate::proc::ProcProbe::real());
         let summaries = summarize(
             states,
@@ -3401,13 +3412,17 @@ async fn settings_put_roles(
     .await
 }
 
-async fn queue_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TaskView>>> {
+async fn queue_list(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<ListQuery>,
+) -> ApiResult<Json<Vec<TaskView>>> {
     blocking(move || {
         let tasks = ui.queue.list();
         let inv = crate::blockers::Inventory::new(tasks.clone(), &ui.questions.list());
         Ok(Json(
             tasks
                 .into_iter()
+                .filter(|t| q.contains(&t.id) || t.status == crate::queue::TaskStatus::Blocked)
                 .map(|t| TaskView::with_inventory(t, &inv))
                 .collect(),
         ))
@@ -4922,31 +4937,39 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(POLL);
         let mut last: Option<(u64, u64, u64, u64, u64, u64)> = None;
+        let mut stamps: Option<[Stamps; 3]> = None;
         loop {
             // The first tick completes immediately, which is what makes the
             // stream announce the current revisions on connect.
             ticker.tick().await;
             let state = Arc::clone(&ui);
             let revisions = tokio::task::spawn_blocking(move || {
-                (
-                    state.queue.revision(),
-                    runs_revision(&state.runs),
+                let stamps = [
+                    store_stamps(state.queue.root(), false),
+                    store_stamps(&state.runs, true),
+                    store_stamps(state.talks.root(), false),
+                ];
+                let revisions = (
+                    stamps_revision(&stamps[0]),
+                    stamps_revision(&stamps[1]),
                     state.questions.revision(),
-                    state.talks.revision(),
+                    stamps_revision(&stamps[2]),
                     state.notices.revision(),
                     // The loop's counter is in-process state rather than a
                     // file, so nothing the three stats above look at would
                     // tell this phone that another one started the loop.
                     state.lock_loop().rev,
-                )
+                );
+                (revisions, stamps)
             })
             .await;
-            let Ok(revisions) = revisions else { break };
+            let Ok((revisions, next_stamps)) = revisions else {
+                break;
+            };
             if last == Some(revisions) {
                 continue;
             }
-            last = Some(revisions);
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "queue_rev": revisions.0,
                 "runs_rev": revisions.1,
                 "questions_rev": revisions.2,
@@ -4954,7 +4977,25 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
                 "notifications_rev": revisions.4,
                 "loop_rev": revisions.5,
             });
-            // Serializing five integers cannot fail; giving up beats looping.
+            if let (Some(base), Some(previous)) = (last, stamps.as_ref()) {
+                for (index, (key, rev)) in [
+                    ("queue_delta", base.0),
+                    ("runs_delta", base.1),
+                    ("talks_delta", base.3),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let delta = diff_stamps(&previous[index], &next_stamps[index], rev);
+                    // Empty diffs may mean a non-file dependency moved. Read whole.
+                    if delta.changed.len() + delta.removed.len() > 0 && delta.changed.len() <= 50 {
+                        payload[key] = serde_json::to_value(delta).expect("serializable delta");
+                    }
+                }
+            }
+            last = Some(revisions);
+            stamps = Some(next_stamps);
+            // Giving up beats looping if the receiver is gone.
             let Ok(event) = Event::default().event("change").json_data(payload) else {
                 break;
             };
@@ -4967,6 +5008,66 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
         .keep_alive(KeepAlive::new().interval(KEEPALIVE))
 }
 
+type Stamps = HashMap<String, (u128, u64)>;
+
+/// Metadata only: no task instructions or conversation bodies are read here.
+fn store_stamps(root: &FsPath, runs: bool) -> Stamps {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = if runs {
+                entry.path().join("run.json")
+            } else {
+                entry.path()
+            };
+            if !runs && path.extension().is_none_or(|ext| ext != "json") {
+                return None;
+            }
+            let metadata = path.metadata().ok()?;
+            let modified = metadata
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            let id = if runs {
+                entry.file_name().to_string_lossy().into_owned()
+            } else {
+                path.file_stem()?.to_string_lossy().into_owned()
+            };
+            Some((id, (modified.as_nanos(), metadata.len())))
+        })
+        .collect()
+}
+
+#[derive(Debug, Serialize)]
+struct Delta {
+    base: u64,
+    changed: Vec<String>,
+    removed: Vec<String>,
+}
+
+fn diff_stamps(previous: &Stamps, next: &Stamps, base: u64) -> Delta {
+    let mut changed: Vec<_> = next
+        .iter()
+        .filter(|(id, stamp)| previous.get(*id) != Some(*stamp))
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut removed: Vec<_> = previous
+        .keys()
+        .filter(|id| !next.contains_key(*id))
+        .cloned()
+        .collect();
+    changed.sort_unstable();
+    removed.sort_unstable();
+    Delta {
+        base,
+        changed,
+        removed,
+    }
+}
+
 /// Change detection token for recorded runs under `runs`.
 ///
 /// Combines the id and `run.json` modification time of each run, so adding,
@@ -4974,39 +5075,22 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
 /// notifies connected clients via the change stream. Returns 0 when no runs
 /// exist.
 fn runs_revision(runs: &FsPath) -> u64 {
+    stamps_revision(&store_stamps(runs, true))
+}
+
+/// Opaque tokens use the exact metadata snapshot behind the delta, in both
+/// health and SSE. Nanoseconds and length also detect same-millisecond writes
+/// and deleting an older conversation (a newest-mtime token cannot do that).
+fn stamps_revision(stamps: &Stamps) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
-
-    let mut entries: Vec<(String, u64)> = std::fs::read_dir(runs)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let path = e.path().join("run.json");
-            let mtime = path
-                .metadata()
-                .ok()?
-                .modified()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_millis() as u64;
-            let id = e.file_name().to_string_lossy().into_owned();
-            Some((id, mtime))
-        })
-        .collect();
-
-    if entries.is_empty() {
+    if stamps.is_empty() {
         return 0;
     }
-
+    let mut entries: Vec<_> = stamps.iter().collect();
     entries.sort_unstable();
     let mut hasher = std::hash::DefaultHasher::new();
-    for (id, mtime) in &entries {
-        id.hash(&mut hasher);
-        mtime.hash(&mut hasher);
-    }
-    let h = hasher.finish();
-    if h == 0 { 1 } else { h }
+    entries.hash(&mut hasher);
+    hasher.finish().max(1)
 }
 
 /// Run ids under `runs`, newest first.
@@ -5611,13 +5695,17 @@ struct RosterEntry {
 ///
 /// Every conversation, open ones first and newest first - [`Talks::list`]'s
 /// own order.
-async fn talks_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<TalkView>>> {
+async fn talks_list(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<ListQuery>,
+) -> ApiResult<Json<Vec<TalkView>>> {
     blocking(move || {
         let mut configs: HashMap<PathBuf, Option<Config>> = HashMap::new();
         Ok(Json(
             ui.talks
                 .list()
                 .into_iter()
+                .filter(|talk| q.contains(&talk.id))
                 .map(|talk| {
                     let thinking = ui.is_thinking(&talk.id);
                     let cfg = configs
@@ -7186,7 +7274,10 @@ mod tests {
     /// the alternative, hand-writing that object, would make these tests fail
     /// the day the seat gains a field.
     fn seed_talk(fx: &Fixture, id: &str, status: &str) -> String {
-        let store = fx.talks();
+        seed_talk_at(&fx.talks(), id, status)
+    }
+
+    fn seed_talk_at(store: &Talks, id: &str, status: &str) -> String {
         std::fs::create_dir_all(store.root()).expect("talks dir");
         let seat = serde_json::to_value(crate::agent::SeatState::new("talk", "mock", 7))
             .expect("serialize a seat");
@@ -12140,6 +12231,240 @@ mod tests {
         assert_eq!(
             fx.head(&format!("/api/questions/{id}/panel")).await.status,
             200
+        );
+    }
+
+    #[test]
+    fn delta_stamps_cover_add_update_remove_and_noop() {
+        let before: Stamps = [("a".into(), (1, 10)), ("b".into(), (2, 20))].into();
+        let after: Stamps = [("b".into(), (2, 21)), ("c".into(), (3, 30))].into();
+        let delta = diff_stamps(&before, &after, 42);
+        assert_eq!(delta.base, 42);
+        assert_eq!(delta.changed, ["b", "c"]);
+        assert_eq!(delta.removed, ["a"]);
+        let same = diff_stamps(&after, &after, 43);
+        assert!(same.changed.is_empty() && same.removed.is_empty());
+        assert_ne!(stamps_revision(&before), stamps_revision(&after));
+        let nanos: Stamps = [("b".into(), (2, 20))].into();
+        let same_ms: Stamps = [("b".into(), (3, 20))].into();
+        assert_ne!(stamps_revision(&nanos), stamps_revision(&same_ms));
+        assert_eq!(stamps_revision(&Stamps::new()), 0);
+    }
+
+    fn delta_test_ui(home: &FsPath) -> Arc<Ui> {
+        std::fs::create_dir_all(home.join("runs")).unwrap();
+        Arc::new(Ui::new(
+            Queue::at(home.join("queue")),
+            Questions::at(home.join("questions")),
+            Talks::at(home.join("talks")),
+            home.join("runs"),
+            home.to_owned(),
+            PathBuf::from("/repo/magi"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn delta_stream_announces_a_base_then_changed_and_removed_ids() {
+        let home = TempDir::new().unwrap();
+        let ui = delta_test_ui(home.path());
+        let mut task = Task::new(
+            "stream task".into(),
+            "text".into(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        ui.queue.put(&mut task).unwrap();
+        let response = events(State(ui.clone())).await.into_response();
+        let mut stream = response.into_body().into_data_stream();
+        async fn change(stream: &mut axum::body::BodyDataStream) -> serde_json::Value {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let text = String::from_utf8(chunk.to_vec()).unwrap();
+            let data = text
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("data: ")
+                        .or_else(|| line.strip_prefix("data:"))
+                })
+                .unwrap();
+            serde_json::from_str(data).unwrap()
+        }
+        let initial = change(&mut stream).await;
+        assert!(initial.get("queue_delta").is_none());
+        task.instruction.push_str(" changed");
+        ui.queue.put(&mut task).unwrap();
+        let updated = change(&mut stream).await;
+        assert_eq!(updated["queue_delta"]["base"], initial["queue_rev"]);
+        assert_eq!(
+            updated["queue_delta"]["changed"],
+            serde_json::json!([task.id])
+        );
+        assert_eq!(
+            updated["queue_rev"].as_u64(),
+            Some(stamps_revision(&store_stamps(ui.queue.root(), false)))
+        );
+        std::fs::remove_file(ui.queue.path_of(&task.id)).unwrap();
+        let removed = change(&mut stream).await;
+        assert_eq!(removed["queue_delta"]["base"], updated["queue_rev"]);
+        assert_eq!(
+            removed["queue_delta"]["removed"],
+            serde_json::json!([task.id])
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_lists_keep_blockers_and_respect_the_run_window() {
+        let home = TempDir::new().unwrap();
+        let ui = delta_test_ui(home.path());
+        let queue = ui.queue.clone();
+        let query = |ids: Option<&str>| {
+            Query(ListQuery {
+                limit: Some(2),
+                ids: ids.map(str::to_owned),
+            })
+        };
+        let mut root = Task::new(
+            "root".into(),
+            "instruction".into(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        queue.put(&mut root).unwrap();
+        let mut blocked = Task::new(
+            "blocked".into(),
+            "instruction".into(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        blocked.block(vec![root.id.clone()], None);
+        queue.put(&mut blocked).unwrap();
+        let whole =
+            serde_json::to_value(queue_list(State(ui.clone()), query(None)).await.unwrap().0)
+                .unwrap();
+        let subset = serde_json::to_value(
+            queue_list(State(ui.clone()), query(Some(&root.id)))
+                .await
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        assert_eq!(whole, subset, "requested root plus its blocked dependent");
+        let blockers = serde_json::to_value(
+            queue_list(State(ui.clone()), query(Some("")))
+                .await
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        assert_eq!(blockers.as_array().unwrap().len(), 1);
+        assert_eq!(blockers[0]["id"], blocked.id);
+        assert_eq!(
+            blockers[0]["waits_on"],
+            whole
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == blocked.id)
+                .unwrap()["waits_on"]
+        );
+
+        for id in [
+            "20260902-140501-aaaa",
+            "20260902-140502-bbbb",
+            "20260902-140503-cccc",
+        ] {
+            write_run(&ui.runs, id, RunStatus::Merged);
+        }
+        let old = serde_json::to_value(
+            runs_list(State(ui.clone()), query(Some("20260902-140501-aaaa")))
+                .await
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        assert!(
+            old.as_array().unwrap().is_empty(),
+            "older updates must not enter the window"
+        );
+        let newest = serde_json::to_value(
+            runs_list(State(ui.clone()), query(Some("20260902-140503-cccc")))
+                .await
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        assert_eq!(newest.as_array().unwrap().len(), 1);
+        assert_eq!(newest[0]["id"], "20260902-140503-cccc");
+
+        seed_talk_at(&ui.talks, "20260905-000000-d4e5", "open");
+        seed_talk_at(&ui.talks, "20260905-000001-d4e6", "open");
+        let talks = serde_json::to_value(
+            talks_list(State(ui.clone()), query(Some("20260905-000000-d4e5")))
+                .await
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        assert_eq!(talks.as_array().unwrap().len(), 1);
+        assert_eq!(talks[0]["id"], "20260905-000000-d4e5");
+        assert_eq!(
+            serde_json::to_value(
+                talks_list(State(ui.clone()), query(Some("")))
+                    .await
+                    .unwrap()
+                    .0
+            )
+            .unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "manual payload measurement; requires a JSON snapshot in MAGI_WEB_BENCH_HOME"]
+    async fn delta_payload_benchmark() {
+        let home = PathBuf::from(std::env::var_os("MAGI_WEB_BENCH_HOME").expect("snapshot"));
+        let ui = delta_test_ui(&home);
+        let query = |ids: Option<String>| {
+            Query(ListQuery {
+                limit: Some(50),
+                ids,
+            })
+        };
+        let queue = queue_list(State(ui.clone()), query(None)).await.unwrap().0;
+        let runs = runs_list(State(ui.clone()), query(None)).await.unwrap().0;
+        let talks = talks_list(State(ui.clone()), query(None)).await.unwrap().0;
+        let queue_id = queue
+            .iter()
+            .find(|row| row.task.status == crate::queue::TaskStatus::Running)
+            .unwrap_or(&queue[0])
+            .task
+            .id
+            .clone();
+        let queue_delta = queue_list(State(ui.clone()), query(Some(queue_id)))
+            .await
+            .unwrap()
+            .0;
+        let runs_delta = runs_list(State(ui.clone()), query(Some(runs[0].id.clone())))
+            .await
+            .unwrap()
+            .0;
+        let talks_delta = talks_list(State(ui.clone()), query(Some(talks[0].talk.id.clone())))
+            .await
+            .unwrap()
+            .0;
+        let bytes = |rows: serde_json::Value| serde_json::to_vec(&rows).unwrap().len();
+        eprintln!(
+            "DELTA_PAYLOAD {}",
+            serde_json::json!({
+                "queue": [bytes(serde_json::to_value(&queue).unwrap()), bytes(serde_json::to_value(&queue_delta).unwrap())],
+                "runs50": [bytes(serde_json::to_value(&runs).unwrap()), bytes(serde_json::to_value(&runs_delta).unwrap())],
+                "talks": [bytes(serde_json::to_value(&talks).unwrap()), bytes(serde_json::to_value(&talks_delta).unwrap())],
+                "counts": [queue.len(), runs.len(), talks.len()],
+                "blocked": queue_delta.len() - 1,
+            })
         );
     }
 

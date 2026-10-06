@@ -322,7 +322,9 @@ function numbers(parts) {
 /* Keyed reconcile. Rows are reused by id and mutated in place, so an update
    arriving while the operator is reading does not reflow the page under their
    thumb or drop their scroll position. */
-function syncList(parent, items, keyOf, create, update) {
+let incrementalListRender = false;
+
+function syncList(parent, items, keyOf, create, update, inputsOf = (item) => [item]) {
   const existing = new Map();
   for (const child of parent.children) existing.set(child.dataset.key, child);
 
@@ -336,9 +338,13 @@ function syncList(parent, items, keyOf, create, update) {
       node = create(item);
       node.dataset.key = key;
     }
-    /* Applied to new and reused rows alike; a freshly created row is a blank
-       shell until its fields are written. */
-    update(node, item);
+    /* Ordinary renders also refresh dependencies outside the row (questions,
+       search hits, read markers, timers). Delta renders preserve those inputs. */
+    const inputs = inputsOf(item);
+    if (!incrementalListRender || !node.listInputs
+      || inputs.length !== node.listInputs.length
+      || inputs.some((input, index) => input !== node.listInputs[index])) update(node, item);
+    node.listInputs = inputs;
     const wanted = previous ? previous.nextSibling : parent.firstChild;
     if (node !== wanted) parent.insertBefore(node, wanted);
     previous = node;
@@ -1965,7 +1971,8 @@ function updateRunSection(node, heads, childrenOf) {
     ? `, ${plural(foldedTotal, "earlier attempt", "earlier attempts")} folded`
     : "");
   syncList(node.refs.list, heads, (r) => r.id, createRunRow,
-    (row, run) => updateRunRow(row, run, childrenOf.get(run.id) || []));
+    (row, run) => updateRunRow(row, run, childrenOf.get(run.id) || []),
+    (run) => [run, ...(childrenOf.get(run.id) || [])]);
 }
 
 function syncRunSections(root, bySection, childrenOf) {
@@ -4783,24 +4790,13 @@ function talkIsThinking(talk) {
   return Boolean(talk && (talk.thinking || state.talkWaits.has(talk.id)));
 }
 
-async function loadTalks() {
-  /* A response started before a send cannot revoke the wait that send just
-     created. Keep the per-talk generation that was current when this read
-     began, rather than comparing a late response with today's state. */
-  const observedAt = Date.now();
-  const observed = new Map([...state.talkWaits].map(([id, wait]) => [id, {
-    generation: wait.generation, startedAt: observedAt,
-  }]));
-  try {
-    const list = await getJson(API.talks);
-    state.talks = Array.isArray(list) ? list : [];
-    for (const talk of state.talks) trackTalkThinking(talk, observed.get(talk.id));
-    renderTalks();
+function loadTalks(change) {
+  return loadStore("talks", API.talks, change, (list, partial, observed, fetched) => {
+    state.talks = list;
+    for (const talk of fetched) trackTalkThinking(talk, observed.get(talk.id));
+    renderStoreList(partial, renderTalks);
     refreshSearch("chats");
-    ok();
-  } catch (error) {
-    fail(`Could not load conversations: ${error.message}`);
-  }
+  });
 }
 
 /* Refresh one conversation. This must not decide which conversation is on
@@ -7126,26 +7122,108 @@ function wireRunTabs() {
 }
 
 /* ---- loading ----------------------------------------------------------- */
-async function loadRuns() {
-  try {
-    state.runs = await getJson(API.runs(RUN_LIMIT));
-    renderRuns();
-    refreshSearch("runs");
-    ok();
-  } catch (error) {
-    fail(`Could not load runs: ${error.message}`);
-  }
+/* One request per store. Notifications arriving during a read replace the
+   pending target, never its applied revision. A skipped delta base forces a
+   whole read, as do reconnects and the health fallback. */
+const storeReads = new Map();
+const storeRetryTimers = new Map();
+
+function cancelStoreRetry(name) {
+  clearTimeout(storeRetryTimers.get(name));
+  storeRetryTimers.delete(name);
 }
 
-async function loadQueue() {
-  try {
-    state.queue = await getJson(API.queue);
-    renderQueue();
-    refreshSearch("tasks");
-    ok();
-  } catch (error) {
-    fail(`Could not load the queue: ${error.message}`);
+function renderStoreList(partial, render) {
+  incrementalListRender = partial;
+  try { render(); } finally { incrementalListRender = false; }
+}
+
+function mergeStore(name, rows, delta) {
+  const merged = new Map(state[name].map((row) => [row.id, row]));
+  for (const id of delta.removed) merged.delete(id);
+  // A changed file that could not be decoded is absent from the API too.
+  for (const id of delta.changed) merged.delete(id);
+  for (const row of rows) merged.set(row.id, row);
+  const list = [...merged.values()];
+  if (name === "runs") return list.sort((a, b) => b.id.localeCompare(a.id)).slice(0, RUN_LIMIT);
+  if (name === "queue") return list.sort((a, b) => b.priority - a.priority || b.id.localeCompare(a.id));
+  return sortTalks(list);
+}
+
+function loadStore(name, url, change, apply) {
+  cancelStoreRetry(name);
+  let flight = storeReads.get(name);
+  if (flight) {
+    // An explicit refresh needs a whole read even if followed by a delta.
+    flight.pending = {
+      change: change || (flight.pending && flight.pending.change),
+      whole: !change || Boolean(flight.pending && flight.pending.whole),
+    };
+    return flight.promise;
   }
+  flight = { pending: { change }, promise: null };
+  storeReads.set(name, flight);
+  flight.promise = (async () => {
+    try {
+      while (flight.pending) {
+        const request = flight.pending;
+        flight.pending = null;
+        const target = request.change;
+        const delta = target && target.delta;
+        const partial = Boolean(!request.whole && delta && delta.base === state.rev[name] && state[name] !== null
+          // Replenish the 50-row window after deletion or an unreadable row.
+          && (name !== "runs" || delta.removed.length === 0));
+        const observedAt = Date.now();
+        const observed = new Map([...state.talkWaits].map(([id, wait]) => [id, {
+          generation: wait.generation, startedAt: observedAt,
+        }]));
+        try {
+          const endpoint = partial
+            ? `${url}${url.includes("?") ? "&" : "?"}ids=${encodeURIComponent(delta.changed.join(","))}` : url;
+          let rows = await getJson(endpoint);
+          if (partial && name === "runs" && delta.changed.some((id) =>
+            state.runs.some((run) => run.id === id) && !rows.some((row) => row.id === id))) {
+            rows = await getJson(url);
+            apply(rows, false, observed, rows);
+          } else {
+            apply(partial ? mergeStore(name, rows, delta) : rows, partial, observed, rows);
+          }
+          // Only successful reads acknowledge the target. A later notification
+          // may already be queued; its base will be checked on the next read.
+          if (target) state.rev[name] = target.rev;
+          cancelStoreRetry(name);
+          ok();
+        } catch (error) {
+          state.rev[name] = null;
+          fail(`Could not load ${name}: ${error.message}`);
+          // Even the final change must recover while SSE stays connected:
+          // health otherwise polls without applying revisions in that state.
+          cancelStoreRetry(name);
+          storeRetryTimers.set(name, setTimeout(() => {
+            storeRetryTimers.delete(name);
+            if (!storeReads.has(name)) loadStore(name, url, target && { rev: target.rev }, apply);
+          }, 3000));
+        }
+      }
+    } finally { storeReads.delete(name); }
+  })();
+  return flight.promise;
+}
+
+function loadRuns(change) {
+  return loadStore("runs", API.runs(RUN_LIMIT), change, (list, partial) => {
+    state.runs = list;
+    renderStoreList(partial, renderRuns);
+    refreshSearch("runs");
+  });
+}
+
+function loadQueue(change) {
+  return loadStore("queue", API.queue, change, (list, partial) => {
+    state.queue = list;
+    renderStoreList(partial, renderQueue);
+    refreshSearch("tasks");
+  });
 }
 
 async function loadStats() {
@@ -7377,12 +7455,10 @@ async function applyRevisions_(source) {
   }
 
   if (queueRev !== state.rev.queue) {
-    state.rev.queue = queueRev;
-    jobs.push(loadQueue());
+    jobs.push(loadQueue({ rev: queueRev, delta: source.queue_delta }));
   }
-  if (runsRev !== state.rev.runs) {
-    state.rev.runs = runsRev;
-    jobs.push(loadRuns());
+  if (runsRev !== state.rev.runs || queueRev !== state.rev.queue) {
+    jobs.push(loadRuns({ rev: runsRev, delta: queueRev === state.rev.queue ? source.runs_delta : null }));
     if (state.route.name === "run" && state.detail.id) jobs.push(loadRun(state.detail.id));
   }
   /* A task's page lists its runs' statuses, so either stream moving can stale it. */
@@ -7393,12 +7469,16 @@ async function applyRevisions_(source) {
   if (questionsRev !== state.rev.questions) {
     state.rev.questions = questionsRev;
     jobs.push(loadQuestions());
+    /* The queue may have moved in the same event; its real delta was queued
+       above and a later request replaces a pending one, so reuse it. */
+    jobs.push(loadQueue({ rev: queueRev, delta: queueRev !== state.rev.queue
+      ? source.queue_delta : { base: state.rev.queue, changed: [], removed: [] } }));
+    jobs.push(loadRuns({ rev: runsRev }));
   }
   /* A turn landing on disk is what bumps this, so it is also how the reply
      reaches a phone whose own POST is still outstanding. */
   if (talksRev !== state.rev.talks) {
-    state.rev.talks = talksRev;
-    jobs.push(loadTalks());
+    jobs.push(loadTalks({ rev: talksRev, delta: source.talks_delta }));
     if (state.route.name === "talk" && state.talkDetail.id && !state.talkDetail.gone) jobs.push(loadTalk(state.talkDetail.id));
   }
   /* Bumped by this process whenever the loop it owns starts, stops, claims or
@@ -8325,10 +8405,9 @@ async function boot() {
     loadHealth(), loadRuns(), loadQueue(), loadQuestions(), loadTalks(), loadNotifications(),
   ]);
   if (state.health) {
-    state.rev.queue = state.health.queue_rev;
-    state.rev.runs = state.health.runs_rev;
+    // The first stream event (or stream-down health poll) establishes list
+    // revisions through successful reads, rather than an unrelated health read.
     state.rev.questions = state.health.questions_rev;
-    state.rev.talks = state.health.talks_rev;
     state.rev.notifications = state.health.notifications_rev;
     state.rev.loop = state.health.loop_rev;
     if (state.health.loop) state.loop = state.health.loop;

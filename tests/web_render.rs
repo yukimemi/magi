@@ -937,3 +937,254 @@ async fn queue_row_click_previews_task_in_split_pane() {
         failures.join("\n  ")
     );
 }
+
+/// Exercise the actual client functions without boot's timers. The test-only
+/// harness is appended to the embedded source; shipped assets need no hooks.
+async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
+    browser
+        .eval(
+            page,
+            r#"(async () => {
+      const source = await (await fetch('/app.js')).text();
+      window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
+        return { state, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads };
+      `))();
+      await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
+    })()"#,
+        )
+        .await
+        .expect("install client harness");
+}
+
+#[tokio::test]
+async fn delta_client_merges_rows_coalesces_and_recovers() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP delta client: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let ids = seed_tasks(&queue, &fx.repo, "run");
+    let base = serve(
+        &home,
+        queue.clone(),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser
+        .open_page(&format!("{base}#/queue"), 1280, 900, false)
+        .await
+        .expect("page");
+    browser
+        .wait_for(
+            &page,
+            "!!document.querySelector('#queue-sections li.card')",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("loaded queue");
+    client_harness(&mut browser, &page).await;
+    let id = &ids[0];
+    let unchanged = &ids[1];
+    browser
+        .eval(
+            &page,
+            &format!(
+                r#"window.sameRow = deck.state.queue.find(t => t.id === {unchanged:?});
+      deck.state.rev.queue = 1; performance.clearResourceTimings();"#
+            ),
+        )
+        .await
+        .unwrap();
+    let mut task = queue.get(id).expect("task");
+    task.title = "Updated through a delta".into();
+    queue.put(&mut task).unwrap();
+    let check = browser.eval(&page, &format!(r#"(async () => {{
+      await deck.loadQueue({{rev: 2, delta: {{base: 1, changed: [{id:?}], removed: []}}}});
+      return {{same: sameRow === deck.state.queue.find(t => t.id === {unchanged:?}),
+        title: deck.state.queue.find(t => t.id === {id:?}).title,
+        partial: performance.getEntriesByType('resource').some(r => r.name.includes('/api/queue?test_client=1&ids='))}};
+    }})()"#)).await.unwrap();
+    assert_eq!(check["same"], true);
+    assert_eq!(check["partial"], true);
+    assert_eq!(check["title"], "Updated through a delta");
+
+    let result = browser.eval(&page, r#"(async () => {
+      const native = window.fetch;
+      const requests = [];
+      let release;
+      window.fetch = async (url, options) => {
+        if (String(url).includes('/api/queue?test_client=1')) {
+          requests.push(String(url));
+          if (requests.length === 1) await new Promise(resolve => release = resolve);
+        }
+        return native(url, options);
+      };
+      const first = deck.loadQueue({rev: 3, delta: {base: 2, changed: [], removed: []}});
+      for (let rev = 4; rev <= 20; rev++) deck.loadQueue({rev, delta: {base: rev - 1, changed: [], removed: []}});
+      const before = requests.length;
+      release();
+      await first;
+      window.fetch = native;
+      const coalesced = {before, count: requests.length, fallback: requests[1] === '/api/queue?test_client=1', rev: deck.state.rev.queue};
+      window.fetch = async () => { throw new Error('test read failed'); };
+      await deck.loadQueue({rev: 21, delta: {base: 20, changed: [], removed: []}});
+      const failedRev = deck.state.rev.queue;
+      window.fetch = native;
+      performance.clearResourceTimings();
+      await deck.loadQueue({rev: 22, delta: {base: 21, changed: [], removed: []}});
+      return {coalesced, failedRev, recovered: deck.state.rev.queue === 22,
+        whole: performance.getEntriesByType('resource').some(r => r.name.endsWith('/api/queue?test_client=1'))};
+    })()"#).await.unwrap();
+    assert_eq!(
+        result["coalesced"],
+        serde_json::json!({"before": 1, "count": 2, "fallback": true, "rev": 20})
+    );
+    assert!(result["failedRev"].is_null());
+    assert_eq!(result["recovered"], true);
+    assert_eq!(result["whole"], true);
+    std::fs::remove_file(queue.path_of(id)).unwrap();
+    let removed = browser
+        .eval(
+            &page,
+            &format!(
+                r#"(async () => {{
+      await deck.loadQueue({{rev: 23, delta: {{base: 22, changed: [], removed: [{id:?}]}}}});
+      return !deck.state.queue.some(t => t.id === {id:?});
+    }})()"#
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(removed, true);
+    browser
+        .eval(
+            &page,
+            r#"(async () => {
+      const native = window.fetch;
+      window.fetch = async () => { throw new Error('final event read failed'); };
+      await deck.loadQueue({rev: 24});
+      window.fetch = native;
+      performance.clearResourceTimings();
+    })()"#,
+        )
+        .await
+        .unwrap();
+    browser
+        .wait_for(
+            &page,
+            "deck.state.rev.queue === 24",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("failed final event retries without another notification");
+    let retry = browser.eval(&page, "performance.getEntriesByType('resource').some(r => r.name.endsWith('/api/queue?test_client=1'))").await.unwrap();
+    assert_eq!(retry, true);
+    browser.close_page(&page).await;
+}
+
+/// Run explicitly against a read-only snapshot of the operator's home. Only
+/// JSON records are copied; neither the browser nor server touches that home.
+#[tokio::test]
+#[ignore = "manual before/after measurement; requires MAGI_WEB_BENCH_HOME"]
+async fn delta_list_benchmark() {
+    let source = std::path::PathBuf::from(
+        std::env::var_os("MAGI_WEB_BENCH_HOME").expect("benchmark source"),
+    );
+    let chrome = cdp::find_chrome().expect("benchmark requires Chrome");
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    for store in ["queue", "talks", "questions", "runs"] {
+        let target = home.join(store);
+        std::fs::create_dir_all(&target).unwrap();
+        for entry in std::fs::read_dir(source.join(store)).unwrap().flatten() {
+            let (from, to) = if store == "runs" {
+                let target = target.join(entry.file_name());
+                std::fs::create_dir_all(&target).unwrap();
+                (entry.path().join("run.json"), target.join("run.json"))
+            } else {
+                (entry.path(), target.join(entry.file_name()))
+            };
+            if from.extension().is_some_and(|ext| ext == "json") && from.is_file() {
+                std::fs::copy(from, to).unwrap();
+            }
+        }
+    }
+    let base = serve(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser
+        .open_page(&format!("{base}#/queue"), 1280, 900, false)
+        .await
+        .expect("page");
+    browser
+        .wait_for(
+            &page,
+            "!!document.querySelector('#queue-sections li.card')",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("queue loaded");
+    client_harness(&mut browser, &page).await;
+    for kind in ["runs", "queue+runs", "talks"] {
+        let script = r#"(async () => {
+      const source = await (await fetch('/app.js')).text();
+      window.bench = new Function(source.replace(/\nboot\(\);\s*$/, `
+        let renderMs = 0;
+        for (const [name, render] of [['queue', renderQueue], ['runs', renderRuns], ['talks', renderTalks]]) {
+          const timed = () => { const start = performance.now(); render(); renderMs += performance.now() - start; };
+          if (name === 'queue') renderQueue = timed;
+          if (name === 'runs') renderRuns = timed;
+          if (name === 'talks') renderTalks = timed;
+        }
+        return { state, loadQueue, loadRuns, loadTalks, reset: () => renderMs = 0, time: () => renderMs };
+      `))();
+      await Promise.all([bench.loadQueue(), bench.loadRuns(), bench.loadTalks()]);
+      const ids = Object.fromEntries(['queue', 'runs', 'talks'].map(k => [k,
+        (k === 'queue' ? bench.state.queue.find(t => t.status_str === 'running') || bench.state.queue[0] : bench.state[k][0]).id]));
+      const report = {};
+      for (const kind of ['runs', 'queue+runs', 'talks']) {
+        location.hash = kind === 'talks' ? '#/chat' : kind === 'runs' ? '#/runs' : '#/queue';
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        report[kind] = {};
+        for (const partial of [false, true]) {
+          const samples = [];
+          for (let n = 0; n < 25; n++) {
+            bench.reset(); performance.clearResourceTimings();
+            const change = name => ({rev: n + 1, delta: partial ? {base: bench.state.rev[name], changed: [ids[name]], removed: []} : null});
+            if (kind === 'runs') await bench.loadRuns(change('runs'));
+            if (kind === 'talks') await bench.loadTalks(change('talks'));
+            if (kind === 'queue+runs') await Promise.all([bench.loadQueue(change('queue')), bench.loadRuns({rev: n + 1})]);
+            // Resource timings are delivered after the response is consumed.
+            await new Promise(resolve => setTimeout(resolve, 0));
+            const bytes = performance.getEntriesByType('resource').filter(r => /\/api\/(queue|runs|talks)(\?|$)/.test(r.name)).reduce((sum, r) => sum + r.transferSize, 0);
+            samples.push({bytes, renderMs: bench.time()});
+          }
+          const percentile = (key, p) => samples.map(s => s[key]).sort((a,b) => a-b)[Math.ceil(samples.length*p)-1];
+          report[kind][partial ? 'after' : 'before'] = {bytesMedian: percentile('bytes', .5), bytesP95: percentile('bytes', .95), renderMedian: percentile('renderMs', .5), renderP95: percentile('renderMs', .95)};
+        }
+      }
+      report.counts = Object.fromEntries(['queue','runs','talks'].map(k => [k, bench.state[k].length]));
+      return report;
+    })()"#.replace("['runs', 'queue+runs', 'talks']", &format!("['{kind}']"));
+        let results = browser
+            .eval(&page, &script)
+            .await
+            .expect("benchmark scenario");
+        eprintln!("DELTA_BENCH {results}");
+    }
+    browser.close_page(&page).await;
+}
