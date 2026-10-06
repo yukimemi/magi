@@ -12008,8 +12008,10 @@ mod tests {
             "openRunsFiltered must exist as the single place a stats tile sets the Runs filter"
         );
         assert!(
-            APP_JS.contains("if (status && String(run.status || \"\") !== status) return false;"),
-            "matchesFilter must gate on the exact status a KPI tile named"
+            APP_JS.contains(
+                "if (status && !statusInBucket(String(run.status || \"\"), status)) return false;"
+            ),
+            "matchesFilter must gate on the statuses of the bucket a KPI tile named"
         );
         // applyRoute() only flips which view is visible for a plain `#runs`
         // hash - it does not itself redraw the list (see applyRoute's own
