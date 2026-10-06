@@ -6478,6 +6478,86 @@ function renderMagiSeats(run, tally) {
   show(box, true);
 }
 
+/* The mark, drawn from the real candidate list: independent bodies at the top,
+   one gold verdict at the convergence point. The winner's stroke survives at
+   full weight; the others recede, and a candidate that never produced work is
+   dashed. `decided` is the quorum: without it the convergence point stays
+   hollow, because a stalled run reached no verdict however its ranking read. */
+function convergeDiagramSingle(candidates, winner, decided) {
+  const width = 320;
+  const height = 132;
+  const midX = width / 2;
+  const knot = 96;
+  const count = Math.max(candidates.length, 1);
+
+  const labels = candidates.map((c) => c.label).filter(Boolean).join(", ");
+  const root = svg("svg", {
+    viewBox: `0 0 ${width} ${height}`,
+    role: "img",
+    "aria-label": candidates.length
+      ? `${plural(candidates.length, "candidate", "candidates")} ${labels}${winner && decided ? `; ${winner} won` : winner ? `; ${winner} leads but the panel reached no quorum` : "; no verdict yet"}`
+      : "No candidates yet",
+  });
+
+  const span = Math.min(96, (width - 68) / Math.max(count - 1, 1));
+  const xs = candidates.map((_, i) => midX + (i - (count - 1) / 2) * span);
+
+  candidates.forEach((candidate, i) => {
+    const x = xs[i];
+    const won = winner && candidate.label === winner && decided;
+    const dead = !viable(candidate);
+    const tone = candTone(i);
+    const path = x === midX
+      ? `M ${x} 44 L ${x} ${knot}`
+      : `M ${x} 44 C ${x} ${knot - 22}, ${(x + midX) / 2} ${knot - 8}, ${midX} ${knot}`;
+
+    root.append(svg("path", {
+      d: path,
+      fill: "none",
+      stroke: tone,
+      "stroke-width": won ? 5 : 2.5,
+      "stroke-linecap": "round",
+      "stroke-dasharray": dead ? "3 5" : null,
+      opacity: won ? 1 : dead ? 0.35 : 0.55,
+    }));
+    root.append(svg("circle", {
+      cx: x, cy: 26, r: 13,
+      fill: dead ? "var(--sunk)" : tone,
+      stroke: tone,
+      "stroke-width": 2,
+      "stroke-dasharray": dead ? "3 3" : null,
+    }));
+    root.append(svg("text", {
+      x, y: 31,
+      "text-anchor": "middle",
+      fill: dead ? tone : "var(--surface)",
+      text: candidate.label || "?",
+    }));
+  });
+
+  if (winner && decided) {
+    root.append(svg("rect", {
+      x: midX - 11, y: knot - 11, width: 22, height: 22,
+      transform: `rotate(45 ${midX} ${knot})`,
+      fill: "var(--gold-line)",
+    }));
+    root.append(svg("path", {
+      d: `M ${midX} ${knot + 16} L ${midX} ${height - 8}`,
+      stroke: "var(--gold-line)", "stroke-width": 5, "stroke-linecap": "round",
+    }));
+  } else {
+    /* No verdict: the convergence point is drawn hollow, so an unfinished or
+       collapsed run does not display a decided diamond. */
+    root.append(svg("rect", {
+      x: midX - 10, y: knot - 10, width: 20, height: 20,
+      transform: `rotate(45 ${midX} ${knot})`,
+      fill: "none", stroke: "var(--line-2)", "stroke-width": 2, "stroke-dasharray": "3 3",
+    }));
+  }
+
+  return root;
+}
+
 /* The mark, drawn from the real candidate list in the MAGI panel idiom:
    hexagonal candidate nodes at the top, angular wiring, one hexagonal verdict
    node at the convergence point and a chamfered plate naming its state. The
@@ -6486,6 +6566,9 @@ function renderMagiSeats(run, tally) {
    convergence node is never filled, because a stalled run reached no verdict
    however its ranking read. */
 function convergeDiagram(candidates, winner, decided) {
+  /* The MAGI-panel drawing is for a competition only; a single candidate
+     keeps its original drawing. */
+  if (candidates.length < 2) return convergeDiagramSingle(candidates, winner, decided);
   const width = 320;
   const height = 160;
   const midX = width / 2;
