@@ -953,9 +953,9 @@ impl Watcher {
         let q = crate::queue::Queue::at(self.home.join("queue"));
         let mut t = match q.get(&id) {
             Ok(t) => t,
-            // Only a task file that is really gone is "nothing to restore";
+            // Only a task file confirmed absent is "nothing to restore";
             // any other failure may be transient, so keep the record.
-            Err(_) if !q.path_of(&id).exists() => return true,
+            Err(_) if matches!(q.path_of(&id).try_exists(), Ok(false)) => return true,
             Err(e) => {
                 tracing::warn!("could not read task {id} to restore it after the release: {e:#}");
                 st.held_task = Some(id);
