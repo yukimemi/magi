@@ -111,6 +111,7 @@ async fn a_run_branches_off_what_the_remote_has_not_a_stale_local_ref() {
         &["init", "--bare", "--quiet", remote_dir.to_str().unwrap()],
         fx.tmp.path(),
     );
+    git(&["remote", "remove", "origin"], &fx.repo);
     git(
         &["remote", "add", "origin", remote_dir.to_str().unwrap()],
         &fx.repo,

@@ -44,6 +44,8 @@ struct Origin {
 
 fn wire_origin(fx: &common::Fixture) -> Origin {
     let origin = fx.tmp.path().join("origin.git");
+    // These tests wire their own remote over the fixture's default one.
+    run_git(&fx.repo, &["remote", "remove", "origin"]);
     run_git(
         fx.tmp.path(),
         &[

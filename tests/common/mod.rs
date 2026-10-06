@@ -630,6 +630,19 @@ pub fn fixture(home: HomeGuard, judges: Judges, require_fix: bool) -> Fixture {
     std::fs::write(repo.join("README.md"), "# fixture\n").unwrap();
     run_git(&repo, &["add", "-A"]);
     run_git(&repo, &["commit", "-m", "init"]);
+    // A local bare repository as `origin`: the base is read from the remote,
+    // and a missing remote is an error rather than a fallback.
+    let origin = tmp.path().join("fixture-origin.git");
+    run_git(
+        tmp.path(),
+        &["init", "--bare", "-b", "main", "fixture-origin.git"],
+    );
+    run_git(
+        &repo,
+        &["remote", "add", "origin", &origin.to_string_lossy()],
+    );
+    run_git(&repo, &["push", "origin", "main"]);
+    run_git(&repo, &["fetch", "origin"]);
 
     let script = tmp.path().join("mock-agent.sh");
     std::fs::write(&script, MOCK).unwrap();

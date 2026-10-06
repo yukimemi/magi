@@ -470,6 +470,39 @@ package. Deriving them would make `magi self-update` look for a
 `yui`, whose updater omits `.crate_name` and would `cargo install yui`, an
 unrelated crate by another author.
 
+### The repo config layer is read from `<remote>/<base>`, never the working tree
+
+`Config::discover` takes the repository layers (`magi.toml`,
+`.magi/config.toml`) from the commit of `refs/remotes/<remote>/<base>`
+(`git show <sha>:<file>`, one commit for both files), extracted to
+`<git-common-dir>/magi/config/<sha>-<hash of repo>/` (temp dir if that is not
+writable) and loaded from there; a `.magi-repo` sidecar keeps `repo` /
+`repo_name` in the render context pointing at the real checkout. A primary
+checkout is often stale or detached: nagi's run ce6e failed its gate on a step
+`origin/main` had already dropped.
+
+- **Order for locating the ref**, first hit wins: `[merge] base` / `remote` in
+  the machine layer; then the same keys probed (plain `toml`, no render, no other
+  key, unreadable ignored) from the checkout's `magi.toml` and
+  `.magi/config.toml`; then `remote = origin` and `base` from
+  `refs/remotes/<remote>/HEAD`. None of them: an error naming `[merge] base`.
+- **`discover` does not fetch** (it is sync and called per web request); it
+  reads the tracking ref `daemon::fetch_loop` keeps fresh, so a display can be
+  up to `fetch_interval` behind. **`discover_fetched`** fetches first and is
+  used by everything that starts work (`daemon::attempt`, `magi run` /
+  `magi review`). A failed fetch or missing ref is an error, never a fallback to
+  the local file or branch; the daemon holds the task with a `[config] ` reason
+  and spends no attempt. `graph::resolve_base` follows the same rule.
+- **Exceptions that are not fallbacks**: an explicit `--config` is read as
+  named, and a directory that is not a git working tree (no branch to be stale
+  against) reads its files from disk.
+- `include = [...]` is refused in a repository layer (a relative include would
+  resolve beside the extracted copy). Out of scope, still local-checkout reads:
+  `current_branch` base selection, the `is_clean` warning, `release_local`'s
+  `Cargo.toml`.
+- Tests that start a run need a remote: `tests/common::fixture` pushes `main` to
+  a local bare `origin`.
+
 ### Agent CLIs are the only backend
 
 magi drives subscription CLIs (`claude -p`, `opencode run`, `agy -p`,

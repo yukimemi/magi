@@ -131,13 +131,10 @@ fn fingerprint(bytes: &[u8]) -> String {
 }
 
 fn repo_layers(repo: &Path) -> Vec<PathBuf> {
-    [
-        repo.join(".magi").join("config.toml"),
-        repo.join("magi.toml"),
-    ]
-    .into_iter()
-    .filter(|p| p.is_file())
-    .collect()
+    Config::repo_layers(repo).unwrap_or_else(|e| {
+        tracing::warn!("could not read the repository's config layers: {e:#}");
+        Vec::new()
+    })
 }
 
 /// Every layer that applies, machine first - [`Config::layers`] with the

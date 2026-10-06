@@ -2755,6 +2755,21 @@ async fn attempt(
         repo.display()
     );
 
+    // The repository's magi.toml comes from `<remote>/<base>`, fetched now. A
+    // failure here is the network's or the operator's, not the task's: hold
+    // without spending an attempt, never fall back to a possibly stale copy.
+    let explicit = match &task.overrides {
+        Some(o) => o.config.as_deref(),
+        None => opts.config.as_deref(),
+    };
+    if let Err(e) = Config::discover_fetched(&repo, explicit).await {
+        let reason = format!("[config] {e:#}");
+        task.last_error = Some(reason.clone());
+        task.hold_machine(Some(reason.clone()));
+        record(queue, task);
+        tracing::warn!("holding {}: {reason}", task.short());
+        return Vec::new();
+    }
     let mut config = match prepare_for(&repo, opts, task) {
         Ok(c) => c,
         Err(e) => {

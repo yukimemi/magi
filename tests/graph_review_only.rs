@@ -336,6 +336,8 @@ fn rev(repo: &std::path::Path, rev: &str) -> String {
 /// stands in for a jj workspace moving only the remote-tracking ref.
 fn wire_origin(fx: &common::Fixture) -> std::path::PathBuf {
     let origin = fx.tmp.path().join("origin.git");
+    // These tests wire their own remote over the fixture's default one.
+    run_git(&fx.repo, &["remote", "remove", "origin"]);
     run_git(
         fx.tmp.path(),
         &[

@@ -42,7 +42,7 @@ async fn a_fixer_that_commits_for_itself_counts_as_progress() {
     let remote = fx.tmp.path().join("remote.git");
     git(fx.tmp.path(), &["init", "-q", "--bare", remote.to_str().unwrap()]);
     let remote_name = state.config.merge.remote.clone();
-    git(&winner.worktree, &["remote", "add", &remote_name, remote.to_str().unwrap()]);
+    git(&winner.worktree, &["remote", "set-url", &remote_name, remote.to_str().unwrap()]);
     git(&winner.worktree, &["push", "-q", &remote_name, &winner.branch]);
 
     let pr = PrState {
