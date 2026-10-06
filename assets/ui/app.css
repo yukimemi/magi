@@ -2686,3 +2686,22 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 .scatter-axis { font: 10px var(--sans); fill: var(--ink-3); text-transform: uppercase; letter-spacing: .05em; }
 .scatter-label { font: 11px var(--sans); fill: var(--ink-2); }
 .scatter-whisker { stroke-width: 2; opacity: .35; }
+
+/* Runs-per-day chart: stacked bars (merged / ready / other) plus a thin
+   completion-rate line. Values read from the readout above, not tooltips. */
+.stats-daily-readout { min-height: 1.4em; font-size: var(--t3); color: var(--ink-2); font-variant-numeric: tabular-nums; margin: var(--s2) 0; }
+.stats-daily-svg { width: 100%; height: auto; display: block; touch-action: pan-y; cursor: crosshair; }
+.stats-daily-svg:focus-visible { outline: 2px solid var(--ink-3); outline-offset: 2px; }
+.daily-base { stroke: var(--sunk); stroke-width: 1; }
+.daily-cursor { fill: var(--sunk); opacity: .7; }
+.daily-seg[data-s="merged"] { fill: var(--verdict-merged); }
+.daily-seg[data-s="ready"] { fill: var(--verdict-ready); }
+.daily-seg[data-s="other"] { fill: var(--ink-3); opacity: .6; }
+.daily-line { fill: none; stroke: var(--ink); stroke-width: 1; opacity: .55; stroke-linejoin: round; }
+.daily-dot { fill: var(--ink); opacity: .55; }
+.daily-axis { font: 7px var(--sans); fill: var(--ink-3); }
+.stats-daily-legend { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); margin: var(--s2) 0 0; font-size: var(--t2); color: var(--ink-3); }
+.stats-daily-legend span::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 6px; border-radius: 2px; background: var(--ink-3); }
+.stats-daily-legend [data-s="merged"]::before { background: var(--verdict-merged); }
+.stats-daily-legend [data-s="ready"]::before { background: var(--verdict-ready); }
+.stats-daily-legend [data-s="rate"]::before { height: 2px; background: var(--ink); opacity: .55; }

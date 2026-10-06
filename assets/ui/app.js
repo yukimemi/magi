@@ -2997,6 +2997,7 @@ function renderStats() {
   if (!noRuns) {
     renderStatsTiles(t);
     renderStatsVerdictBar(t);
+    renderStatsDaily(s.daily);
     renderStatsAgents(s.agents);
     renderStatsReviewers(s.reviewers);
     renderStatsAdvisors(s.advisors);
@@ -3193,6 +3194,116 @@ function renderStatsVerdictBar(t) {
   const widened = arcs.some((a) => a.deg === Math.min(STATS_DONUT_MIN_DEG, 360 / arcs.length)
     && (counts[a.index] / (runs || 1)) * 360 < a.deg - 0.01);
   show($("stats-verdict-note"), widened);
+}
+
+/* Runs-per-day chart. `daily` comes from /api/stats as server-local dates
+   ("YYYY-MM-DD", oldest first); they are labelled as given and never
+   re-parsed into a Date, which would shift them by the browser's offset.
+
+   Pure: geometry for a w x h plot. Stacked bars (merged, ready, other from the
+   bottom) scaled to a rounded-up y max, plus the completion-rate line on a
+   0-100% scale, split into separate runs wherever a day has no runs. A
+   non-zero segment keeps at least 2px so a lone run stays visible. */
+function statsDailyPlan(daily, w, h) {
+  const n = daily.length;
+  const peak = Math.max(1, ...daily.map((d) => d.runs));
+  const step = peak <= 4 ? 1 : peak <= 10 ? 2 : peak <= 20 ? 5 : 10;
+  const max = Math.ceil(peak / step) * step;
+  const colW = n ? w / n : w;
+  const barW = Math.max(2, colW * 0.7);
+  const bars = daily.map((d, i) => {
+    const x = i * colW + (colW - barW) / 2;
+    let y = h;
+    const segs = [];
+    for (const key of ["merged", "ready", "other"]) {
+      const count = d[key] || 0;
+      if (!count) continue;
+      const sh = Math.max(2, (count / max) * h);
+      y -= sh;
+      segs.push({ key, y, h: sh });
+    }
+    return { x, w: barW, segs };
+  });
+  const lines = [];
+  let run = [];
+  daily.forEach((d, i) => {
+    if (!d.completion_rate) {
+      if (run.length) lines.push(run);
+      run = [];
+      return;
+    }
+    run.push([i * colW + colW / 2, h - (d.completion_rate.pct / 100) * h]);
+  });
+  if (run.length) lines.push(run);
+  return { max, step, colW, bars, lines };
+}
+
+function statsDailyReadout(d) {
+  const [, mm, dd] = d.date.split("-");
+  const rate = d.completion_rate ? `${Math.round(d.completion_rate.pct)}% of ${d.runs}` : "no runs";
+  return `${mm}/${dd} · ${plural(d.runs, "run", "runs")} · merged ${d.merged} · ready ${d.ready} · other ${d.other} · ${rate}`;
+}
+
+function renderStatsDaily(daily) {
+  const chart = $("stats-daily-chart");
+  const readout = $("stats-daily-readout");
+  clear(chart);
+  const days = (daily || []).filter((d) => d.runs > 0).length;
+  if (days < 2) {
+    setText(readout, "");
+    chart.append(el("p", { class: "empty", text: "Not enough history yet — runs on at least 2 days are needed." }));
+    return;
+  }
+  const W = 300, H = 110, PAD_B = 16, PAD_R = 26;
+  const plot = W - PAD_R;
+  const plan = statsDailyPlan(daily, plot, H);
+  let selected = daily.reduce((last, d, i) => (d.runs > 0 ? i : last), 0);
+  const cursor = svg("rect", { class: "daily-cursor", y: 0, width: plan.colW, height: H });
+  const bars = plan.bars.flatMap((b) => b.segs.map((s) =>
+    svg("rect", { class: "daily-seg", "data-s": s.key, x: b.x.toFixed(2), y: s.y.toFixed(2), width: b.w.toFixed(2), height: s.h.toFixed(2) })));
+  const lines = plan.lines.map((pts) => pts.length === 1
+    ? svg("circle", { class: "daily-dot", cx: pts[0][0].toFixed(2), cy: pts[0][1].toFixed(2), r: 1.8 })
+    : svg("polyline", { class: "daily-line", points: pts.map((p) => `${p[0].toFixed(2)},${p[1].toFixed(2)}`).join(" ") }));
+  const labelEvery = Math.ceil(daily.length / 6);
+  const labels = daily.map((d, i) => (i % labelEvery === 0 || i === daily.length - 1)
+    ? svg("text", { class: "daily-axis", x: (i * plan.colW + plan.colW / 2).toFixed(2), y: H + 11, "text-anchor": "middle", text: d.date.slice(5).replace("-", "/") })
+    : null);
+  const chartSvg = svg(
+    "svg",
+    { class: "stats-daily-svg", viewBox: `0 0 ${W} ${H + PAD_B}`, tabindex: "0", role: "img",
+      "aria-label": "Runs per day over the last 30 days. Use the left and right arrow keys to read each day." },
+    svg("line", { class: "daily-base", x1: 0, y1: H, x2: plot, y2: H }),
+    cursor, ...bars, ...lines, ...labels,
+    svg("text", { class: "daily-axis", x: plot + 3, y: 8, text: "100%" }),
+    svg("text", { class: "daily-axis", x: plot + 3, y: H, text: "0%" }),
+    svg("text", { class: "daily-axis", x: plot - 2, y: 8, "text-anchor": "end", text: String(plan.max) }),
+  );
+  const select = (i) => {
+    selected = Math.max(0, Math.min(daily.length - 1, i));
+    cursor.setAttribute("x", (selected * plan.colW).toFixed(2));
+    setText(readout, statsDailyReadout(daily[selected]));
+  };
+  const pick = (ev) => {
+    const box = chartSvg.getBoundingClientRect();
+    if (!box.width) return;
+    const x = ((ev.clientX - box.left) / box.width) * W;
+    select(Math.floor(x / plan.colW));
+  };
+  chartSvg.addEventListener("pointermove", pick);
+  chartSvg.addEventListener("pointerdown", pick);
+  chartSvg.addEventListener("keydown", (ev) => {
+    if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+    ev.preventDefault();
+    select(selected + (ev.key === "ArrowLeft" ? -1 : 1));
+  });
+  const legend = el("p", { class: "stats-daily-legend" },
+    el("span", { "data-s": "merged", text: "merged" }),
+    el("span", { "data-s": "ready", text: "ready" }),
+    el("span", { "data-s": "other", text: "other" }),
+    el("span", { "data-s": "rate", text: "completion rate (right axis)" }),
+  );
+  chart.append(chartSvg, legend);
+  select(selected);
 }
 
 /* A rate over fewer than this many samples swings by 30 points or more on a

@@ -784,6 +784,64 @@ fn normalize(title: &str) -> String {
         .collect()
 }
 
+/// One local calendar day of the daily-runs chart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayBucket {
+    /// The day, in the timezone the buckets were cut in.
+    pub date: jiff::civil::Date,
+    /// Runs created that day.
+    pub runs: usize,
+    /// Of those, runs whose status is `Merged` now.
+    pub merged: usize,
+    /// Of those, runs whose status is `Ready` now.
+    pub ready: usize,
+    /// Everything else, in-flight runs included: `runs - merged - ready`.
+    pub other: usize,
+}
+
+/// Runs per local day over the last `days` days ending at `today`, oldest
+/// first, always exactly `days` buckets (empty days are zero-filled).
+///
+/// Cut by `created_at` in `tz` and classified by the run's *current* status
+/// (the same merged / ready split [`Totals`] uses), so an in-flight run counts
+/// as `other` until it finishes and a past day's mix can change later. Runs
+/// outside the window are ignored. `today` and `tz` are arguments so the cut
+/// is testable; calendar arithmetic is civil, never 24-hour subtraction.
+pub fn daily<'a>(
+    states: impl IntoIterator<Item = &'a RunState>,
+    today: jiff::civil::Date,
+    tz: &jiff::tz::TimeZone,
+    days: usize,
+) -> Vec<DayBucket> {
+    let mut buckets: Vec<DayBucket> = (0..days)
+        .rev()
+        .filter_map(|back| {
+            let span = jiff::Span::new().days(i64::try_from(back).ok()?);
+            today.checked_sub(span).ok()
+        })
+        .map(|date| DayBucket {
+            date,
+            runs: 0,
+            merged: 0,
+            ready: 0,
+            other: 0,
+        })
+        .collect();
+    for state in states {
+        let date = state.created_at.to_zoned(tz.clone()).date();
+        let Some(bucket) = buckets.iter_mut().find(|b| b.date == date) else {
+            continue;
+        };
+        bucket.runs += 1;
+        match state.status {
+            RunStatus::Merged => bucket.merged += 1,
+            RunStatus::Ready => bucket.ready += 1,
+            _ => bucket.other += 1,
+        }
+    }
+    buckets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1637,5 +1695,53 @@ mod tests {
         )];
         assert!(filter_repo(&states, Path::new("/repos/nope")).is_empty());
         assert!(filter_repo(&[], Path::new("/repos/a")).is_empty());
+    }
+
+    #[test]
+    fn daily_cuts_by_local_date_zero_fills_and_ignores_the_window_outside() {
+        let tz = jiff::tz::TimeZone::fixed(jiff::tz::offset(9));
+        let today = jiff::civil::date(2026, 3, 2);
+        let at = |ts: &str, status| {
+            let mut s = state_with(Vec::new(), 'A', status);
+            s.created_at = ts.parse().unwrap();
+            s
+        };
+        let states = vec![
+            // 23:30 UTC on the 1st is 08:30 on the 2nd at +09:00.
+            at("2026-03-01T23:30:00Z", RunStatus::Merged),
+            at("2026-03-02T01:00:00Z", RunStatus::Ready),
+            at("2026-03-02T02:00:00Z", RunStatus::Implementing),
+            at("2026-03-02T03:00:00Z", RunStatus::Failed),
+            // Last day of the window across a month boundary (Feb has 28).
+            at("2026-02-01T00:00:00Z", RunStatus::Merged),
+            // Outside the window, and in the future.
+            at("2026-01-01T00:00:00Z", RunStatus::Merged),
+            at("2026-03-05T00:00:00Z", RunStatus::Merged),
+        ];
+        let d = daily(&states, today, &tz, 30);
+        assert_eq!(d.len(), 30);
+        assert_eq!(d.last().unwrap().date, today);
+        assert_eq!(d[0].date, jiff::civil::date(2026, 2, 1));
+        assert!(d.windows(2).all(|w| w[0].date < w[1].date));
+        let last = d.last().unwrap();
+        assert_eq!(
+            (last.runs, last.merged, last.ready, last.other),
+            (4, 1, 1, 2)
+        );
+        assert_eq!(d[0].runs, 1);
+        assert_eq!(d.iter().map(|b| b.runs).sum::<usize>(), 5);
+        assert!(d.iter().all(|b| b.merged + b.ready + b.other == b.runs));
+    }
+
+    #[test]
+    fn daily_survives_a_dst_boundary() {
+        let tz = jiff::tz::TimeZone::get("America/New_York").unwrap();
+        let today = jiff::civil::date(2026, 3, 9);
+        let d = daily(&[], today, &tz, 30);
+        assert_eq!(d.len(), 30);
+        assert!(
+            d.windows(2)
+                .all(|w| w[0].date.tomorrow().unwrap() == w[1].date)
+        );
     }
 }

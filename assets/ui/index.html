@@ -410,6 +410,13 @@
           <p class="panel-note" id="stats-verdict-note" hidden>Small slices are widened to stay visible; the legend shows the exact figures.</p>
         </div>
 
+        <div class="panel" id="stats-daily">
+          <h2>Runs per day</h2>
+          <p class="panel-note">Last 30 days, by the day each run was created (server-local date), grouped by its current outcome. A run still in flight counts as "other" until it finishes.</p>
+          <div class="stats-daily-readout" id="stats-daily-readout" role="status" aria-live="polite"></div>
+          <div class="stats-daily-chart" id="stats-daily-chart"></div>
+        </div>
+
         <div class="panel" id="stats-agents-panel" hidden>
           <h2>Implementation win rate</h2>
           <p class="panel-note">Relative to this workload only — the task mix and seat rotation are not controlled.</p>
