@@ -261,7 +261,7 @@ a { color: inherit; text-decoration: none; }
 }
 .icon-btn:active { background: var(--sunk); }
 .icon-btn { position: relative; }
-.bell .badge { position: absolute; top: 2px; right: 0; background: var(--rust); color: #fff; }
+.bell .badge { position: absolute; top: 2px; right: 0; background: var(--rust); color: var(--badge-ink, #fff); }
 .icon-btn svg { width: 20px; height: 20px; }
 
 /* Sun / moon / auto, drawn in CSS so the toggle costs no markup and no fetch. */
@@ -343,7 +343,7 @@ a { color: inherit; text-decoration: none; }
   font-size: var(--t3);
   background: var(--surface); border-color: var(--edge); color: var(--ink);
 }
-.daemon-btn[data-kind="start"] { background: var(--gold); border-color: var(--gold); color: #241d05; }
+.daemon-btn[data-kind="start"] { background: var(--fill); border-color: var(--gold-line); color: #241d05; }
 
 .daemon[data-state="working"] { background: var(--tint-blue); color: var(--on-blue); border-bottom-color: var(--tint-blue); }
 .daemon[data-state="working"] .daemon-dot { background: var(--on-blue); animation: pulse 1.8s var(--ease) infinite; box-shadow: 0 0 0 2px var(--tint-blue), 0 0 0 3px var(--on-blue); }
@@ -542,7 +542,7 @@ main {
 
 /* Gold is the verdict colour in the mark, so it is the commit action here and
    nowhere else. */
-.btn-gold { background: var(--gold); border-color: var(--gold); color: #241d05; }
+.btn-gold { background: var(--fill); border-color: var(--gold-line); color: #241d05; }
 :root[data-theme="dark"] .btn-gold { color: #241d05; }
 .btn-quiet { background: transparent; border-color: var(--edge); color: var(--ink-2); }
 
@@ -1487,7 +1487,7 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   width: var(--tap); height: var(--tap); flex: none;
   display: flex; align-items: center; justify-content: center;
   border-radius: 50%; border: 1px solid var(--gold-line);
-  background: var(--gold); color: #241d05;
+  background: var(--fill); color: #241d05;
   box-shadow: var(--shadow);
   cursor: pointer;
 }
@@ -1757,7 +1757,7 @@ details.panel > summary + * { margin-top: var(--s2); }
   border: 1px dashed currentColor;
   font-weight: 600;
 }
-.turn-at { display: block; margin-top: var(--s1); font-size: var(--t1); opacity: .75; }
+.turn-at { display: block; margin-top: var(--s1); font-size: var(--t1); }
 
 /* Images attached to a turn, already sent - a row of squares that wraps
    rather than one that scrolls sideways, so a narrow phone never has to pan
@@ -1919,7 +1919,7 @@ details.panel > summary + * { margin-top: var(--s2); }
   /* The rail's Chat entry is the primary action: a filled gold button, not
      another grey link — the same gold as the dock's chat item, and the only
      .btn among the links. */
-  .rail-link.btn-gold { color: #241d05; background: var(--gold); border-color: var(--gold); }
+  .rail-link.btn-gold { color: #241d05; background: var(--fill); border-color: var(--gold-line); }
   main { padding: var(--s5); }
   h1 { font-size: var(--t7); }
   .view { gap: var(--s5); }
@@ -2009,7 +2009,9 @@ details.panel > summary + * { margin-top: var(--s2); }
 }
 .notice[data-sev="warn"] { border-left-color: var(--gold); }
 .notice[data-sev="error"] { border-left-color: var(--rust); }
-.notice[data-read="1"] { opacity: .68; }
+/* Read is shown by a sunk ground and the lighter weight below, never by
+   opacity: dimming text drops it under AA on paper. */
+.notice[data-read="1"] { background: var(--sunk); }
 .notice-msg { font-size: var(--t3); overflow-wrap: anywhere; }
 .notice[data-read="0"] .notice-msg { font-weight: 600; }
 .notice-meta { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: center; font-size: var(--t2); color: var(--ink-3); }
@@ -2282,13 +2284,13 @@ details.panel > summary + * { margin-top: var(--s2); }
 #view-run .advise-reflect { font-size: var(--t1); color: var(--ink-3); }
 #view-run .advise-chip[data-reflection="absent"] { border-style: dashed; }
 #view-run .advise-chip[data-reflection="absent"] .advise-dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--chip-tone, var(--line-2)); }
-#view-run .advise-chip[data-reflection="faint"] { opacity: .8; }
+#view-run .advise-chip[data-reflection="faint"] { border-style: dotted; }
 #view-run .advise-link { flex: 1 1 1rem; min-width: .75rem; height: 1px; background: var(--line-2); }
 #view-run .advise-brief {
   display: inline-flex; align-items: center; min-height: 1.75rem; padding: 0 var(--s3);
   border-radius: 999px; font: 700 var(--t1) var(--sans); letter-spacing: .08em; text-transform: uppercase;
 }
-#view-run .advise-brief[data-state="filled"] { background: var(--gold-line); color: #241d05; }
+#view-run .advise-brief[data-state="filled"] { background: var(--fill); color: #241d05; }
 #view-run .advise-brief[data-state="empty"] { border: 1px dashed var(--line-2); color: var(--ink-3); }
 #view-run .advise-proposals { margin-top: var(--s3); }
 #view-run .advise-proposals > summary { cursor: pointer; font: 700 var(--t2) var(--sans); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); min-height: 32px; }
@@ -2302,23 +2304,152 @@ details.panel > summary + * { margin-top: var(--s2); }
 /* ======================================================================== *
  * NERV / MAGI skin.
  *
- * Deliberately the LAST block: it re-declares the palette tokens for every
- * theme selector above at a higher specificity, so no rule needs a colour
- * written into it and the data-tone / data-status mapping keeps working
+ * Deliberately the LAST block: it re-declares the palette tokens at a higher
+ * specificity than the base themes above, so no rule needs a colour written
+ * into it and the data-tone / data-status mapping keeps working
  * (gold -> NERV orange, teal -> phosphor green, rust -> alarm red).
- * Light and dark differ only in how black the black is.
  *
- * Contrast (WCAG, on --surface #0d0c0a unless noted):
- *   --ink #f1ede4 16:1 · --ink-2 #c8c1b2 10:1 · --ink-3 #a39b8a 6.6:1
- *   --gold #ff7a1a 7.5:1 · --teal #3dff8f 14:1 · --rust #ff4a3d 5.6:1
- *   on-gold #ffa24d / tint #2a1606 8.6:1 · on-teal #6dffaa / #082414 13:1
- *   on-rust #ff8a80 / #2d0c0a 7.1:1 · --edge #7a6a50 on --bg 3.4:1 (>=3:1)
- *   Black text on the orange .btn-gold fill (#ff7a1a): 8.6:1.
- *   Alarm banner text is #fff on solid #7a0a0a (13:1) laid OVER the stripes,
- *   never directly on them. Tap targets stay at --tap (44px).
+ * Two palettes, selected the way the base themes are: light is the default
+ * (explicit data-theme="light", or auto with a light OS); dark is an explicit
+ * data-theme="dark", or auto under prefers-color-scheme: dark. An explicit
+ * choice beats the OS setting. The dark values are written out twice for the
+ * same reason as in the base tokens: there is no single selector for it.
+ *
+ *   dark  = the black NERV console.
+ *   light = NERV-manual paper: cream ground, near-black ink, thin dark rules,
+ *           orange and alarm red as accents, phosphor green darkened to read.
+ *
+ * --fill is the bright orange of a filled button; its label is #241d05 in both
+ * themes. It is kept apart from --gold, which is a TEXT colour and so has to
+ * darken on paper. A fill's boundary on paper (2.3:1) is carried by --gold-line.
+ *
+ * Contrast (WCAG 2.x, computed; surface / sunk / bg unless noted)
+ *                         dark                      light
+ *   surface / sunk / bg   #0d0c0a #000 #050504      #fbf7ea #ebe4d0 #f4efe1
+ *   --ink                 17.5 / 16.7 / 18.0        16.4 / 17.6 / 14.8
+ *   --ink-2               11.4 / 10.9 / 11.7        10.1 / 10.8 / 9.1
+ *   --ink-3                7.4 /  7.1 /  7.6         6.6 /  7.1 / 6.0
+ *   --gold (text)          7.8 /  7.5 /  8.1         5.3 /  5.7 / 4.8
+ *   --teal                15.4 / 14.8 / 15.9         5.8 /  6.2 / 5.2
+ *   --rust                 6.1 /  5.9 /  6.3         6.0 /  6.5 / 5.5
+ *   --violet               7.8 /  7.5 /  8.0         8.6 /  9.2 / 7.8
+ *   --blue                 9.2 /  8.8 /  9.5         7.8 /  8.4 / 7.1
+ *   --cand-d (yellow)     14.1 / 13.5 / 14.5         5.8 /  6.2 / 5.2
+ *   --cand-c (violet)      7.8 /  7.5 /  8.0         6.9 /  7.4 / 6.2
+ *   chips on-gold / tint    8.7                       7.5
+ *   chips on-teal / tint   13.0                       6.7
+ *   chips on-blue / tint   10.2                       7.0
+ *   chips on-rust / tint    7.9                       6.9
+ *   chips on-ink  / tint   10.0                       9.4
+ *   --stamp-ink on tint-rust   5.4                    5.1
+ *   provisional stamp (--ink-3 on tint-rust, no opacity)   -     5.5
+ *   --badge-ink on --rust (bell badge)   6.3          6.9
+ *   #241d05 on --fill #ff7a1a (every filled button)   6.4  6.4
+ *   alarm banner #fff on #7a0a0a (same in both)       11.2
+ * Non-text (>= 3:1):
+ *   --edge on surface / sunk / bg      3.9 on bg      3.6 / 3.8 / 3.2
+ *   --line-2 (panel rule) on surface / sunk / bg      4.4 / 4.7 / 4.0 (light)
+ *   --gold-line on surface / sunk / bg                4.8 / 5.1 / 4.3 (light)
+ *   --focus on bg 14.1 (dark #ffd23d)  7.8 (light #1a4a80); light ring on
+ *   the orange fill 3.4.  Tap targets stay at --tap (44px).
  * ======================================================================== */
-html:root, html:root[data-theme="light"], html:root[data-theme="dark"],
-html:root:not([data-theme="light"]) {
+html:root {
+  --nerv-alarm-deep: #7a0a0a;
+  --nerv-hazard: #ffd23d;
+  --nerv-stripe-ink: #000;
+  --radius: 0; --radius-sm: 0;
+  --mincho: "Hiragino Mincho ProN", "Hiragino Mincho Pro", "Yu Mincho", YuMincho, "MS PMincho", serif;
+  --sans: var(--mono);
+}
+
+/* ---- light (default) ----------------------------------------------------- */
+html:root, html:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4efe1;
+  --surface: #fbf7ea;
+  --sunk: #ebe4d0;
+  --ink: #14110c;
+  --ink-2: #3f382c;
+  --ink-3: #5c5342;
+  --line: #cfc4a6;
+  --line-2: #7a6e54;
+  --edge: #8a7c5c;
+
+  --gold: #a84300;
+  --gold-line: #b34700;
+  --fill: #ff7a1a;
+  --teal: #0a6b34;
+  --rust: #b3150d;
+  --violet: #5b2a86;
+  --blue: #1a4a80;
+
+  --mark-a: #ff6a00; --mark-b: #12a150; --mark-c: #7d4b9e; --mark-gold: #ff7a1a;
+  --cand-a: #a84300; --cand-b: #0a6b34; --cand-c: #6a3a96; --cand-d: #765800; --cand-e: #1a4a80;
+
+  --tint-gold: #f9e3c4;  --on-gold: #7a3000;
+  --tint-teal: #d3ecd9;  --on-teal: #0a5a2c;
+  --tint-blue: #d8e4f3;  --on-blue: #1d4a80;
+  --tint-rust: #f6d5d0;  --on-rust: #8f0f08;
+  --tint-ink:  #e6dfcb;  --on-ink:  #3a3326;
+
+  --focus: #1a4a80;
+  --shadow: none;
+  --hatch: rgba(179, 21, 13, .14);
+  --hatch-gold: rgba(168, 67, 0, .2);
+
+  --nerv-alarm: #b3150d;
+  --stamp-ink: #b3150d;
+  --badge-ink: #fff;
+  --nerv-grid: rgba(20, 17, 12, .06);
+  --nerv-hex: rgba(20, 17, 12, .05);
+  --nerv-scan: rgba(20, 17, 12, .035);
+}
+
+/* ---- dark ---------------------------------------------------------------- */
+@media (prefers-color-scheme: dark) {
+  html:root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #050504;
+    --surface: #0d0c0a;
+    --sunk: #000000;
+    --ink: #f1ede4;
+    --ink-2: #c8c1b2;
+    --ink-3: #a39b8a;
+    --line: #2a2118;
+    --line-2: #4a3a24;
+    --edge: #7a6a50;
+
+    --gold: #ff7a1a;
+    --gold-line: #ff7a1a;
+    --fill: #ff7a1a;
+    --teal: #3dff8f;
+    --rust: #ff4a3d;
+    --violet: #b78fe0;
+    --blue: #5fb4ff;
+
+    --mark-a: #ff7a1a; --mark-b: #3dff8f; --mark-c: #b78fe0; --mark-gold: #ff7a1a;
+    --cand-a: #ff7a1a; --cand-b: #3dff8f; --cand-c: #b78fe0; --cand-d: #ffd23d; --cand-e: #5fb4ff;
+
+    --tint-gold: #2a1606;  --on-gold: #ffa24d;
+    --tint-teal: #082414;  --on-teal: #6dffaa;
+    --tint-blue: #08192b;  --on-blue: #8fcaff;
+    --tint-rust: #2d0c0a;  --on-rust: #ff8a80;
+    --tint-ink:  #1a1712;  --on-ink:  #c8c1b2;
+
+    --focus: #ffd23d;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 4px 14px rgba(0, 0, 0, .35);
+    --hatch: rgba(255, 74, 61, .22);
+    --hatch-gold: rgba(255, 122, 26, .25);
+
+    --nerv-alarm: #e0201a;
+    --stamp-ink: #ff4a3d;
+    --badge-ink: #000;
+    --nerv-grid: rgba(255, 122, 26, .05);
+    --nerv-hex: rgba(255, 122, 26, .10);
+    --nerv-scan: rgba(0, 0, 0, .18);
+  }
+}
+html:root[data-theme="dark"] {
   color-scheme: dark;
   --bg: #050504;
   --surface: #0d0c0a;
@@ -2332,6 +2463,7 @@ html:root:not([data-theme="light"]) {
 
   --gold: #ff7a1a;
   --gold-line: #ff7a1a;
+  --fill: #ff7a1a;
   --teal: #3dff8f;
   --rust: #ff4a3d;
   --violet: #b78fe0;
@@ -2347,35 +2479,31 @@ html:root:not([data-theme="light"]) {
   --tint-ink:  #1a1712;  --on-ink:  #c8c1b2;
 
   --focus: #ffd23d;
-  --shadow: none;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 4px 14px rgba(0, 0, 0, .35);
   --hatch: rgba(255, 74, 61, .22);
   --hatch-gold: rgba(255, 122, 26, .25);
 
-  /* Alarm-only token: banner, hazard stripes and the stalled card's edge.
-     Kept apart from --rust so the data tone and the alert cannot drift. */
   --nerv-alarm: #e0201a;
-  --nerv-alarm-deep: #7a0a0a;
-  --nerv-hazard: #ffd23d;
-
-  --radius: 0; --radius-sm: 0;
-  --mincho: "Hiragino Mincho ProN", "Hiragino Mincho Pro", "Yu Mincho", YuMincho, "MS PMincho", serif;
-  --sans: var(--mono);
+  --stamp-ink: #ff4a3d;
+  --badge-ink: #000;
+  --nerv-grid: rgba(255, 122, 26, .05);
+  --nerv-hex: rgba(255, 122, 26, .10);
+  --nerv-scan: rgba(0, 0, 0, .18);
 }
-html:root[data-theme="light"] { --bg: #0b0a08; --surface: #141210; }
 
 /* Grid + hexagon motifs, gradients only. */
 body {
   background-color: var(--bg);
   background-image:
-    linear-gradient(rgba(255, 122, 26, .05) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 122, 26, .05) 1px, transparent 1px);
+    linear-gradient(var(--nerv-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--nerv-grid) 1px, transparent 1px);
   background-size: 32px 32px;
 }
 @supports (background: conic-gradient(#000, #fff)) {
   .top {
-    background-image: conic-gradient(from 30deg at 50% 50%, rgba(255, 122, 26, .10) 0 60deg, transparent 60deg 120deg,
-      rgba(255, 122, 26, .10) 120deg 180deg, transparent 180deg 240deg,
-      rgba(255, 122, 26, .10) 240deg 300deg, transparent 300deg 360deg);
+    background-image: conic-gradient(from 30deg at 50% 50%, var(--nerv-hex) 0 60deg, transparent 60deg 120deg,
+      var(--nerv-hex) 120deg 180deg, transparent 180deg 240deg,
+      var(--nerv-hex) 240deg 300deg, transparent 300deg 360deg);
     background-size: 28px 48px;
   }
 }
@@ -2394,7 +2522,7 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 }
 .card[data-status="stalled"] {
   border-left: 8px solid transparent;
-  border-image: repeating-linear-gradient(-45deg, var(--nerv-alarm) 0 6px, #000 6px 12px) 1 / 0 0 0 8px;
+  border-image: repeating-linear-gradient(-45deg, var(--nerv-alarm) 0 6px, var(--nerv-stripe-ink) 6px 12px) 1 / 0 0 0 8px;
 }
 .btn, .chip, .tag, .icon-btn { border-radius: 0; }
 
@@ -2405,14 +2533,14 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
   overflow-wrap: anywhere;
   background: var(--nerv-alarm-deep);
   border: 8px solid var(--nerv-alarm);
-  border-image: repeating-linear-gradient(-45deg, var(--nerv-hazard) 0 10px, #000 10px 20px) 8;
+  border-image: repeating-linear-gradient(-45deg, var(--nerv-hazard) 0 10px, var(--nerv-stripe-ink) 10px 20px) 8;
 }
 @media (prefers-reduced-motion: no-preference) {
   .alert-banner { animation: nerv-blink 1.4s steps(2, jump-none) infinite; }
   @keyframes nerv-blink { 0% { filter: none; } 100% { filter: brightness(1.45); } }
   body::after {
     content: ""; position: fixed; inset: 0; z-index: 1; pointer-events: none;
-    background: repeating-linear-gradient(transparent 0 2px, rgba(0, 0, 0, .18) 2px 3px);
+    background: repeating-linear-gradient(transparent 0 2px, var(--nerv-scan) 2px 3px);
   }
 }
 
@@ -2425,8 +2553,8 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 }
 .stamp .stamp-ja { font-size: var(--t7); font-weight: 900; letter-spacing: .2em; }
 .stamp .stamp-en { font-family: var(--mono); font-size: var(--t2); letter-spacing: .12em; text-transform: uppercase; overflow-wrap: anywhere; }
-.stamp-approved { color: var(--nerv-alarm); background: var(--tint-rust); }
-.stamp-provisional { color: var(--ink-3); border-style: dashed; opacity: .7; }
+.stamp-approved { color: var(--stamp-ink); background: var(--tint-rust); }
+.stamp-provisional { color: var(--ink-3); border-style: dashed; }
 .tag .stamp-ja { font-family: var(--mincho); font-weight: 900; letter-spacing: .15em; }
 
 /* ---- MAGI seats ----------------------------------------------------------- */
