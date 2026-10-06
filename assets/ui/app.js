@@ -6354,6 +6354,33 @@ function renderAdvise(run) {
   });
 }
 
+/* The verdict of a one-candidate run in the design-deliberation shape: one
+   chip for the candidate and a "solo" marker where that panel shows "brief". */
+function renderVerdictSolo(candidate) {
+  const label = candidate.label || "?";
+  const dead = !viable(candidate);
+  const strip = $("verdict-solo");
+  setText($("verdict-solo-note"),
+    `Only one candidate, so there is no judging or vote; ${label} goes straight to review.`);
+  strip.setAttribute("aria-label", `Solo run, 1 candidate${dead ? ", not viable" : ""}`);
+  const chip = el("span", {
+    class: "advise-chip",
+    role: "listitem",
+    style: `--chip-tone: ${candTone(0)}`,
+    title: `${label}${candidate.agent ? ` (${candidate.agent})` : ""}`,
+  },
+    el("span", { class: "advise-dot", "aria-hidden": "true" }),
+    el("span", { class: "advise-seat", text: label }),
+    el("span", { class: "advise-agent", text: candidate.agent || "" }),
+  );
+  if (dead) chip.setAttribute("data-dead", "");
+  strip.append(
+    chip,
+    el("span", { class: "advise-link", "aria-hidden": "true" }),
+    el("span", { class: "advise-brief", role: "listitem", "data-state": "filled", text: "solo" }),
+  );
+}
+
 function renderVerdict(run) {
   const tally = run.tally;
   const panel = $("run-verdict");
@@ -6363,6 +6390,27 @@ function renderVerdict(run) {
 
   const converge = $("converge");
   clear(converge);
+  /* A solo run has nothing to judge: the compact strip replaces the diagram.
+     Decided on the candidate count alone, never on how many stayed viable. */
+  const solo = candidates.length === 1;
+  const soloStrip = $("verdict-solo");
+  clear(soloStrip);
+  setText($("verdict-count"), solo ? "solo · 1 candidate" : "");
+  show($("verdict-solo-note"), solo);
+  show(soloStrip, solo);
+  if (solo) {
+    clear($("verdict-stamp"));
+    clear($("magi-seats"));
+    clear($("tally-facts"));
+    show($("verdict-stamp"), false);
+    show($("magi-seats"), false);
+    show($("tally-facts"), false);
+    show(converge, false);
+    renderVerdictSolo(candidates[0]);
+    return;
+  }
+  show($("tally-facts"), true);
+  show(converge, true);
   /* A winner label alone does not mean a verdict. A run whose panel collapsed
      still records the one ranking it got, so the diamond is only drawn as
      decided when the quorum backs it. */
