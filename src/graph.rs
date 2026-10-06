@@ -584,24 +584,10 @@ impl Runner {
                 missing.join(", ")
             );
         }
-        let base_branch = match config.merge.base.clone() {
-            Some(b) => b,
-            None => git::current_branch(&repo)
-                .await?
-                .context("HEAD is detached; set [merge] base in magi.toml")?,
-        };
+        let base_branch =
+            git::merge_base_branch(&repo, &config.merge.remote, config.merge.base.as_deref())
+                .await?;
         let base_commit = resolve_base(&repo, &base_branch, &config.merge.remote).await?;
-        // Still worth saying out loud. The operator's uncommitted work is not
-        // part of this run, and someone watching a candidate fail to use a
-        // change they just made deserves to know why.
-        if !git::is_clean(&repo).await? {
-            tracing::warn!(
-                "{} has uncommitted changes; they are not part of this run, \
-                 which branches off {base_branch} ({})",
-                repo.display(),
-                &base_commit[..base_commit.len().min(8)]
-            );
-        }
         let roles = config.resolve_roles()?;
         let max_parallel = config.graph.max_parallel.max(1);
         // A task that points at work already in the repository starts from
@@ -676,12 +662,9 @@ impl Runner {
                 missing.join(", ")
             );
         }
-        let base_branch = match config.merge.base.clone() {
-            Some(b) => b,
-            None => git::current_branch(&repo)
-                .await?
-                .context("HEAD is detached; set [merge] base in magi.toml")?,
-        };
+        let base_branch =
+            git::merge_base_branch(&repo, &config.merge.remote, config.merge.base.as_deref())
+                .await?;
         if base_branch == branch {
             bail!("`{branch}` is the base branch; there is nothing to review against");
         }
@@ -3481,9 +3464,10 @@ impl Runner {
         let tracking = format!("{remote}/{base_branch}");
 
         git::fetch(&repo, &remote, &base_branch).await.ok();
-        // No network, or the remote never had this branch: `resolve_base`
-        // already treats that as non-fatal at branch time, and a run that got
-        // this far must not be blocked by it here either.
+        // No network, or the remote never had this branch: the run already
+        // started from a fetched `<remote>/<base>` (`resolve_base` refuses
+        // otherwise), and one that got this far is not blocked by a fetch
+        // that fails now. It just has no newer tip to compare against.
         let Ok(tip) = git::rev_parse(&repo, &tracking).await else {
             return Ok(());
         };
@@ -8265,11 +8249,16 @@ async fn merge_is_empty(repo: &Path, state: &RunState, branch: &str, mode: Merge
     let base = &state.base_branch;
     let mut against = base.clone();
     if mode == MergeMode::Pr {
+        // A pull request lands on the remote's base, never the local branch
+        // of the same name: if that cannot be read, "not empty" is the safe
+        // answer.
         let remote = &state.config.merge.remote;
         let tracking = format!("{remote}/{base}");
         let fetched = git::fetch(repo, remote, base).await;
         if fetched.is_ok_and(|o| o.ok()) && git::rev_exists(repo, &tracking).await {
             against = tracking;
+        } else {
+            return false;
         }
     }
     matches!(git::commits_ahead(repo, &against, branch).await, Ok(0))

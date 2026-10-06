@@ -111,6 +111,12 @@ async fn a_run_branches_off_what_the_remote_has_not_a_stale_local_ref() {
         &["init", "--bare", "--quiet", remote_dir.to_str().unwrap()],
         fx.tmp.path(),
     );
+    // The remote's default branch is what a run with no `[merge] base` starts
+    // from; `init --bare` would leave it on `init.defaultBranch`.
+    git(
+        &["symbolic-ref", "HEAD", &format!("refs/heads/{base}")],
+        &remote_dir,
+    );
     git(&["remote", "remove", "origin"], &fx.repo);
     git(
         &["remote", "add", "origin", remote_dir.to_str().unwrap()],
@@ -231,5 +237,44 @@ async fn a_run_branches_off_what_the_remote_has_not_a_stale_local_ref() {
         &fx.repo,
     );
     assert!(listed.contains("landed.txt"), "got {listed}");
+}
+}
+
+common::e2e! {
+async fn a_detached_diverged_checkout_does_not_choose_the_base() {
+    // jj keeps HEAD detached, and a primary checkout is often arbitrarily far
+    // from the remote. With no `[merge] base`, the remote's default branch
+    // decides - and the run branches off its tip, not off HEAD.
+    let _home = common::home_lock().await;
+    let fx = common::fixture(_home, common::Judges::Unanimous, false);
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&fx.repo)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    let remote_tip = git(&["rev-parse", "origin/main"]);
+    git(&["checkout", "--quiet", "--detach"]);
+    std::fs::write(fx.repo.join("local-only.txt"), "x\n").expect("write");
+    git(&["add", "local-only.txt"]);
+    git(&[
+        "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "local only",
+    ]);
+    git(&["branch", "-f", "main", "HEAD"]);
+    assert_ne!(git(&["rev-parse", "HEAD"]), remote_tip);
+    assert!(fx.config.merge.base.is_none());
+
+    let runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
+        .await
+        .expect("a detached, diverged checkout must not stop a run");
+    assert_eq!(runner.state.base_branch, "main");
+    assert_eq!(runner.state.base_commit, remote_tip);
 }
 }

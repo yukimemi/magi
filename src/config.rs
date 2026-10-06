@@ -1552,7 +1552,11 @@ impl Config {
         explicit: Option<&Path>,
     ) -> Result<(Self, Vec<PathBuf>)> {
         if explicit.is_none() && is_git_worktree(repo) {
-            let (remote, base) = resolve_remote_base(repo)?;
+            // A checkout that was never cloned from the remote has no
+            // `<remote>/HEAD`; learn it here (refs/remotes only) so an
+            // ordinary start recovers instead of failing in `discover`.
+            let (remote, explicit) = probe_remote_base(repo);
+            let base = crate::git::merge_base_branch(repo, &remote, explicit.as_deref()).await?;
             let out = crate::git::fetch(repo, &remote, &base)
                 .await
                 .with_context(|| format!("fetching {remote}/{base} to read magi.toml"))?;
@@ -2061,8 +2065,8 @@ fn probe_merge(path: &Path, repo: &Path) -> Option<ProbeMerge> {
     toml::from_str::<Probe>(&text).ok()?.merge
 }
 
-/// Where the remote ref is: see the module doc for the order.
-fn resolve_remote_base(repo: &Path) -> Result<(String, String)> {
+/// The `[merge] remote` / `base` the layers name, before any git lookup.
+fn probe_remote_base(repo: &Path) -> (String, Option<String>) {
     let mut remote = None;
     let mut base = None;
     let mut sources: Vec<PathBuf> = Config::machine_layer().into_iter().collect();
@@ -2074,17 +2078,18 @@ fn resolve_remote_base(repo: &Path) -> Result<(String, String)> {
             base = base.or(m.base.filter(|s| !s.trim().is_empty()));
         }
     }
-    let remote = remote.unwrap_or_else(|| "origin".to_owned());
+    (remote.unwrap_or_else(|| "origin".to_owned()), base)
+}
+
+/// Where the remote ref is: see the module doc for the order.
+fn resolve_remote_base(repo: &Path) -> Result<(String, String)> {
+    let (remote, base) = probe_remote_base(repo);
     let base = match base {
         Some(b) => b,
         None => {
             let head = format!("refs/remotes/{remote}/HEAD");
-            git_out(repo, &["symbolic-ref", "--short", &head])
-                .and_then(|s| {
-                    s.trim()
-                        .strip_prefix(&format!("{remote}/"))
-                        .map(str::to_owned)
-                })
+            git_out(repo, &["symbolic-ref", "--quiet", &head])
+                .and_then(|s| crate::git::remote_head_branch(&remote, &s))
                 .with_context(|| {
                     format!(
                         "cannot tell which branch of `{remote}` holds magi.toml: \
