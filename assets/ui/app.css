@@ -34,6 +34,15 @@
   --violet: #7d4b9e;
   --blue: #4a72b8;
 
+  --verdict-merged: #b8901f;
+  --verdict-ready: #0a7e8c;
+  --verdict-in_progress: #4a72b8;
+  --verdict-blocked: #c5582d;
+  --verdict-failed: #a3283c;
+  --verdict-verified_noop: #7d4b9e;
+  --verdict-superseded: #857f74;
+  --verdict-stalled: #b83d86;
+
   /* The mark, exactly as assets/logo.svg draws it. A logotype is exempt from
      the contrast minimum and must not be tampered with to satisfy it. */
   --mark-a: #c5582d;
@@ -103,6 +112,15 @@
     --violet: #b78fe0;
     --blue: #7ea6e8;
 
+    --verdict-merged: #e9c14a;
+    --verdict-ready: #3aa9b8;
+    --verdict-in_progress: #7ea6e8;
+    --verdict-blocked: #e58050;
+    --verdict-failed: #e8607a;
+    --verdict-verified_noop: #b78fe0;
+    --verdict-superseded: #9b948a;
+    --verdict-stalled: #e57ab5;
+
     /* assets/logo-dark.svg, verbatim. */
     --mark-a: #e58050;
     --mark-b: #3aa9b8;
@@ -145,6 +163,15 @@
   --rust: #e58050;
   --violet: #b78fe0;
   --blue: #7ea6e8;
+
+  --verdict-merged: #e9c14a;
+  --verdict-ready: #3aa9b8;
+  --verdict-in_progress: #7ea6e8;
+  --verdict-blocked: #e58050;
+  --verdict-failed: #e8607a;
+  --verdict-verified_noop: #b78fe0;
+  --verdict-superseded: #9b948a;
+  --verdict-stalled: #e57ab5;
 
   /* assets/logo-dark.svg, verbatim. */
   --mark-a: #e58050;
@@ -1288,32 +1315,41 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
    banner's own padding so it does not make the banner taller. */
 .stats-banner-close { color: inherit; margin: calc(var(--s3) * -1) calc(var(--s4) * -1) calc(var(--s3) * -1) 0; }
 
-/* The verdict breakdown: one segment per RunStatus bucket, width proportional
-   to its share of total runs — a stacked bar, not a pie, because a phone-width
-   screen has far more usable horizontal than radial space. */
-.stack-bar {
-  display: flex; width: 100%; height: 22px;
-  border-radius: var(--radius-sm); overflow: hidden;
-  background: var(--sunk);
-}
-.stack-bar-seg { height: 100%; }
-.stack-bar-seg[data-tone="gold"] { background: var(--gold); }
-.stack-bar-seg[data-tone="teal"] { background: var(--teal); }
-.stack-bar-seg[data-tone="rust"] { background: var(--rust); }
-.stack-bar-seg[data-tone="blue"] { background: var(--blue); }
-.stack-bar-seg[data-tone="ink"]  { background: var(--ink-3); }
+/* The verdict breakdown: a donut (inline SVG) with the run total in the
+   centre and a legend beside it. Every bucket has one fixed colour via
+   --verdict-*, read as --vc by the slice, the legend dot and the KPI tile. */
+[data-verdict="merged"] { --vc: var(--verdict-merged); }
+[data-verdict="ready"] { --vc: var(--verdict-ready); }
+[data-verdict="in_progress"] { --vc: var(--verdict-in_progress); }
+[data-verdict="blocked"] { --vc: var(--verdict-blocked); }
+[data-verdict="failed"] { --vc: var(--verdict-failed); }
+[data-verdict="verified_noop"] { --vc: var(--verdict-verified_noop); }
+[data-verdict="superseded"] { --vc: var(--verdict-superseded); }
+[data-verdict="stalled"] { --vc: var(--verdict-stalled); }
+.stats-tile[data-verdict] .stats-tile-value { color: var(--vc); }
 
-.stats-legend {
-  display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4);
-  font-size: var(--t2); color: var(--ink-2); margin-top: var(--s1);
+.verdict-donut { display: flex; flex-direction: column; align-items: center; gap: var(--s3); }
+@media (min-width: 720px) {
+  .verdict-donut { flex-direction: row; justify-content: flex-start; gap: var(--s5, 24px); }
 }
-.stats-legend li { display: flex; align-items: center; gap: var(--s1); }
-.stats-legend-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
-.stats-legend-dot[data-tone="gold"] { background: var(--gold); }
-.stats-legend-dot[data-tone="teal"] { background: var(--teal); }
-.stats-legend-dot[data-tone="rust"] { background: var(--rust); }
-.stats-legend-dot[data-tone="blue"] { background: var(--blue); }
-.stats-legend-dot[data-tone="ink"]  { background: var(--ink-3); }
+.verdict-donut-svg { width: 180px; height: 180px; flex: none; }
+.donut-ring { fill: none; stroke: var(--sunk); stroke-width: 26; }
+.donut-slice { fill: none; stroke: var(--vc); stroke-width: 26; cursor: pointer; }
+.donut-slice:hover { opacity: .8; }
+.donut-total { font: 700 30px var(--sans); fill: var(--ink); text-anchor: middle; font-variant-numeric: tabular-nums; }
+.donut-total-label { font: 11px var(--sans); fill: var(--ink-3); text-anchor: middle; text-transform: uppercase; letter-spacing: .05em; }
+.verdict-legend { list-style: none; margin: 0; padding: 0; width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: 2px; }
+.verdict-legend-row {
+  display: flex; align-items: center; gap: var(--s2); width: 100%; min-height: 36px;
+  padding: 0 var(--s2); background: transparent; border: 0; border-radius: var(--radius-sm);
+  font: inherit; font-size: var(--t3); color: var(--ink-2); cursor: pointer; text-align: left;
+}
+.verdict-legend-row:hover { background: var(--sunk); }
+.verdict-legend-row[data-zero] { opacity: .55; }
+.verdict-legend-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--vc); }
+.verdict-legend-name { flex: 1; }
+.verdict-legend-count, .verdict-legend-pct { font-variant-numeric: tabular-nums; color: var(--ink); }
+.verdict-legend-pct { min-width: 5ch; text-align: right; color: var(--ink-3); }
 
 /* Per-agent / per-reviewer rate bars: a label row above a filled track,
    repeated once per row. */

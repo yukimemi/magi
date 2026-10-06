@@ -12028,8 +12028,10 @@ mod tests {
             "openRunsFiltered must exist as the single place a stats tile sets the Runs filter"
         );
         assert!(
-            APP_JS.contains("if (status && String(run.status || \"\") !== status) return false;"),
-            "matchesFilter must gate on the exact status a KPI tile named"
+            APP_JS.contains(
+                "if (status && !statusInBucket(String(run.status || \"\"), status)) return false;"
+            ),
+            "matchesFilter must gate on the statuses of the bucket a KPI tile named"
         );
         // applyRoute() only flips which view is visible for a plain `#runs`
         // hash - it does not itself redraw the list (see applyRoute's own
@@ -14762,5 +14764,34 @@ mod tests {
 
         let missing = dir.path().join("does-not-exist-at-all");
         assert_eq!(normalize_default_repo(missing.clone()).await, missing);
+    }
+
+    #[test]
+    fn stats_verdict_donut_has_fixed_colours_and_a_minimum_arc() {
+        assert!(APP_JS.contains("function statsDonutArcs"));
+        assert!(APP_JS.contains("STATS_DONUT_MIN_DEG"));
+        // A bucket click filters by the statuses src/stats.rs counts in it.
+        assert!(APP_JS.contains("function statusInBucket"));
+        assert!(APP_JS.contains("statuses: [\"superseded\", \"already_in_base\"]"));
+        assert!(INDEX_HTML.contains("id=\"stats-verdict-donut\""));
+        let buckets = [
+            "merged",
+            "ready",
+            "in_progress",
+            "blocked",
+            "failed",
+            "verified_noop",
+            "superseded",
+            "stalled",
+        ];
+        for key in buckets {
+            let var = format!("--verdict-{key}:");
+            // Light, OS-dark and pinned-dark blocks each define it.
+            assert_eq!(APP_CSS.matches(&var).count(), 3, "{var}");
+            assert!(
+                APP_CSS.contains(&format!("[data-verdict=\"{key}\"]")),
+                "{key}"
+            );
+        }
     }
 }

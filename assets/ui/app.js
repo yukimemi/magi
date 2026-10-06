@@ -1561,10 +1561,18 @@ function sectionCompatibleWithStateFilter(sectionKey, filterKey) {
    stats tile can set (see openRunsFiltered): "Merged" is done by
    construction, so pairing it with "Active" or "In flight" always yields
    zero cards the same way "Landed" does. */
+/* A stats bucket is not always one RunStatus: "In flight" is every active
+   status and "Superseded" also takes already_in_base (mirroring src/stats.rs).
+   A filter that is not a bucket key is an exact status. */
+function statusInBucket(runStatus, filterStatus) {
+  const bucket = STATS_VERDICT_BUCKETS.find((b) => b.key === filterStatus);
+  return bucket ? bucket.statuses.includes(runStatus) : runStatus === filterStatus;
+}
+
 function statusCompatibleWithStateFilter(status, filterKey) {
   const filter = RUN_STATE_FILTERS.find((f) => f.key === filterKey);
   if (!filter) return true;
-  return REPRESENTATIVE_RUN_SHAPES.some((run) => run.status === status && filter.match(run));
+  return REPRESENTATIVE_RUN_SHAPES.some((run) => statusInBucket(run.status, status) && filter.match(run));
 }
 
 /* A head that still names a `superseded_by` (see foldRuns below) is one
@@ -1747,7 +1755,7 @@ function buildRunsTree(bySection) {
    screen, not a place worth deep-linking to. */
 function matchesFilter(run) {
   const { section, repo, status } = state.runsFilter;
-  if (status && String(run.status || "") !== status) return false;
+  if (status && !statusInBucket(String(run.status || ""), status)) return false;
   if (!section) return true;
   if (runSection(run) !== section) return false;
   return !repo || repoLabel(run) === repo;
@@ -3036,6 +3044,7 @@ function statsTile(label, value, tone, activate) {
       class: "stats-tile",
       type: "button",
       "data-tone": tone || null,
+      "data-verdict": activate.verdict || null,
       "aria-label": activate.ariaLabel,
       onclick: activate.onClick,
     },
@@ -3058,7 +3067,8 @@ function statsPct(rate) {
 function renderStatsTiles(t) {
   const root = $("stats-kpis");
   clear(root);
-  const statusTile = (label, value, tone, status) => statsTile(label, value, tone, {
+  const statusTile = (label, value, status) => statsTile(label, value, null, {
+    verdict: status,
     onClick: () => openRunsFiltered(status),
     ariaLabel: `Show ${value} ${label.toLowerCase()} runs`,
   });
@@ -3067,53 +3077,121 @@ function renderStatsTiles(t) {
       onClick: () => openRunsFiltered(null),
       ariaLabel: `Show all ${t.runs} runs`,
     }),
-    statusTile("Merged", t.merged, "gold", "merged"),
-    statusTile("Ready", t.ready, "teal", "ready"),
-    statusTile("Blocked", t.blocked, "rust", "blocked"),
-    statusTile("Stalled", t.stalled, "rust", "stalled"),
+    statusTile("Merged", t.merged, "merged"),
+    statusTile("Ready", t.ready, "ready"),
+    statusTile("Blocked", t.blocked, "blocked"),
+    statusTile("Stalled", t.stalled, "stalled"),
     statsTile("Completion", statsPct(t.completion_rate), "teal"),
   );
 }
 
-/* One segment per non-empty RunStatus bucket. `blocked` and `stalled` share
-   a tone deliberately: both are runs that stopped short of a verdict, and
-   the legend (not the colour) is what tells them apart - see
+/* One fixed colour per RunStatus bucket (--verdict-<key> in app.css, picked
+   up through data-verdict), shared by the donut, its legend and the KPI
+   tiles. `blocked` and `stalled` are deliberately different colours now: see
    RunStatus::Stalled's own doc for why a stall must never read as decided. */
 const STATS_VERDICT_BUCKETS = [
-  { key: "merged", label: "Merged", tone: "gold" },
-  { key: "ready", label: "Ready", tone: "teal" },
-  { key: "in_progress", label: "In flight", tone: "blue" },
-  { key: "blocked", label: "Blocked", tone: "rust" },
-  { key: "stalled", label: "Stalled", tone: "rust" },
-  { key: "failed", label: "Failed", tone: "ink" },
-  { key: "verified_noop", label: "Verified no-op", tone: "ink" },
-  { key: "superseded", label: "Superseded", tone: "ink" },
+  { key: "merged", label: "Merged", statuses: ["merged"] },
+  { key: "ready", label: "Ready", statuses: ["ready"] },
+  { key: "in_progress", label: "In flight", statuses: ["prep", "implementing", "judging", "deliberating", "voting", "reviewing", "gating", "landing"] },
+  { key: "blocked", label: "Blocked", statuses: ["blocked"] },
+  { key: "stalled", label: "Stalled", statuses: ["stalled"] },
+  { key: "failed", label: "Failed", statuses: ["failed"] },
+  { key: "verified_noop", label: "Verified no-op", statuses: ["verified_noop"] },
+  { key: "superseded", label: "Superseded", statuses: ["superseded", "already_in_base"] },
 ];
 
-function renderStatsVerdictBar(t) {
-  const bar = $("stats-verdict-bar");
-  const legend = $("stats-verdict-legend");
-  clear(bar);
-  clear(legend);
-  const total = t.runs || 1;
-  const described = [];
-  for (const bucket of STATS_VERDICT_BUCKETS) {
-    const value = t[bucket.key];
-    if (!value) continue;
-    described.push(`${bucket.label} ${value}`);
-    bar.append(el("div", {
-      class: "stack-bar-seg",
-      "data-tone": bucket.tone,
-      style: `width: ${((100 * value) / total).toFixed(2)}%`,
-    }));
-    legend.append(el(
-      "li",
-      {},
-      el("span", { class: "stats-legend-dot", "data-tone": bucket.tone }),
-      el("span", { text: `${bucket.label} · ${value}` }),
-    ));
+/* Pure: degrees per slice for `counts` (zeros are dropped, so the result
+   holds one entry per non-zero count, in order). Each gets at least `minDeg`
+   so a 4-of-300 slice stays visible; slices pinned at the minimum are taken
+   out and the rest share what is left in proportion to their counts, so the
+   total stays 360. */
+function statsDonutArcs(counts, minDeg) {
+  const items = counts.map((count, index) => ({ count, index })).filter((x) => x.count > 0);
+  const total = items.reduce((n, x) => n + x.count, 0);
+  if (total === 0) return [];
+  const min = Math.min(minDeg, 360 / items.length);
+  const pinned = new Set();
+  for (;;) {
+    const free = items.filter((x) => !pinned.has(x));
+    const freeCount = free.reduce((n, x) => n + x.count, 0);
+    const room = 360 - min * pinned.size;
+    const next = free.filter((x) => (room * x.count) / freeCount < min);
+    if (next.length === 0) {
+      return items.map((x) => ({
+        index: x.index,
+        deg: pinned.has(x) ? min : (room * x.count) / freeCount,
+      }));
+    }
+    next.forEach((x) => pinned.add(x));
   }
-  setAttr(bar, "aria-label", `Verdict breakdown of ${t.runs} runs: ${described.join(", ")}`);
+}
+
+const STATS_DONUT_MIN_DEG = 6;
+
+function renderStatsVerdictBar(t) {
+  const root = $("stats-verdict-donut");
+  clear(root);
+  const counts = STATS_VERDICT_BUCKETS.map((b) => t[b.key] || 0);
+  const runs = t.runs || 0;
+  const pctOf = (n) => (runs ? ((100 * n) / runs).toFixed(1) : "0.0");
+  const R = 64, C = 90;
+  const arcs = statsDonutArcs(counts, STATS_DONUT_MIN_DEG);
+  const point = (deg) => {
+    const a = ((deg - 90) * Math.PI) / 180;
+    return [C + R * Math.cos(a), C + R * Math.sin(a)];
+  };
+  const slices = [svg("circle", { class: "donut-ring", cx: C, cy: C, r: R })];
+  let at = 0;
+  for (const arc of arcs) {
+    const bucket = STATS_VERDICT_BUCKETS[arc.index];
+    const n = counts[arc.index];
+    const props = {
+      class: "donut-slice", "data-verdict": bucket.key,
+    };
+    let node;
+    if (arc.deg >= 359.99) {
+      node = svg("circle", { ...props, cx: C, cy: C, r: R });
+    } else {
+      const [x0, y0] = point(at);
+      const [x1, y1] = point(at + arc.deg);
+      node = svg("path", {
+        ...props,
+        d: `M ${x0.toFixed(2)} ${y0.toFixed(2)} A ${R} ${R} 0 ${arc.deg > 180 ? 1 : 0} 1 ${x1.toFixed(2)} ${y1.toFixed(2)}`,
+      });
+    }
+    node.append(svg("title", { text: `${bucket.label}: ${n} (${pctOf(n)}%)` }));
+    node.addEventListener("click", () => openRunsFiltered(bucket.key));
+    slices.push(node);
+    at += arc.deg;
+  }
+  const chart = svg(
+    "svg",
+    { class: "verdict-donut-svg", viewBox: "0 0 180 180", "aria-hidden": "true" },
+    ...slices,
+    svg("text", { class: "donut-total", x: C, y: C + 6, text: String(runs) }),
+    svg("text", { class: "donut-total-label", x: C, y: C + 24, text: "runs" }),
+  );
+  const legend = el("ul", { class: "verdict-legend" });
+  STATS_VERDICT_BUCKETS.forEach((bucket, i) => {
+    const n = counts[i];
+    legend.append(el("li", {}, el(
+      "button",
+      {
+        class: "verdict-legend-row", type: "button", "data-verdict": bucket.key,
+        "data-zero": n ? null : true,
+        "aria-label": `Show ${n} ${bucket.label.toLowerCase()} runs (${pctOf(n)}%)`,
+        onclick: () => openRunsFiltered(bucket.key),
+      },
+      el("span", { class: "verdict-legend-dot" }),
+      el("span", { class: "verdict-legend-name", text: bucket.label }),
+      el("span", { class: "verdict-legend-count", text: String(n) }),
+      el("span", { class: "verdict-legend-pct", text: `${pctOf(n)}%` }),
+    )));
+  });
+  root.append(chart, legend);
+  const widened = arcs.some((a) => a.deg === Math.min(STATS_DONUT_MIN_DEG, 360 / arcs.length)
+    && (counts[a.index] / (runs || 1)) * 360 < a.deg - 0.01);
+  show($("stats-verdict-note"), widened);
 }
 
 /* A rate over fewer than this many samples swings by 30 points or more on a
