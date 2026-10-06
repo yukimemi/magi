@@ -999,6 +999,22 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         .filter_map(|a| store.attachment_path(&talk.id, a))
         .collect();
 
+    // A question handed to this conversation is answered with `magi answer`,
+    // which writes the question store; a read-only sandbox refuses that. So the
+    // turn that answers a hand-over - and only that turn, never the rest of
+    // the conversation - may write, with the question store as a writable
+    // root. As for the deputy, what the seat may touch beyond that rests on
+    // the prompt, not the sandbox.
+    let consulted = talk
+        .turns
+        .last()
+        .is_some_and(|t| t.who == Who::Operator && crate::consult::is_consult_text(&t.body));
+    let consult_roots: Vec<PathBuf> = if consulted {
+        vec![crate::ask::Questions::open().root().to_path_buf()]
+    } else {
+        Vec::new()
+    };
+
     let artifacts = store.artifacts_of(&talk.id);
     // From the transcript, not the seat: a switched agent's seat restarts at
     // zero and must not overwrite an earlier turn's artifacts.
@@ -1075,7 +1091,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             // `crate::config::Talk::allow_write` and this module's doc for why
             // the default keeps a conversational edit from landing in a checkout
             // no run or review can claim.
-            allow_write: cfg.talk.allow_write,
+            allow_write: cfg.talk.allow_write || consulted,
             sessions: cfg.graph.sessions,
             artifacts: &artifacts,
             stem: &attempt_stem,
@@ -1085,7 +1101,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             node: crate::queue::CHAT_NODE,
             cache_dir: cache_dir.as_deref(),
             attachments: &attachment_paths,
-            writable: &[],
+            writable: &consult_roots,
         };
         let result = agent::invoke(spec, &mut talk.seat, &inv).await;
         let advance = agent::chain_advances(&result);

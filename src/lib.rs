@@ -32,6 +32,7 @@ pub mod cache;
 pub mod clean;
 pub mod conduct;
 pub mod config;
+pub mod consult;
 pub mod daemon;
 pub mod deputy;
 pub mod direct;

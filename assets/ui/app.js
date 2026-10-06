@@ -48,6 +48,7 @@ const API = {
   notificationDismiss: (id) => `/api/notifications/${encodeURIComponent(id)}/dismiss`,
   answer: (id) => `/api/questions/${encodeURIComponent(id)}/answer`,
   questionSay: (id) => `/api/questions/${encodeURIComponent(id)}/say`,
+  questionConsult: (id) => `/api/questions/${encodeURIComponent(id)}/consult`,
   /* Agent-authored HTML, served by its own endpoint so it lands in a
      sandboxed frame of its own document rather than in this one. */
   /* Ends in a filename on purpose: a panel references its attachments by bare
@@ -4019,17 +4020,22 @@ function createAskCard() {
   const sayBox = el("div", { class: "ask-say" },
     el("label", { class: "ask-say-label", text: "Not ready to decide? Ask back instead:" }),
     sayText, saySend);
+  /* Not one of the question's choices: a separate action, shown only when the
+     server says the question's task came from a chat (`origin_chat`). */
+  const consultBtn = el("button", { class: "btn ask-consult", type: "button", text: "Ask the chat agent" });
+  const consultBox = el("div", { class: "ask-consult-box" }, consultBtn);
 
   const row = el("li", { class: "ask" },
     band,
     el("div", { class: "ask-top" }, chipSlot, whenSlot),
     /* The panel sits above the prose: when there is one, it is the case for
        the decision and the detail is the footnote. */
-    summary, where, panelBox, detail, thread, hint, waitingNote, stakes, choices, free, sayBox, error, answer, note,
+    summary, where, panelBox, detail, thread, hint, waitingNote, stakes, choices, free, consultBox, sayBox, error, answer, note,
   );
   row.refs = { chipSlot, whenSlot, summary, runLink, node, seat, where, detail,
                hint, choices, text, send, free, error, answerLabel, answerText, answer, note,
-               band, panelBox, stakes, thread, waitingNote, sayText, saySend, sayBox };
+               band, panelBox, stakes, thread, waitingNote, sayText, saySend, sayBox,
+               consultBtn, consultBox };
   return row;
 }
 
@@ -4147,6 +4153,11 @@ function updateAskCard(row, question, { compact = false } = {}) {
 
   r.saySend.onclick = () => sayToQuestion(question.id, r.sayText.value, row);
   show(r.sayBox, open);
+  const canConsult = open && typeof question.origin_chat === "string" && question.origin_chat !== "";
+  show(r.consultBox, canConsult);
+  r.consultBtn.disabled = Boolean(question.consult);
+  setText(r.consultBtn, question.consult ? "Asked the chat agent" : "Ask the chat agent");
+  r.consultBtn.onclick = () => consultChat(question.id, row);
   r.sayText.disabled = waitingOnAgent;
   r.saySend.disabled = waitingOnAgent;
 
@@ -4306,6 +4317,28 @@ async function sayToQuestion(id, text, row) {
     show(r.error, true);
     r.sayText.disabled = false;
     r.saySend.disabled = false;
+  }
+}
+
+/* Hand the question to the chat it came from: `POST /api/questions/{id}/consult`.
+   The question stays open; the chat agent answers it or asks the owner there. */
+async function consultChat(id, row) {
+  const r = row.refs;
+  r.consultBtn.disabled = true;
+  try {
+    const said = await postJson(API.questionConsult(id), {});
+    reflectQuestion(said);
+    announce("Sent to the chat. It stays open until the chat or you answer it.");
+    ok();
+  } catch (error) {
+    if (error.status === 409) {
+      announce(error.message);
+      await loadQuestions();
+      return;
+    }
+    setText(r.error, error.message);
+    show(r.error, true);
+    r.consultBtn.disabled = false;
   }
 }
 

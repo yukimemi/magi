@@ -474,7 +474,7 @@ enum Command {
         /// Question id or unambiguous prefix/suffix. Omit for the oldest open one.
         id: Option<String>,
         /// The answer: one of the offered choices, or free text.
-        #[arg(long, conflicts_with_all = ["list", "say"])]
+        #[arg(long, conflicts_with_all = ["list", "say", "ask_chat"])]
         reply: Option<String>,
         /// Speak back without deciding: a clarifying question, a request for
         /// more context. The run stays parked; the agent picks the
@@ -482,8 +482,13 @@ enum Command {
         /// `--reply` - a question is either answered or asked back, not both
         /// at once, and the terminal has the same choice the phone's "Send"
         /// box does.
-        #[arg(long, conflicts_with_all = ["list", "reply"])]
+        #[arg(long, conflicts_with_all = ["list", "reply", "ask_chat"])]
         say: Option<String>,
+        /// Hand the question to the chat conversation its task came from; the
+        /// chat agent answers it or puts the decision to you there. The
+        /// question stays open. Exclusive with `--reply` and `--say`.
+        #[arg(long, conflicts_with_all = ["list", "reply", "say"])]
+        ask_chat: bool,
         /// Show the open questions and stop.
         #[arg(long)]
         list: bool,
@@ -1552,8 +1557,9 @@ async fn dispatch(command: Command) -> Result<()> {
             id,
             reply,
             say,
+            ask_chat,
             list,
-        } => answer_cmd(id, reply, say, list),
+        } => answer_cmd(id, reply, say, ask_chat, list),
 
         Command::Task { command } => task_cmd(command).await,
 
@@ -2409,6 +2415,7 @@ fn answer_cmd(
     id: Option<String>,
     reply: Option<String>,
     say: Option<String>,
+    ask_chat: bool,
     list: bool,
 ) -> Result<()> {
     let store = ask::Questions::open();
@@ -2418,7 +2425,7 @@ fn answer_cmd(
         .filter(|q| q.status.open())
         .collect();
 
-    if list || (id.is_none() && reply.is_none() && say.is_none()) {
+    if list || (id.is_none() && reply.is_none() && say.is_none() && !ask_chat) {
         if open.is_empty() {
             println!("nothing is waiting on you");
             return Ok(());
@@ -2450,6 +2457,23 @@ fn answer_cmd(
             .next_back()
             .context("nothing is waiting on you")?,
     };
+
+    if ask_chat {
+        let talks = magi::talk::Talks::open();
+        let tasks = Queue::open().list();
+        let talk = magi::consult::origin_talk(&tasks, &talks.list(), &q)
+            .context("this question has no open chat to ask")?;
+        if magi::consult::begin(&store, &talks, &q, &talk)? {
+            println!(
+                "handed {} to chat {} — it is queued there as a draft; resume it in the chat to start",
+                q.short(),
+                talk.short()
+            );
+        } else {
+            println!("{} was already handed to the chat", q.short());
+        }
+        return Ok(());
+    }
 
     if let Some(body) = say {
         // Not a decision: the question stays open and the run stays parked,
@@ -3986,6 +4010,18 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(clash.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        for other in [["--say", "why?"], ["--reply", "SQLite"]] {
+            let clash =
+                Cli::try_parse_from(["magi", "answer", "ab12", "--ask-chat", other[0], other[1]])
+                    .unwrap_err();
+            assert_eq!(clash.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        let alone = Cli::try_parse_from(["magi", "answer", "ab12", "--ask-chat"]).unwrap();
+        assert!(matches!(
+            alone.command,
+            Some(Command::Answer { ask_chat: true, .. })
+        ));
 
         let clash_list =
             Cli::try_parse_from(["magi", "answer", "ab12", "--say", "why?", "--list"]).unwrap_err();
