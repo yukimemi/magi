@@ -7469,7 +7469,10 @@ async function applyRevisions_(source) {
   if (questionsRev !== state.rev.questions) {
     state.rev.questions = questionsRev;
     jobs.push(loadQuestions());
-    jobs.push(loadQueue({ rev: queueRev, delta: { base: state.rev.queue, changed: [], removed: [] } }));
+    /* The queue may have moved in the same event; its real delta was queued
+       above and a later request replaces a pending one, so reuse it. */
+    jobs.push(loadQueue({ rev: queueRev, delta: queueRev !== state.rev.queue
+      ? source.queue_delta : { base: state.rev.queue, changed: [], removed: [] } }));
     jobs.push(loadRuns({ rev: runsRev }));
   }
   /* A turn landing on disk is what bumps this, so it is also how the reply
