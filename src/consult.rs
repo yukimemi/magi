@@ -101,6 +101,46 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
     Ok(true)
 }
 
+/// What [`answer_in_chat`] did with the draft [`begin`] left.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Handled {
+    /// The chat was idle: the draft became a turn and the agent answered it.
+    Ran,
+    /// The chat is mid-conversation (or holds other drafts), so the draft stays
+    /// queued for the turn that is running to pick up.
+    LeftQueued,
+}
+
+/// Start the chat's turn for a question [`begin`] just queued, from a process
+/// that is not the web server.
+///
+/// The turn gate lives in the server's memory, so idleness is read off the
+/// disk: the last turn is not an operator turn still waiting for its answer,
+/// and the only draft is this question's own text. Otherwise the draft is left
+/// for the running turn's drain. The window between that read and the drain is
+/// not exclusive against a `say` from the web at the same instant.
+pub async fn answer_in_chat(
+    talks: &Talks,
+    cfg: &crate::config::Config,
+    q: &Question,
+    talk_id: &str,
+) -> Result<Handled> {
+    let mut talk = talks.get(talk_id)?;
+    let own = crate::prompt::chat_consult(q);
+    let waiting = talk
+        .turns
+        .last()
+        .is_some_and(|t| t.who == talk::Who::Operator);
+    if waiting || talk.pending.trim() != own.trim() || !talk.pending_attachments.is_empty() {
+        return Ok(Handled::LeftQueued);
+    }
+    let Some(text) = talk::drain(&mut talk, talks)? else {
+        return Ok(Handled::LeftQueued);
+    };
+    talk::respond(&mut talk, talks, cfg, &text).await?;
+    Ok(Handled::Ran)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -293,5 +333,24 @@ mod tests {
         v.as_object_mut().unwrap().remove("consult");
         let back: Question = serde_json::from_value(v).unwrap();
         assert!(back.consult.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_talk_waiting_on_its_agent_keeps_the_draft() {
+        let (tmp, store, talk) = talks();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = question("implement");
+        questions.put(&mut q).unwrap();
+        let mut t = talk.clone();
+        talk::queue(&mut t, &store, "earlier", Vec::new()).unwrap();
+        talk::drain(&mut t, &store).unwrap();
+        assert!(begin(&questions, &store, &q, &talk).unwrap());
+
+        let cfg = Config::default();
+        let got = answer_in_chat(&store, &cfg, &q, &talk.id).await.unwrap();
+        assert_eq!(got, Handled::LeftQueued);
+        let after = store.get(&talk.id).unwrap();
+        assert!(is_consult_text(&after.pending));
+        assert_eq!(after.turns.len(), 1, "no agent turn was started");
     }
 }
