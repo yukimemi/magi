@@ -2038,13 +2038,20 @@ struct Probe {
 /// saying `base = "{{ env.X }}"` locates the same ref; when rendering fails
 /// (a checkout file that needs its own repo context) the plain TOML is read
 /// instead. Unreadable is `None`: the real load reports it.
-fn probe_merge(path: &Path) -> Option<ProbeMerge> {
+fn probe_merge(path: &Path, repo: &Path) -> Option<ProbeMerge> {
     if !path.is_file() {
         return None;
     }
     let paths = [path.to_path_buf()];
     let mut engine = teravars::Engine::default();
-    let ctx = Config::render_ctx(&paths);
+    let mut ctx = Config::render_ctx(&paths);
+    // The layered load renders every layer for the checkout being resolved;
+    // so does this, or `{{ repo_name }}` would name the file's own directory.
+    ctx.insert("repo", &repo.to_string_lossy());
+    ctx.insert(
+        "repo_name",
+        &repo.file_name().unwrap_or_default().to_string_lossy(),
+    );
     if let Ok(merged) = teravars::load_merged(&paths, &mut engine, &ctx)
         && let Ok(probe) = toml::Value::Table(merged.config).try_into::<Probe>()
     {
@@ -2062,7 +2069,7 @@ fn resolve_remote_base(repo: &Path) -> Result<(String, String)> {
     sources.push(repo.join("magi.toml"));
     sources.push(repo.join(".magi").join("config.toml"));
     for path in sources {
-        if let Some(m) = probe_merge(&path) {
+        if let Some(m) = probe_merge(&path, repo) {
             remote = remote.or(m.remote.filter(|s| !s.trim().is_empty()));
             base = base.or(m.base.filter(|s| !s.trim().is_empty()));
         }
@@ -2098,14 +2105,22 @@ fn fnv_hex(text: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Does the text mention an `include` directive (root or `[teravars]`)?
-/// Over-detecting only costs an extra extraction.
+/// Does the text declare an `include` directive in any form teravars accepts
+/// (root `include`, bare or quoted, or `[teravars] include`, as a table or an
+/// inline table)? Parsed as TOML when it parses; a templated file that does
+/// not parse is judged by a plain search for the word, because over-detecting
+/// only costs an extra extraction while missing one fails the load.
 fn declares_include(text: &str) -> bool {
-    text.lines().any(|line| {
-        line.trim_start()
-            .strip_prefix("include")
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-    })
+    match toml::from_str::<toml::Table>(text) {
+        Ok(table) => {
+            table.contains_key("include")
+                || table
+                    .get("teravars")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|t| t.contains_key("include"))
+        }
+        Err(_) => text.contains("include"),
+    }
 }
 
 /// Unpack the whole tree of `sha` into `dest`, so relative `include`s of a
@@ -3182,11 +3197,28 @@ mod tests {
             )
             .unwrap();
             let (remote, base) = {
-                let probe = probe_merge(&m).unwrap();
+                let probe = probe_merge(&m, &repo).unwrap();
                 (probe.remote, probe.base)
             };
             assert_eq!((remote, base), (None, Some("trunk".to_owned())));
-            let _ = repo;
+        }
+
+        #[test]
+        fn a_machine_layer_base_sees_the_checkouts_repo_name() {
+            let (t, repo) = fixture("[graph]\ncandidates = 2\n", "");
+            let m = t.path().join("machine.toml");
+            std::fs::write(&m, "[merge]\nbase = \"{{ repo_name }}\"\n").unwrap();
+            let probe = probe_merge(&m, &repo).unwrap();
+            assert_eq!(probe.base.as_deref(), Some("repo"));
+        }
+
+        #[test]
+        fn every_include_form_is_recognised() {
+            assert!(declares_include("include = [\"a.toml\"]\n"));
+            assert!(declares_include("\"include\" = [\"a.toml\"]\n"));
+            assert!(declares_include("teravars = { include = [\"a.toml\"] }\n"));
+            assert!(declares_include("[teravars]\ninclude = [\"a.toml\"]\n"));
+            assert!(!declares_include("[graph]\ncandidates = 2\n"));
         }
 
         #[test]
