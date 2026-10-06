@@ -10467,6 +10467,7 @@ mod tests {
             automerge_enabled: true,
             merged_directly: false,
             local: false,
+            release: None,
             problem: None,
             action_required: None,
         });
@@ -10486,6 +10487,7 @@ mod tests {
             automerge_enabled: false,
             merged_directly: false,
             local: false,
+            release: None,
             problem: Some("checks red".to_owned()),
             action_required: Some("look at the PR".to_owned()),
         });

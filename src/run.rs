@@ -1671,6 +1671,11 @@ pub struct ReleaseBump {
     /// ([`crate::release_local`]).
     #[serde(default)]
     pub local: bool,
+    /// What the local release did (tag, commit, each command's exit code and
+    /// output tail), kept here because the watcher's own record is deleted
+    /// once the release is done.
+    #[serde(default)]
+    pub release: Option<crate::release_local::Job>,
     /// What went wrong, verbatim from the tool that said it.
     #[serde(default)]
     pub problem: Option<String>,

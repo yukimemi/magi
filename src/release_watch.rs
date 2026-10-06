@@ -49,6 +49,7 @@ use crate::ask::{Answer, Question, Questions};
 use crate::land::{self, PrLifecycle, RollupView, Verdict};
 use crate::notices::{self, Notice, Notices};
 use crate::release_local::{self, Job};
+use crate::run::RunState;
 
 /// Pause between laps.
 const LAP: Duration = Duration::from_secs(300);
@@ -860,6 +861,10 @@ impl Watcher {
             // Saved as finished, but a stop may have come before the task was
             // given back: do that now, and keep the record until it is.
             st.job = Some(job);
+            if !self.record_on_run(&st) {
+                self.save(pr, &st);
+                return;
+            }
             return self.complete(pr, &mut st);
         }
         if job.interrupted() {
@@ -901,7 +906,13 @@ impl Watcher {
             Ok(()) => {
                 self.raise_released(pr, &job);
                 st.job = Some(job);
-                self.complete(pr, &mut st);
+                if self.record_on_run(&st) {
+                    self.complete(pr, &mut st);
+                } else {
+                    // Finished and saved as such: the next lap retries only
+                    // the run record, never the commands.
+                    self.save(pr, &st);
+                }
             }
             Err(e) => {
                 job.failed = Some(format!("{e:#}"));
@@ -910,6 +921,50 @@ impl Watcher {
                 self.file_job_question(pr, &mut st, &job);
                 st.job = Some(job);
                 self.save(pr, &st);
+                self.record_on_run(&st);
+            }
+        }
+    }
+
+    /// Copy the job onto the run that opened the release PR, so what the
+    /// release did outlives the watcher's record. Returns whether the record
+    /// may go: `false` only when a readable run could not be saved. No run, or
+    /// a run that is gone, is warned about and counts as done.
+    fn record_on_run(&self, st: &WatchState) -> bool {
+        let (Some(run), Some(job)) = (st.run.as_deref(), st.job.as_ref()) else {
+            return true;
+        };
+        let mut state = match RunState::load_under(run, &self.home) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("could not record the release on run {run}: {e:#}");
+                return true;
+            }
+        };
+        let bump = state.release_bump.get_or_insert_with(Default::default);
+        if bump.release.as_ref() == Some(job) {
+            return true;
+        }
+        bump.release = Some(job.clone());
+        state.event(
+            "release",
+            format!(
+                "release {} {}",
+                job.tag(),
+                if job.finished {
+                    "finished"
+                } else if let Some(why) = &job.failed {
+                    why
+                } else {
+                    "stopped"
+                }
+            ),
+        );
+        match state.save_under(&self.home) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("could not save the release on run {run}: {e:#}");
+                false
             }
         }
     }
@@ -1766,5 +1821,47 @@ mod tests {
         w.save("o/r#7", &live);
         register(d.path(), Path::new("/r"), URL, "run1");
         assert_eq!(w.load("o/r#7").head, "keep");
+    }
+
+    #[tokio::test]
+    async fn a_finished_release_is_kept_on_the_run_and_a_missing_run_still_completes() {
+        let (d, fake, w) = rig();
+        *fake.local.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Merged, "h1", vec![]));
+        let repo = d.path().join("nowhere");
+        let mut run = RunState::new(
+            repo.clone(),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "t".to_owned(),
+            crate::config::Config::default(),
+        );
+        run.id = "run1".to_owned();
+        run.save_under(d.path()).unwrap();
+        let mut job = Job::new("1.0.0", URL, "deadbeef");
+        job.finished = true;
+        job.log.push(release_local::StepLog {
+            name: "cmd".to_owned(),
+            code: Some(0),
+            tail: "ok".to_owned(),
+            output: None,
+        });
+        let mk = |run: &str| WatchState {
+            repo: repo.to_string_lossy().into_owned(),
+            url: URL.to_owned(),
+            run: Some(run.to_owned()),
+            job: Some(job.clone()),
+            ..WatchState::default()
+        };
+        w.save("o/r#7", &mk("run1"));
+        w.lap(std::slice::from_ref(&repo), 60, 1, &(|| false)).await;
+        assert!(!w.state_path("o/r#7").exists());
+        let kept = RunState::load_under("run1", d.path()).unwrap();
+        assert_eq!(kept.release_bump.unwrap().release, Some(job.clone()));
+
+        // A run that is gone must not keep the watcher record forever.
+        w.save("o/r#7", &mk("gone"));
+        w.lap(std::slice::from_ref(&repo), 60, 1, &(|| false)).await;
+        assert!(!w.state_path("o/r#7").exists());
     }
 }
