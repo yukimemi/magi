@@ -10867,7 +10867,6 @@ mod tests {
         for root in [
             "stats-agents-bars",
             "stats-reviewers-bars",
-            "stats-advisors-bars",
         ] {
             assert!(APP_JS.contains(&format!("statsBarRows($(\"{root}\")")));
         }
@@ -10889,6 +10888,21 @@ mod tests {
         );
         assert!(INDEX_HTML.contains("id=\"stats-reviewers-scatter\""));
         assert!(APP_CSS.contains(".precision-scatter"));
+    }
+
+    #[test]
+    fn advisor_reflection_is_drawn_as_stacked_segments() {
+        assert!(APP_JS.contains("statsReflectionRows($(\"stats-advisors-bars\")"));
+        assert!(APP_JS.contains("const STATS_SEG_MIN = 4;"));
+        let html = include_str!("../assets/ui/index.html");
+        assert!(html.contains("Approximate"));
+        for label in ["reflected strongly", "faint", "no proposal"] {
+            assert!(html.contains(label));
+        }
+        let css = include_str!("../assets/ui/app.css");
+        for c in ["refl-strong", "refl-faint", "refl-absent"] {
+            assert!(css.contains(&format!(".{c} {{")));
+        }
     }
 
     #[test]
