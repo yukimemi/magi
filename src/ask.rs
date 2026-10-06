@@ -764,19 +764,20 @@ impl Question {
                 self.short()
             );
         }
+        // The owner's latest message is what counts (an earlier one may since
+        // have been qualified or withdrawn).
+        let latest = self
+            .thread
+            .iter()
+            .rev()
+            .find(|t| t.who == Who::Operator)
+            .map(|t| t.body.trim());
         if crate::deputy::merge_gated(self) {
-            // The merge is irreversible and a say is not a decision. The
-            // owner's latest message is what counts (an earlier one may since
-            // have been qualified or withdrawn). `hold` must be that message
-            // exactly; `merge` may sit among other requests, but only as a
-            // clear, unhedged instruction quoted verbatim - see
-            // `land::merge_intent`, which holds on anything doubtful.
-            let latest = self
-                .thread
-                .iter()
-                .rev()
-                .find(|t| t.who == Who::Operator)
-                .map(|t| t.body.trim());
+            // The merge is irreversible and a say is not a decision. `hold` must
+            // be the latest message exactly; `merge` may sit among other
+            // requests, but only as a clear, unhedged instruction quoted
+            // verbatim - see `land::merge_intent`, which holds on anything
+            // doubtful.
             let ok = if label == crate::land::APPROVE {
                 latest.is_some_and(|m| crate::land::merge_intent(m, quote))
             } else if label == crate::land::HOLD {
@@ -798,6 +799,15 @@ impl Question {
                     }
                 );
             }
+        } else if crate::deputy::destructive(self, label)
+            && !latest.is_some_and(|m| crate::land::unhedged(m, quote))
+        {
+            bail!(
+                "`{label}` cannot be undone; it settles question {} only when the owner's \
+                 latest message clearly says so, unhedged and quoted verbatim (no maybe / if \
+                 / not / question); ask what they mean with `--thread` instead",
+                self.short()
+            );
         }
         self.thread.push(Turn {
             who: Who::Agent,

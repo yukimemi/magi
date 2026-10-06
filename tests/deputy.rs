@@ -506,6 +506,10 @@ fn a_merge_approvals_deadline_never_moves_on_a_reply() {
     );
     assert_eq!(magi::deputy::kind_of(&land), Some(magi::deputy::Kind::Land));
     c.node = "implement".to_owned();
+    // No cwd and choices on offer: the fallback serves it.
+    assert_eq!(magi::deputy::kind_of(&c), Some(magi::deputy::Kind::Generic));
+    // Asked from inside a run (cwd recorded): the asker's, never a deputy's.
+    c.cwd = Some("/somewhere".to_owned());
     assert_eq!(magi::deputy::kind_of(&c), None);
 }
 
@@ -563,4 +567,162 @@ fn a_release_questions_deadline_never_moves_on_a_reply() {
     q.thread[0].at = Timestamp::from_second(base + 900).unwrap();
     assert_eq!(magi::deputy::deadline(&q, 5), base + 1000);
     assert_eq!(magi::deputy::kind_of(&q), Some(magi::deputy::Kind::Release));
+}
+
+/// One question as production files it: no `cwd`, the node, seat and choices
+/// its filer uses. Every node that files a question with nobody asking belongs
+/// here, so a new kind cannot ship without a listener: add its constant and
+/// its shape, or `kind_of` returning `None` fails this test.
+fn unasked_questions() -> Vec<Question> {
+    let q = |node: &str, seat: &str, choices: &[&str]| {
+        Question::new(
+            TASK.to_owned(),
+            node.to_owned(),
+            seat.to_owned(),
+            "s".to_owned(),
+            String::new(),
+            choices.iter().map(|c| (*c).to_owned()).collect(),
+        )
+    };
+    vec![
+        q(magi::conduct::NODE, "conduct", &["a", "b"]),
+        q(magi::land::APPROVAL_NODE, "land", &["merge", "hold"]),
+        q(
+            magi::bump::NOTICE_NODE,
+            "release-watch",
+            &["hold", "leave it"],
+        ),
+        q(magi::triage::NODE, "triage", &["resume", "keep", "discard"]),
+        q(
+            magi::triage::DEPS_NODE,
+            "triage",
+            &["release", "discard", "detach"],
+        ),
+        q(
+            magi::reconcile::NODE,
+            magi::reconcile::SEAT,
+            &["push local", "keep remote"],
+        ),
+    ]
+}
+
+#[test]
+fn every_question_filed_without_an_asker_has_a_deputy_kind() {
+    for q in unasked_questions() {
+        assert!(
+            magi::deputy::kind_of(&q).is_some(),
+            "node `{}` files questions that nobody listens to",
+            q.node
+        );
+    }
+}
+
+#[test]
+fn the_fallback_follows_the_cwd_and_the_choices_not_the_node_name() {
+    use magi::deputy::{Kind, kind_of};
+    let mut by_name = unasked_questions().pop().unwrap();
+    assert_eq!(by_name.node, "review");
+    assert_eq!(kind_of(&by_name), Some(Kind::Generic));
+    // A reviewer's own `magi ask` from node `review` records its cwd: it has an
+    // asker and the waiter, so no deputy.
+    by_name.cwd = Some("/somewhere".to_owned());
+    assert_eq!(kind_of(&by_name), None);
+    // An unknown future node, no cwd, choices on offer: still served.
+    let mut future = by_name.clone();
+    future.cwd = None;
+    future.node = "some-future-node".to_owned();
+    assert_eq!(kind_of(&future), Some(Kind::Generic));
+    // No choices: nothing to settle.
+    future.choices.clear();
+    assert_eq!(kind_of(&future), None);
+    // A conductor question with a cwd is still served.
+    let mut c = unasked_questions().remove(0);
+    c.cwd = Some("/somewhere".to_owned());
+    assert_eq!(kind_of(&c), Some(Kind::Conduct));
+    // The bump notice (no choices, seat `bump`) stays unserved.
+    let mut notice = unasked_questions().remove(2);
+    notice.seat = "bump".to_owned();
+    notice.choices.clear();
+    assert_eq!(kind_of(&notice), None);
+}
+
+#[test]
+fn only_the_conductors_question_is_ever_given_a_cwd_or_a_fixed_clock() {
+    use magi::deputy::{Kind, fixed_clock, kind_of};
+    for q in unasked_questions() {
+        let kind = kind_of(&q).unwrap();
+        // Triage and fallback questions run from their last activity, like a
+        // conductor's; the waiter would otherwise take them as its own.
+        if matches!(kind, Kind::Triage | Kind::Generic) {
+            assert!(!fixed_clock(&q), "{}", q.node);
+            assert!(q.cwd.is_none());
+        }
+    }
+}
+
+fn settle_ready(mut q: Question, said: &str) -> Question {
+    let key = magi::ask::deputy_seat_key(&q.id);
+    let mut d = Deputy::new("brief".to_owned());
+    d.seat = Some(magi::agent::SeatState::new(&key, "stub", 1));
+    q.deputy = Some(d);
+    q.say(said).unwrap();
+    q
+}
+
+#[test]
+fn a_destructive_choice_settles_only_on_an_unhedged_quote() {
+    let triage = unasked_questions().remove(3);
+    let key = magi::ask::deputy_seat_key(&triage.id);
+    for (said, quote, ok) in [
+        ("discard it", "discard it", true),
+        ("maybe discard it", "discard it", false),
+        ("discard it if CI is red", "discard it", false),
+        ("discard it. actually wait", "discard it", false),
+    ] {
+        let mut q = settle_ready(triage.clone(), said);
+        let r = q.settle_by_deputy(&key, "discard", quote);
+        assert_eq!(r.is_ok(), ok, "{said:?}: {r:?}");
+    }
+    // The task is released, not deleted: no mechanical hedge gate.
+    let mut q = settle_ready(triage.clone(), "maybe release it");
+    q.settle_by_deputy(&key, "resume", "maybe release it")
+        .unwrap();
+    // A divergence answer drops commits either way.
+    let div = unasked_questions().pop().unwrap();
+    let mut q = settle_ready(div.clone(), "keep the remote, I guess?");
+    assert!(
+        q.settle_by_deputy(&key, "keep remote", "keep the remote")
+            .is_err()
+    );
+    assert!(magi::deputy::destructive(&div, "push local"));
+}
+
+common::e2e! {
+async fn a_say_on_a_triage_or_unknown_question_gets_a_deputy_without_a_cwd() {
+    let s = scene(home_lock().await);
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    let mut ids = Vec::new();
+    for mut q in unasked_questions().into_iter().filter(|q| {
+        matches!(q.node.as_str(), "triage" | "triage-deps" | "review")
+    }) {
+        q.answer_timeout = 3600;
+        s.store.put(&mut q).unwrap();
+        s.store.update(&q.id, |r| r.say("what happens if I pick the last one?")).unwrap();
+        ids.push(q.id.clone());
+    }
+    let mut d = deputies(&s, 3);
+
+    turn(&mut d).await;
+
+    for id in &ids {
+        let q = s.store.get(id).unwrap();
+        assert_eq!(q.status, QuestionStatus::Open, "a say never settles it");
+        assert!(q.cwd.is_none(), "a cwd would make `{}` the waiter's", q.node);
+        let dep = q.deputy.as_ref().expect("a deputy was attached");
+        assert_eq!(dep.starts, 1);
+        assert!(!dep.brief.is_empty());
+        assert_eq!(q.thread.last().unwrap().who, Who::Agent, "the say was answered");
+    }
+    assert_eq!(log(&s).len(), 3);
+}
 }

@@ -49,6 +49,15 @@
 //!   nothing: `--settle` records a choice and the watcher applies it on its next
 //!   lap. A local approval's `merge` / `hold` go through the merge-approval
 //!   rules ([`merge_gated`]). A deputy never closes or merges the pull request.
+//! - **Every open question the owner can say something to has a listener.**
+//!   [`Kind::Triage`] serves the triage questions; [`Kind::Generic`] is the
+//!   fallback for any other question with choices and no `cwd` (the divergence
+//!   question today, a node nobody has written yet tomorrow). It is decided by
+//!   the missing `cwd`, never by node name. Only a conductor question is ever
+//!   given a `cwd` ([`Deputies::attach`]); the other kinds would otherwise be
+//!   resumed and expired by the waiter beside the deputy. A test enumerates
+//!   every node filed without an asker, so a new kind of question cannot ship
+//!   without one.
 //! - **No new authority.** A deputy does not edit, merge or touch the queue,
 //!   and `--settle` accepts only an offered label backed by a verbatim quote
 //!   of the owner, never on a task the operator holds.
@@ -144,9 +153,21 @@ pub enum Kind {
     Land,
     /// A question the release watcher filed ([`crate::release_watch`]).
     Release,
+    /// A triage question about a held task or a stuck dependency root
+    /// ([`crate::triage::NODE`], [`crate::triage::DEPS_NODE`]).
+    Triage,
+    /// Any other question nobody asked from inside a run (no `cwd`) that offers
+    /// choices: the fallback, so a node nobody has met yet still has a listener.
+    Generic,
 }
 
 /// The kind of question a deputy serves for `q`, `None` for every other.
+///
+/// The fallback is decided by the absence of a `cwd`, never by the node name: a
+/// question filed with `magi ask` inside a run records its `cwd` and has an
+/// asker (and the waiter), and the node a seat asks from is the seat's own name
+/// (a reviewer's `review` is also the divergence question's node). A question
+/// with no choices cannot be settled and is a notice, not something to answer.
 pub fn kind_of(q: &Question) -> Option<Kind> {
     match q.node.as_str() {
         crate::conduct::NODE => Some(Kind::Conduct),
@@ -154,16 +175,59 @@ pub fn kind_of(q: &Question) -> Option<Kind> {
         // The seat matters: `bump` files choice-less notices on the same node,
         // which nobody can answer and which must not cost a deputy.
         crate::bump::NOTICE_NODE if q.seat == "release-watch" => Some(Kind::Release),
+        crate::bump::NOTICE_NODE => None,
+        crate::triage::NODE | crate::triage::DEPS_NODE => Some(Kind::Triage),
+        _ if q.cwd.is_none() && !q.choices.is_empty() => Some(Kind::Generic),
         _ => None,
     }
 }
 
+/// What a deputy is told about a question of no known kind: only what the
+/// question itself stored.
+pub fn generic_brief(q: &Question, actions: &BTreeMap<String, ChoiceAction>) -> String {
+    let mut s = format!(
+        "This question was filed by magi (node `{}`, seat `{}`) with no agent \
+         waiting on it. Magi records the owner's answer and the component that \
+         asked applies it; you apply nothing. You know only what the question \
+         itself says. A choice whose effect you cannot read from the question is \
+         not yours to guess: do not settle it, ask the owner what they mean with \
+         `--thread` instead.",
+        q.node, q.seat
+    );
+    if !q.choices.is_empty() {
+        s.push_str("\n\nWhat each option does:");
+        for c in &q.choices {
+            match actions.get(c) {
+                Some(a) => s.push_str(&format!("\n- `{c}`: also {}", a.describe())),
+                None => s.push_str(&format!(
+                    "\n- `{c}`: recorded as the answer (nothing more is known)"
+                )),
+            }
+        }
+    }
+    s
+}
+
+/// Is picking `label` on `q` something that cannot be taken back, so that
+/// `--settle` must hold the owner's words to the same mechanical standard as a
+/// merge (`land::unhedged`)? Discarding a task deletes it; a divergence answer
+/// drops commits.
+pub fn destructive(q: &Question, label: &str) -> bool {
+    let at = q.choices.iter().position(|c| c == label);
+    match q.node.as_str() {
+        crate::triage::NODE => at == Some(2),
+        crate::triage::DEPS_NODE => at == Some(1),
+        n => n == crate::reconcile::NODE && q.seat == crate::reconcile::SEAT,
+    }
+}
+
 /// Does `--settle` hold `q` to the merge-approval rules (`land::merge_intent`
-/// for `merge`, the whole message for `hold`)? A merge approval, and the release
-/// watcher's local-mode approval, which merges just as irreversibly.
+/// for `merge`, the whole message for `hold`)? A merge approval, and any other
+/// served question that offers `merge` (the release watcher's local-mode
+/// approval merges just as irreversibly).
 pub fn merge_gated(q: &Question) -> bool {
     q.node == crate::land::APPROVAL_NODE
-        || (kind_of(q) == Some(Kind::Release)
+        || (kind_of(q).is_some_and(|k| k != Kind::Conduct)
             && q.choices.iter().any(|c| c == crate::land::APPROVE))
 }
 
@@ -295,15 +359,16 @@ impl Deputies {
     /// deputies existed - a lost reason is not invented) and the deadline.
     ///
     /// A conductor question also gets the working directory the waiter and
-    /// `magi ask --wait` use. A release-watch question never does either (it has
-    /// no asker for the waiter to resume). A merge approval never gets one: `cwd` is what
-    /// makes a question the waiter's, and land's approval is not.
+    /// `magi ask --wait` use. Every other kind never does: `cwd` is what makes a
+    /// question the waiter's (it would resume and expire it beside the deputy),
+    /// and a release-watch question, a merge approval, a triage question and a
+    /// fallback one have no asker to resume.
     fn attach(&self, q: &Question, kind: Kind) -> Option<Question> {
         let default_timeout = self.default_timeout();
         let repo = self.fallback_repo.to_string_lossy().into_owned();
         let state = match kind {
             Kind::Land => crate::run::RunState::load(&q.run).ok(),
-            Kind::Conduct | Kind::Release => None,
+            Kind::Conduct | Kind::Release | Kind::Triage | Kind::Generic => None,
         };
         // The deadline land itself enforces for this run.
         let timeout = state
@@ -316,6 +381,11 @@ impl Deputies {
                         Kind::Conduct => brief(&r.run, &r.detail, &r.choices, &r.actions),
                         Kind::Land => crate::land::deputy_brief(r, state.as_ref()),
                         Kind::Release => crate::release_watch::deputy_brief(r, &self.home),
+                        Kind::Triage => crate::triage::deputy_brief(
+                            r,
+                            &crate::queue::Queue::at(self.home.join("queue")),
+                        ),
+                        Kind::Generic => generic_brief(r, &r.actions),
                     }));
                 }
                 if kind == Kind::Conduct && r.cwd.is_none() {
@@ -325,7 +395,7 @@ impl Deputies {
                     r.answer_timeout = match kind {
                         Kind::Conduct => default_timeout,
                         Kind::Land => timeout,
-                        Kind::Release => default_timeout,
+                        Kind::Release | Kind::Triage | Kind::Generic => default_timeout,
                     };
                 }
                 Ok(())
@@ -542,11 +612,18 @@ impl Job {
         };
         // A release-watch question has no `cwd`; its watch record names the
         // checkout the pull request belongs to.
-        let recorded = q.cwd.clone().or_else(|| {
-            (kind_of(&q) == Some(Kind::Release))
-                .then(|| crate::release_watch::state_for_question(&self.home, &q.id))
-                .flatten()
-                .map(|st| st.repo)
+        let recorded = q.cwd.clone().or_else(|| match kind_of(&q) {
+            Some(Kind::Release) => {
+                crate::release_watch::state_for_question(&self.home, &q.id).map(|st| st.repo)
+            }
+            // These record a task id in `run` (or a run id for a divergence's
+            // sibling kinds): the task's repository, when it can be found.
+            Some(Kind::Triage | Kind::Generic) => crate::queue::Queue::at(self.home.join("queue"))
+                .get(&q.run)
+                .ok()
+                .map(|t| t.repo.to_string_lossy().into_owned())
+                .filter(|r| !r.is_empty()),
+            _ => None,
         });
         let cwd = recorded
             .as_deref()
