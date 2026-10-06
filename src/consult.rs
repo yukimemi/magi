@@ -231,7 +231,10 @@ mod tests {
         assert!(!pending_consults(&questions, "other-talk"));
 
         questions
-            .update(&q.id, |q| q.status = crate::ask::QuestionStatus::Abandoned)
+            .update(&q.id, |q| {
+                q.abandon("test");
+                Ok(())
+            })
             .unwrap();
         assert!(!pending_consults(&questions, &talk.id), "closed question");
     }
