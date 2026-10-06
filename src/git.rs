@@ -1655,6 +1655,7 @@ mod tests {
 
     fn sh(cwd: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
+            .quiet()
             .args(args)
             .current_dir(cwd)
             .output()
