@@ -2571,3 +2571,20 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 .magi-seat[data-state="quota"] { border-color: var(--nerv-alarm); }
 .magi-seat[data-state="quota"] .magi-name, .magi-seat[data-state="quota"] .magi-state { color: var(--on-rust); }
 .magi-seat[data-state="active"] { border-style: dashed; }
+
+/* ---- verdict diagram (competition) ----------------------------------------
+   Scoped to `.cv-duel`, the class only the competition drawing carries, so the
+   other `.converge` users are untouched. */
+.converge svg.cv-duel {
+  border: 1px solid var(--line-2);
+  background-color: var(--sunk);
+  background-image:
+    repeating-linear-gradient(transparent 0 2px, var(--nerv-scan) 2px 3px),
+    linear-gradient(var(--nerv-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--nerv-grid) 1px, transparent 1px);
+  background-size: auto, 16px 16px, 16px 16px;
+  clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+}
+.converge svg.cv-duel text { font-family: var(--mono); font-weight: 700; }
+.converge svg.cv-duel .cv-label { font-size: 13px; letter-spacing: .06em; }
+.converge svg.cv-duel .cv-plate { font-size: 11px; letter-spacing: .14em; }
