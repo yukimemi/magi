@@ -1430,7 +1430,7 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
     let land = kind == crate::deputy::Kind::Land;
     let mut s = format!(
         "# {DEPUTY_HEADING}\n\n\
-         The conductor asked the owner a question and may not wait for the \
+         magi asked the owner a question and may not wait for the \
          answer itself, so you are the one that does. You hold this one \
          question ({id}) and nothing else: you do not edit files, merge, or \
          touch the queue.\n\n"

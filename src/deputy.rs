@@ -49,6 +49,14 @@
 //!   nothing: `--settle` records a choice and the watcher applies it on its next
 //!   lap. A local approval's `merge` / `hold` go through the merge-approval
 //!   rules ([`merge_gated`]). A deputy never closes or merges the pull request.
+//! - **Every other question without an asker is served too** ([`Kind::Generic`]):
+//!   triage, the divergence question (node `review`, seat
+//!   [`crate::daemon::DIVERGED_SEAT`]) and any later filer. The rule is only
+//!   that `cwd` is unset - a `magi ask` question has one and keeps its asker and
+//!   the waiter. The deputy never writes `cwd` (that would hand it to the
+//!   waiter), runs on a fixed `asked_at + answer_timeout` clock, and a `merge`
+//!   choice is held to the merge-approval rules ([`merge_gated`]). `bump`'s
+//!   choice-less notices get none.
 //! - **No new authority.** A deputy does not edit, merge or touch the queue,
 //!   and `--settle` accepts only an offered label backed by a verbatim quote
 //!   of the owner, never on a task the operator holds.
@@ -135,6 +143,56 @@ pub fn brief(
     s
 }
 
+/// What a deputy is told about a question nobody specific owns: node and seat,
+/// the task it names when there is one, what each choice does, and that the
+/// deputy applies nothing. Nothing is guessed beyond what the record stores.
+pub fn generic_brief(q: &Question, queue: &crate::queue::Queue) -> String {
+    let mut s = format!(
+        "This question was filed by magi itself (node `{}`, seat `{}`) with no \
+         agent waiting on it. Whatever the owner picks, magi's own machinery \
+         acts on it through the normal answer path; you apply nothing and never \
+         merge, push or change anything yourself. Silence is a hold.",
+        q.node, q.seat
+    );
+    if let Ok(t) = queue.get(&q.run) {
+        s.push_str(&format!(
+            "\n\nIt is about task {} (`magi task show {}`).",
+            t.short(),
+            t.id
+        ));
+        if t.operator_held() {
+            s.push_str(
+                " That task is held by the operator, so `magi ask --settle` is \
+                 refused for it: you can only talk with the owner here.",
+            );
+        }
+    }
+    if let Some(note) = crate::triage::deputy_note(q) {
+        s.push_str("\n\n");
+        s.push_str(&note);
+    }
+    if q.choices.is_empty() {
+        s.push_str("\n\nThere are no fixed choices: the owner answers in words.");
+    } else {
+        s.push_str("\n\nWhat each option does:");
+        for c in &q.choices {
+            match q.actions.get(c) {
+                Some(a) => s.push_str(&format!("\n- `{c}`: also {}", a.describe())),
+                None => s.push_str(&format!(
+                    "\n- `{c}`: recorded as the answer; magi applies it through its \
+                     existing answer path"
+                )),
+            }
+        }
+    }
+    s.push_str(
+        "\n\nIf you do not know what an option does beyond this, say so rather \
+         than guessing, and ask the owner with `--thread` when their words are \
+         ambiguous.",
+    );
+    s
+}
+
 /// What a deputy serves: the question kinds it is attached to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -144,6 +202,9 @@ pub enum Kind {
     Land,
     /// A question the release watcher filed ([`crate::release_watch`]).
     Release,
+    /// Any other question magi itself filed with no asker (`cwd` unset):
+    /// triage, the divergence question, and whatever is added later.
+    Generic,
 }
 
 /// The kind of question a deputy serves for `q`, `None` for every other.
@@ -154,6 +215,12 @@ pub fn kind_of(q: &Question) -> Option<Kind> {
         // The seat matters: `bump` files choice-less notices on the same node,
         // which nobody can answer and which must not cost a deputy.
         crate::bump::NOTICE_NODE if q.seat == "release-watch" => Some(Kind::Release),
+        crate::bump::NOTICE_NODE => None,
+        // Everything else without an asker: a question with a `cwd` was filed
+        // by `magi ask` and belongs to its asker and the waiter. The node name
+        // cannot tell them apart (`review` is both a run's seat and the
+        // divergence question), so the absence of `cwd` is the whole rule.
+        _ if q.cwd.is_none() => Some(Kind::Generic),
         _ => None,
     }
 }
@@ -163,7 +230,7 @@ pub fn kind_of(q: &Question) -> Option<Kind> {
 /// watcher's local-mode approval, which merges just as irreversibly.
 pub fn merge_gated(q: &Question) -> bool {
     q.node == crate::land::APPROVAL_NODE
-        || (kind_of(q) == Some(Kind::Release)
+        || (matches!(kind_of(q), Some(Kind::Release | Kind::Generic))
             && q.choices.iter().any(|c| c == crate::land::APPROVE))
 }
 
@@ -171,7 +238,7 @@ pub fn merge_gated(q: &Question) -> bool {
 /// questions that something other than the waiter retires: a merge approval
 /// (land) and a release-watch question (the watcher, by silence being a hold).
 pub fn fixed_clock(q: &Question) -> bool {
-    matches!(kind_of(q), Some(Kind::Land | Kind::Release))
+    matches!(kind_of(q), Some(Kind::Land | Kind::Release | Kind::Generic))
 }
 
 /// Second after which nobody is to be started or kept on `q`.
@@ -303,7 +370,7 @@ impl Deputies {
         let repo = self.fallback_repo.to_string_lossy().into_owned();
         let state = match kind {
             Kind::Land => crate::run::RunState::load(&q.run).ok(),
-            Kind::Conduct | Kind::Release => None,
+            Kind::Conduct | Kind::Release | Kind::Generic => None,
         };
         // The deadline land itself enforces for this run.
         let timeout = state
@@ -316,6 +383,7 @@ impl Deputies {
                         Kind::Conduct => brief(&r.run, &r.detail, &r.choices, &r.actions),
                         Kind::Land => crate::land::deputy_brief(r, state.as_ref()),
                         Kind::Release => crate::release_watch::deputy_brief(r, &self.home),
+                        Kind::Generic => generic_brief(r, &crate::queue::Queue::open()),
                     }));
                 }
                 if kind == Kind::Conduct && r.cwd.is_none() {
@@ -325,7 +393,7 @@ impl Deputies {
                     r.answer_timeout = match kind {
                         Kind::Conduct => default_timeout,
                         Kind::Land => timeout,
-                        Kind::Release => default_timeout,
+                        Kind::Release | Kind::Generic => default_timeout,
                     };
                 }
                 Ok(())
@@ -542,11 +610,16 @@ impl Job {
         };
         // A release-watch question has no `cwd`; its watch record names the
         // checkout the pull request belongs to.
-        let recorded = q.cwd.clone().or_else(|| {
-            (kind_of(&q) == Some(Kind::Release))
-                .then(|| crate::release_watch::state_for_question(&self.home, &q.id))
-                .flatten()
-                .map(|st| st.repo)
+        let recorded = q.cwd.clone().or_else(|| match kind_of(&q) {
+            Some(Kind::Release) => {
+                crate::release_watch::state_for_question(&self.home, &q.id).map(|st| st.repo)
+            }
+            // A generic question names its task in `run`; the task's checkout.
+            Some(Kind::Generic) => crate::queue::Queue::open()
+                .get(&q.run)
+                .ok()
+                .map(|t| t.repo.to_string_lossy().into_owned()),
+            _ => None,
         });
         let cwd = recorded
             .as_deref()

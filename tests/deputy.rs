@@ -506,7 +506,12 @@ fn a_merge_approvals_deadline_never_moves_on_a_reply() {
     );
     assert_eq!(magi::deputy::kind_of(&land), Some(magi::deputy::Kind::Land));
     c.node = "implement".to_owned();
-    assert_eq!(magi::deputy::kind_of(&c), None);
+    c.cwd = Some("/x".to_owned());
+    assert_eq!(
+        magi::deputy::kind_of(&c),
+        None,
+        "`magi ask` keeps its asker"
+    );
 }
 
 fn file_release(store: &Questions, seat: &str, choices: &[&str]) -> Question {
@@ -563,4 +568,159 @@ fn a_release_questions_deadline_never_moves_on_a_reply() {
     q.thread[0].at = Timestamp::from_second(base + 900).unwrap();
     assert_eq!(magi::deputy::deadline(&q, 5), base + 1000);
     assert_eq!(magi::deputy::kind_of(&q), Some(magi::deputy::Kind::Release));
+}
+
+// ---- every question filer has a listener ----
+
+fn q_with(node: &str, seat: &str, choices: &[&str]) -> Question {
+    Question::new(
+        TASK.to_owned(),
+        node.to_owned(),
+        seat.to_owned(),
+        "s".to_owned(),
+        String::new(),
+        choices.iter().map(|c| (*c).to_owned()).collect(),
+    )
+}
+
+/// The `(node, seat)` of every question magi files itself with no `cwd`, by the
+/// source expression that names them. A new filer must be added here; the scan
+/// below fails on an expression it does not know.
+fn known_filers() -> Vec<(&'static str, &'static str, &'static str, bool)> {
+    // (node expr, node, seat, expects a deputy)
+    vec![
+        ("NODE.to_owned()", magi::conduct::NODE, "conduct", true),
+        (
+            "DEPS_NODE.to_owned()",
+            magi::triage::DEPS_NODE,
+            "triage",
+            true,
+        ),
+        (
+            "APPROVAL_NODE.to_owned()",
+            magi::land::APPROVAL_NODE,
+            "land",
+            true,
+        ),
+        (
+            "NOTICE_NODE.to_owned()",
+            magi::bump::NOTICE_NODE,
+            "release-watch",
+            true,
+        ),
+        // bump's own choice-less notice (seat `bump`) is the one exception.
+        (
+            "NOTICE_NODE.to_owned()",
+            magi::bump::NOTICE_NODE,
+            "bump",
+            false,
+        ),
+        (
+            "\"review\".to_owned()",
+            "review",
+            magi::daemon::DIVERGED_SEAT,
+            true,
+        ),
+        // triage's `NODE` reads the same in its own file.
+        ("NODE.to_owned()", magi::triage::NODE, "triage", true),
+        (
+            "crate::bump::NOTICE_NODE.to_owned()",
+            magi::bump::NOTICE_NODE,
+            "release-watch",
+            true,
+        ),
+    ]
+}
+
+#[test]
+fn every_question_node_that_magi_files_has_a_deputy() {
+    for (_, node, seat, expected) in known_filers() {
+        let q = q_with(node, seat, &["a", "b"]);
+        assert_eq!(
+            magi::deputy::kind_of(&q).is_some(),
+            expected,
+            "node {node} seat {seat}"
+        );
+        // A question with a `cwd` was filed by `magi ask`: never a deputy
+        // (except the conductor's, matched by node).
+        if node != magi::conduct::NODE
+            && node != magi::land::APPROVAL_NODE
+            && node != magi::bump::NOTICE_NODE
+        {
+            let mut asked = q_with(node, seat, &["a"]);
+            asked.cwd = Some("/x".to_owned());
+            assert_eq!(magi::deputy::kind_of(&asked), None, "{node} with cwd");
+        }
+    }
+    let unknown = q_with("some-future-node", "x", &["a"]);
+    assert_eq!(
+        magi::deputy::kind_of(&unknown),
+        Some(magi::deputy::Kind::Generic)
+    );
+}
+
+/// Scan `src/**/*.rs` (before each file's `#[cfg(test)]`) for
+/// `Question::new(` calls and require the node argument to be one the table
+/// above knows. Limit: this is text matching, so a filer that builds the
+/// question through a helper or formats the call differently is not seen.
+#[test]
+fn every_question_filer_in_src_is_in_the_table() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    let known: Vec<&str> = known_filers().iter().map(|k| k.0).collect();
+    // `magi ask` files with a `cwd`, so those keep their asker and the waiter.
+    let exempt = ["src/ask.rs", "src/main.rs"];
+    let mut unknown = Vec::new();
+    for f in files {
+        let rel = f.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if exempt.iter().any(|e| rel.ends_with(e)) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&f).unwrap();
+        let prod = text.split("#[cfg(test)]").next().unwrap();
+        let mut rest = prod;
+        while let Some(i) = rest.find("Question::new(") {
+            rest = &rest[i + "Question::new(".len()..];
+            let args: Vec<&str> = rest.lines().take(4).map(str::trim).collect();
+            let node = args.get(2).copied().unwrap_or("").trim_end_matches(',');
+            if !known.contains(&node) {
+                let line = prod[..prod.len() - rest.len()].lines().count();
+                unknown.push(format!("{rel}:{line}: node argument `{node}`"));
+            }
+        }
+    }
+    assert!(
+        unknown.is_empty(),
+        "a question filer is not in known_filers() - give it a deputy kind and add it:\n{}",
+        unknown.join("\n")
+    );
+}
+
+#[test]
+fn a_generic_question_runs_on_a_fixed_clock_and_is_merge_gated() {
+    let mut q = q_with("triage", "triage", &["merge", "hold"]);
+    q.answer_timeout = 100;
+    q.asked_at = Timestamp::from_second(1000).unwrap();
+    q.thread.push(magi::ask::Turn {
+        who: Who::Operator,
+        body: "hmm".to_owned(),
+        at: Timestamp::from_second(5000).unwrap(),
+    });
+    assert!(magi::deputy::fixed_clock(&q));
+    assert_eq!(magi::deputy::deadline(&q, 999), 1100);
+    assert!(magi::deputy::merge_gated(&q));
 }

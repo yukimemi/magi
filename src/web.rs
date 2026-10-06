@@ -5027,11 +5027,7 @@ fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
         return None;
     }
     if q.cwd.is_none() && q.deputy.is_none() {
-        return (matches!(
-            q.node.as_str(),
-            crate::conduct::NODE | crate::land::APPROVAL_NODE
-        ) || crate::deputy::kind_of(q) == Some(crate::deputy::Kind::Release))
-        .then_some("nobody");
+        return crate::deputy::kind_of(q).is_some().then_some("nobody");
     }
     Some(match lease.filter(|l| l.fresh(jiff::Timestamp::now())) {
         Some(_) if q.deputy.is_some() => "deputy",
@@ -6407,7 +6403,17 @@ mod tests {
             String::new(),
             Vec::new(),
         );
-        assert_eq!(holder_of(&q, None), None, "no `magi ask` filed it");
+        // No `cwd`: magi filed it itself, so a deputy is owed (not yet attached).
+        assert_eq!(holder_of(&q, None), Some("nobody"));
+        let notice = Question::new(
+            String::new(),
+            crate::bump::NOTICE_NODE.to_owned(),
+            "bump".to_owned(),
+            "s".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        assert_eq!(holder_of(&notice, None), None, "a choice-less notice");
         q.cwd = Some("/tmp".to_owned());
         assert_eq!(holder_of(&q, None), Some("nobody"));
         let beat = |kind, ago: i64| ask::Lease {

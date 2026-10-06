@@ -94,6 +94,23 @@ use crate::queue::{HoldSource, OperatorResume, Queue, Task, TaskStatus};
 /// for the same idea applied to a `crate::conduct` decision instead.
 pub const NODE: &str = "triage";
 
+/// What a deputy is told about a triage question beyond the generic brief.
+pub(crate) fn deputy_note(q: &Question) -> Option<String> {
+    match q.node.as_str() {
+        NODE => Some(
+            "Triage asks what to do with a held task that has gone stale. A hold \
+             the operator placed is never settled by an answer."
+                .to_owned(),
+        ),
+        DEPS_NODE => Some(
+            "This question is about a task other tasks wait on. Its second option \
+             detaches the dependants from it; it does not discard the task."
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
 /// Node on the question filed about a stuck dependency root - see
 /// [`ask_about_stuck_roots`]. Separate from [`NODE`] because the choices mean
 /// something else (position 2 is "detach the dependants", not "discard").
