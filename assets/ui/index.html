@@ -294,8 +294,13 @@
       <div class="panel" id="run-report-panel">
         <div class="panel-bar">
           <h2>Report</h2>
-          <button class="btn btn-quiet" type="button" id="wrap-toggle" aria-pressed="false">Wrap</button>
+          <span class="panel-bar-btns">
+            <button class="btn btn-quiet" type="button" id="report-raw-toggle" aria-pressed="false">Raw</button>
+            <button class="btn btn-quiet" type="button" id="wrap-toggle" aria-pressed="false">Wrap</button>
+          </span>
         </div>
+        <p class="rmeta" id="run-report-note" hidden></p>
+        <div class="rcards" id="run-report-cards" hidden></div>
         <pre class="report" id="run-report" tabindex="0" aria-label="Run report">Loading…</pre>
       </div>
      </div>

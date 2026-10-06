@@ -26,6 +26,7 @@ const API = {
   foldMergedRun: (id) => `/api/runs/${encodeURIComponent(id)}/fold-merged`,
   resumeRun: (id) => `/api/runs/${encodeURIComponent(id)}/resume`,
   report: (id) => `/api/runs/${encodeURIComponent(id)}/report`,
+  reportJson: (id) => `/api/runs/${encodeURIComponent(id)}/report.json`,
   queue: "/api/queue",
   search: (scope, q) => `/api/search?scope=${scope}&q=${encodeURIComponent(q)}`,
   task: (id) => `/api/queue/${encodeURIComponent(id)}`,
@@ -602,7 +603,7 @@ const state = {
      stale-search-clear recursion - only cleared right before
      revealQueueSection() actually runs. */
   queueSectionFocus: null,
-  detail: { id: null, run: null, report: null },
+  detail: { id: null, run: null, report: null, reportView: null },
   /* The task page's own subject: { id, task } while on #/tasks/<id>. */
   taskDetail: { id: null, task: null, error: null },
   questions: null,
@@ -642,6 +643,8 @@ const state = {
   rev: { queue: null, runs: null, questions: null, notifications: null, talks: null, loop: null },
   streamOpen: false,
   wrap: false,
+  /* Report tab: show the raw text instead of the cards. */
+  rawReport: false,
   /* The upgrade stage last rendered, so a transition into "done" can be told
      apart from just being on it already - the loop strip re-renders on every
      health poll, and only a transition is worth announcing. */
@@ -5660,12 +5663,284 @@ function wireRunPanels() {
   }
 }
 
+/* ---- run detail: the Report tab as cards -------------------------------- *
+ * Drawn from `/api/runs/{id}/report.json` (`report_view.rs`), which holds the
+ * judgements; this only lays them out. Open state is kept per run and card in
+ * the same store as the record panels, so a periodic refresh never closes a
+ * card the operator opened. The raw text stays one toggle away and is also
+ * the fallback whenever the view is missing or speaks a schema we do not. */
+const REPORT_VIEW_SCHEMA = 1;
+const RTONE = { ok: "teal", fail: "rust", warn: "gold", neutral: "ink" };
+
+function reportCardOpen(runId, key, dflt) {
+  const entry = loadCollapsed(RUN_PANELS_STORAGE_KEY)[runId];
+  const stored = entry && typeof entry === "object" ? entry[`rc:${key}`] : undefined;
+  return typeof stored === "boolean" ? stored : dflt;
+}
+
+function setReportCardOpen(runId, key, open) {
+  const all = loadCollapsed(RUN_PANELS_STORAGE_KEY);
+  const entry = all[runId] && typeof all[runId] === "object" ? all[runId] : {};
+  entry[`rc:${key}`] = open;
+  delete all[runId];
+  all[runId] = entry;
+  for (const id of Object.keys(all).slice(0, Math.max(0, Object.keys(all).length - RUN_PANELS_KEEP))) delete all[id];
+  saveCollapsed(RUN_PANELS_STORAGE_KEY, all);
+}
+
+function rtag(text, tone, title) {
+  return el("span", { class: "tag rtag", "data-tone": RTONE[tone] || "ink", title: title || null, text });
+}
+
+function rcard(runId, key, titleText, tone, dflt, badges, ...body) {
+  const open = reportCardOpen(runId, key, dflt);
+  const card = el("details", { class: "rcard", "data-tone": tone || "neutral", open: open ? true : null },
+    el("summary", { class: "rcard-sum" },
+      el("span", { class: "rcard-title card-title", text: titleText }),
+      el("span", { class: "rcard-badges" }, badges)),
+    el("div", { class: "rcard-body" }, body));
+  card.dataset.seen = String(open);
+  card.addEventListener("toggle", () => {
+    if (String(card.open) === card.dataset.seen) return;   /* creation, not the operator */
+    card.dataset.seen = String(card.open);
+    setReportCardOpen(runId, key, card.open);
+  });
+  return card;
+}
+
+/* A command's output is long by nature: closed until asked for. */
+function routput(text) {
+  if (!text) return null;
+  return el("details", { class: "rout" }, el("summary", { text: "output" }), el("pre", { class: "rpre", text }));
+}
+
+function rcommands(list) {
+  return el("ul", { class: "rlist" }, (list || []).map((c) => el("li", { class: "rrow" },
+    rtag(c.state === "pass" ? "pass" : c.state === "blocked" ? "blocked" : c.state === "warn" ? "warn" : "FAIL",
+      c.state === "pass" ? "ok" : c.state === "fail" ? "fail" : "warn"),
+    el("code", { class: "rmono", text: c.command }),
+    routput(c.output_tail))));
+}
+
+function rlines(lines) {
+  return el("ul", { class: "rlist" }, (lines || []).map((l) => el("li", { class: "rrow", text: l })));
+}
+
+const SEV_LABEL = { blocker: "Major", major: "Major", minor: "Minor", nit: "Nit" };
+const SEV_TONE = { blocker: "fail", major: "fail", minor: "warn", nit: "neutral" };
+const FINDING_STATE = {
+  fixed: ["fixed (reported)", "ok", "The fixer reported acting on this; a later review has not confirmed it."],
+  declined: ["declined", "warn", "The fixer chose not to act on this."],
+  open: ["open", "neutral", null],
+};
+
+function renderFinding(f) {
+  const sev = f.severity;
+  const st = FINDING_STATE[f.state] || FINDING_STATE.open;
+  const where = f.file ? `${f.file}${f.line ? `:${f.line}` : ""}` : null;
+  return el("li", { class: "rfinding", "data-state": f.state || "open", "data-blocking": f.blocking ? "1" : "0" },
+    el("div", { class: "rfinding-top" },
+      sev ? rtag(SEV_LABEL[sev] || sev, SEV_TONE[sev] || "neutral") : null,
+      sev === "blocker" ? rtag("Blocker", "fail", "Must fix before merge") : null,
+      f.blocking ? rtag("blocking", "fail", "Holds the merge") : null,
+      rtag(st[0], st[1], st[2]),
+      el("span", { class: "finding-id", text: f.id })),
+    f.title ? el("div", { class: "rfinding-title", text: f.title }) : null,
+    where ? el("div", { class: "finding-where", text: where }) : null,
+    f.declined_why ? el("div", { class: "rfinding-why", text: `Declined: ${f.declined_why}` }) : null);
+}
+
+function renderRound(runId, r) {
+  const e2eTone = { pass: "ok", fail: r.e2e && r.e2e.build_failed ? "warn" : "fail", blocked: "warn", deferred: "warn", not_configured: "neutral" };
+  const e2eText = { pass: "e2e pass", fail: "e2e FAIL", blocked: "e2e blocked", deferred: "e2e deferred", not_configured: "no e2e" };
+  const e2e = r.e2e || {};
+  const badges = [
+    rtag(r.status, r.tone),
+    rtag(e2eText[e2e.state] || "e2e ?", e2eTone[e2e.state] || "neutral",
+      e2e.build_failed ? "Build or link failure, not a verdict on the patch" : e2e.defer_reason || null),
+  ];
+  if (r.verdict) badges.push(rtag(r.verdict.label, r.verdict.vote === "approve" ? "ok" : r.verdict.vote === "reject" ? "fail" : "warn"));
+  if (r.verdict && r.verdict.split) badges.push(rtag("panel split", "warn"));
+  const fix = r.fix;
+  let fixLine = null;
+  if (fix) {
+    fixLine = fix.report_lost
+      ? `fix: adoption report lost (${fix.report_lost}); tree ${fix.tree_changed ? "changed" : "unchanged"}`
+      : `fix: ${fix.addressed} reported addressed / ${fix.rejected} declined, tree ${fix.tree_changed ? "changed" : "unchanged"}`;
+    if (!fix.committed) fixLine += " (NO COMMIT)";
+    if (fix.continuation) fixLine += ` [${fix.continuation}]`;
+  }
+  const meta = `${r.raised} finding(s), ${r.blocking} blocking · @ ${r.head}${r.verified_head ? ` (verified @ ${r.verified_head})` : ""}`
+    + (e2e.retried ? " · e2e retried once" : "");
+  return rcard(runId, `review:${r.round}`, `Round ${r.round}`, r.tone, r.default_open, badges,
+    el("p", { class: "rmeta", text: meta }),
+    (r.missing || []).length ? el("p", { class: "rmeta", text: `${r.answered}/${r.expected} reviewers answered (${r.missing.join(", ")})` }) : null,
+    fixLine ? el("p", { class: "rmeta", text: fixLine }) : null,
+    (r.commands || []).length ? rcommands(r.commands) : null,
+    (r.findings || []).length
+      ? el("ul", { class: "rfindings" }, r.findings.map(renderFinding))
+      : el("p", { class: "rmeta", text: "No findings." }),
+    (r.reviewers || []).length
+      ? rlines(r.reviewers.map((x) => `review-${x.reviewer} (${x.agent}) ${x.failed ? `failed: ${x.failed}` : x.vote ? x.vote.replace(/_/g, " ") : "no vote"}`))
+      : null,
+    (r.reconsideration || []).length
+      ? el("div", null, el("p", { class: "rmeta", text: "reconsideration" }),
+        rlines(r.reconsideration.map((x) => `review-${x.reviewer} → ${x.vote ? x.vote.replace(/_/g, " ") : ""} ${x.reason || ""}`.trim())))
+      : null);
+}
+
+function renderSection(runId, s) {
+  const key = s.kind + (s.key ? `:${s.key}` : "");
+  const card = (badges, ...body) => rcard(runId, key, s.title, s.tone, s.default_open, badges, ...body);
+  switch (s.kind) {
+    case "candidates":
+      return card([rtag(plural((s.items || []).length, "candidate", "candidates"), "neutral")],
+        el("ul", { class: "rlist" }, (s.items || []).map((c) => el("li", { class: "rrow" },
+          el("strong", { text: c.label }),
+          el("span", { class: "rmono", text: c.agent }),
+          rtag(c.state.replace(/_/g, " "), c.state === "failed" ? "fail" : c.state === "changed" ? "ok" : "warn"),
+          c.winner ? rtag("winner", "ok") : null,
+          c.provisional_winner ? rtag("provisional", "warn", "Leads, but the panel did not reach quorum") : null,
+          el("span", { class: "rmeta", text: `${c.files} files, ${c.commits} commits, ${c.duration_secs}s` }),
+          c.detail ? el("div", { class: "rwide", text: c.detail }) : null))));
+    case "judging":
+      return card([],
+        rlines((s.judges || []).map((j) => `judge ${j.judge} (${j.agent}) ${j.failed ? `no ranking: ${j.failed}` : `${j.ranking}${j.confidence != null ? ` confidence ${j.confidence}` : ""}`}`)),
+        (s.deliberation || []).length ? rlines(s.deliberation) : null,
+        (s.votes || []).length ? rlines(s.votes.map((v) => `final vote: judge ${v.judge} (${v.agent}) ${v.vote}${v.changed ? " (changed after deliberation)" : ""}`)) : null);
+    case "tally": {
+      const t = s.tally;
+      /* The verdict is only a verdict when the panel met quorum. */
+      const badges = [t.decided ? rtag(`winner ${t.winner}`, "ok") : rtag(`provisional ${t.winner}`, "warn", "No quorum: not a decision")];
+      if (!t.decided) badges.push(rtag("below quorum", "fail"));
+      const first = Object.entries(t.first_choice || {}).map(([k, v]) => `${k}:${v}`).join("  ");
+      return card(badges, rlines([
+        t.uncontested ? `judging not needed — ${t.uncontested}` : `judges ${t.present}/${t.judges} present${t.quorum ? ` (${t.quorum} required)` : ""}`,
+        t.uncontested ? null : `first choice ${first}`,
+        t.uncontested ? null : `initial: ${t.initial}`,
+        t.uncontested ? null : `after votes: ${t.unanimous_final ? "unanimous" : "still split"} (${t.changed_votes} moved)`,
+        t.tie_break ? `tie break: ${t.tie_break}` : null,
+        (t.rate_limited || []).length ? `rate limited: ${t.rate_limited.join(", ")}` : null,
+      ].filter(Boolean)));
+    }
+    case "notes":
+      return card([rtag(String((s.lines || []).length), s.tone)], rlines(s.lines));
+    case "review": {
+      const rounds = s.rounds || [];
+      return card([rtag(plural(rounds.length, "round", "rounds"), "neutral")],
+        s.handed_off ? el("p", { class: "rmeta rwarn", text: s.handed_off }) : null,
+        el("div", { class: "rrounds" }, rounds.map((r) => renderRound(runId, r))));
+    }
+    case "operator_fixes":
+      return card([], (s.requests || []).map((req) => el("div", { class: "rblock" },
+        el("p", { class: "rmeta", text: `${req.requested_at}${req.stale ? " · stale head" : ""} — ${req.reason}` }),
+        rlines((req.findings || []).map((f) => `${f.id} [${f.severity}] ${f.title}: ${f.outcome}${f.why ? ` (${f.why})` : ""}`)),
+        req.follow_up_review_run ? el("p", { class: "rmeta", text: `re-verified by run ${req.follow_up_review_run}` })
+          : req.unverified_commit ? el("p", { class: "rmeta rwarn", text: "committed, but the follow-up review could not be opened" }) : null)));
+    case "base_sync": {
+      const b = s.base_sync;
+      const label = { already_in: "already in base", conflict: "conflict", in_sync: "in sync", behind: `${b.behind} behind` }[b.state] || b.state;
+      return card([rtag(label, s.tone)], rlines([
+        `${b.base_branch} @ ${b.tip}${b.attempts ? ` (${b.attempts} rebase attempt(s))` : ""}`,
+        b.already_in ? `already in ${b.base_branch} as ${b.already_in}` : null,
+        b.conflict ? `conflict: ${b.conflict}` : null,
+      ].filter(Boolean)));
+    }
+    case "pre_gate":
+      return card([rtag((s.commands || []).every((c) => c.state === "pass") ? "pass" : "warn", s.tone)],
+        rcommands(s.commands), s.committed ? el("p", { class: "rmeta", text: `committed mechanical fixes @ ${s.committed}` }) : null);
+    case "gate":
+      return card([rtag(s.status.replace(/_/g, " "), s.tone)],
+        s.commands && s.commands.length ? rcommands(s.commands) : el("p", { class: "rmeta", text: "no gate commands configured" }));
+    case "merge": {
+      const m = s.merge;
+      return card([rtag(m.state.replace(/_/g, " "), s.tone)], rlines([
+        `mode ${m.mode}`, m.detail || null,
+        m.branch ? `branch ${m.branch} still exists, unmerged` : null,
+        m.squash_caveat ? "pass an explicit commit message — a squash merge otherwise inherits the placeholder subject" : null,
+        (m.red_at_merge || []).length ? `merged with red checks: ${m.red_at_merge.join(", ")}` : null,
+      ].filter(Boolean)));
+    }
+    case "followups":
+      return card([rtag(String((s.items || []).length), "neutral")], rlines((s.items || []).map((f) => `${f.task} ${(f.findings || []).join(", ")}`)));
+    case "release_bump": {
+      const b = s.bump;
+      return card([rtag(`automerge ${b.automerge.replace(/_/g, " ")}`, s.tone)], rlines([
+        b.version ? `version v${b.version}` : null, b.pr_url ? `pr ${b.pr_url}` : null,
+        b.problem, b.action_required ? `action required: ${b.action_required}` : null,
+      ].filter(Boolean)));
+    }
+    case "winner_worktree":
+      return card(s.provisional ? [rtag("provisional", "warn", "The panel did not reach quorum")] : [],
+        el("p", { class: "rmeta rmono", text: s.worktree }), el("p", { class: "rmeta rmono", text: `branch ${s.branch}` }));
+    case "jobs":
+      return card([rtag(String((s.groups || []).reduce((n, g) => n + (g.jobs || []).length, 0)), "neutral")],
+        s.empty_note ? el("p", { class: "rmeta", text: s.empty_note }) : null,
+        (s.groups || []).map((g) => el("div", { class: "rblock" },
+          el("p", { class: "rmeta rmono", text: `${g.node}/${g.seat}` }),
+          el("ul", { class: "rlist" }, (g.jobs || []).map((j) => el("li", { class: "rrow" },
+            rtag(j.status, j.status === "completed" ? "ok" : j.status === "failed" ? "fail" : "warn"),
+            j.exit_code != null ? el("span", { class: "rmeta", text: `exit ${j.exit_code}` }) : null,
+            j.round != null ? el("span", { class: "rmeta", text: `round ${j.round}` }) : null,
+            el("code", { class: "rmono", text: j.description }),
+            routput(j.result_summary)))))),
+        el("p", { class: "rmeta", text: s.coverage }));
+    default:
+      /* A kind this build does not know: say so rather than drop it. */
+      return card([], el("p", { class: "rmeta", text: `(unknown section: ${s.kind})` }));
+  }
+}
+
+function renderReportCards() {
+  const view = state.detail.reportView;
+  const box = $("run-report-cards");
+  const raw = $("run-report");
+  const note = $("run-report-note");
+  const toggle = $("report-raw-toggle");
+  let reason = null;
+  if (!view) reason = null;
+  else if (view.error) reason = `Structured report unavailable (${view.error}); showing the raw text.`;
+  else if (view.schema !== REPORT_VIEW_SCHEMA || !Array.isArray(view.sections)) {
+    reason = `Structured report schema ${view.schema} is not understood; showing the raw text.`;
+  }
+  const runId = state.detail.id;
+  const cards = Boolean(view) && !reason && !state.rawReport;
+  setAttr(toggle, "aria-pressed", String(state.rawReport));
+  setText(toggle, state.rawReport ? "Cards" : "Raw");
+  show(toggle, !reason);
+  setText(note, reason || "");
+  show(note, Boolean(reason));
+  show(box, cards);
+  show(raw, !cards);
+  show($("wrap-toggle"), !cards);
+  if (!cards) return;
+  /* Rebuild only when the data moved, so a refresh does not disturb a card
+     the operator is reading. */
+  const sig = `${runId}\n${JSON.stringify(view)}`;
+  if (box.dataset.sig === sig) return;
+  box.dataset.sig = sig;
+  const h = view.header || {};
+  clear(box);
+  append(box, [
+    el("div", { class: "rhead" },
+      rtag(h.status || "", h.tone || "neutral"),
+      h.unmerged_by_design ? rtag("not landed by design", "neutral") : null,
+      h.needs_attention ? rtag("needs a human", "warn") : null,
+      el("span", { class: "rmeta", text: `${h.repo || ""} (${h.base_branch || ""} @ ${h.base_commit || ""}) · created ${h.created || ""}` }),
+      h.task ? el("div", { class: "rwide", text: h.task }) : null,
+      h.origin ? el("div", { class: "rmeta", text: h.origin }) : null),
+    view.active_seats ? el("details", { class: "rout" }, el("summary", { text: "active seats" }), el("pre", { class: "rpre", text: view.active_seats })) : null,
+    view.sections.map((s) => renderSection(runId, s)),
+  ]);
+}
+
 function renderRunDetail() {
   const run = state.detail.run;
   const report = state.detail.report;
 
   $("run-report").dataset.wrap = state.wrap ? "1" : "0";
   applyRunTab();
+  renderReportCards();
 
   if (!run) {
     setText($("run-h"), "Loading run\u2026");
@@ -7408,10 +7683,12 @@ async function loadHealth({ applyRevisions = false } = {}) {
 
 async function loadRun(id) {
   const fresh = state.detail.id !== id;
-  if (fresh) state.detail = { id, run: null, report: null };
+  if (fresh) state.detail = { id, run: null, report: null, reportView: null };
   renderRunDetail();
 
-  const [run, report] = await Promise.allSettled([getJson(API.run(id)), getText(API.report(id))]);
+  const [run, report, view] = await Promise.allSettled([
+    getJson(API.run(id)), getText(API.report(id)), getJson(API.reportJson(id)),
+  ]);
 
   if (state.detail.id !== id) return;   /* the operator navigated away */
 
@@ -7424,6 +7701,11 @@ async function loadRun(id) {
   state.detail.report = report.status === "fulfilled"
     ? report.value
     : `The report could not be rendered: ${report.reason.message}`;
+  /* A failed or unknown-schema structured view is kept as a reason, never as
+     an empty report: renderReportCards falls back to the raw text with it. */
+  state.detail.reportView = view.status === "fulfilled"
+    ? view.value
+    : { error: view.reason && view.reason.message ? view.reason.message : "request failed" };
 
   renderRunDetail();
 }
@@ -7646,7 +7928,7 @@ function applyRoute() {
     applyRunTab();
     if (state.detail.id !== route.id) loadRun(route.id);
   } else {
-    state.detail = { id: null, run: null, report: null };
+    state.detail = { id: null, run: null, report: null, reportView: null };
   }
 
   const taskId = route.name === "task" || (split && split.detail === "task") ? route.id : null;
@@ -8309,6 +8591,11 @@ function wire() {
   $("theme-toggle").addEventListener("click", () => {
     const next = THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length];
     applyTheme(next);
+  });
+
+  $("report-raw-toggle").addEventListener("click", () => {
+    state.rawReport = !state.rawReport;
+    renderReportCards();
   });
 
   $("wrap-toggle").addEventListener("click", (event) => {

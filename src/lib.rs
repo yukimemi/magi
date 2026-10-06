@@ -54,6 +54,7 @@ pub mod refs;
 pub mod release_local;
 pub mod release_watch;
 pub mod report;
+pub mod report_view;
 pub mod repos;
 pub mod rng;
 pub mod run;

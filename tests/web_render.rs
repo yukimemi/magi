@@ -683,12 +683,58 @@ async fn run_detail_tabs_landing_and_strip_hold_at_both_widths_and_themes() {
             browser
                 .wait_for(
                     &page,
-                    "(() => { const r = document.getElementById('run-report'); \
+                    "(() => { const r = document.querySelector('#run-report-cards .rcard'); \
                      return !!r && r.offsetParent !== null; })()",
                     w,
                 )
                 .await
                 .unwrap_or_else(|e| panic!("{tag}: report tab: {e}"));
+            // The structured view is what the tab opens on; the raw text is one
+            // toggle away and the cards stay inside the list pane.
+            let cards = browser
+                .eval(
+                    &page,
+                    "(() => { const box = document.getElementById('run-report-cards'); \
+                     const b = box.getBoundingClientRect(); \
+                     const sums = [...box.querySelectorAll('.rcard-sum')]; \
+                     return { raw_hidden: document.getElementById('run-report').hidden, \
+                              n: sums.length, \
+                              titles: sums.every((s) => s.querySelector('.rcard-title').textContent.trim() !== ''), \
+                              inside: sums.every((s) => s.getBoundingClientRect().right <= b.right + 1) }; })()",
+                )
+                .await
+                .unwrap();
+            assert_eq!(cards["raw_hidden"], true, "{tag}: {cards}");
+            assert_eq!(cards["titles"], true, "{tag}: {cards}");
+            assert_eq!(cards["inside"], true, "{tag}: card spills out: {cards}");
+            assert!(cards["n"].as_u64().unwrap_or(0) >= 1, "{tag}: {cards}");
+            browser
+                .eval(
+                    &page,
+                    "document.getElementById('report-raw-toggle').click(); true",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                browser
+                    .eval(
+                        &page,
+                        "!document.getElementById('run-report').hidden && document.getElementById('run-report-cards').hidden"
+                    )
+                    .await
+                    .unwrap(),
+                true,
+                "{tag}: the Raw toggle shows the text report"
+            );
+            browser
+                .eval(
+                    &page,
+                    "document.getElementById('report-raw-toggle').click(); true",
+                )
+                .await
+                .unwrap();
+            let problems = console_problems(&browser.take_events(&page.session));
+            assert!(problems.is_empty(), "{tag}: console: {problems:?}");
             assert_eq!(
                 browser
                     .eval(
