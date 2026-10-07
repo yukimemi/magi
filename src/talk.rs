@@ -2550,7 +2550,10 @@ mod tests {
         assert!(tickets.iter().all(|t| t.exists()));
         // Past the sweep age they go, and the next attempt recovers.
         for t in &tickets {
-            let f = std::fs::OpenOptions::new().write(true).open(t).expect("open");
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(t)
+                .expect("open");
             f.set_modified(std::time::SystemTime::now() - TICKET_SWEEP_AGE * 2)
                 .expect("age");
         }
