@@ -2512,7 +2512,7 @@ mod tests {
         std::fs::create_dir_all(lock.parent().expect("dir")).expect("dir");
         std::fs::write(&lock, "t1-dead").expect("dead lock");
         age_file(&lock);
-        let t0 = lease.with_extension("lock.t1-dead.break.0");
+        let t0 = lock.with_extension("lock.t1-dead.break.0");
         assert!(create_exclusive(&t0, "").expect("ticket"));
         // A fresh ticket 0 blocks the same dead token, whatever the clock says.
         assert!(TurnLock::take(&lease).expect("take").is_none());
@@ -2521,7 +2521,7 @@ mod tests {
         age_file(&t0);
         let c = TurnLock::take(&lease).expect("take").expect("generation 1");
         assert_eq!(std::fs::read_to_string(&lock).expect("read"), c.token);
-        assert!(lease.with_extension("lock.t1-dead.break.1").exists());
+        assert!(lock.with_extension("lock.t1-dead.break.1").exists());
         assert!(TurnLock::take(&lease).expect("take").is_none());
     }
 
