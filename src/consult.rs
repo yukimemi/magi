@@ -161,11 +161,19 @@ pub async fn start_turn(
     let mut talk = talks.get(&talk.id)?;
     // Other starters that found the lease held queued drafts and left them to
     // us, so drain until nothing is left (as the web's drain loop does).
+    // A failed turn is kept and reported at the end, not returned at once:
+    // drafts accepted meanwhile are still owed an answer.
+    let mut failed = None;
     while let Some(text) = talk::drain(&mut talk, talks)? {
-        talk::respond(&lease, &mut talk, talks, cfg, &text).await?;
+        if let Err(e) = talk::respond(&lease, &mut talk, talks, cfg, &text).await {
+            failed.get_or_insert(e);
+        }
         if !lease.beat()? {
             bail!("the turn lease for chat {} was lost", talk.short());
         }
+    }
+    if let Some(e) = failed {
+        return Err(e);
     }
     Ok(Started::Answered)
 }
