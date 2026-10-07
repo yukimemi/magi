@@ -235,9 +235,14 @@ pub fn context_usage(talk: &Talk, cfg: Option<&Config>) -> ContextUsage {
     let measured = usage.map(|u| u.context_tokens);
     let tokens = measured.or_else(|| {
         let standing = cfg.map_or(STANDING_PROMPT_FALLBACK_CHARS, |c| {
-            briefing(&talk.repo, &c.graph.language, c.talk.allow_write)
-                .chars()
-                .count() as u64
+            briefing_with(
+                &talk.repo,
+                &c.graph.language,
+                c.talk.allow_write,
+                crate::persona::active(&c.talk.personas, &talk.persona).as_ref(),
+            )
+            .chars()
+            .count() as u64
         });
         estimate_context_tokens(talk, standing)
     });
@@ -319,6 +324,15 @@ pub struct Talk {
     /// even when that agent also appears in the chain.
     #[serde(default)]
     pub fallback: bool,
+    /// Persona id (see [`crate::persona`]); empty is the plain default voice.
+    /// Independent of [`Self::agent`]: it survives an agent switch.
+    #[serde(default)]
+    pub persona: String,
+    /// The persona changed after the CLI session was last told about it. The
+    /// next resumed turn carries a persona update; cleared only once a turn
+    /// has succeeded (a fresh seat's briefing already holds the new persona).
+    #[serde(default)]
+    pub persona_dirty: bool,
     /// When the conversation was opened.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -989,6 +1003,8 @@ pub fn begin(store: &Talks, cfg: &Config, repo: PathBuf, agent: Option<&str>) ->
         pending: String::new(),
         pending_attachments: Vec::new(),
         fallback: agent.is_none(),
+        persona: String::new(),
+        persona_dirty: false,
         created_at: now,
         updated_at: now,
         seat: SeatState::new(SEAT, &spec.id, crate::rng::entropy()),
@@ -1218,6 +1234,52 @@ pub fn switch_agent(talk: &mut Talk, store: &Talks, spec: &AgentSpec) -> Result<
     Ok(true)
 }
 
+/// Pick the conversation's persona (`""` or `default` is the plain voice).
+///
+/// The CLI session keeps its seat: the change is recorded with
+/// [`Talk::persona_dirty`] and a magi note, and the next turn tells the session
+/// about it (or its fresh briefing already does). Returns `false` and writes
+/// nothing when the stored persona is already `id`. Refusing a closed talk, an
+/// unknown id or a turn in flight is the caller's job.
+pub fn switch_persona(talk: &mut Talk, store: &Talks, id: &str) -> Result<bool> {
+    let id = if id.trim() == crate::persona::DEFAULT_ID {
+        ""
+    } else {
+        id.trim()
+    };
+    let _guard = store.guard();
+    let mut fresh = store
+        .get(&talk.id)
+        .with_context(|| format!("talk {} was deleted", talk.short()))?;
+    if fresh.persona == id {
+        *talk = fresh;
+        return Ok(false);
+    }
+    let from = std::mem::replace(&mut fresh.persona, id.to_owned());
+    fresh.persona_dirty = true;
+    let label = |p: &str| {
+        if p.is_empty() {
+            crate::persona::DEFAULT_ID.to_owned()
+        } else {
+            p.to_owned()
+        }
+    };
+    fresh.turns.push(Turn {
+        who: Who::Agent,
+        body: format!(
+            "{MAGI_NOTE}persona changed from {} to {}",
+            label(&from),
+            label(id)
+        ),
+        at: Timestamp::now(),
+        attachments: Vec::new(),
+        usage: None,
+    });
+    store.put(&mut fresh)?;
+    *talk = fresh;
+    Ok(true)
+}
+
 /// Discard the durable draft without adding a transcript turn.
 pub fn clear_pending(talk: &mut Talk, store: &Talks) -> Result<()> {
     let _guard = store.guard();
@@ -1371,6 +1433,13 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         }
     }
 
+    let persona = crate::persona::active(&cfg.talk.personas, &talk.persona);
+    let persona_update = if talk.persona_dirty {
+        format!("{}\n\n", crate::persona::update_block(persona.as_ref()))
+    } else {
+        String::new()
+    };
+
     let mut outcome = None;
     let mut fell_back_from: Option<String> = None;
     // What the conversation looked like after the first agent's failed try,
@@ -1393,20 +1462,37 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         let body = if talk.seat.turns == 0 && first_ever {
             format!(
                 "{}\n\n# Operator\n\n{text}{last_note}",
-                briefing(&talk.repo, &cfg.graph.language, cfg.talk.allow_write)
+                briefing_with(
+                    &talk.repo,
+                    &cfg.graph.language,
+                    cfg.talk.allow_write,
+                    persona.as_ref()
+                )
             )
         } else if talk.seat.turns == 0 {
             // A fresh seat on a conversation that already has history (the
             // agent was switched): the briefing, then everything said so far.
             format!(
                 "{}\n\n{}\n\n# Operator\n\n{text}{last_note}",
-                briefing(&talk.repo, &cfg.graph.language, cfg.talk.allow_write),
+                briefing_with(
+                    &talk.repo,
+                    &cfg.graph.language,
+                    cfg.talk.allow_write,
+                    persona.as_ref()
+                ),
                 transcript(talk, store)
             )
         } else if resuming {
-            format!("{text}{last_note}")
+            format!("{persona_update}{text}{last_note}")
         } else {
-            format!("{}\n\n{text}{last_note}", transcript(talk, store))
+            // No session to hold the persona: the transcript never stores it,
+            // so a non-default persona is re-sent on every such turn (the
+            // update block already carries it when the choice just changed).
+            let standing = match (&persona, talk.persona_dirty) {
+                (Some(p), false) => format!("{}\n", crate::persona::section(p)),
+                _ => persona_update.clone(),
+            };
+            format!("{}\n\n{standing}{text}{last_note}", transcript(talk, store))
         };
         let attempt_stem = if n == 0 {
             stem.clone()
@@ -1553,6 +1639,11 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             talk.agent
         )));
     }
+    // The persona is in the session's context only once a turn has answered
+    // (a failed one may never have reached the agent), so only then is it clean.
+    if failure.is_none() {
+        talk.persona_dirty = false;
+    }
     talk.turns.push(reply);
     if let Err(put_err) = store.put(talk) {
         // `Talks::put` already retried the write itself - reaching here
@@ -1684,6 +1775,17 @@ fn attachment_note(store: &Talks, talk_id: &str, attachments: &[Attachment]) -> 
 /// the instruction is to ask rather than guess when that happens - the
 /// silent-decision line this task must not cross.
 pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
+    briefing_with(repo, language, allow_write, None)
+}
+
+/// [`briefing`] plus the selected persona's tone-only section. `None` is
+/// byte-for-byte the plain briefing.
+pub fn briefing_with(
+    repo: &Path,
+    language: &str,
+    allow_write: bool,
+    persona: Option<&crate::persona::Persona>,
+) -> String {
     let write_policy = if allow_write {
         "Write access is enabled for this conversation (`allow_write = \
          true`), so you may write files - but only a small, \
@@ -1755,6 +1857,9 @@ pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
         repo = repo.display(),
     );
     out.push_str(&language_note(language));
+    if let Some(p) = persona {
+        out.push_str(&crate::persona::section(p));
+    }
     out
 }
 
@@ -1956,6 +2061,8 @@ mod tests {
             pending: String::new(),
             pending_attachments: Vec::new(),
             fallback: false,
+            persona: String::new(),
+            persona_dirty: false,
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, agent, 1),
@@ -2197,6 +2304,8 @@ mod tests {
             pending: String::new(),
             pending_attachments: Vec::new(),
             fallback: false,
+            persona: String::new(),
+            persona_dirty: false,
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, "sonnet", 7),
@@ -2709,6 +2818,100 @@ mod tests {
             .await
             .expect_err("c alone, and it fails");
         assert_eq!(calls(tmp.path(), "b"), 0);
+    }
+
+    #[test]
+    fn briefing_carries_a_persona_section_only_when_one_is_chosen() {
+        let plain = briefing(Path::new("/repo"), "en", false);
+        assert_eq!(plain, briefing_with(Path::new("/repo"), "en", false, None));
+        assert!(!plain.contains("Persona"));
+        let rei = crate::persona::builtin_catalog()
+            .into_iter()
+            .find(|p| p.id == "rei")
+            .expect("rei");
+        let with = briefing_with(Path::new("/repo"), "en", false, Some(&rei));
+        assert!(with.starts_with(&plain), "the plain briefing is untouched");
+        assert!(with.contains("# Persona (tone only)"));
+        assert!(with.contains("TONE ONLY"));
+        assert!(with.contains("task ids"));
+        assert!(with.contains("write policy"));
+        assert!(with.contains("`magi task add`"));
+        assert!(with.contains("Rei Ayanami"));
+    }
+
+    #[test]
+    fn a_talk_written_before_personas_still_loads() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), ECHO, BTreeMap::new());
+        let cfg = config(spec);
+        let talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        let path = talks.root.join(format!("{}.json", talk.id));
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("persona");
+        v.as_object_mut().unwrap().remove("persona_dirty");
+        std::fs::write(&path, v.to_string()).unwrap();
+        let loaded = talks.get(&talk.id).expect("old record loads");
+        assert_eq!(loaded.persona, "");
+        assert!(!loaded.persona_dirty);
+    }
+
+    #[tokio::test]
+    async fn a_persona_switch_notes_marks_dirty_and_updates_the_next_turn_once() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), ECHO, BTreeMap::new());
+        let cfg = config(spec);
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        say(&mut talk, &talks, &cfg, "hello", Vec::new())
+            .await
+            .expect("first turn");
+        assert!(!talk.turns[1].body.contains("Persona"));
+
+        assert!(switch_persona(&mut talk, &talks, "misato").expect("switch"));
+        assert!(!switch_persona(&mut talk, &talks, "misato").expect("same"));
+        assert!(talk.persona_dirty);
+        assert!(talk.turns.last().unwrap().body.contains("persona changed"));
+
+        say(&mut talk, &talks, &cfg, "next", Vec::new())
+            .await
+            .expect("turn");
+        let prompt = &talk.turns.last().unwrap().body;
+        assert!(prompt.contains("# Persona update"), "{prompt}");
+        assert!(prompt.contains("Misato Katsuragi"));
+        assert!(!talk.persona_dirty, "cleared after a successful turn");
+
+        say(&mut talk, &talks, &cfg, "again", Vec::new())
+            .await
+            .expect("turn");
+        assert!(!talk.turns.last().unwrap().body.contains("# Persona update"));
+
+        assert!(switch_persona(&mut talk, &talks, "default").expect("back"));
+        assert_eq!(talk.persona, "");
+        say(&mut talk, &talks, &cfg, "plain", Vec::new())
+            .await
+            .expect("turn");
+        assert!(
+            talk.turns
+                .last()
+                .unwrap()
+                .body
+                .contains("turned the persona off")
+        );
+
+        // Without a resumable session every turn re-sends the persona.
+        assert!(switch_persona(&mut talk, &talks, "rei").expect("rei"));
+        let mut no_sessions = cfg.clone();
+        no_sessions.graph.sessions = false;
+        say(&mut talk, &talks, &no_sessions, "one", Vec::new())
+            .await
+            .expect("turn");
+        say(&mut talk, &talks, &no_sessions, "two", Vec::new())
+            .await
+            .expect("turn");
+        let last = &talk.turns.last().unwrap().body;
+        assert!(!talk.persona_dirty);
+        assert!(last.contains("# Persona (tone only)"), "{last}");
+        assert!(last.contains("Rei Ayanami"));
     }
 
     #[tokio::test]
@@ -3388,6 +3591,8 @@ mod tests {
                 pending: String::new(),
                 pending_attachments: Vec::new(),
                 fallback: false,
+                persona: String::new(),
+                persona_dirty: false,
                 created_at: Timestamp::now(),
                 updated_at: Timestamp::now(),
                 seat: SeatState::new(SEAT, "mock", 7),

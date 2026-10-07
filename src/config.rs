@@ -1194,6 +1194,23 @@ pub struct Talk {
     /// checkout - has nothing to lose by turning this on in its own
     /// `magi.toml`, and a one-line fix stops costing a queued task to get.
     pub allow_write: bool,
+    /// Extra chat personas, `[[talk.personas]]`. They add to the built-ins in
+    /// [`crate::persona`]; an entry with a built-in's id replaces it. Like every
+    /// array outside [`array_merge_policy`]'s append list, declaring it in two
+    /// layers is refused.
+    pub personas: Vec<PersonaSpec>,
+}
+
+/// One `[[talk.personas]]` entry: a tone for the standing chat, nothing more.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonaSpec {
+    /// Stable id the conversation stores. Not `default`.
+    pub id: String,
+    /// What the selector shows.
+    pub name: String,
+    /// The voice instruction appended to the chat's system prompt.
+    pub prompt: String,
 }
 
 /// Roles resolved to concrete agent specs for one run.
@@ -1383,6 +1400,7 @@ impl Config {
         let mut cfg: Self = toml::Value::Table(table)
             .try_into()
             .context("deserializing magi config")?;
+        crate::persona::validate(&cfg.talk.personas)?;
         if detect_agents {
             cfg.agents = Self::autodetected().agents;
         }
@@ -1991,6 +2009,14 @@ impl Config {
              # Optional independent E2E/final-gate timeout; uncomment to keep\n\
              # verification independent if timeout_review changes later.\n\
              # timeout_verify = 1200\n\n\
+             # Chat personas (tone only; the web Chat picks one per conversation).\n\
+             # Built in: magi, rei, misato, ritsuko, shinji, asuka, kaworu. Entries add to\n\
+             # them, and one with a built-in's id replaces it. `default` is the plain\n\
+             # voice and cannot be redefined. Declare this in one layer only.\n\
+             # [[talk.personas]]\n\
+             # id = \"gendo\"\n\
+             # name = \"Gendo Ikari\"\n\
+             # prompt = \"Speak coldly and tersely, hands folded.\"\n\n\
              [verify]\n\
              # Run once per review round in the winner's worktree; failures are\n\
              # fed back to the fixer.\n\
@@ -2931,6 +2957,70 @@ mod tests {
         assert!(starter.contains("When timeout_verify is omitted, E2E and"));
         assert!(starter.contains("verification independent if timeout_review changes later"));
         assert!(starter.contains("# timeout_verify = 1200"));
+    }
+
+    #[test]
+    fn starter_toml_documents_chat_personas() {
+        let starter = Config::starter_toml();
+        assert!(starter.contains("# [[talk.personas]]"));
+        assert!(starter.contains("tone only"));
+    }
+
+    #[test]
+    fn talk_personas_parse_and_are_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        std::fs::write(
+            &path,
+            "[[talk.personas]]\nid = \"rei\"\nname = \"Quiet\"\nprompt = \"Be brief.\"\n\n\
+             [[talk.personas]]\nid = \"gendo\"\nname = \"Gendo\"\nprompt = \"Be cold.\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("loads");
+        assert_eq!(cfg.talk.personas.len(), 2);
+        let catalog = crate::persona::catalog(&cfg.talk.personas);
+        let rei = catalog.iter().find(|p| p.id == "rei").unwrap();
+        assert_eq!(
+            (rei.name.as_str(), rei.prompt.as_str()),
+            ("Quiet", "Be brief.")
+        );
+        assert_eq!(catalog.last().unwrap().id, "gendo");
+
+        for (body, needle) in [
+            (
+                "[[talk.personas]]\nid = \"\"\nname = \"n\"\nprompt = \"p\"\n",
+                "empty `id`",
+            ),
+            (
+                "[[talk.personas]]\nid = \"a\"\nname = \"n\"\nprompt = \" \"\n",
+                "empty `prompt`",
+            ),
+            (
+                "[[talk.personas]]\nid = \"a\"\nname = \"n\"\nprompt = \"p\"\n\
+                 [[talk.personas]]\nid = \"a\"\nname = \"m\"\nprompt = \"q\"\n",
+                "more than once",
+            ),
+            (
+                "[[talk.personas]]\nid = \"default\"\nname = \"n\"\nprompt = \"p\"\n",
+                "cannot be redefined",
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let err = format!("{:#}", Config::load(&path).unwrap_err());
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+    }
+
+    #[test]
+    fn talk_personas_in_two_layers_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.toml");
+        let repo = dir.path().join("repo.toml");
+        let one = "[[talk.personas]]\nid = \"a\"\nname = \"n\"\nprompt = \"p\"\n";
+        std::fs::write(&machine, one).unwrap();
+        std::fs::write(&repo, one.replace("\"a\"", "\"b\"")).unwrap();
+        let err = format!("{:#}", Config::load_layers(&[machine, repo]).unwrap_err());
+        assert!(err.contains("talk.personas"), "{err}");
     }
 
     #[test]

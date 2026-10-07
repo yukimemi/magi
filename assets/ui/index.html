@@ -540,10 +540,16 @@
       <div class="run-status" id="talk-status"></div>
       <h1 id="talk-h">Loading conversation…</h1>
       <p class="view-sub" id="talk-meta"></p>
-      <label class="talk-agent" id="talk-agent-box" hidden>
-        <span class="talk-agent-label">Agent</span>
-        <select id="talk-agent" aria-label="Agent for this conversation"></select>
-      </label>
+      <div class="talk-selectors">
+        <label class="talk-agent" id="talk-agent-box" hidden>
+          <span class="talk-agent-label">Agent</span>
+          <select id="talk-agent" aria-label="Agent for this conversation"></select>
+        </label>
+        <label class="talk-agent" id="talk-persona-box" hidden>
+          <span class="talk-agent-label">Persona</span>
+          <select id="talk-persona" aria-label="Persona for this conversation"></select>
+        </label>
+      </div>
     </div>
 
     <ol class="turns" id="talk-turns"></ol>

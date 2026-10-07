@@ -1516,3 +1516,77 @@ async fn stats_scatter_plots_reviewers_on_a_log_axis() {
     assert_eq!(out["spill"], true);
     browser.close_page(&page).await;
 }
+
+#[tokio::test]
+async fn chat_persona_select_sits_beside_the_agent_select_without_overlap() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let agent = fx.config.agents[0].id.clone();
+    let mut t = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(&agent)).expect("seed talk");
+    talk::record(&mut t, &talks, "Which persona suits me?", Vec::new()).expect("seed turn");
+    let talk_id = t.id.clone();
+
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome)
+        .await
+        .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
+    let w = Duration::from_secs(30);
+
+    for (width, height, mobile) in [(1280u32, 900u32, false), (390, 844, true)] {
+        let tag = format!("persona select @{width}px");
+        let page = browser
+            .open_page(&format!("{base}#/chat/{talk_id}"), width, height, mobile)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: open: {e}"));
+        browser
+            .wait_for(
+                &page,
+                "(() => { const b = document.getElementById('talk-persona-box'); \
+                 return !!b && !b.hidden && document.querySelectorAll('#talk-persona option').length > 1; })()",
+                w,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: persona select never rendered: {e}"));
+        let got = browser
+            .eval(
+                &page,
+                "(() => { const s = document.getElementById('talk-persona'); \
+                 const r = s.getBoundingClientRect(); \
+                 const a = document.getElementById('talk-agent-box'); \
+                 const ar = a.hidden ? null : a.getBoundingClientRect(); \
+                 return { value: s.value, options: s.options.length, disabled: s.disabled, \
+                 w: r.width, h: r.height, right: r.right, vw: document.documentElement.clientWidth, \
+                 overlap: !!ar && ar.left < r.right - 1 && r.left < ar.right - 1 \
+                   && ar.top < r.bottom - 1 && r.top < ar.bottom - 1 }; })()",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: eval: {e}"));
+        assert_eq!(got["value"], "default", "{tag}: {got}");
+        assert!(got["options"].as_u64().unwrap_or(0) >= 8, "{tag}: {got}");
+        assert_eq!(got["disabled"], false, "{tag}: {got}");
+        assert!(
+            got["w"].as_f64().unwrap_or(0.0) > 0.0 && got["h"].as_f64().unwrap_or(0.0) > 0.0,
+            "{tag}: {got}"
+        );
+        assert!(
+            got["right"].as_f64().unwrap_or(0.0) <= got["vw"].as_f64().unwrap_or(0.0) + 1.0,
+            "{tag}: spills out {got}"
+        );
+        assert_eq!(
+            got["overlap"], false,
+            "{tag}: overlaps the agent select {got}"
+        );
+    }
+}

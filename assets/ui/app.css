@@ -536,6 +536,7 @@ main {
 
 .view-head { display: flex; flex-direction: column; gap: var(--s1); }
 .view-sub { font-size: var(--t2); color: var(--ink-3); }
+.talk-selectors { display: flex; flex-wrap: wrap; column-gap: var(--s4); }
 .talk-agent { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: var(--t2); color: var(--ink-3); }
 .talk-agent select { min-width: 0; max-width: min(100%, 22rem); min-height: 36px; font: inherit; }
 
