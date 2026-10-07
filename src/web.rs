@@ -765,13 +765,14 @@ impl Ui {
         if live.live.contains(id) {
             return Ok(TalkTurnStart::Busy);
         }
+        let Some(lease) = self.talks.claim_turn(id).map_err(ApiError::from)? else {
+            return Ok(TalkTurnStart::Foreign);
+        };
+        // A refused `Pending` below drops the lease again.
         let talk = self.talks.get(id).map_err(ApiError::from)?;
         if !talk.pending.is_empty() || !talk.pending_attachments.is_empty() {
             return Ok(TalkTurnStart::Pending);
         }
-        let Some(lease) = self.talks.claim_turn(id).map_err(ApiError::from)? else {
-            return Ok(TalkTurnStart::Busy);
-        };
         live.live.insert(id.to_owned());
         Ok(TalkTurnStart::Claimed(TalkTurnGuard {
             talk: id.to_owned(),
@@ -960,6 +961,9 @@ struct TalkTurns {
 enum TalkTurnStart {
     Claimed(TalkTurnGuard),
     Busy,
+    /// Another process holds the turn lease. Unlike `Busy` there is no local
+    /// drain loop that would answer a queued draft, so the caller refuses.
+    Foreign,
     Pending,
 }
 
@@ -974,7 +978,10 @@ impl TalkTurnGuard {
         text: &str,
     ) -> anyhow::Result<()> {
         match &self.lease {
-            Some(lease) => lease.beating(talk::respond(talk, talks, cfg, text)).await,
+            Some(lease) => lease
+                .beating(talk::respond(talk, talks, cfg, text))
+                .await
+                .and_then(|done| done),
             None => talk::respond(talk, talks, cfg, text).await,
         }
     }
@@ -6113,6 +6120,11 @@ async fn talk_say(
         TalkTurnStart::Pending => {
             return Err(ApiError::conflict(
                 "a queued draft is waiting; resume it, edit it, or clear it before sending another message",
+            ));
+        }
+        TalkTurnStart::Foreign => {
+            return Err(ApiError::conflict(
+                "a turn is already running in another process; try again when it has finished",
             ));
         }
         TalkTurnStart::Busy => {
@@ -13843,6 +13855,13 @@ mod tests {
             .expect("the other process wins");
         assert!(ui.is_thinking(id), "a foreign turn reads as thinking");
         assert!(ui.begin_talk_turn(id).expect("claim").is_none());
+        assert!(
+            matches!(
+                ui.begin_talk_turn_unless_pending(id).expect("start"),
+                TalkTurnStart::Foreign
+            ),
+            "a foreign holder is refused, not queued behind"
+        );
         assert!(
             !ui.talk_turns.lock().unwrap().live.contains(id),
             "a refused claim leaves no in-process entry behind"
