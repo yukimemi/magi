@@ -1957,6 +1957,10 @@ impl Config {
         }
         s.push_str(
             "# Leave a role list empty to rotate through the roster.\n\
+             # A non-empty list is also an ordered backup list: seats take entries from the\n\
+             # front (see [graph] counts) and a failed or out-of-quota seat moves on to the\n\
+             # next agent to its right, each tried once. Same for judges and reviewers.\n\
+             # implementers = [\"opus\", \"codex\", \"sonnet\"]  # with implementers = 1 below: opus sits, codex then sonnet are spares\n\
              [roles]\n\
              implementers = []\n\
              judges = []\n\
@@ -2927,6 +2931,13 @@ mod tests {
         assert!(starter.contains("When timeout_verify is omitted, E2E and"));
         assert!(starter.contains("verification independent if timeout_review changes later"));
         assert!(starter.contains("# timeout_verify = 1200"));
+    }
+
+    #[test]
+    fn starter_toml_documents_role_lists_as_backup_order() {
+        let starter = Config::starter_toml();
+        assert!(starter.contains("also an ordered backup list"));
+        assert!(starter.contains("codex then sonnet are spares"));
     }
 
     /// A repository whose ruleset forbids merge commits declares that once,
