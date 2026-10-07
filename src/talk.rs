@@ -818,6 +818,7 @@ impl TurnLock {
         // own TTL: an owner stalled past `TICKET_TTL` between creating its
         // ticket and publishing can overlap with the next generation's taker.
         let mut won = false;
+        let mut last = None;
         for n in 0..TICKET_GENERATIONS {
             let ticket = path.with_extension(format!("lock.{key}.break.{n}"));
             if create_exclusive(&ticket, "")? {
@@ -832,8 +833,14 @@ impl TurnLock {
             if !stale {
                 return Ok(None);
             }
+            last = Some(ticket);
         }
         if !won {
+            // Every generation was abandoned: free the last slot so the next
+            // attempt can recover instead of waiting for the sweep.
+            if let Some(last) = last {
+                let _ = std::fs::remove_file(last);
+            }
             return Ok(None);
         }
         Self::sweep_tickets(&path);
@@ -2523,6 +2530,23 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&lock).expect("read"), c.token);
         assert!(lock.with_extension("lock.t1-dead.break.1").exists());
         assert!(TurnLock::take(&lease).expect("take").is_none());
+    }
+
+    #[test]
+    fn exhausted_ticket_generations_do_not_wedge_recovery() {
+        let (_tmp, a, _b) = lease_store();
+        let lease = a.turn_path("t1");
+        let lock = lease.with_extension("turn.lock");
+        std::fs::create_dir_all(lock.parent().expect("dir")).expect("dir");
+        std::fs::write(&lock, "t1-dead").expect("dead lock");
+        age_file(&lock);
+        for n in 0..TICKET_GENERATIONS {
+            let t = lock.with_extension(format!("lock.t1-dead.break.{n}"));
+            assert!(create_exclusive(&t, "").expect("ticket"));
+            age_file(&t);
+        }
+        assert!(TurnLock::take(&lease).expect("take").is_none());
+        assert!(TurnLock::take(&lease).expect("take").is_some());
     }
 
     #[test]
