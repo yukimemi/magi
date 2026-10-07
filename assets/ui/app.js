@@ -8585,7 +8585,9 @@ if (splitMedia) {
  * GET /api/settings is the effective layered config; PUT /api/settings/roles
  * writes the machine file only. `draft` holds unsaved edits per role key, so a
  * reload from the server never throws away what the operator is arranging. */
-const settingsState = { data: null, draft: {}, busy: false, message: null };
+const settingsState = { data: null, draft: {}, countDraft: {}, busy: false, message: null };
+
+const settingsDirty = () => Object.keys(settingsState.draft).length + Object.keys(settingsState.countDraft).length > 0;
 
 async function putJson(url, body) {
   return request(url, {
@@ -8628,19 +8630,27 @@ function settingsSet(role, ids) {
 
 async function saveSettings() {
   const d = settingsState.data;
-  if (!d || settingsState.busy || !Object.keys(settingsState.draft).length) return;
+  if (!d || settingsState.busy || !settingsDirty()) return;
   settingsState.busy = true;
   settingsState.message = null;
   renderSettings();
   const sent = { ...settingsState.draft };
+  const sentCounts = { ...settingsState.countDraft };
   try {
+    // A count is sent as typed; the server says why a bad one is refused.
+    const counts = {};
+    for (const [k, v] of Object.entries(sentCounts)) counts[k] = v.trim() === "" ? null : Number(v);
     settingsState.data = await putJson(API.settingsRoles, {
       revision: d.revision,
       roles: sent,
+      counts,
     });
     // Edits made while the save was in flight were not sent; keep them.
     for (const k of Object.keys(sent)) {
       if (settingsState.draft[k] === sent[k]) delete settingsState.draft[k];
+    }
+    for (const k of Object.keys(sentCounts)) {
+      if (settingsState.countDraft[k] === sentCounts[k]) delete settingsState.countDraft[k];
     }
     settingsState.message = {
       bad: false,
@@ -8651,6 +8661,43 @@ async function saveSettings() {
   }
   settingsState.busy = false;
   renderSettings();
+}
+
+function settingsCountHint(c, n) {
+  if (c.roster_len == null || !Number.isInteger(n)) return "";
+  if (n === 0) return "0 seats: the design stage is skipped.";
+  if (n > c.roster_len) return `${n} seats, no backups (some agents fill more than one seat).`;
+  const m = c.roster_len - n;
+  return `${n} seat${n === 1 ? "" : "s"}, ${m} backup${m === 1 ? "" : "s"} (agents beyond the seats take over when a seat's agent fails).`;
+}
+
+function renderSettingsCount(role) {
+  const c = role.count;
+  if (!c) return null;
+  const locked = !c.editable;
+  const draft = settingsState.countDraft[role.key];
+  const text = draft ?? String(c.value);
+  const input = el("input", {
+    type: "number", step: "1", min: String(c.min), inputmode: "numeric",
+    id: `set-count-${role.key}`, value: text, disabled: locked, "aria-label": `Seat count for ${role.key}`,
+  });
+  input.addEventListener("input", () => {
+    if (input.value === String(c.value)) delete settingsState.countDraft[role.key];
+    else settingsState.countDraft[role.key] = input.value;
+    settingsState.message = null;
+    renderSettings();
+    // The view is rebuilt on every edit; keep the operator typing.
+    document.getElementById(`set-count-${role.key}`)?.focus();
+  });
+  const origin = c.source === "default"
+    ? "built-in default"
+    : `set in the ${c.source} config (${c.source_path})`;
+  const hint = settingsCountHint(c, Number(text));
+  return el("div", { class: "set-add" },
+    el("label", { class: "set-meta" }, `Seats (graph.${c.file_key}, min ${c.min}): `, input),
+    el("span", { class: "set-meta", text: `${origin}${draft !== undefined ? " \u2014 unsaved change" : ""}` }),
+    locked && c.locked_reason ? el("span", { class: "set-meta", text: c.locked_reason }) : null,
+    hint ? el("span", { class: "set-meta", text: hint }) : null);
 }
 
 function renderSettingsRole(d, role) {
@@ -8677,6 +8724,7 @@ function renderSettingsRole(d, role) {
       role.fallback ? ` \u2014 unset, so it falls back to the ${role.fallback} roster` : "",
       dirty ? " \u2014 unsaved change" : ""),
     locked && el("p", { class: "set-meta", text: role.locked_reason }),
+    renderSettingsCount(role),
     ids.length
       ? el("ol", { class: "set-seats" }, ids.map((id, i) => el("li", { class: "set-seat" },
           el("span", { class: "set-seat-id", text: id }),
@@ -8715,7 +8763,7 @@ function renderSettings() {
   } else {
     show(banner, false);
   }
-  const dirty = Object.keys(settingsState.draft).length > 0;
+  const dirty = settingsDirty();
   body.append(
     el("p", { class: "set-note" },
       d.machine.path
@@ -8725,7 +8773,7 @@ function renderSettings() {
     ...d.roles.map((r) => renderSettingsRole(d, r)),
     el("div", { class: "set-actions" },
       el("button", { class: "btn btn-gold", type: "button", disabled: !dirty || settingsState.busy, onclick: saveSettings }, settingsState.busy ? "Saving…" : "Save"),
-      dirty && el("button", { class: "btn btn-quiet", type: "button", disabled: settingsState.busy, onclick: () => { settingsState.draft = {}; renderSettings(); } }, "Discard changes"),
+      dirty && el("button", { class: "btn btn-quiet", type: "button", disabled: settingsState.busy, onclick: () => { settingsState.draft = {}; settingsState.countDraft = {}; renderSettings(); } }, "Discard changes"),
       msg && !msg.bad && el("span", { class: "set-meta", role: "status", text: msg.text })),
     el("div", { class: "panel" },
       el("h2", { text: "Agents" }),
