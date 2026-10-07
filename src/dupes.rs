@@ -780,8 +780,10 @@ fn about_of(title: &str, instruction: &str) -> String {
     squeeze(&full, ABOUT_MAX_CHARS)
 }
 
-/// Longest description of one owner's work given to the judge.
-const ABOUT_MAX_CHARS: usize = 2000;
+/// Longest description of one owner's work given to the judge: the same limit
+/// as the new text, so an instruction the judge accepts on one side is not
+/// cut on the other.
+const ABOUT_MAX_CHARS: usize = prompt::DUPES_JUDGE_MAX_CHARS;
 
 fn task_claims(
     t: &Task,
@@ -1570,8 +1572,10 @@ mod tests {
             "Retries: # Task Fix auth retries"
         );
         assert_eq!(about_of("", "x"), "x");
-        let long = format!("{} TAIL", "y ".repeat(3000));
+        let mid = format!("{} MIDDLE {}", "a ".repeat(2000), "b ".repeat(500));
+        assert!(about_of("", &mid).contains("MIDDLE"));
+        let long = format!("{} TAIL", "y ".repeat(5000));
         let a = about_of("", &long);
-        assert!(a.ends_with("TAIL") && a.chars().count() < 2100, "{a}");
+        assert!(a.ends_with("TAIL") && a.chars().count() < 6100, "{a}");
     }
 }
