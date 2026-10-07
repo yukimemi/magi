@@ -236,7 +236,7 @@ fn quoted_credential(rest: &str) -> Option<(usize, &'static str)> {
         let n = match t.chars().next() {
             Some(q @ ('"' | '\'')) => {
                 let inner = &t[1..];
-                let end = inner.find(q).unwrap_or(inner.len());
+                let end = quoted_end(inner, q).unwrap_or(inner.len());
                 1 + end + usize::from(end < inner.len())
             }
             _ => run(t, |c| {
@@ -246,6 +246,19 @@ fn quoted_credential(rest: &str) -> Option<(usize, &'static str)> {
         let value = t;
         if n > 0 {
             return Some((rest.len() - value.len() + n, "[redacted-token]"));
+        }
+    }
+    None
+}
+
+/// Byte offset of the first `q` in `inner` that no backslash escapes.
+fn quoted_end(inner: &str, q: char) -> Option<usize> {
+    let mut chars = inner.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else if c == q {
+            return Some(i);
         }
     }
     None
@@ -423,6 +436,26 @@ mod tests {
 
     fn s(t: &str) -> String {
         scrub(t, &id())
+    }
+
+    #[test]
+    fn quoted_credentials_honor_escaped_quotes() {
+        let out = s(r#"{"password":"prefix\"hunter2"} tail"#);
+        assert!(!out.contains("hunter2") && !out.contains("prefix"), "{out}");
+        assert!(out.ends_with("} tail"), "{out}");
+        // An even run of backslashes leaves the quote as the closer.
+        let out = s(r#"{"password":"a\\\\"} tail"#);
+        assert!(out.ends_with("} tail") && !out.contains("a\\"), "{out}");
+        // An odd run escapes it.
+        let out = s(r#"{"password":"a\\\"hunter2"} tail"#);
+        assert!(!out.contains("hunter2"), "{out}");
+        let out = s(r#"{'token':'x\'hunter2'} tail"#);
+        assert!(!out.contains("hunter2"), "{out}");
+        let out = s(r#"{"password":"日本\"語hunter2"} tail"#);
+        assert!(!out.contains("hunter2") && !out.contains('語'), "{out}");
+        // No closing quote: everything after is removed.
+        let out = s(r#"{"password":"abc\"hunter2"#);
+        assert!(!out.contains("hunter2"), "{out}");
     }
 
     #[test]
