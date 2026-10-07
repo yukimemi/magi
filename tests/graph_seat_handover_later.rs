@@ -166,7 +166,8 @@ async fn a_reviewer_that_failed_its_reconsideration_is_handed_over_with_the_patc
     let _home = common::home_lock().await;
     let mut fx = common::fixture(_home, Judges::Unanimous, false);
     // review-1 is `alpha`, review-2 `beta`; review-2 dissents, so the panel
-    // splits and reconsiders. alpha fails only that reconsideration.
+    // splits and reconsiders. alpha fails only that reconsideration, and beta
+    // already holds review-2, so the spare `gamma` takes review-1.
     for a in ["alpha", "beta", "gamma"] {
         set_env(&mut fx, a, &[("MOCK_SPLIT_REVIEW_SEAT", "review-2")]);
     }
@@ -184,7 +185,7 @@ async fn a_reviewer_that_failed_its_reconsideration_is_handed_over_with_the_patc
 
     let hs = handover(state, "review", "review-1");
     assert_eq!(hs.len(), 1, "{:?}", state.handovers);
-    assert_eq!((hs[0].from.as_str(), hs[0].to.as_str()), ("alpha", "beta"));
+    assert_eq!((hs[0].from.as_str(), hs[0].to.as_str()), ("alpha", "gamma"));
     let recon: Vec<String> = prompts(state, "review", "review-1")
         .into_iter()
         .filter(|f| f.contains("panel"))
@@ -197,7 +198,7 @@ async fn a_reviewer_that_failed_its_reconsideration_is_handed_over_with_the_patc
         .iter()
         .find(|r| r.reviewer == 1)
         .expect("revote");
-    assert_eq!((rec.agent.as_str(), rec.failed.as_deref()), ("beta", None), "{rec:?}");
+    assert_eq!((rec.agent.as_str(), rec.failed.as_deref()), ("gamma", None), "{rec:?}");
     assert!(rec.vote.is_some());
 }
 }
