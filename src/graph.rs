@@ -2035,6 +2035,14 @@ impl Runner {
             .map(str::to_owned);
         let attachments = self.state.attachments.clone();
         for (wi, seat, out) in results.iter_mut() {
+            // Who holds the other candidate seats of this wave right now
+            // (earlier handovers already written back to `sent`).
+            let others: BTreeSet<String> = sent
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| j != wi)
+                .map(|(_, j)| j.spec.id.clone())
+                .collect();
             let Some(job) = sent.get_mut(*wi) else {
                 continue;
             };
@@ -2056,7 +2064,8 @@ impl Runner {
                     break;
                 }
                 let Some(next) =
-                    next_untried_in_roster(&self.roles.implementer_roster, start, &tried).cloned()
+                    pick_successor(&self.roles.implementer_roster, start, &tried, None, &others)
+                        .cloned()
                 else {
                     break;
                 };
@@ -6380,6 +6389,53 @@ fn next_untried_in_roster<'a>(
         .find(|s| !tried.contains(&s.id))
 }
 
+/// The successor for a seat, shared by all four seat kinds (implement, judge,
+/// review, advise). `others` holds the ids that *currently* occupy the other
+/// seats of the same wave (after any earlier handover, as [`Runner::occupant`]
+/// sees them), so roster entries beyond the seat count act as spares: a failed
+/// seat goes to an agent no other seat holds whenever the roster permits.
+///
+/// `carried` is `Some` only for the review loop's carried failure history.
+/// Order: (1) forward from `start`, never wrapping, untried, not a carried
+/// failure, not another seat's occupant; (2) with `carried`, a rescue over the
+/// whole roster: untried and not another seat's occupant; (3) the plain walk
+/// ([`next_untried_in_roster`] / [`next_for_seat`]) that ignores `others`.
+/// Step 3 is deliberate: a duplicate agent on two seats is a worse panel but
+/// a better outcome than an empty seat, and it keeps the answer to "is there
+/// a successor at all" exactly what it was before occupants were considered,
+/// so no handover rule (`should_hand_over`, nudges, the tried-once bound)
+/// moves. The rescue excludes occupants too, on the same reasoning: retrying a
+/// carried failure is a cheaper bet than doubling an agent on the panel, and
+/// if it fails again `tried` bounds it and step 3 takes over. Seats failing in
+/// the same round are handled one at a time, so a seat later in the batch
+/// sees an earlier one's new occupant but not yet its own freed agent.
+fn pick_successor<'a>(
+    roster: &'a [AgentSpec],
+    start: usize,
+    tried: &BTreeSet<String>,
+    carried: Option<&BTreeSet<String>>,
+    others: &BTreeSet<String>,
+) -> Option<&'a AgentSpec> {
+    let free = |s: &&AgentSpec| !tried.contains(&s.id) && !others.contains(&s.id);
+    roster
+        .get(start + 1..)
+        .and_then(|tail| {
+            tail.iter()
+                .filter(free)
+                .find(|s| carried.is_none_or(|c| !c.contains(&s.id)))
+        })
+        .or_else(|| {
+            carried
+                .is_some()
+                .then(|| roster.iter().find(free))
+                .flatten()
+        })
+        .or_else(|| match carried {
+            Some(c) => next_for_seat(roster, start, tried, c),
+            None => next_untried_in_roster(roster, start, tried),
+        })
+}
+
 /// The next agent for a seat that carries its failure history across rounds
 /// (the review loop). `round_tried` is this round's own bound and starts
 /// empty every round; `carried_failed` only decides priority.
@@ -7123,13 +7179,23 @@ where
                 .and_then(|h| h.last_fail.clone())
         })
         .collect();
-    let next_agent = |i: usize, tried: &BTreeSet<String>| -> Option<AgentSpec> {
-        if carry {
-            next_for_seat(roster, starts[i], tried, &carried[i]).cloned()
-        } else {
-            next_untried_in_roster(roster, starts[i], tried).cloned()
-        }
-    };
+    let next_agent =
+        |i: usize, tried: &BTreeSet<String>, specs: &[AgentSpec]| -> Option<AgentSpec> {
+            let others: BTreeSet<String> = specs
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, s)| s.id.clone())
+                .collect();
+            pick_successor(
+                roster,
+                starts[i],
+                tried,
+                carry.then(|| &carried[i]),
+                &others,
+            )
+            .cloned()
+        };
     let mut fresh: Vec<Option<String>> = vec![None; n];
     let mut last_quota: Vec<Option<Option<String>>> = vec![None; n];
     let mut pending: Vec<usize> = (0..n).collect();
@@ -7216,7 +7282,7 @@ where
                 && !roster.is_empty();
             if let Some(cur) = class.clone().filter(|_| !roster.is_empty() && !nudge_first) {
                 let next = should_hand_over(prev[i].as_ref(), &cur)
-                    .then(|| next_agent(i, &tried[i]))
+                    .then(|| next_agent(i, &tried[i], &specs))
                     .flatten();
                 if carry {
                     let h = state
@@ -7312,7 +7378,7 @@ where
             let agent_failure = class.is_some()
                 && !nudge_first
                 && !roster.is_empty()
-                && next_agent(i, &tried[i]).is_some();
+                && next_agent(i, &tried[i], &specs).is_some();
             if failed && !quota && !agent_failure && nudges[i] < retries {
                 nudges[i] += 1;
                 still.push(i);
@@ -8509,6 +8575,52 @@ mod tests {
 
     fn ids(xs: &[&str]) -> BTreeSet<String> {
         xs.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn pick_successor_skips_an_agent_another_seat_holds() {
+        // Seats a and b of roster [a, b, c]; a fails, b holds the other seat.
+        let roster = [spec("a"), spec("b"), spec("c")];
+        let next = pick_successor(&roster, 0, &ids(&["a"]), None, &ids(&["b"]));
+        assert_eq!(next.map(|s| s.id.as_str()), Some("c"));
+    }
+
+    #[test]
+    fn pick_successor_respects_the_occupant_after_an_earlier_handover() {
+        // The other seat started on c but was handed to d; c is free again.
+        let roster = [spec("a"), spec("b"), spec("c"), spec("d")];
+        let next = pick_successor(&roster, 0, &ids(&["a"]), None, &ids(&["b"]));
+        assert_eq!(next.map(|s| s.id.as_str()), Some("c"));
+        let next = pick_successor(&roster, 0, &ids(&["a"]), None, &ids(&["b", "c"]));
+        assert_eq!(next.map(|s| s.id.as_str()), Some("d"));
+    }
+
+    #[test]
+    fn pick_successor_falls_back_to_a_duplicate_when_no_distinct_agent_remains() {
+        let roster = [spec("a"), spec("b")];
+        let next = pick_successor(&roster, 0, &ids(&["a"]), None, &ids(&["b"]));
+        assert_eq!(next.map(|s| s.id.as_str()), Some("b"));
+        let carried = ids(&["b"]);
+        let next = pick_successor(&roster, 0, &ids(&["a"]), Some(&carried), &ids(&["b"]));
+        assert_eq!(next.map(|s| s.id.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn pick_successor_returns_none_without_any_untried_successor() {
+        let roster = [spec("a"), spec("b")];
+        assert!(pick_successor(&roster, 1, &ids(&["b"]), None, &ids(&["a"])).is_none());
+        assert!(pick_successor(&roster, 0, &ids(&["a", "b"]), None, &ids(&[])).is_none());
+        let carried = ids(&["a"]);
+        assert!(pick_successor(&roster, 0, &ids(&["a", "b"]), Some(&carried), &ids(&[])).is_none());
+    }
+
+    #[test]
+    fn pick_successor_rescue_avoids_another_seats_occupant() {
+        // b is a carried failure and free; a is held by the other seat.
+        let roster = [spec("a"), spec("b"), spec("c")];
+        let carried = ids(&["b", "c"]);
+        let next = pick_successor(&roster, 2, &ids(&["c"]), Some(&carried), &ids(&["a"]));
+        assert_eq!(next.map(|s| s.id.as_str()), Some("b"));
     }
 
     #[test]

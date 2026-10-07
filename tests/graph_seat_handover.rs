@@ -279,18 +279,52 @@ async fn a_reviewer_seat_does_not_re_ask_an_agent_that_failed_it_in_an_earlier_r
         .filter(|h| h.node == "review" && h.seat == "review-1")
         .map(|h| (h.from.as_str(), h.to.as_str()))
         .collect();
-    // One handover in round 1; later rounds start on the agent that answered.
-    assert_eq!(review_moves, [("alpha", "beta")], "{:?}", state.handovers);
+    // One handover in round 1 (to the spare: beta already holds review-2); later rounds start on the agent that answered.
+    assert_eq!(review_moves, [("alpha", "gamma")], "{:?}", state.handovers);
     assert_eq!(asked(state, "review", "review-1"), 1 + state.reviews.len());
     for round in &state.reviews {
-        assert_eq!(round.reviews[0].agent, "beta");
+        assert_eq!(round.reviews[0].agent, "gamma");
     }
 
     // Persisted: a resume reads the same history.
     let loaded = RunState::load(&state.id).expect("load");
     let h = loaded.seat_history.get("review-1").expect("history");
-    assert_eq!(h.last_ok.as_deref(), Some("beta"));
+    assert_eq!(h.last_ok.as_deref(), Some("gamma"));
     assert!(h.failed.contains("alpha"));
     assert_eq!(loaded.seat_history, state.seat_history);
+}
+}
+
+common::e2e! {
+async fn a_spare_reviewer_is_used_instead_of_doubling_up_another_seat() {
+    let _home = common::home_lock().await;
+    let mut fx = common::fixture(_home, common::Judges::Unanimous, false);
+    fx.config.graph.candidates = 1;
+    fx.config.graph.reviewers = 2;
+    fx.config.graph.retries = 0;
+    fx.config.roles.reviewers = vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()];
+    for a in &mut fx.config.agents {
+        if a.id == "alpha" {
+            a.env.insert("MOCK_FAIL_SEAT".to_owned(), "review-1".to_owned());
+        }
+    }
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    // review-1 failed on alpha; review-2 holds beta, so the spare gamma takes it.
+    let moves: Vec<(&str, &str)> = state
+        .handovers
+        .iter()
+        .filter(|h| h.node == "review" && h.seat == "review-1")
+        .map(|h| (h.from.as_str(), h.to.as_str()))
+        .collect();
+    assert_eq!(moves, [("alpha", "gamma")], "{:?}", state.handovers);
+    let one = &state.seats["review-1"].agent;
+    let two = &state.seats["review-2"].agent;
+    assert_ne!(one, two, "seats must be held by distinct agents");
+    assert_eq!((one.as_str(), two.as_str()), ("gamma", "beta"));
 }
 }
