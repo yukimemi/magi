@@ -393,7 +393,7 @@ fn lacks_english(text: &str) -> bool {
     let (counted, hits) = english_words(text);
     if counted < PROSE_WORDS {
         // Too short for "no English word" to mean anything by itself.
-        return hits == 0 && foreign_looking(text);
+        return (hits == 0 || (counted >= 4 && hits * 3 < counted)) && foreign_looking(text);
     }
     hits == 0 || hits * 3 < counted
 }
@@ -611,6 +611,8 @@ mod tests {
             "fix(request): Wartezeiten reduzieren",
             "Leistung verbessern",
             "Corrección rápida",
+            "fix: Wartezeiten im request reduzieren",
+            "fix(request): Wartezeiten bei retries reduzieren",
         ] {
             assert!(
                 check(text, "").contains(&Violation::TitleLanguage),
