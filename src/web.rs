@@ -9945,7 +9945,7 @@ mod tests {
         std::fs::write(repo.join("magi.toml"), judge).expect("write magi.toml");
         let f = Fixture::with_repo(repo.clone()).await;
         let queue = f.queue();
-let mut owner = Task::new(
+        let mut owner = Task::new(
             "owner".to_owned(),
             "review it".to_owned(),
             repo.clone(),
