@@ -4879,14 +4879,18 @@ async fn queue_edit(
             let cfg = crate::config::Config::discover(repo, None)
                 .ok()
                 .map(|(c, _)| c);
-            crate::dupes::screen_with_config(hits, &body.instruction, None, repo, cfg.as_ref())
-                .await
-                .map_err(|dup| {
-                    ApiError::conflict(dup.render(
-                        "Nothing was saved. If it is not a duplicate, repeat the request with \
-                         \"force\": true.",
-                    ))
-                })?;
+            let screened =
+                crate::dupes::screen_with_config(hits, &body.instruction, None, repo, cfg.as_ref())
+                    .await
+                    .map_err(|dup| {
+                        ApiError::conflict(dup.render(
+                            "Nothing was saved. If it is not a duplicate, repeat the request \
+                             with \"force\": true.",
+                        ))
+                    })?;
+            if let crate::dupes::Screened::Unjudged(why) = screened {
+                tracing::warn!(%why, "task edit saved without a duplicate-work judgement");
+            }
         }
         judged = seen;
     }

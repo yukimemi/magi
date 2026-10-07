@@ -81,6 +81,9 @@ pub struct Hit {
     pub token: String,
     /// How the owner is tied to it, e.g. `produced by its run c9eb`.
     pub via: String,
+    /// The owner's own work in one line (its instruction, trimmed), for the
+    /// judge only: never shown in [`Display`]. Empty when no record has it.
+    pub about: String,
 }
 
 impl fmt::Display for Hit {
@@ -150,26 +153,26 @@ impl fmt::Display for Duplicate {
 
 impl std::error::Error for Duplicate {}
 
-/// What the judge made of a match.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ruling {
-    /// The new work would do work on the same branch / pull request / commit.
-    Owns,
-    /// The new work only cites it as context.
-    Mentions,
-    /// The judge could not tell.
-    Unsure,
-}
-
 /// The judge's answer, with the agent that gave it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Judgement {
-    /// The verdict.
-    pub ruling: Ruling,
+    /// True when the new work is genuinely a duplicate of the matched claims.
+    pub duplicate: bool,
     /// One line, as the agent wrote it.
     pub reason: String,
     /// Id of the agent that answered.
     pub agent: String,
+}
+
+/// How [`screen`] let work through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Screened {
+    /// No identifier matched; no judge was asked.
+    Clean,
+    /// A match was found and the judge said it is not a duplicate.
+    Cleared(Judgement),
+    /// A match was found and nobody could judge it (the reason): let through.
+    Unjudged(String),
 }
 
 /// A judge: given the instruction and the matched claims, rules on them.
@@ -177,21 +180,22 @@ pub struct Judgement {
 pub type JudgeFuture = Pin<Box<dyn Future<Output = Result<Judgement>> + Send>>;
 
 /// Whole-chain wall-clock budget for the judge call.
-const JUDGE_BUDGET: Duration = Duration::from_secs(120);
+const JUDGE_BUDGET: Duration = Duration::from_secs(45);
 /// Per-agent cap inside that budget.
-const JUDGE_TURN: Duration = Duration::from_secs(90);
+const JUDGE_TURN: Duration = Duration::from_secs(30);
 
-/// Read the judge's reply. Strict: anything but one of the three rulings with a
-/// non-empty reason is an error, which the caller treats as a refusal.
-fn parse_ruling(text: &str) -> Result<(Ruling, String)> {
+/// Read the judge's reply. Strict: anything but one JSON object with a bool
+/// `duplicate` and a non-empty reason is an error (the caller lets the work
+/// through unjudged, see [`screen`]).
+fn parse_judgement(text: &str) -> Result<(bool, String)> {
     #[derive(Deserialize)]
     struct Raw {
-        ruling: String,
+        duplicate: bool,
         reason: String,
     }
     // The whole reply must be one object (optionally in a code fence): hunting
-    // for an object inside prose or a second answer could recover an approval
-    // from a reply that is not itself a single valid ruling.
+    // for an object inside prose or a second answer could recover a verdict
+    // from a reply that is not itself a single valid one.
     let mut body = text.trim();
     if let Some(rest) = body.strip_prefix("```") {
         let rest = rest.strip_prefix("json").unwrap_or(rest);
@@ -199,23 +203,16 @@ fn parse_ruling(text: &str) -> Result<(Ruling, String)> {
     }
     let raw: Raw =
         serde_json::from_str(body).context("the judge's reply is not a single JSON object")?;
-    let ruling = match raw.ruling.trim().to_ascii_lowercase().as_str() {
-        "owns" => Ruling::Owns,
-        "mentions" => Ruling::Mentions,
-        "unsure" => Ruling::Unsure,
-        other => bail!("unknown ruling `{other}`"),
-    };
     let reason = raw.reason.split_whitespace().collect::<Vec<_>>().join(" ");
     if reason.is_empty() {
         bail!("the judge gave no reason");
     }
-    Ok((ruling, reason.chars().take(300).collect()))
+    Ok((raw.duplicate, reason.chars().take(300).collect()))
 }
 
 /// Ask the `[roles] chatter` chain (or the default agent) once. Each agent is
-/// tried at most once; only an error, quota or unusable answer moves on. A
-/// usable answer that does not parse, or that rules `owns` / `unsure`, ends
-/// the chain.
+/// tried at most once, with a fresh seat; only an error, quota or unusable
+/// answer moves on. A usable answer that does not parse ends the chain.
 pub async fn chain_judge(
     cfg: &Config,
     repo: &Path,
@@ -228,7 +225,10 @@ pub async fn chain_judge(
         &agent::installed,
         "dupes judge",
     )?;
-    let claims: Vec<String> = hits.iter().map(ToString::to_string).collect();
+    let claims: Vec<(String, String)> = hits
+        .iter()
+        .map(|h| (h.to_string(), h.about.clone()))
+        .collect();
     let body = prompt::dupes_judge(&instruction, &claims);
     let artifacts = std::env::temp_dir().join(format!("magi-dupes-{:016x}", crate::rng::entropy()));
     let started = Instant::now();
@@ -269,9 +269,9 @@ pub async fn chain_judge(
             continue;
         }
         result = Some(
-            out.and_then(|o| parse_ruling(&o.text))
-                .map(|(ruling, reason)| Judgement {
-                    ruling,
+            out.and_then(|o| parse_judgement(&o.text))
+                .map(|(duplicate, reason)| Judgement {
+                    duplicate,
                     reason,
                     agent: spec.id.clone(),
                 }),
@@ -284,8 +284,16 @@ pub async fn chain_judge(
 
 /// The one decision point every caller shares. `hits` is [`check`]'s output:
 /// empty passes without the judge being asked. Otherwise the judge is asked
-/// once, and only a clean `mentions` lets the work through; `owns`, `unsure`
-/// and every failure refuse, carrying the judge's reason when there is one.
+/// once, and only a `duplicate: true` answer refuses (with its reason).
+///
+/// **Fail mode: open.** If the judge cannot answer (agent error, timeout,
+/// quota, unparseable reply, no readable config) or the text is too long to
+/// show it in full, the work is let through as [`Screened::Unjudged`] and a
+/// `tracing::warn` is logged; callers also say so on stderr. A mechanical
+/// match cannot tell "continue from PR #28" from a real duplicate, so refusing
+/// whenever the judge is away would bring back exactly the false positives the
+/// judge exists to remove. The cost is that a real duplicate slips through
+/// while no agent is available, which is why it is never silent.
 ///
 /// For a review-only request `text` is empty, so `review_branch` is put in
 /// front of the judge as the thing the work is about.
@@ -294,21 +302,20 @@ pub async fn screen(
     text: &str,
     review_branch: Option<&str>,
     judge: &(dyn Fn(String, Vec<Hit>) -> JudgeFuture + Sync),
-) -> Result<(), Duplicate> {
+) -> Result<Screened, Duplicate> {
     if hits.is_empty() {
-        return Ok(());
+        return Ok(Screened::Clean);
     }
-    // A judge that has not seen the whole text cannot clear it: the part it
-    // missed may be the part that does the work.
+    let unjudged = |why: String| {
+        tracing::warn!(hits = hits.len(), %why, "duplicate check: judgement unavailable, letting the work through");
+        Ok(Screened::Unjudged(why))
+    };
+    // A judge that has not seen the whole text cannot rule on it.
     if text.chars().count() > prompt::DUPES_JUDGE_MAX_CHARS {
-        return Err(Duplicate {
-            hits,
-            judge: Some(format!(
-                "judge could not decide: the text is longer than {} characters, \
-                 too long to judge in full",
-                prompt::DUPES_JUDGE_MAX_CHARS
-            )),
-        });
+        return unjudged(format!(
+            "the text is longer than {} characters, too long to judge in full",
+            prompt::DUPES_JUDGE_MAX_CHARS
+        ));
     }
     let mut subject = text.to_owned();
     if let Some(b) = review_branch {
@@ -319,41 +326,33 @@ pub async fn screen(
             "(This is a review-only request for branch `{b}`: it would do work on that branch.)"
         ));
     }
-    let note = match judge(subject, hits.clone()).await {
-        Ok(j) if j.ruling == Ruling::Mentions => {
+    match judge(subject, hits.clone()).await {
+        Ok(j) if !j.duplicate => {
             tracing::info!(
                 agent = %j.agent,
                 reason = %j.reason,
                 hits = hits.len(),
-                "duplicate check: the judge says the work only mentions what is in flight"
+                "duplicate check: the judge says this is not duplicate work"
             );
-            return Ok(());
+            Ok(Screened::Cleared(j))
         }
-        Ok(j) => {
-            let word = if j.ruling == Ruling::Owns {
-                "owns"
-            } else {
-                "unsure"
-            };
-            format!("judge ({}): {word} - {}", j.agent, j.reason)
-        }
-        Err(e) => format!("judge could not decide: {e:#}"),
-    };
-    Err(Duplicate {
-        hits,
-        judge: Some(note),
-    })
+        Ok(j) => Err(Duplicate {
+            hits,
+            judge: Some(format!("judge ({}): duplicate - {}", j.agent, j.reason)),
+        }),
+        Err(e) => unjudged(format!("{e:#}")),
+    }
 }
 
 /// [`screen`] with the production judge: the `[roles] chatter` chain of `cfg`.
-/// No config (`None`) means no judge, so a hit refuses as it always did.
+/// No config (`None`) means no judge, so a hit is let through unjudged.
 pub async fn screen_with_config(
     hits: Vec<Hit>,
     text: &str,
     review_branch: Option<&str>,
     repo: &Path,
     cfg: Option<&Config>,
-) -> Result<(), Duplicate> {
+) -> Result<Screened, Duplicate> {
     let judge = |instruction: String, hits: Vec<Hit>| -> JudgeFuture {
         let cfg = cfg.cloned();
         let repo = repo.to_path_buf();
@@ -379,6 +378,8 @@ struct RunView {
     status: String,
     #[serde(default)]
     base_commit: String,
+    #[serde(default)]
+    instruction: String,
     #[serde(default)]
     candidates: Vec<CandView>,
     #[serde(default)]
@@ -504,6 +505,8 @@ struct Claim {
     id: String,
     status: String,
     via: String,
+    /// The owner's work in one line, for the judge.
+    about: String,
     branch: Option<String>,
     /// Commit the branch forked from; without it a SHA cannot be judged.
     base: Option<String>,
@@ -598,6 +601,7 @@ pub fn check_with(
             None,
             "its own run",
             !released,
+            &view.instruction,
         ));
     }
 
@@ -610,6 +614,7 @@ pub fn check_with(
             signal,
             token,
             via: c.via.clone(),
+            about: c.about.clone(),
         };
         if !hits.contains(&hit) {
             hits.push(hit);
@@ -661,6 +666,7 @@ pub fn check_with(
                 signal: Signal::Pr,
                 token,
                 via: format!("an open pull request with no run record here ({url})"),
+                about: String::new(),
             });
         }
     }
@@ -719,6 +725,18 @@ fn gh_pr_view(repo: &Path, n: u64) -> Option<serde_json::Value> {
     serde_json::from_str(&raw).ok()
 }
 
+/// First non-empty line of an owner's instruction, cut to 160 characters.
+fn about_of(instruction: &str) -> String {
+    instruction
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(160)
+        .collect()
+}
+
 fn task_claims(
     t: &Task,
     runs_root: &Path,
@@ -734,6 +752,7 @@ fn task_claims(
             id: t.id.clone(),
             status: status.clone(),
             via: "its review branch".into(),
+            about: about_of(&t.instruction),
             branch: Some(b.clone()),
             base: None,
             pr: None,
@@ -751,6 +770,7 @@ fn task_claims(
                 Some((&t.id, &status)),
                 &format!("produced by its run {}", crate::queue::short(rid)),
                 live_pr,
+                &t.instruction,
             ));
         }
     }
@@ -767,7 +787,9 @@ fn run_claims(
     task: Option<(&str, &str)>,
     via: &str,
     live_pr: bool,
+    instruction: &str,
 ) -> Vec<Claim> {
+    let about = about_of(instruction);
     let (id, status) = match task {
         Some((id, status)) => (id.to_owned(), status.to_owned()),
         None => (view.id.clone(), view.status.clone()),
@@ -790,6 +812,7 @@ fn run_claims(
             id: id.clone(),
             status: status.clone(),
             via: via_pr(""),
+            about: about.clone(),
             branch: Some(c.branch.clone()),
             base: (!view.base_commit.is_empty()).then(|| view.base_commit.clone()),
             pr: None,
@@ -801,6 +824,7 @@ fn run_claims(
             id,
             status,
             via: via_pr(""),
+            about,
             branch: None,
             base: None,
             pr,
@@ -1383,9 +1407,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn verdict(ruling: Ruling) -> Result<Judgement> {
+    fn verdict(duplicate: bool) -> Result<Judgement> {
         Ok(Judgement {
-            ruling,
+            duplicate,
             reason: "because".into(),
             agent: "j".into(),
         })
@@ -1397,7 +1421,7 @@ mod tests {
         f: &Fx,
         text: &str,
         answer: impl Fn() -> Result<Judgement> + Send + Sync + 'static,
-    ) -> (Result<(), Duplicate>, usize) {
+    ) -> (Result<Screened, Duplicate>, usize) {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
         let judge = move |_: String, _: Vec<Hit>| -> JudgeFuture {
@@ -1422,79 +1446,80 @@ mod tests {
     }
 
     #[test]
-    fn a_mentions_ruling_lets_the_work_through() {
+    fn a_no_ruling_lets_the_work_through() {
         let f = fx_with_run();
-        let (out, calls) = judged(&f, NAMES, || verdict(Ruling::Mentions));
-        assert!(out.is_ok());
+        let (out, calls) = judged(&f, NAMES, || verdict(false));
+        assert!(matches!(out, Ok(Screened::Cleared(_))));
         assert_eq!(calls, 1);
     }
 
     #[test]
-    fn an_owns_ruling_refuses_and_says_why() {
+    fn a_yes_ruling_refuses_and_says_why() {
         let f = fx_with_run();
-        let (out, _) = judged(&f, NAMES, || verdict(Ruling::Owns));
+        let (out, _) = judged(&f, NAMES, || verdict(true));
         let msg = out.unwrap_err().to_string();
         assert!(
-            msg.contains("owns - because") && msg.contains("--force"),
+            msg.contains("duplicate - because") && msg.contains("--force"),
             "{msg}"
         );
         assert!(msg.contains("magi/aaaa/A"), "{msg}");
     }
 
     #[test]
-    fn an_unsure_ruling_refuses() {
-        let f = fx_with_run();
-        let (out, _) = judged(&f, NAMES, || verdict(Ruling::Unsure));
-        assert!(out.unwrap_err().to_string().contains("unsure - because"));
-    }
-
-    #[test]
-    fn a_failing_judge_refuses() {
+    fn a_failing_judge_lets_it_through_unjudged() {
         let f = fx_with_run();
         let (out, calls) = judged(&f, NAMES, || Err(anyhow::anyhow!("quota")));
-        let msg = out.unwrap_err().to_string();
-        assert!(msg.contains("judge could not decide: quota"), "{msg}");
+        match out {
+            Ok(Screened::Unjudged(why)) => assert!(why.contains("quota"), "{why}"),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(calls, 1);
     }
 
     #[test]
-    fn garbage_and_unknown_rulings_do_not_parse() {
-        assert!(parse_ruling("sure, go ahead").is_err());
-        assert!(parse_ruling(r#"{"ruling":"maybe","reason":"x"}"#).is_err());
-        assert!(parse_ruling(r#"{"ruling":"mentions"}"#).is_err());
-        assert!(parse_ruling(r#"{"ruling":"mentions","reason":"  "}"#).is_err());
-        let two = "{\"ruling\":\"mentions\",\"reason\":\"c\"}\n{\"ruling\":\"owns\"}";
-        assert!(parse_ruling(two).is_err());
-        assert!(parse_ruling("ok {\"ruling\":\"mentions\",\"reason\":\"c\"}").is_err());
-        let (r, why) = parse_ruling("{\"ruling\":\"Mentions\",\"reason\":\"cites\\nit\"}").unwrap();
-        assert_eq!((r, why.as_str()), (Ruling::Mentions, "cites it"));
+    fn garbage_replies_do_not_parse() {
+        assert!(parse_judgement("sure, go ahead").is_err());
+        assert!(parse_judgement(r#"{"duplicate":"maybe","reason":"x"}"#).is_err());
+        assert!(parse_judgement(r#"{"duplicate":false}"#).is_err());
+        assert!(parse_judgement(r#"{"duplicate":false,"reason":"  "}"#).is_err());
+        let two = "{\"duplicate\":false,\"reason\":\"c\"}\n{\"duplicate\":true}";
+        assert!(parse_judgement(two).is_err());
+        assert!(parse_judgement("ok {\"duplicate\":false,\"reason\":\"c\"}").is_err());
+        let (d, why) = parse_judgement("{\"duplicate\":true,\"reason\":\"same\\nPR\"}").unwrap();
+        assert_eq!((d, why.as_str()), (true, "same PR"));
     }
 
     #[test]
-    fn a_text_too_long_to_judge_in_full_refuses_without_asking() {
+    fn a_text_too_long_to_judge_in_full_passes_without_asking() {
         let f = fx_with_run();
         let long = format!("{NAMES} {}", "x".repeat(prompt::DUPES_JUDGE_MAX_CHARS));
-        let (out, calls) = judged(&f, &long, || verdict(Ruling::Mentions));
-        assert!(out.unwrap_err().to_string().contains("too long to judge"));
+        let (out, calls) = judged(&f, &long, || verdict(false));
+        assert!(matches!(out, Ok(Screened::Unjudged(w)) if w.contains("too long to judge")));
         assert_eq!(calls, 0);
     }
 
     #[test]
     fn no_hit_never_asks_the_judge() {
         let (f, _, _) = fx();
-        let (out, calls) = judged(&f, "nothing named here", || verdict(Ruling::Owns));
-        assert!(out.is_ok());
+        let (out, calls) = judged(&f, "nothing named here", || verdict(true));
+        assert_eq!(out.unwrap(), Screened::Clean);
         assert_eq!(calls, 0);
     }
 
     #[test]
-    fn without_a_config_a_hit_still_refuses() {
+    fn without_a_config_a_hit_passes_unjudged() {
         let f = fx_with_run();
         let hits = run(&f, NAMES, None);
         let out = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
             .block_on(screen_with_config(hits, NAMES, None, &f.repo, None));
-        assert!(out.unwrap_err().judge.is_some());
+        assert!(matches!(out, Ok(Screened::Unjudged(_))));
+    }
+
+    #[test]
+    fn about_is_the_first_line_trimmed() {
+        assert_eq!(about_of("\n  fix x \nmore"), "fix x");
+        assert_eq!(about_of(&"y".repeat(300)).chars().count(), 160);
     }
 }

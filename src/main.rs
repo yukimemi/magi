@@ -2508,7 +2508,7 @@ async fn refuse_duplicates(
     cfg: Option<&Config>,
 ) -> Result<()> {
     let hits = magi::dupes::check(q, runs, repo, text, review_branch, ignore_task);
-    magi::dupes::screen_with_config(hits, text, review_branch, repo, cfg)
+    let screened = magi::dupes::screen_with_config(hits, text, review_branch, repo, cfg)
         .await
         .map_err(|dup| {
             anyhow::anyhow!(
@@ -2518,7 +2518,11 @@ async fn refuse_duplicates(
                      an agent should tell the operator about this instead of forcing it."
                 )
             )
-        })
+        })?;
+    if let magi::dupes::Screened::Unjudged(why) = screened {
+        eprintln!("note: duplicate-work judgement unavailable ({why}); filed anyway");
+    }
+    Ok(())
 }
 
 async fn task_cmd(command: TaskCmd) -> Result<()> {

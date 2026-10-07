@@ -1771,7 +1771,9 @@ sat for hours with auto-merge waiting and nobody told.
 
 `src/dupes.rs` refuses (`--force` overrides) a `magi task add`, `magi run` or
 `magi review`, and a web edit that changes a task's instruction, when it names
-a branch, a commit SHA or a pull request that unfinished work already owns.
+a branch, a commit SHA or a pull request that unfinished work already owns
+*and* a one-shot judge (`[roles] chatter` chain) says it is duplicate work; a
+judge that cannot answer lets it through (fail-open, stderr note + warn).
 Only concrete identifiers match, never text similarity. What counts as
 "owned" is spread over `Task::review_branch`, `Task::runs`, and each run's
 `candidates[].branch` / `pr` / `base_commit` in `run.json`, none of which a
