@@ -4657,11 +4657,45 @@ struct StatsView {
     /// repository selector is built from. Always the full list regardless of
     /// `repo`, so switching repositories never needs a second request.
     repos: Vec<RepoSummaryView>,
+    /// Runs per local day over the last 30 days, oldest first, always 30
+    /// entries. Days are the *server's* local dates (the UI must not convert
+    /// them again), cut by run creation and classified by current status.
+    /// Narrowed by `repo` like every other run-derived field.
+    daily: Vec<DailyStatsView>,
     /// The `?repo=` value this response was narrowed to, echoed back so the
     /// UI can confirm its selection round-tripped. `None` for the aggregate,
     /// all-repositories view.
     repo: Option<String>,
 }
+
+/// One day of [`StatsView::daily`].
+#[derive(Debug, Serialize)]
+struct DailyStatsView {
+    /// `YYYY-MM-DD`, server-local.
+    date: String,
+    runs: usize,
+    merged: usize,
+    ready: usize,
+    other: usize,
+    /// `None` on a day with no runs, so it never reads as 0%.
+    completion_rate: Option<RateView>,
+}
+
+impl From<&stats::DayBucket> for DailyStatsView {
+    fn from(b: &stats::DayBucket) -> Self {
+        Self {
+            date: b.date.to_string(),
+            runs: b.runs,
+            merged: b.merged,
+            ready: b.ready,
+            other: b.other,
+            completion_rate: RateView::of(b.merged + b.ready, b.runs),
+        }
+    }
+}
+
+/// How many days [`StatsView::daily`] covers.
+const STATS_DAILY_DAYS: usize = 30;
 
 /// `?repo=<path>` narrows `GET /api/stats` to the runs recorded against one
 /// repository. Matched by full-path equality against `RunState.repo` only
@@ -4696,6 +4730,7 @@ async fn stats_get(
             .iter()
             .map(RepoSummaryView::from)
             .collect();
+        let mut scoped: Vec<&RunState> = states.iter().collect();
         let collected = match &q.repo {
             Some(repo) => {
                 let filtered = stats::filter_repo(&states, std::path::Path::new(repo));
@@ -4704,10 +4739,17 @@ async fn stats_get(
                         "no runs recorded against repo `{repo}`"
                     )));
                 }
+                scoped = filtered.clone();
                 stats::collect_refs(filtered)
             }
             None => stats::collect(&states),
         };
+        let daily = stats::daily(
+            scoped,
+            jiff::Zoned::now().date(),
+            &jiff::tz::TimeZone::system(),
+            STATS_DAILY_DAYS,
+        );
         let queue_counts = crate::queue::TaskCounts::of(&ui.queue.list());
         Ok(Json(StatsView {
             totals: StatsTotalsView::from(&collected.totals),
@@ -4727,6 +4769,7 @@ async fn stats_get(
             queue: TaskCountsView::from(queue_counts),
             runs_unreadable: runs_unreadable(&ui.runs),
             repos,
+            daily: daily.iter().map(DailyStatsView::from).collect(),
             repo: q.repo.clone(),
         }))
     })
@@ -10903,6 +10946,13 @@ mod tests {
     }
 
     #[test]
+    fn stats_daily_chart_is_planned_purely_and_rendered_from_the_api() {
+        assert!(APP_JS.contains("function statsDailyPlan("));
+        assert!(APP_JS.contains("renderStatsDaily(s.daily)"));
+        assert!(INDEX_HTML.contains("id=\"stats-daily\""));
+    }
+
+    #[test]
     fn a_keystroke_invalidates_the_search_reply_still_in_flight() {
         let start = APP_JS
             .find("function scheduleSearch(")
@@ -11214,6 +11264,42 @@ mod tests {
         // runs_unreadable is a whole-workload count, never scoped to the
         // selected repository - see StatsView::runs_unreadable's own doc.
         assert_eq!(stats.json()["runs_unreadable"], 0);
+    }
+
+    #[tokio::test]
+    async fn stats_daily_is_thirty_ascending_days_scoped_by_repo() {
+        let f = Fixture::start().await;
+        write_run_repo(
+            &f.runs(),
+            "20260902-140501-a",
+            RunStatus::Merged,
+            "/repos/a",
+        );
+        write_run_repo(
+            &f.runs(),
+            "20260902-140502-b",
+            RunStatus::Merged,
+            "/repos/b",
+        );
+
+        for uri in ["/api/stats", "/api/stats?repo=%2Frepos%2Fa"] {
+            let json = f.get(uri).await.json();
+            let daily = json["daily"].as_array().expect("daily is an array");
+            assert_eq!(daily.len(), 30);
+            let dates: Vec<&str> = daily.iter().map(|d| d["date"].as_str().unwrap()).collect();
+            let mut sorted = dates.clone();
+            sorted.sort();
+            assert_eq!(dates, sorted);
+            for d in daily {
+                assert_eq!(
+                    d["merged"].as_u64().unwrap()
+                        + d["ready"].as_u64().unwrap()
+                        + d["other"].as_u64().unwrap(),
+                    d["runs"].as_u64().unwrap()
+                );
+            }
+            assert!(json["totals"]["runs"].as_u64().unwrap() >= 1);
+        }
     }
 
     #[tokio::test]
