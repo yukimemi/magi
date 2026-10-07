@@ -114,12 +114,26 @@ fn non_english(text: &str) -> bool {
         })
 }
 
+/// Offset just past the first backtick run of exactly `n` in `text`, if any.
+/// An unmatched opener is literal text in Markdown, so it exempts nothing.
+fn closing_run(text: &str, n: usize) -> Option<usize> {
+    let mut at = 0;
+    while let Some(i) = text[at..].find('`') {
+        let start = at + i;
+        let len = text[start..].chars().take_while(|c| *c == '`').count();
+        if len == n {
+            return Some(start + len);
+        }
+        at = start + len;
+    }
+    None
+}
+
 fn prose(body: &str) -> String {
     let mut out = String::new();
     let mut details = 0usize;
     let mut quote = false;
     let mut fence: Option<(char, usize)> = None;
-    let mut inline = 0usize;
     for line in body.lines() {
         let trimmed = line.trim_start();
         if let Some((marker, width)) = fence {
@@ -157,16 +171,14 @@ fn prose(body: &str) -> String {
             }
             if rest.starts_with('`') {
                 let n = rest.chars().take_while(|c| *c == '`').count();
-                if inline == 0 {
-                    inline = n;
-                } else if inline == n {
-                    inline = 0;
-                }
-                rest = &rest[n..];
+                rest = match closing_run(&rest[n..], n) {
+                    Some(end) => &rest[n + end..],
+                    None => &rest[n..],
+                };
                 continue;
             }
             let c = rest.chars().next().expect("nonempty");
-            if details == 0 && !quote && inline == 0 {
+            if details == 0 && !quote {
                 out.push(c);
             }
             rest = &rest[c.len_utf8()..];
@@ -214,10 +226,21 @@ mod tests {
         );
         assert!(check("fix: retries", "Add retries for failed requests.\n<details>\n<summary>Original task</summary>\n日本語の元の依頼です。\n</details>").is_empty());
         for body in [
+            "Fix `cache\n\n日本語の説明を書きます。",
+            "Fix `cache 日本語の説明を書きます。",
+        ] {
+            assert_eq!(
+                check("fix: retries", body),
+                vec![Violation::BodyLanguage],
+                "{body}"
+            );
+        }
+        for body in [
             "Add retries. `日本語の識別子`",
             "Add retries.\n```text\n日本語のコードです\n```",
             "Add retries.\n> 日本語の引用です",
             "Add retries.\n<blockquote>日本語の引用です</blockquote>",
+            "Add retries. ``日本語 ` の識別子``",
             "Update café names.",
             "Change src/graph.rs and tests/common/mod.rs.",
         ] {
