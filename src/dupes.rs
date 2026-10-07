@@ -284,11 +284,10 @@ pub async fn chain_judge(
 
 /// The one decision point every caller shares. `hits` is [`check`]'s output:
 /// empty passes without the judge being asked. Otherwise the judge is asked
-/// once, and only a `duplicate: true` answer refuses (with its reason).
+/// once (a long text is squeezed to its head and tail first), and only a `duplicate: true` answer refuses (with its reason).
 ///
 /// **Fail mode: open.** If the judge cannot answer (agent error, timeout,
-/// quota, unparseable reply, no readable config) or the text is too long to
-/// show it in full, the work is let through as [`Screened::Unjudged`] and a
+/// quota, unparseable reply, no readable config) the work is let through as [`Screened::Unjudged`] and a
 /// `tracing::warn` is logged; callers also say so on stderr. A mechanical
 /// match cannot tell "continue from PR #28" from a real duplicate, so refusing
 /// whenever the judge is away would bring back exactly the false positives the
@@ -760,7 +759,10 @@ fn squeeze(s: &str, max: usize) -> String {
     let half = max / 2;
     let head: String = s.chars().take(half).collect();
     let tail: String = s.chars().skip(n - half).collect();
-    format!("{head}\n[... {} characters omitted ...]\n{tail}", n - 2 * half)
+    format!(
+        "{head}\n[... {} characters omitted ...]\n{tail}",
+        n - 2 * half
+    )
 }
 
 /// The owner's work for the judge: its title (when it has one) and its
