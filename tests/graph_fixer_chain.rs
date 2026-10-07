@@ -132,3 +132,26 @@ async fn a_single_string_fixer_behaves_as_before() {
     assert!(state.handovers.iter().all(|h| h.node != "gate-fix"));
 }
 }
+
+common::e2e! {
+async fn a_fallback_that_is_the_winners_author_gets_a_fresh_fix_seat() {
+    let home = common::home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    fx.config.disk.min_free_bytes = 0;
+    fx.config.verify.gate = vec![GATE_NEEDS_FIX.to_owned()];
+    fx.config.roles.fixer = chain(&["beta", "alpha"]);
+    quota_on_fix(&mut fx, &["beta"]);
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    let winner = state.winner().expect("winner").clone();
+    assert_eq!(winner.agent, "alpha", "the fixture's winner is the first agent");
+    assert_eq!(state.gate_fixes[0].agent, "alpha");
+    // Not the implementation conversation: the shared fix seat took it.
+    assert_eq!(state.seats["fix"].agent, "alpha");
+    assert_ne!(state.seats["fix"].claude_session, state.seats[&format!("impl-{}", winner.label)].claude_session);
+}
+}

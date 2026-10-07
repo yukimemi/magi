@@ -15,9 +15,9 @@
 //! quota re-billed) every round. The memory is the run's own
 //! [`RunState::handovers`]: the last handover on a [`FIX_NODES`] node whose
 //! `to` is on the chain. The report and the behaviour therefore read one
-//! record, and nothing is written to the config. The entries before the start
-//! are still tried afterwards (each id at most once per call), so a chain
-//! whose current agent fails can come back round to the others.
+//! record, and nothing is written to the config. A call runs from the start to
+//! the end of the chain, forward only: entries before the start are not
+//! asked again, so the chain's last failure ends the call as it always did.
 //!
 //! A fallback agent always gets a fresh [`SeatState`] ([`seat_for`]), never
 //! the previous agent's seat renamed: its session id is minted from the agent
@@ -37,9 +37,13 @@ pub const FIX_NODES: [&str; 4] = ["fix", "gate-fix", "land", "rebase"];
 ///
 /// With `[roles] fixer` unset: the winner's own implementer, whose
 /// conversation continues now that the competition is over (one entry, as it
-/// has always been). With a chain: every entry once, starting at the sticky
-/// agent. An entry that is the winner's own agent sits in the winner's seat
-/// (`impl-<label>`), any other in the shared `fix` seat.
+/// has always been). With a chain: the entries from the sticky agent to the
+/// end, once each, never wrapping. The chain's *first* entry, when it is the
+/// winner's own agent, sits in the winner's seat (`impl-<label>`), as a lone
+/// fixer always has; every other entry - a fallback, even one that is the
+/// winner's author - sits in the shared `fix` seat, which `seat_for` gives a
+/// fresh session (the implementation conversation is never reused by a
+/// handover).
 pub fn attempts(
     state: &RunState,
     roles: &ResolvedRoles,
@@ -59,10 +63,12 @@ pub fn attempts(
         return vec![own()];
     };
     let start = sticky_start(chain, &state.handovers);
-    (0..chain.len())
-        .map(|k| &chain[(start + k) % chain.len()])
-        .map(|f| {
-            if f.id == winner.agent {
+    chain
+        .iter()
+        .enumerate()
+        .skip(start)
+        .map(|(i, f)| {
+            if i == 0 && f.id == winner.agent {
                 own()
             } else {
                 (f.clone(), "fix".to_owned())

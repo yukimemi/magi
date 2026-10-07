@@ -3683,7 +3683,7 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
                 roles
                     .fixer
                     .as_ref()
-                    .map_or("the winner's own author".to_owned(), |chain| chain
+                    .map_or("the winner's own author".to_owned(), |chain: &Vec<magi::config::AgentSpec>| chain
                         .iter()
                         .map(|f| f.display())
                         .collect::<Vec<_>>()

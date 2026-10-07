@@ -641,8 +641,11 @@ one place that decides to move on (error, quota - judged apart from `usable`
   read from `RunState::handovers`: the last handover on a `fixer::FIX_NODES` node
   (`fix`, `gate-fix`, `land`, `rebase`) whose `to` is on the chain. Every consumer
   records under exactly one of those names - a name nobody records sends every
-  round back to the first agent and re-bills its quota. Entries before the start
-  still follow (each once), so a failing current agent can come back round.
+  round back to the first agent and re-bills its quota. A call runs from the
+  start to the end of the chain, forward only (no wrap), so the last entry's
+  failure ends it. Only the chain's first entry may sit in the winner's
+  `impl-<label>` seat; a fallback that is the winner's author takes the `fix`
+  seat, fresh.
   `FixRecord` / `GateFixRecord` / `RebaseFixRecord` `.agent` is the agent that
   answered; `run::SCHEMA` is unchanged. In a rebase round the round is spent and
   saved before the first call; a chain advance only rewrites the record's `agent`.
