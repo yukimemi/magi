@@ -81,7 +81,7 @@ pub struct Hit {
     pub token: String,
     /// How the owner is tied to it, e.g. `produced by its run c9eb`.
     pub via: String,
-    /// The owner's own work in one line (its instruction, trimmed), for the
+    /// The owner's title and instruction (collapsed, cut), for the
     /// judge only: never shown in [`Display`]. Empty when no record has it.
     pub about: String,
 }
@@ -505,7 +505,7 @@ struct Claim {
     id: String,
     status: String,
     via: String,
-    /// The owner's work in one line, for the judge.
+    /// The owner's title and instruction, for the judge.
     about: String,
     branch: Option<String>,
     /// Commit the branch forked from; without it a SHA cannot be judged.
@@ -601,7 +601,7 @@ pub fn check_with(
             None,
             "its own run",
             !released,
-            &view.instruction,
+            ("", &view.instruction),
         ));
     }
 
@@ -725,16 +725,23 @@ fn gh_pr_view(repo: &Path, n: u64) -> Option<serde_json::Value> {
     serde_json::from_str(&raw).ok()
 }
 
-/// First non-empty line of an owner's instruction, cut to 160 characters.
-fn about_of(instruction: &str) -> String {
-    instruction
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("")
-        .chars()
-        .take(160)
-        .collect()
+/// The owner's work for the judge: its title (when it has one) and its
+/// instruction with whitespace collapsed, cut to 400 characters. The whole
+/// instruction is used, not its first line: a heading such as `# Task` says
+/// nothing about what the work is.
+fn about_of(title: &str, instruction: &str) -> String {
+    let body = instruction.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = title.trim();
+    let full = match (title.is_empty(), body.is_empty()) {
+        (true, _) => body,
+        (false, true) => title.to_owned(),
+        (false, false) => format!("{title}: {body}"),
+    };
+    let mut out: String = full.chars().take(400).collect();
+    if full.chars().count() > 400 {
+        out.push('…');
+    }
+    out
 }
 
 fn task_claims(
@@ -752,7 +759,7 @@ fn task_claims(
             id: t.id.clone(),
             status: status.clone(),
             via: "its review branch".into(),
-            about: about_of(&t.instruction),
+            about: about_of(&t.title, &t.instruction),
             branch: Some(b.clone()),
             base: None,
             pr: None,
@@ -770,7 +777,7 @@ fn task_claims(
                 Some((&t.id, &status)),
                 &format!("produced by its run {}", crate::queue::short(rid)),
                 live_pr,
-                &t.instruction,
+                (&t.title, &t.instruction),
             ));
         }
     }
@@ -787,9 +794,9 @@ fn run_claims(
     task: Option<(&str, &str)>,
     via: &str,
     live_pr: bool,
-    instruction: &str,
+    (title, instruction): (&str, &str),
 ) -> Vec<Claim> {
-    let about = about_of(instruction);
+    let about = about_of(title, instruction);
     let (id, status) = match task {
         Some((id, status)) => (id.to_owned(), status.to_owned()),
         None => (view.id.clone(), view.status.clone()),
@@ -1518,8 +1525,12 @@ mod tests {
     }
 
     #[test]
-    fn about_is_the_first_line_trimmed() {
-        assert_eq!(about_of("\n  fix x \nmore"), "fix x");
-        assert_eq!(about_of(&"y".repeat(300)).chars().count(), 160);
+    fn about_carries_title_and_whole_instruction() {
+        assert_eq!(
+            about_of("Retries", "# Task\nFix  auth\nretries"),
+            "Retries: # Task Fix auth retries"
+        );
+        assert_eq!(about_of("", "x"), "x");
+        assert_eq!(about_of("", &"y".repeat(500)).chars().count(), 401);
     }
 }

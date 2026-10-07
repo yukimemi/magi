@@ -1997,7 +1997,7 @@ pub fn dupes_judge(instruction: &str, claims: &[(String, String)]) -> String {
     );
     for (c, about) in claims {
         let about = if about.is_empty() {
-            "unknown"
+            "unknown (a pull request with no local record: judge from its number alone)"
         } else {
             about.as_str()
         };
