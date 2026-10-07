@@ -152,7 +152,7 @@ pub async fn start_turn(
     if q.consult.is_some() {
         return Ok(Started::Nothing);
     }
-    let Some(lease) = talks.claim_turn(&talk.id)? else {
+    let Some(mut lease) = talks.claim_turn(&talk.id)? else {
         return Ok(Started::Busy);
     };
     if !begin(questions, talks, q, talk)? {
@@ -164,13 +164,31 @@ pub async fn start_turn(
     // A failed turn is kept and reported at the end, not returned at once:
     // drafts accepted meanwhile are still owed an answer.
     let mut failed = None;
-    while let Some(text) = talk::drain(&mut talk, talks)? {
-        if let Err(e) = talk::respond(&lease, &mut talk, talks, cfg, &text).await {
-            failed.get_or_insert(e);
+    loop {
+        while let Some(text) = talk::drain(&mut talk, talks)? {
+            if let Err(e) = talk::respond(&lease, &mut talk, talks, cfg, &text).await {
+                failed.get_or_insert(e);
+            }
+            if !lease.beat()? {
+                bail!("the turn lease for chat {} was lost", talk.short());
+            }
         }
-        if !lease.beat()? {
-            bail!("the turn lease for chat {} was lost", talk.short());
+        // A draft queued after the last drain, before the lease is gone, was
+        // left to us by a starter that found the lease held. Release first,
+        // then look again: whoever queues later either sees no lease (and
+        // starts its own turn) or is seen by this re-check.
+        drop(lease);
+        talk = talks.get(&talk.id)?;
+        let owed = talk.status.open()
+            && (!talk.pending.is_empty() || !talk.pending_attachments.is_empty());
+        if !owed {
+            break;
         }
+        // Somebody else took the lease meanwhile: they drain it.
+        let Some(again) = talks.claim_turn(&talk.id)? else {
+            break;
+        };
+        lease = again;
     }
     if let Some(e) = failed {
         return Err(e);

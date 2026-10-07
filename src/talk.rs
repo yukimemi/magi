@@ -395,8 +395,21 @@ impl Talks {
     /// one panicking caller must not wedge every talk in the store the way it
     /// would wedge the loop's own lock; see [`crate::web`]'s `lock_or_recover`,
     /// which this mirrors.
-    fn guard(&self) -> MutexGuard<'_, ()> {
-        self.lock.lock().unwrap_or_else(PoisonError::into_inner)
+    ///
+    /// The mutex only serializes this process. The cycle is also taken under a
+    /// short file lock beside the records, so the CLI (`magi answer
+    /// --ask-chat`) and the web server cannot overwrite each other's draft.
+    /// The file lock is best effort: if it stays busy past its short wait, the
+    /// cycle proceeds under the mutex alone (the lock ages out on its own).
+    fn guard(&self) -> StoreGuard<'_> {
+        let mutex = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let file = std::fs::create_dir_all(&self.root)
+            .ok()
+            .and_then(|()| TurnLock::take_patiently(&self.root.join(".store.turn")));
+        StoreGuard {
+            _file: file,
+            _mutex: mutex,
+        }
     }
 
     /// Directory holding the conversation files.
@@ -603,6 +616,7 @@ impl Talks {
             .flatten()
             .flatten()
             .filter(|e| e.path().extension().is_none_or(|x| x != "turn"))
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
             .filter_map(|e| e.metadata().ok())
             .filter_map(|m| m.modified().ok())
             .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -697,6 +711,13 @@ impl Talks {
         let _ = std::fs::remove_file(self.turn_path(&resolved));
         Ok(())
     }
+}
+
+/// What [`Talks::guard`] hands out: the in-process mutex plus the
+/// cross-process file lock. The file lock is released first.
+struct StoreGuard<'a> {
+    _file: Option<TurnLock>,
+    _mutex: MutexGuard<'a, ()>,
 }
 
 /// The body of a `<id>.turn` file. `pid` is for a human reading it; nothing
