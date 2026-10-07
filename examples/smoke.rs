@@ -28,7 +28,7 @@ fn main() {
     std::fs::create_dir_all(&tmp).expect("create smoke dir");
     std::fs::write(&starter, Config::starter_toml()).expect("write starter config");
     let cfg = Config::load(&starter).expect("starter config must load");
-    assert_eq!(cfg.graph.candidates, 3);
+    assert_eq!(cfg.graph.implementers, 3);
 
     // Atomic save into a directory that does not exist yet, then load back
     // through jiff's timestamp deserializer.
