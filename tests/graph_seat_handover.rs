@@ -299,7 +299,7 @@ common::e2e! {
 async fn a_spare_reviewer_is_used_instead_of_doubling_up_another_seat() {
     let _home = common::home_lock().await;
     let mut fx = common::fixture(_home, common::Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     fx.config.graph.reviewers = 2;
     fx.config.graph.retries = 0;
     fx.config.roles.reviewers = vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()];
