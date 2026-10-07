@@ -2892,11 +2892,13 @@ mod tests {
             .unwrap();
         q.say(" Merge it please ").unwrap();
         assert!(
-            q.settle_by_deputy("deputy-x", "merge", "   ", None).is_err(),
+            q.settle_by_deputy("deputy-x", "merge", "   ", None)
+                .is_err(),
             "an empty quote is refused"
         );
         assert!(
-            q.settle_by_deputy("deputy-x", "merge", "ship it", None).is_err(),
+            q.settle_by_deputy("deputy-x", "merge", "ship it", None)
+                .is_err(),
             "a quote the owner never said is refused"
         );
         assert_eq!(q.status, QuestionStatus::Open);
@@ -2989,7 +2991,12 @@ mod tests {
         store.put(&mut q).unwrap();
         store
             .update(&id, |q| {
-                q.settle_by_deputy("deputy-x", "yes", "setup done", Some("  no follow-up was queued  "))
+                q.settle_by_deputy(
+                    "deputy-x",
+                    "yes",
+                    "setup done",
+                    Some("  no follow-up was queued  "),
+                )
             })
             .unwrap();
         let back = store.get(&id).unwrap();
@@ -3030,10 +3037,9 @@ mod tests {
 
     #[test]
     fn a_turn_written_before_notes_existed_still_reads() {
-        let t: Turn = serde_json::from_str(
-            r#"{"who":"agent","body":"old","at":"2026-01-01T00:00:00Z"}"#,
-        )
-        .unwrap();
+        let t: Turn =
+            serde_json::from_str(r#"{"who":"agent","body":"old","at":"2026-01-01T00:00:00Z"}"#)
+                .unwrap();
         assert_eq!(t.note, None);
     }
 
@@ -3044,7 +3050,10 @@ mod tests {
         q.reply("sure?", vec!["merge".into(), "hold".into()])
             .unwrap();
         q.say("wait, hold off").unwrap();
-        assert!(q.settle_by_deputy("deputy-x", "merge", "merge", None).is_err());
+        assert!(
+            q.settle_by_deputy("deputy-x", "merge", "merge", None)
+                .is_err()
+        );
         assert_eq!(q.status, QuestionStatus::Open);
     }
 
@@ -3080,7 +3089,8 @@ mod tests {
         assert!(q.settle_by_deputy("deputy-x", "yes", "  ", None).is_err());
         assert_eq!(q.status, QuestionStatus::Open);
 
-        q.settle_by_deputy("deputy-x", "yes", "setup done", None).unwrap();
+        q.settle_by_deputy("deputy-x", "yes", "setup done", None)
+            .unwrap();
         assert_eq!(q.status, QuestionStatus::Answered);
         assert_eq!(q.resolution().as_deref(), Some("yes"));
         let last = q.thread.last().unwrap();

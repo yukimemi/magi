@@ -2598,7 +2598,10 @@ fn print_question_record(q: &ask::Question) {
         };
         println!("      {who}: {}", t.body.trim().replace('\n', "\n        "));
         if let Some(note) = &t.note {
-            println!("          note: {}", note.replace('\n', "\n                "));
+            println!(
+                "          note: {}",
+                note.replace('\n', "\n                ")
+            );
         }
     }
 }
