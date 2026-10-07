@@ -1961,7 +1961,7 @@ impl Runner {
     /// quota path itself being unchanged — instead of leaving the
     /// seat's loss final the moment one agent's account runs dry.
     ///
-    /// Solo runs (`graph.candidates = 1`, `daemon::apply_solo`'s forced shape)
+    /// Solo runs (`graph.implementers = 1`, `daemon::apply_solo`'s forced shape)
     /// are the motivating case: `Config::resolve_roles`'s `implementers`
     /// truncates to the single slot rotation picked, so a solo task whose one
     /// implementer hits quota mid-run used to have nothing else to try. This

@@ -295,7 +295,10 @@ pub struct Roles {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Graph {
-    /// Parallel implementations of the same task. **One by default.**
+    /// Parallel implementations of the same task (the number of implementer
+    /// seats; pairs with [`Roles::implementers`]). **One by default.**
+    ///
+    /// Formerly `candidates`, still read as a deprecated alias.
     ///
     /// Competition is the thing magi is for, and it is still here - it is just
     /// no longer what every task buys without being asked. Three days and 13
@@ -323,7 +326,8 @@ pub struct Graph {
     /// records that `execute` already degrades to implement -> review -> gate
     /// -> merge, because `judge` skips a one-candidate field, `deliberate` has
     /// no two first choices to reconcile and `vote` returns early.
-    pub candidates: usize,
+    #[serde(alias = "candidates")]
+    pub implementers: usize,
     /// Independent judges.
     pub judges: usize,
     /// Deliberation rounds when the judges' first choices disagree.
@@ -332,9 +336,9 @@ pub struct Graph {
     /// a lens cycle (see [`crate::prompt::Lens`]) covers exactly once, so the
     /// default panel reads the patch for spec compliance, regressions, and
     /// simplicity without repeating an angle. Review is also the one stage
-    /// [`Self::candidates`]'s doc describes as running on every task
+    /// [`Self::implementers`]'s doc describes as running on every task
     /// regardless of competition, which is what makes a panel worth its cost
-    /// here even though `candidates` itself defaults to one.
+    /// here even though `implementers` itself defaults to one.
     pub reviewers: usize,
     /// Maximum review+fix rounds before the run is declared blocked.
     pub review_rounds: usize,
@@ -467,12 +471,12 @@ pub struct Graph {
     /// tool loop that re-reads the codebase on every turn - so three
     /// sketches, gathered once before `implement` starts, cost a fraction of
     /// a fourth candidate and buy back a form of the same disagreement
-    /// [`Self::candidates`]'s doc describes moving away from being the
+    /// [`Self::implementers`]'s doc describes moving away from being the
     /// default, on every run rather than only the ones an operator remembers
-    /// to ask for with `--candidates`.
+    /// to ask for with `--implementers`.
     pub advise: bool,
     /// How many independent design proposals the deliberation stage gathers.
-    /// **Three by default** - the same number [`Self::candidates`]'s doc
+    /// **Three by default** - the same number [`Self::implementers`]'s doc
     /// names as the point where a fourth judge's first choice stopped
     /// changing the tally.
     pub advisors: usize,
@@ -481,7 +485,7 @@ pub struct Graph {
 impl Default for Graph {
     fn default() -> Self {
         Self {
-            candidates: 1,
+            implementers: 1,
             judges: 3,
             deliberate_rounds: 1,
             reviewers: 3,
@@ -1197,8 +1201,8 @@ pub struct ResolvedRoles {
     pub conductor: AgentSpec,
     /// The full ordered implementer roster, in [`Roles::implementers`]'s own
     /// order — or `[[agents]]` in file order, when that list is empty. Unlike
-    /// [`Self::implementers`], never truncated to `graph.candidates` and
-    /// never `rotate`d/wrapped: a solo run (`candidates = 1`) resolves
+    /// [`Self::implementers`], never truncated to `graph.implementers` and
+    /// never `rotate`d/wrapped: a solo run (`implementers = 1`) resolves
     /// `implementers` down to a single slot, but `graph::Runner`'s per-seat
     /// quota fallback needs the *whole* list to walk forward through when
     /// that one slot's agent runs out of quota mid-run.
@@ -1355,6 +1359,7 @@ impl Config {
             )
         })?;
         let mut table = merged.config;
+        Self::normalize_renamed_keys(paths, &mut engine, &ctx, &mut table)?;
         // `[vars]` is teravars' own input, already resolved into the render
         // context; `deny_unknown_fields` must not trip over it.
         table.remove("vars");
@@ -1369,6 +1374,52 @@ impl Config {
             cfg.agents = Self::autodetected().agents;
         }
         Ok(cfg)
+    }
+
+    /// `graph.candidates` was renamed `graph.implementers`. Both spellings are
+    /// read, but the layers are merged into one table before serde sees it, so
+    /// an old name in a lower layer and the new name in a higher one would
+    /// arrive together and fail as a duplicate field instead of letting the
+    /// higher layer win. Resolve it here: a single layer that writes both is
+    /// refused (naming both keys and the file); otherwise the value from the
+    /// last layer that wrote either key becomes `implementers`.
+    fn normalize_renamed_keys(
+        paths: &[PathBuf],
+        engine: &mut teravars::Engine,
+        ctx: &teravars::Context,
+        table: &mut toml::map::Map<String, toml::Value>,
+    ) -> Result<()> {
+        let both = matches!(
+            table.get("graph"),
+            Some(toml::Value::Table(g)) if g.contains_key("candidates") && g.contains_key("implementers")
+        );
+        if !both {
+            return Ok(());
+        }
+        let mut winner: Option<toml::Value> = None;
+        for path in paths {
+            let one = teravars::load_merged([path], engine, ctx)
+                .with_context(|| format!("rendering {}", path.display()))?;
+            let Some(toml::Value::Table(g)) = one.config.get("graph") else {
+                continue;
+            };
+            if g.contains_key("candidates") && g.contains_key("implementers") {
+                bail!(
+                    "`[graph]` sets both `implementers` and its deprecated alias \n                     `candidates` in {}; keep only `implementers`.",
+                    path.display()
+                );
+            }
+            if let Some(v) = g.get("implementers").or_else(|| g.get("candidates")) {
+                winner = Some(v.clone());
+            }
+        }
+        if let Some(toml::Value::Table(g)) = table.get_mut("graph") {
+            g.remove("candidates");
+            if let Some(v) = winner {
+                g.insert("implementers".to_owned(), v);
+            }
+        }
+        Ok(())
     }
 
     /// Refuse an array that two layers both declare, unless
@@ -1736,7 +1787,7 @@ impl Config {
     /// Fill the roles out to the configured widths.
     ///
     /// An empty role list rotates through the whole roster, so a three-agent
-    /// roster with `candidates = 3` gives one implementation per agent, and
+    /// roster with `implementers = 3` gives one implementation per agent, and
     /// `judges = 3` rotates the judge seats by one so that judge *i* is not the
     /// author of candidate *i* whenever the roster has more than one agent.
     pub fn resolve_roles(&self) -> Result<ResolvedRoles> {
@@ -1748,7 +1799,7 @@ impl Config {
             );
         }
         Ok(ResolvedRoles {
-            implementers: self.rotate(&self.roles.implementers, self.graph.candidates, 0)?,
+            implementers: self.rotate(&self.roles.implementers, self.graph.implementers, 0)?,
             judges: self.rotate(&self.roles.judges, self.graph.judges, 1)?,
             reviewers: self.rotate(&self.roles.reviewers, self.graph.reviewers, 0)?,
             fixer: self
@@ -1896,7 +1947,7 @@ impl Config {
              # synthesizer = \"opus\"  # blends the advisors into one brief; unset picks a seat like chatter does\n\
              # synthesizer = [\"opus\", \"codex\"]  # array form: fallback chain, each tried once on quota or failure\n\n\
              [graph]\n\
-             candidates = 3\n\
+             implementers = 3\n\
              judges = 3\n\
              deliberate_rounds = 1\n\
              reviewers = 3\n\
@@ -2338,6 +2389,45 @@ mod tests {
     }
 
     #[test]
+    fn graph_implementers_new_key_loads_and_old_key_is_an_alias() {
+        let g: Graph = toml::from_str("implementers = 4\n").unwrap();
+        assert_eq!(g.implementers, 4);
+        let g: Graph = toml::from_str("candidates = 5\n").unwrap();
+        assert_eq!(g.implementers, 5);
+    }
+
+    fn layered(lower: &str, upper: &str) -> Result<Config> {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        std::fs::write(&a, lower).unwrap();
+        std::fs::write(&b, upper).unwrap();
+        Config::load_layers(&[a, b])
+    }
+
+    #[test]
+    fn graph_implementers_higher_layer_wins_across_spellings() {
+        let c = layered("[graph]\ncandidates = 2\n", "[graph]\nimplementers = 5\n").unwrap();
+        assert_eq!(c.graph.implementers, 5);
+        let c = layered("[graph]\nimplementers = 2\n", "[graph]\ncandidates = 5\n").unwrap();
+        assert_eq!(c.graph.implementers, 5);
+        let c = layered("[graph]\ncandidates = 2\n", "[graph]\njudges = 3\n").unwrap();
+        assert_eq!(c.graph.implementers, 2);
+    }
+
+    #[test]
+    fn graph_implementers_both_keys_in_one_layer_is_refused() {
+        let err = layered("", "[graph]\ncandidates = 2\nimplementers = 3\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("candidates") && err.contains("implementers"),
+            "{err}"
+        );
+        assert!(err.contains("b.toml"), "{err}");
+    }
+
+    #[test]
     fn a_toml_layer_written_before_these_fields_existed_still_parses() {
         // `deny_unknown_fields` cuts both ways: a config from before
         // `timeout_verify`/`e2e_every_round` existed must still parse, with
@@ -2359,7 +2449,7 @@ mod tests {
         let cfg = Config {
             agents: vec![spec("a"), spec("b"), spec("c")],
             graph: Graph {
-                candidates: 3,
+                implementers: 3,
                 ..Graph::default()
             },
             ..Config::default()
@@ -2379,7 +2469,7 @@ mod tests {
         let cfg = Config {
             agents: vec![spec("solo")],
             graph: Graph {
-                candidates: 3,
+                implementers: 3,
                 ..Graph::default()
             },
             ..Config::default()
@@ -2391,14 +2481,14 @@ mod tests {
 
     #[test]
     fn implementer_roster_is_the_whole_agent_list_untruncated_when_unset() {
-        // `candidates = 1` (a solo run) still resolves `implementers` down to
+        // `implementers = 1` (a solo run) still resolves `implementers` down to
         // one slot, but `implementer_roster` must carry every agent in the
         // roster, in file order, for `graph::Runner`'s quota fallback to walk
         // forward through once that one slot's agent runs out of quota.
         let cfg = Config {
             agents: vec![spec("a"), spec("b"), spec("c")],
             graph: Graph {
-                candidates: 1,
+                implementers: 1,
                 ..Graph::default()
             },
             ..Config::default()
@@ -2422,7 +2512,7 @@ mod tests {
                 ..Roles::default()
             },
             graph: Graph {
-                candidates: 1,
+                implementers: 1,
                 ..Graph::default()
             },
             ..Config::default()
@@ -2708,7 +2798,7 @@ mod tests {
         let path = dir.path().join("magi.toml");
         std::fs::write(&path, Config::starter_toml()).unwrap();
         let parsed = Config::load(&path).expect("starter config must load");
-        assert_eq!(parsed.graph.candidates, 3);
+        assert_eq!(parsed.graph.implementers, 3);
         assert_eq!(parsed.merge.mode, MergeMode::None);
         assert_eq!(parsed.merge.style, MergeStyle::Merge);
         assert!(parsed.graph.sessions);
@@ -2802,7 +2892,7 @@ mod tests {
 
         let cfg = Config::load_layers(&[machine, project]).expect("layered load");
         assert_eq!(cfg.agents.len(), 1, "roster comes from the machine layer");
-        assert_eq!(cfg.graph.candidates, 2, "project layer wins");
+        assert_eq!(cfg.graph.implementers, 2, "project layer wins");
         assert_eq!(cfg.graph.max_parallel, 8, "machine layer survives");
         assert_eq!(
             cfg.verify.gate,
@@ -2899,7 +2989,7 @@ mod tests {
         )
         .unwrap();
         let cfg = Config::load(&path).expect("comments must be inert, not rendered");
-        assert_eq!(cfg.graph.candidates, 2);
+        assert_eq!(cfg.graph.implementers, 2);
     }
 
     #[test]
@@ -3140,7 +3230,7 @@ mod tests {
         fn reads_the_remote_blob_not_the_working_tree() {
             let (_t, repo) = fixture("[graph]\ncandidates = 2\n", "[graph]\ncandidates = 5\n");
             let (cfg, _) = Config::discover(&repo, None).unwrap();
-            assert_eq!(cfg.graph.candidates, 2);
+            assert_eq!(cfg.graph.implementers, 2);
         }
 
         #[test]
@@ -3148,7 +3238,7 @@ mod tests {
             let (_t, repo) = fixture("[graph]\ncandidates = 2\n", "[graph]\ncandidates = 5\n");
             git(&repo, &["checkout", "--detach"]);
             let (cfg, _) = Config::discover(&repo, None).unwrap();
-            assert_eq!(cfg.graph.candidates, 2);
+            assert_eq!(cfg.graph.implementers, 2);
         }
 
         #[test]
@@ -3176,7 +3266,7 @@ mod tests {
             git(&repo, &["push", "origin", "trunk"]);
             git(&repo, &["fetch", "origin"]);
             let (cfg, layers) = Config::discover(&repo, None).unwrap();
-            assert_eq!((cfg.graph.candidates, cfg.graph.judges), (2, 3));
+            assert_eq!((cfg.graph.implementers, cfg.graph.judges), (2, 3));
             assert_eq!(layers.len(), 2);
         }
 
@@ -3192,7 +3282,7 @@ mod tests {
             // The working tree's copy differs and must not be used.
             std::fs::write(repo.join("gate.toml"), "[graph]\ncandidates = 9\n").unwrap();
             let (cfg, _) = Config::discover(&repo, None).unwrap();
-            assert_eq!(cfg.graph.candidates, 2);
+            assert_eq!(cfg.graph.implementers, 2);
         }
 
         #[test]
@@ -3235,7 +3325,7 @@ mod tests {
             let own = t.path().join("own.toml");
             std::fs::write(&own, "[graph]\ncandidates = 4\n").unwrap();
             let (cfg, _) = Config::discover(&repo, Some(&own)).unwrap();
-            assert_eq!(cfg.graph.candidates, 4);
+            assert_eq!(cfg.graph.implementers, 4);
         }
 
         #[test]
@@ -3268,7 +3358,7 @@ mod tests {
                 .build()
                 .unwrap();
             let (cfg, _) = rt.block_on(Config::discover_fetched(&repo, None)).unwrap();
-            assert_eq!(cfg.graph.candidates, 2);
+            assert_eq!(cfg.graph.implementers, 2);
         }
 
         #[test]
@@ -3276,7 +3366,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("magi.toml"), "[graph]\ncandidates = 4\n").unwrap();
             let (cfg, _) = Config::discover(dir.path(), None).unwrap();
-            assert_eq!(cfg.graph.candidates, 4);
+            assert_eq!(cfg.graph.implementers, 4);
         }
     }
 }

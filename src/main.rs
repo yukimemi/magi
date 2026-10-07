@@ -77,9 +77,9 @@ struct RunOpts {
     /// Config file; defaults to <repo>/magi.toml.
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Parallel implementations.
-    #[arg(short = 'c', long)]
-    candidates: Option<usize>,
+    /// Parallel implementations (`--candidates` is a deprecated alias).
+    #[arg(short = 'c', long, alias = "candidates")]
+    implementers: Option<usize>,
     /// Independent judges.
     #[arg(short = 'j', long)]
     judges: Option<usize>,
@@ -113,7 +113,7 @@ impl RunOpts {
         Self {
             repo: self.repo.or(other.repo),
             config: self.config.or(other.config),
-            candidates: self.candidates.or(other.candidates),
+            implementers: self.implementers.or(other.implementers),
             judges: self.judges.or(other.judges),
             review_rounds: self.review_rounds.or(other.review_rounds),
             merge: self.merge.or(other.merge),
@@ -188,6 +188,9 @@ enum Command {
         /// Config file; defaults to <repo>/magi.toml.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Parallel implementations (`--candidates` is a deprecated alias).
+        #[arg(short = 'c', long, alias = "candidates")]
+        implementers: Option<usize>,
         /// Reviewers per round.
         #[arg(long)]
         reviewers: Option<usize>,
@@ -556,6 +559,9 @@ enum TaskCmd {
         /// `magi task release` lets it run.
         #[arg(long, value_name = "REASON")]
         hold: Option<String>,
+        /// Parallel implementations (`--candidates` is a deprecated alias).
+        #[arg(long, alias = "candidates")]
+        implementers: Option<usize>,
         /// Run this task alone: one implementer, straight into review, rather
         /// than the usual multi-candidate competition. For work whose design
         /// is already settled and only needs building - the shape a standing
@@ -1106,7 +1112,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let patch = magi::queue::RunOverrides {
                     merge: opts.merge.map(|m| merge_arg_name(m).to_owned()),
-                    candidates: opts.candidates,
+                    candidates: opts.implementers,
                     judges: opts.judges,
                     reviewers: None,
                     review_rounds: opts.review_rounds,
@@ -1119,7 +1125,7 @@ async fn dispatch(command: Command) -> Result<()> {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let overrides = magi::queue::RunOverrides {
                 merge: opts.merge.map(|m| merge_arg_name(m).to_owned()),
-                candidates: opts.candidates,
+                candidates: opts.implementers,
                 judges: opts.judges,
                 reviewers: None,
                 review_rounds: opts.review_rounds,
@@ -1164,6 +1170,7 @@ async fn dispatch(command: Command) -> Result<()> {
             branch,
             repo,
             config,
+            implementers,
             reviewers,
             review_rounds,
             merge,
@@ -1175,7 +1182,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let patch = magi::queue::RunOverrides {
                     merge: merge.map(|m| merge_arg_name(m).to_owned()),
-                    candidates: None,
+                    candidates: implementers,
                     judges: None,
                     reviewers,
                     review_rounds,
@@ -1187,7 +1194,7 @@ async fn dispatch(command: Command) -> Result<()> {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let overrides = magi::queue::RunOverrides {
                 merge: merge.map(|m| merge_arg_name(m).to_owned()),
-                candidates: None,
+                candidates: implementers,
                 judges: None,
                 reviewers,
                 review_rounds,
@@ -2549,6 +2556,7 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             attach,
             force,
             json,
+            implementers,
         } => {
             if let Some(why) = mistyped_command(
                 "magi task add",
@@ -2602,6 +2610,12 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             task.priority = priority;
             task.solo = solo;
             task.urgent = urgent;
+            if implementers.is_some() {
+                task.overrides = Some(magi::queue::RunOverrides {
+                    candidates: implementers,
+                    ..Default::default()
+                });
+            }
             if !attach.is_empty() {
                 let attach = absolute_paths(&attach, &cwd);
                 q.attach_and_put(&mut task, &attach)?;
@@ -4706,6 +4720,7 @@ mod tests {
                 attach: vec![shot.clone()],
                 force: false,
                 json: false,
+                implementers: None,
             },
             q.clone(),
         )
@@ -4774,6 +4789,7 @@ mod tests {
                 attach: Vec::new(),
                 force: false,
                 json: false,
+                implementers: None,
             },
             q.clone(),
         )
@@ -4794,6 +4810,7 @@ mod tests {
                 attach: Vec::new(),
                 force: false,
                 json: false,
+                implementers: None,
             },
             q.clone(),
         )
@@ -4831,6 +4848,7 @@ mod tests {
                 attach: Vec::new(),
                 force: false,
                 json: false,
+                implementers: None,
             },
             q.clone(),
         )
@@ -4851,6 +4869,7 @@ mod tests {
                 attach: Vec::new(),
                 force: false,
                 json: false,
+                implementers: None,
             },
             q.clone(),
         )
@@ -4892,6 +4911,7 @@ mod tests {
                 attach: Vec::new(),
                 force: false,
                 json: false,
+                implementers: None,
             },
             q.clone(),
         )
@@ -4914,6 +4934,7 @@ mod tests {
                 attach: Vec::new(),
                 force: false,
                 json: false,
+                implementers: None,
             },
             q.clone(),
         )
@@ -4952,6 +4973,7 @@ mod tests {
                 attach: Vec::new(),
                 force: false,
                 json: false,
+                implementers: None,
             },
             q.clone(),
         )
@@ -5285,6 +5307,7 @@ mod tests {
                 attach: Vec::new(),
                 force: false,
                 json: false,
+                implementers: None,
             },
             q.clone(),
         )
@@ -5314,6 +5337,7 @@ mod tests {
                 attach: Vec::new(),
                 force: false,
                 json: false,
+                implementers: None,
             },
             q.clone(),
         )
@@ -5379,6 +5403,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
             attach: Vec::new(),
             force,
             json: false,
+            implementers: None,
         };
 
         let err = task_cmd_on(add(false), q.clone())
@@ -5887,7 +5912,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
                 ..
             }) => {
                 assert_eq!(id, vec!["the", "dead", "code"]);
-                assert_eq!(opts.candidates, Some(3));
+                assert_eq!(opts.implementers, Some(3));
             }
             other => panic!("expected RunCmd::Rm carrying --candidates, got {other:?}"),
         }
@@ -5916,14 +5941,62 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
                 ..
             }) => {
                 assert_eq!(id, vec!["the", "dead", "code"]);
-                assert_eq!(opts.candidates, Some(3));
+                assert_eq!(opts.implementers, Some(3));
                 assert_eq!(rm_opts.seed, Some(7));
                 let merged = rm_opts.merge(opts);
-                assert_eq!(merged.candidates, Some(3));
+                assert_eq!(merged.implementers, Some(3));
                 assert_eq!(merged.seed, Some(7));
             }
             other => panic!("expected RunCmd::Rm with flags on both sides, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn implementers_flag_and_its_old_spellings_parse_to_one_value() {
+        use clap::CommandFactory;
+        for flag in ["-c", "--candidates", "--implementers"] {
+            let cli = Cli::try_parse_from(["magi", "run", flag, "4", "do the thing"]).unwrap();
+            match cli.command {
+                Some(Command::Run { opts, .. }) => assert_eq!(opts.implementers, Some(4), "{flag}"),
+                other => panic!("expected Run, got {other:?}"),
+            }
+            let cli = Cli::try_parse_from(["magi", "run", "rm", "the", "code", flag, "2"]).unwrap();
+            match cli.command {
+                Some(Command::Run {
+                    command: Some(RunCmd::Rm { opts, .. }),
+                    ..
+                }) => assert_eq!(opts.implementers, Some(2), "{flag}"),
+                other => panic!("expected Run rm, got {other:?}"),
+            }
+        }
+        for flag in ["--candidates", "--implementers"] {
+            let cli = Cli::try_parse_from(["magi", "review", "br", flag, "2"]).unwrap();
+            match cli.command {
+                Some(Command::Review { implementers, .. }) => assert_eq!(implementers, Some(2)),
+                other => panic!("expected Review, got {other:?}"),
+            }
+            let cli =
+                Cli::try_parse_from(["magi", "task", "add", flag, "2", "some", "text"]).unwrap();
+            match cli.command {
+                Some(Command::Task {
+                    command:
+                        TaskCmd::Add {
+                            implementers,
+                            instruction,
+                            ..
+                        },
+                }) => {
+                    assert_eq!(implementers, Some(2));
+                    assert_eq!(instruction, vec!["some", "text"]);
+                }
+                other => panic!("expected task add, got {other:?}"),
+            }
+        }
+        let mut cmd = Cli::command();
+        let run = cmd.find_subcommand_mut("run").unwrap();
+        let help = run.render_long_help().to_string();
+        assert!(help.contains("--implementers"), "{help}");
+        assert!(!help.contains("--candidates --"), "{help}");
     }
 
     #[test]

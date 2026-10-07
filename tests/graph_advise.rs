@@ -23,7 +23,7 @@ common::e2e! {
 async fn advisor_proposals_are_gathered_and_synthesized_into_the_implementer_briefing() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 2);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
@@ -59,7 +59,7 @@ common::e2e! {
 async fn the_synthesizer_role_pins_the_synthesis_seat_to_a_named_agent() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 2);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     fx.config.roles = Roles {
         synthesizer: Some("beta".into()),
         ..Roles::default()
@@ -94,7 +94,7 @@ common::e2e! {
 async fn an_unset_synthesizer_role_falls_back_to_the_default_order() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 2);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     assert!(
         fx.config.roles.synthesizer.is_none(),
         "the fixture must not already name a synthesizer"
@@ -125,7 +125,7 @@ async fn the_on_off_switch_leaves_no_trace_when_off() {
     // default explicitly rather than relying on it silently.
     let mut fx = common::fixture(home, common::Judges::Unanimous, false);
     assert!(!fx.config.graph.advise);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
@@ -144,7 +144,7 @@ common::e2e! {
 async fn the_proposal_count_config_controls_how_many_advisor_seats_are_asked() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 1);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
@@ -165,7 +165,7 @@ common::e2e! {
 async fn a_failed_advisor_seat_still_leaves_a_record_and_the_others_still_synthesize() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 2);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     for a in &mut fx.config.agents {
         a.env
             .insert("MOCK_ADVISOR_FAIL_SEAT".to_owned(), "advisor-1".to_owned());
@@ -217,7 +217,7 @@ common::e2e! {
 async fn an_unresolvable_advisor_roster_does_not_fail_the_run_and_names_the_run_data() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 1);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     fx.config.roles = Roles {
         advisors: vec!["nope".to_owned()],
         ..Roles::default()
@@ -267,7 +267,7 @@ common::e2e! {
 async fn advise_does_not_reenter_once_implementation_has_already_progressed() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 2);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await

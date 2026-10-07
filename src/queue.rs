@@ -467,7 +467,7 @@ pub struct RunOverrides {
     /// `--merge`: `none`, `local` or `pr`.
     #[serde(default)]
     pub merge: Option<String>,
-    /// `-c`: parallel implementations.
+    /// `-c` / `--implementers`: parallel implementations (persisted as `candidates`).
     #[serde(default)]
     pub candidates: Option<usize>,
     /// `-j`: independent judges.
@@ -511,7 +511,7 @@ impl RunOverrides {
     /// Apply these on top of `config`.
     pub fn apply(&self, config: &mut crate::config::Config) {
         if let Some(n) = self.candidates {
-            config.graph.candidates = n;
+            config.graph.implementers = n;
         }
         if let Some(n) = self.judges {
             config.graph.judges = n;

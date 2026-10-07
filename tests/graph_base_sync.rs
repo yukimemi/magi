@@ -91,7 +91,7 @@ async fn the_gate_runs_on_a_tree_that_contains_what_landed_while_the_run_was_thi
     // Base-sync behaviour does not depend on the panel: a solo candidate
     // skips judging and reaches the same winner-under-rebase scenario for a
     // fraction of the subprocess cost.
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     let origin = wire_origin(&fx);
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
@@ -164,7 +164,7 @@ common::e2e! {
 async fn a_conflicting_base_is_resolved_by_the_fixer_and_the_run_goes_on_to_review() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     // The base gains its own, different `note.txt` - the path the candidate
     // creates - so replaying the candidate's commit cannot avoid a conflict.
     let origin = wire_origin(&fx);
@@ -221,7 +221,7 @@ common::e2e! {
 async fn a_fixer_that_never_resolves_the_conflict_blocks_the_run_and_says_what_was_tried() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     set_agent_env(&mut fx, "MOCK_REBASE_FIX_NOOP");
     let origin = wire_origin(&fx);
 
@@ -267,7 +267,7 @@ common::e2e! {
 async fn a_fixer_that_abandons_the_rebase_is_not_mistaken_for_success() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     set_agent_env(&mut fx, "MOCK_REBASE_FIX_ABORT");
     let origin = wire_origin(&fx);
 
@@ -295,7 +295,7 @@ common::e2e! {
 async fn a_fixer_that_skips_every_commit_does_not_lose_the_branch() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     set_agent_env(&mut fx, "MOCK_REBASE_FIX_SKIP");
     let origin = wire_origin(&fx);
 
@@ -325,7 +325,7 @@ common::e2e! {
 async fn the_conflict_round_bound_is_counted_in_state_and_survives_a_resume() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     set_agent_env(&mut fx, "MOCK_REBASE_FIX_NOOP");
     let origin = wire_origin(&fx);
 
@@ -365,7 +365,7 @@ common::e2e! {
 async fn with_no_conflict_rounds_a_conflict_stops_without_asking_a_fixer() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     fx.config.graph.review_rounds = 0;
     let origin = wire_origin(&fx);
 
@@ -392,7 +392,7 @@ common::e2e! {
 async fn a_rebased_winner_is_pushed_over_the_remote_copy_magi_last_saw() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     let origin = wire_origin(&fx);
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
@@ -437,7 +437,7 @@ common::e2e! {
 async fn a_remote_branch_with_someone_elses_commits_blocks_the_base_sync() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     let origin = wire_origin(&fx);
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
@@ -474,7 +474,7 @@ common::e2e! {
 async fn a_change_that_already_landed_under_another_commit_ends_the_run_without_a_conflict() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     let origin = wire_origin(&fx);
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
@@ -557,7 +557,7 @@ common::e2e! {
 async fn a_resume_after_a_local_only_rebase_pushes_it_with_a_lease() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     let origin = wire_origin(&fx);
     let (mut runner, branch, twin) = rebased_locally_only(&fx, &origin).await;
     let bare = fx.tmp.path().join("origin.git");
@@ -586,7 +586,7 @@ async fn two_commit_run(
     second_upstream: bool,
     third_commit: bool,
 ) -> Runner {
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     set_agent_env(fx, "MOCK_IMPL_TWO_COMMITS");
     if third_commit {
         set_agent_env(fx, "MOCK_IMPL_THIRD_COMMIT");
@@ -637,7 +637,7 @@ common::e2e! {
 async fn a_resume_with_nothing_to_push_pushes_nothing() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     let origin = wire_origin(&fx);
     let (mut runner, branch, _twin) = rebased_locally_only(&fx, &origin).await;
     let bare = fx.tmp.path().join("origin.git");
@@ -676,7 +676,7 @@ common::e2e! {
 async fn a_resume_over_a_foreign_push_to_the_branch_stops_without_pushing() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     let origin = wire_origin(&fx);
     let (mut runner, branch, twin) = rebased_locally_only(&fx, &origin).await;
     let bare = fx.tmp.path().join("origin.git");

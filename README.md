@@ -32,7 +32,7 @@ flowchart TD
     prep["prep: worktrees + blind hook\n(no agent)"]
     advisor["advise: advisors ×A, read-only\n[roles] advisors (falls back to judges)\n[graph] advise, advisors"]
     synth["advise: synthesis ×1, blends the advisors\n[roles] synthesizer"]
-    impl["implement ×N\n[roles] implementers\n[graph] candidates"]
+    impl["implement ×N\n[roles] implementers\n[graph] implementers"]
     judge["judge ×M, blind\n[roles] judges\n[graph] judges"]
     delib["deliberate\n[roles] judges\n[graph] deliberate_rounds"]
     vote["final vote, private\n[roles] judges"]
@@ -64,7 +64,7 @@ specific one:
 | conductor | once per poll cycle | `conductor` | — | yes |
 | advisors (design deliberation) | ×`advisors` (default 3) | `advisors` *(unset falls back to `judges`)* | `[graph] advise` on/off, `[graph] advisors` count | yes |
 | advise-synthesis (blends the advisors into one brief) | ×1 | `synthesizer` *(unset falls back to a claude seat, else roster order)* | — | yes |
-| implementers | ×`candidates` (default 3) | `implementers` | `[graph] candidates` | yes |
+| implementers | ×`implementers` (default 3) | `implementers` | `[graph] implementers` | yes |
 | judges (rank / deliberate / vote) | ×`judges` (default 3) | `judges` | `[graph] judges`, `deliberate_rounds` | yes |
 | reviewers | ×`reviewers` (default 3) | `reviewers` | `[graph] reviewers`, `review_rounds` | yes |
 | fixer (review loop and land loop) | ×1, only when findings block | `fixer` *(unset falls back to the winner's own seat)* | — | yes |
@@ -737,7 +737,7 @@ reviewers = ["opus", "opencode"]
 # would otherwise compete with that judge for the same account.
 
 [graph]
-candidates = 3
+implementers = 3
 judges = 3
 deliberate_rounds = 1
 reviewers = 3

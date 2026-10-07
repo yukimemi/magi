@@ -1,6 +1,6 @@
 //! A run that already reached its conclusion must keep it on reentry.
 //!
-//! `graph.candidates = 1` is the shipped default, so `judge` skips the panel
+//! `graph.implementers = 1` is the shipped default, so `judge` skips the panel
 //! on every run, not just an edge case. That skip leaves `judgements` empty
 //! forever, which used to be indistinguishable from "not yet judged" on a
 //! later reentry: `judge` ran a second time, rewrote `status` back to

@@ -34,7 +34,7 @@ fn write_config(dir: &std::path::Path, config: &magi::config::Config) -> std::pa
 /// churn while this test holds the process-wide test home lock.
 fn daemon_config(fx: &common::Fixture) -> magi::config::Config {
     let mut config = fx.config.clone();
-    config.graph.candidates = 1;
+    config.graph.implementers = 1;
     config.graph.reviewers = 1;
     config.disk.min_free_bytes = 0;
     config.disk.auto_fold = false;
