@@ -71,6 +71,19 @@ specific one:
 | chatter (`magi chat`, `magi bump`) | ×1 per turn | `chatter` *(unset falls back to a claude seat, else roster order)* | — | yes |
 | tally / fold / gate / merge | n/a — no agent seat | — | `[verify] gate`, `[graph] land`, `land_approval` | n/a |
 
+**Role lists are also an ordered backup list.** An array-valued `implementers`,
+`judges` or `reviewers` may be longer than its `[graph]` seat count. With
+`[graph] implementers = 1` and `implementers = ["a", "b", "c"]`, only the first
+entry sits on a seat (`judges` starts one place along, because its list is
+rotated). The rest are spares: when a seat's agent fails or hits quota,
+`graph::pick_successor` walks the full, untruncated roster
+(`ResolvedRoles::implementer_roster` / `judge_roster` / `reviewer_roster`) from
+that seat's position to the right, preferring agents no other seat holds and
+trying each agent at most once per call. A reviewer seat can additionally
+retry an agent that failed it earlier once the forward entries are used up.
+This is separate from the fallback chains of `synthesizer`, `chatter` and
+`fixer`.
+
 ## What makes the judging blind
 
 A judge that knows which model wrote a candidate stops grading the patch and
