@@ -110,17 +110,9 @@ pub async fn rebase_with_fixer(
             .config
             .resolve_roles()
             .context("resolve the roster for the rebase fix")?;
-        let (spec, seat_key) = match &roles.fixer {
-            Some(f) if f.id != winner.agent => (f.clone(), "fix".to_owned()),
-            _ => (
-                state
-                    .config
-                    .agent(&winner.agent)
-                    .cloned()
-                    .unwrap_or_else(|_| roles.implementers[winner.index].clone()),
-                format!("impl-{}", winner.label),
-            ),
-        };
+        // The chain (`crate::fixer`): one round however many agents it takes.
+        let attempts = crate::fixer::attempts(state, &roles, &winner);
+        let ids: Vec<String> = attempts.iter().map(|(s, _)| s.id.clone()).collect();
 
         let round = spent + 1;
         let branch_subjects = subjects(scratch, &format!("{onto}..{branch}")).await;
@@ -148,7 +140,7 @@ pub async fn rebase_with_fixer(
         // Spent before the call, on disk: a run killed mid-round must not
         // get the round back.
         state.rebase_fixes.push(RebaseFixRecord {
-            agent: spec.id.clone(),
+            agent: ids[0].clone(),
             paths: paths.clone(),
             from: Some(orig.clone()),
             finished: false,
@@ -163,29 +155,59 @@ pub async fn rebase_with_fixer(
         );
         state.save()?;
 
-        let mut seat = seat_of(state, &seat_key, &spec.id);
+        // Each id at most once, forward only. The round was spent and saved
+        // above, so a chain advance inside it spends nothing further and a
+        // crash cannot hand it back; only the record's `agent` follows the
+        // asked agent (saved before its call, like the round itself).
         let artifacts = agent::artifacts_dir(&state.dir());
-        let out = agent::invoke(
-            &spec,
-            &mut seat,
-            &Invocation {
-                cwd: scratch,
-                prompt: &prompt_text,
-                timeout: Duration::from_secs(state.config.graph.timeout_fix),
-                allow_write: true,
-                sessions: state.config.graph.sessions,
-                artifacts: &artifacts,
-                stem: &format!("rebase-fix-{round}"),
-                run: &state.id,
-                node: "rebase",
-                cache_dir: state.config.cache_dir().as_deref(),
-                attachments: &[],
-                writable: &[],
-            },
-        )
-        .await;
-        let seat_name = seat.key.clone();
-        state.seats.insert(seat.key.clone(), seat);
+        let mut last = None;
+        for (i, (spec, seat_key)) in attempts.into_iter().enumerate() {
+            if i > 0 {
+                if let Some(r) = state.rebase_fixes.last_mut() {
+                    r.agent = spec.id.clone();
+                }
+                state.save()?;
+            }
+            let mut seat = seat_of(state, &seat_key, &spec.id);
+            let stem = if i == 0 {
+                format!("rebase-fix-{round}")
+            } else {
+                format!("rebase-fix-{round}-{}", spec.id)
+            };
+            let out = agent::invoke(
+                &spec,
+                &mut seat,
+                &Invocation {
+                    cwd: scratch,
+                    prompt: &prompt_text,
+                    timeout: Duration::from_secs(state.config.graph.timeout_fix),
+                    allow_write: true,
+                    sessions: state.config.graph.sessions,
+                    artifacts: &artifacts,
+                    stem: &stem,
+                    run: &state.id,
+                    node: "rebase",
+                    cache_dir: state.config.cache_dir().as_deref(),
+                    attachments: &[],
+                    writable: &[],
+                },
+            )
+            .await;
+            let seat_name = seat.key.clone();
+            state.seats.insert(seat.key.clone(), seat);
+            if let Some(next) = ids.get(i + 1)
+                && agent::chain_advances(&out)
+            {
+                let (class, why) = crate::fixer::failure_of(&out);
+                crate::graph::record_handover(
+                    state, "rebase", &seat_name, &spec.id, next, &class, &why,
+                );
+                continue;
+            }
+            last = Some((out, seat_name));
+            break;
+        }
+        let (out, seat_name) = last.expect("the fixer chain always has an entry");
 
         let mut error = None;
         let mut quota = false;

@@ -37,13 +37,19 @@ use serde::Serialize;
 use crate::config::{AgentChoice, AgentSpec, Config};
 
 /// The `[roles]` keys the screen edits, in display order.
-pub(crate) const ROLE_KEYS: [&str; 5] = [
+pub(crate) const ROLE_KEYS: [&str; 6] = [
     "implementers",
     "judges",
     "reviewers",
     "advisors",
     "synthesizer",
+    "fixer",
 ];
+
+/// The roles that take one id as a bare string and several as a chain.
+fn is_chain_role(key: &str) -> bool {
+    matches!(key, "synthesizer" | "fixer")
+}
 
 /// Serializes saves: a read-modify-write of one file is not safe to interleave.
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
@@ -189,6 +195,7 @@ fn role_ids(cfg: &Config, key: &str) -> Vec<String> {
         "judges" => cfg.roles.judges.clone(),
         "reviewers" => cfg.roles.reviewers.clone(),
         "advisors" => cfg.roles.advisors.clone(),
+        "fixer" => choice_ids(cfg.roles.fixer.as_ref()),
         _ => choice_ids(cfg.roles.synthesizer.as_ref()),
     }
 }
@@ -331,6 +338,27 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
                     .map(|a| ids_of(a))
                     .map_err(|e| anyhow::anyhow!("{e:#}"))
             }
+            // Unset keeps the winner's own author: no chain to show.
+            "fixer" if cfg.roles.fixer.is_none() => {
+                view.fallback = Some("winner's implementer");
+                Ok(Vec::new())
+            }
+            "fixer" => crate::agent::pick_chain(
+                &cfg.agents,
+                cfg.roles.fixer.as_ref(),
+                &crate::agent::installed,
+                "fixer",
+            )
+            .map(|chain| {
+                let ids = ids_of(&chain);
+                view.skipped = view
+                    .configured
+                    .iter()
+                    .filter(|id| !ids.contains(id))
+                    .cloned()
+                    .collect();
+                ids
+            }),
             _ => crate::agent::pick_chain(
                 &cfg.agents,
                 cfg.roles.synthesizer.as_ref(),
@@ -576,10 +604,10 @@ fn quote(s: &str) -> String {
     toml::Value::String(s.to_owned()).to_string()
 }
 
-/// The value text for `key`: a bare string for a one-agent synthesizer, an
-/// array otherwise.
+/// The value text for `key`: a bare string for a one-agent chain role
+/// (synthesizer, fixer), an array otherwise.
 fn value_text(key: &str, ids: &[String]) -> String {
-    if key == "synthesizer" && ids.len() == 1 {
+    if is_chain_role(key) && ids.len() == 1 {
         return quote(&ids[0]);
     }
     let items: Vec<String> = ids.iter().map(|i| quote(i)).collect();
@@ -826,7 +854,7 @@ fn patch_role(text: &str, key: &str, ids: &[String]) -> Result<String, String> {
             };
             let interior = &old.notes[..old.notes.len() - usize::from(trailing.is_some())];
             let replacement: Vec<String> =
-                if interior.is_empty() || (key == "synthesizer" && ids.len() == 1) {
+                if interior.is_empty() || (is_chain_role(key) && ids.len() == 1) {
                     // One line. Comments that cannot ride on it stay above it.
                     let mut v: Vec<String> = interior
                         .iter()
@@ -978,6 +1006,16 @@ mod tests {
         // `[graph] judges` is not `[roles] judges`.
         let out = patch_role("[graph]\njudges = 3\n", "judges", &[]).unwrap();
         assert_eq!(out, "[graph]\njudges = 3\n");
+    }
+
+    #[test]
+    fn fixer_is_a_string_for_one_and_an_array_for_a_chain() {
+        let one = patch_role("", "fixer", &ids(&["a"])).unwrap();
+        assert!(one.contains("fixer = \"a\""), "{one}");
+        let two = patch_role("[roles]\nfixer = \"a\"\n", "fixer", &ids(&["a", "b"])).unwrap();
+        assert!(two.contains("fixer = [\"a\", \"b\"]"), "{two}");
+        let reset = patch_role(&two, "fixer", &[]).unwrap();
+        assert!(!reset.contains("fixer ="), "{reset}");
     }
 
     #[test]

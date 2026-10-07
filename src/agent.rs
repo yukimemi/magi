@@ -1523,8 +1523,15 @@ pub fn pick_chain(
 pub fn chain_advances(outcome: &Result<AgentOutput>) -> bool {
     match outcome {
         Err(_) => true,
-        Ok(out) => out.quota_exhausted() || !out.usable(),
+        Ok(out) => output_advances(out),
     }
+}
+
+/// [`chain_advances`] for a call that did return an output: the `Ok` half,
+/// shared with callers that classify the call into their own outcome type
+/// first (the graph's fixer chain).
+pub fn output_advances(out: &AgentOutput) -> bool {
+    out.quota_exhausted() || !out.usable()
 }
 
 fn ids(agents: &[AgentSpec]) -> String {

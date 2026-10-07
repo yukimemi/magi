@@ -3683,7 +3683,11 @@ async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
                 roles
                     .fixer
                     .as_ref()
-                    .map_or("the winner's own author".to_owned(), |f| f.display())
+                    .map_or("the winner's own author".to_owned(), |chain| chain
+                        .iter()
+                        .map(|f| f.display())
+                        .collect::<Vec<_>>()
+                        .join(" -> "))
             );
             // The chat seat, resolved the same way `talk::begin` resolves it.
             // Shown because a setting an operator cannot confirm is a setting

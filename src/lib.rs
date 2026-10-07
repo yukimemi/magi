@@ -38,6 +38,7 @@ pub mod deputy;
 pub mod direct;
 pub mod disk;
 pub mod dupes;
+pub mod fixer;
 pub mod followup;
 pub mod git;
 pub mod graph;
