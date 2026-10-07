@@ -601,6 +601,8 @@ mod tests {
             "Improve performance",
             "perf: speed cache",
             "Trim idle sockets",
+            "Optimize memory consumption",
+            "ci: pin actions",
             "Quicker warmup sprocket",
         ] {
             assert_eq!(english_words(text).1, 0, "{text} must have no list hit");
