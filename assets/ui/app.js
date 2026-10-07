@@ -4463,7 +4463,7 @@ function updateAskCard(row, question, { compact = false } = {}) {
   setAttr(row, "data-waiting-agent", waitingOnAgent ? "1" : null);
 
   const turns = Array.isArray(question.thread) ? question.thread : [];
-  const threadKey = String(turns.length);
+  const threadKey = turns.map((t) => (t.note ? "n" : "-")).join("") + ":" + turns.length;
   if (row.dataset.threadKey !== threadKey) {
     row.dataset.threadKey = threadKey;
     clear(r.thread);
@@ -4474,6 +4474,11 @@ function updateAskCard(row, question, { compact = false } = {}) {
         el("span", { class: "ask-turn-who", text: isAgent ? "Agent" : "You" }),
         el("time", { class: "ask-turn-when", datetime: turn.at, title: at.title, text: at.text }),
         mdBlock("ask-turn-body", (question.thread_bodies_md || [])[turns.indexOf(turn)]),
+        turn.note
+          ? el("div", { class: "ask-turn-note" },
+              el("span", { class: "ask-turn-note-label", text: "Deputy's note" }),
+              mdBlock("ask-turn-note-body", ((question.thread_notes_md || [])[turns.indexOf(turn)]) || []))
+          : null,
       ));
     }
   }

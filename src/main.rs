@@ -515,6 +515,12 @@ enum Command {
         /// The owner's words that justify `--settle`, verbatim.
         #[arg(long, requires = "settle")]
         quote: Option<String>,
+        /// Your own report on a `--settle`, shown to the owner under the
+        /// "Settled as" line: what you did besides recording the choice (task
+        /// ids filed) and which of their requests you could not carry out.
+        /// It is your claim; magi does not check it.
+        #[arg(long, requires = "settle")]
+        note: Option<String>,
     },
     /// Answer a question an agent is waiting on, or ask it back.
     Answer {
@@ -1591,6 +1597,7 @@ async fn dispatch(command: Command) -> Result<()> {
             wait,
             settle,
             quote,
+            note,
         } => {
             ask_cmd(AskArgs {
                 summary,
@@ -1605,6 +1612,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 wait,
                 settle,
                 quote,
+                note,
             })
             .await
         }
@@ -2074,6 +2082,7 @@ struct AskArgs {
     wait: Option<String>,
     settle: Option<String>,
     quote: Option<String>,
+    note: Option<String>,
 }
 
 /// The one message `--summary`/`--detail` make, whether that is a fresh
@@ -2103,6 +2112,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         wait,
         settle,
         quote,
+        note,
     } = args;
 
     let (cfg, _) = Config::discover(&repo, None).unwrap_or_default();
@@ -2115,7 +2125,13 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         return ask_wait_cmd(&store, &cfg, timeout, &id).await;
     }
     if let Some(id) = settle {
-        return ask_settle_cmd(&store, &id, &choices, quote.as_deref().unwrap_or_default());
+        return ask_settle_cmd(
+            &store,
+            &id,
+            &choices,
+            quote.as_deref().unwrap_or_default(),
+            note.as_deref(),
+        );
     }
     let summary = summary.context("give --summary, or resume a wait with --wait <question-id>")?;
 
@@ -2264,7 +2280,13 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
 /// claimed from a shell; [`ask::Question::settle_by_deputy`] compares it with
 /// the seat recorded on the question. A task the operator holds by hand is
 /// never settled this way: an answer must not be able to release it.
-fn ask_settle_cmd(store: &ask::Questions, id: &str, choices: &[String], quote: &str) -> Result<()> {
+fn ask_settle_cmd(
+    store: &ask::Questions,
+    id: &str,
+    choices: &[String],
+    quote: &str,
+    note: Option<&str>,
+) -> Result<()> {
     let [label] = choices else {
         bail!("give exactly one --choice: the option the owner's words decided");
     };
@@ -2297,9 +2319,12 @@ fn ask_settle_cmd(store: &ask::Questions, id: &str, choices: &[String], quote: &
                 task.short()
             );
         }
-        q.settle_by_deputy(&seat, label, quote)
+        q.settle_by_deputy(&seat, label, quote, note)
     })?;
     println!("settled on `{label}`; the daemon applies it from here");
+    if let Some(note) = note.map(str::trim).filter(|n| !n.is_empty()) {
+        println!("note recorded for the owner: {note}");
+    }
     Ok(())
 }
 
@@ -2539,6 +2564,13 @@ fn answer_cmd(
         return Ok(());
     }
 
+    if reply.is_none() && !q.status.open() {
+        // Nothing left to answer: show what was decided and what the deputy
+        // reported beside it.
+        print_question_record(&q);
+        return Ok(());
+    }
+
     let reply = reply.context("give the answer with --reply, or ask back with --say")?;
     let answer = if q.free_text() {
         ask::Answer::Text(reply)
@@ -2548,6 +2580,30 @@ fn answer_cmd(
     store.update(&q.id, |r| r.answer(answer))?;
     println!("answered {} {}", q.short(), q.summary);
     Ok(())
+}
+
+/// The record of a question that is no longer open: its status, answer and
+/// thread, a deputy's note indented under the turn it belongs to.
+fn print_question_record(q: &ask::Question) {
+    println!("{}  {}", q.short(), q.summary);
+    println!("      status: {:?}", q.status);
+    if let Some(answer) = &q.answer {
+        println!("      answer: {answer:?}");
+    }
+    for t in &q.thread {
+        let who = if t.who == ask::Who::Operator {
+            "owner"
+        } else {
+            "agent"
+        };
+        println!("      {who}: {}", t.body.trim().replace('\n', "\n        "));
+        if let Some(note) = &t.note {
+            println!(
+                "          note: {}",
+                note.replace('\n', "\n                ")
+            );
+        }
+    }
 }
 
 /// The `magi task` verbs.

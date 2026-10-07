@@ -1637,7 +1637,7 @@ mod tests {
         w.questions().update(&id, |q| q.say(say)).unwrap();
         w.questions()
             .update(&id, |q| {
-                q.settle_by_deputy(&seat, LEAVE_IT, "クローズしていいよ")
+                q.settle_by_deputy(&seat, LEAVE_IT, "クローズしていいよ", None)
             })
             .unwrap();
         let q = w.questions().get(&id).unwrap();

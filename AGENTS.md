@@ -1405,6 +1405,14 @@ not move on a say.
   `merge`. `deputy::destructive` (triage discard, the divergence answers) needs
   the owner's latest message to pass `land::unhedged`, the hedge / negation /
   retraction check `land::merge_intent` is built on.
+- **A settle can carry a note** (`magi ask --settle ... --note`, `ask::Turn::note`,
+  `ask::SCHEMA` 7, `#[serde(default)]`). It is the deputy's own report - task ids it
+  filed, requests it could not carry out - stored on the "Settled as" turn by
+  `settle_by_deputy` only after every guard passed. magi does not verify it, which is
+  why it is a field of its own and not part of `body`; the web card shows it under the
+  turn (`thread_notes_md`), `magi answer <id>` on a closed question prints it, and a
+  resumed deputy reads it back as `(note: ...)`. Deputies with no authority to file
+  tasks are told to name any request they did not carry out.
 - **A new question node must be added to `unasked_questions()` in
   `tests/deputy.rs`**, which asserts `deputy::kind_of` is `Some` for each node
   filed without an asker; a node that is not listed there can ship unheard.
