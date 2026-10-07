@@ -159,8 +159,13 @@ pub async fn start_turn(
         return Ok(Started::Nothing);
     }
     let mut talk = talks.get(&talk.id)?;
-    if let Some(text) = talk::drain(&mut talk, talks)? {
+    // Other starters that found the lease held queued drafts and left them to
+    // us, so drain until nothing is left (as the web's drain loop does).
+    while let Some(text) = talk::drain(&mut talk, talks)? {
         talk::respond(&lease, &mut talk, talks, cfg, &text).await?;
+        if !lease.beat()? {
+            bail!("the turn lease for chat {} was lost", talk.short());
+        }
     }
     Ok(Started::Answered)
 }

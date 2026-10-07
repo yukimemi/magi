@@ -1206,6 +1206,11 @@ fn check_lease(lease: &TurnLease, talk: &Talk) -> Result<()> {
     if lease.talk != talk.id {
         bail!("the turn lease is for talk {}, not {}", lease.talk, talk.id);
     }
+    // Renewing doubles as the ownership check: a lease that aged out and was
+    // taken over must not start a turn (or write the operator's text) at all.
+    if !lease.beat()? {
+        bail!("the turn lease for talk {} is no longer held", talk.short());
+    }
     Ok(())
 }
 
