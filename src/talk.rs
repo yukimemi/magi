@@ -703,9 +703,15 @@ fn read_turn(path: &Path) -> Option<TurnRecord> {
 /// A takeover lock older than this belonged to a taker that died inside it.
 const TAKEOVER_LOCK_TTL: Duration = Duration::from_secs(10);
 
-/// How long a break ticket for one dead token stays unique before another
-/// taker may try that token again (the ticket's owner died holding it).
-const TICKET_BUCKET: Duration = Duration::from_secs(60);
+/// A break ticket older than this belonged to a taker that died holding it;
+/// the next generation's ticket may then be tried for the same dead token.
+const TICKET_TTL: Duration = Duration::from_secs(10);
+
+/// Most ticket generations tried for one dead token.
+const TICKET_GENERATIONS: u32 = 16;
+
+/// Tickets are forgotten only this long after their last write.
+const TICKET_SWEEP_AGE: Duration = Duration::from_secs(3600);
 
 /// Create `path` exclusively with `body`; `false` when it already exists.
 fn create_exclusive(path: &Path, body: &str) -> Result<bool> {
@@ -805,14 +811,29 @@ impl TurnLock {
         // it. The lock itself is never moved aside, so a fresh lock made by
         // the winner is never off the path, not even for an instant.
         //
-        // The ticket name also carries a coarse time bucket, so a ticket
-        // abandoned by a taker that died right after creating it blocks the
-        // same token only until the next bucket.
-        let bucket = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() / TICKET_BUCKET.as_secs());
-        let ticket = path.with_extension(format!("lock.{key}.{bucket}.break"));
-        if !create_exclusive(&ticket, "")? {
+        // The ticket name carries a generation, not the wall clock, so no
+        // time boundary can let a second taker in while a ticket is alive.
+        // Generation n+1 is tried only when ticket n is older than
+        // `TICKET_TTL` (its owner died). Residual risk, same kind as the lock's
+        // own TTL: an owner stalled past `TICKET_TTL` between creating its
+        // ticket and publishing can overlap with the next generation's taker.
+        let mut won = false;
+        for n in 0..TICKET_GENERATIONS {
+            let ticket = path.with_extension(format!("lock.{key}.break.{n}"));
+            if create_exclusive(&ticket, "")? {
+                won = true;
+                break;
+            }
+            let stale = std::fs::metadata(&ticket)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > TICKET_TTL);
+            if !stale {
+                return Ok(None);
+            }
+        }
+        if !won {
             return Ok(None);
         }
         Self::sweep_tickets(&path);
@@ -842,7 +863,7 @@ impl TurnLock {
         for entry in entries.flatten() {
             let file = entry.file_name();
             let Some(file) = file.to_str() else { continue };
-            if !(file.starts_with(&prefix) && file.ends_with(".break")) {
+            if !(file.starts_with(&prefix) && file.contains(".break.")) {
                 continue;
             }
             let old = entry
@@ -850,7 +871,7 @@ impl TurnLock {
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age > TICKET_BUCKET * 60);
+                .is_some_and(|age| age > TICKET_SWEEP_AGE);
             if old {
                 let _ = std::fs::remove_file(entry.path());
             }
@@ -2468,18 +2489,40 @@ mod tests {
             .expect("dir")
             .flatten()
             .map(|e| e.path())
-            .find(|p| p.to_string_lossy().ends_with(".break"))
+            .find(|p| p.to_string_lossy().ends_with(".break.0"))
             .expect("ticket");
         assert!(!create_exclusive(&ticket, "").expect("ticket"));
         assert!(TurnLock::take(&lease).expect("take").is_none());
         assert_eq!(std::fs::read_to_string(&lock).expect("read"), fresh);
-        // A later generation is breakable despite the old ticket.
+        // A later generation is breakable once the old ticket is stale too.
         age_file(&lock);
+        age_file(&ticket);
         std::mem::forget(b);
         let c = TurnLock::take(&lease)
             .expect("take")
             .expect("next generation");
         assert_ne!(c.token, fresh);
+    }
+
+    #[test]
+    fn a_live_ticket_blocks_and_a_stale_one_hands_over_to_the_next_generation() {
+        let (_tmp, a, _b) = lease_store();
+        let lease = a.turn_path("t1");
+        let lock = lease.with_extension("turn.lock");
+        std::fs::create_dir_all(lock.parent().expect("dir")).expect("dir");
+        std::fs::write(&lock, "t1-dead").expect("dead lock");
+        age_file(&lock);
+        let t0 = lease.with_extension("lock.t1-dead.break.0");
+        assert!(create_exclusive(&t0, "").expect("ticket"));
+        // A fresh ticket 0 blocks the same dead token, whatever the clock says.
+        assert!(TurnLock::take(&lease).expect("take").is_none());
+        assert_eq!(std::fs::read_to_string(&lock).expect("read"), "t1-dead");
+        // Once ticket 0 is stale, exactly one taker gets through via ticket 1.
+        age_file(&t0);
+        let c = TurnLock::take(&lease).expect("take").expect("generation 1");
+        assert_eq!(std::fs::read_to_string(&lock).expect("read"), c.token);
+        assert!(lease.with_extension("lock.t1-dead.break.1").exists());
+        assert!(TurnLock::take(&lease).expect("take").is_none());
     }
 
     #[test]
