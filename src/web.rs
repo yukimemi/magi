@@ -678,6 +678,9 @@ impl Ui {
         self.talk_turns
             .lock()
             .is_ok_and(|turns| turns.live.contains(id))
+            // Another process (the CLI) can hold the turn through the
+            // on-disk lease.
+            || self.talks.turn_held(id)
     }
 
     /// Claim the right to run one turn in a talk, or report that it is busy.
@@ -713,7 +716,26 @@ impl Ui {
             .talk_turns
             .lock()
             .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
-        if !live.live.insert(id.to_owned()) {
+        let inserted = live.live.insert(id.to_owned());
+        // The on-disk lease is the cross-process half of the gate. Taken
+        // second, and undone if lost, so `live` never claims a turn the lease
+        // refused.
+        let lease = if inserted {
+            match self.talks.claim_turn(id) {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) => {
+                    live.live.remove(id);
+                    None
+                }
+                Err(e) => {
+                    live.live.remove(id);
+                    return Err(ApiError::from(e));
+                }
+            }
+        } else {
+            None
+        };
+        if lease.is_none() {
             if queued {
                 // A queued write has landed before this busy check.
                 // `drain_loop` uses this generation to recheck after its
@@ -727,6 +749,7 @@ impl Ui {
             talk: id.to_owned(),
             turns: Arc::clone(&self.talk_turns),
             released: false,
+            lease,
         }))
     }
 
@@ -746,11 +769,15 @@ impl Ui {
         if !talk.pending.is_empty() || !talk.pending_attachments.is_empty() {
             return Ok(TalkTurnStart::Pending);
         }
+        let Some(lease) = self.talks.claim_turn(id).map_err(ApiError::from)? else {
+            return Ok(TalkTurnStart::Busy);
+        };
         live.live.insert(id.to_owned());
         Ok(TalkTurnStart::Claimed(TalkTurnGuard {
             talk: id.to_owned(),
             turns: Arc::clone(&self.talk_turns),
             released: false,
+            lease: Some(lease),
         }))
     }
 
@@ -912,6 +939,8 @@ struct TalkTurnGuard {
     talk: String,
     turns: Arc<Mutex<TalkTurns>>,
     released: bool,
+    /// The cross-process half of the slot; dropped with the guard.
+    lease: Option<crate::talk::TurnLease>,
 }
 
 /// In-memory turn ownership plus the queue generation observed by a drainer.
@@ -935,11 +964,27 @@ enum TalkTurnStart {
 }
 
 impl TalkTurnGuard {
+    /// `talk::respond` while renewing the on-disk lease, so a turn longer
+    /// than the lease's TTL still reads as held to other processes.
+    async fn respond(
+        &self,
+        talk: &mut Talk,
+        talks: &Talks,
+        cfg: &Config,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        match &self.lease {
+            Some(lease) => lease.beating(talk::respond(talk, talks, cfg, text)).await,
+            None => talk::respond(talk, talks, cfg, text).await,
+        }
+    }
+
     /// Release while the caller already holds the claim mutex, closing the
     /// last-drain/arrival gap without letting `Drop` revoke a later claim.
     fn release(mut self, live: &mut TalkTurns) {
         live.live.remove(&self.talk);
         live.queued.remove(&self.talk);
+        self.lease = None;
         self.released = true;
     }
 }
@@ -6248,7 +6293,7 @@ async fn talk_say(
             // exactly as it would have for a caller that stayed connected.
             let _ = tx.send(Ok((queued, thinking)));
 
-            if let Err(e) = talk::respond(&mut talk, &talks, &cfg, &text).await {
+            if let Err(e) = turn_guard.respond(&mut talk, &talks, &cfg, &text).await {
                 // `respond` records the failure in the transcript itself,
                 // which is what the phone reads; this line is for the
                 // operator's terminal.
@@ -6392,7 +6437,11 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
                 break;
             }
         };
-        if let Err(e) = talk::respond(&mut talk, &talks, &cfg, &drained).await {
+        let responded = match turn.as_ref() {
+            Some(turn) => turn.respond(&mut talk, &talks, &cfg, &drained).await,
+            None => talk::respond(&mut talk, &talks, &cfg, &drained).await,
+        };
+        if let Err(e) = responded {
             tracing::warn!("talk {id} turn failed: {e:#}");
         }
     }
@@ -13771,6 +13820,41 @@ mod tests {
         );
         drop(turn);
         assert!(!ui.is_thinking(id), "dropping the guard releases thinking");
+    }
+
+    #[test]
+    fn an_on_disk_turn_lease_held_elsewhere_refuses_the_web_claim() {
+        let home = TempDir::new().expect("temp home");
+        let talks = Talks::at(home.path().join("talks"));
+        let ui = Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            talks.clone(),
+            home.path().join("runs"),
+            home.path().to_path_buf(),
+            PathBuf::from("/repo"),
+        )
+        .with_worktrees_root(home.path().join("wt"));
+        let id = "20260901-000000-cross";
+
+        let other = Talks::at(home.path().join("talks"))
+            .claim_turn(id)
+            .expect("claim")
+            .expect("the other process wins");
+        assert!(ui.is_thinking(id), "a foreign turn reads as thinking");
+        assert!(ui.begin_talk_turn(id).expect("claim").is_none());
+        assert!(
+            !ui.talk_turns.lock().unwrap().live.contains(id),
+            "a refused claim leaves no in-process entry behind"
+        );
+        drop(other);
+        let turn = ui.begin_talk_turn(id).expect("claim").expect("free again");
+        assert!(talks.turn_held(id), "the web turn holds the lease");
+        drop(turn);
+        assert!(
+            !talks.turn_held(id),
+            "dropping the guard releases the lease"
+        );
     }
 
     #[tokio::test]
