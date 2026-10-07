@@ -703,6 +703,10 @@ fn read_turn(path: &Path) -> Option<TurnRecord> {
 /// A takeover lock older than this belonged to a taker that died inside it.
 const TAKEOVER_LOCK_TTL: Duration = Duration::from_secs(10);
 
+/// How long a break ticket for one dead token stays unique before another
+/// taker may try that token again (the ticket's owner died holding it).
+const TICKET_BUCKET: Duration = Duration::from_secs(60);
+
 /// Create `path` exclusively with `body`; `false` when it already exists.
 fn create_exclusive(path: &Path, body: &str) -> Result<bool> {
     use std::io::Write as _;
@@ -777,11 +781,16 @@ impl TurnLock {
         if Self::publish(&path, &token)? {
             return Ok(Some(Self { path, token }));
         }
-        let Some(seen) = std::fs::read_to_string(&path)
-            .ok()
-            .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
-        else {
+        let Ok(seen) = std::fs::read_to_string(&path) else {
             return Ok(None);
+        };
+        // A lock that is not a whole token (an older build wrote it in two
+        // steps) is breakable too, under one fixed ticket name.
+        let key = if !seen.is_empty() && seen.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            seen.as_str()
+        } else {
+            "invalid"
         };
         let aged = std::fs::metadata(&path)
             .and_then(|m| m.modified())
@@ -795,7 +804,14 @@ impl TurnLock {
         // that was judged dead: exactly one taker per generation can create
         // it. The lock itself is never moved aside, so a fresh lock made by
         // the winner is never off the path, not even for an instant.
-        let ticket = path.with_extension(format!("lock.{seen}.break"));
+        //
+        // The ticket name also carries a coarse time bucket, so a ticket
+        // abandoned by a taker that died right after creating it blocks the
+        // same token only until the next bucket.
+        let bucket = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() / TICKET_BUCKET.as_secs());
+        let ticket = path.with_extension(format!("lock.{key}.{bucket}.break"));
         if !create_exclusive(&ticket, "")? {
             return Ok(None);
         }
@@ -834,7 +850,7 @@ impl TurnLock {
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age > TAKEOVER_LOCK_TTL * 360);
+                .is_some_and(|age| age > TICKET_BUCKET * 60);
             if old {
                 let _ = std::fs::remove_file(entry.path());
             }
@@ -2448,8 +2464,12 @@ mod tests {
         assert_eq!(fresh, b.token);
         // C read the same dead token earlier: its ticket is already spent, and
         // the fresh lock is never moved, so a newcomer cannot slip in.
-        let ticket = lock.with_extension("lock.t1-dead.break");
-        assert!(ticket.exists());
+        let ticket = std::fs::read_dir(lock.parent().expect("dir"))
+            .expect("dir")
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with(".break"))
+            .expect("ticket");
         assert!(!create_exclusive(&ticket, "").expect("ticket"));
         assert!(TurnLock::take(&lease).expect("take").is_none());
         assert_eq!(std::fs::read_to_string(&lock).expect("read"), fresh);
@@ -2460,6 +2480,17 @@ mod tests {
             .expect("take")
             .expect("next generation");
         assert_ne!(c.token, fresh);
+    }
+
+    #[test]
+    fn an_aged_empty_lock_is_broken() {
+        let (_tmp, a, _b) = lease_store();
+        let lease = a.turn_path("t1");
+        let lock = lease.with_extension("turn.lock");
+        std::fs::create_dir_all(lock.parent().expect("dir")).expect("dir");
+        std::fs::write(&lock, "").expect("empty lock");
+        age_file(&lock);
+        assert!(TurnLock::take(&lease).expect("take").is_some());
     }
 
     #[test]
