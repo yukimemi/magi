@@ -1110,6 +1110,31 @@ timeout_minutes = 30                # per command
   commands) and `release_watch` (fake forge) for the flow; `config` for the
   keys and defaults.
 
+### Chat personas are a tone, never a behaviour
+
+`src/persona.rs` holds the built-ins (`default`, `magi`, `rei`, `misato`,
+`ritsuko`, `shinji`, `asuka`, `kaworu`); the web Chat picks one per
+conversation (`Talk::persona`, `POST /api/talks/{id}/persona`, `#talk-persona`
+beside the agent select). `default` is empty, is the initial choice, and the
+briefing is byte-for-byte unchanged for it.
+
+- **Tone only.** `talk::briefing_with` appends a `# Persona (tone only)`
+  section that says facts, commands, task ids, duplicate-warning handling, the
+  write policy and "tell the operator the task id" stay exact. A persona is never
+  copied into the `<instruction>` given to `magi task add`: implementers stay
+  neutral. Nothing but the prompt enforces this.
+- **Config lives in `[talk]`**: `[[talk.personas]]` with `id`, `name`, `prompt`.
+  Entries add to the built-ins; a built-in's id overrides it in place; `default`
+  cannot be redefined. `Config::load_layers` validates (non-blank, unique) and,
+  as for any array outside `array_merge_policy`'s append list, two layers
+  declaring it is refused.
+- **The persona is independent of the agent.** Switching it keeps the CLI seat:
+  `Talk::persona_dirty` makes the next turn prefix a `# Persona update` block
+  (a plain-voice notice when going back to `default`), and is cleared only after
+  a turn succeeds. A fresh seat's briefing already carries the persona. A stored
+  id the config no longer has is treated as `default` with a warning.
+- Both new `Talk` fields are `#[serde(default)]`; `talk::SCHEMA` is unchanged.
+
 ### Handing the address over: release, then spawn
 
 `POST /api/upgrade` ends the process it is serving from, and the order of the

@@ -48,6 +48,7 @@ pub mod land;
 pub mod lang;
 pub mod md;
 pub mod notices;
+pub mod persona;
 pub mod proc;
 pub mod prompt;
 pub mod queue;

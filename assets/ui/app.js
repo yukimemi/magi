@@ -64,6 +64,7 @@ const API = {
   talkPendingClear: (id) => `/api/talks/${encodeURIComponent(id)}/pending/clear`,
   talkPendingEdit: (id) => `/api/talks/${encodeURIComponent(id)}/pending/edit`,
   talkClose: (id) => `/api/talks/${encodeURIComponent(id)}/close`,
+  talkPersona: (id) => `/api/talks/${encodeURIComponent(id)}/persona`,
   talkAgent: (id) => `/api/talks/${encodeURIComponent(id)}/agent`,
   talkReopen: (id) => `/api/talks/${encodeURIComponent(id)}/reopen`,
   talkDelete: (id) => `/api/talks/${encodeURIComponent(id)}`,
@@ -620,7 +621,7 @@ const state = {
      reload. A conversation absent from this map has never been opened, so
      every agent turn in it counts as unread. */
   talkReads: loadCollapsed(TALK_READS_KEY),
-  talkDetail: { id: null, talk: null, roster: [] },
+  talkDetail: { id: null, talk: null, roster: [], personas: [] },
   /* Images picked, pasted or dropped for the *next* `talk-say`, not yet part
      of any turn. Each item is `{ localId, previewUrl, name, status,
      serverId, mime, bytes }` with `status` one of `"uploading"` /
@@ -5225,6 +5226,7 @@ async function loadTalk(id) {
     if (state.talkDetail.id !== id) return;
     state.talkDetail.talk = talk;
     state.talkDetail.roster = Array.isArray(talk.roster) ? talk.roster : [];
+    state.talkDetail.personas = Array.isArray(talk.personas) ? talk.personas : [];
     renderTalk();
     ok();
   } catch (error) {
@@ -5236,6 +5238,7 @@ async function loadTalk(id) {
       if (state.talkDetail.id === id) {
         state.talkDetail.talk = null;
         state.talkDetail.roster = [];
+        state.talkDetail.personas = [];
         state.talkDetail.gone = true;
         ok();
         renderTalk();
@@ -5332,6 +5335,7 @@ function renderTalk() {
     show($("talk-reopen-go"), false);
     show($("talk-wait"), false);
     show($("talk-agent-box"), false);
+    show($("talk-persona-box"), false);
     clear($("talk-delete-box"));
     renderTalkThumbs();
     return;
@@ -5403,6 +5407,7 @@ function renderTalk() {
   setText($("talk-send"), uploading ? "Uploading…" : busy ? "Queue next" : "Send");
   renderTalkPending(talk);
   renderTalkAgent(talk, busy);
+  renderTalkPersona(talk, busy);
   show($("talk-wait"), busy);
   renderTalkDelete(talk);
 }
@@ -5431,7 +5436,7 @@ function renderTalkAgent(talk, busy) {
     }
     select.value = talk.agent;
   }
-  select.disabled = busy || talkAgentSwitching
+  select.disabled = busy || talkAgentSwitching || talkPersonaSwitching
     || String(talk.status || "open") !== "open" || roster.length < 2;
 }
 
@@ -5457,6 +5462,56 @@ async function switchTalkAgent() {
     fail(`Could not change the agent: ${error.message}`);
   } finally {
     talkAgentSwitching = false;
+    if (state.talkDetail.id === id) {
+      select.blur();
+      renderTalk();
+    }
+  }
+}
+
+/* The persona selector: a tone for this conversation, independent of the
+   agent. Same rules as the agent selector - left alone while focused, and
+   disabled during a turn, while either change is posting, or once closed. The
+   built-in list always arrives, so it does not depend on the roster. */
+let talkPersonaSwitching = false;
+
+function renderTalkPersona(talk, busy) {
+  const box = $("talk-persona-box");
+  const select = $("talk-persona");
+  const personas = state.talkDetail.personas || [];
+  show(box, personas.length > 0);
+  const current = talk.persona || "default";
+  if (document.activeElement !== select) {
+    clear(select);
+    const ids = personas.map((p) => p.id);
+    const entries = ids.includes(current) ? personas : [{ id: current, name: current }, ...personas];
+    for (const p of entries) select.append(el("option", { value: p.id, text: p.name }));
+    select.value = current;
+  }
+  select.disabled = busy || talkPersonaSwitching || talkAgentSwitching
+    || String(talk.status || "open") !== "open";
+}
+
+async function switchTalkPersona() {
+  const id = state.talkDetail.id;
+  const select = $("talk-persona");
+  const persona = select.value;
+  const current = state.talkDetail.talk;
+  if (!id || !current || persona === (current.persona || "default")) return;
+  talkPersonaSwitching = true;
+  renderTalk();
+  try {
+    const talk = await postJson(API.talkPersona(id), { persona });
+    if (state.talkDetail.id === id) {
+      state.talkDetail.talk = talk;
+      announce(`Persona changed to ${persona}.`);
+    }
+    await loadTalks();
+    ok();
+  } catch (error) {
+    fail(`Could not change the persona: ${error.message}`);
+  } finally {
+    talkPersonaSwitching = false;
     if (state.talkDetail.id === id) {
       select.blur();
       renderTalk();
@@ -5770,7 +5825,7 @@ async function startTalk() {
   try {
     const talk = await postJson(API.talks, {});
     state.talks = sortTalks([talk, ...(state.talks || []).filter((t) => t.id !== talk.id)]);
-    state.talkDetail = { id: talk.id, talk, roster: [] };
+    state.talkDetail = { id: talk.id, talk, roster: [], personas: [] };
     trackTalkThinking(talk);
     renderTalks();
     announce("Conversation opened.");
@@ -8529,13 +8584,13 @@ function applyRoute() {
     if (changed) state.openingTalk = true;
     if (state.talkDetail.id !== route.id) {
       resetTalkAttachments(route.id);
-      state.talkDetail = { id: route.id, talk: null, roster: [] };
+      state.talkDetail = { id: route.id, talk: null, roster: [], personas: [] };
       loadTalk(route.id);
     }
     renderTalk();
   } else if (state.talkDetail.id) {
     resetTalkAttachments(null);
-    state.talkDetail = { id: null, talk: null, roster: [] };
+    state.talkDetail = { id: null, talk: null, roster: [], personas: [] };
   }
 
   /* In the two-pane layout the page itself never scrolls: a new detail starts
@@ -9248,6 +9303,7 @@ function wire() {
   $("talk-say").addEventListener("submit", sendTalkTurn);
   $("talk-close-go").addEventListener("click", closeTalk);
   $("talk-agent").addEventListener("change", switchTalkAgent);
+  $("talk-persona").addEventListener("change", switchTalkPersona);
   $("talk-reopen-go").addEventListener("click", reopenTalk);
   wireRunPanels();
   wireRunTabs();

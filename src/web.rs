@@ -119,6 +119,7 @@ use crate::ask::{self, Answer, Question, Questions};
 use crate::config::{AgentKind, Config, Update, UpdateMode};
 use crate::md;
 use crate::notices::{Notice, Notices};
+use crate::persona;
 use crate::proc::Quiet as _;
 use crate::queue::{Queue, Source, Task, TaskStatus, title_from};
 use crate::run::{RunState, RunStatus};
@@ -910,6 +911,7 @@ impl Ui {
             .route("/api/talks/{id}/pending/clear", post(talk_pending_clear))
             .route("/api/talks/{id}/pending/edit", post(talk_pending_edit))
             .route("/api/talks/{id}/agent", post(talk_agent))
+            .route("/api/talks/{id}/persona", post(talk_persona))
             .route("/api/talks/{id}/close", post(talk_close))
             .route("/api/talks/{id}/reopen", post(talk_reopen))
             // `DefaultBodyLimit` is raised only on this one route - every
@@ -5920,6 +5922,16 @@ struct TalkDetailView {
     /// The agents this talk's repository can switch to; empty when its
     /// configuration cannot be read, which must not fail the whole detail.
     roster: Vec<RosterEntry>,
+    /// The personas the conversation can pick from. The built-ins are always
+    /// listed, even when the repository's configuration cannot be read.
+    personas: Vec<PersonaEntry>,
+}
+
+/// One persona as the talk's persona selector shows it.
+#[derive(Debug, Serialize)]
+struct PersonaEntry {
+    id: String,
+    name: String,
 }
 
 /// One roster agent as the talk's agent selector shows it.
@@ -6020,10 +6032,21 @@ async fn talk_detail(
                     .collect()
             })
             .unwrap_or_default();
+        let specs = Config::discover(&talk.repo, None)
+            .map(|(cfg, _)| cfg.talk.personas)
+            .unwrap_or_default();
+        let personas = persona::catalog(&specs)
+            .into_iter()
+            .map(|p| PersonaEntry {
+                id: p.id,
+                name: p.name,
+            })
+            .collect();
         Ok(Json(TalkDetailView {
             view: TalkView::new(talk, thinking),
             tasks,
             roster,
+            personas,
         }))
     })
     .await
@@ -6623,6 +6646,79 @@ async fn talk_agent(
     // left a durable draft, trusting the claim's owner to drain it. So the
     // claim goes to `drain_loop` whatever the outcome - it releases at once
     // when nothing is queued - rather than being dropped here.
+    let fresh = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || Ok(ui.talks.get(&id)?)).await
+    };
+    let draining = match fresh {
+        Ok(talk) => {
+            let draining = talk.status.open()
+                && (!talk.pending.is_empty() || !talk.pending_attachments.is_empty());
+            let talks = ui.talks.clone();
+            tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+            draining
+        }
+        Err(_) => false,
+    };
+    let talk = switched?;
+    Ok(Json(TalkView::new(talk, draining)))
+}
+
+/// The body of `POST /api/talks/{id}/persona`.
+#[derive(Debug, Deserialize)]
+struct TalkPersona {
+    persona: String,
+}
+
+/// `POST /api/talks/{id}/persona` - choose the conversation's tone. Shaped
+/// like [`talk_agent`]: the turn guard is held for the change and always handed
+/// to `drain_loop`, so a draft left meanwhile is not stranded.
+async fn talk_persona(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    Json(body): Json<TalkPersona>,
+) -> ApiResult<Json<TalkView>> {
+    let id = {
+        let ui = Arc::clone(&ui);
+        blocking(move || resolve_talk(&ui.talks, &id)).await?
+    };
+    let repo = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || Ok(ui.talks.get(&id)?.repo)).await?
+    };
+    let cfg = config_for(&repo).await?;
+    let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
+        return Err(ApiError::conflict(
+            "a talk turn is running; change the persona once it has answered",
+        ));
+    };
+    let switched = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        let cfg = cfg.clone();
+        blocking(move || {
+            let Some(chosen) = persona::find(&cfg.talk.personas, &body.persona) else {
+                return Err(ApiError::bad_request(format!(
+                    "unknown persona `{}`",
+                    body.persona
+                )));
+            };
+            let mut talk = ui.talks.get(&id)?;
+            if !talk.status.open() {
+                return Err(ApiError::conflict(format!(
+                    "talk {} is {} and takes no more turns",
+                    talk.short(),
+                    talk.status.as_str()
+                )));
+            }
+            talk::switch_persona(&mut talk, &ui.talks, &chosen.id)?;
+            Ok(talk)
+        })
+        .await
+    };
+    // As in `talk_agent`: the claim goes to `drain_loop` whatever happened.
     let fresh = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
@@ -8598,6 +8694,87 @@ mod tests {
         let mut closed = talks.get(&id).expect("reload");
         talk::close(&mut closed, &talks).expect("close");
         let refused = call("mock").await.expect_err("closed talk");
+        assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.message);
+    }
+
+    #[tokio::test]
+    async fn talk_persona_round_trips_and_refuses_unknown_busy_or_closed() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::write(
+            repo.join("magi.toml"),
+            format!(
+                "{MOCK_AGENT_TOML}\n[[talk.personas]]\nid = \"gendo\"\nname = \"Gendo\"\nprompt = \"Be cold.\"\n"
+            ),
+        )
+        .expect("write magi.toml");
+        let home = TempDir::new().expect("temp home");
+        let talks = Talks::at(home.path().join("talks"));
+        let ui = Arc::new(
+            Ui::new(
+                Queue::at(home.path().join("queue")),
+                Questions::at(home.path().join("questions")),
+                talks.clone(),
+                home.path().join("runs"),
+                home.path().to_path_buf(),
+                repo.clone(),
+            )
+            .with_worktrees_root(home.path().join("wt")),
+        );
+        let cfg = config_for(&repo).await.expect("discover config");
+        let talk = talk::begin(&talks, &cfg, repo.clone(), Some("mock")).expect("begin talk");
+        let id = talk.id.clone();
+        let call = |persona: &str| {
+            talk_persona(
+                State(Arc::clone(&ui)),
+                Path(id.clone()),
+                Json(TalkPersona {
+                    persona: persona.to_owned(),
+                }),
+            )
+        };
+
+        let unknown = call("nobody").await.expect_err("unknown persona");
+        assert_eq!(
+            unknown.status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            unknown.message
+        );
+
+        {
+            let mut claimed = None;
+            for _ in 0..200 {
+                claimed = ui.begin_talk_turn(&id).expect("claim");
+                if claimed.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let _busy = claimed.expect("free");
+            let busy = call("rei").await.expect_err("busy talk");
+            assert_eq!(busy.status, StatusCode::CONFLICT, "{}", busy.message);
+        }
+        assert_eq!(talks.get(&id).expect("reload").persona, "");
+
+        let Json(view) = call("gendo").await.expect("switch to a configured persona");
+        assert_eq!(view.talk.persona, "gendo");
+        assert_eq!(talks.get(&id).expect("reload").persona, "gendo");
+
+        let detail = talk_detail(State(Arc::clone(&ui)), Path(id.clone()))
+            .await
+            .expect("detail");
+        let ids: Vec<&str> = detail.0.personas.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids.first(), Some(&"default"));
+        assert!(ids.contains(&"rei") && ids.contains(&"gendo"));
+
+        let Json(view) = call("default").await.expect("back to default");
+        assert_eq!(view.talk.persona, "");
+
+        let mut closed = talks.get(&id).expect("reload");
+        talk::close(&mut closed, &talks).expect("close");
+        let refused = call("rei").await.expect_err("closed talk");
         assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.message);
     }
 
