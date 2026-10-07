@@ -1,4 +1,4 @@
-//! End-to-end: `graph.candidates = 1`, the default this repo now ships.
+//! End-to-end: `graph.implementers = 1`, the default this repo now ships.
 //!
 //! Judging is skipped because there is nothing to compare, and that must read
 //! as "no panel was needed" — not as the same collapsed-panel report a real
@@ -15,7 +15,7 @@ common::e2e! {
 async fn a_single_candidate_run_is_uncontested_not_collapsed() {
     let home = common::home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await

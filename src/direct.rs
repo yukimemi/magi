@@ -118,7 +118,7 @@ pub fn config_for(task: &Task, repo: &Path) -> Result<Config> {
         o.apply(&mut cfg);
     }
     if task.solo {
-        cfg.graph.candidates = 1;
+        cfg.graph.implementers = 1;
     }
     Ok(cfg)
 }

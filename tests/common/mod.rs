@@ -676,7 +676,7 @@ pub fn fixture(home: HomeGuard, judges: Judges, require_fix: bool) -> Fixture {
         agents: vec![agent("alpha"), agent("beta"), agent("gamma")],
         roles: Roles::default(),
         graph: Graph {
-            candidates: 3,
+            implementers: 3,
             judges: 3,
             deliberate_rounds: 1,
             reviewers: 2,
@@ -787,7 +787,7 @@ pub fn fixture_with_quota_on_agents_and_candidates(
     candidates: usize,
 ) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, false);
-    fx.config.graph.candidates = candidates;
+    fx.config.graph.implementers = candidates;
     let value = seats.join(",");
     for a in &mut fx.config.agents {
         if quota_agents.contains(&a.id.as_str()) {
@@ -829,7 +829,7 @@ pub fn fixture_with_handover_failures(
     seats: &[&str],
 ) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     let value = seats.join(",");
     for a in &mut fx.config.agents {
         if fail_agents.contains(&a.id.as_str()) {
@@ -903,7 +903,7 @@ pub fn fixture_with_fixer_mentioning_waiting(home: HomeGuard) -> Fixture {
     fx
 }
 
-/// A solo candidate (`graph.candidates = 1`, the shipped default) whose
+/// A solo candidate (`graph.implementers = 1`, the shipped default) whose
 /// reviewers raise a blocking finding every round, no matter what the fixer
 /// does, **and** whose own e2e never passes — so the review loop exhausts
 /// its budget with a real red command in hand and the run ends `Blocked`.
@@ -914,7 +914,7 @@ pub fn fixture_with_fixer_mentioning_waiting(home: HomeGuard) -> Fixture {
 /// it.
 pub fn fixture_always_blocked(home: HomeGuard) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, true);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     fx.config.verify.e2e = vec!["false".to_owned()];
     for a in &mut fx.config.agents {
         a.env
@@ -995,7 +995,7 @@ pub fn fixture_with_review_seat_that_recovers_on_retry(home: HomeGuard, seats: &
 /// three implement calls and a judge/vote wave nothing here asserts on.
 pub fn fixture_with_split_review_vote(home: HomeGuard, split_seat: &str) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     for a in &mut fx.config.agents {
         a.env
             .insert("MOCK_SPLIT_REVIEW_SEAT".to_owned(), split_seat.to_owned());
@@ -1016,7 +1016,7 @@ pub fn fixture_with_split_review_vote(home: HomeGuard, split_seat: &str) -> Fixt
 /// about. Real subprocesses stay real; there are just fewer of them.
 pub fn fixture_that_never_clears(home: HomeGuard, rounds: usize) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, false);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     fx.config.graph.review_rounds = rounds;
     for a in &mut fx.config.agents {
         a.env

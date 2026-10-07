@@ -77,9 +77,9 @@ struct RunOpts {
     /// Config file; defaults to <repo>/magi.toml.
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Parallel implementations.
-    #[arg(short = 'c', long)]
-    candidates: Option<usize>,
+    /// Parallel implementations (`--candidates` is a deprecated alias).
+    #[arg(short = 'c', long, alias = "candidates")]
+    implementers: Option<usize>,
     /// Independent judges.
     #[arg(short = 'j', long)]
     judges: Option<usize>,
@@ -113,7 +113,7 @@ impl RunOpts {
         Self {
             repo: self.repo.or(other.repo),
             config: self.config.or(other.config),
-            candidates: self.candidates.or(other.candidates),
+            implementers: self.implementers.or(other.implementers),
             judges: self.judges.or(other.judges),
             review_rounds: self.review_rounds.or(other.review_rounds),
             merge: self.merge.or(other.merge),
@@ -1106,7 +1106,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let patch = magi::queue::RunOverrides {
                     merge: opts.merge.map(|m| merge_arg_name(m).to_owned()),
-                    candidates: opts.candidates,
+                    candidates: opts.implementers,
                     judges: opts.judges,
                     reviewers: None,
                     review_rounds: opts.review_rounds,
@@ -1119,7 +1119,7 @@ async fn dispatch(command: Command) -> Result<()> {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let overrides = magi::queue::RunOverrides {
                 merge: opts.merge.map(|m| merge_arg_name(m).to_owned()),
-                candidates: opts.candidates,
+                candidates: opts.implementers,
                 judges: opts.judges,
                 reviewers: None,
                 review_rounds: opts.review_rounds,
@@ -5887,7 +5887,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
                 ..
             }) => {
                 assert_eq!(id, vec!["the", "dead", "code"]);
-                assert_eq!(opts.candidates, Some(3));
+                assert_eq!(opts.implementers, Some(3));
             }
             other => panic!("expected RunCmd::Rm carrying --candidates, got {other:?}"),
         }
@@ -5916,14 +5916,39 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
                 ..
             }) => {
                 assert_eq!(id, vec!["the", "dead", "code"]);
-                assert_eq!(opts.candidates, Some(3));
+                assert_eq!(opts.implementers, Some(3));
                 assert_eq!(rm_opts.seed, Some(7));
                 let merged = rm_opts.merge(opts);
-                assert_eq!(merged.candidates, Some(3));
+                assert_eq!(merged.implementers, Some(3));
                 assert_eq!(merged.seed, Some(7));
             }
             other => panic!("expected RunCmd::Rm with flags on both sides, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn implementers_flag_and_its_old_spellings_parse_to_one_value() {
+        use clap::CommandFactory;
+        for flag in ["-c", "--candidates", "--implementers"] {
+            let cli = Cli::try_parse_from(["magi", "run", flag, "4", "do the thing"]).unwrap();
+            match cli.command {
+                Some(Command::Run { opts, .. }) => assert_eq!(opts.implementers, Some(4), "{flag}"),
+                other => panic!("expected Run, got {other:?}"),
+            }
+            let cli = Cli::try_parse_from(["magi", "run", "rm", "the", "code", flag, "2"]).unwrap();
+            match cli.command {
+                Some(Command::Run {
+                    command: Some(RunCmd::Rm { opts, .. }),
+                    ..
+                }) => assert_eq!(opts.implementers, Some(2), "{flag}"),
+                other => panic!("expected Run rm, got {other:?}"),
+            }
+        }
+        let mut cmd = Cli::command();
+        let run = cmd.find_subcommand_mut("run").unwrap();
+        let help = run.render_long_help().to_string();
+        assert!(help.contains("--implementers"), "{help}");
+        assert!(!help.contains("--candidates --"), "{help}");
     }
 
     #[test]

@@ -87,7 +87,7 @@ async fn a_head_with_no_more_blocking_findings_runs_e2e_before_going_clean() {
     // This is a review-loop scenario, not a panel one: a solo candidate skips
     // judging entirely, dropping three implement calls and a judge/vote wave
     // that nothing here asserts on.
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
@@ -239,7 +239,7 @@ common::e2e! {
 async fn each_rounds_verified_head_and_time_stay_pinned_to_that_rounds_own_commit() {
     let _guard = common::home_lock().await;
     let mut fx = fixture(_guard, Judges::Unanimous, true);
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     fx.config.graph.e2e_every_round = true;
     // Distinct from the marker the fixer always leaves (`fixed.txt` is
     // created for every scenario the fixer runs in): round 1's e2e must fail

@@ -172,7 +172,7 @@ async fn a_clean_round_is_unaffected_by_any_of_this() {
     // A review-loop regression guard, not a panel one — see
     // `fixture_that_never_clears`'s doc comment for why a solo candidate is
     // enough and cheaper.
-    fx.config.graph.candidates = 1;
+    fx.config.graph.implementers = 1;
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");

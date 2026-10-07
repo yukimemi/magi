@@ -131,7 +131,7 @@ common::e2e! {
 async fn a_later_candidate_slots_seat_falls_back_past_its_own_position_not_the_roster_front() {
     let _home = common::home_lock().await;
     let mut fx = common::fixture(_home, common::Judges::Unanimous, false);
-    fx.config.graph.candidates = 2;
+    fx.config.graph.implementers = 2;
     // `implementers` rotation gives candidate slot 0 -> alpha, slot 1 ->
     // beta (`Config::resolve_roles`, offset 0). Which *label* each slot lands
     // on is a seeded shuffle (`blind::assign_labels`), so the seat name for
@@ -195,7 +195,7 @@ common::e2e! {
 async fn a_later_candidate_slots_fallback_chain_stops_at_the_rosters_tail_without_wrapping() {
     let _home = common::home_lock().await;
     let mut fx = common::fixture(_home, common::Judges::Unanimous, false);
-    fx.config.graph.candidates = 2;
+    fx.config.graph.implementers = 2;
     let labels = magi::blind::assign_labels(2, fx.config.blind.seed.expect("fixture pins a seed"));
     let seat_for_slot_1 = format!("impl-{}", labels[1]);
     // Slot 1's own agent (`beta`) and the only roster entry after it

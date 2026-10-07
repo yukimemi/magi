@@ -3226,7 +3226,7 @@ fn cooldown_until(quota: &[QuotaLoss], now: Timestamp) -> Option<Timestamp> {
 /// never touched - only the `Config` this one attempt hands to `Runner::start`.
 fn apply_solo(config: &mut Config, task: &Task) {
     if task.solo {
-        config.graph.candidates = 1;
+        config.graph.implementers = 1;
     }
 }
 
@@ -6497,19 +6497,19 @@ mod tests {
         // 1 when one implementation became the default and left the two
         // halves of this test asserting the same thing.
         let mut solo_cfg = Config::default();
-        solo_cfg.graph.candidates = 3;
+        solo_cfg.graph.implementers = 3;
         let mut solo_task = task();
         solo_task.solo = true;
         apply_solo(&mut solo_cfg, &solo_task);
-        assert_eq!(solo_cfg.graph.candidates, 1);
+        assert_eq!(solo_cfg.graph.implementers, 1);
 
         let mut plain_cfg = Config::default();
-        plain_cfg.graph.candidates = 3;
+        plain_cfg.graph.implementers = 3;
         let plain_task = task();
         assert!(!plain_task.solo);
         apply_solo(&mut plain_cfg, &plain_task);
         assert_eq!(
-            plain_cfg.graph.candidates, 3,
+            plain_cfg.graph.implementers, 3,
             "a task that did not ask to run alone keeps the config's candidates"
         );
     }
