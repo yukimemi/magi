@@ -618,7 +618,7 @@ impl Talks {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
         let path = self.turn_path(id);
-        let token = crate::rng::SplitMix64::new(crate::rng::entropy()).uuid_v4();
+        let token = fresh_token();
         if create_turn(&path, &token, now)? {
             return Ok(Some(TurnLease { path, token }));
         }
@@ -686,6 +686,16 @@ impl TurnRecord {
     }
 }
 
+/// A token no other caller in this process shares: `rng::entropy` is the
+/// clock and the pid, so two threads in one clock tick would otherwise get the
+/// same token, and with it the same temp file name and the same identity.
+fn fresh_token() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let seed = crate::rng::entropy() ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    crate::rng::SplitMix64::new(seed).uuid_v4()
+}
+
 fn read_turn(path: &Path) -> Option<TurnRecord> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
@@ -744,7 +754,7 @@ struct TurnLock {
 
 impl TurnLock {
     fn token() -> String {
-        crate::rng::SplitMix64::new(crate::rng::entropy()).uuid_v4()
+        fresh_token()
     }
 
     /// Publish `token` at `path` complete (written privately, then linked), so
