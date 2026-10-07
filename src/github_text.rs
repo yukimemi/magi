@@ -34,7 +34,69 @@ pub fn check(title: &str, body: &str) -> Vec<Violation> {
     out
 }
 
+/// Function words and common verbs of the Latin-script languages most likely
+/// to appear, chosen to avoid ordinary English words.
+const FOREIGN_WORDS: &[&str] = &[
+    "este",
+    "esta",
+    "para",
+    "los",
+    "las",
+    "del",
+    "una",
+    "que",
+    "por",
+    "errores",
+    "corregir",
+    "agrega",
+    "cambio",
+    "solicitudes",
+    "fallidas",
+    "reintentos",
+    "les",
+    "des",
+    "pour",
+    "avec",
+    "dans",
+    "est",
+    "une",
+    "pas",
+    "und",
+    "der",
+    "das",
+    "nicht",
+    "mit",
+    "ein",
+    "eine",
+    "für",
+    "wird",
+    "não",
+    "uma",
+    "della",
+    "che",
+    "con",
+    "fehler",
+    "corrigir",
+    "erreurs",
+];
+
+fn foreign_words(text: &str) -> bool {
+    let words: Vec<String> = text
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let hits = words
+        .iter()
+        .filter(|w| FOREIGN_WORDS.contains(&w.as_str()))
+        .count();
+    hits >= 2 && hits * 4 >= words.len()
+}
+
 fn non_english(text: &str) -> bool {
+    if foreign_words(text) {
+        return true;
+    }
     let letters = text.chars().filter(|c| c.is_alphabetic()).count();
     let foreign = text
         .chars()
@@ -246,5 +308,36 @@ mod tests {
     #[test]
     fn github_text_fixed_fallback_passes() {
         assert!(check(NEUTRAL_TITLE, NEUTRAL_BODY).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod review_round_tests {
+    use super::*;
+
+    #[test]
+    fn latin_script_non_english_is_flagged() {
+        assert!(check("Corregir errores", "fix: retry").contains(&Violation::TitleLanguage));
+        assert!(
+            check(
+                "fix: retries",
+                "Este cambio agrega reintentos para solicitudes fallidas."
+            )
+            .contains(&Violation::BodyLanguage)
+        );
+        assert!(
+            check(
+                "fix: retry failed requests",
+                "Adds retries for failed requests."
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn quoted_json_credentials_are_sensitive() {
+        let body = "Example: {\"password\": \"hunter2\"}";
+        assert!(check("t", body).contains(&Violation::SensitiveData));
+        assert!(!crate::scrub::scrub(body, &Identity::default()).contains("hunter2"));
     }
 }

@@ -1316,7 +1316,12 @@ async fn after_merge_inner(
         );
     }
     let mut decision = parse_decision(&out.text).context("parse the release-bump decision")?;
-    let violations = crate::github_text::check("", &decision.reason);
+    let mut violations = crate::github_text::check("", &decision.reason);
+    // Sensitive-only: span redaction is enough, no rewrite needed.
+    violations.retain(|v| *v != crate::github_text::Violation::SensitiveData);
+    if violations.is_empty() {
+        decision.reason = crate::scrub::scrub(&decision.reason, &crate::scrub::Identity::current());
+    }
     if state.config.graph.github_text_guard && !violations.is_empty() {
         state.event(
             "github-text",

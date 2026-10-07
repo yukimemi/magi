@@ -5933,6 +5933,10 @@ impl Runner {
         {
             violations.push(crate::github_text::Violation::SensitiveData);
         }
+        // Sensitive-only hits are handled by `prepare`'s span redaction; a
+        // rewrite cannot fix them (e.g. a quoted original task) and the
+        // fallback would discard a useful description.
+        violations.retain(|v| *v != crate::github_text::Violation::SensitiveData);
         if self.state.config.graph.github_text_guard && !violations.is_empty() {
             self.state.event(
                 "github-text",

@@ -211,7 +211,41 @@ fn named_identity(rest: &str) -> Option<(usize, &'static str)> {
     None
 }
 
+/// `"password": "value"` and `'token':'value'`: the key is quoted, so the
+/// unquoted `key=` / `key: ` forms below never match.
+fn quoted_credential(rest: &str) -> Option<(usize, &'static str)> {
+    for key in [
+        "password", "token", "api_key", "api-key", "apikey", "secret",
+    ] {
+        let Some(after) = rest
+            .get(..key.len())
+            .filter(|p| p.eq_ignore_ascii_case(key))
+            .map(|_| &rest[key.len()..])
+        else {
+            continue;
+        };
+        let Some(after_quote) = after.strip_prefix(['"', '\'']) else {
+            continue;
+        };
+        let t = after_quote.trim_start();
+        let Some(t) = t.strip_prefix([':', '=']) else {
+            continue;
+        };
+        let value = t.trim_start_matches([' ', '\t', '"', '\'']);
+        let n = run(value, |c| {
+            !c.is_whitespace() && !matches!(c, '`' | '<' | '>' | '"' | '\'' | ',' | '}')
+        });
+        if n > 0 {
+            return Some((rest.len() - value.len() + n, "[redacted-token]"));
+        }
+    }
+    None
+}
+
 fn credential(rest: &str) -> Option<(usize, &'static str)> {
+    if let Some(hit) = quoted_credential(rest) {
+        return Some(hit);
+    }
     for key in [
         "password=",
         "token=",
