@@ -3462,7 +3462,13 @@ struct RolesBody {
     /// The `revision` the client last read.
     revision: String,
     /// Role key to its new ids; an empty list resets the key to its default.
+    #[serde(default)]
     roles: std::collections::BTreeMap<String, Vec<String>>,
+    /// Role key (`implementers`, `judges`, `reviewers`, `advisors`) to its new
+    /// `[graph]` seat count. Kept as raw JSON so a non-integer is refused in
+    /// words (422) instead of as a deserialization error.
+    #[serde(default)]
+    counts: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// `PUT /api/settings/roles` - save role assignments to the machine config.
@@ -3481,6 +3487,7 @@ async fn settings_put_roles(
             ui.machine_config.as_deref(),
             &body.revision,
             &body.roles,
+            &body.counts,
         )
         .map(Json)
         .map_err(|e| match e {
@@ -8306,6 +8313,71 @@ mod tests {
         // The old revision is now stale.
         let stale = f.put("/api/settings/roles", &body).await;
         assert_eq!(stale.status, 409, "{}", stale.body);
+    }
+
+    #[tokio::test]
+    async fn settings_counts_are_reported_and_saved() {
+        let (_tmp, repo, machine) = settings_dirs(
+            &format!("{SETTINGS_AGENTS}\n[graph]\nreviewers = 2\n"),
+            Some("# mine\n[graph]\ncandidates = 2 # seats\n"),
+        );
+        let f = Fixture::with_repo_and_machine(repo, machine.clone()).await;
+        let v = f.get("/api/settings").await.json();
+        let count = |v: &serde_json::Value, k: &str| {
+            v["roles"]
+                .as_array()
+                .and_then(|r| r.iter().find(|x| x["key"] == k))
+                .map(|x| x["count"].clone())
+                .unwrap_or_else(|| panic!("no role {k}: {v}"))
+        };
+        let imp = count(&v, "implementers");
+        assert_eq!(imp["value"], 2);
+        assert_eq!(imp["source"], "machine");
+        assert_eq!(imp["file_key"], "candidates");
+        assert_eq!(imp["roster_len"], 2);
+        assert_eq!(imp["backups"], 0);
+        assert_eq!(count(&v, "judges")["source"], "default");
+        assert_eq!(count(&v, "advisors")["min"], 0);
+        assert_eq!(count(&v, "reviewers")["editable"], false);
+        assert!(
+            count(&v, "reviewers")["locked_reason"]
+                .as_str()
+                .is_some_and(|m| m.contains("graph.reviewers"))
+        );
+        assert!(count(&v, "fixer").is_null());
+        let rev = v["revision"].as_str().expect("revision").to_owned();
+        let body = serde_json::json!({
+            "revision": rev,
+            "roles": { "judges": ["b"] },
+            "counts": { "implementers": 1, "advisors": 0 }
+        })
+        .to_string();
+        let res = f.put("/api/settings/roles", &body).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let text = std::fs::read_to_string(&machine).expect("machine");
+        assert_eq!(
+            text,
+            "# mine\n[graph]\ncandidates = 1 # seats\nadvisors = 0\n\n[roles]\njudges = [\"b\"]\n"
+        );
+        let after = f.get("/api/settings").await.json();
+        assert_eq!(count(&after, "implementers")["value"], 1);
+        assert_eq!(count(&after, "implementers")["backups"], 1);
+        assert_eq!(count(&after, "advisors")["value"], 0);
+        let before = std::fs::read_to_string(&machine).expect("machine");
+        let rev = after["revision"].as_str().expect("revision").to_owned();
+        for counts in [
+            serde_json::json!({ "judges": 0 }),
+            serde_json::json!({ "judges": "x" }),
+            serde_json::json!({ "judges": 2.5 }),
+            serde_json::json!({ "judges": -1 }),
+            serde_json::json!({ "reviewers": 3 }),
+            serde_json::json!({ "bogus": 3 }),
+        ] {
+            let body = serde_json::json!({ "revision": rev, "counts": counts }).to_string();
+            let res = f.put("/api/settings/roles", &body).await;
+            assert_eq!(res.status, 422, "{counts}: {}", res.body);
+            assert_eq!(std::fs::read_to_string(&machine).expect("machine"), before);
+        }
     }
 
     #[tokio::test]

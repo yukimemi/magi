@@ -103,6 +103,63 @@ pub(crate) struct RoleView {
     pub(crate) seats_error: Option<String>,
     /// Synthesizer ids that cannot run here (not in the roster, or not installed).
     pub(crate) skipped: Vec<String>,
+    /// The `[graph]` seat count, for the four roster roles only.
+    pub(crate) count: Option<CountView>,
+}
+
+/// The number of seats a roster role fills (`[graph]`), and how it relates to
+/// the roster: seats beyond the count are the ordered backup list that
+/// `graph::pick_successor` walks when a seat's agent fails.
+#[derive(Debug, Serialize)]
+pub(crate) struct CountView {
+    pub(crate) value: usize,
+    /// Lowest value a save accepts: `0` for advisors (the design stage is
+    /// skipped), `1` otherwise.
+    pub(crate) min: usize,
+    /// The `[graph]` key a save writes (`candidates` when the machine file
+    /// already spells implementers that way).
+    pub(crate) file_key: &'static str,
+    /// `machine`, `repo` or `default`.
+    pub(crate) source: &'static str,
+    pub(crate) source_path: Option<String>,
+    pub(crate) editable: bool,
+    pub(crate) locked_reason: Option<String>,
+    /// Length of the untruncated roster; `None` when roles do not resolve.
+    pub(crate) roster_len: Option<usize>,
+    /// `roster_len - value`, never below zero; `None` with `roster_len`.
+    pub(crate) backups: Option<usize>,
+}
+
+/// The four roles that have a seat count, with the `[graph]` spellings of it.
+const COUNT_KEYS: [&str; 4] = ["implementers", "judges", "reviewers", "advisors"];
+
+fn count_spellings(key: &str) -> &'static [&'static str] {
+    match key {
+        "implementers" => &["implementers", "candidates"],
+        "judges" => &["judges"],
+        "reviewers" => &["reviewers"],
+        _ => &["advisors"],
+    }
+}
+
+fn count_min(key: &str) -> usize {
+    usize::from(key != "advisors")
+}
+
+fn graph_count(cfg: &Config, key: &str) -> usize {
+    match key {
+        "implementers" => cfg.graph.implementers,
+        "judges" => cfg.graph.judges,
+        "reviewers" => cfg.graph.reviewers,
+        _ => cfg.graph.advisors,
+    }
+}
+
+fn declares_count(table: &toml::Table, key: &str) -> bool {
+    table
+        .get("graph")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|g| count_spellings(key).iter().any(|k| g.contains_key(*k)))
 }
 
 #[derive(Debug, Serialize)]
@@ -181,6 +238,14 @@ fn declares(table: &toml::Table, key: &str) -> bool {
         .get("roles")
         .and_then(toml::Value::as_table)
         .is_some_and(|r| r.contains_key(key))
+}
+
+fn key_name(key: &str) -> &'static str {
+    COUNT_KEYS
+        .iter()
+        .find(|k| **k == key)
+        .copied()
+        .unwrap_or("")
 }
 
 fn choice_ids(choice: Option<&AgentChoice>) -> Vec<String> {
@@ -315,7 +380,60 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
             seats: Vec::new(),
             seats_error: None,
             skipped: Vec::new(),
+            count: None,
         };
+        if COUNT_KEYS.contains(&key) {
+            let owner = tables.iter().rev().find(|(_, t)| declares_count(t, key));
+            let (source, source_path) = match owner {
+                Some((p, _)) if is_machine(p) => ("machine", Some(p.display().to_string())),
+                Some((p, _)) => ("repo", Some(p.display().to_string())),
+                None => ("default", None),
+            };
+            let repo_owner = tables
+                .iter()
+                .find(|(p, t)| !is_machine(p) && declares_count(t, key));
+            let (editable, locked_reason) = if let Some((p, _)) = repo_owner {
+                (
+                    false,
+                    Some(format!(
+                        "This repo overrides graph.{key} in {} - edit it there.",
+                        p.display()
+                    )),
+                )
+            } else if machine.is_none() {
+                (false, out.machine.unavailable.clone())
+            } else {
+                (true, None)
+            };
+            let file_key = tables
+                .iter()
+                .find(|(p, _)| is_machine(p))
+                .and_then(|(_, t)| t.get("graph").and_then(toml::Value::as_table))
+                .filter(|g| key == "implementers" && g.contains_key("candidates"))
+                .map_or(key_name(key), |_| "candidates");
+            let roster_len = resolved.as_ref().ok().map(|r| match key {
+                "implementers" => r.implementer_roster.len(),
+                "judges" => r.judge_roster.len(),
+                _ => r.reviewer_roster.len(),
+            });
+            let roster_len = if key == "advisors" {
+                cfg.advisor_roster().ok().map(|r| r.len())
+            } else {
+                roster_len
+            };
+            let value = graph_count(&cfg, key);
+            view.count = Some(CountView {
+                value,
+                min: count_min(key),
+                file_key,
+                source,
+                source_path,
+                editable,
+                locked_reason,
+                roster_len,
+                backups: roster_len.map(|n| n.saturating_sub(value)),
+            });
+        }
         let seats = match key {
             "implementers" => resolved
                 .as_ref()
@@ -424,6 +542,7 @@ pub(crate) fn save(
     machine: Option<&Path>,
     revision: &str,
     roles: &BTreeMap<String, Vec<String>>,
+    counts: &BTreeMap<String, serde_json::Value>,
 ) -> Result<SettingsView, SaveError> {
     let _guard = SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let Some(machine) = machine else {
@@ -446,7 +565,7 @@ pub(crate) fn save(
                 .to_owned(),
         ));
     }
-    if roles.is_empty() {
+    if roles.is_empty() && counts.is_empty() {
         return Err(SaveError::Refused("Nothing to change.".to_owned()));
     }
     let known: Vec<&str> = current.agents.iter().map(|a| a.id.as_str()).collect();
@@ -476,6 +595,39 @@ pub(crate) fn save(
         }
         edits.push((role.key, ids));
     }
+    let mut count_edits: Vec<(&'static str, &'static str, usize)> = Vec::new();
+    for (key, raw) in counts {
+        let Some(count) = current
+            .roles
+            .iter()
+            .find(|r| r.key == key)
+            .and_then(|r| r.count.as_ref())
+        else {
+            return Err(SaveError::Refused(format!(
+                "`{key}` has no seat count this screen edits."
+            )));
+        };
+        if !count.editable {
+            return Err(SaveError::Refused(
+                count
+                    .locked_reason
+                    .clone()
+                    .unwrap_or_else(|| format!("The `{key}` seat count cannot be edited here.")),
+            ));
+        }
+        let Some(n) = raw.as_u64().and_then(|n| usize::try_from(n).ok()) else {
+            return Err(SaveError::Refused(format!(
+                "The {key} seat count must be a whole number, got {raw}."
+            )));
+        };
+        if n < count.min {
+            return Err(SaveError::Refused(format!(
+                "The {key} seat count must be at least {}, got {n}.",
+                count.min
+            )));
+        }
+        count_edits.push((key_name(key), count.file_key, n));
+    }
 
     let original = match std::fs::read_to_string(machine) {
         Ok(text) => text,
@@ -490,6 +642,9 @@ pub(crate) fn save(
     let mut text = original.clone();
     for (key, ids) in &edits {
         text = patch_role(&text, key, ids).map_err(SaveError::Refused)?;
+    }
+    for (key, file_key, n) in &count_edits {
+        text = patch_count(&text, file_key, key, *n).map_err(SaveError::Refused)?;
     }
     let dir = machine
         .parent()
@@ -536,6 +691,16 @@ pub(crate) fn save(
                  it). Nothing was saved.",
                 got.join(", "),
                 ids.join(", ")
+            ))));
+        }
+    }
+    for (key, _, n) in &count_edits {
+        let got = graph_count(&loaded, key);
+        if got != *n {
+            return Err(cleanup(SaveError::Refused(format!(
+                "The change would not take effect as asked: the {key} seat count would be \
+                 {got} instead of {n} (an include or a template in the machine file \
+                 overrides it). Nothing was saved."
             ))));
         }
     }
@@ -701,6 +866,10 @@ fn assigned_key(trimmed: &str) -> Option<(String, usize)> {
 }
 
 fn is_roles_header(trimmed: &str) -> bool {
+    is_table_header(trimmed, "roles")
+}
+
+fn is_table_header(trimmed: &str, name: &str) -> bool {
     let Some(rest) = trimmed.strip_prefix('[') else {
         return false;
     };
@@ -709,7 +878,7 @@ fn is_roles_header(trimmed: &str) -> bool {
     }
     rest.split(']')
         .next()
-        .is_some_and(|n| n.trim().trim_matches(|c| c == '"' || c == '\'') == "roles")
+        .is_some_and(|n| n.trim().trim_matches(|c| c == '"' || c == '\'') == name)
 }
 
 /// What the old value's lines said besides the ids: per line, the ids on it
@@ -914,6 +1083,131 @@ fn patch_role(text: &str, key: &str, ids: &[String]) -> Result<String, String> {
     Ok(out.concat())
 }
 
+/// Set the seat count in the `[graph]` table, leaving every other byte alone.
+///
+/// `file_key` is the spelling to edit when the file already has it
+/// (`candidates` is the deprecated alias of `implementers`); a file that
+/// spells both is refused, as is a value this screen cannot rewrite in place
+/// (template, multi-line, inline `graph = {..}`, dotted `graph.x = ..`). With
+/// no such key the canonical `key` is added after the table's last key, and a
+/// missing `[graph]` is appended at the end.
+fn patch_count(text: &str, file_key: &str, key: &str, n: usize) -> Result<String, String> {
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let spellings = count_spellings(key);
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut st = Scan::default();
+    let mut in_graph = false;
+    let mut in_table = false;
+    let mut header: Option<usize> = None;
+    let mut last_key_end: Option<usize> = None;
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        if !st.open() && trimmed.starts_with('[') {
+            in_table = true;
+            in_graph = header.is_none() && is_table_header(trimmed, "graph");
+            if in_graph {
+                header = Some(i);
+            } else if header.is_some() {
+                break;
+            }
+            i += 1;
+            continue;
+        }
+        if !st.open()
+            && !in_table
+            && (trimmed.starts_with("graph.") || trimmed.starts_with("graph "))
+        {
+            let inline = assigned_key(trimmed).is_some_and(|(k, _)| k == "graph");
+            if inline || trimmed.starts_with("graph.") {
+                return Err(
+                    "`graph` is written as an inline or dotted table, which this screen \
+                     cannot edit. Change it by hand."
+                        .to_owned(),
+                );
+            }
+        }
+        if !st.open()
+            && let Some((name, _)) = assigned_key(trimmed)
+        {
+            let start = i;
+            let first = lines[i].trim_start();
+            let at = first.find('=').map_or(0, |p| p + 1);
+            let mut end = i;
+            scan_line(&first[at..], &mut st);
+            while st.open() && end + 1 < lines.len() {
+                end += 1;
+                scan_line(lines[end], &mut st);
+            }
+            if in_graph {
+                last_key_end = Some(end);
+                if spellings.contains(&name.as_str()) {
+                    found.push((start, end));
+                }
+            }
+            i = end + 1;
+            continue;
+        }
+        if st.open() {
+            scan_line(lines[i], &mut st);
+        }
+        i += 1;
+    }
+    if found.len() > 1 {
+        return Err(format!(
+            "`[graph]` sets `{key}` more than once (it and its alias `candidates`); keep \
+             only one and try again."
+        ));
+    }
+    let mut out: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
+    if let Some(&(start, end)) = found.first() {
+        let body = lines[start..=end].concat();
+        if start != end || body.contains("{{") || body.contains("{%") {
+            return Err(format!(
+                "`{file_key}` is written with a template expression or over several lines, \
+                 which this screen cannot edit without losing it. Change it by hand."
+            ));
+        }
+        let line = lines[start];
+        let eq = line.find('=').unwrap_or(0) + 1;
+        let rest = &line[eq..];
+        let mut scratch = Scan::default();
+        let code_len = scan_line(rest, &mut scratch).unwrap_or(rest.len());
+        let value_end = rest[..code_len].trim_end().len();
+        let lead = rest.len() - rest.trim_start().len();
+        out[start] = format!(
+            "{}{}{n}{}",
+            &line[..eq],
+            &rest[..lead.min(value_end)],
+            &rest[value_end..]
+        );
+        return Ok(out.concat());
+    }
+    let new_line = format!("{key} = {n}{eol}");
+    match (header, last_key_end) {
+        (Some(_), Some(end)) | (Some(end), None) => {
+            if !out[end].ends_with('\n') {
+                out[end].push_str(eol);
+            }
+            out.insert(end + 1, new_line);
+        }
+        (None, _) => {
+            if let Some(last) = out.last_mut()
+                && !last.ends_with('\n')
+            {
+                last.push_str(eol);
+            }
+            if !out.is_empty() {
+                out.push(eol.to_owned());
+            }
+            out.push(format!("[graph]{eol}"));
+            out.push(new_line);
+        }
+    }
+    Ok(out.concat())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1054,6 +1348,7 @@ mod tests {
             Some(&machine),
             &v.revision,
             &BTreeMap::from([("judges".to_owned(), ids(&["b", "a"]))]),
+            &BTreeMap::new(),
         )
         .unwrap();
         let text = std::fs::read_to_string(&machine).unwrap();
@@ -1088,6 +1383,7 @@ mod tests {
             Some(&machine),
             &v.revision,
             &BTreeMap::from([("judges".to_owned(), ids(&["nope"]))]),
+            &BTreeMap::new(),
         )
         .unwrap_err();
         assert!(matches!(err, SaveError::Refused(m) if m.contains("nope")));
@@ -1110,12 +1406,12 @@ mod tests {
         assert!(!j.editable && j.source == "repo");
         let want = BTreeMap::from([("judges".to_owned(), ids(&["b"]))]);
         assert!(matches!(
-            save(&repo, Some(&machine), &v.revision, &want),
+            save(&repo, Some(&machine), &v.revision, &want, &BTreeMap::new()),
             Err(SaveError::Refused(_))
         ));
         let want = BTreeMap::from([("reviewers".to_owned(), ids(&["b"]))]);
         assert!(matches!(
-            save(&repo, Some(&machine), "stale", &want),
+            save(&repo, Some(&machine), "stale", &want, &BTreeMap::new()),
             Err(SaveError::Conflict(_))
         ));
     }
@@ -1192,6 +1488,7 @@ mod tests {
             Some(&machine),
             &v.revision,
             &BTreeMap::from([("judges".to_owned(), ids(&["b"]))]),
+            &BTreeMap::new(),
         )
         .unwrap_err();
         assert!(
@@ -1206,6 +1503,7 @@ mod tests {
             Some(&machine),
             &v.revision,
             &BTreeMap::from([("reviewers".to_owned(), ids(&["b"]))]),
+            &BTreeMap::new(),
         )
         .unwrap();
         let mut layers = vec![machine.clone()];
@@ -1229,6 +1527,7 @@ mod tests {
             Some(&machine),
             &v.revision,
             &BTreeMap::from([("judges".to_owned(), ids(&[&first]))]),
+            &BTreeMap::new(),
         )
         .unwrap();
         let text = std::fs::read_to_string(&machine).unwrap();
@@ -1271,5 +1570,125 @@ mod tests {
             why.starts_with("This repo overrides roles.judges in "),
             "{why}"
         );
+    }
+
+    #[test]
+    fn patch_count_replaces_in_place_and_keeps_the_rest() {
+        let src =
+            "# top\n[graph]\n# seats\njudges   =   3   # three\nreviewers = 2\n\n[vars]\nx = 1\n";
+        let out = patch_count(src, "judges", "judges", 5).unwrap();
+        assert_eq!(
+            out,
+            "# top\n[graph]\n# seats\njudges   =   5   # three\nreviewers = 2\n\n[vars]\nx = 1\n"
+        );
+    }
+
+    #[test]
+    fn patch_count_keeps_the_alias_spelling() {
+        let src = "[graph]\ncandidates = 2\n";
+        let out = patch_count(src, "candidates", "implementers", 4).unwrap();
+        assert_eq!(out, "[graph]\ncandidates = 4\n");
+        assert!(!out.contains("implementers"));
+    }
+
+    #[test]
+    fn patch_count_refuses_both_spellings() {
+        let src = "[graph]\ncandidates = 2\nimplementers = 3\n";
+        assert!(patch_count(src, "implementers", "implementers", 4).is_err());
+    }
+
+    #[test]
+    fn patch_count_adds_the_key_after_the_last_graph_key() {
+        let src = "[graph]\nreviewers = 2 # r\n\n[roles]\njudges = [\"a\"]\n";
+        let out = patch_count(src, "judges", "judges", 2).unwrap();
+        assert_eq!(
+            out,
+            "[graph]\nreviewers = 2 # r\njudges = 2\n\n[roles]\njudges = [\"a\"]\n"
+        );
+        let empty = patch_count("[graph]\n", "advisors", "advisors", 0).unwrap();
+        assert_eq!(empty, "[graph]\nadvisors = 0\n");
+    }
+
+    #[test]
+    fn patch_count_creates_a_missing_graph_table_and_keeps_crlf() {
+        let out = patch_count("# c\n[roles]\njudges = [\"a\"]", "judges", "judges", 2).unwrap();
+        assert_eq!(
+            out,
+            "# c\n[roles]\njudges = [\"a\"]\n\n[graph]\njudges = 2\n"
+        );
+        assert_eq!(
+            patch_count("", "judges", "judges", 2).unwrap(),
+            "[graph]\njudges = 2\n"
+        );
+        let crlf = patch_count("[graph]\r\nreviewers = 2\r\n", "judges", "judges", 2).unwrap();
+        assert_eq!(crlf, "[graph]\r\nreviewers = 2\r\njudges = 2\r\n");
+    }
+
+    #[test]
+    fn patch_count_refuses_what_it_cannot_rewrite_in_place() {
+        assert!(patch_count("[graph]\njudges = {{ vars.n }}\n", "judges", "judges", 2).is_err());
+        assert!(patch_count("graph = { judges = 2 }\n", "judges", "judges", 3).is_err());
+        assert!(patch_count("graph.judges = 2\n", "judges", "judges", 3).is_err());
+        assert!(patch_count("[graph]\njudges = \\\n", "judges", "judges", 3).is_ok());
+    }
+
+    #[test]
+    fn save_writes_a_count_through_the_alias_and_refuses_bad_ones() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("magi.toml"),
+            "[[agents]]\nid = \"a\"\nkind = \"command\"\ncommand = [\"true\"]\n",
+        )
+        .unwrap();
+        let machine = tmp.path().join("m").join("magi").join("config.toml");
+        std::fs::create_dir_all(machine.parent().unwrap()).unwrap();
+        std::fs::write(&machine, "[graph]\ncandidates = 1 # old\n").unwrap();
+        let v = view(&repo, Some(&machine));
+        let c = |n: serde_json::Value| BTreeMap::from([("implementers".to_owned(), n)]);
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(2.5),
+            serde_json::json!("x"),
+            serde_json::json!(-1),
+        ] {
+            let err = save(
+                &repo,
+                Some(&machine),
+                &v.revision,
+                &BTreeMap::new(),
+                &c(bad),
+            )
+            .unwrap_err();
+            assert!(matches!(err, SaveError::Refused(_)), "{err:?}");
+        }
+        save(
+            &repo,
+            Some(&machine),
+            &v.revision,
+            &BTreeMap::new(),
+            &c(serde_json::json!(2)),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&machine).unwrap(),
+            "[graph]\ncandidates = 2 # old\n"
+        );
+        let after = view(&repo, Some(&machine));
+        let count = after.roles[0].count.as_ref().unwrap();
+        assert_eq!(
+            (count.value, count.file_key, count.backups),
+            (2, "candidates", Some(0))
+        );
+        // Advisors may be zero.
+        save(
+            &repo,
+            Some(&machine),
+            &after.revision,
+            &BTreeMap::new(),
+            &BTreeMap::from([("advisors".to_owned(), serde_json::json!(0))]),
+        )
+        .unwrap();
     }
 }
