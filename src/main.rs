@@ -5099,6 +5099,12 @@ mod tests {
 
     impl NoMachineConfig {
         fn set() -> Self {
+            Self::set_dir("")
+        }
+
+        /// As [`NoMachineConfig::set`], but the machine layer is the one
+        /// under `dir` (`<dir>/magi/config.toml`).
+        fn set_dir(dir: &str) -> Self {
             let lock = NO_MACHINE_CONFIG_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5108,7 +5114,7 @@ mod tests {
             // `MAGI_CONFIG_DIR` - the same reasoning `web::tests::
             // recheck_never_spawns_when_checking_is_off_or_killed_by_env`
             // relies on for its own, differently-named env var.
-            unsafe { std::env::set_var(Config::CONFIG_DIR_ENV, "") };
+            unsafe { std::env::set_var(Config::CONFIG_DIR_ENV, dir) };
             Self {
                 previous,
                 _lock: lock,
@@ -5321,7 +5327,35 @@ mod tests {
 
     #[tokio::test]
     async fn task_add_refuses_a_duplicate_until_forced() {
+        // The judge is an agent: a machine-layer agent that answers
+        // "duplicate" stands in for it, so the refusal is the judge's.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cfg_dir.path().join("magi")).unwrap();
+        std::fs::write(
+            cfg_dir.path().join("magi").join("config.toml"),
+            r#"[[agents]]
+id = "mock"
+kind = "command"
+command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reason\":\"same branch\"}"']
+"#,
+        )
+        .unwrap();
+        let _guard = NoMachineConfig::set_dir(cfg_dir.path().to_str().unwrap());
         let (_repo_dir, repo) = scratch_repo().await;
+        // Config is read from `origin/main`, so the repo needs one.
+        let origin = tempfile::tempdir().unwrap();
+        magi::git::git(origin.path(), &["init", "--bare", "-b", "main"])
+            .await
+            .unwrap();
+        let url = origin.path().to_str().unwrap();
+        for args in [
+            vec!["remote", "add", "origin", url],
+            vec!["commit", "--allow-empty", "-m", "init"],
+            vec!["push", "origin", "main"],
+            vec!["fetch", "origin"],
+        ] {
+            magi::git::git(&repo, &args).await.unwrap();
+        }
         let queue_dir = tempfile::tempdir().unwrap();
         let q = Queue::at(queue_dir.path().join("queue"));
         let mut owner = Task::new(
