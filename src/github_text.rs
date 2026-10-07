@@ -302,6 +302,20 @@ const ENGLISH_WORDS: &[&str] = &[
 ];
 
 fn english_words(text: &str) -> (usize, usize) {
+    // A conventional-commit prefix (`fix(scope)!:`) says nothing about the
+    // language; drop it from the raw text, before punctuation is flattened.
+    let t = text.trim_start();
+    let kind = t.chars().take_while(|c| c.is_ascii_lowercase()).count();
+    let mut rest = &t[kind..];
+    if kind > 0 && rest.starts_with('(') {
+        rest = rest.find(')').map_or(rest, |i| &rest[i + 1..]);
+    }
+    let rest = rest.strip_prefix('!').unwrap_or(rest);
+    let text = if kind > 0 && rest.starts_with(':') {
+        &rest[1..]
+    } else {
+        text
+    };
     let cleaned: String = text
         .chars()
         .map(|c| {
@@ -313,17 +327,7 @@ fn english_words(text: &str) -> (usize, usize) {
         })
         .collect();
     let (mut counted, mut hits) = (0, 0);
-    // A conventional-commit prefix (`fix(scope):`) says nothing about the language.
-    let mut tokens = cleaned.split_whitespace().peekable();
-    if let Some(first) = tokens.peek()
-        && first.ends_with(':')
-        && first.len() > 1
-        && first[..first.len() - 1]
-            .chars()
-            .all(|c| c.is_ascii_lowercase())
-    {
-        tokens.next();
-    }
+    let tokens = cleaned.split_whitespace();
     for raw in tokens {
         let w = raw.trim_matches(|c| c == ':' || c == '.');
         if w.len() < 2 || !w.chars().all(|c| c.is_ascii_alphabetic()) {
