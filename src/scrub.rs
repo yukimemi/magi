@@ -231,10 +231,19 @@ fn quoted_credential(rest: &str) -> Option<(usize, &'static str)> {
         let Some(t) = t.strip_prefix([':', '=']) else {
             continue;
         };
-        let value = t.trim_start_matches([' ', '\t', '"', '\'']);
-        let n = run(value, |c| {
-            !c.is_whitespace() && !matches!(c, '`' | '<' | '>' | '"' | '\'' | ',' | '}')
-        });
+        let t = t.trim_start();
+        // A quoted value runs to its closing quote and may hold spaces or commas.
+        let n = match t.chars().next() {
+            Some(q @ ('"' | '\'')) => {
+                let inner = &t[1..];
+                let end = inner.find(q).unwrap_or(inner.len());
+                1 + end + usize::from(end < inner.len())
+            }
+            _ => run(t, |c| {
+                !c.is_whitespace() && !matches!(c, '`' | '<' | '>' | ',' | '}')
+            }),
+        };
+        let value = t;
         if n > 0 {
             return Some((rest.len() - value.len() + n, "[redacted-token]"));
         }

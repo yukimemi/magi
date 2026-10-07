@@ -341,3 +341,20 @@ mod review_round_tests {
         assert!(!crate::scrub::scrub(body, &Identity::default()).contains("hunter2"));
     }
 }
+
+#[cfg(test)]
+mod quoted_value_tests {
+    use crate::scrub::{Identity, scrub};
+
+    #[test]
+    fn quoted_values_are_redacted_whole() {
+        for v in ["correct horse battery staple", ",hunter2"] {
+            let out = scrub(
+                &format!("{{\"password\": \"{v}\"}} ok"),
+                &Identity::default(),
+            );
+            assert!(!out.contains("horse") && !out.contains("hunter2"), "{out}");
+            assert!(out.ends_with("ok"), "{out}");
+        }
+    }
+}
