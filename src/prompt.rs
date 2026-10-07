@@ -1969,7 +1969,7 @@ fn conduct_task_block(t: &ConductTask) -> String {
 }
 
 /// Longest instruction the duplicate-work judge is given, in characters. A
-/// longer one is never truncated: it is let through unjudged.
+/// longer one keeps its head and tail, with the cut marked.
 pub const DUPES_JUDGE_MAX_CHARS: usize = 6000;
 
 /// Heading of the duplicate-work judge's prompt; the test mock agent

@@ -310,14 +310,7 @@ pub async fn screen(
         tracing::warn!(hits = hits.len(), %why, "duplicate check: judgement unavailable, letting the work through");
         Ok(Screened::Unjudged(why))
     };
-    // A judge that has not seen the whole text cannot rule on it.
-    if text.chars().count() > prompt::DUPES_JUDGE_MAX_CHARS {
-        return unjudged(format!(
-            "the text is longer than {} characters, too long to judge in full",
-            prompt::DUPES_JUDGE_MAX_CHARS
-        ));
-    }
-    let mut subject = text.to_owned();
+    let mut subject = squeeze(text, prompt::DUPES_JUDGE_MAX_CHARS);
     if let Some(b) = review_branch {
         if !subject.is_empty() {
             subject.push_str("\n\n");
@@ -756,10 +749,24 @@ fn describe_forge_hits(repo: &Path, hits: &mut [Hit]) {
     }
 }
 
+/// Keep the head and the tail of `s` within `max` characters, marking the cut.
+/// A long instruction often has background first and the concrete change last,
+/// so dropping only the end would lose exactly what the judge compares.
+fn squeeze(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_owned();
+    }
+    let half = max / 2;
+    let head: String = s.chars().take(half).collect();
+    let tail: String = s.chars().skip(n - half).collect();
+    format!("{head}\n[... {} characters omitted ...]\n{tail}", n - 2 * half)
+}
+
 /// The owner's work for the judge: its title (when it has one) and its
-/// instruction with whitespace collapsed, cut to 400 characters. The whole
-/// instruction is used, not its first line: a heading such as `# Task` says
-/// nothing about what the work is.
+/// instruction with whitespace collapsed, keeping the head and the tail when
+/// it is long. The whole instruction is used, not its first line: a heading
+/// such as `# Task` says nothing about what the work is.
 fn about_of(title: &str, instruction: &str) -> String {
     let body = instruction.split_whitespace().collect::<Vec<_>>().join(" ");
     let title = title.trim();
@@ -768,12 +775,11 @@ fn about_of(title: &str, instruction: &str) -> String {
         (false, true) => title.to_owned(),
         (false, false) => format!("{title}: {body}"),
     };
-    let mut out: String = full.chars().take(400).collect();
-    if full.chars().count() > 400 {
-        out.push('…');
-    }
-    out
+    squeeze(&full, ABOUT_MAX_CHARS)
 }
+
+/// Longest description of one owner's work given to the judge.
+const ABOUT_MAX_CHARS: usize = 2000;
 
 fn task_claims(
     t: &Task,
@@ -1528,12 +1534,12 @@ mod tests {
     }
 
     #[test]
-    fn a_text_too_long_to_judge_in_full_passes_without_asking() {
+    fn a_text_too_long_is_squeezed_and_still_judged() {
         let f = fx_with_run();
         let long = format!("{NAMES} {}", "x".repeat(prompt::DUPES_JUDGE_MAX_CHARS));
         let (out, calls) = judged(&f, &long, || verdict(false));
-        assert!(matches!(out, Ok(Screened::Unjudged(w)) if w.contains("too long to judge")));
-        assert_eq!(calls, 0);
+        assert!(matches!(out, Ok(Screened::Cleared(_))));
+        assert_eq!(calls, 1);
     }
 
     #[test]
@@ -1562,6 +1568,8 @@ mod tests {
             "Retries: # Task Fix auth retries"
         );
         assert_eq!(about_of("", "x"), "x");
-        assert_eq!(about_of("", &"y".repeat(500)).chars().count(), 401);
+        let long = format!("{} TAIL", "y ".repeat(3000));
+        let a = about_of("", &long);
+        assert!(a.ends_with("TAIL") && a.chars().count() < 2100, "{a}");
     }
 }
