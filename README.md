@@ -137,6 +137,8 @@ any command you point it at. It spends your existing plan and nothing else.
 
 ## Use
 
+Help and usage errors are coloured; `--no-color`, `NO_COLOR` or a pipe makes them plain.
+
 ```sh
 magi                          # the observation deck (see below)
 magi init                     # write a starter magi.toml
