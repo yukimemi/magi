@@ -313,7 +313,18 @@ fn english_words(text: &str) -> (usize, usize) {
         })
         .collect();
     let (mut counted, mut hits) = (0, 0);
-    for raw in cleaned.split_whitespace() {
+    // A conventional-commit prefix (`fix(scope):`) says nothing about the language.
+    let mut tokens = cleaned.split_whitespace().peekable();
+    if let Some(first) = tokens.peek()
+        && first.ends_with(':')
+        && first.len() > 1
+        && first[..first.len() - 1]
+            .chars()
+            .all(|c| c.is_ascii_lowercase())
+    {
+        tokens.next();
+    }
+    for raw in tokens {
         let w = raw.trim_matches(|c| c == ':' || c == '.');
         if w.len() < 2 || !w.chars().all(|c| c.is_ascii_alphabetic()) {
             continue;
@@ -349,7 +360,7 @@ fn english_words(text: &str) -> (usize, usize) {
 
 fn lacks_english(text: &str) -> bool {
     let (counted, hits) = english_words(text);
-    (counted >= 2 && hits == 0) || (counted >= 3 && hits * 4 < counted)
+    (counted >= 2 && hits == 0) || (counted >= 4 && hits * 3 < counted)
 }
 
 fn foreign_words(text: &str) -> bool {
