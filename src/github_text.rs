@@ -229,7 +229,11 @@ mod tests {
             "Fix `cache\n\n日本語の説明を書きます。",
             "Fix `cache 日本語の説明を書きます。",
         ] {
-            assert_eq!(check("fix: retries", body), vec![Violation::BodyLanguage], "{body}");
+            assert_eq!(
+                check("fix: retries", body),
+                vec![Violation::BodyLanguage],
+                "{body}"
+            );
         }
         for body in [
             "Add retries. `日本語の識別子`",
