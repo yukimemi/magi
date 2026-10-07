@@ -737,24 +737,48 @@ fn create_turn(path: &Path, token: &str, now: Timestamp) -> Result<bool> {
 /// The short exclusive lock every change to an existing lease (takeover, beat,
 /// release) happens under, so none of them can act on a stale reading. It
 /// ages out after [`TAKEOVER_LOCK_TTL`] in case its holder died inside it.
-struct TurnLock(PathBuf);
+struct TurnLock {
+    path: PathBuf,
+    token: String,
+}
 
 impl TurnLock {
+    fn token() -> String {
+        crate::rng::SplitMix64::new(crate::rng::entropy()).uuid_v4()
+    }
+
     fn take(lease: &Path) -> Result<Option<Self>> {
-        let lock = lease.with_extension("turn.lock");
-        if create_exclusive(&lock, "")? {
-            return Ok(Some(Self(lock)));
+        let path = lease.with_extension("turn.lock");
+        let token = Self::token();
+        if create_exclusive(&path, &token)? {
+            return Ok(Some(Self { path, token }));
         }
-        let aged = std::fs::metadata(&lock)
+        let seen = std::fs::read_to_string(&path).ok();
+        let aged = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age > TAKEOVER_LOCK_TTL);
-        if aged {
-            let _ = std::fs::remove_file(&lock);
-            if create_exclusive(&lock, "")? {
-                return Ok(Some(Self(lock)));
-            }
+        if !aged {
+            return Ok(None);
+        }
+        // Move the old lock aside rather than delete it: the rename is what
+        // one of several takers wins. Then check what was moved is the lock
+        // we judged dead; if a faster taker's fresh lock was moved instead,
+        // put it back and lose.
+        let aside = path.with_extension(format!("lock.{token}.dead"));
+        if std::fs::rename(&path, &aside).is_err() {
+            return Ok(None);
+        }
+        let moved = std::fs::read_to_string(&aside).ok();
+        if moved != seen {
+            let _ = std::fs::hard_link(&aside, &path);
+            let _ = std::fs::remove_file(&aside);
+            return Ok(None);
+        }
+        let _ = std::fs::remove_file(&aside);
+        if create_exclusive(&path, &token)? {
+            return Ok(Some(Self { path, token }));
         }
         Ok(None)
     }
@@ -774,7 +798,10 @@ impl TurnLock {
 
 impl Drop for TurnLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        // Only our own lock: one that aged out and was taken over is not ours.
+        if std::fs::read_to_string(&self.path).is_ok_and(|t| t == self.token) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 

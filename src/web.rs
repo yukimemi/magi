@@ -968,6 +968,15 @@ enum TalkTurnStart {
 }
 
 impl TalkTurnGuard {
+    /// Does this guard still own the on-disk lease? A transient failure to
+    /// check counts as owning: the next beat decides. A guard that lost it
+    /// must not start another turn on the same session.
+    fn owns(&self) -> bool {
+        self.lease
+            .as_ref()
+            .is_none_or(|lease| !matches!(lease.beat(), Ok(false)))
+    }
+
     /// `talk::respond` while renewing the on-disk lease, so a turn longer
     /// than the lease's TTL still reads as held to other processes.
     async fn respond(
@@ -6394,6 +6403,16 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
     // is the exact gap `release` exists to close.
     let mut turn = Some(turn);
     loop {
+        if !turn.as_ref().is_some_and(TalkTurnGuard::owns) {
+            // The lease was taken over while a turn ran. Whatever is queued
+            // stays a draft; running it here would race the new owner.
+            tracing::warn!("talk {id} lost its turn lease; not draining further");
+            let mut live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(turn) = turn.take() {
+                turn.release(&mut live);
+            }
+            break;
+        }
         // `talk::drain` takes the store lock and can write/rename the talk
         // file. Keep the turn mutex out of that synchronous work: it protects
         // every talk's in-memory claim, not this talk's disk operation.
