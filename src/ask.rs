@@ -56,7 +56,7 @@ use crate::run::RunStatus;
 /// "no conversation yet" rather than "unreadable", and a strict equality check
 /// would turn every bump into an upgrade that breaks reading yesterday's
 /// question files.
-pub const SCHEMA: u32 = 6;
+pub const SCHEMA: u32 = 7;
 
 /// How often the wait re-reads the question file.
 ///
@@ -358,6 +358,12 @@ pub struct Turn {
     pub body: String,
     /// When they said it.
     pub at: Timestamp,
+    /// A deputy's own report beside a settle: side effects it caused and
+    /// requests it could not carry out. The deputy's claim, never checked by
+    /// magi, and kept apart from `body` so the verified "Settled as" line and
+    /// this self-report cannot be mistaken for each other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Who is keeping watch over an open question.
@@ -753,7 +759,13 @@ impl Question {
     /// `quote` appears verbatim in something the owner said; the quote is
     /// kept in the thread as an agent turn so the record shows what the
     /// decision rests on.
-    pub fn settle_by_deputy(&mut self, seat: &str, label: &str, quote: &str) -> Result<()> {
+    pub fn settle_by_deputy(
+        &mut self,
+        seat: &str,
+        label: &str,
+        quote: &str,
+        note: Option<&str>,
+    ) -> Result<()> {
         let Some(deputy) = &self.deputy else {
             bail!("question {} has no deputy", self.short());
         };
@@ -828,6 +840,10 @@ impl Question {
             who: Who::Agent,
             body: format!("Settled as `{label}` on the owner's words: \"{quote}\""),
             at: Timestamp::now(),
+            note: note
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned),
         });
         self.delivered_turns = self.thread.len();
         self.answer(Answer::Choice(label.to_owned()))
@@ -864,6 +880,7 @@ impl Question {
             who: Who::Operator,
             body,
             at: Timestamp::now(),
+            note: None,
         });
         Ok(())
     }
@@ -902,6 +919,7 @@ impl Question {
             who: Who::Agent,
             body,
             at: Timestamp::now(),
+            note: None,
         });
         // The agent has read everything up to its own reply - but only if
         // nothing the owner said in the meantime is still unread. A second say
@@ -2823,6 +2841,7 @@ mod tests {
             who,
             body: body.to_owned(),
             at,
+            note: None,
         }
     }
 
@@ -2873,15 +2892,15 @@ mod tests {
             .unwrap();
         q.say(" Merge it please ").unwrap();
         assert!(
-            q.settle_by_deputy("deputy-x", "merge", "   ").is_err(),
+            q.settle_by_deputy("deputy-x", "merge", "   ", None).is_err(),
             "an empty quote is refused"
         );
         assert!(
-            q.settle_by_deputy("deputy-x", "merge", "ship it").is_err(),
+            q.settle_by_deputy("deputy-x", "merge", "ship it", None).is_err(),
             "a quote the owner never said is refused"
         );
         assert_eq!(q.status, QuestionStatus::Open);
-        q.settle_by_deputy("deputy-x", "merge", "Merge it please")
+        q.settle_by_deputy("deputy-x", "merge", "Merge it please", None)
             .unwrap();
         assert_eq!(q.resolution().as_deref(), Some("merge"));
     }
@@ -2907,18 +2926,18 @@ mod tests {
         approval.say("マージしていいよ").unwrap();
         assert!(
             approval
-                .settle_by_deputy("deputy-x", "merge", "ぜひマージして")
+                .settle_by_deputy("deputy-x", "merge", "ぜひマージして", None)
                 .is_err(),
             "a quote the owner never said is refused"
         );
         approval
-            .settle_by_deputy("deputy-x", "merge", "マージしていいよ")
+            .settle_by_deputy("deputy-x", "merge", "マージしていいよ", None)
             .unwrap();
 
         let mut esc = mk(vec!["rerun again".into(), "hold".into(), "leave it".into()]);
         assert!(!crate::deputy::merge_gated(&esc));
         esc.say("もう監視はいらない").unwrap();
-        esc.settle_by_deputy("deputy-x", "leave it", "監視はいらない")
+        esc.settle_by_deputy("deputy-x", "leave it", "監視はいらない", None)
             .unwrap();
         assert_eq!(esc.resolution().as_deref(), Some("leave it"));
     }
@@ -2929,18 +2948,93 @@ mod tests {
         q.say("マージしていいよ。残りのレビュー指摘はフォローアップタスクとして積んで")
             .unwrap();
         assert!(
-            q.settle_by_deputy("deputy-x", "merge", "どこかの言葉")
+            q.settle_by_deputy("deputy-x", "merge", "どこかの言葉", None)
                 .is_err(),
             "the quote must be the owner's"
         );
         assert!(
-            q.settle_by_deputy("deputy-x", "hold", "マージしていいよ")
+            q.settle_by_deputy("deputy-x", "hold", "マージしていいよ", None)
                 .is_err(),
             "`hold` still needs the whole message"
         );
-        q.settle_by_deputy("deputy-x", "merge", "マージしていいよ")
+        q.settle_by_deputy("deputy-x", "merge", "マージしていいよ", None)
             .unwrap();
         assert_eq!(q.resolution().as_deref(), Some("merge"));
+    }
+
+    fn settle_ready() -> Question {
+        let mut q = Question::new(
+            "task".to_owned(),
+            "conduct".to_owned(),
+            "conduct".to_owned(),
+            "Done?".to_owned(),
+            String::new(),
+            vec!["yes".to_owned(), "no".to_owned()],
+        );
+        let mut seat = crate::agent::SeatState::new("deputy-x", "alpha", 1);
+        seat.turns = 1;
+        let mut dep = Deputy::new("brief".to_owned());
+        dep.seat = Some(seat);
+        q.deputy = Some(dep);
+        q.say("setup done, and file a follow-up").unwrap();
+        q
+    }
+
+    #[test]
+    fn a_settle_note_is_stored_on_the_turn_through_update_and_reads_back() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Questions::at(dir.path().join("questions"));
+        let mut q = settle_ready();
+        let id = q.id.clone();
+        store.put(&mut q).unwrap();
+        store
+            .update(&id, |q| {
+                q.settle_by_deputy("deputy-x", "yes", "setup done", Some("  no follow-up was queued  "))
+            })
+            .unwrap();
+        let back = store.get(&id).unwrap();
+        let turn = back.thread.last().unwrap();
+        assert_eq!(turn.who, Who::Agent);
+        assert!(turn.body.starts_with("Settled as `yes`"));
+        assert_eq!(turn.note.as_deref(), Some("no follow-up was queued"));
+        assert_eq!(back.thread[0].note, None);
+    }
+
+    #[test]
+    fn an_empty_or_blank_settle_note_is_no_note() {
+        for note in [None, Some(""), Some("  \n ")] {
+            let mut q = settle_ready();
+            q.settle_by_deputy("deputy-x", "yes", "setup done", note)
+                .unwrap();
+            assert_eq!(q.thread.last().unwrap().note, None, "{note:?}");
+            let json = serde_json::to_string(&q).unwrap();
+            assert!(!json.contains("\"note\""), "no key when there is none");
+        }
+    }
+
+    #[test]
+    fn a_refused_settle_leaves_no_note_behind() {
+        let mut q = settle_ready();
+        let before = q.thread.clone();
+        assert!(
+            q.settle_by_deputy("deputy-x", "yes", "never said this", Some("n"))
+                .is_err()
+        );
+        assert!(
+            q.settle_by_deputy("someone-else", "yes", "setup done", Some("n"))
+                .is_err()
+        );
+        assert_eq!(q.thread, before);
+        assert_eq!(q.status, QuestionStatus::Open);
+    }
+
+    #[test]
+    fn a_turn_written_before_notes_existed_still_reads() {
+        let t: Turn = serde_json::from_str(
+            r#"{"who":"agent","body":"old","at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(t.note, None);
     }
 
     #[test]
@@ -2950,7 +3044,7 @@ mod tests {
         q.reply("sure?", vec!["merge".into(), "hold".into()])
             .unwrap();
         q.say("wait, hold off").unwrap();
-        assert!(q.settle_by_deputy("deputy-x", "merge", "merge").is_err());
+        assert!(q.settle_by_deputy("deputy-x", "merge", "merge", None).is_err());
         assert_eq!(q.status, QuestionStatus::Open);
     }
 
@@ -2972,21 +3066,21 @@ mod tests {
         q.say("setup done, go ahead").unwrap();
 
         assert!(
-            q.settle_by_deputy("someone-else", "yes", "setup done")
+            q.settle_by_deputy("someone-else", "yes", "setup done", None)
                 .is_err()
         );
         assert!(
-            q.settle_by_deputy("deputy-x", "maybe", "setup done")
+            q.settle_by_deputy("deputy-x", "maybe", "setup done", None)
                 .is_err()
         );
         assert!(
-            q.settle_by_deputy("deputy-x", "yes", "never said this")
+            q.settle_by_deputy("deputy-x", "yes", "never said this", None)
                 .is_err()
         );
-        assert!(q.settle_by_deputy("deputy-x", "yes", "  ").is_err());
+        assert!(q.settle_by_deputy("deputy-x", "yes", "  ", None).is_err());
         assert_eq!(q.status, QuestionStatus::Open);
 
-        q.settle_by_deputy("deputy-x", "yes", "setup done").unwrap();
+        q.settle_by_deputy("deputy-x", "yes", "setup done", None).unwrap();
         assert_eq!(q.status, QuestionStatus::Answered);
         assert_eq!(q.resolution().as_deref(), Some("yes"));
         let last = q.thread.last().unwrap();

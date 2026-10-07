@@ -734,6 +734,7 @@ mod tests {
             who: Who::Agent,
             body: "context".into(),
             at: ts(4000),
+            note: None,
         });
         q.delivered_turns = 1;
         assert_eq!(decide(&q, None, false, 86_400, ts(4500)), Action::Idle);

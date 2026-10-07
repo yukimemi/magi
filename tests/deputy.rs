@@ -464,6 +464,49 @@ async fn a_non_verbatim_quote_is_refused_and_the_question_stays_open() {
 }
 
 common::e2e! {
+async fn a_settle_note_naming_the_filed_task_lands_on_the_thread() {
+    let s = scene(home_lock().await);
+    let land = file_land(&s.store, "Merge #7?");
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    let say = "マージしていいよ。残りのレビュー指摘はフォローアップタスクとして積んで";
+    s.store.update(&land.id, |q| q.say(say)).unwrap();
+    script(&s, &[
+        FOLLOW_UP,
+        "MAGI ask --settle \"$qid\" --choice merge --quote 'マージしていいよ' \
+         --note 'Filed Fix R1-1 (held until `magi task release <id>`).'",
+    ]);
+
+    turn(&mut deputies(&s, 2)).await;
+
+    let q = s.store.get(&land.id).unwrap();
+    assert_eq!(q.status, QuestionStatus::Answered, "{:?}", q.thread);
+    let turn = q.thread.last().unwrap();
+    assert!(turn.body.starts_with("Settled as `merge`"));
+    assert!(turn.note.as_deref().unwrap().contains("Fix R1-1"), "{:?}", turn.note);
+}
+}
+
+common::e2e! {
+async fn a_release_merge_settle_can_say_the_follow_ups_were_not_queued() {
+    let s = scene(home_lock().await);
+    let land = file_land(&s.store, "Merge #7?");
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    s.store.update(&land.id, |q| q.say("マージしていいよ。フォローアップも積んで")).unwrap();
+    // A deputy without authority to file: it settles and says so.
+    script(&s, &[
+        "MAGI ask --settle \"$qid\" --choice merge --quote 'マージしていいよ' \
+         --note 'Follow-ups were NOT queued; file them yourself.'",
+    ]);
+
+    turn(&mut deputies(&s, 2)).await;
+
+    assert!(follow_ups(&s).is_empty());
+    let q = s.store.get(&land.id).unwrap();
+    assert!(q.thread.last().unwrap().note.as_deref().unwrap().contains("NOT queued"));
+}
+}
+
+common::e2e! {
 async fn an_operator_held_task_refuses_a_verbatim_merge_settle() {
     let s = scene(home_lock().await);
     let land = file_land(&s.store, "Merge #7?");
@@ -708,18 +751,18 @@ fn a_destructive_choice_settles_only_on_an_unhedged_quote() {
         ("discard it. actually wait", "discard it", false),
     ] {
         let mut q = settle_ready(triage.clone(), said);
-        let r = q.settle_by_deputy(&key, "discard", quote);
+        let r = q.settle_by_deputy(&key, "discard", quote, None);
         assert_eq!(r.is_ok(), ok, "{said:?}: {r:?}");
     }
     // The task is released, not deleted: no mechanical hedge gate.
     let mut q = settle_ready(triage.clone(), "maybe release it");
-    q.settle_by_deputy(&key, "resume", "maybe release it")
+    q.settle_by_deputy(&key, "resume", "maybe release it", None)
         .unwrap();
     // A divergence answer drops commits either way.
     let div = unasked_questions().pop().unwrap();
     let mut q = settle_ready(div.clone(), "keep the remote, I guess?");
     assert!(
-        q.settle_by_deputy(&key, "keep remote", "keep the remote")
+        q.settle_by_deputy(&key, "keep remote", "keep the remote", None)
             .is_err()
     );
     assert!(magi::deputy::destructive(&div, "push local"));

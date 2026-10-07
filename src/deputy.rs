@@ -631,17 +631,28 @@ impl Job {
             .filter(|p| p.is_dir())
             .unwrap_or_else(|| self.fallback_repo.clone());
 
+        // A settle's note is part of what the seat said, so a resumed seat
+        // reads its own report back.
+        let bodies: Vec<String> = q
+            .thread
+            .iter()
+            .map(|t| match &t.note {
+                Some(n) => format!("{}\n(note: {n})", t.body),
+                None => t.body.clone(),
+            })
+            .collect();
         let thread: Vec<(&str, &str)> = q
             .thread
             .iter()
-            .map(|t| {
+            .zip(&bodies)
+            .map(|(t, body)| {
                 (
                     if t.who == Who::Operator {
                         "operator"
                     } else {
                         "agent"
                     },
-                    t.body.as_str(),
+                    body.as_str(),
                 )
             })
             .collect();

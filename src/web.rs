@@ -5242,6 +5242,9 @@ struct QuestionView {
     detail_md: Vec<md::Node>,
     /// Each thread turn's body, parsed; same order as `question.thread`.
     thread_bodies_md: Vec<Vec<md::Node>>,
+    /// Each thread turn's deputy note, parsed (`None` for a turn without
+    /// one); same order as `question.thread`.
+    thread_notes_md: Vec<Option<Vec<md::Node>>>,
     /// Is the ball in the agent's court right now?
     ///
     /// [`QuestionStatus`] stays `Open` for the whole of a round trip - see
@@ -5285,6 +5288,11 @@ impl QuestionView {
                 .thread
                 .iter()
                 .map(|t| md::to_nodes(&t.body, &base))
+                .collect(),
+            thread_notes_md: question
+                .thread
+                .iter()
+                .map(|t| t.note.as_deref().map(|n| md::to_nodes(n, &base)))
                 .collect(),
             waiting_on_agent: question.waiting_on_agent(),
             holder,
@@ -12053,6 +12061,34 @@ mod tests {
         assert_eq!(bodies.as_array().unwrap().len(), 2);
         assert!(!bodies[0].to_string().contains("strong"));
         assert!(bodies[1].to_string().contains("strong"));
+    }
+
+    #[test]
+    fn a_question_view_carries_each_turns_deputy_note_as_markdown() {
+        let home = TempDir::new().unwrap();
+        let store = ask::Questions::at(home.path().join("questions"));
+        let mut q = Question::new(
+            "run".to_owned(),
+            "conduct".to_owned(),
+            "conduct".to_owned(),
+            "which?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        q.say("plain words").unwrap();
+        q.thread.push(ask::Turn {
+            who: ask::Who::Agent,
+            body: "Settled as `merge`".to_owned(),
+            at: jiff::Timestamp::now(),
+            note: Some("filed `abc123` _Fix [R1-1]_ (held; `magi task release abc123`)".to_owned()),
+        });
+        let v = serde_json::to_value(QuestionView::of(q, &store, false)).unwrap();
+        let notes = &v["thread_notes_md"];
+        assert_eq!(notes.as_array().unwrap().len(), 2);
+        assert!(notes[0].is_null());
+        let text = notes[1].to_string();
+        assert!(text.contains("abc123") && text.contains("R1-1"), "{text}");
+        assert!(APP_JS.contains("ask-turn-note"));
     }
 
     #[test]

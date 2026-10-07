@@ -1528,8 +1528,14 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
              text (put them in the `--hold` reason), and never pass `--force`. \
              Run `magi task list` first so a request is not filed twice. A follow-up request alone is \
              not a merge: file the tasks, then tell the owner the task ids with \
-             `--thread` and settle nothing. When you also settle, name the ids \
-             in your final plain-text answer instead.\n\
+             `--thread` and settle nothing. When you also settle, file the tasks \
+             BEFORE the settle and pass `--note \"...\"` to it: the note is what the \
+             owner reads under the settle, so list each task you actually filed \
+             (its id and a one-line title) and say they are held until the owner \
+             runs `magi task release <id>`. If the owner asked for follow-ups but \
+             you filed none (nothing eligible, or `magi task add` refused it as a \
+             duplicate), say so in the note and give the real reason. On a resumed \
+             session, run `magi task list` and report only ids that exist.\n\
              - `hold` settles only when the owner's whole message is that word.\n\n",
         );
     }
@@ -1541,6 +1547,13 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
              change anything yourself - not with `gh`, not with git - and you \
              add nothing to the queue. Closing the pull request, if the owner \
              wants it, is theirs to do by hand. Silence is a hold.\n\n\
+             You cannot queue follow-up tasks either. When the owner's reply also \
+             asks for something you cannot do - \"merge, and queue follow-ups\", \
+             closing the pull request, rerunning CI - never ignore that part: the \
+             `--note` of your settle (or, when you settle nothing, your `--thread` \
+             reply) must say plainly that the follow-ups were NOT queued (or which \
+             request you did not carry out) and that the owner has to do it or file \
+             it themselves.\n\n\
              Read the owner's latest message:\n\n\
              - **Words that clearly pick one offered choice** (for `leave it`: \
              \"stop watching\", \"ignore it\", \"クローズしていいよ\" meaning stop \
@@ -1608,6 +1621,19 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
         s.push_str(&lang(language));
         return s;
     }
+    // The land deputy may file follow-up tasks and says what it filed in the
+    // settle's note; every other kind has no such authority and must not let
+    // a request it cannot serve vanish.
+    let limits = if land {
+        ""
+    } else {
+        "   If the owner's reply also asks for something you cannot do (follow-up \
+         tasks, closing a pull request, rerunning CI, ...), never ignore that \
+         part: name each request you did not carry out and say the owner has to \
+         do it or file it themselves. When you settle, put that in \
+         `--note \"...\"` on the same `--settle` (the owner reads it under the \
+         settle); when you settle nothing, put it in your `--thread` reply.\n"
+    };
     s.push_str(&format!(
         "\n## What to do\n\n\
          1. Wait for the owner with `magi ask --wait {id}`, in the foreground. \
@@ -1624,6 +1650,7 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
          `magi ask --settle {id} --choice \"<the choice, exactly>\" --quote \
          \"<their words, exactly>\"`. If it is at all ambiguous, ask them with \
          `--thread` instead; a wrong settle sends the task down the wrong path.\n\
+         {limits}\
          4. When `magi ask` prints an answer, or says the question is settled or \
          abandoned, you are done: stop. Magi applies the outcome itself.\n"
     ));
