@@ -818,7 +818,6 @@ impl TurnLock {
         // own TTL: an owner stalled past `TICKET_TTL` between creating its
         // ticket and publishing can overlap with the next generation's taker.
         let mut won = false;
-        let mut last = None;
         for n in 0..TICKET_GENERATIONS {
             let ticket = path.with_extension(format!("lock.{key}.break.{n}"));
             if create_exclusive(&ticket, "")? {
@@ -833,14 +832,13 @@ impl TurnLock {
             if !stale {
                 return Ok(None);
             }
-            last = Some(ticket);
         }
         if !won {
-            // Every generation was abandoned: free the last slot so the next
-            // attempt can recover instead of waiting for the sweep.
-            if let Some(last) = last {
-                let _ = std::fs::remove_file(last);
-            }
+            // Every generation was abandoned. A ticket is never unlinked by
+            // name while it may still be someone's exclusion: only the sweep
+            // removes tickets, and only ones far older than any taker lives,
+            // so recovery resumes once they age out.
+            Self::sweep_tickets(&path);
             return Ok(None);
         }
         Self::sweep_tickets(&path);
@@ -2533,17 +2531,28 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_ticket_generations_do_not_wedge_recovery() {
+    fn exhausted_ticket_generations_recover_once_the_sweep_ages_them_out() {
         let (_tmp, a, _b) = lease_store();
         let lease = a.turn_path("t1");
         let lock = lease.with_extension("turn.lock");
         std::fs::create_dir_all(lock.parent().expect("dir")).expect("dir");
         std::fs::write(&lock, "t1-dead").expect("dead lock");
         age_file(&lock);
-        for n in 0..TICKET_GENERATIONS {
-            let t = lock.with_extension(format!("lock.t1-dead.break.{n}"));
-            assert!(create_exclusive(&t, "").expect("ticket"));
-            age_file(&t);
+        let tickets: Vec<_> = (0..TICKET_GENERATIONS)
+            .map(|n| lock.with_extension(format!("lock.t1-dead.break.{n}")))
+            .collect();
+        for t in &tickets {
+            assert!(create_exclusive(t, "").expect("ticket"));
+            age_file(t);
+        }
+        // Stale but not yet swept: no recovery, and no ticket is unlinked.
+        assert!(TurnLock::take(&lease).expect("take").is_none());
+        assert!(tickets.iter().all(|t| t.exists()));
+        // Past the sweep age they go, and the next attempt recovers.
+        for t in &tickets {
+            let f = std::fs::OpenOptions::new().write(true).open(t).expect("open");
+            f.set_modified(std::time::SystemTime::now() - TICKET_SWEEP_AGE * 2)
+                .expect("age");
         }
         assert!(TurnLock::take(&lease).expect("take").is_none());
         assert!(TurnLock::take(&lease).expect("take").is_some());
