@@ -13,9 +13,53 @@ use magi::queue::{self, Queue, Source, Task, TaskStatus};
 use magi::run::{RunState, RunStatus, is_run_id, latest_id, list_ids, resolve_id};
 use magi::{agent, ask, daemon, land, report, repos, stats, triage, tui, updater, web};
 
+/// Evangelion palette for `--help` and clap's errors: EVA-01 purple for
+/// headers, NERV green for literals, orange for placeholders. 16 colours where
+/// they exist (the terminal theme keeps them legible on dark and light);
+/// orange has no 16-colour slot, so it is 256-colour 208. Never 24-bit.
+fn cli_styles() -> clap::builder::Styles {
+    use clap::builder::styling::{Ansi256Color, AnsiColor, Color, Effects, Style};
+    let orange = Color::Ansi256(Ansi256Color(208));
+    let purple = Style::new()
+        .fg_color(Some(AnsiColor::Magenta.into()))
+        .effects(Effects::BOLD);
+    let green = Style::new()
+        .fg_color(Some(AnsiColor::Green.into()))
+        .effects(Effects::BOLD);
+    clap::builder::Styles::styled()
+        .header(purple)
+        .usage(purple)
+        .literal(green)
+        .valid(green)
+        .placeholder(Style::new().fg_color(Some(orange)))
+        .invalid(Style::new().fg_color(Some(orange)).effects(Effects::BOLD))
+        .error(
+            Style::new()
+                .fg_color(Some(AnsiColor::Red.into()))
+                .effects(Effects::BOLD),
+        )
+}
+
+/// clap renders help and usage errors inside `Cli::parse`, before `--no-color`
+/// is read as a field, so the flag is looked for in argv first. Anything else
+/// (`NO_COLOR`, a pipe, `CLICOLOR_FORCE`) is left to clap. A `--no-color` that
+/// is really a value errs towards plain text, never towards stray escapes.
+fn clap_color(args: &[std::ffi::OsString]) -> clap::ColorChoice {
+    let plain = args
+        .iter()
+        .skip(1)
+        .take_while(|a| *a != "--")
+        .any(|a| a == "--no-color");
+    if plain {
+        clap::ColorChoice::Never
+    } else {
+        clap::ColorChoice::Auto
+    }
+}
+
 /// Blind multi-agent implementation competition.
 #[derive(Debug, Parser)]
-#[command(name = "magi", version, about, long_about = None)]
+#[command(name = "magi", version, about, long_about = None, styles = cli_styles())]
 struct Cli {
     /// Increase log verbosity (-v, -vv).
     #[arg(short, long, action = ArgAction::Count, global = true)]
@@ -832,7 +876,12 @@ fn run() -> Result<()> {
 static IS_WEB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 async fn async_main() -> Result<()> {
-    let cli = Cli::parse();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let mut matches = Cli::command()
+        .color(clap_color(&args))
+        .get_matches_from(args.clone());
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches_mut(&mut matches)
+        .unwrap_or_else(|e| e.exit());
     let is_web = matches!(cli.command, Some(Command::Web { .. }));
     IS_WEB.store(is_web, std::sync::atomic::Ordering::Relaxed);
     init_logging(cli.verbose, is_web);
@@ -3913,6 +3962,28 @@ async fn probe(program: &str, args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clap_color_reads_no_color_before_the_terminator() {
+        let a = |v: &[&str]| {
+            v.iter()
+                .map(Into::into)
+                .collect::<Vec<std::ffi::OsString>>()
+        };
+        assert_eq!(clap_color(&a(&["magi", "--help"])), clap::ColorChoice::Auto);
+        assert_eq!(
+            clap_color(&a(&["magi", "--no-color", "--help"])),
+            clap::ColorChoice::Never
+        );
+        assert_eq!(
+            clap_color(&a(&["magi", "run", "--help", "--no-color"])),
+            clap::ColorChoice::Never
+        );
+        assert_eq!(
+            clap_color(&a(&["magi", "run", "--", "--no-color"])),
+            clap::ColorChoice::Auto
+        );
+    }
 
     #[test]
     fn resume_owner_files_only_when_asked_and_never_twice() {

@@ -2020,3 +2020,12 @@ with `magi answer` or puts the decision points to the owner in the chat.
   the talk's own turn gate and session run it. The web route starts the drain
   when the turn slot is free; the CLI only leaves the draft, which the owner
   resumes in the chat. The question's `answer_timeout` is not extended.
+
+### `--no-color` reaches clap through a pre-scan of argv
+
+clap renders `--help` and usage errors inside parsing, before `Cli::no_color`
+exists, so `main::clap_color` looks for a literal `--no-color` before any `--`
+and hands clap `ColorChoice::Never`; otherwise `Auto` leaves `NO_COLOR`, pipes
+and `CLICOLOR_FORCE` to clap. A false positive (the flag as a value) only turns
+colour off. The `styles` (`cli_styles`) are always set. `tests/cli_help_color.rs`
+runs the real binary.
