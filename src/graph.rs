@@ -35,6 +35,7 @@ use crate::config::{
     AgentSpec, Config, IncompleteReviewPolicy, LeakPolicy, MergeMode, MergeStyle, Prompts,
     ResolvedRoles,
 };
+use crate::fixer;
 use crate::git;
 use crate::land;
 use crate::proc::Quiet as _;
@@ -4084,18 +4085,6 @@ impl Runner {
         let language = self.state.config.graph.language.clone();
         let sessions = self.state.config.graph.sessions;
         let artifacts = agent::artifacts_dir(&self.state.dir());
-        let (fix_spec, fix_seat_key) = match &self.roles.fixer {
-            Some(f) if f.id != winner.agent => (f.clone(), "fix".to_owned()),
-            _ => (
-                self.state
-                    .config
-                    .agent(&winner.agent)
-                    .cloned()
-                    .unwrap_or_else(|_| self.roles.implementers[winner.index].clone()),
-                format!("impl-{}", winner.label),
-            ),
-        };
-        let seat = self.seat(&fix_seat_key, &fix_spec.id);
         let finding_list: Vec<Finding> = self.state.operator_fixes[request_index]
             .findings
             .iter()
@@ -4108,36 +4097,29 @@ impl Runner {
                 detail: f.detail.clone(),
             })
             .collect();
-        let job = SeatJob {
-            prompt: prompt::operator_fix(
-                &self.state.instruction,
-                &finding_list,
-                reason,
-                &stale_details,
-                &head_at_request,
-                &language,
-            ),
-            spec: fix_spec.clone(),
-            seat,
-            cwd: fix_worktree.clone(),
-            timeout: Duration::from_secs(self.state.config.graph.timeout_fix),
-            allow_write: true,
-            sessions,
-            artifacts: artifacts.clone(),
-            stem: "operator-fix".to_owned(),
-            handover: None,
-        };
-        let cache = self.state.config.cache_dir();
-        let ctx = WaveCtx {
-            carry_seats: false,
-            run: &run_id,
-            node: "fix",
-            prompts: &prompts,
-            cache: cache.as_deref(),
-            round: None,
-        };
-        let (seat, out) =
-            run_one(job.clone(), Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
+        let fix_prompt = prompt::operator_fix(
+            &self.state.instruction,
+            &finding_list,
+            reason,
+            &stale_details,
+            &head_at_request,
+            &language,
+        );
+        let timeout = Duration::from_secs(self.state.config.graph.timeout_fix);
+        let (job, seat, out) = self
+            .ask_fixer(&winner, "fix", None, |spec, seat| SeatJob {
+                prompt: fix_prompt.clone(),
+                spec,
+                seat,
+                cwd: fix_worktree.clone(),
+                timeout,
+                allow_write: true,
+                sessions,
+                artifacts: artifacts.clone(),
+                stem: "operator-fix".to_owned(),
+                handover: None,
+            })
+            .await;
         let agent_id = seat.agent.clone();
 
         let mut fix = FixRecord {
@@ -4371,22 +4353,81 @@ impl Runner {
 
     // --------------------------------------------------------------- review
 
-    /// The agent and seat key that fix the winner's tree: the configured
-    /// fixer, else the winner's own implementer seat, whose conversation
-    /// continues now that the competition is over. Shared by the review loop
-    /// and the gate-fix round so both talk to the same seat.
-    fn fixer_spec(&self, winner: &Candidate) -> (AgentSpec, String) {
-        match &self.roles.fixer {
-            Some(f) if f.id != winner.agent => (f.clone(), "fix".to_owned()),
-            _ => (
-                self.state
-                    .config
-                    .agent(&winner.agent)
-                    .cloned()
-                    .unwrap_or_else(|_| self.roles.implementers[winner.index].clone()),
-                format!("impl-{}", winner.label),
-            ),
+    /// Ask the fixer chain once for one fix call: the agents [`fixer::attempts`]
+    /// names, in order, each at most once, moving on only when the call
+    /// advances (an error, a quota hit or nothing usable - the same decision
+    /// point `agent::chain_advances` is for the other chained roles).
+    ///
+    /// Each agent gets its own seat from `Runner::seat`: the same agent
+    /// continues its conversation (the winner's own implementer seat when it
+    /// is the winner's author, now that the competition is over), another
+    /// takes a fresh one so the full prompt is sent again. A handover is
+    /// recorded under `node`, which is what makes the fallback stick for the
+    /// rest of the run (see `crate::fixer`). Only the last attempt's outcome
+    /// is returned, so an exhausted chain reads exactly like a single failed
+    /// fixer: one quota loss, the same wording, the same refund. An earlier
+    /// attempt's edits are left in the tree and judged, with the final
+    /// attempt's, by what git says afterwards.
+    ///
+    /// Returns the job that produced the outcome, for `continue_fix_report`.
+    async fn ask_fixer(
+        &mut self,
+        winner: &Candidate,
+        node: &'static str,
+        round: Option<usize>,
+        build: impl Fn(AgentSpec, SeatState) -> SeatJob,
+    ) -> (SeatJob, SeatState, AgentOutcome) {
+        let run_id = self.state.id.clone();
+        let prompts = self.state.config.prompts.clone();
+        let cache = self.state.config.cache_dir();
+        let attempts = fixer::attempts(&self.state, &self.roles, winner);
+        let ids: Vec<String> = attempts.iter().map(|(s, _)| s.id.clone()).collect();
+        let mut last = None;
+        for (i, (spec, key)) in attempts.into_iter().enumerate() {
+            let seat = self.seat(&key, &spec.id);
+            let mut job = build(spec.clone(), seat);
+            if i > 0 {
+                job.stem = format!("{}-{}", job.stem, spec.id);
+            }
+            let ctx = WaveCtx {
+                carry_seats: false,
+                run: &run_id,
+                node,
+                prompts: &prompts,
+                cache: cache.as_deref(),
+                round,
+            };
+            let (seat, out) =
+                run_one(job.clone(), Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
+            let advances = match &out {
+                AgentOutcome::Ok(o) => agent::output_advances(o),
+                _ => true,
+            };
+            if let Some(next) = ids.get(i + 1)
+                && advances
+            {
+                self.state.seats.insert(seat.key.clone(), seat.clone());
+                let class =
+                    FailClass::of(&out).unwrap_or_else(|| FailClass::Other("unusable".to_owned()));
+                let reason = match &out {
+                    AgentOutcome::Ok(_) => "nothing usable".to_owned(),
+                    other => fail_reason(other),
+                };
+                record_handover(
+                    &mut self.state,
+                    node,
+                    &seat.key,
+                    &spec.id,
+                    next,
+                    &class,
+                    &reason,
+                );
+                continue;
+            }
+            last = Some((job, seat, out));
+            break;
         }
+        last.expect("the fixer chain always has an entry")
     }
 
     async fn review_loop(&mut self) -> Result<()> {
@@ -5028,44 +5069,35 @@ impl Runner {
 
             // Fix. The winner's own implementer seat continues its conversation:
             // the competition is over, so context is pure benefit now.
-            let (fix_spec, fix_seat_key) = self.fixer_spec(&winner);
-            let seat = self.seat(&fix_seat_key, &fix_spec.id);
             let blocking_findings: Vec<_> = all_findings
                 .iter()
                 .filter(|f| f.severity.blocks())
                 .cloned()
                 .collect();
-            let job = SeatJob {
-                prompt: prompt::fix(
-                    &self.state.instruction,
-                    &blocking_findings,
-                    this_round_verification.as_ref(),
-                    round,
-                    max_rounds,
-                    &language,
-                ),
-                spec: fix_spec.clone(),
-                seat,
-                cwd: winner.worktree.clone(),
-                timeout: Duration::from_secs(self.state.config.graph.timeout_fix),
-                allow_write: true,
-                sessions,
-                artifacts: artifacts.clone(),
-                stem: format!("fix-{round}"),
-                handover: None,
-            };
+            let fix_prompt = prompt::fix(
+                &self.state.instruction,
+                &blocking_findings,
+                this_round_verification.as_ref(),
+                round,
+                max_rounds,
+                &language,
+            );
+            let timeout = Duration::from_secs(self.state.config.graph.timeout_fix);
             let before = git::rev_parse(&winner.worktree, "HEAD").await?;
-            let cache = self.state.config.cache_dir();
-            let ctx = WaveCtx {
-                carry_seats: false,
-                run: &run_id,
-                node: "fix",
-                prompts: &prompts,
-                cache: cache.as_deref(),
-                round: Some(round),
-            };
-            let (seat, out) =
-                run_one(job.clone(), Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
+            let (job, seat, out) = self
+                .ask_fixer(&winner, "fix", Some(round), |spec, seat| SeatJob {
+                    prompt: fix_prompt.clone(),
+                    spec,
+                    seat,
+                    cwd: winner.worktree.clone(),
+                    timeout,
+                    allow_write: true,
+                    sessions,
+                    artifacts: artifacts.clone(),
+                    stem: format!("fix-{round}"),
+                    handover: None,
+                })
+                .await;
             let agent_id = seat.agent.clone();
 
             let mut fix = FixRecord {
@@ -5744,46 +5776,38 @@ impl Runner {
         }
 
         let attempt = spent + 1;
-        let run_id = self.state.id.clone();
-        let prompts = self.state.config.prompts.clone();
         let failed: Vec<CommandOutcome> = outcomes.iter().filter(|o| !o.ok()).cloned().collect();
         let base = self.landing_base();
-        let (fix_spec, fix_seat_key) = self.fixer_spec(winner);
-        let seat = self.seat(&fix_seat_key, &fix_spec.id);
-        let job = SeatJob {
-            prompt: prompt::gate_fix(
-                &self.state.instruction,
-                &failed,
-                attempt,
-                cap,
-                &self.state.config.graph.language,
-            ),
-            spec: fix_spec,
-            seat,
-            cwd: winner.worktree.clone(),
-            timeout: Duration::from_secs(self.state.config.graph.timeout_fix),
-            allow_write: true,
-            sessions: self.state.config.graph.sessions,
-            artifacts: agent::artifacts_dir(&self.state.dir()),
-            stem: format!("gate-fix-{attempt}"),
-            handover: None,
-        };
+        let fix_prompt = prompt::gate_fix(
+            &self.state.instruction,
+            &failed,
+            attempt,
+            cap,
+            &self.state.config.graph.language,
+        );
+        let timeout = Duration::from_secs(self.state.config.graph.timeout_fix);
+        let sessions = self.state.config.graph.sessions;
+        let artifacts = agent::artifacts_dir(&self.state.dir());
         self.state.event(
             "gate",
             format!("gate failed; gate-fix round {attempt} of {cap}"),
         );
         let before = git::rev_parse(&winner.worktree, "HEAD").await?;
         let patch = git::diff(&winner.worktree, &base, "HEAD").await?;
-        let cache = self.state.config.cache_dir();
-        let ctx = WaveCtx {
-            carry_seats: false,
-            run: &run_id,
-            node: "gate-fix",
-            prompts: &prompts,
-            cache: cache.as_deref(),
-            round: None,
-        };
-        let (seat, out) = run_one(job, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
+        let (_, seat, out) = self
+            .ask_fixer(winner, "gate-fix", None, |spec, seat| SeatJob {
+                prompt: fix_prompt.clone(),
+                spec,
+                seat,
+                cwd: winner.worktree.clone(),
+                timeout,
+                allow_write: true,
+                sessions,
+                artifacts: artifacts.clone(),
+                stem: format!("gate-fix-{attempt}"),
+                handover: None,
+            })
+            .await;
         let mut record = GateFixRecord {
             agent: seat.agent.clone(),
             failed,
@@ -6491,7 +6515,7 @@ fn pick_start_spec(roster: &[AgentSpec], spec: AgentSpec, hist: Option<&SeatHist
 /// A fresh seat for the agent taking over `key`. Mixes the agent id into the
 /// seed so a CLI that mints its session id up front (`--session-id`) never
 /// reuses the uuid the previous agent already opened under the same seat key.
-fn handover_seat(key: &str, agent: &str, run_seed: u64) -> SeatState {
+pub(crate) fn handover_seat(key: &str, agent: &str, run_seed: u64) -> SeatState {
     SeatState::new(key, agent, run_seed ^ crate::rng::fnv1a(agent))
 }
 
@@ -6580,7 +6604,7 @@ fn fail_reason(out: &AgentOutcome) -> String {
 
 /// Note one handover in the run: the structured record and, in the timeline,
 /// the sentence a person reads. A quota keeps the wording it always had.
-fn record_handover(
+pub(crate) fn record_handover(
     state: &mut RunState,
     node: &str,
     seat: &str,

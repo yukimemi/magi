@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, Invocation, SeatState};
 use crate::ask;
-use crate::config::{AgentSpec, MergeMode};
+use crate::config::MergeMode;
 use crate::git;
 use crate::proc::Quiet as _;
 use crate::prompt;
@@ -3923,23 +3923,13 @@ pub async fn fix_round(
         .config
         .resolve_roles()
         .context("resolve the roster for the fix round")?;
-    // Same rule as the review loop: an explicitly configured fixer, otherwise
-    // the winner's own author continuing its own conversation - the competition
-    // is over, so its context is pure benefit.
-    let (spec, seat_key): (AgentSpec, String) = match &roles.fixer {
-        Some(f) if f.id != winner.agent => (f.clone(), "fix".to_owned()),
-        _ => (
-            state
-                .config
-                .agent(&winner.agent)
-                .cloned()
-                .unwrap_or_else(|_| roles.implementers[winner.index].clone()),
-            format!("impl-{}", winner.label),
-        ),
-    };
+    // Same chain as the review loop (see `crate::fixer`): the configured
+    // fixers in order, otherwise the winner's own author continuing its own
+    // conversation - the competition is over, so its context is pure benefit.
+    let attempts = crate::fixer::attempts(state, &roles, &winner);
+    let ids: Vec<String> = attempts.iter().map(|(s, _)| s.id.clone()).collect();
 
     let prompt = fix_prompt(state, pr, round, budget, reason, logs);
-    let mut seat = seat_of(state, &seat_key, &spec.id);
     let artifacts = agent::artifacts_dir(&state.dir());
     let prompt = if state.config.cache_dir().is_some() {
         format!("{prompt}\n\n{}", prompt::build_cache_note("fix", true))
@@ -3950,26 +3940,48 @@ pub async fn fix_round(
     // already moved by the time it returns and a later read would see no
     // progress (run 20261004-041622-5769 stopped on a fix that had landed).
     let before = git::rev_parse(&winner.worktree, "HEAD").await?;
-    let out = agent::invoke(
-        &spec,
-        &mut seat,
-        &Invocation {
-            cwd: &winner.worktree,
-            prompt: &prompt,
-            timeout: Duration::from_secs(state.config.graph.timeout_fix),
-            allow_write: true,
-            sessions: state.config.graph.sessions,
-            artifacts: &artifacts,
-            stem: &format!("land-{round}"),
-            run: &state.id,
-            node: "land",
-            cache_dir: state.config.cache_dir().as_deref(),
-            attachments: &[],
-            writable: &[],
-        },
-    )
-    .await;
-    state.seats.insert(seat.key.clone(), seat);
+    // Each id at most once, forward only: the next one is asked only when the
+    // call advances, and only the last attempt's result is judged below, so an
+    // exhausted chain ends as a single failed fixer does.
+    let mut last = None;
+    for (i, (spec, seat_key)) in attempts.into_iter().enumerate() {
+        let mut seat = seat_of(state, &seat_key, &spec.id);
+        let stem = if i == 0 {
+            format!("land-{round}")
+        } else {
+            format!("land-{round}-{}", spec.id)
+        };
+        let out = agent::invoke(
+            &spec,
+            &mut seat,
+            &Invocation {
+                cwd: &winner.worktree,
+                prompt: &prompt,
+                timeout: Duration::from_secs(state.config.graph.timeout_fix),
+                allow_write: true,
+                sessions: state.config.graph.sessions,
+                artifacts: &artifacts,
+                stem: &stem,
+                run: &state.id,
+                node: "land",
+                cache_dir: state.config.cache_dir().as_deref(),
+                attachments: &[],
+                writable: &[],
+            },
+        )
+        .await;
+        state.seats.insert(seat.key.clone(), seat);
+        if let Some(next) = ids.get(i + 1)
+            && agent::chain_advances(&out)
+        {
+            let (class, why) = crate::fixer::failure_of(&out);
+            crate::graph::record_handover(state, "land", &seat_key, &spec.id, next, &class, &why);
+            continue;
+        }
+        last = Some(out);
+        break;
+    }
+    let out = last.expect("the fixer chain always has an entry");
 
     match out {
         Ok(o) if o.quota_exhausted() => {
@@ -4019,14 +4031,7 @@ pub async fn fix_round(
 
 /// Fetch or create a seat, keeping its conversation across nodes.
 pub(crate) fn seat_of(state: &mut RunState, key: &str, agent: &str) -> SeatState {
-    if let Some(existing) = state.seats.get(key)
-        && existing.agent == agent
-    {
-        return existing.clone();
-    }
-    let fresh = SeatState::new(key, agent, state.seed);
-    state.seats.insert(key.to_owned(), fresh.clone());
-    fresh
+    crate::fixer::seat_for(state, key, agent)
 }
 
 /// What the fixer is told.

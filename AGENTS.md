@@ -625,6 +625,27 @@ one place that decides to move on (error, quota - judged apart from `usable`
   move it home, an operator's agent switch does. Only a talk whose agent is
   in `[roles] chatter`'s chain falls back; an explicit `--agent` is a chain
   of one. A turn can now cost up to N x the turn timeout.
+- **`[roles] fixer` is a chain too** (`config::Roles::fixer`,
+  `ResolvedRoles::fixer: Option<Vec<AgentSpec>>`, resolved by `agent::pick_chain`
+  only when set: unset stays `None` and means the winner's own implementer, as
+  before). `src/fixer.rs` holds what the five consumers share - the review loop's
+  fix round, the operator-selected fix, the gate-fix round, `land::fix_round` and
+  `rebase::rebase_with_fixer`: `fixer::attempts` (the order and each entry's seat
+  key), `seat_for` (a fresh `SeatState` for another agent, session id minted from
+  the agent too) and `failure_of`. Each consumer is a plain forward `for`, each id
+  at most once, advancing only through `agent::output_advances` (the `Ok` half of
+  `chain_advances`); only the **last** attempt's outcome reaches the old `match`,
+  so an exhausted chain ends with the single fixer's wording, one `QuotaLoss` and
+  the same refund. An intermediate quota is a handover record only.
+- **A fixer fallback is sticky within a run and never persisted.** The start is
+  read from `RunState::handovers`: the last handover on a `fixer::FIX_NODES` node
+  (`fix`, `gate-fix`, `land`, `rebase`) whose `to` is on the chain. Every consumer
+  records under exactly one of those names - a name nobody records sends every
+  round back to the first agent and re-bills its quota. Entries before the start
+  still follow (each once), so a failing current agent can come back round.
+  `FixRecord` / `GateFixRecord` / `RebaseFixRecord` `.agent` is the agent that
+  answered; `run::SCHEMA` is unchanged. In a rebase round the round is spent and
+  saved before the first call; a chain advance only rewrites the record's `agent`.
 - `[roles]` roster roles (implementers, judges, reviewers, advisors) are
   untouched.
 

@@ -8659,7 +8659,7 @@ function renderSettingsRole(d, role) {
     ? `A run now fills its seats with: ${role.seats.join(", ")}.`
     : role.seats_error ? `Cannot resolve seats: ${role.seats_error}` : "";
   const defined = d.agents.map((a) => a.id);
-  const addable = defined.filter((id) => !ids.includes(id) || role.key !== "synthesizer");
+  const addable = defined.filter((id) => !ids.includes(id) || !["synthesizer", "fixer"].includes(role.key));
   const select = el("select", { "aria-label": `Add an agent to ${role.key}` },
     el("option", { value: "" }, "Add agent…"),
     addable.map((id) => el("option", { value: id }, id)));
@@ -8678,7 +8678,7 @@ function renderSettingsRole(d, role) {
           el("button", { class: "btn btn-quiet", type: "button", disabled: locked || i === 0, "aria-label": `Move ${id} up`, onclick: () => settingsMove(role, i, i - 1) }, "\u2191"),
           el("button", { class: "btn btn-quiet", type: "button", disabled: locked || i === ids.length - 1, "aria-label": `Move ${id} down`, onclick: () => settingsMove(role, i, i + 1) }, "\u2193"),
           el("button", { class: "btn btn-quiet", type: "button", disabled: locked, "aria-label": `Remove ${id}`, onclick: () => settingsSet(role, ids.filter((_, j) => j !== i)) }, "\u00d7"))))
-      : el("p", { class: "set-meta", text: role.key === "advisors" ? "No seats named; the judge roster is used." : "No seats named; the whole roster rotates through." }),
+      : el("p", { class: "set-meta", text: role.key === "advisors" ? "No seats named; the judge roster is used." : role.key === "fixer" ? "No fixer named; the winner's own implementer applies the findings." : "No seats named; the whole roster rotates through." }),
     !locked && el("div", { class: "set-add" }, select,
       ids.length ? el("button", { class: "btn btn-quiet", type: "button", onclick: () => settingsSet(role, []) }, "Reset to default") : null),
     role.skipped.length ? el("p", { class: "set-meta", text: `Cannot run here (not in the roster or not installed): ${role.skipped.join(", ")}.` }) : null,

@@ -237,7 +237,14 @@ pub struct Roles {
     /// Agents that review the winning patch.
     pub reviewers: Vec<String>,
     /// Agent that applies review findings. Defaults to the winner's author.
-    pub fixer: Option<String>,
+    ///
+    /// Accepts one id or an ordered array of ids: a fallback chain, see
+    /// [`AgentChoice`]. The review loop, the gate-fix round, `land`'s fix
+    /// rounds and the rebase conflict round move to the next id when one
+    /// errors, hits its quota or answers nothing usable; each id is tried at
+    /// most once per call, and once a fallback answered, the rest of the run
+    /// starts from it (see `crate::fixer`). Unset keeps the winner's author.
+    pub fixer: Option<AgentChoice>,
     /// Agent that answers the standing chat's turns (`src/talk.rs`).
     ///
     /// Unset picks a `claude` seat, else the first runnable agent in roster
@@ -1195,8 +1202,11 @@ pub struct ResolvedRoles {
     pub judges: Vec<AgentSpec>,
     /// One per reviewer slot.
     pub reviewers: Vec<AgentSpec>,
-    /// Explicit fixer, if configured.
-    pub fixer: Option<AgentSpec>,
+    /// The configured fixer chain in order, if `[roles] fixer` is set
+    /// (resolved like [`crate::agent::pick_chain`]: unknown or uninstalled ids
+    /// skipped, duplicates keep their first place). `None` means the winner's
+    /// own author.
+    pub fixer: Option<Vec<AgentSpec>>,
     /// Queue conductor, explicitly selected or resolved by the standalone-seat fallback.
     pub conductor: AgentSpec,
     /// The full ordered implementer roster, in [`Roles::implementers`]'s own
@@ -1802,12 +1812,15 @@ impl Config {
             implementers: self.rotate(&self.roles.implementers, self.graph.implementers, 0)?,
             judges: self.rotate(&self.roles.judges, self.graph.judges, 1)?,
             reviewers: self.rotate(&self.roles.reviewers, self.graph.reviewers, 0)?,
-            fixer: self
-                .roles
-                .fixer
-                .as_deref()
-                .map(|f| self.agent(f).cloned())
-                .transpose()?,
+            fixer: match self.roles.fixer.as_ref() {
+                Some(choice) => Some(crate::agent::pick_chain(
+                    &self.agents,
+                    Some(choice),
+                    &crate::agent::installed,
+                    "fixer",
+                )?),
+                None => None,
+            },
             // Role resolution validates roster shape, but deliberately does
             // not preflight a CLI. The other graph seats have always deferred
             // that failure to invocation; doing it only for the conductor
@@ -1945,7 +1958,9 @@ impl Config {
              reviewers = []\n\
              # conductor = \"opus\"  # arranges the queue; unset picks a seat like chatter does\n\
              # synthesizer = \"opus\"  # blends the advisors into one brief; unset picks a seat like chatter does\n\
-             # synthesizer = [\"opus\", \"codex\"]  # array form: fallback chain, each tried once on quota or failure\n\n\
+             # synthesizer = [\"opus\", \"codex\"]  # array form: fallback chain, each tried once on quota or failure\n\
+             # fixer = \"opus\"  # applies review findings; unset keeps the winner's own author\n\
+             # fixer = [\"opus\", \"codex\"]  # array form: fallback chain, each tried once on quota or failure\n\n\
              [graph]\n\
              implementers = 3\n\
              judges = 3\n\
@@ -2537,7 +2552,7 @@ mod tests {
                 implementers: vec!["b".to_owned()],
                 judges: vec!["a".to_owned()],
                 reviewers: Vec::new(),
-                fixer: Some("a".to_owned()),
+                fixer: Some("a".into()),
                 ..Roles::default()
             },
             ..Config::default()
@@ -2545,8 +2560,47 @@ mod tests {
         let roles = cfg.resolve_roles().unwrap();
         assert!(roles.implementers.iter().all(|a| a.id == "b"));
         assert!(roles.judges.iter().all(|a| a.id == "a"));
-        assert_eq!(roles.fixer.unwrap().id, "a");
+        let fixer = roles.fixer.unwrap();
+        assert_eq!(fixer.len(), 1);
+        assert_eq!(fixer[0].id, "a");
         assert_eq!(roles.conductor.id, "a");
+    }
+
+    #[test]
+    fn fixer_takes_a_string_or_an_ordered_chain() {
+        let one: Roles = toml::from_str("fixer = \"a\"").unwrap();
+        assert_eq!(one.fixer.as_ref().unwrap().ids(), ["a"]);
+        let chain: Roles = toml::from_str("fixer = [\"b\", \"a\"]").unwrap();
+        assert_eq!(chain.fixer.as_ref().unwrap().ids(), ["b", "a"]);
+
+        let resolve = |fixer: Option<AgentChoice>| {
+            Config {
+                agents: vec![spec("a"), spec("b"), spec("c")],
+                roles: Roles {
+                    fixer,
+                    ..Roles::default()
+                },
+                ..Config::default()
+            }
+            .resolve_roles()
+        };
+        let ids = |r: &ResolvedRoles| -> Vec<String> {
+            r.fixer
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|s| s.id.clone())
+                .collect()
+        };
+        // The string form is a chain of one; unset stays unset (the winner's author).
+        assert_eq!(ids(&resolve(Some("c".into())).unwrap()), ["c"]);
+        assert!(resolve(None).unwrap().fixer.is_none());
+        // Order kept, an unknown id skipped, a duplicate keeps its first place.
+        let chain = AgentChoice::Chain(vec!["b".into(), "zzz".into(), "a".into(), "b".into()]);
+        assert_eq!(ids(&resolve(Some(chain)).unwrap()), ["b", "a"]);
+        // Nothing resolving names the role.
+        let err = resolve(Some(AgentChoice::Chain(vec!["zzz".into()]))).unwrap_err();
+        assert!(format!("{err:#}").contains("fixer"), "{err:#}");
     }
 
     #[test]
