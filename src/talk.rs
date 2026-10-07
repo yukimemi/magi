@@ -1485,10 +1485,14 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         } else if resuming {
             format!("{persona_update}{text}{last_note}")
         } else {
-            format!(
-                "{}\n\n{persona_update}{text}{last_note}",
-                transcript(talk, store)
-            )
+            // No session to hold the persona: the transcript never stores it,
+            // so a non-default persona is re-sent on every such turn (the
+            // update block already carries it when the choice just changed).
+            let standing = match (&persona, talk.persona_dirty) {
+                (Some(p), false) => format!("{}\n", crate::persona::section(p)),
+                _ => persona_update.clone(),
+            };
+            format!("{}\n\n{standing}{text}{last_note}", transcript(talk, store))
         };
         let attempt_stem = if n == 0 {
             stem.clone()
@@ -2893,6 +2897,21 @@ mod tests {
                 .body
                 .contains("turned the persona off")
         );
+
+        // Without a resumable session every turn re-sends the persona.
+        assert!(switch_persona(&mut talk, &talks, "rei").expect("rei"));
+        let mut no_sessions = cfg.clone();
+        no_sessions.graph.sessions = false;
+        say(&mut talk, &talks, &no_sessions, "one", Vec::new())
+            .await
+            .expect("turn");
+        say(&mut talk, &talks, &no_sessions, "two", Vec::new())
+            .await
+            .expect("turn");
+        let last = &talk.turns.last().unwrap().body;
+        assert!(!talk.persona_dirty);
+        assert!(last.contains("# Persona (tone only)"), "{last}");
+        assert!(last.contains("Rei Ayanami"));
     }
 
     #[tokio::test]
