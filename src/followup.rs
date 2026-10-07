@@ -63,7 +63,7 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) {
         return;
     }
     let body = comment_body(state, &outcome);
-    match crate::bump::gh_pr_comment(&state.repo, pr_url, &body).await {
+    match crate::bump::gh_pr_comment(state, pr_url, &body).await {
         Ok(()) => state.followup_commented = true,
         Err(e) => state.event(NODE, format!("follow-up comment not posted: {e:#}")),
     }
@@ -754,6 +754,13 @@ mod tests {
         let out = file(&mut s, PR, &q).unwrap();
         assert_eq!(out.covered.len(), 2, "{out:?}");
         assert_eq!(out.filed.len(), 1);
+    }
+
+    #[test]
+    fn github_text_fixed_followup_comment_passes() {
+        let state = merged(two_seats());
+        let body = comment_body(&state, &Outcome::default());
+        assert!(crate::github_text::check("", &body).is_empty());
     }
 
     #[test]

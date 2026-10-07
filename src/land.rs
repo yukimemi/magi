@@ -2141,7 +2141,8 @@ pub async fn close_superseded_pr(
 /// `gh pr edit <url> --title <title>`, for an adopted pull request whose title
 /// differs from the one this run computed. Only the title: the body may have
 /// been edited by the owner and cannot be compared.
-pub async fn set_pr_title(repo: &Path, url: &str, title: &str) -> Result<()> {
+pub async fn set_pr_title(state: &mut RunState, repo: &Path, url: &str, title: &str) -> Result<()> {
+    let (title, _) = crate::github_text::prepare(state, title, "");
     let (ok, out) = gh(
         repo,
         &[
@@ -4173,6 +4174,10 @@ fn stop_comment(run_id: &str, why: &str) -> String {
 /// up to a pull request that explains itself rather than to a silent queue.
 async fn stop(state: &mut RunState, repo: &Path, pr: &PrState, why: &str) -> Result<()> {
     let body = stop_comment(&state.id, why);
+    let (_, mut body) = crate::github_text::prepare(state, "", &body);
+    if !body.contains(MARKER) {
+        body = format!("{MARKER}\n{body}");
+    }
     let posted = gh(
         repo,
         &[
@@ -5336,6 +5341,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let mut state = run_state();
         state.config.graph.language = "ja".to_owned();
         let comment = stop_comment(&state.id, "checks are still red");
+        assert!(crate::github_text::check("", &comment).is_empty());
         assert!(comment.is_ascii(), "{comment}");
         assert!(comment.starts_with(MARKER));
 

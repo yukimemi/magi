@@ -5910,6 +5910,119 @@ impl Runner {
 
     // ---------------------------------------------------------------- merge
 
+    /// One read-only rewrite by the summary's author, followed by a fixed fallback.
+    async fn guarded_pr_message(
+        &mut self,
+        winner: &Candidate,
+        facts: Option<&BranchFacts>,
+        posting: bool,
+    ) -> PrMessage {
+        let mut pr = pr_message_raw(&self.state, winner.label, facts);
+        if !posting {
+            let identity = crate::scrub::Identity::current();
+            return PrMessage {
+                title: crate::scrub::scrub(&pr.title, &identity),
+                body: crate::scrub::scrub(&pr.body, &identity),
+            };
+        }
+        let mut violations = crate::github_text::check(&pr.title, &pr.body);
+        let identity = crate::scrub::Identity::current();
+        if (crate::scrub::scrub(&pr.title, &identity) != pr.title
+            || crate::scrub::scrub(&pr.body, &identity) != pr.body)
+            && !violations.contains(&crate::github_text::Violation::SensitiveData)
+        {
+            violations.push(crate::github_text::Violation::SensitiveData);
+        }
+        // Sensitive-only hits are handled by `prepare`'s span redaction; a
+        // rewrite cannot fix them (e.g. a quoted original task) and the
+        // fallback would discard a useful description.
+        violations.retain(|v| *v != crate::github_text::Violation::SensitiveData);
+        if self.state.config.graph.github_text_guard && !violations.is_empty() {
+            self.state.event(
+                "github-text",
+                format!("description rejected: {violations:?}; requesting one rewrite"),
+            );
+            let mut rewritten = false;
+            if let Some(spec) = self
+                .state
+                .config
+                .agents
+                .iter()
+                .find(|a| a.id == winner.agent)
+                .cloned()
+            {
+                let key = format!("impl-{}", winner.label);
+                let seat = self.seat(&key, &spec.id);
+                let prompt = format!(
+                    "Rewrite only the following pull request description. The posting gate reported {violations:?}. Write English prose and remove all machine or operator identifying data and secrets. Do not edit files or run commands. Return TITLE: followed by the title, then the complete Markdown body. Preserve the magi run marker.\n\nTITLE: {}\n{}",
+                    pr.title, pr.body
+                );
+                let job = SeatJob {
+                    spec,
+                    seat,
+                    cwd: winner.worktree.clone(),
+                    prompt,
+                    timeout: retry_budget(
+                        Duration::from_secs(self.state.config.graph.timeout_implement),
+                        true,
+                    ),
+                    allow_write: false,
+                    sessions: self.state.config.graph.sessions,
+                    artifacts: agent::artifacts_dir(&self.state.dir()),
+                    stem: "github-text-rewrite".to_owned(),
+                    handover: None,
+                };
+                let prompts = self.state.config.prompts.clone();
+                let cache = self.state.config.cache_dir();
+                let run = self.state.id.clone();
+                let ctx = WaveCtx {
+                    run: &run,
+                    node: "github-text",
+                    prompts: &prompts,
+                    cache: cache.as_deref(),
+                    round: None,
+                    carry_seats: false,
+                };
+                let (seat, outcome) =
+                    run_one(job, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
+                self.state.seats.insert(seat.key.clone(), seat);
+                if let AgentOutcome::Ok(output) = outcome
+                    && let Some(title) = summary_title(&output.text)
+                {
+                    let mut body = summary_without_title(&output.text);
+                    if !body.trim().is_empty()
+                        && crate::github_text::check(&title, &body).is_empty()
+                    {
+                        let marker = format!("magi:run/{}", self.state.id);
+                        if !body.contains(&marker) {
+                            body.push_str(&format!("\n\n{marker}"));
+                        }
+                        pr = PrMessage { title, body };
+                        rewritten = true;
+                        self.state
+                            .event("github-text", "description rewrite passed");
+                    }
+                }
+            }
+            if !rewritten {
+                self.state.event(
+                    "github-text",
+                    "description rewrite unavailable or rejected; using neutral body",
+                );
+                pr = PrMessage {
+                    title: pr.title,
+                    body: format!(
+                        "{}\n\nmagi:run/{}",
+                        crate::github_text::NEUTRAL_BODY,
+                        self.state.id
+                    ),
+                };
+            }
+        }
+        let (title, body) = crate::github_text::prepare(&mut self.state, &pr.title, &pr.body);
+        PrMessage { title, body }
+    }
+
     async fn merge(&mut self) -> Result<()> {
         // Same reasoning as `gate`: ask the review and gate records directly
         // rather than `status`, which a solo-candidate `judge`/`deliberate`
@@ -5983,7 +6096,9 @@ impl Runner {
         } else {
             Some(Vec::new())
         };
-        let pr = pr_message_with(&self.state, winner.label, facts.as_ref());
+        let pr = self
+            .guarded_pr_message(&winner, facts.as_ref(), mode == MergeMode::Pr)
+            .await;
         let message = pr.commit_message();
 
         let outcome = match mode {
@@ -6077,8 +6192,13 @@ impl Runner {
                                     || leaked
                                         .as_deref()
                                         .is_some_and(|l| should_retitle(&title, &pr.title, l)))
-                                && let Err(e) =
-                                    land::set_pr_title(&winner.worktree, &url, &pr.title).await
+                                && let Err(e) = land::set_pr_title(
+                                    &mut self.state,
+                                    &winner.worktree,
+                                    &url,
+                                    &pr.title,
+                                )
+                                .await
                             {
                                 tracing::warn!("could not refresh title of {url}: {e:#}");
                                 self.state
@@ -7067,7 +7187,7 @@ fn review_conclusion(reviews: &[ReviewRound], max_rounds: usize) -> Option<RunSt
 /// does not collapse to nothing. A retry that re-sends the whole prompt
 /// (because the seat kept no context) is the original job again, and keeps the
 /// original budget.
-fn retry_budget(full: Duration, nudged: bool) -> Duration {
+pub(crate) fn retry_budget(full: Duration, nudged: bool) -> Duration {
     if nudged {
         (full / 4).max(Duration::from_secs(120)).min(full)
     } else {
@@ -8153,7 +8273,17 @@ fn pr_message(state: &RunState, winner: char) -> PrMessage {
 
 /// [`pr_message`] with what the branch of a review-only run says about itself.
 /// `facts` is ignored for a run that implements a task.
+#[cfg(test)]
 fn pr_message_with(state: &RunState, winner: char, facts: Option<&BranchFacts>) -> PrMessage {
+    let raw = pr_message_raw(state, winner, facts);
+    let id = crate::scrub::Identity::current();
+    PrMessage {
+        title: crate::scrub::scrub(&raw.title, &id),
+        body: crate::scrub::scrub(&raw.body, &id),
+    }
+}
+
+fn pr_message_raw(state: &RunState, winner: char, facts: Option<&BranchFacts>) -> PrMessage {
     let summary = state
         .candidates
         .iter()
@@ -8306,13 +8436,7 @@ fn pr_message_with(state: &RunState, winner: char, facts: Option<&BranchFacts>) 
         winner.to_ascii_lowercase()
     ));
 
-    // Prompts are advisory; this is the enforced half of the confidentiality
-    // rule, and it covers the verbatim task in <details> too.
-    let id = crate::scrub::Identity::current();
-    PrMessage {
-        title: crate::scrub::scrub(&title, &id),
-        body: crate::scrub::scrub(&body, &id),
-    }
+    PrMessage { title, body }
 }
 
 /// The task with what the repository says about the existing work it names
@@ -11588,17 +11712,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn github_text_rewrite_is_bounded_and_falls_back() {
+        crate::run::pin_test_home();
+        for (reply, accepted) in [
+            (
+                "TITLE: fix: retries\nAdd retries for failed requests.",
+                true,
+            ),
+            (
+                "TITLE: fix: retries\n日本語の説明をもう一度書きます。",
+                false,
+            ),
+            ("TITLE: fix: retries\nUse token=secret", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut runner = runner_at(RunStatus::Gating);
+            runner.state = state_with_summary(
+                "add retries",
+                "TITLE: fix: retries\n日本語の説明を書きます。",
+            );
+            runner.state.repo = dir.path().to_owned();
+            runner.state.candidates[0].worktree = dir.path().to_owned();
+            let mut author = spec("alpha");
+            author.command = vec![
+                "sh".into(),
+                "-c".into(),
+                "printf '%s' \"$REWRITE_REPLY\"".into(),
+            ];
+            author.env.insert("REWRITE_REPLY".into(), reply.into());
+            runner.state.config.agents = vec![author];
+            let winner = runner.state.candidates[0].clone();
+            let message = runner.guarded_pr_message(&winner, None, true).await;
+            assert!(crate::github_text::check(&message.title, &message.body).is_empty());
+            assert_eq!(
+                message.body.contains("Add retries for failed requests."),
+                accepted
+            );
+            assert_eq!(
+                runner.state.seats["impl-A"].turns, 1,
+                "only one rewrite invocation"
+            );
+            assert!(runner.state.events.iter().any(|e| e.node == "github-text"));
+            if !accepted {
+                assert!(message.body.contains(crate::github_text::NEUTRAL_BODY));
+                assert!(
+                    message
+                        .body
+                        .contains(&format!("magi:run/{}", runner.state.id))
+                );
+            }
+        }
+    }
+
     #[test]
     fn pr_message_magi_text_is_english_and_the_task_is_verbatim() {
         // What magi itself writes stays English under any configured language,
         // so a future localisation of these headings fails here. (The agents'
-        // own text is held to English by the prompt only; magi cannot check it.)
+        // own text is also checked by the posting gate.)
         let mut state = state_with_summary(
             "add retries",
             "TITLE: fix(web): batch reads\n- reads run.json once",
         );
         state.config.graph.language = "ja".to_owned();
         let m = pr_message(&state, 'A');
+        assert!(crate::github_text::check(&m.title, &m.body).is_empty());
         assert!(m.title.is_ascii() && m.body.is_ascii(), "{}", m.body);
 
         // The task is the operator's own text: it goes in untouched, and the
