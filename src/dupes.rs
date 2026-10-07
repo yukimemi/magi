@@ -358,7 +358,17 @@ pub async fn screen_with_config(
         let repo = repo.to_path_buf();
         Box::pin(async move {
             match cfg {
-                Some(cfg) => chain_judge(&cfg, &repo, instruction, hits).await,
+                Some(cfg) => {
+                    let dir = repo.clone();
+                    let hits = tokio::task::spawn_blocking(move || {
+                        let mut hits = hits;
+                        describe_forge_hits(&dir, &mut hits);
+                        hits
+                    })
+                    .await
+                    .context("describing the pull request")?;
+                    chain_judge(&cfg, &repo, instruction, hits).await
+                }
                 None => bail!("no readable configuration to resolve a judge agent from"),
             }
         })
@@ -678,7 +688,7 @@ pub fn check_with(
 /// today's behaviour. `GH_REPO` is dropped so the PR is looked up in `repo`'s
 /// own remote, not whatever the environment points at.
 fn gh_open_pr(repo: &Path, n: u64) -> Option<String> {
-    let v = gh_pr_view(repo, n)?;
+    let v = gh_pr_view(repo, n, "state,url")?;
     (v["state"] == "OPEN")
         .then(|| v["url"].as_str().map(str::to_owned))
         .flatten()
@@ -687,7 +697,7 @@ fn gh_open_pr(repo: &Path, n: u64) -> Option<String> {
 /// [`gh_open_pr`]'s question asked of a pull request a run record names: its
 /// lifecycle, or `None` when the forge cannot say.
 fn gh_pr_state(repo: &Path, n: u64) -> Option<PrLifecycle> {
-    match gh_pr_view(repo, n)?["state"].as_str()? {
+    match gh_pr_view(repo, n, "state,url")?["state"].as_str()? {
         "OPEN" => Some(PrLifecycle::Open),
         "MERGED" => Some(PrLifecycle::Merged),
         "CLOSED" => Some(PrLifecycle::Closed),
@@ -695,10 +705,10 @@ fn gh_pr_state(repo: &Path, n: u64) -> Option<PrLifecycle> {
     }
 }
 
-fn gh_pr_view(repo: &Path, n: u64) -> Option<serde_json::Value> {
+fn gh_pr_view(repo: &Path, n: u64, fields: &str) -> Option<serde_json::Value> {
     let mut child = Command::new("gh")
         .quiet()
-        .args(["pr", "view", &n.to_string(), "--json", "state,url"])
+        .args(["pr", "view", &n.to_string(), "--json", fields])
         .current_dir(repo)
         .env_remove("GH_REPO")
         .env("GH_PROMPT_DISABLED", "1")
@@ -723,6 +733,27 @@ fn gh_pr_view(repo: &Path, n: u64) -> Option<serde_json::Value> {
     let mut raw = String::new();
     std::io::Read::read_to_string(&mut child.stdout.take()?, &mut raw).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+/// Fill in what a forge-only hit (an open pull request no record here owns)
+/// is about, from its title and body. Only the judge reads it, so this runs
+/// after the mechanical check, only on a hit, and best effort: an unreadable
+/// forge leaves `about` empty, never drops the hit.
+fn describe_forge_hits(repo: &Path, hits: &mut [Hit]) {
+    for h in hits
+        .iter_mut()
+        .filter(|h| h.owner == Owner::Pr && h.about.is_empty())
+    {
+        let Some(n) = h.token.trim_start_matches('#').parse::<u64>().ok() else {
+            continue;
+        };
+        if let Some(v) = gh_pr_view(repo, n, "title,body") {
+            h.about = about_of(
+                v["title"].as_str().unwrap_or(""),
+                v["body"].as_str().unwrap_or(""),
+            );
+        }
+    }
 }
 
 /// The owner's work for the judge: its title (when it has one) and its
