@@ -988,13 +988,11 @@ impl TalkTurnGuard {
         cfg: &Config,
         text: &str,
     ) -> anyhow::Result<()> {
-        match &self.lease {
-            Some(lease) => lease
-                .beating(talk::respond(talk, talks, cfg, text))
-                .await
-                .and_then(|done| done),
-            None => talk::respond(talk, talks, cfg, text).await,
-        }
+        let lease = self
+            .lease
+            .as_ref()
+            .context("the turn guard no longer holds its lease")?;
+        talk::respond(lease, talk, talks, cfg, text).await
     }
 
     /// Release while the caller already holds the claim mutex, closing the
@@ -6515,7 +6513,7 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
         };
         let responded = match turn.as_ref() {
             Some(turn) => turn.respond(&mut talk, &talks, &cfg, &drained).await,
-            None => talk::respond(&mut talk, &talks, &cfg, &drained).await,
+            None => Err(anyhow::anyhow!("the turn guard was released")),
         };
         if let Err(e) = responded {
             tracing::warn!("talk {id} turn failed: {e:#}");
