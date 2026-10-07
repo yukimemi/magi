@@ -78,7 +78,294 @@ const FOREIGN_WORDS: &[&str] = &[
     "fehler",
     "corrigir",
     "erreurs",
+    "bitte",
+    "anfrage",
+    "anfragen",
+    "wiederholen",
+    "korrigieren",
 ];
+
+/// English function words and everyday development vocabulary. Text whose
+/// words never meet this list is not English, whatever FOREIGN_WORDS knows.
+/// Words spelled the same in German or Dutch (will, die, also) stay out.
+const ENGLISH_WORDS: &[&str] = &[
+    "the",
+    "a",
+    "an",
+    "to",
+    "of",
+    "and",
+    "or",
+    "for",
+    "in",
+    "on",
+    "at",
+    "by",
+    "with",
+    "from",
+    "when",
+    "while",
+    "this",
+    "that",
+    "these",
+    "those",
+    "is",
+    "are",
+    "be",
+    "was",
+    "were",
+    "been",
+    "not",
+    "no",
+    "it",
+    "its",
+    "as",
+    "if",
+    "so",
+    "but",
+    "than",
+    "then",
+    "into",
+    "after",
+    "before",
+    "only",
+    "can",
+    "should",
+    "must",
+    "may",
+    "has",
+    "have",
+    "had",
+    "do",
+    "does",
+    "all",
+    "any",
+    "each",
+    "one",
+    "two",
+    "new",
+    "old",
+    "more",
+    "less",
+    "which",
+    "what",
+    "why",
+    "how",
+    "now",
+    "never",
+    "always",
+    "instead",
+    "without",
+    "within",
+    "over",
+    "under",
+    "per",
+    "via",
+    "we",
+    "you",
+    "they",
+    "there",
+    "their",
+    "your",
+    "our",
+    "use",
+    "used",
+    "uses",
+    "make",
+    "makes",
+    "fix",
+    "add",
+    "update",
+    "remove",
+    "bump",
+    "refactor",
+    "test",
+    "retry",
+    "request",
+    "review",
+    "run",
+    "task",
+    "branch",
+    "merge",
+    "release",
+    "error",
+    "config",
+    "build",
+    "check",
+    "docs",
+    "feat",
+    "chore",
+    "change",
+    "changes",
+    "file",
+    "code",
+    "repository",
+    "repo",
+    "pull",
+    "commit",
+    "message",
+    "text",
+    "title",
+    "body",
+    "github",
+    "gate",
+    "default",
+    "value",
+    "key",
+    "name",
+    "path",
+    "state",
+    "agent",
+    "seat",
+    "fail",
+    "failure",
+    "failed",
+    "pass",
+    "read",
+    "write",
+    "set",
+    "get",
+    "send",
+    "post",
+    "open",
+    "close",
+    "start",
+    "stop",
+    "keep",
+    "drop",
+    "move",
+    "rename",
+    "handle",
+    "support",
+    "allow",
+    "avoid",
+    "ensure",
+    "prevent",
+    "background",
+    "summary",
+    "risk",
+    "risks",
+    "follow",
+    "verify",
+    "hand",
+    "version",
+    "bug",
+    "issue",
+    "finding",
+    "findings",
+    "round",
+    "rounds",
+    "queue",
+    "worktree",
+    "diff",
+    "line",
+    "lines",
+    "word",
+    "words",
+    "list",
+    "case",
+    "cases",
+    "input",
+    "output",
+    "result",
+    "results",
+    "fallback",
+    "replace",
+    "replaced",
+    "withheld",
+    "generated",
+    "neutral",
+    "english",
+    "language",
+    "detect",
+    "detection",
+    "match",
+    "matches",
+    "wrong",
+    "stale",
+    "missing",
+    "extra",
+    "small",
+    "let",
+    "settle",
+    "carry",
+    "note",
+    "help",
+    "colour",
+    "color",
+    "palette",
+    "deputy",
+    "brief",
+    "briefs",
+    "serde",
+    "tokio",
+];
+
+fn english_words(text: &str) -> (usize, usize) {
+    // A conventional-commit prefix (`fix(scope)!:`) says nothing about the
+    // language; drop it from the raw text, before punctuation is flattened.
+    let t = text.trim_start();
+    let kind = t.chars().take_while(|c| c.is_ascii_lowercase()).count();
+    let mut rest = &t[kind..];
+    if kind > 0 && rest.starts_with('(') {
+        rest = rest.find(')').map_or(rest, |i| &rest[i + 1..]);
+    }
+    let rest = rest.strip_prefix('!').unwrap_or(rest);
+    let text = if kind > 0 && rest.starts_with(':') {
+        &rest[1..]
+    } else {
+        text
+    };
+    let cleaned: String = text
+        .chars()
+        .map(|c| {
+            if "()[],;!?\"'*#<>`-=|".contains(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let (mut counted, mut hits) = (0, 0);
+    let tokens = cleaned.split_whitespace();
+    for raw in tokens {
+        let w = raw.trim_matches(|c| c == ':' || c == '.');
+        if w.len() < 2 || !w.chars().all(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        if w.chars().all(|c| c.is_ascii_uppercase())
+            || w.chars().skip(1).any(|c| c.is_ascii_uppercase())
+        {
+            continue;
+        }
+        counted += 1;
+        let w = w.to_ascii_lowercase();
+        let known = |x: &str| ENGLISH_WORDS.contains(&x);
+        let stem = |suffix: &str, add: &str| w.strip_suffix(suffix).map(|b| format!("{b}{add}"));
+        if known(&w)
+            || [
+                stem("ies", "y"),
+                stem("es", ""),
+                stem("s", ""),
+                stem("ed", ""),
+                stem("ed", "e"),
+                stem("ing", ""),
+                stem("ing", "e"),
+            ]
+            .iter()
+            .flatten()
+            .any(|x| known(x))
+        {
+            hits += 1;
+        }
+    }
+    (counted, hits)
+}
+
+fn lacks_english(text: &str) -> bool {
+    let (counted, hits) = english_words(text);
+    (counted >= 2 && hits == 0) || (counted >= 4 && hits * 3 < counted)
+}
 
 fn foreign_words(text: &str) -> bool {
     let words: Vec<String> = text
@@ -94,7 +381,12 @@ fn foreign_words(text: &str) -> bool {
 }
 
 fn non_english(text: &str) -> bool {
-    if foreign_words(text) {
+    if foreign_words(text)
+        || lacks_english(text)
+        || text
+            .split("\n\n")
+            .any(|p| p.split_whitespace().count() >= 5 && lacks_english(p))
+    {
         return true;
     }
     let letters = text.chars().filter(|c| c.is_alphabetic()).count();
@@ -246,6 +538,30 @@ mod tests {
         ] {
             assert!(check("fix: retries", body).is_empty(), "{body}");
         }
+        for title in [
+            "chore: release v0.95.0",
+            "feat(deputy): let a settle carry a note",
+            "feat(cli): colour --help in an Evangelion palette",
+            "Refactor deputy briefs",
+            "Bump tokio and serde",
+        ] {
+            assert!(check(title, "").is_empty(), "{title}");
+        }
+        assert!(check("Bitte Anfragen wiederholen", "").contains(&Violation::TitleLanguage));
+        assert!(
+            check("fix: retries", "Bitte Anfragen wiederholen").contains(&Violation::BodyLanguage)
+        );
+        assert!(
+            check(
+                "fix: retries",
+                "Add retries for failed requests.\n\nBitte Anfragen schnell wiederholen heute."
+            )
+            .contains(&Violation::BodyLanguage)
+        );
+        assert!(
+            check("fix: retries", "Zeitweise Sperren lösen Wartezeiten aus")
+                .contains(&Violation::BodyLanguage)
+        );
     }
 
     #[test]
