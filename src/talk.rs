@@ -582,6 +582,7 @@ impl Talks {
             .into_iter()
             .flatten()
             .flatten()
+            .filter(|e| e.path().extension().is_none_or(|x| x != "turn"))
             .filter_map(|e| e.metadata().ok())
             .filter_map(|m| m.modified().ok())
             .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -593,6 +594,54 @@ impl Talks {
     /// How many conversations are still open.
     pub fn count_open(&self) -> usize {
         self.list().iter().filter(|t| t.status.open()).count()
+    }
+
+    /// Where one conversation's turn lease lives. Not a `*.json`, so
+    /// [`Talks::list`] never sees it.
+    pub fn turn_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.turn"))
+    }
+
+    /// Claim the right to run one agent turn in `id`, across processes.
+    ///
+    /// `None` means somebody else holds a fresh lease - the caller reports
+    /// "a turn is already running" and must not start one. A lease is held
+    /// while its last beat is within [`crate::ask::LEASE_TTL`]; pids are never
+    /// consulted. A stale (or unreadable) lease is taken over: renamed to a
+    /// unique name first, so of several takers only the one whose rename wins
+    /// deletes it, and the claim itself is an exclusive create.
+    pub fn claim_turn(&self, id: &str) -> Result<Option<TurnLease>> {
+        self.claim_turn_at(id, Timestamp::now())
+    }
+
+    fn claim_turn_at(&self, id: &str, now: Timestamp) -> Result<Option<TurnLease>> {
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("create {}", self.root.display()))?;
+        let path = self.turn_path(id);
+        let token = crate::rng::SplitMix64::new(crate::rng::entropy()).uuid_v4();
+        if create_turn(&path, &token, now)? {
+            return Ok(Some(TurnLease { path, token }));
+        }
+        if read_turn(&path).is_some_and(|r| r.fresh(now)) {
+            return Ok(None);
+        }
+        // Stale or unreadable. Every replacement happens under a short-lived
+        // exclusive lock file, so two takers cannot each delete the other's
+        // fresh lease. A taker that finds the lock held simply loses; the lock
+        // itself ages out, so a taker that died inside it cannot wedge the talk.
+        let Some(_lock) = TurnLock::take(&path)? else {
+            return Ok(None);
+        };
+        if read_turn(&path).is_some_and(|r| r.fresh(now)) {
+            return Ok(None);
+        }
+        let _ = std::fs::remove_file(&path);
+        Ok(create_turn(&path, &token, now)?.then_some(TurnLease { path, token }))
+    }
+
+    /// Is a turn running in `id` anywhere, by a fresh lease?
+    pub fn turn_held(&self, id: &str) -> bool {
+        read_turn(&self.turn_path(id)).is_some_and(|r| r.fresh(Timestamp::now()))
     }
 
     /// Remove a conversation from disk, record and artifacts both. The
@@ -617,7 +666,215 @@ impl Talks {
             std::fs::remove_dir_all(&artifacts)
                 .with_context(|| format!("remove {}", artifacts.display()))?;
         }
+        let _ = std::fs::remove_file(self.turn_path(&resolved));
         Ok(())
+    }
+}
+
+/// The body of a `<id>.turn` file. `pid` is for a human reading it; nothing
+/// decides on it.
+#[derive(Debug, Serialize, Deserialize)]
+struct TurnRecord {
+    token: String,
+    pid: u32,
+    beat_at: Timestamp,
+}
+
+impl TurnRecord {
+    fn fresh(&self, now: Timestamp) -> bool {
+        now.as_second() - self.beat_at.as_second() <= crate::ask::LEASE_TTL.as_secs() as i64
+    }
+}
+
+fn read_turn(path: &Path) -> Option<TurnRecord> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// A takeover lock older than this belonged to a taker that died inside it.
+const TAKEOVER_LOCK_TTL: Duration = Duration::from_secs(10);
+
+/// Create `path` exclusively with `body`; `false` when it already exists.
+fn create_exclusive(path: &Path, body: &str) -> Result<bool> {
+    use std::io::Write as _;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(body.as_bytes()) {
+                drop(f);
+                let _ = std::fs::remove_file(path);
+                return Err(e).with_context(|| format!("write {}", path.display()));
+            }
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
+    }
+}
+
+fn create_turn(path: &Path, token: &str, now: Timestamp) -> Result<bool> {
+    let record = TurnRecord {
+        token: token.to_owned(),
+        pid: std::process::id(),
+        beat_at: now,
+    };
+    let body = serde_json::to_string(&record).context("serialize turn lease")?;
+    // Written in full under a private name, then linked into place: the link
+    // fails if the lease exists, and a reader never sees a half-written one.
+    let tmp = path.with_extension(format!("turn.{token}.new"));
+    std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
+    }
+}
+
+/// The short exclusive lock every change to an existing lease (takeover, beat,
+/// release) happens under, so none of them can act on a stale reading. It
+/// ages out after [`TAKEOVER_LOCK_TTL`] in case its holder died inside it.
+struct TurnLock {
+    path: PathBuf,
+    token: String,
+}
+
+impl TurnLock {
+    fn token() -> String {
+        crate::rng::SplitMix64::new(crate::rng::entropy()).uuid_v4()
+    }
+
+    fn take(lease: &Path) -> Result<Option<Self>> {
+        let path = lease.with_extension("turn.lock");
+        let token = Self::token();
+        if create_exclusive(&path, &token)? {
+            return Ok(Some(Self { path, token }));
+        }
+        let seen = std::fs::read_to_string(&path).ok();
+        let aged = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > TAKEOVER_LOCK_TTL);
+        if !aged {
+            return Ok(None);
+        }
+        // Move the old lock aside rather than delete it: the rename is what
+        // one of several takers wins. Then check what was moved is the lock
+        // we judged dead; if a faster taker's fresh lock was moved instead,
+        // put it back and lose.
+        let aside = path.with_extension(format!("lock.{token}.dead"));
+        if std::fs::rename(&path, &aside).is_err() {
+            return Ok(None);
+        }
+        let moved = std::fs::read_to_string(&aside).ok();
+        if moved != seen {
+            let _ = std::fs::hard_link(&aside, &path);
+            let _ = std::fs::remove_file(&aside);
+            return Ok(None);
+        }
+        let _ = std::fs::remove_file(&aside);
+        if create_exclusive(&path, &token)? {
+            return Ok(Some(Self { path, token }));
+        }
+        Ok(None)
+    }
+
+    /// Wait briefly for the lock; the holders only do a read and a write.
+    fn take_patiently(lease: &Path) -> Option<Self> {
+        for _ in 0..50 {
+            match Self::take(lease) {
+                Ok(Some(lock)) => return Some(lock),
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+}
+
+impl Drop for TurnLock {
+    fn drop(&mut self) {
+        // Only our own lock: one that aged out and was taken over is not ours.
+        if std::fs::read_to_string(&self.path).is_ok_and(|t| t == self.token) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// How often a running turn renews its lease: well inside
+/// [`crate::ask::LEASE_TTL`].
+pub const TURN_BEAT: Duration = Duration::from_secs(20);
+
+/// One talk's cross-process turn slot, released on drop (success, error,
+/// panic or a dropped handler future alike). Release only removes the file
+/// while it still carries this lease's token, so a guard that outlived its
+/// own expiry cannot delete the lease of whoever took over.
+#[derive(Debug)]
+pub struct TurnLease {
+    path: PathBuf,
+    token: String,
+}
+
+impl TurnLease {
+    /// Renew the lease. `Ok(false)` means it was taken over or removed, so
+    /// this turn no longer owns the slot; `Err` is a transient failure (the
+    /// lock stayed busy, a write failed) and the next beat tries again.
+    pub fn beat(&self) -> Result<bool> {
+        let _lock = TurnLock::take_patiently(&self.path)
+            .with_context(|| format!("lock {} to renew it", self.path.display()))?;
+        let Some(mut record) = read_turn(&self.path).filter(|r| r.token == self.token) else {
+            return Ok(false);
+        };
+        record.beat_at = Timestamp::now();
+        let body = serde_json::to_string(&record).context("serialize turn lease")?;
+        let tmp = self.path.with_extension(format!("turn.{}.tmp", self.token));
+        write_atomic(&tmp, &self.path, &body)?;
+        Ok(true)
+    }
+
+    /// Run `fut` while renewing this lease every [`TURN_BEAT`]. A transient
+    /// beat failure is logged and the turn goes on; a lost lease drops `fut`
+    /// (the turn stops) and is an error, since somebody else may now be
+    /// running the same conversation.
+    pub async fn beating<T>(&self, fut: impl std::future::Future<Output = T>) -> Result<T> {
+        self.beating_every(TURN_BEAT, fut).await
+    }
+
+    async fn beating_every<T>(
+        &self,
+        period: Duration,
+        fut: impl std::future::Future<Output = T>,
+    ) -> Result<T> {
+        tokio::pin!(fut);
+        loop {
+            match tokio::time::timeout(period, &mut fut).await {
+                Ok(out) => return Ok(out),
+                Err(_) => match self.beat() {
+                    Ok(true) => {}
+                    Ok(false) => bail!(
+                        "the turn lease {} was taken over; this turn is stopped",
+                        self.path.display()
+                    ),
+                    Err(e) => tracing::warn!("{e:#}"),
+                },
+            }
+        }
+    }
+}
+
+impl Drop for TurnLease {
+    fn drop(&mut self) {
+        // Under the lock, so a takeover cannot slip in between the check and
+        // the removal. If the lock stays busy the lease just ages out.
+        if let Some(_lock) = TurnLock::take_patiently(&self.path) {
+            if read_turn(&self.path).is_some_and(|r| r.token == self.token) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
     }
 }
 
@@ -1977,6 +2234,137 @@ mod tests {
 
         let talk = talks.get("20260904-014455-ab12").expect("must still read");
         assert!(talk.turns[0].attachments.is_empty());
+    }
+
+    fn lease_store() -> (tempfile::TempDir, Talks, Talks) {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path().join("talks");
+        (tmp, Talks::at(root.clone()), Talks::at(root))
+    }
+
+    #[test]
+    fn two_starters_on_one_talk_one_wins_and_the_other_is_refused() {
+        let (_tmp, a, b) = lease_store();
+        let won = a.claim_turn("t1").expect("claim").expect("first wins");
+        assert!(
+            b.claim_turn("t1").expect("claim").is_none(),
+            "second is refused"
+        );
+        assert!(b.turn_held("t1"));
+        assert!(
+            b.claim_turn("t2").expect("claim").is_some(),
+            "other talks are free"
+        );
+        drop(won);
+    }
+
+    #[test]
+    fn a_stale_lease_is_taken_over_and_the_old_guard_cannot_release_it() {
+        let (_tmp, a, b) = lease_store();
+        let old = a.claim_turn("t1").expect("claim").expect("held");
+        let later = Timestamp::now()
+            .checked_add(jiff::SignedDuration::from_secs(
+                crate::ask::LEASE_TTL.as_secs() as i64 + 5,
+            ))
+            .expect("later");
+        let new = b
+            .claim_turn_at("t1", later)
+            .expect("claim")
+            .expect("a stale lease is taken over");
+        drop(old);
+        assert!(a.turn_held("t1"), "the old guard left the new lease alone");
+        assert!(new.beat().expect("beat"), "the new owner still beats");
+        drop(new);
+        assert!(!a.turn_held("t1"));
+    }
+
+    #[tokio::test]
+    async fn a_turn_whose_lease_was_taken_over_is_stopped() {
+        let (_tmp, a, b) = lease_store();
+        let old = a.claim_turn("t1").expect("claim").expect("held");
+        let later = Timestamp::now()
+            .checked_add(jiff::SignedDuration::from_secs(
+                crate::ask::LEASE_TTL.as_secs() as i64 + 5,
+            ))
+            .expect("later");
+        let _new = b
+            .claim_turn_at("t1", later)
+            .expect("claim")
+            .expect("taken over");
+        let out = old
+            .beating_every(Duration::from_millis(10), std::future::pending::<()>())
+            .await;
+        assert!(out.is_err(), "the displaced turn must stop, not run on");
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_finishes_is_returned_and_keeps_its_lease_beating() {
+        let (_tmp, a, _b) = lease_store();
+        let lease = a.claim_turn("t1").expect("claim").expect("held");
+        let out = lease
+            .beating_every(Duration::from_millis(5), async {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                7
+            })
+            .await
+            .expect("still ours");
+        assert_eq!(out, 7);
+        assert!(a.turn_held("t1"));
+    }
+
+    #[test]
+    fn an_unreadable_lease_counts_as_stale() {
+        let (_tmp, a, b) = lease_store();
+        std::fs::create_dir_all(a.root()).expect("dir");
+        std::fs::write(a.turn_path("t1"), "not json").expect("write");
+        assert!(!a.turn_held("t1"));
+        assert!(b.claim_turn("t1").expect("claim").is_some());
+    }
+
+    #[test]
+    fn a_lease_is_released_when_the_turn_ends_or_fails() {
+        let (_tmp, a, b) = lease_store();
+        let lease = a.claim_turn("t1").expect("claim").expect("held");
+        let failed: Result<()> = (|| {
+            let _held = &lease;
+            bail!("turn failed")
+        })();
+        assert!(failed.is_err());
+        assert!(
+            b.claim_turn("t1").expect("claim").is_none(),
+            "held mid-turn"
+        );
+        drop(lease);
+        assert!(
+            b.claim_turn("t1").expect("claim").is_some(),
+            "free after the turn"
+        );
+    }
+
+    #[test]
+    fn concurrent_takeovers_of_a_stale_lease_have_one_winner() {
+        let (_tmp, a, _b) = lease_store();
+        drop(a.claim_turn("t1").expect("claim").expect("held"));
+        std::fs::write(
+            a.turn_path("t1"),
+            serde_json::to_string(&TurnRecord {
+                token: "gone".into(),
+                pid: 1,
+                beat_at: Timestamp::from_second(1).expect("ts"),
+            })
+            .expect("json"),
+        )
+        .expect("write");
+        let wins: Vec<_> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..8)
+                .map(|_| {
+                    let s = a.clone();
+                    sc.spawn(move || s.claim_turn("t1").expect("claim"))
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().expect("join")).collect()
+        });
+        assert_eq!(wins.iter().filter(|w| w.is_some()).count(), 1);
     }
 
     #[test]
