@@ -3369,14 +3369,71 @@ function renderStatsReviewerScatter(reviewers) {
     .map((d) => `${d.agent} ${d.adopted}/${d.submitted} (${d.pct.toFixed(0)}%)`).join(", ")}`);
 }
 
+/* A non-zero share narrower than this is drawn at this width, so a faint or
+   no-proposal part stays visible next to a 98% strong one. */
+const STATS_SEG_MIN = 4;
+
+/* Pure: each advisor's seats split into strong / faint / no proposal. A part
+   with no seats gets no segment; a non-zero part gets at least STATS_SEG_MIN
+   percent, the excess taken from the largest part so the widths sum to 100.
+   `pct` is the true share, `width` the drawn one. Same order as statsBarPlan. */
+function statsReflectionPlan(advisors) {
+  const kinds = [["strong", "strong"], ["faint", "faint"], ["absent", "no proposal"]];
+  const rows = advisors.map((a) => {
+    const parts = kinds.map(([key, label]) => {
+      const count = a[key] || 0;
+      const pct = a.seated > 0 ? (100 * count) / a.seated : 0;
+      return { key, label, count, pct, width: count > 0 ? Math.max(pct, STATS_SEG_MIN) : 0 };
+    });
+    const over = parts.reduce((t, p) => t + p.width, 0) - 100;
+    if (over > 0) {
+      const big = parts.reduce((m, p) => (p.width > m.width ? p : m), parts[0]);
+      big.width -= over;
+    }
+    const tier = a.seated === 0 ? 2 : a.seated < STATS_LOW_N ? 1 : 0;
+    return { row: a, tier, parts };
+  });
+  const rate = (r) => (r.row.reflection_rate ? r.row.reflection_rate.pct : 0);
+  rows.sort((x, y) => x.tier - y.tier
+    || rate(y) - rate(x)
+    || y.row.seated - x.row.seated
+    || (x.row.agent < y.row.agent ? -1 : x.row.agent > y.row.agent ? 1 : 0));
+  return rows;
+}
+
+function statsReflectionRows(root, advisors) {
+  clear(root);
+  for (const { row, tier, parts } of statsReflectionPlan(advisors)) {
+    const name = el("span", { class: "bar-row-name", text: row.agent });
+    if (tier === 1) name.append(el("span", { class: "bar-row-tag", text: "low n" }));
+    const value = el("span", {
+      class: "bar-row-value refl-value",
+      text: `${row.strong}/${row.proposed} strong`,
+    });
+    value.append(el("span", { class: "bar-row-n", text: `n=${row.seated}` }));
+    const item = el("div", { class: "bar-row" }, el("div", { class: "bar-row-head" }, name, value));
+    if (tier === 1) setAttr(item, "data-low-n", "");
+    if (tier !== 2) {
+      const summary = parts.map((p) => `${p.label} ${p.count}/${row.seated} (${p.pct.toFixed(1)}%)`).join(", ");
+      const track = el("div", { class: "refl-track", role: "img", "aria-label": summary });
+      for (const p of parts) {
+        if (p.count === 0) continue;
+        track.append(el("div", {
+          class: `refl-seg refl-${p.key}`,
+          style: `flex: 0 0 ${p.width.toFixed(2)}%`,
+          title: `${p.label} ${p.count}/${row.seated} (${p.pct.toFixed(1)}%)`,
+        }));
+      }
+      item.append(track);
+    }
+    root.append(item);
+  }
+}
+
 function renderStatsAdvisors(advisors) {
   show($("stats-advisors-panel"), advisors.length > 0);
   if (advisors.length === 0) return;
-  statsBarRows($("stats-advisors-bars"), advisors.map((a) => ({
-    agent: a.agent,
-    fraction: `${a.strong}/${a.proposed} strong (${a.seated} seats · ${a.faint} faint · ${a.absent} no proposal)`,
-    rate: a.reflection_rate,
-  })));
+  statsReflectionRows($("stats-advisors-bars"), advisors);
 }
 
 /* Hidden entirely when `merged` is zero - a home with nothing merged yet has

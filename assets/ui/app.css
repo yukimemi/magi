@@ -1362,6 +1362,15 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .bar-row[data-low-n] .bar-fill { opacity: 0.4; }
 .bar-track { height: 10px; border-radius: 5px; background: var(--sunk); overflow: hidden; }
 .bar-fill { height: 100%; border-radius: 5px; }
+.refl-legend { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4, 16px); margin: 0 0 var(--s3); padding: 0; list-style: none; font-size: var(--t3); color: var(--ink-3); }
+.refl-dot { display: inline-block; width: 10px; height: 10px; margin-right: var(--s2); border-radius: 50%; vertical-align: baseline; }
+.refl-strong { background: var(--teal); }
+.refl-faint { background: var(--gold); }
+.refl-absent { background: var(--rust); }
+.refl-track { display: flex; gap: 1px; height: 10px; border-radius: 5px; background: var(--sunk); overflow: hidden; }
+.refl-seg { min-width: 3px; height: 100%; }
+.refl-value { white-space: normal; text-align: right; }
+.bar-row[data-low-n] .refl-seg { opacity: 0.55; }
 
 /* ---- candidates -------------------------------------------------------- */
 .cands { display: flex; flex-direction: column; gap: var(--s3); }
