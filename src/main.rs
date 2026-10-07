@@ -1623,7 +1623,7 @@ async fn dispatch(command: Command) -> Result<()> {
             say,
             ask_chat,
             list,
-        } => answer_cmd(id, reply, say, ask_chat, list),
+        } => answer_cmd(id, reply, say, ask_chat, list).await,
 
         Command::Task { command } => task_cmd(command).await,
 
@@ -2492,7 +2492,7 @@ fn resolved_before_the_wait_even_starts(q: &ask::Question) -> Result<Option<Stri
 
 /// `magi answer`: reply or ask back from the terminal, so the phone is a
 /// convenience and never the only way to unblock a run.
-fn answer_cmd(
+async fn answer_cmd(
     id: Option<String>,
     reply: Option<String>,
     say: Option<String>,
@@ -2544,14 +2544,32 @@ fn answer_cmd(
         let tasks = Queue::open().list();
         let talk = magi::consult::origin_talk(&tasks, &talks.list(), &q)
             .context("this question has no open chat to ask")?;
-        if magi::consult::begin(&store, &talks, &q, &talk)? {
-            println!(
-                "handed {} to chat {} — it is queued there as a draft; resume it in the chat to start",
+        if !magi::consult::begin(&store, &talks, &q, &talk)? {
+            println!("{} was already handed to the chat", q.short());
+            return Ok(());
+        }
+        let (cfg, _) = magi::config::Config::discover(&talk.repo, None)?;
+        match magi::consult::answer_in_chat(&talks, &cfg, &talk.id).await? {
+            magi::consult::Handled::Ran => {
+                let reply = talks
+                    .get(&talk.id)?
+                    .turns
+                    .last()
+                    .map(|t| t.body.lines().next().unwrap_or("").to_owned())
+                    .unwrap_or_default();
+                let closed = !store.get(&q.id)?.status.open();
+                println!(
+                    "chat {} took {}: {reply}{}",
+                    talk.short(),
+                    q.short(),
+                    if closed { " (question closed)" } else { "" }
+                );
+            }
+            magi::consult::Handled::LeftQueued => println!(
+                "handed {} to chat {} — the chat is busy, so it is queued there and picked up after the running turn",
                 q.short(),
                 talk.short()
-            );
-        } else {
-            println!("{} was already handed to the chat", q.short());
+            ),
         }
         return Ok(());
     }
