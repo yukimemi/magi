@@ -949,6 +949,11 @@ pub struct TurnLease {
 }
 
 impl TurnLease {
+    /// Does the lease file still carry this lease's token? A read only.
+    pub fn holds(&self) -> bool {
+        read_turn(&self.path).is_some_and(|r| r.token == self.token)
+    }
+
     /// Renew the lease. `Ok(false)` means it was taken over or removed, so
     /// this turn no longer owns the slot; `Err` is a transient failure (the
     /// lock stayed busy, a write failed) and the next beat tries again.
@@ -1206,9 +1211,9 @@ fn check_lease(lease: &TurnLease, talk: &Talk) -> Result<()> {
     if lease.talk != talk.id {
         bail!("the turn lease is for talk {}, not {}", lease.talk, talk.id);
     }
-    // Renewing doubles as the ownership check: a lease that aged out and was
-    // taken over must not start a turn (or write the operator's text) at all.
-    if !lease.beat()? {
+    // A lease that aged out and was taken over must not start a turn (or
+    // write the operator's text) at all.
+    if !lease.holds() {
         bail!("the turn lease for talk {} is no longer held", talk.short());
     }
     Ok(())
