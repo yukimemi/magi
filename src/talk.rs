@@ -399,16 +399,25 @@ impl Talks {
     /// The mutex only serializes this process. The cycle is also taken under a
     /// short file lock beside the records, so the CLI (`magi answer
     /// --ask-chat`) and the web server cannot overwrite each other's draft.
-    /// The file lock is best effort: if it stays busy past its short wait, the
-    /// cycle proceeds under the mutex alone (the lock ages out on its own).
-    fn guard(&self) -> StoreGuard<'_> {
+    /// The file lock is never skipped: a cycle that cannot get it within
+    /// longer than the lock's own expiry fails instead of writing unguarded.
+    fn guard(&self) -> Result<StoreGuard<'_>> {
         let mutex = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let file = std::fs::create_dir_all(&self.root)
-            .ok()
-            .and_then(|()| TurnLock::take_patiently(&self.root.join(".store.turn")));
-        StoreGuard {
-            _file: file,
-            _mutex: mutex,
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("create {}", self.root.display()))?;
+        let path = self.root.join(".store.turn");
+        let deadline = std::time::Instant::now() + TAKEOVER_LOCK_TTL * 2;
+        loop {
+            if let Some(file) = TurnLock::take(&path)? {
+                return Ok(StoreGuard {
+                    _file: file,
+                    _mutex: mutex,
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("the talk store is locked by another process");
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -699,7 +708,7 @@ impl Talks {
     /// give up without writing if it is not, which is what stops their `put`
     /// from resurrecting a conversation this call already removed.
     pub fn remove(&self, id: &str) -> Result<()> {
-        let _guard = self.guard();
+        let _guard = self.guard()?;
         let resolved = self.resolve_id(id)?;
         let path = self.path_of(&resolved);
         std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
@@ -716,7 +725,7 @@ impl Talks {
 /// What [`Talks::guard`] hands out: the in-process mutex plus the
 /// cross-process file lock. The file lock is released first.
 struct StoreGuard<'a> {
-    _file: Option<TurnLock>,
+    _file: TurnLock,
     _mutex: MutexGuard<'a, ()>,
 }
 
@@ -1099,7 +1108,7 @@ pub fn record(
     // concurrent `close` could land in between this call's own read and its
     // `put`, it does not remove it. See [`Talks::guard`] and the matching
     // guard in `turn`, which this mirrors.
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     // A concurrent `Talks::remove` can have landed in that same gap. `put`
     // writes unconditionally, so trusting the stale `talk` here would recreate
     // the file a delete just removed - the record must still be there for a
@@ -1145,7 +1154,7 @@ pub fn queue(
     if text.is_empty() && attachments.is_empty() {
         bail!("nothing to say");
     }
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1172,7 +1181,7 @@ pub fn queue(
 
 /// Promote the current durable draft to one operator turn.
 pub fn drain(talk: &mut Talk, store: &Talks) -> Result<Option<String>> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1258,7 +1267,7 @@ fn check_lease(lease: &TurnLease, talk: &Talk) -> Result<()> {
 /// [`Talks::remove`] having deleted it, and writing the stale copy back would
 /// resurrect exactly what that delete removed.
 pub fn close(talk: &mut Talk, store: &Talks) -> Result<()> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1282,7 +1291,7 @@ pub fn close(talk: &mut Talk, store: &Talks) -> Result<()> {
 /// falling back to the stale copy if the re-read fails, for the same reasons
 /// `close`'s doc gives.
 pub fn reopen(talk: &mut Talk, store: &Talks) -> Result<()> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1305,7 +1314,7 @@ pub fn reopen(talk: &mut Talk, store: &Talks) -> Result<()> {
 /// resurrecting a record a concurrent delete removed. Refusing a closed talk
 /// or a turn in flight is the caller's job: only it can see the latter.
 pub fn switch_agent(talk: &mut Talk, store: &Talks, spec: &AgentSpec) -> Result<bool> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1377,7 +1386,7 @@ pub fn switch_persona(talk: &mut Talk, store: &Talks, id: &str) -> Result<bool> 
 
 /// Discard the durable draft without adding a transcript turn.
 pub fn clear_pending(talk: &mut Talk, store: &Talks) -> Result<()> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1395,7 +1404,7 @@ pub fn clear_pending_if_matches(
     expected_text: &str,
     expected_attachments: &[String],
 ) -> Result<bool> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1420,7 +1429,7 @@ pub fn edit_pending_text(
     expected_text: &str,
     expected_attachments: &[String],
 ) -> Result<bool> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1728,7 +1737,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // section atomic with `close`'s own - taken only for this tail and not
     // for the whole invocation above, so one talk's fifteen-minute turn does
     // not block another talk's close from proceeding.
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     // A delete is the more final version of that same race: `put` writes
     // unconditionally, so a talk removed while this turn was in flight must
     // stay removed rather than being written back with this turn's reply
@@ -3714,7 +3723,7 @@ mod tests {
         // Hold the same guard `record`'s read-modify-write section holds for
         // the whole of its own read-then-write, standing in for `record`
         // being paused between its read and its `put`.
-        let held = talks.guard();
+        let held = talks.guard().unwrap();
 
         let talks2 = talks.clone();
         let id = talk.id.clone();
