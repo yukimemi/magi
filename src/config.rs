@@ -1813,10 +1813,12 @@ impl Config {
             judges: self.rotate(&self.roles.judges, self.graph.judges, 1)?,
             reviewers: self.rotate(&self.roles.reviewers, self.graph.reviewers, 0)?,
             fixer: match self.roles.fixer.as_ref() {
+                // Ids are validated against the roster here; whether the CLI
+                // is installed is left to invocation, like every other seat.
                 Some(choice) => Some(crate::agent::pick_chain(
                     &self.agents,
                     Some(choice),
-                    &crate::agent::installed,
+                    &|_| true,
                     "fixer",
                 )?),
                 None => None,
