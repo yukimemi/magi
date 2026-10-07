@@ -2420,7 +2420,10 @@ mod tests {
         let err = layered("", "[graph]\ncandidates = 2\nimplementers = 3\n")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("candidates") && err.contains("implementers"), "{err}");
+        assert!(
+            err.contains("candidates") && err.contains("implementers"),
+            "{err}"
+        );
         assert!(err.contains("b.toml"), "{err}");
     }
 

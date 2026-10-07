@@ -5975,10 +5975,16 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
                 Some(Command::Review { implementers, .. }) => assert_eq!(implementers, Some(2)),
                 other => panic!("expected Review, got {other:?}"),
             }
-            let cli = Cli::try_parse_from(["magi", "task", "add", flag, "2", "some", "text"]).unwrap();
+            let cli =
+                Cli::try_parse_from(["magi", "task", "add", flag, "2", "some", "text"]).unwrap();
             match cli.command {
                 Some(Command::Task {
-                    command: TaskCmd::Add { implementers, instruction, .. },
+                    command:
+                        TaskCmd::Add {
+                            implementers,
+                            instruction,
+                            ..
+                        },
                 }) => {
                     assert_eq!(implementers, Some(2));
                     assert_eq!(instruction, vec!["some", "text"]);
