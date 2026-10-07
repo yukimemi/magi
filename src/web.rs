@@ -4879,14 +4879,18 @@ async fn queue_edit(
             let cfg = crate::config::Config::discover(repo, None)
                 .ok()
                 .map(|(c, _)| c);
-            crate::dupes::screen_with_config(hits, &body.instruction, None, repo, cfg.as_ref())
-                .await
-                .map_err(|dup| {
-                    ApiError::conflict(dup.render(
-                        "Nothing was saved. If it is not a duplicate, repeat the request with \
-                         \"force\": true.",
-                    ))
-                })?;
+            let screened =
+                crate::dupes::screen_with_config(hits, &body.instruction, None, repo, cfg.as_ref())
+                    .await
+                    .map_err(|dup| {
+                        ApiError::conflict(dup.render(
+                            "Nothing was saved. If it is not a duplicate, repeat the request \
+                             with \"force\": true.",
+                        ))
+                    })?;
+            if let crate::dupes::Screened::Unjudged(why) = screened {
+                tracing::warn!(%why, "task edit saved without a duplicate-work judgement");
+            }
         }
         judged = seen;
     }
@@ -9929,12 +9933,22 @@ mod tests {
 
     #[tokio::test]
     async fn editing_in_a_duplicate_is_a_409_naming_the_match_until_forced() {
-        let f = Fixture::start().await;
+        // The judge is an agent now: a repo whose only agent answers
+        // "duplicate" stands in for it, so the refusal is the judge's.
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let judge = MOCK_AGENT_TOML.replace(
+            "printf ok",
+            r#"printf '{\"duplicate\":true,\"reason\":\"same branch\"}'"#,
+        );
+        std::fs::write(repo.join("magi.toml"), judge).expect("write magi.toml");
+        let f = Fixture::with_repo(repo.clone()).await;
         let queue = f.queue();
         let mut owner = Task::new(
             "owner".to_owned(),
             "review it".to_owned(),
-            PathBuf::from("/repo/magi"),
+            repo.clone(),
             Source::Human,
         );
         owner.review_branch = Some("magi/ab12/A".to_owned());
@@ -9942,7 +9956,7 @@ mod tests {
         let mut task = Task::new(
             "draft".to_owned(),
             "old".to_owned(),
-            PathBuf::from("/repo/magi"),
+            repo.clone(),
             Source::Human,
         );
         queue.put(&mut task).expect("file the draft");
