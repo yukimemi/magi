@@ -362,9 +362,40 @@ fn english_words(text: &str) -> (usize, usize) {
     (counted, hits)
 }
 
+/// Word endings that are common in German, Dutch, Spanish and Italian and
+/// rare in English. Only ever applied to long ASCII words (see `foreign_looking`).
+const FOREIGN_SUFFIXES: &[&str] = &[
+    "ieren", "ierung", "ungen", "ung", "keit", "heit", "lich", "zeit", "zeiten", "mente", "zione",
+];
+
+/// Prose shorter than this many counted words cannot be judged by a zero-hit
+/// result alone: a title like `Improve performance` has no word the list knows.
+const PROSE_WORDS: usize = 5;
+
+/// Positive evidence that a short text is not English, without needing a
+/// match against the English list: non-ASCII letters, any known foreign word,
+/// or a long ASCII word with a foreign ending (`Wartezeiten`, `reduzieren`).
+fn foreign_looking(text: &str) -> bool {
+    text.chars().any(|c| c.is_alphabetic() && !c.is_ascii())
+        || text
+            .split(|c: char| !c.is_alphabetic())
+            .filter(|w| !w.is_empty())
+            .map(str::to_lowercase)
+            .any(|w| {
+                FOREIGN_WORDS.contains(&w.as_str())
+                    || (w.len() >= 6
+                        && w.is_ascii()
+                        && FOREIGN_SUFFIXES.iter().any(|s| w.ends_with(s)))
+            })
+}
+
 fn lacks_english(text: &str) -> bool {
     let (counted, hits) = english_words(text);
-    (counted >= 2 && hits == 0) || (counted >= 4 && hits * 3 < counted)
+    if counted < PROSE_WORDS {
+        // Too short for "no English word" to mean anything by itself.
+        return (hits == 0 || hits * 2 < counted) && foreign_looking(text);
+    }
+    hits == 0 || hits * 3 < counted
 }
 
 fn foreign_words(text: &str) -> bool {
@@ -562,6 +593,44 @@ mod tests {
             check("fix: retries", "Zeitweise Sperren lösen Wartezeiten aus")
                 .contains(&Violation::BodyLanguage)
         );
+    }
+
+    #[test]
+    fn short_english_without_list_hits_passes_but_foreign_short_text_fails() {
+        for text in [
+            "Improve performance",
+            "perf: speed cache",
+            "Trim idle sockets",
+            "Quicker warmup sprocket",
+        ] {
+            assert_eq!(english_words(text).1, 0, "{text} must have no list hit");
+            assert!(check(text, "").is_empty(), "{text}");
+            assert!(check("fix: retries", text).is_empty(), "{text}");
+        }
+        for text in [
+            "fix(request): Wartezeiten reduzieren",
+            "Leistung verbessern",
+            "Corrección rápida",
+            "fix: Wartezeiten im request reduzieren",
+            "fix: retries schneller wiederholen",
+            "fix(request): Wartezeiten bei retries reduzieren",
+        ] {
+            assert!(
+                check(text, "").contains(&Violation::TitleLanguage),
+                "{text}"
+            );
+            assert!(
+                check("fix: retries", text).contains(&Violation::BodyLanguage),
+                "{text}"
+            );
+        }
+        // Four zero-hit words are short; five are prose and need a hit.
+        let four = "Quicker warmup sprocket tweak";
+        let five = "Quicker warmup sprocket tweak gizmo";
+        assert_eq!(english_words(four), (4, 0));
+        assert_eq!(english_words(five), (5, 0));
+        assert!(check(four, "").is_empty());
+        assert!(check(five, "").contains(&Violation::TitleLanguage));
     }
 
     #[test]
