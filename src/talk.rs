@@ -747,13 +747,32 @@ impl TurnLock {
         crate::rng::SplitMix64::new(crate::rng::entropy()).uuid_v4()
     }
 
+    /// Publish `token` at `path` complete (written privately, then linked), so
+    /// nobody reads an empty or half-written token; `false` if `path` exists.
+    fn publish(path: &Path, token: &str) -> Result<bool> {
+        let tmp = path.with_extension(format!("lock.{token}.new"));
+        std::fs::write(&tmp, token).with_context(|| format!("write {}", tmp.display()))?;
+        let linked = std::fs::hard_link(&tmp, path);
+        let _ = std::fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
+        }
+    }
+
     fn take(lease: &Path) -> Result<Option<Self>> {
         let path = lease.with_extension("turn.lock");
         let token = Self::token();
-        if create_exclusive(&path, &token)? {
+        if Self::publish(&path, &token)? {
             return Ok(Some(Self { path, token }));
         }
-        let seen = std::fs::read_to_string(&path).ok();
+        let Some(seen) = std::fs::read_to_string(&path)
+            .ok()
+            .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        else {
+            return Ok(None);
+        };
         let aged = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok()
@@ -762,25 +781,54 @@ impl TurnLock {
         if !aged {
             return Ok(None);
         }
-        // Move the old lock aside rather than delete it: the rename is what
-        // one of several takers wins. Then check what was moved is the lock
-        // we judged dead; if a faster taker's fresh lock was moved instead,
-        // put it back and lose.
-        let aside = path.with_extension(format!("lock.{token}.dead"));
-        if std::fs::rename(&path, &aside).is_err() {
+        // Breaking a dead lock is decided by a ticket named after the token
+        // that was judged dead: exactly one taker per generation can create
+        // it. The lock itself is never moved aside, so a fresh lock made by
+        // the winner is never off the path, not even for an instant.
+        let ticket = path.with_extension(format!("lock.{seen}.break"));
+        if !create_exclusive(&ticket, "")? {
             return Ok(None);
         }
-        let moved = std::fs::read_to_string(&aside).ok();
-        if moved != seen {
-            let _ = std::fs::hard_link(&aside, &path);
-            let _ = std::fs::remove_file(&aside);
+        Self::sweep_tickets(&path);
+        // Only the ticket's owner reaches this point for `seen`, and nobody
+        // else removes a lock that still carries it; if it changed, leave it.
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(seen.as_str()) {
             return Ok(None);
         }
-        let _ = std::fs::remove_file(&aside);
-        if create_exclusive(&path, &token)? {
+        let _ = std::fs::remove_file(&path);
+        if Self::publish(&path, &token)? {
             return Ok(Some(Self { path, token }));
         }
         Ok(None)
+    }
+
+    /// Forget tickets far older than the lock's TTL. They stay that long so a
+    /// slow taker that read the same dead token cannot break it a second time.
+    fn sweep_tickets(path: &Path) {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        else {
+            return;
+        };
+        let prefix = format!("{name}.");
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let file = entry.file_name();
+            let Some(file) = file.to_str() else { continue };
+            if !(file.starts_with(&prefix) && file.ends_with(".break")) {
+                continue;
+            }
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > TAKEOVER_LOCK_TTL * 360);
+            if old {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 
     /// Wait briefly for the lock; the holders only do a read and a write.
@@ -2365,6 +2413,43 @@ mod tests {
             hs.into_iter().map(|h| h.join().expect("join")).collect()
         });
         assert_eq!(wins.iter().filter(|w| w.is_some()).count(), 1);
+    }
+
+    fn age_file(path: &Path) {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open");
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .expect("age");
+    }
+
+    #[test]
+    fn a_late_taker_of_a_broken_lock_cannot_disturb_its_replacement() {
+        let (_tmp, a, _b) = lease_store();
+        let lease = a.turn_path("t1");
+        let lock = lease.with_extension("turn.lock");
+        std::fs::create_dir_all(lock.parent().expect("dir")).expect("dir");
+        std::fs::write(&lock, "t1-dead").expect("dead lock");
+        age_file(&lock);
+        // B breaks the dead lock and holds a fresh one.
+        let b = TurnLock::take(&lease).expect("take").expect("b wins");
+        let fresh = std::fs::read_to_string(&lock).expect("read");
+        assert_eq!(fresh, b.token);
+        // C read the same dead token earlier: its ticket is already spent, and
+        // the fresh lock is never moved, so a newcomer cannot slip in.
+        let ticket = lock.with_extension("lock.t1-dead.break");
+        assert!(ticket.exists());
+        assert!(!create_exclusive(&ticket, "").expect("ticket"));
+        assert!(TurnLock::take(&lease).expect("take").is_none());
+        assert_eq!(std::fs::read_to_string(&lock).expect("read"), fresh);
+        // A later generation is breakable despite the old ticket.
+        age_file(&lock);
+        std::mem::forget(b);
+        let c = TurnLock::take(&lease)
+            .expect("take")
+            .expect("next generation");
+        assert_ne!(c.token, fresh);
     }
 
     #[test]
