@@ -101,6 +101,64 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
     Ok(true)
 }
 
+/// What [`run_turn`] did with the drafts waiting in the chat.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Handled {
+    /// This process held the turn lease and answered every draft.
+    Ran(usize),
+    /// Nothing was left to run (the web server drained it first).
+    Idle,
+    /// Another turn kept the lease for the whole wait; the draft stays queued.
+    Busy,
+}
+
+/// Run the chat turn for a consultation [`begin`] queued, from a process that
+/// is not the web server.
+///
+/// Exclusion is the on-disk turn lease (`Talks::claim_turn`), the same slot the
+/// web server takes, kept alive with `TurnLease::beating` for as long as the
+/// agent runs. A held lease is retried every `poll` up to `wait`; past that the
+/// draft stays in `Talk::pending` for the running turn's drain or a resume.
+pub async fn run_turn(
+    talks: &Talks,
+    cfg: &crate::config::Config,
+    talk_id: &str,
+    wait: std::time::Duration,
+    poll: std::time::Duration,
+) -> Result<Handled> {
+    let deadline = std::time::Instant::now() + wait;
+    let lease = loop {
+        if let Some(lease) = talks.claim_turn(talk_id)? {
+            break lease;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(Handled::Busy);
+        }
+        tokio::time::sleep(poll).await;
+    };
+    // Read after the claim: the web server may have drained the draft while
+    // this process waited.
+    let mut talk = talks.get(talk_id)?;
+    let mut ran = 0;
+    loop {
+        if !lease.beat()? {
+            bail!("the turn lease was taken over; the remaining drafts stay queued");
+        }
+        let Some(text) = talk::drain(&mut talk, talks)? else {
+            break;
+        };
+        lease
+            .beating(talk::respond(&mut talk, talks, cfg, &text))
+            .await??;
+        ran += 1;
+    }
+    Ok(if ran == 0 {
+        Handled::Idle
+    } else {
+        Handled::Ran(ran)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -293,5 +351,41 @@ mod tests {
         v.as_object_mut().unwrap().remove("consult");
         let back: Question = serde_json::from_value(v).unwrap();
         assert!(back.consult.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_turn_leaves_the_draft_when_the_lease_stays_held() {
+        let (_tmp, store, talk) = talks();
+        let mut t = store.get(&talk.id).expect("talk");
+        talk::queue(&mut t, &store, "consult", Vec::new()).expect("queue");
+        let _held = store.claim_turn(&talk.id).expect("claim").expect("free");
+        let cfg = Config::default();
+        let out = run_turn(
+            &store,
+            &cfg,
+            &talk.id,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .expect("run");
+        assert_eq!(out, Handled::Busy);
+        assert!(!store.get(&talk.id).expect("talk").pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_turn_with_nothing_queued_is_idle() {
+        let (_tmp, store, talk) = talks();
+        let out = run_turn(
+            &store,
+            &Config::default(),
+            &talk.id,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .expect("run");
+        assert_eq!(out, Handled::Idle);
+        assert!(store.claim_turn(&talk.id).expect("claim").is_some());
     }
 }

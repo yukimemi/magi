@@ -1623,7 +1623,7 @@ async fn dispatch(command: Command) -> Result<()> {
             say,
             ask_chat,
             list,
-        } => answer_cmd(id, reply, say, ask_chat, list),
+        } => answer_cmd(id, reply, say, ask_chat, list).await,
 
         Command::Task { command } => task_cmd(command).await,
 
@@ -2492,7 +2492,7 @@ fn resolved_before_the_wait_even_starts(q: &ask::Question) -> Result<Option<Stri
 
 /// `magi answer`: reply or ask back from the terminal, so the phone is a
 /// convenience and never the only way to unblock a run.
-fn answer_cmd(
+async fn answer_cmd(
     id: Option<String>,
     reply: Option<String>,
     say: Option<String>,
@@ -2544,14 +2544,42 @@ fn answer_cmd(
         let tasks = Queue::open().list();
         let talk = magi::consult::origin_talk(&tasks, &talks.list(), &q)
             .context("this question has no open chat to ask")?;
-        if magi::consult::begin(&store, &talks, &q, &talk)? {
-            println!(
-                "handed {} to chat {} — it is queued there as a draft; resume it in the chat to start",
-                q.short(),
-                talk.short()
-            );
-        } else {
+        // Read the config before `begin` saves anything: a failure must leave
+        // no consult record or draft behind, or a retry would never start the
+        // turn.
+        let (cfg, _) = magi::config::Config::discover(&talk.repo, None)?;
+        let fresh = magi::consult::begin(&store, &talks, &q, &talk)?;
+        if !fresh {
             println!("{} was already handed to the chat", q.short());
+        }
+        if fresh || !talks.get(&talk.id)?.pending.is_empty() {
+            eprintln!("running the chat turn (waiting if one is already running)...");
+            match magi::consult::run_turn(
+                &talks,
+                &cfg,
+                &talk.id,
+                std::time::Duration::from_secs(300),
+                std::time::Duration::from_secs(2),
+            )
+            .await?
+            {
+                magi::consult::Handled::Ran(n) => println!(
+                    "chat {} answered {} ({n} turn{})",
+                    talk.short(),
+                    q.short(),
+                    if n == 1 { "" } else { "s" }
+                ),
+                magi::consult::Handled::Idle => println!(
+                    "chat {} had nothing left to run for {}",
+                    talk.short(),
+                    q.short()
+                ),
+                magi::consult::Handled::Busy => println!(
+                    "chat {} is busy; {} stays queued there as a draft - resume the chat to run it",
+                    talk.short(),
+                    q.short()
+                ),
+            }
         }
         return Ok(());
     }
