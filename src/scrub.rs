@@ -3,7 +3,7 @@
 //! The prompts tell agents not to put machine- or operator-identifying data
 //! (hostnames, account names, IPs, home paths, emails, tokens) into pull
 //! requests and issues, but a prompt is advisory. [`scrub`] is the enforced
-//! half: a pure function run right before `gh pr create`.
+//! half: shared rules used by the GitHub text posting gate.
 //!
 //! It scans the input left to right exactly once and pushes into a *separate*
 //! output string, so a replacement is never scanned again (compare the
@@ -46,7 +46,8 @@ impl Identity {
     }
 }
 
-const TOKEN_PREFIXES: [&str; 8] = [
+const TOKEN_PREFIXES: [&str; 9] = [
+    "AKIA",
     "github_pat_",
     "ghp_",
     "gho_",
@@ -65,7 +66,7 @@ fn is_word(c: char) -> bool {
 }
 
 fn is_name(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.')
 }
 
 fn is_email_local(c: char) -> bool {
@@ -105,7 +106,18 @@ pub fn scrub(text: &str, id: &Identity) -> String {
 fn match_at(rest: &str, prev: Option<char>, id: &Identity) -> Option<(usize, &'static str)> {
     let starts_word = prev.is_none_or(|p| !is_word(p));
     home_path(rest, prev, id)
-        .or_else(|| starts_word.then(|| token(rest)).flatten())
+        .or_else(|| {
+            starts_word
+                .then(|| {
+                    token(rest).or_else(|| credential(rest)).or_else(|| {
+                        prev.is_none_or(|c| !is_name(c))
+                            .then(|| named_identity(rest))
+                            .flatten()
+                    })
+                })
+                .flatten()
+        })
+        .or_else(|| absolute_path(rest, prev))
         .or_else(|| {
             prev.is_none_or(|p| !is_email_local(p))
                 .then(|| email(rest))
@@ -164,6 +176,105 @@ fn token(rest: &str) -> Option<(usize, &'static str)> {
     let prefix = TOKEN_PREFIXES.iter().find(|p| rest.starts_with(**p))?;
     let tail = run(&rest[prefix.len()..], is_word);
     (tail >= TOKEN_MIN_TAIL).then_some((prefix.len() + tail, "[redacted-token]"))
+}
+
+/// Explicit assignments avoid guessing whether an ordinary word is an account.
+fn named_identity(rest: &str) -> Option<(usize, &'static str)> {
+    for key in [
+        "hostname=",
+        "hostname: ",
+        "username=",
+        "username: ",
+        "user=",
+        "host=",
+    ] {
+        if rest
+            .get(..key.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(key))
+        {
+            let n = run(&rest[key.len()..], is_name);
+            if n > 0 {
+                return Some((key.len() + n, "[redacted-identity]"));
+            }
+        }
+    }
+    let n = name_len(rest);
+    if n > 0
+        && [".local", ".internal", ".lan"].iter().any(|suffix| {
+            n.checked_sub(suffix.len())
+                .and_then(|start| rest.get(start..n))
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+        })
+    {
+        return Some((n, "[redacted-host]"));
+    }
+    None
+}
+
+fn credential(rest: &str) -> Option<(usize, &'static str)> {
+    for key in [
+        "password=",
+        "token=",
+        "api_key=",
+        "api-key=",
+        "password: ",
+        "token: ",
+        "api_key: ",
+        "bearer ",
+        "password ",
+        "token ",
+        "api key ",
+    ] {
+        if rest
+            .get(..key.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(key))
+        {
+            let tail = &rest[key.len()..];
+            let padding = tail.len() - tail.trim_start_matches([' ', '\'', '"']).len();
+            let value = &tail[padding..];
+            let n = run(value, |c| {
+                !c.is_whitespace() && !matches!(c, '`' | '<' | '>' | '"' | '\'')
+            });
+            let contextual = matches!(key, "password " | "token " | "api key ");
+            let entropy = n >= 20
+                && value[..n].bytes().any(|b| b.is_ascii_digit())
+                && value[..n].bytes().any(|b| b.is_ascii_alphabetic());
+            if n > 0 && (!contextual || entropy) {
+                return Some((key.len() + padding + n, "[redacted-token]"));
+            }
+        }
+    }
+    None
+}
+
+fn absolute_path(rest: &str, prev: Option<char>) -> Option<(usize, &'static str)> {
+    if prev.is_some_and(|c| c.is_alphanumeric() || matches!(c, '/' | ':' | '.' | '~')) {
+        return None;
+    }
+    let b = rest.as_bytes();
+    let windows =
+        b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\');
+    // Known filesystem roots, rather than arbitrary slash-prefixed API routes.
+    let unix = [
+        "/tmp/",
+        "/private/",
+        "/var/",
+        "/etc/",
+        "/opt/",
+        "/srv/",
+        "/usr/",
+        "/mnt/",
+        "/Volumes/",
+    ]
+    .iter()
+    .any(|root| rest.starts_with(root));
+    if windows || unix {
+        let n = run(rest, |c| {
+            !c.is_whitespace() && !matches!(c, '`' | '"' | '\'' | '<' | '>')
+        });
+        return Some((n, "[redacted-path]"));
+    }
+    None
 }
 
 fn email(rest: &str) -> Option<(usize, &'static str)> {
@@ -316,7 +427,7 @@ mod tests {
             "returns std::io::Error, or a::b, Vec::new()",
             "released v1.2.3, version 0.41.1, 300.1.1.1",
             "thanks @coderabbitai; at 12:34:56 it ran",
-            "/tmp/x and /api/v1/runs; docs/home/x and ./Users/y",
+            "/api/v1/runs; docs/home/x and ./Users/y",
             "A plain sentence about background and motivation.",
             "日本語のテキスト 🎉 with émoji",
         ] {
@@ -326,7 +437,10 @@ mod tests {
 
     #[test]
     fn multibyte_input_does_not_panic_and_replacement_is_not_rescanned() {
-        assert_eq!(s("C:\\日本語 and C:/日本"), "C:\\日本語 and C:/日本");
+        assert_eq!(
+            s("C:\\日本語 and C:/日本"),
+            "[redacted-path] and [redacted-path]"
+        );
         assert_eq!(s("é/Users/bob/é 日本 alice"), "é~/é 日本 [redacted-user]");
         let once = s("/Users/bob 10.0.0.1 a@b.io alice");
         assert_eq!(scrub(&once, &Identity::default()), once);

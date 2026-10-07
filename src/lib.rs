@@ -41,6 +41,7 @@ pub mod dupes;
 pub mod fixer;
 pub mod followup;
 pub mod git;
+pub mod github_text;
 pub mod graph;
 pub mod handover;
 pub mod land;

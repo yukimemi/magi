@@ -2029,3 +2029,10 @@ and hands clap `ColorChoice::Never`; otherwise `Auto` leaves `NO_COLOR`, pipes
 and `CLICOLOR_FORCE` to clap. A false positive (the flag as a value) only turns
 colour off. The `styles` (`cli_styles`) are always set. `tests/cli_help_color.rs`
 runs the real binary.
+
+### GitHub text posting gate
+
+`src/github_text.rs` checks titles and bodies before magi posts or edits GitHub
+text; this is a gate, not a prompt. `[graph] github_text_guard` defaults to true.
+Language checks exempt code and quoted original tasks; sensitive data is always
+scrubbed, including those sections, using the shared rules in `src/scrub.rs`.

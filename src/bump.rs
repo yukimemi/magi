@@ -1315,7 +1315,55 @@ async fn after_merge_inner(
             out.timed_out
         );
     }
-    let decision = parse_decision(&out.text).context("parse the release-bump decision")?;
+    let mut decision = parse_decision(&out.text).context("parse the release-bump decision")?;
+    let violations = crate::github_text::check("", &decision.reason);
+    if state.config.graph.github_text_guard && !violations.is_empty() {
+        state.event(
+            "github-text",
+            format!("release reason rejected: {violations:?}; requesting one rewrite"),
+        );
+        let rewrite = format!(
+            "{prompt}\n\nYour release reason failed the GitHub text gate: {violations:?}. Return the same decision JSON with an English reason containing no local identity or secrets. Previous reason: {}",
+            decision.reason
+        );
+        let retry = agent::invoke(
+            &spec,
+            &mut seat,
+            &Invocation {
+                cwd: &repo,
+                prompt: &rewrite,
+                timeout: crate::graph::retry_budget(DECISION_TIMEOUT, true),
+                allow_write: false,
+                sessions: false,
+                artifacts: &artifacts,
+                stem: "bump-rewrite",
+                run: &state.id,
+                node: "bump",
+                cache_dir: state.config.cache_dir().as_deref(),
+                attachments: &[],
+                writable: &[],
+            },
+        )
+        .await;
+        let reason = retry
+            .ok()
+            .filter(|o| o.usable())
+            .and_then(|o| parse_decision(&o.text).ok())
+            .filter(|d| {
+                d.level == decision.level && crate::github_text::check("", &d.reason).is_empty()
+            })
+            .map(|d| d.reason);
+        if let Some(reason) = reason {
+            decision.reason = reason;
+            state.event("github-text", "release reason rewrite passed");
+        } else {
+            decision.reason = "The merged change requires a release.".to_owned();
+            state.event(
+                "github-text",
+                "release reason rewrite unavailable or rejected; using neutral text",
+            );
+        }
+    }
 
     if let Some(p) = pending {
         return match pending_action(p.level, decision.level) {
@@ -1349,7 +1397,7 @@ async fn after_merge_inner(
     progress.version = Some(next.clone());
     let branch = format!("chore/release-v{next}");
     let worktree = state.dir().join("bump");
-    let (shared, branch_ref, next_ref, decision_ref) = (&*state, &branch, &next, &decision);
+    let (shared, branch_ref, next_ref, decision_ref) = (&mut *state, &branch, &next, &decision);
     let (pr_url_opened, outcome) =
         release_attempt(
             &repo,
@@ -1585,12 +1633,7 @@ async fn report_problem_in(
     match surface_problem_in(state, store, pr_url, version, reason, pending) {
         Ok((notice, comment)) => {
             if let (Some(url), Some(body)) = (pr_url, comment)
-                && let Err(e) = gh_pr_comment(
-                    &state.repo,
-                    url,
-                    &crate::scrub::scrub(&body, &crate::scrub::Identity::current()),
-                )
-                .await
+                && let Err(e) = gh_pr_comment(state, url, &body).await
             {
                 state.event("bump", format!("could not comment on {url}: {e:#}"));
             }
@@ -1623,9 +1666,11 @@ async fn report_problem_in(
     }
 }
 
-pub(crate) async fn gh_pr_comment(cwd: &Path, pr_url: &str, body: &str) -> Result<()> {
+pub(crate) async fn gh_pr_comment(state: &mut RunState, pr_url: &str, body: &str) -> Result<()> {
+    let (_, body) = crate::github_text::prepare(state, "", body);
+    let cwd = &state.repo;
     let out = tokio::process::Command::new("gh")
-        .args(["pr", "comment", pr_url, "--body", body])
+        .args(["pr", "comment", pr_url, "--body", &body])
         .current_dir(cwd)
         .quiet()
         .stdin(std::process::Stdio::null())
@@ -1724,16 +1769,12 @@ async fn escalate_pending(
     // The commit is on the remote branch now regardless of what happens
     // below - the title edit is cosmetic, and the marker and the event must
     // both reflect the real, already-pushed state even if it fails.
-    let title_warning = match gh_pr_edit_title(
-        &worktree,
-        &pending.pr_url,
-        &crate::scrub::scrub(
-            &format!("chore: release v{next} ({} bump)", decision.level.as_str()),
-            &crate::scrub::Identity::current(),
-        ),
-    )
-    .await
-    {
+    let (title, _) = crate::github_text::prepare(
+        state,
+        &format!("chore: release v{next} ({} bump)", decision.level.as_str()),
+        "",
+    );
+    let title_warning = match gh_pr_edit_title(&worktree, &pending.pr_url, &title).await {
         Ok(()) => None,
         Err(e) => Some(e.to_string()),
     };
@@ -1970,7 +2011,7 @@ where
 /// still exists on the forge either way, and the caller must not lose track
 /// of its URL over that failure alone.
 async fn open_bump_pr(
-    state: &RunState,
+    state: &mut RunState,
     worktree: &Path,
     branch: &str,
     next_version: &str,
@@ -2008,11 +2049,7 @@ async fn open_bump_pr(
         &state.id,
         source_pr_url,
     );
-    let who = crate::scrub::Identity::current();
-    let (title, body) = (
-        crate::scrub::scrub(&title, &who),
-        crate::scrub::scrub(&body, &who),
-    );
+    let (title, body) = crate::github_text::prepare(state, &title, &body);
     let url = gh_pr_create(worktree, &state.base_branch, branch, &title, &body).await?;
     // Without Actions nothing would ever merge it on green, and a direct merge
     // here would skip the owner's approval: leave it open for the release
@@ -2302,6 +2339,7 @@ mod tests {
     fn github_facing_bump_text_is_english() {
         let (title, body) =
             release_pr("minor", "adds a flag", "0.37.0", "ab12", "https://x/pull/1");
+        assert!(crate::github_text::check(&title, &body).is_empty());
         assert!(title.is_ascii() && body.is_ascii(), "{title}\n{body}");
         assert_eq!(title, "chore: release v0.37.0 (minor bump)");
         assert!(

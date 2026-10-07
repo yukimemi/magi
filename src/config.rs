@@ -302,6 +302,8 @@ pub struct Roles {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Graph {
+    /// Gate GitHub prose before posting. Secret redaction remains mandatory when disabled.
+    pub github_text_guard: bool,
     /// Parallel implementations of the same task (the number of implementer
     /// seats; pairs with [`Roles::implementers`]). **One by default.**
     ///
@@ -492,6 +494,7 @@ pub struct Graph {
 impl Default for Graph {
     fn default() -> Self {
         Self {
+            github_text_guard: true,
             implementers: 1,
             judges: 3,
             deliberate_rounds: 1,
@@ -1964,6 +1967,8 @@ impl Config {
              # fixer = \"opus\"  # applies review findings; unset keeps the winner's own author\n\
              # fixer = [\"opus\", \"codex\"]  # array form: fallback chain, each tried once on quota or failure\n\n\
              [graph]\n\
+             # Gate GitHub prose; secret redaction is always enabled.\n\
+             github_text_guard = true\n\
              implementers = 3\n\
              judges = 3\n\
              deliberate_rounds = 1\n\
@@ -2374,6 +2379,17 @@ mod tests {
             env: BTreeMap::new(),
             prompt_delivery: None,
         }
+    }
+
+    #[test]
+    fn github_text_guard_defaults_on_and_can_be_disabled() {
+        let default: Graph = toml::from_str("").unwrap();
+        assert!(default.github_text_guard);
+        let disabled: Graph = toml::from_str("github_text_guard = false").unwrap();
+        assert!(!disabled.github_text_guard);
+        let config = layered("", "[graph]\ngithub_text_guard = false\n").unwrap();
+        assert!(!config.graph.github_text_guard);
+        assert!(Config::starter_toml().contains("github_text_guard = true"));
     }
 
     #[test]
@@ -2858,6 +2874,7 @@ mod tests {
         assert_eq!(parsed.merge.mode, MergeMode::None);
         assert_eq!(parsed.merge.style, MergeStyle::Merge);
         assert!(parsed.graph.sessions);
+        assert!(parsed.graph.github_text_guard);
         assert_eq!(parsed.graph.timeout_review, 1200);
         assert_eq!(parsed.graph.verify_timeout(), 1200);
         assert_eq!(parsed.update.mode, UpdateMode::Notify);
