@@ -337,6 +337,11 @@ a { color: inherit; text-decoration: none; }
 .daemon[data-state="failed"] .daemon-body,
 .daemon[data-upgrade-failed="yes"] .daemon-body,
 .daemon:has([data-armed="yes"]) .daemon-body { grid-column: 1 / -1; grid-row: 2; padding: 2px 0 var(--s1); }
+/* An expanded strip is where failures are read: let the sentence wrap. */
+.daemon[data-more="yes"] .daemon-text,
+.daemon[data-state="failed"] .daemon-text,
+.daemon[data-upgrade-failed="yes"] .daemon-text,
+.daemon:has([data-armed="yes"]) .daemon-text { white-space: normal; overflow: visible; text-overflow: clip; }
 .daemon-more {
   appearance: none; border: 1px solid var(--line-2); background: transparent; color: var(--ink-3);
   width: 16px; height: 16px; padding: 0; border-radius: 50%;
@@ -357,7 +362,7 @@ a { color: inherit; text-decoration: none; }
 }
 .daemon:has(#loop-park:not([hidden])) .daemon-version,
 .daemon:has(#loop-upgrade:not([hidden])) .daemon-version { display: none; }
-.daemon-btn {
+.daemon .daemon-btn {
   flex: none;
   font-size: var(--t1);
   min-height: 0; height: 22px; padding: 0 var(--s2);
@@ -365,8 +370,8 @@ a { color: inherit; text-decoration: none; }
   text-decoration: underline; text-underline-offset: 2px;
   white-space: nowrap;
 }
-@media (pointer: coarse) { .daemon-btn { height: 32px; } }
-.daemon-btn[data-kind="start"] { color: var(--ink); font-weight: 650; }
+@media (pointer: coarse) { .daemon .daemon-btn { height: 32px; } }
+.daemon .daemon-btn[data-kind="start"] { color: var(--ink); font-weight: 650; }
 
 .daemon[data-state="working"] { background: var(--tint-blue); color: var(--on-blue); border-bottom-color: var(--tint-blue); }
 .daemon[data-state="working"] .daemon-dot { background: var(--on-blue); animation: pulse 1.8s var(--ease) infinite; box-shadow: 0 0 0 2px var(--tint-blue), 0 0 0 3px var(--on-blue); }

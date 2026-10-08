@@ -826,6 +826,12 @@ function initLoopDetail() {
     if (!note) more.setAttribute("aria-expanded", "false");
   };
   new MutationObserver(sync).observe(why, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ["hidden"] });
+  /* The status sentence can carry an error or a stuck-handover message that
+     the ellipsis cuts: keep it readable as a tooltip too. */
+  const text = box.querySelector(".daemon-text");
+  const syncText = () => setAttr(text, "title", (text.textContent || "").trim() || null);
+  new MutationObserver(syncText).observe(text, { childList: true, characterData: true, subtree: true });
+  syncText();
   more.onclick = () => {
     const open = box.dataset.more !== "yes";
     box.dataset.more = open ? "yes" : "";
