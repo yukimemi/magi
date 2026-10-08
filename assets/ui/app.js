@@ -809,6 +809,32 @@ function upgradeStageDetail(stage) {
   }
 }
 
+/* The strip is one slim line: the explanatory sentence (#loop-why) is written
+   by many places, so rather than patch each one a single observer mirrors it
+   into a tooltip and shows the (i) toggle only while there is something to
+   explain. The sentence itself opens on demand (data-more) or on its own for
+   a failure, an upgrade note or a pending stop confirmation (see app.css). */
+function initLoopDetail() {
+  const why = $("loop-why");
+  const more = $("loop-more");
+  const box = $("daemon");
+  if (!why || !more || !box) return;
+  const sync = () => {
+    const note = why.hidden ? "" : (why.textContent || "").trim();
+    setAttr(box.querySelector(".daemon-body"), "title", note || null);
+    show(more, Boolean(note));
+    if (!note) more.setAttribute("aria-expanded", "false");
+  };
+  new MutationObserver(sync).observe(why, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ["hidden"] });
+  more.onclick = () => {
+    const open = box.dataset.more !== "yes";
+    box.dataset.more = open ? "yes" : "";
+    more.setAttribute("aria-expanded", String(open));
+  };
+  sync();
+}
+initLoopDetail();
+
 function renderLoop() {
   const box = $("daemon");
   const text = box.querySelector(".daemon-text");
