@@ -5217,6 +5217,29 @@ function loadTalks(change) {
    screen - that is the router's job, in `applyRoute` - and the wait strip is
    settled from here whether or not the reply landed while the operator was
    looking at something else. */
+/* Roster and personas are per repository and cheap to remember, so opening a
+   conversation can draw its selectors (disabled) before the detail arrives.
+   An empty answer is still an answer: it replaces what was cached. */
+const talkChoices = new Map();
+let lastPersonas = [];
+
+function rememberTalkChoices(repo, roster, personas) {
+  if (personas.length > 0) lastPersonas = personas;
+  if (repo) talkChoices.set(repo, { roster, personas });
+}
+
+/* A detail shell for a conversation whose full record is still in flight. */
+function talkShell(id, summary) {
+  const known = summary && talkChoices.get(summary.repo);
+  return {
+    id,
+    talk: null,
+    summary: summary || null,
+    roster: known ? known.roster : [],
+    personas: known ? known.personas : lastPersonas,
+  };
+}
+
 async function loadTalk(id) {
   const wait = state.talkWaits.get(id);
   const observed = wait && { generation: wait.generation, startedAt: Date.now() };
@@ -5227,6 +5250,7 @@ async function loadTalk(id) {
     state.talkDetail.talk = talk;
     state.talkDetail.roster = Array.isArray(talk.roster) ? talk.roster : [];
     state.talkDetail.personas = Array.isArray(talk.personas) ? talk.personas : [];
+    rememberTalkChoices(talk.repo, state.talkDetail.roster, state.talkDetail.personas);
     renderTalk();
     ok();
   } catch (error) {
@@ -5321,6 +5345,7 @@ function renderTalk() {
 
   if (!talk) {
     const gone = Boolean(state.talkDetail.gone);
+    const summary = gone ? null : state.talkDetail.summary;
     setText($("talk-h"), gone ? "This conversation no longer exists." : "Loading conversation…");
     setText(
       $("talk-meta"),
@@ -5334,8 +5359,13 @@ function renderTalk() {
     show($("talk-close-go"), false);
     show($("talk-reopen-go"), false);
     show($("talk-wait"), false);
-    show($("talk-agent-box"), false);
-    show($("talk-persona-box"), false);
+    if (summary) {
+      renderTalkAgent(summary, true);
+      renderTalkPersona(summary, true);
+    } else {
+      show($("talk-agent-box"), false);
+      show($("talk-persona-box"), false);
+    }
     clear($("talk-delete-box"));
     renderTalkThumbs();
     return;
@@ -5456,7 +5486,7 @@ async function switchTalkAgent() {
       state.talkDetail.talk = talk;
       announce(`Agent changed to ${agent}.`);
     }
-    await loadTalks();
+    loadTalks().catch(() => {});
     ok();
   } catch (error) {
     fail(`Could not change the agent: ${error.message}`);
@@ -5506,7 +5536,7 @@ async function switchTalkPersona() {
       state.talkDetail.talk = talk;
       announce(`Persona changed to ${persona}.`);
     }
-    await loadTalks();
+    loadTalks().catch(() => {});
     ok();
   } catch (error) {
     fail(`Could not change the persona: ${error.message}`);
@@ -5825,7 +5855,7 @@ async function startTalk() {
   try {
     const talk = await postJson(API.talks, {});
     state.talks = sortTalks([talk, ...(state.talks || []).filter((t) => t.id !== talk.id)]);
-    state.talkDetail = { id: talk.id, talk, roster: [], personas: [] };
+    state.talkDetail = { ...talkShell(talk.id, talk), talk };
     trackTalkThinking(talk);
     renderTalks();
     announce("Conversation opened.");
@@ -8584,7 +8614,7 @@ function applyRoute() {
     if (changed) state.openingTalk = true;
     if (state.talkDetail.id !== route.id) {
       resetTalkAttachments(route.id);
-      state.talkDetail = { id: route.id, talk: null, roster: [], personas: [] };
+      state.talkDetail = talkShell(route.id, (state.talks || []).find((t) => t.id === route.id));
       loadTalk(route.id);
     }
     renderTalk();

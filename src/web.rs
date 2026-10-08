@@ -6020,8 +6020,10 @@ async fn talk_detail(
             .into_iter()
             .map(TaskView::from)
             .collect();
-        let roster = Config::discover(&talk.repo, None)
-            .map(|(cfg, _)| {
+        let cfg = Config::discover(&talk.repo, None).ok().map(|(cfg, _)| cfg);
+        let roster = cfg
+            .as_ref()
+            .map(|cfg| {
                 cfg.agents
                     .iter()
                     .map(|a| RosterEntry {
@@ -6032,8 +6034,9 @@ async fn talk_detail(
                     .collect()
             })
             .unwrap_or_default();
-        let specs = Config::discover(&talk.repo, None)
-            .map(|(cfg, _)| cfg.talk.personas)
+        let specs = cfg
+            .as_ref()
+            .map(|cfg| cfg.talk.personas.clone())
             .unwrap_or_default();
         let personas = persona::catalog(&specs)
             .into_iter()
@@ -6043,7 +6046,7 @@ async fn talk_detail(
             })
             .collect();
         Ok(Json(TalkDetailView {
-            view: TalkView::new(talk, thinking),
+            view: TalkView::with_config(talk, thinking, cfg.as_ref()),
             tasks,
             roster,
             personas,
