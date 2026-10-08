@@ -507,6 +507,25 @@ checkout is often stale or detached: nagi's run ce6e failed its gate on a step
 - Tests that start a run need a remote: `tests/common::fixture` pushes `main` to
   a local bare `origin`.
 
+### `[worktree] setup` products are hidden, not committed
+
+`src/worktree_setup.rs` runs after every worktree magi creates (candidates,
+judges, advisors, reviewers, under-review, operator-fix; not the rebase or
+release throwaways). Conventions that nothing but this note enforces:
+
+- **Products are hidden per worktree.** Untracked paths left by setup are
+  listed in `<worktree git dir>/magi-setup-paths` and pointed at by a
+  per-worktree `core.excludesFile` (needs `extensions.worktreeConfig`, taken
+  through `git::acquire_worktree_config` in `prep`; best effort elsewhere).
+  `git::commit_all` / `rescue_commit` additionally `reset` those paths. Never
+  hide them in the shared `info/exclude`: that changes the operator's checkout.
+- **Setup may not change tracked files** (`seal` fails the worktree), which is
+  what stops a `kata apply`-shaped step.
+- **Reviewer seats re-run setup after every `reset_detached`** (`clean -fdx`
+  wipes the products). A failed prep removes everything it created so a resume
+  starts over.
+- The command's environment has `MAGI_RUN` / `MAGI_NODE` removed (blindness).
+
 ### The base branch is the remote's default, never the checkout's
 
 `git::merge_base_branch` is the one place that names the base. Order: an explicit

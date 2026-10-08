@@ -72,3 +72,4 @@ pub mod updater;
 pub mod verdict;
 pub mod waiter;
 pub mod web;
+pub mod worktree_setup;

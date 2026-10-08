@@ -55,6 +55,7 @@ use crate::verdict::{
     self, FinalVote, Finding, FixReport, Position, Proposal, Ranking, Review, ReviewRevote,
     ReviewVote, Severity,
 };
+use crate::worktree_setup;
 
 /// How much verification output is kept and fed back to the fixer.
 const OUTPUT_TAIL: usize = 8_000;
@@ -781,6 +782,10 @@ impl Runner {
                 format!("checking out `{branch}` at {path} (is it checked out elsewhere?)")
             })?;
 
+        if let Err(e) = worktree_setup::prepare(&state.config, repo, &worktree).await {
+            git::worktree_remove(repo, &worktree).await.ok();
+            return Err(e);
+        }
         let commits = git::commits_ahead(&worktree, &base_commit, "HEAD")
             .await
             .unwrap_or(0);
@@ -1156,6 +1161,22 @@ impl Runner {
 
     // ---------------------------------------------------------------- prep
 
+    /// Run `[worktree] setup` in a seat's fresh worktree. A failure blocks the
+    /// run with the step and its output in the event; it is never swallowed.
+    async fn setup_seat_worktree(&mut self, repo: &Path, wt: &Path) -> Result<()> {
+        if let Err(e) = worktree_setup::prepare(&self.state.config, repo, wt).await {
+            git::worktree_remove(repo, wt).await.ok();
+            self.state.status = RunStatus::Blocked;
+            self.state.event(
+                "setup",
+                format!("worktree setup failed in {}: {e:#}", wt.display()),
+            );
+            self.state.save()?;
+            return Err(e);
+        }
+        Ok(())
+    }
+
     async fn prep(&mut self) -> Result<()> {
         if !self.state.candidates.is_empty() {
             return Ok(());
@@ -1189,6 +1210,13 @@ impl Runner {
             self.state.enabled_worktree_config = true;
         }
 
+        // `[worktree] setup` hides its products per worktree, which needs the
+        // same per-worktree config the hook does. Held until fold, like it.
+        if !self.state.config.worktree.setup.is_empty() && !self.state.enabled_worktree_config {
+            git::acquire_worktree_config(&repo).await?;
+            self.state.enabled_worktree_config = true;
+        }
+
         for (index, (spec, label)) in self
             .roles
             .implementers
@@ -1204,6 +1232,21 @@ impl Runner {
                 git::set_worktree_hooks_path(&worktree, &hooks_dir).await?;
             }
             git::local_exclude(&worktree, "/.magi/").await?;
+            if let Err(e) = worktree_setup::prepare(&self.state.config, &repo, &worktree).await {
+                // Nothing of this prep may survive: a resume must start over,
+                // not find half the candidates and skip the rest.
+                git::worktree_remove(&repo, &worktree).await.ok();
+                git::branch_delete(&repo, &branch).await.ok();
+                for c in std::mem::take(&mut self.state.candidates) {
+                    git::worktree_remove(&repo, &c.worktree).await.ok();
+                    git::branch_delete(&repo, &c.branch).await.ok();
+                }
+                self.state.status = RunStatus::Blocked;
+                self.state
+                    .event("prep", format!("worktree setup failed: {e:#}"));
+                self.state.save()?;
+                return Err(e);
+            }
             for pick in &plan.picks {
                 if let Err(e) = git::cherry_pick(&worktree, pick).await {
                     self.state.status = RunStatus::Blocked;
@@ -1235,6 +1278,7 @@ impl Runner {
             let wt = root.join(format!("judge-{j}"));
             if !wt.exists() {
                 git::worktree_add_detached(&repo, &wt, &base).await?;
+                self.setup_seat_worktree(&repo, &wt).await?;
             }
         }
 
@@ -1250,6 +1294,7 @@ impl Runner {
                 let wt = root.join(format!("advisor-{k}"));
                 if !wt.exists() {
                     git::worktree_add_detached(&repo, &wt, &base).await?;
+                    self.setup_seat_worktree(&repo, &wt).await?;
                 }
             }
         }
@@ -4080,6 +4125,14 @@ impl Runner {
                 winner.branch
             );
         }
+        if let Err(e) =
+            worktree_setup::prepare(&self.state.config, &self.state.repo, &fix_worktree).await
+        {
+            git::worktree_remove(&self.state.repo, &fix_worktree)
+                .await
+                .ok();
+            return Err(e);
+        }
 
         let run_id = self.state.id.clone();
         let prompts = self.state.config.prompts.clone();
@@ -4533,11 +4586,14 @@ impl Runner {
             let mut jobs = Vec::new();
             for (r, spec) in reviewers.iter().cloned().enumerate() {
                 let wt = root.join(format!("review-{}", r + 1));
+                // `clean -fdx` in a reset wipes setup's products, so every
+                // round sets the seat up again.
                 if wt.exists() {
                     git::reset_detached(&wt, &head).await?;
                 } else {
                     git::worktree_add_detached(&repo, &wt, &head).await?;
                 }
+                self.setup_seat_worktree(&repo, &wt).await?;
                 let seat_key = format!("review-{}", r + 1);
                 // The seat starts the round on whoever answered it last, not
                 // on the agent the spec names, so a failure is not re-paid.
