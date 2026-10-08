@@ -842,6 +842,27 @@ fn link_unsupported(e: &std::io::Error) -> bool {
 /// a writer stalled between create and write for longer than the TTL can have
 /// its file replaced; it then finds the path no longer carries its body and
 /// reports `false`.
+/// The no-hard-link path of [`publish_exclusive`]. A failed write never
+/// removes `path`: by then it may belong to a successor, so the half-made file
+/// is left to expire (a young empty one blocks, an unreadable one is stale).
+fn create_in_place(path: &Path, body: &str) -> Result<bool> {
+    use std::io::Write as _;
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+    };
+    f.write_all(body.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
+    // Written through our own handle, so a stalled writer can only write into
+    // its own file; confirm the path still carries it before claiming it.
+    Ok(std::fs::read_to_string(path).is_ok_and(|t| t == body))
+}
+
 fn publish_exclusive(path: &Path, tmp: &Path, body: &str) -> Result<bool> {
     std::fs::write(tmp, body).with_context(|| format!("write {}", tmp.display()))?;
     #[cfg(test)]
@@ -855,13 +876,7 @@ fn publish_exclusive(path: &Path, tmp: &Path, body: &str) -> Result<bool> {
     let out = match linked {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) if link_unsupported(&e) => match create_exclusive(path, body) {
-            // Written through the handle that created it, so a writer that
-            // stalled can only ever write into its own file, never replace a
-            // successor's. Confirm the path still carries it before claiming.
-            Ok(true) => Ok(std::fs::read_to_string(path).is_ok_and(|t| t == body)),
-            other => other,
-        },
+        Err(e) if link_unsupported(&e) => create_in_place(path, body),
         Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
     };
     let _ = std::fs::remove_file(tmp);
