@@ -1351,7 +1351,7 @@ pub fn switch_persona(talk: &mut Talk, store: &Talks, id: &str) -> Result<bool> 
     } else {
         id.trim()
     };
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
