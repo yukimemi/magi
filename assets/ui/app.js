@@ -779,6 +779,9 @@ function startCost(loop) {
 /* Has `upgrade` been busy longer than this page is willing to wait quietly?
    See `UPGRADE_WAIT_LIMIT_MS` for why that ceiling is where it is. */
 function upgradeOverdue(upgrade) {
+  /* A handover that is alive and waiting on a run is not overdue, however
+     long the run's node takes. */
+  if (upgrade.handover_alive === true) return false;
   const startedAt = Date.parse(upgrade.started_at);
   return Number.isFinite(startedAt) && Date.now() - startedAt > UPGRADE_WAIT_LIMIT_MS;
 }
@@ -964,8 +967,11 @@ function renderLoop() {
         ? `Handover stuck in ${upgradeStage} for ${Math.floor(stuckSecs / 60)} min.`
         : (overdue ? "The upgrade is taking longer than expected." : upgradeStageLabel(upgradeStage)),
     }));
+    const stuckHint = upgradeInfo.stuck_kind === "never_entered"
+      ? "The old process may need to be restarted by hand; see upgrade.log under the magi home."
+      : "See upgrade.log under the magi home.";
     quiet(stuckSecs !== null
-      ? `${upgradeInfo.waiting_on || "Nothing is moving."} The old process may need to be restarted by hand; see upgrade.log under the magi home. (Once the address is released this page cannot reach the deck, so this is the last value it saw.)`
+      ? `${upgradeInfo.waiting_on || "Nothing is moving."} ${stuckHint} (Once the address is released this page cannot reach the deck, so this is the last value it saw.)`
       : overdue
       ? `Asked for ${upgradeInfo.to || "an update"} more than an hour ago and has not come back. Check on it by hand.`
       : (upgradeInfo.waiting_on || upgradeStageDetail(upgradeStage)));
