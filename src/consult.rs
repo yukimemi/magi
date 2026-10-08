@@ -21,6 +21,7 @@ use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 
 use crate::ask::{ChatConsult, Question, Questions};
+use crate::config::Config;
 use crate::queue::{CHAT_NODE, Source, Task};
 use crate::talk::{self, Talk, Talks};
 
@@ -124,62 +125,75 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
     Ok(true)
 }
 
-/// What [`run_turn`] did with the drafts waiting in the chat.
+/// What [`start_turn`] did.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Handled {
-    /// This process held the turn lease and answered every draft.
-    Ran(usize),
-    /// Nothing was left to run (the web server drained it first).
-    Idle,
-    /// Another turn kept the lease for the whole wait; the draft stays queued.
+pub enum Started {
+    /// The question was handed over and the chat's turn ran to its end.
+    Answered,
+    /// Another process holds the talk's turn lease; nothing was changed.
     Busy,
+    /// The question had already been handed to the chat; nothing was changed.
+    Nothing,
 }
 
-/// Run the chat turn for a consultation [`begin`] queued, from a process that
-/// is not the web server.
+/// [`begin`], then run the chat's turn here, under the talk's own lease.
 ///
-/// Exclusion is the on-disk turn lease (`Talks::claim_turn`), the same slot the
-/// web server takes, kept alive with `TurnLease::beating` for as long as the
-/// agent runs. A held lease is retried every `poll` up to `wait`; past that the
-/// draft stays in `Talk::pending` for the running turn's drain or a resume.
-pub async fn run_turn(
+/// The lease is taken *before* anything is written, so a talk somebody else is
+/// running leaves no consult record and no draft behind (`Started::Busy`) and
+/// the caller can simply try again later. A turn that fails after `begin`
+/// leaves the record and the draft, so the chat can resume it.
+pub async fn start_turn(
+    questions: &Questions,
     talks: &Talks,
-    cfg: &crate::config::Config,
-    talk_id: &str,
-    wait: std::time::Duration,
-    poll: std::time::Duration,
-) -> Result<Handled> {
-    let deadline = std::time::Instant::now() + wait;
-    let lease = loop {
-        if let Some(lease) = talks.claim_turn(talk_id)? {
-            break lease;
-        }
-        if std::time::Instant::now() >= deadline {
-            return Ok(Handled::Busy);
-        }
-        tokio::time::sleep(poll).await;
+    q: &Question,
+    talk: &Talk,
+    cfg: &Config,
+) -> Result<Started> {
+    if q.consult.is_some() {
+        return Ok(Started::Nothing);
+    }
+    let Some(mut lease) = talks.claim_turn(&talk.id)? else {
+        return Ok(Started::Busy);
     };
-    // Read after the claim: the web server may have drained the draft while
-    // this process waited.
-    let mut talk = talks.get(talk_id)?;
-    let mut ran = 0;
+    if !begin(questions, talks, q, talk)? {
+        return Ok(Started::Nothing);
+    }
+    let mut talk = talks.get(&talk.id)?;
+    // Other starters that found the lease held queued drafts and left them to
+    // us, so drain until nothing is left (as the web's drain loop does).
+    // A failed turn is kept and reported at the end, not returned at once:
+    // drafts accepted meanwhile are still owed an answer.
+    let mut failed = None;
     loop {
-        if !lease.beat()? {
-            bail!("the turn lease was taken over; the remaining drafts stay queued");
+        while let Some(text) = talk::drain(&mut talk, talks)? {
+            if let Err(e) = talk::respond(&lease, &mut talk, talks, cfg, &text).await {
+                failed.get_or_insert(e);
+            }
+            if !lease.beat()? {
+                bail!("the turn lease for chat {} was lost", talk.short());
+            }
         }
-        let Some(text) = talk::drain(&mut talk, talks)? else {
+        // A draft queued after the last drain, before the lease is gone, was
+        // left to us by a starter that found the lease held. Release first,
+        // then look again: whoever queues later either sees no lease (and
+        // starts its own turn) or is seen by this re-check.
+        drop(lease);
+        talk = talks.get(&talk.id)?;
+        let owed = talk.status.open()
+            && (!talk.pending.is_empty() || !talk.pending_attachments.is_empty());
+        if !owed {
+            break;
+        }
+        // Somebody else took the lease meanwhile: they drain it.
+        let Some(again) = talks.claim_turn(&talk.id)? else {
             break;
         };
-        lease
-            .beating(talk::respond(&mut talk, talks, cfg, &text))
-            .await??;
-        ran += 1;
+        lease = again;
     }
-    Ok(if ran == 0 {
-        Handled::Idle
-    } else {
-        Handled::Ran(ran)
-    })
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    Ok(Started::Answered)
 }
 
 #[cfg(test)]
@@ -240,6 +254,23 @@ mod tests {
             "SQLite is simpler.".to_owned(),
             vec!["SQLite".to_owned(), "Redis".to_owned()],
         )
+    }
+
+    #[tokio::test]
+    async fn start_turn_is_busy_and_writes_nothing_while_the_lease_is_held() {
+        let (tmp, store, talk) = talks();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = question("implement");
+        questions.put(&mut q).expect("put");
+        let held = store.claim_turn(&talk.id).expect("claim").expect("first");
+
+        let got = start_turn(&questions, &store, &q, &talk, &Config::default())
+            .await
+            .expect("start");
+        assert_eq!(got, Started::Busy);
+        assert!(questions.get(&q.id).unwrap().consult.is_none());
+        assert!(store.get(&talk.id).unwrap().pending.is_empty());
+        drop(held);
     }
 
     #[test]
@@ -448,41 +479,5 @@ mod tests {
         v.as_object_mut().unwrap().remove("consult");
         let back: Question = serde_json::from_value(v).unwrap();
         assert!(back.consult.is_none());
-    }
-
-    #[tokio::test]
-    async fn run_turn_leaves_the_draft_when_the_lease_stays_held() {
-        let (_tmp, store, talk) = talks();
-        let mut t = store.get(&talk.id).expect("talk");
-        talk::queue(&mut t, &store, "consult", Vec::new()).expect("queue");
-        let _held = store.claim_turn(&talk.id).expect("claim").expect("free");
-        let cfg = Config::default();
-        let out = run_turn(
-            &store,
-            &cfg,
-            &talk.id,
-            std::time::Duration::from_millis(50),
-            std::time::Duration::from_millis(10),
-        )
-        .await
-        .expect("run");
-        assert_eq!(out, Handled::Busy);
-        assert!(!store.get(&talk.id).expect("talk").pending.is_empty());
-    }
-
-    #[tokio::test]
-    async fn run_turn_with_nothing_queued_is_idle() {
-        let (_tmp, store, talk) = talks();
-        let out = run_turn(
-            &store,
-            &Config::default(),
-            &talk.id,
-            std::time::Duration::ZERO,
-            std::time::Duration::from_millis(10),
-        )
-        .await
-        .expect("run");
-        assert_eq!(out, Handled::Idle);
-        assert!(store.claim_turn(&talk.id).expect("claim").is_some());
     }
 }

@@ -2544,41 +2544,20 @@ async fn answer_cmd(
         let tasks = Queue::open().list();
         let talk = magi::consult::origin_talk(&tasks, &talks.list(), &q)
             .context("this question has no open chat to ask")?;
-        // Read the config before `begin` saves anything: a failure must leave
-        // no consult record or draft behind, or a retry would never start the
-        // turn.
-        let (cfg, _) = magi::config::Config::discover(&talk.repo, None)?;
-        let fresh = magi::consult::begin(&store, &talks, &q, &talk)?;
-        if !fresh {
-            println!("{} was already handed to the chat", q.short());
-        }
-        if fresh || !talks.get(&talk.id)?.pending.is_empty() {
-            eprintln!("running the chat turn (waiting if one is already running)...");
-            match magi::consult::run_turn(
-                &talks,
-                &cfg,
-                &talk.id,
-                std::time::Duration::from_secs(300),
-                std::time::Duration::from_secs(2),
-            )
-            .await?
-            {
-                magi::consult::Handled::Ran(n) => println!(
-                    "chat {} answered {} ({n} turn{})",
-                    talk.short(),
-                    q.short(),
-                    if n == 1 { "" } else { "s" }
-                ),
-                magi::consult::Handled::Idle => println!(
-                    "chat {} had nothing left to run for {}",
-                    talk.short(),
-                    q.short()
-                ),
-                magi::consult::Handled::Busy => println!(
-                    "chat {} is busy; {} stays queued there as a draft - resume the chat to run it",
-                    talk.short(),
-                    q.short()
-                ),
+        // Read before anything is saved: a failure here leaves no record.
+        let cfg = Config::discover(&talk.repo, None)?.0;
+        match magi::consult::start_turn(&store, &talks, &q, &talk, &cfg).await? {
+            magi::consult::Started::Answered => println!(
+                "handed {} to chat {} — the chat's turn has run",
+                q.short(),
+                talk.short()
+            ),
+            magi::consult::Started::Busy => bail!(
+                "chat {} is running a turn in another process; nothing was changed, try again later",
+                talk.short()
+            ),
+            magi::consult::Started::Nothing => {
+                println!("{} was already handed to the chat", q.short())
             }
         }
         return Ok(());

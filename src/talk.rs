@@ -395,8 +395,30 @@ impl Talks {
     /// one panicking caller must not wedge every talk in the store the way it
     /// would wedge the loop's own lock; see [`crate::web`]'s `lock_or_recover`,
     /// which this mirrors.
-    fn guard(&self) -> MutexGuard<'_, ()> {
-        self.lock.lock().unwrap_or_else(PoisonError::into_inner)
+    ///
+    /// The mutex only serializes this process. The cycle is also taken under a
+    /// short file lock beside the records, so the CLI (`magi answer
+    /// --ask-chat`) and the web server cannot overwrite each other's draft.
+    /// The file lock is never skipped: a cycle that cannot get it within
+    /// longer than the lock's own expiry fails instead of writing unguarded.
+    fn guard(&self) -> Result<StoreGuard<'_>> {
+        let mutex = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("create {}", self.root.display()))?;
+        let path = self.root.join(".store.turn");
+        let deadline = std::time::Instant::now() + TAKEOVER_LOCK_TTL * 2;
+        loop {
+            if let Some(file) = TurnLock::take(&path)? {
+                return Ok(StoreGuard {
+                    _file: file,
+                    _mutex: mutex,
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("the talk store is locked by another process");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Directory holding the conversation files.
@@ -603,6 +625,7 @@ impl Talks {
             .flatten()
             .flatten()
             .filter(|e| e.path().extension().is_none_or(|x| x != "turn"))
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
             .filter_map(|e| e.metadata().ok())
             .filter_map(|m| m.modified().ok())
             .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -640,7 +663,11 @@ impl Talks {
         let path = self.turn_path(id);
         let token = fresh_token();
         if create_turn(&path, &token, now)? {
-            return Ok(Some(TurnLease { path, token }));
+            return Ok(Some(TurnLease {
+                talk: id.to_owned(),
+                path,
+                token,
+            }));
         }
         if read_turn(&path).is_some_and(|r| r.fresh(now)) {
             return Ok(None);
@@ -656,7 +683,11 @@ impl Talks {
             return Ok(None);
         }
         let _ = std::fs::remove_file(&path);
-        Ok(create_turn(&path, &token, now)?.then_some(TurnLease { path, token }))
+        Ok(create_turn(&path, &token, now)?.then_some(TurnLease {
+            talk: id.to_owned(),
+            path,
+            token,
+        }))
     }
 
     /// Is a turn running in `id` anywhere, by a fresh lease?
@@ -677,7 +708,7 @@ impl Talks {
     /// give up without writing if it is not, which is what stops their `put`
     /// from resurrecting a conversation this call already removed.
     pub fn remove(&self, id: &str) -> Result<()> {
-        let _guard = self.guard();
+        let _guard = self.guard()?;
         let resolved = self.resolve_id(id)?;
         let path = self.path_of(&resolved);
         std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
@@ -689,6 +720,13 @@ impl Talks {
         let _ = std::fs::remove_file(self.turn_path(&resolved));
         Ok(())
     }
+}
+
+/// What [`Talks::guard`] hands out: the in-process mutex plus the
+/// cross-process file lock. The file lock is released first.
+struct StoreGuard<'a> {
+    _file: TurnLock,
+    _mutex: MutexGuard<'a, ()>,
 }
 
 /// The body of a `<id>.turn` file. `pid` is for a human reading it; nothing
@@ -935,11 +973,17 @@ pub const TURN_BEAT: Duration = Duration::from_secs(20);
 /// own expiry cannot delete the lease of whoever took over.
 #[derive(Debug)]
 pub struct TurnLease {
+    talk: String,
     path: PathBuf,
     token: String,
 }
 
 impl TurnLease {
+    /// Does the lease file still carry this lease's token? A read only.
+    pub fn holds(&self) -> bool {
+        read_turn(&self.path).is_some_and(|r| r.token == self.token)
+    }
+
     /// Renew the lease. `Ok(false)` means it was taken over or removed, so
     /// this turn no longer owns the slot; `Err` is a transient failure (the
     /// lock stayed busy, a write failed) and the next beat tries again.
@@ -1064,7 +1108,7 @@ pub fn record(
     // concurrent `close` could land in between this call's own read and its
     // `put`, it does not remove it. See [`Talks::guard`] and the matching
     // guard in `turn`, which this mirrors.
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     // A concurrent `Talks::remove` can have landed in that same gap. `put`
     // writes unconditionally, so trusting the stale `talk` here would recreate
     // the file a delete just removed - the record must still be there for a
@@ -1110,7 +1154,7 @@ pub fn queue(
     if text.is_empty() && attachments.is_empty() {
         bail!("nothing to say");
     }
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1137,7 +1181,7 @@ pub fn queue(
 
 /// Promote the current durable draft to one operator turn.
 pub fn drain(talk: &mut Talk, store: &Talks) -> Result<Option<String>> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1162,19 +1206,47 @@ pub fn drain(talk: &mut Talk, store: &Talks) -> Result<Option<String>> {
 /// One operator turn and one agent turn, appended - the synchronous form, used
 /// by tests and by anything that is fine waiting out the turn itself.
 pub async fn say(
+    lease: &TurnLease,
     talk: &mut Talk,
     store: &Talks,
     cfg: &Config,
     text: &str,
     attachments: Vec<Attachment>,
 ) -> Result<()> {
+    check_lease(lease, talk)?;
     let text = record(talk, store, text, attachments)?;
-    turn(talk, store, cfg, &text).await
+    respond(lease, talk, store, cfg, &text).await
 }
 
 /// The agent's half of a turn: invoke, append, flush. Pairs with [`record`].
-pub async fn respond(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Result<()> {
-    turn(talk, store, cfg, text).await
+///
+/// Requires the talk's [`TurnLease`] (from [`Talks::claim_turn`]), so no
+/// starter can run a turn without holding the cross-process slot. The lease is
+/// renewed while the turn runs; a lease lost mid-turn stops it with an error.
+pub async fn respond(
+    lease: &TurnLease,
+    talk: &mut Talk,
+    store: &Talks,
+    cfg: &Config,
+    text: &str,
+) -> Result<()> {
+    check_lease(lease, talk)?;
+    lease
+        .beating(turn(talk, store, cfg, text))
+        .await
+        .and_then(|done| done)
+}
+
+fn check_lease(lease: &TurnLease, talk: &Talk) -> Result<()> {
+    if lease.talk != talk.id {
+        bail!("the turn lease is for talk {}, not {}", lease.talk, talk.id);
+    }
+    // A lease that aged out and was taken over must not start a turn (or
+    // write the operator's text) at all.
+    if !lease.holds() {
+        bail!("the turn lease for talk {} is no longer held", talk.short());
+    }
+    Ok(())
 }
 
 /// Close a conversation. Idempotent: closing an already-closed conversation is
@@ -1195,7 +1267,7 @@ pub async fn respond(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -
 /// [`Talks::remove`] having deleted it, and writing the stale copy back would
 /// resurrect exactly what that delete removed.
 pub fn close(talk: &mut Talk, store: &Talks) -> Result<()> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1219,7 +1291,7 @@ pub fn close(talk: &mut Talk, store: &Talks) -> Result<()> {
 /// falling back to the stale copy if the re-read fails, for the same reasons
 /// `close`'s doc gives.
 pub fn reopen(talk: &mut Talk, store: &Talks) -> Result<()> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1242,7 +1314,7 @@ pub fn reopen(talk: &mut Talk, store: &Talks) -> Result<()> {
 /// resurrecting a record a concurrent delete removed. Refusing a closed talk
 /// or a turn in flight is the caller's job: only it can see the latter.
 pub fn switch_agent(talk: &mut Talk, store: &Talks, spec: &AgentSpec) -> Result<bool> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1279,7 +1351,7 @@ pub fn switch_persona(talk: &mut Talk, store: &Talks, id: &str) -> Result<bool> 
     } else {
         id.trim()
     };
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1314,7 +1386,7 @@ pub fn switch_persona(talk: &mut Talk, store: &Talks, id: &str) -> Result<bool> 
 
 /// Discard the durable draft without adding a transcript turn.
 pub fn clear_pending(talk: &mut Talk, store: &Talks) -> Result<()> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1332,7 +1404,7 @@ pub fn clear_pending_if_matches(
     expected_text: &str,
     expected_attachments: &[String],
 ) -> Result<bool> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1357,7 +1429,7 @@ pub fn edit_pending_text(
     expected_text: &str,
     expected_attachments: &[String],
 ) -> Result<bool> {
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
@@ -1665,7 +1737,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // section atomic with `close`'s own - taken only for this tail and not
     // for the whole invocation above, so one talk's fifteen-minute turn does
     // not block another talk's close from proceeding.
-    let _guard = store.guard();
+    let _guard = store.guard()?;
     // A delete is the more final version of that same race: `put` writes
     // unconditionally, so a talk removed while this turn was in flight must
     // stay removed rather than being written back with this turn's reply
@@ -2817,7 +2889,14 @@ mod tests {
         let response_talks = talks.clone();
         let response_cfg = cfg.clone();
         let reply = tokio::spawn(async move {
-            respond(&mut running, &response_talks, &response_cfg, &first).await
+            respond(
+                &response_talks.claim_turn(&running.id).unwrap().unwrap(),
+                &mut running,
+                &response_talks,
+                &response_cfg,
+                &first,
+            )
+            .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
@@ -2873,9 +2952,16 @@ mod tests {
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
         assert_eq!(talk.agent, "a");
 
-        say(&mut talk, &talks, &cfg, "hello there", Vec::new())
-            .await
-            .expect("turn");
+        say(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
+            &mut talk,
+            &talks,
+            &cfg,
+            "hello there",
+            Vec::new(),
+        )
+        .await
+        .expect("turn");
         assert_eq!(calls(tmp.path(), "a"), 1, "each id is tried once");
         assert_eq!(calls(tmp.path(), "b"), 1);
         assert_eq!(talk.agent, "b", "the switch persists");
@@ -2902,9 +2988,16 @@ mod tests {
         let cfg = chain_config(vec![a, b], &["a", "b", "a"]);
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
 
-        let err = say(&mut talk, &talks, &cfg, "hi", Vec::new())
-            .await
-            .expect_err("every agent failed");
+        let err = say(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
+            &mut talk,
+            &talks,
+            &cfg,
+            "hi",
+            Vec::new(),
+        )
+        .await
+        .expect_err("every agent failed");
         assert!(err.to_string().contains("`a`"), "{err:#}");
         assert_eq!(calls(tmp.path(), "a"), 1);
         assert_eq!(calls(tmp.path(), "b"), 1);
@@ -2927,9 +3020,16 @@ mod tests {
         let b = counting_agent(tmp.path(), "b", "cat");
         let cfg = chain_config(vec![a, b], &["a", "b"]);
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), Some("a")).expect("begin");
-        say(&mut talk, &talks, &cfg, "hi", Vec::new())
-            .await
-            .expect_err("a alone, and it fails");
+        say(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
+            &mut talk,
+            &talks,
+            &cfg,
+            "hi",
+            Vec::new(),
+        )
+        .await
+        .expect_err("a alone, and it fails");
         assert_eq!(calls(tmp.path(), "b"), 0);
         assert_eq!(talk.agent, "a");
     }
@@ -2942,9 +3042,16 @@ mod tests {
         let c = counting_agent(tmp.path(), "c", "cat >/dev/null\nexit 3");
         let cfg = chain_config(vec![a, b, c], &["a", "b"]);
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), Some("c")).expect("begin");
-        say(&mut talk, &talks, &cfg, "hi", Vec::new())
-            .await
-            .expect_err("c alone, and it fails");
+        say(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
+            &mut talk,
+            &talks,
+            &cfg,
+            "hi",
+            Vec::new(),
+        )
+        .await
+        .expect_err("c alone, and it fails");
         assert_eq!(calls(tmp.path(), "b"), 0);
     }
 
@@ -3015,7 +3122,8 @@ mod tests {
         let spec = mock_agent(tmp.path(), ECHO, BTreeMap::new());
         let cfg = config(spec);
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
-        say(&mut talk, &talks, &cfg, "hello", Vec::new())
+        let lease = talks.claim_turn(&talk.id).unwrap().unwrap();
+        say(&lease, &mut talk, &talks, &cfg, "hello", Vec::new())
             .await
             .expect("first turn");
         assert!(!talk.turns[1].body.contains("Persona"));
@@ -3025,7 +3133,7 @@ mod tests {
         assert!(talk.persona_dirty);
         assert!(talk.turns.last().unwrap().body.contains("persona changed"));
 
-        say(&mut talk, &talks, &cfg, "next", Vec::new())
+        say(&lease, &mut talk, &talks, &cfg, "next", Vec::new())
             .await
             .expect("turn");
         let prompt = &talk.turns.last().unwrap().body;
@@ -3033,14 +3141,14 @@ mod tests {
         assert!(prompt.contains("Misato Katsuragi"));
         assert!(!talk.persona_dirty, "cleared after a successful turn");
 
-        say(&mut talk, &talks, &cfg, "again", Vec::new())
+        say(&lease, &mut talk, &talks, &cfg, "again", Vec::new())
             .await
             .expect("turn");
         assert!(!talk.turns.last().unwrap().body.contains("# Persona update"));
 
         assert!(switch_persona(&mut talk, &talks, "default").expect("back"));
         assert_eq!(talk.persona, "");
-        say(&mut talk, &talks, &cfg, "plain", Vec::new())
+        say(&lease, &mut talk, &talks, &cfg, "plain", Vec::new())
             .await
             .expect("turn");
         assert!(
@@ -3055,10 +3163,10 @@ mod tests {
         assert!(switch_persona(&mut talk, &talks, "rei").expect("rei"));
         let mut no_sessions = cfg.clone();
         no_sessions.graph.sessions = false;
-        say(&mut talk, &talks, &no_sessions, "one", Vec::new())
+        say(&lease, &mut talk, &talks, &no_sessions, "one", Vec::new())
             .await
             .expect("turn");
-        say(&mut talk, &talks, &no_sessions, "two", Vec::new())
+        say(&lease, &mut talk, &talks, &no_sessions, "two", Vec::new())
             .await
             .expect("turn");
         let last = &talk.turns.last().unwrap().body;
@@ -3075,6 +3183,7 @@ mod tests {
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
 
         say(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
             &mut talk,
             &talks,
             &cfg,
@@ -3087,9 +3196,16 @@ mod tests {
         assert!(first_prompt.contains("magi task add --solo"));
         assert!(first_prompt.contains("what does the queue module do?"));
 
-        say(&mut talk, &talks, &cfg, "and how is it locked?", Vec::new())
-            .await
-            .expect("second turn");
+        say(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
+            &mut talk,
+            &talks,
+            &cfg,
+            "and how is it locked?",
+            Vec::new(),
+        )
+        .await
+        .expect("second turn");
         let second_prompt = &talk.turns[3].body;
         assert!(
             !second_prompt.contains("magi task add --solo"),
@@ -3107,9 +3223,16 @@ mod tests {
         let mut cfg = config(a.clone());
         cfg.agents.push(b.clone());
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), Some(&a.id)).expect("begin");
-        say(&mut talk, &talks, &cfg, "remember the walrus", Vec::new())
-            .await
-            .expect("first turn");
+        say(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
+            &mut talk,
+            &talks,
+            &cfg,
+            "remember the walrus",
+            Vec::new(),
+        )
+        .await
+        .expect("first turn");
         let old_session = talk.seat.claude_session.clone();
         assert_eq!(talk.seat.turns, 1);
 
@@ -3128,9 +3251,16 @@ mod tests {
         assert!(!switch_agent(&mut talk, &talks, &b).expect("same agent"));
         assert_eq!(talk.turns.len(), before, "a no-op writes no note");
 
-        say(&mut talk, &talks, &cfg, "what did I say?", Vec::new())
-            .await
-            .expect("turn after switch");
+        say(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
+            &mut talk,
+            &talks,
+            &cfg,
+            "what did I say?",
+            Vec::new(),
+        )
+        .await
+        .expect("turn after switch");
         let prompt = &talk.turns.last().expect("reply").body;
         assert!(prompt.contains("remember the walrus"), "{prompt}");
         assert!(prompt.contains("## magi"), "{prompt}");
@@ -3145,6 +3275,7 @@ mod tests {
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
 
         say(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
             &mut talk,
             &talks,
             &cfg,
@@ -3169,9 +3300,16 @@ mod tests {
         let cfg = config(spec);
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
 
-        let err = say(&mut talk, &talks, &cfg, "check the tests", Vec::new())
-            .await
-            .expect_err("a turn with no answer is an error");
+        let err = say(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
+            &mut talk,
+            &talks,
+            &cfg,
+            "check the tests",
+            Vec::new(),
+        )
+        .await
+        .expect_err("a turn with no answer is an error");
         assert!(err.to_string().contains("no answer"), "{err}");
 
         let on_disk = talks.get(&talk.id).expect("get");
@@ -3200,9 +3338,15 @@ mod tests {
         // One fewer failure than `write_atomic` will retry through, so the
         // very last attempt must succeed.
         failpoint::force_put_failures(PUT_RETRIES - 1);
-        respond(&mut talk, &talks, &cfg, &text)
-            .await
-            .expect("respond must survive a write failure its own retries can outlast");
+        respond(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
+            &mut talk,
+            &talks,
+            &cfg,
+            &text,
+        )
+        .await
+        .expect("respond must survive a write failure its own retries can outlast");
 
         assert_eq!(talk.turns.len(), 2);
         assert_eq!(talk.turns[1].who, Who::Agent);
@@ -3232,9 +3376,15 @@ mod tests {
         // common case this exercises - a large write racing something,
         // followed by a small one that does not.
         failpoint::force_put_failures(PUT_RETRIES);
-        let err = respond(&mut talk, &talks, &cfg, &text)
-            .await
-            .expect_err("a reply that cannot be saved must be reported, not swallowed");
+        let err = respond(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
+            &mut talk,
+            &talks,
+            &cfg,
+            &text,
+        )
+        .await
+        .expect_err("a reply that cannot be saved must be reported, not swallowed");
         assert!(err.to_string().contains("could not be saved"), "{err}");
 
         let on_disk = talks.get(&talk.id).expect("get");
@@ -3306,9 +3456,15 @@ mod tests {
         // Enough forced failures to exhaust the retries for both the reply
         // and the note that would have replaced it.
         failpoint::force_put_failures(PUT_RETRIES * 2);
-        let err = respond(&mut talk, &talks, &cfg, &text)
-            .await
-            .expect_err("neither the reply nor the note could be saved");
+        let err = respond(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
+            &mut talk,
+            &talks,
+            &cfg,
+            &text,
+        )
+        .await
+        .expect_err("neither the reply nor the note could be saved");
         assert!(err.to_string().contains("could not be saved"), "{err}");
 
         assert_eq!(talk.turns.len(), 1, "only the operator's own turn");
@@ -3357,9 +3513,16 @@ mod tests {
             )
             .expect("put attachment");
 
-        say(&mut talk, &talks, &cfg, "", vec![att.clone()])
-            .await
-            .expect("an empty body with an attachment is still a turn");
+        say(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
+            &mut talk,
+            &talks,
+            &cfg,
+            "",
+            vec![att.clone()],
+        )
+        .await
+        .expect("an empty body with an attachment is still a turn");
 
         let operator_turn = &talk.turns[0];
         assert_eq!(operator_turn.who, Who::Operator);
@@ -3420,9 +3583,16 @@ mod tests {
         cfg.graph.timeout_talk = 1;
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
 
-        let err = say(&mut talk, &talks, &cfg, "check the tests", Vec::new())
-            .await
-            .expect_err("a turn that never answers is an error");
+        let err = say(
+            &talks.claim_turn(&talk.id).unwrap().unwrap(),
+            &mut talk,
+            &talks,
+            &cfg,
+            "check the tests",
+            Vec::new(),
+        )
+        .await
+        .expect_err("a turn that never answers is an error");
         assert!(
             err.to_string().contains("did not answer within 1s"),
             "{err}"
@@ -3478,9 +3648,15 @@ mod tests {
         // close - and finishing it must not resurrect the conversation the
         // operator already ended.
         assert_eq!(in_flight.status, TalkStatus::Open);
-        respond(&mut in_flight, &talks, &cfg, "one more question")
-            .await
-            .expect("the turn itself still completes");
+        respond(
+            &talks.claim_turn(&in_flight.id).unwrap().unwrap(),
+            &mut in_flight,
+            &talks,
+            &cfg,
+            "one more question",
+        )
+        .await
+        .expect("the turn itself still completes");
 
         let on_disk = talks.get(&in_flight.id).expect("reread");
         assert_eq!(
@@ -3548,7 +3724,7 @@ mod tests {
         // Hold the same guard `record`'s read-modify-write section holds for
         // the whole of its own read-then-write, standing in for `record`
         // being paused between its read and its `put`.
-        let held = talks.guard();
+        let held = talks.guard().unwrap();
 
         let talks2 = talks.clone();
         let id = talk.id.clone();
@@ -3644,9 +3820,15 @@ mod tests {
 
         // The turn's own handle has no way to know the record is gone -
         // finishing it must not write the file back into existence.
-        respond(&mut in_flight, &talks, &cfg, "one more question")
-            .await
-            .expect("the turn itself still completes rather than erroring");
+        respond(
+            &talks.claim_turn(&in_flight.id).unwrap().unwrap(),
+            &mut in_flight,
+            &talks,
+            &cfg,
+            "one more question",
+        )
+        .await
+        .expect("the turn itself still completes rather than erroring");
 
         assert!(
             talks.get(&in_flight.id).is_err(),
