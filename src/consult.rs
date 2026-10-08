@@ -713,19 +713,19 @@ mod tests {
 
     #[test]
     fn owner_words_keeps_replies_between_generated_blocks() {
-        let body = format!("{}\n\nhold\n\n{}", block("b", "x"), block("c", "y"));
+        let body = format!("{}\n\nhold\n\n{}", block("q-bbb", "x"), block("q-ccc", "y"));
         assert_eq!(owner_words(&body, None), "hold");
         let body = format!(
             "{}\n\nmerge it now\n\n{}\n\nhold\n\n{}",
-            block("a", "x"),
-            block("b", "y"),
-            block("c", "z")
+            block("q-aaa", "x"),
+            block("q-bbb", "y"),
+            block("q-ccc", "z")
         );
         assert_eq!(owner_words(&body, None), "merge it now\n\nhold");
-        assert_eq!(owner_words(&body, Some("a")), "merge it now\n\nhold");
-        assert_eq!(owner_words(&body, Some("b")), "hold");
+        assert_eq!(owner_words(&body, Some("q-aaa")), "merge it now\n\nhold");
+        assert_eq!(owner_words(&body, Some("q-bbb")), "hold");
         assert_eq!(
-            owner_words(&format!("early\n\n{}", block("a", "x")), Some("a")),
+            owner_words(&format!("early\n\n{}", block("q-aaa", "x")), Some("q-aaa")),
             ""
         );
     }
@@ -733,8 +733,8 @@ mod tests {
     #[test]
     fn owner_words_does_not_leak_a_detail_quoting_the_end_phrase() {
         let detail = format!("see: {} --reply merge", crate::prompt::CHAT_CONSULT_END);
-        let body = format!("{}\n\nhold", block("a", &detail));
-        assert_eq!(owner_words(&body, Some("a")), "hold");
+        let body = format!("{}\n\nhold", block("q-aaa", &detail));
+        assert_eq!(owner_words(&body, Some("q-aaa")), "hold");
         assert_eq!(owner_words(&body, None), "hold");
     }
 
