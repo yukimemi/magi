@@ -102,6 +102,12 @@ pub struct Invocation<'a> {
     pub timeout: Duration,
     /// May the agent modify files? Judges and reviewers may not.
     pub allow_write: bool,
+    /// Drop the CLI's own sandbox and approval gate. Conversational talk
+    /// turns only, and only together with `allow_write`: it is the codex
+    /// counterpart of claude's `bypassPermissions`. Unattended seats
+    /// (implementer, judge, reviewer, deputy, ...) never set it, and only
+    /// `talk.rs` may.
+    pub unsandboxed: bool,
     /// Continue this seat's conversation when the CLI supports it.
     pub sessions: bool,
     /// Directory for prompt / stdout / stderr artifacts.
@@ -677,32 +683,40 @@ fn build_command(
             argv.push(inv.cwd.to_string_lossy().into_owned());
             // Codex is the only kind whose read-only-ness is enforced by the
             // CLI rather than by the prompt: a judge or reviewer seat cannot
-            // write even if it decides to try. Implementers get the workspace,
-            // and nothing ever gets `--dangerously-bypass-approvals-and-sandbox`.
-            argv.push("--sandbox".to_owned());
-            argv.push(
-                if inv.allow_write {
-                    "workspace-write"
-                } else {
-                    "read-only"
-                }
-                .to_owned(),
-            );
-            // Nothing is watching to approve anything: an unattended seat that
-            // asks blocks until its timeout kills it.
-            argv.push("-c".to_owned());
-            argv.push("approval_policy=\"never\"".to_owned());
-            if inv.allow_write && !inv.writable.is_empty() {
-                let roots: Vec<String> = inv
-                    .writable
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect();
+            // write even if it decides to try. Implementers get the workspace.
+            // The one exception is a conversational talk turn that the
+            // repository opted into (`unsandboxed` and `allow_write`): it
+            // drops sandbox and approvals altogether, as claude's
+            // `bypassPermissions` does, so `magi task add`, `git fetch` and
+            // the like are not refused. Nothing else ever gets the bypass.
+            if inv.allow_write && inv.unsandboxed {
+                argv.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
+            } else {
+                argv.push("--sandbox".to_owned());
+                argv.push(
+                    if inv.allow_write {
+                        "workspace-write"
+                    } else {
+                        "read-only"
+                    }
+                    .to_owned(),
+                );
+                // Nothing is watching to approve anything: an unattended seat
+                // that asks blocks until its timeout kills it.
                 argv.push("-c".to_owned());
-                argv.push(format!(
-                    "sandbox_workspace_write.writable_roots={}",
-                    serde_json::to_string(&roots).unwrap_or_else(|_| "[]".to_owned())
-                ));
+                argv.push("approval_policy=\"never\"".to_owned());
+                if inv.allow_write && !inv.writable.is_empty() {
+                    let roots: Vec<String> = inv
+                        .writable
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
+                    argv.push("-c".to_owned());
+                    argv.push(format!(
+                        "sandbox_workspace_write.writable_roots={}",
+                        serde_json::to_string(&roots).unwrap_or_else(|_| "[]".to_owned())
+                    ));
+                }
             }
             if let Some(m) = &spec.model {
                 argv.push("-m".to_owned());
@@ -1611,6 +1625,7 @@ mod tests {
             prompt: "do the thing",
             timeout: Duration::from_secs(900),
             allow_write,
+            unsandboxed: false,
             sessions: true,
             artifacts: art,
             stem: "t",
@@ -1735,6 +1750,41 @@ mod tests {
     }
 
     #[test]
+    fn codex_talk_turn_bypasses_sandbox_only_when_opted_in() {
+        const BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
+        let mut seat = SeatState::new("talk", "a", 7);
+        let build = |seat: &SeatState, allow_write: bool, unsandboxed: bool| {
+            let mut i = inv(Path::new("."), Path::new("/art"), allow_write);
+            i.unsandboxed = unsandboxed;
+            build_command(
+                &spec(AgentKind::Codex, None),
+                seat,
+                &i,
+                Path::new("/art/p.md"),
+            )
+            .unwrap()
+        };
+
+        // (a) both set: bypass, and none of the sandbox flags.
+        let first = build(&seat, true, true);
+        assert!(first.argv.iter().any(|a| a == BYPASS));
+        assert!(!first.argv.iter().any(|a| a == "--sandbox"));
+        assert!(!first.argv.iter().any(|a| a.starts_with("approval_policy")));
+
+        // (b) the flag precedes the `resume` subcommand.
+        seat.captured_session = Some("thread-1".to_owned());
+        seat.turns = 1;
+        let resumed = build(&seat, true, true);
+        let at = |p: &Plan, x: &str| p.argv.iter().position(|a| a == x).unwrap();
+        assert!(at(&resumed, BYPASS) < at(&resumed, "resume"));
+
+        // (c) without write access the read-only sandbox stays.
+        let ro = build(&seat, false, true);
+        assert!(!ro.argv.iter().any(|a| a == BYPASS));
+        assert!(ro.argv.windows(2).any(|w| w == ["--sandbox", "read-only"]));
+    }
+
+    #[test]
     fn codex_is_sandboxed_reads_stdin_and_puts_resume_last() {
         let mut seat = SeatState::new("judge-1", "a", 7);
 
@@ -1749,7 +1799,24 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["--sandbox", "workspace-write"])
         );
-        for p in [&ro, &rw] {
+        // `unsandboxed` without a talk turn's opt-in never reaches an unattended
+        // seat, and on its own it never lifts a read-only seat either.
+        let mut ro_flagged = inv(Path::new("."), Path::new("/art"), false);
+        ro_flagged.unsandboxed = true;
+        let ro_flagged = build_command(
+            &spec(AgentKind::Codex, None),
+            &seat,
+            &ro_flagged,
+            Path::new("/art/p.md"),
+        )
+        .unwrap();
+        assert!(
+            ro_flagged
+                .argv
+                .windows(2)
+                .any(|w| w == ["--sandbox", "read-only"])
+        );
+        for p in [&ro, &rw, &ro_flagged] {
             assert!(
                 !p.argv
                     .iter()
@@ -2040,6 +2107,7 @@ mod tests {
                 prompt: "p",
                 timeout: Duration::from_secs(3600),
                 allow_write: true,
+                unsandboxed: false,
                 sessions: true,
                 artifacts: Path::new("/art"),
                 stem: "t",
@@ -2483,6 +2551,7 @@ mod tests {
                 prompt: "unused",
                 timeout: Duration::from_secs(30),
                 allow_write: true,
+                unsandboxed: false,
                 sessions: true,
                 artifacts: &art,
                 stem: "impl-A",
@@ -2519,6 +2588,7 @@ mod tests {
                 prompt: "unused",
                 timeout: Duration::from_secs(30),
                 allow_write: true,
+                unsandboxed: false,
                 sessions: true,
                 artifacts: &dir.path().join("artifacts"),
                 stem: "cache",
@@ -2566,6 +2636,7 @@ mod tests {
                 prompt: "unused",
                 timeout: Duration::from_secs(30),
                 allow_write: false,
+                unsandboxed: false,
                 sessions: true,
                 artifacts: &dir.path().join("artifacts"),
                 stem: "no-cache",
@@ -2612,6 +2683,7 @@ mod tests {
                 prompt: &big,
                 timeout: Duration::from_secs(60),
                 allow_write: true,
+                unsandboxed: false,
                 sessions: true,
                 artifacts: &dir.path().join("artifacts"),
                 stem: "big",
@@ -2641,6 +2713,7 @@ mod tests {
                 prompt: "unused",
                 timeout: Duration::from_millis(300),
                 allow_write: true,
+                unsandboxed: false,
                 sessions: true,
                 artifacts: &dir.path().join("artifacts"),
                 stem: "slow",
@@ -2680,6 +2753,7 @@ mod tests {
                 // which is a dice roll rather than a test.
                 timeout: Duration::from_secs(10),
                 allow_write: true,
+                unsandboxed: false,
                 sessions: true,
                 artifacts: &artifacts,
                 stem: "chatty",

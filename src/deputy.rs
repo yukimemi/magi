@@ -719,6 +719,7 @@ impl Job {
                     prompt: $prompt,
                     timeout: $timeout,
                     allow_write,
+                    unsandboxed: false,
                     sessions: cfg.graph.sessions,
                     artifacts: &artifacts,
                     stem: $stem,

@@ -1588,6 +1588,7 @@ impl Runner {
                     prompt: &prompt,
                     timeout,
                     allow_write: false,
+                    unsandboxed: false,
                     sessions: false,
                     artifacts,
                     stem: &if n == 0 {
@@ -6996,6 +6997,7 @@ async fn wave(
                     prompt: &job.prompt,
                     timeout: job.timeout,
                     allow_write: job.allow_write,
+                    unsandboxed: false,
                     sessions: job.sessions,
                     artifacts: &job.artifacts,
                     stem: &job.stem,

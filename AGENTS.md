@@ -667,10 +667,26 @@ under review every round. Do not "fix" this by withholding `--auto`.
 
 `--sandbox read-only` is refused by the CLI, not by the prompt, so a codex
 judge or reviewer cannot write even if it decides to. Implementers get
-`workspace-write`. **Nothing ever gets
-`--dangerously-bypass-approvals-and-sandbox`** — it would throw away the one
-enforced guarantee in the roster, and `codex_is_sandboxed_reads_stdin_and_puts_resume_last`
-fails if it appears.
+`workspace-write`. **No unattended seat ever gets
+`--dangerously-bypass-approvals-and-sandbox`** (implementer, judge, reviewer,
+deputy, waiter, conductor, fixer ...) — it would throw away the one enforced
+guarantee in the roster, and `codex_is_sandboxed_reads_stdin_and_puts_resume_last`
+fails if it appears for them.
+
+**The one exception is a conversational talk turn** (`src/talk.rs`) in a
+repository that opted in with `[talk] allow_write`. There the turn runs with
+the bypass instead of `--sandbox` / `approval_policy` / `writable_roots` (the
+codex counterpart of claude's `bypassPermissions`), because `magi task add`
+writes into magi's queue under the home directory and `git fetch` needs
+credentials and the network, which the sandbox refuses. `Invocation::unsandboxed`
+carries it and only `talk.rs` sets it, through `talk::turn_access`; it takes effect
+only together with `allow_write`. A turn that is writable merely because a
+handed-over question is open (`consulted`) keeps the sandbox and only gets the
+question store as a writable root. Consequence accepted: such a turn can write
+outside the repository and reach the network, and what limits it is the prompt
+and the briefing's "small explicit edits only, everything else to the queue".
+`codex_talk_turn_bypasses_sandbox_only_when_opted_in` pins the shape (the flag
+sits before `resume`).
 
 Unattended seats also pass `-c approval_policy="never"`: a seat that stops to
 ask blocks until its node timeout kills it, and there is nobody at the
@@ -684,7 +700,7 @@ opencode, `--auto-approve` gates every permission, reads included, and a
 non-interactive seat without it cannot open its prompt file at all. So magi
 always passes it, and read-only-ness for those seats rests on the prompt plus
 the worktree discipline named above — never on the flag. `--dangerously-bypass-
-approvals-and-sandbox` appears nowhere, exactly as for codex.
+approvals-and-sandbox` appears nowhere for omp (codex's talk-turn exception does not extend to it).
 
 The extraction is the part that will be got wrong by anyone reading the event
 names instead of the stream. `omp -p --mode=json` emits `agent_end` **only** for

@@ -516,6 +516,7 @@ impl Waiter {
             prompt: &body,
             timeout: DELIVERY_TIMEOUT,
             allow_write: target.allow_write,
+            unsandboxed: false,
             sessions: target.sessions,
             artifacts: &artifacts,
             stem: &stem,

@@ -182,6 +182,7 @@ pub async fn rebase_with_fixer(
                     prompt: &prompt_text,
                     timeout: Duration::from_secs(state.config.graph.timeout_fix),
                     allow_write: true,
+                    unsandboxed: false,
                     sessions: state.config.graph.sessions,
                     artifacts: &artifacts,
                     stem: &stem,
