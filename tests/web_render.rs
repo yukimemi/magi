@@ -1476,6 +1476,16 @@ async fn unreachable_banner_waits_out_transient_failures() {
         out.early = shown();
         clock += 20000; await deck.loadHealth();
         out.persisted = shown();
+        Object.defineProperty(Navigator.prototype, 'onLine', { get: () => false, configurable: true });
+        await deck.loadHealth();
+        out.offlineHides = !shown();
+        Object.defineProperty(Navigator.prototype, 'onLine', onLine);
+        resetStore: {
+          const gen = deck.unreachable;
+          gen.since = null; gen.failures = 0;
+        }
+        await deck.loadQueue();
+        out.storeQuiet = !shown();
         window.fetch = native;
         await deck.loadHealth();
         out.cleared = !shown();
@@ -1503,6 +1513,8 @@ async fn unreachable_banner_waits_out_transient_failures() {
     assert_eq!(r["first"], false);
     assert_eq!(r["early"], false);
     assert_eq!(r["persisted"], true);
+    assert_eq!(r["offlineHides"], true);
+    assert_eq!(r["storeQuiet"], true);
     assert_eq!(r["cleared"], true);
     assert_eq!(r["offline"], false);
     assert_eq!(r["stale"], false);

@@ -8199,7 +8199,7 @@ function loadStore(name, url, change, apply) {
           ok();
         } catch (error) {
           state.rev[name] = null;
-          fail(`Could not load ${name}: ${error.message}`);
+          failBackground(`Could not load ${name}: ${error.message}`, error);
           // Even the final change must recover while SSE stays connected:
           // health otherwise polls without applying revisions in that state.
           cancelStoreRetry(name);
@@ -8239,7 +8239,7 @@ async function loadStats() {
     renderStats();
     ok();
   } catch (error) {
-    fail(`Could not load stats: ${error.message}`);
+    failBackground(`Could not load stats: ${error.message}`, error);
   }
 }
 
@@ -8271,7 +8271,7 @@ async function loadQuestions() {
     if (state.route.name === "run" && state.detail.run) renderRunDetail();
     ok();
   } catch (error) {
-    fail(`Could not load questions: ${error.message}`);
+    failBackground(`Could not load questions: ${error.message}`, error);
   }
 }
 
@@ -8288,7 +8288,7 @@ async function loadNotifications() {
     renderBell();
     ok();
   } catch (error) {
-    fail(`Could not load notifications: ${error.message}`);
+    failBackground(`Could not load notifications: ${error.message}`, error);
   }
 }
 
@@ -8415,6 +8415,21 @@ function resumeConnection() {
   loadHealth({ applyRevisions: true });
 }
 
+/* A background refresh (not a person's action) that failed. A network-level
+   failure waits out the same grace period as the health poll and shares its
+   clock; it never advances the failure count, so parallel loaders cannot
+   shorten the grace. Anything else is reported at once. */
+function failBackground(message, error) {
+  if (error.status || error instanceof SyntaxError) { fail(message); return; }
+  if (navigator.onLine === false) return;
+  const now = Date.now();
+  if (unreachable.since === null) unreachable.since = now;
+  if (unreachable.failures >= UNREACHABLE_GRACE_FAILURES
+    && now - unreachable.since >= UNREACHABLE_GRACE_MS) {
+    fail(message, "unreachable");
+  }
+}
+
 /* `explicit` is for a person's own action (Retry): reported at once. */
 async function loadHealth({ applyRevisions = false, explicit = false } = {}) {
   const gen = unreachable.gen;
@@ -8438,6 +8453,7 @@ async function loadHealth({ applyRevisions = false, explicit = false } = {}) {
     if (network && !explicit && navigator.onLine === false) {
       /* Offline is not "magi is down"; the browser will say online again. */
       resetUnreachable();
+      clearUnreachableBanner();
       return;
     }
     if (reportUnreachableDuringUpgrade(error)) return;
