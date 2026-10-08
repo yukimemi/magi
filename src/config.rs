@@ -1208,6 +1208,23 @@ pub struct Talk {
     /// array outside [`array_merge_policy`]'s append list, declaring it in two
     /// layers is refused.
     pub personas: Vec<PersonaSpec>,
+    /// What the chat calls the operator: the persona addresses them by this
+    /// name and the web Chat labels their turns with it instead of `YOU`.
+    /// Blank is unset; at most [`OPERATOR_NAME_MAX`] characters, one line.
+    pub operator_name: Option<String>,
+}
+
+/// Longest accepted `[talk] operator_name`, in characters.
+pub const OPERATOR_NAME_MAX: usize = 64;
+
+impl Talk {
+    /// The trimmed operator name, `None` when unset or blank.
+    pub fn operator_name(&self) -> Option<&str> {
+        self.operator_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+    }
 }
 
 /// One `[[talk.personas]]` entry: a tone for the standing chat, nothing more.
@@ -1410,6 +1427,13 @@ impl Config {
             .try_into()
             .context("deserializing magi config")?;
         crate::persona::validate(&cfg.talk.personas)?;
+        if let Some(name) = cfg.talk.operator_name() {
+            if name.chars().count() > OPERATOR_NAME_MAX || name.chars().any(char::is_control) {
+                bail!(
+                    "[talk] operator_name must be one line of at most {OPERATOR_NAME_MAX} characters"
+                );
+            }
+        }
         if detect_agents {
             cfg.agents = Self::autodetected().agents;
         }
@@ -2019,6 +2043,9 @@ impl Config {
              # Optional independent E2E/final-gate timeout; uncomment to keep\n\
              # verification independent if timeout_review changes later.\n\
              # timeout_verify = 1200\n\n\
+             # What the chat calls you (persona address and the Chat's turn label).\n\
+             # [talk]\n\
+             # operator_name = \"Commander\"\n\n\
              # Chat personas (tone only; the web Chat picks one per conversation).\n\
              # Built in: magi, rei, misato, ritsuko, shinji, asuka, kaworu. Entries add to\n\
              # them, and one with a built-in's id replaces it. `default` is the plain\n\
@@ -3019,6 +3046,23 @@ mod tests {
             let err = format!("{:#}", Config::load(&path).unwrap_err());
             assert!(err.contains(needle), "{needle}: {err}");
         }
+    }
+
+    #[test]
+    fn talk_operator_name_is_trimmed_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        let load = |body: &str| {
+            std::fs::write(&path, body).unwrap();
+            Config::load(&path)
+        };
+        let ok = load("[talk]\noperator_name = \"  Commander \"\n").expect("ok");
+        assert_eq!(ok.talk.operator_name(), Some("Commander"));
+        let blank = load("[talk]\noperator_name = \"   \"\n").expect("blank");
+        assert_eq!(blank.talk.operator_name(), None);
+        assert!(load("[talk]\noperator_name = \"a\\nb\"\n").is_err());
+        let long = "x".repeat(65);
+        assert!(load(&format!("[talk]\noperator_name = \"{long}\"\n")).is_err());
     }
 
     #[test]

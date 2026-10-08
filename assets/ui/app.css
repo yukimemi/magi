@@ -1829,7 +1829,7 @@ details.panel > summary + * { margin-top: var(--s2); }
 .turn-who {
   display: block; margin-bottom: var(--s1);
   font-size: var(--t1); font-weight: 700;
-  text-transform: uppercase; letter-spacing: .06em;
+  letter-spacing: .06em; overflow-wrap: anywhere;
 }
 .turn-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .turn[data-who="operator"] {

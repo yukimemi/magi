@@ -185,6 +185,28 @@ pub fn active(personas: &[PersonaSpec], id: &str) -> Option<Persona> {
 
 /// The briefing's persona section.
 pub fn section(p: &Persona) -> String {
+    section_for(p, None)
+}
+
+/// [`section`] that also tells the persona how to address the operator.
+pub fn section_for(p: &Persona, operator_name: Option<&str>) -> String {
+    let mut out = section_base(p);
+    if let Some(n) = operator_name {
+        out.push_str(&addressing(n));
+    }
+    out
+}
+
+/// The sentence naming the operator, shared by the persona section and the
+/// default voice's own short section.
+pub fn addressing(operator_name: &str) -> String {
+    format!(
+        "\nAddress the operator as \"{operator_name}\" when you address them by \
+         name. This is how they are called, not a change of tone.\n"
+    )
+}
+
+fn section_base(p: &Persona) -> String {
     format!(
         "\n# Persona (tone only)\n\n\
          The operator picked the persona \"{name}\" for this conversation. It \
@@ -206,11 +228,16 @@ pub fn section(p: &Persona) -> String {
 /// What a resumed session is told when the persona changed since the briefing
 /// it holds. `None` means the operator went back to the plain voice.
 pub fn update_block(p: Option<&Persona>) -> String {
+    update_block_for(p, None)
+}
+
+/// [`update_block`] naming the operator the way the briefing does.
+pub fn update_block_for(p: Option<&Persona>, operator_name: Option<&str>) -> String {
     match p {
         Some(p) => format!(
             "# Persona update\n\nThe operator changed the persona. Drop any earlier \
              persona and use this one from now on.\n{}",
-            section(p)
+            section_for(p, operator_name)
         ),
         None => "# Persona update\n\nThe operator turned the persona off. Drop any earlier \
                  persona and go back to your plain, normal voice from now on.\n"
