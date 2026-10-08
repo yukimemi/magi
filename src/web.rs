@@ -2479,8 +2479,10 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
     // spawned task happens to get scheduled.
     let mut progress = updater::Progress::new(from.clone(), latest.tag_name.clone());
     progress.parked_run = parked.clone();
-    updater::write_progress(&ui.home, &progress)
-        .map_err(|e| ApiError::internal(format!("record the upgrade: {e:#}")))?;
+    // A failed write is logged, not returned: the loop is already parked
+    // above, and bailing out here would leave it parked with no upgrade
+    // spawned to hand over or resume it.
+    updater::write_progress_logged(&ui.home, &progress);
 
     let home = ui.home.clone();
     let looping = ui.looping();
