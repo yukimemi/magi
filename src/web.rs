@@ -14627,7 +14627,9 @@ mod tests {
         assert!(health["upgrade"]["stuck_for_secs"].is_null(), "{health}");
         assert!(health["upgrade"]["stuck_kind"].is_null());
         assert_eq!(health["upgrade"]["handover_alive"], true);
-        let waiting_on = health["upgrade"]["waiting_on"].as_str().expect("waiting_on");
+        let waiting_on = health["upgrade"]["waiting_on"]
+            .as_str()
+            .expect("waiting_on");
         assert!(waiting_on.contains("cd51"), "{waiting_on}");
     }
 

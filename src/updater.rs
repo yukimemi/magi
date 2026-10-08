@@ -665,11 +665,7 @@ pub fn waited_secs(lease: &HandoverLease, now: Timestamp) -> i64 {
 /// A fresh lease means `hand_over` is alive and waiting on the loop, which is
 /// legitimate for as long as the run's node takes, so it is never stuck.
 #[must_use]
-pub fn stall(
-    progress: &Progress,
-    lease: Option<&HandoverLease>,
-    now: Timestamp,
-) -> Option<Stall> {
+pub fn stall(progress: &Progress, lease: Option<&HandoverLease>, now: Timestamp) -> Option<Stall> {
     if progress.stage.terminal() || progress.stage == Stage::Downloading {
         return None;
     }
