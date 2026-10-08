@@ -258,6 +258,19 @@ impl Stage {
     pub fn terminal(self) -> bool {
         matches!(self, Self::Done | Self::Failed)
     }
+
+    /// The wire spelling, the same one serde writes to `upgrade.json`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Downloading => "downloading",
+            Self::Replaced => "replaced",
+            Self::Parking => "parking",
+            Self::Restarting => "restarting",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// One upgrade's progress, persisted at [`progress_path`].

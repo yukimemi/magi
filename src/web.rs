@@ -314,6 +314,10 @@ pub struct Ui {
     /// see it, and a second `magi web` on the same home is already a
     /// misconfiguration the queue's claims would catch first.
     talk_turns: Arc<Mutex<TalkTurns>>,
+    /// Held by `POST /api/upgrade` from its busy-stage check until the first
+    /// progress record is written, so two taps cannot both start an upgrade.
+    /// After that `upgrade.json` carries the exclusion.
+    upgrade_gate: Arc<tokio::sync::Mutex<()>>,
     /// Runs this process is resuming right now.
     ///
     /// Separate from `talk_turns` because a run and a talk are different
@@ -407,6 +411,7 @@ impl Ui {
             // `with_merge` gives.
             worktrees_root: run::default_worktree_root(),
             talk_turns: Arc::default(),
+            upgrade_gate: Arc::default(),
             resuming: Arc::default(),
             repos_cache: repos::Cache::new(),
             machine_config: Config::machine_layer(),
@@ -2340,6 +2345,12 @@ struct UpgradeView {
     detail: String,
 }
 
+/// The stage of an upgrade that is still moving, if the record says so.
+/// Mirrors `UPGRADE_BUSY_STAGES` in `assets/ui/app.js`.
+fn upgrade_in_motion(progress: Option<&updater::Progress>) -> Option<&updater::Progress> {
+    progress.filter(|p| !p.stage.terminal())
+}
+
 /// `POST /api/upgrade` - replace this binary with the newest release and come
 /// back on it.
 ///
@@ -2371,6 +2382,26 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
              that process running an old one against the same queue. Upgrade \
              where it was started.",
             other.who()
+        )));
+    }
+
+    // A second upgrade while one is moving would replace the binary and
+    // signal the handover again after `serve` already consumed the first
+    // signal, leaving the process in `replaced` forever. Try-lock rather than
+    // wait: a phone connection must not hang behind a GitHub round trip.
+    let Ok(_gate) = Arc::clone(&ui.upgrade_gate).try_lock_owned() else {
+        return Err(ApiError::conflict(
+            "another request is already preparing an upgrade",
+        ));
+    };
+    let recorded = updater::read_progress(&ui.home);
+    if let Some(p) = upgrade_in_motion(recorded.as_ref()) {
+        return Err(ApiError::conflict(format!(
+            "an upgrade is already in progress (stage: {}, {} -> {}). If it \
+             stays stuck, restart the deck; on start it settles a stale record.",
+            p.stage.as_str(),
+            p.from,
+            p.to.as_deref().unwrap_or("?"),
         )));
     }
 
@@ -2448,7 +2479,8 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
     // spawned task happens to get scheduled.
     let mut progress = updater::Progress::new(from.clone(), latest.tag_name.clone());
     progress.parked_run = parked.clone();
-    let _ = updater::write_progress(&ui.home, &progress);
+    updater::write_progress(&ui.home, &progress)
+        .map_err(|e| ApiError::internal(format!("record the upgrade: {e:#}")))?;
 
     let home = ui.home.clone();
     let looping = ui.looping();
@@ -14371,6 +14403,79 @@ mod tests {
                 .contains("disabled by MAGI_NO_AUTOUPDATE"),
             "{body:?}"
         );
+    }
+
+    fn seeded_progress(stage: crate::updater::Stage) -> crate::updater::Progress {
+        let mut p = crate::updater::Progress::new("0.1.0".into(), "v0.2.0".into());
+        p.stage = stage;
+        p
+    }
+
+    #[test]
+    fn busy_stages_match_the_ui_set() {
+        use crate::updater::Stage;
+        assert!(APP_JS.contains(
+            "UPGRADE_BUSY_STAGES = new Set([\"downloading\", \"replaced\", \"parking\", \"restarting\"])"
+        ));
+        for s in [
+            Stage::Downloading,
+            Stage::Replaced,
+            Stage::Parking,
+            Stage::Restarting,
+        ] {
+            assert!(upgrade_in_motion(Some(&seeded_progress(s))).is_some());
+        }
+        for s in [Stage::Done, Stage::Failed] {
+            assert!(upgrade_in_motion(Some(&seeded_progress(s))).is_none());
+        }
+        assert!(upgrade_in_motion(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_second_upgrade_during_a_busy_stage_is_refused_and_changes_nothing() {
+        use crate::updater::Stage;
+        for stage in [
+            Stage::Downloading,
+            Stage::Replaced,
+            Stage::Parking,
+            Stage::Restarting,
+        ] {
+            let fx = Fixture::start().await;
+            let seeded = seeded_progress(stage);
+            crate::updater::write_progress(fx.home.path(), &seeded).expect("seed");
+            let before = std::fs::read_to_string(crate::updater::progress_path(fx.home.path()))
+                .expect("read");
+
+            let res = fx.post("/api/upgrade", None).await;
+            assert_eq!(res.status, 409, "{stage:?}");
+            let err = res.json()["error"].as_str().unwrap().to_owned();
+            assert!(err.contains("already in progress"), "{err}");
+            assert!(err.contains(stage.as_str()), "{err}");
+
+            let after = std::fs::read_to_string(crate::updater::progress_path(fx.home.path()))
+                .expect("read");
+            assert_eq!(before, after, "{stage:?}: upgrade.json is untouched");
+            let log = std::fs::read_to_string(crate::updater::log_path(fx.home.path()))
+                .unwrap_or_default();
+            assert!(!log.contains("signalling HANDOVER"), "{log}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_after_a_finished_or_failed_one_is_allowed() {
+        use crate::updater::Stage;
+        let repo = TempDir::new().expect("repo dir");
+        std::fs::write(repo.path().join("magi.toml"), "[update]\nmode = \"off\"\n")
+            .expect("write magi.toml");
+        let fx = Fixture::with_repo(repo.path().to_path_buf()).await;
+        for stage in [Stage::Done, Stage::Failed] {
+            crate::updater::write_progress(fx.home.path(), &seeded_progress(stage)).expect("seed");
+            let res = fx.post("/api/upgrade", None).await;
+            assert_eq!(res.status, 200, "{stage:?}");
+        }
+        // No record at all, and the gate was released by the earlier calls.
+        let _ = std::fs::remove_file(crate::updater::progress_path(fx.home.path()));
+        assert_eq!(fx.post("/api/upgrade", None).await.status, 200);
     }
 
     #[tokio::test]
