@@ -529,6 +529,9 @@ enum Command {
         /// The answer: one of the offered choices, or free text.
         #[arg(long, conflicts_with_all = ["list", "say", "ask_chat"])]
         reply: Option<String>,
+        /// Verbatim owner words when answering a consulted merge approval from chat.
+        #[arg(long, requires = "reply")]
+        quote: Option<String>,
         /// Speak back without deciding: a clarifying question, a request for
         /// more context. The run stays parked; the agent picks the
         /// conversation back up with `magi ask --thread`. Exclusive with
@@ -1620,10 +1623,11 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Answer {
             id,
             reply,
+            quote,
             say,
             ask_chat,
             list,
-        } => answer_cmd(id, reply, say, ask_chat, list).await,
+        } => answer_cmd(id, reply, quote, say, ask_chat, list).await,
 
         Command::Task { command } => task_cmd(command).await,
 
@@ -2495,6 +2499,7 @@ fn resolved_before_the_wait_even_starts(q: &ask::Question) -> Result<Option<Stri
 async fn answer_cmd(
     id: Option<String>,
     reply: Option<String>,
+    quote: Option<String>,
     say: Option<String>,
     ask_chat: bool,
     list: bool,
@@ -2584,7 +2589,22 @@ async fn answer_cmd(
     } else {
         ask::Answer::Choice(reply)
     };
-    store.update(&q.id, |r| r.answer(answer))?;
+    store.update(&q.id, |r| {
+        if let Some((run, node)) = agent_env() {
+            let reply = match &answer {
+                ask::Answer::Choice(s) | ask::Answer::Text(s) => s,
+            };
+            magi::consult::validate_answer(
+                r,
+                &magi::talk::Talks::open(),
+                &run,
+                &node,
+                reply,
+                quote.as_deref(),
+            )?;
+        }
+        r.answer(answer)
+    })?;
     println!("answered {} {}", q.short(), q.summary);
     Ok(())
 }

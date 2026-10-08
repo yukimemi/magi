@@ -2072,9 +2072,11 @@ with `magi answer` or puts the decision points to the owner in the chat.
 
 - **One judge.** `consult::origin_talk` is the only place that decides a
   question has a chat to ask (open question, task from a chat, talk still
-  open, and never `land::APPROVAL_NODE` / `bump::NOTICE_NODE`, whose answers
-  are gated by `land::merge_intent`). `QuestionView::origin_chat` is its
-  result; `app.js` shows "Ask the chat agent" only when it is set.
+  open, and never `bump::NOTICE_NODE`). Merge approvals can be consulted,
+  but the chat must wait for explicit owner confirmation. `magi answer` from
+  a chat requires its run id to match the consultation and `--quote` to cite
+  the latest owner message; hold requires the whole message to be `hold`.
+  `QuestionView::origin_chat` is its result; `app.js` shows "Ask the chat agent" only when it is set.
 - **Never a choice.** Nothing is added to `Question::choices` and
   `Question::answer` is untouched. The question stays `Open`; `Question::consult`
   (`ask::SCHEMA` 6, `#[serde(default)]`) only records that the chat was asked, so

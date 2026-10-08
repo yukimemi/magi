@@ -28,14 +28,10 @@ use crate::talk::{self, Talk, Talks};
 /// The conversation `q` may be handed to, if any.
 ///
 /// Requires an open question whose task was filed from a chat that is still
-/// open. A merge approval and a release notice are left out: their answer is
-/// gated by the deputy's merge-intent rules and must not be settled by a side
-/// door.
+/// open. Release notices are left out. Merge approvals may be discussed, but
+/// answering from chat requires the owner's latest words.
 pub fn origin_talk(tasks: &[Task], talks: &[Talk], q: &Question) -> Option<Talk> {
-    if !q.status.open()
-        || q.node == crate::land::APPROVAL_NODE
-        || q.node == crate::bump::NOTICE_NODE
-    {
+    if !q.status.open() || q.node == crate::bump::NOTICE_NODE {
         return None;
     }
     let task = crate::daemon::task_of_question(tasks, q)?;
@@ -123,6 +119,115 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
         return Err(e).context("queue the question into the chat");
     }
     Ok(true)
+}
+
+/// Validate a merge approval answered by a running chat. Terminal answers and
+/// other question types retain their existing behavior. Intent is judged by
+/// the chat; this gate requires evidence from the correct conversation.
+pub fn validate_answer(
+    q: &Question,
+    talks: &Talks,
+    run: &str,
+    node: &str,
+    reply: &str,
+    quote: Option<&str>,
+) -> Result<()> {
+    if q.node != crate::land::APPROVAL_NODE || node != CHAT_NODE {
+        return Ok(());
+    }
+    let consult = q
+        .consult
+        .as_ref()
+        .context("merge approval was not handed to a chat")?;
+    if consult.talk != run {
+        bail!("merge approval belongs to a different chat");
+    }
+    if !q.status.open() {
+        bail!("merge approval is no longer open");
+    }
+    let talk = talks.get(run)?;
+    if !talk.status.open() {
+        bail!("the consulted chat is closed");
+    }
+    // Only words the owner wrote after this question was handed over count.
+    // The generated hand-over text is stored as an operator turn (possibly
+    // coalesced with owner replies), so it is cut out by its own markers.
+    let at = talk
+        .turns
+        .iter()
+        .rposition(|t| {
+            t.who == talk::Who::Operator
+                && t.body.contains(crate::prompt::CHAT_CONSULT_HEADING)
+                && t.body.contains(&q.id)
+        })
+        .context("the question was not delivered to the chat yet")?;
+    // A reply still waiting in `pending` is newer than every stored turn.
+    let queued = owner_words(&talk.pending, false);
+    let stored = talk.turns[at..]
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, t)| t.who == talk::Who::Operator)
+        .map(|(i, t)| owner_words(&t.body, i == 0))
+        .find(|w| !w.is_empty());
+    let latest = if queued.is_empty() {
+        stored
+    } else {
+        Some(queued)
+    }
+    .context("no owner message after the question was handed to the chat")?;
+    // Replies sent while a turn runs are joined with a blank line into one
+    // turn, so the last paragraph is the only text certain to be the newest.
+    let latest = latest
+        .rsplit("\n\n")
+        .map(str::trim)
+        .find(|p| !p.is_empty())
+        .unwrap_or_default()
+        .to_owned();
+    let quote = quote
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .context("chat merge approval requires --quote from the owner's latest message")?;
+    let valid = match reply {
+        crate::land::APPROVE => latest.contains(quote),
+        crate::land::HOLD => {
+            latest.trim().eq_ignore_ascii_case(crate::land::HOLD)
+                && quote.eq_ignore_ascii_case(crate::land::HOLD)
+        }
+        _ => false,
+    };
+    if !valid {
+        bail!(
+            "merge requires a verbatim quote of the latest owner message; hold requires the whole message to be hold"
+        );
+    }
+    Ok(())
+}
+
+/// The owner's own words in an operator turn, with magi's generated hand-over
+/// text cut out. `drain` stores a queued consult as an operator turn, and
+/// `talk::queue` joins an owner reply sent meanwhile onto the same draft, so
+/// the turn's origin cannot be told from the turn as a whole. The generated
+/// block runs from [`CHAT_CONSULT_HEADING`](crate::prompt::CHAT_CONSULT_HEADING)
+/// to the last [`CHAT_CONSULT_END`](crate::prompt::CHAT_CONSULT_END); an owner
+/// reply that happens to contain that phrase is cut too, which only ever
+/// refuses. With `after_block_only` (the turn carrying the hand-over itself)
+/// words queued before the block predate it and are dropped.
+fn owner_words(body: &str, after_block_only: bool) -> String {
+    use crate::prompt::{CHAT_CONSULT_END, CHAT_CONSULT_HEADING};
+    let Some(start) = body.find(CHAT_CONSULT_HEADING) else {
+        return body.trim().to_owned();
+    };
+    let after = match body.rfind(CHAT_CONSULT_END) {
+        Some(e) if e >= start => &body[e + CHAT_CONSULT_END.len()..],
+        _ => "",
+    };
+    if after_block_only {
+        return after.trim().to_owned();
+    }
+    let before = &body[..start];
+    let before = before.strip_suffix("# ").unwrap_or(before);
+    format!("{before}\n\n{after}").trim().to_owned()
 }
 
 /// What [`start_turn`] did.
@@ -367,23 +472,60 @@ mod tests {
         assert!(hit(std::slice::from_ref(&chat), &[closed], &q).is_none());
         // No task owns the question.
         assert!(hit(&[], std::slice::from_ref(&talk), &q).is_none());
-        // Approvals and release notices are never handed over.
-        for node in [crate::land::APPROVAL_NODE, crate::bump::NOTICE_NODE] {
-            assert!(
-                hit(
-                    std::slice::from_ref(&chat),
-                    std::slice::from_ref(&talk),
-                    &question(node)
-                )
-                .is_none()
-            );
-        }
+        // Merge approvals can be consulted; release notices cannot.
+        assert!(
+            hit(
+                std::slice::from_ref(&chat),
+                std::slice::from_ref(&talk),
+                &question(crate::land::APPROVAL_NODE)
+            )
+            .is_some()
+        );
+        assert!(
+            hit(
+                std::slice::from_ref(&chat),
+                std::slice::from_ref(&talk),
+                &question(crate::bump::NOTICE_NODE)
+            )
+            .is_none()
+        );
         // A settled question has nothing left to ask.
         let mut answered = question("implement");
         answered
             .answer(crate::ask::Answer::Choice("Redis".to_owned()))
             .unwrap();
         assert!(hit(&[chat], &[talk], &answered).is_none());
+    }
+
+    #[test]
+    fn approval_origin_requires_an_open_chat_task_and_question() {
+        let (_tmp, _store, talk) = talks();
+        let chat = from_chat(&talk);
+        let mut q = question(crate::land::APPROVAL_NODE);
+        assert!(origin_talk(&[task(Source::Human)], std::slice::from_ref(&talk), &q).is_none());
+        assert!(
+            origin_talk(
+                &[task(Source::Agent {
+                    run: talk.id.clone(),
+                    node: "implement".into(),
+                })],
+                std::slice::from_ref(&talk),
+                &q
+            )
+            .is_none()
+        );
+        assert!(origin_talk(std::slice::from_ref(&chat), &[], &q).is_none());
+        let mut closed = talk.clone();
+        closed.status = TalkStatus::Closed;
+        assert!(origin_talk(std::slice::from_ref(&chat), &[closed], &q).is_none());
+        q.abandon("expired");
+        assert!(
+            origin_talk(std::slice::from_ref(&chat), std::slice::from_ref(&talk), &q).is_none()
+        );
+        let mut q = question(crate::land::APPROVAL_NODE);
+        q.answer(crate::ask::Answer::Choice("Redis".into()))
+            .unwrap();
+        assert!(origin_talk(&[chat], &[talk], &q).is_none());
     }
 
     #[test]
@@ -526,6 +668,172 @@ mod tests {
         assert_eq!(
             queued.matches(crate::prompt::CHAT_CONSULT_HEADING).count(),
             1
+        );
+    }
+
+    #[test]
+    fn approval_consult_waits_for_latest_owner_confirmation() {
+        let (tmp, store, mut talk) = talks();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = question(crate::land::APPROVAL_NODE);
+        q.choices = vec![crate::land::APPROVE.into(), crate::land::HOLD.into()];
+        questions.put(&mut q).unwrap();
+        assert!(begin(&questions, &store, &q, &talk).unwrap());
+        assert!(!begin(&questions, &store, &q, &talk).unwrap());
+        q = questions.get(&q.id).unwrap();
+        assert!(q.status.open());
+        assert!(q.answer.is_none());
+        assert!(q.thread.is_empty());
+        let queued = store.get(&talk.id).unwrap().pending;
+        assert!(queued.contains("Never answer it yourself"));
+        assert!(queued.contains("Silence holds"));
+        assert!(queued.contains("--reply merge --quote"));
+        assert!(!queued.contains("answer it yourself with"));
+
+        let owner_turn = |body: &str| talk::Turn {
+            who: talk::Who::Operator,
+            body: body.into(),
+            at: Timestamp::now(),
+            attachments: Vec::new(),
+            usage: None,
+        };
+        // An approval the owner gave before the hand-over is not reusable.
+        let mut old = talk.clone();
+        old.turns
+            .insert(0, owner_turn("Please merge PR 12 after review"));
+        store.put(&mut old).unwrap();
+        talk.turns = old.turns.clone();
+        // The drained consult draft is stored as an operator turn; it must not
+        // count as the owner's words even though it contains "merge".
+        talk.turns.push(owner_turn(&queued));
+        store.put(&mut talk).unwrap();
+        assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, "merge", Some("merge")).is_err());
+        assert!(
+            validate_answer(
+                &q,
+                &store,
+                &talk.id,
+                CHAT_NODE,
+                "merge",
+                Some("Please merge PR 12")
+            )
+            .is_err()
+        );
+        // An owner reply coalesced onto the same draft still counts.
+        let n = talk.turns.len();
+        talk.turns[n - 1].body = format!("{queued}\n\nmerge it now");
+        store.put(&mut talk).unwrap();
+        assert!(
+            validate_answer(
+                &q,
+                &store,
+                &talk.id,
+                CHAT_NODE,
+                "merge",
+                Some("merge it now")
+            )
+            .is_ok()
+        );
+        // A later retraction in the same coalesced turn wins.
+        talk.turns[n - 1].body = format!("{queued}\n\nmerge it now\n\nhold");
+        store.put(&mut talk).unwrap();
+        assert!(
+            validate_answer(
+                &q,
+                &store,
+                &talk.id,
+                CHAT_NODE,
+                "merge",
+                Some("merge it now")
+            )
+            .is_err()
+        );
+        assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, "hold", Some("hold")).is_ok());
+        // So does a reply still waiting in the draft.
+        talk.turns[n - 1].body = format!("{queued}\n\nmerge it now");
+        talk.pending = "hold".into();
+        store.put(&mut talk).unwrap();
+        assert!(
+            validate_answer(
+                &q,
+                &store,
+                &talk.id,
+                CHAT_NODE,
+                "merge",
+                Some("merge it now")
+            )
+            .is_err()
+        );
+        // Another question's hand-over queued after the retraction hides nothing.
+        talk.pending = format!("hold\n\n{queued}");
+        store.put(&mut talk).unwrap();
+        assert!(
+            validate_answer(
+                &q,
+                &store,
+                &talk.id,
+                CHAT_NODE,
+                "merge",
+                Some("merge it now")
+            )
+            .is_err()
+        );
+        talk.pending.clear();
+        talk.turns[n - 1].body = queued.clone();
+        store.put(&mut talk).unwrap();
+        talk.turns
+            .push(owner_turn("Merge this pull request please"));
+        store.put(&mut talk).unwrap();
+        let check = |q: &Question, run: &str, reply: &str, quote: Option<&str>| {
+            validate_answer(q, &store, run, CHAT_NODE, reply, quote)
+        };
+        assert!(check(&q, "other-talk", "merge", Some("Merge this")).is_err());
+        assert!(check(&q, &talk.id, "merge", None).is_err());
+        assert!(check(&q, &talk.id, "merge", Some("never said")).is_err());
+        assert!(
+            check(
+                &q,
+                &talk.id,
+                "merge",
+                Some("Merge this pull request please")
+            )
+            .is_ok()
+        );
+        assert!(check(&q, &talk.id, "hold", Some("hold")).is_err());
+        talk.turns
+            .push(owner_turn("Wait, explain the checks first"));
+        store.put(&mut talk).unwrap();
+        assert!(
+            check(
+                &q,
+                &talk.id,
+                "merge",
+                Some("Merge this pull request please")
+            )
+            .is_err()
+        );
+        talk.turns.push(owner_turn("Please hold"));
+        store.put(&mut talk).unwrap();
+        assert!(check(&q, &talk.id, "hold", Some("hold")).is_err());
+        talk.turns.push(owner_turn("hold"));
+        store.put(&mut talk).unwrap();
+        assert!(check(&q, &talk.id, "hold", Some("hold")).is_ok());
+        talk.turns
+            .push(owner_turn("Merge this pull request please"));
+        store.put(&mut talk).unwrap();
+        q.abandon("approval expired or head changed");
+        assert!(
+            check(
+                &q,
+                &talk.id,
+                "merge",
+                Some("Merge this pull request please")
+            )
+            .is_err()
+        );
+        assert!(
+            q.answer(crate::ask::Answer::Choice("merge".into()))
+                .is_err()
         );
     }
 
