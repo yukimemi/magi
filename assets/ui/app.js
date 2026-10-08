@@ -4331,6 +4331,8 @@ function choiceNamed(question, want) {
    it is two deliberate taps away rather than made to wait. */
 function renderStakes(row, question) {
   const r = row.refs;
+  /* Keep consultation outside the rebuilt approval controls. */
+  row.insertBefore(r.consultBox, r.stakes.nextSibling);
   const armed = row.dataset.armed === "1";
   clear(r.stakes);
 
@@ -4558,6 +4560,9 @@ function updateAskCard(row, question, { compact = false } = {}) {
   } else if (waitingOnAgent) {
     waitingText = "Nobody is attached to this question to reply. Your message is recorded.";
   }
+  if (open && merge && question.consult) {
+    waitingText = "Waiting for your explicit merge confirmation in the originating chat. Silence holds; nothing merges while you discuss it. You can also decide on this card.";
+  }
   setText(r.waitingNote, waitingText);
   show(r.waitingNote, waitingText !== "");
 
@@ -4624,13 +4629,14 @@ function updateAskCard(row, question, { compact = false } = {}) {
   show(r.free, open && choices.length === 0);
   show(r.error, open && !r.error.hidden && r.error.textContent !== "");
 
-  // While the agent has not replied yet, deciding is not an option: the
+  // A consultation leaves merge decisions with the owner. Otherwise, while
+  // the agent has not replied yet, deciding is not an option: the
   // controls stay visible - the owner can still see what was on offer - but
   // disabled, with `waitingNote` above saying why.
   r.text.disabled = waitingOnAgent;
   r.send.disabled = waitingOnAgent;
-  for (const btn of r.choices.querySelectorAll("button")) btn.disabled = choicesLocked;
-  for (const btn of r.stakes.querySelectorAll("button")) btn.disabled = choicesLocked;
+  for (const btn of r.choices.querySelectorAll("button")) btn.disabled = choicesLocked && !(merge && question.consult);
+  for (const btn of r.stakes.querySelectorAll("button")) btn.disabled = choicesLocked && !(merge && question.consult);
 
   const given = question.answer && typeof question.answer === "object" ? question.answer : null;
   const value = given
@@ -4662,7 +4668,7 @@ async function answerQuestion(id, body, row) {
      panel's own controls are not part of the decision, and one of them is
      deliberately disabled when the panel failed to load — re-enabling it
      here would offer a full-screen view of something that is not there. */
-  const buttons = [...row.querySelectorAll("button")].filter((b) => !b.closest(".ask-panel"));
+  const buttons = [...row.querySelectorAll("button")].filter((b) => !b.closest(".ask-panel") && !b.closest(".ask-consult-box"));
   const value = typeof body.choice === "string" ? body.choice : String(body.text || "");
 
   if (!value.trim()) {

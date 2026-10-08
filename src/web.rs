@@ -8052,6 +8052,15 @@ mod tests {
             serde_json::json!(["SQLite", "Redis"]),
             "the hand-over is never a choice"
         );
+        fx.questions()
+            .update(&id, |q| {
+                q.node = crate::land::APPROVAL_NODE.into();
+                q.choices = vec!["merge".into(), "hold".into()];
+                Ok(())
+            })
+            .unwrap();
+        let list = fx.get("/api/questions").await.json();
+        assert_eq!(list[0]["origin_chat"], talk.id.as_str(), "{list}");
         let _ = id;
     }
 
@@ -8059,6 +8068,13 @@ mod tests {
     async fn a_consult_that_cannot_read_its_config_leaves_nothing_to_retry_around() {
         let fx = Fixture::start().await;
         let id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+        fx.questions()
+            .update(&id, |q| {
+                q.node = crate::land::APPROVAL_NODE.into();
+                q.choices = vec!["merge".into(), "hold".into()];
+                Ok(())
+            })
+            .unwrap();
         let cfg = Config {
             agents: vec![crate::config::AgentSpec {
                 id: "mock".to_owned(),
@@ -8099,6 +8115,10 @@ mod tests {
         let res = fx.post(&path, None).await;
         assert_eq!(res.status, 202, "{}", res.body);
         assert!(fx.questions().get(&id).unwrap().consult.is_some());
+        let q = fx.questions().get(&id).unwrap();
+        assert!(q.status.open());
+        assert!(q.answer.is_none());
+        assert_eq!(res.json()["origin_chat"], talk.id.as_str());
     }
 
     #[tokio::test]

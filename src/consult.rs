@@ -28,14 +28,10 @@ use crate::talk::{self, Talk, Talks};
 /// The conversation `q` may be handed to, if any.
 ///
 /// Requires an open question whose task was filed from a chat that is still
-/// open. A merge approval and a release notice are left out: their answer is
-/// gated by the deputy's merge-intent rules and must not be settled by a side
-/// door.
+/// open. Release notices are left out. Merge approvals may be discussed, but
+/// answering from chat requires the owner's latest words.
 pub fn origin_talk(tasks: &[Task], talks: &[Talk], q: &Question) -> Option<Talk> {
-    if !q.status.open()
-        || q.node == crate::land::APPROVAL_NODE
-        || q.node == crate::bump::NOTICE_NODE
-    {
+    if !q.status.open() || q.node == crate::bump::NOTICE_NODE {
         return None;
     }
     let task = crate::daemon::task_of_question(tasks, q)?;
@@ -123,6 +119,60 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
         return Err(e).context("queue the question into the chat");
     }
     Ok(true)
+}
+
+/// Validate a merge approval answered by a running chat. Terminal answers and
+/// other question types retain their existing behavior. Intent is judged by
+/// the chat; this gate requires evidence from the correct conversation.
+pub fn validate_answer(
+    q: &Question,
+    talks: &Talks,
+    run: &str,
+    node: &str,
+    reply: &str,
+    quote: Option<&str>,
+) -> Result<()> {
+    if q.node != crate::land::APPROVAL_NODE || node != CHAT_NODE {
+        return Ok(());
+    }
+    let consult = q
+        .consult
+        .as_ref()
+        .context("merge approval was not handed to a chat")?;
+    if consult.talk != run {
+        bail!("merge approval belongs to a different chat");
+    }
+    if !q.status.open() {
+        bail!("merge approval is no longer open");
+    }
+    let talk = talks.get(run)?;
+    if !talk.status.open() {
+        bail!("the consulted chat is closed");
+    }
+    let latest = talk
+        .turns
+        .iter()
+        .rev()
+        .find(|t| t.who == talk::Who::Operator)
+        .context("no owner message in the consulted chat")?;
+    let quote = quote
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .context("chat merge approval requires --quote from the owner's latest message")?;
+    let valid = match reply {
+        crate::land::APPROVE => latest.body.contains(quote),
+        crate::land::HOLD => {
+            latest.body.trim().eq_ignore_ascii_case(crate::land::HOLD)
+                && quote.eq_ignore_ascii_case(crate::land::HOLD)
+        }
+        _ => false,
+    };
+    if !valid {
+        bail!(
+            "merge requires a verbatim quote of the latest owner message; hold requires the whole message to be hold"
+        );
+    }
+    Ok(())
 }
 
 /// What [`start_turn`] did.
@@ -298,23 +348,60 @@ mod tests {
         assert!(hit(std::slice::from_ref(&chat), &[closed], &q).is_none());
         // No task owns the question.
         assert!(hit(&[], std::slice::from_ref(&talk), &q).is_none());
-        // Approvals and release notices are never handed over.
-        for node in [crate::land::APPROVAL_NODE, crate::bump::NOTICE_NODE] {
-            assert!(
-                hit(
-                    std::slice::from_ref(&chat),
-                    std::slice::from_ref(&talk),
-                    &question(node)
-                )
-                .is_none()
-            );
-        }
+        // Merge approvals can be consulted; release notices cannot.
+        assert!(
+            hit(
+                std::slice::from_ref(&chat),
+                std::slice::from_ref(&talk),
+                &question(crate::land::APPROVAL_NODE)
+            )
+            .is_some()
+        );
+        assert!(
+            hit(
+                std::slice::from_ref(&chat),
+                std::slice::from_ref(&talk),
+                &question(crate::bump::NOTICE_NODE)
+            )
+            .is_none()
+        );
         // A settled question has nothing left to ask.
         let mut answered = question("implement");
         answered
             .answer(crate::ask::Answer::Choice("Redis".to_owned()))
             .unwrap();
         assert!(hit(&[chat], &[talk], &answered).is_none());
+    }
+
+    #[test]
+    fn approval_origin_requires_an_open_chat_task_and_question() {
+        let (_tmp, _store, talk) = talks();
+        let chat = from_chat(&talk);
+        let mut q = question(crate::land::APPROVAL_NODE);
+        assert!(origin_talk(&[task(Source::Human)], std::slice::from_ref(&talk), &q).is_none());
+        assert!(
+            origin_talk(
+                &[task(Source::Agent {
+                    run: talk.id.clone(),
+                    node: "implement".into(),
+                })],
+                std::slice::from_ref(&talk),
+                &q
+            )
+            .is_none()
+        );
+        assert!(origin_talk(std::slice::from_ref(&chat), &[], &q).is_none());
+        let mut closed = talk.clone();
+        closed.status = TalkStatus::Closed;
+        assert!(origin_talk(std::slice::from_ref(&chat), &[closed], &q).is_none());
+        q.abandon("expired");
+        assert!(
+            origin_talk(std::slice::from_ref(&chat), std::slice::from_ref(&talk), &q).is_none()
+        );
+        let mut q = question(crate::land::APPROVAL_NODE);
+        q.answer(crate::ask::Answer::Choice("Redis".into()))
+            .unwrap();
+        assert!(origin_talk(&[chat], &[talk], &q).is_none());
     }
 
     #[test]
@@ -457,6 +544,88 @@ mod tests {
         assert_eq!(
             queued.matches(crate::prompt::CHAT_CONSULT_HEADING).count(),
             1
+        );
+    }
+
+    #[test]
+    fn approval_consult_waits_for_latest_owner_confirmation() {
+        let (tmp, store, mut talk) = talks();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = question(crate::land::APPROVAL_NODE);
+        q.choices = vec![crate::land::APPROVE.into(), crate::land::HOLD.into()];
+        questions.put(&mut q).unwrap();
+        assert!(begin(&questions, &store, &q, &talk).unwrap());
+        assert!(!begin(&questions, &store, &q, &talk).unwrap());
+        q = questions.get(&q.id).unwrap();
+        assert!(q.status.open());
+        assert!(q.answer.is_none());
+        assert!(q.thread.is_empty());
+        let queued = store.get(&talk.id).unwrap().pending;
+        assert!(queued.contains("Never answer it yourself"));
+        assert!(queued.contains("Silence holds"));
+        assert!(queued.contains("--reply merge --quote"));
+        assert!(!queued.contains("answer it yourself with"));
+
+        let owner_turn = |body: &str| talk::Turn {
+            who: talk::Who::Operator,
+            body: body.into(),
+            at: Timestamp::now(),
+            attachments: Vec::new(),
+            usage: None,
+        };
+        talk.turns
+            .push(owner_turn("Merge this pull request please"));
+        store.put(&mut talk).unwrap();
+        let check = |q: &Question, run: &str, reply: &str, quote: Option<&str>| {
+            validate_answer(q, &store, run, CHAT_NODE, reply, quote)
+        };
+        assert!(check(&q, "other-talk", "merge", Some("Merge this")).is_err());
+        assert!(check(&q, &talk.id, "merge", None).is_err());
+        assert!(check(&q, &talk.id, "merge", Some("never said")).is_err());
+        assert!(
+            check(
+                &q,
+                &talk.id,
+                "merge",
+                Some("Merge this pull request please")
+            )
+            .is_ok()
+        );
+        assert!(check(&q, &talk.id, "hold", Some("hold")).is_err());
+        talk.turns
+            .push(owner_turn("Wait, explain the checks first"));
+        store.put(&mut talk).unwrap();
+        assert!(
+            check(
+                &q,
+                &talk.id,
+                "merge",
+                Some("Merge this pull request please")
+            )
+            .is_err()
+        );
+        talk.turns.push(owner_turn("Please hold"));
+        store.put(&mut talk).unwrap();
+        assert!(check(&q, &talk.id, "hold", Some("hold")).is_err());
+        talk.turns.push(owner_turn("hold"));
+        store.put(&mut talk).unwrap();
+        assert!(check(&q, &talk.id, "hold", Some("hold")).is_ok());
+        talk.turns
+            .push(owner_turn("Merge this pull request please"));
+        store.put(&mut talk).unwrap();
+        q.abandon("approval expired or head changed");
+        assert!(
+            check(
+                &q,
+                &talk.id,
+                "merge",
+                Some("Merge this pull request please")
+            )
+            .is_err()
+        );
+        assert!(
+            q.answer(crate::ask::Answer::Choice("merge".into()))
+                .is_err()
         );
     }
 

@@ -5786,6 +5786,47 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .into_iter()
             .find(|q| q.run == state.id)
             .expect("filed above");
+        let talks = crate::talk::Talks::open();
+        let cfg = crate::config::Config {
+            agents: vec![crate::config::AgentSpec {
+                id: "mock".into(),
+                kind: crate::config::AgentKind::Command,
+                model: None,
+                command: vec!["true".into()],
+                extra_args: Vec::new(),
+                env: Default::default(),
+                prompt_delivery: None,
+            }],
+            ..crate::config::Config::default()
+        };
+        let mut talk = crate::talk::begin(&talks, &cfg, state.repo.clone(), Some("mock")).unwrap();
+        crate::consult::begin(&store, &talks, &q, &talk).unwrap();
+        assert_eq!(
+            approval_gate(&mut state, &pr, "feat: x", None, "abc")
+                .await
+                .unwrap(),
+            ApprovalGate::Pending,
+            "consultation cannot approve or hold the merge"
+        );
+        q = store.get(&q.id).unwrap();
+        assert!(q.answer.is_none());
+        talk.turns.push(crate::talk::Turn {
+            who: crate::talk::Who::Operator,
+            body: "Merge this pull request now".into(),
+            at: Timestamp::now(),
+            attachments: Vec::new(),
+            usage: None,
+        });
+        talks.put(&mut talk).unwrap();
+        crate::consult::validate_answer(
+            &q,
+            &talks,
+            &talk.id,
+            crate::queue::CHAT_NODE,
+            APPROVE,
+            Some("Merge this pull request now"),
+        )
+        .unwrap();
         q.answer(ask::Answer::Choice(APPROVE.to_owned())).unwrap();
         store.put(&mut q).unwrap();
 
