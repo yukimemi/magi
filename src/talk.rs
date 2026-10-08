@@ -669,7 +669,7 @@ impl Talks {
                 token,
             }));
         }
-        if read_turn(&path).is_some_and(|r| r.fresh(now)) {
+        if lease_blocks(&path, now) {
             return Ok(None);
         }
         // Stale or unreadable. Every replacement happens under a short-lived
@@ -679,7 +679,7 @@ impl Talks {
         let Some(_lock) = TurnLock::take(&path)? else {
             return Ok(None);
         };
-        if read_turn(&path).is_some_and(|r| r.fresh(now)) {
+        if lease_blocks(&path, now) {
             return Ok(None);
         }
         let _ = std::fs::remove_file(&path);
@@ -799,17 +799,122 @@ fn create_turn(path: &Path, token: &str, now: Timestamp) -> Result<bool> {
         beat_at: now,
     };
     let body = serde_json::to_string(&record).context("serialize turn lease")?;
-    // Written in full under a private name, then linked into place: the link
-    // fails if the lease exists, and a reader never sees a half-written one.
+    // Written in full under a private name, then published exclusively: a
+    // reader never sees a half-written lease.
     let tmp = path.with_extension(format!("turn.{token}.new"));
-    std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
-    let linked = std::fs::hard_link(&tmp, path);
-    let _ = std::fs::remove_file(&tmp);
-    match linked {
+    publish_exclusive(path, &tmp, &body)
+}
+
+/// Is there a lease at `path` that must not be taken over? A fresh beat, or
+/// an empty file young enough to be a [`publish_exclusive`] placeholder whose
+/// writer has not yet renamed the real record into place.
+fn lease_blocks(path: &Path, now: Timestamp) -> bool {
+    if read_turn(path).is_some_and(|r| r.fresh(now)) {
+        return true;
+    }
+    std::fs::metadata(path).is_ok_and(|m| {
+        m.len() == 0
+            && m.modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age <= TAKEOVER_LOCK_TTL)
+    })
+}
+
+/// Does this error mean the filesystem has no hard links (as opposed to an
+/// ordinary I/O failure, which must not be hidden by a fallback)?
+fn link_unsupported(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Unsupported || (cfg!(windows) && e.raw_os_error() == Some(1))
+}
+
+/// Publish the finished file `tmp` (holding `body`) at `path` unless `path`
+/// exists; `false` when it does. `tmp` is always removed.
+///
+/// The first choice is `hard_link`, which is exclusive and atomic. Where hard
+/// links are unsupported the fallback is an exclusive `create_new` of `path`
+/// itself, written through that handle (never a `rename` over `path`, which
+/// would let a stalled writer clobber a successor). Readers can briefly see
+/// the file empty: [`lease_blocks`] treats a young empty one as held, and a
+/// lock side treats it as an "invalid" token that cannot be broken for
+/// [`TAKEOVER_LOCK_TTL`]. Residual windows, not closable by path alone: a
+/// reader may see a partly written file for the length of one small write, and
+/// a writer stalled between create and write for longer than the TTL can have
+/// its file replaced; it then finds the path no longer carries its body and
+/// reports `false`.
+/// The no-hard-link path of [`publish_exclusive`]. A failed write never
+/// removes `path`: by then it may belong to a successor, so the half-made file
+/// is left to expire (a young empty one blocks, an unreadable one is stale).
+fn create_in_place(path: &Path, body: &str) -> Result<bool> {
+    use std::io::Write as _;
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+    };
+    f.write_all(body.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
+    // Written through our own handle, so a stalled writer can only write into
+    // its own file; confirm the path still carries it before claiming it.
+    Ok(std::fs::read_to_string(path).is_ok_and(|t| t == body))
+}
+
+fn publish_exclusive(path: &Path, tmp: &Path, body: &str) -> Result<bool> {
+    std::fs::write(tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+    #[cfg(test)]
+    let linked = if failpoint::no_link_forced() {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    } else {
+        std::fs::hard_link(tmp, path)
+    };
+    #[cfg(not(test))]
+    let linked = std::fs::hard_link(tmp, path);
+    let out = match linked {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) if link_unsupported(&e) => create_in_place(path, body),
         Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
+    };
+    let _ = std::fs::remove_file(tmp);
+    out
+}
+
+/// Remove `path` only if it carries exactly `expected`; `true` when it did.
+///
+/// There is no atomic compare-and-unlink on a path, so the file is first
+/// renamed to a private name, which makes the read and the removal act on the
+/// same inode. If it carried something else (a newer holder published between
+/// the caller's read and now) it is put back exclusively, so the wrong lock is
+/// off the path for microseconds instead of deleted. Residual window: in those
+/// microseconds a fourth party can publish at `path`; the restore then loses,
+/// the displaced file is dropped (with a warning) and two holders can overlap
+/// until the survivor's TTL. Path operations alone cannot close that.
+fn remove_if_carries(path: &Path, expected: &str) -> bool {
+    let gone = path.with_extension(format!("gone.{}", fresh_token()));
+    if std::fs::rename(path, &gone).is_err() {
+        return false;
     }
+    let found = std::fs::read_to_string(&gone);
+    if found.as_ref().is_ok_and(|t| t == expected) {
+        let _ = std::fs::remove_file(&gone);
+        return true;
+    }
+    if let Ok(body) = found {
+        let back = path.with_extension(format!("back.{}", fresh_token()));
+        match publish_exclusive(path, &back, &body) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => tracing::warn!(
+                "{} was replaced while a stale removal had it aside; \
+                 the displaced file is dropped",
+                path.display()
+            ),
+        }
+    }
+    let _ = std::fs::remove_file(&gone);
+    false
 }
 
 /// The short exclusive lock every change to an existing lease (takeover, beat,
@@ -825,18 +930,12 @@ impl TurnLock {
         fresh_token()
     }
 
-    /// Publish `token` at `path` complete (written privately, then linked), so
-    /// nobody reads an empty or half-written token; `false` if `path` exists.
+    /// Publish `token` at `path` complete (written privately, then published
+    /// exclusively), so nobody reads a half-written token; `false` if `path`
+    /// exists.
     fn publish(path: &Path, token: &str) -> Result<bool> {
         let tmp = path.with_extension(format!("lock.{token}.new"));
-        std::fs::write(&tmp, token).with_context(|| format!("write {}", tmp.display()))?;
-        let linked = std::fs::hard_link(&tmp, path);
-        let _ = std::fs::remove_file(&tmp);
-        match linked {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
-        }
+        publish_exclusive(path, &tmp, token)
     }
 
     fn take(lease: &Path) -> Result<Option<Self>> {
@@ -900,12 +999,14 @@ impl TurnLock {
             return Ok(None);
         }
         Self::sweep_tickets(&path);
-        // Only the ticket's owner reaches this point for `seen`, and nobody
-        // else removes a lock that still carries it; if it changed, leave it.
-        if std::fs::read_to_string(&path).ok().as_deref() != Some(seen.as_str()) {
+        // Only the ticket's owner reaches this point for `seen`, but the
+        // lock's own holder may still release it (its `Drop`) and a third
+        // taker publish a new one meanwhile, so the removal is verified
+        // against the content (see [`remove_if_carries`] for the window that
+        // remains); if the lock changed, leave it.
+        if !remove_if_carries(&path, &seen) {
             return Ok(None);
         }
-        let _ = std::fs::remove_file(&path);
         if Self::publish(&path, &token)? {
             return Ok(Some(Self { path, token }));
         }
@@ -957,9 +1058,7 @@ impl TurnLock {
 impl Drop for TurnLock {
     fn drop(&mut self) {
         // Only our own lock: one that aged out and was taken over is not ours.
-        if std::fs::read_to_string(&self.path).is_ok_and(|t| t == self.token) {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        remove_if_carries(&self.path, &self.token);
     }
 }
 
@@ -2094,6 +2193,17 @@ mod failpoint {
 
     thread_local! {
         static FORCE_PUT_FAILURES: Cell<u32> = const { Cell::new(0) };
+        static FORCE_NO_LINK: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// While set, `hard_link` on this thread fails as unsupported, so the
+    /// create-and-rename fallback runs.
+    pub(super) fn force_no_link(on: bool) {
+        FORCE_NO_LINK.with(|c| c.set(on));
+    }
+
+    pub(super) fn no_link_forced() -> bool {
+        FORCE_NO_LINK.with(Cell::get)
     }
 
     /// Arrange for the next `count` calls into [`super::try_write_atomic`] to
@@ -2649,6 +2759,58 @@ mod tests {
         std::fs::write(a.turn_path("t1"), "not json").expect("write");
         assert!(!a.turn_held("t1"));
         assert!(b.claim_turn("t1").expect("claim").is_some());
+    }
+
+    #[test]
+    fn without_hard_links_a_claim_is_still_exclusive_and_a_young_placeholder_blocks() {
+        let (_tmp, a, b) = lease_store();
+        failpoint::force_no_link(true);
+        let held = a.claim_turn("t1").expect("claim").expect("first wins");
+        assert!(b.claim_turn("t1").expect("claim").is_none());
+        assert!(a.turn_held("t1"));
+        drop(held);
+        assert!(!a.turn_held("t1"));
+        // A writer between its exclusive create and its write: an empty file.
+        let path = a.turn_path("t1");
+        assert!(create_exclusive(&path, "").expect("placeholder"));
+        assert!(b.claim_turn("t1").expect("claim").is_none(), "young: held");
+        age_file(&path);
+        assert!(b.claim_turn("t1").expect("claim").is_some(), "old: stale");
+        // The lock publishes through the same path.
+        let lease = a.turn_path("t2");
+        let lock = TurnLock::take(&lease).expect("take").expect("lock");
+        assert!(TurnLock::take(&lease).expect("take").is_none());
+        drop(lock);
+        assert!(TurnLock::take(&lease).expect("take").is_some());
+        failpoint::force_no_link(false);
+    }
+
+    #[test]
+    fn remove_if_carries_removes_only_the_expected_content() {
+        let (_tmp, a, _b) = lease_store();
+        std::fs::create_dir_all(a.root()).expect("dir");
+        let p = a.root().join("x.turn.lock");
+        std::fs::write(&p, "mine").expect("write");
+        assert!(!remove_if_carries(&p, "other"));
+        assert_eq!(std::fs::read_to_string(&p).expect("kept"), "mine");
+        assert!(remove_if_carries(&p, "mine"));
+        assert!(!p.exists());
+        assert!(!remove_if_carries(&p, "mine"), "absent is not a removal");
+    }
+
+    #[test]
+    fn a_dropped_lock_does_not_remove_a_lock_taken_over_since() {
+        let (_tmp, a, _b) = lease_store();
+        std::fs::create_dir_all(a.root()).expect("dir");
+        let lease = a.turn_path("t1");
+        let lock = TurnLock::take(&lease).expect("take").expect("lock");
+        let path = lock.path.clone();
+        std::fs::write(&path, "someone-else").expect("replace");
+        drop(lock);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("kept"),
+            "someone-else"
+        );
     }
 
     #[test]
