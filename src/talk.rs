@@ -2756,7 +2756,7 @@ mod tests {
         assert!(a.turn_held("t1"));
         drop(held);
         assert!(!a.turn_held("t1"));
-        // A writer between its exclusive create and its rename: an empty file.
+        // A writer between its exclusive create and its write: an empty file.
         let path = a.turn_path("t1");
         assert!(create_exclusive(&path, "").expect("placeholder"));
         assert!(b.claim_turn("t1").expect("claim").is_none(), "young: held");
