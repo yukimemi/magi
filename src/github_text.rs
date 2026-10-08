@@ -39,6 +39,14 @@ pub struct LanguageDecision {
     pub title_english: bool,
     /// The body's prose is written in English.
     pub body_english: bool,
+    /// The judge saw the whole prose. Set by [`judge_language`]; a truncated
+    /// input can condemn the body but never vouch for the unseen rest.
+    #[serde(skip, default = "all_seen")]
+    pub body_complete: bool,
+}
+
+fn all_seen() -> bool {
+    true
 }
 
 /// [`check`] with an optional decision from [`judge_language`].
@@ -51,7 +59,13 @@ pub fn check_with(title: &str, body: &str, decision: Option<LanguageDecision>) -
     if non_english_with(title, decision.map(|d| d.title_english)) {
         out.push(Violation::TitleLanguage);
     }
-    if non_english_with(&prose(body), decision.map(|d| d.body_english)) {
+    // An approval only covers what the judge saw; a rejection always stands.
+    let body_verdict = decision.and_then(|d| match (d.body_english, d.body_complete) {
+        (false, _) => Some(false),
+        (true, true) => Some(true),
+        (true, false) => None,
+    });
+    if non_english_with(&prose(body), body_verdict) {
         out.push(Violation::BodyLanguage);
     }
     let id = Identity::default();
@@ -658,10 +672,9 @@ async fn ask_judge(cfg: &Config, cwd: &Path, title: &str, body: &str) -> Result<
         "language judge",
     )?;
     let id = Identity::current();
-    let prose: String = scrub(&prose(body), &id)
-        .chars()
-        .take(JUDGE_MAX_CHARS)
-        .collect();
+    let scrubbed = scrub(&prose(body), &id);
+    let truncated = scrubbed.chars().count() > JUDGE_MAX_CHARS;
+    let prose: String = scrubbed.chars().take(JUDGE_MAX_CHARS).collect();
     let prompt = judge_prompt(&scrub(title, &id), &prose);
     let artifacts =
         std::env::temp_dir().join(format!("magi-langjudge-{:016x}", crate::rng::entropy()));
@@ -702,7 +715,13 @@ async fn ask_judge(cfg: &Config, cwd: &Path, title: &str, body: &str) -> Result<
             };
             continue;
         }
-        result = Some(out.and_then(|o| parse_decision(&o.text)));
+        result = Some(
+            out.and_then(|o| parse_decision(&o.text))
+                .map(|d| LanguageDecision {
+                    body_complete: !truncated,
+                    ..d
+                }),
+        );
         break;
     }
     let _ = std::fs::remove_dir_all(&artifacts);
@@ -930,6 +949,7 @@ mod review_round_tests {
         Some(LanguageDecision {
             title_english: title,
             body_english: body,
+            body_complete: true,
         })
     }
 
@@ -1036,6 +1056,7 @@ mod review_round_tests {
 
 #[cfg(test)]
 mod quoted_value_tests {
+    use super::{LanguageDecision, Violation, check_with};
     use crate::scrub::{Identity, scrub};
 
     #[test]
@@ -1048,5 +1069,27 @@ mod quoted_value_tests {
             assert!(!out.contains("horse") && !out.contains("hunter2"), "{out}");
             assert!(out.ends_with("ok"), "{out}");
         }
+    }
+
+    #[test]
+    fn an_approval_of_a_truncated_prose_leaves_the_heuristics_on_the_body() {
+        let body = format!(
+            "{}\n\nCorregir errores para los reintentos de solicitudes fallidas en las colas del sistema\n",
+            "Fix the queue. ".repeat(10)
+        );
+        let partial = Some(LanguageDecision {
+            title_english: true,
+            body_english: true,
+            body_complete: false,
+        });
+        assert!(check_with("Fix", &body, partial).contains(&Violation::BodyLanguage));
+        let rejected = Some(LanguageDecision {
+            title_english: true,
+            body_english: false,
+            body_complete: false,
+        });
+        assert!(
+            check_with("Fix", "Plain English text.", rejected).contains(&Violation::BodyLanguage)
+        );
     }
 }
