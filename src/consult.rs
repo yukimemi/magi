@@ -236,18 +236,41 @@ fn owner_words(body: &str, after_block_of: Option<&str>) -> String {
         return body.trim().to_owned();
     }
     // (start, end) of each generated block, the heading's own "# " included.
-    let blocks: Vec<(usize, usize)> = heads
-        .iter()
-        .enumerate()
-        .map(|(n, &h)| {
-            let limit = heads.get(n + 1).copied().unwrap_or(body.len());
-            let end = body[h..limit]
-                .rfind(CHAT_CONSULT_END)
-                .map_or(limit, |e| h + e + CHAT_CONSULT_END.len());
-            let start = if body[..h].ends_with("# ") { h - 2 } else { h };
-            (start, end)
-        })
-        .collect();
+    // A full consultation quoted in a detail nests: headings open and end
+    // phrases close, and only text outside every open block can be the owner's.
+    // Once a block has closed, a further end phrase before the next top-level
+    // heading extends it (a detail may quote the phrase alone). A block that
+    // never closes runs to the end of the text.
+    let mut events: Vec<(usize, bool)> = heads.iter().map(|&h| (h, true)).collect();
+    events.extend(
+        body.match_indices(CHAT_CONSULT_END)
+            .map(|(e, _)| (e, false)),
+    );
+    events.sort_unstable();
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut cur: Option<(usize, usize, usize)> = None; // start, end, depth
+    for (at, is_head) in events {
+        match (&mut cur, is_head) {
+            (Some((_, _, depth)), true) if *depth > 0 => *depth += 1,
+            (_, true) => {
+                blocks.extend(cur.take().map(|(s, e, _)| (s, e)));
+                let start = if body[..at].ends_with("# ") {
+                    at - 2
+                } else {
+                    at
+                };
+                cur = Some((start, body.len(), 1));
+            }
+            (Some((_, end, depth)), false) => {
+                *depth = depth.saturating_sub(1);
+                if *depth == 0 {
+                    *end = at + CHAT_CONSULT_END.len();
+                }
+            }
+            (None, false) => {}
+        }
+    }
+    blocks.extend(cur.map(|(s, e, _)| (s, e)));
     let mut from = 0;
     if let Some(id) = after_block_of {
         if let Some(&(_, end)) = blocks.iter().rfind(|&&(s, e)| body[s..e].contains(id)) {
@@ -752,6 +775,18 @@ mod tests {
         let mut q = question(crate::land::APPROVAL_NODE);
         q.detail = detail;
         assert_eq!(owner_words(&crate::prompt::chat_consult(&q), None), "");
+    }
+
+    #[test]
+    fn owner_words_keeps_a_quoted_full_consultation_inside_its_block() {
+        let mut q = question(crate::land::APPROVAL_NODE);
+        q.detail = "quoted".into();
+        let inner = crate::prompt::chat_consult(&q);
+        let mut b = question(crate::land::APPROVAL_NODE);
+        b.detail = format!("{inner}\n\nmerge it now\n\n{inner}");
+        let body = crate::prompt::chat_consult(&b);
+        assert_eq!(owner_words(&body, None), "");
+        assert_eq!(owner_words(&format!("{body}\n\nhold"), None), "hold");
     }
 
     #[test]
