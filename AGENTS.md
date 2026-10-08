@@ -2070,3 +2070,23 @@ runs the real binary.
 text; this is a gate, not a prompt. `[graph] github_text_guard` defaults to true.
 Language checks exempt code and quoted original tasks; sensitive data is always
 scrubbed, including those sections, using the shared rules in `src/scrub.rs`.
+
+### Jev for the English check is a role, never an HTTP client
+
+`[roles] language_judge` names an agent (normally a `kind = "command"` wrapper
+around Jev) that `github_text::judge_language` asks whether a pull request
+title and its prose are English. Unset spawns nothing; a missing agent, a spawn
+failure, a non-zero exit, a timeout (15 s for the whole call), a quota hit or a
+reply that is not `{"title_english": bool, "body_english": bool}` all yield
+`None`, and the built-in heuristics decide as before. No API key and no HTTP
+dependency, so offline tests and CI are unaffected.
+
+- The wrapper receives the prompt through `{prompt_file}` and prints the JSON
+  object on stdout (a code fence or earlier log lines are tolerated).
+- Only prose goes out (code, quotes and `<details>` are dropped) and only after
+  `scrub`; sensitive-data detection always runs on the original text.
+- A decision replaces the vocabulary heuristics only. "Not English" always
+  stands; "English" still has to clear the non-ASCII share floor.
+- Wired into `graph::Runner::guarded_pr_message` (first check, the rewrite's
+  re-check and the final `prepare_with`); `bump.rs` and `land.rs` still use the
+  heuristics. The event log records which source decided, never the text.

@@ -296,6 +296,15 @@ pub struct Roles {
     ///
     /// Accepts a string or a fallback chain, like [`Self::chatter`].
     pub synthesizer: Option<AgentChoice>,
+    /// Agent (normally a `kind = "command"` wrapper around Jev) that decides
+    /// whether a pull request title and prose are English, for
+    /// [`crate::github_text`]'s posting gate.
+    ///
+    /// Unset spawns nothing: the gate keeps its built-in heuristics. Set, a
+    /// failed, timed-out or unparsable call also falls back to them, so the
+    /// gate never depends on this seat being reachable. Accepts a string or a
+    /// fallback chain, like [`Self::chatter`].
+    pub language_judge: Option<AgentChoice>,
 }
 
 /// Graph shape and limits.
@@ -1986,6 +1995,7 @@ impl Config {
              # conductor = \"opus\"  # arranges the queue; unset picks a seat like chatter does\n\
              # synthesizer = \"opus\"  # blends the advisors into one brief; unset picks a seat like chatter does\n\
              # synthesizer = [\"opus\", \"codex\"]  # array form: fallback chain, each tried once on quota or failure\n\
+             # language_judge = \"jev\"  # kind = \"command\" wrapper deciding if PR text is English; unset keeps the built-in heuristics\n\
              # fixer = \"opus\"  # applies review findings; unset keeps the winner's own author\n\
              # fixer = [\"opus\", \"codex\"]  # array form: fallback chain, each tried once on quota or failure\n\n\
              [graph]\n\

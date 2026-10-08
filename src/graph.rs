@@ -5925,7 +5925,8 @@ impl Runner {
                 body: crate::scrub::scrub(&pr.body, &identity),
             };
         }
-        let mut violations = crate::github_text::check(&pr.title, &pr.body);
+        let mut decision = self.judge_pr_language(&winner.worktree, &pr).await;
+        let mut violations = crate::github_text::check_with(&pr.title, &pr.body, decision);
         let identity = crate::scrub::Identity::current();
         if (crate::scrub::scrub(&pr.title, &identity) != pr.title
             || crate::scrub::scrub(&pr.body, &identity) != pr.body)
@@ -5990,9 +5991,15 @@ impl Runner {
                     && let Some(title) = summary_title(&output.text)
                 {
                     let mut body = summary_without_title(&output.text);
+                    let rewrite = PrMessage {
+                        title: title.clone(),
+                        body: body.clone(),
+                    };
+                    let redecision = self.judge_pr_language(&winner.worktree, &rewrite).await;
                     if !body.trim().is_empty()
-                        && crate::github_text::check(&title, &body).is_empty()
+                        && crate::github_text::check_with(&title, &body, redecision).is_empty()
                     {
+                        decision = redecision;
                         let marker = format!("magi:run/{}", self.state.id);
                         if !body.contains(&marker) {
                             body.push_str(&format!("\n\n{marker}"));
@@ -6017,10 +6024,38 @@ impl Runner {
                         self.state.id
                     ),
                 };
+                // The neutral body is fixed English; only the title's verdict
+                // still applies.
+                decision = decision.map(|d| crate::github_text::LanguageDecision {
+                    body_english: true,
+                    ..d
+                });
             }
         }
-        let (title, body) = crate::github_text::prepare(&mut self.state, &pr.title, &pr.body);
+        let (title, body) =
+            crate::github_text::prepare_with(&mut self.state, &pr.title, &pr.body, decision);
         PrMessage { title, body }
+    }
+
+    /// Ask `[roles] language_judge` about this text and record which source
+    /// decided; the text itself is never recorded.
+    async fn judge_pr_language(
+        &mut self,
+        cwd: &Path,
+        pr: &PrMessage,
+    ) -> Option<crate::github_text::LanguageDecision> {
+        self.state.config.roles.language_judge.as_ref()?;
+        let decision =
+            crate::github_text::judge_language(&self.state.config, cwd, &pr.title, &pr.body).await;
+        self.state.event(
+            "github-text",
+            if decision.is_some() {
+                "language decided by the language judge"
+            } else {
+                "language judge unavailable; using built-in heuristics"
+            },
+        );
+        decision
     }
 
     async fn merge(&mut self) -> Result<()> {
