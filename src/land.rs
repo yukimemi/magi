@@ -5801,6 +5801,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         };
         let mut talk = crate::talk::begin(&talks, &cfg, state.repo.clone(), Some("mock")).unwrap();
         crate::consult::begin(&store, &talks, &q, &talk).unwrap();
+        crate::talk::drain(&mut talk, &talks).unwrap();
         assert_eq!(
             approval_gate(&mut state, &pr, "feat: x", None, "abc")
                 .await

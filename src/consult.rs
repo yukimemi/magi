@@ -161,14 +161,29 @@ pub fn validate_answer(
                 && t.body.contains(&q.id)
         })
         .context("the question was not delivered to the chat yet")?;
-    let latest = talk.turns[at..]
+    // A reply still waiting in `pending` is newer than every stored turn.
+    let queued = owner_words(&talk.pending, true);
+    let stored = talk.turns[at..]
         .iter()
         .enumerate()
         .rev()
         .filter(|(_, t)| t.who == talk::Who::Operator)
         .map(|(i, t)| owner_words(&t.body, i == 0))
-        .find(|w| !w.is_empty())
-        .context("no owner message after the question was handed to the chat")?;
+        .find(|w| !w.is_empty());
+    let latest = if queued.is_empty() {
+        stored
+    } else {
+        Some(queued)
+    }
+    .context("no owner message after the question was handed to the chat")?;
+    // Replies sent while a turn runs are joined with a blank line into one
+    // turn, so the last paragraph is the only text certain to be the newest.
+    let latest = latest
+        .rsplit("\n\n")
+        .map(str::trim)
+        .find(|p| !p.is_empty())
+        .unwrap_or_default()
+        .to_owned();
     let quote = quote
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -650,6 +665,37 @@ mod tests {
             )
             .is_ok()
         );
+        // A later retraction in the same coalesced turn wins.
+        talk.turns[n - 1].body = format!("{queued}\n\nmerge it now\n\nhold");
+        store.put(&mut talk).unwrap();
+        assert!(
+            validate_answer(
+                &q,
+                &store,
+                &talk.id,
+                CHAT_NODE,
+                "merge",
+                Some("merge it now")
+            )
+            .is_err()
+        );
+        assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, "hold", Some("hold")).is_ok());
+        // So does a reply still waiting in the draft.
+        talk.turns[n - 1].body = format!("{queued}\n\nmerge it now");
+        talk.pending = "hold".into();
+        store.put(&mut talk).unwrap();
+        assert!(
+            validate_answer(
+                &q,
+                &store,
+                &talk.id,
+                CHAT_NODE,
+                "merge",
+                Some("merge it now")
+            )
+            .is_err()
+        );
+        talk.pending.clear();
         talk.turns[n - 1].body = queued.clone();
         store.put(&mut talk).unwrap();
         talk.turns
