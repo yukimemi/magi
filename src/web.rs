@@ -1384,21 +1384,15 @@ async fn hand_over(
     successor: impl FnOnce(bool) -> Result<u32>,
 ) -> Result<()> {
     updater::log_step(home, "hand_over: entered; writing the parking stage");
-    // Written before the stage, so a reader that sees `parking` also finds
-    // the proof that hand_over is alive. Dropped on every way out.
-    let mut lease = updater::LeaseGuard::enter(
-        home,
-        updater::read_progress(home).and_then(|p| p.parked_run),
-    );
-    match updater::read_progress(home) {
-        Some(mut progress) => {
-            progress.advance(updater::Stage::Parking);
-            updater::write_progress_logged(home, &progress);
-        }
-        None => updater::log_warn(
+    // The lease and the stage are written as one step, so a reader that sees
+    // `parking` also finds the proof that hand_over is alive. Dropped on
+    // every way out.
+    let (mut lease, recorded) = updater::LeaseGuard::enter_parking(home);
+    if !recorded {
+        updater::log_warn(
             home,
             "hand_over: upgrade.json is unreadable; no parking stage",
-        ),
+        );
     }
     finish_loop(home, looping, Some(&mut lease)).await;
     drop(lease);

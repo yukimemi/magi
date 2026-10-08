@@ -554,6 +554,29 @@ impl LeaseGuard {
         }
     }
 
+    /// Enter the handover: write the lease and the `parking` stage as one step
+    /// under the progress lock, so a failing upgrade request ([`fail_progress`])
+    /// or a fresh one ([`write_progress`]) cannot land between the two and leave
+    /// a record that is newer than the lease. `None` for the stage means
+    /// `upgrade.json` was unreadable (the lease is still written).
+    #[must_use]
+    pub fn enter_parking(home: &Path) -> (Self, bool) {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let progress = read_progress(home);
+        let this = Self::enter(home, progress.as_ref().and_then(|p| p.parked_run.clone()));
+        let recorded = match progress {
+            Some(mut p) => {
+                p.advance(Stage::Parking);
+                if let Err(e) = write_progress_locked(home, &p) {
+                    log_warn(home, &format!("could not write upgrade.json: {e:#}"));
+                }
+                true
+            }
+            None => false,
+        };
+        (this, recorded)
+    }
+
     /// Say it is still alive.
     pub fn beat(&mut self) {
         self.lease.beat_at = Timestamp::now();
@@ -1253,6 +1276,20 @@ mod tests {
         write_progress(fresh.path(), &staged(Stage::Downloading, 1000)).expect("write");
         assert!(fail_progress(fresh.path(), "boom").expect("fail"));
         assert_eq!(read_progress(fresh.path()).unwrap().stage, Stage::Failed);
+    }
+
+    #[test]
+    fn entering_parking_is_one_step_that_keeps_the_lease_newer_than_the_record() {
+        let home = tempfile::tempdir().expect("temp home");
+        write_progress(home.path(), &staged(Stage::Replaced, 1000)).expect("write");
+        let (guard, recorded) = LeaseGuard::enter_parking(home.path());
+        assert!(recorded);
+        let p = read_progress(home.path()).expect("record");
+        assert_eq!(p.stage, Stage::Parking);
+        let l = read_lease(home.path()).expect("lease");
+        assert!(l.entered_at >= p.started_at);
+        assert!(!fail_progress(home.path(), "boom").expect("fail"));
+        drop(guard);
     }
 
     #[test]
