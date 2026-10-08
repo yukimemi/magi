@@ -1270,7 +1270,11 @@ async fn settings_gear_is_reachable_on_a_phone_and_never_doubles_the_rail_link()
         )
         .await
         .expect("count");
-    assert_eq!(visible, serde_json::json!(["rail-link"]), "desktop Settings entries");
+    assert_eq!(
+        visible,
+        serde_json::json!(["rail-link"]),
+        "desktop Settings entries"
+    );
     browser.close_page(&page).await;
 }
 
