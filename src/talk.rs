@@ -240,6 +240,7 @@ pub fn context_usage(talk: &Talk, cfg: Option<&Config>) -> ContextUsage {
                 &c.graph.language,
                 c.talk.allow_write,
                 crate::persona::active(&c.talk.personas, &talk.persona).as_ref(),
+                c.talk.operator_name(),
             )
             .chars()
             .count() as u64
@@ -1460,8 +1461,12 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     }
 
     let persona = crate::persona::active(&cfg.talk.personas, &talk.persona);
+    let operator_name = cfg.talk.operator_name();
     let persona_update = if talk.persona_dirty {
-        format!("{}\n\n", crate::persona::update_block(persona.as_ref()))
+        format!(
+            "{}\n\n",
+            crate::persona::update_block_for(persona.as_ref(), operator_name)
+        )
     } else {
         String::new()
     };
@@ -1492,7 +1497,8 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
                     &talk.repo,
                     &cfg.graph.language,
                     cfg.talk.allow_write,
-                    persona.as_ref()
+                    persona.as_ref(),
+                    operator_name
                 )
             )
         } else if talk.seat.turns == 0 {
@@ -1504,7 +1510,8 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
                     &talk.repo,
                     &cfg.graph.language,
                     cfg.talk.allow_write,
-                    persona.as_ref()
+                    persona.as_ref(),
+                    operator_name
                 ),
                 transcript(talk, store)
             )
@@ -1515,7 +1522,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             // so a non-default persona is re-sent on every such turn (the
             // update block already carries it when the choice just changed).
             let standing = match (&persona, talk.persona_dirty) {
-                (Some(p), false) => format!("{}\n", crate::persona::section(p)),
+                (Some(p), false) => format!("{}\n", crate::persona::section_for(p, operator_name)),
                 _ => persona_update.clone(),
             };
             format!("{}\n\n{standing}{text}{last_note}", transcript(talk, store))
@@ -1801,16 +1808,19 @@ fn attachment_note(store: &Talks, talk_id: &str, attachments: &[Attachment]) -> 
 /// the instruction is to ask rather than guess when that happens - the
 /// silent-decision line this task must not cross.
 pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
-    briefing_with(repo, language, allow_write, None)
+    briefing_with(repo, language, allow_write, None, None)
 }
 
-/// [`briefing`] plus the selected persona's tone-only section. `None` is
-/// byte-for-byte the plain briefing.
+/// [`briefing`] plus the selected persona's tone-only section and, when the
+/// operator has a configured name, how to address them. `None` for both is
+/// byte-for-byte the plain briefing. A name changed mid-session reaches a
+/// running CLI session only on its next fresh seat (nothing is persisted).
 pub fn briefing_with(
     repo: &Path,
     language: &str,
     allow_write: bool,
     persona: Option<&crate::persona::Persona>,
+    operator_name: Option<&str>,
 ) -> String {
     let write_policy = if allow_write {
         "Write access is enabled for this conversation (`allow_write = \
@@ -1883,8 +1893,13 @@ pub fn briefing_with(
         repo = repo.display(),
     );
     out.push_str(&language_note(language));
-    if let Some(p) = persona {
-        out.push_str(&crate::persona::section(p));
+    match (persona, operator_name) {
+        (Some(p), n) => out.push_str(&crate::persona::section_for(p, n)),
+        (None, Some(n)) => {
+            out.push_str("\n# Addressing the operator\n");
+            out.push_str(&crate::persona::addressing(n));
+        }
+        (None, None) => {}
     }
     out
 }
@@ -2900,15 +2915,40 @@ mod tests {
     }
 
     #[test]
+    fn briefing_names_the_operator_with_or_without_a_persona() {
+        let plain = briefing(Path::new("/repo"), "en", false);
+        let named = briefing_with(Path::new("/repo"), "en", false, None, Some("Commander"));
+        assert!(named.starts_with(&plain));
+        assert!(named.contains("# Addressing the operator"));
+        assert!(named.contains("\"Commander\""));
+        let rei = crate::persona::builtin_catalog()
+            .into_iter()
+            .find(|p| p.id == "rei")
+            .expect("rei");
+        let with = briefing_with(
+            Path::new("/repo"),
+            "en",
+            false,
+            Some(&rei),
+            Some("Commander"),
+        );
+        assert!(with.contains("\"Commander\""));
+        assert!(!with.contains("# Addressing the operator"));
+    }
+
+    #[test]
     fn briefing_carries_a_persona_section_only_when_one_is_chosen() {
         let plain = briefing(Path::new("/repo"), "en", false);
-        assert_eq!(plain, briefing_with(Path::new("/repo"), "en", false, None));
+        assert_eq!(
+            plain,
+            briefing_with(Path::new("/repo"), "en", false, None, None)
+        );
         assert!(!plain.contains("Persona"));
         let rei = crate::persona::builtin_catalog()
             .into_iter()
             .find(|p| p.id == "rei")
             .expect("rei");
-        let with = briefing_with(Path::new("/repo"), "en", false, Some(&rei));
+        let with = briefing_with(Path::new("/repo"), "en", false, Some(&rei), None);
         assert!(with.starts_with(&plain), "the plain briefing is untouched");
         assert!(with.contains("# Persona (tone only)"));
         assert!(with.contains("TONE ONLY"));

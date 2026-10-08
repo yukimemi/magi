@@ -4862,7 +4862,8 @@ function updateTurnRow(row, item) {
   const body = String(turn.body || "");
 
   setAttr(row, "data-who", kind);
-  setText(r.who, kind === "operator" ? "You" : kind === "system" ? "magi" : "Agent");
+  setText(r.who, kind === "operator" ? (item.operatorName || "YOU")
+    : kind === "system" ? "MAGI" : (item.personaName || "AGENT"));
 
   /* A turn never changes once it is on disk, so its body is built once. The
      agent's is markdown prose, already parsed server-side, and is rendered as
@@ -5407,7 +5408,8 @@ function renderTalk() {
   const turnsMd = talkTurnsMd(talk);
   syncList(
     $("talk-turns"),
-    turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i), conversationId: talk.id })),
+    turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i), conversationId: talk.id,
+      operatorName: talk.operator_name, personaName: talk.persona_name })),
     (item) => item.key, createTurnRow, updateTurnRow,
   );
 

@@ -5882,6 +5882,11 @@ struct TalkView {
     /// [`talk::context_usage`]. Carried on every talk response (list, detail
     /// and each mutation) so the phone needs no extra call or polling.
     context: talk::ContextUsage,
+    /// `[talk] operator_name`, when configured; the Chat labels the
+    /// operator's turns with it.
+    operator_name: Option<String>,
+    /// The active persona's display name; `None` for the default voice.
+    persona_name: Option<String>,
 }
 
 impl TalkView {
@@ -5901,10 +5906,17 @@ impl TalkView {
             .iter()
             .map(|turn| md::to_nodes(&turn.body, &md::ImageBase::None))
             .collect();
+        let specs = cfg.map_or(&[][..], |c| &c.talk.personas[..]);
+        let persona_name = persona::find(specs, &talk.persona)
+            .filter(|p| !p.is_default())
+            .map(|p| p.name);
+        let operator_name = cfg.and_then(|c| c.talk.operator_name()).map(str::to_owned);
         Self {
             turn_bodies_md,
             thinking,
             context,
+            operator_name,
+            persona_name,
             talk,
         }
     }
