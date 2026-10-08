@@ -3122,7 +3122,8 @@ mod tests {
         let spec = mock_agent(tmp.path(), ECHO, BTreeMap::new());
         let cfg = config(spec);
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
-        say(&mut talk, &talks, &cfg, "hello", Vec::new())
+        let lease = talks.claim_turn(&talk.id).unwrap().unwrap();
+        say(&lease, &mut talk, &talks, &cfg, "hello", Vec::new())
             .await
             .expect("first turn");
         assert!(!talk.turns[1].body.contains("Persona"));
@@ -3132,7 +3133,7 @@ mod tests {
         assert!(talk.persona_dirty);
         assert!(talk.turns.last().unwrap().body.contains("persona changed"));
 
-        say(&mut talk, &talks, &cfg, "next", Vec::new())
+        say(&lease, &mut talk, &talks, &cfg, "next", Vec::new())
             .await
             .expect("turn");
         let prompt = &talk.turns.last().unwrap().body;
@@ -3140,14 +3141,14 @@ mod tests {
         assert!(prompt.contains("Misato Katsuragi"));
         assert!(!talk.persona_dirty, "cleared after a successful turn");
 
-        say(&mut talk, &talks, &cfg, "again", Vec::new())
+        say(&lease, &mut talk, &talks, &cfg, "again", Vec::new())
             .await
             .expect("turn");
         assert!(!talk.turns.last().unwrap().body.contains("# Persona update"));
 
         assert!(switch_persona(&mut talk, &talks, "default").expect("back"));
         assert_eq!(talk.persona, "");
-        say(&mut talk, &talks, &cfg, "plain", Vec::new())
+        say(&lease, &mut talk, &talks, &cfg, "plain", Vec::new())
             .await
             .expect("turn");
         assert!(
@@ -3162,10 +3163,10 @@ mod tests {
         assert!(switch_persona(&mut talk, &talks, "rei").expect("rei"));
         let mut no_sessions = cfg.clone();
         no_sessions.graph.sessions = false;
-        say(&mut talk, &talks, &no_sessions, "one", Vec::new())
+        say(&lease, &mut talk, &talks, &no_sessions, "one", Vec::new())
             .await
             .expect("turn");
-        say(&mut talk, &talks, &no_sessions, "two", Vec::new())
+        say(&lease, &mut talk, &talks, &no_sessions, "two", Vec::new())
             .await
             .expect("turn");
         let last = &talk.turns.last().unwrap().body;
