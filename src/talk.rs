@@ -832,14 +832,16 @@ fn link_unsupported(e: &std::io::Error) -> bool {
 /// exists; `false` when it does. `tmp` is always removed.
 ///
 /// The first choice is `hard_link`, which is exclusive and atomic. Where hard
-/// links are unsupported the fallback is an exclusive `create_new` of an empty
-/// placeholder at `path` (that create is the exclusion), then a `rename` of
-/// `tmp` over it. Readers can briefly see the empty placeholder: [`lease_blocks`]
-/// treats a young one as held, and a lock side treats it as a breakable-after-TTL
-/// "invalid" token. Residual window: a writer stalled between the create and
-/// the rename for longer than [`TAKEOVER_LOCK_TTL`] can have its placeholder
-/// treated as stale and replaced; the failed writer leaves the placeholder to
-/// that same expiry rather than deleting a path it may no longer own.
+/// links are unsupported the fallback is an exclusive `create_new` of `path`
+/// itself, written through that handle (never a `rename` over `path`, which
+/// would let a stalled writer clobber a successor). Readers can briefly see
+/// the file empty: [`lease_blocks`] treats a young empty one as held, and a
+/// lock side treats it as an "invalid" token that cannot be broken for
+/// [`TAKEOVER_LOCK_TTL`]. Residual windows, not closable by path alone: a
+/// reader may see a partly written file for the length of one small write, and
+/// a writer stalled between create and write for longer than the TTL can have
+/// its file replaced; it then finds the path no longer carries its body and
+/// reports `false`.
 fn publish_exclusive(path: &Path, tmp: &Path, body: &str) -> Result<bool> {
     std::fs::write(tmp, body).with_context(|| format!("write {}", tmp.display()))?;
     #[cfg(test)]
@@ -853,10 +855,11 @@ fn publish_exclusive(path: &Path, tmp: &Path, body: &str) -> Result<bool> {
     let out = match linked {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) if link_unsupported(&e) => match create_exclusive(path, "") {
-            Ok(true) => std::fs::rename(tmp, path)
-                .map(|()| true)
-                .with_context(|| format!("publish {}", path.display())),
+        Err(e) if link_unsupported(&e) => match create_exclusive(path, body) {
+            // Written through the handle that created it, so a writer that
+            // stalled can only ever write into its own file, never replace a
+            // successor's. Confirm the path still carries it before claiming.
+            Ok(true) => Ok(std::fs::read_to_string(path).is_ok_and(|t| t == body)),
             other => other,
         },
         Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
