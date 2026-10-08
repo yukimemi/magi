@@ -1007,9 +1007,12 @@ impl TalkTurnGuard {
     /// Release while the caller already holds the claim mutex, closing the
     /// last-drain/arrival gap without letting `Drop` revoke a later claim.
     fn release(mut self, live: &mut TalkTurns) {
+        // The on-disk lease goes first: while `live` still names the talk, no
+        // local claim can start, so nobody observes the slot free but the
+        // lease held.
+        self.lease = None;
         live.live.remove(&self.talk);
         live.queued.remove(&self.talk);
-        self.lease = None;
         self.released = true;
     }
 }
@@ -1019,6 +1022,8 @@ impl Drop for TalkTurnGuard {
         if self.released {
             return;
         }
+        // Lease first, then the in-process slot (see `release`).
+        drop(self.lease.take());
         if let Ok(mut live) = self.turns.lock() {
             live.live.remove(&self.talk);
             live.queued.remove(&self.talk);
@@ -14255,6 +14260,35 @@ mod tests {
             !talks.turn_held(id),
             "dropping the guard releases the lease"
         );
+    }
+
+    #[test]
+    fn a_dropped_guard_releases_the_lease_before_the_in_process_slot() {
+        let home = TempDir::new().expect("temp home");
+        let talks = Talks::at(home.path().join("talks"));
+        let ui = Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            talks.clone(),
+            home.path().join("runs"),
+            home.path().to_path_buf(),
+            PathBuf::from("/repo"),
+        )
+        .with_worktrees_root(home.path().join("wt"));
+        let id = "20260901-000000-order";
+        let turn = ui.begin_talk_turn(id).expect("claim").expect("free");
+        // Hold the slot mutex so the drop can finish the lease but not the slot.
+        let slots = ui.talk_turns.lock().unwrap();
+        let dropper = std::thread::spawn(move || drop(turn));
+        let start = std::time::Instant::now();
+        while talks.turn_held(id) && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!talks.turn_held(id), "the lease is released first");
+        assert!(slots.live.contains(id), "the slot is still held meanwhile");
+        drop(slots);
+        dropper.join().expect("join");
+        assert!(!ui.talk_turns.lock().unwrap().live.contains(id));
     }
 
     #[tokio::test]
