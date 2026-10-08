@@ -5359,9 +5359,12 @@ function renderTalk() {
     show($("talk-close-go"), false);
     show($("talk-reopen-go"), false);
     show($("talk-wait"), false);
-    if (summary) {
-      renderTalkAgent(summary, true);
-      renderTalkPersona(summary, true);
+    if (!gone) {
+      /* Nothing cached and no list row (a direct link): a disabled
+         placeholder keeps the selectors in place until the detail lands. */
+      const shown = summary || { agent: "Loading…", persona: "default", status: "open" };
+      renderTalkAgent(shown, true, true);
+      renderTalkPersona(shown, true, true);
     } else {
       show($("talk-agent-box"), false);
       show($("talk-persona-box"), false);
@@ -5448,11 +5451,11 @@ function renderTalk() {
    switch already posting, a closed conversation, or nobody to switch to. */
 let talkAgentSwitching = false;
 
-function renderTalkAgent(talk, busy) {
+function renderTalkAgent(talk, busy, loading = false) {
   const box = $("talk-agent-box");
   const select = $("talk-agent");
   const roster = state.talkDetail.roster || [];
-  show(box, roster.length > 0);
+  show(box, loading || roster.length > 0);
   if (document.activeElement !== select) {
     clear(select);
     const ids = roster.map((r) => r.id);
@@ -5505,11 +5508,11 @@ async function switchTalkAgent() {
    built-in list always arrives, so it does not depend on the roster. */
 let talkPersonaSwitching = false;
 
-function renderTalkPersona(talk, busy) {
+function renderTalkPersona(talk, busy, loading = false) {
   const box = $("talk-persona-box");
   const select = $("talk-persona");
   const personas = state.talkDetail.personas || [];
-  show(box, personas.length > 0);
+  show(box, loading || personas.length > 0);
   const current = talk.persona || "default";
   if (document.activeElement !== select) {
     clear(select);
