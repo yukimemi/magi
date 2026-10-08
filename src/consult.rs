@@ -149,20 +149,34 @@ pub fn validate_answer(
     if !talk.status.open() {
         bail!("the consulted chat is closed");
     }
-    let latest = talk
+    // Only words the owner wrote after this question was handed over count.
+    // The generated hand-over text is stored as an operator turn (possibly
+    // coalesced with owner replies), so it is cut out by its own markers.
+    let at = talk
         .turns
         .iter()
+        .rposition(|t| {
+            t.who == talk::Who::Operator
+                && t.body.contains(crate::prompt::CHAT_CONSULT_HEADING)
+                && t.body.contains(&q.id)
+        })
+        .context("the question was not delivered to the chat yet")?;
+    let latest = talk.turns[at..]
+        .iter()
+        .enumerate()
         .rev()
-        .find(|t| t.who == talk::Who::Operator && !is_generated_consult(&t.body))
-        .context("no owner message in the consulted chat")?;
+        .filter(|(_, t)| t.who == talk::Who::Operator)
+        .map(|(i, t)| owner_words(&t.body, i == 0))
+        .find(|w| !w.is_empty())
+        .context("no owner message after the question was handed to the chat")?;
     let quote = quote
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .context("chat merge approval requires --quote from the owner's latest message")?;
     let valid = match reply {
-        crate::land::APPROVE => latest.body.contains(quote),
+        crate::land::APPROVE => latest.contains(quote),
         crate::land::HOLD => {
-            latest.body.trim().eq_ignore_ascii_case(crate::land::HOLD)
+            latest.trim().eq_ignore_ascii_case(crate::land::HOLD)
                 && quote.eq_ignore_ascii_case(crate::land::HOLD)
         }
         _ => false,
@@ -175,10 +189,30 @@ pub fn validate_answer(
     Ok(())
 }
 
-/// `talk::drain` stores the queued consult text as an operator turn; it is
-/// magi's own wording (it even contains the word `merge`), never the owner's.
-fn is_generated_consult(body: &str) -> bool {
-    body.contains(crate::prompt::CHAT_CONSULT_HEADING)
+/// The owner's own words in an operator turn, with magi's generated hand-over
+/// text cut out. `drain` stores a queued consult as an operator turn, and
+/// `talk::queue` joins an owner reply sent meanwhile onto the same draft, so
+/// the turn's origin cannot be told from the turn as a whole. The generated
+/// block runs from [`CHAT_CONSULT_HEADING`](crate::prompt::CHAT_CONSULT_HEADING)
+/// to the last [`CHAT_CONSULT_END`](crate::prompt::CHAT_CONSULT_END); an owner
+/// reply that happens to contain that phrase is cut too, which only ever
+/// refuses. With `after_block_only` (the turn carrying the hand-over itself)
+/// words queued before the block predate it and are dropped.
+fn owner_words(body: &str, after_block_only: bool) -> String {
+    use crate::prompt::{CHAT_CONSULT_END, CHAT_CONSULT_HEADING};
+    let Some(start) = body.find(CHAT_CONSULT_HEADING) else {
+        return body.trim().to_owned();
+    };
+    let after = match body.rfind(CHAT_CONSULT_END) {
+        Some(e) if e >= start => &body[e + CHAT_CONSULT_END.len()..],
+        _ => "",
+    };
+    if after_block_only {
+        return after.trim().to_owned();
+    }
+    let before = &body[..start];
+    let before = before.strip_suffix("# ").unwrap_or(before);
+    format!("{before}\n\n{after}").trim().to_owned()
 }
 
 /// What [`start_turn`] did.
@@ -579,11 +613,45 @@ mod tests {
             attachments: Vec::new(),
             usage: None,
         };
+        // An approval the owner gave before the hand-over is not reusable.
+        let mut old = talk.clone();
+        old.turns
+            .insert(0, owner_turn("Please merge PR 12 after review"));
+        store.put(&mut old).unwrap();
+        talk.turns = old.turns.clone();
         // The drained consult draft is stored as an operator turn; it must not
         // count as the owner's words even though it contains "merge".
         talk.turns.push(owner_turn(&queued));
         store.put(&mut talk).unwrap();
         assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, "merge", Some("merge")).is_err());
+        assert!(
+            validate_answer(
+                &q,
+                &store,
+                &talk.id,
+                CHAT_NODE,
+                "merge",
+                Some("Please merge PR 12")
+            )
+            .is_err()
+        );
+        // An owner reply coalesced onto the same draft still counts.
+        let n = talk.turns.len();
+        talk.turns[n - 1].body = format!("{queued}\n\nmerge it now");
+        store.put(&mut talk).unwrap();
+        assert!(
+            validate_answer(
+                &q,
+                &store,
+                &talk.id,
+                CHAT_NODE,
+                "merge",
+                Some("merge it now")
+            )
+            .is_ok()
+        );
+        talk.turns[n - 1].body = queued.clone();
+        store.put(&mut talk).unwrap();
         talk.turns
             .push(owner_turn("Merge this pull request please"));
         store.put(&mut talk).unwrap();

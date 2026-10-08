@@ -1415,6 +1415,9 @@ pub struct DeputyPrompt<'a> {
 /// Heading of the turn that hands a question to the chat it came from.
 pub const CHAT_CONSULT_HEADING: &str = "A question was handed to you";
 
+/// The last words of every generated consult text, used to find where it ends.
+pub const CHAT_CONSULT_END: &str = "edit the repository.";
+
 /// The operator turn that puts an open question in front of the chat agent.
 ///
 /// The question's id is in the text on purpose: it is what `magi answer <id>`
