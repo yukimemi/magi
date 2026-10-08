@@ -786,6 +786,15 @@ gate = ["cargo make check"]
 # become one commit. A failing command only warns. Uses timeout_verify.
 pre_gate = ["cargo fmt --all"]
 
+[worktree]
+# Prepared in order right after magi creates a worktree, before any agent or
+# verify command touches it (see "Worktree setup" below).
+setup = [
+  { copy = ".env.example -> .env" },
+  { copy = ".env.local", optional = true },
+  { run = "pnpm install --frozen-lockfile", timeout_secs = 900 },
+]
+
 [merge]
 mode = "none"            # none | local | pr
 
@@ -818,6 +827,46 @@ command = ["sh", "./mock-agent.sh"]   # {prompt_file} {cwd} {label} {session}
 
 `command` agents also receive `MAGI_SEAT`, `MAGI_TURN`, `MAGI_PROMPT_FILE` and
 `MAGI_ALLOW_WRITE` in the environment.
+
+### Worktree setup
+
+magi creates its worktrees with plain `git worktree add` and does not read
+`renri.toml`, so a copied `.env` or a one-off bootstrap that `renri add` would
+have produced is missing there. `[worktree] setup` is an ordered list of steps
+run in each new worktree:
+
+- `{ copy = "src -> dst" }` (or `{ copy = "path" }`) copies from the **primary
+  checkout's working tree** (an absolute source is allowed; this is not the
+  `origin/main` commit the rest of the config is read from). It never
+  overwrites a file that already exists in the worktree, and a missing source is
+  an error unless the step has `optional = true`. `dst` must stay inside the
+  worktree (no absolute path, no `..`, nothing under `.git`).
+- `{ run = "..." }` goes through the configured shell with the worktree as cwd,
+  `timeout_secs` (default `timeout_verify`) and stdin closed. `MAGI_RUN` and
+  `MAGI_NODE` are removed from its environment so nothing seat-shaped leaks.
+
+A failing step (copy error, non-zero exit, timeout) fails that worktree with the
+step number, the command and the tail of its output; the run is `Blocked`, never
+carried on. The key is an array, so it is declared in exactly one layer; the
+default is empty and changes nothing.
+
+Covered worktrees: implementer candidates (hence the winner/verify worktree,
+which is the candidate itself and is not set up twice), judge and advisor
+seats, reviewer seats (set up again every round, because the reset wipes them),
+the review-takeover checkout and the operator-fix checkout. **Not covered:**
+the throwaway worktrees used for rebases and local releases; a release command
+prepares its own checkout.
+
+Things to know:
+
+- Setup must not edit tracked files; one that does fails the worktree. For the
+  same reason it is the wrong place for things like `kata apply`: every
+  candidate would carry the same diff. That is explicitly out of scope.
+- What setup leaves untracked is hidden from `git add` through a per-worktree
+  `core.excludesFile`, and magi's rescue commits skip it too, so a copied `.env`
+  never lands in a candidate branch.
+- The cost is paid once per seat (and per review round), so prefer light
+  commands, and write `run` steps to be safe to repeat.
 
 ## The review loop
 

@@ -467,6 +467,19 @@ pub async fn commit_all(worktree: &Path, message: &str) -> Result<bool> {
         return Ok(false);
     }
     git(worktree, &["add", "-A"]).await?;
+    // What `[worktree] setup` produced is not the agent's work.
+    if !crate::worktree_setup::withheld_paths(worktree)
+        .await
+        .is_empty()
+    {
+        crate::worktree_setup::unstage_products(worktree).await?;
+        if git_raw(worktree, &["diff", "--cached", "--quiet"])
+            .await?
+            .ok()
+        {
+            return Ok(false);
+        }
+    }
     let out = git_raw(
         worktree,
         &[
@@ -603,6 +616,7 @@ pub async fn rescue_commit(worktree: &Path, message: &str) -> Result<Rescue> {
         args.extend(withheld.iter().map(|s| s.path.as_str()));
         git(worktree, &args).await?;
     }
+    crate::worktree_setup::unstage_products(worktree).await?;
     if git_raw(worktree, &["diff", "--cached", "--quiet"])
         .await?
         .ok()

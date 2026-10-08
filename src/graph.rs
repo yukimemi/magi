@@ -55,6 +55,7 @@ use crate::verdict::{
     self, FinalVote, Finding, FixReport, Position, Proposal, Ranking, Review, ReviewRevote,
     ReviewVote, Severity,
 };
+use crate::worktree_setup;
 
 /// How much verification output is kept and fed back to the fixer.
 const OUTPUT_TAIL: usize = 8_000;
@@ -781,6 +782,14 @@ impl Runner {
                 format!("checking out `{branch}` at {path} (is it checked out elsewhere?)")
             })?;
 
+        let setup = match ensure_setup_config(&mut state, repo).await {
+            Ok(()) => worktree_setup::prepare(&state.config, repo, &worktree).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = setup {
+            git::worktree_remove(repo, &worktree).await.ok();
+            return Err(e);
+        }
         let commits = git::commits_ahead(&worktree, &base_commit, "HEAD")
             .await
             .unwrap_or(0);
@@ -1156,6 +1165,51 @@ impl Runner {
 
     // ---------------------------------------------------------------- prep
 
+    /// Run `[worktree] setup` in a seat's fresh worktree. A failure blocks the
+    /// run with the step and its output in the event; it is never swallowed.
+    /// During `prep` (`in_prep`) the whole preparation is rolled back, so a
+    /// resume starts over instead of finding candidates and missing seats.
+    async fn setup_seat_worktree(&mut self, repo: &Path, wt: &Path, in_prep: bool) -> Result<()> {
+        let result = match ensure_setup_config(&mut self.state, repo).await {
+            Ok(()) => worktree_setup::prepare(&self.state.config, repo, wt).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            git::worktree_remove(repo, wt).await.ok();
+            if in_prep {
+                self.rollback_prep(repo).await;
+            }
+            self.state.status = RunStatus::Blocked;
+            self.state.event(
+                "setup",
+                format!("worktree setup failed in {}: {e:#}", wt.display()),
+            );
+            self.state.save()?;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Undo everything `prep` created, so a resume re-runs it whole.
+    async fn rollback_prep(&mut self, repo: &Path) {
+        let root = self.state.worktree_root();
+        for c in std::mem::take(&mut self.state.candidates) {
+            git::worktree_remove(repo, &c.worktree).await.ok();
+            git::branch_delete(repo, &c.branch).await.ok();
+        }
+        let seats = self.roles.judges.len().max(self.state.config.graph.judges);
+        for j in 1..=seats {
+            git::worktree_remove(repo, &root.join(format!("judge-{j}")))
+                .await
+                .ok();
+        }
+        for k in 1..=self.state.config.graph.advisors {
+            git::worktree_remove(repo, &root.join(format!("advisor-{k}")))
+                .await
+                .ok();
+        }
+    }
+
     async fn prep(&mut self) -> Result<()> {
         if !self.state.candidates.is_empty() {
             return Ok(());
@@ -1189,6 +1243,10 @@ impl Runner {
             self.state.enabled_worktree_config = true;
         }
 
+        // `[worktree] setup` hides its products per worktree, which needs the
+        // same per-worktree config the hook does. Held until fold, like it.
+        ensure_setup_config(&mut self.state, &repo).await?;
+
         for (index, (spec, label)) in self
             .roles
             .implementers
@@ -1204,6 +1262,18 @@ impl Runner {
                 git::set_worktree_hooks_path(&worktree, &hooks_dir).await?;
             }
             git::local_exclude(&worktree, "/.magi/").await?;
+            if let Err(e) = worktree_setup::prepare(&self.state.config, &repo, &worktree).await {
+                // Nothing of this prep may survive: a resume must start over,
+                // not find half the candidates and skip the rest.
+                git::worktree_remove(&repo, &worktree).await.ok();
+                git::branch_delete(&repo, &branch).await.ok();
+                self.rollback_prep(&repo).await;
+                self.state.status = RunStatus::Blocked;
+                self.state
+                    .event("prep", format!("worktree setup failed: {e:#}"));
+                self.state.save()?;
+                return Err(e);
+            }
             for pick in &plan.picks {
                 if let Err(e) = git::cherry_pick(&worktree, pick).await {
                     self.state.status = RunStatus::Blocked;
@@ -1235,6 +1305,7 @@ impl Runner {
             let wt = root.join(format!("judge-{j}"));
             if !wt.exists() {
                 git::worktree_add_detached(&repo, &wt, &base).await?;
+                self.setup_seat_worktree(&repo, &wt, true).await?;
             }
         }
 
@@ -1250,6 +1321,7 @@ impl Runner {
                 let wt = root.join(format!("advisor-{k}"));
                 if !wt.exists() {
                     git::worktree_add_detached(&repo, &wt, &base).await?;
+                    self.setup_seat_worktree(&repo, &wt, true).await?;
                 }
             }
         }
@@ -4080,6 +4152,19 @@ impl Runner {
                 winner.branch
             );
         }
+        let repo_for_setup = self.state.repo.clone();
+        let setup = match ensure_setup_config(&mut self.state, &repo_for_setup).await {
+            Ok(()) => {
+                worktree_setup::prepare(&self.state.config, &repo_for_setup, &fix_worktree).await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = setup {
+            git::worktree_remove(&self.state.repo, &fix_worktree)
+                .await
+                .ok();
+            return Err(e);
+        }
 
         let run_id = self.state.id.clone();
         let prompts = self.state.config.prompts.clone();
@@ -4533,11 +4618,14 @@ impl Runner {
             let mut jobs = Vec::new();
             for (r, spec) in reviewers.iter().cloned().enumerate() {
                 let wt = root.join(format!("review-{}", r + 1));
+                // `clean -fdx` in a reset wipes setup's products, so every
+                // round sets the seat up again.
                 if wt.exists() {
                     git::reset_detached(&wt, &head).await?;
                 } else {
                     git::worktree_add_detached(&repo, &wt, &head).await?;
                 }
+                self.setup_seat_worktree(&repo, &wt, false).await?;
                 let seat_key = format!("review-{}", r + 1);
                 // The seat starts the round on whoever answered it last, not
                 // on the agent the spec names, so a failure is not re-paid.
@@ -8675,6 +8763,17 @@ pub fn worst_open(state: &RunState) -> Option<Severity> {
         .flat_map(|r| r.findings.iter())
         .map(|f| f.severity)
         .max()
+}
+
+/// `[worktree] setup` hides its products per worktree, which needs
+/// `extensions.worktreeConfig`. Taken once per run and released with the run's
+/// worktrees, like the hook's; every place that runs setup calls this first.
+async fn ensure_setup_config(state: &mut RunState, repo: &Path) -> Result<()> {
+    if !state.config.worktree.setup.is_empty() && !state.enabled_worktree_config {
+        git::acquire_worktree_config(repo).await?;
+        state.enabled_worktree_config = true;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

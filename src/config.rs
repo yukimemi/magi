@@ -678,6 +678,59 @@ impl Verify {
     }
 }
 
+/// Per-repository worktree preparation, run right after magi creates a worktree.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Worktree {
+    /// Ordered steps. Declare in one layer only. Empty (the default) changes
+    /// nothing. See [`crate::worktree_setup`].
+    pub setup: Vec<SetupStep>,
+}
+
+/// One setup step: exactly one of `copy` / `run`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SetupStep {
+    /// `"src -> dst"` (or just `"path"`): copy from the primary checkout (an
+    /// absolute source is allowed) into the worktree. Never overwrites.
+    pub copy: Option<String>,
+    /// With `copy`: a missing source is skipped instead of an error.
+    pub optional: bool,
+    /// Shell command, run with the worktree as cwd.
+    pub run: Option<String>,
+    /// With `run`: seconds before the command is killed. Defaults to
+    /// `graph.verify_timeout()`.
+    pub timeout_secs: Option<u64>,
+}
+
+impl Worktree {
+    /// Refuse a malformed step at load time rather than in the middle of a run.
+    pub fn validate(&self) -> Result<()> {
+        for (i, step) in self.setup.iter().enumerate() {
+            let n = i + 1;
+            match (&step.copy, &step.run) {
+                (Some(c), None) => {
+                    if step.timeout_secs.is_some() {
+                        bail!("[worktree] setup step {n}: `timeout_secs` applies to `run` only");
+                    }
+                    crate::worktree_setup::validate_copy(c)
+                        .with_context(|| format!("[worktree] setup step {n}"))?;
+                }
+                (None, Some(r)) => {
+                    if r.trim().is_empty() {
+                        bail!("[worktree] setup step {n}: `run` is empty");
+                    }
+                    if step.optional {
+                        bail!("[worktree] setup step {n}: `optional` applies to `copy` only");
+                    }
+                }
+                _ => bail!("[worktree] setup step {n} must set exactly one of `copy` and `run`"),
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Disk hygiene: how hard magi is allowed to press on the machine's free space.
 ///
 /// The numbers below come from one incident, not from theory: a machine with
@@ -926,6 +979,8 @@ pub struct Config {
     pub blind: Blind,
     /// Verification commands.
     pub verify: Verify,
+    /// Worktree preparation.
+    pub worktree: Worktree,
     /// Disk hygiene.
     pub disk: Disk,
     /// Merge policy.
@@ -1427,6 +1482,7 @@ impl Config {
             .try_into()
             .context("deserializing magi config")?;
         crate::persona::validate(&cfg.talk.personas)?;
+        cfg.worktree.validate()?;
         if let Some(name) = cfg.talk.operator_name() {
             if name.chars().count() > OPERATOR_NAME_MAX || name.chars().any(char::is_control) {
                 bail!(
@@ -2065,6 +2121,21 @@ impl Config {
              # command only warns - the gate stays the arbiter. Same timeout as the\n\
              # gate (timeout_verify). Keep it light and idempotent.\n\
              # pre_gate = []\n\n\
+             # Prepare each worktree magi creates (candidates, judges, advisors,\n\
+             # reviewers, the operator-fix and review-takeover checkouts), in order,\n\
+             # before any agent or verify command touches it. `copy` reads from the\n\
+             # primary checkout and never overwrites; `optional` skips a missing\n\
+             # source. `run` goes through the shell with the worktree as cwd and\n\
+             # fails the seat on a non-zero exit or timeout (timeout_secs, default\n\
+             # the verify timeout). Setup must not edit tracked files, and what it\n\
+             # leaves untracked is kept out of magi's commits. Declare this in one\n\
+             # layer only.\n\
+             # [worktree]\n\
+             # setup = [\n\
+             #   { copy = \".env.example -> .env\" },\n\
+             #   { copy = \".env.local\", optional = true },\n\
+             #   { run = \"pnpm install --frozen-lockfile\", timeout_secs = 900 },\n\
+             # ]\n\n\
              [merge]\n\
              # none | local | pr\n\
              mode = \"none\"\n\
@@ -3310,6 +3381,78 @@ mod tests {
             ],
             "low-priority (machine) command first, high-priority (repo) command after"
         );
+    }
+
+    fn load_one(body: &str) -> Result<Config> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        std::fs::write(&path, body).unwrap();
+        Config::load_layers(&[path])
+    }
+
+    #[test]
+    fn worktree_setup_defaults_to_empty_and_parses_steps() {
+        assert!(Config::default().worktree.setup.is_empty());
+        let cfg = load_one(
+            "[worktree]\nsetup = [\n  { copy = \".env.example -> .env\" },\n  \
+             { copy = \"x\", optional = true },\n  { run = \"true\", timeout_secs = 5 },\n]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.worktree.setup.len(), 3);
+        assert!(cfg.worktree.setup[1].optional);
+        assert_eq!(cfg.worktree.setup[2].timeout_secs, Some(5));
+    }
+
+    #[test]
+    fn worktree_setup_rejects_malformed_steps() {
+        for bad in [
+            "{ copy = \"a\", run = \"b\" }",
+            "{ optional = true }",
+            "{ copy = \"a -> ../b\" }",
+            "{ copy = \"a -> /abs\" }",
+            "{ copy = \"a -> .git/config\" }",
+            "{ run = \"b\", optional = true }",
+            "{ copy = \"a\", timeout_secs = 3 }",
+            "{ run = \"b\", bogus = 1 }",
+        ] {
+            let body = format!("[worktree]\nsetup = [{bad}]\n");
+            assert!(load_one(&body).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn worktree_setup_in_two_layers_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.toml");
+        let repo = dir.path().join("magi.toml");
+        std::fs::write(&machine, "[worktree]\nsetup = [{ run = \"a\" }]\n").unwrap();
+        std::fs::write(&repo, "[worktree]\nsetup = [{ run = \"b\" }]\n").unwrap();
+        assert!(Config::load_layers(&[machine, repo]).is_err());
+    }
+
+    #[test]
+    fn starter_toml_documents_worktree_setup() {
+        let starter = Config::starter_toml();
+        assert!(starter.contains("# [worktree]") && starter.contains("setup = ["));
+        // The commented example must be valid once uncommented.
+        let body = starter.replace("# [worktree]", "[worktree]");
+        let mut out = String::new();
+        let mut live = false;
+        for line in body.lines() {
+            if line == "[worktree]" {
+                live = true;
+            } else if live && !line.starts_with("# ") {
+                live = false;
+            }
+            out.push_str(&if live {
+                line.replacen("# ", "", 1)
+            } else {
+                line.to_owned()
+            });
+            out.push('\n');
+        }
+        let cfg = load_one(&out).expect("uncommented example loads");
+        assert_eq!(cfg.worktree.setup.len(), 3);
     }
 
     #[test]
