@@ -273,6 +273,75 @@ mod tests {
         drop(held);
     }
 
+    /// A `kind = "command"` agent running `script`; `LEASE` names the turn
+    /// lease file so the script can look at it while the turn is in flight.
+    fn scripted(tmp: &std::path::Path, script: &str, lease: &std::path::Path) -> Config {
+        let path = tmp.join("mock-consult-agent.sh");
+        std::fs::write(&path, script).expect("write mock");
+        Config {
+            agents: vec![AgentSpec {
+                id: "mock".to_owned(),
+                kind: AgentKind::Command,
+                model: None,
+                command: vec!["sh".to_owned(), path.to_string_lossy().into_owned()],
+                extra_args: Vec::new(),
+                env: BTreeMap::from([("LEASE".to_owned(), lease.to_string_lossy().into_owned())]),
+                prompt_delivery: None,
+            }],
+            ..Config::default()
+        }
+    }
+
+    /// Run `start_turn` with `script` as the agent and hand back its result,
+    /// the store and the talk, for the caller to claim the lease afterwards.
+    async fn run_turn(
+        script: &str,
+    ) -> (
+        tempfile::TempDir,
+        Result<Started>,
+        Questions,
+        Question,
+        Talk,
+    ) {
+        crate::run::set_home(crate::run::test_home());
+        let (tmp, store, talk) = talks();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = question("implement");
+        questions.put(&mut q).expect("put");
+        let cfg = scripted(tmp.path(), script, &store.turn_path(&talk.id));
+        let got = start_turn(&questions, &store, &q, &talk, &cfg).await;
+        (tmp, got, questions, q, talk)
+    }
+
+    #[tokio::test]
+    async fn the_lease_is_held_during_the_turn_and_free_once_it_ends() {
+        // exit 7 if the lease file is missing while the agent runs.
+        let (tmp, got, _questions, _q, talk) =
+            run_turn("#!/bin/sh\ncat >/dev/null\n[ -f \"$LEASE\" ] || exit 7\nprintf 'ok\\n'\n")
+                .await;
+        assert_eq!(got.expect("turn"), Started::Answered);
+        let other = Talks::at(tmp.path().join("talks"));
+        assert!(
+            other.claim_turn(&talk.id).expect("claim").is_some(),
+            "free once the turn ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lease_is_free_again_after_a_failed_turn() {
+        let (tmp, got, questions, q, talk) = run_turn("#!/bin/sh\ncat >/dev/null\nexit 3\n").await;
+        assert!(got.is_err(), "the agent failed");
+        assert!(
+            questions.get(&q.id).unwrap().consult.is_some(),
+            "the turn got as far as running"
+        );
+        let other = Talks::at(tmp.path().join("talks"));
+        assert!(
+            other.claim_turn(&talk.id).expect("claim").is_some(),
+            "free after the failed turn"
+        );
+    }
+
     #[test]
     fn origin_talk_is_decided_in_one_table() {
         let (_tmp, _store, talk) = talks();

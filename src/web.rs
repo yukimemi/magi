@@ -7522,10 +7522,18 @@ mod tests {
         _opts: daemon::Opts,
         _stop: daemon::Stop,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-        Box::pin(async {
-            Err(anyhow::anyhow!(
+        // The stand-in dies instantly, so a restarted one can record its own
+        // failure before the start's response is read. The second attempt
+        // therefore fails with a different message, to tell a stale error
+        // from a fresh one.
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let first = CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        Box::pin(async move {
+            Err(anyhow::anyhow!(if first {
                 "publish the daemon status file: read-only file system"
-            ))
+            } else {
+                "the restarted stand-in failed as well"
+            }))
         })
     }
 
@@ -10815,10 +10823,12 @@ mod tests {
         // occupy the slot.
         let again = f.post("/api/loop", Some(r#"{"running":true}"#)).await;
         assert_eq!(again.status, 200, "{}", again.body);
-        assert_eq!(
-            again.json()["last_error"],
-            Value::Null,
-            "a fresh start does not keep showing why the last one died"
+        assert!(
+            again.json()["last_error"]
+                .as_str()
+                .is_none_or(|e| !e.contains("read-only file system")),
+            "a fresh start does not keep showing why the last one died: {}",
+            again.body
         );
     }
 
