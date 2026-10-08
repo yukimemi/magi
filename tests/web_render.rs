@@ -1124,6 +1124,156 @@ async fn queue_row_click_previews_task_in_split_pane() {
     );
 }
 
+/// The Settings link is a `.rail-link` that only exists from 720px up, and the
+/// dock has no sixth item, so a phone reaches Settings through a gear in the
+/// header. It must be a real tap target that opens the view, must not crowd
+/// the brand or the bell, and must never appear next to the rail's link.
+#[tokio::test]
+async fn settings_gear_is_reachable_on_a_phone_and_never_doubles_the_rail_link() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome)
+        .await
+        .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
+    let w = Duration::from_secs(30);
+
+    // Phone: the gear is visible, big enough, clear of its neighbours.
+    let page = browser
+        .open_page(&format!("{base}#/runs"), 390, 844, true)
+        .await
+        .expect("open");
+    browser
+        .wait_for(&page, "!!document.getElementById('settings-btn')", w)
+        .await
+        .expect("gear in the DOM");
+    let geometry = browser
+        .eval(
+            &page,
+            r##"(() => {
+              const fails = [];
+              const shown = (e) => { const r = e.getBoundingClientRect(), cs = getComputedStyle(e);
+                return r.width > 0 && r.height > 0 && cs.display !== "none" && cs.visibility !== "hidden"; };
+              const hit = (a, b) => a.left < b.right - 1 && b.left < a.right - 1 && a.top < b.bottom - 1 && b.top < a.bottom - 1;
+              const gear = document.getElementById("settings-btn");
+              if (!shown(gear)) return ["gear is not visible at 390px"];
+              const g = gear.getBoundingClientRect();
+              if (g.width < 44 || g.height < 44) fails.push(`gear is ${g.width}x${g.height}, under 44px`);
+              if (g.right > innerWidth + 1) fails.push("gear spills past the viewport");
+              for (const sel of [".brand", "#bell", "#theme-toggle"]) {
+                const e = document.querySelector(sel);
+                if (e && shown(e) && hit(g, e.getBoundingClientRect())) fails.push(`gear overlaps ${sel}`);
+              }
+              const visible = [...document.querySelectorAll('[data-nav="settings"]')].filter(shown).length;
+              if (visible !== 1) fails.push(`${visible} visible Settings entries, want 1`);
+              return fails;
+            })()"##,
+        )
+        .await
+        .expect("measure gear");
+    assert_eq!(geometry, serde_json::json!([]), "phone header: {geometry}");
+
+    // Tap it for real, at its centre.
+    let point = browser
+        .eval(
+            &page,
+            "(() => { const r = document.getElementById('settings-btn').getBoundingClientRect(); \
+             return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()",
+        )
+        .await
+        .expect("locate gear");
+    for kind in ["mousePressed", "mouseReleased"] {
+        browser
+            .call(
+                Some(&page.session),
+                "Input.dispatchMouseEvent",
+                serde_json::json!({
+                    "type": kind, "x": point["x"], "y": point["y"],
+                    "button": "left", "clickCount": 1,
+                }),
+            )
+            .await
+            .expect("mouse");
+    }
+    browser
+        .wait_for(
+            &page,
+            "location.hash === '#/settings' \
+             && !document.getElementById('view-settings').hidden \
+             && document.getElementById('settings-btn').getAttribute('aria-current') === 'page'",
+            w,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("tapping the gear did not open Settings: {e}"));
+    let after = browser
+        .eval(
+            &page,
+            r##"(() => {
+              window.scrollTo(0, 0);
+              const h = document.getElementById("settings-h");
+              if (!h) return "no settings heading";
+              const r = h.getBoundingClientRect();
+              const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+              if (!top || !h.contains(top)) return "heading covered by " + (top ? (top.id || top.className || top.tagName) : "nothing");
+              const others = [...document.querySelectorAll("[data-nav][aria-current]")]
+                .filter((e) => e.dataset.nav !== "settings").map((e) => e.dataset.nav);
+              return others.length ? "also current: " + others.join(",") : "ok";
+            })()"##,
+        )
+        .await
+        .expect("after");
+    assert_eq!(after, "ok", "after tapping the gear");
+
+    // Leaving Settings drops the highlight.
+    browser
+        .eval(&page, "location.hash = '#/runs'")
+        .await
+        .expect("navigate away");
+    browser
+        .wait_for(
+            &page,
+            "!document.getElementById('settings-btn').hasAttribute('aria-current')",
+            w,
+        )
+        .await
+        .expect("gear no longer current");
+    browser.close_page(&page).await;
+
+    // Desktop: the rail owns Settings and the gear stays out of the way.
+    let page = browser
+        .open_page(&format!("{base}#/runs"), 1280, 900, false)
+        .await
+        .expect("open desktop");
+    browser
+        .wait_for(&page, "!!document.getElementById('settings-btn')", w)
+        .await
+        .expect("gear in the DOM");
+    let visible = browser
+        .eval(
+            &page,
+            r##"[...document.querySelectorAll('[data-nav="settings"]')]
+                 .filter((e) => { const r = e.getBoundingClientRect();
+                   return r.width > 0 && r.height > 0 && getComputedStyle(e).display !== "none"; })
+                 .map((e) => e.id || e.className)"##,
+        )
+        .await
+        .expect("count");
+    assert_eq!(visible, serde_json::json!(["rail-link"]), "desktop Settings entries");
+    browser.close_page(&page).await;
+}
+
 /// Exercise the actual client functions without boot's timers. The test-only
 /// harness is appended to the embedded source; shipped assets need no hooks.
 async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
