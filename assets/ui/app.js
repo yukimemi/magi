@@ -117,6 +117,15 @@ const UPGRADE_BUSY_STAGES = new Set(["downloading", "replaced", "parking", "rest
    skew between this page and the deck. */
 const UPGRADE_WAIT_LIMIT_MS = 70 * 60 * 1000;
 
+/* How long a background health poll may keep failing at the network level
+   before the page says it cannot reach magi. A phone drops the network in a
+   tunnel, and the first fetch after unlocking runs before the radio is back;
+   by the time anyone taps something it has recovered. Both limits must be
+   passed: failed polls count once per health load (never per parallel
+   loader), and the time runs from the first failure. */
+const UNREACHABLE_GRACE_MS = 18 * 1000;
+const UNREACHABLE_GRACE_FAILURES = 2;
+
 /* ---- status vocabulary ------------------------------------------------- *
  * Every status carries a glyph as well as a colour. `stalled` additionally
  * gets a hatched, double-bordered chip in CSS: a panel that collapsed on
@@ -700,9 +709,10 @@ const postBytes = (url, file, filename) =>
   }).then((r) => r.json());
 
 /* ---- alert ------------------------------------------------------------- */
-function fail(message) {
+function fail(message, kind = null) {
   const box = $("alert");
   setText(box.querySelector(".alert-text"), message);
+  setAttr(box, "data-kind", kind);
   show(box, true);
 }
 
@@ -8381,7 +8391,33 @@ function reportUnreachableDuringUpgrade(error) {
   return true;
 }
 
-async function loadHealth({ applyRevisions = false } = {}) {
+/* Background health failures at the network level, tracked in one place.
+   `gen` moves on every resume so a slow failure from before it is ignored. */
+const unreachable = { since: null, failures: 0, gen: 0 };
+
+function resetUnreachable() {
+  unreachable.since = null;
+  unreachable.failures = 0;
+}
+
+/* Hides only the banner this grace logic raised, never a save failure. */
+function clearUnreachableBanner() {
+  const box = $("alert");
+  if (box.getAttribute("data-kind") === "unreachable") show(box, false);
+}
+
+/* The page came back (unlocked, online, restored from the back-forward
+   cache): whatever failed before is stale, so forget it and ask again now. */
+function resumeConnection() {
+  unreachable.gen += 1;
+  resetUnreachable();
+  clearUnreachableBanner();
+  loadHealth({ applyRevisions: true });
+}
+
+/* `explicit` is for a person's own action (Retry): reported at once. */
+async function loadHealth({ applyRevisions = false, explicit = false } = {}) {
+  const gen = unreachable.gen;
   try {
     state.health = await getJson(API.health);
     renderBell();
@@ -8394,9 +8430,29 @@ async function loadHealth({ applyRevisions = false } = {}) {
        answered, so the indicator is right on the very first paint. */
     renderAskBar();
     if (applyRevisions) await applyRevisions_(state.health);
+    resetUnreachable();
     ok();
   } catch (error) {
-    if (!reportUnreachableDuringUpgrade(error)) fail(`Cannot reach magi: ${error.message}`);
+    if (gen !== unreachable.gen) return;
+    const network = !error.status && !(error instanceof SyntaxError);
+    if (network && !explicit && navigator.onLine === false) {
+      /* Offline is not "magi is down"; the browser will say online again. */
+      resetUnreachable();
+      return;
+    }
+    if (reportUnreachableDuringUpgrade(error)) return;
+    const message = `Cannot reach magi: ${error.message}`;
+    if (!network || explicit) {
+      fail(message);
+      return;
+    }
+    const now = Date.now();
+    if (unreachable.since === null) unreachable.since = now;
+    unreachable.failures += 1;
+    if (unreachable.failures >= UNREACHABLE_GRACE_FAILURES
+      && now - unreachable.since >= UNREACHABLE_GRACE_MS) {
+      fail(message, "unreachable");
+    }
   }
 }
 
@@ -9373,7 +9429,8 @@ function wire() {
 
   $("alert-retry").addEventListener("click", () => {
     ok();
-    loadHealth({ applyRevisions: true });
+    resetUnreachable();
+    loadHealth({ applyRevisions: true, explicit: true });
     loadQuestions();
     if (state.route.name === "run" && state.detail.id) loadRun(state.detail.id);
     if (state.route.name === "talk" && state.talkDetail.id) loadTalk(state.talkDetail.id);
@@ -9434,12 +9491,16 @@ function wire() {
      is what stops the operator reading a snapshot from an hour ago. */
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
-    loadHealth({ applyRevisions: true });
+    resumeConnection();
     /* The talk on screen may already hold turns that arrived - and were
        fetched - while this tab was hidden, in which case revisions have not
        moved since and the load above will not touch it. Re-render it
        directly so `renderTalk`'s now-unguarded markTalkRead sees it. */
     if (state.route.name === "talk" && state.talkDetail.id) renderTalk();
+  });
+  window.addEventListener("online", resumeConnection);
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted) resumeConnection();
   });
 }
 
