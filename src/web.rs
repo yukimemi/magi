@@ -1279,7 +1279,7 @@ pub async fn serve(opts: Opts) -> Result<()> {
         },
         () = interrupted => {
             tracing::info!("shutting down the web UI");
-            finish_loop(&home, &looping).await;
+            finish_loop(&home, &looping, None).await;
             Ok(())
         }
         () = handover => {
@@ -1384,17 +1384,18 @@ async fn hand_over(
     successor: impl FnOnce(bool) -> Result<u32>,
 ) -> Result<()> {
     updater::log_step(home, "hand_over: entered; writing the parking stage");
-    match updater::read_progress(home) {
-        Some(mut progress) => {
-            progress.advance(updater::Stage::Parking);
-            updater::write_progress_logged(home, &progress);
-        }
-        None => updater::log_warn(
+    // The lease and the stage are written as one step, so a reader that sees
+    // `parking` also finds the proof that hand_over is alive. Dropped on
+    // every way out.
+    let (mut lease, recorded) = updater::LeaseGuard::enter_parking(home);
+    if !recorded {
+        updater::log_warn(
             home,
             "hand_over: upgrade.json is unreadable; no parking stage",
-        ),
+        );
     }
-    finish_loop(home, looping).await;
+    finish_loop(home, looping, Some(&mut lease)).await;
+    drop(lease);
     updater::log_step(home, "hand_over: releasing the listener (abort and await)");
     served.abort();
     let _ = served.await;
@@ -1431,13 +1432,21 @@ async fn hand_over(
     }
 }
 
+/// How often `finish_loop` renews the handover lease; well inside
+/// [`updater::LEASE_TTL_SECS`].
+const LEASE_BEAT: Duration = Duration::from_secs(20);
+
 /// Ask the loop to stop and wait for it, on the way out of [`serve`].
 ///
 /// The wait is the whole function. Returning from `serve` while a graph is
 /// mid-node ends the process with worktrees, branches and agent sessions left
 /// behind and every agent call in that run paid for and thrown away, which is
 /// exactly what the daemon's own shutdown refuses to do.
-async fn finish_loop(home: &FsPath, state: &Mutex<LoopState>) {
+async fn finish_loop(
+    home: &FsPath,
+    state: &Mutex<LoopState>,
+    mut lease: Option<&mut updater::LeaseGuard>,
+) {
     let live = lock_or_recover(state).live.take();
     let Some(live) = live else {
         updater::log_step(home, "finish_loop: no loop running; nothing to wait for");
@@ -1452,7 +1461,18 @@ async fn finish_loop(home: &FsPath, state: &Mutex<LoopState>) {
     let waited = std::time::Instant::now();
     // The task records its own outcome and logs it, so there is nothing to do
     // with a join error here but stop waiting.
-    let _ = live.handle.await;
+    let mut handle = live.handle;
+    let mut beat = tokio::time::interval(LEASE_BEAT);
+    loop {
+        tokio::select! {
+            _ = &mut handle => break,
+            _ = beat.tick() => {
+                if let Some(lease) = lease.as_deref_mut() {
+                    lease.beat();
+                }
+            }
+        }
+    }
     updater::log_step(
         home,
         &format!(
@@ -1813,6 +1833,12 @@ struct UpgradeProgressView {
     /// Seconds the stage has outlived its allowance, when it has - see
     /// [`updater::stall`]. `null` while the stage is moving normally.
     stuck_for_secs: Option<i64>,
+    /// Which kind of stuck: `never_entered` (hand_over left no record of
+    /// starting) or `stopped_beating`. `null` when not stuck.
+    stuck_kind: Option<updater::StallKind>,
+    /// `hand_over` is alive and waiting on the loop: however long that takes,
+    /// it is not an overdue upgrade.
+    handover_alive: bool,
 }
 
 /// Whether [`run_update_recheck`] may act at all this tick.
@@ -1935,25 +1961,39 @@ fn cached_update_view(cfg: Option<&Config>) -> UpdateView {
 /// already on disk in `run.json`, so this reads them fresh rather than
 /// trusting whatever was true the moment the park was requested.
 fn upgrade_progress_view(ui: &Ui, progress: updater::Progress) -> UpgradeProgressView {
+    let now = Timestamp::now();
+    let lease = updater::read_lease(&ui.home);
+    let alive = updater::live_lease(&progress, lease.as_ref(), now);
+    let run_id = alive
+        .and_then(|l| l.parked_run.as_deref())
+        .or(progress.parked_run.as_deref());
     let waiting_on = (progress.stage == updater::Stage::Parking)
-        .then_some(progress.parked_run.as_deref())
+        .then_some(run_id)
         .flatten()
-        .and_then(|id| read_run(&ui.runs, id).ok())
-        .map(|run| {
-            format!(
-                "run {} is finishing {} before the address is handed over",
-                run.short(),
-                run.status.as_str()
-            )
+        .map(|id| {
+            let waited = alive.map_or_else(String::new, |l| {
+                let secs = updater::waited_secs(l, now);
+                format!(" (waited {} min so far)", secs / 60)
+            });
+            match read_run(&ui.runs, id).ok() {
+                Some(run) => format!(
+                    "run {} is finishing {} before the address is handed over{waited}",
+                    run.short(),
+                    run.status.as_str()
+                ),
+                None => format!("run {id} is finishing before the address is handed over{waited}"),
+            }
         });
     let detail = progress
         .detail
         .clone()
         .or_else(|| updater::read_note(&ui.home, &progress));
-    let stalled = updater::stall(&progress, Timestamp::now());
+    let stalled = updater::stall(&progress, lease.as_ref(), now);
     let waiting_on = waiting_on.or_else(|| stalled.as_ref().map(|s| s.waiting_on.clone()));
     UpgradeProgressView {
-        stuck_for_secs: stalled.map(|s| s.age_secs),
+        stuck_for_secs: stalled.as_ref().map(|s| s.age_secs),
+        stuck_kind: stalled.map(|s| s.kind),
+        handover_alive: alive.is_some(),
         stage: progress.stage,
         from: progress.from,
         to: progress.to,
@@ -2416,10 +2456,10 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
         if let Err(e) = upgrade_and_restart(home.clone()).await {
             tracing::error!("the upgrade did not complete: {e:#}");
             lock_or_recover(&looping).resume_after_handover = false;
-            if let Some(mut progress) = updater::read_progress(&home) {
-                progress.fail(format!("{e:#}"));
-                let _ = updater::write_progress(&home, &progress);
-            }
+            // A failure of this attempt says nothing about a handover an
+            // earlier request already has in flight; checked and written
+            // under the progress lock.
+            let _ = updater::fail_progress(&home, &format!("{e:#}"));
         }
     });
 
@@ -14558,7 +14598,49 @@ mod tests {
         let health = fx.get("/api/health").await.json();
         let stuck = health["upgrade"]["stuck_for_secs"].as_i64().expect("stuck");
         assert!(stuck >= 600, "{stuck}");
+        assert_eq!(health["upgrade"]["stuck_kind"], "never_entered");
         assert!(health["upgrade"]["waiting_on"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_second_replaced_write_cannot_pull_a_parking_handover_back() {
+        let home = tempfile::tempdir().expect("temp home");
+        let mut progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
+        progress.advance(crate::updater::Stage::Parking);
+        crate::updater::write_progress(home.path(), &progress).expect("seed");
+        // What the second upgrade_and_restart and its handler do.
+        let mut again = progress.clone();
+        again.advance(crate::updater::Stage::Replaced);
+        crate::updater::write_progress(home.path(), &again).expect("replaced");
+        let fresh = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
+        crate::updater::write_progress(home.path(), &fresh).expect("downloading");
+        let after = crate::updater::read_progress(home.path()).expect("record");
+        assert_eq!(after.stage, crate::updater::Stage::Parking);
+    }
+
+    #[tokio::test]
+    async fn health_does_not_call_a_live_parking_wait_stuck() {
+        let fx = Fixture::start().await;
+        let mut progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
+        progress.parked_run = Some("20260905-000000-cd51".to_owned());
+        progress.advance(crate::updater::Stage::Parking);
+        let hours = Duration::from_secs(3 * 3600);
+        progress.started_at = Timestamp::now() - hours;
+        progress.updated_at = Timestamp::now() - hours;
+        crate::updater::write_progress(fx.home.path(), &progress).expect("write upgrade.json");
+        let _lease = crate::updater::LeaseGuard::enter(
+            fx.home.path(),
+            Some("20260905-000000-cd51".to_owned()),
+        );
+
+        let health = fx.get("/api/health").await.json();
+        assert!(health["upgrade"]["stuck_for_secs"].is_null(), "{health}");
+        assert!(health["upgrade"]["stuck_kind"].is_null());
+        assert_eq!(health["upgrade"]["handover_alive"], true);
+        let waiting_on = health["upgrade"]["waiting_on"]
+            .as_str()
+            .expect("waiting_on");
+        assert!(waiting_on.contains("cd51"), "{waiting_on}");
     }
 
     fn idle_ui(home: &TempDir) -> Ui {

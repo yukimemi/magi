@@ -240,6 +240,19 @@ pub enum Stage {
 }
 
 impl Stage {
+    /// Position in the upgrade's progression. Only meaningful for the
+    /// non-terminal stages; a terminal one ends the upgrade.
+    #[must_use]
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Downloading => 0,
+            Self::Replaced => 1,
+            Self::Parking => 2,
+            Self::Restarting => 3,
+            Self::Done | Self::Failed => 4,
+        }
+    }
+
     /// Finished, one way or the other - nothing is still moving.
     #[must_use]
     pub fn terminal(self) -> bool {
@@ -315,21 +328,76 @@ pub fn progress_path(home: &Path) -> PathBuf {
     home.join("upgrade.json")
 }
 
-/// Persist `progress`, atomically.
+/// Serialises the read-compare-rename of [`write_progress`], so two writers
+/// in this process cannot each compare against the same stale record.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// What to persist when `candidate` is written over `current`.
+///
+/// An upgrade in progress never goes backwards: a candidate whose stage is
+/// not past the recorded one (a second `POST /api/upgrade` landing on a live
+/// handover wrote `replaced` over `parking`) keeps the recorded stage and
+/// timestamps and only refreshes `to`. A terminal record is over, so whatever
+/// comes next starts a new upgrade, and a candidate that ends the upgrade
+/// (`Done` / `Failed`) always goes through.
+#[must_use]
+pub fn monotonic(current: Option<&Progress>, candidate: &Progress) -> Progress {
+    match current {
+        Some(cur)
+            if !cur.stage.terminal()
+                && !candidate.stage.terminal()
+                && candidate.stage.rank() <= cur.stage.rank() =>
+        {
+            let mut kept = cur.clone();
+            if candidate.to.is_some() {
+                kept.to.clone_from(&candidate.to);
+            }
+            kept
+        }
+        _ => candidate.clone(),
+    }
+}
+
+/// Persist `progress`, atomically, never moving an upgrade in progress back
+/// to an earlier stage - see [`monotonic`].
 ///
 /// Written to a sibling `.tmp` and renamed, the same reason
 /// `daemon::write_status_to` does it: `/api/health` reads this file on every
 /// poll and must never see a half-written one.
 pub fn write_progress(home: &Path, progress: &Progress) -> Result<()> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    write_progress_locked(home, progress)
+}
+
+fn write_progress_locked(home: &Path, progress: &Progress) -> Result<()> {
     let path = progress_path(home);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let body = serde_json::to_string_pretty(progress).context("serialize upgrade progress")?;
+    let to_write = monotonic(read_progress(home).as_ref(), progress);
+    let body = serde_json::to_string_pretty(&to_write).context("serialize upgrade progress")?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
     Ok(())
+}
+
+/// Record `detail` as the failure of the upgrade request that is asking,
+/// unless a handover is already in flight (`parking` / `restarting`): that
+/// handover is not this request's to fail. The check and the write happen
+/// under the same lock as [`write_progress`], so a handover that records
+/// `parking` in between cannot be overwritten. Returns whether it was written.
+pub fn fail_progress(home: &Path, detail: &str) -> Result<bool> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut progress) = read_progress(home) else {
+        return Ok(false);
+    };
+    if matches!(progress.stage, Stage::Parking | Stage::Restarting) {
+        return Ok(false);
+    }
+    progress.fail(detail);
+    write_progress_locked(home, &progress)?;
+    Ok(true)
 }
 
 /// The last upgrade this deck recorded, if it has ever started one.
@@ -352,9 +420,9 @@ pub const LOG_MAX_BYTES: u64 = 256 * 1024;
 /// A non-terminal `replaced` / `restarting` stage older than this is stuck.
 pub const STALL_AFTER_SECS: i64 = 120;
 
-/// `parking` waits for the node in flight, up to an implement wave (an hour by
-/// default), so it is only called stuck past that plus a margin.
-pub const PARKING_STALL_AFTER_SECS: i64 = 70 * 60;
+/// A handover lease with no beat for this long is not alive. Same idiom as
+/// `ask::LEASE_TTL`; no pid is consulted.
+pub const LEASE_TTL_SECS: i64 = 90;
 
 /// How often the watchdog repeats itself for one stage.
 pub const HEARTBEAT_SECS: i64 = 60;
@@ -416,12 +484,131 @@ pub fn write_progress_logged(home: &Path, progress: &Progress) {
     }
 }
 
+/// Proof that `hand_over` is running: written when it is entered, beaten
+/// while it waits on the loop, removed when it leaves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoverLease {
+    /// When `hand_over` was entered.
+    pub entered_at: Timestamp,
+    /// Last time it said it was alive.
+    pub beat_at: Timestamp,
+    /// The run it is waiting on, when one was in flight.
+    #[serde(default)]
+    pub parked_run: Option<String>,
+}
+
+impl HandoverLease {
+    /// Whether the last beat is recent enough at `now`.
+    #[must_use]
+    pub fn fresh(&self, now: Timestamp) -> bool {
+        now.as_second() - self.beat_at.as_second() <= LEASE_TTL_SECS
+    }
+}
+
+/// Where the [`HandoverLease`] lives, beside `upgrade.json`.
+#[must_use]
+pub fn lease_path(home: &Path) -> PathBuf {
+    home.join("upgrade.handover.json")
+}
+
+/// The lease on disk, if there is one.
+#[must_use]
+pub fn read_lease(home: &Path) -> Option<HandoverLease> {
+    let body = std::fs::read_to_string(lease_path(home)).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+fn write_lease(home: &Path, lease: &HandoverLease) {
+    let path = lease_path(home);
+    let tmp = path.with_extension("json.tmp");
+    let written = serde_json::to_string(lease)
+        .map_err(std::io::Error::other)
+        .and_then(|body| std::fs::write(&tmp, body))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = written {
+        log_warn(home, &format!("could not write the handover lease: {e}"));
+    }
+}
+
+/// Held by `hand_over` for as long as it runs; removes the lease on drop.
+#[derive(Debug)]
+pub struct LeaseGuard {
+    home: PathBuf,
+    lease: HandoverLease,
+}
+
+impl LeaseGuard {
+    /// Record that `hand_over` has been entered.
+    #[must_use]
+    pub fn enter(home: &Path, parked_run: Option<String>) -> Self {
+        let now = Timestamp::now();
+        let lease = HandoverLease {
+            entered_at: now,
+            beat_at: now,
+            parked_run,
+        };
+        write_lease(home, &lease);
+        Self {
+            home: home.to_owned(),
+            lease,
+        }
+    }
+
+    /// Enter the handover: write the lease and the `parking` stage as one step
+    /// under the progress lock, so a failing upgrade request ([`fail_progress`])
+    /// or a fresh one ([`write_progress`]) cannot land between the two and leave
+    /// a record that is newer than the lease. `None` for the stage means
+    /// `upgrade.json` was unreadable (the lease is still written).
+    #[must_use]
+    pub fn enter_parking(home: &Path) -> (Self, bool) {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let progress = read_progress(home);
+        let this = Self::enter(home, progress.as_ref().and_then(|p| p.parked_run.clone()));
+        let recorded = match progress {
+            Some(mut p) => {
+                p.advance(Stage::Parking);
+                if let Err(e) = write_progress_locked(home, &p) {
+                    log_warn(home, &format!("could not write upgrade.json: {e:#}"));
+                }
+                true
+            }
+            None => false,
+        };
+        (this, recorded)
+    }
+
+    /// Say it is still alive.
+    pub fn beat(&mut self) {
+        self.lease.beat_at = Timestamp::now();
+        write_lease(&self.home, &self.lease);
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(lease_path(&self.home));
+    }
+}
+
+/// How a non-terminal stage came to be called stuck.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StallKind {
+    /// The handover was signalled but `hand_over` left no record of entering.
+    NeverEntered,
+    /// `hand_over` did enter (or the successor is starting) but nothing has
+    /// moved or beaten for longer than allowed.
+    StoppedBeating,
+}
+
 /// A non-terminal stage that has outlived what it should take.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stall {
     /// The stage that is stuck.
     pub stage: Stage,
-    /// How long it has been in that stage.
+    /// Which kind of stuck, which decides what the operator is told.
+    pub kind: StallKind,
+    /// How long it has been without progress.
     pub age_secs: i64,
     /// What it is waiting on, in words.
     pub waiting_on: String,
@@ -434,35 +621,75 @@ pub fn stage_age_secs(progress: &Progress, now: Timestamp) -> i64 {
     (now.as_second() - progress.updated_at.as_second()).max(0)
 }
 
+/// The lease, when it proves `hand_over` of *this* upgrade is alive at `now`.
+#[must_use]
+pub fn live_lease<'a>(
+    progress: &Progress,
+    lease: Option<&'a HandoverLease>,
+    now: Timestamp,
+) -> Option<&'a HandoverLease> {
+    lease.filter(|l| {
+        !progress.stage.terminal() && l.fresh(now) && l.entered_at >= progress.started_at
+    })
+}
+
 /// What a stage is waiting on, in words.
-fn waiting_on(progress: &Progress) -> String {
+fn waiting_on(progress: &Progress, lease: Option<&HandoverLease>) -> String {
     match progress.stage {
-        Stage::Replaced => "serve() observing the handover signal and calling hand_over \
-                            (hand_over has not recorded `parking`)"
+        Stage::Replaced => "hand_over to start (HANDOVER was signalled; hand_over has left no \
+                            record that it was entered)"
             .to_owned(),
-        Stage::Parking => match &progress.parked_run {
-            Some(run) => format!("the loop to finish run {run} at its next node boundary"),
-            None => "the loop to stop (no run was recorded as in flight)".to_owned(),
-        },
+        Stage::Parking => {
+            let run = lease
+                .and_then(|l| l.parked_run.as_ref())
+                .or(progress.parked_run.as_ref());
+            match run {
+                Some(run) => format!("the loop to finish run {run} at its next node boundary"),
+                None => "the loop to stop (no run was recorded as in flight)".to_owned(),
+            }
+        }
         Stage::Restarting => "spawn_successor returning and this process exiting".to_owned(),
         Stage::Downloading => "the release download and binary replacement".to_owned(),
         Stage::Done | Stage::Failed => String::new(),
     }
 }
 
-/// Pure: whether `progress` is stuck at `now`.
+/// Seconds `hand_over` has been alive and waiting, when `lease` proves it.
 #[must_use]
-pub fn stall(progress: &Progress, now: Timestamp) -> Option<Stall> {
-    let limit = match progress.stage {
-        Stage::Replaced | Stage::Restarting => STALL_AFTER_SECS,
-        Stage::Parking => PARKING_STALL_AFTER_SECS,
-        Stage::Downloading | Stage::Done | Stage::Failed => return None,
+pub fn waited_secs(lease: &HandoverLease, now: Timestamp) -> i64 {
+    (now.as_second() - lease.entered_at.as_second()).max(0)
+}
+
+/// Pure: whether `progress` is stuck at `now`.
+///
+/// A fresh lease means `hand_over` is alive and waiting on the loop, which is
+/// legitimate for as long as the run's node takes, so it is never stuck.
+#[must_use]
+pub fn stall(progress: &Progress, lease: Option<&HandoverLease>, now: Timestamp) -> Option<Stall> {
+    if progress.stage.terminal() || progress.stage == Stage::Downloading {
+        return None;
+    }
+    if live_lease(progress, lease, now).is_some() {
+        return None;
+    }
+    // A stale lease for this upgrade means hand_over was alive and went quiet.
+    let stale = lease.filter(|l| l.entered_at >= progress.started_at);
+    let (kind, since) = match (progress.stage, stale) {
+        (_, Some(l)) => (StallKind::StoppedBeating, l.beat_at),
+        (Stage::Replaced, None) => (StallKind::NeverEntered, progress.updated_at),
+        _ => (StallKind::StoppedBeating, progress.updated_at),
     };
-    let age_secs = stage_age_secs(progress, now);
+    let age_secs = (now.as_second() - since.as_second()).max(0);
+    let limit = if stale.is_some() {
+        LEASE_TTL_SECS
+    } else {
+        STALL_AFTER_SECS
+    };
     (age_secs > limit).then(|| Stall {
         stage: progress.stage,
+        kind,
         age_secs,
-        waiting_on: waiting_on(progress),
+        waiting_on: waiting_on(progress, lease),
     })
 }
 
@@ -486,7 +713,12 @@ pub struct Watchdog {
 impl Watchdog {
     /// Look at the record at `now`. `None` means stay quiet: terminal, too
     /// early, or already spoken within [`HEARTBEAT_SECS`] for this stage.
-    pub fn tick(&mut self, progress: &Progress, now: Timestamp) -> Option<Beat> {
+    pub fn tick(
+        &mut self,
+        progress: &Progress,
+        lease: Option<&HandoverLease>,
+        now: Timestamp,
+    ) -> Option<Beat> {
         if progress.stage.terminal() {
             self.last = None;
             return None;
@@ -494,10 +726,11 @@ impl Watchdog {
         if self.last.is_some_and(|(stage, _)| stage != progress.stage) {
             self.last = None;
         }
-        let stalled = stall(progress, now);
-        // `parking` is allowed to be long, but says what it waits on; the
-        // other stages are silent until they are stalled.
-        if stalled.is_none() && progress.stage != Stage::Parking {
+        let stalled = stall(progress, lease, now);
+        let alive = live_lease(progress, lease, now);
+        // A live `hand_over` is allowed to wait long, but says what it waits
+        // on; the other stages are silent until they are stalled.
+        if stalled.is_none() && alive.is_none() && progress.stage != Stage::Parking {
             return None;
         }
         if let Some((_, at)) = self.last
@@ -506,12 +739,12 @@ impl Watchdog {
             return None;
         }
         self.last = Some((progress.stage, now));
-        let age = stage_age_secs(progress, now);
+        let age = alive.map_or_else(|| stage_age_secs(progress, now), |l| waited_secs(l, now));
         let (warn, message) = match &stalled {
             Some(s) => (
                 true,
                 format!(
-                    "stuck in {:?} for {} min {} s, waiting on {}",
+                    "stuck in {:?} for {} min {} s without progress, waiting on {}",
                     s.stage,
                     s.age_secs / 60,
                     s.age_secs % 60,
@@ -524,7 +757,7 @@ impl Watchdog {
                     "parking for {} min {} s, waiting on {}",
                     age / 60,
                     age % 60,
-                    waiting_on(progress)
+                    waiting_on(progress, lease)
                 ),
             ),
         };
@@ -589,7 +822,8 @@ pub fn spawn_watchdog(home: PathBuf) {
                 let Some(progress) = read_progress(&home) else {
                     continue;
                 };
-                let Some(beat) = dog.tick(&progress, Timestamp::now()) else {
+                let lease = read_lease(&home);
+                let Some(beat) = dog.tick(&progress, lease.as_ref(), Timestamp::now()) else {
                     continue;
                 };
                 if beat.warn {
@@ -624,6 +858,8 @@ pub fn reconcile_after_restart(home: &Path) {
     let Some(mut progress) = read_progress(home) else {
         return;
     };
+    // Whoever held it is not this process.
+    let _ = std::fs::remove_file(lease_path(home));
     if progress.stage.terminal() {
         return;
     }
@@ -934,39 +1170,142 @@ mod tests {
     fn staged(stage: Stage, since: i64) -> Progress {
         let mut p = Progress::new("0.1.0".to_owned(), "v0.2.0".to_owned());
         p.stage = stage;
+        p.started_at = at(since);
         p.updated_at = at(since);
         p
     }
 
+    fn lease(entered: i64, beat: i64) -> HandoverLease {
+        HandoverLease {
+            entered_at: at(entered),
+            beat_at: at(beat),
+            parked_run: Some("r1".to_owned()),
+        }
+    }
+
     #[test]
-    fn stall_has_a_threshold_per_stage_and_is_silent_when_terminal() {
+    fn a_handover_never_entered_is_stuck_and_says_only_what_is_known() {
         let p = staged(Stage::Replaced, 1000);
-        assert!(stall(&p, at(1000 + STALL_AFTER_SECS)).is_none());
-        let s = stall(&p, at(1000 + STALL_AFTER_SECS + 1)).expect("stalled");
+        assert!(stall(&p, None, at(1000 + STALL_AFTER_SECS)).is_none());
+        let s = stall(&p, None, at(1000 + STALL_AFTER_SECS + 1)).expect("stalled");
         assert_eq!(s.stage, Stage::Replaced);
+        assert_eq!(s.kind, StallKind::NeverEntered);
         assert_eq!(s.age_secs, STALL_AFTER_SECS + 1);
         assert!(s.waiting_on.contains("hand_over"), "{}", s.waiting_on);
 
         let p = staged(Stage::Restarting, 1000);
-        assert!(stall(&p, at(1000 + STALL_AFTER_SECS + 1)).is_some());
-
-        let p = staged(Stage::Parking, 1000);
-        assert!(
-            stall(&p, at(1000 + 3600)).is_none(),
-            "an hour of parking is normal"
-        );
-        assert!(stall(&p, at(1000 + PARKING_STALL_AFTER_SECS + 1)).is_some());
+        let s = stall(&p, None, at(1000 + STALL_AFTER_SECS + 1)).expect("stalled");
+        assert_eq!(s.kind, StallKind::StoppedBeating);
 
         for stage in [Stage::Done, Stage::Failed, Stage::Downloading] {
-            assert!(stall(&staged(stage, 0), at(1_000_000)).is_none());
+            assert!(stall(&staged(stage, 0), None, at(1_000_000)).is_none());
         }
+    }
+
+    #[test]
+    fn a_live_parking_wait_is_never_stuck_however_long_it_lasts() {
+        let mut p = staged(Stage::Parking, 1000);
+        p.started_at = at(900);
+        let hours = 5 * 3600;
+        let l = lease(1000, 1000 + hours);
+        assert!(stall(&p, Some(&l), at(1000 + hours + 10)).is_none());
+        // Even a record that regressed to `replaced` is read through the lease.
+        let r = staged(Stage::Replaced, 1000);
+        assert!(stall(&r, Some(&l), at(1000 + hours + 10)).is_none());
+        // Once the beat stops, it is stuck, and says so.
+        let s = stall(&p, Some(&l), at(1000 + hours + LEASE_TTL_SECS + 1)).expect("stuck");
+        assert_eq!(s.kind, StallKind::StoppedBeating);
+    }
+
+    #[test]
+    fn a_lease_from_an_earlier_upgrade_proves_nothing() {
+        let p = staged(Stage::Replaced, 2000);
+        let old = lease(10, 3000);
+        assert!(live_lease(&p, Some(&old), at(3001)).is_none());
+    }
+
+    #[test]
+    fn a_stage_never_goes_backwards_but_a_new_upgrade_after_a_terminal_one_starts() {
+        let parking = staged(Stage::Parking, 1000);
+        for back in [Stage::Replaced, Stage::Downloading, Stage::Parking] {
+            let mut cand = staged(back, 5000);
+            cand.to = Some("v9.9.9".to_owned());
+            let kept = monotonic(Some(&parking), &cand);
+            assert_eq!(kept.stage, Stage::Parking);
+            assert_eq!(kept.updated_at, at(1000));
+            assert_eq!(kept.started_at, parking.started_at);
+            assert_eq!(kept.to.as_deref(), Some("v9.9.9"), "data is refreshed");
+        }
+        assert_eq!(
+            monotonic(Some(&parking), &staged(Stage::Restarting, 5000)).stage,
+            Stage::Restarting
+        );
+        assert_eq!(
+            monotonic(Some(&parking), &staged(Stage::Failed, 5000)).stage,
+            Stage::Failed
+        );
+        let done = staged(Stage::Done, 1000);
+        assert_eq!(
+            monotonic(Some(&done), &staged(Stage::Downloading, 5000)).stage,
+            Stage::Downloading
+        );
+    }
+
+    #[test]
+    fn write_progress_refuses_a_regression_on_disk() {
+        let home = tempfile::tempdir().expect("temp home");
+        write_progress(home.path(), &staged(Stage::Parking, 1000)).expect("write");
+        write_progress(home.path(), &staged(Stage::Replaced, 5000)).expect("write");
+        let on_disk = read_progress(home.path()).expect("record");
+        assert_eq!(on_disk.stage, Stage::Parking);
+        assert_eq!(on_disk.updated_at, at(1000));
+    }
+
+    #[test]
+    fn a_failed_request_cannot_overwrite_a_live_handover() {
+        let home = tempfile::tempdir().expect("temp home");
+        write_progress(home.path(), &staged(Stage::Parking, 1000)).expect("write");
+        assert!(!fail_progress(home.path(), "boom").expect("fail"));
+        assert_eq!(read_progress(home.path()).unwrap().stage, Stage::Parking);
+        write_progress(home.path(), &staged(Stage::Replaced, 1000)).ok();
+        let fresh = tempfile::tempdir().expect("temp home");
+        write_progress(fresh.path(), &staged(Stage::Downloading, 1000)).expect("write");
+        assert!(fail_progress(fresh.path(), "boom").expect("fail"));
+        assert_eq!(read_progress(fresh.path()).unwrap().stage, Stage::Failed);
+    }
+
+    #[test]
+    fn entering_parking_is_one_step_that_keeps_the_lease_newer_than_the_record() {
+        let home = tempfile::tempdir().expect("temp home");
+        write_progress(home.path(), &staged(Stage::Replaced, 1000)).expect("write");
+        let (guard, recorded) = LeaseGuard::enter_parking(home.path());
+        assert!(recorded);
+        let p = read_progress(home.path()).expect("record");
+        assert_eq!(p.stage, Stage::Parking);
+        let l = read_lease(home.path()).expect("lease");
+        assert!(l.entered_at >= p.started_at);
+        assert!(!fail_progress(home.path(), "boom").expect("fail"));
+        drop(guard);
+    }
+
+    #[test]
+    fn the_lease_guard_writes_beats_and_removes_the_lease() {
+        let home = tempfile::tempdir().expect("temp home");
+        {
+            let mut guard = LeaseGuard::enter(home.path(), Some("r1".to_owned()));
+            let first = read_lease(home.path()).expect("lease");
+            assert_eq!(first.parked_run.as_deref(), Some("r1"));
+            guard.beat();
+            assert!(read_lease(home.path()).is_some());
+        }
+        assert!(read_lease(home.path()).is_none());
     }
 
     #[test]
     fn a_clock_that_went_backwards_is_age_zero() {
         let p = staged(Stage::Replaced, 5000);
         assert_eq!(stage_age_secs(&p, at(100)), 0);
-        assert!(stall(&p, at(100)).is_none());
+        assert!(stall(&p, None, at(100)).is_none());
     }
 
     #[test]
@@ -985,25 +1324,28 @@ mod tests {
     fn the_watchdog_speaks_once_a_minute_and_resets_on_a_new_stage() {
         let mut dog = Watchdog::default();
         let p = staged(Stage::Replaced, 1000);
-        assert!(dog.tick(&p, at(1060)).is_none(), "not stalled yet");
-        let beat = dog.tick(&p, at(1200)).expect("stalled");
+        assert!(dog.tick(&p, None, at(1060)).is_none(), "not stalled yet");
+        let beat = dog.tick(&p, None, at(1200)).expect("stalled");
         assert!(beat.warn);
-        assert!(dog.tick(&p, at(1230)).is_none(), "spoke 30 s ago");
-        assert!(dog.tick(&p, at(1260)).is_some(), "a minute later");
+        assert!(dog.tick(&p, None, at(1230)).is_none(), "spoke 30 s ago");
+        assert!(dog.tick(&p, None, at(1260)).is_some(), "a minute later");
 
         let parking = staged(Stage::Parking, 1260);
+        let l = lease(1260, 1270);
         let beat = dog
-            .tick(&parking, at(1270))
+            .tick(&parking, Some(&l), at(1275))
             .expect("parking heartbeat at once");
-        assert!(!beat.warn, "a short park is not a warning");
-        assert!(dog.tick(&parking, at(1300)).is_none());
-        let late = dog
-            .tick(&parking, at(1260 + PARKING_STALL_AFTER_SECS + 1))
-            .expect("past the parking ceiling");
-        assert!(late.warn);
+        assert!(!beat.warn, "a live wait is not a warning");
+        assert!(dog.tick(&parking, Some(&l), at(1300)).is_none());
+        let l = lease(1260, 1260 + 4 * 3600);
+        let later = dog
+            .tick(&parking, Some(&l), at(1260 + 4 * 3600 + 5))
+            .expect("heartbeat");
+        assert!(!later.warn, "hours of waiting on a run is still not stuck");
+        assert!(later.message.contains("r1"), "{}", later.message);
 
         let done = staged(Stage::Done, 0);
-        assert!(dog.tick(&done, at(9_999_999)).is_none());
+        assert!(dog.tick(&done, None, at(9_999_999)).is_none());
     }
 
     #[test]
