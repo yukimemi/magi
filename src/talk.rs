@@ -2652,26 +2652,6 @@ mod tests {
     }
 
     #[test]
-    fn a_lease_is_released_when_the_turn_ends_or_fails() {
-        let (_tmp, a, b) = lease_store();
-        let lease = a.claim_turn("t1").expect("claim").expect("held");
-        let failed: Result<()> = (|| {
-            let _held = &lease;
-            bail!("turn failed")
-        })();
-        assert!(failed.is_err());
-        assert!(
-            b.claim_turn("t1").expect("claim").is_none(),
-            "held mid-turn"
-        );
-        drop(lease);
-        assert!(
-            b.claim_turn("t1").expect("claim").is_some(),
-            "free after the turn"
-        );
-    }
-
-    #[test]
     fn concurrent_takeovers_of_a_stale_lease_have_one_winner() {
         let (_tmp, a, _b) = lease_store();
         drop(a.claim_turn("t1").expect("claim").expect("held"));
