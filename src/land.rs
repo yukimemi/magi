@@ -3960,6 +3960,7 @@ pub async fn fix_round(
                 prompt: &prompt,
                 timeout: Duration::from_secs(state.config.graph.timeout_fix),
                 allow_write: true,
+                unsandboxed: false,
                 sessions: state.config.graph.sessions,
                 artifacts: &artifacts,
                 stem: &stem,

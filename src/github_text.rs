@@ -692,6 +692,7 @@ async fn ask_judge(cfg: &Config, cwd: &Path, title: &str, body: &str) -> Result<
             prompt: &prompt,
             timeout: left,
             allow_write: false,
+            unsandboxed: false,
             sessions: false,
             artifacts: &artifacts,
             stem: &format!("language-{}", spec.id),

@@ -1296,6 +1296,7 @@ async fn after_merge_inner(
             // The decision reads a diffstat and writes a verdict; it must
             // never touch a file.
             allow_write: false,
+            unsandboxed: false,
             sessions: false,
             artifacts: &artifacts,
             stem: "bump-decision",
@@ -1339,6 +1340,7 @@ async fn after_merge_inner(
                 prompt: &rewrite,
                 timeout: crate::graph::retry_budget(DECISION_TIMEOUT, true),
                 allow_write: false,
+                unsandboxed: false,
                 sessions: false,
                 artifacts: &artifacts,
                 stem: "bump-rewrite",

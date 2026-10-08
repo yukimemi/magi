@@ -29,6 +29,11 @@
 //! bigger than a small, operator-named edit to the queue, and still tells the
 //! agent to say what it changed.
 //!
+//! With `[talk] allow_write` on, a codex turn also runs unsandboxed
+//! ([`turn_access`]), as a claude turn already does under `bypassPermissions`:
+//! otherwise `magi task add` (writes to magi's queue under the home directory)
+//! or `git fetch` is refused by the sandbox. Unattended seats never get this.
+//!
 //! `--solo` rather than a plain `magi task add` is the point of pairing this
 //! module with [`crate::queue::Task::solo`]. A task that came out of a
 //! conversation the operator just had is a decision already made, not a
@@ -1433,6 +1438,8 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         Vec::new()
     };
 
+    let (allow_write, unsandboxed) = turn_access(cfg.talk.allow_write, consulted);
+
     let artifacts = store.artifacts_of(&talk.id);
     // From the transcript, not the seat: a switched agent's seat restarts at
     // zero and must not overwrite an earlier turn's artifacts.
@@ -1533,7 +1540,8 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             // `crate::config::Talk::allow_write` and this module's doc for why
             // the default keeps a conversational edit from landing in a checkout
             // no run or review can claim.
-            allow_write: cfg.talk.allow_write || consulted,
+            allow_write,
+            unsandboxed,
             sessions: cfg.graph.sessions,
             artifacts: &artifacts,
             stem: &attempt_stem,
@@ -1785,6 +1793,14 @@ fn attachment_note(store: &Talks, talk_id: &str, attachments: &[Attachment]) -> 
 /// it names `magi task add --solo` (the route this conversation always has to
 /// changing anything) and it never tells the agent to write a task *file* of
 /// its own - that would compete with filing through the queue.
+/// What a turn may do: `(allow_write, unsandboxed)`. Only the repository's own
+/// `[talk] allow_write` lifts the CLI sandbox (codex's counterpart of claude's
+/// `bypassPermissions`); a turn writable merely because a handed-over question
+/// is open keeps the sandbox and gets just the question store as a writable root.
+pub(crate) fn turn_access(talk_allow_write: bool, consulted: bool) -> (bool, bool) {
+    (talk_allow_write || consulted, talk_allow_write)
+}
+
 /// `allow_write` only ever adds an extra permission on top of that; it never
 /// removes the queue as an option, which is why both branches keep the same
 /// `# When the operator wants something done` section - `write_policy` is
@@ -2051,6 +2067,16 @@ fn new_attachment_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn turn_access_lifts_the_sandbox_only_for_the_talk_opt_in() {
+        use super::turn_access;
+        assert_eq!(turn_access(false, false), (false, false));
+        assert_eq!(turn_access(true, false), (true, true));
+        // A handed-over question opens the question store, never the sandbox.
+        assert_eq!(turn_access(false, true), (true, false));
+        assert_eq!(turn_access(true, true), (true, true));
+    }
+
     #[test]
     fn the_briefing_points_at_origin_main_not_the_working_tree() {
         let b = briefing(Path::new("/r"), "en", false);

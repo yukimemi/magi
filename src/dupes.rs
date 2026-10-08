@@ -245,6 +245,7 @@ pub async fn chain_judge(
             prompt: &body,
             timeout: left.min(JUDGE_TURN),
             allow_write: false,
+            unsandboxed: false,
             sessions: false,
             artifacts: &artifacts,
             stem: &format!("judge-{}", spec.id),
