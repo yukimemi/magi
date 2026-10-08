@@ -717,6 +717,8 @@ function fail(message, kind = null) {
 }
 
 function ok() {
+  /* Any successful fetch proves the network is back: the grace restarts. */
+  resetUnreachable();
   show($("alert"), false);
 }
 
@@ -1308,11 +1310,11 @@ function applyLoop(view) {
   renderLoop();
 }
 
-async function loadLoop() {
+async function loadLoop({ background = false } = {}) {
   try {
     applyLoop(await getJson(API.loop));
   } catch (error) {
-    fail(`Could not read the loop: ${error.message}`);
+    failFor(background, `Could not read the loop: ${error.message}`, error);
   }
 }
 
@@ -5297,7 +5299,7 @@ function talkShell(id, summary) {
   };
 }
 
-async function loadTalk(id) {
+async function loadTalk(id, { background = false } = {}) {
   const wait = state.talkWaits.get(id);
   const observed = wait && { generation: wait.generation, startedAt: Date.now() };
   try {
@@ -5327,7 +5329,7 @@ async function loadTalk(id) {
       return;
     }
     if (state.talkDetail.id === id) {
-      fail(`Could not load conversation ${shortId(id)}: ${error.message}`);
+      failFor(background, `Could not load conversation ${shortId(id)}: ${error.message}`, error);
     }
   }
 }
@@ -8230,7 +8232,7 @@ function loadQueue(change) {
   });
 }
 
-async function loadStats() {
+async function loadStats({ background = false } = {}) {
   try {
     const url = state.statsRepo
       ? `${API.stats}?repo=${encodeURIComponent(state.statsRepo)}`
@@ -8239,7 +8241,7 @@ async function loadStats() {
     renderStats();
     ok();
   } catch (error) {
-    failBackground(`Could not load stats: ${error.message}`, error);
+    failFor(background, `Could not load stats: ${error.message}`, error);
   }
 }
 
@@ -8430,6 +8432,12 @@ function failBackground(message, error) {
   }
 }
 
+/* A person's own action is reported at once; a refresh gets the grace. */
+function failFor(background, message, error) {
+  if (background) failBackground(message, error);
+  else fail(message);
+}
+
 /* `explicit` is for a person's own action (Retry): reported at once. */
 async function loadHealth({ applyRevisions = false, explicit = false } = {}) {
   const gen = unreachable.gen;
@@ -8472,7 +8480,7 @@ async function loadHealth({ applyRevisions = false, explicit = false } = {}) {
   }
 }
 
-async function loadRun(id) {
+async function loadRun(id, { background = false } = {}) {
   const fresh = state.detail.id !== id;
   if (fresh) state.detail = { id, run: null, report: null, reportView: null };
   renderRunDetail();
@@ -8487,7 +8495,7 @@ async function loadRun(id) {
     state.detail.run = run.value;
     ok();
   } else {
-    fail(`Could not load run ${shortId(id)}: ${run.reason.message}`);
+    failFor(background, `Could not load run ${shortId(id)}: ${run.reason.message}`, run.reason);
   }
   state.detail.report = report.status === "fulfilled"
     ? report.value
@@ -8532,13 +8540,13 @@ async function applyRevisions_(source) {
   }
   if (runsRev !== state.rev.runs || queueRev !== state.rev.queue) {
     jobs.push(loadRuns({ rev: runsRev, delta: queueRev === state.rev.queue ? source.runs_delta : null }));
-    if (state.route.name === "run" && state.detail.id) jobs.push(loadRun(state.detail.id));
+    if (state.route.name === "run" && state.detail.id) jobs.push(loadRun(state.detail.id, { background: true }));
   }
   /* A task's page lists its runs' statuses, so either stream moving can stale it. */
   if (taskStale && state.taskDetail.id) {
-    jobs.push(loadTask(state.taskDetail.id));
+    jobs.push(loadTask(state.taskDetail.id, { background: true }));
   }
-  if (statsStale && state.route.name === "stats") jobs.push(loadStats());
+  if (statsStale && state.route.name === "stats") jobs.push(loadStats({ background: true }));
   if (questionsRev !== state.rev.questions) {
     state.rev.questions = questionsRev;
     jobs.push(loadQuestions());
@@ -8552,14 +8560,14 @@ async function applyRevisions_(source) {
      reaches a phone whose own POST is still outstanding. */
   if (talksRev !== state.rev.talks) {
     jobs.push(loadTalks({ rev: talksRev, delta: source.talks_delta }));
-    if (state.route.name === "talk" && state.talkDetail.id && !state.talkDetail.gone) jobs.push(loadTalk(state.talkDetail.id));
+    if (state.route.name === "talk" && state.talkDetail.id && !state.talkDetail.gone) jobs.push(loadTalk(state.talkDetail.id, { background: true }));
   }
   /* Bumped by this process whenever the loop it owns starts, stops, claims or
      finishes, so a phone learns about a tap it did not make. Guarded on the
      field existing: a payload without it must not refetch every tick. */
   if (source.loop_rev !== undefined && source.loop_rev !== state.rev.loop) {
     state.rev.loop = source.loop_rev;
-    jobs.push(loadLoop());
+    jobs.push(loadLoop({ background: true }));
   }
   if (jobs.length) {
     const saidBefore = saidAt;
@@ -8996,7 +9004,7 @@ function renderSettings() {
  * Everything here comes from GET /api/queue/{id}: the server reads every run
  * in Task.runs and says what kind of attempt each was and how it ended, so
  * this only lays it out. */
-async function loadTask(id) {
+async function loadTask(id, { background = false } = {}) {
   if (state.taskDetail.id !== id) state.taskDetail = { id, task: null, error: null };
   renderTask();
   try {
@@ -9008,7 +9016,7 @@ async function loadTask(id) {
   } catch (e) {
     if (state.taskDetail.id !== id) return;
     state.taskDetail.error = e.message;
-    fail(`Could not load task ${shortId(id)}: ${e.message}`);
+    failFor(background, `Could not load task ${shortId(id)}: ${e.message}`, e);
   }
   renderTask();
 }

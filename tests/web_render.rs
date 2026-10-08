@@ -1287,7 +1287,7 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
       window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
-        return { state, loadHealth, resumeConnection, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter };
+        return { state, loadHealth, loadLoop, loadStats, resumeConnection, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
     })()"#,
@@ -1486,9 +1486,22 @@ async fn unreachable_banner_waits_out_transient_failures() {
         }
         await deck.loadQueue();
         out.storeQuiet = !shown();
+        await deck.loadLoop({ background: true });
+        out.loopQuiet = !shown();
+        await deck.loadStats();
+        out.statsExplicit = shown();
         window.fetch = native;
         await deck.loadHealth();
         out.cleared = !shown();
+        window.fetch = async () => { throw new TypeError('Failed to fetch'); };
+        deck.resumeConnection();
+        clock += 1000; await deck.loadHealth();
+        clock += 10000; await deck.loadHealth();
+        window.fetch = native;
+        await deck.loadStats();
+        window.fetch = async () => { throw new TypeError('Failed to fetch'); };
+        clock += 10000; await deck.loadHealth();
+        out.successResets = !shown();
         deck.resumeConnection();
         window.fetch = async () => { throw new TypeError('Failed to fetch'); };
         Object.defineProperty(Navigator.prototype, 'onLine', { get: () => false, configurable: true });
@@ -1515,6 +1528,9 @@ async fn unreachable_banner_waits_out_transient_failures() {
     assert_eq!(r["persisted"], true);
     assert_eq!(r["offlineHides"], true);
     assert_eq!(r["storeQuiet"], true);
+    assert_eq!(r["loopQuiet"], true);
+    assert_eq!(r["statsExplicit"], true);
+    assert_eq!(r["successResets"], true);
     assert_eq!(r["cleared"], true);
     assert_eq!(r["offline"], false);
     assert_eq!(r["stale"], false);
