@@ -303,6 +303,7 @@ mod tests {
         Question,
         Talk,
     ) {
+        crate::run::set_home(crate::run::test_home());
         let (tmp, store, talk) = talks();
         let questions = Questions::at(tmp.path().join("questions"));
         let mut q = question("implement");
