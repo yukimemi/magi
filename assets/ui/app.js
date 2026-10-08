@@ -778,10 +778,12 @@ function startCost(loop) {
 
 /* Has `upgrade` been busy longer than this page is willing to wait quietly?
    See `UPGRADE_WAIT_LIMIT_MS` for why that ceiling is where it is. */
-function upgradeOverdue(upgrade) {
+function upgradeOverdue(upgrade, reachable = true) {
   /* A handover that is alive and waiting on a run is not overdue, however
-     long the run's node takes. */
-  if (upgrade.handover_alive === true) return false;
+     long the run's node takes - but only while the deck still answers: the
+     last value seen before it went away says "alive" even if the successor
+     never comes up, so an unreachable deck is judged on elapsed time alone. */
+  if (reachable && upgrade.handover_alive === true) return false;
   const startedAt = Date.parse(upgrade.started_at);
   return Number.isFinite(startedAt) && Date.now() - startedAt > UPGRADE_WAIT_LIMIT_MS;
 }
@@ -8360,7 +8362,7 @@ $("notifications-read-all").addEventListener("click", () =>
 function reportUnreachableDuringUpgrade(error) {
   const upgradeInfo = state.health && state.health.upgrade;
   if (!upgradeInfo || !UPGRADE_BUSY_STAGES.has(upgradeInfo.stage)) return false;
-  if (upgradeOverdue(upgradeInfo)) {
+  if (upgradeOverdue(upgradeInfo, false)) {
     fail(`Cannot reach magi: ${error.message}. It was replacing itself with ${upgradeInfo.to || "a new release"} and has not come back in over an hour — check on it by hand.`);
     return true;
   }

@@ -2463,16 +2463,9 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
             tracing::error!("the upgrade did not complete: {e:#}");
             lock_or_recover(&looping).resume_after_handover = false;
             // A failure of this attempt says nothing about a handover an
-            // earlier request already has in flight; leave that one's record.
-            if let Some(mut progress) = updater::read_progress(&home)
-                && !matches!(
-                    progress.stage,
-                    updater::Stage::Parking | updater::Stage::Restarting
-                )
-            {
-                progress.fail(format!("{e:#}"));
-                let _ = updater::write_progress(&home, &progress);
-            }
+            // earlier request already has in flight; checked and written
+            // under the progress lock.
+            let _ = updater::fail_progress(&home, &format!("{e:#}"));
         }
     });
 

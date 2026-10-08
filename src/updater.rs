@@ -366,6 +366,10 @@ pub fn monotonic(current: Option<&Progress>, candidate: &Progress) -> Progress {
 /// poll and must never see a half-written one.
 pub fn write_progress(home: &Path, progress: &Progress) -> Result<()> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    write_progress_locked(home, progress)
+}
+
+fn write_progress_locked(home: &Path, progress: &Progress) -> Result<()> {
     let path = progress_path(home);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -376,6 +380,24 @@ pub fn write_progress(home: &Path, progress: &Progress) -> Result<()> {
     std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
     Ok(())
+}
+
+/// Record `detail` as the failure of the upgrade request that is asking,
+/// unless a handover is already in flight (`parking` / `restarting`): that
+/// handover is not this request's to fail. The check and the write happen
+/// under the same lock as [`write_progress`], so a handover that records
+/// `parking` in between cannot be overwritten. Returns whether it was written.
+pub fn fail_progress(home: &Path, detail: &str) -> Result<bool> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut progress) = read_progress(home) else {
+        return Ok(false);
+    };
+    if matches!(progress.stage, Stage::Parking | Stage::Restarting) {
+        return Ok(false);
+    }
+    progress.fail(detail);
+    write_progress_locked(home, &progress)?;
+    Ok(true)
 }
 
 /// The last upgrade this deck recorded, if it has ever started one.
@@ -1218,6 +1240,19 @@ mod tests {
         let on_disk = read_progress(home.path()).expect("record");
         assert_eq!(on_disk.stage, Stage::Parking);
         assert_eq!(on_disk.updated_at, at(1000));
+    }
+
+    #[test]
+    fn a_failed_request_cannot_overwrite_a_live_handover() {
+        let home = tempfile::tempdir().expect("temp home");
+        write_progress(home.path(), &staged(Stage::Parking, 1000)).expect("write");
+        assert!(!fail_progress(home.path(), "boom").expect("fail"));
+        assert_eq!(read_progress(home.path()).unwrap().stage, Stage::Parking);
+        write_progress(home.path(), &staged(Stage::Replaced, 1000)).ok();
+        let fresh = tempfile::tempdir().expect("temp home");
+        write_progress(fresh.path(), &staged(Stage::Downloading, 1000)).expect("write");
+        assert!(fail_progress(fresh.path(), "boom").expect("fail"));
+        assert_eq!(read_progress(fresh.path()).unwrap().stage, Stage::Failed);
     }
 
     #[test]
