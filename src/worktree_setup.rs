@@ -44,13 +44,17 @@ pub async fn prepare(cfg: &Config, repo: &Path, wt: &Path) -> Result<()> {
         return Ok(());
     }
     let total = steps.len();
+    let mut copied: Vec<String> = Vec::new();
     for (i, step) in steps.iter().enumerate() {
         let n = i + 1;
         let what = step.describe();
         match (&step.copy, &step.run) {
-            (Some(spec), None) => copy_step(repo, wt, spec, step.optional)
-                .await
-                .with_context(|| format!("worktree setup step {n}/{total} ({what}) failed"))?,
+            (Some(spec), None) => {
+                let made = copy_step(repo, wt, spec, step.optional)
+                    .await
+                    .with_context(|| format!("worktree setup step {n}/{total} ({what}) failed"))?;
+                copied.extend(made);
+            }
             (None, Some(command)) => {
                 let secs = step
                     .timeout_secs
@@ -62,7 +66,7 @@ pub async fn prepare(cfg: &Config, repo: &Path, wt: &Path) -> Result<()> {
             _ => bail!("worktree setup step {n}/{total} must set exactly one of copy / run"),
         }
     }
-    seal(wt).await.context("worktree setup")
+    seal(wt, &copied).await.context("worktree setup")
 }
 
 /// `src -> dst`, or just `path` for the same path on both sides.
@@ -107,7 +111,8 @@ pub fn validate_copy(spec: &str) -> Result<()> {
     valid_destination(dst)
 }
 
-async fn copy_step(repo: &Path, wt: &Path, spec: &str, optional: bool) -> Result<()> {
+/// Returns the destination when this call created it.
+async fn copy_step(repo: &Path, wt: &Path, spec: &str, optional: bool) -> Result<Option<String>> {
     let (src, dst) = split_copy(spec);
     validate_copy(spec)?;
     let src_path = if Path::new(src).is_absolute() {
@@ -130,7 +135,7 @@ async fn copy_step(repo: &Path, wt: &Path, spec: &str, optional: bool) -> Result
     }
     let data = match tokio::fs::read(&src_path).await {
         Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && optional => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && optional => return Ok(None),
         Err(e) => bail!("cannot read source {}: {e}", src_path.display()),
     };
     if let Some(parent) = dst_path.parent() {
@@ -155,9 +160,9 @@ async fn copy_step(repo: &Path, wt: &Path, spec: &str, optional: bool) -> Result
                     .await
                     .ok();
             }
-            Ok(())
+            Ok(Some(dst.trim_start_matches("./").to_owned()))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
         Err(e) => bail!("cannot create {}: {e}", dst_path.display()),
     }
 }
@@ -271,7 +276,7 @@ pub async fn unstage_products(wt: &Path) -> Result<()> {
 
 /// After the steps: refuse tracked edits, record the untracked products and
 /// hide them from `git add`.
-async fn seal(wt: &Path) -> Result<()> {
+async fn seal(wt: &Path, copied: &[String]) -> Result<()> {
     let tracked = git::git(wt, &["diff", "--name-only", "HEAD"]).await?;
     if !tracked.trim().is_empty() {
         bail!(
@@ -282,7 +287,14 @@ async fn seal(wt: &Path) -> Result<()> {
     }
     let out = git::git(wt, &["ls-files", "-z", "--others", "--exclude-standard"]).await?;
     let mut paths: Vec<String> = withheld_paths(wt).await;
-    for p in out.split('\0').filter(|p| !p.is_empty()) {
+    // Copied files are recorded even when `.gitignore` hides them from
+    // `--exclude-standard`: a later `git add -f` or an edited ignore rule must
+    // still not carry them into a commit.
+    for p in copied
+        .iter()
+        .map(String::as_str)
+        .chain(out.split('\0').filter(|p| !p.is_empty()))
+    {
         if !paths.iter().any(|q| q == p) {
             paths.push(p.to_owned());
         }
@@ -297,8 +309,7 @@ async fn seal(wt: &Path) -> Result<()> {
         raw.push(0);
     }
     tokio::fs::write(dir.join(RECORD), raw).await?;
-    hide(wt, &dir, &paths).await;
-    Ok(())
+    hide(wt, &dir, &paths).await
 }
 
 fn exclude_line(p: &str) -> String {
@@ -313,9 +324,19 @@ fn exclude_line(p: &str) -> String {
 }
 
 /// Point this worktree's `core.excludesFile` at its products, keeping the
-/// user's own excludes. Best effort: needs `extensions.worktreeConfig`, and
-/// the rescue commits' [`unstage_products`] holds when it is not on.
-async fn hide(wt: &Path, dir: &Path, paths: &[String]) {
+/// user's own excludes. Needs `extensions.worktreeConfig`, which the caller
+/// takes with `git::acquire_worktree_config`; without it `--worktree` would
+/// write the shared config and change the operator's checkout, so that is a
+/// loud failure, never a fallback.
+async fn hide(wt: &Path, dir: &Path, paths: &[String]) -> Result<()> {
+    let ext = git::git_raw(wt, &["config", "--get", "extensions.worktreeConfig"]).await?;
+    if !(ext.ok() && ext.stdout.trim() == "true") {
+        bail!(
+            "setup left untracked files ({}) but extensions.worktreeConfig is off, so they \
+             cannot be hidden from `git add` per worktree",
+            paths.join(", ")
+        );
+    }
     let file = dir.join(EXCLUDE);
     let file_s = file.to_string_lossy().replace('\\', "/");
     let current = git::git_raw(wt, &["config", "--get", "core.excludesFile"])
@@ -347,12 +368,10 @@ async fn hide(wt: &Path, dir: &Path, paths: &[String]) {
             body.push('\n');
         }
     }
-    if std::fs::write(&file, body).is_err() {
-        return;
-    }
-    if let Err(e) = git::git(wt, &["config", "--worktree", "core.excludesFile", &file_s]).await {
-        tracing::debug!("worktree setup: products not hidden from git add: {e:#}");
-    }
+    std::fs::write(&file, body).with_context(|| format!("write {}", file.display()))?;
+    git::git(wt, &["config", "--worktree", "core.excludesFile", &file_s])
+        .await
+        .map(|_| ())
 }
 
 impl SetupStep {
@@ -411,6 +430,8 @@ mod tests {
         git::worktree_add_detached(&repo, &wt, "HEAD")
             .await
             .unwrap();
+        // What `prep` and the other callers take before setup runs.
+        git::acquire_worktree_config(&repo).await.unwrap();
         (tmp, repo, wt)
     }
 
@@ -528,7 +549,6 @@ mod tests {
     #[tokio::test]
     async fn products_are_kept_out_of_both_commit_paths() {
         let (_t, repo, wt) = scratch().await;
-        git::acquire_worktree_config(&repo).await.unwrap();
         std::fs::write(repo.join("secret"), "s\n").unwrap();
         prepare(&cfg(vec![copy("secret")]), &repo, &wt)
             .await
@@ -555,19 +575,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(files.trim(), "work.txt");
-        git::release_worktree_config(&repo).await.unwrap();
     }
 
     #[tokio::test]
-    async fn the_rescue_commits_hold_without_worktree_config() {
+    async fn products_without_worktree_config_fail_loudly_and_leave_shared_config_alone() {
         let (_t, repo, wt) = scratch().await;
+        git::release_worktree_config(&repo).await.unwrap();
         std::fs::write(repo.join("secret"), "s\n").unwrap();
-        prepare(&cfg(vec![copy("secret")]), &repo, &wt)
+        let err = format!(
+            "{:#}",
+            prepare(&cfg(vec![copy("secret")]), &repo, &wt)
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains("worktreeConfig"), "{err}");
+        let shared = git::git_raw(&repo, &["config", "--get", "core.excludesFile"])
             .await
             .unwrap();
+        assert!(!shared.ok(), "shared config was written: {}", shared.stdout);
+    }
+
+    #[tokio::test]
+    async fn an_ignored_copy_is_still_withheld_from_commits() {
+        let (_t, repo, wt) = scratch().await;
+        std::fs::write(wt.join(".gitignore"), ".env\n").unwrap();
+        git::git(&wt, &["add", ".gitignore"]).await.unwrap();
+        git::git(&wt, &["commit", "-m", "ignore"]).await.unwrap();
+        std::fs::write(repo.join(".env"), "s\n").unwrap();
+        prepare(&cfg(vec![copy(".env")]), &repo, &wt).await.unwrap();
+        assert_eq!(withheld_paths(&wt).await, [".env"]);
+        // The agent force-adds it, then magi rescues.
+        git::git(&wt, &["add", "-f", ".env"]).await.unwrap();
         std::fs::write(wt.join("work.txt"), "w\n").unwrap();
-        let r = git::rescue_commit(&wt, "rescue").await.unwrap();
-        assert!(r.committed);
+        assert!(git::commit_all(&wt, "rescue").await.unwrap());
         let files = git::git(&wt, &["show", "--name-only", "--format=", "HEAD"])
             .await
             .unwrap();
