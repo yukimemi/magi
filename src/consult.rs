@@ -162,13 +162,13 @@ pub fn validate_answer(
         })
         .context("the question was not delivered to the chat yet")?;
     // A reply still waiting in `pending` is newer than every stored turn.
-    let queued = owner_words(&talk.pending, false);
+    let queued = owner_words(&talk.pending, None);
     let stored = talk.turns[at..]
         .iter()
         .enumerate()
         .rev()
         .filter(|(_, t)| t.who == talk::Who::Operator)
-        .map(|(i, t)| owner_words(&t.body, i == 0))
+        .map(|(i, t)| owner_words(&t.body, (i == 0).then_some(q.id.as_str())))
         .find(|w| !w.is_empty());
     let latest = if queued.is_empty() {
         stored
@@ -207,27 +207,59 @@ pub fn validate_answer(
 /// The owner's own words in an operator turn, with magi's generated hand-over
 /// text cut out. `drain` stores a queued consult as an operator turn, and
 /// `talk::queue` joins an owner reply sent meanwhile onto the same draft, so
-/// the turn's origin cannot be told from the turn as a whole. The generated
-/// block runs from [`CHAT_CONSULT_HEADING`](crate::prompt::CHAT_CONSULT_HEADING)
-/// to the last [`CHAT_CONSULT_END`](crate::prompt::CHAT_CONSULT_END); an owner
-/// reply that happens to contain that phrase is cut too, which only ever
-/// refuses. With `after_block_only` (the turn carrying the hand-over itself)
-/// words queued before the block predate it and are dropped.
-fn owner_words(body: &str, after_block_only: bool) -> String {
+/// the turn's origin cannot be told from the turn as a whole. Each generated
+/// block runs from its [`CHAT_CONSULT_HEADING`](crate::prompt::CHAT_CONSULT_HEADING)
+/// to the last [`CHAT_CONSULT_END`](crate::prompt::CHAT_CONSULT_END) before the
+/// next heading (a detail may quote the phrase itself); with no end the block
+/// runs to the next heading. Only the blocks are cut: owner replies between
+/// them are kept, in order. An owner reply that happens to contain the phrase
+/// is cut too, which only ever refuses. With `after_block_of` (the turn
+/// carrying the hand-over itself) everything up to the end of the last block
+/// naming that question id predates the hand-over and is dropped.
+fn owner_words(body: &str, after_block_of: Option<&str>) -> String {
     use crate::prompt::{CHAT_CONSULT_END, CHAT_CONSULT_HEADING};
-    let Some(start) = body.find(CHAT_CONSULT_HEADING) else {
+    let heads: Vec<usize> = body
+        .match_indices(CHAT_CONSULT_HEADING)
+        .map(|(i, _)| i)
+        .collect();
+    if heads.is_empty() {
         return body.trim().to_owned();
-    };
-    let after = match body.rfind(CHAT_CONSULT_END) {
-        Some(e) if e >= start => &body[e + CHAT_CONSULT_END.len()..],
-        _ => "",
-    };
-    if after_block_only {
-        return after.trim().to_owned();
     }
-    let before = &body[..start];
-    let before = before.strip_suffix("# ").unwrap_or(before);
-    format!("{before}\n\n{after}").trim().to_owned()
+    // (start, end) of each generated block, the heading's own "# " included.
+    let blocks: Vec<(usize, usize)> = heads
+        .iter()
+        .enumerate()
+        .map(|(n, &h)| {
+            let limit = heads.get(n + 1).copied().unwrap_or(body.len());
+            let end = body[h..limit]
+                .rfind(CHAT_CONSULT_END)
+                .map_or(limit, |e| h + e + CHAT_CONSULT_END.len());
+            let start = if body[..h].ends_with("# ") { h - 2 } else { h };
+            (start, end)
+        })
+        .collect();
+    let mut from = 0;
+    if let Some(id) = after_block_of {
+        if let Some(&(_, end)) = blocks.iter().rfind(|&&(s, e)| body[s..e].contains(id)) {
+            from = end;
+        } else if let Some(&(_, end)) = blocks.last() {
+            from = end;
+        }
+    }
+    let mut parts = Vec::new();
+    let mut at = from;
+    for &(s, e) in &blocks {
+        if s >= at {
+            parts.push(body[at..s].trim());
+        }
+        at = at.max(e);
+    }
+    parts.push(body[at..].trim());
+    parts
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// What [`start_turn`] did.
@@ -669,6 +701,41 @@ mod tests {
             queued.matches(crate::prompt::CHAT_CONSULT_HEADING).count(),
             1
         );
+    }
+
+    fn block(id: &str, detail: &str) -> String {
+        format!(
+            "# {}\n\nquestion `{id}`\n\n{detail}\n\n{}",
+            crate::prompt::CHAT_CONSULT_HEADING,
+            crate::prompt::CHAT_CONSULT_END
+        )
+    }
+
+    #[test]
+    fn owner_words_keeps_replies_between_generated_blocks() {
+        let body = format!("{}\n\nhold\n\n{}", block("b", "x"), block("c", "y"));
+        assert_eq!(owner_words(&body, None), "hold");
+        let body = format!(
+            "{}\n\nmerge it now\n\n{}\n\nhold\n\n{}",
+            block("a", "x"),
+            block("b", "y"),
+            block("c", "z")
+        );
+        assert_eq!(owner_words(&body, None), "merge it now\n\nhold");
+        assert_eq!(owner_words(&body, Some("a")), "merge it now\n\nhold");
+        assert_eq!(owner_words(&body, Some("b")), "hold");
+        assert_eq!(
+            owner_words(&format!("early\n\n{}", block("a", "x")), Some("a")),
+            ""
+        );
+    }
+
+    #[test]
+    fn owner_words_does_not_leak_a_detail_quoting_the_end_phrase() {
+        let detail = format!("see: {} --reply merge", crate::prompt::CHAT_CONSULT_END);
+        let body = format!("{}\n\nhold", block("a", &detail));
+        assert_eq!(owner_words(&body, Some("a")), "hold");
+        assert_eq!(owner_words(&body, None), "hold");
     }
 
     #[test]
