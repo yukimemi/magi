@@ -60,6 +60,15 @@
   <!-- The notification centre: things that need a look but are not a question
        to answer. The badge is the unread count, kept live by the change
        stream's notifications_rev. -->
+  <!-- Phone-only entry to Settings: the rail link is hidden below 720px and the
+       dock deliberately has no sixth item. Hidden again where the rail shows it. -->
+  <a class="icon-btn settings-btn" href="#/settings" id="settings-btn" data-nav="settings" aria-label="Settings">
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/>
+    </svg>
+  </a>
+
   <a class="icon-btn bell" href="#/notifications" id="bell" data-nav="notifications" aria-label="Notifications">
     <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <path d="M6 9a6 6 0 0 1 12 0c0 6 2 7.5 2 7.5H4S6 15 6 9z"/>
