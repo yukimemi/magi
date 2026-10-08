@@ -162,7 +162,7 @@ pub fn validate_answer(
         })
         .context("the question was not delivered to the chat yet")?;
     // A reply still waiting in `pending` is newer than every stored turn.
-    let queued = owner_words(&talk.pending, true);
+    let queued = owner_words(&talk.pending, false);
     let stored = talk.turns[at..]
         .iter()
         .enumerate()
@@ -683,6 +683,20 @@ mod tests {
         // So does a reply still waiting in the draft.
         talk.turns[n - 1].body = format!("{queued}\n\nmerge it now");
         talk.pending = "hold".into();
+        store.put(&mut talk).unwrap();
+        assert!(
+            validate_answer(
+                &q,
+                &store,
+                &talk.id,
+                CHAT_NODE,
+                "merge",
+                Some("merge it now")
+            )
+            .is_err()
+        );
+        // Another question's hand-over queued after the retraction hides nothing.
+        talk.pending = format!("hold\n\n{queued}");
         store.put(&mut talk).unwrap();
         assert!(
             validate_answer(
