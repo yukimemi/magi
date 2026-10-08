@@ -38,16 +38,39 @@ pub fn origin_talk(tasks: &[Task], talks: &[Talk], q: &Question) -> Option<Talk>
         return None;
     }
     let task = crate::daemon::task_of_question(tasks, q)?;
-    let Source::Agent { run, node } = &task.source else {
+    let Source::Agent { run, .. } = &chat_origin(tasks, task)?.source else {
         return None;
     };
-    if node != CHAT_NODE {
-        return None;
-    }
     talks
         .iter()
         .find(|t| &t.id == run && t.status.open())
         .cloned()
+}
+
+/// Walk the provenance of `start` to the task a chat filed.
+///
+/// A follow-up goes to the task its merged run served: `FollowUp::origin_task`
+/// when recorded (a missing one ends the walk - guessing another task could
+/// hand the question to an unrelated chat), else the task whose `runs` hold
+/// `FollowUp::run`. At most `MAX_FOLLOWUP_GENERATION + 1` tasks are looked at,
+/// each once, so a cycle ends in `None`.
+fn chat_origin<'a>(tasks: &'a [Task], start: &'a Task) -> Option<&'a Task> {
+    let mut seen = std::collections::HashSet::new();
+    let mut cur = start;
+    for _ in 0..=crate::followup::MAX_FOLLOWUP_GENERATION {
+        if !seen.insert(cur.id.as_str()) {
+            return None;
+        }
+        if matches!(&cur.source, Source::Agent { node, .. } if node == CHAT_NODE) {
+            return Some(cur);
+        }
+        let f = cur.followup.as_ref()?;
+        cur = match &f.origin_task {
+            Some(id) => tasks.iter().find(|t| &t.id == id)?,
+            None => tasks.iter().find(|t| t.runs.contains(&f.run))?,
+        };
+    }
+    None
 }
 
 /// Is any question handed to talk `talk_id` still open?
@@ -270,6 +293,80 @@ mod tests {
         let mut q = question(crate::conduct::NODE);
         q.run = chat.id.clone();
         assert!(origin_talk(&[chat], &[talk], &q).is_some());
+    }
+
+    fn followup_of(parent: &Task, n: u32) -> Task {
+        let mut t = Task::new(
+            "f".to_owned(),
+            "Fix".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Agent {
+                run: format!("merged-{n}"),
+                node: "followup".to_owned(),
+            },
+        );
+        t.start(format!("run-f{n}"));
+        t.followup = Some(crate::queue::FollowUp {
+            run: format!("merged-{n}"),
+            origin_task: Some(parent.id.clone()),
+            pr: "https://example.invalid/pr/1".to_owned(),
+            findings: Vec::new(),
+            generation: n,
+        });
+        t
+    }
+
+    fn q_for(t: &Task) -> Question {
+        let mut q = question("implement");
+        q.run = t.runs[0].clone();
+        q
+    }
+
+    #[test]
+    fn a_followup_traces_back_to_the_chat() {
+        let (_tmp, _store, talk) = talks();
+        let mut chat = from_chat(&talk);
+        chat.runs = vec!["chat-run".to_owned()];
+        let f1 = followup_of(&chat, 1);
+        let f2 = followup_of(&f1, 2);
+        let ts = [chat, f1.clone(), f2.clone()];
+        let id = Some(talk.id.clone());
+        let tk = std::slice::from_ref(&talk);
+        assert_eq!(origin_talk(&ts, tk, &q_for(&f1)).map(|t| t.id), id);
+        assert_eq!(origin_talk(&ts, tk, &q_for(&f2)).map(|t| t.id), id);
+    }
+
+    #[test]
+    fn a_followup_without_origin_task_is_found_through_runs() {
+        let (_tmp, _store, talk) = talks();
+        let mut chat = from_chat(&talk);
+        chat.runs = vec!["merged-1".to_owned()];
+        let mut f1 = followup_of(&chat, 1);
+        f1.followup.as_mut().unwrap().origin_task = None;
+        let q = q_for(&f1);
+        assert!(origin_talk(&[chat, f1], &[talk], &q).is_some());
+    }
+
+    #[test]
+    fn a_dangling_origin_task_has_no_chat() {
+        let (_tmp, _store, talk) = talks();
+        let mut chat = from_chat(&talk);
+        chat.runs = vec!["chat-run".to_owned()];
+        let mut f1 = followup_of(&chat, 1);
+        f1.followup.as_mut().unwrap().origin_task = Some("gone".to_owned());
+        let q = q_for(&f1);
+        assert!(origin_talk(&[chat, f1], &[talk], &q).is_none());
+    }
+
+    #[test]
+    fn a_followup_cycle_ends_without_a_chat() {
+        let (_tmp, _store, talk) = talks();
+        let mut a = followup_of(&from_chat(&talk), 1);
+        let mut b = followup_of(&a, 2);
+        a.followup.as_mut().unwrap().origin_task = Some(b.id.clone());
+        b.followup.as_mut().unwrap().origin_task = Some(a.id.clone());
+        let q = q_for(&a);
+        assert!(origin_talk(&[a, b], &[talk], &q).is_none());
     }
 
     #[test]
