@@ -153,7 +153,7 @@ pub fn validate_answer(
         .turns
         .iter()
         .rev()
-        .find(|t| t.who == talk::Who::Operator)
+        .find(|t| t.who == talk::Who::Operator && !is_generated_consult(&t.body))
         .context("no owner message in the consulted chat")?;
     let quote = quote
         .map(str::trim)
@@ -173,6 +173,12 @@ pub fn validate_answer(
         );
     }
     Ok(())
+}
+
+/// `talk::drain` stores the queued consult text as an operator turn; it is
+/// magi's own wording (it even contains the word `merge`), never the owner's.
+fn is_generated_consult(body: &str) -> bool {
+    body.contains(crate::prompt::CHAT_CONSULT_HEADING)
 }
 
 /// What [`start_turn`] did.
@@ -573,6 +579,11 @@ mod tests {
             attachments: Vec::new(),
             usage: None,
         };
+        // The drained consult draft is stored as an operator turn; it must not
+        // count as the owner's words even though it contains "merge".
+        talk.turns.push(owner_turn(&queued));
+        store.put(&mut talk).unwrap();
+        assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, "merge", Some("merge")).is_err());
         talk.turns
             .push(owner_turn("Merge this pull request please"));
         store.put(&mut talk).unwrap();
