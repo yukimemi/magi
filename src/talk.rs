@@ -1521,10 +1521,18 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             // No session to hold the persona: the transcript never stores it,
             // so a non-default persona is re-sent on every such turn (the
             // update block already carries it when the choice just changed).
-            let standing = match (&persona, talk.persona_dirty) {
+            let mut standing = match (&persona, talk.persona_dirty) {
                 (Some(p), false) => format!("{}\n", crate::persona::section_for(p, operator_name)),
                 _ => persona_update.clone(),
             };
+            // The default voice has no persona section to carry the name, and
+            // the transcript never stores the briefing's addressing line.
+            if let (None, Some(n)) = (&persona, operator_name) {
+                standing.push_str(&format!(
+                    "# Addressing the operator\n{}\n",
+                    crate::persona::addressing(n)
+                ));
+            }
             format!("{}\n\n{standing}{text}{last_note}", transcript(talk, store))
         };
         let attempt_stem = if n == 0 {
