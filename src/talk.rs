@@ -824,8 +824,7 @@ fn lease_blocks(path: &Path, now: Timestamp) -> bool {
 /// Does this error mean the filesystem has no hard links (as opposed to an
 /// ordinary I/O failure, which must not be hidden by a fallback)?
 fn link_unsupported(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::Unsupported
-        || (cfg!(windows) && e.raw_os_error() == Some(1))
+    e.kind() == std::io::ErrorKind::Unsupported || (cfg!(windows) && e.raw_os_error() == Some(1))
 }
 
 /// Publish the finished file `tmp` (holding `body`) at `path` unless `path`
@@ -2808,7 +2807,10 @@ mod tests {
         let path = lock.path.clone();
         std::fs::write(&path, "someone-else").expect("replace");
         drop(lock);
-        assert_eq!(std::fs::read_to_string(&path).expect("kept"), "someone-else");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("kept"),
+            "someone-else"
+        );
     }
 
     #[test]
