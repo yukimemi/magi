@@ -91,11 +91,12 @@
     <span class="daemon-text">Connecting…</span>
     <span class="daemon-why" id="loop-why" hidden></span>
   </span>
+  <!-- Opens the explanation for touch screens, where the tooltip on
+       .daemon-body is unreachable. Hidden while there is nothing to explain. -->
+  <button class="daemon-more" type="button" id="loop-more" aria-expanded="false" aria-controls="loop-why" aria-label="Show details" hidden>i</button>
   <!-- One grid cell, always, whatever mix of the version chip and the up to
-       three buttons below happen to be visible. Letting each of those be its
-       own grid item let their count change the number of items in the row,
-       which is what put the button on a row of its own with a stray gap
-       beside it — see .daemon-controls in app.css. -->
+       three buttons below happen to be visible, so the strip stays one slim
+       row — see .daemon-controls in app.css. -->
   <span class="daemon-controls" id="loop-controls">
     <!-- Which build is answering. This strip is already about this process
          and it carries Update & restart, so after an upgrade the operator

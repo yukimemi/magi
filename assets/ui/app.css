@@ -301,76 +301,77 @@ a { color: inherit; text-decoration: none; }
 [data-theme="dark"] .theme-glyph { background: none; box-shadow: inset -5px 0 0 currentColor; }
 
 /* ---- loop strip -------------------------------------------------------- *
- * A two-row grid on a narrow screen: dot + sentence on row one, and a single
- * .daemon-controls cell spanning both columns on row two, holding the build
- * chip and whichever button is live. That wrapper is a fix, not decoration:
- * the old markup put the chip and each of the three buttons directly in this
- * grid, so how many of them happened to be visible changed the item count,
- * and with a wide `waiting/working` sentence, `Working … 4 tasks done`
- * plus a visible version chip filled all three >=720px columns before the
- * button was even placed - auto-placement then wrapped it to a new row at
- * column 1, and because column 1 is an `auto` track it widened to fit the
- * button's own label, which is what shoved the dot away from the text above
- * it too. One wrapper that is always exactly one grid item can't wrap on its
- * own, which is why .daemon-controls exists instead of sizing .daemon-btn
- * more carefully. */
+ * One slim line: dot, status sentence (ellipsised), an (i) toggle and the
+ * .daemon-controls cluster (build chip + live buttons). The cluster is always
+ * exactly one grid item, so how many of its children are visible never changes
+ * the item count. The long explanation (#loop-why) is folded away: it is the
+ * tooltip of .daemon-body, opens under the line via the (i) toggle
+ * (data-more), and opens by itself for a failure, an upgrade note or a stop
+ * waiting for its second tap. */
 .daemon {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
-  gap: var(--s1) var(--s3);
-  padding: var(--s2) var(--s4);
-  padding-left: calc(var(--s4) + env(safe-area-inset-left));
-  padding-right: calc(var(--s4) + env(safe-area-inset-right));
+  gap: 0 var(--s2);
+  padding: var(--s1) var(--s3);
+  padding-left: calc(var(--s3) + env(safe-area-inset-left));
+  padding-right: calc(var(--s3) + env(safe-area-inset-right));
   background: var(--sunk);
   border-bottom: 1px solid var(--line);
-  font-size: var(--t2); color: var(--ink-2);
-  min-height: 34px;
+  font-size: var(--t1); color: var(--ink-2);
+  min-height: 26px;
 }
 .daemon-dot {
-  width: 10px; height: 10px; flex: none; border-radius: 50%;
+  width: 8px; height: 8px; flex: none; border-radius: 50%;
   background: var(--ink-3);
-  box-shadow: 0 0 0 3px var(--surface);
-  /* Aligned to the first line of the sentence rather than centred in a block
-     that may be three lines tall: a dot floating beside the explanation reads
-     as a bullet for it. */
-  align-self: start; margin-top: .4em;
+  box-shadow: 0 0 0 2px var(--surface);
 }
-.daemon-body { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.daemon-text { min-width: 0; }
+.daemon-body { min-width: 0; display: block; }
+.daemon-text { display: block; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .daemon-text b { color: var(--ink); font-weight: 650; }
 .daemon-run { font-family: var(--mono); font-size: var(--t1); }
-/* What the control is about to spend, or why there is no control. Small, but
-   never the same colour as the dot: it is a sentence to read, not a hint to
-   skip. */
 .daemon-why { font-size: var(--t1); }
-/* Everything that is not the status sentence: the build chip and whichever
-   of the three buttons is live, always as one grid item regardless of how
-   many of those happen to be visible (see the note above the rule block). A
-   flex row rather than another grid keeps the chip and the button reading as
-   one compact cluster instead of two more columns fighting for space. */
+.daemon:not([data-more="yes"]):not([data-state="failed"]):not([data-upgrade-failed="yes"]):not(:has([data-armed="yes"])) .daemon-why { display: none; }
+.daemon-why:not([hidden]) { display: block; }
+.daemon[data-more="yes"] .daemon-body,
+.daemon[data-state="failed"] .daemon-body,
+.daemon[data-upgrade-failed="yes"] .daemon-body,
+.daemon:has([data-armed="yes"]) .daemon-body { grid-column: 1 / -1; grid-row: 2; padding: 2px 0 var(--s1); }
+/* An expanded strip is where failures are read: let the sentence wrap. */
+.daemon[data-more="yes"] .daemon-text,
+.daemon[data-state="failed"] .daemon-text,
+.daemon[data-upgrade-failed="yes"] .daemon-text,
+.daemon:has([data-armed="yes"]) .daemon-text { white-space: normal; overflow: visible; text-overflow: clip; }
+.daemon-more {
+  appearance: none; border: 1px solid var(--line-2); background: transparent; color: var(--ink-3);
+  width: 16px; height: 16px; padding: 0; border-radius: 50%;
+  font: italic 600 10px/1 var(--mono); cursor: pointer;
+}
+.daemon-more[aria-expanded="true"] { color: var(--ink); border-color: var(--ink-3); }
 .daemon-controls {
-  grid-column: 1 / -1;
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: var(--s1) var(--s2);
+  gap: var(--s2);
 }
-/* The build answering this page. Monospace because it is an exact string an
-   operator compares against a release tag, and quiet because it is a fact to
-   check rather than something to read on every glance. */
+.daemon-controls:has([data-armed="yes"]) { grid-column: 1 / -1; grid-row: 3; flex-wrap: wrap; }
 .daemon-version {
   font-family: var(--mono);
-  font-size: var(--t1);
+  font-size: .6875rem;
   color: var(--ink-3);
   white-space: nowrap;
 }
-.daemon-btn {
-  flex: 1 1 auto;
-  font-size: var(--t3);
-  background: var(--surface); border-color: var(--edge); color: var(--ink);
+.daemon:has(#loop-park:not([hidden])) .daemon-version,
+.daemon:has(#loop-upgrade:not([hidden])) .daemon-version { display: none; }
+.daemon .daemon-btn {
+  flex: none;
+  font-size: var(--t1);
+  min-height: 0; height: 22px; padding: 0 var(--s2);
+  background: transparent; border-color: transparent; color: var(--ink-2);
+  text-decoration: underline; text-underline-offset: 2px;
+  white-space: nowrap;
 }
-.daemon-btn[data-kind="start"] { background: var(--fill); border-color: var(--gold-line); color: #241d05; }
+@media (pointer: coarse) { .daemon .daemon-btn { height: 32px; } }
+.daemon .daemon-btn[data-kind="start"] { color: var(--ink); font-weight: 650; }
 
 .daemon[data-state="working"] { background: var(--tint-blue); color: var(--on-blue); border-bottom-color: var(--tint-blue); }
 .daemon[data-state="working"] .daemon-dot { background: var(--on-blue); animation: pulse 1.8s var(--ease) infinite; box-shadow: 0 0 0 2px var(--tint-blue), 0 0 0 3px var(--on-blue); }
@@ -399,7 +400,7 @@ a { color: inherit; text-decoration: none; }
 .daemon[data-state="failed"] { background: var(--tint-rust); color: var(--on-rust); border-bottom-color: var(--tint-rust); }
 .daemon[data-state="failed"] .daemon-dot { background: var(--on-rust); box-shadow: 0 0 0 2px var(--tint-rust), 0 0 0 3px var(--on-rust); }
 .daemon[data-state="failed"] .daemon-text b { color: var(--on-rust); }
-.daemon[data-state="failed"] .daemon-btn { background: var(--surface); border-color: var(--on-rust); color: var(--ink); }
+.daemon[data-state="failed"] .daemon-btn { color: var(--ink); }
 /* This deck's own upgrade, in flight. The same blue as "working": it is work
    in progress, not a fault, and a fault colour here would make an ordinary
    restart look like an incident. */
@@ -1991,19 +1992,6 @@ details.panel > summary + * { margin-top: var(--s2); }
   body { padding-bottom: var(--s6); }
   .dock { display: none; }
   .rail { display: flex; align-items: center; gap: var(--s1); }
-  /* With room, the controls return to the end of the same row: a full-width
-     button across a 1280px strip would read as a banner, not a switch.
-     .daemon-controls — not .daemon-btn — is what gets the third column, and
-     it is the only thing that ever could: the chip and every button are its
-     children, not the grid's, so there is exactly one item competing for
-     that column no matter how many of them are visible. Giving .daemon-btn
-     itself `grid-column: auto` here was the actual bug on this page, not
-     just at the narrow width — a fourth item (dot, body, chip, button) over
-     three template columns wrapped the button to a new row at column 1
-     instead of the column 3 this comment always intended. */
-  .daemon { grid-template-columns: auto minmax(0, 1fr) auto; }
-  .daemon-controls { grid-column: auto; flex-wrap: nowrap; }
-  .daemon-btn { flex: none; width: auto; }
   .rail-link {
     display: inline-flex; align-items: center;
     min-height: var(--tap); padding: 0 var(--s3);
