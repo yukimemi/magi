@@ -69,6 +69,7 @@ specific one:
 | reviewers | ×`reviewers` (default 3) | `reviewers` | `[graph] reviewers`, `review_rounds` | yes |
 | fixer (review loop and land loop) | ×1, only when findings block | `fixer` *(unset falls back to the winner's own seat)* | — | yes |
 | chatter (`magi chat`, `magi bump`) | ×1 per turn | `chatter` *(unset falls back to a claude seat, else roster order)* | — | yes |
+| language_judge (PR title / body English check) | ×1 per check, only when set | `language_judge` *(optional; unset spawns nothing and the built-in heuristics decide, as they do after a failed, timed-out or unparsable call)* | `[graph] github_text_guard` | yes |
 | tally / fold / gate / merge | n/a — no agent seat | — | `[verify] gate`, `[graph] land`, `land_approval` | n/a |
 
 **Role lists are also an ordered backup list.** An array-valued `implementers`,
@@ -81,8 +82,8 @@ rotated). The rest are spares: when a seat's agent fails or hits quota,
 that seat's position to the right, preferring agents no other seat holds and
 trying each agent at most once per call. A reviewer seat can additionally
 retry an agent that failed it earlier once the forward entries are used up.
-This is separate from the fallback chains of `synthesizer`, `chatter` and
-`fixer`.
+This is separate from the fallback chains of `synthesizer`, `chatter`,
+`fixer` and `language_judge`.
 
 ## What makes the judging blind
 
@@ -750,6 +751,10 @@ reviewers = ["opus", "opencode"]
 # runnable agent in roster order. Name one explicitly if that agent is also a
 # judge seat — Chat is opened far more often than any single competition and
 # would otherwise compete with that judge for the same account.
+# language_judge = "jev"  # kind = "command" wrapper deciding if PR text is English; unset keeps the built-in heuristics
+# "jev" is an example name for such a wrapper, not a built-in agent. When unset,
+# or when the call fails, times out or returns an unparsable reply, the PR text
+# guard falls back to the built-in heuristics.
 
 [graph]
 implementers = 3
