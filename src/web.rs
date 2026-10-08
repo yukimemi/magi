@@ -318,6 +318,9 @@ pub struct Ui {
     /// progress record is written, so two taps cannot both start an upgrade.
     /// After that `upgrade.json` carries the exclusion.
     upgrade_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Set once an upgrade task is spawned, cleared when it fails. Keeps the
+    /// exclusion in memory for when `upgrade.json` could not be written.
+    upgrade_spawned: Arc<std::sync::atomic::AtomicBool>,
     /// Runs this process is resuming right now.
     ///
     /// Separate from `talk_turns` because a run and a talk are different
@@ -412,6 +415,7 @@ impl Ui {
             worktrees_root: run::default_worktree_root(),
             talk_turns: Arc::default(),
             upgrade_gate: Arc::default(),
+            upgrade_spawned: Arc::default(),
             resuming: Arc::default(),
             repos_cache: repos::Cache::new(),
             machine_config: Config::machine_layer(),
@@ -2394,6 +2398,12 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
             "another request is already preparing an upgrade",
         ));
     };
+    if ui.upgrade_spawned.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(ApiError::conflict(
+            "an upgrade is already in progress (this process started one and it \
+             has not finished or failed yet)",
+        ));
+    }
     let recorded = updater::read_progress(&ui.home);
     if let Some(p) = upgrade_in_motion(recorded.as_ref()) {
         return Err(ApiError::conflict(format!(
@@ -2486,9 +2496,13 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
 
     let home = ui.home.clone();
     let looping = ui.looping();
+    ui.upgrade_spawned
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let spawned = Arc::clone(&ui.upgrade_spawned);
     tokio::spawn(async move {
         if let Err(e) = upgrade_and_restart(home.clone()).await {
             tracing::error!("the upgrade did not complete: {e:#}");
+            spawned.store(false, std::sync::atomic::Ordering::SeqCst);
             lock_or_recover(&looping).resume_after_handover = false;
             // A failure of this attempt says nothing about a handover an
             // earlier request already has in flight; checked and written
