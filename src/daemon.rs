@@ -1215,7 +1215,7 @@ pub struct Verdict {
 ///
 /// | run status                           | task becomes        | attempt spent |
 /// |---------------------------------------|---------------------|---------------|
-/// | parked at a boundary                  | `Failed` (requeued) | **no**        |
+/// | parked at a boundary                  | `Parked` (requeued) | **no**        |
 /// | `Merged`, `Ready`                      | `Done`               | yes          |
 /// | `AlreadyInBase`                        | `Done`, with a note  | **no**        |
 /// | `Stalled`, quota hit                   | `Failed` (requeued) | **no**        |
@@ -1275,7 +1275,7 @@ fn settle_in(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usiz
     // again - and so that swapping the binary a few times cannot exhaust a
     // budget meant for agents that actually misbehaved.
     if verdict.parked {
-        task.stall(detail);
+        task.park(detail);
         return;
     }
     match verdict.status {
@@ -3775,7 +3775,7 @@ where
     }
 }
 
-/// Is `task` a failed task whose last run was parked at a node boundary, so
+/// Is `task` a parked (or, from an older build, failed) task whose last run was parked at a node boundary, so
 /// that [`attempt`] will resume it on its own?
 ///
 /// Mirrors [`unfinished_run_with`]'s own conditions (plus `parked`, and no
@@ -3786,7 +3786,11 @@ fn awaiting_resume_with<F>(task: &Task, load: F) -> bool
 where
     F: FnOnce(&str) -> Result<RunState>,
 {
-    if task.status != TaskStatus::Failed || task.fresh_start || task.review_branch.is_some() {
+    // `Failed` stays: a record an older build wrote for a parked run.
+    if !matches!(task.status, TaskStatus::Parked | TaskStatus::Failed)
+        || task.fresh_start
+        || task.review_branch.is_some()
+    {
         return false;
     }
     let Some(id) = task.runs.last() else {
@@ -4872,11 +4876,13 @@ mod tests {
             parked.status.runnable(),
             "and the task stays in line so the next loop resumes its run"
         );
+        assert_eq!(parked.status, TaskStatus::Parked);
         assert_eq!(
-            parked.last_error.as_deref(),
+            parked.park_reason.as_deref(),
             Some("parked after `implementing`"),
             "the card says where it stopped"
         );
+        assert_eq!(parked.last_error, None, "nothing failed");
 
         // Without the park flag the same non-terminal status is what it always
         // was: `execute` returning mid-flight, which is a bug and spends an
@@ -6028,6 +6034,53 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_maps_a_parked_run_to_parked_without_touching_last_error() {
+        let mut t = task();
+        t.start("20260904-000000-4043".to_owned());
+        t.last_error = Some("earlier trouble".to_owned());
+        let mut state = run_state(RunStatus::Judging);
+        state.parked = true;
+        reclaim(&mut t, Some(state), 1, "en");
+        assert_eq!(t.status, TaskStatus::Parked);
+        assert_eq!(t.attempts, 0, "the park is refunded, even at max_attempts");
+        assert_eq!(t.last_error.as_deref(), Some("earlier trouble"));
+        assert!(t.park_reason.is_some());
+        assert_eq!(t.runs, ["20260904-000000-4043"], "the same run is kept");
+        assert!(!t.fresh_start);
+        assert!(t.status.runnable());
+    }
+
+    #[test]
+    fn settle_parks_a_task_without_a_failure_and_a_new_start_clears_the_reason() {
+        let mut t = task();
+        t.start("20260904-000000-4043".to_owned());
+        t.last_error = Some("earlier trouble".to_owned());
+        settle(
+            &mut t,
+            Verdict {
+                status: RunStatus::Judging,
+                left_pr: false,
+                quota_hit: false,
+                parked: true,
+                no_viable_candidates: false,
+            },
+            "parked after `judging`",
+            1,
+        );
+        assert_eq!(t.status, TaskStatus::Parked);
+        assert_eq!(t.attempts, 0);
+        assert_eq!(t.last_error.as_deref(), Some("earlier trouble"));
+        assert_eq!(t.park_reason.as_deref(), Some("parked after `judging`"));
+        assert_eq!(t.schema, crate::queue::SCHEMA);
+        assert!(
+            crate::notices::task_held(&t).is_none(),
+            "a park is not news"
+        );
+        t.start("20260904-000000-4043".to_owned());
+        assert_eq!(t.park_reason, None);
+    }
+
+    #[test]
     fn reclaim_reuses_the_same_retry_policy_as_a_live_settle() {
         // A blocked run with attempts left goes back to `Failed`, exactly as
         // it would from `attempt` itself - `reclaim` must not invent a second
@@ -7107,14 +7160,25 @@ mod tests {
         let stop = Stop::new();
         let stopper = {
             let stop = stop.clone();
+            let queue = Queue::at(dir.path().join("queue"));
+            let id = t.id.clone();
             tokio::spawn(async move {
+                // Stop once the task has demonstrably been retried, not after
+                // a fixed delay: under a loaded machine 400 ms can pass before
+                // the loop has finished a second attempt.
                 tokio::time::sleep(Duration::from_millis(400)).await;
+                for _ in 0..200 {
+                    if queue.get(&id).is_ok_and(|t| t.attempts >= 2) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 stop.stop();
             })
         };
 
         tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(20),
             drive(&opts, &queue, &status_file, &home, &worktrees, &stop),
         )
         .await
@@ -7896,6 +7960,9 @@ mod tests {
         task.runs = vec![run.id.clone()];
         let with = |t: &Task, r: &RunState| awaiting_resume_with(t, |_| Ok(r.clone()));
         assert!(with(&task, &run), "parked after judging is the case");
+        let mut parked_task = task.clone();
+        parked_task.status = TaskStatus::Parked;
+        assert!(with(&parked_task, &run), "the Parked status is the case");
 
         let mut not_parked = run.clone();
         not_parked.parked = false;

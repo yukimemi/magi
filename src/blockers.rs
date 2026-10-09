@@ -119,7 +119,10 @@ impl Inventory {
                             }
                         }
                     }
-                    TaskStatus::Queued | TaskStatus::Running | TaskStatus::Failed => {
+                    TaskStatus::Queued
+                    | TaskStatus::Running
+                    | TaskStatus::Failed
+                    | TaskStatus::Parked => {
                         moving = true;
                     }
                 },

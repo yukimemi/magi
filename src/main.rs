@@ -2862,6 +2862,9 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             if let Some(e) = &t.last_error {
                 println!("last      {e}");
             }
+            if let Some(r) = &t.park_reason {
+                println!("parked    {r}");
+            }
             if let Some(r) = &t.hold_reason {
                 println!("held for  {r}");
             }
@@ -3607,7 +3610,7 @@ async fn run_existing_task(
             task.status.as_str()
         ),
         TaskStatus::Held | TaskStatus::Done => task.release(),
-        TaskStatus::Queued | TaskStatus::Failed => {}
+        TaskStatus::Queued | TaskStatus::Failed | TaskStatus::Parked => {}
     }
     let mut overrides = task.overrides.take().unwrap_or_default();
     overrides.merge_over(&patch);
@@ -3949,8 +3952,8 @@ fn doctor_queue_and_loop(home: &Path) -> String {
     let mut s = String::new();
 
     let tasks = Queue::at(home.join("queue")).list();
-    let (mut queued, mut running, mut failed, mut held, mut done, mut blocked) =
-        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut queued, mut running, mut failed, mut held, mut done, mut blocked, mut parked) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     for t in &tasks {
         match t.status {
             TaskStatus::Queued => queued += 1,
@@ -3959,6 +3962,7 @@ fn doctor_queue_and_loop(home: &Path) -> String {
             TaskStatus::Held => held += 1,
             TaskStatus::Done => done += 1,
             TaskStatus::Blocked => blocked += 1,
+            TaskStatus::Parked => parked += 1,
         }
     }
     let _ = writeln!(
@@ -3969,7 +3973,12 @@ fn doctor_queue_and_loop(home: &Path) -> String {
         } else {
             format!(
                 "queued {queued}, running {running}, blocked {blocked}, failed {failed}, \
-                 held {held}, done {done}"
+                 held {held}, done {done}{}",
+                if parked > 0 {
+                    format!(", parked {parked}")
+                } else {
+                    String::new()
+                }
             )
         }
     );
