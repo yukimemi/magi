@@ -13331,6 +13331,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         let mut on_disk = f.talks().get(&talk).expect("get seeded talk");
         on_disk.turns.push(crate::talk::Turn {
+            breaks: Some(Vec::new()),
             who: crate::talk::Who::Operator,
             body: "a new turn".to_owned(),
             at: Timestamp::now(),

@@ -172,28 +172,22 @@ pub fn validate_answer(
         })
         .context("the question was not delivered to the chat yet")?;
     // A reply still waiting in `pending` is newer than every stored turn.
-    let queued = owner_words(&talk.pending, None);
+    let queued = latest_message(&talk.pending, talk.pending_breaks.as_deref(), None);
     let stored = talk.turns[at..]
         .iter()
         .enumerate()
         .rev()
         .filter(|(_, t)| t.who == talk::Who::Operator)
-        .map(|(i, t)| owner_words(&t.body, (i == 0).then_some(q.id.as_str())))
-        .find(|w| !w.is_empty());
-    let latest = if queued.is_empty() {
-        stored
-    } else {
-        Some(queued)
-    }
-    .context("no owner message after the question was handed to the chat")?;
-    // Replies sent while a turn runs are joined with a blank line into one
-    // turn, so the last paragraph is the only text certain to be the newest.
-    let latest = latest
-        .rsplit("\n\n")
-        .map(str::trim)
-        .find(|p| !p.is_empty())
-        .unwrap_or_default()
-        .to_owned();
+        .find_map(|(i, t)| {
+            latest_message(
+                &t.body,
+                t.breaks.as_deref(),
+                (i == 0).then_some(q.id.as_str()),
+            )
+        });
+    let latest = queued
+        .or(stored)
+        .context("no owner message after the question was handed to the chat")?;
     let quote = quote
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -212,6 +206,60 @@ pub fn validate_answer(
         );
     }
     Ok(())
+}
+
+/// The owner's newest message in a turn body (or the pending draft).
+///
+/// Replies queued while a turn runs are joined with a blank line, which an
+/// owner's own blank lines cannot be told apart from, so `talk::queue` records
+/// where each message starts (`breaks`) and the newest message is taken whole.
+/// With no usable record (a turn stored before it existed) the only safe cut is
+/// the last paragraph: that can reject a multi-paragraph approval, and can
+/// accept a `hold` that was only the last paragraph of a longer message, which
+/// is harmless because silence is a hold.
+fn latest_message(
+    body: &str,
+    breaks: Option<&[usize]>,
+    after_block_of: Option<&str>,
+) -> Option<String> {
+    let cuts = breaks.filter(|b| {
+        b.windows(2).all(|w| w[0] < w[1])
+            && b.iter().all(|&o| {
+                o >= 2 && o <= body.len() && body.is_char_boundary(o) && body[..o].ends_with("\n\n")
+            })
+    });
+    let Some(cuts) = cuts else {
+        let words = owner_words(body, after_block_of);
+        return words
+            .rsplit("\n\n")
+            .map(str::trim)
+            .find(|p| !p.is_empty())
+            .map(str::to_owned);
+    };
+    let mut starts = vec![0];
+    starts.extend_from_slice(cuts);
+    let messages: Vec<&str> = starts
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            let e = starts.get(i + 1).map_or(body.len(), |&n| n - 2);
+            &body[s..e]
+        })
+        .collect();
+    // The message carrying the hand-over: everything before it is older.
+    let first = after_block_of.map_or(0, |id| {
+        messages
+            .iter()
+            .rposition(|m| m.contains(crate::prompt::CHAT_CONSULT_HEADING) && m.contains(id))
+            .unwrap_or(0)
+    });
+    messages
+        .iter()
+        .enumerate()
+        .skip(first)
+        .rev()
+        .map(|(i, m)| owner_words(m, after_block_of.filter(|_| i == first)))
+        .find(|w| !w.is_empty())
 }
 
 /// Length of a consult stored before quoted markers were defused, which may
@@ -962,6 +1010,31 @@ mod tests {
     }
 
     #[test]
+    fn latest_message_keeps_message_boundaries() {
+        let one = "Merge this pull request now\n\nThe checks look good";
+        assert_eq!(latest_message(one, Some(&[]), None).as_deref(), Some(one));
+        let hold = "Explain what this option means:\n\nhold";
+        assert_eq!(latest_message(hold, Some(&[]), None).as_deref(), Some(hold));
+        // Two queued replies: the second is the newest, whole.
+        let two = "merge it now\n\nhold";
+        let at = "merge it now\n\n".len();
+        assert_eq!(
+            latest_message(two, Some(&[at]), None).as_deref(),
+            Some("hold")
+        );
+        // No record (stored before breaks existed): last paragraph.
+        assert_eq!(
+            latest_message(one, None, None).as_deref(),
+            Some("The checks look good")
+        );
+        // A record that does not fit the body is ignored.
+        assert_eq!(
+            latest_message(two, Some(&[999]), None).as_deref(),
+            Some("hold")
+        );
+    }
+
+    #[test]
     fn chat_consult_has_each_marker_once() {
         use crate::prompt::{CHAT_CONSULT_END as E, CHAT_CONSULT_HEADING as H};
         for node in ["implement", crate::land::APPROVAL_NODE] {
@@ -996,6 +1069,7 @@ mod tests {
         assert!(!queued.contains("answer it yourself with"));
 
         let owner_turn = |body: &str| talk::Turn {
+            breaks: Some(Vec::new()),
             who: talk::Who::Operator,
             body: body.into(),
             at: Timestamp::now(),
@@ -1027,6 +1101,7 @@ mod tests {
         // An owner reply coalesced onto the same draft still counts.
         let n = talk.turns.len();
         talk.turns[n - 1].body = format!("{queued}\n\nmerge it now");
+        talk.turns[n - 1].breaks = Some(vec![queued.len() + 2]);
         store.put(&mut talk).unwrap();
         assert!(
             validate_answer(
@@ -1041,6 +1116,7 @@ mod tests {
         );
         // A later retraction in the same coalesced turn wins.
         talk.turns[n - 1].body = format!("{queued}\n\nmerge it now\n\nhold");
+        talk.turns[n - 1].breaks = Some(vec![queued.len() + 2, queued.len() + 2 + 14]);
         store.put(&mut talk).unwrap();
         assert!(
             validate_answer(
@@ -1056,6 +1132,7 @@ mod tests {
         assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, "hold", Some("hold")).is_ok());
         // So does a reply still waiting in the draft.
         talk.turns[n - 1].body = format!("{queued}\n\nmerge it now");
+        talk.turns[n - 1].breaks = Some(vec![queued.len() + 2]);
         talk.pending = "hold".into();
         store.put(&mut talk).unwrap();
         assert!(
