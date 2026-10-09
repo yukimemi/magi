@@ -1604,8 +1604,8 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // that rests on the prompt, not the sandbox.
     // `try_home`, not `Questions::open`: a unit test that never pinned a home
     // has no store to consult, and must not abort the turn on `run::home()`.
-    let questions = crate::run::try_home()
-        .map(|home| crate::ask::Questions::at(home.join("questions")));
+    let questions =
+        crate::run::try_home().map(|home| crate::ask::Questions::at(home.join("questions")));
     let consulted = questions
         .as_ref()
         .is_some_and(|q| crate::consult::pending_consults(q, &talk.id));
