@@ -1273,7 +1273,7 @@ pub async fn serve(opts: Opts) -> Result<()> {
     tokio::spawn(run_update_recheck(repo, home.clone()));
     let looping = ui.looping();
     let turns = ui.turns();
-    let talk_repo = ui.repo.clone();
+    let talk_store = ui.talks.clone();
     let socket = SocketAddr::new(addr, opts.port);
     let listener = bind_waiting(socket).await?;
     let url = format!("http://{addr}:{}", opts.port);
@@ -1324,13 +1324,8 @@ pub async fn serve(opts: Opts) -> Result<()> {
         () = handover => {
             updater::log_step(&home, "serve: the select! woke on the handover signal");
             let successor_home = home.clone();
-            let timeout_talk = tokio::task::spawn_blocking(move || {
-                Config::discover(&talk_repo, None)
-                    .map_or_else(|_| Config::default().graph.timeout_talk, |(c, _)| c.graph.timeout_talk)
-            })
-            .await
-            .unwrap_or_else(|_| Config::default().graph.timeout_talk);
-            hand_over(&home, &looping, &turns, talk_wait_bound(timeout_talk), served, move |resume| {
+            let wait_for = move |ids: &[String]| talk_wait_for(&talk_store, ids);
+            hand_over(&home, &looping, &turns, &wait_for, served, move |resume| {
                 spawn_successor(&successor_home, resume)
             })
             .await
@@ -1426,7 +1421,7 @@ async fn hand_over(
     home: &FsPath,
     looping: &Mutex<LoopState>,
     turns: &Arc<Mutex<TalkTurns>>,
-    talk_wait: Duration,
+    talk_wait: &(dyn Fn(&[String]) -> Duration + Sync),
     served: tokio::task::JoinHandle<std::io::Result<()>>,
     successor: impl FnOnce(bool) -> Result<u32>,
 ) -> Result<()> {
@@ -1454,7 +1449,7 @@ async fn hand_over(
             _ = beat.tick() => lease.beat(),
         }
     }
-    let abandoned = talks_ended.unwrap_or_default();
+    let (abandoned, waited_for) = talks_ended.unwrap_or_default();
     drop(lease);
     updater::log_step(home, "hand_over: releasing the listener (abort and await)");
     served.abort();
@@ -1470,7 +1465,7 @@ async fn hand_over(
                 progress.detail = Some(format!(
                     "handed over while {} still running after {} s",
                     updater::talks_phrase(&abandoned),
-                    talk_wait.as_secs()
+                    waited_for.as_secs()
                 ));
             }
             updater::write_progress_logged(home, &progress);
@@ -1513,6 +1508,26 @@ fn talk_wait_bound(timeout_talk_secs: u64) -> Duration {
     Duration::from_secs(timeout_talk_secs) + TALK_PARK_GRACE
 }
 
+/// The bound for the turns of `ids`: the longest `[graph] timeout_talk` among
+/// the repositories those talks run in (each turn uses its own talk's
+/// configuration), plus the grace. A talk or config that cannot be read counts
+/// with the default timeout.
+fn talk_wait_for(talks: &Talks, ids: &[String]) -> Duration {
+    let default = Config::default().graph.timeout_talk;
+    let longest = ids
+        .iter()
+        .map(|id| {
+            talks
+                .get(id)
+                .ok()
+                .and_then(|t| Config::discover(&t.repo, None).ok())
+                .map_or(default, |(c, _)| c.graph.timeout_talk)
+        })
+        .max()
+        .unwrap_or(default);
+    talk_wait_bound(longest)
+}
+
 /// Stops new chat turns for as long as it lives, so the hand-over only ever
 /// waits on a set that cannot grow. Dropping it reopens the slots.
 struct ParkingTurns(Arc<Mutex<TalkTurns>>);
@@ -1533,10 +1548,15 @@ impl Drop for ParkingTurns {
     }
 }
 
-/// Wait until no chat turn is running in this process, for at most `bound`.
-/// Returns the talk ids still running when the bound was hit (empty when the
-/// turns finished), after saying so in the upgrade log.
-async fn finish_talks(home: &FsPath, turns: &Mutex<TalkTurns>, bound: Duration) -> Vec<String> {
+/// Wait until no chat turn is running in this process, for at most the longest
+/// `bound_for` has given for the turns seen so far. Returns the talk ids still
+/// running when the bound was hit (empty when the turns finished) with the
+/// bound that applied, after saying so in the upgrade log.
+async fn finish_talks(
+    home: &FsPath,
+    turns: &Mutex<TalkTurns>,
+    bound_for: &(dyn Fn(&[String]) -> Duration + Sync),
+) -> (Vec<String>, Duration) {
     let running = || {
         let mut ids: Vec<String> = turns
             .lock()
@@ -1550,9 +1570,11 @@ async fn finish_talks(home: &FsPath, turns: &Mutex<TalkTurns>, bound: Duration) 
     };
     let started = std::time::Instant::now();
     let mut seen = Vec::new();
+    let mut bound = Duration::ZERO;
     loop {
         let ids = running();
         if ids != seen {
+            bound = bound.max(bound_for(&ids));
             if ids.is_empty() {
                 updater::log_step(home, "finish_talks: no chat turn is running");
             } else {
@@ -1568,7 +1590,7 @@ async fn finish_talks(home: &FsPath, turns: &Mutex<TalkTurns>, bound: Duration) 
             seen = ids;
         }
         if seen.is_empty() {
-            return Vec::new();
+            return (Vec::new(), bound);
         }
         if started.elapsed() >= bound {
             updater::log_warn(
@@ -1579,7 +1601,7 @@ async fn finish_talks(home: &FsPath, turns: &Mutex<TalkTurns>, bound: Duration) 
                     bound.as_secs()
                 ),
             );
-            return seen;
+            return (seen, bound);
         }
         tokio::time::sleep(TALK_POLL).await;
     }
@@ -6734,8 +6756,19 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
             .unwrap_or(0);
         let drained = blocking({
             let talks = talks.clone();
+            let live_set = Arc::clone(&live_set);
             move || {
-                let result = talk::drain(&mut talk, &talks);
+                // Promoting a draft is what starts a turn, so it is decided
+                // under the same lock a parking upgrade takes: either the
+                // promotion lands first (and its turn is waited for) or the
+                // draft stays queued.
+                let live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
+                let result = if live.parking {
+                    Ok(None)
+                } else {
+                    talk::drain(&mut talk, &talks)
+                };
+                drop(live);
                 Ok((talk, result))
             }
         })
@@ -11175,7 +11208,7 @@ mod tests {
             home.path(),
             &looping,
             &turns,
-            Duration::from_secs(5),
+            &|_: &[String]| Duration::from_secs(5),
             served,
             |_| {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -14913,7 +14946,7 @@ mod tests {
             home.path(),
             &looping,
             &turns,
-            Duration::from_secs(5),
+            &|_: &[String]| Duration::from_secs(5),
             served,
             |_| Ok(1),
         )
@@ -14950,7 +14983,7 @@ mod tests {
                 home.path(),
                 &looping,
                 &turns,
-                Duration::from_secs(5),
+                &|_: &[String]| Duration::from_secs(5),
                 served,
                 |_| {
                     calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -15125,7 +15158,7 @@ mod tests {
                     &home,
                     &looping,
                     &turns,
-                    Duration::from_secs(60),
+                    &|_: &[String]| Duration::from_secs(60),
                     served,
                     move |_| {
                         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -15200,7 +15233,7 @@ mod tests {
             home.path(),
             &looping,
             &turns,
-            Duration::from_millis(300),
+            &|_: &[String]| Duration::from_millis(300),
             served,
             |_| {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -15277,7 +15310,7 @@ mod tests {
             home.path(),
             &looping,
             &turns,
-            Duration::from_secs(5),
+            &|_: &[String]| Duration::from_secs(5),
             served,
             |resume| {
                 *told.lock().unwrap() = Some(resume);
