@@ -1287,7 +1287,7 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
       window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
-        return { state, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter };
+        return { state, loadHealth, loadLoop, loadStats, resumeConnection, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
     })()"#,
@@ -1426,6 +1426,119 @@ async fn delta_client_merges_rows_coalesces_and_recovers() {
         .expect("failed final event retries without another notification");
     let retry = browser.eval(&page, "performance.getEntriesByType('resource').some(r => r.name.endsWith('/api/queue?test_client=1'))").await.unwrap();
     assert_eq!(retry, true);
+    browser.close_page(&page).await;
+}
+
+#[tokio::test]
+async fn unreachable_banner_waits_out_transient_failures() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP unreachable grace: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let base = serve(
+        &home,
+        queue,
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser
+        .open_page(&format!("{base}#/queue"), 1280, 900, false)
+        .await
+        .expect("page");
+    browser
+        .wait_for(
+            &page,
+            "!!document.getElementById('alert')",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("page loaded");
+    client_harness(&mut browser, &page).await;
+    let r = browser
+        .eval(
+            &page,
+            r#"(async () => {
+      const native = window.fetch, nativeNow = Date.now;
+      const onLine = Object.getOwnPropertyDescriptor(Navigator.prototype, 'onLine');
+      const shown = () => !document.getElementById('alert').hidden;
+      const out = {};
+      let clock = nativeNow.call(Date);
+      Date.now = () => clock;
+      try {
+        window.fetch = async () => { throw new TypeError('Failed to fetch'); };
+        await deck.loadHealth();
+        out.first = shown();
+        clock += 5000; await deck.loadHealth();
+        out.early = shown();
+        clock += 20000; await deck.loadHealth();
+        out.persisted = shown();
+        Object.defineProperty(Navigator.prototype, 'onLine', { get: () => false, configurable: true });
+        await deck.loadHealth();
+        out.offlineHides = !shown();
+        Object.defineProperty(Navigator.prototype, 'onLine', onLine);
+        resetStore: {
+          const gen = deck.unreachable;
+          gen.since = null; gen.failures = 0;
+        }
+        await deck.loadQueue();
+        out.storeQuiet = !shown();
+        await deck.loadLoop({ background: true });
+        out.loopQuiet = !shown();
+        await deck.loadStats();
+        out.statsExplicit = shown();
+        window.fetch = native;
+        await deck.loadHealth();
+        out.cleared = !shown();
+        window.fetch = async () => { throw new TypeError('Failed to fetch'); };
+        deck.resumeConnection();
+        clock += 1000; await deck.loadHealth();
+        clock += 10000; await deck.loadHealth();
+        window.fetch = native;
+        await deck.loadStats();
+        window.fetch = async () => { throw new TypeError('Failed to fetch'); };
+        clock += 10000; await deck.loadHealth();
+        out.successResets = !shown();
+        deck.resumeConnection();
+        window.fetch = async () => { throw new TypeError('Failed to fetch'); };
+        Object.defineProperty(Navigator.prototype, 'onLine', { get: () => false, configurable: true });
+        clock += 60000; await deck.loadHealth(); await deck.loadHealth();
+        out.offline = shown();
+        Object.defineProperty(Navigator.prototype, 'onLine', onLine);
+        const stale = deck.loadHealth();
+        deck.resumeConnection();
+        await stale;
+        await new Promise(r => setTimeout(r, 50)); out.stale = shown();
+        await deck.loadHealth({ explicit: true });
+        out.explicit = shown();
+      } finally {
+        window.fetch = native; Date.now = nativeNow;
+        Object.defineProperty(Navigator.prototype, 'onLine', onLine);
+      }
+      return out;
+    })()"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["first"], false);
+    assert_eq!(r["early"], false);
+    assert_eq!(r["persisted"], true);
+    assert_eq!(r["offlineHides"], true);
+    assert_eq!(r["storeQuiet"], true);
+    assert_eq!(r["loopQuiet"], true);
+    assert_eq!(r["statsExplicit"], true);
+    assert_eq!(r["successResets"], true);
+    assert_eq!(r["cleared"], true);
+    assert_eq!(r["offline"], false);
+    assert_eq!(r["stale"], false);
+    assert_eq!(r["explicit"], true);
     browser.close_page(&page).await;
 }
 

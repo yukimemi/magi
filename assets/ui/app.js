@@ -117,6 +117,15 @@ const UPGRADE_BUSY_STAGES = new Set(["downloading", "replaced", "parking", "rest
    skew between this page and the deck. */
 const UPGRADE_WAIT_LIMIT_MS = 70 * 60 * 1000;
 
+/* How long a background health poll may keep failing at the network level
+   before the page says it cannot reach magi. A phone drops the network in a
+   tunnel, and the first fetch after unlocking runs before the radio is back;
+   by the time anyone taps something it has recovered. Both limits must be
+   passed: failed polls count once per health load (never per parallel
+   loader), and the time runs from the first failure. */
+const UNREACHABLE_GRACE_MS = 18 * 1000;
+const UNREACHABLE_GRACE_FAILURES = 2;
+
 /* ---- status vocabulary ------------------------------------------------- *
  * Every status carries a glyph as well as a colour. `stalled` additionally
  * gets a hatched, double-bordered chip in CSS: a panel that collapsed on
@@ -700,13 +709,16 @@ const postBytes = (url, file, filename) =>
   }).then((r) => r.json());
 
 /* ---- alert ------------------------------------------------------------- */
-function fail(message) {
+function fail(message, kind = null) {
   const box = $("alert");
   setText(box.querySelector(".alert-text"), message);
+  setAttr(box, "data-kind", kind);
   show(box, true);
 }
 
 function ok() {
+  /* Any successful fetch proves the network is back: the grace restarts. */
+  resetUnreachable();
   show($("alert"), false);
 }
 
@@ -1298,11 +1310,11 @@ function applyLoop(view) {
   renderLoop();
 }
 
-async function loadLoop() {
+async function loadLoop({ background = false } = {}) {
   try {
     applyLoop(await getJson(API.loop));
   } catch (error) {
-    fail(`Could not read the loop: ${error.message}`);
+    failFor(background, `Could not read the loop: ${error.message}`, error);
   }
 }
 
@@ -5287,7 +5299,7 @@ function talkShell(id, summary) {
   };
 }
 
-async function loadTalk(id) {
+async function loadTalk(id, { background = false } = {}) {
   const wait = state.talkWaits.get(id);
   const observed = wait && { generation: wait.generation, startedAt: Date.now() };
   try {
@@ -5317,7 +5329,7 @@ async function loadTalk(id) {
       return;
     }
     if (state.talkDetail.id === id) {
-      fail(`Could not load conversation ${shortId(id)}: ${error.message}`);
+      failFor(background, `Could not load conversation ${shortId(id)}: ${error.message}`, error);
     }
   }
 }
@@ -8189,7 +8201,7 @@ function loadStore(name, url, change, apply) {
           ok();
         } catch (error) {
           state.rev[name] = null;
-          fail(`Could not load ${name}: ${error.message}`);
+          failBackground(`Could not load ${name}: ${error.message}`, error);
           // Even the final change must recover while SSE stays connected:
           // health otherwise polls without applying revisions in that state.
           cancelStoreRetry(name);
@@ -8220,7 +8232,7 @@ function loadQueue(change) {
   });
 }
 
-async function loadStats() {
+async function loadStats({ background = false } = {}) {
   try {
     const url = state.statsRepo
       ? `${API.stats}?repo=${encodeURIComponent(state.statsRepo)}`
@@ -8229,7 +8241,7 @@ async function loadStats() {
     renderStats();
     ok();
   } catch (error) {
-    fail(`Could not load stats: ${error.message}`);
+    failFor(background, `Could not load stats: ${error.message}`, error);
   }
 }
 
@@ -8261,7 +8273,7 @@ async function loadQuestions() {
     if (state.route.name === "run" && state.detail.run) renderRunDetail();
     ok();
   } catch (error) {
-    fail(`Could not load questions: ${error.message}`);
+    failBackground(`Could not load questions: ${error.message}`, error);
   }
 }
 
@@ -8278,7 +8290,7 @@ async function loadNotifications() {
     renderBell();
     ok();
   } catch (error) {
-    fail(`Could not load notifications: ${error.message}`);
+    failBackground(`Could not load notifications: ${error.message}`, error);
   }
 }
 
@@ -8381,7 +8393,54 @@ function reportUnreachableDuringUpgrade(error) {
   return true;
 }
 
-async function loadHealth({ applyRevisions = false } = {}) {
+/* Background health failures at the network level, tracked in one place.
+   `gen` moves on every resume so a slow failure from before it is ignored. */
+const unreachable = { since: null, failures: 0, gen: 0 };
+
+function resetUnreachable() {
+  unreachable.since = null;
+  unreachable.failures = 0;
+}
+
+/* Hides only the banner this grace logic raised, never a save failure. */
+function clearUnreachableBanner() {
+  const box = $("alert");
+  if (box.getAttribute("data-kind") === "unreachable") show(box, false);
+}
+
+/* The page came back (unlocked, online, restored from the back-forward
+   cache): whatever failed before is stale, so forget it and ask again now. */
+function resumeConnection() {
+  unreachable.gen += 1;
+  resetUnreachable();
+  clearUnreachableBanner();
+  loadHealth({ applyRevisions: true });
+}
+
+/* A background refresh (not a person's action) that failed. A network-level
+   failure waits out the same grace period as the health poll and shares its
+   clock; it never advances the failure count, so parallel loaders cannot
+   shorten the grace. Anything else is reported at once. */
+function failBackground(message, error) {
+  if (error.status || error instanceof SyntaxError) { fail(message); return; }
+  if (navigator.onLine === false) return;
+  const now = Date.now();
+  if (unreachable.since === null) unreachable.since = now;
+  if (unreachable.failures >= UNREACHABLE_GRACE_FAILURES
+    && now - unreachable.since >= UNREACHABLE_GRACE_MS) {
+    fail(message, "unreachable");
+  }
+}
+
+/* A person's own action is reported at once; a refresh gets the grace. */
+function failFor(background, message, error) {
+  if (background) failBackground(message, error);
+  else fail(message);
+}
+
+/* `explicit` is for a person's own action (Retry): reported at once. */
+async function loadHealth({ applyRevisions = false, explicit = false } = {}) {
+  const gen = unreachable.gen;
   try {
     state.health = await getJson(API.health);
     renderBell();
@@ -8394,13 +8453,34 @@ async function loadHealth({ applyRevisions = false } = {}) {
        answered, so the indicator is right on the very first paint. */
     renderAskBar();
     if (applyRevisions) await applyRevisions_(state.health);
+    resetUnreachable();
     ok();
   } catch (error) {
-    if (!reportUnreachableDuringUpgrade(error)) fail(`Cannot reach magi: ${error.message}`);
+    if (gen !== unreachable.gen) return;
+    const network = !error.status && !(error instanceof SyntaxError);
+    if (network && !explicit && navigator.onLine === false) {
+      /* Offline is not "magi is down"; the browser will say online again. */
+      resetUnreachable();
+      clearUnreachableBanner();
+      return;
+    }
+    if (reportUnreachableDuringUpgrade(error)) return;
+    const message = `Cannot reach magi: ${error.message}`;
+    if (!network || explicit) {
+      fail(message);
+      return;
+    }
+    const now = Date.now();
+    if (unreachable.since === null) unreachable.since = now;
+    unreachable.failures += 1;
+    if (unreachable.failures >= UNREACHABLE_GRACE_FAILURES
+      && now - unreachable.since >= UNREACHABLE_GRACE_MS) {
+      fail(message, "unreachable");
+    }
   }
 }
 
-async function loadRun(id) {
+async function loadRun(id, { background = false } = {}) {
   const fresh = state.detail.id !== id;
   if (fresh) state.detail = { id, run: null, report: null, reportView: null };
   renderRunDetail();
@@ -8415,7 +8495,7 @@ async function loadRun(id) {
     state.detail.run = run.value;
     ok();
   } else {
-    fail(`Could not load run ${shortId(id)}: ${run.reason.message}`);
+    failFor(background, `Could not load run ${shortId(id)}: ${run.reason.message}`, run.reason);
   }
   state.detail.report = report.status === "fulfilled"
     ? report.value
@@ -8460,13 +8540,13 @@ async function applyRevisions_(source) {
   }
   if (runsRev !== state.rev.runs || queueRev !== state.rev.queue) {
     jobs.push(loadRuns({ rev: runsRev, delta: queueRev === state.rev.queue ? source.runs_delta : null }));
-    if (state.route.name === "run" && state.detail.id) jobs.push(loadRun(state.detail.id));
+    if (state.route.name === "run" && state.detail.id) jobs.push(loadRun(state.detail.id, { background: true }));
   }
   /* A task's page lists its runs' statuses, so either stream moving can stale it. */
   if (taskStale && state.taskDetail.id) {
-    jobs.push(loadTask(state.taskDetail.id));
+    jobs.push(loadTask(state.taskDetail.id, { background: true }));
   }
-  if (statsStale && state.route.name === "stats") jobs.push(loadStats());
+  if (statsStale && state.route.name === "stats") jobs.push(loadStats({ background: true }));
   if (questionsRev !== state.rev.questions) {
     state.rev.questions = questionsRev;
     jobs.push(loadQuestions());
@@ -8480,14 +8560,14 @@ async function applyRevisions_(source) {
      reaches a phone whose own POST is still outstanding. */
   if (talksRev !== state.rev.talks) {
     jobs.push(loadTalks({ rev: talksRev, delta: source.talks_delta }));
-    if (state.route.name === "talk" && state.talkDetail.id && !state.talkDetail.gone) jobs.push(loadTalk(state.talkDetail.id));
+    if (state.route.name === "talk" && state.talkDetail.id && !state.talkDetail.gone) jobs.push(loadTalk(state.talkDetail.id, { background: true }));
   }
   /* Bumped by this process whenever the loop it owns starts, stops, claims or
      finishes, so a phone learns about a tap it did not make. Guarded on the
      field existing: a payload without it must not refetch every tick. */
   if (source.loop_rev !== undefined && source.loop_rev !== state.rev.loop) {
     state.rev.loop = source.loop_rev;
-    jobs.push(loadLoop());
+    jobs.push(loadLoop({ background: true }));
   }
   if (jobs.length) {
     const saidBefore = saidAt;
@@ -8924,7 +9004,7 @@ function renderSettings() {
  * Everything here comes from GET /api/queue/{id}: the server reads every run
  * in Task.runs and says what kind of attempt each was and how it ended, so
  * this only lays it out. */
-async function loadTask(id) {
+async function loadTask(id, { background = false } = {}) {
   if (state.taskDetail.id !== id) state.taskDetail = { id, task: null, error: null };
   renderTask();
   try {
@@ -8936,7 +9016,7 @@ async function loadTask(id) {
   } catch (e) {
     if (state.taskDetail.id !== id) return;
     state.taskDetail.error = e.message;
-    fail(`Could not load task ${shortId(id)}: ${e.message}`);
+    failFor(background, `Could not load task ${shortId(id)}: ${e.message}`, e);
   }
   renderTask();
 }
@@ -9373,7 +9453,8 @@ function wire() {
 
   $("alert-retry").addEventListener("click", () => {
     ok();
-    loadHealth({ applyRevisions: true });
+    resetUnreachable();
+    loadHealth({ applyRevisions: true, explicit: true });
     loadQuestions();
     if (state.route.name === "run" && state.detail.id) loadRun(state.detail.id);
     if (state.route.name === "talk" && state.talkDetail.id) loadTalk(state.talkDetail.id);
@@ -9434,12 +9515,16 @@ function wire() {
      is what stops the operator reading a snapshot from an hour ago. */
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
-    loadHealth({ applyRevisions: true });
+    resumeConnection();
     /* The talk on screen may already hold turns that arrived - and were
        fetched - while this tab was hidden, in which case revisions have not
        moved since and the load above will not touch it. Re-render it
        directly so `renderTalk`'s now-unguarded markTalkRead sees it. */
     if (state.route.name === "talk" && state.talkDetail.id) renderTalk();
+  });
+  window.addEventListener("online", resumeConnection);
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted) resumeConnection();
   });
 }
 

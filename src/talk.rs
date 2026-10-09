@@ -1602,12 +1602,16 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // as a writable root. It goes back to read-only once the question is
     // answered or abandoned. As for the deputy, what the seat may touch beyond
     // that rests on the prompt, not the sandbox.
-    let questions = crate::ask::Questions::open();
-    let consulted = crate::consult::pending_consults(&questions, &talk.id);
-    let consult_roots: Vec<PathBuf> = if consulted {
-        vec![questions.root().to_path_buf()]
-    } else {
-        Vec::new()
+    // `try_home`, not `Questions::open`: a unit test that never pinned a home
+    // has no store to consult, and must not abort the turn on `run::home()`.
+    let questions =
+        crate::run::try_home().map(|home| crate::ask::Questions::at(home.join("questions")));
+    let consulted = questions
+        .as_ref()
+        .is_some_and(|q| crate::consult::pending_consults(q, &talk.id));
+    let consult_roots: Vec<PathBuf> = match &questions {
+        Some(q) if consulted => vec![q.root().to_path_buf()],
+        _ => Vec::new(),
     };
 
     let (allow_write, unsandboxed) = turn_access(cfg.talk.allow_write, consulted);
