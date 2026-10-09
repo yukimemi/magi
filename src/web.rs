@@ -4914,6 +4914,7 @@ struct TaskCountsView {
     failed: usize,
     held: usize,
     blocked: usize,
+    parked: usize,
 }
 
 impl From<crate::queue::TaskCounts> for TaskCountsView {
@@ -4925,6 +4926,7 @@ impl From<crate::queue::TaskCounts> for TaskCountsView {
             failed: c.failed,
             held: c.held,
             blocked: c.blocked,
+            parked: c.parked,
         }
     }
 }

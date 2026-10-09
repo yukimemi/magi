@@ -186,6 +186,7 @@ const TASK_STATUS = {
   running: { glyph: "\u25b8", tone: "blue", flight: true },
   done:    { glyph: "\u25c6", tone: "gold" },
   failed:  { glyph: "\u2715", tone: "rust" },
+  parked:  { glyph: "\u2016", tone: "ink", note: "Parked at a node boundary. Nothing failed; the next loop resumes the same run." },
   held:    { glyph: "\u2016", tone: "rust", note: "Held. This task will not be claimed until it is released." },
   /* Waiting on another task or an unanswered question - see `Task::blocked_by`.
      Set and cleared by the daemon, never by hand, which is why there is no
@@ -2355,6 +2356,7 @@ function updateTaskCard(row, task) {
   let noteText = waitingOn && meta.note
     ? `${meta.note} Waiting on: ${waitingOn}`
     : meta.note || (waitingOn ? `Waiting on: ${waitingOn}` : "");
+  if (status === "parked" && task.park_reason) noteText = `${meta.note} ${task.park_reason}`;
 
   /* `status_str` alone decides whether the dependency breakdown gets added -
      never the mere presence of `blocked_by`/`block_reason`. Both fields can
@@ -2737,7 +2739,7 @@ const QUEUE_SECTIONS = [
 function queueSection(task) {
   const status = String(task.status_str || task.status || "");
   if (status === "running") return "running";
-  if (status === "queued" || status === "failed") return "upnext";
+  if (status === "queued" || status === "failed" || status === "parked") return "upnext";
   if (status === "blocked") return "blocked";
   if (status === "held") return "held";
   return "done";
@@ -3655,6 +3657,7 @@ function renderStatsQueue(q) {
     sectionTile("Running", q.running, "blue", "running"),
     sectionTile("Done", q.done, "gold", "done"),
     sectionTile("Failed", q.failed, "rust", "upnext"),
+    sectionTile("Parked", q.parked || 0, "blue", "upnext"),
     sectionTile("Held", q.held, "rust", "held"),
     sectionTile("Blocked", q.blocked, "rust", "blocked"),
   );
@@ -3671,7 +3674,7 @@ function renderQueue(allowSearchJump = false) {
 
   const runnable = tasks.filter((t) => {
     const status = t.status_str || t.status;
-    return status === "queued" || status === "failed";
+    return status === "queued" || status === "failed" || status === "parked";
   }).length;
   const held = tasks.filter((t) => (t.status_str || t.status) === "held").length;
   const parts = [`${plural(tasks.length, "task", "tasks")}`];
@@ -5357,13 +5360,13 @@ async function loadTalk(id, { background = false } = {}) {
    that want a human (running, held, failed) ahead of the quiet ones, and a
    zero count is left out rather than printed as "0 done". */
 function talkTasksSummary(tasks) {
-  const counts = { running: 0, held: 0, failed: 0, queued: 0, done: 0 };
+  const counts = { running: 0, held: 0, failed: 0, parked: 0, queued: 0, done: 0 };
   for (const task of tasks) {
     const status = String(task.status_str || task.status || "");
     if (status in counts) counts[status] += 1;
   }
   const parts = [`${tasks.length} filed`];
-  for (const key of ["running", "held", "failed", "queued", "done"]) {
+  for (const key of ["running", "held", "failed", "parked", "queued", "done"]) {
     if (counts[key]) parts.push(`${counts[key]} ${key}`);
   }
   return parts.join(" · ");
@@ -9081,7 +9084,7 @@ function renderTask() {
   setAttr($("task-meta"), "title", task.id);
 
   const waitingOn = task.hold_reason || task.block_reason;
-  const noteBits = [(TASK_STATUS[status] || {}).note, waitingOn ? `Waiting on: ${waitingOn}` : ""].filter(Boolean);
+  const noteBits = [(TASK_STATUS[status] || {}).note, waitingOn ? `Waiting on: ${waitingOn}` : "", status === "parked" ? task.park_reason : ""].filter(Boolean);
   setText($("task-note"), noteBits.join(" "));
   show($("task-note"), noteBits.length > 0);
   setText($("task-error"), task.last_error || "");

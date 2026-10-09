@@ -83,6 +83,11 @@ use crate::ask::Questions;
 /// hand (`magi run` / `magi review`) is carried by a task without losing its
 /// command-line choices. Field-only.
 ///
+/// 11: added [`TaskStatus::Parked`] and [`Task::park_reason`], so a run that
+/// stopped at a node boundary (an upgrade, an operator's park) is no longer
+/// recorded as a failed task. Variant plus `#[serde(default)]` field; an older
+/// build must not half-read the new status.
+///
 /// 3: added [`HoldSource`] so conductor recovery cannot release a hold an
 /// operator deliberately placed. Old records default to `None` and are
 /// protected as operator-held until an explicit release; the safe direction
@@ -97,7 +102,7 @@ use crate::ask::Questions;
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 10;
+pub const SCHEMA: u32 = 11;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,12 +181,17 @@ pub enum TaskStatus {
     /// [`Task::blocked_by`]. Set and cleared by `crate::conduct` and
     /// `crate::daemon`'s deterministic resolver, never by hand.
     Blocked,
+    /// The run stopped at a node boundary because the process was asked to
+    /// give itself back. Nothing failed: the run's work is intact and the next
+    /// loop resumes it. Runnable like [`TaskStatus::Queued`]; the reason is in
+    /// [`Task::park_reason`], never [`Task::last_error`].
+    Parked,
 }
 
 impl TaskStatus {
     /// Is this task eligible for a daemon to claim?
     pub fn runnable(self) -> bool {
-        matches!(self, Self::Queued | Self::Failed)
+        matches!(self, Self::Queued | Self::Failed | Self::Parked)
     }
 
     /// Lowercase name, as it appears on disk and in the API.
@@ -193,6 +203,7 @@ impl TaskStatus {
             Self::Failed => "failed",
             Self::Held => "held",
             Self::Blocked => "blocked",
+            Self::Parked => "parked",
         }
     }
 }
@@ -213,6 +224,8 @@ pub struct TaskCounts {
     pub held: usize,
     /// Waiting on another task or an unanswered question.
     pub blocked: usize,
+    /// Run parked at a node boundary; resumable, not a failure.
+    pub parked: usize,
 }
 
 impl TaskCounts {
@@ -229,6 +242,7 @@ impl TaskCounts {
                 TaskStatus::Failed => counts.failed += 1,
                 TaskStatus::Held => counts.held += 1,
                 TaskStatus::Blocked => counts.blocked += 1,
+                TaskStatus::Parked => counts.parked += 1,
             }
         }
         counts
@@ -455,6 +469,11 @@ pub struct Task {
     /// cause: a question filed before it is about something older.
     #[serde(default)]
     pub held_at: Option<Timestamp>,
+    /// Why the run parked, while the task is [`TaskStatus::Parked`]. Kept apart
+    /// from [`Task::last_error`] because nothing failed. Cleared by every
+    /// transition out of the parked state. `#[serde(default)]`.
+    #[serde(default)]
+    pub park_reason: Option<String>,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -622,6 +641,7 @@ impl Task {
             overrides: None,
             review_of: None,
             held_at: None,
+            park_reason: None,
             created_at: now,
             updated_at: now,
         }
@@ -672,6 +692,7 @@ impl Task {
         self.attempts += 1;
         self.runs.push(run);
         self.last_error = None;
+        self.park_reason = None;
         self.fresh_start = false;
         self.interrupt = false;
         // The answer has been honoured: the task got its turn.
@@ -703,6 +724,7 @@ impl Task {
         self.status = TaskStatus::Done;
         self.resume_override = None;
         self.last_error = None;
+        self.park_reason = None;
         self.hold_reason = None;
         self.hold_source = None;
         self.diagnostic = None;
@@ -807,6 +829,7 @@ impl Task {
     pub fn fail(&mut self, why: impl Into<String>, max_attempts: usize) {
         let why = why.into();
         self.diagnostic = None;
+        self.park_reason = None;
         self.status = if self.attempts >= max_attempts {
             self.note_held();
             self.hold_source = Some(HoldSource::Machine);
@@ -834,6 +857,21 @@ impl Task {
         self.status = TaskStatus::Failed;
     }
 
+    /// Record a run that parked at a node boundary. Nothing failed: the attempt
+    /// is refunded, [`Task::last_error`] is left as it was, the run history and
+    /// `fresh_start` are kept so the next loop resumes the same run, and the
+    /// reason goes to [`Task::park_reason`]. Runnable like a requeued task and
+    /// never counted against `max_attempts`.
+    pub fn park(&mut self, why: impl Into<String>) {
+        self.diagnostic = None;
+        self.attempts = self.attempts.saturating_sub(1);
+        self.status = TaskStatus::Parked;
+        self.park_reason = Some(why.into());
+        // The variant and field are schema 11; stamp it so an older build
+        // refuses the record instead of half-reading it.
+        self.schema = self.schema.max(SCHEMA);
+    }
+
     /// Whether this held task may only be released by an operator.
     ///
     /// Old files did not record a source. Preserve every such hold rather
@@ -853,6 +891,7 @@ impl Task {
     /// button is reachable on a blocked task, same as "Mark done" - kept
     /// reading as still waiting on a dependency it no longer had any claim on.
     pub fn hold_manual(&mut self, reason: Option<String>) {
+        self.park_reason = None;
         self.note_held();
         self.status = TaskStatus::Held;
         if reason.is_some() {
@@ -869,6 +908,7 @@ impl Task {
     /// Clears `blocked_by`/`block_reason` for the same reason
     /// [`Task::hold_manual`] does.
     pub fn hold_machine(&mut self, reason: Option<String>) {
+        self.park_reason = None;
         self.note_held();
         self.status = TaskStatus::Held;
         if reason.is_some() {
@@ -1117,6 +1157,7 @@ impl Task {
         self.held_at = None;
         self.attempts = 0;
         self.last_error = None;
+        self.park_reason = None;
         // Otherwise the next person who holds this task reads a reason that
         // belonged to whatever it was waiting on last time.
         self.hold_reason = None;
@@ -2308,7 +2349,19 @@ mod tests {
         let mut blocked = queued.clone();
         blocked.status = TaskStatus::Blocked;
 
-        let counts = TaskCounts::of(&[queued, running, done.clone(), done, failed, held, blocked]);
+        let mut parked = queued.clone();
+        parked.status = TaskStatus::Parked;
+
+        let counts = TaskCounts::of(&[
+            queued,
+            running,
+            done.clone(),
+            done,
+            failed,
+            held,
+            blocked,
+            parked,
+        ]);
         assert_eq!(
             counts,
             TaskCounts {
@@ -2318,6 +2371,7 @@ mod tests {
                 failed: 1,
                 held: 1,
                 blocked: 1,
+                parked: 1,
             }
         );
     }
