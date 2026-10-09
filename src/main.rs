@@ -313,6 +313,10 @@ enum Command {
         /// happens to be in.
         #[arg(long)]
         repo: Option<PathBuf>,
+        /// Include agents that are no longer in the current config roster
+        /// (hidden by default).
+        #[arg(long)]
+        all: bool,
     },
     /// Remove a run's worktrees and branches.
     Fold {
@@ -1415,14 +1419,18 @@ async fn dispatch(command: Command) -> Result<()> {
         // report pane parses those same ANSI codes back into ratatui spans.
         Command::Tui => tui::run(),
 
-        Command::Stats { repo } => {
+        Command::Stats { repo, all } => {
             let states = stats::load_all();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             match repo {
                 Some(repo) => {
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                     let resolved = resolve_stats_repo(&repo, &cwd, &states).await?;
                     let filtered = stats::filter_repo(&states, &resolved);
-                    print!("{}", report::stats(&stats::collect_refs(filtered)));
+                    let mut st = stats::collect_refs(filtered);
+                    if !all {
+                        stats::retain_current_roster(&mut st, &resolved);
+                    }
+                    print!("{}", report::stats(&st));
                 }
                 None => {
                     let by_repo = stats::by_repo(&states);
@@ -1430,7 +1438,11 @@ async fn dispatch(command: Command) -> Result<()> {
                         print!("{}", report::repo_summary(&by_repo));
                         println!();
                     }
-                    print!("{}", report::stats(&stats::collect(&states)));
+                    let mut st = stats::collect(&states);
+                    if !all {
+                        stats::retain_current_roster(&mut st, &cwd);
+                    }
+                    print!("{}", report::stats(&st));
                 }
             }
             Ok(())

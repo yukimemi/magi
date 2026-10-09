@@ -393,6 +393,8 @@
          renderStatsRepoSelector(). Defaults to "All repositories" (empty
          value), the aggregate view built above. -->
     <select class="stats-repo-select" id="stats-repo" hidden></select>
+    <label class="stats-all-toggle"><input type="checkbox" id="stats-all"> Show retired agents</label>
+    <p class="panel-note" id="stats-retired-note" role="status" hidden></p>
     <!-- Same reasoning as /api/health's own runs_unreadable: a skipped run
          must be counted, not silently dropped from the tallies below. -->
     <div class="stats-banner" id="stats-unreadable-banner" role="status" hidden>

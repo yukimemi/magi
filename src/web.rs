@@ -4829,6 +4829,10 @@ struct StatsView {
     /// UI can confirm its selection round-tripped. `None` for the aggregate,
     /// all-repositories view.
     repo: Option<String>,
+    /// Agent ids left out of `agents` / `reviewers` / `advisors` because the
+    /// current config roster no longer lists them. Empty with `?all=true`, an
+    /// unreadable config, or when nothing was retired.
+    retired_hidden: Vec<String>,
 }
 
 /// One day of [`StatsView::daily`].
@@ -4872,6 +4876,8 @@ const STATS_DAILY_DAYS: usize = 30;
 #[serde(default)]
 struct StatsQuery {
     repo: Option<String>,
+    /// `?all=true` keeps agents that are no longer in the roster.
+    all: bool,
 }
 
 /// `GET /api/stats` - task and run statistics for the dashboard, aggregated
@@ -4894,7 +4900,7 @@ async fn stats_get(
             .map(RepoSummaryView::from)
             .collect();
         let mut scoped: Vec<&RunState> = states.iter().collect();
-        let collected = match &q.repo {
+        let mut collected = match &q.repo {
             Some(repo) => {
                 let filtered = stats::filter_repo(&states, std::path::Path::new(repo));
                 if filtered.is_empty() {
@@ -4907,6 +4913,13 @@ async fn stats_get(
             }
             None => stats::collect(&states),
         };
+        if !q.all {
+            let repo = q
+                .repo
+                .as_deref()
+                .map_or_else(|| ui.repo.clone(), PathBuf::from);
+            stats::retain_current_roster(&mut collected, &repo);
+        }
         let daily = stats::daily(
             scoped,
             jiff::Zoned::now().date(),
@@ -4934,6 +4947,7 @@ async fn stats_get(
             repos,
             daily: daily.iter().map(DailyStatsView::from).collect(),
             repo: q.repo.clone(),
+            retired_hidden: collected.retired_hidden.clone(),
         }))
     })
     .await
@@ -11545,7 +11559,8 @@ mod tests {
         )
         .expect("write run.json");
 
-        let advisors = f.get("/api/stats").await.json()["advisors"].clone();
+        // `alpha` is in no roster here; this test is about the rates.
+        let advisors = f.get("/api/stats?all=true").await.json()["advisors"].clone();
         let alpha = advisors
             .as_array()
             .expect("an array")
@@ -11558,6 +11573,60 @@ mod tests {
         assert_eq!(alpha["strong"], 1);
         assert_eq!(alpha["faint"], 0);
         assert_eq!(alpha["reflection_rate"]["pct"], 100.0);
+    }
+
+    #[tokio::test]
+    async fn stats_hides_agents_outside_the_roster_unless_all() {
+        use crate::run::Candidate;
+        let repo = TempDir::new().expect("repo dir");
+        std::fs::write(
+            repo.path().join("magi.toml"),
+            "[[agents]]\nid = \"keep\"\nkind = \"claude\"\n",
+        )
+        .expect("magi.toml");
+        let f = Fixture::with_repo(repo.path().to_path_buf()).await;
+        let mut state = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        );
+        state.id = "20260902-140501-a".to_owned();
+        state.status = RunStatus::Merged;
+        for (label, agent) in [('A', "keep"), ('B', "retired")] {
+            let mut c: Candidate = serde_json::from_value(serde_json::json!({
+                "index": 0, "label": label.to_string(), "agent": agent,
+                "branch": "b", "worktree": "/w",
+            }))
+            .expect("candidate");
+            c.label = label;
+            state.candidates.push(c);
+        }
+        let dir = f.runs().join(&state.id);
+        std::fs::create_dir_all(&dir).expect("run dir");
+        std::fs::write(
+            dir.join("run.json"),
+            serde_json::to_string_pretty(&state).expect("serialize run"),
+        )
+        .expect("write run.json");
+
+        let agents_of = |v: &serde_json::Value| -> Vec<String> {
+            v["agents"]
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|a| a["agent"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let hidden = f.get("/api/stats").await.json();
+        assert_eq!(agents_of(&hidden), ["keep"]);
+        assert_eq!(hidden["retired_hidden"], serde_json::json!(["retired"]));
+        assert_eq!(hidden["totals"]["runs"], 1);
+
+        let all = f.get("/api/stats?all=true").await.json();
+        assert_eq!(agents_of(&all).len(), 2);
+        assert_eq!(all["retired_hidden"], serde_json::json!([]));
     }
 
     #[tokio::test]

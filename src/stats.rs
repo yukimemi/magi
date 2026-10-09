@@ -5,7 +5,7 @@
 //! happened to ask for, and a model that draws harder tasks looks worse. Read
 //! them as "relative performance on my workload", which is the only claim the
 //! data supports.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::run::{RunState, RunStatus, list_ids};
@@ -432,6 +432,48 @@ pub struct Stats {
     pub nodes: Vec<NodeDuration>,
     /// Post-merge release-bump record, over every merged run.
     pub release_bumps: ReleaseBumpStats,
+    /// Agent ids whose rows [`retain_roster`] left out of `agents`,
+    /// `reviewers` and `advisors`, sorted, once each. Empty when nothing was
+    /// filtered.
+    pub retired_hidden: Vec<String>,
+}
+
+/// The agent ids of the current configured roster, or `None` when there is
+/// nothing to filter by: an empty roster is "not configured", never "every
+/// agent retired", so it must not blank the tables.
+pub fn roster_of(cfg: &crate::config::Config) -> Option<BTreeSet<String>> {
+    let ids: BTreeSet<String> = cfg.agents.iter().map(|a| a.id.clone()).collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// Drop the per-agent rows of agents outside `roster`, keeping the order.
+/// Only `agents`, `reviewers` and `advisors` are touched: totals, e2e, nodes
+/// and release bumps are not per-agent and stay as aggregated. The hidden ids
+/// are recorded in [`Stats::retired_hidden`]. Run history is never altered.
+pub fn retain_roster(stats: &mut Stats, roster: &BTreeSet<String>) {
+    let mut hidden = BTreeSet::new();
+    let mut keep = |agent: &str| {
+        let keep = roster.contains(agent);
+        if !keep {
+            hidden.insert(agent.to_owned());
+        }
+        keep
+    };
+    stats.agents.retain(|a| keep(&a.agent));
+    stats.reviewers.retain(|a| keep(&a.agent));
+    stats.advisors.retain(|a| keep(&a.agent));
+    stats.retired_hidden = hidden.into_iter().collect();
+}
+
+/// [`retain_roster`] against the layered config discovered for `repo`; an
+/// unreadable config (or an empty roster) leaves `stats` unfiltered.
+pub fn retain_current_roster(stats: &mut Stats, repo: &Path) {
+    if let Some(roster) = crate::config::Config::discover(repo, None)
+        .ok()
+        .and_then(|(cfg, _)| roster_of(&cfg))
+    {
+        retain_roster(stats, &roster);
+    }
 }
 
 /// Load every run on disk, skipping any that cannot be read.
@@ -755,6 +797,7 @@ pub fn collect_refs<'a>(states: impl IntoIterator<Item = &'a RunState>) -> Stats
         e2e,
         nodes,
         release_bumps,
+        retired_hidden: Vec::new(),
     }
 }
 
@@ -849,6 +892,85 @@ mod tests {
     use crate::run::{Candidate, CommandOutcome, FixRecord, ReviewRecord, ReviewRound, Tally};
     use crate::verdict::{Finding, Severity};
     use std::path::PathBuf;
+
+    fn mixed_stats() -> Stats {
+        Stats {
+            totals: Totals {
+                runs: 7,
+                ..Totals::default()
+            },
+            agents: ["cc", "cx", "oc"]
+                .map(|a| AgentStats {
+                    agent: a.into(),
+                    entered: 2,
+                    ..AgentStats::default()
+                })
+                .to_vec(),
+            reviewers: ["cx", "cc"]
+                .map(|a| ReviewerStats {
+                    agent: a.into(),
+                    ..ReviewerStats::default()
+                })
+                .to_vec(),
+            advisors: ["cx", "gone"]
+                .map(|a| AdvisorStats {
+                    agent: a.into(),
+                    ..AdvisorStats::default()
+                })
+                .to_vec(),
+            ..Stats::default()
+        }
+    }
+
+    fn roster(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn retain_roster_drops_retired_agents_from_every_table() {
+        let mut st = mixed_stats();
+        retain_roster(&mut st, &roster(&["cc", "oc"]));
+        let agents: Vec<&str> = st.agents.iter().map(|a| a.agent.as_str()).collect();
+        assert_eq!(agents, ["cc", "oc"]);
+        let reviewers: Vec<&str> = st.reviewers.iter().map(|a| a.agent.as_str()).collect();
+        assert_eq!(reviewers, ["cc"]);
+        assert!(st.advisors.is_empty());
+        assert_eq!(st.retired_hidden, ["cx", "gone"]);
+    }
+
+    #[test]
+    fn retain_roster_leaves_non_agent_totals_alone() {
+        let mut st = mixed_stats();
+        retain_roster(&mut st, &roster(&["cc"]));
+        assert_eq!(st.totals.runs, 7);
+    }
+
+    #[test]
+    fn retain_roster_with_everyone_present_hides_nothing() {
+        let mut st = mixed_stats();
+        retain_roster(&mut st, &roster(&["cc", "cx", "oc", "gone"]));
+        assert_eq!(st.agents.len(), 3);
+        assert!(st.retired_hidden.is_empty());
+    }
+
+    #[test]
+    fn an_empty_roster_is_no_filter() {
+        let cfg = Config {
+            agents: vec![],
+            ..Config::default()
+        };
+        assert!(roster_of(&cfg).is_none());
+    }
+
+    #[test]
+    fn an_unreadable_config_does_not_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("magi.toml"), "this is = = not toml").unwrap();
+        let mut st = mixed_stats();
+        retain_current_roster(&mut st, dir.path());
+        assert_eq!(st.agents.len(), 3);
+        assert!(st.retired_hidden.is_empty());
+    }
 
     fn finding(id: &str, file: &str, line: u32, title: &str, sev: Severity) -> Finding {
         Finding {
