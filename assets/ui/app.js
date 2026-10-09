@@ -572,6 +572,8 @@ const state = {
      all-repositories aggregate - the default. In-memory only, same as
      queueSearch: a reload starts back at the aggregate view. */
   statsRepo: null,
+  /* Show agents that are no longer in the configured roster. */
+  statsAll: false,
   /* Same idea for the Backlog's sections, kept separately since the two
      views don't share section keys or default open/closed state. */
   queueCollapsed: loadCollapsed(QUEUE_COLLAPSE_KEY),
@@ -3036,6 +3038,19 @@ function renderStats() {
 
   renderStatsRepoSelector(s.repos, s.repo);
   show($("stats-queue-scope-note"), !!s.repo);
+
+  /* Outside stats-runs-section on purpose: the note must survive a state in
+     which every row was hidden. */
+  const hidden = s.retired_hidden || [];
+  $("stats-all").checked = state.statsAll;
+  $("stats-all").onchange = (e) => toggleStatsAll(e.target.checked);
+  show($("stats-retired-note"), hidden.length > 0);
+  if (hidden.length > 0) {
+    setText(
+      $("stats-retired-note"),
+      `${plural(hidden.length, "retired agent", "retired agents")} hidden: ${hidden.join(", ")}`,
+    );
+  }
 
   /* stats-body stays visible whenever there is anything to show at all -
      which, unlike the run-only panels below, includes the queue: a home
@@ -8234,9 +8249,11 @@ function loadQueue(change) {
 
 async function loadStats({ background = false } = {}) {
   try {
-    const url = state.statsRepo
-      ? `${API.stats}?repo=${encodeURIComponent(state.statsRepo)}`
-      : API.stats;
+    const params = new URLSearchParams();
+    if (state.statsRepo) params.set("repo", state.statsRepo);
+    if (state.statsAll) params.set("all", "true");
+    const query = params.toString();
+    const url = query ? `${API.stats}?${query}` : API.stats;
     state.stats = await getJson(url);
     renderStats();
     ok();
@@ -8247,6 +8264,11 @@ async function loadStats({ background = false } = {}) {
 
 /* The repository selector's change handler - switches state.statsRepo and
    refetches, same as any other filter control in this file. */
+function toggleStatsAll(checked) {
+  state.statsAll = !!checked;
+  loadStats();
+}
+
 function selectStatsRepo(value) {
   state.statsRepo = value || null;
   loadStats();

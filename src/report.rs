@@ -1258,6 +1258,16 @@ pub fn stats(stats: &Stats) -> String {
         );
     }
 
+    if !stats.retired_hidden.is_empty() {
+        let n = stats.retired_hidden.len();
+        let _ = writeln!(
+            s,
+            "{n} retired agent{} hidden: {} (magi stats --all to show)\n",
+            if n == 1 { "" } else { "s" },
+            stats.retired_hidden.join(", ")
+        );
+    }
+
     if !stats.agents.is_empty() {
         let _ = writeln!(
             s,
