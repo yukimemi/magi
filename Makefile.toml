@@ -246,3 +246,31 @@ script = '''
 cd tools/demo
 node record.mjs --shots
 '''
+
+[tasks.demo-gif-desktop]
+description = "Re-record assets/demo-desktop.gif (two-pane desktop layout, same scratch setup)"
+dependencies = ["demo-build", "demo-deps"]
+script_runner = "@shell"
+script = '''
+cd tools/demo
+node record.mjs --profile=desktop
+'''
+
+[tasks.demo-shots-desktop]
+description = "Run the desktop storyboard to Cargo's target/demo-shots-desktop as one PNG per beat (no encode)"
+dependencies = ["demo-build", "demo-deps"]
+script_runner = "@shell"
+script = '''
+cd tools/demo
+node record.mjs --profile=desktop --shots
+'''
+
+[tasks.demo-gif-all]
+description = "Re-record both README gifs (mobile, then desktop)"
+dependencies = ["demo-build", "demo-deps"]
+script_runner = "@shell"
+script = '''
+cd tools/demo
+node record.mjs
+node record.mjs --profile=desktop
+'''
